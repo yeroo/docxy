@@ -2375,7 +2375,7 @@ impl App {
             .collect();
         // Decided once above, for every group: written without deciding
         // again against what the earlier groups recalculated.
-        self.record_groups(keys, |app| {
+        self.record_groups(keys, None, |app| {
             for (sheet_idx, changes) in groups {
                 app.engine
                     .set_cells_prechecked(&mut app.pkg.workbook, sheet_idx, changes);
@@ -2389,9 +2389,14 @@ impl App {
     /// its after once the last is done, so each group is one snapshot of its
     /// cells, as [`Engine::restore_cells`] needs: taken cell by cell, a spill
     /// anchor's after could still claim a cell a later write blocked it with.
+    ///
+    /// `cut_from` is a cut's source (sheet, rect) when `write` pastes one: a
+    /// table lying wholly inside it was cut whole, so clearing its headers
+    /// renames none of its columns.
     fn record_groups(
         &mut self,
         keys: Vec<(usize, Vec<(u32, u32)>)>,
+        cut_from: Option<(usize, (u32, u32, u32, u32))>,
         write: impl FnOnce(&mut Self),
     ) {
         let keys: Vec<_> = keys.into_iter().filter(|(_, k)| !k.is_empty()).collect();
@@ -2416,9 +2421,56 @@ impl App {
                 .map(|(s, cells)| app.snapshot(*s, cells))
                 .collect()
         };
+        // A header cell of a table names its column: an edit there renames
+        // the column in every formula (`sync_table_headers`), which only a
+        // whole-workbook step can undo. Snapshotted only when one is hit.
+        let headers = keys
+            .iter()
+            .any(|(s, cells)| self.hits_table_header(*s, cells));
+        let wb_before = headers.then(|| self.wb_snapshot());
         let befores = snapshot(self);
         write(self);
+        let mut written = None;
+        let mut renamed = false;
+        if headers {
+            written = Some(snapshot(self));
+            let inside = |a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)| {
+                b.0 <= a.0 && a.2 <= b.2 && b.1 <= a.1 && a.3 <= b.3
+            };
+            let cut_whole: Vec<(usize, (u32, u32, u32, u32))> = (self.pkg.workbook.tables.iter())
+                .filter(|t| cut_from.is_some_and(|(s, rect)| t.sheet == s && inside(t.range, rect)))
+                .map(|t| (t.sheet, t.range))
+                .collect();
+            for (s, cells) in &keys {
+                let cells: Vec<(u32, u32)> = (cells.iter().copied())
+                    .filter(|&(r, c)| {
+                        !cut_whole
+                            .iter()
+                            .any(|&(ts, rect)| ts == *s && inside((r, c, r, c), rect))
+                    })
+                    .collect();
+                renamed |= gridcore::edit::sync_table_headers(&mut self.pkg.workbook, *s, &cells);
+            }
+        }
+        if let (true, Some(before)) = (renamed, wb_before) {
+            let after = self.wb_snapshot();
+            self.rebuild_engine();
+            // As every structural step does (`try_structural`): a pending
+            // cut's cells were captured before the formulas were rewritten.
+            // When this step is the cut-paste itself, the cut is spent.
+            self.cancel_cut();
+            self.undo.push(UndoAction::Structural { before, after });
+            self.redo.clear();
+            self.modified = true;
+            self.warn_new_circles(&circles_before);
+            return;
+        }
         let afters = snapshot(self);
+        // A header written back as its column's name (a formula, a
+        // duplicate) changed under the engine.
+        if written.is_some_and(|w| w != afters) {
+            self.rebuild_engine();
+        }
         let undo = keys
             .iter()
             .zip(befores.into_iter().zip(afters))
@@ -2436,6 +2488,18 @@ impl App {
         self.redo.clear();
         self.modified = true;
         self.warn_new_circles(&circles_before);
+    }
+
+    /// Whether any of `cells` on sheet `sheet` is a header cell of a table.
+    fn hits_table_header(&self, sheet: usize, cells: &[(u32, u32)]) -> bool {
+        self.pkg.workbook.tables.iter().any(|t| {
+            let (r1, c1, _, c2) = t.range;
+            t.sheet == sheet
+                && t.header_rows > 0
+                && cells
+                    .iter()
+                    .any(|&(r, c)| r == r1 && (c1..=c2).contains(&c))
+        })
     }
 
     /// Restyle cells on sheet `sheet_idx` — `(row, col, style index)` — as one
@@ -2575,6 +2639,31 @@ impl App {
         model_rename: Option<(&str, &str)>,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.structural_step(model_rename, false, op)
+    }
+
+    /// [`Self::structural`] for an edit that writes cell content in place
+    /// (Replace All, Text to Columns, AutoSum): a table header it rewrote
+    /// renames that column, as typing there does
+    /// ([`Self::sync_written_headers`]). An edit that moves cells (rows,
+    /// columns, a sort) must not use it: its moved headers aren't written.
+    fn structural_writing_cells(&mut self, op: impl FnOnce(&mut gridcore::sheet::Workbook)) {
+        let infallible = self.structural_step(None, true, |wb| {
+            op(wb);
+            Ok(())
+        });
+        debug_assert!(infallible.is_ok());
+    }
+
+    /// The one structural step behind [`Self::try_structural`] and
+    /// [`Self::structural_writing_cells`]; `sync_headers` says whether the
+    /// edit wrote cells in place, whose header cells then rename columns.
+    fn structural_step(
+        &mut self,
+        model_rename: Option<(&str, &str)>,
+        sync_headers: bool,
+        op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
+    ) -> Result<(), String> {
         let mut before = self.wb_snapshot();
         // A structural edit moves cells, so compare how many cells sit on
         // circles rather than where: a circle that merely moved is not new.
@@ -2582,6 +2671,9 @@ impl App {
         if let Err(e) = op(&mut self.pkg.workbook) {
             self.put_back(&before);
             return Err(e);
+        }
+        if sync_headers {
+            self.sync_written_headers(&before);
         }
         let mut after = self.wb_snapshot();
         if let Some((old, new)) = model_rename {
@@ -2599,6 +2691,38 @@ impl App {
         self.clamp_cursor();
         self.cancel_cut();
         Ok(())
+    }
+
+    /// A structural edit that wrote cells in place (Replace All, Text to
+    /// Columns, AutoSum; see [`Self::structural_writing_cells`]) renames the
+    /// columns whose header cells it rewrote, as typing there does
+    /// ([`gridcore::edit::sync_table_headers`]). Only a header that differs
+    /// from `before` while its table kept its name and range counts, so a
+    /// loaded header that merely reads otherwise than its column's name (a
+    /// number, say) is left as the file has it.
+    fn sync_written_headers(&mut self, before: &WbSnapshot) {
+        let wb = &self.pkg.workbook;
+        let mut written: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
+        for t in &wb.tables {
+            let kept = before.tables.iter().any(|b| {
+                b.sheet == t.sheet && b.range == t.range && b.name.eq_ignore_ascii_case(&t.name)
+            });
+            if t.header_rows == 0 || !kept {
+                continue;
+            }
+            let (r1, c1, _, c2) = t.range;
+            let was = |c| before.sheets.get(t.sheet).and_then(|s| s.cell(r1, c));
+            let cells: Vec<(u32, u32)> = (c1..=c2)
+                .filter(|&c| was(c) != wb.sheets[t.sheet].cell(r1, c))
+                .map(|c| (r1, c))
+                .collect();
+            if !cells.is_empty() {
+                written.push((t.sheet, cells));
+            }
+        }
+        for (s, cells) in written {
+            gridcore::edit::sync_table_headers(&mut self.pkg.workbook, s, &cells);
+        }
     }
 
     /// The data model follows table `old` being renamed `new`: its
@@ -3331,7 +3455,15 @@ impl App {
                 } else {
                     vec![(src, clear_keys), (here, writes)]
                 };
-                self.record_groups(keys, |app| {
+                // The cut's source block: a table lying wholly inside it keeps
+                // its column names (it does not move with the cells).
+                let cut_from = cut.then(|| {
+                    let (fr, fc) = clip.from;
+                    let h = clip.cells.len().max(1) as u32;
+                    let w = clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
+                    (src, (fr, fc, fr + h - 1, fc + w - 1))
+                });
+                self.record_groups(keys, cut_from, |app| {
                     let (clears, late) = if same_sheet {
                         app.engine
                             .split_frozen_blanks(&app.pkg.workbook, src, clears)
@@ -4724,6 +4856,7 @@ impl App {
             TableName => self.table_name_act(),
             ResizeTable => self.resize_table_act(),
             ConvertToRange => self.convert_table_act(),
+            Consolidate => self.open_consolidate(),
             Subtotal => self.subtotal(),
             DataForm => self.data_form(),
             GroupOutline => self.group_outline(false),
@@ -5784,7 +5917,7 @@ impl App {
         };
         let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
         self.status = Some(format!("AutoSum: =SUM({range})"));
-        self.structural(move |wb| {
+        self.structural_writing_cells(move |wb| {
             let cell = Cell {
                 style,
                 ..Cell::formula(&format!("SUM({range})"))
@@ -5889,7 +6022,7 @@ impl App {
     ) -> usize {
         let today = now_serial();
         let mut n = 0;
-        self.structural(|wb| {
+        self.structural_writing_cells(|wb| {
             n = gridcore::edit::text_to_columns(wb, src, opts, today);
         });
         self.status = Some(format!(
@@ -5949,7 +6082,23 @@ impl App {
         &mut self,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<String, String>,
     ) -> Result<bool, ()> {
-        if self.protected() {
+        self.try_outline_edit_on(self.sheet, op)
+    }
+
+    /// [`App::try_outline_edit`] for an edit of `sheet`, which need not be
+    /// the active one: that sheet's protection is what refuses it.
+    fn try_outline_edit_on(
+        &mut self,
+        sheet: usize,
+        op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<String, String>,
+    ) -> Result<bool, ()> {
+        if self
+            .pkg
+            .workbook
+            .sheets
+            .get(sheet)
+            .is_some_and(|s| s.is_protected())
+        {
             self.status =
                 Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
             return Err(());
@@ -6124,6 +6273,50 @@ impl App {
         ));
     }
 
+    /// Consolidate…: the dialog writing at the cursor, starting from the
+    /// settings this sheet kept.
+    fn open_consolidate(&mut self) {
+        let kept = self.sheet().consolidate.as_ref();
+        let names = self
+            .pkg
+            .workbook
+            .sheets
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        self.outline_dialog = Some(outlinedlg::Dialog::Consolidate(
+            outlinedlg::ConsolidateDialog::new(self.sheet, self.cur, kept, names),
+        ));
+    }
+
+    /// Consolidate into `sheet` at `at` as one undo step. The detail rows of
+    /// a linked consolidation carry the workbook's name: the file's stem.
+    /// A refusal changes nothing and says why.
+    pub(crate) fn apply_consolidate(
+        &mut self,
+        sheet: usize,
+        at: (u32, u32),
+        mut opts: gridcore::edit::ConsolidateOptions,
+    ) -> Result<gridcore::edit::Area, String> {
+        opts.book_name = file_stem(&self.path);
+        let mut out = None;
+        let done = self.try_outline_edit_on(sheet, |wb| {
+            let area =
+                gridcore::edit::consolidate(wb, sheet, at, &opts).map_err(|e| e.to_string())?;
+            out = Some(area);
+            let (r1, c1, r2, c2) = area;
+            Ok(format!(
+                "Consolidated into {}:{}",
+                cell_name(r1, c1),
+                cell_name(r2, c2)
+            ))
+        });
+        match (done, out) {
+            (Ok(_), Some(area)) => Ok(area),
+            _ => Err(self.status.clone().unwrap_or_default()),
+        }
+    }
+
     /// A key for the open outline dialog.
     fn outline_dialog_key(&mut self, code: KeyCode) {
         let Some(d) = self.outline_dialog.as_mut() else {
@@ -6147,6 +6340,15 @@ impl App {
                 });
                 // A refusal (no column chosen) leaves the dialog open.
                 if done.is_ok() {
+                    self.outline_dialog = None;
+                }
+            }
+            outlinedlg::Outcome::Consolidate(opts) => {
+                let Some(outlinedlg::Dialog::Consolidate(d)) = self.outline_dialog.clone() else {
+                    return;
+                };
+                // A refusal leaves the dialog open, with the reason showing.
+                if self.apply_consolidate(d.sheet, d.at, opts).is_ok() {
                     self.outline_dialog = None;
                 }
             }
@@ -13056,6 +13258,148 @@ mod tests {
         assert_eq!(app.pkg.workbook.sheets[0].row_height(5), Some(45.0));
     }
 
+    /// East and West (labels over A1:B3) and an empty Summary, the cursor
+    /// on Summary!A1.
+    fn consolidate_app() -> App {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].name = "East".into();
+        pkg.add_sheet("West");
+        pkg.add_sheet("Summary");
+        for (s, rows) in [
+            (0, [("A", 1.0), ("B", 2.0)]),
+            (1, [("b", 10.0), ("C", 20.0)]),
+        ] {
+            let sh = &mut pkg.workbook.sheets[s];
+            sh.set_cell(0, 1, Cell::text("Jan"));
+            for (i, (k, v)) in rows.iter().enumerate() {
+                sh.set_cell(i as u32 + 1, 0, Cell::text(k));
+                sh.set_cell(i as u32 + 1, 1, Cell::number(*v));
+            }
+        }
+        let mut app = App::new(pkg, "Sales.xlsx");
+        app.os_clip = None;
+        app.sheet = 2;
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.rebuild_engine();
+        app
+    }
+
+    fn consolidate_dialog(app: &mut App) -> &mut outlinedlg::ConsolidateDialog {
+        match &mut app.outline_dialog {
+            Some(outlinedlg::Dialog::Consolidate(d)) => d,
+            other => panic!("the Consolidate dialog opens: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consolidate_ok_is_one_undo_step_and_the_dialog_remembers() {
+        use gridcore::sheet::CellValue;
+        let mut app = consolidate_app();
+        let undo_len = app.undo.len();
+        app.ribbon_act(ribbon::Act::Consolidate);
+        let d = consolidate_dialog(&mut app);
+        d.refs = vec!["East!A1:B3".into(), "west!a1:b3".into()];
+        (d.top_row, d.left_col, d.links) = (true, true, true);
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        assert_eq!(app.undo.len(), undo_len + 1);
+        let v = |app: &App, r, c| app.sheet().cell(r, c).map(|cl| cl.value.clone());
+        // Jan over the data column; A (East), B (East + West's b), C (West).
+        assert_eq!(v(&app, 0, 2), Some(CellValue::Text("Jan".into())));
+        assert_eq!(
+            v(&app, 1, 1),
+            Some(CellValue::Text("Sales".into())),
+            "the book's name"
+        );
+        assert_eq!(v(&app, 2, 0), Some(CellValue::Text("A".into())));
+        assert_eq!(v(&app, 2, 2), Some(CellValue::Number(1.0)), "recalculated");
+        assert_eq!(v(&app, 5, 2), Some(CellValue::Number(12.0)));
+        assert!(app.sheet().row_hidden(1) && app.sheet().row_collapsed(2));
+        // Reopened, the dialog starts from what OK kept.
+        app.ribbon_act(ribbon::Act::Consolidate);
+        let d = consolidate_dialog(&mut app);
+        assert_eq!(d.refs, ["East!$A$1:$B$3", "West!$A$1:$B$3"]);
+        assert!(d.top_row && d.left_col && d.links);
+        app.outline_dialog_key(KeyCode::Esc);
+        app.undo();
+        assert_eq!(app.sheet().cell(0, 2), None);
+        assert_eq!(app.sheet().consolidate, None);
+        assert_eq!(app.sheet().max_row_outline(), 0);
+    }
+
+    #[test]
+    fn consolidate_refusal_keeps_the_dialog_open() {
+        let mut app = consolidate_app();
+        let undo_len = app.undo.len();
+        let before = app.pkg.workbook.sheets.clone();
+        app.ribbon_act(ribbon::Act::Consolidate);
+        let d = consolidate_dialog(&mut app);
+        d.refs = vec!["East!A1:B3".into(), "A1:B3".into()];
+        d.links = true;
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_some());
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                gridcore::edit::ConsolidateError::LinksOnDestSheet
+                    .to_string()
+                    .as_str()
+            )
+        );
+        assert!(!gridcore::edit::sheets_differ(
+            &before,
+            &app.pkg.workbook.sheets
+        ));
+        assert_eq!(app.undo.len(), undo_len);
+        // Nothing to consolidate: refused too.
+        consolidate_dialog(&mut app).refs.clear();
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_some());
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                gridcore::edit::ConsolidateError::NoRefs
+                    .to_string()
+                    .as_str()
+            )
+        );
+        // A protected sheet refuses it like Subtotal.
+        app.outline_dialog_key(KeyCode::Esc);
+        app.pkg.workbook.sheets[2].set_protected(true);
+        app.ribbon_act(ribbon::Act::Consolidate);
+        consolidate_dialog(&mut app).refs = vec!["East!A1:B3".into()];
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("protected"))
+        );
+        assert_eq!(app.sheet().cell(0, 0), None);
+        assert_eq!(app.undo.len(), undo_len);
+    }
+
+    #[test]
+    fn space_on_the_function_row_does_not_run_consolidate() {
+        let mut app = consolidate_app();
+        let before = app.pkg.workbook.sheets.clone();
+        app.ribbon_act(ribbon::Act::Consolidate);
+        consolidate_dialog(&mut app).refs = vec!["East!A1:B3".into()];
+        app.outline_dialog_key(KeyCode::Char(' '));
+        assert!(app.outline_dialog.is_some());
+        assert!(!gridcore::edit::sheets_differ(
+            &before,
+            &app.pkg.workbook.sheets
+        ));
+        // Enter there is OK.
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        assert!(gridcore::edit::sheets_differ(
+            &before,
+            &app.pkg.workbook.sheets
+        ));
+    }
+
     /// Grp/Amt with two A rows and one B row (A1:B4), cursor in the data.
     fn subtotal_app() -> App {
         use gridcore::sheet::Cell;
@@ -13942,6 +14286,168 @@ mod tests {
         app.cur = to;
         app.copy(cut);
         app.anchor = None;
+    }
+
+    /// #683: `Sales` over A1:B3 (Item, Qty), `=SUM(Sales[Qty])` in D1.
+    fn header_app() -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let sh = &mut app.pkg.workbook.sheets[0];
+        sh.set_cell(0, 0, Cell::text("Item"));
+        sh.set_cell(0, 1, Cell::text("Qty"));
+        sh.set_cell(1, 1, Cell::number(3.0));
+        sh.set_cell(2, 1, Cell::number(4.0));
+        app.pkg
+            .add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .unwrap();
+        gridcore::edit::rename_table(&mut app.pkg.workbook, "Table1", "Sales").unwrap();
+        app.rebuild_engine();
+        app.apply_on(0, vec![(0, 3, parse_input("=SUM(Sales[Qty])"))]);
+        app
+    }
+
+    fn header_state(app: &App) -> (String, Vec<String>, String) {
+        let sh = &app.pkg.workbook.sheets[0];
+        let text = |r, c| match sh.cell(r, c).map(|x| &x.value) {
+            Some(CellValue::Text(t)) => t.clone(),
+            other => format!("{other:?}"),
+        };
+        let d1 = sh
+            .cell(0, 3)
+            .and_then(|c| c.formula.clone())
+            .unwrap_or_default();
+        (text(0, 1), app.pkg.workbook.tables[0].columns.clone(), d1)
+    }
+
+    #[test]
+    fn header_rename_is_one_undo_step_683() {
+        let mut app = header_app();
+        let before = header_state(&app);
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        let after = header_state(&app);
+        assert_eq!(after.0, "Units");
+        assert_eq!(after.1, ["Item", "Units"]);
+        assert_eq!(after.2, "SUM(Sales[Units])");
+        assert!(matches!(
+            app.undo.last(),
+            Some(UndoAction::Structural { .. })
+        ));
+        app.undo();
+        assert_eq!(header_state(&app), before);
+        app.redo();
+        assert_eq!(header_state(&app), after);
+        let d1 = app.pkg.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.value, CellValue::Number(7.0));
+        // A header edit that keeps the name is an ordinary cell step.
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        assert!(matches!(app.undo.last(), Some(UndoAction::Cells(_))));
+        // A cleared header takes `Column2`, written into the cell.
+        app.apply_on(0, vec![(0, 1, Cell::default())]);
+        assert_eq!(header_state(&app).0, "Column2");
+        assert_eq!(header_state(&app).2, "SUM(Sales[Column2])");
+    }
+
+    #[test]
+    fn text_to_columns_over_a_header_renames_the_columns_683() {
+        // A1 `Item;Units` split on `;` writes B1, the Qty header.
+        let mut app = header_app();
+        app.apply_on(0, vec![(0, 0, parse_input("Item;Units"))]);
+        let src = gridcore::edit::TtcSource::new(0, (0, 0, 0, 0)).unwrap();
+        app.apply_text_to_columns(&src, &TextParse::csv(';'));
+        assert_eq!(header_state(&app).1, ["Item", "Units"]);
+        assert_eq!(header_state(&app).2, "SUM(Sales[Units])");
+        let d1 = app.pkg.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.value, CellValue::Number(7.0));
+    }
+
+    #[test]
+    fn a_sort_over_a_tables_header_renames_nothing_683() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let sh = &mut app.pkg.workbook.sheets[0];
+        for (r, row) in [["Name", "City"], ["Zed", "Oslo"], ["Amy", "Rome"]]
+            .into_iter()
+            .enumerate()
+        {
+            for (c, t) in row.into_iter().enumerate() {
+                sh.set_cell(r as u32, c as u32, Cell::text(t));
+            }
+        }
+        app.pkg
+            .add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .unwrap();
+        app.rebuild_engine();
+        // Away from the region the sort moves.
+        app.apply_on(0, vec![(9, 5, parse_input("=COUNTA(Table1[City])"))]);
+        let header = |app: &App| {
+            let sh = &app.pkg.workbook.sheets[0];
+            [0, 1].map(|c| sh.cell(0, c).map(|x| x.value.clone()))
+        };
+        let before = header(&app);
+        app.cur = (1, 0);
+        app.sort_region(true);
+        assert_ne!(header(&app), before, "the sort moved the header row");
+        assert_eq!(app.pkg.workbook.tables[0].columns, ["Name", "City"]);
+        let f10 = app.pkg.workbook.sheets[0].cell(9, 5).unwrap();
+        assert_eq!(f10.formula.as_deref(), Some("COUNTA(Table1[City])"));
+    }
+
+    #[test]
+    fn cutting_a_whole_table_renames_nothing_683() {
+        let mut app = header_app();
+        clip_range(&mut app, (0, 0), (2, 1), true);
+        app.cur = (9, 5);
+        app.paste();
+        assert_eq!(header_state(&app).1, ["Item", "Qty"]);
+        assert_eq!(header_state(&app).2, "SUM(Sales[Qty])");
+        let f10 = app.pkg.workbook.sheets[0]
+            .cell(9, 5)
+            .map(|c| c.value.clone());
+        assert_eq!(f10, Some(CellValue::Text("Item".into())));
+        // Cutting a header alone still clears it to `Column<n>`.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 1), (0, 1), true);
+        app.cur = (9, 5);
+        app.paste();
+        assert_eq!(header_state(&app).1, ["Item", "Column2"]);
+    }
+
+    #[test]
+    fn cut_paste_onto_a_header_renames_the_column_683() {
+        let mut app = header_app();
+        app.apply_on(0, vec![(5, 0, parse_input("Units"))]);
+        clip_range(&mut app, (5, 0), (5, 0), true);
+        app.cur = (0, 1);
+        app.paste();
+        assert_eq!(header_state(&app).1, ["Item", "Units"]);
+        assert_eq!(header_state(&app).2, "SUM(Sales[Units])");
+        assert!(
+            app.pkg.workbook.sheets[0]
+                .cell(5, 0)
+                .is_none_or(|c| c.value.is_empty())
+        );
+        // One undo puts back the header, the formula and the cut cell.
+        app.undo();
+        assert_eq!(header_state(&app).1, ["Item", "Qty"]);
+        assert_eq!(header_state(&app).2, "SUM(Sales[Qty])");
+        let a6 = app.pkg.workbook.sheets[0]
+            .cell(5, 0)
+            .map(|c| c.value.clone());
+        assert_eq!(a6, Some(CellValue::Text("Units".into())));
+    }
+
+    #[test]
+    fn a_header_rename_cancels_a_pending_cut_683() {
+        // Cut D1, rename the Qty header, paste at F1: the rename rewrote
+        // D1, so the cut is a copy now and D1 stays.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), true);
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        app.cur = (0, 5);
+        app.paste();
+        let d1 = app.pkg.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.formula.as_deref(), Some("SUM(Sales[Units])"));
+        assert_eq!(d1.value, CellValue::Number(7.0));
     }
 
     const PROTECTED_STATUS: &str = "Sheet is protected — unprotect it to edit (Review ▸ Protect)";
@@ -15879,6 +16385,7 @@ mod tests {
             totals_rows: 0,
             columns: cols.iter().map(|s| s.to_string()).collect(),
             part: String::new(),
+            column_ids: Vec::new(),
         };
         pkg.workbook
             .tables

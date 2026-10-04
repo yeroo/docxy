@@ -524,12 +524,58 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
         ],
     },
-    // Excel's Data tab (#693): Data Validation and Text to Columns moved
-    // here from Insert, where they never were in Excel.
+    // Excel's Data tab (#693, #696): Sort & Filter, Data Tools, Outline. Data
+    // Validation and Text to Columns moved here from Insert, where they never
+    // were in Excel.
     Tab {
         tab: RibbonTab::Data,
         titles: Titles::Plain,
         groups: &[
+            // Excel's names; ids prefixed where Home has the same command.
+            Group {
+                title: "Sort & Filter",
+                launcher: false,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        Item::Col {
+                            gap: COL,
+                            cmds: &[
+                                row_as(
+                                    "data-sort-a-z",
+                                    "Sort A to Z",
+                                    "Sort A \u{2192} Z",
+                                    Some("sort"),
+                                    SheetAct::SortAsc,
+                                ),
+                                row_as(
+                                    "data-sort-z-a",
+                                    "Sort Z to A",
+                                    "Sort Z \u{2192} A",
+                                    Some("sort"),
+                                    SheetAct::SortDesc,
+                                ),
+                            ],
+                        },
+                        Item::One(large(
+                            "data-sort",
+                            "Sort",
+                            Some("sort"),
+                            SheetAct::CustomSort,
+                        )),
+                        Item::One(large("data-filter", "Filter", None, SheetAct::Filter)),
+                        // Reapply and Advanced need stored criteria (#690).
+                        Item::Col {
+                            gap: COL,
+                            cmds: &[
+                                row("clear-filter", "Clear", None, SheetAct::ClearFilter),
+                                row("reapply-filter", "Reapply", None, SheetAct::Todo),
+                                row("advanced-filter", "Advanced", None, SheetAct::Todo),
+                            ],
+                        },
+                    ],
+                },
+            },
             Group {
                 title: "Data Tools",
                 launcher: false,
@@ -542,11 +588,49 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             None,
                             SheetAct::TextToColumns,
                         )),
+                        // Flash Fill is #666.
+                        Item::Col {
+                            gap: COL,
+                            cmds: &[
+                                row("flash-fill", "Flash Fill", None, SheetAct::Todo),
+                                row(
+                                    "data-remove-duplicates",
+                                    "Remove Duplicates",
+                                    None,
+                                    SheetAct::RemoveDuplicates,
+                                ),
+                            ],
+                        },
                         Item::One(large(
                             "data-validation",
                             "Data Validation",
                             None,
                             SheetAct::DataValidation,
+                        )),
+                        // Excel keeps these under Data Validation's split
+                        // button; this ribbon has none, so they follow it (#689).
+                        Item::Col {
+                            gap: COL,
+                            cmds: &[
+                                row(
+                                    "circle-invalid",
+                                    "Circle Invalid Data",
+                                    None,
+                                    SheetAct::Todo,
+                                ),
+                                row(
+                                    "clear-validation-circles",
+                                    "Clear Validation Circles",
+                                    None,
+                                    SheetAct::Todo,
+                                ),
+                            ],
+                        },
+                        Item::One(large(
+                            "consolidate",
+                            "Consolidate",
+                            None,
+                            SheetAct::Consolidate,
                         )),
                     ],
                 },
@@ -832,6 +916,11 @@ mod tests {
                 "fill",
                 "clear",
                 "find-select",
+                "reapply-filter",
+                "advanced-filter",
+                "flash-fill",
+                "circle-invalid",
+                "clear-validation-circles",
                 "spelling",
                 "protect-workbook",
             ]
@@ -860,6 +949,77 @@ mod tests {
             resolve(&home, "Home", "Format Painter", off).unwrap_err(),
             "'Format Painter' is not implemented"
         );
+    }
+
+    #[test]
+    fn the_data_tab_has_excels_groups_in_excels_order() {
+        let data = tab_def(RibbonTab::Data);
+        assert!(data.tab == RibbonTab::Data);
+        let titles: Vec<&str> = data.groups.iter().map(|g| g.title).collect();
+        assert_eq!(
+            titles,
+            ["Sort & Filter", "Data Tools", "Outline", "Show Level"]
+        );
+        let labels = |i: usize| -> Vec<&str> {
+            data.groups[i]
+                .commands()
+                .iter()
+                .map(|c| c.label(false))
+                .collect()
+        };
+        assert_eq!(
+            labels(0),
+            [
+                "Sort A to Z",
+                "Sort Z to A",
+                "Sort",
+                "Filter",
+                "Clear",
+                "Reapply",
+                "Advanced"
+            ]
+        );
+        assert_eq!(
+            labels(1),
+            [
+                "Text to Columns",
+                "Flash Fill",
+                "Remove Duplicates",
+                "Data Validation",
+                "Circle Invalid Data",
+                "Clear Validation Circles",
+                "Consolidate"
+            ]
+        );
+        assert_eq!(
+            labels(2)[..5],
+            ["Group", "Ungroup", "Subtotal", "Show Detail", "Hide Detail"]
+        );
+    }
+
+    #[test]
+    fn data_tab_resolves_excel_names_to_the_existing_commands() {
+        let data = tab_def(RibbonTab::Data).commands();
+        let off = |_| false;
+        let act = |q| resolve(&data, "Data", q, off).map(|c| c.act);
+        assert_eq!(act("Sort A to Z"), Ok(SheetAct::SortAsc));
+        assert_eq!(act("Sort Z to A"), Ok(SheetAct::SortDesc));
+        assert_eq!(act("Sort"), Ok(SheetAct::CustomSort));
+        assert_eq!(act("Filter"), Ok(SheetAct::Filter));
+        assert_eq!(act("Clear"), Ok(SheetAct::ClearFilter));
+        assert_eq!(act("Remove Duplicates"), Ok(SheetAct::RemoveDuplicates));
+        assert_eq!(act("Text to Columns"), Ok(SheetAct::TextToColumns));
+        assert_eq!(act("Data Validation"), Ok(SheetAct::DataValidation));
+        assert_eq!(act("Consolidate"), Ok(SheetAct::Consolidate));
+        for todo in [
+            "Reapply",
+            "Advanced",
+            "Flash Fill",
+            "Circle Invalid Data",
+            "Clear Validation Circles",
+        ] {
+            assert_eq!(act(todo), Err(format!("'{todo}' is not implemented")));
+        }
     }
 
     #[test]

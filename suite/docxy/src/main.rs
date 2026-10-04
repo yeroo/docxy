@@ -62,6 +62,7 @@ mod ribbon_export;
 mod sect_pr_tests;
 #[cfg(test)]
 mod sheet_clip_tests;
+mod sheet_consolidate;
 #[cfg(test)]
 mod sheet_entry_tests;
 mod sheet_outline;
@@ -900,7 +901,8 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
 /// Outline and the outline Settings are properties of the whole sheet, the
 /// Number format combo only opens or closes its strip (a format picked there
 /// is what acts on cells), and `Todo` does nothing at all. Group, Ungroup,
-/// Show/Hide Detail, Auto Outline and Subtotal read the selection.
+/// Show/Hide Detail, Auto Outline and Subtotal read the selection, and
+/// Consolidate writes at the selected cell.
 fn act_targets_cells(act: SheetAct) -> bool {
     !matches!(
         act,
@@ -1500,10 +1502,16 @@ enum SheetAct {
     CondFormat,
     DataValidation,
     Filter,
+    /// Data › Sort & Filter › Clear: unhide every hidden row of the region
+    /// around the cursor (hand-hidden ones too) and drop its filter marks,
+    /// as `clear` typed in the Filter bar does (#696).
+    ClearFilter,
     RemoveDuplicates,
     TextToColumns,
     FormatAsTable,
     ProtectSheet,
+    /// Data › Data Tools › Consolidate: Excel's Consolidate dialog (#694).
+    Consolidate,
     /// Data › Subtotal...: Excel's Subtotal dialog (#693).
     Subtotal,
     /// Data › Outline (#693): Group, Ungroup, Show and Hide Detail, a level
@@ -2670,6 +2678,45 @@ impl SheetView {
         });
         let start = if header { top + 1 } else { top };
         (bottom > start).then_some((start, bottom))
+    }
+
+    /// The contiguous rows around the cursor a filter acts on, as
+    /// `(top, bottom)`; `None` when the cursor's row is empty.
+    fn filter_region(&self) -> Option<(u32, u32)> {
+        let (max_r, max_c) = self.extent();
+        let sh = self.sheet();
+        let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+        let cur_r = self.sel.0;
+        if !used(cur_r) {
+            return None;
+        }
+        let mut top = cur_r;
+        while top > 0 && used(top - 1) {
+            top -= 1;
+        }
+        let mut bottom = cur_r;
+        while bottom < max_r && used(bottom + 1) {
+            bottom += 1;
+        }
+        Some((top, bottom))
+    }
+
+    /// Data › Sort & Filter › Clear, and `clear` typed in the Filter bar:
+    /// unhide every row of the region around the cursor and drop its filter
+    /// marks. Whether any row changed.
+    fn clear_filter(&mut self) -> bool {
+        let Some((top, bottom)) = self.filter_region() else {
+            return false;
+        };
+        let s = self.active;
+        let sh = &mut self.pkg.workbook.sheets[s];
+        let rows: Vec<u32> = (top..=bottom)
+            .filter(|&r| sh.row_hidden(r) || sh.filtered_rows.contains(&r))
+            .collect();
+        for &r in &rows {
+            sh.set_row_filtered(r, false);
+        }
+        !rows.is_empty()
     }
 
     /// Commit the editor before computing bounds or sorting its row. Rows
@@ -12708,51 +12755,55 @@ impl Docxy {
     /// contiguous region whose value fails it (header kept). "clear" unhides.
     fn sheet_apply_filter(&mut self, text: &str, cx: &mut Context<Self>) {
         use gridcore::sheet::CellValue;
+        if text.trim().eq_ignore_ascii_case("clear") {
+            return self.sheet_clear_filter(cx);
+        }
         if self.protected_refused(cx) {
             return;
         }
-        if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            let sc = v.sel.1;
-            let cur_r = v.sel.0;
-            let (max_r, max_c) = v.extent();
-            // Contiguous region around the cursor.
-            let sh = &v.pkg.workbook.sheets[s];
-            let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-            if !used(cur_r) {
-                return;
-            }
-            let mut top = cur_r;
-            while top > 0 && used(top - 1) {
-                top -= 1;
-            }
-            let mut bottom = cur_r;
-            while bottom < max_r && used(bottom + 1) {
-                bottom += 1;
-            }
-            let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
-            let start = if header { top + 1 } else { top };
-            // Rows are marked filter-hidden (not hidden by hand) so SUBTOTAL
-            // 1-11 skips them and still counts hand-hidden rows.
-            if text.trim().eq_ignore_ascii_case("clear") {
-                for r in top..=bottom {
-                    v.pkg.workbook.sheets[s].set_row_filtered(r, false);
-                }
-            } else if let Some((op, operand)) = gridcore::filter::parse(text) {
-                let keep: Vec<bool> = (start..=bottom)
-                    .map(|r| {
-                        let val = v.pkg.workbook.sheets[s]
-                            .cell(r, sc)
-                            .map(|c| c.value.clone());
-                        gridcore::filter::matches(val.as_ref(), op, &operand)
-                    })
-                    .collect();
-                for (i, r) in (start..=bottom).enumerate() {
-                    v.pkg.workbook.sheets[s].set_row_filtered(r, !keep[i]);
-                }
-            }
+        // An empty or unreadable criteria changes nothing, so it leaves the
+        // tab clean; the bar has already closed.
+        let Some((op, operand)) = gridcore::filter::parse(text) else {
+            return cx.notify();
+        };
+        let Some(v) = self.active_sheet_mut() else {
+            return;
+        };
+        let Some((top, bottom)) = v.filter_region() else {
+            return;
+        };
+        let s = v.active;
+        let sc = v.sel.1;
+        let sh = &v.pkg.workbook.sheets[s];
+        let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
+        let start = if header { top + 1 } else { top };
+        // Rows are marked filter-hidden (not hidden by hand) so SUBTOTAL
+        // 1-11 skips them and still counts hand-hidden rows.
+        let keep: Vec<bool> = (start..=bottom)
+            .map(|r| {
+                let val = v.pkg.workbook.sheets[s]
+                    .cell(r, sc)
+                    .map(|c| c.value.clone());
+                gridcore::filter::matches(val.as_ref(), op, &operand)
+            })
+            .collect();
+        for (i, r) in (start..=bottom).enumerate() {
+            v.pkg.workbook.sheets[s].set_row_filtered(r, !keep[i]);
         }
         self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    /// Data › Sort & Filter › Clear (and `clear` in the Filter bar): unhide
+    /// every hidden row of the region around the cursor (hand-hidden ones
+    /// too) and drop its filter marks; dirty only when a row changed.
+    fn sheet_clear_filter(&mut self, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
+        if self.active_sheet_mut().is_some_and(SheetView::clear_filter) {
+            self.mark_sheet_dirty();
+        }
         cx.notify();
     }
 
@@ -14707,9 +14758,19 @@ impl Docxy {
                 self.sheet_filter_edit = Some(String::new());
                 cx.notify();
             }
+            SheetAct::ClearFilter => self.sheet_clear_filter(cx),
             SheetAct::RemoveDuplicates => self.sheet_remove_duplicates(cx),
             SheetAct::FormatAsTable => self.sheet_format_as_table(cx),
             SheetAct::ProtectSheet => self.sheet_toggle_protection(cx),
+            SheetAct::Consolidate => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    match sheet_consolidate::consolidate_dialog(tab) {
+                        Ok(d) => tab.dialogs.push(d),
+                        Err(e) => tab.status = e.into(),
+                    }
+                }
+                cx.notify();
+            }
             SheetAct::Subtotal | SheetAct::OutlineSettings => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let d = if act == SheetAct::Subtotal {
@@ -34426,7 +34487,9 @@ mod grid_geom_tests {
             SheetAct::AutoSum,
             SheetAct::SortAsc,
             SheetAct::RemoveDuplicates,
+            SheetAct::ClearFilter,
             SheetAct::Subtotal,
+            SheetAct::Consolidate,
         ] {
             assert!(act_targets_cells(act));
         }
@@ -34477,6 +34540,38 @@ mod grid_geom_tests {
     }
 
     #[test]
+    fn clear_filter_unhides_the_filtered_rows_of_the_region_around_the_cursor() {
+        use super::{Surface, new_sheet_surface};
+        use gridcore::sheet::Cell;
+        let Surface::Sheet(mut v) = new_sheet_surface() else {
+            unreachable!()
+        };
+        // Two regions, A1:A4 and A6:A7, split by the blank row 5.
+        for r in [0, 1, 2, 3, 5, 6] {
+            let s = v.active;
+            v.engine
+                .set_cell(&mut v.pkg.workbook, (s, r, 0), Cell::number(f64::from(r)));
+        }
+        let sh = &mut v.pkg.workbook.sheets[0];
+        sh.set_row_filtered(1, true);
+        sh.set_row_filtered(3, true);
+        sh.set_row_filtered(6, true);
+        v.sel = (2, 0);
+        assert!(v.clear_filter());
+        let sh = &v.pkg.workbook.sheets[0];
+        for r in 0..=3 {
+            assert!(!sh.row_hidden(r) && !sh.row_filtered(r), "row {r}");
+        }
+        assert!(sh.row_filtered(6), "the other region keeps its filter");
+        // Nothing left to clear: no change, so the tab is not dirtied.
+        assert!(!v.clear_filter());
+        // An empty cursor row has no region.
+        v.sel = (4, 0);
+        assert!(!v.clear_filter());
+        assert!(v.pkg.workbook.sheets[0].row_filtered(6));
+    }
+
+    #[test]
     fn protected_view_refuses_every_outline_command() {
         use super::SheetAct;
         // Each writes the outline, `hidden` or `collapsed` into the file.
@@ -34490,6 +34585,10 @@ mod grid_geom_tests {
             SheetAct::ClearOutline,
             SheetAct::OutlineSettings,
             SheetAct::Subtotal,
+            // Consolidate writes cells, and an outline when it links.
+            SheetAct::Consolidate,
+            // Clear writes `hidden` too (#696).
+            SheetAct::ClearFilter,
         ] {
             assert!(!super::protected_view_allows_act(act), "{act:?}");
         }

@@ -52,12 +52,28 @@ fn group_cells<'a>(
         .collect()
 }
 
-/// Sheets + defined names — snapshotted around structural edits whose inverse
-/// is not expressible as per-cell changes (Task 3 uses this).
+/// Sheets, defined names and tables — snapshotted around structural edits
+/// whose inverse is not expressible as per-cell changes (Task 3 uses this).
+/// Row and column edits move and resize tables, and a column delete can
+/// remove one (into `removed_tables`, whose part a save then drops), so
+/// undo puts both lists back with the cells.
 #[derive(Clone)]
 struct WbSnapshot {
     sheets: Vec<Sheet>,
     names: Vec<DefinedName>,
+    tables: Vec<gridcore::sheet::Table>,
+    removed_tables: Vec<gridcore::sheet::RemovedTable>,
+}
+
+impl WbSnapshot {
+    fn of(wb: &gridcore::sheet::Workbook) -> Self {
+        WbSnapshot {
+            sheets: wb.sheets.clone(),
+            names: wb.defined_names.clone(),
+            tables: wb.tables.clone(),
+            removed_tables: wb.removed_tables.clone(),
+        }
+    }
 }
 
 enum UndoAction {
@@ -659,16 +675,10 @@ impl Session {
     /// Snapshot-run-snapshot for structural edits (row/col ops, renames):
     /// the inverse isn't per-cell, so undo restores the whole grid state.
     fn structural(&mut self, op: impl FnOnce(&mut gridcore::sheet::Workbook)) {
-        let before = WbSnapshot {
-            sheets: self.pkg.workbook.sheets.clone(),
-            names: self.pkg.workbook.defined_names.clone(),
-        };
+        let before = WbSnapshot::of(&self.pkg.workbook);
         op(&mut self.pkg.workbook);
         self.rebuild_engine();
-        let after = WbSnapshot {
-            sheets: self.pkg.workbook.sheets.clone(),
-            names: self.pkg.workbook.defined_names.clone(),
-        };
+        let after = WbSnapshot::of(&self.pkg.workbook);
         self.undo.push(UndoAction::Structural { before, after });
         self.edits += 1;
         self.redo.clear();
@@ -676,8 +686,11 @@ impl Session {
     }
 
     fn restore(&mut self, snap: &WbSnapshot) {
-        self.pkg.workbook.sheets = snap.sheets.clone();
-        self.pkg.workbook.defined_names = snap.names.clone();
+        let wb = &mut self.pkg.workbook;
+        wb.sheets = snap.sheets.clone();
+        wb.defined_names = snap.names.clone();
+        wb.tables = snap.tables.clone();
+        wb.removed_tables = snap.removed_tables.clone();
         self.rebuild_engine();
         self.dirty = true;
     }
@@ -3050,6 +3063,52 @@ mod tests {
         assert!(!v.contains("Pear"), "row 2 must be clipped: {v}");
         // dims still reports the full used extent, not the window
         assert!(v.contains("\"dims\":{\"rows\":4,\"cols\":2}"), "{v}");
+    }
+
+    /// #683: `Calc` (Qty, Price, Line) over A1:C4, `=SUM(Calc[Line])` in F2.
+    fn table_session() -> Session {
+        let mut pkg = new_xlsx();
+        let sh = &mut pkg.workbook.sheets[0];
+        for (c, name) in ["Qty", "Price", "Line"].into_iter().enumerate() {
+            sh.set_cell(0, c as u32, Cell::text(name));
+            for r in 1..4 {
+                sh.set_cell(r, c as u32, Cell::number((10 * c as u32 + r) as f64));
+            }
+        }
+        sh.set_cell(1, 5, Cell::formula("SUM(Calc[Line])"));
+        pkg.add_table(0, (0, 0, 3, 2), true, "TableStyleMedium2")
+            .unwrap();
+        gridcore::edit::rename_table(&mut pkg.workbook, "Table1", "Calc").unwrap();
+        Session::open(&save_xlsx(&pkg)).expect("open")
+    }
+
+    fn cell_value(s: &Session, r: u32, c: u32) -> Option<gridcore::sheet::CellValue> {
+        s.pkg.workbook.sheets[0].cell(r, c).map(|x| x.value.clone())
+    }
+
+    #[test]
+    fn undo_of_a_column_delete_restores_the_table_683() {
+        use gridcore::sheet::CellValue;
+        let mut s = table_session();
+        let table = s.pkg.workbook.tables.clone();
+        assert_eq!(cell_value(&s, 1, 5), Some(CellValue::Number(66.0)));
+        // Every column: the table goes and its reference with it.
+        s.dispatch("delcol\t0\t3");
+        assert!(s.pkg.workbook.tables.is_empty());
+        assert_eq!(s.pkg.workbook.removed_tables.len(), 1);
+        assert_eq!(cell_value(&s, 1, 2), Some(CellValue::Error("#REF!".into())));
+        s.dispatch("undo");
+        assert_eq!(s.pkg.workbook.tables, table);
+        assert!(s.pkg.workbook.removed_tables.is_empty());
+        assert_eq!(cell_value(&s, 1, 5), Some(CellValue::Number(66.0)));
+        // One column: the table shrinks, and undo widens it again.
+        s.dispatch("delcol\t1\t1");
+        assert_eq!(s.pkg.workbook.tables[0].columns, ["Qty", "Line"]);
+        assert_eq!(s.pkg.workbook.tables[0].range, (0, 0, 3, 1));
+        s.dispatch("undo");
+        assert_eq!(s.pkg.workbook.tables, table);
+        s.dispatch("redo");
+        assert_eq!(s.pkg.workbook.tables[0].columns, ["Qty", "Line"]);
     }
 
     #[test]

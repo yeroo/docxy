@@ -1180,13 +1180,13 @@ fn parse_spec_part(raw: &str) -> Result<SpecPart, String> {
         };
         return Ok(SpecPart::Span(name(a)?, name(b)?));
     }
-    // Strip one level of brackets: `[#Totals]` → `#Totals`.
-    let t = t
-        .strip_prefix('[')
-        .and_then(|y| y.strip_suffix(']'))
-        .unwrap_or(t)
-        .trim();
-    if let Some(rest) = t.strip_prefix('#') {
+    // Strip one level of brackets: `[#Totals]` → `#Totals`. Inside them a
+    // column name is exact: `[[Qty ]]` names `Qty ` (its space and all).
+    let (t, bracketed) = match t.strip_prefix('[').and_then(|y| y.strip_suffix(']')) {
+        Some(inner) => (inner, true),
+        None => (t, false),
+    };
+    if let Some(rest) = t.trim_start().strip_prefix('#') {
         return match rest.trim().to_ascii_lowercase().as_str() {
             "all" => Ok(SpecPart::Item(TableItem::All)),
             "data" => Ok(SpecPart::Item(TableItem::Data)),
@@ -1196,7 +1196,7 @@ fn parse_spec_part(raw: &str) -> Result<SpecPart, String> {
             other => Err(format!("unknown table item #{other}")),
         };
     }
-    if let Some(rest) = t.strip_prefix('@') {
+    if let Some(rest) = t.trim_start().strip_prefix('@') {
         let rest = rest.trim();
         if rest.is_empty() {
             return Ok(SpecPart::ThisRow(None));
@@ -1207,6 +1207,7 @@ fn parse_spec_part(raw: &str) -> Result<SpecPart, String> {
             .unwrap_or(rest);
         return Ok(SpecPart::ThisRow(Some(unescape_spec(inner))));
     }
+    let t = if bracketed { t } else { t.trim() };
     Ok(SpecPart::Col(unescape_spec(t)))
 }
 
@@ -1291,6 +1292,23 @@ fn escape_spec(name: &str) -> String {
     out
 }
 
+/// A column name as one bracketed spec part: `[Qty]`, `[Price, USD]`.
+fn bracket_spec(name: &str) -> String {
+    format!("[{}]", escape_spec(name))
+}
+
+/// Whether column name `name` takes its own brackets where a bare name could
+/// stand (`Sales[Qty]`, `[@Qty]`). Excel brackets a name with any of its
+/// special characters (`Sales[[Total $ Amount]]`, `[@[Price (USD)]]`), and
+/// some would not read back bare (a `,` or `:` splits the spec, edge
+/// whitespace is trimmed): the bracketed form is always valid, so any
+/// character but a letter, a digit or an interior space takes it.
+fn needs_brackets(name: &str) -> bool {
+    name.starts_with(char::is_whitespace)
+        || name.ends_with(char::is_whitespace)
+        || name.chars().any(|c| !(c.is_alphanumeric() || c == ' '))
+}
+
 /// Print a structured reference back to canonical text. `file` spells the
 /// this-row item as a file stores it, `[#This Row],[c]`: the file grammar has
 /// no `@`.
@@ -1304,9 +1322,17 @@ fn structured_to_string(
     let prefix = table.clone().unwrap_or_default();
     // The column part: `[a]` or the span `[a]:[b]`.
     let cols = col1.as_ref().map(|a| match col2 {
-        Some(b) => format!("[{}]:[{}]", escape_spec(a), escape_spec(b)),
-        None => format!("[{}]", escape_spec(a)),
+        Some(b) => format!("{}:{}", bracket_spec(a), bracket_spec(b)),
+        None => bracket_spec(a),
     });
+    // A lone column name stands bare unless it can't (`needs_brackets`).
+    let bare = |c: &str| {
+        if needs_brackets(c) {
+            bracket_spec(c)
+        } else {
+            escape_spec(c)
+        }
+    };
     let tag = match item {
         TableItem::Data => "#Data",
         TableItem::All => "#All",
@@ -1316,10 +1342,10 @@ fn structured_to_string(
     };
     let body = match (item, col1, col2, cols) {
         (TableItem::Data, None, _, _) => String::new(),
-        (TableItem::Data, Some(c), None, _) => escape_spec(c),
+        (TableItem::Data, Some(c), None, _) => bare(c),
         (TableItem::Data, _, _, Some(span)) => span,
         (TableItem::ThisRow, None, _, _) if !file => "@".to_string(),
-        (TableItem::ThisRow, Some(c), None, _) if !file => format!("@{}", escape_spec(c)),
+        (TableItem::ThisRow, Some(c), None, _) if !file => format!("@{}", bare(c)),
         (_, None, _, _) => tag.to_string(),
         (_, _, _, Some(cols)) => format!("[{tag}],{cols}"),
         (_, Some(_), _, None) => unreachable!("cols is set whenever col1 is"),
@@ -1585,30 +1611,9 @@ impl Printer {
             .map(|(s, lambda)| (s.as_str(), *lambda))
     }
 
-    /// May a LET value bind a lambda? Yes unless it provably can't: a
-    /// literal, a reference, an operator, or a builtin call that never passes
-    /// a lambda through. A call of a local that may hold one, an unbound name
-    /// or a call of one (a defined name or UDF may be or make a lambda), an
-    /// immediate call (`LAMBDA(n,LAMBDA(…))(2)`) and the choosing functions
-    /// (`IF(c,LAMBDA(…),LAMBDA(…))`) may.
+    /// May a LET value bind a lambda? See [`may_bind_lambda`].
     fn binds_lambda(&self, value: &Expr) -> bool {
-        match value {
-            Expr::Name(n) => self.bound(n).is_none_or(|(_, lambda)| lambda),
-            Expr::Call(..) => true,
-            Expr::Func(n, _) => match self.bound(n) {
-                Some((_, lambda)) => lambda,
-                None => {
-                    [
-                        "LAMBDA", "LET", "IF", "IFS", "CHOOSE", "SWITCH", "IFERROR", "IFNA",
-                        "INDEX",
-                    ]
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(n))
-                        || !is_builtin(n)
-                }
-            },
-            _ => false,
-        }
+        may_bind_lambda(value, |n| self.bound(n).map(|(_, lambda)| lambda))
     }
 
     fn func(&mut self, name: &str, args: &[Expr]) -> String {
@@ -1680,8 +1685,35 @@ impl Printer {
     }
 }
 
+/// May a LET value bind a lambda? Yes unless it provably can't: a
+/// literal, a reference, an operator, or a builtin call that never passes
+/// a lambda through. A call of a local that may hold one, an unbound name
+/// or a call of one (a defined name or UDF may be or make a lambda), an
+/// immediate call (`LAMBDA(n,LAMBDA(…))(2)`) and the choosing functions
+/// (`IF(c,LAMBDA(…),LAMBDA(…))`) may. `bound(n)` says whether a LET/LAMBDA
+/// name in scope around the value may hold a lambda (`None` when nothing
+/// binds `n`). Shared by the printer and the engine's dependency pruning.
+pub(crate) fn may_bind_lambda(value: &Expr, bound: impl Fn(&str) -> Option<bool>) -> bool {
+    match value {
+        Expr::Name(n) => bound(n).unwrap_or(true),
+        Expr::Call(..) => true,
+        Expr::Func(n, _) => match bound(n) {
+            Some(lambda) => lambda,
+            None => {
+                [
+                    "LAMBDA", "LET", "IF", "IFS", "CHOOSE", "SWITCH", "IFERROR", "IFNA", "INDEX",
+                ]
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(n))
+                    || !is_builtin(n)
+            }
+        },
+        _ => false,
+    }
+}
+
 /// `n` with a leading `_xlpm.` (Excel's LET/LAMBDA name prefix) removed.
-fn bare_param(n: &str) -> &str {
+pub(crate) fn bare_param(n: &str) -> &str {
     match n.get(..6) {
         Some(p) if p.eq_ignore_ascii_case("_xlpm.") => &n[6..],
         _ => n,
@@ -2492,6 +2524,124 @@ pub fn rename_tables_in_expr(e: &Expr, map: &[(String, String)]) -> Expr {
     })
 }
 
+/// Whether structured reference `table` (None = unqualified) names table
+/// `name`: qualified by it (ignoring case), or unqualified in a formula
+/// `inside` the table.
+fn names_table(table: &Option<String>, name: &str, inside: bool) -> bool {
+    match table {
+        Some(t) => t.eq_ignore_ascii_case(name),
+        None => inside,
+    }
+}
+
+/// Rename columns of table `table`: every structured reference to it (see
+/// [`names_table`]) whose column, or span end, is an old name in `map`
+/// (case-insensitive) takes the new one. The map applies all at once, like
+/// [`rename_tables_in_expr`].
+pub fn rename_table_columns_in_expr(
+    e: &Expr,
+    table: &str,
+    inside: bool,
+    map: &[(String, String)],
+) -> Expr {
+    let new_of = |c: &Option<String>| {
+        c.as_ref().and_then(|c| {
+            map.iter()
+                .find(|(old, _)| old.eq_ignore_ascii_case(c))
+                .map(|(_, new)| new.clone())
+        })
+    };
+    map_expr(e, &|x| match x {
+        Expr::Structured {
+            table: t,
+            item,
+            col1,
+            col2,
+        } if names_table(t, table, inside) => {
+            let (n1, n2) = (new_of(col1), new_of(col2));
+            (n1.is_some() || n2.is_some()).then(|| Expr::Structured {
+                table: t.clone(),
+                item: *item,
+                col1: n1.or_else(|| col1.clone()),
+                col2: n2.or_else(|| col2.clone()),
+            })
+        }
+        _ => None,
+    })
+}
+
+/// Columns of table `table` were deleted: `columns` are its columns before
+/// the delete and `deleted[i]` says whether column `i` went. A structured
+/// reference to it (see [`names_table`]) naming a deleted column becomes
+/// `#REF!`; a span keeps its surviving columns, an end that went moving
+/// inward to the nearest survivor, and becomes `#REF!` when none survive.
+/// A reference to no column (`Sales[#All]`, bare `Sales`), or to a column
+/// the table doesn't have, is left alone.
+pub fn delete_table_columns_in_expr(
+    e: &Expr,
+    table: &str,
+    inside: bool,
+    columns: &[String],
+    deleted: &[bool],
+) -> Expr {
+    let index = |c: &str| columns.iter().position(|x| x.eq_ignore_ascii_case(c));
+    let gone = |i: usize| deleted.get(i).copied().unwrap_or(false);
+    map_expr(e, &|x| {
+        let Expr::Structured {
+            table: t,
+            item,
+            col1: Some(c1),
+            col2,
+        } = x
+        else {
+            return None;
+        };
+        if !names_table(t, table, inside) {
+            return None;
+        }
+        let i1 = index(c1)?;
+        let i2 = match col2 {
+            Some(c2) => index(c2)?,
+            None => i1,
+        };
+        let (lo, hi) = (i1.min(i2), i1.max(i2));
+        if !(lo..=hi).any(gone) {
+            return None;
+        }
+        let Some(first) = (lo..=hi).find(|&i| !gone(i)) else {
+            return Some(Expr::Err(ExcelError::Ref));
+        };
+        let last = (lo..=hi).rev().find(|&i| !gone(i)).unwrap_or(first);
+        // Each end keeps its own spelling unless it moved.
+        let end = |i: usize, kept: &String| {
+            if gone(i) {
+                columns[if i == lo { first } else { last }].clone()
+            } else {
+                kept.clone()
+            }
+        };
+        let col2 = col2.as_ref().map(|c2| end(i2, c2));
+        Some(Expr::Structured {
+            table: t.clone(),
+            item: *item,
+            col1: Some(end(i1, c1)),
+            col2,
+        })
+    })
+}
+
+/// Table `table` was deleted with all its columns: every structured
+/// reference to it (see [`names_table`]) and its bare name become `#REF!`.
+pub fn delete_table_in_expr(e: &Expr, table: &str, inside: bool) -> Expr {
+    map_expr(e, &|x| match x {
+        Expr::Structured { table: t, .. } if names_table(t, table, inside) => {
+            Some(Expr::Err(ExcelError::Ref))
+        }
+        Expr::Name(n) if n.eq_ignore_ascii_case(table) => Some(Expr::Err(ExcelError::Ref)),
+        _ => None,
+    })
+}
+
 /// A table being converted to a range: what its references become.
 pub struct TableToRange<'a> {
     pub name: &'a str,
@@ -2928,6 +3078,70 @@ pub fn collect_names(e: &Expr, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// [`collect_names`] without the names a `LET` or `LAMBDA` binds: only the
+/// names the workbook resolves (`LET(Sales,2,Sales*3)` reads no table
+/// `Sales`). Scoping follows the printer: a LET value sees the names bound
+/// before it, a LAMBDA body sees every parameter.
+pub fn collect_free_names(e: &Expr, out: &mut Vec<String>) {
+    fn walk(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
+        let is_bound =
+            |bound: &[String], n: &str| bound.iter().any(|b| b.eq_ignore_ascii_case(bare_param(n)));
+        match e {
+            Expr::Name(n) if !is_bound(bound, n) => out.push(n.clone()),
+            Expr::Func(name, args) if name.eq_ignore_ascii_case("LET") => {
+                let (mark, last) = (bound.len(), args.len().saturating_sub(1));
+                let mut pending = None;
+                for (i, a) in args.iter().enumerate() {
+                    match a {
+                        Expr::Name(n) if i < last && i % 2 == 0 => {
+                            pending = Some(bare_param(n).to_string());
+                        }
+                        _ => {
+                            walk(a, bound, out);
+                            bound.extend(pending.take());
+                        }
+                    }
+                }
+                bound.truncate(mark);
+            }
+            Expr::Func(name, args) if name.eq_ignore_ascii_case("LAMBDA") => {
+                let (mark, last) = (bound.len(), args.len().saturating_sub(1));
+                for (i, a) in args.iter().enumerate() {
+                    match a {
+                        Expr::Name(n)
+                        | Expr::Structured {
+                            table: None,
+                            item: TableItem::Data,
+                            col1: Some(n),
+                            col2: None,
+                        } if i < last => bound.push(bare_param(n).to_string()),
+                        _ => walk(a, bound, out),
+                    }
+                }
+                bound.truncate(mark);
+            }
+            Expr::Func(_, args) => {
+                for a in args {
+                    walk(a, bound, out);
+                }
+            }
+            Expr::Call(callee, args) => {
+                walk(callee, bound, out);
+                for a in args {
+                    walk(a, bound, out);
+                }
+            }
+            Expr::Un(_, x) => walk(x, bound, out),
+            Expr::Bin(_, l, r) => {
+                walk(l, bound, out);
+                walk(r, bound, out);
+            }
+            _ => {}
+        }
+    }
+    walk(e, &mut Vec::new(), out);
 }
 
 /// Collect every 3D span in a formula: (first, last, r1, c1, r2, c2).
@@ -3851,6 +4065,15 @@ impl<'a> Eval<'a> {
                         }
                     },
                     Some(_) => Arg::Scalar(Value::Err(ExcelError::Name)),
+                    // A bare table name (`Sales`) is the table's data body,
+                    // as `Sales[]` is. Tables and defined names share one
+                    // namespace in Excel, so the order here is moot.
+                    None if self.res.table(n).is_some() => self.eval_arg(&Expr::Structured {
+                        table: Some(n.clone()),
+                        item: TableItem::Data,
+                        col1: None,
+                        col2: None,
+                    }),
                     None => {
                         self.unsupported = true;
                         Arg::Scalar(Value::Err(ExcelError::Name))
@@ -5145,8 +5368,23 @@ impl<'a> Eval<'a> {
 
     /// `INDIRECT(ref_text)` — build a reference from a string at runtime.
     fn indirect(&mut self, args: &[Expr]) -> Arg {
+        match self.indirect_target(args) {
+            Ok(ast) => {
+                self.depth += 1;
+                let arg = self.eval_arg(&ast);
+                self.depth -= 1;
+                arg
+            }
+            Err(v) => Arg::Scalar(v),
+        }
+    }
+
+    /// The reference `INDIRECT(args…)` names, parsed but not evaluated: a
+    /// cell, range, whole rows/columns or a name. Errors are the value
+    /// INDIRECT gives.
+    fn indirect_target(&mut self, args: &[Expr]) -> Result<Expr, Value> {
         if args.is_empty() || args.len() > 2 {
-            return Arg::Scalar(Value::Err(ExcelError::Value));
+            return Err(Value::Err(ExcelError::Value));
         }
         if let Some(e) = args.get(1) {
             // Only A1-style (the default). R1C1 requests are unsupported.
@@ -5154,14 +5392,14 @@ impl<'a> Eval<'a> {
                 Ok(true) => {}
                 Ok(false) => {
                     self.unsupported = true;
-                    return Arg::Scalar(Value::Err(ExcelError::Ref));
+                    return Err(Value::Err(ExcelError::Ref));
                 }
-                Err(er) => return Arg::Scalar(Value::Err(er)),
+                Err(er) => return Err(Value::Err(er)),
             }
         }
         let text = match to_text(&self.eval(&args[0])) {
             Ok(t) => t,
-            Err(er) => return Arg::Scalar(Value::Err(er)),
+            Err(er) => return Err(Value::Err(er)),
         };
         // Parse the text as a reference expression; only refs/ranges qualify.
         match parse(&text) {
@@ -5170,14 +5408,9 @@ impl<'a> Eval<'a> {
                 | Expr::Range(..)
                 | Expr::ColRange { .. }
                 | Expr::RowRange { .. }),
-            ) => self.eval_arg(&ast),
-            Ok(Expr::Name(_)) if self.depth < 32 => {
-                self.depth += 1;
-                let arg = self.eval_arg(&Expr::Name(text));
-                self.depth -= 1;
-                arg
-            }
-            _ => Arg::Scalar(Value::Err(ExcelError::Ref)),
+            ) => Ok(ast),
+            Ok(Expr::Name(_)) if self.depth < 32 => Ok(Expr::Name(text)),
+            _ => Err(Value::Err(ExcelError::Ref)),
         }
     }
 
@@ -6997,7 +7230,9 @@ impl<'a> Eval<'a> {
                 Ok(v) => num(v.iter().sum()),
                 Err(e) => Value::Err(e),
             },
+            // No number to multiply is 0 in Excel, not the empty product.
             "PRODUCT" => match self.collect_values(args, true) {
+                Ok(v) if v.is_empty() => num(0.0),
                 Ok(v) => num(v.iter().product()),
                 Err(e) => Value::Err(e),
             },
@@ -8272,12 +8507,14 @@ impl<'a> Eval<'a> {
                 [] => Value::Num(self.cell.0 as f64 + 1.0),
                 [Expr::Ref(r)] => Value::Num(r.row as f64 + 1.0),
                 [Expr::Range(a, _)] => Value::Num(a.row as f64 + 1.0),
+                [e] => self.position_of(e, true),
                 _ => Value::Err(ExcelError::Value),
             },
             "COLUMN" => match args {
                 [] => Value::Num(self.cell.1 as f64 + 1.0),
                 [Expr::Ref(r)] => Value::Num(r.col as f64 + 1.0),
                 [Expr::Range(a, _)] => Value::Num(a.col as f64 + 1.0),
+                [e] => self.position_of(e, false),
                 _ => Value::Err(ExcelError::Value),
             },
             "ROWS" => match args {
@@ -11246,11 +11483,70 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// `e` as [`Self::eval_arg`] gives it, except that a single cell stays a
+    /// reference: a cell, a defined name whose definition is (or leads to)
+    /// one, and `INDIRECT(…)` give a 1x1 `Arg::Range` without reading the
+    /// cell, so ROW/COLUMN/ROWS/COLUMNS measure where it is, not what it
+    /// holds. A LET binding is its bound value, as eval_arg gives it.
+    fn area_of(&mut self, e: &Expr) -> Arg {
+        match e {
+            Expr::Ref(r) if r.row >= 0 && r.col >= 0 => match self.resolve_sheet(&r.sheet) {
+                Ok(s) => {
+                    let (row, col) = (r.row as u32, r.col as u32);
+                    Arg::Range(s, row, col, row, col)
+                }
+                Err(v) => Arg::Scalar(v),
+            },
+            Expr::Name(n)
+                if self.depth < 32
+                    && !self
+                        .lets
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case(bare_param(n))) =>
+            {
+                match self.res.defined_name(n, self.sheet).map(|def| parse(&def)) {
+                    Some(Ok(ast)) => {
+                        self.depth += 1;
+                        let arg = self.area_of(&ast);
+                        self.depth -= 1;
+                        arg
+                    }
+                    _ => self.eval_arg(e),
+                }
+            }
+            Expr::Func(name, args) if name == "INDIRECT" => match self.indirect_target(args) {
+                Ok(ast) => {
+                    self.depth += 1;
+                    let arg = self.area_of(&ast);
+                    self.depth -= 1;
+                    arg
+                }
+                Err(v) => Arg::Scalar(v),
+            },
+            _ => self.eval_arg(e),
+        }
+    }
+
+    /// ROW/COLUMN of a reference that isn't a literal cell or range (a
+    /// structured reference, a table or defined name, `A1#`, INDIRECT,
+    /// OFFSET…): the top-left cell's row or column, 1-based, as the
+    /// `Expr::Range` arms give, found by [`Self::area_of`] without reading
+    /// any cell. Errors propagate; a LAMBDA is `#CALC!`, and anything else
+    /// that isn't a reference is `#VALUE!`.
+    fn position_of(&mut self, e: &Expr, row: bool) -> Value {
+        match self.area_of(e) {
+            Arg::Range(_, r1, c1, ..) => Value::Num(if row { r1 } else { c1 } as f64 + 1.0),
+            Arg::Scalar(Value::Err(e)) => Value::Err(e),
+            Arg::Lambda(_) => Value::Err(ExcelError::Calc),
+            Arg::Scalar(_) | Arg::Matrix(_) => Value::Err(ExcelError::Value),
+        }
+    }
+
     /// ROWS/COLUMNS of anything that is not a literal reference form: a
     /// name, table or spill reference gives its extent, a computed array its
     /// dimensions, and a scalar 1.
     fn extent_of(&mut self, e: &Expr, rows: bool) -> Value {
-        match self.eval_arg(e) {
+        match self.area_of(e) {
             Arg::Range(_, r1, c1, r2, c2) => Value::Num(if rows {
                 (r2 - r1 + 1) as f64
             } else {
@@ -12715,6 +13011,9 @@ mod tests {
         assert_eq!(n("COUNT(A1:B3)", &g), 3.0);
         assert_eq!(n("COUNTA(A1:B3)", &g), 4.0);
         assert_eq!(n("COUNTBLANK(A1:B3)", &g), 2.0);
+        // No number to multiply: 0, as in Excel, not the empty product.
+        assert_eq!(n("PRODUCT(B1:B3)", &g), 0.0);
+        assert_eq!(n("PRODUCT(A2:B3)", &g), 6.0);
     }
 
     #[test]
@@ -13645,6 +13944,153 @@ mod tests {
             assert_eq!(at_row_3(typed), Value::Num(want), "{typed}");
             assert_eq!(at_row_3(saved), Value::Num(want), "{saved}");
         }
+    }
+
+    /// The #679 table: `Sales` with Item/Qty/Price/Region, four data rows,
+    /// no totals row, its header at 0-based (`r0`, `c0`) — A1:D5 at (0, 0).
+    fn issue_679_grid(r0: u32, c0: u32) -> Grid {
+        let rows = [
+            ["Item", "Qty", "Price", "Region"],
+            ["pen", "10", "1.5", "North"],
+            ["pad", "12", "4", "South"],
+            ["ink", "7", "2", "East"],
+            ["cap", "8", "3", "West"],
+        ];
+        let mut g = Grid::new(&[]);
+        for (r, row) in rows.iter().enumerate() {
+            for (c, text) in row.iter().enumerate() {
+                let v = match text.parse::<f64>() {
+                    Ok(x) if r > 0 => Value::Num(x),
+                    _ => Value::Str(text.to_string()),
+                };
+                g.cells.insert((r0 + r as u32, c0 + c as u32), v);
+            }
+        }
+        g.with_table(TableInfo {
+            sheet: 0,
+            range: (r0, c0, r0 + 4, c0 + 3),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: rows[0].iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
+    /// Evaluate `src` from a cell outside the #679 table (Z100).
+    fn eval_outside(src: &str, g: &Grid) -> (Value, bool) {
+        let ast = parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}"));
+        let mut ev = Eval::new(g, 0, (99, 25));
+        let v = ev.eval(&ast);
+        (v, ev.unsupported)
+    }
+
+    #[test]
+    fn structured_refs_measure_with_rows_columns_row_column() {
+        // #679: Excel's answers for every form in the issue's table.
+        let g = issue_679_grid(0, 0);
+        for (src, want) in [
+            ("ROWS(Sales)", 4.0),
+            ("COLUMNS(Sales)", 4.0),
+            ("ROWS(Sales[#All])", 5.0),
+            ("ROWS(Sales[#Headers])", 1.0),
+            ("COLUMNS(Sales[[Item]:[Price]])", 3.0),
+            ("ROWS(Sales[[#All],[Qty]])", 5.0),
+            ("MIN(ROW(Sales[#Data]))", 2.0),
+            ("ROW(Sales[#Headers])", 1.0),
+            ("COLUMN(Sales[Price])", 3.0),
+            ("SUM(Sales[Qty])", 37.0),
+            ("ROWS(A1:D5)", 5.0),
+            // A bare table name is its data body everywhere.
+            ("ROW(Sales)", 2.0),
+            ("COLUMN(Sales)", 1.0),
+            ("SUM(Sales)", 37.0 + 1.5 + 4.0 + 2.0 + 3.0),
+            ("ROWS(INDIRECT(\"Sales\"))", 4.0),
+            // ROW/COLUMN of any other reference-valued argument.
+            ("ROW(OFFSET(A1,4,0))", 5.0),
+            ("COLUMN(OFFSET(A1,0,3))", 4.0),
+        ] {
+            let (v, unsupported) = eval_outside(src, &g);
+            assert_eq!(v, Value::Num(want), "{src}");
+            assert!(!unsupported, "{src} flagged unsupported");
+        }
+        // A bad column is #REF!, not #VALUE!; a non-reference stays #VALUE!.
+        for (src, want) in [
+            ("ROW(Sales[Nope])", ExcelError::Ref),
+            ("COLUMN(Sales[Nope])", ExcelError::Ref),
+            ("ROW({1,2})", ExcelError::Value),
+            ("COLUMN(\"A1\")", ExcelError::Value),
+        ] {
+            assert_eq!(eval_outside(src, &g).0, Value::Err(want), "{src}");
+        }
+        // An unknown bare name is still #NAME? and unsupported.
+        let (v, unsupported) = eval_outside("ROWS(Nope)", &g);
+        assert_eq!(v, Value::Err(ExcelError::Name));
+        assert!(unsupported);
+        // A defined name is looked up before a table of the same name.
+        let named = issue_679_grid(0, 0).with_name("Sales", "Sheet1!$A$1:$A$2");
+        assert_eq!(eval_outside("ROWS(Sales)", &named).0, Value::Num(2.0));
+    }
+
+    #[test]
+    fn structured_ref_positions_are_sheet_coordinates() {
+        // #679: the same table at C3:F7 — ROW/COLUMN give the sheet's row
+        // and column, not the position inside the table.
+        let g = issue_679_grid(2, 2);
+        for (src, want) in [
+            ("ROW(Sales[#Headers])", 3.0),
+            ("COLUMN(Sales[Price])", 5.0),
+            ("MIN(ROW(Sales[#Data]))", 4.0),
+            ("ROW(Sales)", 4.0),
+            ("COLUMN(Sales)", 3.0),
+            ("ROWS(Sales)", 4.0),
+            ("COLUMNS(Sales)", 4.0),
+            ("SUM(Sales[Qty])", 37.0),
+        ] {
+            assert_eq!(eval_outside(src, &g).0, Value::Num(want), "{src}");
+        }
+    }
+
+    #[test]
+    fn position_functions_keep_single_cell_references() {
+        // #679 FIX r2 M1: a single cell reached through a defined name or
+        // INDIRECT is still a reference — ROW/COLUMN give its position and
+        // never read (or propagate) its value.
+        let at = |src: &str, g: &Grid, row: u32, col: u32| {
+            let ast = parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}"));
+            Eval::new(g, 0, (row, col)).eval(&ast)
+        };
+        for b5 in [Value::Num(9.0), Value::Err(ExcelError::NA)] {
+            let mut g = issue_679_grid(0, 0).with_name("StartCell", "Sheet1!$B$5");
+            g.cells.insert((4, 1), b5.clone());
+            for (src, want) in [
+                ("ROW(StartCell)", 5.0),
+                ("COLUMN(StartCell)", 2.0),
+                ("ROWS(StartCell)", 1.0),
+                ("COLUMNS(StartCell)", 1.0),
+                ("ROW(INDIRECT(\"B5\"))", 5.0),
+                ("COLUMN(INDIRECT(\"C1\"))", 3.0),
+                ("ROW(INDIRECT(\"StartCell\"))", 5.0),
+            ] {
+                assert_eq!(at(src, &g, 99, 25), Value::Num(want), "{src} (B5 = {b5:?})");
+            }
+            assert_eq!(at("ROW()-ROW(StartCell)", &g, 6, 25), Value::Num(2.0));
+        }
+        // Single-cell structured references are references too.
+        let g = issue_679_grid(0, 0);
+        assert_eq!(
+            at("ROW(Sales[[#Headers],[Qty]])", &g, 99, 25),
+            Value::Num(1.0)
+        );
+        assert_eq!(
+            at("COLUMN(Sales[[#Headers],[Qty]])", &g, 99, 25),
+            Value::Num(2.0)
+        );
+        assert_eq!(at("COLUMN(Sales[@Price])", &g, 2, 6), Value::Num(3.0));
+        assert_eq!(at("ROW(Sales[@Price])", &g, 2, 6), Value::Num(3.0));
+        // A bad INDIRECT target is still #REF!.
+        assert_eq!(
+            at("ROW(INDIRECT(\"nope nope\"))", &g, 99, 25),
+            Value::Err(ExcelError::Ref)
+        );
     }
 
     #[test]
@@ -15331,5 +15777,143 @@ mod tests {
         assert!(direct_precedents(&wb, 0, 9, 9).is_empty(), "a constant");
         assert!(direct_precedents(&wb, 0, 5, 5).is_empty(), "a blank");
         assert!(direct_precedents(&wb, 7, 0, 0).is_empty(), "no such sheet");
+    }
+
+    fn table_rewrite(src: &str, f: impl Fn(&Expr) -> Expr) -> String {
+        to_string(&f(&parse(src).unwrap()))
+    }
+
+    #[test]
+    fn renaming_a_table_column_renames_its_references() {
+        let map = [("Qty".to_string(), "Units".to_string())];
+        let ren = |src: &str, inside: bool| {
+            table_rewrite(src, |e| {
+                rename_table_columns_in_expr(e, "Sales", inside, &map)
+            })
+        };
+        assert_eq!(ren("SUM(sales[QTY])", false), "SUM(sales[Units])");
+        assert_eq!(
+            ren("SUM(Sales[[Item]:[Qty]])", false),
+            "SUM(Sales[[Item]:[Units]])"
+        );
+        assert_eq!(
+            ren("Sales[[#Totals],[Qty]]", false),
+            "Sales[[#Totals],[Units]]"
+        );
+        // Unqualified references name the table only from inside it.
+        assert_eq!(ren("[@Qty]*2", true), "[@Units]*2");
+        assert_eq!(ren("[@Qty]*2", false), "[@Qty]*2");
+        // Another table's column of that name is another column.
+        assert_eq!(ren("Other[Qty]", true), "Other[Qty]");
+    }
+
+    #[test]
+    fn deleting_table_columns_turns_their_references_to_ref() {
+        let cols: Vec<String> = ["Item", "Qty", "Price", "Region"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let del = |src: &str, deleted: &[bool], inside: bool| {
+            table_rewrite(src, |e| {
+                delete_table_columns_in_expr(e, "Sales", inside, &cols, deleted)
+            })
+        };
+        let price = [false, false, true, false];
+        let qty = [false, true, false, false];
+        assert_eq!(del("SUM(Sales[Price])", &price, false), "SUM(#REF!)");
+        assert_eq!(del("SUM(Sales[Qty])", &price, false), "SUM(Sales[Qty])");
+        assert_eq!(del("[@Price]*2", &price, true), "#REF!*2");
+        assert_eq!(del("[@Price]*2", &price, false), "[@Price]*2");
+        // A span keeps its survivors; an end that went moves inward.
+        assert_eq!(
+            del("SUM(Sales[[Qty]:[Region]])", &price, false),
+            "SUM(Sales[[Qty]:[Region]])"
+        );
+        assert_eq!(
+            del("SUM(Sales[[Qty]:[Region]])", &qty, false),
+            "SUM(Sales[[Price]:[Region]])"
+        );
+        assert_eq!(
+            del("SUM(Sales[[Region]:[Qty]])", &qty, false),
+            "SUM(Sales[[Region]:[Price]])"
+        );
+        assert_eq!(
+            del(
+                "SUM(Sales[[Qty]:[Price]])",
+                &[false, true, true, false],
+                false
+            ),
+            "SUM(#REF!)"
+        );
+        // References to no column stay.
+        for src in ["ROWS(Sales[#All])", "ROWS(Sales[#Data])", "ROWS(Sales)"] {
+            assert_eq!(del(src, &price, false), table_rewrite(src, Expr::clone));
+        }
+    }
+
+    #[test]
+    fn deleting_a_whole_table_turns_every_reference_to_ref() {
+        let del = |src: &str, inside: bool| {
+            table_rewrite(src, |e| delete_table_in_expr(e, "Calc", inside))
+        };
+        assert_eq!(
+            del("SUM(Calc[Line])+ROWS(calc)", false),
+            "SUM(#REF!)+ROWS(#REF!)"
+        );
+        assert_eq!(del("[@Qty]", true), "#REF!");
+        assert_eq!(del("[@Qty]+Other[Qty]", false), "[@Qty]+Other[Qty]");
+    }
+
+    #[test]
+    fn column_names_that_need_brackets_round_trip() {
+        let sales = |col: &str, item: TableItem| Expr::Structured {
+            table: Some("Sales".into()),
+            item,
+            col1: Some(col.into()),
+            col2: None,
+        };
+        let cases = [
+            ("Price, USD", "Sales[[Price, USD]]"),
+            ("Qty:kg", "Sales[[Qty:kg]]"),
+            ("Qty ", "Sales[[Qty ]]"),
+            (" Qty", "Sales[[ Qty]]"),
+            ("Price USD", "Sales[Price USD]"),
+            ("Price (USD)", "Sales[[Price (USD)]]"),
+            ("Total $ Amount", "Sales[[Total $ Amount]]"),
+            ("Cost-USD", "Sales[[Cost-USD]]"),
+            ("2021.01", "Sales[[2021.01]]"),
+            ("a'b", "Sales[[a''b]]"),
+            ("x#y", "Sales[[x'#y]]"),
+            ("Unit_Price", "Sales[[Unit_Price]]"),
+            ("Qty2", "Sales[Qty2]"),
+        ];
+        for (col, text) in cases {
+            let e = sales(col, TableItem::Data);
+            assert_eq!(to_string(&e), text);
+            assert_eq!(parse(text).unwrap(), e, "{text}");
+            assert_eq!(parse(&to_file_string(&e)).unwrap(), e, "{text}");
+            let row = sales(col, TableItem::ThisRow);
+            assert_eq!(parse(&to_string(&row)).unwrap(), row, "{}", to_string(&row));
+            assert_eq!(parse(&to_file_string(&row)).unwrap(), row);
+        }
+        assert_eq!(
+            to_string(&sales("Qty ", TableItem::ThisRow)),
+            "Sales[@[Qty ]]"
+        );
+        // A span and a totals row bracket every name already.
+        let span = parse("SUM(Sales[[Qty ]:[Price, USD]])").unwrap();
+        assert_eq!(to_string(&span), "SUM(Sales[[Qty ]:[Price, USD]])");
+        let totals = parse("Sales[[#Totals],[Qty ]]").unwrap();
+        assert_eq!(to_string(&totals), "Sales[[#Totals],[Qty ]]");
+        // Bare names are still read trimmed.
+        assert_eq!(
+            parse("Sales[ Qty ]").unwrap(),
+            sales("Qty", TableItem::Data)
+        );
+        // A rename to such a name prints a formula that reads back.
+        let map = [("Qty".to_string(), "Price, USD".to_string())];
+        let e =
+            rename_table_columns_in_expr(&parse("SUM(Sales[Qty])").unwrap(), "Sales", false, &map);
+        assert_eq!(parse(&to_string(&e)).unwrap(), e);
     }
 }

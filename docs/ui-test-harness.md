@@ -461,7 +461,7 @@ The Project ribbon holds only Project's commands, and its Report tab has no
 groups yet (`groups: []`). Extend Selection mode, native prompts,
 and backstage pages are not represented by these verbs.
 
-On a sheet tab the reply lists File, Home, Insert, Review and View from
+On a sheet tab the reply lists File, Home, Insert, Data, Review and View from
 `sheet_ribbon::SHEET_RIBBON`, the table the sheet ribbon is drawn from, so a
 button cannot be drawn without being listed. Ids are kebab-case and unique
 across the sheet ribbon (`bold`, `sort-a-z`, `freeze-panes`); icon and glyph
@@ -838,6 +838,8 @@ included. Each has a stable id, which the state's `dialog` key reports:
 | `hf-distance`, `page-number-format` | the Header & Footer tab's distance box (#641) and Page Number Format (#650) |
 | `insert-table`, `delete-cells`, `split-cells`, `sort`, `convert-to-text`, `convert-text-to-table` | the table dialogs (#646, #647) |
 | `text-to-columns`, `text-to-columns-replace` | Excel's Convert Text to Columns Wizard and its replace question (#692) |
+| `subtotal`, `outline-settings`, `group`, `ungroup` | Data › Outline (#693): Subtotal (OK, Remove All, Cancel), the outline Settings, and Group's (Ungroup's) Rows/Columns question |
+| `consolidate` | Data › Data Tools › Consolidate (#694): `function`, `reference`, `refs` (All references; choosing an entry is what Delete removes), `top`, `left`, `links`; Add and Delete edit the list and keep the dialog open, OK writes at the cell it opened on as one undo step and a refusal keeps it open, Close cancels |
 | `reopen` | "… is already open … Do you want to reopen …?" before an open discards a workbook's unsaved changes (#610) |
 | `mail-envelopes`, `mail-envelope-options`, `mail-labels`, `mail-label-options`, `mail-replace` | Mailings: Envelopes and Labels (Create), Envelope and Label Options (Start Mail Merge), and the confirm before those replace the document (#628) |
 | `mail-recipients`, `mail-address-block`, `mail-greeting-line`, `mail-match-fields`, `mail-find`, `mail-check-errors`, `mail-merge-new`, `mail-attach`, `mail-report` | Mailings: Edit Recipient List, Address Block, Greeting Line, Match Fields, Find Recipient, Check for Errors, Merge to New Document, "Opening this document will run the following SQL command" and a report (#628) |

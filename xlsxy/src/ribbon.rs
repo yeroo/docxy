@@ -59,6 +59,8 @@ pub enum Act {
     TableName,
     ResizeTable,
     ConvertToRange,
+    /// Data ▸ Data Tools ▸ Consolidate.
+    Consolidate,
     /// Data ▸ Outline.
     Subtotal,
     /// Data ▸ Form…: Excel's data form over the list at the cursor.
@@ -331,7 +333,7 @@ fn data_groups() -> Vec<Group> {
     vec![
         Group {
             title: "Data Tools",
-            width: 20,
+            width: 30,
             rows: [
                 vec![
                     btn(
@@ -353,6 +355,12 @@ fn data_groups() -> Vec<Group> {
                         "Split",
                         TextToColumns,
                         "Text to Columns: split by a delimiter",
+                    ),
+                    Seg::Gap(" "),
+                    btn(
+                        "Consolidate…",
+                        Consolidate,
+                        "Combine ranges from several sheets into one, by position or label",
                     ),
                 ],
             ],

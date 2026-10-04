@@ -19,7 +19,14 @@ pub use dataform::{
     CANNOT_EXTEND, criterion_matches, delete_record, delete_splits_array, find_record,
     is_formula_field, new_record_changes, record_matches,
 };
+mod consolidate;
 mod subtotal;
+pub(crate) use consolidate::split_ref_text;
+pub use consolidate::{
+    ConsolidateError, ConsolidateFunc, ConsolidateOptions, ConsolidateRef, ConsolidateSettings,
+    canonical_consolidate_ref, consolidate, consolidate_fn_name, consolidate_token,
+    format_consolidate_ref, parse_consolidate_func, parse_consolidate_ref,
+};
 pub use subtotal::{
     Area, SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,
     remove_subtotals, sheets_differ, subtotal, subtotal_columns, subtotal_region,
@@ -1223,6 +1230,11 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
     for (&(r, c), cell) in wb.sheets[idx].cells.iter_mut() {
         own_array_ref(cell, r, c);
     }
+    // Before the grid moves, while each formula is still where the tables
+    // see it (an unqualified `[@Qty]` names the table it sits in).
+    if !shift.rows && shift.delta < 0 {
+        delete_table_columns(wb, idx, &shift);
+    }
     shift_grid(&mut wb.sheets[idx], &shift);
 
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
@@ -1337,10 +1349,12 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         }
     }
 
-    // Table regions follow the grid. Row edits stretch/shift freely; column
-    // edits move a table only when they fall entirely to its left — resizing
-    // a table's column set would desync it from its tableColumns definition
-    // (a later refinement), so intersecting column edits leave it in place.
+    // Table regions follow the grid. Row edits stretch/shift freely. A column
+    // delete shrinks a table to its surviving columns (`delete_table_columns`
+    // dropped their names and removed a table left with none). A column
+    // insert moves a table only when it falls entirely to its left: an
+    // insert inside it would need a new column (a later refinement), so it
+    // leaves the table in place.
     for t in &mut wb.tables {
         if t.sheet != idx {
             continue;
@@ -1353,29 +1367,89 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
                     t.range = (lo, c1, hi, c2);
                 }
             }
+        } else if shift.delta < 0 {
+            if let Some((lo, hi)) = span(c1, c2, &shift) {
+                t.range = (r1, lo, r2, hi);
+            }
         } else if shift.at <= c1 {
-            let edge = if shift.delta < 0 {
-                shift.at as i64 - shift.delta // first surviving column
-            } else {
-                shift.at as i64
-            };
-            if edge <= c1 as i64 {
-                let d = shift.delta;
-                let nc1 = (c1 as i64 + d).max(0) as u32;
-                let nc2 = (c2 as i64 + d).max(0) as u32;
-                if nc2 < MAX_COLS {
-                    t.range = (r1, nc1, r2, nc2);
-                }
+            let d = shift.delta;
+            let nc2 = c2 as i64 + d;
+            if nc2 < MAX_COLS as i64 {
+                t.range = (r1, (c1 as i64 + d) as u32, r2, nc2 as u32);
             }
         }
     }
-    // A converted table keeps the geometry it was converted with; the edits
-    // its cells went through since are replayed at save on the references
-    // to it (see `RemovedTable::edits`).
+    // A table converted to a range, or deleted with all its columns (by
+    // this edit, too), keeps the geometry it was removed with; the edits its
+    // cells went through since are replayed at save on the references to it
+    // (see `RemovedTable::edits`).
     for rt in &mut wb.removed_tables {
         if rt.table.sheet == idx {
             rt.edits.push(shift);
         }
+    }
+}
+
+/// Column delete `shift` on sheet `idx`, as Excel deletes table columns: a
+/// reference to a deleted column of a table goes `#REF!` (a span keeps its
+/// survivors, [`crate::formula::delete_table_columns_in_expr`]) and the
+/// column leaves the table's names and ids; a table that loses every column
+/// is deleted, every reference to it going `#REF!`, and its part leaves the
+/// file at the next save (it is kept in [`Workbook::removed_tables`] until
+/// then, as a converted table is). The tables' ranges move with the grid in
+/// [`structural_edit`].
+fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
+    let mut i = 0;
+    while i < wb.tables.len() {
+        let t = wb.tables[i].clone();
+        let deleted: Vec<bool> = (t.range.1..=t.range.3)
+            .map(|c| point(c, shift).is_none())
+            .collect();
+        if t.sheet != idx || !deleted.contains(&true) {
+            i += 1;
+            continue;
+        }
+        let inside = |(s, cell): FormulaSite| match (s, cell) {
+            (Some(s), Some((r, c))) => t.contains(s, r, c),
+            _ => false,
+        };
+        if deleted.iter().all(|&d| d) {
+            rewrite_workbook_formulas(
+                wb,
+                |_, _| true,
+                |e, site| crate::formula::delete_table_in_expr(e, &t.name, inside(site)),
+            );
+            wb.tables.remove(i);
+            wb.removed_tables.push(crate::sheet::RemovedTable {
+                table: t,
+                edits: Vec::new(),
+            });
+            continue;
+        }
+        rewrite_workbook_formulas(
+            wb,
+            |_, _| true,
+            |e, site| {
+                crate::formula::delete_table_columns_in_expr(
+                    e,
+                    &t.name,
+                    inside(site),
+                    &t.columns,
+                    &deleted,
+                )
+            },
+        );
+        let kept = |j: usize| !deleted.get(j).copied().unwrap_or(false);
+        let tm = &mut wb.tables[i];
+        tm.columns = (t.columns.iter().enumerate())
+            .filter(|&(j, _)| kept(j))
+            .map(|(_, n)| n.clone())
+            .collect();
+        tm.column_ids = (t.column_ids.iter().enumerate())
+            .filter(|&(j, _)| kept(j))
+            .map(|(_, &id)| id)
+            .collect();
+        i += 1;
     }
 }
 
@@ -1653,6 +1727,75 @@ pub fn table_column_name(header: Option<&CellValue>, n: u32, taken: &[String]) -
     name
 }
 
+/// Excel's header edit: `cells` on `sheet` were just written, and a table
+/// column whose header cell is among them takes its header's name
+/// ([`table_column_name`]: the text, a number's digits, else `Column<n>`,
+/// made unique among the table's other columns ignoring case). A header
+/// that doesn't read as that name (a blank, a duplicate, a number, a
+/// formula) is written over with it as text, keeping its style. A column
+/// whose name changed is renamed in every formula that names it — structured
+/// references, rules, defined names — and its part's element keeps it (by
+/// [`crate::sheet::Table::column_ids`]). True when a column was renamed.
+pub fn sync_table_headers(wb: &mut Workbook, sheet: usize, cells: &[(u32, u32)]) -> bool {
+    let mut renamed = false;
+    for ti in 0..wb.tables.len() {
+        let (r1, c1, _, c2) = wb.tables[ti].range;
+        if wb.tables[ti].sheet != sheet || wb.tables[ti].header_rows == 0 {
+            continue;
+        }
+        let mut hits: Vec<u32> = cells
+            .iter()
+            .filter(|&&(r, c)| r == r1 && (c1..=c2).contains(&c))
+            .map(|&(_, c)| c)
+            .collect();
+        hits.sort_unstable();
+        hits.dedup();
+        // Left to right: a later header is made unique against the earlier.
+        for c in hits {
+            let t = &wb.tables[ti];
+            let j = (c - c1) as usize;
+            let Some(cur) = t.columns.get(j).cloned() else {
+                continue;
+            };
+            let taken: Vec<String> = (t.columns.iter().enumerate())
+                .filter(|&(k, _)| k != j)
+                .map(|(_, n)| n.clone())
+                .collect();
+            let header = wb.sheets[sheet].cell(r1, c).cloned();
+            let value = header.as_ref().map(|cl| &cl.value);
+            let name = table_column_name(value, j as u32 + 1, &taken);
+            let reads_as_name = header.as_ref().is_some_and(|cl| {
+                cl.formula.is_none() && cl.value == CellValue::Text(name.clone())
+            });
+            if !reads_as_name {
+                let mut cell = header.unwrap_or_default();
+                cell.value = CellValue::Text(name.clone());
+                cell.formula = None;
+                wb.sheets[sheet].set_cell(r1, c, cell);
+            }
+            if name == cur {
+                continue;
+            }
+            let t = wb.tables[ti].clone();
+            let map = [(cur, name.clone())];
+            rewrite_workbook_formulas(
+                wb,
+                |_, _| true,
+                |e, (s, cell)| {
+                    let inside = match (s, cell) {
+                        (Some(s), Some((r, c))) => t.contains(s, r, c),
+                        _ => false,
+                    };
+                    crate::formula::rename_table_columns_in_expr(e, &t.name, inside, &map)
+                },
+            );
+            wb.tables[ti].columns[j] = name;
+            renamed = true;
+        }
+    }
+    renamed
+}
+
 fn rects_overlap(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> bool {
     a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
 }
@@ -1701,7 +1844,8 @@ pub fn table_range_conflict(
 /// has none) and its cell (a conditional-format or validation rule has none).
 type FormulaSite = (Option<usize>, Option<(u32, u32)>);
 
-/// Rewrite every formula a table rename or conversion can reach: cell
+/// Rewrite every formula a table edit can reach (a table or column rename, a
+/// conversion, a column delete through a table): cell
 /// formulas (array formulas included), defined names, and the
 /// conditional-format and data-validation rules `rules` takes (given the
 /// rule's sheet and ranges). A formula `f` leaves unchanged keeps its text
@@ -1842,13 +1986,18 @@ pub fn resize_table(
             .then(|| old_columns.get((c - oc1) as usize).cloned())
             .flatten()
     };
+    // A kept column keeps its id; a new one has none in the part yet.
+    let old_ids = t.column_ids.clone();
+    let mut column_ids = Vec::new();
     let mut taken: Vec<String> = (c1..=c2).filter_map(kept).collect();
     let mut columns = Vec::new();
     for c in c1..=c2 {
         if let Some(n) = kept(c) {
             columns.push(n);
+            column_ids.push(old_ids.get((c - oc1) as usize).copied().unwrap_or(0));
             continue;
         }
+        column_ids.push(0);
         let header = (header_rows > 0)
             .then(|| wb.sheets[sheet].cell(r1, c).map(|cl| cl.value.clone()))
             .flatten();
@@ -1866,6 +2015,9 @@ pub fn resize_table(
     let t = &mut wb.tables[idx];
     t.range = rect;
     t.columns = columns;
+    if !old_ids.is_empty() {
+        t.column_ids = column_ids;
+    }
     Ok(())
 }
 
@@ -3764,7 +3916,7 @@ mod tests {
 mod table_tests {
     use super::*;
     use crate::engine::Engine;
-    use crate::sheet::{Cell, DefinedName, Table, parse_cell_name};
+    use crate::sheet::{Cell, CellValue, DefinedName, Table, parse_cell_name};
 
     /// Sheet1 holds `Sales` over A1:C4 (Item, Qty, Dbl; Dbl = [@Qty]*2); a
     /// second sheet, `My Data`, holds nothing yet.
@@ -3801,6 +3953,7 @@ mod table_tests {
             totals_rows: 0,
             columns: vec!["Item".into(), "Qty".into(), "Dbl".into()],
             part: "xl/tables/table1.xml".into(),
+            column_ids: Vec::new(),
         });
         wb
     }
@@ -3866,6 +4019,7 @@ mod table_tests {
             totals_rows: 0,
             columns: (range.1..=range.3).map(|c| format!("C{c}")).collect(),
             part: format!("xl/tables/{name}.xml"),
+            column_ids: Vec::new(),
         }
     }
 
@@ -4091,5 +4245,218 @@ mod table_tests {
             Some("The range contains part of the array formula at G1")
         );
         assert_eq!(table_range_conflict(&wb, 1, (0, 7, 4, 8), None), None);
+    }
+
+    fn grid(cells: &[(&str, Cell)]) -> Workbook {
+        let mut sheet = Sheet {
+            name: "Sheet1".into(),
+            ..Sheet::default()
+        };
+        for (at, cell) in cells {
+            let (r, c) = parse_cell_name(at).unwrap();
+            sheet.set_cell(r, c, cell.clone());
+        }
+        Workbook {
+            sheets: vec![sheet],
+            ..Workbook::default()
+        }
+    }
+
+    /// Issue #683's table: `Sales` on A1:D5 (Item, Qty, Price, Region), its
+    /// ids 1..=4 as a loaded part gives them.
+    fn sales4() -> Workbook {
+        let mut wb = grid(&[
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Price")),
+            ("D1", Cell::text("Region")),
+        ]);
+        for r in 1..5 {
+            let sh = &mut wb.sheets[0];
+            sh.set_cell(r, 0, Cell::text(&format!("I{r}")));
+            sh.set_cell(r, 1, Cell::number(r as f64));
+            sh.set_cell(r, 2, Cell::number(10.0 * r as f64));
+            sh.set_cell(r, 3, Cell::text("N"));
+        }
+        wb.tables.push(Table {
+            name: "Sales".into(),
+            sheet: 0,
+            range: (0, 0, 4, 3),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: ["Item", "Qty", "Price", "Region"]
+                .map(String::from)
+                .to_vec(),
+            column_ids: vec![1, 2, 3, 4],
+            part: "xl/tables/table1.xml".into(),
+        });
+        wb
+    }
+
+    fn set_header(wb: &mut Workbook, at: &str, cell: Cell) -> bool {
+        let (r, c) = parse_cell_name(at).unwrap();
+        wb.sheets[0].set_cell(r, c, cell);
+        sync_table_headers(wb, 0, &[(r, c)])
+    }
+
+    fn text_at(wb: &Workbook, at: &str) -> CellValue {
+        let (r, c) = parse_cell_name(at).unwrap();
+        wb.sheets[0].cell(r, c).unwrap().value.clone()
+    }
+
+    #[test]
+    fn header_edit_renames_the_column_and_its_references() {
+        let mut wb = sales4();
+        put(&mut wb, 0, "F2", "SUM(Sales[Qty])");
+        put(&mut wb, 0, "G2", "SUM(Sales[[Qty]:[Price]])");
+        // Inside the table, an unqualified reference names it.
+        put(&mut wb, 0, "D2", "[@Qty]*2");
+        wb.sheets[0].validations.push(crate::sheet::DataValidation {
+            formula1: "Sales[Qty]".into(),
+            ..Default::default()
+        });
+        wb.defined_names.push(DefinedName {
+            name: "Units".into(),
+            scope: None,
+            formula: "SALES[QTY]".into(),
+        });
+        let before = value(&mut wb, 0, "F2");
+        assert!(set_header(&mut wb, "B1", Cell::text("Units")));
+        assert_eq!(wb.tables[0].columns, ["Item", "Units", "Price", "Region"]);
+        assert_eq!(wb.tables[0].column_ids, [1, 2, 3, 4]);
+        assert_eq!(formula(&wb, 0, "F2"), "SUM(Sales[Units])");
+        assert_eq!(formula(&wb, 0, "G2"), "SUM(Sales[[Units]:[Price]])");
+        assert_eq!(formula(&wb, 0, "D2"), "[@Units]*2");
+        assert_eq!(wb.sheets[0].validations[0].formula1, "Sales[Units]");
+        assert_eq!(wb.defined_names[0].formula, "SALES[Units]");
+        assert_eq!(value(&mut wb, 0, "F2"), before);
+        // Typing the same name again renames nothing.
+        assert!(!set_header(&mut wb, "B1", Cell::text("Units")));
+        // A header outside every table is no header.
+        assert!(!set_header(&mut wb, "F1", Cell::text("Qty")));
+        // Another case is a rename, as Excel shows it.
+        assert!(set_header(&mut wb, "B1", Cell::text("UNITS")));
+        assert_eq!(formula(&wb, 0, "F2"), "SUM(Sales[UNITS])");
+    }
+
+    #[test]
+    fn header_edit_clear_and_duplicate_follow_excel_names() {
+        let mut wb = sales4();
+        put(&mut wb, 0, "F2", "SUM(Sales[Qty])");
+        // A cleared header is `Column<n>`, written into the cell.
+        assert!(set_header(&mut wb, "B1", Cell::default()));
+        assert_eq!(text_at(&wb, "B1"), CellValue::Text("Column2".into()));
+        assert_eq!(formula(&wb, 0, "F2"), "SUM(Sales[Column2])");
+        // Another column's name, in any case, is made unique.
+        assert!(set_header(&mut wb, "B1", Cell::text("item")));
+        assert_eq!(text_at(&wb, "B1"), CellValue::Text("item2".into()));
+        assert_eq!(wb.tables[0].columns[1], "item2");
+        // A number names the column with its digits.
+        assert!(set_header(&mut wb, "B1", Cell::number(5.0)));
+        assert_eq!(text_at(&wb, "B1"), CellValue::Text("5".into()));
+        assert_eq!(formula(&wb, 0, "F2"), "SUM(Sales[5])");
+        // A header that keeps its name but not its text (a formula) is
+        // written back as the name, with nothing to rename.
+        let item = Cell {
+            value: CellValue::Text("Item".into()),
+            ..Cell::formula("\"Item\"")
+        };
+        assert!(!set_header(&mut wb, "A1", item));
+        let a1 = wb.sheets[0].cell(0, 0).unwrap();
+        assert_eq!(a1.formula, None);
+        // Several headers at once: left to right, each unique so far.
+        let sh = &mut wb.sheets[0];
+        sh.set_cell(0, 2, Cell::text("Cost"));
+        sh.set_cell(0, 3, Cell::text("cost"));
+        assert!(sync_table_headers(&mut wb, 0, &[(0, 3), (0, 2)]));
+        assert_eq!(wb.tables[0].columns, ["Item", "5", "Cost", "cost2"]);
+    }
+
+    #[test]
+    fn deleting_a_table_column_turns_its_references_to_ref_and_shrinks_the_table() {
+        let mut wb = sales4();
+        put(&mut wb, 0, "F2", "SUM(Sales[Qty])");
+        put(&mut wb, 0, "G2", "SUM(Sales[Price])");
+        put(&mut wb, 0, "H2", "SUM(Sales[[Qty]:[Region]])");
+        put(&mut wb, 0, "I2", "ROWS(Sales[#All])+ROWS(Sales)");
+        put(&mut wb, 0, "D3", "[@Price]+1");
+        let qty = value(&mut wb, 0, "F2");
+        delete_cols(&mut wb, 0, 2, 1);
+        let t = &wb.tables[0];
+        assert_eq!(t.range, (0, 0, 4, 2));
+        assert_eq!(t.columns, ["Item", "Qty", "Region"]);
+        assert_eq!(t.column_ids, [1, 2, 4]);
+        // F2..I2 moved left one column.
+        assert_eq!(formula(&wb, 0, "E2"), "SUM(Sales[Qty])");
+        assert_eq!(formula(&wb, 0, "F2"), "SUM(#REF!)");
+        assert_eq!(formula(&wb, 0, "G2"), "SUM(Sales[[Qty]:[Region]])");
+        assert_eq!(formula(&wb, 0, "H2"), "ROWS(Sales[#All])+ROWS(Sales)");
+        assert_eq!(formula(&wb, 0, "C3"), "#REF!+1");
+        assert_eq!(value(&mut wb, 0, "E2"), qty);
+        assert_eq!(value(&mut wb, 0, "F2"), CellValue::Error("#REF!".into()));
+        // A span loses an end column: the end moves inward.
+        let mut wb = sales4();
+        put(&mut wb, 0, "H2", "SUM(Sales[[Qty]:[Region]])");
+        delete_cols(&mut wb, 0, 1, 1);
+        assert_eq!(formula(&wb, 0, "G2"), "SUM(Sales[[Price]:[Region]])");
+        // A delete from the left of the table into it: B:E with A:C gone
+        // keeps D:E's columns on A:B.
+        let mut wb = sales4();
+        insert_cols(&mut wb, 0, 0, 1);
+        assert_eq!(wb.tables[0].range, (0, 1, 4, 4));
+        delete_cols(&mut wb, 0, 0, 3);
+        let t = &wb.tables[0];
+        assert_eq!(t.range, (0, 0, 4, 1));
+        assert_eq!(t.columns, ["Price", "Region"]);
+        assert_eq!(t.column_ids, [3, 4]);
+        // Entirely to the left or right of it, the columns stay.
+        delete_cols(&mut wb, 0, 5, 2);
+        assert_eq!(wb.tables[0].range, (0, 0, 4, 1));
+        insert_cols(&mut wb, 0, 0, 2);
+        delete_cols(&mut wb, 0, 0, 1);
+        assert_eq!(wb.tables[0].range, (0, 1, 4, 2));
+        assert_eq!(wb.tables[0].columns, ["Price", "Region"]);
+    }
+
+    #[test]
+    fn deleting_every_column_of_a_table_removes_it() {
+        let mut wb = grid(&[
+            ("A1", Cell::text("Qty")),
+            ("B1", Cell::text("Price")),
+            ("C1", Cell::text("Line")),
+        ]);
+        for r in 1..4 {
+            wb.sheets[0].set_cell(r, 2, Cell::number(r as f64));
+        }
+        wb.tables.push(Table {
+            name: "Calc".into(),
+            sheet: 0,
+            range: (0, 0, 3, 2),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: ["Qty", "Price", "Line"].map(String::from).to_vec(),
+            column_ids: vec![1, 2, 3],
+            part: "xl/tables/table1.xml".into(),
+        });
+        put(&mut wb, 0, "F2", "SUM(Calc[Line])");
+        put(&mut wb, 0, "F3", "ROWS(Calc)");
+        let table = wb.tables[0].clone();
+        delete_cols(&mut wb, 0, 0, 3);
+        assert!(wb.tables.is_empty());
+        let shift = EditShift {
+            rows: false,
+            at: 0,
+            delta: -3,
+        };
+        assert_eq!(
+            wb.removed_tables,
+            [crate::sheet::RemovedTable {
+                table,
+                edits: vec![shift],
+            }]
+        );
+        assert_eq!(formula(&wb, 0, "C2"), "SUM(#REF!)");
+        assert_eq!(formula(&wb, 0, "C3"), "ROWS(#REF!)");
+        assert_eq!(value(&mut wb, 0, "C2"), CellValue::Error("#REF!".into()));
     }
 }
