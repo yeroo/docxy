@@ -6161,10 +6161,10 @@ fn table_column_ids(xml: &str) -> Vec<u32> {
 /// table with no query table, or one whose part can't be found, is left
 /// alone.
 fn drop_query_table_fields(parts: &mut [(String, Vec<u8>)], part: &str, dropped: &[u32]) {
-    let Some((dir, file)) = part.rsplit_once('/') else {
+    let Some((dir, _)) = part.rsplit_once('/') else {
         return;
     };
-    let rels_name = format!("{dir}/_rels/{file}.rels");
+    let rels_name = rels_part_name(part);
     let Some((_, rels)) = parts.iter().find(|(n, _)| *n == rels_name) else {
         return;
     };
@@ -19470,6 +19470,8 @@ mod table_command_tests {
             ("Price, USD", "SUM(Table1[[Price, USD]])"),
             ("Qty:kg", "SUM(Table1[[Qty:kg]])"),
             ("Qty ", "SUM(Table1[[Qty ]])"),
+            ("Price (USD)", "SUM(Table1[[Price (USD)]])"),
+            ("Total $ Amount", "SUM(Table1[[Total $ Amount]])"),
         ] {
             let mut pkg = reload(&one_table());
             assert!(type_header(&mut pkg, 0, 1, name));

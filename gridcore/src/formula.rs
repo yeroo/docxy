@@ -1297,13 +1297,16 @@ fn bracket_spec(name: &str) -> String {
     format!("[{}]", escape_spec(name))
 }
 
-/// Whether column name `name` needs its own brackets to read back where a
-/// bare name could stand (`Sales[Qty]`, `[@Qty]`): a `,` or `:` would split
-/// the spec, and the bare form is trimmed of edge whitespace.
+/// Whether column name `name` takes its own brackets where a bare name could
+/// stand (`Sales[Qty]`, `[@Qty]`). Excel brackets a name with any of its
+/// special characters (`Sales[[Total $ Amount]]`, `[@[Price (USD)]]`), and
+/// some would not read back bare (a `,` or `:` splits the spec, edge
+/// whitespace is trimmed): the bracketed form is always valid, so any
+/// character but a letter, a digit or an interior space takes it.
 fn needs_brackets(name: &str) -> bool {
-    name.contains([',', ':'])
-        || name.starts_with(char::is_whitespace)
+    name.starts_with(char::is_whitespace)
         || name.ends_with(char::is_whitespace)
+        || name.chars().any(|c| !(c.is_alphanumeric() || c == ' '))
 }
 
 /// Print a structured reference back to canonical text. `file` spells the
@@ -15416,6 +15419,14 @@ mod tests {
             ("Qty ", "Sales[[Qty ]]"),
             (" Qty", "Sales[[ Qty]]"),
             ("Price USD", "Sales[Price USD]"),
+            ("Price (USD)", "Sales[[Price (USD)]]"),
+            ("Total $ Amount", "Sales[[Total $ Amount]]"),
+            ("Cost-USD", "Sales[[Cost-USD]]"),
+            ("2021.01", "Sales[[2021.01]]"),
+            ("a'b", "Sales[[a''b]]"),
+            ("x#y", "Sales[[x'#y]]"),
+            ("Unit_Price", "Sales[[Unit_Price]]"),
+            ("Qty2", "Sales[Qty2]"),
         ];
         for (col, text) in cases {
             let e = sales(col, TableItem::Data);
