@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use crate::entry::{EntryCtx, parse_entry};
+use crate::entry::{parse_entry, probe_ctx, stays_text};
 use crate::sheet::{CellValue, Sheet, Workbook, Xf, format_with};
 
 /// A Flash Fill the host can apply: the text to type into each filled cell,
@@ -94,30 +94,91 @@ impl std::error::Error for NoFill {}
 
 /// Flash Fill on the column of (row, col) of `sheet` (Ctrl+E, Data › Flash
 /// Fill). The examples are the column's non-empty cells from the top of the
-/// data down to the first empty one; the sources are the non-empty columns
+/// data down to the first empty one — or from the row below, when the top
+/// row is a header (the column's top cell is empty, or its examples show no
+/// pattern with it and do without it); the sources are the non-empty columns
 /// next to it on either side, up to the first empty column; the fill runs to
 /// the sources' last row and leaves every cell that already holds a value
 /// (ENT-107). Columns only (ENT-111).
 pub fn flash_fill(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Result<FlashFill, NoFill> {
     let sh = wb.sheets.get(sheet).ok_or(NoFill::Nothing)?;
-    let region = Region::around(sh, row, col).ok_or(NoFill::Nothing)?;
-    let text = |r: u32, c: u32| shown(wb, sh, r, c);
-    let (top, ex_end) = region.examples(sh);
-    let ex_end = ex_end.ok_or(NoFill::Nothing)?;
-    let targets: Vec<u32> = (ex_end + 1..=region.bottom)
-        .filter(|&r| is_empty(sh, r, col))
-        .collect();
-    if targets.is_empty() {
-        return Err(NoFill::Nothing);
+    run_plan(wb, sh, &plan(wb, sh, row, col, MAX_LEN)?)
+}
+
+/// The automatic Flash Fill preview (ENT-105), after a typed commit at
+/// (row, col): only when the column's examples (below a header row, if
+/// there is one) run to `row`, `row` is the second example or later, every
+/// cell below in the data is empty, and the program fills every one of
+/// them. Nothing else shows a preview. It runs on every typed commit, so it
+/// reads shorter values than Ctrl+E does ([`PREVIEW_MAX_LEN`]).
+pub fn flash_preview(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<FlashFill> {
+    let sh = wb.sheets.get(sheet)?;
+    let plan = plan(wb, sh, row, col, PREVIEW_MAX_LEN).ok()?;
+    let (top, ex_end) = plan.examples;
+    if ex_end != row || row < top + 1 {
+        return None;
     }
-    let examples: Vec<Example> = (top..=ex_end)
-        .map(|r| Example {
-            sources: region.sources.iter().map(|&c| text(r, c)).collect(),
-            output: text(r, col),
-        })
-        .collect();
-    let program = synthesize(&examples).ok_or(NoFill::NoPattern)?;
-    let as_text = (top..=ex_end).all(|r| typed_as_text(wb, sh, r, col));
+    if !(row + 1..=plan.region.bottom).all(|r| is_empty(sh, r, col)) {
+        return None;
+    }
+    let fill = run_plan(wb, sh, &plan).ok()?;
+    fill.blank.is_empty().then_some(fill)
+}
+
+/// What a Flash Fill reads and runs: the region, the examples' first and
+/// last rows, and the program they show.
+struct Plan {
+    region: Region,
+    examples: (u32, u32),
+    program: Vec<Atom>,
+}
+
+/// The plan for a Flash Fill at (row, col): the examples from the top of the
+/// data, else from the row below it (a header row).
+fn plan(wb: &Workbook, sh: &Sheet, row: u32, col: u32, max_len: usize) -> Result<Plan, NoFill> {
+    let region = Region::around(sh, row, col).ok_or(NoFill::Nothing)?;
+    let mut found = NoFill::Nothing;
+    for start in [region.top, region.top + 1] {
+        let Some(end) = region.examples_from(sh, start) else {
+            continue;
+        };
+        if end >= region.bottom {
+            // Nothing below the examples to fill.
+            continue;
+        }
+        let examples: Vec<Example> = (start..=end)
+            .map(|r| Example {
+                sources: region
+                    .sources
+                    .iter()
+                    .map(|&c| shown(wb, sh, r, c))
+                    .collect(),
+                output: shown(wb, sh, r, col),
+            })
+            .collect();
+        match synthesize(&examples, max_len) {
+            Some(program) => {
+                return Ok(Plan {
+                    region,
+                    examples: (start, end),
+                    program,
+                });
+            }
+            None => found = NoFill::NoPattern,
+        }
+    }
+    Err(found)
+}
+
+/// Run a plan's program on the empty cells below its examples.
+fn run_plan(wb: &Workbook, sh: &Sheet, plan: &Plan) -> Result<FlashFill, NoFill> {
+    let Plan {
+        region,
+        examples: (top, ex_end),
+        program,
+    } = plan;
+    let (top, ex_end, col) = (*top, *ex_end, region.col);
+    let as_text = (top..=ex_end).all(|r| typed_as_text(sh, r, col));
     let mut fill = FlashFill {
         col,
         examples: (top, ex_end),
@@ -125,35 +186,28 @@ pub fn flash_fill(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Result<Fla
         blank: Vec::new(),
         last_row: region.bottom,
     };
-    for r in targets {
-        let sources: Vec<String> = region.sources.iter().map(|&c| text(r, c)).collect();
-        match run(&program, &sources) {
-            Some(out) if !out.is_empty() => fill.fills.push((r, typed(&out, as_text))),
+    for r in (ex_end + 1..=region.bottom).filter(|&r| is_empty(sh, r, col)) {
+        let sources: Vec<String> = region
+            .sources
+            .iter()
+            .map(|&c| shown(wb, sh, r, c))
+            .collect();
+        match run(program, &sources) {
+            Some(out) if !out.is_empty() => {
+                let style = sh.cell(r, col).map_or(0, |c| c.style);
+                let text_target = crate::entry::is_text(&wb.styles.xf(style));
+                fill.fills.push((r, typed(&out, as_text, text_target)));
+            }
             _ => fill.blank.push(r),
         }
+    }
+    if fill.fills.is_empty() && fill.blank.is_empty() {
+        return Err(NoFill::Nothing);
     }
     if fill.fills.is_empty() {
         return Err(NoFill::NoPattern);
     }
     Ok(fill)
-}
-
-/// The automatic Flash Fill preview (ENT-105), after a typed commit at
-/// (row, col): only when the column's examples run from the top of the data
-/// to `row`, `row` is the second example or later, and every cell below in
-/// the data is empty. Nothing else shows a preview.
-pub fn flash_preview(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<FlashFill> {
-    let sh = wb.sheets.get(sheet)?;
-    let region = Region::around(sh, row, col)?;
-    let (top, ex_end) = region.examples(sh);
-    if ex_end != Some(row) || row < top + 1 {
-        return None;
-    }
-    if !(row + 1..=region.bottom).all(|r| is_empty(sh, r, col)) {
-        return None;
-    }
-    let fill = flash_fill(wb, sheet, row, col).ok()?;
-    fill.blank.is_empty().then_some(fill)
 }
 
 // ---------------------------------------------------------------------------
@@ -228,16 +282,16 @@ impl Region {
         out
     }
 
-    /// The examples: from the top, the column's run of non-empty cells
-    /// (`None` when the top cell is empty).
-    fn examples(&self, sh: &Sheet) -> (u32, Option<u32>) {
+    /// The last row of the column's run of non-empty cells from `start`
+    /// (`None` when the cell at `start` is empty): the examples.
+    fn examples_from(&self, sh: &Sheet, start: u32) -> Option<u32> {
         let mut end = None;
-        let mut r = self.top;
+        let mut r = start;
         while r <= self.bottom && !is_empty(sh, r, self.col) {
             end = Some(r);
             r += 1;
         }
-        (self.top, end)
+        end
     }
 }
 
@@ -258,32 +312,25 @@ fn shown(wb: &Workbook, sh: &Sheet, r: u32, c: u32) -> String {
     }
 }
 
-/// Was the example at (r, c) entered as text that typing would read as
-/// something else (`'007`)? Then the results are text too (ENT-108).
-fn typed_as_text(wb: &Workbook, sh: &Sheet, r: u32, c: u32) -> bool {
-    let Some(cell) = sh.cell(r, c) else {
-        return false;
-    };
-    let CellValue::Text(t) = &cell.value else {
-        return false;
-    };
-    let xf = wb.styles.xf(cell.style);
-    xf.quote_prefix || crate::entry::is_text(&xf) || !stays_text(t)
-}
-
-fn stays_text(text: &str) -> bool {
-    let ctx = EntryCtx {
-        today: Some(45_000.0),
-        ..EntryCtx::default()
-    };
-    parse_entry(text, &Xf::default(), &ctx)
-        .is_ok_and(|e| e.cell.formula.is_none() && e.cell.value == CellValue::Text(text.into()))
+/// Is the example at (r, c) text that typing would read as something else
+/// (`'007`, entered with an apostrophe or into a Text cell)? When every
+/// example is, the results are text too (ENT-108). A text that stays text
+/// typed bare (`'Ada`) says nothing about the results.
+fn typed_as_text(sh: &Sheet, r: u32, c: u32) -> bool {
+    match sh.cell(r, c).map(|cell| &cell.value) {
+        Some(CellValue::Text(t)) => !stays_text(t),
+        _ => false,
+    }
 }
 
 /// The text a host types for a result: with an apostrophe when the examples
 /// were text, or when typing it bare would make a formula — Flash Fill writes
-/// constants (ENT-106).
-fn typed(out: &str, as_text: bool) -> String {
+/// constants (ENT-106). A Text-formatted target takes any text as it is, so
+/// it gets none: there the apostrophe would be kept as a character.
+fn typed(out: &str, as_text: bool, text_target: bool) -> String {
+    if text_target {
+        return out.to_string();
+    }
     let formula = matches!(out.chars().next(), Some('=' | '\''))
         || ((out.starts_with(['+', '-', '@'])) && !stays_text(out) && !is_value(out));
     if as_text || formula {
@@ -295,7 +342,7 @@ fn typed(out: &str, as_text: bool) -> String {
 
 /// Does `text` type as a number, date, logical or error (not a formula)?
 fn is_value(text: &str) -> bool {
-    parse_entry(text, &Xf::default(), &EntryCtx::default())
+    parse_entry(text, &Xf::default(), &probe_ctx())
         .is_ok_and(|e| e.cell.formula.is_none() && !matches!(e.cell.value, CellValue::Text(_)))
 }
 
@@ -520,107 +567,187 @@ fn subs(sources: &[String]) -> Vec<(Atom, String)> {
     out
 }
 
-/// The edges of one example's graph: from each char position of its output,
-/// the atoms that produce the text starting there and the position after it.
-/// Constant atoms run from a position to the start of a Sub or to the end,
-/// never a char at a time, so the graphs stay small.
-fn graph(ex: &Example) -> Vec<Vec<(Atom, usize)>> {
-    let out: Vec<char> = ex.output.chars().collect();
-    let n = out.len();
-    let mut edges: Vec<Vec<(Atom, usize)>> = vec![Vec::new(); n + 1];
-    let subs = subs(&ex.sources);
-    let mut starts = vec![false; n + 1];
-    starts[n] = true;
-    for p in 0..n {
-        let rest: String = out[p..].iter().collect();
-        for (atom, text) in &subs {
-            if rest.starts_with(text.as_str()) {
-                edges[p].push((atom.clone(), p + text.chars().count()));
-                starts[p] = true;
-            }
-        }
-    }
-    for p in 0..n {
-        for q in p + 1..=n {
-            if starts[q] {
-                edges[p].push((Atom::Const(out[p..q].iter().collect()), q));
-            }
-        }
-    }
-    edges
+/// One example's graph: from each char position of its output, the atoms
+/// that produce the text starting there and the position after it; and the
+/// same edges indexed by atom, for the other examples' lookups.
+struct Graph {
+    edges: Vec<Vec<(Atom, usize)>>,
+    index: Vec<HashMap<Atom, usize>>,
 }
 
-/// The longest example or source text the search reads, in chars: the graphs
-/// grow with the square of an example's length, and a pattern in values
-/// longer than this is not what Flash Fill is for.
+/// The longest example or source text Ctrl+E reads, in chars, and the
+/// automatic preview's (it runs on every typed commit). A graph has a
+/// constant edge from each position to each later piece's start, so it grows
+/// with the square of its example's length, and a pattern in values longer
+/// than this is not what Flash Fill is for.
 const MAX_LEN: usize = 1000;
+const PREVIEW_MAX_LEN: usize = 200;
+/// The most edges one example's graph may have, and the most edges the
+/// search may follow: past either, Flash Fill sees no pattern rather than
+/// keep the user waiting (text of many repeated words makes every piece
+/// match everywhere).
+const MAX_EDGES: usize = 200_000;
+const MAX_STEPS: usize = 2_000_000;
+
+/// The graph of one example, or `None` when it would pass [`MAX_EDGES`].
+/// Constant atoms run from a position to the start of a Sub or to the end,
+/// never a char at a time, so the graphs stay small.
+fn graph(ex: &Example) -> Option<Graph> {
+    let out: Vec<char> = ex.output.chars().collect();
+    let n = out.len();
+    let mut char_at = vec![0; ex.output.len() + 1];
+    for (ci, (bi, _)) in ex.output.char_indices().enumerate() {
+        char_at[bi] = ci;
+    }
+    char_at[ex.output.len()] = n;
+    // The atoms grouped by the text they produce, so each text is searched
+    // for once; each keeps its place in `subs` for a stable edge order.
+    let mut groups: Vec<(String, Vec<(usize, Atom)>)> = Vec::new();
+    let mut by_text: HashMap<String, usize> = HashMap::new();
+    for (order, (atom, text)) in subs(&ex.sources).into_iter().enumerate() {
+        let g = *by_text.entry(text.clone()).or_insert_with(|| {
+            groups.push((text, Vec::new()));
+            groups.len() - 1
+        });
+        groups[g].1.push((order, atom));
+    }
+    let mut ordered: Vec<Vec<(usize, Atom, usize)>> = vec![Vec::new(); n + 1];
+    let mut count = 0usize;
+    for (text, atoms) in &groups {
+        let len = text.chars().count();
+        let mut from = 0;
+        while let Some(i) = ex.output[from..].find(text.as_str()) {
+            let b = from + i;
+            let p = char_at[b];
+            count += atoms.len();
+            if count > MAX_EDGES {
+                return None;
+            }
+            ordered[p].extend(atoms.iter().map(|(o, a)| (*o, a.clone(), p + len)));
+            from = b + out[p].len_utf8();
+        }
+    }
+    let mut starts: Vec<usize> = (0..n).filter(|&p| !ordered[p].is_empty()).collect();
+    starts.push(n);
+    let mut edges: Vec<Vec<(Atom, usize)>> = Vec::with_capacity(n + 1);
+    for (p, mut subs_here) in ordered.into_iter().enumerate() {
+        subs_here.sort_by_key(|(o, _, _)| *o);
+        let mut here: Vec<(Atom, usize)> = subs_here.into_iter().map(|(_, a, q)| (a, q)).collect();
+        for &q in starts.iter().filter(|&&q| q > p) {
+            count += 1;
+            if count > MAX_EDGES {
+                return None;
+            }
+            here.push((Atom::Const(out[p..q].iter().collect()), q));
+        }
+        edges.push(here);
+    }
+    let index = edges
+        .iter()
+        .map(|here| here.iter().map(|(a, q)| (a.clone(), *q)).collect())
+        .collect();
+    Some(Graph { edges, index })
+}
 
 /// The cheapest program every example's graph has a path for, holding at
-/// least one Sub; `None` when there is none.
-fn synthesize(examples: &[Example]) -> Option<Vec<Atom>> {
+/// least one Sub; `None` when there is none, when an example or source is
+/// longer than `max_len` chars, or when the search passes its budget.
+fn synthesize(examples: &[Example], max_len: usize) -> Option<Vec<Atom>> {
     if examples.is_empty() || examples.iter().any(|e| e.output.is_empty()) {
         return None;
     }
-    let long = |s: &String| s.chars().count() > MAX_LEN;
+    let long = |s: &String| s.chars().count() > max_len;
     if examples
         .iter()
         .any(|e| long(&e.output) || e.sources.iter().any(long))
     {
         return None;
     }
-    let graphs: Vec<_> = examples.iter().map(graph).collect();
+    let graphs: Vec<Graph> = examples.iter().map(graph).collect::<Option<_>>()?;
     let ends: Vec<usize> = examples.iter().map(|e| e.output.chars().count()).collect();
-    let mut memo = HashMap::new();
-    best(&graphs, &ends, vec![0; examples.len()], false, &mut memo).map(|(_, p)| p)
+    let mut search = Search {
+        graphs: &graphs,
+        ends: &ends,
+        memo: HashMap::new(),
+        steps: 0,
+    };
+    let start = vec![0; examples.len()];
+    search.best(start.clone(), false).ok()??;
+    // Follow the choices the search kept from the start to the ends.
+    let (mut at, mut has_sub, mut program) = (start, false, Vec::new());
+    while at != ends {
+        let (_, atom, next) = search.memo.get(&(at, has_sub))?.clone()?;
+        has_sub |= matches!(atom, Atom::Sub { .. });
+        program.push(atom);
+        at = next;
+    }
+    Some(program)
 }
 
-type Memo = HashMap<(Vec<usize>, bool), Option<(Cost, Vec<Atom>)>>;
+/// The search for the cheapest program: per state (one position per
+/// example, and whether a Sub came yet) its cost to the ends, the atom that
+/// starts it and the state after that atom.
+struct Search<'a> {
+    graphs: &'a [Graph],
+    ends: &'a [usize],
+    memo: HashMap<(Vec<usize>, bool), Option<Choice>>,
+    steps: usize,
+}
 
-/// The cheapest program from positions `at` (one per example) to the ends,
-/// `has_sub` telling whether the program so far has a Sub.
-fn best(
-    graphs: &[Vec<Vec<(Atom, usize)>>],
-    ends: &[usize],
-    at: Vec<usize>,
-    has_sub: bool,
-    memo: &mut Memo,
-) -> Option<(Cost, Vec<Atom>)> {
-    if at == ends {
-        return has_sub.then(|| ([0; 5], Vec::new()));
-    }
-    let key = (at.clone(), has_sub);
-    if let Some(hit) = memo.get(&key) {
-        return hit.clone();
-    }
-    let mut found: Option<(Cost, Vec<Atom>)> = None;
-    // An atom moves every example at once; the first graph proposes, the
-    // others must have the same atom at their position.
-    for (atom, next0) in &graphs[0][at[0]] {
-        let mut next = vec![*next0];
-        let fits = graphs[1..].iter().zip(&at[1..]).all(|(g, &p)| {
-            match g[p].iter().find(|(a, _)| a == atom) {
-                Some((_, q)) => {
-                    next.push(*q);
-                    true
+/// A state's cheapest way on: the cost to the ends, the atom that starts it
+/// and the state after that atom.
+type Choice = (Cost, Atom, Vec<usize>);
+
+/// The search passed [`MAX_STEPS`].
+struct OverBudget;
+
+impl Search<'_> {
+    /// The cheapest cost from `at` to the ends (`None`: no program).
+    fn best(&mut self, at: Vec<usize>, has_sub: bool) -> Result<Option<Cost>, OverBudget> {
+        if at == self.ends {
+            return Ok(has_sub.then_some([0; 5]));
+        }
+        let key = (at, has_sub);
+        if let Some(hit) = self.memo.get(&key) {
+            return Ok(hit.as_ref().map(|(c, _, _)| *c));
+        }
+        let at = &key.0;
+        let graphs = self.graphs;
+        let mut found: Option<Choice> = None;
+        // An atom moves every example at once; the first graph proposes, the
+        // others must have the same atom at their position.
+        for (atom, next0) in &graphs[0].edges[at[0]] {
+            self.steps += 1;
+            if self.steps > MAX_STEPS {
+                return Err(OverBudget);
+            }
+            let mut next = Vec::with_capacity(at.len());
+            next.push(*next0);
+            let fits = graphs[1..]
+                .iter()
+                .zip(&at[1..])
+                .all(|(g, &p)| match g.index[p].get(atom) {
+                    Some(&q) => {
+                        next.push(q);
+                        true
+                    }
+                    None => false,
+                });
+            if !fits {
+                continue;
+            }
+            let sub = has_sub || matches!(atom, Atom::Sub { .. });
+            if let Some(rest) = self.best(next.clone(), sub)? {
+                let cost = add(atom.cost(), rest);
+                if found.as_ref().is_none_or(|(c, _, _)| cost < *c) {
+                    found = Some((cost, atom.clone(), next));
                 }
-                None => false,
-            }
-        });
-        if !fits {
-            continue;
-        }
-        let sub = has_sub || matches!(atom, Atom::Sub { .. });
-        if let Some((cost, rest)) = best(graphs, ends, next, sub, memo) {
-            let cost = add(atom.cost(), cost);
-            if found.as_ref().is_none_or(|(c, _)| cost < *c) {
-                let mut prog = vec![atom.clone()];
-                prog.extend(rest);
-                found = Some((cost, prog));
             }
         }
+        let cost = found.as_ref().map(|(c, _, _)| *c);
+        self.memo.insert(key, found);
+        Ok(cost)
     }
-    memo.insert(key, found.clone());
-    found
 }
 
 #[cfg(test)]
@@ -800,11 +927,104 @@ mod tests {
 
     #[test]
     fn results_are_constants_even_when_they_look_like_formulas() {
-        assert_eq!(typed("=x", false), "'=x");
-        assert_eq!(typed("-5", false), "-5");
-        assert_eq!(typed("+a", false), "'+a");
-        assert_eq!(typed("Ada", false), "Ada");
-        assert_eq!(typed("007", true), "'007");
+        assert_eq!(typed("=x", false, false), "'=x");
+        assert_eq!(typed("-5", false, false), "-5");
+        assert_eq!(typed("+a", false, false), "'+a");
+        assert_eq!(typed("Ada", false, false), "Ada");
+        assert_eq!(typed("007", true, false), "'007");
+        // A Text-formatted target keeps whatever it is given.
+        assert_eq!(typed("=x", false, true), "=x");
+        assert_eq!(typed("007", true, true), "007");
+    }
+
+    /// FIX r1 M1: a header row above the examples.
+    fn with_header(b: &[&str]) -> Workbook {
+        let mut a = vec!["Full Name"];
+        a.extend(NAMES);
+        wb_with(&[&a, b])
+    }
+
+    #[test]
+    fn a_header_row_is_not_an_example() {
+        // B1 `First Name`, B2 `Ada`: Ctrl+E on B3 (Enter moved there) and on B2.
+        let wb = with_header(&["First Name", "Ada"]);
+        for row in [2, 1] {
+            let f = flash_fill(&wb, 0, row, 1).unwrap();
+            assert_eq!(f.examples, (1, 1));
+            assert_eq!(
+                filled(&f),
+                [
+                    (2, "Alan"),
+                    (3, "Grace"),
+                    (4, "Edsger"),
+                    (5, "Barbara"),
+                    (6, "Donald")
+                ]
+            );
+        }
+        // B1 empty above the example.
+        let f = flash_fill(&with_header(&["", "Ada"]), 0, 1, 1).unwrap();
+        assert_eq!(f.examples, (1, 1));
+        assert_eq!(f.fills.len(), 5);
+        // A header that is itself the pattern's output stays an example.
+        let wb = wb_with(&[&["Ada Lovelace", "Alan Turing", "Grace Hopper"], &["Ada"]]);
+        assert_eq!(flash_fill(&wb, 0, 0, 1).unwrap().examples, (0, 0));
+    }
+
+    #[test]
+    fn the_preview_works_under_a_header_row() {
+        let wb = with_header(&["First Name", "Ada", "Alan"]);
+        let f = flash_preview(&wb, 0, 2, 1).expect("a preview under the header");
+        assert_eq!(
+            filled(&f),
+            [(3, "Grace"), (4, "Edsger"), (5, "Barbara"), (6, "Donald")]
+        );
+        assert_eq!(
+            flash_preview(&with_header(&["First Name", "Ada"]), 0, 1, 1),
+            None
+        );
+        assert!(flash_preview(&with_header(&["", "Ada", "Alan"]), 0, 2, 1).is_some());
+    }
+
+    /// FIX r1 M2: the text-ness of the examples and of the target.
+    #[test]
+    fn text_targets_and_quoted_examples_get_no_literal_apostrophe() {
+        // B1:B6 formatted Text, `Ada` in B1.
+        let mut wb = wb_with(&[&NAMES]);
+        let mut xf = Xf::default();
+        xf.set_code(Some("@".into()));
+        let text_style = wb.styles.intern(xf);
+        for r in 0..6 {
+            wb.sheets[0].set_cell(
+                r,
+                1,
+                Cell {
+                    style: text_style,
+                    ..Cell::default()
+                },
+            );
+        }
+        let cell = crate::entry::entry_cell(&mut wb, 0, 0, 1, "Ada", None).unwrap();
+        wb.sheets[0].set_cell(0, 1, cell);
+        let f = flash_fill(&wb, 0, 0, 1).unwrap();
+        assert_eq!(filled(&f)[0], (1, "Alan"));
+        apply(&mut wb, &f);
+        assert_eq!(
+            wb.sheets[0].cell(1, 1).unwrap().value,
+            CellValue::Text("Alan".into())
+        );
+        // A quote-prefixed example that stays text: plain results.
+        let mut wb = wb_with(&[&NAMES]);
+        let cell = crate::entry::entry_cell(&mut wb, 0, 0, 1, "'Ada", None).unwrap();
+        wb.sheets[0].set_cell(0, 1, cell);
+        let f = flash_fill(&wb, 0, 0, 1).unwrap();
+        assert_eq!(filled(&f)[0], (1, "Alan"));
+        // `'007` on a General target still gives text `042`.
+        let mut wb = wb_with(&[&["x-007", "y-042"]]);
+        let cell = crate::entry::entry_cell(&mut wb, 0, 0, 1, "'007", None).unwrap();
+        wb.sheets[0].set_cell(0, 1, cell);
+        let f = flash_fill(&wb, 0, 0, 1).unwrap();
+        assert_eq!(filled(&f), [(1, "'042")]);
     }
 }
 
@@ -842,6 +1062,31 @@ mod perf {
             f.unwrap().fills[0].1,
             "21 | Q4 | id_3@example.com | North-West region account 3"
         );
+    }
+
+    /// FIX r1 m2: text of many repeated words matches every piece
+    /// everywhere; the search stays bounded either way.
+    #[test]
+    fn repeated_words_stay_fast() {
+        let words = |n: usize, w: &str| vec![w; n].join(" ");
+        let mut sh = Sheet::default();
+        for r in 0..3u32 {
+            let src = format!("{} end{r}", words(80, "alpha beta"));
+            sh.set_cell(r, 0, Cell::text(&src));
+        }
+        for r in 0..2u32 {
+            let out = format!("{} END{r}", words(60, "beta alpha"));
+            sh.set_cell(r, 1, Cell::text(&out));
+        }
+        let wb = Workbook {
+            sheets: vec![sh],
+            ..Workbook::default()
+        };
+        let t = std::time::Instant::now();
+        let _ = flash_fill(&wb, 0, 2, 1);
+        let _ = flash_preview(&wb, 0, 1, 1);
+        let took = t.elapsed();
+        assert!(took.as_secs_f64() < 2.0, "{took:?}");
     }
 
     #[test]
