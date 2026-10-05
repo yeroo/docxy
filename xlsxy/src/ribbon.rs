@@ -16,6 +16,8 @@ pub enum Act {
     Cut,
     Copy,
     Paste,
+    /// Home › Paste Special (Ctrl+Alt+V, #669).
+    PasteSpecial,
     Undo,
     Redo,
     Find,
@@ -24,6 +26,9 @@ pub enum Act {
     ClearContents,
     FillDown,
     FillRight,
+    /// Home › Fill › Up and Left (#668).
+    FillUp,
+    FillLeft,
     InsertRow,
     InsertCol,
     DeleteRow,
@@ -149,7 +154,11 @@ fn home_groups() -> Vec<Group> {
             title: "Clipboard",
             width: 13,
             rows: [
-                vec![btn("Paste", Paste, "Paste (Ctrl+V)")],
+                vec![
+                    btn("Paste", Paste, "Paste (Ctrl+V)"),
+                    Seg::Gap(" "),
+                    btn("Spec…", PasteSpecial, "Paste Special (Ctrl+Alt+V)"),
+                ],
                 vec![
                     btn("✂ Cut", Cut, "Cut (Ctrl+X)"),
                     Seg::Gap(" "),
@@ -159,7 +168,7 @@ fn home_groups() -> Vec<Group> {
         },
         Group {
             title: "Cells",
-            width: 26,
+            width: 28,
             rows: [
                 vec![
                     btn("+Row", InsertRow, "Insert rows above the selection"),
@@ -176,6 +185,10 @@ fn home_groups() -> Vec<Group> {
                     btn("−Col", DeleteCol, "Delete the selected columns"),
                     Seg::Gap(" "),
                     btn("Fill→", FillRight, "Fill right (Ctrl+R)"),
+                    Seg::Gap(" "),
+                    btn("Fill↑", FillUp, "Fill up"),
+                    Seg::Gap(" "),
+                    btn("Fill←", FillLeft, "Fill left"),
                 ],
             ],
         },
