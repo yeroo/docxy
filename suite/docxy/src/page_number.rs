@@ -186,7 +186,7 @@ fn strip_part(tab: &mut DocTab, part: &str, is_header: bool) -> bool {
     }
     let inner = docxcore::serialize::blocks_to_xml(&blocks);
     rewrite_part(pkg, part, is_header, &inner);
-    tab.dirty = true;
+    tab.set_dirty();
     true
 }
 

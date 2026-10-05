@@ -3221,8 +3221,15 @@ impl DocTab {
         if self.access.protected {
             protected_rollback(self);
         } else {
-            self.dirty = true;
+            self.set_dirty();
         }
+    }
+
+    /// The tab has unsaved changes. Every change goes through here, so it
+    /// also makes a Repeat record taken before it stale (#618).
+    fn set_dirty(&mut self) {
+        self.dirty = true;
+        bump_edit_generation();
     }
 }
 
@@ -9293,10 +9300,14 @@ impl Docxy {
                 cx,
             );
         }
+        let untouched = repeat_untouched(self.repeat);
         match action {
-            QatAction::Undo => self.with_editor(window, cx, |ed| {
-                ed.undo();
-            }),
+            QatAction::Undo => {
+                self.with_editor(window, cx, |ed| {
+                    ed.undo();
+                });
+                self.keep_repeat_current(untouched);
+            }
             // Redo, or Repeat with nothing to redo (#618). With neither,
             // nothing happens and the tab stays clean.
             QatAction::Redo => {
@@ -9312,6 +9323,7 @@ impl Docxy {
                     redo_or_repeat(ed, &mut rec);
                 });
                 self.repeat = rec;
+                self.keep_repeat_current(untouched);
             }
         }
     }
@@ -12051,7 +12063,7 @@ impl Docxy {
                 protected_rollback(t);
                 return;
             }
-            t.dirty = true;
+            t.set_dirty();
         }
     }
 
@@ -15166,6 +15178,13 @@ impl Docxy {
         }
     }
 
+    /// After a handler that recorded for Repeat, or that only undid, redid
+    /// or repeated (`keep`): the tab it marked dirty does not make the record
+    /// stale. Anything else that changed a tab since still does.
+    fn keep_repeat_current(&mut self, keep: bool) {
+        keep_current(&mut self.repeat, keep);
+    }
+
     /// [`Self::edit_target`] and the Repeat record (#618), borrowed apart.
     fn edit_target_and_repeat(&mut self) -> (Option<&mut Editor>, &mut Option<RepeatRecord>) {
         let ed = self.tabs.get_mut(self.active).and_then(tab_edit_target);
@@ -16086,7 +16105,7 @@ impl Docxy {
             let since = docxcore::editor::undo_serial_counter();
             ed.break_undo_group();
             let clip = ed.cut();
-            ed.name_steps_since(since, "Cut");
+            ed.name_command(since, "Cut");
             clip
         });
         if let Some(clip) = clip {
@@ -16117,7 +16136,7 @@ impl Docxy {
                 let since = docxcore::editor::undo_serial_counter();
                 e.break_undo_group();
                 e.paste(&clip);
-                e.name_steps_since(since, "Paste");
+                e.name_command(since, "Paste");
             });
         } else {
             self.refocus(window, cx);
@@ -17917,6 +17936,10 @@ impl Docxy {
                 _ => {}
             }
         }
+        // Undo, Redo and Repeat change the document but keep a current Repeat
+        // record current (#618).
+        let untouched = repeat_untouched(self.repeat);
+        let history = (ctrl && matches!(key.as_str(), "z" | "y")) || (!ctrl && key == "f4");
         let (Some(ed), repeat) = self.edit_target_and_repeat() else {
             return;
         };
@@ -17996,14 +18019,13 @@ impl Docxy {
                 },
             }
         };
-        if let Some(what) = noted {
-            note_edit(ed, repeat, since, what);
-        }
+        let recorded = noted.is_some_and(|what| note_edit(ed, repeat, since, what));
         if changed {
             if let Some(t) = self.tabs.get_mut(self.active) {
                 t.mark_dirty();
             }
         }
+        self.keep_repeat_current(recorded || (history && untouched));
         self.scroll_to_caret();
         cx.notify();
     }
@@ -18832,7 +18854,7 @@ mod load_failed_save_tests {
         let before = std::fs::read(path).ok();
         let mut tab = tab_from_path(&path.to_path_buf());
         assert!(tab.load_failed, "{}", tab.status);
-        tab.dirty = true;
+        tab.set_dirty();
         assert!(!save_doc_tab(&mut tab, None));
         assert_eq!(tab.status.as_ref(), DOC_LOAD_FAILED_SAVE);
         assert!(tab.dirty, "a refused save leaves the tab dirty");
@@ -18858,7 +18880,7 @@ mod load_failed_save_tests {
         assert!(save_doc_tab(&mut tab, Some(md.clone())));
         assert!(tab.markdown);
         assert_eq!(tab.path.as_deref(), Some(md.as_path()));
-        tab.dirty = true;
+        tab.set_dirty();
         std::fs::write(&md, b"stale").unwrap();
         assert!(save_doc_tab(&mut tab, None));
         let written = std::fs::read(&md).unwrap();
@@ -19044,7 +19066,7 @@ mod load_failed_save_tests {
         assert!(save_doc_tab(&mut tab, Some(copy.clone())), "{}", tab.status);
         assert!(!tab.load_failed && !tab.dirty);
         assert_eq!(tab.path.as_deref(), Some(copy.as_path()));
-        tab.dirty = true;
+        tab.set_dirty();
         assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
         assert!(!tab_from_path(&copy).load_failed);
         assert_eq!(std::fs::read(&path).unwrap(), b"not a zip");
@@ -19072,7 +19094,7 @@ mod load_failed_save_tests {
         let mut tab = tab_from_path(&path);
         assert!(!tab.load_failed, "{}", tab.status);
         assert_eq!(tab.access.converted, Some(open_mode::Converted::Html));
-        tab.dirty = true;
+        tab.set_dirty();
         for target in [None, Some(path.clone())] {
             assert!(!save_doc_tab(&mut tab, target));
             assert_eq!(
@@ -19107,7 +19129,7 @@ mod load_failed_save_tests {
         let mut tab = tab_from_path(&path);
         assert!(!tab.load_failed, "{}", tab.status);
         assert!(tab.status.starts_with("loaded"), "{}", tab.status);
-        tab.dirty = true;
+        tab.set_dirty();
         assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
         let reopened = tab_from_path(&path);
         assert!(reopened.pkg.is_some(), "{}", reopened.status);
@@ -19131,7 +19153,7 @@ mod load_failed_save_tests {
             if path.extension().is_some_and(|ext| ext == "md") {
                 assert_eq!(tab.status.as_ref(), "loaded (markdown)");
             }
-            tab.dirty = true;
+            tab.set_dirty();
             assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -19613,7 +19635,7 @@ mod sheet_save_tests {
         let dir = Scratch::new();
         let input = dir.path("in.xlsm");
         let mut tab = loaded_sheet_tab(&dir, "in.xlsm", &xlm_book(SpreadsheetKind::MacroWorkbook));
-        tab.dirty = true;
+        tab.set_dirty();
         // Save As .xlsx, .xltx, or a name with no extension (an .xlsx).
         for name in ["out.xlsx", "out.xltx", "out"] {
             let mut asked = Vec::new();
@@ -20163,21 +20185,80 @@ impl Repeat {
 }
 
 /// The last repeatable action and the undo step it made. Repeat replays it
-/// only while that step is still its editor's newest: any edit the record
-/// did not see, through any path and in any editor, pushes a newer step
-/// (serials are unique across editors), so a stale record never replays.
-/// That holds because only typing coalesces into an existing step, and every
-/// host edit (`Docxy::with_editor`, and so the ribbon, pickers, dialogs,
-/// ruler, paste and menus) breaks the group first.
+/// only while nothing else has happened since:
+/// - its step is still its editor's newest (`serial`);
+/// - no undo step was pushed anywhere since (`counter`, the thread's
+///   [`docxcore::editor::undo_serial_counter`]): an edit in another tab or
+///   the header/footer editor pushes one there;
+/// - no edit that pushes no step at all (Page Color, a watermark, a dialog's
+///   package change) marked any tab dirty since (`generation`, the
+///   [`edit_generation`]).
+///
+/// Only typing coalesces into an existing step, and every host edit
+/// (`Docxy::with_editor`: the ribbon, pickers, dialogs, ruler, paste and
+/// menus) breaks the group first, so no edit can hide inside the record's
+/// step. Undo and Redo push no step; the app keeps a current record current
+/// across them (`Docxy::keep_repeat_current`).
 #[derive(Clone, Copy, Debug)]
 struct RepeatRecord {
     what: Repeat,
     serial: u64,
+    counter: u64,
+    generation: u64,
+}
+
+impl RepeatRecord {
+    /// A record of `what`, whose step is `ed`'s newest, taken now.
+    fn now(what: Repeat, ed: &Editor) -> Option<Self> {
+        Some(Self {
+            what,
+            serial: ed.undo_serial()?,
+            counter: docxcore::editor::undo_serial_counter(),
+            generation: edit_generation(),
+        })
+    }
+}
+
+thread_local! {
+    /// Bumped by every change that marks a tab dirty
+    /// ([`DocTab::set_dirty`]), whether or not it pushed an undo step: what
+    /// makes a Repeat record stale after an edit outside the undo history
+    /// (#618). Per thread, like docxcore's serial counter: the app edits on
+    /// one thread.
+    static EDIT_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn edit_generation() -> u64 {
+    EDIT_GENERATION.with(|g| g.get())
+}
+
+fn bump_edit_generation() {
+    EDIT_GENERATION.with(|g| g.set(g.get() + 1));
+}
+
+/// Whether no undo step was pushed and no tab changed since `rec` was taken:
+/// the record is current, though its step may be undone for now.
+fn repeat_untouched(rec: Option<RepeatRecord>) -> bool {
+    rec.is_some_and(|r| {
+        docxcore::editor::undo_serial_counter() == r.counter && edit_generation() == r.generation
+    })
+}
+
+/// [`Docxy::keep_repeat_current`]'s rule: when `keep`, the tab changes
+/// made since `rec` was taken were the handler's own.
+fn keep_current(rec: &mut Option<RepeatRecord>, keep: bool) {
+    if let (true, Some(r)) = (keep, rec.as_mut()) {
+        r.generation = edit_generation();
+    }
 }
 
 /// Whether Ctrl+Y / F4 would repeat on `ed` now (nothing to redo).
 fn repeat_ready(ed: &Editor, rec: Option<RepeatRecord>) -> bool {
-    rec.is_some_and(|r| ed.undo_serial() == Some(r.serial))
+    rec.is_some_and(|r| {
+        ed.undo_serial() == Some(r.serial)
+            && docxcore::editor::undo_serial_counter() == r.counter
+            && edit_generation() == r.generation
+    })
 }
 
 /// Ctrl+Y, F4 and the Quick Access Toolbar's Redo/Repeat (#618): redo when
@@ -20203,41 +20284,40 @@ fn redo_or_repeat(ed: &mut Editor, rec: &mut Option<RepeatRecord>) -> bool {
         Repeat::Tab => ed.insert_tab(),
         Repeat::Act(act) => apply_doc_act(ed, act),
     }
-    match ed.undo_serial() {
-        Some(serial) if serial > since => {
-            if let Some(name) = r.what.step_name() {
-                ed.name_steps_since(since, name);
-            }
-            *rec = Some(RepeatRecord {
-                what: r.what,
-                serial,
-            });
-            true
-        }
-        _ => false,
+    if !ed.undo_serial().is_some_and(|s| s > since) {
+        return false;
     }
+    if let Some(name) = r.what.step_name() {
+        ed.name_command(since, name);
+    }
+    *rec = RepeatRecord::now(r.what, ed);
+    true
 }
 
-/// After an edit the host ran (a command or a key): name the undo steps it
-/// pushed after `since` and, when it can be repeated, record it for Repeat.
-/// An edit that pushed no step changes neither.
-fn note_edit(ed: &mut Editor, rec: &mut Option<RepeatRecord>, since: u64, what: Repeat) {
+/// After an edit the host ran (a command or a key): make the undo steps it
+/// pushed after `since` one step, named, and, when it can be repeated,
+/// record it for Repeat. An edit that pushed no step changes neither. True
+/// when it recorded.
+fn note_edit(ed: &mut Editor, rec: &mut Option<RepeatRecord>, since: u64, what: Repeat) -> bool {
     if matches!(what, Repeat::Typing) {
         // Typing grows its step as it coalesces; the record follows it.
-        if let (Some(_), Some(serial)) = (ed.last_typed(), ed.undo_serial()) {
-            *rec = Some(RepeatRecord { what, serial });
+        if ed.last_typed().is_none() {
+            return false;
         }
-        return;
+        *rec = RepeatRecord::now(what, ed);
+        return rec.is_some();
     }
-    let Some(serial) = ed.undo_serial().filter(|s| *s > since) else {
-        return;
-    };
+    if !ed.undo_serial().is_some_and(|s| s > since) {
+        return false;
+    }
     if let Some(name) = what.step_name() {
-        ed.name_steps_since(since, name);
+        ed.name_command(since, name);
     }
-    if !matches!(what, Repeat::Act(act) if !repeatable_act(act)) {
-        *rec = Some(RepeatRecord { what, serial });
+    if matches!(what, Repeat::Act(act) if !repeatable_act(act)) {
+        return false;
     }
+    *rec = RepeatRecord::now(what, ed);
+    rec.is_some()
 }
 
 /// Insert ▸ Symbol's insertion: a step of its own, named for the Undo
@@ -20247,7 +20327,7 @@ fn insert_symbol_into(e: &mut Editor, s: &str) {
     let since = docxcore::editor::undo_serial_counter();
     e.break_undo_group();
     e.insert_str(s);
-    e.name_steps_since(since, "Insert Symbol");
+    e.name_command(since, "Insert Symbol");
 }
 
 /// What a document key does that Repeat can do again (#618): the formatting
@@ -20509,7 +20589,7 @@ mod repeat_tests {
         assert_ne!(ed.doc, one_tab, "F4 typed a second tab");
         assert_eq!(ed.undo_names(), ["Tab", "Tab"]);
 
-        let indented = ed.doc.clone();
+        let tabbed = ed.doc.clone();
         let since = docxcore::editor::undo_serial_counter();
         ed.break_undo_group();
         apply_doc_act(&mut ed, Act::IndentInc);
@@ -20522,7 +20602,124 @@ mod repeat_tests {
         assert_eq!(ed.undo_names()[0], "Decrease Indent");
         assert!(redo_or_repeat(&mut ed, &mut rec), "F4 outdents again");
         assert_eq!(ed.undo_names()[..2], ["Decrease Indent", "Decrease Indent"]);
-        assert_eq!(ed.doc.body[2].plain_text(), indented.body[2].plain_text());
+        // Two indents in, two out: the paragraph's indent is back as it was.
+        assert_eq!(ed.doc, tabbed);
+        assert!(ed.undo());
+        assert_ne!(ed.doc, tabbed, "the repeat outdented");
+    }
+
+    /// An undo step pushed in another editor (another tab, the
+    /// header/footer editor) makes the record stale, though this editor's
+    /// newest step is still the recorded one.
+    #[test]
+    fn a_step_in_another_editor_stales_the_record_618() {
+        let mut ed = three();
+        let mut rec = None;
+        select(&mut ed, 0, 4, 9);
+        key(&mut ed, &mut rec, "b", true, false);
+        assert!(repeat_ready(&ed, rec));
+        let mut header = Editor::new(docxcore::markdown::from_markdown("Header\n"));
+        insert_symbol_into(&mut header, "\u{00A9}");
+        assert_eq!(ed.undo_serial(), rec.map(|r| r.serial), "body untouched");
+        assert!(!repeat_ready(&ed, rec));
+        select(&mut ed, 0, 10, 15);
+        let before = ed.doc.clone();
+        assert!(!redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(ed.doc, before);
+    }
+
+    /// Design > Page Color edits the package, pushes no undo step, and
+    /// marks the tab dirty: the record is stale after it.
+    #[test]
+    fn a_package_edit_without_an_undo_step_stales_the_record_618() {
+        let mut tab = tab_from_path(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
+        );
+        let mut rec = None;
+        {
+            let Surface::Doc(ed) = &mut tab.surface else {
+                panic!("basic.docx is a document")
+            };
+            type_text(ed, &mut rec, "fox");
+            key(ed, &mut rec, "a", true, false);
+            key(ed, &mut rec, "b", true, false);
+            assert_eq!(ed.undo_names()[0], "Bold");
+            assert!(repeat_ready(ed, rec));
+        }
+        design_tab::design_apply(&mut tab, design_tab::DesignAct::PageColor(Some(0xFFEEDD)))
+            .unwrap();
+        assert!(tab.dirty);
+        let Surface::Doc(ed) = &mut tab.surface else {
+            unreachable!()
+        };
+        assert!(!repeat_ready(ed, rec));
+        assert!(!redo_or_repeat(ed, &mut rec));
+    }
+
+    /// Bold, Undo, Ctrl+Y (redo), Ctrl+Y (repeat): the app's own
+    /// dirty-marking after each keeps the record current.
+    #[test]
+    fn undo_then_redo_then_repeat_618() {
+        let mut ed = three();
+        let mut rec = None;
+        select(&mut ed, 0, 4, 9);
+        key(&mut ed, &mut rec, "b", true, false);
+        // Each of these marks the tab dirty after it, as `on_key` does.
+        let history =
+            |ed: &mut Editor,
+             rec: &mut Option<RepeatRecord>,
+             f: &dyn Fn(&mut Editor, &mut Option<RepeatRecord>) -> bool| {
+                let untouched = repeat_untouched(*rec);
+                assert!(f(ed, rec));
+                bump_edit_generation();
+                keep_current(rec, untouched);
+            };
+        history(&mut ed, &mut rec, &|ed, _| ed.undo());
+        assert!(!repeat_ready(&ed, rec), "its step is undone");
+        history(&mut ed, &mut rec, &redo_or_repeat);
+        assert_eq!(ed.undo_names(), ["Bold"], "that was the redo");
+        select(&mut ed, 0, 10, 15);
+        history(&mut ed, &mut rec, &redo_or_repeat);
+        assert_eq!(ed.undo_names(), ["Bold", "Bold"], "and this the repeat");
+        assert!(saved_run_of(&ed, "brown").contains("<w:b/>"));
+        // An edit the handler did not make is not kept current.
+        bump_edit_generation();
+        keep_current(&mut rec, false);
+        assert!(!repeat_ready(&ed, rec));
+    }
+
+    /// No Spacing edits through four editor calls: one `Style` step, one
+    /// undo restores the paragraph, and a repeat is one step too.
+    #[test]
+    fn no_spacing_is_one_step_and_repeats_as_one_619() {
+        let mut ed = three();
+        let mut rec = None;
+        let original = ed.doc.clone();
+        ed.set_caret(Caret::at(vec![1], 0));
+        let since = docxcore::editor::undo_serial_counter();
+        ed.break_undo_group();
+        apply_doc_act(&mut ed, Act::NoSpacing);
+        assert!(note_edit(
+            &mut ed,
+            &mut rec,
+            since,
+            Repeat::Act(Act::NoSpacing)
+        ));
+        assert_eq!(ed.undo_names(), ["Style"]);
+        let spaced = ed.doc.clone();
+        assert!(ed.undo());
+        assert_eq!(ed.doc, original, "one undo restores it exactly");
+        assert!(!ed.can_redo() || ed.redo());
+        assert_eq!(ed.doc, spaced);
+        ed.set_caret(Caret::at(vec![2], 0));
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(
+            ed.undo_names(),
+            ["Style", "Style"],
+            "the repeat is one step"
+        );
+        assert!(ed.undo());
+        assert_eq!(ed.doc, spaced);
     }
 
     #[test]
@@ -23814,6 +24011,7 @@ impl Docxy {
         // A document edit is its own undo step, named for the Undo drop-down
         // (#619) and kept for Repeat (#618) when it can be repeated.
         let since = docxcore::editor::undo_serial_counter();
+        let untouched = repeat_untouched(self.repeat);
         if act_undo_name(act).is_some() {
             if let Some(ed) = self.edit_target() {
                 ed.break_undo_group();
@@ -23824,6 +24022,10 @@ impl Docxy {
             if let (Some(ed), rec) = self.edit_target_and_repeat() {
                 note_edit(ed, rec, since, Repeat::Act(act));
             }
+        }
+        // The Undo drop-down only undoes (#619).
+        if matches!(act, Act::UndoTo(_)) {
+            self.keep_repeat_current(untouched);
         }
     }
 

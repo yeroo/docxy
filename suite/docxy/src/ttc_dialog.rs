@@ -468,7 +468,7 @@ fn convert(tab: &mut DocTab, src: &TtcSource, opts: &TextParse) {
     let today = v.engine.clock;
     let n = text_to_columns(&mut v.pkg.workbook, src, opts, today);
     v.engine = crate::sheet_engine(&v.pkg.workbook);
-    tab.dirty = true;
+    tab.set_dirty();
     tab.status = format!(
         "Text to Columns: converted {n} row{}",
         if n == 1 { "" } else { "s" }

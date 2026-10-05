@@ -597,7 +597,7 @@ pub(crate) fn set_content(
             let pkg = tab.pkg.as_mut().ok_or("Headers/footers need a .docx")?;
             pkg.ensure_styles(&[crate::hf::style_id(is_header)]);
             rewrite_part(pkg, &name, is_header, inner);
-            tab.dirty = true;
+            tab.set_dirty();
             Ok(name)
         }
         None => crate::hf::create_for(tab, section, is_header, variant, inner)
@@ -736,7 +736,7 @@ pub(crate) fn hf_apply(tab: &mut DocTab, act: HfAct) -> Result<(), String> {
             })?;
             let pkg = tab.pkg.as_mut().ok_or("no package")?;
             rewrite_part(pkg, &name, is_header, &crate::hf::empty_content(is_header));
-            tab.dirty = true;
+            tab.set_dirty();
             if tab.hf_edit.as_ref().is_some_and(|h| h.part_name == name) {
                 reopen(tab, section, is_header, variant);
             }
@@ -791,7 +791,7 @@ pub(crate) fn hf_apply(tab: &mut DocTab, act: HfAct) -> Result<(), String> {
                 });
                 tab.status = "Link to Previous: on".into();
             }
-            tab.dirty = true;
+            tab.set_dirty();
             reopen(tab, section, is_header, variant);
         }
         HfAct::DifferentFirst => {
@@ -804,7 +804,7 @@ pub(crate) fn hf_apply(tab: &mut DocTab, act: HfAct) -> Result<(), String> {
             let pkg = tab.pkg.as_mut().ok_or("no package")?;
             let on = !pkg.has_even_odd();
             pkg.set_even_odd(on);
-            tab.dirty = true;
+            tab.set_dirty();
             if !on && variant == HeaderVariant::Even {
                 reopen(tab, section, is_header_now, HeaderVariant::Default);
             }
@@ -827,7 +827,9 @@ pub(crate) fn hf_apply(tab: &mut DocTab, act: HfAct) -> Result<(), String> {
                     s.margins.footer = twips;
                 }
             });
-            tab.dirty |= changed;
+            if changed {
+                tab.set_dirty();
+            }
             let name = if is_header {
                 "Header from Top"
             } else {

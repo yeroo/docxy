@@ -361,7 +361,9 @@ pub(crate) fn set_watermark(
     let refs = ed.replace_sections(&raws);
     let changed = parts || refs;
     if spec.is_some() && pkg.shown_text_watermarks(&ed.sections()).is_empty() {
-        tab.dirty |= changed;
+        if changed {
+            tab.set_dirty();
+        }
         return Err("Could not add the watermark: the document cannot take a header".into());
     }
     Ok(changed)
@@ -401,7 +403,9 @@ pub(crate) fn design_apply(tab: &mut DocTab, act: DesignAct) -> Result<(), Strin
         | DesignAct::CustomWatermark
         | DesignAct::PageBorders => return Ok(()),
     };
-    tab.dirty |= changed;
+    if changed {
+        tab.set_dirty();
+    }
     tab.status = status.into();
     Ok(())
 }

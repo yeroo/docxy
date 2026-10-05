@@ -103,7 +103,7 @@ pub(crate) fn run(
     match sort_view(v, area, levels, opts) {
         Ok((n, changed)) => {
             if changed {
-                tab.dirty = true;
+                tab.set_dirty();
             }
             tab.status = format!(
                 "Sorted {n} {}",
@@ -134,7 +134,7 @@ pub(crate) fn commit_first(tab: &mut DocTab) -> Result<bool, String> {
     };
     let committed = v.commit_edit();
     if committed {
-        tab.dirty = true;
+        tab.set_dirty();
     }
     let Surface::Sheet(v) = &tab.surface else {
         return Ok(committed);

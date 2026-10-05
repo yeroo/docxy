@@ -4052,7 +4052,7 @@ mod tests {
         };
         let mut word = doc(crate::Kind::Docx, "a.docx");
         word.path = Some("C:/work/a.docx".into());
-        word.dirty = true;
+        word.set_dirty();
         let book = doc(crate::Kind::Xlsx, "Untitled.xlsx");
         let blank = crate::new_project_tab();
         let mut mpp = doc(crate::Kind::Project, "plan.mpp");

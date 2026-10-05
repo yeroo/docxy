@@ -154,7 +154,7 @@ struct Snapshot {
 }
 
 /// An undo step's name. Typing is named by its text as it coalesces; a host
-/// names a command's steps with [`Editor::name_steps_since`]; anything else
+/// names a command's steps with [`Editor::name_command`]; anything else
 /// falls back to what kind of edit pushed it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum StepName {
@@ -188,10 +188,18 @@ impl StepName {
 /// then never match another document's step by coincidence).
 static UNDO_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The most recent undo-step serial issued by any editor. Every step pushed
-/// after this call has a larger serial; see [`Editor::name_steps_since`].
+thread_local! {
+    /// The last serial issued on this thread.
+    static LAST_SERIAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The most recent undo-step serial issued on this thread, by any editor.
+/// Every step pushed after this call has a larger serial (see
+/// [`Editor::name_command`]), and it changes exactly when a step is pushed
+/// on this thread, so a host can tell that no edit pushed one since. Per
+/// thread, so editors on other threads never disturb it.
 pub fn undo_serial_counter() -> u64 {
-    UNDO_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+    LAST_SERIAL.with(|c| c.get())
 }
 
 const UNDO_CAP: usize = 500;
@@ -286,6 +294,7 @@ impl Editor {
 
     fn push_undo(&mut self, mut snapshot: Snapshot) {
         snapshot.serial = UNDO_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        LAST_SERIAL.with(|c| c.set(snapshot.serial));
         self.undo.push(snapshot);
         if self.undo.len() > UNDO_CAP {
             self.undo.remove(0);
@@ -321,10 +330,6 @@ impl Editor {
         }
     }
 
-    pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
-    }
-
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }
@@ -341,19 +346,25 @@ impl Editor {
         self.undo.last().map(|s| s.serial)
     }
 
-    /// Name every undo step pushed after `since` (a value of
-    /// [`undo_serial_counter`] taken before a command ran) as `name`. Steps
-    /// from before, such as a typing step the command did not start, keep
-    /// their names. A named step is a command's: typing after it starts a
-    /// step of its own rather than growing it.
-    pub fn name_steps_since(&mut self, since: u64, name: &str) {
-        for step in self.undo.iter_mut().rev() {
-            if step.serial <= since {
-                break;
-            }
-            step.name = StepName::Named(name.into());
-            self.last = EditKind::None;
+    /// The undo steps pushed after `since` (a value of
+    /// [`undo_serial_counter`] taken before a command ran) are one command's:
+    /// collapse them into one step, the oldest (its snapshot is the state
+    /// before the command, and it keeps its serial), named `name`. One Undo
+    /// then undoes the whole command. Steps from before, such as a typing
+    /// step the command did not start, are left alone. Typing after a named
+    /// step starts a step of its own rather than growing it.
+    pub fn name_command(&mut self, since: u64, name: &str) {
+        let first = self
+            .undo
+            .iter()
+            .rposition(|step| step.serial <= since)
+            .map_or(0, |i| i + 1);
+        if first == self.undo.len() {
+            return;
         }
+        self.undo.truncate(first + 1);
+        self.undo[first].name = StepName::Named(name.into());
+        self.last = EditKind::None;
     }
 
     /// The text of the newest undo step when it is typing.
@@ -4685,7 +4696,7 @@ mod tests {
         ed.toggle_bold();
         let bold = ed.undo_serial();
         assert_ne!(typed, bold);
-        ed.name_steps_since(typed.unwrap(), "Bold");
+        ed.name_command(typed.unwrap(), "Bold");
         assert_eq!(ed.undo_names(), vec!["Bold", "Typing \"ab\""]);
         assert!(ed.undo());
         assert_eq!(ed.undo_serial(), typed);
@@ -4715,28 +4726,62 @@ mod tests {
     }
 
     #[test]
-    fn name_steps_since_renames_only_newer_steps() {
+    fn name_command_merges_only_newer_steps() {
         let mut ed = Editor::new(doc(&[""]));
         ed.insert_str("ab");
         let since = undo_serial_counter();
         // Coalesces into the typing step from before: no new step to name.
         ed.insert_str("c");
-        ed.name_steps_since(since, "Symbol");
+        ed.name_command(since, "Symbol");
         assert_eq!(ed.undo_names(), vec!["Typing \"abc\""]);
         ed.break_undo_group();
         ed.insert_str("d");
         ed.insert_newline();
-        ed.name_steps_since(since, "Insert Stuff");
+        ed.name_command(since, "Insert Stuff");
+        assert_eq!(ed.undo_names(), vec!["Insert Stuff", "Typing \"abc\""]);
+        assert!(ed.undo());
         assert_eq!(
-            ed.undo_names(),
-            vec!["Insert Stuff", "Insert Stuff", "Typing \"abc\""]
+            top_text(&ed),
+            vec!["abc"],
+            "one undo takes the whole command"
         );
+        assert!(ed.redo());
         // Typing after a named command starts its own step.
         let since = undo_serial_counter();
         ed.insert_str("e");
-        ed.name_steps_since(since, "Named");
+        ed.name_command(since, "Named");
         ed.insert_str("f");
         assert_eq!(ed.undo_names()[..2], ["Typing \"f\"", "Named"]);
+    }
+
+    /// A command that edits through several calls (No Spacing: style, two
+    /// spacings, line spacing) is one step once named.
+    #[test]
+    fn name_command_makes_a_multi_call_command_one_step() {
+        let mut ed = Editor::new(doc(&["a", "b"]));
+        ed.insert_str("x");
+        let typed = ed.undo_serial();
+        let before = ed.doc.clone();
+        let since = undo_serial_counter();
+        ed.break_undo_group();
+        ed.set_space_before(Some(0));
+        ed.set_space_after(Some(0));
+        ed.set_line_spacing(240, "auto");
+        assert_eq!(ed.undo_names().len(), 4);
+        let last = undo_serial_counter();
+        ed.name_command(since, "Style");
+        assert_eq!(ed.undo_names(), vec!["Style", "Typing \"x\""]);
+        let kept = ed.undo_serial().unwrap();
+        assert!(kept > since && kept < last, "the oldest new step's serial");
+        let after = ed.doc.clone();
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert_eq!(ed.undo_serial(), typed);
+        assert!(ed.redo());
+        assert_eq!(ed.doc, after);
+        // Nothing new since: nothing changes.
+        ed.name_command(undo_serial_counter(), "Other");
+        assert_eq!(ed.undo_names(), vec!["Style", "Typing \"x\""]);
     }
 
     #[test]

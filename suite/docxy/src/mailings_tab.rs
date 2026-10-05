@@ -649,7 +649,7 @@ fn write_settings(tab: &mut DocTab) -> Result<(), String> {
             .or_else(|| tab.mail.pending_source.clone()),
     });
     package(tab)?.set_mail_merge(mm.as_ref());
-    tab.dirty = true;
+    tab.set_dirty();
     Ok(())
 }
 
@@ -751,7 +751,7 @@ pub(crate) fn insert_inline(
     if let Surface::Doc(body) = &mut tab.surface {
         body.refresh_merge_preview();
     }
-    tab.dirty = true;
+    tab.set_dirty();
     Ok(())
 }
 
@@ -839,7 +839,9 @@ pub(crate) fn mail_apply(tab: &mut DocTab, act: MailAct) -> Result<(), String> {
             let ed = body_editor(tab)?;
             let changed = docxcore::merge::labels::update_labels_at_caret(ed)?;
             ed.refresh_merge_preview();
-            tab.dirty |= changed;
+            if changed {
+                tab.set_dirty();
+            }
             tab.status = if changed {
                 "Labels updated"
             } else {
