@@ -192,15 +192,14 @@ fn resolve_cells(wb: &Workbook, sheet: usize, src: &str) -> Option<(usize, Vec<(
         .find(|d| d.name.eq_ignore_ascii_case(src))
         .map(|d| d.formula.trim_start_matches('=').to_string());
     let src = named.as_deref().unwrap_or(src);
-    let (name, range) = match src.rsplit_once('!') {
-        Some((n, r)) => (Some(n.trim_matches(['\'', ' '])), r),
-        None => (None, src),
-    };
+    // The sheet unquoted (`'Bob''s data'` is `Bob's data`), as other
+    // references read it.
+    let (name, range) = crate::edit::split_ref_text(src)?;
     let at = match name {
         Some(n) => wb
             .sheets
             .iter()
-            .position(|s| s.name.eq_ignore_ascii_case(n))?,
+            .position(|s| s.name.eq_ignore_ascii_case(&n))?,
         None => sheet,
     };
     let clean = range.replace('$', "");
@@ -1155,22 +1154,14 @@ pub fn set_validation(sheet: &mut Sheet, range: Rect, rule: &DataValidation, app
         return;
     }
     match held {
-        Some(mut h) => {
-            h.ranges = ranges;
-            h.kind.clone_from(&rule.kind);
-            h.operator.clone_from(&rule.operator);
-            h.formula1.clone_from(&rule.formula1);
-            h.formula2.clone_from(&rule.formula2);
-            h.prompt.clone_from(&rule.prompt);
-            h.prompt_title.clone_from(&rule.prompt_title);
-            h.allow_blank = rule.allow_blank;
-            h.show_input = rule.show_input;
-            h.show_error = rule.show_error;
-            h.show_dropdown = rule.show_dropdown;
-            h.error_style = rule.error_style;
-            h.error_title.clone_from(&rule.error_title);
-            h.error.clone_from(&rule.error);
-            sheet.validations.push(h);
+        Some(h) => {
+            // The rule's settings, on the element it already has.
+            sheet.validations.push(DataValidation {
+                ranges,
+                ix: h.ix,
+                orig: h.orig,
+                ..rule.clone()
+            });
         }
         None => add_ranges(sheet, rule, &ranges),
     }
@@ -2262,14 +2253,19 @@ mod tests {
                         c.label,
                         cell.value
                     );
-                    // Typing the label passes too, wherever typing gives the
-                    // value the pick stores. Where it can't (`=1+1` and `-1/2`
-                    // type as formulas, `'01` as quote-prefixed `01`), the pick
-                    // stores the label as text and typing is not comparable:
-                    // Excel itself would refuse those typed.
-                    let typed =
-                        crate::entry::entry_cell(&mut wb, 0, 9, 3, &c.label, Some(CLOCK)).unwrap();
-                    if typed.formula.is_none() && typed.value == cell.value {
+                    // Typing the label passes too, for every label whose pick
+                    // is the typed entry itself. The ones whose typing would be
+                    // a formula or quote-prefixed text (`=1+1`, `-1/2`, `'01`)
+                    // are stored as text by the pick instead, and Excel would
+                    // refuse them typed.
+                    let xf = target_xf(&wb, 0, 9, 3);
+                    if !inline_pick(&wb, &xf, &c.label, Some(CLOCK)).1 {
+                        let ctx = crate::entry::EntryCtx {
+                            today: Some(CLOCK),
+                            ..crate::entry::entry_ctx(&wb, Some(CLOCK))
+                        };
+                        let typed =
+                            crate::entry::entry_cell_ctx(&mut wb, 0, 9, 3, &c.label, &ctx).unwrap();
                         assert!(
                             check_entry(&mut wb, 0, 9, 3, &typed, Some(CLOCK)).is_none(),
                             "typing {:?} under {code:?} gives {:?}",
@@ -2285,6 +2281,37 @@ mod tests {
                 .filter(|i| !not_offered(code).contains(i))
                 .collect();
             assert_eq!(offered_labels, want, "offered under {code:?}");
+        }
+    }
+
+    // ---- review r10 ----
+
+    #[test]
+    fn a_list_source_on_a_quoted_sheet_name_resolves() {
+        for (name, source) in [
+            ("Bob's data", "'Bob''s data'!$A$1:$A$3"),
+            ("My Sheet", "'My Sheet'!$A$1:$A$3"),
+            ("Plain", "Plain!$A$1:$A$3"),
+        ] {
+            let mut wb = book();
+            let mut other = Sheet::default();
+            other.name = name.into();
+            for (r, v) in ["Red", "Green", "Blue"].iter().enumerate() {
+                other.set_cell(r as u32, 0, Cell::text(v));
+            }
+            wb.sheets.push(other);
+            let mut dv = rule("list", "", source, "");
+            dv.ranges = vec![(1, 1, 9, 1)];
+            wb.sheets[0].validations.push(dv);
+            // Enforced: Green passes, Pink does not; and the dropdown offers all three.
+            assert!(check(&mut wb, 1, 1, "Green").is_none(), "{name}");
+            assert!(check(&mut wb, 1, 1, "Pink").is_some(), "{name}");
+            let labels: Vec<_> = list_choices(&wb, 0, 1, 1, None)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.label)
+                .collect();
+            assert_eq!(labels, ["Red", "Green", "Blue"], "{name}");
         }
     }
 }

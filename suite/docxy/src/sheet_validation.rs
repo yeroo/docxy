@@ -95,15 +95,9 @@ pub(crate) fn alert_click(tab: &mut DocTab, button: &str) -> Option<Result<(), S
 
 // ---- the dialog ------------------------------------------------------------
 
-fn kind_ix(d: &Dialog) -> usize {
-    match d.value("allow") {
-        Some(Value::Choice(Some(i))) => *i,
-        _ => 0,
-    }
-}
-
-fn operator_ix(d: &Dialog) -> usize {
-    match d.value("operator") {
+/// The index of the choice a dropdown control has picked (0 when none).
+fn choice(d: &Dialog, name: &str) -> usize {
+    match d.value(name) {
         Some(Value::Choice(Some(i))) => *i,
         _ => 0,
     }
@@ -124,8 +118,8 @@ fn checked(d: &Dialog, name: &str) -> bool {
 /// bounded types, the bounds' boxes with their captions, Ignore blank and In-cell
 /// dropdown; and hold a title or message to Excel's length limits.
 fn react(d: &mut Dialog, i: usize, _before: &Value) {
-    let kind = KINDS[kind_ix(d).min(KINDS.len() - 1)].0;
-    let op = OPERATORS[operator_ix(d).min(OPERATORS.len() - 1)].0;
+    let kind = KINDS[choice(d, "allow").min(KINDS.len() - 1)].0;
+    let op = OPERATORS[choice(d, "operator").min(OPERATORS.len() - 1)].0;
     let any = kind.is_empty();
     for c in &mut d.controls {
         match c.name {
@@ -278,13 +272,9 @@ pub(crate) fn rule(
     current: Option<&DataValidation>,
     at: (u32, u32),
 ) -> Result<DataValidation, String> {
-    let ix = |name: &str| match d.value(name) {
-        Some(Value::Choice(Some(i))) => *i,
-        _ => 0,
-    };
     DialogBoxes {
-        kind: kind_ix(d),
-        operator: operator_ix(d),
+        kind: choice(d, "allow"),
+        operator: choice(d, "operator"),
         first: text(d, "first"),
         second: text(d, "second"),
         ignore_blank: checked(d, "ignore-blank"),
@@ -293,7 +283,7 @@ pub(crate) fn rule(
         prompt_title: text(d, "input-title"),
         prompt: text(d, "input-message"),
         show_error: checked(d, "show-error"),
-        style: ix("error-style"),
+        style: choice(d, "error-style"),
         error_title: text(d, "error-title"),
         error: text(d, "error-message"),
     }
@@ -957,5 +947,78 @@ mod tests {
             Ok(crate::GridPasted::KeptAsCopy(why)) => assert!(why.contains("data validation"), "{why}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    // ---- review r10 ----
+
+    #[test]
+    fn a_refused_save_leaves_no_stale_alert_for_a_later_ctrl_enter() {
+        let mut t = book(AlertStyle::Warning);
+        select(&mut t, "B2");
+        let v = view(&mut t);
+        v.begin_cell_edit(Some(String::new()));
+        v.edit_caret = 0;
+        v.edit_type("2");
+        v.edit_type("5");
+        v.edit_type("0");
+        // Save's commit: refused, the editor kept, nothing held for an alert.
+        let saved = crate::close::commit_changed_cell(&mut t);
+        assert!(saved.is_err());
+        assert!(view(&mut t).dv_pending.is_none());
+        // Esc ends the editor; a later Ctrl+Enter over a range, refused for
+        // another reason, shows that reason and holds no stale entry.
+        let v = view(&mut t);
+        v.end_cell_edit();
+        v.anchor = at("B2");
+        v.sel = at("B4");
+        v.begin_cell_edit(Some(String::new()));
+        v.edit_caret = 0;
+        for ch in "=SUM(B1".chars() {
+            v.edit_type(&ch.to_string());
+        }
+        assert!(!v.commit_edit_to_selection());
+        assert!(v.dv_pending.is_none(), "no stale alert to show");
+        assert!(v.entry_error.is_some(), "the formula error is what is shown");
+        assert_eq!(value(&mut t, "B2"), CellValue::Number(50.0));
+    }
+
+    #[test]
+    fn a_structural_edit_refused_over_a_breaking_entry_holds_nothing() {
+        let mut t = book(AlertStyle::Information);
+        select(&mut t, "B2");
+        let v = view(&mut t);
+        v.begin_cell_edit(Some(String::new()));
+        v.edit_caret = 0;
+        v.edit_type("2");
+        v.edit_type("5");
+        v.edit_type("0");
+        assert!(!v.structural_edit(crate::StructOp::InsertRow));
+        assert!(v.dv_pending.is_none());
+    }
+
+    #[test]
+    fn ctrl_enter_over_a_range_with_yes_fills_it_in_one_undo_step() {
+        let mut t = book(AlertStyle::Warning);
+        let v = view(&mut t);
+        v.anchor = at("B2");
+        v.sel = at("B4");
+        v.begin_cell_edit(Some(String::new()));
+        v.edit_caret = 0;
+        for ch in "250".chars() {
+            v.edit_type(&ch.to_string());
+        }
+        assert!(!v.commit_edit_to_selection());
+        let p = v.dv_pending.clone().expect("held for its alert");
+        t.dialogs.push(alert_dialog(&p.violation));
+        press(&mut t, "Yes").unwrap();
+        for cell in ["B2", "B3", "B4"] {
+            assert_eq!(value(&mut t, cell), CellValue::Number(250.0), "{cell}");
+        }
+        let v = view(&mut t);
+        assert_eq!((v.anchor, v.sel), (at("B2"), at("B4")), "the selection stays");
+        assert_eq!(v.undo.len(), 1);
+        assert!(v.undo_step());
+        assert_eq!(value(&mut t, "B2"), CellValue::Number(50.0));
+        assert_eq!(value(&mut t, "B3"), CellValue::Empty);
     }
 }

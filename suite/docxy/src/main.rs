@@ -642,8 +642,8 @@ struct SheetView {
     /// text meanwhile.
     dv_pending: Option<DvPending>,
     /// The move the commit now running makes once its entry is in, which a
-    /// data-validation alert holds for Yes or OK; `None` keeps the selection.
-    dv_then: Option<(i32, i32)>,
+    /// data-validation alert holds for Yes or OK; (0, 0) when none runs.
+    dv_then: (i32, i32),
     /// Circle Invalid Data's circles: (sheet, row, col). View state, never
     /// saved, and a circle goes when its cell is valid (#689).
     circles: Vec<(usize, u32, u32)>,
@@ -1675,6 +1675,8 @@ enum StructOp {
 
 impl SheetView {
     fn end_cell_edit(&mut self) {
+        // An entry waiting on a data-validation alert goes with its editor.
+        self.dv_pending = None;
         self.editing = None;
         self.edit_seed = None;
         self.edit_origin = None;
@@ -2095,7 +2097,7 @@ impl SheetView {
         // The cell's data-validation rule: a breaking entry waits for its
         // alert, the editor kept with the text.
         if let Some(cell) = &cell {
-            if self.dv_violation(origin, vec![(r, c, cell.clone())], self.dv_then) {
+            if self.dv_violation(origin, vec![(r, c, cell.clone())], Some(self.dv_then)) {
                 return false;
             }
         }
@@ -2516,9 +2518,9 @@ impl SheetView {
     /// refused: then the editor stays open, nothing moves, `entry_error` says
     /// why and this is `None`. `Some(committed)` otherwise.
     fn commit_and_move(&mut self, dr: i32, dc: i32) -> Option<bool> {
-        self.dv_then = Some((dr, dc));
+        self.dv_then = (dr, dc);
         let committed = self.commit_edit();
-        self.dv_then = Some((0, 0));
+        self.dv_then = (0, 0);
         if self.entry_error.is_some() {
             return None;
         }
@@ -2679,6 +2681,7 @@ impl SheetView {
     /// selection kept. False when nothing was entered (no editor, or refused).
     fn commit_edit_to_selection(&mut self) -> bool {
         self.entry_error = None;
+        self.dv_pending = None;
         self.take_proposal();
         let Some(buf) = self.editing.clone() else {
             return false;
@@ -2781,6 +2784,8 @@ impl SheetView {
 
         self.commit_edit();
         if self.editing.is_some() {
+            // No alert is shown on this path: the entry waits for nothing.
+            self.dv_pending = None;
             return false;
         }
         self.push_undo();
@@ -8246,7 +8251,7 @@ fn new_sheet_surface() -> Surface {
         last_format: None,
         entry_error: None,
         dv_pending: None,
-        dv_then: Some((0, 0)),
+        dv_then: (0, 0),
         circles: Vec::new(),
         engine,
         undo: vec![],
@@ -8317,7 +8322,7 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     last_format: None,
                     entry_error: None,
                     dv_pending: None,
-                    dv_then: Some((0, 0)),
+                    dv_then: (0, 0),
                     circles: Vec::new(),
                     engine,
                     undo: vec![],

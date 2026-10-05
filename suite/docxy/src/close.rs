@@ -130,15 +130,20 @@ pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
 /// unchanged. `commit_edit` also skips that case, but taking the buffer here
 /// would close the editor; cancelled close or Save As must leave it open.
 /// `Err` (the reason, also put in the tab's status) when the sheet refused the
-/// entry — an unfinished formula, or one over the cell limit — and the editor
-/// stays open with the text.
-fn commit_changed_cell(tab: &mut DocTab) -> Result<(), String> {
+/// entry — an unfinished formula, one over the cell limit, or one that breaks
+/// its cell's data-validation rule, whatever the rule's alert style (no alert
+/// is shown here, so Save and close never let a rule-breaking entry in behind
+/// the user's back) — and the editor stays open with the text.
+pub(crate) fn commit_changed_cell(tab: &mut DocTab) -> Result<(), String> {
     if let Surface::Sheet(v) = &mut tab.surface
         && v.editing.is_some()
         && !v.edit_untouched()
     {
         let changed = v.commit_edit();
         if v.editing.is_some() {
+            // The alert a rule-breaking entry would raise is not shown from
+            // here; nothing is left waiting on it.
+            v.dv_pending = None;
             let message = v
                 .entry_error
                 .take()
