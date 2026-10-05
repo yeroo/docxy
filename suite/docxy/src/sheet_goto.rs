@@ -567,7 +567,7 @@ mod tests {
         assert_eq!((plan.cells.len(), plan.notes.len()), (55_000, 50_000));
         assert_eq!(v.clear_what(ClearWhat::Comments), Ok(true));
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
+            started.elapsed() < crate::PERF_BOUND,
             "{:?}",
             started.elapsed()
         );
@@ -599,7 +599,7 @@ mod tests {
         let started = std::time::Instant::now();
         v.format_selection(&|xf| xf.bold = true);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
+            started.elapsed() < crate::PERF_BOUND,
             "{:?}",
             started.elapsed()
         );

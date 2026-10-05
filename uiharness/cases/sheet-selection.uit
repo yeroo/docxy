@@ -100,7 +100,7 @@ test ctrl+click adds areas and shift extends only the active one
   drag F1 -> F2 ctrl
   assert areas.2 is F1:F2
   click B2
-  assert areas.1 is nothing
+  assert areas is ["B2"]
 
 test delete clears every area and a multi-area cut is refused
   open ../fixtures/basic.xlsx

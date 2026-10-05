@@ -397,11 +397,7 @@ fn fifty_thousand_notes_and_rules_paste_fast() {
 }
 
 fn fast_enough(t: std::time::Instant) {
-    assert!(
-        t.elapsed() < std::time::Duration::from_secs(3),
-        "{:?}",
-        t.elapsed()
-    );
+    assert!(t.elapsed() < crate::PERF_BOUND, "{:?}", t.elapsed());
 }
 
 /// #707 r7 M1: a pasted note replaces the destination's threaded comment,

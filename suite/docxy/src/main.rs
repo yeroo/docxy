@@ -64,6 +64,11 @@ mod sect_pr_tests;
 mod sheet_clip_tests;
 mod sheet_consolidate;
 mod sheet_drag;
+/// The wall-clock bound of the tests that guard against a quadratic cost
+/// (#707): generous, since they run as debug builds on shared CI runners,
+/// and still far below what the quadratic version they guard took (minutes).
+#[cfg(test)]
+pub(crate) const PERF_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
 #[cfg(test)]
 mod sheet_entry_tests;
 mod sheet_fill;

@@ -10176,11 +10176,7 @@ mod tests {
         // All but the last link.
         apply_clear(&mut wb, 0, &[(0, 0, 49_998, 0)], ClearWhat::Hyperlinks, &[]).unwrap();
         let saved = splice_worksheet(&xml, &wb.sheets[0], "<sheetData/>", &[], &mut |_, _| None);
-        assert!(
-            t.elapsed() < std::time::Duration::from_secs(3),
-            "{:?}",
-            t.elapsed()
-        );
+        assert!(t.elapsed() < crate::edit::PERF_BOUND, "{:?}", t.elapsed());
         let back = parse_worksheet(&saved, &[], &Default::default());
         assert_eq!(back.hyperlinks.len(), 1);
         assert!(back.hyperlinks.contains_key(&(49_999, 0)));

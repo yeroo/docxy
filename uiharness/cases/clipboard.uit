@@ -389,7 +389,8 @@ test the gallery and the Paste Options button paste another way
   call menu-open {"target":{"grid":"paste-options"}}
   call menu-click {"label":"Values"}
   call cell {"cell":"O33"}
-  assert reply.value is 0
+  # Values pastes what the copied M33 shows: =M32*10 is 50.
+  assert reply.value is 50
   assert paste_options is Values
   click Q33
   call menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}}
@@ -403,6 +404,9 @@ test the gallery and the Paste Options button paste another way
 
 test the Office Clipboard keeps copies and pastes them as values
   open ../fixtures/basic.xlsx
+  # The pane is the app's, not the workbook's: it keeps the copies earlier
+  # cases made, as Excel's does across workbooks.
+  call office-clipboard {"action":"clear-all"}
   click A2
   key ctrl+c
   click B2

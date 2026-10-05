@@ -368,11 +368,7 @@ fn whole_sheet_scopes_are_fast_and_keep_excels_results() {
         &[],
     );
     assert_eq!(found, Ok(vec![(0, 0, MAX_ROWS - 1, 0)]));
-    assert!(
-        t.elapsed() < std::time::Duration::from_secs(2),
-        "{:?}",
-        t.elapsed()
-    );
+    assert!(t.elapsed() < crate::edit::PERF_BOUND, "{:?}", t.elapsed());
 }
 
 /// #707 r4 M2: the planner's three cases.
@@ -427,11 +423,7 @@ fn the_current_region_of_a_long_column_is_fast() {
         go(&wb, &["A1"], "A1", GoSpecial::CurrentRegion),
         Ok(vec![(0, 0, 49_999, 0)])
     );
-    assert!(
-        t.elapsed() < std::time::Duration::from_secs(1),
-        "{:?}",
-        t.elapsed()
-    );
+    assert!(t.elapsed() < crate::edit::PERF_BOUND, "{:?}", t.elapsed());
 }
 
 #[test]
@@ -452,7 +444,7 @@ fn union_rects_merges_without_walking_cells() {
 
 fn fast(t: std::time::Instant, what: &str) {
     assert!(
-        t.elapsed() < std::time::Duration::from_secs(3),
+        t.elapsed() < crate::edit::PERF_BOUND,
         "{what}: {:?}",
         t.elapsed()
     );

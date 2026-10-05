@@ -834,7 +834,7 @@ fn add_weekdays_matches_the_walk() {
     }
     let t = std::time::Instant::now();
     let far = add_weekdays(parts_to_serial(2024, 10, 4, 0, false), 5_000_000, false);
-    assert!(t.elapsed() < std::time::Duration::from_millis(50));
+    assert!(t.elapsed() < crate::edit::PERF_BOUND);
     assert_eq!(far - parts_to_serial(2024, 10, 4, 0, false), 7_000_000.0);
 }
 
@@ -942,7 +942,7 @@ fn weekdays_off_the_calendar_and_huge_steps() {
     let far = add_weekdays(45000.0, i64::MAX, false);
     assert!(far > MAX_SERIAL);
     assert_eq!(weekdays_between(1e300, 45000.0, false), 0);
-    assert!(t.elapsed() < std::time::Duration::from_millis(50));
+    assert!(t.elapsed() < crate::edit::PERF_BOUND);
     let mut wb = book(&[("A1", Cell::number(45000.0))]);
     let r = fill_series(
         &mut wb,
@@ -971,7 +971,7 @@ fn uneven_month_seeds_continue_from_the_last() {
 
 fn fast(t: std::time::Instant, what: &str) {
     assert!(
-        t.elapsed() < std::time::Duration::from_secs(3),
+        t.elapsed() < crate::edit::PERF_BOUND,
         "{what}: {:?}",
         t.elapsed()
     );

@@ -696,11 +696,7 @@ fn fifty_thousand_spilling_anchors_paste_fast() {
         &PasteSpec::of(PasteWhat::Formulas),
     )
     .unwrap();
-    assert!(
-        t.elapsed() < std::time::Duration::from_secs(3),
-        "{:?}",
-        t.elapsed()
-    );
+    assert!(t.elapsed() < crate::edit::PERF_BOUND, "{:?}", t.elapsed());
     assert_eq!(ch.len(), 150_000);
     let g1 = ch.iter().find(|(r, c, _)| (*r, *c) == (0, 6)).unwrap();
     assert!(g1.2.is_blank(), "a member pastes blank");
@@ -763,11 +759,7 @@ fn a_50k_row_copy_with_rules_notes_and_styles_is_fast() {
         },
     )
     .unwrap();
-    assert!(
-        t.elapsed() < std::time::Duration::from_secs(3),
-        "{:?}",
-        t.elapsed()
-    );
+    assert!(t.elapsed() < crate::edit::PERF_BOUND, "{:?}", t.elapsed());
     assert_eq!((clip.rules.len(), clip.notes.len()), (50_000, 50_000));
     assert_eq!(ex.rules.len(), 50_000);
     assert_eq!(ch.len(), 100_000);

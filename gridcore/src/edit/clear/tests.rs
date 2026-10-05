@@ -150,11 +150,7 @@ fn clearing_10k_areas_over_50k_cells_links_notes_and_merges_is_fast() {
     let notes: Vec<(u32, u32)> = (0..n).map(|r| (r, 0)).collect();
     let t = std::time::Instant::now();
     let plan = clear_plan(&wb.sheets[0], &areas, ClearWhat::All, &notes).unwrap();
-    assert!(
-        t.elapsed() < std::time::Duration::from_secs(3),
-        "{:?}",
-        t.elapsed()
-    );
+    assert!(t.elapsed() < crate::edit::PERF_BOUND, "{:?}", t.elapsed());
     // Column A whole and every tenth B (F6 is in no strip).
     assert_eq!(plan.cells.len(), 50_000 + 5_000);
     assert_eq!((plan.notes.len(), plan.unlink.len()), (50_000, 50_000));
@@ -188,11 +184,7 @@ fn clearing_10k_areas_out_of_conditional_formatting_is_fast() {
     let t = std::time::Instant::now();
     let plan = clear_plan(&wb.sheets[0], &areas, ClearWhat::Formats, &[]).unwrap();
     apply_clear_sheet(&mut wb.sheets[0], &plan);
-    assert!(
-        t.elapsed() < std::time::Duration::from_secs(3),
-        "{:?}",
-        t.elapsed()
-    );
+    assert!(t.elapsed() < crate::edit::PERF_BOUND, "{:?}", t.elapsed());
     let cf = &wb.sheets[0].cond_formats[0];
     let size = |a: &Area| u64::from(a.2 - a.0 + 1) * u64::from(a.3 - a.1 + 1);
     assert_eq!(

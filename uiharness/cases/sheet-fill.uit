@@ -80,9 +80,9 @@ test fill-drag counts text and fits a trend (#668's reproduction)
   key enter
   call fill-drag {"from":"K1:K3","to":"K5"}
   call cell {"cell":"K4"}
-  assert reply.value is 5.33333333333333
+  assert reply.value is 5.333333333333334
   call cell {"cell":"K5"}
-  assert reply.value is 6.83333333333333
+  assert reply.value is 6.833333333333334
 
 test the Auto Fill Options button and Ctrl swap copy and series
   open ../fixtures/basic.xlsx

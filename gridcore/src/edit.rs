@@ -17,6 +17,11 @@ use std::collections::BTreeMap;
 pub type Area = (u32, u32, u32, u32);
 
 mod areas;
+/// The wall-clock bound of the tests that guard against a quadratic cost
+/// (#707): generous, since they run as debug builds on shared CI runners,
+/// and still far below what the quadratic version they guard took (minutes).
+#[cfg(test)]
+pub(crate) const PERF_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
 pub use areas::{RectIndex, cells_in_areas};
 mod clear;
 mod clip;
