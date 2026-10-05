@@ -26220,7 +26220,7 @@ impl Docxy {
 /// The drag payload for a title-chip drag: the source tab's absolute index,
 /// plus the strip length and the tab's title at drag start — a tab closed or
 /// another reorder landing mid-drag invalidates the snapshot, and the drop
-/// must not guess at what moved. Titles are not unique (new documents are
+/// must not guess at what moved. Titles are not unique (new workbooks are
 /// all `Untitled.*`), so the guard passes if the shifted index happens to
 /// land on a same-title tab; a per-tab id would close that and is out of
 /// scope here. Cloned into the view gpui draws under the cursor — the same
