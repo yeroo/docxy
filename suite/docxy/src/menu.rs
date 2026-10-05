@@ -13,6 +13,10 @@ pub(crate) enum MenuTarget {
     Document,
     /// A sheet cell's context menu (#690, #691): clipboard, Sort and Filter.
     Cell,
+    /// Pick From Drop-down List (Alt+Down, #665): the column block's
+    /// distinct text entries over the selected cell.
+    PickList,
+
     /// A Project task row's context menu; `None` is the entry row.
     Row(Option<i32>),
     /// A ribbon split button's drop-down: tab, group and the primary's label
@@ -30,6 +34,8 @@ impl MenuTarget {
         match self {
             Self::Document => Json::Str("document".into()),
             Self::Cell => Json::Str("cell".into()),
+            Self::PickList => Json::Str("pick-list".into()),
+
             Self::Row(uid) => Json::obj(vec![(
                 "row",
                 uid.map_or(Json::Null, |u| Json::Num(u as f64)),
@@ -234,8 +240,16 @@ pub(crate) fn target_stands(
         (MenuTarget::Document, Some(_)) => {
             Err("the document menu does not run on a Project tab".into())
         }
-        (MenuTarget::Cell, Some(_)) => Err("the cell menu runs on a sheet tab".into()),
-        (MenuTarget::Document | MenuTarget::Cell | MenuTarget::Ribbon { .. }, _) => Ok(()),
+        (MenuTarget::Cell | MenuTarget::PickList, Some(_)) => {
+            Err("this menu runs on a sheet tab".into())
+        }
+        (
+            MenuTarget::Document
+            | MenuTarget::Cell
+            | MenuTarget::PickList
+            | MenuTarget::Ribbon { .. },
+            _,
+        ) => Ok(()),
     }
 }
 
@@ -474,7 +488,31 @@ pub(crate) fn cell_menu() -> Vec<MenuItem> {
             Act::Sheet(S::NewComment),
             true,
         )),
+        Separator,
+        Item(sheet(
+            "cm-pick-list",
+            "Pick From Drop-down List...",
+            S::PickList,
+        )),
     ]
+}
+
+/// Pick From Drop-down List's menu (#665): one item per entry, in order.
+pub(crate) fn pick_menu(values: &[String]) -> Vec<MenuItem> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let at = u16::try_from(i).unwrap_or(u16::MAX);
+            MenuItem::Item(Entry::new(
+                &format!("pick-{i}"),
+                v,
+                "",
+                Act::Sheet(crate::SheetAct::PickItem(at)),
+                true,
+            ))
+        })
+        .collect()
 }
 
 /// A split button's drop-down, from its menu commands on the ribbon.
@@ -549,7 +587,7 @@ mod tests {
         }
         let mut seen = 0;
         walk(&cell_menu(), &mut seen);
-        assert_eq!(seen, 15);
+        assert_eq!(seen, 16);
     }
 
     #[test]

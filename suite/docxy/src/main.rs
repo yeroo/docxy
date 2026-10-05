@@ -62,6 +62,7 @@ mod ribbon_export;
 mod sect_pr_tests;
 #[cfg(test)]
 mod sheet_clip_tests;
+mod sheet_complete;
 mod sheet_consolidate;
 #[cfg(test)]
 mod sheet_entry_tests;
@@ -621,6 +622,9 @@ struct SheetView {
     /// commit takes the value; Backspace or Delete drops the suffix; a caret
     /// move keeps the text and drops the marker.
     edit_proposal: Option<(usize, String)>,
+    /// Formula AutoComplete's list for the open editor (#686), kept with the
+    /// buffer it was made for ([`sheet_complete::CompleteList`]).
+    edit_complete: Option<sheet_complete::CompleteList>,
     /// Which workbook tab this is, for the grid clip: a cut moves cells only
     /// within the workbook it came from ([`next_sheet_view_id`]).
     id: u64,
@@ -1536,6 +1540,10 @@ enum SheetAct {
     OutlineSettings,
     /// The Number group's format combo: opens or closes the format strip.
     NumberFormatMenu,
+    /// Pick From Drop-down List... (the cell menu, Alt+Down; #665): its menu
+    /// over the selected cell, and entry `n` of it chosen.
+    PickList,
+    PickItem(u16),
     Todo,
 }
 
@@ -1606,6 +1614,7 @@ impl SheetView {
         self.edit_overtype = false;
         self.edit_point = None;
         self.edit_proposal = None;
+        self.edit_complete = None;
     }
 
     /// The context a typed commit reads its entry under: the workbook's, with
@@ -1779,6 +1788,7 @@ impl SheetView {
         self.edit_overtype = false;
         self.edit_point = None;
         self.edit_proposal = None;
+        self.edit_complete = None;
     }
 
     fn edit_untouched(&self) -> bool {
@@ -8005,6 +8015,7 @@ fn new_sheet_surface() -> Surface {
         reveal_col: None,
         edit_opts: EditOptions::default(),
         edit_proposal: None,
+        edit_complete: None,
         id: next_sheet_view_id(),
         edit_gen: 0,
     })
@@ -8073,6 +8084,7 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     reveal_col: None,
                     edit_opts: EditOptions::default(),
                     edit_proposal: None,
+                    edit_complete: None,
                     id: next_sheet_view_id(),
                     edit_gen: 0,
                 };
@@ -14475,6 +14487,8 @@ impl Docxy {
             self.bar_open(target);
         }
         match act {
+            SheetAct::PickList => self.open_pick_menu(cx),
+            SheetAct::PickItem(i) => self.sheet_pick_item(usize::from(i), cx),
             SheetAct::Cut => self.sheet_copy(true, cx),
             SheetAct::Copy => self.sheet_copy(false, cx),
             SheetAct::Paste => {
@@ -14697,6 +14711,32 @@ impl Docxy {
             return self.sheet_find_key(ev, shift, key, cx);
         }
         let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
+        // Alt+Down opens a drop-down list (#665), before point mode or the
+        // type-over arrows can take the Down.
+        if alt && !ctrl && !shift && key == "down" {
+            return self.sheet_alt_down(cx);
+        }
+        // Formula AutoComplete's list (#686) takes Up, Down and Esc while it
+        // shows: they move its highlight or close it, and neither commit,
+        // point nor cancel the entry.
+        if editing
+            && !ctrl
+            && !alt
+            && matches!(key, "up" | "down" | "escape")
+            && self
+                .active_sheet_mut()
+                .is_some_and(SheetView::complete_open)
+        {
+            if let Some(v) = self.active_sheet_mut() {
+                match key {
+                    "up" => v.complete_step(false),
+                    "down" => v.complete_step(true),
+                    _ => v.complete_close(),
+                }
+            }
+            cx.notify();
+            return;
+        }
         let caret_keys = editing
             && self
                 .active_sheet()
@@ -17559,6 +17599,15 @@ impl Docxy {
                 cx.notify();
                 return;
             }
+            // Formula AutoComplete's list takes Tab: the highlighted name
+            // goes in, the editor stays (#686, FRM-151).
+            if self
+                .active_sheet_mut()
+                .is_some_and(|v| v.complete_open() && v.complete_insert())
+            {
+                cx.notify();
+                return;
+            }
             // Tab is action-bound, so it never reaches `sheet_key`'s hand-back
             // arm — the rule has to be stated again here. It moves the cell
             // selection exactly as the arrows do, and a selection the chart is
@@ -17698,6 +17747,11 @@ impl Docxy {
         // Alt+Shift+Right/Left group and ungroup (#693). Alt has raised the
         // KeyTips by the time the arrow comes, so they go down unasked.
         if self.active_is_sheet() && sheet_outline::group_key(&key, ctrl, shift, m.alt).is_some() {
+            self.keytips = KeyTip::Off;
+            return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
+        }
+        // Alt+Down: the drop-down lists (#665), for the same reason.
+        if self.active_is_sheet() && sheet_complete::alt_down_key(&key, *m) {
             self.keytips = KeyTip::Off;
             return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
         }
@@ -30083,6 +30137,59 @@ fn sheet_el(
                 }
                 dv_overlay.push(list.into_any_element());
             }
+        }
+    }
+    // Formula AutoComplete's list (#686) under the cell being edited: each
+    // name with its kind, the highlighted one marked. Keys drive it (Up/Down
+    // move, Tab inserts, Esc closes); a press inserts that item.
+    if let Some(c) = view.complete_view() {
+        let (er, ec) = view
+            .edit_origin
+            .filter(|o| o.0 == view.active)
+            .map_or(view.sel, |(_, r, c)| (r, c));
+        if let Some(cx0) = col_x(ec) {
+            let y = row_y(er);
+            let mut list = v_flex()
+                .id("fx-complete")
+                .absolute()
+                .left(px(cx0))
+                .top(px(y + SHEET_ROW_H))
+                .min_w(px(200.))
+                .max_h(px(220.))
+                .overflow_y_scroll()
+                .bg(hsla_u(0xffffff))
+                .border_1()
+                .border_color(hsla_u(0x9a9a9a))
+                .rounded_sm();
+            for (i, item) in c.list.items.iter().enumerate() {
+                let mark = match item.kind {
+                    gridcore::fcomplete::Kind::Function => "fx",
+                    gridcore::fcomplete::Kind::Name => "nm",
+                    gridcore::fcomplete::Kind::Table => "tb",
+                    gridcore::fcomplete::Kind::Column => "co",
+                    gridcore::fcomplete::Kind::Specifier => "",
+                };
+                let ent_pick = ent.clone();
+                list = list.child(
+                    div()
+                        .id(("fx-complete-item", i))
+                        .flex()
+                        .gap_2()
+                        .px_2()
+                        .py(px(2.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(hsla_u(0x1a1a1a))
+                        .when(i == c.sel, |d| d.bg(hsla_u(0xd2e3fc)))
+                        .hover(|d| d.bg(hsla_u(0xe8f0fe)))
+                        .child(div().w(px(16.)).text_color(hsla_u(0x777777)).child(mark))
+                        .child(SharedString::from(item.label.clone()))
+                        .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                            ent_pick.update(cx, |this, cx| this.sheet_complete_pick(i, cx));
+                        }),
+                );
+            }
+            dv_overlay.push(list.into_any_element());
         }
     }
     // AutoFilter buttons (#690): an arrow at the right of each header cell of

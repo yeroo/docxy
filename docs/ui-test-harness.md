@@ -335,6 +335,7 @@ State keys, as the app reports them after every driving verb:
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
+| `completions` | Formula AutoComplete's list under a formula being typed (#686): `{items: [labels], sel}` (`sel` the highlighted index), or null while none shows. Up/Down move `sel`, Tab inserts it, Esc closes the list and leaves the editor open; Alt+Down opens it on demand |
 | `comment_edit` | the sheet comment editor's text (`null` when closed) |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
 | `field`, `field_text` | the focused reference field, and its buffer |
@@ -987,7 +988,7 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment; #690, #691), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task) or `{"ribbon": [tab, group, command]}` | the menu, as `menu-read` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task) or `{"ribbon": [tab, group, command]}` | the menu, as `menu-read` |
 | `menu-read` | `{}` | `{open: true, target, items, highlight}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null |
 | `menu-click` | `{label}` among the top-level items, or `{path: [labels]}` through submenus | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |

@@ -2124,6 +2124,22 @@ fn menu_open(
             app.open_cell_menu(at, cx);
             Ok(())
         }
+        // Pick From Drop-down List (#665): Alt+Down's menu over the selected
+        // cell, through the same opener.
+        Json::Str(name) if name == "pick-list" => {
+            if !app.active_is_sheet() {
+                return Err("the pick list opens on a sheet tab".into());
+            }
+            app.open_pick_menu(cx);
+            if app.menu.is_none() {
+                return Err(app
+                    .tabs
+                    .get(app.active)
+                    .map(|t| t.status.to_string())
+                    .unwrap_or_else(|| "no pick list opened".into()));
+            }
+            Ok(())
+        }
         Json::Str(name) if name == "document" => {
             if app.active_is_project() {
                 return Err(
@@ -2214,7 +2230,7 @@ fn menu_open(
                 app.open_split_menu(id, at, cx)
             }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, cell, row and ribbon are)"
+                "menu target '{other}' is not supported yet (document, cell, pick-list, row and ribbon are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
@@ -2564,6 +2580,26 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ("range", Json::Str(a1_range(v.range()))),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
+            // Formula AutoComplete's list (#686): its labels and highlighted
+            // index, or null while none shows.
+            (
+                "completions",
+                v.complete_view().map_or(Json::Null, |c| {
+                    Json::obj(vec![
+                        (
+                            "items",
+                            Json::Arr(
+                                c.list
+                                    .items
+                                    .into_iter()
+                                    .map(|i| Json::Str(i.label))
+                                    .collect(),
+                            ),
+                        ),
+                        ("sel", Json::Num(c.sel as f64)),
+                    ])
+                }),
+            ),
             // The sheet comment editor New Comment opens, and its text.
             ("comment_edit", str_or_null(app.sheet_comment_edit.clone())),
         ]);
