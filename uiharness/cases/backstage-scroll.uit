@@ -79,27 +79,29 @@ test the rail's last item is reachable in the shortest window
 
 # The generic guard: every page the rail can show either fits a 1000x500
 # window or scrolls until its last row is in view, so a new page cannot be
-# added without scrolling. (`last_item_visible` is true for a page that fits.)
+# added without scrolling. The wheel, not a key, drives it: a key sets the
+# offset whether or not the pane can scroll. (`last_item_visible` is true for
+# a page that fits.)
 test every Backstage page is reachable at 1000x500
   open ../fixtures/basic.docx
   call window-size {"w":1000,"h":500}
   call backstage {"action":"open"}
   call backstage-page {"page":"open"}
   shot window
-  key end
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
   shot window
   call backstage-layout {}
   assert reply.last_item_visible is true
   call backstage-page {"page":"new"}
   shot window
-  key end
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
   shot window
   call backstage-layout {}
   assert reply.page is new
   assert reply.last_item_visible is true
   call backstage-page {"page":"info"}
   shot window
-  key end
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
   shot window
   call backstage-layout {}
   assert reply.page is info
