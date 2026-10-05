@@ -196,7 +196,7 @@ impl EditOptions {
     }
 }
 
-fn parse_bool(v: &str) -> Option<bool> {
+pub(crate) fn parse_bool(v: &str) -> Option<bool> {
     match v {
         "1" => Some(true),
         "0" => Some(false),

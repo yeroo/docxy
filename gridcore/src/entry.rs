@@ -652,13 +652,18 @@ fn block_texts(sheet: &Sheet, row: u32, col: u32) -> impl Iterator<Item = &Strin
 
 /// Does `text`, typed into a General cell, stay that same text? With a
 /// clock, so a yearless date such as `3/4` is read as the date it would be.
-fn stays_text(text: &str) -> bool {
-    let ctx = EntryCtx {
+pub(crate) fn stays_text(text: &str) -> bool {
+    parse_entry(text, &Xf::default(), &probe_ctx())
+        .is_ok_and(|e| e.cell.formula.is_none() && e.cell.value == CellValue::Text(text.into()))
+}
+
+/// The context that asks how typed text would read, with no workbook: a
+/// fixed clock, so a yearless date reads as a date rather than as text.
+pub(crate) fn probe_ctx() -> EntryCtx {
+    EntryCtx {
         today: Some(45_000.0),
         ..EntryCtx::default()
-    };
-    parse_entry(text, &Xf::default(), &ctx)
-        .is_ok_and(|e| e.cell.formula.is_none() && e.cell.value == CellValue::Text(text.into()))
+    }
 }
 
 // ---------------------------------------------------------------------------

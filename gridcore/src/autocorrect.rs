@@ -539,7 +539,7 @@ impl AutoCorrect {
     /// opens: `www.x.com` opens `http://www.x.com`, `a@b.com`
     /// `mailto:a@b.com`.
     pub fn hyperlink(&self, entry: &str) -> Option<String> {
-        if !self.opts.hyperlinks {
+        if !self.opts.hyperlinks || is_formula_or_quoted(entry) {
             return None;
         }
         hyperlink_target(entry)
@@ -613,13 +613,7 @@ impl AutoCorrect {
                     ac.delete_exception(ExceptionKind::InitialCaps, v);
                 }
                 _ => {
-                    let flag = match v.trim() {
-                        "1" => Some(true),
-                        "0" => Some(false),
-                        t if t.eq_ignore_ascii_case("true") => Some(true),
-                        t if t.eq_ignore_ascii_case("false") => Some(false),
-                        _ => None,
-                    };
+                    let flag = crate::options::parse_bool(v.trim());
                     if let (Some(slot), Some(b)) = (ac.opts.slot(k), flag) {
                         *slot = b;
                     }
@@ -646,13 +640,9 @@ fn is_formula_or_quoted(buf: &str) -> bool {
 
 /// Does `buf` commit as text in a General cell?
 fn reads_as_text(buf: &str) -> bool {
-    use crate::entry::{EntryCtx, parse_entry};
+    use crate::entry::{parse_entry, probe_ctx};
     use crate::sheet::{CellValue, Xf};
-    let ctx = EntryCtx {
-        today: Some(45_000.0),
-        ..EntryCtx::default()
-    };
-    parse_entry(buf, &Xf::default(), &ctx)
+    parse_entry(buf, &Xf::default(), &probe_ctx())
         .is_ok_and(|e| e.cell.formula.is_none() && matches!(e.cell.value, CellValue::Text(_)))
 }
 
@@ -964,6 +954,9 @@ mod tests {
             "a@b",
             "\\\\server",
             "plain",
+            "=A1&\"@x.com\"",
+            "'a@b.com",
+            "'https://example.com",
         ] {
             assert_eq!(ac.hyperlink(t), None, "{t}");
         }
