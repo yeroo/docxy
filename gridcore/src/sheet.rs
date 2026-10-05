@@ -546,6 +546,13 @@ pub struct Sheet {
     /// or an in-workbook location as `#Sheet!A1`. Rendered underlined; a click
     /// opens the URL (external) or jumps (internal).
     pub hyperlinks: std::collections::BTreeMap<(u32, u32), String>,
+    /// The `ref` each loaded `<hyperlink>` covers, keyed by its top-left
+    /// cell: a link over a range spreads over its cells in `hyperlinks`, and
+    /// removing it from one cell removes it from all of them (#671).
+    pub hyperlink_refs: std::collections::BTreeMap<(u32, u32), (u32, u32, u32, u32)>,
+    /// The `ref`s of loaded `<hyperlink>` elements whose link was removed: the
+    /// worksheet part still holds them, so a save strikes them.
+    pub hyperlinks_removed: Vec<(u32, u32, u32, u32)>,
     /// Data-validation rules (`<dataValidation>`): the constraint on a cell's
     /// value (a dropdown list, a number range, …). Surfaced in the UI, not
     /// enforced on edit.

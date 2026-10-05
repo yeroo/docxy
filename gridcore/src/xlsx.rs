@@ -1883,6 +1883,7 @@ fn parse_worksheet(
                             None
                         };
                         if let Some(t) = target {
+                            sheet.hyperlink_refs.insert((r1, c1), (r1, c1, r2, c2));
                             // A whole-column hyperlink applies only to its anchor.
                             let cells = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
                             if cells > 4096 {
@@ -3696,7 +3697,51 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     let out = set_auto_filter(out, sheet.auto_filter.as_ref());
     // Conditional formatting and data validation: likewise.
     let out = set_cond_formats(out, sheet);
-    set_validations(out, sheet)
+    let out = set_validations(out, sheet);
+    // Hyperlinks: a removed link's element goes.
+    set_hyperlinks(out, sheet)
+}
+
+/// Strike the `<hyperlink>` elements whose links were removed
+/// ([`Sheet::hyperlinks_removed`]), and the `<hyperlinks>` block once it is
+/// empty. The external relationship a removed link used stays in the rels,
+/// unreferenced, which OPC allows. Every other element is left as it is.
+fn set_hyperlinks(xml: String, sheet: &Sheet) -> String {
+    if sheet.hyperlinks_removed.is_empty() {
+        return xml;
+    }
+    let Some((ws, we)) = worksheet_child_span(&xml, "hyperlinks") else {
+        return xml;
+    };
+    let block = &xml[ws..we];
+    let items: Vec<(usize, usize)> = element_children(block)
+        .into_iter()
+        .filter(|(name, _, _)| name == "hyperlink")
+        .map(|(_, a, b)| (a, b))
+        .collect();
+    let mut edits = Vec::new();
+    for &(a, b) in &items {
+        let Some(tag) = start_tag(&block[a..b]) else {
+            continue;
+        };
+        let Some(&(_, vs, ve)) = tag.attrs.iter().find(|(n, _, _)| *n == "ref") else {
+            continue;
+        };
+        let r = &block[a + vs..a + ve];
+        let rect = crate::sheet::parse_range_name(r)
+            .or_else(|| crate::sheet::parse_cell_name(r).map(|(r, c)| (r, c, r, c)));
+        if rect.is_some_and(|rect| sheet.hyperlinks_removed.contains(&rect)) {
+            edits.push((a, b, String::new()));
+        }
+    }
+    if edits.is_empty() {
+        return xml;
+    }
+    if edits.len() == items.len() {
+        return remove_worksheet_child(&xml, "hyperlinks");
+    }
+    let kept = apply_edits(block.to_string(), edits);
+    format!("{}{kept}{}", &xml[..ws], &xml[we..])
 }
 
 /// The worksheet's top-level `<conditionalFormatting>` elements (in any
@@ -9561,6 +9606,54 @@ mod tests {
             sheet.hyperlinks.get(&(1, 1)).map(String::as_str),
             Some("#Sheet2!C3")
         );
+    }
+
+    /// #671 R14: removing a link survives the save, a range link touched
+    /// anywhere goes whole, and the others stay byte for byte.
+    #[test]
+    fn removed_hyperlinks_are_struck_on_save() {
+        use crate::edit::{ClearWhat, clear_areas};
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let rns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let xml = format!(
+            "<worksheet xmlns=\"{ns}\" xmlns:r=\"{rns}\"><sheetData/><hyperlinks>\
+             <hyperlink ref=\"A1:B2\" r:id=\"rId1\"/>\
+             <hyperlink ref=\"D4\" location=\"Sheet2!C3\"/></hyperlinks></worksheet>"
+        );
+        let mut targets = std::collections::HashMap::new();
+        targets.insert("rId1".to_string(), "https://example.com".to_string());
+        let load = |xml: &str| parse_worksheet(xml, &[], &targets);
+        let book = |sheet: Sheet| crate::sheet::Workbook {
+            sheets: vec![sheet],
+            ..Default::default()
+        };
+        // A partial clear: B2 of A1:B2 takes the whole link.
+        let mut wb = book(load(&xml));
+        assert_eq!(wb.sheets[0].hyperlinks.len(), 5);
+        clear_areas(&mut wb, 0, &[(1, 1, 1, 1)], ClearWhat::Hyperlinks, &[]).unwrap();
+        assert_eq!(wb.sheets[0].hyperlinks.len(), 1, "A1:B2 went whole");
+        let saved = splice_worksheet(&xml, &wb.sheets[0], "<sheetData/>");
+        assert!(!saved.contains("A1:B2"), "{saved}");
+        assert!(saved.contains("<hyperlink ref=\"D4\" location=\"Sheet2!C3\"/>"));
+        let back = load(&saved);
+        assert!(!back.hyperlinks.contains_key(&(1, 1)) && !back.hyperlinks.contains_key(&(0, 0)));
+        assert_eq!(back.hyperlinks.len(), 1);
+        // A full clear drops the block.
+        let mut wb = book(load(&xml));
+        clear_areas(
+            &mut wb,
+            0,
+            &[(0, 0, 9, 9)],
+            ClearWhat::RemoveHyperlinks,
+            &[],
+        )
+        .unwrap();
+        let saved = splice_worksheet(&xml, &wb.sheets[0], "<sheetData/>");
+        assert!(!saved.contains("hyperlink"), "{saved}");
+        assert!(load(&saved).hyperlinks.is_empty());
+        // Nothing removed: the part is left alone.
+        let wb = book(load(&xml));
+        assert!(splice_worksheet(&xml, &wb.sheets[0], "<sheetData/>").contains("A1:B2"));
     }
 
     #[test]

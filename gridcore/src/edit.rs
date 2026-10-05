@@ -12,7 +12,14 @@
 
 use std::collections::BTreeMap;
 
+mod clear;
 mod clip;
+mod goto_special;
+pub use clear::{ClearPlan, ClearWhat, MERGED_PART, apply_clear_sheet, clear_areas, clear_plan};
+pub use goto_special::{
+    GoSpecial, MAX_AREAS, NO_CELLS, TOO_MANY_AREAS, Types, current_region, go_to_special,
+    special_scope,
+};
 pub(crate) mod series;
 pub use clip::{
     MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block, translated_block,
