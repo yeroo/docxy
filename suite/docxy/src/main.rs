@@ -680,7 +680,7 @@ struct SheetView {
     dv_pending: Option<DvPending>,
     /// The move the commit now running makes once its entry is in, which a
     /// data-validation alert holds for Yes or OK; (0, 0) when none runs.
-    dv_then: (i32, i32),
+    dv_then: DvThen,
     /// Circle Invalid Data's circles: (sheet, row, col). View state, never
     /// saved, and a circle goes when its cell is valid (#689).
     circles: Vec<(usize, u32, u32)>,
@@ -1166,16 +1166,30 @@ fn act_targets_cells(act: SheetAct) -> bool {
     )
 }
 
+/// What a commit does once its entry is in: the move a key makes, or the
+/// selection change a click makes. A data-validation alert holds it for Yes
+/// or OK (Retry, No and Cancel never do it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DvThen {
+    Move(i32, i32),
+    /// A plain click: the cell becomes the selection.
+    Select(u32, u32),
+    /// A Shift+click: the active area extends to the cell.
+    Extend(u32, u32),
+    /// A Ctrl+click: the cell starts a new area.
+    AddArea(u32, u32),
+}
+
 /// A typed entry waiting on its data-validation alert: what it writes, the
-/// rule's violation, and the move to make once it is let in.
+/// rule's violation, and what to do once it is let in.
 #[derive(Clone, Debug)]
 struct DvPending {
     origin: (usize, u32, u32),
     /// What the entry writes: its cell, or the whole range of a Ctrl+Enter.
     cells: Vec<(u32, u32, gridcore::sheet::Cell)>,
     violation: gridcore::validation::Violation,
-    /// The move Yes or OK goes on to make; `None` keeps the selection.
-    then: Option<(i32, i32)>,
+    /// What Yes or OK goes on to do; `None` keeps the selection.
+    then: Option<DvThen>,
 }
 
 /// A live text field: which target it edits, its buffer, the caret and the
@@ -2405,7 +2419,7 @@ impl SheetView {
         &mut self,
         origin: (usize, u32, u32),
         cells: Vec<(u32, u32, gridcore::sheet::Cell)>,
-        then: Option<(i32, i32)>,
+        then: Option<DvThen>,
     ) -> bool {
         let (s, r, c) = origin;
         let Some(cell) = cells.iter().find(|(cr, cc, _)| (*cr, *cc) == (r, c)) else {
@@ -2450,8 +2464,16 @@ impl SheetView {
                 .engine
                 .set_cells_prechecked(&mut self.pkg.workbook, s, cells),
         }
-        if let Some((dr, dc)) = p.then {
-            self.move_sel(dr, dc);
+        match p.then {
+            Some(DvThen::Move(dr, dc)) => self.move_sel(dr, dc),
+            Some(DvThen::Select(r, c)) => {
+                self.sel = (r, c);
+                self.anchor = (r, c);
+                self.clear_areas();
+            }
+            Some(DvThen::Extend(r, c)) => self.extend_active((r, c)),
+            Some(DvThen::AddArea(r, c)) => self.add_area((r, c)),
+            None => {}
         }
         self.prune_circles();
         true
@@ -2808,14 +2830,22 @@ impl SheetView {
     /// refused: then the editor stays open, nothing moves, `entry_error` says
     /// why and this is `None`. `Some(committed)` otherwise.
     fn commit_and_move(&mut self, dr: i32, dc: i32) -> Option<bool> {
-        self.dv_then = (dr, dc);
+        let committed = self.commit_then(DvThen::Move(dr, dc))?;
+        self.move_sel(dr, dc);
+        self.prune_circles();
+        Some(committed)
+    }
+
+    /// Commit the editor, leaving the follow-up (`then`) to the caller; a
+    /// data-validation alert holds it instead. Refused as [`Self::commit_and_move`]
+    /// is: `None`, the editor kept.
+    fn commit_then(&mut self, then: DvThen) -> Option<bool> {
+        self.dv_then = then;
         let committed = self.commit_edit();
-        self.dv_then = (0, 0);
+        self.dv_then = DvThen::Move(0, 0);
         if self.entry_error.is_some() {
             return None;
         }
-        self.move_sel(dr, dc);
-        self.prune_circles();
         Some(committed)
     }
 
@@ -8923,7 +8953,7 @@ fn new_sheet_surface() -> Surface {
         last_format: None,
         entry_error: None,
         dv_pending: None,
-        dv_then: (0, 0),
+        dv_then: DvThen::Move(0, 0),
         circles: Vec::new(),
         engine,
         undo: vec![],
@@ -9005,7 +9035,7 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     last_format: None,
                     entry_error: None,
                     dv_pending: None,
-                    dv_then: (0, 0),
+                    dv_then: DvThen::Move(0, 0),
                     circles: Vec::new(),
                     engine,
                     undo: vec![],
@@ -10858,8 +10888,11 @@ impl Docxy {
             // would not. Escape is the way out of the field.
             return self.range_pick_to(row, col, true, cx);
         }
-        if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
-            self.sheet_commit(0, 0, cx); // commit in place before moving away
+        // Commit in place before moving away; an alert holds the click.
+        if self.active_sheet().is_some_and(|v| v.editing.is_some())
+            && !self.sheet_commit_then(DvThen::Select(row, col), cx)
+        {
+            return;
         }
         // The chart drops its handles and its source outlines; the cell ring
         // comes back out. The PANEL stays open on it — that is the sticky rule,
@@ -10888,8 +10921,10 @@ impl Docxy {
             // there is nothing to add to.
             return self.select_cell(row, col, cx);
         }
-        if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
-            self.sheet_commit(0, 0, cx);
+        if self.active_sheet().is_some_and(|v| v.editing.is_some())
+            && !self.sheet_commit_then(DvThen::AddArea(row, col), cx)
+        {
+            return;
         }
         if let Some(v) = self.active_sheet_mut() {
             v.add_area((row, col));
@@ -11079,8 +11114,10 @@ impl Docxy {
         // keyboard going to the one the chart is hiding. `select_cell` commits
         // in place for the same reason; a press on a card is as much a press
         // away from the cell as a press on another cell is.
-        if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
-            self.sheet_commit(0, 0, cx);
+        if self.active_sheet().is_some_and(|v| v.editing.is_some())
+            && !self.sheet_commit_then(DvThen::Move(0, 0), cx)
+        {
+            return;
         }
         self.chart_sel = after.chart;
         // The panel swaps to it, opening if it was shut.
@@ -13171,8 +13208,10 @@ impl Docxy {
             }
             return self.range_pick_to(row, col, false, cx);
         }
-        if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
-            self.sheet_commit(0, 0, cx);
+        if self.active_sheet().is_some_and(|v| v.editing.is_some())
+            && !self.sheet_commit_then(DvThen::Extend(row, col), cx)
+        {
+            return;
         }
         self.chart_sel = after.chart;
         self.chart_panel_event(PanelEvent::Deselect);
@@ -13777,6 +13816,28 @@ impl Docxy {
             .active_sheet()
             .and_then(|v| v.editing.as_ref().and(v.edit_origin));
         let res = self.active_sheet_mut().map(|v| v.commit_and_move(dr, dc));
+        self.finish_commit(res, origin, cx)
+    }
+
+    /// Commit the open editor before a pointer gesture changes the selection
+    /// (`then`). False when the entry was refused or is waiting on its
+    /// data-validation alert: the gesture then stops, and Yes or OK on the
+    /// alert goes on to make it.
+    fn sheet_commit_then(&mut self, then: DvThen, cx: &mut Context<Self>) -> bool {
+        let origin = self
+            .active_sheet()
+            .and_then(|v| v.editing.as_ref().and(v.edit_origin));
+        let res = self.active_sheet_mut().map(|v| v.commit_then(then));
+        self.finish_commit(res, origin, cx)
+    }
+
+    /// What a commit's result means for the app: dirty, Flash Fill, the alert.
+    fn finish_commit(
+        &mut self,
+        res: Option<Option<bool>>,
+        origin: Option<(usize, u32, u32)>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         cx.notify();
         match res {
             Some(Some(committed)) => {

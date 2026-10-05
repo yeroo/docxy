@@ -1047,4 +1047,56 @@ mod tests {
         assert_eq!(value(&mut t, "B2"), CellValue::Number(50.0));
         assert_eq!(value(&mut t, "B3"), CellValue::Empty);
     }
+
+    /// Type `text` into B2 and commit it the way a click away from it does
+    /// (`then` is the click), putting up the alert as the app does.
+    fn click_away(t: &mut DocTab, text: &str, then: crate::DvThen) -> Option<bool> {
+        select(t, "B2");
+        let v = view(t);
+        v.begin_cell_edit(Some(String::new()));
+        v.edit_caret = 0;
+        for ch in text.chars() {
+            v.edit_type(&ch.to_string());
+        }
+        let res = v.commit_then(then);
+        if let Some(p) = &view(t).dv_pending {
+            let d = alert_dialog(&p.violation);
+            t.dialogs.push(d);
+            view(t).entry_error = None;
+        }
+        res
+    }
+
+    #[test]
+    fn a_click_away_over_a_breaking_entry_waits_for_the_alert() {
+        use crate::DvThen::{AddArea, Extend, Select};
+        // Yes: the entry goes in, then the click's selection change is made.
+        for (then, check) in [
+            (Select(4, 3), "select"),
+            (Extend(4, 3), "extend"),
+            (AddArea(4, 3), "area"),
+        ] {
+            let mut t = book(AlertStyle::Warning);
+            assert_eq!(click_away(&mut t, "250", then), None, "{check}");
+            // The editor and the held entry survive until the alert is answered.
+            assert!(view(&mut t).editing.is_some() && view(&mut t).dv_pending.is_some());
+            assert_eq!(view(&mut t).sel, at("B2"), "{check}: nothing moved yet");
+            press(&mut t, "Yes").unwrap();
+            assert_eq!(value(&mut t, "B2"), CellValue::Number(250.0), "{check}");
+            let v = view(&mut t);
+            match check {
+                "select" => assert_eq!((v.sel, v.anchor), (at("D5"), at("D5"))),
+                "extend" => assert_eq!((v.anchor, v.sel), (at("B2"), at("D5"))),
+                _ => assert_eq!(v.sel, at("D5"), "a new area at the clicked cell"),
+            }
+        }
+        // No (and Retry): the text stays in the editor and the selection stays.
+        let mut t = book(AlertStyle::Warning);
+        click_away(&mut t, "250", Select(4, 3));
+        press(&mut t, "No").unwrap();
+        let v = view(&mut t);
+        assert_eq!(v.editing.as_deref(), Some("250"));
+        assert_eq!(v.sel, at("B2"));
+        assert_eq!(value(&mut t, "B2"), CellValue::Number(50.0));
+    }
 }
