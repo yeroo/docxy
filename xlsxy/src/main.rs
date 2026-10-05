@@ -1866,8 +1866,8 @@ struct DvAlert {
 
 /// The list-validation dropdown: the allowed values and the highlighted row.
 struct DvPicker {
-    values: Vec<String>,
-    /// What each value stands for, so picking enters it exactly.
+    /// The labels shown and the values they stand for, so picking enters the
+    /// value exactly.
     choices: Vec<gridcore::validation::ListChoice>,
     sel: usize,
 }
@@ -5101,25 +5101,20 @@ impl App {
         }
         let dv = dv.clone();
         let choices = self.resolve_list_values();
-        let values: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
-        if values.is_empty() {
+        if choices.is_empty() {
             self.status = Some(format!("List: {} (no resolvable values)", dv.formula1));
             return;
         }
         let current = self.current_input_text();
-        let sel = values.iter().position(|v| *v == current).unwrap_or(0);
-        self.dv_picker = Some(DvPicker {
-            values,
-            choices,
-            sel,
-        });
+        let sel = choices.iter().position(|c| c.label == current).unwrap_or(0);
+        self.dv_picker = Some(DvPicker { choices, sel });
     }
 
     fn dv_picker_key(&mut self, code: KeyCode) {
         let Some(p) = self.dv_picker.as_mut() else {
             return;
         };
-        let n = p.values.len();
+        let n = p.choices.len();
         match code {
             KeyCode::Esc => self.dv_picker = None,
             KeyCode::Up | KeyCode::Char('k') => p.sel = p.sel.saturating_sub(1),
@@ -9294,13 +9289,13 @@ fn draw_dv_alert(a: &DvAlert, f: &mut Frame, grid: Rect) {
 }
 
 fn draw_dv_picker(app: &App, p: &DvPicker, f: &mut Frame, grid: Rect) {
-    if p.values.is_empty() {
+    if p.choices.is_empty() {
         return;
     }
     let widest = p
-        .values
+        .choices
         .iter()
-        .map(|v| v.chars().count())
+        .map(|c| c.label.chars().count())
         .max()
         .unwrap_or(6)
         .max(8);
@@ -9309,7 +9304,7 @@ fn draw_dv_picker(app: &App, p: &DvPicker, f: &mut Frame, grid: Rect) {
     let w = ((widest + 4) as u16)
         .max(10)
         .min(grid.width.saturating_sub(2));
-    let h = (p.values.len() as u16 + 2).min(grid.height.max(3));
+    let h = (p.choices.len() as u16 + 2).min(grid.height.max(3));
     // Anchor under the cursor cell when it's on screen, else the grid's corner.
     let cell_x = app
         .vis_cols
@@ -9337,7 +9332,8 @@ fn draw_dv_picker(app: &App, p: &DvPicker, f: &mut Frame, grid: Rect) {
     ))];
     let vis = h.saturating_sub(2) as usize;
     let top = p.sel.saturating_sub(vis.saturating_sub(1));
-    for (i, v) in p.values.iter().enumerate().skip(top).take(vis) {
+    for (i, c) in p.choices.iter().enumerate().skip(top).take(vis) {
+        let v = &c.label;
         let style = if i == p.sel {
             Style::new().fg(Color::Black).bg(Color::Cyan)
         } else {
@@ -12657,7 +12653,8 @@ mod tests {
         assert!(app.current_validation().is_some());
         app.open_dv_dropdown();
         let p = app.dv_picker.as_ref().expect("dropdown opened");
-        assert_eq!(p.values, vec!["Yes", "No", "Maybe"]);
+        let labels: Vec<_> = p.choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["Yes", "No", "Maybe"]);
         // Move to "No" and commit → the cell takes that value.
         app.dv_picker_key(KeyCode::Down);
         app.dv_picker_key(KeyCode::Enter);
@@ -12669,6 +12666,28 @@ mod tests {
         assert!(app.current_validation().is_none());
         app.open_dv_dropdown();
         assert!(app.dv_picker.is_none());
+    }
+
+    #[test]
+    fn picking_a_number_from_an_inline_list_enters_a_number() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(0, 0, 4, 0)],
+                kind: "list".into(),
+                formula1: "\"1,2,3\"".into(),
+                ..Default::default()
+            });
+        app.cur = (0, 0);
+        app.open_dv_dropdown();
+        app.dv_picker_key(KeyCode::Down);
+        app.dv_picker_key(KeyCode::Enter);
+        assert_eq!(
+            app.sheet().cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(2.0))
+        );
     }
 
     #[test]

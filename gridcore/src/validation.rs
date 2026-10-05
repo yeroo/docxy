@@ -281,10 +281,26 @@ pub fn list_choices(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<V
             items
                 .into_iter()
                 .filter(|s| !s.is_empty())
-                .map(|s| ListChoice {
-                    label: s.clone(),
-                    value: CellValue::Text(s),
-                    code: None,
+                .map(|s| {
+                    // An inline item is entered the way typing it would be
+                    // read: `1` a number, `TRUE` a boolean, `10%` a percent,
+                    // `1/1/2024` a date (with its format).
+                    let ctx = crate::entry::EntryCtx {
+                        date1904: wb.date1904,
+                        ..Default::default()
+                    };
+                    match crate::entry::parse_entry(&s, &crate::sheet::Xf::default(), &ctx) {
+                        Ok(e) if e.cell.formula.is_none() && !e.quote_prefix => ListChoice {
+                            label: s,
+                            value: e.cell.value,
+                            code: e.format.map(str::to_string),
+                        },
+                        _ => ListChoice {
+                            value: CellValue::Text(s.clone()),
+                            label: s,
+                            code: None,
+                        },
+                    }
                 })
                 .collect(),
         );
@@ -294,7 +310,8 @@ pub fn list_choices(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<V
     let mut out = Vec::new();
     for (r, c) in cells {
         let v = to_cell_value(cell_value_at(wb, at, r, c));
-        if v.is_empty() {
+        // An error value is not a choice: the check rejects it too.
+        if v.is_empty() || matches!(v, CellValue::Error(_)) {
             continue;
         }
         let xf = wb.styles.xf(sh.cell(r, c).map_or(0, |cl| cl.style));
@@ -386,7 +403,12 @@ fn breaks(
             let text = text_of(value);
             !items.iter().any(|item| match (item, value) {
                 (CellValue::Number(a), CellValue::Number(b)) => a == b,
-                _ if is_inline => text_of(item).trim() == text,
+                // An inline item matches as the text it is, or as the value
+                // typing it would give (`20%` is 0.2, `TRUE` a boolean).
+                _ if is_inline => {
+                    text_of(item).trim() == text
+                        || inline_value(item, wb.date1904).as_ref() == Some(value)
+                }
                 _ => text_of(item).eq_ignore_ascii_case(&text),
             })
         }
@@ -397,6 +419,21 @@ fn breaks(
         },
         _ => false,
     }
+}
+
+/// The value typing the inline list item `item` would give, when it is a
+/// number, boolean or date rather than text.
+fn inline_value(item: &CellValue, date1904: bool) -> Option<CellValue> {
+    let CellValue::Text(t) = item else {
+        return None;
+    };
+    let ctx = crate::entry::EntryCtx {
+        date1904,
+        ..Default::default()
+    };
+    let e = crate::entry::parse_entry(t.trim(), &crate::sheet::Xf::default(), &ctx).ok()?;
+    (e.cell.formula.is_none() && !e.quote_prefix && !matches!(e.cell.value, CellValue::Text(_)))
+        .then_some(e.cell.value)
 }
 
 /// Is `n` outside what the rule's operator allows against the bounds? A
@@ -2007,5 +2044,59 @@ mod tests {
         assert_eq!(xf.code.as_deref(), Some("m/d/yyyy"));
         // And a value near but not equal to an item still breaks the rule.
         assert!(check(&mut wb, 9, 3, "3.14").is_some());
+    }
+
+    // ---- review r6 ----
+
+    #[test]
+    fn an_inline_item_is_entered_the_way_typing_it_reads() {
+        for (items, pick, want) in [
+            ("1,2,3", 0, CellValue::Number(1.0)),
+            ("TRUE,FALSE", 0, CellValue::Bool(true)),
+            ("10%,20%", 1, CellValue::Number(0.2)),
+            ("1/1/2024,2/1/2024", 0, CellValue::Number(45292.0)),
+            ("Yes,No", 0, CellValue::Text("Yes".into())),
+        ] {
+            let mut wb = book();
+            wb.styles.intern(crate::sheet::Xf::default());
+            let mut dv = rule("list", "", &format!("\"{items}\""), "");
+            dv.ranges = vec![(0, 3, 9, 3)];
+            wb.sheets[0].validations.push(dv);
+            let choices = list_choices(&wb, 0, 0, 3).unwrap();
+            let cell = pick_cell(&mut wb, 0, 9, 3, &choices[pick]);
+            assert_eq!(cell.value, want, "{items}");
+            assert!(check_entry(&mut wb, 0, 9, 3, &cell).is_none(), "{items}");
+        }
+        // A picked percent and date carry their format.
+        let mut wb = book();
+        wb.styles.intern(crate::sheet::Xf::default());
+        let mut dv = rule("list", "", "\"10%,1/1/2024\"", "");
+        dv.ranges = vec![(0, 3, 9, 3)];
+        wb.sheets[0].validations.push(dv);
+        let choices = list_choices(&wb, 0, 0, 3).unwrap();
+        let pct = pick_cell(&mut wb, 0, 9, 3, &choices[0]);
+        assert!(crate::entry::is_percent(&wb.styles.xf(pct.style)));
+        let date = pick_cell(&mut wb, 0, 9, 3, &choices[1]);
+        assert!(crate::entry::is_date(&wb.styles.xf(date.style)));
+    }
+
+    #[test]
+    fn an_error_cell_in_the_source_is_not_a_choice() {
+        let mut wb = book();
+        let s = &mut wb.sheets[0];
+        s.set_cell(0, 0, Cell::text("Yes"));
+        s.set_cell(1, 0, Cell::formula("NA()"));
+        s.set_cell(2, 0, Cell::text("No"));
+        let mut dv = rule("list", "", "$A$1:$A$3", "");
+        dv.ranges = vec![(0, 3, 9, 3)];
+        s.validations.push(dv);
+        let mut engine = crate::engine::Engine::new(&wb);
+        engine.recalc_all(&mut wb);
+        let labels: Vec<_> = list_choices(&wb, 0, 0, 3)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        assert_eq!(labels, ["Yes", "No"]);
     }
 }
