@@ -15,6 +15,10 @@ use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Workbook, cell_na
 
 use super::{Area, rects_overlap as overlaps};
 
+/// Why a block whose rows and columns no longer cover its cells is refused
+/// ([`ClipBlock::is_consistent`]).
+pub(crate) const BLOCK_STALE: &str = "The copy no longer matches its cells: copy again";
+
 /// Why a transposed paste of a spilling array is refused (#707 r5 m1).
 pub(crate) const TRANSPOSE_ARRAY: &str =
     "You can't transpose part of an array: paste its values instead.";
@@ -88,6 +92,7 @@ impl PasteWhat {
     }
 
     /// The option a label names, any case; also `comments`, `notes`.
+    #[cfg(test)]
     pub fn from_label(s: &str) -> Option<PasteWhat> {
         let s = s.trim();
         if s.eq_ignore_ascii_case("comments") || s.eq_ignore_ascii_case("notes") {
@@ -152,6 +157,7 @@ impl PasteOp {
         }
     }
 
+    #[cfg(test)]
     pub fn from_label(s: &str) -> Option<PasteOp> {
         PasteOp::ALL
             .into_iter()
@@ -207,6 +213,9 @@ pub struct ClipRule {
     pub formula2: String,
     pub prompt: Option<String>,
     pub cells: Vec<(usize, usize)>,
+    /// The source rule's anchor (the top-left of its ranges, as
+    /// `shift_rule_ranges` reads it): its formulas are relative to it.
+    pub anchor: (u32, u32),
 }
 
 /// The positions in sorted `v` of the values `lo..=hi`.
@@ -233,6 +242,11 @@ pub struct ClipBlock {
     pub notes: Vec<ClipNote>,
     /// The data validation over the copied cells.
     pub rules: Vec<ClipRule>,
+    /// Clipboard text from another program, each field read as typed where
+    /// it lands (`rows`/`cols` are those destinations): a formula in it is
+    /// never moved, even transposed, but kept as typed at its destination,
+    /// and Values evaluates it there (#707 r8 M2).
+    pub typed: bool,
 }
 
 impl ClipBlock {
@@ -270,7 +284,14 @@ impl ClipBlock {
                     cells.sort_unstable();
                     cells.dedup();
                 }
+                let anchor = dv
+                    .ranges
+                    .iter()
+                    .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, _, _)| {
+                        (r.min(r1), c.min(c1))
+                    });
                 (!cells.is_empty()).then(|| ClipRule {
+                    anchor,
                     kind: dv.kind.clone(),
                     operator: dv.operator.clone(),
                     formula1: dv.formula1.clone(),
@@ -289,6 +310,7 @@ impl ClipBlock {
             widths,
             notes: Vec::new(),
             rules,
+            typed: false,
         }
     }
 
@@ -311,8 +333,9 @@ impl ClipBlock {
 
     /// Whether every copied cell has its source row and column: a block
     /// whose `cells` outgrew `rows`/`cols` (its sheet gone, say, so
-    /// [`ClipBlock::capture`] found nothing) is not pasted (#707 r1).
-    pub fn is_consistent(&self) -> bool {
+    /// [`ClipBlock::capture`] found nothing) is refused by
+    /// [`paste_special_changes`] (#707 r1, r8).
+    pub(crate) fn is_consistent(&self) -> bool {
         self.cells.len() == self.rows.len()
             && self.cells.iter().all(|row| row.len() <= self.cols.len())
     }
@@ -511,9 +534,36 @@ pub fn paste_special_changes(
     clip: &ClipBlock,
     spec: &PasteSpec,
 ) -> Result<Vec<(u32, u32, Cell)>, &'static str> {
+    if !clip.is_consistent() {
+        return Err(BLOCK_STALE);
+    }
     let mut out = Vec::new();
     if !spec.what.pastes_contents() && spec.what != PasteWhat::Formats {
         return Ok(out);
+    }
+    // A typed formula pasted as a value: what it evaluates to where it
+    // lands, as the sheet stands before the paste.
+    let mut typed_values: std::collections::HashMap<(usize, usize), CellValue> = Default::default();
+    if clip.typed && spec.what.pastes_contents() && sheet < wb.sheets.len() {
+        let values_only = matches!(
+            spec.what,
+            PasteWhat::Values
+                | PasteWhat::ValuesAndNumberFormats
+                | PasteWhat::ValuesAndSourceFormatting
+        );
+        for (i, row) in clip.cells.iter().enumerate().take(clip.rows.len()) {
+            for (j, src) in row.iter().enumerate().take(clip.cols.len()) {
+                let (Some(f), Some(dest), true) = (
+                    src.formula.as_deref(),
+                    clip.dest(at, (i, j), spec.transpose),
+                    values_only,
+                ) else {
+                    continue;
+                };
+                let v = crate::engine::eval_formula_at(wb, sheet, dest.0, dest.1, f);
+                typed_values.insert((i, j), crate::engine::value_to_cell(v));
+            }
+        }
     }
     let Workbook { sheets, styles, .. } = wb;
     let Some(s) = sheets.get(sheet) else {
@@ -574,6 +624,8 @@ pub fn paste_special_changes(
             }
             let formula = if values_only {
                 None
+            } else if clip.typed {
+                src.formula.clone()
             } else {
                 src.formula.as_deref().map(|f| {
                     clip.moved_formula(f, (i, j), dest, at, spec.transpose, &s.name)
@@ -630,7 +682,9 @@ pub fn paste_special_changes(
                     c
                 }
                 None if values_only || !spec.what.all() => Cell {
-                    value: src.value.clone(),
+                    value: typed_values
+                        .remove(&(i, j))
+                        .unwrap_or_else(|| src.value.clone()),
                     ..Cell::default()
                 },
                 None => src.clone(),
@@ -677,31 +731,28 @@ pub fn paste_special_extras(clip: &ClipBlock, at: (u32, u32), spec: &PasteSpec) 
                 .iter()
                 .filter_map(|&ij| clip.dest(at, ij, spec.transpose))
                 .collect();
-            let Some(&first) = cells.first() else {
-                continue;
-            };
-            // The rule's relative references move with its first cell.
-            let (i0, j0) = rule.cells[0];
-            let (Some(&sr), Some(&sc)) = (clip.rows.get(i0), clip.cols.get(j0)) else {
-                continue;
-            };
-            let dr = i64::from(first.0) - i64::from(sr);
-            let dc = i64::from(first.1) - i64::from(sc);
-            let mv = |f: &str| {
-                if f.is_empty() || (dr, dc) == (0, 0) {
-                    f.to_string()
-                } else {
-                    translate_formula(f, dr, dc).unwrap_or_else(|| f.to_string())
-                }
-            };
-            let moved = ClipRule {
-                formula1: mv(&rule.formula1),
-                formula2: mv(&rule.formula2),
-                cells: Vec::new(),
-                ..rule.clone()
-            };
+            // The formulas read relative to the source rule's anchor; each
+            // rectangle pasted is a rule of its own, anchored at its
+            // top-left, so it reads them moved by the distance from the old
+            // anchor to that corner (#707 r8 M1).
             for rect in cells_to_rects(&cells) {
-                ex.rules.push((rect, moved.clone()));
+                let dr = i64::from(rect.0) - i64::from(rule.anchor.0);
+                let dc = i64::from(rect.1) - i64::from(rule.anchor.1);
+                let mv = |f: &str| {
+                    if f.is_empty() || (dr, dc) == (0, 0) {
+                        f.to_string()
+                    } else {
+                        translate_formula(f, dr, dc).unwrap_or_else(|| f.to_string())
+                    }
+                };
+                let moved = ClipRule {
+                    formula1: mv(&rule.formula1),
+                    formula2: mv(&rule.formula2),
+                    cells: Vec::new(),
+                    anchor: (rect.0, rect.1),
+                    ..rule.clone()
+                };
+                ex.rules.push((rect, moved));
             }
         }
     }
@@ -862,9 +913,6 @@ pub fn paste_special(
     }
     if clip.cells.is_empty() || at.0 >= MAX_ROWS || at.1 >= MAX_COLS {
         return Err("Nothing to paste".into());
-    }
-    if !clip.is_consistent() {
-        return Err("The copy no longer matches its cells: copy again".into());
     }
     let changes = paste_special_changes(wb, sheet, at, clip, spec)?;
     let ex = paste_special_extras(clip, at, spec);

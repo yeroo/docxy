@@ -46,6 +46,7 @@ impl ClearWhat {
         }
     }
 
+    #[cfg(test)]
     pub fn from_label(s: &str) -> Option<ClearWhat> {
         let s = s.trim();
         ClearWhat::ALL.into_iter().find(|w| {

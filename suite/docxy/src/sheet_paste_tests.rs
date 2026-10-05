@@ -433,3 +433,32 @@ fn a_pasted_note_replaces_a_thread_on_the_destination() {
         vec![("a thread".to_string(), true)]
     );
 }
+
+/// #707 r8 M2: a formula in text from another program is read as typed
+/// where it lands: All keeps it, Transpose keeps each as typed at its
+/// transposed cell, and Values gives what it evaluates to there.
+#[test]
+fn typed_formulas_in_text_paste_as_typed() {
+    let mut v = view();
+    put(&mut v, "A1", Cell::number(7.0));
+    put(&mut v, "A2", Cell::number(9.0));
+    let block = v.text_clip_block("=A1\n", at("C5"));
+    v.paste_special_at(&block, &PasteSpec::of(PasteWhat::All), at("C5"))
+        .unwrap();
+    assert_eq!(formula(&v, "C5").as_deref(), Some("A1"));
+    assert_eq!(value(&v, "C5"), CellValue::Number(7.0));
+    let block = v.text_clip_block("=A1+1\n=A2+1\n", at("C5"));
+    let spec = PasteSpec {
+        transpose: true,
+        ..PasteSpec::default()
+    };
+    v.paste_special_at(&block, &spec, at("C5")).unwrap();
+    assert_eq!(formula(&v, "C5").as_deref(), Some("A1+1"));
+    assert_eq!(formula(&v, "D5").as_deref(), Some("A2+1"));
+    assert_eq!(value(&v, "D5"), CellValue::Number(10.0));
+    let block = v.text_clip_block("=A1\n", at("E9"));
+    v.paste_special_at(&block, &PasteSpec::of(PasteWhat::Values), at("E9"))
+        .unwrap();
+    assert_eq!(formula(&v, "E9"), None);
+    assert_eq!(value(&v, "E9"), CellValue::Number(7.0));
+}

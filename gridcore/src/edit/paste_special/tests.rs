@@ -511,7 +511,7 @@ fn a_malformed_block_is_refused_and_never_panics() {
     clip.cells = vec![vec![Cell::number(1.0)], vec![Cell::formula("A1*3")]];
     assert!(!clip.is_consistent());
     assert!(paste_special(&mut wb, 0, at("C1"), &clip, &PasteSpec::default()).is_err());
-    // The cell writes alone skip what they cannot place; transposed too.
+    // The cell writes refuse it themselves (#707 r8 i2); transposed too.
     clip.rows = vec![0];
     clip.cols = vec![0];
     for transpose in [false, true] {
@@ -519,9 +519,12 @@ fn a_malformed_block_is_refused_and_never_panics() {
             transpose,
             ..PasteSpec::default()
         };
-        let ch = paste_special_changes(&mut wb, 0, at("C1"), &clip, &spec).unwrap();
-        assert_eq!(ch.len(), 1);
+        assert_eq!(
+            paste_special_changes(&mut wb, 0, at("C1"), &clip, &spec),
+            Err(BLOCK_STALE)
+        );
     }
+    assert!(wb.sheets[0].cells.is_empty());
     clip.rules = vec![ClipRule {
         kind: "list".into(),
         operator: String::new(),
@@ -529,6 +532,7 @@ fn a_malformed_block_is_refused_and_never_panics() {
         formula2: String::new(),
         prompt: None,
         cells: vec![(5, 5)],
+        anchor: (0, 0),
     }];
     let _ = paste_special_extras(&clip, at("C1"), &PasteSpec::of(PasteWhat::Validation));
 }
@@ -776,4 +780,62 @@ fn a_50k_row_copy_with_rules_notes_and_styles_is_fast() {
 
 fn a_style(r: u32, styles: &[u32]) -> u32 {
     styles[(r as usize * 7) % styles.len()]
+}
+
+/// A custom rule over `ranges` reading `f`.
+fn custom_rule(ranges: Vec<Area>, f: &str) -> DataValidation {
+    DataValidation {
+        ranges,
+        kind: "custom".into(),
+        operator: String::new(),
+        formula1: f.into(),
+        formula2: String::new(),
+        prompt: None,
+        ix: None,
+    }
+}
+
+/// The rules a Validation paste of `from` at `to` adds: (rect, formula1).
+fn pasted_rules(wb: &Workbook, from: &str, to: &str) -> Vec<(Area, String)> {
+    let clip = copy(wb, 0, from);
+    paste_special_extras(&clip, at(to), &PasteSpec::of(PasteWhat::Validation))
+        .rules
+        .into_iter()
+        .map(|(rect, r)| (rect, r.formula1))
+        .collect()
+}
+
+/// #707 r8 M1: a pasted rule reads its formulas from the source rule's
+/// anchor, moved to each pasted rectangle's top-left, as Excel does.
+#[test]
+fn pasted_validation_reads_from_the_rules_anchor() {
+    let mut wb = book(&[("Sheet1", &[])]);
+    // The repro: A1>0 over A1:A10; A5 pasted at C5 reads C5.
+    wb.sheets[0].validations = vec![custom_rule(vec![(0, 0, 9, 0)], "A1>0")];
+    assert_eq!(
+        pasted_rules(&wb, "A5", "C5"),
+        vec![((4, 2, 4, 2), "C5>0".to_string())]
+    );
+    // A rule of two ranges whose anchor is the second's corner: B6 reads
+    // itself, and so does the cell it lands on.
+    wb.sheets[0].validations = vec![custom_rule(vec![(5, 1, 6, 1), (0, 0, 1, 0)], "A1>0")];
+    assert_eq!(
+        pasted_rules(&wb, "B6", "D1"),
+        vec![((0, 3, 0, 3), "D1>0".to_string())]
+    );
+    // Copied cells that split in two rectangles: each reads its own cells.
+    wb.sheets[0].validations = vec![custom_rule(vec![(0, 0, 0, 0), (2, 0, 2, 0)], "A1>0")];
+    assert_eq!(
+        pasted_rules(&wb, "A1:A3", "C5"),
+        vec![
+            ((4, 2, 4, 2), "C5>0".to_string()),
+            ((6, 2, 6, 2), "C7>0".to_string())
+        ]
+    );
+    // An absolute reference stays.
+    wb.sheets[0].validations = vec![custom_rule(vec![(0, 0, 9, 0)], "$A$1>0")];
+    assert_eq!(
+        pasted_rules(&wb, "A5", "C5"),
+        vec![((4, 2, 4, 2), "$A$1>0".to_string())]
+    );
 }

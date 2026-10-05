@@ -834,8 +834,8 @@ pub enum FillTarget {
     None,
     /// A fill into `dest`, in `dir` (beside the source, along one axis).
     Extend { dir: FillDir, dest: Area },
-    /// The handle was dragged back inside the source: `cells` leave the
-    /// selection and are cleared (contents only).
+    /// The handle was dragged back inside the source: the cells of this
+    /// rectangle leave the selection and are cleared (contents only).
     Clear(Area),
 }
 

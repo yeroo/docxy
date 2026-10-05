@@ -1029,7 +1029,9 @@ fn multi_area_ok(act: SheetAct) -> bool {
 /// ones that never touch it — protection, the outline level buttons, Clear
 /// Outline and the outline Settings are properties of the whole sheet, the
 /// Number format combo only opens or closes its strip (a format picked there
-/// is what acts on cells), and `Todo` does nothing at all. Group, Ungroup,
+/// is what acts on cells), a `Menu` only opens a dropdown (its items are what
+/// act), the Office Clipboard pane and Edit Custom Lists are the app's own
+/// state rather than the cells', and `Todo` does nothing at all. Group, Ungroup,
 /// Show/Hide Detail, Auto Outline and Subtotal read the selection, and
 /// Consolidate writes at the selected cell.
 fn act_targets_cells(act: SheetAct) -> bool {
@@ -10059,6 +10061,30 @@ impl Docxy {
     /// (#545) do hit-test through gpui, but a case built on the handler
     /// verbs cannot see a handler added here. This guard can. See
     /// `docs/ui-test-harness.md`.
+    /// A right-button press on the fill handle: the fill arms, and its
+    /// release opens the fill menu (#668). The handle's own handler and the
+    /// harness's `fill-drag` both press through here.
+    fn sheet_fill_start_right(&mut self, cx: &mut Context<Self>) {
+        self.sheet_fill_start(cx);
+        if let Some(f) = self.sheet_fill.as_mut() {
+            f.right = true;
+        }
+    }
+
+    /// The pointer over (r, c) with the left button held, Ctrl as `ctrl`: a
+    /// block dragged by its border goes there (#670), a fill swaps copy and
+    /// series with Ctrl (#668), and anything else sweeps the selection. The
+    /// cell's move handler and the harness's drags both go through here.
+    fn grid_left_drag_over(&mut self, r: u32, c: u32, ctrl: bool, cx: &mut Context<Self>) {
+        if self.drops.border_drag.is_some() {
+            return self.border_drag_over((r, c), ctrl, cx);
+        }
+        if let Some(f) = self.sheet_fill.as_mut() {
+            f.ctrl = ctrl;
+        }
+        self.grid_drag_over(r, c, cx)
+    }
+
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
         // A new gesture: a drop still waiting on its menu is over.
         self.drops.new_gesture();
@@ -11649,19 +11675,11 @@ impl Docxy {
         if after == before {
             return;
         }
-        let Some((r0, c0, r1, c1)) = after else {
+        let Some(rect) = after else {
             return;
         };
         if let Some(v) = self.active_sheet_mut() {
-            // Reveal the far end first, then the near one: a range that fits
-            // ends up wholly in view, and one that doesn't shows its start.
-            let (near, far) = (v.row_list_index(r0), v.row_list_index(r1));
-            v.vlist.scroll_to_reveal_item(far);
-            v.vlist.scroll_to_reveal_item(near);
-            // A range to the LEFT can be scrolled to here; one to the right
-            // needs the grid width, which only the render pass knows.
-            v.col0 = v.col0.min(c0);
-            v.reveal_col = Some(c1);
+            v.reveal(rect);
         }
     }
 
@@ -29164,17 +29182,9 @@ fn sheet_row(
         cell = cell.on_mouse_move(move |ev, _window, cx| {
             let ctrl = ctrl_held(&ev.modifiers);
             match ev.pressed_button {
-                Some(MouseButton::Left) => ent_drag.update(cx, |this, cx| {
-                    // A block dragged by its border goes where this is (#670).
-                    if this.drops.border_drag.is_some() {
-                        return this.border_drag_over((r, c), ctrl, cx);
-                    }
-                    // Ctrl as a fill moves swaps copy and series (#668).
-                    if let Some(f) = this.sheet_fill.as_mut() {
-                        f.ctrl = ctrl;
-                    }
-                    this.grid_drag_over(r, c, cx)
-                }),
+                Some(MouseButton::Left) => {
+                    ent_drag.update(cx, |this, cx| this.grid_left_drag_over(r, c, ctrl, cx))
+                }
                 Some(MouseButton::Right) => ent_drag.update(cx, |this, cx| {
                     if this.drops.border_drag.is_some_and(|d| d.right) {
                         return this.border_drag_over((r, c), ctrl, cx);
@@ -29316,12 +29326,7 @@ fn sheet_row(
                     // A right-drag opens the fill menu where it is let go.
                     .on_mouse_down(MouseButton::Right, move |_ev, _w, cx2| {
                         cx2.stop_propagation();
-                        ent_fill_dn.update(cx2, |this, cx2| {
-                            this.sheet_fill_start(cx2);
-                            if let Some(f) = this.sheet_fill.as_mut() {
-                                f.right = true;
-                            }
-                        });
+                        ent_fill_dn.update(cx2, |this, cx2| this.sheet_fill_start_right(cx2));
                     })
                     .child(
                         // A 6px square in a 1px white surround, so it reads against

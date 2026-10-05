@@ -3505,10 +3505,12 @@ pub fn dispatch(
                 }
                 return Done::ok(reply);
             }
-            app.sheet_fill_start(cx);
-            if let Some(f) = app.sheet_fill.as_mut() {
-                f.ctrl = ctrl;
-                f.right = right;
+            // Pressed and moved as the handle's and the cells' own handlers
+            // press and move: a right press, and Ctrl held in each move.
+            if right {
+                app.sheet_fill_start_right(cx);
+            } else {
+                app.sheet_fill_start(cx);
             }
             if app.sheet_fill.is_none() {
                 return Err(if app.protected_view() {
@@ -3526,7 +3528,7 @@ pub fn dispatch(
                 if right {
                     app.sheet_fill_over(r, c, cx);
                 } else {
-                    app.grid_drag_over(r, c, cx);
+                    app.grid_left_drag_over(r, c, ctrl, cx);
                 }
             }
             if right {

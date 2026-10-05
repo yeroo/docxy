@@ -129,7 +129,9 @@ impl SheetView {
     }
 
     /// Clipboard text as a [`ClipBlock`], for Paste Special's All, Values and
-    /// Transpose of text (no formulas to translate).
+    /// Transpose of text: each field read as typed where it lands, so its
+    /// source is its destination and a typed formula is never moved
+    /// ([`ClipBlock::typed`]).
     pub(crate) fn text_clip_block(&mut self, text: &str, at: (u32, u32)) -> ClipBlock {
         let cells = self.text_block(text, at);
         let w = cells.iter().map(Vec::len).max().unwrap_or(0);
@@ -138,8 +140,9 @@ impl SheetView {
             row.resize(w, Cell::default());
         }
         ClipBlock {
-            rows: (0..cells.len() as u32).collect(),
-            cols: (0..w as u32).collect(),
+            rows: (0..cells.len() as u32).map(|i| at.0 + i).collect(),
+            cols: (0..w as u32).map(|j| at.1 + j).collect(),
+            typed: true,
             sheet: self.active,
             sheet_name: self.sheet().name.clone(),
             widths: vec![gridcore::sheet::DEFAULT_COL_WIDTH; w],
