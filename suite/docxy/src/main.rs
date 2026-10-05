@@ -631,6 +631,8 @@ struct SheetView {
     /// Formula AutoComplete's list for the open editor (#686), kept with the
     /// buffer it was made for ([`sheet_complete::CompleteList`]).
     edit_complete: Option<sheet_complete::CompleteList>,
+    /// That list's scroll: its highlighted row is kept in view.
+    fx_scroll: ScrollHandle,
     /// Flash Fill's greyed preview after a typed commit, and the last fill
     /// for its Options button (#666); each stands only while nothing has
     /// moved on from it ([`SheetView::live_preview`],
@@ -1740,8 +1742,11 @@ impl SheetView {
     /// feed, the Ctrl+; / Ctrl+' entry chords — drops the suffix first, as
     /// typing does, so it lands after the typed text. A key that moves the
     /// caret or rewrites the buffer (Home/End, F2/F4/F9, Insert, Edit-mode
-    /// Left/Right, Ctrl+Left/Right/Delete/Z) keeps the text and drops only
-    /// the marker. Every other key leaves it live: the keys that commit
+    /// Left/Right, Ctrl+Left/Right/Delete) keeps the text and drops only
+    /// the marker. Ctrl+Z drops the suffix too, as a typed character does:
+    /// it may take back the AutoCorrect change the proposal was made from,
+    /// and the suffix is not part of what was typed. Every other key leaves
+    /// it live: the keys that commit
     /// (Enter, Tab, Ctrl+Enter, Ctrl+S's save) take it in `commit_edit`, and
     /// Backspace, Delete and typing handle it themselves.
     fn proposal_before_key(&mut self, key: &str, ctrl: bool, alt: bool) {
@@ -1836,6 +1841,12 @@ impl SheetView {
         self.edit_complete = None;
         self.edit_correction = None;
         self.edit_kept = None;
+        self.edit_typed_tail = None;
+    }
+
+    /// A caret move or a deletion: the last word is no longer the one just
+    /// typed, so the commit's AutoCorrect leaves it (#667).
+    fn edit_tail_left(&mut self) {
         self.edit_typed_tail = None;
     }
 
@@ -2280,9 +2291,7 @@ impl SheetView {
 
     /// Ctrl+Left / Ctrl+Right: to the start of the previous / next word.
     fn edit_word_move(&mut self, forward: bool) {
-        // A caret move or a deletion: the last word is no longer the one
-        // just typed (the commit's AutoCorrect, #667).
-        self.edit_typed_tail = None;
+        self.edit_tail_left();
         let chars: Vec<char> = self.editing.as_deref().unwrap_or("").chars().collect();
         let word = |c: char| c.is_alphanumeric() || c == '_';
         let mut i = self.edit_caret.min(chars.len());
@@ -2306,9 +2315,7 @@ impl SheetView {
 
     /// Ctrl+Delete: delete from the caret to the end of the text.
     fn edit_delete_to_end(&mut self) {
-        // A caret move or a deletion: the last word is no longer the one
-        // just typed (the commit's AutoCorrect, #667).
-        self.edit_typed_tail = None;
+        self.edit_tail_left();
         let caret = self.edit_caret;
         if let Some(buf) = self.editing.as_mut() {
             let at = char_to_byte(buf, caret);
@@ -2785,18 +2792,14 @@ impl SheetView {
     }
     /// Delete the char before the caret (Backspace).
     fn edit_backspace(&mut self) {
-        // A caret move or a deletion: the last word is no longer the one
-        // just typed (the commit's AutoCorrect, #667).
-        self.edit_typed_tail = None;
+        self.edit_tail_left();
         if let Some(buf) = self.editing.as_mut() {
             buf_backspace(buf, &mut self.edit_caret);
         }
     }
     /// Delete the char at the caret (Delete).
     fn edit_delete(&mut self) {
-        // A caret move or a deletion: the last word is no longer the one
-        // just typed (the commit's AutoCorrect, #667).
-        self.edit_typed_tail = None;
+        self.edit_tail_left();
         let caret = self.edit_caret;
         if let Some(buf) = self.editing.as_mut() {
             buf_delete(buf, caret);
@@ -2804,9 +2807,7 @@ impl SheetView {
     }
     /// Move the caret by `delta` chars, clamped to the buffer.
     fn edit_move(&mut self, delta: i32) {
-        // A caret move or a deletion: the last word is no longer the one
-        // just typed (the commit's AutoCorrect, #667).
-        self.edit_typed_tail = None;
+        self.edit_tail_left();
         let n = self.edit_len() as i32;
         self.edit_caret = (self.edit_caret as i32 + delta).clamp(0, n) as usize;
     }
@@ -3361,6 +3362,9 @@ struct Docxy {
     picker: Option<PickKind>,
     // Scroll handle for the document body, so the caret can be kept in view.
     doc_scroll: ScrollHandle,
+    /// The open menu's scroll, and Formula AutoComplete's list's (their
+    /// highlighted row is scrolled into view).
+    menu_scroll: ScrollHandle,
     // New-comment entry bar (Review ▸ New comment); routes keys while open.
     comment_open: bool,
     comment_text: String,
@@ -5790,7 +5794,7 @@ fn fx_segment(
                 if let Some(v) = this.active_sheet_mut() {
                     v.edit_caret = idx;
                     v.edit_proposal = None;
-                    v.edit_typed_tail = None;
+                    v.edit_tail_left();
                 }
                 cx.notify();
             });
@@ -8112,6 +8116,7 @@ fn new_sheet_surface() -> Surface {
         edit_opts: EditOptions::default(),
         edit_proposal: None,
         edit_complete: None,
+        fx_scroll: ScrollHandle::new(),
         flash_preview: None,
         last_flash: None,
         autocorrect: Default::default(),
@@ -8187,6 +8192,7 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     edit_opts: EditOptions::default(),
                     edit_proposal: None,
                     edit_complete: None,
+                    fx_scroll: ScrollHandle::new(),
                     flash_preview: None,
                     last_flash: None,
                     autocorrect: Default::default(),
@@ -9153,6 +9159,7 @@ impl Docxy {
             find_cur: None,
             picker: None,
             doc_scroll: ScrollHandle::new(),
+            menu_scroll: ScrollHandle::new(),
             comment_open: false,
             comment_text: String::new(),
             show_marks: false,
@@ -15237,14 +15244,14 @@ impl Docxy {
             "home" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_caret = 0;
-                    v.edit_typed_tail = None;
+                    v.edit_tail_left();
                 }
                 cx.notify();
             }
             "end" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_caret_to_end();
-                    v.edit_typed_tail = None;
+                    v.edit_tail_left();
                 }
                 cx.notify();
             }
@@ -23026,6 +23033,9 @@ impl Docxy {
         match key {
             "down" | "up" => {
                 menu.step(key == "down");
+                if let Some(i) = menu.hi {
+                    self.menu_scroll.scroll_to_item(i);
+                }
                 cx.notify();
             }
             "enter" => {
@@ -23086,8 +23096,14 @@ impl Docxy {
     /// click; a ticked item shows its tick where the icon goes.
     fn menu_el(&self, menu: &menu::Menu, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         use menu::MenuItem;
+        // Bounded and scrollable: a menu holding data (the pick list) can
+        // outgrow the window. Up/Down scroll the highlight into view.
         let mut list = v_flex()
+            .id("menu-list")
             .min_w(px(200.))
+            .max_h(px(320.))
+            .overflow_y_scroll()
+            .track_scroll(&self.menu_scroll)
             .py_1()
             .rounded_md()
             .bg(pal.panel)
@@ -30364,7 +30380,10 @@ fn sheet_el(
                     .text_color(hsla_u(0x333333))
                     .child("\u{26a1}")
                     .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
                         ent_btn.update(cx, |this, cx| {
+                            // The button is drawn only while a fill stands, so
+                            // the only refusal (no fill) cannot happen here.
                             let _ = this.open_flash_menu(cx);
                         });
                     })
@@ -30390,10 +30409,12 @@ fn sheet_el(
                 .min_w(px(200.))
                 .max_h(px(220.))
                 .overflow_y_scroll()
+                .track_scroll(&view.fx_scroll)
                 .bg(hsla_u(0xffffff))
                 .border_1()
                 .border_color(hsla_u(0x9a9a9a))
                 .rounded_sm();
+            view.fx_scroll.scroll_to_item(c.sel);
             for (i, item) in c.list.items.iter().enumerate() {
                 let mark = match item.kind {
                     gridcore::fcomplete::Kind::Function => "fx",

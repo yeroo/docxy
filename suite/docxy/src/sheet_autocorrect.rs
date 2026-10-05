@@ -449,17 +449,17 @@ fn redefine_click(
     button: &str,
 ) -> Result<bool, String> {
     let yes = presses(button, "Yes");
-    let mut staged = None;
     dialogs.click(button, |_| Ok(()))?;
-    if yes {
-        if let Ok(parent) = dialogs.top_dialog_mut() {
-            let (replace, with) = (text(parent, "replace"), text(parent, "with"));
-            ac.add(&replace, &with).map_err(|e| e.to_string())?;
-            refresh(parent, ac);
-            staged = Some(());
-        }
+    if !yes {
+        return Ok(false);
     }
-    Ok(staged.is_some())
+    let Ok(parent) = dialogs.top_dialog_mut() else {
+        return Ok(false);
+    };
+    let (replace, with) = (text(parent, "replace"), text(parent, "with"));
+    ac.add(&replace, &with).map_err(|e| e.to_string())?;
+    refresh(parent, ac);
+    Ok(true)
 }
 
 /// The Exceptions dialog's Add and Delete, on the tab it shows; OK and

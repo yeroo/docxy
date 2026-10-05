@@ -501,10 +501,16 @@ pub(crate) fn cell_menu() -> Vec<MenuItem> {
     ]
 }
 
-/// Pick From Drop-down List's menu (#665): one item per entry, in order.
+/// The most entries the pick list's menu holds (the filter checklist's
+/// bound too), so a column of unique text keeps the layout bounded.
+pub(crate) const PICK_MENU_MAX: usize = 10_000;
+
+/// Pick From Drop-down List's menu (#665): one item per entry, in order, up
+/// to [`PICK_MENU_MAX`].
 pub(crate) fn pick_menu(values: &[String]) -> Vec<MenuItem> {
     values
         .iter()
+        .take(PICK_MENU_MAX)
         .enumerate()
         .map(|(i, v)| {
             let at = u32::try_from(i).unwrap_or(u32::MAX);
@@ -692,6 +698,16 @@ mod tests {
         assert_eq!(
             MenuTarget::Row(None).to_json().get("row"),
             Some(&Json::Null)
+        );
+    }
+
+    #[test]
+    fn the_pick_menu_is_capped() {
+        let values: Vec<String> = (0..PICK_MENU_MAX + 5).map(|i| format!("v{i}")).collect();
+        let items = pick_menu(&values);
+        assert_eq!(items.len(), PICK_MENU_MAX);
+        assert!(
+            matches!(&items[PICK_MENU_MAX - 1], MenuItem::Item(e) if e.id == format!("pick-{}", PICK_MENU_MAX - 1))
         );
     }
 

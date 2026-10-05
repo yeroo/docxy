@@ -195,7 +195,7 @@ for the two ways a tab's semantics differ from a terminal instance.
   sidesteps the versioned-path problem entirely — see
   [docs/agent-control.md](../docs/agent-control.md#mcp-native-tools-in-claude-code).
 - **Tools** — the bundled server (`serverInfo.name` `"offxy"`) exposes exactly
-  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (81
+  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (83
   tools total): `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`,
   `docxy_read`, `docxy_find`, `docxy_replace_range`, `docxy_insert`,
   `docxy_append`, `docxy_save`, `docxy_export`, `docxy_export_pdf`,

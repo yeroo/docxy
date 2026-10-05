@@ -167,10 +167,23 @@ fn the_preview_goes_with_any_move_and_obeys_the_option() {
         "dropped, not hidden: no revival"
     );
     assert!(!v.accept_preview());
+    // An edit alone (the selection unchanged) retires a fresh preview.
+    let mut v = names();
+    type_enter(&mut v, 0, 1, "Ada");
+    type_enter(&mut v, 1, 1, "Alan");
+    assert!(v.live_preview().is_some(), "a fresh preview");
     put(&mut v, 9, 9, "x");
     v.push_undo();
-    assert!(v.live_preview().is_none(), "an edit");
+    assert!(v.live_preview().is_none(), "the edit generation moved");
     assert!(!v.accept_preview());
+    // The per-frame path (`stamp_edit_opts`) drops it for good as well.
+    let mut v = names();
+    type_enter(&mut v, 0, 1, "Ada");
+    type_enter(&mut v, 1, 1, "Alan");
+    select(&mut v, 7, 7);
+    v.retire_stale_preview();
+    select(&mut v, 2, 1);
+    assert!(v.flash_preview.is_none(), "gone from the state, not hidden");
     // Automatically Flash Fill off: no preview.
     let mut v = names();
     v.edit_opts.flash_fill_auto = false;
