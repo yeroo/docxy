@@ -108,14 +108,18 @@ test keys pressed in the Backstage do not reach the hidden tab
   assert dialog is none
   assert title is basic.docx
 
-# The window cannot be shorter than 420 (`window_min_size`) and the rail's six
-# or seven items fit in that, so this only asserts the rail fits at the
-# minimum window (`rail_last_item_visible` is true for a rail that fits). It
-# does not test that the rail scrolls: no window is short enough to need it.
-test the rail fits in the shortest window
+# The window cannot be shorter than 420 (`window_min_size`), and the rail's
+# items (Account included) overflow that, so the rail must scroll: it is not at
+# its end until the wheel takes it there.
+test the rail scrolls in the shortest window
   open ../fixtures/basic.docx
   call window-size {"w":1000,"h":300}
   call backstage {"action":"open"}
+  shot window
+  call backstage-layout {}
+  assert reply.rail_scrollable is true
+  assert reply.rail_last_item_visible is false
+  call pointer-wheel {"region":"backstage-rail","dy":-6000}
   shot window
   call backstage-layout {}
   assert reply.rail_last_item_visible is true
@@ -149,4 +153,11 @@ test every Backstage page is reachable at 1000x500
   shot window
   call backstage-layout {}
   assert reply.page is info
+  assert reply.last_item_visible is true
+  call backstage-page {"page":"account"}
+  shot window
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.page is account
   assert reply.last_item_visible is true

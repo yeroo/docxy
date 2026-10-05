@@ -10193,6 +10193,7 @@ impl Docxy {
         self.bs_info = false;
         self.bs_info_status = None;
         self.bs_new = false;
+        self.reset_backstage_scroll();
         cx.notify();
     }
 
@@ -28252,8 +28253,7 @@ impl Docxy {
         let info = about::info();
         let page = v_flex()
             .relative()
-            .flex_1()
-            .h_full()
+            .w_full()
             .p_8()
             .gap_4()
             .bg(bg)

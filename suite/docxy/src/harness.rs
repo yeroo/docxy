@@ -1048,7 +1048,9 @@ fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
 fn backstage_layout_json(app: &crate::Docxy) -> Json {
     let pane = crate::BackstageLayout::read(&app.bs_scroll);
     let rail = crate::BackstageLayout::read(&app.bs_rail_scroll);
-    let page = if app.bs_new {
+    let page = if app.bs_account {
+        "account"
+    } else if app.bs_new {
         "new"
     } else if app.bs_info {
         "info"
@@ -3757,8 +3759,9 @@ fn dispatch_verb(
                     }
                     app.backstage_rail_action(crate::BackstageRailAction::Info, window, cx)
                 }
+                "account" => app.open_account(cx),
                 "open" => app.show_backstage_open_page(),
-                _ => return Err("'page' must be new, info or open".into()),
+                _ => return Err("'page' must be new, info, account or open".into()),
             }
             Done::ok(backstage_layout_json(app))
         }
