@@ -3210,7 +3210,8 @@ fn dispatch_verb(
             Done::ok(state(app, window))
         }
         // Settings' User name... row (#620): opens its dialog on the active
-        // tab, which `dialog-set` and `dialog-click` then drive.
+        // tab's stack, or the app's own with no document open (#1027), which
+        // `dialog-set` and `dialog-click` then drive.
         "user-name" => {
             app.open_user_name_dialog()?;
             cx.notify();

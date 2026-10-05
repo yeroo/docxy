@@ -1,6 +1,6 @@
 # The User name dialog with no document open (#1027): the Start page has no tab
-# to hold the dialog, so it sits on the app's own stack. This file has only
-# this case: it closes every tab, and cases in one file share one instance.
+# to hold the dialog, so it sits on the app's own stack. Cases in one file share
+# one instance: the first closes every tab and the later ones rely on that.
 
 test the user name dialog opened from the Backstage row takes typed text with no document open
   open copy:../fixtures/basic.docx
@@ -22,6 +22,7 @@ test the user name dialog opened from the Backstage row takes typed text with no
   assert user_initials is JD
 
 test a tab arriving under the open dialog does not strand it
+  assert tabs is 0
   call backstage {"action":"open"}
   call user-name {}
   assert dialog is user-name

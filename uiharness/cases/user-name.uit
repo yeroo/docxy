@@ -108,15 +108,18 @@ test Ctrl+V pastes the clipboard over the selected text
   assert reply.controls.0.value is Pat Lee
   call real-key {"key":"escape"}
 
-test keys in Backstage with no dialog edit nothing under it
+test keys in Backstage with no dialog edit or save the document under it
   open copy:../fixtures/basic.docx
+  type hello
+  assert text is hello
+  assert dirty is true
   call backstage {"action":"open"}
   call real-type {"text":"abc"}
-  call real-key {"keys":["backspace","enter","delete"]}
+  call real-key {"keys":["backspace","enter","delete","ctrl+b","ctrl+z"]}
   call backstage {"action":"close"}
-  assert dirty is false
-  assert text is not ab
+  assert text is hello
+  assert dirty is true
   call backstage {"action":"open"}
-  call real-key {"keys":["ctrl+b","ctrl+z","ctrl+s"]}
+  call real-key {"key":"ctrl+s"}
   call backstage {"action":"close"}
-  assert dirty is false
+  assert dirty is true

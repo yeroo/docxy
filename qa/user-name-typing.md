@@ -15,11 +15,12 @@ config (`DOCXY_CONFIG` or a fresh profile), never your own.
 
 **Steps:**
 1. File › scroll to Settings › click **User name...**.
-2. Without clicking, type `Jane Doe`. Press Tab, type `JD`.
-3. In the first field use Ctrl+A, then type `Jane`; press Home, Right, Delete;
-   press End, Left, then type `x`; press Shift+Home, then Backspace.
+2. Without clicking, press Ctrl+A and type `Jane Doe`. Press Tab, Ctrl+A, type `JD`.
+3. Drills, in the first field (finish each by retyping the text with Ctrl+A):
+   type `Jane`, press Home, Right, Delete; press End, Left, then type `x`;
+   press Shift+Home, then Backspace.
 4. Click between two letters of a field and type; paste text with Ctrl+V over a
-   Ctrl+A selection.
+   Ctrl+A selection. Then Ctrl+A in each field and set `Jane Doe` and `JD` again.
 5. Press OK. Close File, select a word, Review › New Comment, type `hi`, Enter.
 
 **Expect:** the first field has the caret as soon as the dialog opens; every

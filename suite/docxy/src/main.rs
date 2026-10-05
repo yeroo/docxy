@@ -17860,7 +17860,7 @@ impl Docxy {
         }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
-            if self.keytips == KeyTip::Off && !self.backstage {
+            if self.keytips == KeyTip::Off {
                 self.mini_bar = None;
                 self.project_tab_key(false, window, cx);
             }
@@ -17876,7 +17876,7 @@ impl Docxy {
             cx.notify();
             return;
         }
-        if self.keytips != KeyTip::Off || self.comment_open || self.backstage {
+        if self.keytips != KeyTip::Off || self.comment_open {
             return;
         }
         self.mini_bar = None;
@@ -17974,13 +17974,13 @@ impl Docxy {
         }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
-            if self.keytips == KeyTip::Off && !self.backstage {
+            if self.keytips == KeyTip::Off {
                 self.mini_bar = None;
                 self.project_tab_key(true, window, cx);
             }
             return;
         }
-        if self.keytips != KeyTip::Off || self.find_open || self.comment_open || self.backstage {
+        if self.keytips != KeyTip::Off || self.find_open || self.comment_open {
             return;
         }
         self.mini_bar = None;
