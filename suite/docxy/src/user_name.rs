@@ -81,6 +81,8 @@ impl Docxy {
         if let Some((name, initials)) = accepted {
             self.user_name = name;
             self.user_initials = initials;
+            crate::set_configured_identity(&self.user_name, &self.user_initials);
+            crate::reauthor_tracking(&mut self.tabs, &self.user_name, &self.user_initials);
             self.persist();
         }
         Some(done)

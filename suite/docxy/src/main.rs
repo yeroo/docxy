@@ -81,6 +81,8 @@ mod table_dialogs;
 mod table_tab;
 mod table_view;
 mod tabstrip;
+#[cfg(test)]
+mod track_tests;
 mod trusted;
 mod ttc_dialog;
 mod user_name;
@@ -91,6 +93,7 @@ use std::path::PathBuf;
 
 use docxcore::comments::Comment;
 use docxcore::editor::{Caret, Clip, Editor, FoundMatch, step_found};
+use docxcore::markup::MarkupView;
 use docxcore::model::{
     Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign,
 };
@@ -955,6 +958,7 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
             | Act::ToggleComments
             | Act::ToggleNav
             | Act::ToggleNotes
+            | Act::Markup(_)
             | Act::DarkMode
             | Act::AutoHideRibbon
             | Act::PrintLayout
@@ -3447,6 +3451,14 @@ struct Docxy {
     menu_scroll: ScrollHandle,
     // New-comment entry bar (Review ▸ New comment); routes keys while open.
     comment_open: bool,
+    /// The comment the Review tab's Resolve acts on: the one last clicked in
+    /// the Comments pane, with the tab it is in (ids are per document). The tab
+    /// is named by its title and file ([`close::TabId`]), not its index, so
+    /// closing or moving tabs never points it at another document.
+    selected_comment: Option<(close::TabId, String)>,
+    /// Display for Review (#625): how tracked changes are shown. A view only,
+    /// not saved; No Markup and Original refuse edits.
+    markup: docxcore::markup::MarkupView,
     comment_text: String,
     // Show formatting marks (¶, tab arrows) — View ▸ Show/Hide.
     show_marks: bool,
@@ -5174,7 +5186,7 @@ impl Loaded {
             kind,
             title,
             path,
-            surface: Surface::Doc(Editor::new(self.doc)),
+            surface: Surface::Doc(new_doc_editor(self.doc, self.pkg.as_ref())),
             dirty,
             status: self.status,
             comments: self.comments,
@@ -5207,6 +5219,70 @@ impl Loaded {
 fn is_markdown_path(path: &std::path::Path) -> bool {
     let l = path.to_string_lossy().to_lowercase();
     l.ends_with(".md") || l.ends_with(".markdown") || l.ends_with(".mdown")
+}
+
+/// The reviewer name and initials the user configured (#620), for the
+/// editors built where no [`Docxy`] is at hand (a load, a restore). Set when
+/// the session is read and whenever the user changes it, so a file that opens
+/// with Track Changes on records as the same reviewer as its comments and
+/// the Track Changes toggle do.
+static CONFIGURED_IDENTITY: std::sync::Mutex<(String, String)> =
+    std::sync::Mutex::new((String::new(), String::new()));
+
+/// The raw configured name and initials (empty when none), to put back.
+#[cfg(test)]
+fn configured_identity_raw() -> (String, String) {
+    CONFIGURED_IDENTITY
+        .lock()
+        .map(|id| id.clone())
+        .unwrap_or_default()
+}
+
+fn set_configured_identity(name: &str, initials: &str) {
+    if let Ok(mut id) = CONFIGURED_IDENTITY.lock() {
+        *id = (name.to_string(), initials.to_string());
+    }
+}
+
+fn configured_identity() -> (String, String) {
+    let (name, initials) = CONFIGURED_IDENTITY
+        .lock()
+        .map(|id| id.clone())
+        .unwrap_or_default();
+    review_identity(&name, &initials)
+}
+
+/// Tabs already recording tracked changes keep recording, as the reviewer
+/// now configured (the user-name dialog changed it).
+fn reauthor_tracking(tabs: &mut [DocTab], user_name: &str, user_initials: &str) {
+    let author = track_author(&review_identity(user_name, user_initials));
+    for tab in tabs {
+        if let Surface::Doc(ed) = &mut tab.surface {
+            if ed.track_changes() {
+                ed.set_track_changes(Some(author.clone()));
+            }
+        }
+    }
+}
+
+/// A document editor over `doc`, recording tracked changes when the file's
+/// settings ask for it (`w:trackRevisions`, #624), as the configured reviewer
+/// ([`configured_identity`]). The Review tab's Track Changes turns it on or
+/// off after that.
+fn new_doc_editor(doc: Document, pkg: Option<&Package>) -> Editor {
+    let mut editor = Editor::new(doc);
+    if pkg.is_some_and(Package::track_revisions) {
+        editor.set_track_changes(Some(track_author(&configured_identity())));
+    }
+    editor
+}
+
+/// Who Track Changes records as: the reviewer identity (#620).
+fn track_author(identity: &(String, String)) -> docxcore::editor::TrackAuthor {
+    docxcore::editor::TrackAuthor {
+        author: identity.0.clone(),
+        clock: utc_now_iso,
+    }
 }
 
 /// Load a `.docx` from bytes, keeping the whole package so save stays lossless.
@@ -5320,7 +5396,7 @@ fn finish_pending_conversion(tab: &mut DocTab) {
     // The whole document is replaced: nothing of the placeholder is kept.
     tab.dirty = false;
     tab.hf_edit = None;
-    tab.surface = Surface::Doc(Editor::new(l.doc));
+    tab.surface = Surface::Doc(new_doc_editor(l.doc, l.pkg.as_ref()));
     tab.comments = l.comments;
     tab.tracked_comment_ids.clear();
     tab.comments_removed_all = false;
@@ -8337,7 +8413,7 @@ fn protected_rollback(tab: &mut DocTab) {
             (Some(_), None) | (None, _) => tab.path.clone().map(|p| reload_without_converting(&p)),
         };
         if let Some(l) = reloaded {
-            tab.surface = Surface::Doc(Editor::new(l.doc));
+            tab.surface = Surface::Doc(new_doc_editor(l.doc, l.pkg.as_ref()));
             tab.comments = l.comments;
             tab.tracked_comment_ids.clear();
             tab.comments_removed_all = false;
@@ -8443,7 +8519,7 @@ fn build_surface(
             Some(p) => {
                 let l = doc_from_path(p);
                 (
-                    Surface::Doc(Editor::new(l.doc)),
+                    Surface::Doc(new_doc_editor(l.doc, l.pkg.as_ref())),
                     l.comments,
                     l.notes,
                     l.pkg,
@@ -8607,25 +8683,51 @@ fn save_base<'a>(
     doc: &Document,
     live: &[Comment],
 ) -> Option<std::borrow::Cow<'a, Package>> {
-    let pkg = tab.pkg.as_ref()?;
+    use std::borrow::Cow;
+    // Track Changes is the editor's state; the package carries it as
+    // `w:trackRevisions` (#624). A new document has no package yet: one
+    // is made for it, as the save would make.
+    let track = matches!(&tab.surface, Surface::Doc(ed) if ed.track_changes());
+    let mut base: Cow<'a, Package> = match (tab.pkg.as_ref(), track) {
+        (Some(pkg), _) => Cow::Borrowed(pkg),
+        (None, true) => Cow::Owned(blank_base(doc)),
+        (None, false) => return None,
+    };
+    if base.track_revisions() != track {
+        base.to_mut().set_track_revisions(track);
+    }
     if !tab.comments_removed_all {
-        return Some(std::borrow::Cow::Borrowed(pkg));
+        return Some(base);
     }
     let mut keep = docxcore::inspect::comment_marker_ids(doc);
     keep.extend(live.iter().map(|c| c.id.clone()));
-    let stale: Vec<String> = pkg
+    let stale: Vec<String> = base
         .comment_ids()
         .into_iter()
         .filter(|id| !keep.contains(id))
         .collect();
     if stale.is_empty() {
-        return Some(std::borrow::Cow::Borrowed(pkg));
+        return Some(base);
     }
-    let mut pruned = pkg.clone();
+    let pruned = base.to_mut();
     for id in &stale {
         pruned.remove_comment_id(id);
     }
-    Some(std::borrow::Cow::Owned(pruned))
+    Some(base)
+}
+
+/// The package a new document is saved into (what [`doc_to_docx_styled`]
+/// builds without a base).
+fn blank_base(doc: &Document) -> Package {
+    let has_list = doc
+        .body
+        .iter()
+        .any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
+    if has_list {
+        docxcore::package::new_markdown_package(doc.clone())
+    } else {
+        docxcore::package::new_package(doc.clone())
+    }
 }
 
 /// Add a comment on `tab`'s selection: its markers go around the selection
@@ -8676,6 +8778,7 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
         date: utc_now_iso(),
         text,
         quoted,
+        ..Comment::default()
     });
     tab.tracked_comment_ids.insert(id.to_string());
     tab.used_comment_ids.insert(id.to_string());
@@ -8691,6 +8794,30 @@ fn delete_doc_comment(tab: &mut DocTab, id: &str) {
     }
     tab.tracked_comment_ids.insert(id.to_string());
     tab.mark_dirty();
+}
+
+/// The id of the selected comment when it belongs to the active tab (the tab
+/// the selection was made in, by title and file), else `None`.
+fn selected_comment_id(
+    tabs: &[DocTab],
+    active: usize,
+    selected: &Option<(close::TabId, String)>,
+) -> Option<String> {
+    let (tab, id) = selected.as_ref()?;
+    let here = tabs.get(active)?;
+    (here.title == tab.0 && here.path == tab.1).then(|| id.clone())
+}
+
+/// Set comment `id` of `tab` resolved (`Some(true)`), reopened (`Some(false)`)
+/// or the other of the two (`None`). The new state, `None` when `tab` lists
+/// no such comment. The state lives on the comment, so it follows the record
+/// through a delete and its undo, and a save writes it ([`doc_to_docx`]).
+fn set_doc_comment_resolved(tab: &mut DocTab, id: &str, resolved: Option<bool>) -> Option<bool> {
+    let c = tab.comments.iter_mut().find(|c| c.id == id)?;
+    c.resolved = resolved.unwrap_or(!c.resolved);
+    let now = c.resolved;
+    tab.mark_dirty();
+    Some(now)
 }
 
 /// The name and initials new comments are stamped with (#620), as Word's
@@ -8750,14 +8877,10 @@ fn doc_to_docx_styled(
             p
         }
         None => {
-            let has_list = doc
-                .body
-                .iter()
-                .any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
-            if has_list || converted {
+            if converted {
                 docxcore::package::new_markdown_package(doc.clone())
             } else {
-                docxcore::package::new_package(doc.clone())
+                blank_base(doc)
             }
         }
     };
@@ -8787,6 +8910,19 @@ fn doc_to_docx_styled(
                 pkg.add_comment(id, &c.author, &c.initials, &c.date, &c.text);
             }
         }
+    }
+    // Resolved state: `w15:done`, written where it differs from the part.
+    let stored: std::collections::HashMap<String, bool> = docxcore::comments::parse_comments(&pkg)
+        .into_iter()
+        .map(|c| (c.id, c.resolved))
+        .collect();
+    for c in comments {
+        if stored.get(&c.id).is_some_and(|&r| r != c.resolved) {
+            pkg.set_comment_resolved(&c.id, c.resolved);
+        }
+    }
+    if comments.is_empty() {
+        pkg.drop_empty_comment_parts();
     }
     docxcore::package::save_package(&pkg)
 }
@@ -9240,6 +9376,7 @@ impl Docxy {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        set_configured_identity(&session.user_name, &session.user_initials);
         // Asked before this run writes its own marker.
         let crashed = recover::was_unclean(&root);
         recover::mark_running(&root);
@@ -9332,6 +9469,8 @@ impl Docxy {
             doc_scroll: ScrollHandle::new(),
             menu_scroll: ScrollHandle::new(),
             comment_open: false,
+            selected_comment: None,
+            markup: Default::default(),
             comment_text: String::new(),
             show_marks: false,
             show_comments: false,
@@ -12408,10 +12547,33 @@ impl Docxy {
             .is_some_and(|t| t.access.locked())
     }
 
-    /// Refuse an edit in Protected View or a document marked as final,
-    /// saying how to edit; `true` when it was refused. Every gate that would
-    /// change the workbook or document asks this first.
+    /// Refuse an edit in Protected View, in a document marked as final, or
+    /// while Display for Review shows No Markup or Original (text that is not
+    /// the document's), saying how to edit; `true` when it was refused. Every
+    /// gate that would change the workbook or document asks this first.
     fn protected_refused(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.view_only_active() {
+            self.set_status(VIEW_ONLY_STATUS);
+            cx.notify();
+            return true;
+        }
+        self.access_refused(cx)
+    }
+
+    /// The active tab is a document shown as No Markup or Original: text that
+    /// is not the document's, so it is looked at and not edited (#625).
+    fn view_only_active(&self) -> bool {
+        !self.markup.is_editable()
+            && matches!(
+                self.tabs.get(self.active).map(|t| &t.surface),
+                Some(Surface::Doc(_))
+            )
+    }
+
+    /// [`Self::protected_refused`] for what holds no text of the view (a
+    /// comment's Resolve and Delete all): only Protected View or Mark as
+    /// Final refuse it.
+    fn access_refused(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(access) = self
             .tabs
             .get(self.active)
@@ -17614,6 +17776,83 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Resolve the selected comment, or reopen it when it is resolved. The
+    /// state is written to `commentsExtended.xml` on save.
+    fn resolve_selected_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.access_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        let active = self.active;
+        let id = selected_comment_id(&self.tabs, active, &self.selected_comment);
+        if let Some(t) = self.tabs.get_mut(active) {
+            t.status = match id.and_then(|id| set_doc_comment_resolved(t, &id, None)) {
+                Some(true) => "Comment resolved".into(),
+                Some(false) => "Comment reopened".into(),
+                None => "Select a comment in the Comments pane first".into(),
+            };
+        }
+        self.refocus(window, cx);
+    }
+
+    /// The Resolve button of one comment card: select it and toggle it.
+    fn resolve_comment(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_comment = close::tab_ids(&self.tabs)
+            .into_iter()
+            .nth(self.active)
+            .map(|tab| (tab, id));
+        self.resolve_selected_comment(window, cx);
+    }
+
+    /// Track Changes on or off for the active document (#624): the editor
+    /// records typing and deletions as tracked changes, and a save writes
+    /// `w:trackRevisions` ([`save_base`]).
+    fn toggle_track(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        let identity = review_identity(&self.user_name, &self.user_initials);
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            if t.markdown {
+                t.status = "Track Changes needs a Word document".into();
+            } else if let Surface::Doc(ed) = &mut t.surface {
+                let on = !ed.track_changes();
+                ed.set_track_changes(on.then(|| track_author(&identity)));
+                t.mark_dirty();
+                t.status = format!("Track Changes: {}", if on { "On" } else { "Off" }).into();
+            }
+        }
+        self.refocus(window, cx);
+    }
+
+    /// Whether the active document records its edits as tracked changes.
+    fn active_track_changes(&self) -> bool {
+        matches!(
+            self.tabs.get(self.active).map(|t| &t.surface),
+            Some(Surface::Doc(ed)) if ed.track_changes()
+        )
+    }
+
+    /// Whether the selected comment is resolved (Resolve shows pressed).
+    fn selected_comment_resolved(&self) -> bool {
+        let Some(id) = selected_comment_id(&self.tabs, self.active, &self.selected_comment) else {
+            return false;
+        };
+        self.tabs
+            .get(self.active)
+            .is_some_and(|t| t.comments.iter().any(|c| c.id == id && c.resolved))
+    }
+
+    /// Delete every comment (Review ▸ Comments ▸ Delete all): the Document
+    /// Inspector's Remove All for comments, one undo step.
+    fn delete_all_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.access_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        let _ = self.inspect_remove_active(inspector::InspectCategory::Comments);
+        self.selected_comment = None;
+        self.refocus(window, cx);
+    }
+
     /// Select the text a comment is anchored to (find its quoted run).
     fn goto_comment(&mut self, quoted: String, window: &mut Window, cx: &mut Context<Self>) {
         if !quoted.is_empty() {
@@ -17655,63 +17894,88 @@ impl Docxy {
         for c in &comments {
             let id = c.id.clone();
             let quoted = c.quoted.clone();
-            list =
-                list.child(
-                    v_flex()
-                        .id(("cmt", id.parse::<usize>().unwrap_or(0)))
-                        .gap_1()
-                        .p_2()
-                        .rounded(px(4.))
-                        .border_1()
-                        .border_color(pal.border)
-                        .bg(pal.panel)
-                        .cursor_pointer()
-                        .hover(|d| d.border_color(hsla_u(BRAND)))
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(hsla_u(BRAND))
-                                        .child(SharedString::from(c.author.clone())),
-                                )
-                                .child(
-                                    div()
-                                        .id(("cmtx", id.parse::<usize>().unwrap_or(0)))
-                                        .px_1()
-                                        .rounded_sm()
-                                        .text_color(pal.dim)
-                                        .hover(|d| d.bg(pal.hover))
-                                        .child("\u{00d7}")
-                                        .on_click(cx.listener({
-                                            let id = id.clone();
-                                            move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.delete_comment(id.clone(), window, cx);
-                                            }
-                                        })),
-                                ),
-                        )
-                        .when(!c.quoted.is_empty(), |d| {
-                            d.child(
-                                div().text_size(px(11.)).italic().text_color(pal.dim).child(
-                                    SharedString::from(format!("\u{201C}{}\u{201D}", c.quoted)),
-                                ),
+            list = list.child(
+                v_flex()
+                    .id(("cmt", id.parse::<usize>().unwrap_or(0)))
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(pal.border)
+                    .bg(pal.panel)
+                    .cursor_pointer()
+                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(hsla_u(BRAND))
+                                    .child(SharedString::from(c.author.clone())),
                             )
-                        })
-                        .child(
+                            .child(
+                                div()
+                                    .id(("cmtr", id.parse::<usize>().unwrap_or(0)))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_size(px(11.))
+                                    .text_color(if c.resolved { hsla_u(BRAND) } else { pal.dim })
+                                    .hover(|d| d.bg(pal.hover))
+                                    .child(if c.resolved { "Reopen" } else { "Resolve" })
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.resolve_comment(id.clone(), window, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("cmtx", id.parse::<usize>().unwrap_or(0)))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_color(pal.dim)
+                                    .hover(|d| d.bg(pal.hover))
+                                    .child("\u{00d7}")
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.delete_comment(id.clone(), window, cx);
+                                        }
+                                    })),
+                            ),
+                    )
+                    .when(!c.quoted.is_empty(), |d| {
+                        d.child(
                             div()
-                                .text_size(px(13.))
-                                .text_color(pal.fg)
-                                .child(SharedString::from(c.text.clone())),
+                                .text_size(px(11.))
+                                .italic()
+                                .text_color(pal.dim)
+                                .child(SharedString::from(format!("\u{201C}{}\u{201D}", c.quoted))),
                         )
-                        .on_click(cx.listener(move |this, _, window, cx| {
+                    })
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(pal.fg)
+                            .child(SharedString::from(c.text.clone())),
+                    )
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, window, cx| {
+                            this.selected_comment = close::tab_ids(&this.tabs)
+                                .into_iter()
+                                .nth(this.active)
+                                .map(|tab| (tab, id.clone()));
                             this.goto_comment(quoted.clone(), window, cx)
-                        })),
-                );
+                        }
+                    })),
+            );
         }
         v_flex()
             .w(px(280.))
@@ -18370,7 +18634,7 @@ impl Docxy {
         // Protected View (#633), or a document marked as final (#617): only
         // keys that look, move or copy reach the document. The find bar still
         // takes typing; its Replace is refused where it would write.
-        if self.active_locked()
+        if (self.active_locked() || self.view_only_active())
             && !self.find_open
             && !open_mode::protected_allows_doc_key(key.as_str(), ctrl, m.alt)
         {
@@ -18513,6 +18777,9 @@ impl Docxy {
         cx.notify();
     }
 }
+
+/// What a refused edit says while Display for Review is No Markup or Original.
+const VIEW_ONLY_STATUS: &str = "Edit blocked: Display for Review is No Markup or Original; switch to All Markup or Simple Markup to edit.";
 
 /// What a harness instance says when asked to Save As a document.
 const DOC_SAVE_AS_HARNESS: &str = "This document needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
@@ -20596,10 +20863,10 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         ClearFmt => e.clear_run_formatting(),
         Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
         | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments
-        | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | BlankPage
-        | Cover(_) | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing
-        | Hf(_) | Design(_) | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler
-        | UndoTo(_) => {}
+        | ResolveComment | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | DarkMode
+        | AutoHideRibbon | InsertField | PageBreak | BlankPage | Cover(_) | ToggleNotes
+        | InsertTable | InsertSymbol | InsertEquation | LineSpacing | Hf(_) | Design(_)
+        | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler | UndoTo(_) => {}
     }
 }
 
@@ -21561,6 +21828,14 @@ enum Act {
     Super,
     Sub,
     NewComment,
+    /// Resolve the selected comment, or reopen it.
+    ResolveComment,
+    /// Delete every comment in the document.
+    DeleteAllComments,
+    /// Display for Review: how tracked changes are shown.
+    Markup(docxcore::markup::MarkupView),
+    /// Track Changes on or off.
+    ToggleTrack,
     Sort,
     LineSpacing,
     ParaBorders,
@@ -21909,6 +22184,64 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                             )
                             .key("P"),
                             cmdt("togglenotes", "comment", "Notes pane", ToggleNotes, "").key("O"),
+                        ]),
+                        rs::column(vec![
+                            cmdt("resolvecomment", "comment", "Resolve", ResolveComment, "")
+                                .key("V"),
+                            cmdt(
+                                "deleteallcomments",
+                                "table-dismiss",
+                                "Delete all",
+                                DeleteAllComments,
+                                "",
+                            )
+                            .key("X"),
+                        ]),
+                    ],
+                ),
+                rs::group(
+                    "Tracking",
+                    35,
+                    vec![
+                        Control::Large(
+                            cmdt("tracktoggle", "paragraph", "Track Changes", ToggleTrack, "")
+                                .key("T"),
+                        ),
+                        rs::column(vec![
+                            cmdt(
+                                "markupall",
+                                "paragraph",
+                                "All markup",
+                                Markup(MarkupView::All),
+                                "",
+                            )
+                            .key("KA"),
+                            cmdt(
+                                "markupsimple",
+                                "paragraph",
+                                "Simple markup",
+                                Markup(MarkupView::Simple),
+                                "",
+                            )
+                            .key("KS"),
+                            cmdt(
+                                "markupnone",
+                                "paragraph",
+                                "No markup",
+                                Markup(MarkupView::NoMarkup),
+                                "",
+                            )
+                            .key("KN"),
+                        ]),
+                        rs::column(vec![
+                            cmdt(
+                                "markuporiginal",
+                                "paragraph",
+                                "Original",
+                                Markup(MarkupView::Original),
+                                "",
+                            )
+                            .key("KO"),
                         ]),
                     ],
                 ),
@@ -23386,6 +23719,31 @@ fn flat_inlines(content: &[Inline]) -> Vec<(Cow<'_, Inline>, bool)> {
     out
 }
 
+/// The runs under a tracked change, drawn as plain text with no caret mapping.
+fn emit_revision_text(out: &mut Vec<AnyElement>, content: &[Inline], base: f32, pal: Pal) {
+    for inline in content {
+        match inline {
+            Inline::Run(r) => {
+                let (mut idx, mut caret) = (0, None);
+                emit_run(
+                    out, &r.text, &r.props, base, false, &mut idx, &mut caret, None, None, pal,
+                );
+            }
+            Inline::Hyperlink(h) => {
+                for r in &h.runs {
+                    let (mut idx, mut caret) = (0, None);
+                    emit_run(
+                        out, &r.text, &r.props, base, true, &mut idx, &mut caret, None, None, pal,
+                    );
+                }
+                emit_revision_text(out, &h.content, base, pal);
+            }
+            Inline::Revision { content, .. } => emit_revision_text(out, content, base, pal),
+            _ => {}
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paragraph_el(
     p: &Paragraph,
@@ -23552,6 +23910,12 @@ fn paragraph_el(
             Inline::Break(..) => {
                 emit_break(&mut spans, &mut idx, &mut caret);
                 x = 0.0; // a hard break restarts the line
+            }
+            Inline::Revision { content, .. } => {
+                // A tracked change is shown, not edited here: its text takes no
+                // caret offsets (the engine counts it as none), and carries the
+                // underline / strike cue the loader gave its runs.
+                emit_revision_text(&mut spans, content, base, pal);
             }
             Inline::Raw(xml) => {
                 // Comment reference → a small badge; other raw XML (range markers,
@@ -24742,7 +25106,14 @@ impl Docxy {
         self.close_menu();
         // Protected View (#633): the ribbon is hidden, but shortcuts, KeyTips,
         // context menus and the harness's `ribbon-click` still come here.
-        if !protected_view_allows_doc_act(act) && self.protected_refused(cx) {
+        // Resolve and Delete all hold no text of the view: only Protected View
+        // and Mark as Final refuse them.
+        let refused = if matches!(act, Act::ResolveComment | Act::DeleteAllComments) {
+            self.access_refused(cx)
+        } else {
+            !protected_view_allows_doc_act(act) && self.protected_refused(cx)
+        };
+        if refused {
             return self.refocus(window, cx);
         }
         // A document edit is its own undo step, named for the Undo drop-down
@@ -24786,6 +25157,14 @@ impl Docxy {
             FontName => self.toggle_picker(PickKind::FontName, window, cx),
             FontSize => self.toggle_picker(PickKind::FontSize, window, cx),
             NewComment => self.start_comment(window, cx),
+            ResolveComment => self.resolve_selected_comment(window, cx),
+            ToggleTrack => self.toggle_track(window, cx),
+            Markup(view) => {
+                self.markup = view;
+                self.set_status(format!("Display for Review: {}", view.label()));
+                self.refocus(window, cx);
+            }
+            DeleteAllComments => self.delete_all_comments(window, cx),
             ShowHide => {
                 self.show_marks = !self.show_marks;
                 self.refocus(window, cx);
@@ -26584,8 +26963,8 @@ impl Docxy {
             ),
             Bold => rp.is_some_and(|p| p.bold),
             Italic => rp.is_some_and(|p| p.italic),
-            Underline => rp.is_some_and(|p| p.underline),
-            Strike => rp.is_some_and(|p| p.strike),
+            Underline => rp.is_some_and(|p| p.user_underline()),
+            Strike => rp.is_some_and(|p| p.user_strike()),
             Super => rp.is_some_and(|p| p.vert_align == VertAlign::Superscript),
             Sub => rp.is_some_and(|p| p.vert_align == VertAlign::Subscript),
             AlignL => pp.is_some_and(|p| p.align == Align::Left),
@@ -26597,6 +26976,9 @@ impl Docxy {
             ParaBorders => pp.is_some_and(|p| p.borders.bottom.is_some()),
             ShowHide => self.show_marks,
             ToggleComments => self.show_comments,
+            ResolveComment => self.selected_comment_resolved(),
+            Markup(view) => self.markup == view,
+            ToggleTrack => self.active_track_changes(),
             ToggleNav => self.show_nav,
             ToggleNotes => self.show_notes,
             PrintLayout => self.page_view,
@@ -28100,8 +28482,15 @@ impl Render for Docxy {
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
                 Surface::Doc(editor) => {
-                    let spans = editor.selection_spans();
-                    let markers = list_markers(&editor.doc.body);
+                    // Display for Review: the document, or a clone shown as No
+                    // Markup / Original / Simple; never saved.
+                    let shown = editor.doc.markup_view(self.markup);
+                    let spans = if self.markup.is_editable() {
+                        editor.selection_spans()
+                    } else {
+                        Vec::new()
+                    };
+                    let markers = list_markers(&shown.body);
                     let ent = cx.entity();
                     // In Print Layout the sheet is white, or the document's page
                     // colour (#651), whatever the app theme, like Word's document
@@ -28136,14 +28525,14 @@ impl Render for Docxy {
                         pal: doc_pal,
                         marks: self.show_marks,
                         zoom: self.zoom,
-                        active: hf.is_none(),
+                        active: hf.is_none() && self.markup.is_editable(),
                         meas: &measurer,
                         hf_width: None,
                         tbl: &tbl,
                         cell_range: body_range.as_ref(),
                         merge_hl: tab.mail.highlight,
                     };
-                    let body = &editor.doc.body;
+                    let body = &shown.body;
                     if self.page_view {
                         // Print Layout: split the body into discrete page sheets
                         // (section margins), stacked on a grey canvas. A sheet is
@@ -28564,6 +28953,16 @@ impl Render for Docxy {
                 }
                 _ => None,
             });
+        // Track Changes and Display for Review, when they are not the default.
+        let mut review_chips: Vec<String> = Vec::new();
+        if is_doc {
+            if self.active_track_changes() {
+                review_chips.push("Track Changes: On".to_string());
+            }
+            if self.markup != MarkupView::All {
+                review_chips.push(self.markup.label().to_string());
+            }
+        }
         let stats_text = doc_stats.map(|(w, p)| {
             SharedString::from(format!(
                 "{} page{} \u{00b7} {} word{}",
@@ -28643,6 +29042,19 @@ impl Render for Docxy {
                 d.child(div().text_color(dim).child("·"))
                     .child(div().text_color(dim).child(s))
             })
+            .children(review_chips.into_iter().flat_map(|chip| {
+                [
+                    div().text_color(dim).child("·").into_any_element(),
+                    div()
+                        .id(SharedString::from(format!(
+                            "status-{}",
+                            chip.to_lowercase().replace([' ', ':'], "-")
+                        )))
+                        .text_color(fg)
+                        .child(SharedString::from(chip))
+                        .into_any_element(),
+                ]
+            }))
             // Excel's status-bar words for the Editing options (#672).
             .when(self.active_is_sheet(), |d| {
                 d.children(sheet_status_words(&self.edit_opts).into_iter().map(|w| {

@@ -382,7 +382,8 @@ right}` (grid columns; `null` when the selection is not across cells), and
 describes that one table: a selection from an outer table's cell into a table
 nested in another cell reports the nested table, with `range` `null` (the
 range belongs to the outer table, which the table commands act on). `view`
-carries `gridlines`, the Table Layout tab's View Gridlines.
+carries `gridlines`, the Table Layout tab's View Gridlines, and `display_mode`,
+Display for Review (`all`, `simple`, `none` or `original`).
 
 `mail` is the tab's mail merge (#628): `doc_type` (`Letters`, `E-mail
 Messages`, `Envelopes`, `Labels`, `Directory`, or `null` for a Normal Word

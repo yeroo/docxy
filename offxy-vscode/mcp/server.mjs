@@ -673,6 +673,68 @@ function docxyToolDefs() {
       ]),
       ['border'],
     ),
+    tool(
+      'docxy_comment_resolve',
+      'Resolve a review comment, or reopen it (Review > Comments > Resolve): writes ' +
+        'w15:done to commentsExtended.xml on save. Pass resolved to set the state; ' +
+        'without it the comment toggles. Returns {id, resolved}.',
+      Object.fromEntries([
+        ['id', prop('string', 'Comment id returned by docxy_comments.')],
+        [
+          'resolved',
+          prop('boolean', 'Optional: true to resolve, false to reopen (default: toggle).'),
+        ],
+        target(),
+      ]),
+      ['id'],
+    ),
+    tool(
+      'docxy_comments_delete_all',
+      'Delete every comment in the document (Review > Comments > Delete All): the ' +
+        'comment records and their anchors, keeping the anchored text, as one undo step. ' +
+        'Returns {deleted}.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_display_mode',
+      'Get or set Display for Review (Review > Tracking): how tracked changes are shown. ' +
+        'A view only: the document, its revisions and its save are unchanged. No Markup and ' +
+        'Original are view-only: edits are refused (protection_denied:display_mode) until ' +
+        'All Markup or Simple Markup is chosen. Returns {mode, label, editable}.',
+      Object.fromEntries([
+        [
+          'mode',
+          prop(
+            'string',
+            'Optional: "all", "simple", "none" or "original" (default: report only).',
+          ),
+        ],
+        target(),
+      ]),
+      [],
+    ),
+    tool(
+      'docxy_track_changes',
+      'Report whether Track Changes is on (edits are recorded as tracked changes) and the ' +
+        'reviewer they are recorded as. Returns {enabled, author}.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_track_changes_set',
+      'Turn Track Changes on or off (Review > Track Changes): typing and deletions are ' +
+        'then recorded as tracked insertions and deletions (w:ins / w:del, stamped with the ' +
+        'reviewer and the time), and the document saves with w:trackRevisions. Paragraph ' +
+        'marks, text in hyperlinks and formatting are not recorded, and a Markdown splice ' +
+        '(markdown: true on insert, append or replace_range) is refused while it is on. ' +
+        'Not an undo step. Returns {enabled, author}.',
+      Object.fromEntries([
+        ['enabled', prop('boolean', 'true to record, false to stop.')],
+        target(),
+      ]),
+      ['enabled'],
+    ),
   ];
 }
 
@@ -1304,6 +1366,11 @@ const DOCXY_VERBS = {
   docxy_page_color: 'doc.page-color',
   docxy_watermark: 'doc.watermark',
   docxy_page_borders: 'doc.page-borders',
+  docxy_comment_resolve: 'doc.comment-resolve',
+  docxy_comments_delete_all: 'doc.comments-delete-all',
+  docxy_display_mode: 'doc.display-mode',
+  docxy_track_changes: 'doc.track-changes',
+  docxy_track_changes_set: 'doc.track-changes-set',
 };
 
 const XLSXY_VERBS = {

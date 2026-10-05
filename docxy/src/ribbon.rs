@@ -69,6 +69,13 @@ pub enum Act {
     /// Add a comment on the selection / delete the selected comment.
     NewComment,
     DeleteComment,
+    /// Resolve / reopen the selected comment; delete every comment.
+    ResolveComment,
+    DeleteAllComments,
+    /// Step Display for Review: All, Simple, No Markup, Original.
+    CycleMarkup,
+    /// Track Changes on or off.
+    ToggleTrack,
     /// Navigate and act on imported tracked changes.
     PrevRevision,
     NextRevision,
@@ -533,12 +540,26 @@ fn review_groups() -> Vec<Group> {
     vec![
         Group {
             title: "Comments",
-            width: 35,
+            width: 43,
             rows: [
                 vec![
                     btn("✎ New", 5, NewComment, "New comment on the selection"),
                     Seg::Gap("  "),
                     btn("✗ Delete", 8, DeleteComment, "Delete the selected comment"),
+                    Seg::Gap("  "),
+                    btn(
+                        "✓ Resolve",
+                        9,
+                        ResolveComment,
+                        "Resolve the selected comment, or reopen it",
+                    ),
+                    Seg::Gap("  "),
+                    btn(
+                        "✗ All",
+                        5,
+                        DeleteAllComments,
+                        "Delete every comment in the document",
+                    ),
                 ],
                 vec![
                     btn("‹ Prev", 6, PrevComment, "Previous comment"),
@@ -569,14 +590,14 @@ fn review_groups() -> Vec<Group> {
                 vec![btn(
                     "Track ▾",
                     7,
-                    Todo("Track Changes"),
-                    "Track Changes (Ctrl+Shift+E)",
+                    ToggleTrack,
+                    "Track Changes: record typing and deletions as tracked changes",
                 )],
                 vec![btn(
                     "Markup ▾",
                     8,
-                    Todo("Display for Review"),
-                    "Display for review",
+                    CycleMarkup,
+                    "Display for Review: step All Markup, Simple Markup, No Markup, Original",
                 )],
             ],
         },
@@ -758,6 +779,33 @@ mod tests {
                 Seg::Btn(b) => b.width,
             })
             .sum()
+    }
+
+    /// #624 / #625: Track and Markup are real commands, not placeholders.
+    #[test]
+    fn review_tab_has_no_placeholder_for_tracking_or_markup() {
+        let acts: Vec<Act> = review_groups()
+            .iter()
+            .flat_map(|g| g.rows.iter().flatten())
+            .filter_map(|s| match s {
+                Seg::Btn(b) => Some(b.act),
+                Seg::Gap(_) => None,
+            })
+            .collect();
+        for wanted in [
+            Act::ToggleTrack,
+            Act::CycleMarkup,
+            Act::ResolveComment,
+            Act::DeleteAllComments,
+        ] {
+            assert!(acts.contains(&wanted), "{wanted:?}");
+        }
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Act::Todo("Track Changes" | "Display for Review"))),
+            "{acts:?}"
+        );
     }
 
     #[test]

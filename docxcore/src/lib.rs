@@ -38,6 +38,7 @@ pub mod latex;
 pub mod legacy;
 pub mod load;
 pub mod markdown;
+pub mod markup;
 pub mod mathbox;
 pub mod merge;
 pub mod mermaid;
