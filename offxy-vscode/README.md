@@ -205,7 +205,9 @@ for the two ways a tab's semantics differ from a terminal instance.
   `docxy_revision_current`, `docxy_revision_next`, `docxy_revision_previous`,
   `docxy_revision_accept`, `docxy_revision_reject`,
   `docxy_revisions_accept_all`, `docxy_revisions_reject_all`,
-  `docxy_compare`, `docxy_page_color`, `docxy_watermark`, `docxy_page_borders` (35) —
+  `docxy_compare`, `docxy_page_color`, `docxy_watermark`, `docxy_page_borders`,
+  `docxy_comment_resolve`, `docxy_comments_delete_all`, `docxy_display_mode`,
+  `docxy_track_changes`, `docxy_track_changes_set` (40) —
   `docxy_replace_range`/`docxy_insert`/`docxy_append` each take an optional
   `markdown` flag to splice formatted Markdown (headings, bold, lists,
   tables, links) into the document instead of plain text, and

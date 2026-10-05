@@ -271,7 +271,9 @@ One JSON object per line; one reply line per request:
 | `doc.compare` | `{original, revised}` | `{path, insertions, deletions, skipped:[{kind, index?, revision?}]}` — Review ▸ Compare: opens a new, unsaved `Compare Result N.docx` (beside the revised file) whose tracked changes turn the original into the revised `.docx`; neither source is written. Refuses while the open document has unsaved changes. `skipped` kinds: `table`, `object`, `formatting` (original property markup whose namespace prefix the revised document binds differently; reported once), `note-ref`, `unsupported-revision`, `paragraph-mark` |
 | `doc.export` | `{format:"markdown"\|"text"}` | `{format, text}` — the **live buffer** |
 | `doc.export-pdf` | `{path}` | `{path}` (absolutized; refuses to overwrite — same `already exists:`/`bad path:`/`create failed:` error family as creating a new file) |
-| `doc.comments` | — | `{comments:[{id,author,initials,date,text,anchor}]}` |
+| `doc.comments` | — | `{comments:[{id,author,initials,date,text,anchor,resolved}]}` |
+| `doc.comment-resolve` | `{id, resolved?}` | `{id,resolved}` — Review ▸ Resolve / Reopen: `w15:done` in `commentsExtended.xml` on save (the part, its relationship and the comment's `w14:paraId` are created when absent; reply threads and unknown attributes are kept). Without `resolved` the comment toggles. Not an undo step; comments-only protection allows it |
+| `doc.comments-delete-all` | — | `{deleted}` — Review ▸ Delete All: every comment and its anchors (text stays), ONE undo step that brings markers and records back |
 | `doc.notes` | — | `{notes:[{id,kind:"footnote"\|"endnote",text}]}` |
 | `doc.header` / `doc.footer` | — | `{blocks:[{index,kind,text}]}` (empty list if the document has none) |
 | `doc.metadata` | — | present-if-set keys: `{title?,author?,subject?,keywords?,comments?,last_saved_by?,revision?,created?,modified?}` |
@@ -288,6 +290,9 @@ One JSON object per line; one reply line per request:
 | `doc.revision-next` / `doc.revision-previous` | — | `{count,revision}` after selecting the wrapping next/previous change |
 | `doc.revision-accept` / `doc.revision-reject` | `{revision}` | structured applied/stale/unsupported/malformed outcome |
 | `doc.revisions-accept-all` / `doc.revisions-reject-all` | — | `{total,applied,outcomes:[…]}` from one undoable transaction |
+| `doc.track-changes` | — | `{enabled, author}` — whether edits are recorded as tracked changes, and as whom |
+| `doc.track-changes-set` | `{enabled}` | `{enabled, author}` — Review ▸ Track Changes: typing, paste, Replace and deletions are then recorded (`w:ins` / `w:del`, stamped with the reviewer and the time) and the document saves with `w:trackRevisions`. Not an undo step (the setting is package metadata). Refuses Markdown documents |
+| `doc.display-mode` | `{mode?}` | `{mode, label, editable}` — Review ▸ Display for Review: `all`, `simple`, `none` (No Markup) or `original`. A view only: never a mutation, never saved. While `none` or `original` is shown every edit verb is refused with `protection_denied:display_mode` (comment verbs still work) |
 
 Notes:
 
@@ -361,11 +366,14 @@ same checks and do not maintain a second policy table:
 The current mutating control/MCP operations cover Structure
 (`doc.replace-range`, `doc.insert`, `doc.append`), Content (`doc.replace-all`,
 `doc.undo`, `doc.redo`, `doc.revision-accept`, `doc.revision-reject`,
-`doc.revisions-accept-all`, `doc.revisions-reject-all`), and Formatting
+`doc.revisions-accept-all`, `doc.revisions-reject-all`), Formatting
 (`doc.format`, `doc.set-style`, `doc.page-color`, `doc.watermark`,
-`doc.page-borders`). There
-is no comment-writing control verb yet, so comments-only protection denies all
-current automation edits even though comment mutations in the TUI are allowed.
+`doc.page-borders`), Comment (`doc.comment-resolve`,
+`doc.comments-delete-all`: the only automation edits comments-only protection
+allows) and Package metadata (`doc.track-changes-set`). Display for Review
+(`doc.display-mode`) is view state, not a mutation, but No Markup and Original
+show text that is not the document's, so while either is chosen every edit
+route except Comment is refused with `protection_denied:display_mode`.
 Markdown control/MCP inserts that carry styles, numbering, or direct run
 formatting additionally require Formatting authorization.
 Read, navigation, inspection, export, same-format save, open/reload, compare, and
@@ -392,9 +400,10 @@ is deliberately no MCP tool for Edit Anyway: unlocking a final document is a
 control-surface decision.
 
 Forms-only, tracked-changes-only, and unknown enforced modes deliberately fail
-closed. docxy cannot yet make conforming form-field-only edits or automatically
-record ordinary edits as tracked changes; use Word for those edits until those
-editing models exist. Recommendation-only `w:writeProtection` is different: the
+closed. docxy cannot yet make conforming form-field-only edits, and a
+tracked-changes-only document still refuses ordinary edits even though Track
+Changes can now record them (turn it on, or use Word, after removing the
+protection); use Word for those edits until those editing models exist. Recommendation-only `w:writeProtection` is different: the
 TUI shows a warning and `doc.path` reports `read-only (recommended)`, but all
 edits remain allowed. A password/hash-backed declaration is enforced read-only
 until docxy can verify the password.
@@ -573,7 +582,9 @@ Tools: `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`, `docxy_read`,
 `docxy_revision_next`, `docxy_revision_previous`, `docxy_revision_accept`,
 `docxy_revision_reject`, `docxy_revisions_accept_all`,
 `docxy_revisions_reject_all`, `docxy_compare`, `docxy_page_color`,
-`docxy_watermark`, and `docxy_page_borders` (35 total). Each edit
+`docxy_watermark`, `docxy_page_borders`, `docxy_comment_resolve`,
+`docxy_comments_delete_all`, `docxy_display_mode`, `docxy_track_changes` and
+`docxy_track_changes_set` (40 total). Each edit
 tool maps to the matching verb — except `docxy_new`, which composes a file
 create with a `doc.open` — and results come back as JSON text. When several
 docxy editors are open, pass `target` (a substring of the instance/pane id) to
@@ -972,7 +983,7 @@ MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
 `xlsxy_page_header`, `xlsxy_print_area_set`, `xlsxy_print_area_add`,
 `xlsxy_print_area_clear`, `xlsxy_print_titles`, `xlsxy_page_break_insert`,
 `xlsxy_page_break_remove`, `xlsxy_page_break_reset`, `xlsxy_print_pages`,
-`xlsxy_export_pdf` (46 total; docxy's 31 + xlsxy's 46 = **77 tools** total
+`xlsxy_export_pdf` (46 total; docxy's 40 + xlsxy's 46 = **86 tools** total
 across both apps).
 Skill: `xlsxy install skill`.
 
