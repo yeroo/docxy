@@ -182,8 +182,8 @@ cold start, and every accepted and rejected form is a unit test.
 | `open copy:"<path>" as <name>` | copy the same fixture under a distinct plain filename (no separators or `..`), so a case can open multiple tabs without the suite focusing an existing path; quotes keep a source path containing ` as ` unambiguous |
 | `call <verb> <json-object>` | send a raw control request, including Project verbs such as `call task.set {"uid":2,"duration":"3d"}`. JSON is parsed before launch and retained verbatim, including quoted `#`; trailing comments are not allowed. Non-object/invalid JSON is a script error; a refused request is an `ERROR` with the server message |
 | `call-error <verb> <json-object> => <message>` | require the app to refuse the request with a message containing the given text; a successful request or different refusal fails the step |
-| `click <cell> [shift] [double]` | the cell's click handler (press, click, release) |
-| `drag <from> -> <to>` | press, one move per cell crossed, release. `to` and a bare space read the same |
+| `click <cell> [shift] [double] [ctrl]` | the cell's click handler (press, click, release); `ctrl` adds an area |
+| `drag <from> -> <to> [ctrl]` | press, one move per cell crossed, release; `ctrl` adds an area. `to` and a bare space read the same |
 | `type <text>` | one key event per character. The text is taken verbatim between its ends; the whitespace on either side of it is trimmed, so `type   =SUM(` types `=SUM(` |
 | `key <k> [k…]` | those keys, in order: `escape`, `enter`, `tab`, `up`, `alt`, `f2`, `ctrl+c`, `shift+down`, … (`tab` and `shift+tab` go through the app's bound *action*, which is where gpui sends them — see below) |
 | `select chart <n>` | the press on a chart card, counting from 0 |
@@ -209,7 +209,7 @@ gets re-routed, and a test fails if it drifts from what `cx.bind_keys`
 registers.
 
 While the File screen is open, every key — Tab and Shift-Tab included — goes
-to `backstage_key` instead (a dialog, the more-tabs list or an open menu first,
+to the File screen (`on_key`: a dialog or the more-tabs list first,
 then PageUp/PageDown/Home/End scroll the page), so nothing reaches the tab
 hidden under it.
 
@@ -278,8 +278,10 @@ that call GPUI window APIs. `title-tab` calls the same handler methods as the
 title-bar arrows and dropdown items, and `tab-select` calls `select_tab`, the
 tab chip's click handler. `pointer-click`/`pointer-drag`/`pointer-wheel` are the hit-testing
 exception (#545, #1028): real `PlatformInput` events dispatched through gpui, for
-overlap order a handler call cannot see. `backstage-page {"page":"open"}` is a
-setup exception: it sets the default page directly, as opening File does. `proj.new` calls `add_tab(Kind::Project)`, the
+overlap order a handler call cannot see; `real-key`/`real-type` (#1027) are the
+same for the keyboard, for which root handles a key (`key`/`type` call `on_key`).
+`backstage-page {"page":"open"}` is a setup exception: it sets the default page
+directly, as opening File does. `proj.new` calls `add_tab(Kind::Project)`, the
 Backstage › New › Project card's handler; F11 also commits the active plan's
 pending cell edit first, and `proj.new` does not.
 
@@ -291,8 +293,8 @@ and cannot see **which elements carry handlers at all**. `drag A1 -> C5` runs
 deferred fill-handle hitbox that sits over the cells, so a case's `assert cells
 unchanged` would stay green if someone put a second handler back on that handle.
 
-The exception is `pointer-click`/`pointer-drag` (#545): they queue real
-`PlatformInput` mouse events on the control reply, and the pump dispatches them
+The exception is `pointer-click`/`pointer-drag` (#545) and `real-key`/`real-type`
+(#1027): they queue real `PlatformInput` mouse and key-down events on the control reply, and the pump dispatches them
 through `Window::dispatch_event` once the entity borrow ends — so hit testing
 runs against the last rendered frame exactly as an OS click would. They exist
 precisely for what handler-calling verbs cannot express: hit order between
@@ -331,16 +333,21 @@ State keys, as the app reports them after every driving verb:
 | `tab`, `title`, `dirty`, `status`, `sheet_tab` | the active tab |
 | `caption`, `read_only`, `protected`, `repaired`, `final` | `final` is a document Word marked as final (#617), locked like Protected View until Edit Anyway and captioned `[Read-Only]`; the active tab's caption as the strip draws it (`book.xlsx [Read-Only]`, or `Report.doc [Compatibility Mode]` for a document imported from Word 97-2003 until Convert, #634) and its open mode; see [Open modes](#open-modes-and-protected-view) |
 | `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor, prompt or dialog is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
-| `dialog` | the active tab's top dialog's id, or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
+| `dialog` | the top dialog's id (the app's own, #1027, else the active tab's), or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
 | `autorecover_minutes` | minutes between AutoRecover writes while a tab is unsaved; `0` is off |
 | `keep_drafts` | whether Don't Save keeps a workbook's last AutoRecover copy as a draft |
 | `user_name`, `user_initials` | Settings' User name and Initials for new comments (#620); empty falls back to the OS account name and initials derived from it |
-| `sheet_editing` | Settings' Sheet editing options (#672), by their `session.json` keys: `edit_fixed_decimal`, `edit_fixed_decimal_places`, `edit_move_after_enter`, `edit_move_direction` (`down`/`right`/`up`/`left`), `edit_in_cell`, `edit_autocomplete`, `edit_fill_handle` |
+| `sheet_editing` | Settings' Sheet editing options (#672), by their `session.json` keys: `edit_fixed_decimal`, `edit_fixed_decimal_places`, `edit_move_after_enter`, `edit_move_direction` (`down`/`right`/`up`/`left`), `edit_in_cell`, `edit_autocomplete`, `edit_fill_handle`, `edit_flash_fill_auto`, `edit_formula_autocomplete` |
 | `fx_expanded` | whether Ctrl+Shift+U has expanded the sheet formula bar |
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
-| `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
+| `sheet`, `sel`, `anchor`, `range` | the sheet and its selection (`range` is the active area) |
+| `areas` | every area of the selection as A1 ranges, the active one last (#670); one entry for a one-area selection |
+| `fill_options`, `paste_options` | the Auto Fill Options (#668) or Paste Options (#669) button's current choice (`Auto Fill`, `Copy Cells`, …; `Paste`, `Values`, …), or `null` when no button shows |
+| `office_clipboard` | how many items the Office Clipboard holds (#669) |
 | `editing`, `edit` | whether a cell edit is open, and its text |
+| `flash_preview` | Flash Fill's greyed preview after the second example is typed (#666, ENT-105): `{range, values}`, the cells it covers and the values Enter writes, or null. Any other key, an edit or a selection change (mouse and Tab included) drops it for good: moving back does not revive it. Ctrl+E and Data › Flash Fill fill without one; no pattern opens the `flash-fill` message dialog (`dialog-read`, OK closes it), and the Flash Fill Options menu is `menu-open "flash-fill"` while the last fill stands |
+| `completions` | Formula AutoComplete's list under a formula being typed (#686): `{items: [labels], sel}` (`sel` the highlighted index), or null while none shows. Up/Down move `sel`, Tab inserts it, Esc closes the list and leaves the editor open; Alt+Down opens it on demand |
 | `comment_edit` | the sheet comment editor's text (`null` when closed) |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
 | `field`, `field_text` | the focused reference field, and its buffer |
@@ -385,7 +392,8 @@ right}` (grid columns; `null` when the selection is not across cells), and
 describes that one table: a selection from an outer table's cell into a table
 nested in another cell reports the nested table, with `range` `null` (the
 range belongs to the outer table, which the table commands act on). `view`
-carries `gridlines`, the Table Layout tab's View Gridlines.
+carries `gridlines`, the Table Layout tab's View Gridlines, and `display_mode`,
+Display for Review (`all`, `simple`, `none` or `original`).
 
 `mail` is the tab's mail merge (#628): `doc_type` (`Letters`, `E-mail
 Messages`, `Envelopes`, `Labels`, `Directory`, or `null` for a Normal Word
@@ -439,6 +447,8 @@ footer editor; `selection-set` refuses while it is open.
 | `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command on a valid tab, contextual tabs included, by id, else by unique label, else by unique screentip title, and invoke the same action handler as its button |
 | `status-read {}` | read the tab's status line as an ordered `items` array of `{id, text}`: on a Project tab `state` (Ready/Edit/Busy), `new-tasks` (`New Tasks: …`) and `message`; on other tabs only `message` (a document's word-count stats are not reported) |
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items (`Info` only while the active tab is a document); `close` returns to the tab |
+| `app-info {}` | the build this suite is (#1023): `{version, commit, short_commit, commit_len, commit_hex, branch, commit_date, dirty, last_pr, last_pr_title, issue, ahead, built_at, profile, target, host, kind, manual, summary}`; `kind` is `release`, `ci` or `local`, `manual` is `kind == local \|\| dirty`. Served by normal Project control too |
+| `account {"action":"open"}` | File > Account while the backstage is open (#1023): `open` is the rail item's handler, `about` the page's About docxy suite button, `read` only reports. The About dialog is an ordinary dialog (`dialog-read`, `dialog-click {"button":"Copy"}` copies the build text to the private clipboard and leaves it open, `Close` or Escape closes it); its controls are the build's rows, headed by a `manual` row on a manual build. Replies `{open, line, manual, badge}`; `badge` is whether the "Manual build" badge was drawn in the last frame (its own probe), so read it after a settled frame (`shot window`), not in the same call that opened the page |
 | `convert {}` | File > Info > Convert on the active tab (#634), the same handler as the page's button: an imported Word 97-2003 document leaves Compatibility Mode (`compatibilityMode` 15 on the next save), its caption drops ` [Compatibility Mode]` and it is dirty. Answers `{status, caption, dirty}`; refused, with the tab's status line saying why, on a tab that is not in Compatibility Mode or not a document |
 | `inspect {}` | File > Info > Inspect Document on the active document tab (refused for any other tab): `{comments:{found,count}, revisions:{found,count}, hidden:{found,count,unremovable}, properties:{found}}`; hidden's `count` includes the `unremovable` runs inside tracked moves, fields, a group shape's other text boxes or other preserved XML (`w:customXml`, unmodeled blocks), which Remove All leaves in place. With `"remove":"comments"` (or `revisions`, `hidden`, `properties`) it runs that category's Remove All, the same handler as the page's button, and adds the `status` line it left; revisions are accepted. A category not found changes nothing but the tab's status line, which says `<Category>: nothing to remove`; the Info page shows the last Remove All's line under its rows |
 | `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
@@ -446,7 +456,7 @@ footer editor; `selection-set` refuses while it is open.
 | `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
 | `tab-list {}` | read every open tab in strip order: `{active, tabs:[{index, title, kind, path, dirty, imported, caption, read_only, protected, final, repaired}]}`. `kind` is `docx`, `xlsx`, `project` or `mail`; `path` is `null` for a tab never saved; `imported` is true for a Project read from `.mpp` and for a document whose file is a Word 97-2003 binary it was imported from (#634; a `.doc`, or one renamed), until a save rebinds the tab to the file it wrote |
 | `tab-select {"tab":"schedule"}` | make a tab active as clicking its chip does, and reply with the state. `tab` is an index or a case-insensitive title/path substring over **all** tabs, the rule the `proj.*` verbs use; a miss (`no tab matches 'x'`), an ambiguous match (`several tabs match 'x' (2, 3)`) and an index past the end (`no tab at index 9`) are refused. The Backstage stays as it was, as it does for a chip click |
-| `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog; a press reaches an open menu's own item or backdrop, so it does not pre-close menus |
+| `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point; or `{"at":"user-name-row"}`: Backstage's User name... row, #1027); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog, except the `{"dialog-field":"user-name","x":N}` form (#1027), which clicks the open dialog's text field `N` pixels in from its left edge (its middle without `x`) and replies `{x, y}`; a press reaches an open menu's own item or backdrop, so it does not pre-close menus |
 | `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 8 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The drag arms once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of about 2.25px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
 | `pointer-wheel {"region":"backstage-content","dy":-600}` | dispatch a real mouse move and wheel notch at the region's centre through gpui's hit testing (#1028); a negative `dy` (logical pixels) scrolls the content down. Replies `{x, y, dy}`. Refuses under a dialog; does not pre-close menus |
 | `backstage-layout {}` | read the File screen's scroll state (refused while it is closed): `page` (`open`, `new`, `info`), the content pane's `viewport_h`, `content_h`, `scroll_y`, `scrollable`, `at_top`, `scrolled`, `last_item_visible` (true when the page fits or has been scrolled to its end), and the rail's `rail_viewport_h`, `rail_content_h`, `rail_scrollable`, `rail_last_item_visible`. Settle with `shot window` first; regions `backstage-content` and `backstage-rail` name the two columns |
@@ -486,8 +496,10 @@ implemented`) instead of replying green over a no-op. `ribbon-click` resolves
 by id, else label, else the drawn text (`Σ AutoSum`), selects the tab and runs
 the button's own `run_sheet_act`. Buttons that open a bar (Filter, Custom
 Sort, Data Validation, …) leave it open for `type` and `key enter`, as a click
-does. The sheet ribbon has no split buttons, so `menu-open {"ribbon": …}`
-refuses a sheet tab. `sheet-ribbon.uit` covers these.
+does. Home's Paste is a split button, and Fill, Clear and Find & Select open
+menus (#707): `menu-open {"ribbon": [tab, group, command]}` opens them, and a
+`ribbon-click` of Fill, Clear or Find & Select opens its menu as the click
+does. `sheet-ribbon.uit` covers these.
 
 Levelling (Level, Level All, Clear Leveling, Ctrl+Shift+L) is asked for, not
 run, so the Project status bar can draw `Busy`; render schedules the pass for
@@ -551,10 +563,43 @@ Recover Unsaved Workbooks does. The ignored desktop test in
 `uiharness/tests/autorecover.rs` walks the issue's scenario.
 
 `call user-name {}` opens Settings' User name... dialog (#620) on the active
-tab, as the backstage row does: `dialog-set` its `user-name` and `initials`
+tab (or the app's own stack when no document is open, #1027), as the backstage
+row does: `dialog-set` its `user-name` and `initials`
 fields and `dialog-click` OK to store and persist them. New Word comments are
 stamped with that name and those initials (else the OS account name, else
 `docxy`, with initials derived from the name) and the UTC time.
+
+`key` and `type` call the key handler directly, so they pass when a window root
+has no key handler. `call real-key {"key":"ctrl+a"}` (or `"keys":[...]`) and
+`call real-type {"text":"…"}` queue the same strokes as real `KeyDown` input,
+which gpui dispatches through the focused window root and its bound actions
+(Tab, Shift+Tab) as the OS's keys go. `call pointer-click {"dialog-field":"user-name"}`
+clicks the open dialog's text field (`"x":N` pixels in from its left edge, else
+its middle), which focuses it and puts the caret under the click; it needs a
+drawn frame, so `shot window` first. `call pointer-click {"at":"user-name-row"}`
+clicks Backstage's User name... row (open File first). Keys pressed in
+Backstage with no dialog up edit nothing under it. `call comments {}` reads the
+active document's comments `{comments:[{id,author,initials,text}]}`. The cases are in
+`uiharness/cases/user-name.uit`; `user-name-no-document.uit` closes every tab,
+so it has its own file (cases in one file share one instance).
+
+`call autocorrect {}` opens Settings' AutoCorrect Options... dialog (#667,
+id `autocorrect`) on the active tab, as the backstage row does. Its tabs are
+AutoCorrect, AutoFormat As You Type, Actions and Math AutoCorrect; each
+switch is a checkbox named by its `session.json` key (`ac_replace_text`,
+`ac_hyperlinks`, …). `dialog-set` `replace` and `with` and press Add: a new
+word is added at once; a word already listed with another With opens
+`autocorrect-redefine` ("Do you want to redefine it?", Yes/No) first.
+Choosing an item of `entries` fills Replace and With, and Delete removes it.
+Exceptions... opens `autocorrect-exceptions` (tabs First Letter and INitial
+CAps, fields `first-word`/`caps-word`, lists `first-list`/`caps-list`, Add,
+Delete, OK). Add, Delete and the exceptions take effect at once, as Office's
+do; the checkboxes apply with OK, and Cancel keeps them. All of it persists
+with the Sheet editing options. A typed URL, `www.` address, e-mail address
+or UNC path becomes a hyperlink while `ac_hyperlinks` is on; such a
+hyperlink lives in the workbook model (clickable, undoable) but is not yet
+written to the file, since the xlsx writer keeps only the hyperlinks a file
+already had (a follow-up).
 
 `project-tabs.uit` drives several plans at once: a blank one from `proj.new`
 that takes tasks without a fixture, two opened plans switched between by title
@@ -659,6 +704,11 @@ case). `cell` reads a task a collapsed summary hides (its reply's `cell` and
 `row` are then `null`); `click-cell` refuses one, since nothing is drawn to
 click. Giving both `cell` and `uid` is an error. The Project `cell` reply adds
 the task's `id` and `uid`, and `entry: true` on the entry row, which reads empty.
+On a sheet, `call cell {"cell":"B2"}` replies `{cell, row, col, text, value,
+empty, hyperlink}`: `text` is what the cell shows, `value` its input text (a
+formula with its `=`, a text a typed entry would read otherwise with its `'`,
+so a Flash Filled `'042` reads as text), and `hyperlink` its link target or
+null (#667).
 
 `call rows {}` lists the rows the entry table draws, top to bottom, without the
 entry row; an optional `tab` picks a Project tab as the control verbs do, without
@@ -689,7 +739,9 @@ pointer on a few pixels, each driven through the app's own handlers (#699).
 | `save-as {"path":"out.md"}` | Save As the active tab to `path` without the native dialog: the path goes to the same save function the dialog's answer feeds (`save_doc_to`, `save_sheet_as`, `save_project_to`), and the tab is rebound (title, path, clean, a document's Markdown flag) exactly as after a dialog Save As. Optional `format` and `overwrite` |
 | `clipboard {"action":"read"}` | the clipboard's text and what the active tab's paste would use |
 | `clipboard {"action":"write","text":"a\tb\n"}` | put text on the clipboard, as another app's copy would |
-| `fill-drag {"from":"B4:B5","to":"B8"}` | press the fill handle, cross each cell to `to`, release. Optional `from` |
+| `fill-drag {"from":"B4:B5","to":"B8"}` | press the fill handle, cross each cell to `to`, release. Optional `from`, `option`, `ctrl`, `right`, `double` (#668) |
+| `border-drag {"from":"B2:B3","to":"J2"}` | press the selection's edge, drop the block with its top-left on `to` (#670). Optional `from`, `ctrl`, `right`, `choice`, `replace` |
+| `office-clipboard {"action":"open"}` | the Office Clipboard pane's own handlers (#669): `read` (the default), `open`, `close`, `paste` item `index`, `paste-all`, `clear-all`, `delete` item `index`. Replies `{open, items, state}`. It collects sheet copies and cuts only, not a document's |
 
 **`save-as`.** `path` is required; a relative one resolves against the folder
 of the tab's own file, where the dialog would open, so after `open copy:` it
@@ -736,14 +788,33 @@ is `none`, and a paste does nothing. The exception is a document copy of only
 an image, whose own text is empty: its clip stays ours.
 `write` needs `text` (an empty one is such a copy) and replies the same. Copy, cut and paste are the app's own keys and
 buttons (`key ctrl+c`, `ribbon-click {"tab":"Home","command":"Copy"}`), not
-actions of this verb, which refuses them and `paste-special` (`paste special is
-not implemented in this app`). `clipboard.uit` covers these.
+actions of this verb, which refuses them and `paste-special` (press the app's
+own key, `key ctrl+alt+v`, or the gallery's Paste Special… through
+`menu-click`). `clipboard.uit` covers these.
+
+**Paste Special, the gallery, Paste Options, the Office Clipboard (#669).**
+`key ctrl+alt+v` (or `menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}}`
+and `menu-click {"label":"Paste Special…"}`) opens the `paste-special` dialog:
+`dialog-set` its `paste` (All, Formulas, Values, Formats, Comments and Notes,
+Validation, All except borders, Column widths, Formulas and number formats,
+Values and number formats) and `operation` (None, Add, Subtract, Multiply,
+Divide) radios and its `skip-blanks` and `transpose` boxes, then `dialog-click`
+OK or Paste Link. Without a live copy only plain text is on the clipboard: All,
+Values and Transpose paste it, the other choices are refused and Paste Link is
+disabled. The gallery's items paste through `menu-click` on the Paste
+split button's menu. After a copy's paste, `menu-open {"target":{"grid":
+"paste-options"}}` opens the Paste Options button's menu (`paste_options` in
+the state says it shows), whose items paste the last paste again that way as
+one undo step. `office-clipboard` drives the Clipboard group launcher's pane;
+an item pastes as values.
 
 **`fill-drag`.** The `drag` verb presses the grid, so it only sweeps a
 selection; `fill-drag` does what a pointer on the fill handle does:
-`sheet_fill_start` (the handle's press), `grid_drag_over` for each cell of the
-straight path from the selection's bottom-right corner to `to`, and
-`grid_release`, which commits the fill as a series (`gridcore::edit::autofill`).
+`sheet_fill_start` (the handle's left press; `sheet_fill_start_right` with
+`right`), `grid_left_drag_over` (the cells' left-button move, which takes
+`ctrl`) for each cell of the straight path from the selection's bottom-right
+corner to `to` (`sheet_fill_over` with `right`), and `grid_release`, which
+commits the fill as a series (`gridcore::edit::autofill`).
 `from`, a cell or range, is selected first with `click-cell`'s own
 press/click/release (then the same with Shift for the far corner). The reply is
 the state plus `filled`, the filled box (`B4:B8`), or `null` when released on
@@ -765,9 +836,59 @@ the source. Refused:
   select Enable Editing to edit` (#610), `the fill did not arm: the sheet is
   protected` (a protected sheet refuses a fill from the pointer too), or
   `… another gesture is in flight`;
-- an `option`: `AutoFill Options are not implemented in this app`.
+- an `option` that names no Auto Fill Options kind (`copy`, `series`,
+  `formats`, `values`, `days`, `weekdays`, `months`, `years`, `linear`,
+  `growth`, or a menu label);
+- flags that don't go together: `right` with `double`, `right` with
+  `option` (a right drag ends in the fill menu: `menu-click` its kind), or
+  `ctrl` with `right` or `double` (Ctrl only swaps copy and series on a left
+  drag). `option` with `double` picks the kind after the double-click's
+  fill, as its Auto Fill Options button does.
+
+The fill runs gridcore's series rules (#668): counted text, ordinals,
+quarters, day/month and custom lists, the least-squares trend, dates by day,
+month or year. A drag above or left of the source fills backwards; one back
+inside the source clears what it leaves (`filled` then names the box left
+selected). `option` picks the Auto Fill Options button's kind after the fill,
+as its menu does (`menu-open {"target":{"grid":"fill-options"}}` opens that
+menu too); `ctrl` holds Ctrl, which swaps copy and series; `right` drags with
+the right button, and the reply is the fill menu it opens on release
+(`menu-click` a kind); `double` double-clicks the handle, filling down to the
+end of the neighbouring column's block (no `to`). Home › Fill's menu (Down,
+Right, Up, Left, Series…, Justify) opens with `menu-open {"target":{"ribbon":
+["Home","Editing","Fill"]}}`; Series… is the `series` dialog (`series-in`,
+`type`, `unit`, `trend`, `step`, `stop`), Justify may ask the `justify`
+question, and Settings' Edit Custom Lists… is `custom-lists` (Add, Delete,
+Import, OK).
 
 `sheet-fill.uit` covers these.
+
+**Multi-area selections and `border-drag` (#670).** `click-cell` and `drag`
+take `ctrl`: a Ctrl+click adds a one-cell area, a Ctrl+drag a swept one;
+`shift` then extends only the active area, and the state's `areas` lists
+them. Copy joins areas that share their rows or columns; a cut, a paste, and
+any command that acts on one rectangle refuse a multi-area selection with
+`This action won't work on multiple selections.` in the status. `border-drag`
+selects `from` (or keeps the selection), grabs it by its top-left and drops
+it with its top-left on `to`: a move (references follow), or with `ctrl` a
+copy; `right` opens the drop menu (its reply), whose `choice` (Move Here,
+Copy Here, Copy Here as Values Only, Copy Here as Formats Only, Link Here,
+Cancel) it then clicks. A drop on other data asks the `drop-replace`
+question: `replace: true` presses OK, `false` Cancel, and without it the
+question stays open. `sheet-selection.uit` covers these.
+
+**Clear and Go To Special (#671).** Home › Clear's menu (Clear All, Clear
+Formats, Clear Contents, Clear Comments and Notes, Clear Hyperlinks, Remove
+Hyperlinks) and Find & Select's (Go To…, Go To Special…) open through
+`menu-open` with the ribbon path or a `ribbon-click` of the command. F5 and
+Ctrl+G open the `goto` dialog (`names`, `reference`, Special…, OK);
+`goto-special` has the `select` radio (Notes, Constants, Formulas, Blanks,
+Current region, Current array, Row differences, Column differences,
+Precedents, Dependents, Last cell, Visible cells only, Conditional formats,
+Data validation), the `numbers`, `text`, `logicals` and `errors` boxes and the
+`levels` and `rules` radios. Its OK selects what it finds as the areas (the
+first found cell active) or puts `No cells were found.` in the status.
+`sheet-clear.uit` covers these.
 
 ### Open modes and Protected View
 
@@ -989,7 +1110,16 @@ Menus open today:
 - **the cell menu** on a sheet (#690, #691): right-click a cell. A cell outside
   the selection is selected first (no link followed; while a formula or a range
   field is pointing, nothing moves). It lists Cut, Copy, Paste, the Filter and
-  Sort submenus and New Comment, each a sheet command as the ribbon runs it;
+  Sort submenus, New Comment and Pick From Drop-down List..., each a sheet
+  command as the ribbon runs it;
+- **the pick list** on a sheet (#665): Alt+Down, the cell menu's Pick From
+  Drop-down List..., or `menu-open "pick-list"`. One item per distinct text of
+  the column's block, sorted, nothing highlighted until Down (Enter then enters
+  the highlighted one); the menu scrolls and holds at most 10,000 entries;
+- **the Flash Fill Options menu** on a sheet (#666): the ⚡ button by the last
+  filled cell, or `menu-open "flash-fill"` while the fill stands. Undo Flash
+  Fill, Accept suggestions, Select all N blank cells, Select all N changed
+  cells;
 - **the Mailings tab's drop-downs** on a document (#628): Start Mail Merge,
   Select Recipients, Insert Merge Field (the attached list's columns), Rules,
   Finish & Merge, and the Preview Results record box (the attached rows).
@@ -1022,8 +1152,8 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment; #690, #691), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619) | the menu, as `menu-read` |
-| `menu-read` | `{}` | `{open: true, target, items}`, or `{open: false}` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619) | the menu, as `menu-read` |
+| `menu-read` | `{}` | `{open: true, target, items, highlight}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null |
 | `menu-click` | `{label}` among the top-level items, `{path: [labels]}` through submenus, or `{index}`: the top-level item at that 0-based index, separators and headings not counted, for labels that repeat | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
 
@@ -1086,20 +1216,25 @@ A menu belongs to the moment it opened in. What moves on from it closes it:
 another tab, the backstage, a command run from anywhere, a control-pipe verb
 that edits, reloads, saves or focuses the plan, and every harness verb that
 stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
+`border-drag`, `office-clipboard` (not `read`),
 `save-as`, `select-chart`,
 `focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,
 `inspect` with `remove`,
 `theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `user-name`,
-`trusted-clear`,
+`autocorrect`, `trusted-clear`,
 `open-draft`,
 `enable-editing`, `edit-anyway`, `close-window` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 
-While a menu is open it takes every key: Esc closes it, and so, until menus
-take arrows and Enter, does any other key, Tab included. None reaches the
-document or cell under it. A press outside the menu closes it too.
+While a menu is open it takes every key. Down and Up move its highlight over
+the items that can run (past separators, headings and disabled items, wrapping
+at the ends; from none, Down takes the first and Up the last), and Enter runs
+the highlighted item — or opens its submenu in the menu's place — or, with
+nothing highlighted, closes the menu. Esc closes it, and so does any other key,
+Tab included. None reaches the document or cell under it. A press outside the
+menu closes it too.
 `project-menus.uit` drives all three menus.
 
 ### Headers and footers

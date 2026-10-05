@@ -5,7 +5,9 @@
 //! The rules the options drive live with the code they change: the fixed
 //! decimal in [`crate::entry::EntryCtx::fixed_decimal`], AutoComplete in
 //! [`crate::entry::autocomplete`], the precedents a double-click jumps to in
-//! [`crate::formula::direct_precedents`]. The hosts read the switches here.
+//! [`crate::formula::direct_precedents`], the automatic Flash Fill preview in
+//! [`crate::flashfill::flash_preview`], Formula AutoComplete in
+//! [`crate::fcomplete::completions`]. The hosts read the switches here.
 
 /// The direction "After pressing Enter, move selection" moves in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -59,8 +61,8 @@ pub const PLACES_MIN: i16 = -300;
 pub const PLACES_MAX: i16 = 300;
 
 /// The Editing options. `Default` is Excel's: fixed decimal off with 2
-/// places, Enter moves down, editing directly in cells, AutoComplete and the
-/// fill handle on.
+/// places, Enter moves down, editing directly in cells, AutoComplete, the
+/// fill handle, Automatically Flash Fill and Formula AutoComplete on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EditOptions {
     /// Automatically insert a decimal point.
@@ -78,6 +80,11 @@ pub struct EditOptions {
     pub autocomplete: bool,
     /// Enable fill handle and cell drag-and-drop.
     pub fill_handle: bool,
+    /// Automatically Flash Fill (Advanced): the greyed preview after the
+    /// second example is typed.
+    pub flash_fill_auto: bool,
+    /// Formula AutoComplete (Formulas › Working with formulas).
+    pub formula_autocomplete: bool,
 }
 
 impl Default for EditOptions {
@@ -90,6 +97,8 @@ impl Default for EditOptions {
             edit_in_cell: true,
             autocomplete: true,
             fill_handle: true,
+            flash_fill_auto: true,
+            formula_autocomplete: true,
         }
     }
 }
@@ -103,6 +112,8 @@ pub const KEY_MOVE_DIRECTION: &str = "edit_move_direction";
 pub const KEY_EDIT_IN_CELL: &str = "edit_in_cell";
 pub const KEY_AUTOCOMPLETE: &str = "edit_autocomplete";
 pub const KEY_FILL_HANDLE: &str = "edit_fill_handle";
+pub const KEY_FLASH_FILL_AUTO: &str = "edit_flash_fill_auto";
+pub const KEY_FORMULA_AUTOCOMPLETE: &str = "edit_formula_autocomplete";
 
 impl EditOptions {
     /// The places a typed commit shifts by: `Some` only while the fixed
@@ -156,6 +167,8 @@ impl EditOptions {
                 KEY_EDIT_IN_CELL => flag(&mut o.edit_in_cell),
                 KEY_AUTOCOMPLETE => flag(&mut o.autocomplete),
                 KEY_FILL_HANDLE => flag(&mut o.fill_handle),
+                KEY_FLASH_FILL_AUTO => flag(&mut o.flash_fill_auto),
+                KEY_FORMULA_AUTOCOMPLETE => flag(&mut o.formula_autocomplete),
                 _ => {}
             }
         }
@@ -169,7 +182,7 @@ impl EditOptions {
         format!(
             "{KEY_FIXED_DECIMAL}={}\n{KEY_PLACES}={}\n{KEY_MOVE_AFTER_ENTER}={}\n\
              {KEY_MOVE_DIRECTION}={}\n{KEY_EDIT_IN_CELL}={}\n{KEY_AUTOCOMPLETE}={}\n\
-             {KEY_FILL_HANDLE}={}\n",
+             {KEY_FILL_HANDLE}={}\n{KEY_FLASH_FILL_AUTO}={}\n{KEY_FORMULA_AUTOCOMPLETE}={}\n",
             b(self.fixed_decimal),
             self.places,
             b(self.move_after_enter),
@@ -177,11 +190,83 @@ impl EditOptions {
             b(self.edit_in_cell),
             b(self.autocomplete),
             b(self.fill_handle),
+            b(self.flash_fill_auto),
+            b(self.formula_autocomplete),
         )
     }
 }
 
-fn parse_bool(v: &str) -> Option<bool> {
+/// The persisted key of one custom list (File › Options › Advanced › Edit
+/// Custom Lists, #668): one `edit_custom_list=a,b,c` line per list, a `,` or
+/// `\` inside an item escaped with `\`.
+pub const KEY_CUSTOM_LIST: &str = "edit_custom_list";
+
+/// The user's custom lists in a preferences text, in order; empty lists and
+/// items are dropped.
+pub fn custom_lists_from_text(text: &str) -> Vec<Vec<String>> {
+    text.lines()
+        .filter_map(|line| {
+            let (k, v) = line.split_once('=')?;
+            (k.trim() == KEY_CUSTOM_LIST).then(|| split_list(v))
+        })
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// `lists` as `key=value` lines, each ending in `\n`; what
+/// [`custom_lists_from_text`] reads back. A backslash, comma or line break
+/// in an item is escaped, so an item imported from a cell with a line break
+/// keeps its list on one line (#707 r6 m1).
+pub fn custom_lists_to_lines(lists: &[Vec<String>]) -> String {
+    let mut out = String::new();
+    for list in lists.iter().filter(|l| !l.is_empty()) {
+        let items: Vec<String> = list
+            .iter()
+            .map(|i| {
+                i.replace('\\', "\\\\")
+                    .replace(',', "\\,")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+            })
+            .collect();
+        out.push_str(&format!("{KEY_CUSTOM_LIST}={}\n", items.join(",")));
+    }
+    out
+}
+
+fn split_list(v: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut cur = String::new();
+    let mut chars = v.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some('n') => cur.push('\n'),
+                Some('r') => cur.push('\r'),
+                next => cur.extend(next),
+            },
+            ',' => items.push(std::mem::take(&mut cur)),
+            _ => cur.push(ch),
+        }
+    }
+    items.push(cur);
+    items
+        .into_iter()
+        .map(|i| i.trim().to_string())
+        .filter(|i| !i.is_empty())
+        .collect()
+}
+
+/// The items an Edit Custom Lists entry box holds: one per line, or
+/// separated by commas.
+pub fn parse_list_entries(text: &str) -> Vec<String> {
+    text.split(['\n', ','])
+        .map(|i| i.trim().to_string())
+        .filter(|i| !i.is_empty())
+        .collect()
+}
+
+pub(crate) fn parse_bool(v: &str) -> Option<bool> {
     match v {
         "1" => Some(true),
         "0" => Some(false),
@@ -203,6 +288,7 @@ mod tests {
         assert!(o.move_after_enter);
         assert_eq!(o.enter_move, EnterMove::Down);
         assert!(o.edit_in_cell && o.autocomplete && o.fill_handle);
+        assert!(o.flash_fill_auto && o.formula_autocomplete);
         assert_eq!(o.fixed_places(), None);
     }
 
@@ -216,6 +302,8 @@ mod tests {
             edit_in_cell: false,
             autocomplete: false,
             fill_handle: false,
+            flash_fill_auto: false,
+            formula_autocomplete: false,
         };
         assert_eq!(EditOptions::from_text(&o.to_lines()), o);
         let d = EditOptions::default();
@@ -245,6 +333,18 @@ mod tests {
     }
 
     #[test]
+    fn text_saved_before_the_flash_fill_and_formula_switches_reads_them_on() {
+        // A preferences text from before #712 has neither key.
+        let old = "edit_fixed_decimal=1\nedit_autocomplete=0\nedit_fill_handle=1\n";
+        let o = EditOptions::from_text(old);
+        assert!(o.fixed_decimal && !o.autocomplete);
+        assert!(o.flash_fill_auto && o.formula_autocomplete);
+        let off =
+            EditOptions::from_text("edit_flash_fill_auto=0\nedit_formula_autocomplete=false\n");
+        assert!(!off.flash_fill_auto && !off.formula_autocomplete);
+    }
+
+    #[test]
     fn enter_moves_by_direction_and_shift_reverses_it() {
         assert_eq!(EnterMove::Down.delta(), (1, 0));
         assert_eq!(EnterMove::Right.delta(), (0, 1));
@@ -270,5 +370,68 @@ mod tests {
             ..EditOptions::default()
         };
         assert_eq!(o.fixed_places(), Some(-2));
+    }
+
+    /// #707 (4th update): the editing options, the custom lists and the
+    /// AutoCorrect lines share one preferences text, each reader taking its
+    /// own keys, whatever the others' values hold (`=`, `,`, `\`, a tab).
+    #[test]
+    fn options_custom_lists_and_autocorrect_share_one_text() {
+        use crate::autocorrect::AutoCorrect;
+        let opts = EditOptions {
+            flash_fill_auto: false,
+            formula_autocomplete: false,
+            ..EditOptions::default()
+        };
+        let lists = vec![
+            vec!["a=b".to_string(), "c,d".into(), "e\\f".into()],
+            vec!["x".to_string(), "y\nz".into()],
+        ];
+        let mut ac = AutoCorrect::default();
+        ac.add("(zz)", "a=b, c\\d").unwrap();
+        let text = format!(
+            "{}{}{}",
+            opts.to_lines(),
+            custom_lists_to_lines(&lists),
+            ac.to_lines()
+        );
+        assert_eq!(EditOptions::from_text(&text), opts);
+        assert_eq!(custom_lists_from_text(&text), lists);
+        assert_eq!(AutoCorrect::from_text(&text).to_lines(), ac.to_lines());
+        // Either side's text alone still reads.
+        let ours = format!("{}{}", opts.to_lines(), custom_lists_to_lines(&lists));
+        assert_eq!(custom_lists_from_text(&ours), lists);
+        assert_eq!(
+            AutoCorrect::from_text(&ours).to_lines(),
+            AutoCorrect::default().to_lines()
+        );
+        assert!(
+            custom_lists_from_text(&format!("{}{}", opts.to_lines(), ac.to_lines())).is_empty()
+        );
+    }
+
+    #[test]
+    fn custom_lists_round_trip_and_escape_commas() {
+        let lists = vec![
+            vec!["North".to_string(), "East".into(), "South".into()],
+            vec!["a, b".to_string(), "c\\d".into()],
+            // Imported from cells with line breaks (#707 r6 m1).
+            vec![
+                "two\nlines".to_string(),
+                "cr\r\nlf".into(),
+                "back\\n".into(),
+            ],
+        ];
+        let text = custom_lists_to_lines(&lists);
+        assert_eq!(text.lines().count(), 3, "{text}");
+        assert_eq!(custom_lists_from_text(&text), lists);
+        // Alongside the other options, each reader takes its own keys.
+        let both = format!("{}{text}", EditOptions::default().to_lines());
+        assert_eq!(custom_lists_from_text(&both), lists);
+        assert_eq!(EditOptions::from_text(&both), EditOptions::default());
+        assert_eq!(
+            parse_list_entries("Low\n Mid ,High,,"),
+            vec!["Low", "Mid", "High"]
+        );
     }
 }

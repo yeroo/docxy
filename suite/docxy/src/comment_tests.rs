@@ -5,7 +5,7 @@
 use crate::open_mode_tests::Scratch;
 use crate::{
     DocTab, Session, Surface, add_doc_comment, delete_doc_comment, live_comments, review_identity,
-    save_doc_tab, tab_from_path,
+    save_doc_tab, set_doc_comment_resolved, tab_from_path,
 };
 use docxcore::package::{Package, load_package, new_package, save_package};
 use std::path::{Path, PathBuf};
@@ -641,4 +641,102 @@ fn a_new_comment_joins_a_utf16_comments_part() {
         ["1".to_string(), "2".to_string(), id.to_string()]
     );
     assert!(comments.contains("Colour?"), "{comments}");
+}
+
+/// The saved comments with their resolved state.
+fn saved_resolved(path: &Path) -> Vec<(String, bool)> {
+    let pkg = load_package(&std::fs::read(path).unwrap()).unwrap();
+    docxcore::comments::parse_comments(&pkg)
+        .into_iter()
+        .map(|c| (c.id, c.resolved))
+        .collect()
+}
+
+/// #621 A1: Resolve writes `w15:done`, Reopen writes it back, and a loaded
+/// resolved comment lists as resolved.
+#[test]
+fn resolve_and_reopen_a_comment_round_trips() {
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &rich_package());
+    assert_eq!(
+        set_doc_comment_resolved(&mut tab, "2", Some(true)),
+        Some(true)
+    );
+    assert_eq!(set_doc_comment_resolved(&mut tab, "9", None), None);
+    assert!(tab.dirty);
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    assert_eq!(
+        saved_resolved(&path),
+        [("1".to_string(), false), ("2".to_string(), true)]
+    );
+    let pkg = load_package(&std::fs::read(&path).unwrap()).unwrap();
+    let ext = pkg.part_text("word/commentsExtended.xml").expect("part");
+    assert!(ext.contains("w15:done=\"1\""), "{ext}");
+    // Reloaded, it is listed resolved; Reopen (a toggle) clears it.
+    let mut tab = tab_from_path(&path);
+    assert!(listed(&tab).iter().any(|c| c.id == "2" && c.resolved));
+    assert_eq!(set_doc_comment_resolved(&mut tab, "2", None), Some(false));
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    assert_eq!(
+        saved_resolved(&path),
+        [("1".to_string(), false), ("2".to_string(), false)]
+    );
+}
+
+/// #621: a comment added in the tab can be resolved before its first save.
+#[test]
+fn a_new_comment_resolved_before_the_first_save_saves_resolved() {
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &fox_package());
+    let id = comment(&mut tab, "Colour?");
+    set_doc_comment_resolved(&mut tab, &id.to_string(), Some(true));
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    assert_eq!(saved_resolved(&path), [(id.to_string(), true)]);
+}
+
+/// #621: the state follows a comment through Delete and its undo.
+#[test]
+fn resolved_state_survives_delete_and_undo() {
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &rich_package());
+    set_doc_comment_resolved(&mut tab, "1", Some(true));
+    delete_doc_comment(&mut tab, "1");
+    assert!(editor(&mut tab).undo(), "the delete");
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    assert_eq!(
+        saved_resolved(&path),
+        [("1".to_string(), true), ("2".to_string(), false)]
+    );
+}
+
+/// #621 A2: Delete All removes every record, part and marker, keeps the
+/// anchored text, and one undo restores markers and records with their
+/// resolved state.
+#[test]
+fn delete_all_comments_removes_every_part_and_one_undo_restores() {
+    use crate::inspector::{InspectCategory, inspect_remove};
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &rich_package());
+    set_doc_comment_resolved(&mut tab, "2", Some(true));
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+    assert!(listed(&tab).is_empty());
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let pkg = load_package(&std::fs::read(&path).unwrap()).unwrap();
+    for part in ["word/comments.xml", "word/commentsExtended.xml"] {
+        assert!(pkg.part(part).is_none(), "{part}");
+    }
+    let doc = pkg.part_text("word/document.xml").unwrap();
+    assert!(!doc.contains("comment"), "{doc}");
+    assert!(doc.contains(FOX), "{doc}");
+    assert!(editor(&mut tab).undo(), "one step");
+    assert_eq!(listed_ids(&tab), ["1", "2"]);
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (doc, comments) = saved(&path);
+    assert_eq!((markers(&doc, 1), markers(&doc, 2)), (3, 3), "{doc}");
+    assert!(comments.contains(RICH), "{comments}");
+    assert_eq!(
+        saved_resolved(&path),
+        [("1".to_string(), false), ("2".to_string(), true)]
+    );
 }

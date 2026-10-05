@@ -2,6 +2,11 @@ use super::*;
 use crate::formula::{CellMove, move_block_formula};
 use crate::sheet::{Cell, DefinedName, Sheet, parse_cell_name};
 
+/// Source columns from `c` on, one per copied column.
+fn from(c: u32) -> Vec<u32> {
+    (c..c + 16).collect()
+}
+
 fn f(text: &str) -> Cell {
     Cell {
         formula: Some(text.to_string()),
@@ -73,11 +78,11 @@ fn a_whole_column_paste_area_reaches_the_used_rows_in_whole_copies() {
 #[test]
 fn copied_formulas_translate_to_where_they_land() {
     let cells = vec![vec![f("A1*10")], vec![f("$A2+A$1+$B$1")]];
-    let out = translated_block(&cells, &[0, 1], 1, (0, 4));
+    let out = translated_block(&cells, &[0, 1], &from(1), (0, 4));
     assert_eq!(out[0][0].formula.as_deref(), Some("D1*10"));
     assert_eq!(out[1][0].formula.as_deref(), Some("$A2+D$1+$B$1"));
     // Pushed off the grid: #REF!.
-    let out = translated_block(&[vec![f("A1")]], &[1], 0, (0, 0));
+    let out = translated_block(&[vec![f("A1")]], &[1], &from(0), (0, 0));
     assert_eq!(out[0][0].formula.as_deref(), Some("#REF!"));
 }
 
@@ -85,11 +90,11 @@ fn copied_formulas_translate_to_where_they_land() {
 fn a_copy_pasted_where_it_came_from_keeps_its_text_exactly() {
     // Reprinting would drop the spaces and the lower case.
     let cells = vec![vec![f("sum( a1 , 2 )")], vec![f("not a formula ((")]];
-    let out = translated_block(&cells, &[0, 1], 1, (0, 1));
+    let out = translated_block(&cells, &[0, 1], &from(1), (0, 1));
     assert_eq!(out[0][0].formula.as_deref(), Some("sum( a1 , 2 )"));
     assert_eq!(out[1][0].formula.as_deref(), Some("not a formula (("));
     // Moved, an unparseable formula keeps its text too.
-    let out = translated_block(&cells, &[0, 1], 1, (5, 5));
+    let out = translated_block(&cells, &[0, 1], &from(1), (5, 5));
     assert_eq!(out[1][0].formula.as_deref(), Some("not a formula (("));
 }
 
@@ -97,7 +102,7 @@ fn a_copy_pasted_where_it_came_from_keeps_its_text_exactly() {
 fn each_row_of_a_filtered_copy_translates_by_its_own_offset() {
     // Rows 1, 2, 4, 6 of a filter (3 and 5 hidden), pasted at D1.
     let cells = vec![vec![f("A1")], vec![f("A2")], vec![f("A4")], vec![f("A6")]];
-    let out = translated_block(&cells, &[0, 1, 3, 5], 1, (0, 3));
+    let out = translated_block(&cells, &[0, 1, 3, 5], &from(1), (0, 3));
     let got: Vec<_> = out.iter().map(|r| r[0].formula.clone().unwrap()).collect();
     // Row 4 lands on row 3: one row up, two columns across.
     assert_eq!(got, ["C1", "C2", "C3", "C4"]);
@@ -106,7 +111,7 @@ fn each_row_of_a_filtered_copy_translates_by_its_own_offset() {
 #[test]
 fn tiles_each_translate_to_their_own_corner() {
     let cells = vec![vec![f("A1*10")], vec![f("A2*10")]];
-    let block = tiled_block(&cells, &[0, 1], 1, (0, 3), (3, 1));
+    let block = tiled_block(&cells, &[0, 1], &from(1), (0, 3), (3, 1));
     let got: Vec<_> = block
         .iter()
         .map(|r| r[0].formula.clone().unwrap())
@@ -114,7 +119,7 @@ fn tiles_each_translate_to_their_own_corner() {
     assert_eq!(got, ["C1*10", "C2*10", "C3*10", "C4*10", "C5*10", "C6*10"]);
     // Across, with a short row padded so the next tile keeps its column.
     let cells = vec![vec![f("A1"), f("B1")], vec![f("A2")]];
-    let block = tiled_block(&cells, &[0, 1], 0, (0, 0), (1, 2));
+    let block = tiled_block(&cells, &[0, 1], &from(0), (0, 0), (1, 2));
     assert_eq!(block[0].len(), 4);
     assert_eq!(block[1].len(), 4);
     assert_eq!(block[0][2].formula.as_deref(), Some("C1"));
@@ -125,7 +130,7 @@ fn tiles_each_translate_to_their_own_corner() {
 #[test]
 fn a_tiled_block_stops_at_the_grids_edge() {
     let cells = vec![vec![Cell::number(1.0)], vec![Cell::number(2.0)]];
-    let block = tiled_block(&cells, &[0, 1], 0, (MAX_ROWS - 3, 0), (2, 1));
+    let block = tiled_block(&cells, &[0, 1], &from(0), (MAX_ROWS - 3, 0), (2, 1));
     assert_eq!(block.len(), 3);
 }
 

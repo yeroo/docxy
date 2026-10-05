@@ -39,7 +39,9 @@ part, and adding a comment is Comment even though it also adds body anchors.
 | Insert ribbon/dialogs | symbols, fields, page number, equations | Content |
 | Insert ribbon/dialogs | table, page break, section break | Structure |
 | Document layout | columns, hyphenation, section orientation, page colour, watermark, page borders | Formatting |
-| Review | commit new comment and delete comment | Comment |
+| Review | commit new comment, delete comment, resolve / reopen comment, delete all comments | Comment |
+| Review | Track Changes on / off (`w:trackRevisions`) | Package metadata |
+| Review | Display for Review (All, Simple, No Markup, Original) | View only: not a mutation. While No Markup or Original is shown the editing routes above refuse with `Edit blocked: Display for Review …` (`ProtectionDenial::DisplayMode`); Comment routes still work |
 | Review | accept/reject current or confirmed accept/reject all tracked changes | Content |
 | Header/footer | typing, deletion, formatting, paste, and committing the edited part | same Content, Structure, or Formatting class as the body operation |
 | Vim insert mode | typing, newline, deletion, paste | Content or Structure as above |
@@ -60,7 +62,8 @@ PasteSpecial, HorizontalLine, PageNumber, PageBreak, InsertTable, Columns,
 Hyphenation, Bold, Italic, Underline, Strike, Subscript, Superscript, GrowFont,
 ShrinkFont, ChangeCase, ClearFormatting, Bullets, Numbering, IncreaseIndent,
 DecreaseIndent, FirstLineIndent, HangingIndent, Sort, ParaBorders, AlignLeft,
-AlignCenter, AlignRight, Justify, ApplyStyle, NewComment, DeleteComment, and the
+AlignCenter, AlignRight, Justify, ApplyStyle, NewComment, DeleteComment, ResolveComment,
+DeleteAllComments, ToggleTrack (Package metadata), and the
 commits made by InsertField, InsertSymbol, InsertEquation, LineSpacing,
 ParagraphDialog, StylesDialog, font/size/color/highlight pickers, and the
 PageColor, Watermark, and PageBorders pickers. Dialog
@@ -82,6 +85,8 @@ open, navigation, and cancel paths are non-mutating.
 | `doc.undo`, `doc.redo` | Content |
 | `doc.revision-accept`, `doc.revision-reject` | Content |
 | `doc.revisions-accept-all`, `doc.revisions-reject-all` | Content |
+| `doc.comment-resolve`, `doc.comments-delete-all` | Comment |
+| `doc.track-changes-set` | Package metadata |
 
 The Markdown forms of replace/insert/append keep their Structure requirement and
 add a Formatting requirement when parsed blocks carry styles, numbering, or
@@ -91,8 +96,12 @@ independent mutation implementation: `docxy_replace_range`, `docxy_insert`,
 `docxy_append`, `docxy_replace_all`, `docxy_format`, `docxy_set_style`,
 `docxy_page_color`, `docxy_watermark`, `docxy_page_borders`,
 `docxy_undo`, `docxy_redo`, `docxy_revision_accept`, `docxy_revision_reject`,
-`docxy_revisions_accept_all`, and `docxy_revisions_reject_all` map one-to-one
-to the control verbs above. Revision listing/current/previous/next are
+`docxy_revisions_accept_all`, `docxy_revisions_reject_all`,
+`docxy_comment_resolve`, `docxy_comments_delete_all` and
+`docxy_track_changes_set` map one-to-one
+to the control verbs above. `docxy_display_mode` / `docxy_track_changes` (and
+`doc.display-mode`, `doc.track-changes`) only report or choose a view, and are
+not gated. Revision listing/current/previous/next are
 non-mutating navigation and inspection routes. The three Design verbs
 (`doc.page-color`, `doc.watermark`, `doc.page-borders`) refuse Markdown
 documents outright; the Design ribbon pickers they share their edits with do

@@ -137,6 +137,19 @@ docxy/                      # the binary crate
         afm.rs                   # standard-14 font glyph-width tables
 ```
 
+`buildinfo/` is a dependency-free crate with one `build.rs` that stamps every binary
+(the suite, docxy, xlsxy, yppxy; lookxy's MCP version) with its commit, last merged PR,
+build kind and manual-build marker. It feeds `--version`, the suite's File › Account /
+About dialog, the `app-info` control verb, the MCP `version` and the crash-log header. The kind comes from
+`DOCXY_BUILD_KIND` (`release` in `release.yml`, `ci` in `ci.yml`, else `local`); a `local` or dirty build is
+a "manual build". It reruns only when `.git/HEAD`, the ref HEAD points to (that ref's directory once
+`git pack-refs` has packed it), `packed-refs`, the index (each while it exists), a tracked file that was
+already modified at the last run, or `DOCXY_BUILD_KIND` / `SOURCE_DATE_EPOCH` / `GITHUB_HEAD_REF` /
+`GITHUB_REF_NAME` change; so a first edit to a clean, unstaged tree is not noticed until `git add` or a
+commit. A repository counts only if it tracks the crate, so a crates.io install reports `unknown`.
+`release.yml` checks out the full history so the last merged PR is found; a shallow checkout only sees
+what it has.
+
 ---
 
 ## 5. Document model (editable OOXML AST)

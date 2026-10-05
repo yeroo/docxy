@@ -148,9 +148,7 @@ impl fmt::Display for SubtotalError {
 
 impl std::error::Error for SubtotalError {}
 
-/// A Subtotal region: rows and columns `(r1, c1, r2, c2)`, 0-based and
-/// inclusive, like a selection.
-pub type Area = (u32, u32, u32, u32);
+pub use super::Area;
 
 /// Whether the row holds a `SUBTOTAL` formula (any case, `_xlfn.` or not) in
 /// columns `c1..=c2`: what Remove All deletes and nesting treats as an

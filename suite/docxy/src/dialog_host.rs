@@ -62,6 +62,18 @@ fn apply_dialog(
         DialogOwner::TextToColumns { .. } | DialogOwner::TextToColumnsReplace => {
             Err("Text to Columns applies through its own wizard".into())
         }
+        // Handled in `sheet_goto::click`, before this.
+        DialogOwner::GoTo | DialogOwner::GoToSpecial => {
+            Err("Go To applies through Find & Select".into())
+        }
+        // Handled in `Docxy::paste_dialog_click`, before this.
+        DialogOwner::PasteSpecial { .. } => Err("Paste Special applies through Paste".into()),
+        // Handled in `Docxy::drop_dialog_click`, before this.
+        DialogOwner::DropReplace => Err("the drop applies through the grid".into()),
+        // Handled in `Docxy::fill_dialog_click`, before this.
+        DialogOwner::Series | DialogOwner::JustifyOverflow | DialogOwner::CustomLists => {
+            Err("a Fill dialog applies through Home › Fill".into())
+        }
         // Handled in `sheet_consolidate::click`, before this.
         DialogOwner::Consolidate { .. } => Err("Consolidate applies through the Data tab".into()),
         // Handled in `sheet_filter::click` and `sheet_sort::click`, before this.
@@ -106,11 +118,18 @@ fn apply_dialog(
         | DialogOwner::DesignBorderOptions => {
             Err("a Design dialog applies through the Design tab".into())
         }
+        DialogOwner::Message => Ok(false),
+        // Handled in `sheet_autocorrect::click`, before this: the app's.
+        DialogOwner::AutoCorrect
+        | DialogOwner::AutoCorrectExceptions
+        | DialogOwner::AutoCorrectRedefine => Err("AutoCorrect is an app setting".into()),
         // Handled in `close::close_prompt_click`, before this: it closes
         // the tab, or goes on with the window's close.
         DialogOwner::SaveOnClose { .. } => Err("closing a tab applies through the app".into()),
         // Handled in `user_name::click`, before this: it is the app's.
         DialogOwner::UserName => Err("the user name is an app setting".into()),
+        // Handled in `Docxy::about_click`, before this: it only copies or closes.
+        DialogOwner::About => Err("the About dialog only copies or closes".into()),
         #[cfg(test)]
         DialogOwner::Test | DialogOwner::TestChild => Ok(false),
     }
@@ -139,6 +158,27 @@ fn reopen_click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
     Some(crate::tab_from_path_mode(&path, mode, &trusted).map(|fresh| *tab = fresh))
 }
 
+/// Whether Enter and Escape on a dialog of `owner` press through
+/// `Docxy::dialog_press`, which the app's own dialogs need (the user name,
+/// About, AutoCorrect, the close prompt, the fill, paste and drop dialogs),
+/// as does Go To's move to another sheet (#707 r6 m2).
+pub(crate) fn presses_through_app(owner: &DialogOwner) -> bool {
+    crate::sheet_autocorrect::is_autocorrect(*owner)
+        || matches!(
+            owner,
+            DialogOwner::UserName
+                | DialogOwner::About
+                | DialogOwner::SaveOnClose { .. }
+                | DialogOwner::Series
+                | DialogOwner::JustifyOverflow
+                | DialogOwner::CustomLists
+                | DialogOwner::PasteSpecial { .. }
+                | DialogOwner::DropReplace
+                | DialogOwner::GoTo
+                | DialogOwner::GoToSpecial
+        )
+}
+
 /// Whether the active tab's top dialog is the reopen question, whose Yes
 /// replaces the tab under any grid state the window keeps for it.
 fn reopen_on_top(tab: Option<&DocTab>) -> bool {
@@ -156,6 +196,10 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
     }
     // So do the outline dialogs (#693): Subtotal's OK and Remove All.
     if let Some(done) = crate::sheet_outline::click(tab, button) {
+        return done;
+    }
+    // Go To's OK selects; its Special… opens Go To Special (#671).
+    if let Some(done) = crate::sheet_goto::click(tab, button) {
         return done;
     }
     // Consolidate's Add and Delete edit its list; OK consolidates (#694).
@@ -202,14 +246,28 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
     Ok(())
 }
 
+/// [`dialog_key_with`] with nothing on the clipboard, for the tests.
+#[cfg(test)]
+pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Modifiers) -> bool {
+    dialog_key_with(tab, key, typed, m, None)
+}
+
 /// A key while the tab has a dialog open: Enter presses the default button,
 /// Escape the cancel one, Tab and Shift+Tab move the focus, and the focused
-/// widget takes the rest: typed characters and Backspace edit a field, Space
-/// toggles a checkbox, Up and Down step a radio group or dropdown. Every key
-/// (chords and Alt too) is swallowed, so nothing under the dialog sees it.
-/// `typed` is the character the key types, when it types one. `false` when
-/// no dialog is open and the key should go on as usual.
-pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Modifiers) -> bool {
+/// widget takes the rest: a field takes typed characters, Backspace, Delete,
+/// the arrows, Home and End (Shift extends a selection), Ctrl+A and Ctrl+V;
+/// Space toggles a checkbox, Up and Down step a radio group or dropdown.
+/// Every key (chords and Alt too) is swallowed, so nothing under the dialog
+/// sees it. `typed` is the character the key types, when it types one.
+/// `false` when no dialog is open and the key should go on as usual.
+/// `clip` is the text Ctrl+V pastes.
+pub(crate) fn dialog_key_with(
+    tab: &mut DocTab,
+    key: &str,
+    typed: Option<&str>,
+    m: Modifiers,
+    clip: Option<&str>,
+) -> bool {
     if !tab.dialogs.is_open() {
         return false;
     }
@@ -220,12 +278,40 @@ pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Mo
         }
         return true;
     }
-    if !plain {
-        return true;
+    if let Err(e) = edit_key(&mut tab.dialogs, key, typed, m, clip) {
+        tab.status = e.into();
     }
-    let Ok(d) = tab.dialogs.top_dialog_mut() else {
-        return true;
+    true
+}
+
+/// The part of [`dialog_key_with`] that edits the top dialog's focused widget.
+pub(crate) fn edit_key(
+    stack: &mut DialogStack,
+    key: &str,
+    typed: Option<&str>,
+    m: Modifiers,
+    clip: Option<&str>,
+) -> Result<(), String> {
+    let Ok(d) = stack.top_dialog_mut() else {
+        return Ok(());
     };
+    if m.alt {
+        return Ok(());
+    }
+    if m.control || m.platform {
+        // Only select-all and paste; any other chord is swallowed.
+        return match (key, clip) {
+            ("a", _) => {
+                d.select_all();
+                Ok(())
+            }
+            ("v", Some(text)) => {
+                let line: String = text.chars().filter(|c| !c.is_control()).collect();
+                d.insert_text(&line)
+            }
+            _ => Ok(()),
+        };
+    }
     let typed = typed.map(str::to_string).or_else(|| {
         // A synthetic key without its character: a one-letter key name.
         let mut chars = key.chars();
@@ -235,12 +321,21 @@ pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Mo
             _ => None,
         }
     });
-    let done = match key {
+    match key {
         "tab" => {
             d.focus_step(m.shift);
             Ok(())
         }
         "backspace" => d.backspace(),
+        "delete" => d.delete(),
+        "left" | "right" => {
+            d.move_caret(key == "right", m.shift);
+            Ok(())
+        }
+        "home" | "end" => {
+            d.move_caret_edge(key == "end", m.shift);
+            Ok(())
+        }
         "space" => d.space(),
         "up" => d.step_focused(false),
         "down" => d.step_focused(true),
@@ -251,24 +346,40 @@ pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Mo
             Some((Some(c), 1)) if !c.is_control() => d.type_char(c),
             _ => Ok(()),
         },
-    };
-    if let Err(e) = done {
-        tab.status = e.into();
     }
-    true
+}
+
+/// The dialogs a person sees: the app's own stack when it holds one (a tab
+/// that arrives while it is open does not hide it), else the active tab's.
+fn shown_stack<'a>(app: &'a DialogStack, tab: Option<&'a DialogStack>) -> Option<&'a DialogStack> {
+    if app.is_open() {
+        return Some(app);
+    }
+    tab.filter(|d| d.is_open())
 }
 
 impl Docxy {
-    /// The active tab's dialogs, when one is open.
+    /// The dialogs a person sees: the app's own stack when one is open (the
+    /// User name opened with no document, #1027; a tab that arrives later
+    /// does not hide it), else the active tab's. `None` when none is open.
     pub(crate) fn active_dialogs(&self) -> Option<&DialogStack> {
-        self.tabs
-            .get(self.active)
-            .map(|t| &t.dialogs)
-            .filter(|d| d.is_open())
+        shown_stack(
+            &self.app_dialogs,
+            self.tabs.get(self.active).map(|t| &t.dialogs),
+        )
     }
 
-    /// Refuse a verb a person could not reach while the active tab has a
-    /// dialog open: its backdrop covers the whole window, title bar and
+    /// The stack [`Docxy::active_dialogs`] reads, to change it: the app's
+    /// when it holds one or no document is open, else the active tab's.
+    pub(crate) fn active_dialogs_mut(&mut self) -> &mut DialogStack {
+        match self.tabs.get_mut(self.active) {
+            Some(t) if !self.app_dialogs.is_open() => &mut t.dialogs,
+            _ => &mut self.app_dialogs,
+        }
+    }
+
+    /// Refuse a verb a person could not reach while a dialog is open (the
+    /// active tab's or the app's): its backdrop covers the whole window, title bar and
     /// ribbon included. Shared by the harness and the Project control server.
     pub(crate) fn refuse_under_dialog(&self) -> Result<(), String> {
         match self.active_dialogs().and_then(|d| d.top()) {
@@ -277,7 +388,8 @@ impl Docxy {
         }
     }
 
-    /// Press a button on the active tab's top dialog.
+    /// Press a button on the top dialog: the app's User name, else the
+    /// active tab's.
     pub(crate) fn dialog_press(
         &mut self,
         button: &str,
@@ -288,16 +400,42 @@ impl Docxy {
         if let Some(done) = self.user_name_click(button) {
             return done;
         }
+        // About's Copy and Close are the app's too (#1023).
+        if let Some(done) = self.about_click(button, cx) {
+            return done;
+        }
+        // So is AutoCorrect (#667).
+        if let Some(done) = self.autocorrect_click(button) {
+            return done;
+        }
         // The close prompt closes the tab, or goes on with the window's
         // close (#629, #630).
         if let Some(done) = self.close_prompt_click(button, window, cx) {
             return done;
         }
+        // So are the custom lists, which the Series dialog reads (#668).
+        if let Some(done) = self.fill_dialog_click(button) {
+            return done;
+        }
+        // And the copy Paste Special pastes (#669).
+        if let Some(done) = self.paste_dialog_click(button) {
+            return done;
+        }
+        // And a drop by the selection's border waiting on its question (#670).
+        if let Some(done) = self.drop_dialog_click(button) {
+            return done;
+        }
         let reopen = reopen_on_top(self.tabs.get(self.active));
+        let sheet_before = self.active_sheet().map(|v| v.active);
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
         dialog_click(tab, button)?;
         if reopen {
             self.after_reopen();
+        }
+        // A dialog that moved to another sheet (Go To) leaves the grid state
+        // of the one it left behind, as a sheet-tab click does (#707 r5 M3).
+        if !reopen && self.active_sheet().map(|v| v.active) != sheet_before {
+            self.drop_grid_state();
         }
         // A merge or a sheet of labels opens as a new document.
         self.take_mail_outputs();
@@ -311,7 +449,8 @@ impl Docxy {
         self.persist();
     }
 
-    /// A key for the active tab's dialog; see [`dialog_key`].
+    /// A key for the open dialog, the app's or the active tab's; see
+    /// [`dialog_key_with`].
     pub(crate) fn dialog_takes_key(
         &mut self,
         key: &str,
@@ -320,26 +459,36 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        // Enter or Escape on a dialog the app owns (the user name, the close
-        // prompt) presses through the app, as its drawn buttons do.
+        // Enter or Escape on a dialog the app applies (the user name, About,
+        // AutoCorrect, the close prompt, the fill, paste and drop dialogs)
+        // presses through the app, as its drawn buttons do; so do Go To and
+        // Go To Special, whose OK may move to another sheet and must drop the
+        // grid state left behind, as a click does (#707 r6 m2).
         let plain = !m.control && !m.alt && !m.platform;
         let app_button = self
-            .tabs
-            .get(self.active)
-            .filter(|t| {
-                t.dialogs.top().is_some_and(|d| {
-                    matches!(
-                        d.owner,
-                        DialogOwner::UserName | DialogOwner::SaveOnClose { .. }
-                    )
-                })
-            })
-            .and_then(|t| t.dialogs.key_button(key, plain));
+            .active_dialogs()
+            .filter(|s| s.top().is_some_and(|d| presses_through_app(&d.owner)))
+            .and_then(|s| s.key_button(key, plain));
         if let Some(label) = app_button {
             if let Err(e) = self.dialog_press(&label, window, cx) {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.status = e.into();
-                }
+                self.set_status(e);
+            }
+            cx.notify();
+            return true;
+        }
+        // Ctrl+V pastes what the clipboard holds.
+        let clip = ((m.control || m.platform) && key == "v" && self.active_dialogs().is_some())
+            .then(|| match self.clipboard_read(cx) {
+                ClipRead::Text(t) => Some(t),
+                _ => None,
+            })
+            .flatten();
+        if self.app_dialogs.is_open() {
+            // The app's own dialog (the User name opened with no document). It
+            // stays on top if a tab arrives under it. A refusal goes to the
+            // active tab's status line, if there is a tab.
+            if let Err(e) = edit_key(&mut self.app_dialogs, key, typed, m, clip.as_deref()) {
+                self.set_status(e);
             }
             cx.notify();
             return true;
@@ -348,7 +497,7 @@ impl Docxy {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return false;
         };
-        let taken = dialog_key(tab, key, typed, m);
+        let taken = dialog_key_with(tab, key, typed, m, clip.as_deref());
         if taken {
             if reopen {
                 self.after_reopen();
@@ -370,24 +519,61 @@ impl Docxy {
 
     /// A press on one of the top dialog's widgets: see [`Dialog::click_control`].
     fn dialog_control_click(&mut self, index: usize, item: Option<usize>, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            let done = tab
-                .dialogs
-                .top_dialog_mut()
-                .and_then(|d| d.click_control(index, item));
-            if let Err(e) = done {
-                tab.status = e.into();
-            }
+        let done = self
+            .active_dialogs_mut()
+            .top_dialog_mut()
+            .and_then(|d| d.click_control(index, item));
+        if let Err(e) = done {
+            self.set_status(e);
+        }
+        cx.notify();
+    }
+
+    /// A click on a text field: focus it and put the caret where the click
+    /// fell, in the characters its text is drawn in.
+    fn dialog_field_click(
+        &mut self,
+        index: usize,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dialog_control_click(index, None, cx);
+        let Some(name) = self
+            .active_dialogs()
+            .and_then(|s| s.top())
+            .and_then(|d| d.controls.get(index))
+            .map(|c| c.name)
+        else {
+            return;
+        };
+        let Some(bounds) = self
+            .probes
+            .borrow()
+            .current(&format!("dialog-field:{name}"))
+        else {
+            return;
+        };
+        // The probe is already inside the border: the text starts a padding in.
+        let x = f32::from(at.x - bounds.left()) - FIELD_INSET;
+        let measurer = Measurer::new(window);
+        if let Some(d) = self
+            .active_dialogs_mut()
+            .top_dialog_mut()
+            .ok()
+            .filter(|d| d.focus == Some(index))
+        {
+            let text = d.focused().map(|c| c.text()).unwrap_or_default();
+            let to = char_at_x(&text, x, |s| measurer.width(s, 12., false, false));
+            d.move_caret_to(to, false);
         }
         cx.notify();
     }
 
     /// A press on the top dialog's tab strip.
     fn dialog_tab_click(&mut self, label: &str, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            if let Err(e) = tab.dialogs.select_tab(label) {
-                tab.status = e.into();
-            }
+        if let Err(e) = self.active_dialogs_mut().select_tab(label) {
+            self.set_status(e);
         }
         cx.notify();
     }
@@ -407,22 +593,53 @@ impl Docxy {
             .text_size(px(12.))
             .text_color(fg)
             .child(probe(&self.probes, format!("dialog-control:{}", c.name)));
-        let boxed = |text: String| {
+        let boxed_with = |content: AnyElement| {
             div()
                 .min_w(px(96.))
                 .px_1()
                 .border_1()
                 .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
                 .bg(pal.panel)
-                .child(SharedString::from(text))
+                .child(content)
         };
+        let boxed = |text: String| boxed_with(SharedString::from(text).into_any_element());
         match c.kind {
             k if k.is_text() => {
-                let caret = if focused { "|" } else { "" };
+                let name = c.name;
+                // The text, with the caret in it and the selection shaded.
+                let text = c.text();
+                let shown: AnyElement = if focused {
+                    let chars: Vec<char> = text.chars().collect();
+                    let caret = d.caret_at().min(chars.len());
+                    let (from, to) = d.selection().unwrap_or((caret, caret));
+                    let part = |a: usize, b: usize| {
+                        SharedString::from(chars[a..b].iter().collect::<String>())
+                    };
+                    let bar = || caret_bar(pal.fg);
+                    h_flex()
+                        .child(part(0, from))
+                        .when(caret == from, |r| r.child(bar()))
+                        .when(from != to, |r| {
+                            r.child(div().bg(hsla_u(BRAND).opacity(0.35)).child(part(from, to)))
+                        })
+                        .when(caret == to && from != to, |r| r.child(bar()))
+                        .child(part(to, chars.len()))
+                        .into_any_element()
+                } else {
+                    SharedString::from(text).into_any_element()
+                };
                 row.child(label)
-                    .child(boxed(format!("{}{caret}", c.text())))
+                    .child(
+                        boxed_with(shown)
+                            .relative()
+                            .child(probe(&self.probes, format!("dialog-field:{name}"))),
+                    )
                     .when(editable, |r| {
-                        r.cursor_text().on_click(on_widget(cx, i, None))
+                        r.cursor_text().on_click(cx.listener(
+                            move |this, ev: &ClickEvent, window, cx| {
+                                this.dialog_field_click(i, ev.position(), window, cx)
+                            },
+                        ))
                     })
                     .into_any_element()
             }
@@ -632,6 +849,31 @@ impl Docxy {
     }
 }
 
+/// How far in from the left of a field's `dialog-field` probe its text
+/// starts: the box's `px_1` padding. The probe is absolutely positioned inside
+/// the box's border, so the one-pixel border is already outside it.
+const FIELD_INSET: f32 = 4.;
+
+/// The character gap nearest to `x` pixels along `text`, whose prefixes
+/// measure as `width` says.
+fn char_at_x(text: &str, x: f32, width: impl Fn(&str) -> f32) -> usize {
+    let ends: Vec<usize> = text.char_indices().map(|(i, c)| i + c.len_utf8()).collect();
+    let mut prev = 0.0;
+    for (n, &end) in ends.iter().enumerate() {
+        let w = width(&text[..end]);
+        if x < (prev + w) / 2.0 {
+            return n;
+        }
+        prev = w;
+    }
+    ends.len()
+}
+
+/// The caret of a focused text field: a thin bar between two characters.
+fn caret_bar(color: Hsla) -> Div {
+    div().w(px(1.)).h(px(14.)).bg(color)
+}
+
 /// The click handler of a dialog widget: control `i`, and the radio item.
 fn on_widget(
     cx: &mut Context<Docxy>,
@@ -740,5 +982,117 @@ mod tests {
         assert!(key(&mut t, "enter", None));
         assert!(!t.dialogs.is_open(), "Enter pressed OK");
         assert!(!key(&mut t, "a", Some("a")), "no dialog, the key goes on");
+    }
+    fn chord() -> Modifiers {
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        }
+    }
+
+    /// Ctrl+A selects the field's text and typing replaces it; Ctrl+V pastes
+    /// the clipboard's text (its line breaks dropped); other chords still
+    /// edit nothing (#1027).
+    #[test]
+    fn select_all_and_paste_edit_the_focused_field() {
+        let mut t = tab_with_form();
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "n", Some("n")));
+        assert!(dialog_key_with(&mut t, "a", None, chord(), None));
+        assert!(key(&mut t, "J", Some("J")));
+        assert_eq!(value(&t, "note"), Value::Text("J".into()));
+        assert!(dialog_key_with(
+            &mut t,
+            "v",
+            None,
+            chord(),
+            Some("ane\r\nDoe")
+        ));
+        assert_eq!(value(&t, "note"), Value::Text("JaneDoe".into()));
+        assert!(
+            dialog_key_with(&mut t, "v", None, chord(), None),
+            "an empty clipboard"
+        );
+        assert!(dialog_key_with(&mut t, "z", None, chord(), None));
+        assert_eq!(value(&t, "note"), Value::Text("JaneDoe".into()));
+    }
+
+    /// Home, End, Left, Right and Delete move and edit within a field.
+    #[test]
+    fn arrows_home_end_and_delete_edit_in_place() {
+        let mut t = tab_with_form();
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "tab", None));
+        for c in ["a", "b", "c"] {
+            assert!(key(&mut t, c, Some(c)));
+        }
+        assert!(key(&mut t, "home", None));
+        assert!(key(&mut t, "right", None));
+        assert!(key(&mut t, "delete", None));
+        assert_eq!(value(&t, "note"), Value::Text("ac".into()));
+        assert!(key(&mut t, "end", None));
+        assert!(key(&mut t, "left", None));
+        assert!(key(&mut t, "x", Some("x")));
+        assert_eq!(value(&t, "note"), Value::Text("axc".into()));
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert!(dialog_key(&mut t, "home", None, shift));
+        assert!(key(&mut t, "backspace", None));
+        assert_eq!(
+            value(&t, "note"),
+            Value::Text("c".into()),
+            "Shift+Home took 'ax'"
+        );
+    }
+
+    /// A click at `x` lands the caret in the nearest gap between characters.
+    #[test]
+    fn a_click_maps_to_the_nearest_character_gap() {
+        // Every character 10px wide.
+        let w = |s: &str| s.chars().count() as f32 * 10.0;
+        assert_eq!(char_at_x("abc", -4.0, w), 0);
+        assert_eq!(char_at_x("abc", 4.0, w), 0);
+        assert_eq!(char_at_x("abc", 6.0, w), 1);
+        assert_eq!(char_at_x("abc", 14.0, w), 1);
+        assert_eq!(char_at_x("abc", 16.0, w), 2);
+        assert_eq!(char_at_x("abc", 29.0, w), 3);
+        assert_eq!(char_at_x("abc", 500.0, w), 3);
+        assert_eq!(char_at_x("", 5.0, w), 0);
+        assert_eq!(
+            char_at_x("a\u{1F600}", 19.0, w),
+            2,
+            "one character past a wide one"
+        );
+    }
+
+    /// An app-level dialog stays the one shown when a tab becomes active
+    /// under it, and the tab's own shows again once it closes (#1027).
+    #[test]
+    fn the_apps_dialog_is_not_stranded_by_a_tab_arriving() {
+        let tab = tab_with_form();
+        let mut app = DialogStack::default();
+        assert!(shown_stack(&app, None).is_none(), "nothing open");
+        assert_eq!(
+            shown_stack(&app, Some(&tab.dialogs)).map(|s| s.top_id()),
+            Some("form")
+        );
+        app.push(crate::user_name::dialog("", ""));
+        assert_eq!(
+            shown_stack(&app, None).map(|s| s.top_id()),
+            Some("user-name")
+        );
+        assert_eq!(
+            shown_stack(&app, Some(&tab.dialogs)).map(|s| s.top_id()),
+            Some("user-name"),
+            "a tab opened under it does not hide it"
+        );
+        app.clear();
+        assert_eq!(
+            shown_stack(&app, Some(&tab.dialogs)).map(|s| s.top_id()),
+            Some("form")
+        );
     }
 }

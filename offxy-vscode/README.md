@@ -195,7 +195,7 @@ for the two ways a tab's semantics differ from a terminal instance.
   sidesteps the versioned-path problem entirely — see
   [docs/agent-control.md](../docs/agent-control.md#mcp-native-tools-in-claude-code).
 - **Tools** — the bundled server (`serverInfo.name` `"offxy"`) exposes exactly
-  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (81
+  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (88
   tools total): `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`,
   `docxy_read`, `docxy_find`, `docxy_replace_range`, `docxy_insert`,
   `docxy_append`, `docxy_save`, `docxy_export`, `docxy_export_pdf`,
@@ -205,7 +205,9 @@ for the two ways a tab's semantics differ from a terminal instance.
   `docxy_revision_current`, `docxy_revision_next`, `docxy_revision_previous`,
   `docxy_revision_accept`, `docxy_revision_reject`,
   `docxy_revisions_accept_all`, `docxy_revisions_reject_all`,
-  `docxy_compare`, `docxy_page_color`, `docxy_watermark`, `docxy_page_borders` (35) —
+  `docxy_compare`, `docxy_page_color`, `docxy_watermark`, `docxy_page_borders`,
+  `docxy_comment_resolve`, `docxy_comments_delete_all`, `docxy_display_mode`,
+  `docxy_track_changes`, `docxy_track_changes_set` (40) —
   `docxy_replace_range`/`docxy_insert`/`docxy_append` each take an optional
   `markdown` flag to splice formatted Markdown (headings, bold, lists,
   tables, links) into the document instead of plain text, and
@@ -213,7 +215,9 @@ for the two ways a tab's semantics differ from a terminal instance.
   color, highlight, font, size) and paragraph styles/alignment to a block
   range; the revision tools navigate imported changes and accept/reject one or
   all supported records as undoable edits; `docxy_page_color`,
-  `docxy_watermark` and `docxy_page_borders` act only on a terminal docxy
+  `docxy_watermark`, `docxy_page_borders`, `docxy_comment_resolve`,
+  `docxy_comments_delete_all`, `docxy_display_mode`, `docxy_track_changes` and
+  `docxy_track_changes_set` act only on a terminal docxy
   (a VS Code tab answers `unknown verb`) — and
   `xlsxy_list`, `xlsxy_new`, `xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`,
   `xlsxy_get`, `xlsxy_set`, `xlsxy_clear`,
@@ -228,8 +232,10 @@ for the two ways a tab's semantics differ from a terminal instance.
   `xlsxy_page_header`, `xlsxy_print_area_set`, `xlsxy_print_area_add`,
   `xlsxy_print_area_clear`, `xlsxy_print_titles`, `xlsxy_page_break_insert`,
   `xlsxy_page_break_remove`, `xlsxy_page_break_reset`, `xlsxy_print_pages`,
-  `xlsxy_export_pdf`
-  (46) — `xlsxy_pivot_create` builds a REAL, persistent workbook pivot table
+  `xlsxy_export_pdf`, `xlsxy_flash_fill`, `xlsxy_autocorrect`
+  (48) — `xlsxy_flash_fill` runs Flash Fill on a column and
+  `xlsxy_autocorrect` reads and edits AutoCorrect's switches, list and
+  exceptions (both on a terminal `xlsxy`), `xlsxy_pivot_create` builds a REAL, persistent workbook pivot table
   on a new sheet (unlike the read-only, ad-hoc `xlsxy_pivot`),
   `xlsxy_properties`/`xlsxy_set_properties` read and set the document
   properties (File › Info), and the page-layout tools edit page setup,

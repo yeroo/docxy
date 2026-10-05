@@ -1335,6 +1335,8 @@ fn prefs() -> Prefs {
         autorecover_minutes: 10,
         keep_drafts: true,
         edit_opts: gridcore::options::EditOptions::default(),
+        custom_lists: Vec::new(),
+        autocorrect: String::new(),
         user_name: String::new(),
         user_initials: String::new(),
     }
@@ -1661,6 +1663,33 @@ fn sheet_editing_options_round_trip_through_the_session() {
     assert_eq!(EditOptions::from_text(&root.session().sheet_editing), opts);
 }
 
+/// #667: AutoCorrect's changes persist in `sheet_editing` beside the
+/// Editing options, and each reads its own keys back.
+#[test]
+fn autocorrect_persists_with_the_sheet_editing_options() {
+    use gridcore::autocorrect::{AutoCorrect, ExceptionKind};
+    use gridcore::options::EditOptions;
+    let root = Root::new("autocorrect");
+    let mut ac = AutoCorrect::default();
+    ac.add("cdp", "Consolidated Data Processing").unwrap();
+    ac.delete("adn");
+    ac.add_exception(ExceptionKind::InitialCaps, "ABc").unwrap();
+    ac.opts.hyperlinks = false;
+    let opts = EditOptions {
+        flash_fill_auto: false,
+        ..EditOptions::default()
+    };
+    let prefs = Prefs {
+        edit_opts: opts,
+        autocorrect: ac.to_lines(),
+        ..prefs()
+    };
+    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
+    let saved = root.session().sheet_editing;
+    assert_eq!(AutoCorrect::from_text(&saved), ac);
+    assert_eq!(EditOptions::from_text(&saved), opts);
+}
+
 /// #672: a sheet tab reached through the app gets the app's Editing options,
 /// so one opened after they changed honours them on its first key.
 #[test]
@@ -1694,6 +1723,55 @@ fn every_sheet_tab_is_stamped_with_the_app_options() {
         }
     }
     assert!(matches!(tabs[2].surface, Surface::Sheet(_)));
+}
+
+/// FIX r5 m4: the per-frame step retires a Flash Fill preview the selection
+/// moved off, so moving back cannot revive it.
+#[test]
+fn the_frame_step_retires_a_preview_the_selection_left() {
+    let mut tabs = vec![tab(Kind::Xlsx)];
+    let Surface::Sheet(v) = &mut tabs[0].surface else {
+        panic!("a sheet tab")
+    };
+    for (r, t) in [
+        "Ada Lovelace",
+        "Alan Turing",
+        "Grace Hopper",
+        "Edsger Dijkstra",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let s = v.active;
+        let cell =
+            gridcore::entry::entry_cell(&mut v.pkg.workbook, s, r as u32, 10, t, None).unwrap();
+        v.engine
+            .set_cell(&mut v.pkg.workbook, (s, r as u32, 10), cell);
+    }
+    for (r, t) in ["Ada", "Alan"].iter().enumerate() {
+        v.sel = (r as u32, 11);
+        v.begin_cell_edit(Some(t.to_string()));
+        let origin = v.edit_origin.unwrap();
+        assert_eq!(v.commit_and_move(1, 0), Some(true));
+        v.flash_preview_after(origin);
+    }
+    assert!(
+        v.flash_preview.is_some(),
+        "a preview after the second example"
+    );
+    let at = v.sel;
+    v.sel = (9, 9);
+    crate::sheet_flashfill::retire_stale_previews(&mut tabs);
+    let Surface::Sheet(v) = &mut tabs[0].surface else {
+        unreachable!()
+    };
+    assert!(v.flash_preview.is_none(), "dropped by the frame step");
+    v.sel = at;
+    crate::sheet_flashfill::retire_stale_previews(&mut tabs);
+    let Surface::Sheet(v) = &tabs[0].surface else {
+        unreachable!()
+    };
+    assert!(v.live_preview().is_none(), "and not revived by moving back");
 }
 
 #[test]
@@ -2256,4 +2334,519 @@ fn an_in_place_tab_keeps_whatever_extension_it_has() {
             "{name}"
         );
     }
+}
+
+// ---- dialog buffers (#202) -------------------------------------------------
+//
+// Window close, harness `quit` and the active tab's own close fold the app's
+// typed-but-uncommitted dialog buffers into the workbook before the hot-exit
+// persist, through `commit_comment_buffer(_for_exit)` and
+// `commit_rename_buffer` below; which buffers reach them is decided per
+// buffer in `Docxy::commit_dialog_buffers_for_exit`. These tests pin the
+// tab-level half: the commit itself, the dirty flag, and the round-trip
+// through the persisted session.
+
+/// The comment on the active sheet's selected cell, if any.
+fn cell_comment(t: &DocTab) -> Option<String> {
+    let Surface::Sheet(v) = &t.surface else {
+        panic!("{}", t.status)
+    };
+    let (r, c) = v.sel;
+    v.pkg
+        .comments()
+        .into_iter()
+        .find(|cm| cm.sheet == v.active && cm.row == r && cm.col == c)
+        .map(|cm| cm.text)
+}
+
+/// What the dropped rule bars (conditional formatting, data validation, row
+/// height) would change: the exit commits must leave all of it alone.
+fn fmt_state(t: &DocTab) -> (usize, usize, usize) {
+    let Surface::Sheet(v) = &t.surface else {
+        panic!("{}", t.status)
+    };
+    let s = &v.pkg.workbook.sheets[v.active];
+    (s.cond_formats.len(), s.validations.len(), s.row_attrs.len())
+}
+
+#[test]
+fn exit_commits_typed_comment_and_marks_tab_dirty() {
+    let mut tabs = vec![tab(Kind::Xlsx)];
+    {
+        let Surface::Sheet(v) = &mut tabs[0].surface else {
+            panic!()
+        };
+        v.sel = (0, 0);
+    }
+    assert!(!tabs[0].dirty);
+    // The bar opened on A1, empty; the user typed and closed the window.
+    assert!(commit_comment_buffer_for_exit(
+        &mut tabs[0],
+        "",
+        "Jane Doe",
+        "Check this"
+    ));
+    assert!(tabs[0].dirty);
+    assert_eq!(cell_comment(&tabs[0]).as_deref(), Some("Check this"));
+    // The persisted hot-exit session carries it, as the next launch sees it.
+    let restored = exit_and_restore(&mut tabs, "exit-comment");
+    assert!(restored[0].dirty);
+    assert_eq!(cell_comment(&restored[0]).as_deref(), Some("Check this"));
+}
+
+#[test]
+fn exit_commits_typed_sheet_rename_and_follows_chart_refs() {
+    let mut tabs = vec![tab(Kind::Xlsx)];
+    let old = {
+        let Surface::Sheet(v) = &mut tabs[0].surface else {
+            panic!()
+        };
+        let old = v.pkg.workbook.sheets[0].name.clone();
+        // A chart this session authored, plotting the sheet about to be
+        // renamed — the workbook-side refs `rename_sheet` follows are its
+        // own; this one follows the `rename_sheet_in_chart` loop.
+        v.charts.push(ChartView {
+            sheet: 0,
+            from: (0, 0),
+            to: (4, 4),
+            data: gridcore::sheet::ChartData {
+                source: Some(gridcore::sheet::ChartSource {
+                    sheet: old.clone(),
+                    range: (0, 0, 4, 3),
+                    cat_col: 0,
+                }),
+                ..Default::default()
+            },
+        });
+        old
+    };
+    let new = format!("{old}X");
+    assert!(commit_rename_buffer(&mut tabs[0], 0, &new));
+    assert!(tabs[0].dirty);
+    {
+        let Surface::Sheet(v) = &tabs[0].surface else {
+            panic!()
+        };
+        assert_eq!(v.pkg.workbook.sheets[0].name, new);
+        let src = v.charts[0].data.source.as_ref().expect("chart source");
+        assert_eq!(src.sheet, new);
+    }
+    // The persisted session round-trips under the new name.
+    let restored = exit_and_restore(&mut tabs, "exit-rename");
+    assert!(restored[0].dirty);
+    let Surface::Sheet(v) = &restored[0].surface else {
+        panic!()
+    };
+    assert_eq!(v.pkg.workbook.sheets[0].name, new);
+}
+
+#[test]
+fn tab_level_exit_commits_leave_cf_dv_and_rowh_alone() {
+    // What this pins: the tab-level exit commits (`commit_comment_buffer_for_exit`,
+    // `commit_rename_buffer`) never touch conditional formats, validations or
+    // row heights. The other half of the decision — that the app drops the
+    // cf/dv/rowh BUFFERS without committing them — lives in
+    // `Docxy::commit_dialog_buffers_for_exit` over gpui state and has no
+    // suite-level guard (same seam as the chart field, agreed in pin 4).
+    let mut t = tab(Kind::Xlsx);
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        // A row height as the row-height bar would have set it; the cf/dv
+        // lists stay as the file has them.
+        v.pkg.workbook.sheets[v.active].set_row_height(2, Some(42.0));
+    }
+    let before = fmt_state(&t);
+    // The exit commits take no rule/format buffer: running them changes none
+    // of it, even while they commit what they do own.
+    assert!(commit_comment_buffer_for_exit(
+        &mut t,
+        "",
+        "Jane Doe",
+        "Check this"
+    ));
+    let old = {
+        let Surface::Sheet(v) = &t.surface else {
+            panic!()
+        };
+        v.pkg.workbook.sheets[0].name.clone()
+    };
+    assert!(commit_rename_buffer(&mut t, 0, &format!("{old}X")));
+    assert_eq!(fmt_state(&t), before);
+    assert!(t.dirty);
+}
+
+#[test]
+fn exit_with_empty_comment_buffer_does_not_dirty_clean_tab() {
+    // A comment bar merely OPEN on a cell with no comment: the buffer is
+    // empty, the commit could only delete a comment that isn't there, so the
+    // tab stays clean — in the live tab and in the restored session.
+    let mut tabs = vec![tab(Kind::Xlsx)];
+    {
+        let Surface::Sheet(v) = &mut tabs[0].surface else {
+            panic!()
+        };
+        v.sel = (1, 1);
+    }
+    assert!(cell_comment(&tabs[0]).is_none());
+    assert!(!commit_comment_buffer_for_exit(
+        &mut tabs[0],
+        "",
+        "Jane Doe",
+        ""
+    ));
+    assert!(!commit_comment_buffer_for_exit(
+        &mut tabs[0],
+        "",
+        "Jane Doe",
+        "   "
+    ));
+    assert!(!tabs[0].dirty);
+    let restored = exit_and_restore(&mut tabs, "exit-empty-comment");
+    assert!(!restored[0].dirty);
+
+    // Complement: on a cell WITH a comment, an empty buffer is a real delete
+    // and marks the tab dirty, exactly as Enter would.
+    let mut t = tab(Kind::Xlsx);
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.sel = (2, 2);
+    }
+    assert!(commit_comment_buffer_for_exit(
+        &mut t,
+        "",
+        "Jane Doe",
+        "Check this"
+    ));
+    // The delete must be what dirties: reset, then a fresh bar on the
+    // commented cell, its buffer cleared, commits the delete at exit.
+    t.dirty = false;
+    assert!(commit_comment_buffer_for_exit(
+        &mut t,
+        "Check this",
+        "Jane Doe",
+        ""
+    ));
+    assert!(t.dirty);
+    assert!(cell_comment(&t).is_none());
+
+    // Enter's own path keeps its long-standing quirk, unchanged: an empty
+    // commit there marks even a clean tab dirty. The exit variant exists so
+    // the bar having been open cannot.
+    let mut t = tab(Kind::Xlsx);
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.sel = (3, 3);
+    }
+    assert!(commit_comment_buffer(&mut t, "Jane Doe", ""));
+    assert!(t.dirty);
+}
+
+#[test]
+fn exit_does_not_edit_a_protected_sheet() {
+    // Protected View and marked-as-final both refuse (Access::locked).
+    for marked_final in [false, true] {
+        let mut t = tab(Kind::Xlsx);
+        t.access.protected = !marked_final;
+        t.access.marked_final = marked_final;
+        let old = {
+            let Surface::Sheet(v) = &t.surface else {
+                panic!()
+            };
+            v.pkg.workbook.sheets[0].name.clone()
+        };
+        {
+            let Surface::Sheet(v) = &mut t.surface else {
+                panic!()
+            };
+            v.sel = (0, 0);
+        }
+        assert!(!commit_comment_buffer_for_exit(
+            &mut t,
+            "",
+            "Jane Doe",
+            "Check this"
+        ));
+        assert!(!commit_rename_buffer(&mut t, 0, &format!("{old}X")));
+        assert!(!t.dirty);
+        assert!(cell_comment(&t).is_none());
+        let Surface::Sheet(v) = &t.surface else {
+            panic!()
+        };
+        assert_eq!(v.pkg.workbook.sheets[0].name, old);
+    }
+}
+
+#[test]
+fn exit_with_unchanged_rename_buffer_leaves_clean_tab_clean() {
+    let mut t = tab(Kind::Xlsx);
+    let name = {
+        let Surface::Sheet(v) = &t.surface else {
+            panic!()
+        };
+        v.pkg.workbook.sheets[0].name.clone()
+    };
+    // The rename bar seeds the buffer with the sheet's name; a bar merely
+    // OPEN at exit must not dirty the tab or rewrite the workbook — the
+    // taken-name check looks at the OTHER sheets, so `rename_sheet` itself
+    // would take the same-name rename.
+    assert!(!commit_rename_buffer_for_exit(&mut t, 0, &name));
+    assert!(!commit_rename_buffer_for_exit(
+        &mut t,
+        0,
+        &format!(" {name} ")
+    ));
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.pkg.workbook.sheets[0].name, name);
+
+    // A case-only rename is not "unchanged" — the trims differ — so it still
+    // commits and is taken (only names the other sheets hold decline).
+    let case = name.to_lowercase();
+    assert_ne!(case, name);
+    assert!(commit_rename_buffer_for_exit(&mut t, 0, &case));
+    assert!(t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.pkg.workbook.sheets[0].name, case);
+}
+
+#[test]
+fn exit_with_unchanged_prefilled_comment_keeps_author_undo_and_clean_tab() {
+    let mut t = tab(Kind::Xlsx);
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.sel = (0, 0);
+    }
+    // A colleague's comment, opened in the bar to read: the buffer is seeded
+    // with the note's text. Exiting with it untouched must not restamp the
+    // author, spend an undo step, or dirty the tab — committing would do all
+    // three for nothing.
+    assert!(commit_comment_buffer(&mut t, "Jane Doe", "Original note"));
+    t.dirty = false;
+    assert!(!commit_comment_buffer_for_exit(
+        &mut t,
+        "Original note",
+        "John Smith",
+        "Original note"
+    ));
+    assert!(!commit_comment_buffer_for_exit(
+        &mut t,
+        "Original note",
+        "John Smith",
+        "  Original note  "
+    ));
+    assert!(!t.dirty);
+    {
+        let Surface::Sheet(v) = &t.surface else {
+            panic!()
+        };
+        let cm = v
+            .pkg
+            .comments()
+            .into_iter()
+            .find(|cm| cm.sheet == v.active && cm.row == 0 && cm.col == 0)
+            .expect("the comment");
+        assert_eq!(cm.text, "Original note");
+        assert_eq!(cm.author, "Jane Doe");
+    }
+    // Undo holds exactly the one step Jane's commit took: the skipped commit
+    // added none (the second undo finds nothing).
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    assert!(v.undo_step());
+    assert!(!v.undo_step());
+    assert!(cell_comment(&t).is_none());
+}
+
+#[test]
+fn exit_with_unchanged_rename_buffer_leaves_trailing_space_sheet_clean() {
+    let mut t = tab(Kind::Xlsx);
+    // A sheet name as a file can hold it — `rename_sheet` would trim it, so
+    // the name is set on the model directly.
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.pkg.workbook.sheets[0].name = "Data ".into();
+    }
+    // The rename bar seeds the buffer with the raw name; a bar merely OPEN
+    // must not rename "Data " to "Data" (rewriting formulas, dirtying the
+    // tab). The skip compares both sides trimmed, so padding skips too.
+    assert!(!commit_rename_buffer_for_exit(&mut t, 0, "Data "));
+    assert!(!commit_rename_buffer_for_exit(&mut t, 0, "  Data  "));
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.pkg.workbook.sheets[0].name, "Data ");
+
+    // A case-only rename is not "unchanged" — the trims differ — so it still
+    // commits and is taken (only names the OTHER sheets hold decline).
+    assert!(commit_rename_buffer_for_exit(&mut t, 0, "data"));
+    assert!(t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.pkg.workbook.sheets[0].name, "data");
+}
+
+#[test]
+fn exit_with_untouched_buffer_keeps_a_whitespace_note_intact() {
+    // A file-loaded note keeps its whitespace; the bar seeds with the raw
+    // text (written here straight into the model, the way a load leaves it).
+    // An untouched buffer must not rewrite the note (trim it, restamp the
+    // author) — and a whitespace-only note must not be deleted by the
+    // empty-looking buffer.
+    let mut t = tab(Kind::Xlsx);
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        assert!(v.pkg.set_comment(v.active, 0, 0, "Jane Doe", "note\n"));
+        assert!(v.pkg.set_comment(v.active, 1, 1, "Jane Doe", "\n"));
+        v.sel = (1, 1);
+    }
+    assert!(!commit_comment_buffer_for_exit(
+        &mut t,
+        "note\n",
+        "John Smith",
+        "note\n"
+    ));
+    assert!(!commit_comment_buffer_for_exit(
+        &mut t,
+        "\n",
+        "John Smith",
+        ""
+    ));
+    // The whitespace-only note trims to the empty buffer, so the commit is
+    // skipped; were it committed it would land on the selection — the
+    // whitespace-note cell — as Enter does.
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    let at = |r: u32, c: u32| {
+        v.pkg
+            .comments()
+            .into_iter()
+            .find(|cm| cm.sheet == v.active && cm.row == r && cm.col == c)
+    };
+    let note = at(0, 0).expect("the note");
+    assert_eq!(note.text, "note\n");
+    assert_eq!(note.author, "Jane Doe");
+    assert!(at(1, 1).is_some(), "the whitespace-only note survives");
+}
+
+#[test]
+fn exit_comment_commit_follows_the_selection_like_enter() {
+    // The bar's label reads off the live selection ("Comment on C5:"), and
+    // Enter/Save write there — the exit commit agrees: a CHANGED buffer
+    // lands on the selected cell even when the bar opened elsewhere. Only an
+    // untouched buffer (the seed) is skipped after a click.
+    let mut t = tab(Kind::Xlsx);
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.sel = (4, 4); // clicked here after opening the bar on A1
+    }
+    assert!(commit_comment_buffer_for_exit(
+        &mut t,
+        "",
+        "Jane Doe",
+        "Typed note"
+    ));
+    assert!(t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    let at = |r: u32, c: u32| {
+        v.pkg
+            .comments()
+            .iter()
+            .any(|cm| cm.sheet == v.active && cm.row == r && cm.col == c)
+    };
+    assert!(at(4, 4), "on the selected cell, where Enter would write");
+    assert!(!at(0, 0), "not on the bar's cell");
+}
+
+#[test]
+fn exit_comment_bar_untouched_survives_a_moved_selection() {
+    // A colleague's note on B2, opened in the bar to read; a click moved the
+    // selection to C3. The buffer is the seed, so the commit is skipped; were
+    // it committed it would land on the selection (C3), as Enter does.
+    let mut t = tab(Kind::Xlsx);
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        assert!(v.pkg.set_comment(v.active, 1, 1, "Jane Doe", "B2 note"));
+        v.sel = (2, 2);
+    }
+    assert!(!commit_comment_buffer_for_exit(
+        &mut t,
+        "B2 note",
+        "John Smith",
+        "B2 note"
+    ));
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    let at = |r: u32, c: u32| {
+        v.pkg
+            .comments()
+            .iter()
+            .any(|cm| cm.sheet == v.active && cm.row == r && cm.col == c)
+    };
+    assert!(at(1, 1), "B2 keeps its note, author unstamped");
+    assert!(!at(2, 2), "C3 gets no copy");
+}
+
+#[test]
+fn exit_comment_edge_whitespace_commit_lands_on_the_selection() {
+    // Open on commented A1 (seed "X"), click empty B2, and type edge
+    // whitespace around the text. Enter would create "X" on B2 — the exit
+    // commit agrees: the trim-equal skip looks at the TARGET cell, which has
+    // no note, so this is a change and it lands on the selection.
+    let mut t = tab(Kind::Xlsx);
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        assert!(v.pkg.set_comment(v.active, 0, 0, "Jane Doe", "X"));
+        v.sel = (1, 1);
+    }
+    assert!(commit_comment_buffer_for_exit(
+        &mut t, "X", "Jane Doe", " X "
+    ));
+    assert!(t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    let at = |r: u32, c: u32| {
+        v.pkg
+            .comments()
+            .iter()
+            .filter(|cm| cm.sheet == v.active && cm.row == r && cm.col == c)
+            .count()
+    };
+    assert_eq!(
+        at(1, 1),
+        1,
+        "one note on the selection, as Enter would write"
+    );
+    assert_eq!(at(0, 0), 1, "A1 keeps its own note, untouched");
 }

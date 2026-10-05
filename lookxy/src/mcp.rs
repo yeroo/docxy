@@ -18,7 +18,7 @@ use ctlcore::mcp::{McpServer, prop, tool};
 pub fn run() -> std::io::Result<()> {
     McpServer {
         name: "lookxy",
-        version: env!("CARGO_PKG_VERSION"),
+        version: buildinfo::long_version(env!("CARGO_PKG_VERSION")),
         tools: tool_defs(),
         handler: &do_tool,
     }
