@@ -168,7 +168,8 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
 }
 
 /// Read the text content of the element whose `Start` was just consumed,
-/// decoding XML entities. Any nested element is skipped whole. Consumes the
+/// decoding XML entities outside CDATA sections (CDATA text is kept
+/// verbatim, #185). Any nested element is skipped whole. Consumes the
 /// element's closing `End`.
 fn text_of(p: &mut XmlParser) -> String {
     element_text(p).0
