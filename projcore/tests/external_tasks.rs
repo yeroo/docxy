@@ -131,10 +131,7 @@ fn predecessors_cell_shows_the_cross_project_name() {
         .unwrap()
         .predecessors[1]
         .cross_project_name = Some("   ".into());
-    assert_eq!(
-        format_predecessors(blank.task(2).unwrap(), &blank),
-        "1, 3"
-    );
+    assert_eq!(format_predecessors(blank.task(2).unwrap(), &blank), "1, 3");
 
     let mut unnamed = proj.clone();
     unnamed

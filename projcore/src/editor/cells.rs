@@ -777,12 +777,17 @@ pub fn format_lag(p: &Predecessor, proj: &Project) -> String {
     text(p.lag.to_string(), LagUnit::Minute)
 }
 
-/// One link as the Predecessors cell shows it.
+/// One link as the Predecessors cell shows it. A cross-project link shows
+/// its external reference (the trimmed `CrossProjectName`), as Microsoft
+/// Project does, instead of the local placeholder's ID.
 fn format_link(p: &Predecessor, proj: &Project) -> String {
-    let id = proj
-        .task(p.uid)
-        .map(|t| t.id.to_string())
-        .unwrap_or_else(|| format!("?{}", p.uid));
+    let id = match p.cross_project_name.as_deref().map(str::trim) {
+        Some(name) if p.cross_project == Some(true) && !name.is_empty() => name.to_string(),
+        _ => proj
+            .task(p.uid)
+            .map(|t| t.id.to_string())
+            .unwrap_or_else(|| format!("?{}", p.uid)),
+    };
     // A zero lag in days is the default and shows nothing; any other
     // format shows, so re-entering the cell keeps it.
     let plain = p.lag == 0 && p.lag_format == LagFormat::DAYS;
@@ -801,6 +806,9 @@ fn format_link(p: &Predecessor, proj: &Project) -> String {
     format!("{id}{kind}{lag}")
 }
 
+/// The cell text for `task`'s links: local IDs, or a cross-project link's
+/// external reference (its `CrossProjectName`) instead of its placeholder's
+/// local ID.
 pub fn format_predecessors(task: &Task, proj: &Project) -> String {
     task.predecessors
         .iter()
@@ -820,13 +828,75 @@ pub(crate) fn parse_predecessors(text: &str, proj: &Project) -> Result<Vec<Prede
 /// entry spelled exactly as the cell shows one of the task's links keeps
 /// that link as it is. A lag shown in a fallback unit (a working month in
 /// days, a fraction of a day in minutes) keeps its format unless it is
-/// edited.
+/// edited. A cross-project link may be spelled by its external reference
+/// (its `CrossProjectName`), in any letter case, with an optional link
+/// type and lag.
 pub fn parse_task_predecessors(
     text: &str,
     task: &Task,
     proj: &Project,
 ) -> Result<Vec<Predecessor>, String> {
     parse_predecessors_keeping(text, proj, &task.predecessors)
+}
+
+/// Split Predecessors cell text into trimmed, uppercased entries, pairing
+/// an entry that starts with one of the task's own cross-project link
+/// names with that link. Names match case-insensitively, longest first,
+/// and may contain `,`. Empty entries are kept, as a plain `,` split
+/// yields them.
+fn split_predecessor_entries<'a>(
+    text: &str,
+    existing: &'a [Predecessor],
+) -> Vec<(String, Option<&'a Predecessor>)> {
+    let names: Vec<(String, &'a Predecessor)> = existing
+        .iter()
+        .filter_map(|p| {
+            let name = p.cross_project_name.as_deref()?.trim();
+            (p.cross_project == Some(true) && !name.is_empty())
+                .then(|| (name.to_ascii_uppercase(), p))
+        })
+        .collect();
+    let upper = text.to_ascii_uppercase();
+    let mut entries = Vec::new();
+    let mut rest = upper.as_str();
+    loop {
+        rest = rest.trim_start();
+        // A match needs a boundary after the name, so a name ending in
+        // digits does not swallow a following ID or suffix; the longest
+        // matching name wins, first on ties.
+        let mut matched: Option<&(String, &'a Predecessor)> = None;
+        for candidate in &names {
+            let Some(tail) = rest.strip_prefix(candidate.0.as_str()) else {
+                continue;
+            };
+            let after_space = tail.trim_start();
+            let boundary = tail.is_empty()
+                || after_space.starts_with(',')
+                || tail.starts_with(['+', '-'])
+                || ["FS", "SS", "FF", "SF"]
+                    .into_iter()
+                    .any(|code| tail.starts_with(code));
+            let longer = match matched {
+                Some(best) => candidate.0.len() > best.0.len(),
+                None => true,
+            };
+            if boundary && longer {
+                matched = Some(candidate);
+            }
+        }
+        let end = match matched {
+            Some((name, _)) => rest[name.len()..]
+                .find(',')
+                .map_or(rest.len(), |at| name.len() + at),
+            None => rest.find(',').unwrap_or(rest.len()),
+        };
+        entries.push((rest[..end].trim_end().to_string(), matched.map(|(_, p)| *p)));
+        match rest[end..].strip_prefix(',') {
+            Some(tail) => rest = tail,
+            None => break,
+        }
+    }
+    entries
 }
 
 fn parse_predecessors_keeping(
@@ -838,27 +908,35 @@ fn parse_predecessors_keeping(
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in text.split(',') {
-        let entry = entry.trim().to_ascii_uppercase();
+    for (entry, cross) in split_predecessor_entries(text, existing) {
         let shown = existing
             .iter()
             .find(|p| format_link(p, proj).to_ascii_uppercase() == entry);
-        let end = entry.bytes().take_while(u8::is_ascii_digit).count();
-        let id: i32 = entry[..end]
-            .parse()
-            .map_err(|_| "Expected predecessor task ID")?;
-        let mut matches = proj.tasks.iter().filter(|t| t.id == id);
-        let uid = matches
-            .next()
-            .ok_or_else(|| format!("No task with ID {id}"))?
-            .uid;
-        if matches.next().is_some() {
-            return Err(format!("Ambiguous task ID {id}"));
-        }
+        // A name entry takes its uid from the matched link (the trimmed
+        // name's byte length: ASCII-uppercasing preserves byte offsets);
+        // any other entry parses a local task ID.
+        let (uid, name_len) = match cross {
+            Some(p) => (p.uid, p.cross_project_name.as_deref().unwrap().trim().len()),
+            None => {
+                let end = entry.bytes().take_while(u8::is_ascii_digit).count();
+                let id: i32 = entry[..end]
+                    .parse()
+                    .map_err(|_| "Expected predecessor task ID")?;
+                let mut matches = proj.tasks.iter().filter(|t| t.id == id);
+                let uid = matches
+                    .next()
+                    .ok_or_else(|| format!("No task with ID {id}"))?
+                    .uid;
+                if matches.next().is_some() {
+                    return Err(format!("Ambiguous task ID {id}"));
+                }
+                (uid, end)
+            }
+        };
         if out.iter().any(|p: &Predecessor| p.uid == uid) {
             return Err("Duplicate predecessor".into());
         }
-        let mut rest = &entry[end..];
+        let mut rest = &entry[name_len..];
         let mut link = LinkType::FinishStart;
         for (code, kind) in [
             ("FS", LinkType::FinishStart),
@@ -880,7 +958,7 @@ fn parse_predecessors_keeping(
             }
             parse_lag(rest, proj).ok_or("Invalid predecessor lag")?
         };
-        let original = existing.iter().find(|p| p.uid == uid);
+        let original = cross.or_else(|| existing.iter().find(|p| p.uid == uid));
         let parsed = Predecessor {
             uid,
             link,
