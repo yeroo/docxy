@@ -202,7 +202,7 @@ fn in_brackets(before: &[char], open: usize, scan: &Scan, wb: &Workbook) -> Opti
     if open != outer && !matches!(before[open - 1], '[' | ',' | ' ' | ':') {
         return None;
     }
-    let typed: String = unescape(&before[open + 1..]);
+    let typed = crate::formula::unescape_spec(&before[open + 1..].iter().collect::<String>());
     let lower = typed.to_lowercase();
     let matches = |label: &str| label.to_lowercase().starts_with(&lower);
     let mut items: Vec<Item> = table
@@ -233,33 +233,10 @@ fn in_brackets(before: &[char], open: usize, scan: &Scan, wb: &Workbook) -> Opti
     })
 }
 
-/// The typed text of a column prefix, with its `'` escapes taken off.
-fn unescape(chars: &[char]) -> String {
-    let mut out = String::new();
-    let mut it = chars.iter();
-    while let Some(&c) = it.next() {
-        if c == '\'' {
-            if let Some(&n) = it.next() {
-                out.push(n);
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 /// A column name as a structured reference spells it: `[`, `]`, `#`, `'` and
-/// `@` take a `'` before them.
+/// `@` take a `'` before them (the parser's own escaping).
 pub fn escape_column(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        if matches!(c, '[' | ']' | '#' | '\'' | '@') {
-            out.push('\'');
-        }
-        out.push(c);
-    }
-    out
+    crate::formula::escape_spec(name)
 }
 
 /// The functions, defined names (global, or scoped to `sheet`) and tables

@@ -1117,7 +1117,7 @@ fn parse_ref_text(s: &str) -> Option<CellRef> {
 
 /// Unescape a structured-ref name: a single quote escapes the next char
 /// (`'[`, `']`, `'#`, `'@`, `''`).
-fn unescape_spec(s: &str) -> String {
+pub(crate) fn unescape_spec(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(ch) = chars.next() {
@@ -1281,7 +1281,7 @@ fn parse_spec(table: Option<String>, spec: &str) -> Result<Expr, String> {
 }
 
 /// Escape a column name for printing inside a structured reference.
-fn escape_spec(name: &str) -> String {
+pub(crate) fn escape_spec(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
         if matches!(ch, '[' | ']' | '\'' | '#' | '@') {
