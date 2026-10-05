@@ -43,7 +43,13 @@ test switching pages resets the scroll
   call window-size {"w":1000,"h":500}
   call backstage {"action":"open"}
   shot window
-  # Open (the default page) overflows: scroll it, then leave for each page.
+  # At 1000x500 Open and Info overflow; New fits. gpui clamps a fitting
+  # page's offset to 0 whatever the code did, so at_top on New cannot show a
+  # dropped reset (it only checks the page shows). The proofs are on the
+  # overflowing pages: Open -> Info (rail's Info reset) and reopening File or
+  # the open-page shortcut (Open's reset).
+  call backstage-layout {}
+  assert reply.scrollable is true
   call pointer-wheel {"region":"backstage-content","dy":-6000}
   shot window
   call backstage-layout {}
@@ -52,6 +58,7 @@ test switching pages resets the scroll
   shot window
   call backstage-layout {}
   assert reply.page is info
+  assert reply.scrollable is true
   assert reply.at_top is true
   call backstage-page {"page":"open"}
   call pointer-wheel {"region":"backstage-content","dy":-6000}
