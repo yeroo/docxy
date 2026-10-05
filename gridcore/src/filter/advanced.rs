@@ -88,9 +88,9 @@ pub fn advanced(
     }
     let total = matched.len();
     set_name(wb, sheet, FILTER_DB, sheet, a.list);
-    match a.criteria {
-        Some((cs, crit)) => set_name(wb, sheet, "_xlnm.Criteria", cs, crit),
-        None => drop_scoped(wb, sheet, "_xlnm.Criteria"),
+    // A run without a criteria range leaves the last one's name alone.
+    if let Some((cs, crit)) = a.criteria {
+        set_name(wb, sheet, "_xlnm.Criteria", cs, crit);
     }
     let Some((_, (dr, dc, _, _))) = a.copy_to else {
         // In place.
@@ -169,9 +169,4 @@ pub fn advanced(
         shown: keep.len(),
         total,
     })
-}
-
-fn drop_scoped(wb: &mut Workbook, sheet: usize, name: &str) {
-    wb.defined_names
-        .retain(|d| !(d.scope == Some(sheet) && d.name.eq_ignore_ascii_case(name)));
 }
