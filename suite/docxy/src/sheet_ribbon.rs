@@ -965,26 +965,9 @@ fn single<'a>(
     }
 }
 
-/// Resolve `query` on `tab` by id, else by label as it reads now, else by
-/// drawn text, as the document ribbon resolves by id, label, then screentip.
-/// `toggled` gives a command's state for its current label. The app resolves
-/// through [`resolve_on`]; this takes any list, for the tests.
-#[cfg(test)]
-pub(crate) fn resolve<'a>(
-    commands: &[&'a SheetCmd],
-    tab_name: &str,
-    query: &str,
-    toggled: impl Fn(SheetAct) -> bool,
-) -> Result<&'a SheetCmd, String> {
-    single(
-        tier_matches(commands, query, &toggled),
-        tab_name,
-        query,
-        &toggled,
-    )
-}
-
-/// [`resolve`] on a tab of the table. A drop-down's items are looked at only
+/// Resolve `query` on a tab of the table by id, else by label as it reads now,
+/// else by drawn text, as the document ribbon resolves by id, label, then
+/// screentip. `toggled` gives a command's state for its current label. A drop-down's items are looked at only
 /// when no button of the tab matches: Home's AutoSum column has a Clear and
 /// so does Sort & Filter, and the button wins.
 pub(crate) fn resolve_on(
@@ -1044,7 +1027,7 @@ mod tests {
             for toggled in [false, true] {
                 let mut seen = HashSet::new();
                 // A menu item may repeat a ribbon button's name (Home's Clear);
-                // `resolve` prefers the button.
+                // `resolve_on` prefers the button.
                 for c in tab
                     .commands()
                     .into_iter()
@@ -1096,26 +1079,25 @@ mod tests {
     #[test]
     fn resolution_takes_an_id_then_a_label_then_the_drawn_text() {
         let home = tab_def(RibbonTab::Home);
-        let resolve =
-            |_: &[&SheetCmd], t: &str, q: &str, f: fn(SheetAct) -> bool| resolve_on(home, t, q, f);
-        let home = home.commands();
         let off = |_| false;
-        assert_eq!(resolve(&home, "Home", "bold", off).unwrap().id, "bold");
-        assert_eq!(resolve(&home, "Home", "Bold", off).unwrap().id, "bold");
+        assert_eq!(resolve_on(home, "Home", "bold", off).unwrap().id, "bold");
+        assert_eq!(resolve_on(home, "Home", "Bold", off).unwrap().id, "bold");
         assert_eq!(
-            resolve(&home, "Home", "Sort A to Z", off).unwrap().id,
+            resolve_on(home, "Home", "Sort A to Z", off).unwrap().id,
             "sort-a-z"
         );
         assert_eq!(
-            resolve(&home, "Home", "\u{03A3} AutoSum", off).unwrap().id,
+            resolve_on(home, "Home", "\u{03A3} AutoSum", off)
+                .unwrap()
+                .id,
             "autosum"
         );
         assert_eq!(
-            resolve(&home, "Home", "Spelling", off).unwrap_err(),
+            resolve_on(home, "Home", "Spelling", off).unwrap_err(),
             "command 'Spelling' is not on tab 'Home'"
         );
         assert_eq!(
-            resolve(&home, "Home", "Format Painter", off).unwrap_err(),
+            resolve_on(home, "Home", "Format Painter", off).unwrap_err(),
             "'Format Painter' is not implemented"
         );
     }
@@ -1168,9 +1150,9 @@ mod tests {
 
     #[test]
     fn data_tab_resolves_excel_names_to_the_existing_commands() {
-        let data = tab_def(RibbonTab::Data).commands();
+        let data = tab_def(RibbonTab::Data);
         let off = |_| false;
-        let act = |q| resolve(&data, "Data", q, off).map(|c| c.act);
+        let act = |q| resolve_on(data, "Data", q, off).map(|c| c.act);
         assert_eq!(act("Sort A to Z"), Ok(SheetAct::SortAsc));
         assert_eq!(act("Sort Z to A"), Ok(SheetAct::SortDesc));
         assert_eq!(act("Sort"), Ok(SheetAct::CustomSort));
@@ -1193,21 +1175,22 @@ mod tests {
 
     #[test]
     fn a_toggle_resolves_by_the_label_it_shows_now() {
-        let view = tab_def(RibbonTab::View).commands();
+        let view = tab_def(RibbonTab::View);
         let on = |act| matches!(act, SheetAct::FreezePanes);
         let off = |_| false;
-        assert!(resolve(&view, "View", "Unfreeze Panes", on).is_ok());
-        assert!(resolve(&view, "View", "Unfreeze Panes", off).is_err());
-        assert!(resolve(&view, "View", "Freeze Panes", off).is_ok());
-        assert!(resolve(&view, "View", "freeze-panes", on).is_ok());
+        assert!(resolve_on(view, "View", "Unfreeze Panes", on).is_ok());
+        assert!(resolve_on(view, "View", "Unfreeze Panes", off).is_err());
+        assert!(resolve_on(view, "View", "Freeze Panes", off).is_ok());
+        assert!(resolve_on(view, "View", "freeze-panes", on).is_ok());
     }
 
     #[test]
     fn an_ambiguous_label_names_the_ids_it_could_mean() {
         static A: SheetCmd = cmd("a", "Same", Shape::Glyph("a"), SheetAct::Bold);
         static B: SheetCmd = cmd("b", "Same", Shape::Glyph("b"), SheetAct::Italic);
+        let off = |_: SheetAct| false;
         assert_eq!(
-            resolve(&[&A, &B], "Home", "Same", |_| false).unwrap_err(),
+            single(tier_matches(&[&A, &B], "Same", &off), "Home", "Same", &off).unwrap_err(),
             "command 'Same' is ambiguous on tab 'Home': a, b"
         );
     }
@@ -1323,13 +1306,9 @@ mod tests {
 
     #[test]
     fn the_sort_filter_menu_keeps_the_ribbon_click_ids_and_runs_the_data_tabs_acts() {
-        let home_tab = tab_def(RibbonTab::Home);
-        let home = home_tab.commands();
+        let home = tab_def(RibbonTab::Home);
         let off = |_| false;
-        let resolve = |_: &[&SheetCmd], t: &str, q: &str, f: fn(SheetAct) -> bool| {
-            resolve_on(home_tab, t, q, f)
-        };
-        let act = |q| resolve(&home, "Home", q, off).map(|c| c.act);
+        let act = |q| resolve_on(home, "Home", q, off).map(|c| c.act);
         assert_eq!(act("sort-a-z"), Ok(SheetAct::SortAsc));
         assert_eq!(act("Sort Z to A"), Ok(SheetAct::SortDesc));
         assert_eq!(act("custom-sort"), Ok(SheetAct::CustomSort));
@@ -1339,15 +1318,15 @@ mod tests {
         // The menu's Clear shares its name with the AutoSum column's: the
         // ribbon button wins, and that one is not implemented yet.
         assert_eq!(
-            resolve(&home, "Home", "Clear", off).unwrap_err(),
+            resolve_on(home, "Home", "Clear", off).unwrap_err(),
             "'Clear' is not implemented"
         );
         assert_eq!(
-            resolve(&home, "Home", "clear", off).unwrap_err(),
+            resolve_on(home, "Home", "clear", off).unwrap_err(),
             "'Clear' is not implemented"
         );
         // The drop-down button itself resolves, enabled: it opens its menu.
-        let button = resolve(&home, "Home", "Sort & Filter", off).unwrap();
+        let button = resolve_on(home, "Home", "Sort & Filter", off).unwrap();
         assert!(button.enabled() && matches!(button.shape, Shape::Menu(_)));
     }
 

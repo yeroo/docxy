@@ -92,6 +92,13 @@ test Project ribbon: no tab is clipped vertically
   assert reply.tab is Task
   assert reply.settled is true
   assert reply.any_clipped_v is false
+  # Report has no groups: nothing to wait for, so it is settled at once.
+  call ribbon-layout {"tab":"Report"}
+  shot window
+  call ribbon-layout {"tab":"Report"}
+  assert reply.tab is Report
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
   call ribbon-layout {"tab":"Resource"}
   shot window
   call ribbon-layout {"tab":"Resource"}
@@ -137,3 +144,11 @@ test ribbon-layout reads under a dialog and refuses to show a tab under one
   assert dialog is filter-menu
   call ribbon-layout {}
   call-error ribbon-layout {"tab":"Data"} => a dialog is open
+
+# A document marked as final hides its ribbon (its message bar takes the
+# place), so no group is drawn to measure. Protected View does the same, but
+# needs a Zone.Identifier stream no script can write (see open-modes.uit).
+test ribbon-layout refuses while a final document hides the ribbon
+  open copy:../fixtures/final.docx
+  assert final is true
+  call-error ribbon-layout {} => the ribbon is hidden
