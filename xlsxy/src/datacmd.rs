@@ -149,8 +149,8 @@ pub(crate) struct FilterPicker {
     /// "Add current selection to filter" for a search.
     pub add: bool,
     pub sel: usize,
-    /// A check was changed since the picker opened (or the search moved
-    /// it): Enter on an untouched list leaves the column's criterion alone.
+    /// A check was changed since the picker opened: Enter on an untouched
+    /// list leaves the column's criterion alone.
     pub touched: bool,
 }
 
@@ -532,22 +532,14 @@ impl App {
             KeyCode::Tab => p.add = !p.add,
             KeyCode::Char(' ') if p.sel >= PICKER_ACTIONS => {
                 p.touched = true;
+                // A node takes the items under it along, and each parent
+                // (a month, a year, Select All over the list) follows them.
                 let i = p.sel - PICKER_ACTIONS;
                 let on = !p.checks[i];
-                if i == 0 {
-                    p.checks.iter_mut().for_each(|c| *c = on);
-                } else {
-                    // A tree node takes its children with it.
-                    let depth = p.menu.items[i - 1].depth;
-                    p.checks[i] = on;
-                    for j in i..p.menu.items.len() {
-                        if p.menu.items[j].depth <= depth {
-                            break;
-                        }
-                        p.checks[j + 1] = on;
-                    }
-                    p.checks[0] = p.checks[1..].iter().all(|c| *c);
-                }
+                let depths: Vec<u8> = std::iter::once(0)
+                    .chain(p.menu.items.iter().map(|x| x.depth + 1))
+                    .collect();
+                gridcore::filter::check_tree(&mut p.checks, &depths, i, on);
             }
             KeyCode::Backspace => {
                 p.search.pop();
@@ -619,7 +611,14 @@ impl App {
                             gridcore::filter::set_criterion(wb, si, col, f, today)
                         });
                     }
-                    Err(e) => self.status = Some(e.to_string()),
+                    // Nothing checked (Excel's OK is greyed out): the
+                    // drop-down stays open on the reason.
+                    Err(e) => {
+                        self.status = Some(e.to_string());
+                        if e == gridcore::filter::FilterError::NothingChecked {
+                            self.filter_picker = Some(p);
+                        }
+                    }
                 }
             }
         }
@@ -1097,5 +1096,82 @@ mod tests {
         assert_eq!(a.status.as_deref(), Some("2 of 5 records found"));
         assert!(a.sheet().row_hidden(4), "Cara's row");
         assert!(!a.sheet().row_hidden(2) && !a.sheet().row_hidden(3));
+    }
+
+    #[test]
+    fn enter_with_nothing_checked_keeps_the_picker_open() {
+        let mut a = regions();
+        a.ribbon_act(crate::ribbon::Act::Filter);
+        a.cur = (0, 1);
+        assert!(a.open_filter_picker());
+        // Clear (Select All).
+        a.filter_picker.as_mut().unwrap().sel = PICKER_ACTIONS;
+        a.filter_picker_key(KeyCode::Char(' '));
+        a.filter_picker_key(KeyCode::Enter);
+        assert_eq!(a.status.as_deref(), Some("Select at least one item."));
+        assert!(a.filter_picker.is_some(), "still open");
+        assert!(a.sheet().auto_filter.as_ref().unwrap().criteria.is_empty());
+        // A search nothing matches lists nothing to check: the same.
+        let p = a.filter_picker.as_mut().unwrap();
+        p.search = "zz".into();
+        a.refilter_picker();
+        a.filter_picker_key(KeyCode::Enter);
+        assert_eq!(a.status.as_deref(), Some("Select at least one item."));
+        assert!(a.filter_picker.is_some());
+    }
+
+    #[test]
+    fn space_on_a_day_moves_its_month_and_year() {
+        let mut a = App::new(new_xlsx(), "t.xlsx");
+        a.os_clip = None;
+        let mut xf = gridcore::sheet::Xf::default();
+        xf.set_code(Some("yyyy-mm-dd".into()));
+        let date = a.pkg.workbook.styles.intern(xf);
+        let s = &mut a.pkg.workbook.sheets[0];
+        s.set_cell(0, 0, Cell::text("When"));
+        // 2024-03-10 and 2024-03-13: one year, one month, two days.
+        for (r, d) in [(1, 45361.0), (2, 45364.0)] {
+            s.set_cell(
+                r,
+                0,
+                Cell {
+                    style: date,
+                    ..Cell::number(d)
+                },
+            );
+        }
+        a.rebuild_engine();
+        a.ribbon_act(crate::ribbon::Act::Filter);
+        a.cur = (0, 0);
+        assert!(a.open_filter_picker());
+        let labels: Vec<String> = a
+            .filter_picker
+            .as_ref()
+            .unwrap()
+            .menu
+            .items
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
+        assert_eq!(labels, ["2024", "March", "10", "13"]);
+        // Uncheck day 10: March, 2024 and (Select All) clear; check it
+        // again and they come back.
+        let day10 = PICKER_ACTIONS + 3;
+        a.filter_picker.as_mut().unwrap().sel = day10;
+        a.filter_picker_key(KeyCode::Char(' '));
+        let p = a.filter_picker.as_ref().unwrap();
+        assert_eq!(p.checks, [false, false, false, false, true]);
+        a.filter_picker_key(KeyCode::Char(' '));
+        assert!(a.filter_picker.as_ref().unwrap().checks.iter().all(|c| *c));
+        // With day 10 out, March reads unchecked, so Space on it checks
+        // the month whole rather than clearing it.
+        a.filter_picker_key(KeyCode::Char(' '));
+        a.filter_picker.as_mut().unwrap().sel = PICKER_ACTIONS + 2;
+        a.filter_picker_key(KeyCode::Char(' '));
+        assert_eq!(
+            a.filter_picker.as_ref().unwrap().checks,
+            [true; 5],
+            "March checks all"
+        );
     }
 }

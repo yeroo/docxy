@@ -48,6 +48,12 @@ pub enum FilterError {
     OtherSheet,
     /// Advanced Filter's copy-to header names a field the list lacks.
     BadExtract,
+    /// A drop-down's OK with nothing checked, which Excel greys out.
+    NothingChecked,
+    /// A search for nothing.
+    EmptySearch,
+    /// A search no value matches.
+    NoMatch,
 }
 
 impl FilterError {
@@ -62,6 +68,9 @@ impl FilterError {
             FilterError::NoIcon => "The cell shows no icon.",
             FilterError::OtherSheet => super::ADVANCED_OTHER_SHEET,
             FilterError::BadExtract => "The extract range has a missing or invalid field name.",
+            FilterError::NothingChecked => "Select at least one item.",
+            FilterError::EmptySearch => "Type something to search for.",
+            FilterError::NoMatch => "No values match the search.",
         }
     }
 }
@@ -350,7 +359,8 @@ pub fn clear(
 
 /// The filter drop-down's search: check every result the drop-down lists
 /// for `pattern` (`*` and `?` wildcards, `~` escapes) — Select All Search
-/// Results. With `add` ("Add current selection to filter"), they join
+/// Results. An empty `pattern` ([`FilterError::EmptySearch`]) or one that
+/// matches nothing ([`FilterError::NoMatch`]) changes nothing. With `add` ("Add current selection to filter"), they join
 /// the column's checked values; a criterion other than a checklist is
 /// replaced, as Excel does.
 pub fn search(
@@ -364,7 +374,13 @@ pub fn search(
     // The drop-down's own results, all checked: one matcher for the list
     // the user sees and the filter it makes (a date matches by its year,
     // month name or day, as the tree shows it).
+    if pattern.is_empty() {
+        return Err(FilterError::EmptySearch);
+    }
     let found = super::menu_all(wb, sheet, col, Some(pattern))?;
+    if found.items.is_empty() {
+        return Err(FilterError::NoMatch);
+    }
     let checks = vec![true; found.items.len()];
     let f = super::checklist_criteria(
         wb,

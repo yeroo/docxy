@@ -483,4 +483,8 @@ fn a_fill_comes_from_the_highest_rule_that_sets_one() {
         crate::cf::cell_font_color(wb, 0, 1, 1),
         crate::cf::Shown::None
     );
+    // The grid paints what the filter compares.
+    let painted = crate::cf::cell_dxf(wb, 0, 2, 1).unwrap();
+    assert_eq!(painted.fill, Some((0, 0xB0, 0x50)));
+    assert_eq!(painted.color, Some((255, 0, 0)));
 }

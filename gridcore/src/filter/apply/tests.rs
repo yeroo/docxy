@@ -1087,3 +1087,16 @@ fn a_searched_checklist_takes_its_unchecks_and_add() {
         .unwrap();
     assert!(f.is_some());
 }
+
+#[test]
+fn check_tree_moves_a_node_its_items_and_its_parents() {
+    // (Select All), 2024, March, 10, 13, Bo.
+    let depths = [0, 1, 2, 3, 3, 1];
+    let mut checks = [true; 6];
+    crate::filter::check_tree(&mut checks, &depths, 3, false);
+    assert_eq!(checks, [false, false, false, false, true, true]);
+    crate::filter::check_tree(&mut checks, &depths, 2, true);
+    assert_eq!(checks, [true; 6]);
+    crate::filter::check_tree(&mut checks, &depths, 0, false);
+    assert_eq!(checks, [false; 6]);
+}

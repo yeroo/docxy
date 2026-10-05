@@ -481,3 +481,31 @@ fn add_to_filter_takes_the_searched_checks_and_keeps_the_old_values() {
     press(&mut t, "OK").unwrap();
     assert_eq!(shown(&mut t), vec![2, 5, 6], "Noor, Noor and Ann");
 }
+
+#[test]
+fn ok_with_nothing_checked_is_refused_and_the_drop_down_stays() {
+    let mut t = list();
+    toggle(&mut t).unwrap();
+    t.dialogs.push(menu_dialog(&t, 0).unwrap());
+    t.dialogs
+        .set(
+            "values",
+            &Json::obj(vec![
+                ("item", Json::Str("(Select All)".into())),
+                ("checked", Json::Bool(false)),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        press(&mut t, "OK").unwrap_err(),
+        "Select at least one item."
+    );
+    assert_eq!(top_id(&t), "filter-menu");
+    // A search nothing matches: no results to check, the same refusal.
+    set(&mut t, "search", Json::Str("zz".into()));
+    press(&mut t, "Search").unwrap();
+    assert_eq!(checklist(&t).len(), 1, "only (Select All Search Results)");
+    assert!(press(&mut t, "OK").is_err());
+    assert_eq!(top_id(&t), "filter-menu");
+    assert_eq!(shown(&mut t), vec![2, 3, 4, 5, 6, 7], "nothing hidden");
+}

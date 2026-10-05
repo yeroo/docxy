@@ -148,7 +148,9 @@ const MONTHS: [&str; 12] = [
 /// distinct by displayed text: dates as a year › month › day tree first,
 /// then numbers ascending, then text (case-insensitive), `(Blanks)` last.
 /// With `search`, only the lines whose text contains it (`*` `?` `~`) are
-/// listed. The typed submenu follows the type most of the column's cells
+/// listed: a value by its displayed text, a date by its year, month name or
+/// day (with the year and month above a matching day, and every day under a
+/// matching month or year). The typed submenu follows the type most of the column's cells
 /// hold (ties: text, then number, then date).
 pub fn menu(
     wb: &Workbook,
@@ -178,6 +180,8 @@ fn menu_up_to(
     search: Option<&str>,
     limit: Option<usize>,
 ) -> Result<FilterMenu, FilterError> {
+    // An empty search is no search, as `checklist_criteria` takes it.
+    let search = search.filter(|s| !s.is_empty());
     let af = wb
         .sheets
         .get(sheet)
@@ -421,7 +425,8 @@ fn menu_up_to(
 /// didn't show keep their current state (under a search, a result not shown
 /// is taken as checked, as Excel's results start), read from [`menu_all`].
 /// With a search and `add` ("Add current selection to filter"), the checked
-/// results join the column's current value checklist.
+/// results join the column's current value checklist. Nothing checked is
+/// [`FilterError::NothingChecked`], as Excel greys out OK.
 #[allow(clippy::too_many_arguments)]
 pub fn checklist_criteria(
     wb: &Workbook,
@@ -472,6 +477,10 @@ pub fn checklist_criteria(
             None => vals.push(item.label),
         }
     }
+    // Excel greys out OK with nothing checked.
+    if vals.is_empty() && dates.is_empty() && !blank {
+        return Err(FilterError::NothingChecked);
+    }
     if let (Some(_), true) = (search, add) {
         let current = wb.sheets[sheet]
             .auto_filter
@@ -502,4 +511,38 @@ pub fn checklist_criteria(
         }
     }
     Ok(Some(ColumnFilter::Values { vals, blank, dates }))
+}
+
+/// Check (or clear) item `k` of a drop-down's check list and the items
+/// under it (each item's `depths`, a [`MenuItem`]'s tree), then mark each
+/// item that has items under it checked exactly when they all are: a month
+/// with its days, a year with its months, and `(Select All)` at depth 0
+/// over the rest when the host lists it there. Both hosts' check lists
+/// toggle through this.
+pub fn check_tree(checks: &mut [bool], depths: &[u8], k: usize, on: bool) {
+    let depth = |i: usize| depths.get(i).copied().unwrap_or(0);
+    if k >= checks.len() {
+        return;
+    }
+    checks[k] = on;
+    let mut j = k + 1;
+    while j < checks.len() && depth(j) > depth(k) {
+        checks[j] = on;
+        j += 1;
+    }
+    // Parents, deepest first: a node's children follow it until the depth
+    // falls back to its own.
+    for i in (0..checks.len()).rev() {
+        let mut j = i + 1;
+        let mut any = false;
+        let mut all = true;
+        while j < checks.len() && depth(j) > depth(i) {
+            any = true;
+            all &= checks[j];
+            j += 1;
+        }
+        if any {
+            checks[i] = all;
+        }
+    }
 }

@@ -1,5 +1,6 @@
 //! Conditional-formatting evaluation. Given a cell, find the differential format
-//! ([`crate::sheet::Dxf`]) of the highest-priority matching rule.
+//! ([`crate::sheet::Dxf`]) its matching rules stack up to: each property from
+//! the highest-priority matching rule that sets it.
 //!
 //! Only `cellIs` and `expression` rules are evaluated (the common ones); other
 //! rule types (colorScale/dataBar/iconSet/top10/…) are ignored for now.
@@ -30,18 +31,32 @@ fn eval_cf(
 }
 
 /// The differential format conditional formatting applies to cell
-/// (sheet, row, col), if any. The lowest-`priority`-number matching rule wins.
+/// (sheet, row, col), if any rule matches. Excel stacks the matching rules'
+/// formats: the fill, the font colour, bold and italic each come from the
+/// highest-precedence (lowest `priority` number) matching rule that sets
+/// it, so a font-only rule above leaves the fill to a rule below. The
+/// unresolved flags travel with their colour. (`stopIfTrue`, which would
+/// end the stack early, isn't read.)
 pub fn cell_dxf(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<Dxf> {
-    cell_dxf_rule(wb, sheet, row, col).map(|(_, d)| d)
+    let rules = matching_rules(wb, sheet, row, col);
+    if rules.is_empty() {
+        return None;
+    }
+    let first = |sets: &dyn Fn(&Dxf) -> bool| rules.iter().map(|r| r.1).find(|d| sets(d));
+    let mut out = Dxf::default();
+    if let Some(d) = first(&|d| dxf_sets_color(d, true)) {
+        (out.fill, out.fill_unresolved) = (d.fill, d.fill_unresolved);
+    }
+    if let Some(d) = first(&|d| dxf_sets_color(d, false)) {
+        (out.color, out.color_unresolved) = (d.color, d.color_unresolved);
+    }
+    out.bold = first(&|d| d.bold.is_some()).and_then(|d| d.bold);
+    out.italic = first(&|d| d.italic.is_some()).and_then(|d| d.italic);
+    Some(out)
 }
 
-/// [`cell_dxf`], with the winning rule's `priority`.
-fn cell_dxf_rule(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<(i32, Dxf)> {
-    cell_dxf_rule_by(wb, sheet, row, col, |_| true)
-}
-
-/// [`cell_dxf_rule`] among the rules whose format `wants` takes: the
-/// highest-precedence matching rule that sets a given property.
+/// The highest-precedence matching rule whose format `wants` takes (the
+/// one that sets a given property), with its `priority`.
 fn cell_dxf_rule_by(
     wb: &Workbook,
     sheet: usize,
@@ -49,11 +64,19 @@ fn cell_dxf_rule_by(
     col: u32,
     wants: impl Fn(&Dxf) -> bool,
 ) -> Option<(i32, Dxf)> {
-    let s = wb.sheets.get(sheet)?;
-    if s.cond_formats.is_empty() {
-        return None;
-    }
-    let mut best: Option<(i32, usize)> = None; // (priority, dxf_id)
+    matching_rules(wb, sheet, row, col)
+        .into_iter()
+        .find(|(_, d)| wants(d))
+        .map(|(p, d)| (p, d.clone()))
+}
+
+/// The formats of the rules over the cell that match it, highest
+/// precedence (lowest `priority` number) first.
+fn matching_rules(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Vec<(i32, &Dxf)> {
+    let Some(s) = wb.sheets.get(sheet) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
     for cf in &s.cond_formats {
         let covers = cf
             .ranges
@@ -70,19 +93,16 @@ fn cell_dxf_rule_by(
                 (r.min(r1), c.min(c1))
             });
         for rule in &cf.rules {
-            let Some(dxf_id) = rule.dxf_id else { continue };
-            if best.is_some_and(|(p, _)| rule.priority >= p) {
-                continue; // a higher-precedence rule already matched
-            }
-            if !wb.styles.dxfs.get(dxf_id).is_some_and(&wants) {
+            let Some(d) = rule.dxf_id.and_then(|i| wb.styles.dxfs.get(i)) else {
                 continue;
-            }
+            };
             if rule_matches(wb, sheet, row, col, anchor, &rule.kind) {
-                best = Some((rule.priority, dxf_id));
+                found.push((rule.priority, d));
             }
         }
     }
-    best.and_then(|(p, id)| Some((p, wb.styles.dxfs.get(id).cloned()?)))
+    found.sort_by_key(|r| r.0);
+    found
 }
 
 fn truthy(v: &Value) -> bool {
@@ -210,10 +230,8 @@ pub fn cell_font_color(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Shown
 }
 
 fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> Shown {
-    // Excel stacks the matching rules' formats: each property comes from the
-    // highest-precedence matching rule that sets it, so a font-only rule
-    // above leaves the fill to a rule below. (`stopIfTrue`, which would end
-    // the stack early, isn't read.)
+    // The colour comes from the highest-precedence matching rule that sets
+    // it, as [`cell_dxf`] stacks the formats the grid paints.
     let winner = cell_dxf_rule_by(wb, sheet, row, col, |d| dxf_sets_color(d, fill));
     // A rule we don't evaluate (Duplicate Values, a colour scale, …) that
     // takes precedence over the one that sets the colour, or any such rule
@@ -784,6 +802,58 @@ mod tests {
         };
         let wb = wb_with_cells(&[("A1", Cell::number(5.0))], cf, vec![red, green.clone()]);
         assert_eq!(cell_dxf(&wb, 0, 0, 0), Some(green));
+    }
+
+    #[test]
+    fn matching_rules_stack_each_property_from_the_top_rule_that_sets_it() {
+        // Priority 1 sets bold and a red font; priority 2 a green fill and
+        // italic off; priority 3 a blue fill. A1 shows red bold on green.
+        let gt0 = || CfKind::CellIs {
+            op: "greaterThan".into(),
+            formulas: vec!["0".into()],
+        };
+        let dxfs = vec![
+            Dxf {
+                bold: Some(true),
+                color: Some((255, 0, 0)),
+                ..Dxf::default()
+            },
+            Dxf {
+                fill: Some((0, 255, 0)),
+                italic: Some(false),
+                ..Dxf::default()
+            },
+            Dxf {
+                fill: Some((0, 0, 255)),
+                bold: Some(false),
+                ..Dxf::default()
+            },
+        ];
+        // Dxf i at priority i + 1, listed lowest precedence first: the
+        // order in the file doesn't decide, the priority does.
+        let cf = CondFormat {
+            ix: None,
+            ranges: vec![(0, 0, 9, 0)],
+            rules: (0..3)
+                .rev()
+                .map(|i| CfRule {
+                    kind: gt0(),
+                    dxf_id: Some(i),
+                    priority: i as i32 + 1,
+                })
+                .collect(),
+        };
+        let wb = wb_with_cells(&[("A1", Cell::number(5.0))], cf, dxfs);
+        let want = Dxf {
+            fill: Some((0, 255, 0)),
+            color: Some((255, 0, 0)),
+            bold: Some(true),
+            italic: Some(false),
+            ..Dxf::default()
+        };
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), Some(want));
+        assert_eq!(cell_fill(&wb, 0, 0, 0), Shown::Rgb((0, 255, 0)));
+        assert_eq!(cell_font_color(&wb, 0, 0, 0), Shown::Rgb((255, 0, 0)));
     }
 
     #[test]

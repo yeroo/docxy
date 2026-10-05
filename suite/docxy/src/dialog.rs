@@ -542,7 +542,7 @@ impl Control {
                 .get("checked")
                 .and_then(Json::as_bool)
                 .ok_or("'checked' must be true or false")?;
-            check_tree(&mut checks, &self.depths, k, on);
+            gridcore::filter::check_tree(&mut checks, &self.depths, k, on);
             return Ok(checks);
         }
         match args.get("value").ok_or("missing argument 'value'")? {
@@ -554,7 +554,7 @@ impl Control {
                         .as_str()
                         .ok_or_else(|| format!("'{label}' takes labels"))?;
                     let k = find(w)?;
-                    check_tree(&mut checks, &self.depths, k, true);
+                    gridcore::filter::check_tree(&mut checks, &self.depths, k, true);
                 }
             }
             _ => return Err(format!("'{label}' takes true, false or a list of labels")),
@@ -643,36 +643,6 @@ fn rows_json(rows: &[Vec<String>]) -> Json {
 /// A label as it is drawn: without its `&` accelerator mark.
 fn shown(label: &str) -> String {
     label.replace('&', "")
-}
-
-/// Check (or clear) item `k` of a check list and the items under it, then
-/// mark each item that has items under it checked exactly when they all are.
-pub(crate) fn check_tree(checks: &mut [bool], depths: &[u8], k: usize, on: bool) {
-    let depth = |i: usize| depths.get(i).copied().unwrap_or(0);
-    if k >= checks.len() {
-        return;
-    }
-    checks[k] = on;
-    let mut j = k + 1;
-    while j < checks.len() && depth(j) > depth(k) {
-        checks[j] = on;
-        j += 1;
-    }
-    // Parents, deepest first: a node's children follow it until the depth
-    // falls back to its own.
-    for i in (0..checks.len()).rev() {
-        let mut j = i + 1;
-        let mut any = false;
-        let mut all = true;
-        while j < checks.len() && depth(j) > depth(i) {
-            any = true;
-            all &= checks[j];
-            j += 1;
-        }
-        if any {
-            checks[i] = all;
-        }
-    }
 }
 
 /// How a label is matched: case-insensitive, without `&` accelerator marks or

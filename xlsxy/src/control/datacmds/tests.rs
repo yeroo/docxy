@@ -526,6 +526,18 @@ fn dat_case_039_menu_search_and_growth() {
     assert!(shown(&mut a, "A12002:A12002").contains(&12002));
     let af = a.pkg.workbook.sheets[0].auto_filter.as_ref().unwrap();
     assert_eq!(af.range.2, 12001);
+    // An empty search, or one nothing matches, is refused and changes
+    // nothing; filter.menu takes an empty search as none.
+    let before = shown(&mut a, "A2:A12002");
+    for (search, why) in [("", "Type something"), ("zz*zz", "No values match")] {
+        let args = format!(r#"{{"col":"Code","criteria":{{"search":"{search}"}}}}"#);
+        let e = call(&mut a, "filter.set", &args).unwrap_err();
+        assert!(e.contains(why), "{e}");
+    }
+    assert_eq!(shown(&mut a, "A2:A12002"), before);
+    let all = ok(&mut a, "filter.menu", r#"{"col":"Qty"}"#);
+    let empty = ok(&mut a, "filter.menu", r#"{"col":"Qty","search":""}"#);
+    assert_eq!(all, empty);
 }
 
 #[test]

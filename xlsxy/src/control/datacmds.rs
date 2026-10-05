@@ -181,6 +181,10 @@ fn criteria_arg(j: &Json) -> Result<Criteria, String> {
         });
     }
     if let Some(p) = j.get_str("search") {
+        // Refused before the filter is turned on or extended.
+        if p.is_empty() {
+            return Err(gridcore::filter::FilterError::EmptySearch.to_string());
+        }
         return Ok(Criteria::Search {
             pattern: p.to_string(),
             add: j.get("add").and_then(Json::as_bool).unwrap_or(false),
