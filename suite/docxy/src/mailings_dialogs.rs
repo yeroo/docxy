@@ -651,7 +651,7 @@ fn apply(tab: &mut DocTab, d: &Dialog) -> Result<(), String> {
             };
             let spec = EnvelopeSpec::from_text(size, &lines(&get_text(d, "delivery")), &ret);
             insert_envelope(body_editor(tab)?, &spec);
-            tab.dirty = true;
+            tab.set_dirty();
             tab.status = format!("Envelope added: {}", size.name).into();
         }
         DialogOwner::MailEnvelopeOptions => {

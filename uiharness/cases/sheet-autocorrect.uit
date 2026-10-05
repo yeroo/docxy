@@ -1,0 +1,99 @@
+# AutoCorrect for sheet entry (#667): ENT-CASE-040 and ENT-CASE-056 in the
+# empty column J of fixtures/basic.xlsx.
+
+# ENT-CASE-040: replacements and capitalisation while typing and at the
+# commit, never in a formula; Ctrl+Z right after a correction takes back
+# only it.
+test ENT-CASE-040 autocorrect while typing and never in a formula
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type (c) 2024
+  key enter
+  type teh cat
+  key enter
+  type ="(c)"
+  key enter
+  type monday meeting
+  key enter
+  type THursday
+  key enter
+  type teh
+  key enter
+  assert cell J1 is © 2024
+  assert cell J2 is the cat
+  assert cell J3 is (c)
+  assert cell J4 is Monday meeting
+  assert cell J5 is Thursday
+  assert cell J6 is the
+  # J7: `teh` and a space correct (and propose J2's `the cat`); Ctrl+Z
+  # takes back the correction only; `x`, Enter.
+  click J7
+  type teh
+  key space
+  key ctrl+z
+  assert editing is true
+  assert edit is "teh "
+  type x
+  key enter
+  assert cell J7 is teh x
+  assert sel is J8
+
+# ENT-CASE-056: the dialog's tabs, Add, redefine, Delete, an INitial CAps
+# exception, and typed URLs as hyperlinks with the switch on and off.
+test ENT-CASE-056 the AutoCorrect dialog and hyperlinks
+  open copy:../fixtures/basic.xlsx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-read {}
+  assert reply.tabs.0 is AutoCorrect
+  assert reply.tabs.1 is AutoFormat As You Type
+  assert reply.tabs.2 is Actions
+  assert reply.tabs.3 is Math AutoCorrect
+  call dialog-set {"control":"replace","value":"cdp"}
+  call dialog-set {"control":"with","value":"Consolidated Data Processing"}
+  call dialog-click {"button":"Add"}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  click J1
+  type cdp report
+  key enter
+  assert cell J1 is Consolidated Data Processing report
+  call autocorrect {}
+  call dialog-set {"control":"replace","value":"cdp"}
+  call dialog-set {"control":"with","value":"Other"}
+  call dialog-click {"button":"Add"}
+  assert dialog is autocorrect-redefine
+  call dialog-click {"button":"Yes"}
+  assert dialog is autocorrect
+  call dialog-set {"control":"replace","value":"cdp"}
+  call dialog-click {"button":"Delete"}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-tab {"tab":"INitial CAps"}
+  call dialog-set {"control":"caps-word","value":"ABc"}
+  call dialog-click {"button":"Add"}
+  call dialog-click {"button":"OK"}
+  assert dialog is autocorrect
+  call dialog-click {"button":"OK"}
+  click J2
+  type cdp
+  key enter
+  assert cell J2 is cdp
+  type ABc
+  key enter
+  assert cell J3 is ABc
+  type https://example.com
+  key enter
+  call cell {"cell":"J4"}
+  assert reply.hyperlink is https://example.com
+  call autocorrect {}
+  call dialog-tab {"tab":"AutoFormat As You Type"}
+  call dialog-set {"control":"ac_hyperlinks","value":false}
+  call dialog-click {"button":"OK"}
+  click J5
+  type https://example.org
+  key enter
+  call cell {"cell":"J5"}
+  assert reply.hyperlink is nothing
+  assert reply.text is https://example.org
+  assert sheet_editing.edit_flash_fill_auto is true

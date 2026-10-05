@@ -63,12 +63,15 @@ mod recover;
 mod ribbon_export;
 #[cfg(test)]
 mod sect_pr_tests;
+mod sheet_autocorrect;
 #[cfg(test)]
 mod sheet_clip_tests;
+mod sheet_complete;
 mod sheet_consolidate;
 #[cfg(test)]
 mod sheet_entry_tests;
 mod sheet_filter;
+mod sheet_flashfill;
 mod sheet_outline;
 mod sheet_ribbon;
 mod sheet_sort;
@@ -139,27 +142,61 @@ fn icon_svg(name: &str, size: f32, color: Hsla) -> Svg {
         .flex_none()
 }
 
+/// The editor a tab's keystrokes and commands drive: its header/footer
+/// editor while one is open, else a document's body; none on other tabs.
+fn tab_edit_target(tab: &mut DocTab) -> Option<&mut Editor> {
+    if let Some(hf) = tab.hf_edit.as_mut() {
+        return Some(&mut hf.editor);
+    }
+    match &mut tab.surface {
+        Surface::Doc(ed) => Some(ed),
+        _ => None,
+    }
+}
+
+/// [`tab_edit_target`], to read.
+fn tab_edit_target_ref(tab: &DocTab) -> Option<&Editor> {
+    if let Some(hf) = tab.hf_edit.as_ref() {
+        return Some(&hf.editor);
+    }
+    match &tab.surface {
+        Surface::Doc(ed) => Some(ed),
+        _ => None,
+    }
+}
+
 /// A small Quick-Access-Toolbar icon button (Undo/Redo in the title bar).
+/// A disabled one (Can't Repeat, #618) is drawn dimmed and takes no click.
 fn qat_btn(
     id: &'static str,
     icon: &'static str,
     tip: &'static str,
+    enabled: bool,
     pal: Pal,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
+) -> Stateful<Div> {
+    let btn = div()
         .id(id)
         .flex()
         .items_center()
         .justify_center()
         .size(px(20.))
         .rounded(px(3.))
-        .cursor_pointer()
+        .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx));
+    if !enabled {
+        return btn.child(icon_svg(icon, 14., pal.dim));
+    }
+    btn.cursor_pointer()
         .hover(|d| d.bg(pal.hover))
         .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
         .child(icon_svg(icon, 14., pal.fg))
-        .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx))
         .on_click(on_click)
+}
+
+/// Where the Undo drop-down opens: below the arrow, when the last frame drew
+/// it.
+fn qat_undo_anchor(probes: &Probes) -> Option<Point<Pixels>> {
+    probes.current("qat-undo-arrow").map(|b| b.bottom_left())
 }
 
 // ---- session model ---------------------------------------------------------
@@ -339,6 +376,10 @@ struct Prefs {
     autorecover_minutes: u32,
     keep_drafts: bool,
     edit_opts: EditOptions,
+    /// AutoCorrect's changes from its defaults (#667), as
+    /// [`gridcore::autocorrect::AutoCorrect::to_lines`] writes them; saved
+    /// in `sheet_editing` with the Editing options.
+    autocorrect: String,
     user_name: String,
     user_initials: String,
 }
@@ -505,7 +546,7 @@ fn backstage_rail_items(
         .filter(move |item| (!item.project_only || project) && (!item.doc_only || doc))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum QatAction {
     Undo,
     Redo,
@@ -627,6 +668,30 @@ struct SheetView {
     /// commit takes the value; Backspace or Delete drops the suffix; a caret
     /// move keeps the text and drops the marker.
     edit_proposal: Option<(usize, String)>,
+    /// Formula AutoComplete's list for the open editor (#686), kept with the
+    /// buffer it was made for ([`sheet_complete::CompleteList`]).
+    edit_complete: Option<sheet_complete::CompleteList>,
+    /// That list's scroll. A list rebuilt for new typing starts at the top and
+    /// scrolls once to the highlight it carries ([`SheetView::complete_now`]);
+    /// nothing scrolls it per frame, so the mouse wheel is free.
+    fx_scroll: ScrollHandle,
+    /// Flash Fill's greyed preview after a typed commit, and the last fill
+    /// for its Options button (#666); each stands only while nothing has
+    /// moved on from it ([`SheetView::live_preview`],
+    /// [`SheetView::live_flash`]).
+    flash_preview: Option<sheet_flashfill::FlashPreview>,
+    last_flash: Option<sheet_flashfill::LastFlash>,
+    /// The app's AutoCorrect (#667), stamped like `edit_opts`.
+    autocorrect: std::rc::Rc<gridcore::autocorrect::AutoCorrect>,
+    /// The last correction while typing, with the buffer and caret it left
+    /// (before AutoComplete proposed): Ctrl+Z takes back just it while they
+    /// stand.
+    edit_correction: Option<(gridcore::autocorrect::Correction, String, usize)>,
+    /// Where Ctrl+Z took a correction back: that word is not corrected again.
+    edit_kept: Option<usize>,
+    /// The buffer and caret the last character typed at the end left: the
+    /// commit corrects the last word only while they stand.
+    edit_typed_tail: Option<(String, usize)>,
     /// Which workbook tab this is, for the grid clip: a cut moves cells only
     /// within the workbook it came from ([`next_sheet_view_id`]).
     id: u64,
@@ -1543,6 +1608,17 @@ enum SheetAct {
     OutlineSettings,
     /// The Number group's format combo: opens or closes the format strip.
     NumberFormatMenu,
+    /// Pick From Drop-down List... (the cell menu, Alt+Down; #665): its menu
+    /// over the selected cell, and entry `n` of it chosen.
+    PickList,
+    PickItem(u32),
+    /// Data › Flash Fill and Ctrl+E (#666), and the Flash Fill Options
+    /// menu's items.
+    FlashFill,
+    FlashUndo,
+    FlashAccept,
+    FlashSelectBlank,
+    FlashSelectChanged,
     Todo,
 }
 
@@ -1613,6 +1689,10 @@ impl SheetView {
         self.edit_overtype = false;
         self.edit_point = None;
         self.edit_proposal = None;
+        self.edit_complete = None;
+        self.edit_correction = None;
+        self.edit_kept = None;
+        self.edit_typed_tail = None;
     }
 
     /// The context a typed commit reads its entry under: the workbook's, with
@@ -1636,11 +1716,17 @@ impl SheetView {
     fn type_char(&mut self, c: &str) {
         if self.editing.is_some() {
             self.drop_proposal();
+            let at_end = self
+                .editing
+                .as_deref()
+                .is_some_and(|b| self.edit_caret == b.chars().count());
             self.edit_type(c);
+            self.autocorrect_typed(c, at_end);
         } else {
             self.begin_cell_edit(Some(String::new()));
             self.edit_caret = 0;
             self.edit_insert(c);
+            self.autocorrect_typed(c, true);
         }
         self.propose();
     }
@@ -1698,17 +1784,23 @@ impl SheetView {
     /// feed, the Ctrl+; / Ctrl+' entry chords — drops the suffix first, as
     /// typing does, so it lands after the typed text. A key that moves the
     /// caret or rewrites the buffer (Home/End, F2/F4/F9, Insert, Edit-mode
-    /// Left/Right, Ctrl+Left/Right/Delete/Z) keeps the text and drops only
-    /// the marker. Every other key leaves it live: the keys that commit
+    /// Left/Right, Ctrl+Left/Right/Delete) keeps the text and drops only
+    /// the marker. Ctrl+Z drops the suffix too, as a typed character does:
+    /// it may take back the AutoCorrect change the proposal was made from,
+    /// and the suffix is not part of what was typed. Every other key leaves
+    /// it live: the keys that commit
     /// (Enter, Tab, Ctrl+Enter, Ctrl+S's save) take it in `commit_edit`, and
     /// Backspace, Delete and typing handle it themselves.
     fn proposal_before_key(&mut self, key: &str, ctrl: bool, alt: bool) {
         if self.edit_proposal.is_none() {
             return;
         }
-        let inserts = (alt && key == "enter") || (ctrl && matches!(key, "'" | "\"" | ";" | ":"));
+        // Ctrl+Z drops the suffix too: it may take back the AutoCorrect
+        // change the proposal was made from, which the suffix is not part of.
+        let inserts =
+            (alt && key == "enter") || (ctrl && matches!(key, "'" | "\"" | ";" | ":" | "z"));
         let caret_move = if ctrl {
-            matches!(key, "left" | "right" | "delete" | "z")
+            matches!(key, "left" | "right" | "delete")
         } else {
             matches!(key, "home" | "end" | "f2" | "f4" | "f9" | "insert")
                 || (self.edit_arrows_move_caret() && matches!(key, "left" | "right"))
@@ -1722,13 +1814,15 @@ impl SheetView {
 
     /// A commit takes a live AutoComplete proposal: the buffer becomes the
     /// value it completes to, in that value's case.
-    fn take_proposal(&mut self) {
-        if let Some((_, value)) = self.edit_proposal.take() {
-            if self.editing.is_some() {
-                self.editing = Some(value);
-                self.edit_caret_to_end();
-            }
+    fn take_proposal(&mut self) -> bool {
+        let Some((_, value)) = self.edit_proposal.take() else {
+            return false;
+        };
+        if self.editing.is_some() {
+            self.editing = Some(value);
+            self.edit_caret_to_end();
         }
+        true
     }
 
     /// Where a double-click on (r, c) goes with editing directly in cells
@@ -1786,6 +1880,16 @@ impl SheetView {
         self.edit_overtype = false;
         self.edit_point = None;
         self.edit_proposal = None;
+        self.edit_complete = None;
+        self.edit_correction = None;
+        self.edit_kept = None;
+        self.edit_typed_tail = None;
+    }
+
+    /// A caret move or a deletion: the last word is no longer the one just
+    /// typed, so the commit's AutoCorrect leaves it (#667).
+    fn edit_tail_left(&mut self) {
+        self.edit_typed_tail = None;
     }
 
     fn edit_untouched(&self) -> bool {
@@ -1986,7 +2090,15 @@ impl SheetView {
     /// text and [`SheetView::entry_error`] says why.
     fn commit_edit(&mut self) -> bool {
         self.entry_error = None;
-        self.take_proposal();
+        let took = self.take_proposal();
+        self.autocorrect_commit(took);
+        self.commit_edit_taken(took)
+    }
+
+    /// [`SheetView::commit_edit`] after the proposal was taken (`took`) and
+    /// AutoCorrect ran: the rest of the commit, which Ctrl+Enter on one cell
+    /// shares so neither takes a proposal twice.
+    fn commit_edit_taken(&mut self, took: bool) -> bool {
         let untouched = self.edit_untouched();
         debug_assert!(self.editing.is_none() || self.edit_origin.is_some());
         let Some(buf) = self.editing.as_deref() else {
@@ -2021,11 +2133,16 @@ impl SheetView {
                 return false;
             }
         }
+        let link = self.typed_link(&buf, took, cell.as_ref());
         self.editing = None;
         self.end_cell_edit();
         self.push_undo();
         if let Some(cell) = cell {
             self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
+        }
+        // A typed URL is a hyperlink (ENT-120), in the same undo step.
+        if let (Some(url), Some(sh)) = (link, self.pkg.workbook.sheets.get_mut(s)) {
+            sh.hyperlinks.insert((r, c), url);
         }
         true
     }
@@ -2216,6 +2333,7 @@ impl SheetView {
 
     /// Ctrl+Left / Ctrl+Right: to the start of the previous / next word.
     fn edit_word_move(&mut self, forward: bool) {
+        self.edit_tail_left();
         let chars: Vec<char> = self.editing.as_deref().unwrap_or("").chars().collect();
         let word = |c: char| c.is_alphanumeric() || c == '_';
         let mut i = self.edit_caret.min(chars.len());
@@ -2239,6 +2357,7 @@ impl SheetView {
 
     /// Ctrl+Delete: delete from the caret to the end of the text.
     fn edit_delete_to_end(&mut self) {
+        self.edit_tail_left();
         let caret = self.edit_caret;
         if let Some(buf) = self.editing.as_mut() {
             let at = char_to_byte(buf, caret);
@@ -2250,6 +2369,10 @@ impl SheetView {
     /// opened with; the editor stays open and the workbook's undo is untouched.
     fn edit_revert(&mut self) {
         if self.editing.is_some() {
+            // Right after an AutoCorrect change, only it goes (ENT-119).
+            if self.undo_correction() {
+                return;
+            }
             self.edit_proposal = None;
             self.editing = Some(self.edit_start.clone());
             self.edit_caret_to_end();
@@ -2521,7 +2644,8 @@ impl SheetView {
     /// selection kept. False when nothing was entered (no editor, or refused).
     fn commit_edit_to_selection(&mut self) -> bool {
         self.entry_error = None;
-        self.take_proposal();
+        let took = self.take_proposal();
+        self.autocorrect_commit(took);
         let Some(buf) = self.editing.clone() else {
             return false;
         };
@@ -2531,7 +2655,7 @@ impl SheetView {
         let range = self.range();
         let inside = (range.0..=range.2).contains(&r) && (range.1..=range.3).contains(&c);
         if !self.has_range() || s != self.active || !inside {
-            return self.commit_edit();
+            return self.commit_edit_taken(took);
         }
         if let Err(e) = gridcore::entry::check_len(&buf) {
             self.entry_error = Some(e.to_string());
@@ -2549,11 +2673,22 @@ impl SheetView {
         if cells.as_ref().is_some_and(|cells| self.refuses(s, cells)) {
             return false;
         }
+        // A typed URL is a link in each cell it fills (ENT-120).
+        let link = cells
+            .as_ref()
+            .and_then(|cells| cells.first())
+            .and_then(|(_, _, cell)| self.typed_link(&buf, took, Some(cell)));
+        let filled: Vec<(u32, u32)> = cells.iter().flatten().map(|(r, c, _)| (*r, *c)).collect();
         self.end_cell_edit();
         self.push_undo();
         if let Some(cells) = cells {
             self.engine
                 .set_cells_prechecked(&mut self.pkg.workbook, s, cells);
+        }
+        if let (Some(url), Some(sh)) = (link, self.pkg.workbook.sheets.get_mut(s)) {
+            for at in filled {
+                sh.hyperlinks.insert(at, url.clone());
+            }
         }
         true
     }
@@ -2699,12 +2834,14 @@ impl SheetView {
     }
     /// Delete the char before the caret (Backspace).
     fn edit_backspace(&mut self) {
+        self.edit_tail_left();
         if let Some(buf) = self.editing.as_mut() {
             buf_backspace(buf, &mut self.edit_caret);
         }
     }
     /// Delete the char at the caret (Delete).
     fn edit_delete(&mut self) {
+        self.edit_tail_left();
         let caret = self.edit_caret;
         if let Some(buf) = self.editing.as_mut() {
             buf_delete(buf, caret);
@@ -2712,6 +2849,7 @@ impl SheetView {
     }
     /// Move the caret by `delta` chars, clamped to the buffer.
     fn edit_move(&mut self, delta: i32) {
+        self.edit_tail_left();
         let n = self.edit_len() as i32;
         self.edit_caret = (self.edit_caret as i32 + delta).clamp(0, n) as usize;
     }
@@ -3172,8 +3310,16 @@ impl DocTab {
         if self.access.locked() {
             protected_rollback(self);
         } else {
-            self.dirty = true;
+            self.set_dirty();
         }
+    }
+
+    /// A document tab's changes go through here; sheet commits and Project
+    /// edits sync `dirty` themselves and call `bump_edit_generation`
+    /// directly. Either way a Repeat record taken before goes stale (#618).
+    fn set_dirty(&mut self) {
+        self.dirty = true;
+        bump_edit_generation();
     }
 }
 
@@ -3245,6 +3391,9 @@ struct Docxy {
     /// keeps a copy that [`stamp_edit_opts`] refreshes on restore, on a
     /// change and every frame (and `active_sheet_mut` on each use).
     edit_opts: EditOptions,
+    /// AutoCorrect (#667): the app's, stamped into every sheet tab, saved
+    /// with the Editing options. Its dialogs change it.
+    autocorrect: std::rc::Rc<gridcore::autocorrect::AutoCorrect>,
     /// The reviewer's name and initials for new comments (#620), as set in
     /// Settings › User name; empty falls back ([`review_identity`]).
     user_name: String,
@@ -3280,6 +3429,9 @@ struct Docxy {
     picker: Option<PickKind>,
     // Scroll handle for the document body, so the caret can be kept in view.
     doc_scroll: ScrollHandle,
+    /// The open menu's scroll: Up/Down scroll the highlighted row into view,
+    /// and each menu (or submenu) starts at the top.
+    menu_scroll: ScrollHandle,
     // New-comment entry bar (Review ▸ New comment); routes keys while open.
     comment_open: bool,
     /// The comment the Review tab's Resolve acts on: the one last clicked in
@@ -3359,6 +3511,9 @@ struct Docxy {
     // The menu the backdrop last closed and where that press was, so a press
     // on a split button's arrow can tell it just shut the arrow's own menu.
     menu_closed_at: Option<(menu::MenuTarget, Point<Pixels>)>,
+    // What Ctrl+Y / F4 repeat when there is nothing to redo (#618); see
+    // `RepeatRecord` for when it is still valid.
+    repeat: Option<RepeatRecord>,
     // Floating mini formatting toolbar shown after a drag-selection (window coords).
     mini_bar: Option<Point<Pixels>>,
     // Document zoom factor (1.0 = 100%), controlled from the status bar.
@@ -3482,6 +3637,9 @@ impl Probes {
 /// toggles it. The pointer and `menu-open` both anchor here; `None` when the
 /// button has not been laid out.
 fn split_menu_anchor(probes: &Probes, primary_id: &str) -> Option<Point<Pixels>> {
+    if primary_id == menu::QAT_UNDO_ID {
+        return qat_undo_anchor(probes);
+    }
     probes
         .current(&format!("ribbon-split:{primary_id}"))
         .map(|b| b.bottom_left())
@@ -5788,6 +5946,7 @@ fn fx_segment(
                 if let Some(v) = this.active_sheet_mut() {
                     v.edit_caret = idx;
                     v.edit_proposal = None;
+                    v.edit_tail_left();
                 }
                 cx.notify();
             });
@@ -8108,6 +8267,14 @@ fn new_sheet_surface() -> Surface {
         reveal_col: None,
         edit_opts: EditOptions::default(),
         edit_proposal: None,
+        edit_complete: None,
+        fx_scroll: ScrollHandle::new(),
+        flash_preview: None,
+        last_flash: None,
+        autocorrect: Default::default(),
+        edit_correction: None,
+        edit_kept: None,
+        edit_typed_tail: None,
         id: next_sheet_view_id(),
         edit_gen: 0,
     })
@@ -8176,6 +8343,14 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     reveal_col: None,
                     edit_opts: EditOptions::default(),
                     edit_proposal: None,
+                    edit_complete: None,
+                    fx_scroll: ScrollHandle::new(),
+                    flash_preview: None,
+                    last_flash: None,
+                    autocorrect: Default::default(),
+                    edit_correction: None,
+                    edit_kept: None,
+                    edit_typed_tail: None,
                     id: next_sheet_view_id(),
                     edit_gen: 0,
                 };
@@ -8422,7 +8597,7 @@ fn write_session_forgetting(
         ask_on_close: prefs.ask_on_close,
         autorecover_minutes: prefs.autorecover_minutes,
         keep_drafts: prefs.keep_drafts,
-        sheet_editing: prefs.edit_opts.to_lines(),
+        sheet_editing: format!("{}{}", prefs.edit_opts.to_lines(), prefs.autocorrect),
         user_name: prefs.user_name,
         user_initials: prefs.user_initials,
     };
@@ -9211,6 +9386,10 @@ impl Docxy {
         this.keep_drafts = session.keep_drafts;
         this.edit_opts = EditOptions::from_text(&session.sheet_editing);
         stamp_edit_opts(&mut this.tabs, this.edit_opts);
+        this.autocorrect = std::rc::Rc::new(gridcore::autocorrect::AutoCorrect::from_text(
+            &session.sheet_editing,
+        ));
+        sheet_autocorrect::stamp_autocorrect(&mut this.tabs, &this.autocorrect);
         this.user_name = session.user_name;
         this.user_initials = session.user_initials;
         this.persist_to(&root);
@@ -9252,6 +9431,7 @@ impl Docxy {
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
             edit_opts: EditOptions::default(),
+            autocorrect: Default::default(),
             user_name: String::new(),
             user_initials: String::new(),
             fx_expanded: false,
@@ -9268,6 +9448,7 @@ impl Docxy {
             find_cur: None,
             picker: None,
             doc_scroll: ScrollHandle::new(),
+            menu_scroll: ScrollHandle::new(),
             comment_open: false,
             selected_comment: None,
             markup: Default::default(),
@@ -9298,6 +9479,7 @@ impl Docxy {
             keytip_prefix: String::new(),
             menu: None,
             menu_closed_at: None,
+            repeat: None,
             mini_bar: None,
             zoom: 1.0,
             ruler_guide: None,
@@ -9339,6 +9521,7 @@ impl Docxy {
             autorecover_minutes: self.autorecover_minutes,
             keep_drafts: self.keep_drafts,
             edit_opts: self.edit_opts,
+            autocorrect: self.autocorrect.to_lines(),
             user_name: self.user_name.clone(),
             user_initials: self.user_initials.clone(),
         }
@@ -9474,14 +9657,46 @@ impl Docxy {
                 cx,
             );
         }
-        self.with_editor(window, cx, |ed| match action {
+        let untouched = repeat_untouched(&self.repeat);
+        match action {
             QatAction::Undo => {
-                ed.undo();
+                self.with_editor(window, cx, |ed| {
+                    ed.undo();
+                });
+                self.keep_repeat_current(untouched);
             }
+            // Redo, or Repeat with nothing to redo (#618). With neither,
+            // nothing happens and the tab stays clean.
             QatAction::Redo => {
-                ed.redo();
+                let ready = match self.edit_target_and_repeat() {
+                    (Some(ed), rec) => ed.can_redo() || repeat_ready(ed, rec),
+                    (None, _) => false,
+                };
+                if !ready {
+                    return self.refocus(window, cx);
+                }
+                // Protected View refuses it as any edit; the tab turns dirty
+                // only when something changed.
+                if self.protected_refused(cx) {
+                    return self.refocus(window, cx);
+                }
+                let changed = match self.edit_target_and_repeat() {
+                    (Some(ed), rec) => {
+                        let changed = redo_or_repeat(ed, rec);
+                        ed.refresh_merge_preview();
+                        changed
+                    }
+                    (None, _) => false,
+                };
+                if changed {
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.mark_dirty();
+                    }
+                }
+                self.keep_repeat_current(untouched);
+                self.refocus(window, cx);
             }
-        });
+        }
     }
 
     fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -9651,6 +9866,31 @@ impl Docxy {
                 |o| o.fill_handle = !o.fill_handle,
                 cx,
             ))
+            .child(check_row(
+                "bs-flash-fill-auto",
+                o.flash_fill_auto,
+                "Automatically Flash Fill",
+                |o| o.flash_fill_auto = !o.flash_fill_auto,
+                cx,
+            ))
+            .child(check_row(
+                "bs-formula-autocomplete",
+                o.formula_autocomplete,
+                "Formula AutoComplete",
+                |o| o.formula_autocomplete = !o.formula_autocomplete,
+                cx,
+            ))
+            // Proofing › AutoCorrect Options... (#667).
+            .child(
+                row("bs-autocorrect")
+                    .child(div().text_color(fg).child("AutoCorrect Options..."))
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        if let Err(e) = this.open_autocorrect_dialog() {
+                            this.set_status(e);
+                        }
+                        cx.notify();
+                    })),
+            )
             .into_any_element()
     }
 
@@ -12169,7 +12409,11 @@ impl Docxy {
     }
     fn active_sheet_mut(&mut self) -> Option<&mut SheetView> {
         let opts = self.edit_opts;
-        sheet_with_opts(self.tabs.get_mut(self.active), opts)
+        let ac = self.autocorrect.clone();
+        let v = sheet_with_opts(self.tabs.get_mut(self.active), opts)?;
+        v.autocorrect = ac;
+        v.retire_stale_preview();
+        Some(v)
     }
     /// Whether the active sheet is protected (cells read-only until unprotected).
     fn sheet_protected(&self) -> bool {
@@ -12257,7 +12501,7 @@ impl Docxy {
                 protected_rollback(t);
                 return;
             }
-            t.dirty = true;
+            t.set_dirty();
         }
     }
 
@@ -12534,12 +12778,19 @@ impl Docxy {
     /// Commit and move; false (the editor left open, the status saying why)
     /// when the entry was refused.
     fn sheet_commit_move(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) -> bool {
+        let origin = self
+            .active_sheet()
+            .and_then(|v| v.editing.as_ref().and(v.edit_origin));
         let res = self.active_sheet_mut().map(|v| v.commit_and_move(dr, dc));
         cx.notify();
         match res {
             Some(Some(committed)) => {
                 if committed {
                     self.mark_sheet_dirty();
+                    // A typed entry may be Flash Fill's second example.
+                    if let (Some(origin), Some(v)) = (origin, self.active_sheet_mut()) {
+                        v.flash_preview_after(origin);
+                    }
                 }
                 true
             }
@@ -14826,6 +15077,15 @@ impl Docxy {
             self.bar_open(target);
         }
         match act {
+            SheetAct::PickList => {
+                let _ = self.open_pick_menu(cx);
+            }
+            SheetAct::FlashFill => self.sheet_flash_fill(cx),
+            SheetAct::FlashUndo
+            | SheetAct::FlashAccept
+            | SheetAct::FlashSelectBlank
+            | SheetAct::FlashSelectChanged => self.flash_option(act, cx),
+            SheetAct::PickItem(i) => self.sheet_pick_item(i as usize, cx),
             SheetAct::Cut => self.sheet_copy(true, cx),
             SheetAct::Copy => self.sheet_copy(false, cx),
             SheetAct::Paste => {
@@ -15048,6 +15308,39 @@ impl Docxy {
             return self.sheet_find_key(ev, shift, key, cx);
         }
         let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
+        // Flash Fill's preview stands for one key: Enter takes it, any
+        // other key (but a lone modifier) leaves it behind (ENT-105).
+        if key != "enter" && !matches!(key, "shift" | "control" | "alt" | "platform" | "function") {
+            if let Some(v) = self.active_sheet_mut() {
+                v.flash_preview = None;
+            }
+        }
+        // Alt+Down opens a drop-down list (#665), before point mode or the
+        // type-over arrows can take the Down.
+        if alt && !ctrl && !shift && key == "down" {
+            return self.sheet_alt_down(cx);
+        }
+        // Formula AutoComplete's list (#686) takes Up, Down and Esc while it
+        // shows: they move its highlight or close it, and neither commit,
+        // point nor cancel the entry.
+        if editing
+            && !ctrl
+            && !alt
+            && matches!(key, "up" | "down" | "escape")
+            && self
+                .active_sheet_mut()
+                .is_some_and(SheetView::complete_open)
+        {
+            if let Some(v) = self.active_sheet_mut() {
+                match key {
+                    "up" => v.complete_step(false),
+                    "down" => v.complete_step(true),
+                    _ => v.complete_close(),
+                }
+            }
+            cx.notify();
+            return;
+        }
         let caret_keys = editing
             && self
                 .active_sheet()
@@ -15126,6 +15419,11 @@ impl Docxy {
                     }
                     cx.notify();
                     return;
+                }
+                // Flash Fill (#666): an open entry is committed first.
+                "e" => {
+                    self.chart_hand_back(cx);
+                    return self.sheet_flash_fill(cx);
                 }
                 "d" | "r" if !editing => {
                     if !protected {
@@ -15285,6 +15583,8 @@ impl Docxy {
                 }
                 cx.notify();
             }
+            // Enter on Flash Fill's preview accepts it (#666, ENT-105).
+            "enter" if !editing && self.sheet_accept_preview(cx) => {}
             // Enter in copy mode pastes and ends it (#664).
             "enter" if !editing && self.sheet_enter_paste(cx) => {}
             "enter" => {
@@ -15379,12 +15679,14 @@ impl Docxy {
             "home" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_caret = 0;
+                    v.edit_tail_left();
                 }
                 cx.notify();
             }
             "end" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_caret_to_end();
+                    v.edit_tail_left();
                 }
                 cx.notify();
             }
@@ -15443,18 +15745,35 @@ impl Docxy {
         }
     }
 
+    /// After a handler that recorded for Repeat, or that only undid, redid
+    /// or repeated (`keep`): the tab it marked dirty does not make the record
+    /// stale. Anything else that changed a tab since still does.
+    fn keep_repeat_current(&mut self, keep: bool) {
+        keep_current(&mut self.repeat, keep);
+    }
+
+    /// [`Self::edit_target`] and the Repeat record (#618), borrowed apart.
+    fn edit_target_and_repeat(&mut self) -> (Option<&mut Editor>, &mut Option<RepeatRecord>) {
+        let ed = self.tabs.get_mut(self.active).and_then(tab_edit_target);
+        (ed, &mut self.repeat)
+    }
+
+    /// What the Quick Access Toolbar shows for the active tab (#618, #619).
+    fn qat_state(&self) -> QatState {
+        let Some(ed) = self.tabs.get(self.active).and_then(tab_edit_target_ref) else {
+            return QatState::Plain;
+        };
+        QatState::Doc {
+            can_redo: ed.can_redo(),
+            can_repeat: repeat_ready(ed, &self.repeat),
+        }
+    }
+
     /// The editor keystrokes/clicks currently drive: the header/footer editor when
     /// in HF edit mode, otherwise the document body. All editing routes through
     /// this so the same machinery serves both surfaces.
     fn edit_target(&mut self) -> Option<&mut Editor> {
-        let tab = self.tabs.get_mut(self.active)?;
-        if let Some(hf) = tab.hf_edit.as_mut() {
-            return Some(&mut hf.editor);
-        }
-        match &mut tab.surface {
-            Surface::Doc(ed) => Some(ed),
-            _ => None,
-        }
+        self.tabs.get_mut(self.active).and_then(tab_edit_target)
     }
 
     /// Whether the active tab is currently in header/footer edit mode.
@@ -16299,6 +16618,23 @@ impl Docxy {
         cx.notify();
     }
 
+    /// [`Self::with_editor`] for an edit a key makes outside `on_key` (Tab,
+    /// Shift+Tab are action-bound): its steps are named and, when it can be
+    /// repeated, recorded for Repeat (#618, #619), as `on_key` does.
+    fn with_editor_noted(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        what: Repeat,
+        f: impl FnOnce(&mut Editor),
+    ) {
+        let since = docxcore::editor::undo_serial_counter();
+        self.with_editor(window, cx, f);
+        if let (Some(ed), rec) = self.edit_target_and_repeat() {
+            note_edit(ed, rec, since, what);
+        }
+    }
+
     fn with_editor(
         &mut self,
         window: &mut Window,
@@ -16312,10 +16648,15 @@ impl Docxy {
         }
         if let Some(tab) = self.tabs.get_mut(self.active) {
             // Route to the header/footer editor while it's open, else the body.
+            // A host edit never grows the typing (or deleting) run before it:
+            // it is a step of its own, which also makes a Repeat record of
+            // that typing stale (#618).
             if let Some(hf) = tab.hf_edit.as_mut() {
+                hf.editor.break_undo_group();
                 f(&mut hf.editor);
                 tab.mark_dirty();
             } else if let Surface::Doc(ed) = &mut tab.surface {
+                ed.break_undo_group();
                 f(ed);
                 // A merge field the edit added shows the previewed record too.
                 ed.refresh_merge_preview();
@@ -16332,9 +16673,16 @@ impl Docxy {
         if cut && self.protected_refused(cx) {
             return self.refocus(window, cx);
         }
-        let clip = self
-            .edit_target()
-            .and_then(|ed| if cut { ed.cut() } else { ed.copy() });
+        let clip = self.edit_target().and_then(|ed| {
+            if !cut {
+                return ed.copy();
+            }
+            let since = docxcore::editor::undo_serial_counter();
+            ed.break_undo_group();
+            let clip = ed.cut();
+            ed.name_command(since, "Cut");
+            clip
+        });
         if let Some(clip) = clip {
             let text = self.clipboard_write_recorded(clip.to_text(), cx);
             self.clip = Some(DocClip { clip, text });
@@ -16359,7 +16707,12 @@ impl Docxy {
             _ => now.text().map(Clip::from_text),
         };
         if let Some(clip) = clip {
-            self.with_editor(window, cx, |e| e.paste(&clip));
+            self.with_editor(window, cx, |e| {
+                let since = docxcore::editor::undo_serial_counter();
+                e.break_undo_group();
+                e.paste(&clip);
+                e.name_command(since, "Paste");
+            });
         } else {
             self.refocus(window, cx);
         }
@@ -16552,7 +16905,7 @@ impl Docxy {
     fn insert_symbol(&mut self, s: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = None;
         let s = s.to_string();
-        self.with_editor(window, cx, move |e| e.insert_str(&s));
+        self.with_editor(window, cx, move |e| insert_symbol_into(e, &s));
     }
 
     /// Insert an inline math equation from a LaTeX template (Insert ▸ Equation).
@@ -18020,6 +18373,15 @@ impl Docxy {
                 cx.notify();
                 return;
             }
+            // Formula AutoComplete's list takes Tab: the highlighted name
+            // goes in, the editor stays (#686, FRM-151).
+            if self
+                .active_sheet_mut()
+                .is_some_and(|v| v.complete_open() && v.complete_insert())
+            {
+                cx.notify();
+                return;
+            }
             // Tab is action-bound, so it never reaches `sheet_key`'s hand-back
             // arm — the rule has to be stated again here. It moves the cell
             // selection exactly as the arrows do, and a selection the chart is
@@ -18030,7 +18392,7 @@ impl Docxy {
         if self.table_tab(false, window, cx) {
             return;
         }
-        self.with_editor(window, cx, |e| e.insert_tab());
+        self.with_editor_noted(window, cx, Repeat::Tab, |e| e.insert_tab());
         self.scroll_to_caret();
     }
 
@@ -18118,7 +18480,9 @@ impl Docxy {
         if self.table_tab(true, window, cx) {
             return;
         }
-        self.with_editor(window, cx, |e| e.change_indent(-720));
+        self.with_editor_noted(window, cx, Repeat::Act(Act::IndentDec), |e| {
+            apply_doc_act(e, Act::IndentDec)
+        });
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -18139,12 +18503,12 @@ impl Docxy {
             }
             return; // the modal list owns keys; do not edit the surface below
         }
-        // An open menu takes the key: Esc closes it, and so, until menus
-        // take arrows and Enter, does any other key; none reaches the
-        // document or cell under it (#397).
-        if self.close_menu() {
-            cx.notify();
-            return;
+        // An open menu takes the key (#397): Up and Down move its highlight,
+        // Enter runs the highlighted item (or opens its submenu), and any
+        // other key — Esc among them — closes it. None reaches the document
+        // or cell under it.
+        if self.menu.is_some() {
+            return self.menu_key(&ev.keystroke.key, window, cx);
         }
         // Word's and Excel's document keys come before every surface's own,
         // so they work on any tab, in Protected View and in a document
@@ -18166,6 +18530,11 @@ impl Docxy {
         // Alt+Shift+Right/Left group and ungroup (#693). Alt has raised the
         // KeyTips by the time the arrow comes, so they go down unasked.
         if self.active_is_sheet() && sheet_outline::group_key(&key, ctrl, shift, m.alt).is_some() {
+            self.keytips = KeyTip::Off;
+            return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
+        }
+        // Alt+Down: the drop-down lists (#665), for the same reason.
+        if self.active_is_sheet() && sheet_complete::alt_down_key(&key, *m) {
             self.keytips = KeyTip::Off;
             return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
         }
@@ -18265,7 +18634,13 @@ impl Docxy {
                 _ => {}
             }
         }
-        let Some(ed) = self.edit_target() else { return };
+        // Undo, Redo and Repeat change the document but keep a current Repeat
+        // record current (#618).
+        let untouched = repeat_untouched(&self.repeat);
+        let history = (ctrl && matches!(key.as_str(), "z" | "y")) || (!ctrl && key == "f4");
+        let (Some(ed), repeat) = self.edit_target_and_repeat() else {
+            return;
+        };
         if key == "escape" {
             ed.clear_selection();
             cx.notify();
@@ -18280,6 +18655,12 @@ impl Docxy {
         ) {
             ed.extend_selection(shift);
         }
+        // What this key's undo steps are named and Repeat records (#618, #619).
+        let since = docxcore::editor::undo_serial_counter();
+        let mut noted = key_repeat(&key, ctrl, shift);
+        if noted.is_some() {
+            ed.break_undo_group();
+        }
         let changed = if ctrl {
             match key.as_str() {
                 "b" => yes(|| ed.toggle_bold()),
@@ -18289,10 +18670,8 @@ impl Docxy {
                     ed.undo();
                     true
                 }
-                "y" => {
-                    ed.redo();
-                    true
-                }
+                // Redo, or Repeat with nothing to redo (#618).
+                "y" => redo_or_repeat(ed, repeat),
                 "a" => no(|| ed.select_all()),
                 // Ctrl+Tab types a tab inside a table cell, where Tab moves to
                 // the next cell (Word). gpui binds no action to it, so it
@@ -18302,7 +18681,11 @@ impl Docxy {
                 "m" if shift => yes(|| ed.change_indent(-720)),
                 "m" => yes(|| ed.change_indent(720)),
                 // Non-breaking space (Ctrl+Shift+Space), a typesetting staple.
-                "space" if shift => yes(|| ed.insert_str("\u{00A0}")),
+                "space" if shift => {
+                    noted = Some(Repeat::Typing);
+                    break_typing_unless_continuing(ed, repeat);
+                    yes(|| ed.insert_str("\u{00A0}"))
+                }
                 // Word- and document-wise motion (Ctrl+←/→, Ctrl+Home/End).
                 "left" => no(|| ed.move_word_left()),
                 "right" => no(|| ed.move_word_right()),
@@ -18315,7 +18698,10 @@ impl Docxy {
                 "backspace" => yes(|| ed.backspace()),
                 "delete" => yes(|| ed.delete_forward()),
                 "enter" => yes(|| ed.insert_newline()),
-                "tab" => yes(|| ed.insert_tab()),
+                // Plain Tab and Shift+Tab are action-bound (`tab_key`,
+                // `shift_tab_key`) and never arrive here.
+                // Word's Repeat key; it redoes first, as Ctrl+Y does (#618).
+                "f4" => redo_or_repeat(ed, repeat),
                 "left" => no(|| ed.move_left()),
                 "right" => no(|| ed.move_right()),
                 "home" => no(|| ed.move_home()),
@@ -18324,18 +18710,22 @@ impl Docxy {
                 "down" => no(|| move_vert(ed, true)),
                 _ => match ev.keystroke.key_char.as_deref() {
                     Some(c) if !c.is_empty() && !c.chars().next().unwrap().is_control() => {
+                        break_typing_unless_continuing(ed, repeat);
                         ed.insert_str(c);
+                        noted = Some(Repeat::Typing);
                         true
                     }
                     _ => false,
                 },
             }
         };
+        let recorded = noted.is_some_and(|what| note_edit(ed, repeat, since, what));
         if changed {
             if let Some(t) = self.tabs.get_mut(self.active) {
                 t.mark_dirty();
             }
         }
+        self.keep_repeat_current(recorded || (history && untouched));
         self.scroll_to_caret();
         cx.notify();
     }
@@ -19167,7 +19557,7 @@ mod load_failed_save_tests {
         let before = std::fs::read(path).ok();
         let mut tab = tab_from_path(&path.to_path_buf());
         assert!(tab.load_failed, "{}", tab.status);
-        tab.dirty = true;
+        tab.set_dirty();
         assert!(!save_doc_tab(&mut tab, None));
         assert_eq!(tab.status.as_ref(), DOC_LOAD_FAILED_SAVE);
         assert!(tab.dirty, "a refused save leaves the tab dirty");
@@ -19193,7 +19583,7 @@ mod load_failed_save_tests {
         assert!(save_doc_tab(&mut tab, Some(md.clone())));
         assert!(tab.markdown);
         assert_eq!(tab.path.as_deref(), Some(md.as_path()));
-        tab.dirty = true;
+        tab.set_dirty();
         std::fs::write(&md, b"stale").unwrap();
         assert!(save_doc_tab(&mut tab, None));
         let written = std::fs::read(&md).unwrap();
@@ -19379,7 +19769,7 @@ mod load_failed_save_tests {
         assert!(save_doc_tab(&mut tab, Some(copy.clone())), "{}", tab.status);
         assert!(!tab.load_failed && !tab.dirty);
         assert_eq!(tab.path.as_deref(), Some(copy.as_path()));
-        tab.dirty = true;
+        tab.set_dirty();
         assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
         assert!(!tab_from_path(&copy).load_failed);
         assert_eq!(std::fs::read(&path).unwrap(), b"not a zip");
@@ -19407,7 +19797,7 @@ mod load_failed_save_tests {
         let mut tab = tab_from_path(&path);
         assert!(!tab.load_failed, "{}", tab.status);
         assert_eq!(tab.access.converted, Some(open_mode::Converted::Html));
-        tab.dirty = true;
+        tab.set_dirty();
         for target in [None, Some(path.clone())] {
             assert!(!save_doc_tab(&mut tab, target));
             assert_eq!(
@@ -19442,7 +19832,7 @@ mod load_failed_save_tests {
         let mut tab = tab_from_path(&path);
         assert!(!tab.load_failed, "{}", tab.status);
         assert!(tab.status.starts_with("loaded"), "{}", tab.status);
-        tab.dirty = true;
+        tab.set_dirty();
         assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
         let reopened = tab_from_path(&path);
         assert!(reopened.pkg.is_some(), "{}", reopened.status);
@@ -19466,7 +19856,7 @@ mod load_failed_save_tests {
             if path.extension().is_some_and(|ext| ext == "md") {
                 assert_eq!(tab.status.as_ref(), "loaded (markdown)");
             }
-            tab.dirty = true;
+            tab.set_dirty();
             assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -19948,7 +20338,7 @@ mod sheet_save_tests {
         let dir = Scratch::new();
         let input = dir.path("in.xlsm");
         let mut tab = loaded_sheet_tab(&dir, "in.xlsm", &xlm_book(SpreadsheetKind::MacroWorkbook));
-        tab.dirty = true;
+        tab.set_dirty();
         // Save As .xlsx, .xltx, or a name with no extension (an .xlsx).
         for name in ["out.xlsx", "out.xltx", "out"] {
             let mut asked = Vec::new();
@@ -20369,6 +20759,988 @@ fn no(mut f: impl FnMut()) -> bool {
     false
 }
 
+/// The commands that are plain edits of the document editor (formatting,
+/// alignment, styles, lists, indent): what `dispatch` runs for them, and what
+/// Repeat (#618) replays. Every other command does nothing here.
+fn apply_doc_act(e: &mut Editor, act: Act) {
+    use Act::*;
+    match act {
+        Bold => e.toggle_bold(),
+        Italic => e.toggle_italic(),
+        Underline => e.toggle_underline(),
+        Strike => e.toggle_strike(),
+        Super => e.toggle_vert_align(VertAlign::Superscript),
+        Sub => e.toggle_vert_align(VertAlign::Subscript),
+        Grow => e.resize_font(2),
+        Shrink => e.resize_font(-2),
+        AlignL => e.set_align(Align::Left),
+        AlignC => e.set_align(Align::Center),
+        AlignR => e.set_align(Align::Right),
+        AlignJ => e.set_align(Align::Justify),
+        Normal => e.set_para_style(None),
+        // No Spacing: Word's body style with single spacing and no space
+        // before/after. Modelled as Normal + explicit zeroed spacing.
+        NoSpacing => {
+            e.set_para_style(None);
+            e.set_space_before(Some(0));
+            e.set_space_after(Some(0));
+            e.set_line_spacing(240, "auto");
+        }
+        H1 => e.set_para_style(Some("Heading1")),
+        H2 => e.set_para_style(Some("Heading2")),
+        H3 => e.set_para_style(Some("Heading3")),
+        HRule => e.insert_hrule(),
+        SelectAll => e.select_all(),
+        Case => e.cycle_case(),
+        // Toggle: if every selected paragraph is already in this list, drop
+        // it; otherwise apply it.
+        Bullets => e.set_list((!e.all_in_list(NUM_BULLET)).then_some(NUM_BULLET)),
+        Numbers => e.set_list((!e.all_in_list(NUM_DECIMAL)).then_some(NUM_DECIMAL)),
+        IndentInc => e.change_indent(720),
+        IndentDec => e.change_indent(-720),
+        Sort => e.sort_paragraphs(),
+        ParaBorders => {
+            let has = e.caret_para_props().borders.bottom.is_some();
+            let b = if has {
+                ParBorders::default()
+            } else {
+                ParBorders {
+                    top: None,
+                    bottom: Some(BorderKind::Single),
+                }
+            };
+            e.set_para_border(b);
+        }
+        Title => e.set_para_style(Some("Title")),
+        Subtitle => e.set_para_style(Some("Subtitle")),
+        ClearFmt => e.clear_run_formatting(),
+        Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
+        | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments
+        | ResolveComment | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | DarkMode
+        | AutoHideRibbon | InsertField | PageBreak | BlankPage | Cover(_) | ToggleNotes
+        | InsertTable | InsertSymbol | InsertEquation | LineSpacing | Hf(_) | Design(_)
+        | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler | UndoTo(_) => {}
+    }
+}
+
+/// What a command's undo steps are called in the Undo drop-down (#619), for
+/// the commands that edit the document; `None` for the rest (they move,
+/// look, open something, or name their own steps).
+fn act_undo_name(act: Act) -> Option<&'static str> {
+    use Act::*;
+    Some(match act {
+        Bold => "Bold",
+        Italic => "Italic",
+        Underline => "Underline",
+        Strike => "Strikethrough",
+        Super => "Superscript",
+        Sub => "Subscript",
+        Grow => "Grow Font",
+        Shrink => "Shrink Font",
+        AlignL => "Align Left",
+        AlignC => "Center",
+        AlignR => "Align Right",
+        AlignJ => "Justify",
+        Normal | NoSpacing | H1 | H2 | H3 | Title | Subtitle => "Style",
+        HRule => "Horizontal Line",
+        Case => "Change Case",
+        Bullets => "Bullets",
+        Numbers => "Numbering",
+        IndentInc => "Increase Indent",
+        IndentDec => "Decrease Indent",
+        Sort => "Sort",
+        ParaBorders => "Borders",
+        ClearFmt => "Clear Formatting",
+        PageBreak => "Page Break",
+        BlankPage => "Blank Page",
+        _ => return None,
+    })
+}
+
+/// Whether Repeat (#618) replays `act`: the edits [`apply_doc_act`] runs,
+/// on whatever is selected now, except Sort. Select All is no edit, and Page
+/// Break and Blank Page do more than edit the editor.
+fn repeatable_act(act: Act) -> bool {
+    act_undo_name(act).is_some() && !matches!(act, Act::Sort | Act::PageBreak | Act::BlankPage)
+}
+
+/// An action Repeat (#618) can do again.
+#[derive(Clone, Copy, Debug)]
+enum Repeat {
+    /// The newest step's typed text, typed again at the caret.
+    Typing,
+    Enter,
+    Tab,
+    /// A command [`repeatable_act`] allows.
+    Act(Act),
+}
+
+impl Repeat {
+    /// The name its step takes; typing is named by docxcore.
+    fn step_name(self) -> Option<&'static str> {
+        match self {
+            Repeat::Typing => None,
+            Repeat::Enter => Some("Enter"),
+            Repeat::Tab => Some("Tab"),
+            Repeat::Act(act) => act_undo_name(act),
+        }
+    }
+}
+
+/// The last repeatable action and the undo step it made. Repeat replays it
+/// only while nothing else has happened since:
+/// - its step is still its editor's newest (`serial`);
+/// - no undo step was pushed anywhere since (`counter`, the thread's
+///   [`docxcore::editor::undo_serial_counter`]): an edit in another tab or
+///   the header/footer editor pushes one there;
+/// - no edit that pushes no step at all (Page Color, a watermark, a dialog's
+///   package change) marked any tab dirty since (`generation`, the
+///   [`edit_generation`]).
+///
+/// Only typing coalesces into an existing step, and every host edit
+/// (`Docxy::with_editor`: the ribbon, pickers, dialogs, ruler, paste and
+/// menus) breaks the group first, so no edit can hide inside the record's
+/// step. Undo and Redo push no step; the app keeps a current record current
+/// across them (`Docxy::keep_repeat_current`).
+#[derive(Clone, Debug)]
+struct RepeatRecord {
+    what: Repeat,
+    serial: u64,
+    counter: u64,
+    generation: u64,
+    /// Where the editor's caret was when it was taken, with no selection:
+    /// typing continues the run only from there, so a caret move by any
+    /// path ends it whether or not that path breaks the undo group.
+    caret: Caret,
+    selecting: bool,
+}
+
+impl RepeatRecord {
+    /// A record of `what`, whose step is `ed`'s newest, taken now.
+    fn now(what: Repeat, ed: &Editor) -> Option<Self> {
+        Some(Self {
+            what,
+            serial: ed.undo_serial()?,
+            counter: docxcore::editor::undo_serial_counter(),
+            generation: edit_generation(),
+            caret: ed.caret.clone(),
+            selecting: ed.has_selection(),
+        })
+    }
+}
+
+thread_local! {
+    /// Bumped by every change that marks a tab dirty
+    /// ([`DocTab::set_dirty`]), whether or not it pushed an undo step: what
+    /// makes a Repeat record stale after an edit outside the undo history
+    /// (#618). A Project tab bumps it on every interaction that syncs its
+    /// dirty state, navigation included: the Project editor has no change
+    /// counter, and a stale record fails safe (Can't Repeat). Per thread,
+    /// like docxcore's serial counter: the app edits on one thread.
+    static EDIT_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn edit_generation() -> u64 {
+    EDIT_GENERATION.with(|g| g.get())
+}
+
+fn bump_edit_generation() {
+    EDIT_GENERATION.with(|g| g.set(g.get() + 1));
+}
+
+/// Whether no undo step was pushed and no tab changed since `rec` was taken:
+/// the record is current, though its step may be undone for now.
+fn repeat_untouched(rec: &Option<RepeatRecord>) -> bool {
+    rec.as_ref().is_some_and(|r| {
+        docxcore::editor::undo_serial_counter() == r.counter && edit_generation() == r.generation
+    })
+}
+
+/// [`Docxy::keep_repeat_current`]'s rule: when `keep`, the tab changes
+/// made since `rec` was taken were the handler's own.
+fn keep_current(rec: &mut Option<RepeatRecord>, keep: bool) {
+    if let (true, Some(r)) = (keep, rec.as_mut()) {
+        r.generation = edit_generation();
+    }
+}
+
+/// Before a typed character: typing grows the newest typing step only while
+/// nothing happened since the last character (the Repeat record of that
+/// typing is still ready). After an edit that pushed no step (Page Color, an
+/// edit in another tab) the open run is over, so the character starts a step
+/// and a record of its own instead of reviving a stale one (#618).
+fn break_typing_unless_continuing(ed: &mut Editor, rec: &Option<RepeatRecord>) {
+    // The caret must be exactly where the last character left it: a move by
+    // any path (arrows, Up/Down, clicks, a future one) ends the run.
+    let continuing = rec.as_ref().is_some_and(|r| {
+        matches!(r.what, Repeat::Typing)
+            && !r.selecting
+            && !ed.has_selection()
+            && ed.caret == r.caret
+    }) && repeat_ready(ed, rec);
+    if !continuing {
+        ed.break_undo_group();
+    }
+}
+
+/// Whether Ctrl+Y / F4 would repeat on `ed` now (nothing to redo).
+fn repeat_ready(ed: &Editor, rec: &Option<RepeatRecord>) -> bool {
+    rec.as_ref().is_some_and(|r| {
+        ed.undo_serial() == Some(r.serial)
+            && docxcore::editor::undo_serial_counter() == r.counter
+            && edit_generation() == r.generation
+    })
+}
+
+/// Ctrl+Y, F4 and the Quick Access Toolbar's Redo/Repeat (#618): redo when
+/// there is something to redo, else repeat the recorded action as its own
+/// undo step, named as the original. True when either changed the document.
+fn redo_or_repeat(ed: &mut Editor, rec: &mut Option<RepeatRecord>) -> bool {
+    if ed.can_redo() {
+        return ed.redo();
+    }
+    let Some(r) = rec.clone().filter(|_| repeat_ready(ed, rec)) else {
+        return false;
+    };
+    let since = docxcore::editor::undo_serial_counter();
+    ed.break_undo_group();
+    match r.what {
+        Repeat::Typing => {
+            let Some(text) = ed.last_typed().filter(|t| !t.is_empty()).map(str::to_owned) else {
+                return false;
+            };
+            ed.insert_str(&text);
+        }
+        Repeat::Enter => ed.insert_newline(),
+        Repeat::Tab => ed.insert_tab(),
+        Repeat::Act(act) => apply_doc_act(ed, act),
+    }
+    if !ed.undo_serial().is_some_and(|s| s > since) {
+        return false;
+    }
+    if let Some(name) = r.what.step_name() {
+        ed.name_command(since, name);
+    }
+    // A repeat is a closed step: typing after it starts a step of its own.
+    ed.break_undo_group();
+    *rec = RepeatRecord::now(r.what, ed);
+    true
+}
+
+/// After an edit the host ran (a command or a key): make the undo steps it
+/// pushed after `since` one step, named, and, when it can be repeated,
+/// record it for Repeat. An edit that pushed no step changes neither. True
+/// when it recorded.
+fn note_edit(ed: &mut Editor, rec: &mut Option<RepeatRecord>, since: u64, what: Repeat) -> bool {
+    if matches!(what, Repeat::Typing) {
+        // Typing grows its step as it coalesces; the record follows it.
+        if ed.last_typed().is_none() {
+            return false;
+        }
+        *rec = RepeatRecord::now(what, ed);
+        return rec.is_some();
+    }
+    if !ed.undo_serial().is_some_and(|s| s > since) {
+        return false;
+    }
+    if let Some(name) = what.step_name() {
+        ed.name_command(since, name);
+    }
+    if matches!(what, Repeat::Act(act) if !repeatable_act(act)) {
+        return false;
+    }
+    *rec = RepeatRecord::now(what, ed);
+    rec.is_some()
+}
+
+/// Insert ▸ Symbol's insertion: a step of its own, named for the Undo
+/// drop-down (#619). Never part of the typing before it, so a Repeat record
+/// of that typing goes stale rather than replaying the symbol (#618).
+fn insert_symbol_into(e: &mut Editor, s: &str) {
+    let since = docxcore::editor::undo_serial_counter();
+    e.break_undo_group();
+    e.insert_str(s);
+    e.name_command(since, "Insert Symbol");
+}
+
+/// What a document key does that Repeat can do again (#618): the formatting
+/// shortcuts and Enter/Tab. Typing is told apart by the key handler.
+fn key_repeat(key: &str, ctrl: bool, shift: bool) -> Option<Repeat> {
+    Some(match (ctrl, key) {
+        (true, "b") => Repeat::Act(Act::Bold),
+        (true, "i") => Repeat::Act(Act::Italic),
+        (true, "u") => Repeat::Act(Act::Underline),
+        (true, "m") if shift => Repeat::Act(Act::IndentDec),
+        (true, "m") => Repeat::Act(Act::IndentInc),
+        (_, "tab") if !shift => Repeat::Tab,
+        (false, "enter") => Repeat::Enter,
+        _ => return None,
+    })
+}
+
+/// What the Quick Access Toolbar shows for the active tab: a document's
+/// redo button reads Redo or Repeat (#618), and its Undo has a drop-down
+/// (#619); Project and sheet tabs keep plain Undo and Redo.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum QatState {
+    Plain,
+    Doc { can_redo: bool, can_repeat: bool },
+}
+
+/// One Quick Access Toolbar button as drawn and as `ribbon-read` reports it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct QatEntry {
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    tip: &'static str,
+    enabled: bool,
+    /// A split button whose arrow opens a menu.
+    menu: bool,
+    action: QatAction,
+}
+
+fn qat_entries(state: QatState) -> Vec<QatEntry> {
+    QAT_ITEMS
+        .iter()
+        .map(|item| {
+            let plain = QatEntry {
+                id: item.id,
+                icon: item.icon,
+                label: item.label,
+                tip: item.tip,
+                enabled: true,
+                menu: false,
+                action: item.action,
+            };
+            match (state, item.action) {
+                (QatState::Plain, _) => plain,
+                (QatState::Doc { .. }, QatAction::Undo) => QatEntry {
+                    menu: true,
+                    ..plain
+                },
+                (QatState::Doc { can_redo: true, .. }, QatAction::Redo) => plain,
+                // The redo icon stays: the suite ships no Repeat icon.
+                (QatState::Doc { can_repeat, .. }, QatAction::Redo) => QatEntry {
+                    label: "Repeat",
+                    tip: if can_repeat {
+                        "Repeat (Ctrl+Y)"
+                    } else {
+                        "Can't Repeat"
+                    },
+                    enabled: can_repeat,
+                    ..plain
+                },
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    /// The #618 reproduction's `three.docx`.
+    fn three() -> Editor {
+        Editor::new(docxcore::markdown::from_markdown(
+            "The quick brown fox. It jumps over the dog.\n\nSecond paragraph here.\n\nThird one.\n",
+        ))
+    }
+
+    fn text(ed: &Editor, i: usize) -> String {
+        ed.doc.body[i].plain_text()
+    }
+
+    fn select(ed: &mut Editor, para: usize, from: usize, to: usize) {
+        ed.set_caret(Caret::at(vec![para], to));
+        ed.anchor = Some(Caret::at(vec![para], from));
+    }
+
+    /// A document key as the key handler runs it: an edit, then
+    /// `note_edit` with what the key records.
+    fn key(ed: &mut Editor, rec: &mut Option<RepeatRecord>, key: &str, ctrl: bool, shift: bool) {
+        let since = docxcore::editor::undo_serial_counter();
+        let noted = key_repeat(key, ctrl, shift);
+        if noted.is_some() {
+            ed.break_undo_group();
+        }
+        match (ctrl, key) {
+            (true, "b") => ed.toggle_bold(),
+            (true, "a") => ed.select_all(),
+            (false, "enter") => ed.insert_newline(),
+            other => panic!("no key {other:?} in this test"),
+        }
+        if let Some(what) = noted {
+            note_edit(ed, rec, since, what);
+        }
+    }
+
+    /// Typed text, one character per key event as the harness's `type` sends.
+    fn type_text(ed: &mut Editor, rec: &mut Option<RepeatRecord>, s: &str) {
+        for ch in s.chars() {
+            let since = docxcore::editor::undo_serial_counter();
+            ed.insert_str(&ch.to_string());
+            note_edit(ed, rec, since, Repeat::Typing);
+        }
+    }
+
+    /// The saved `w:r` that holds `word`, up to the word.
+    fn saved_run_of(ed: &Editor, word: &str) -> String {
+        let xml = docxcore::serialize::document_to_xml(&ed.doc);
+        let at = xml
+            .find(word)
+            .unwrap_or_else(|| panic!("{word} not in {xml}"));
+        let start = xml[..at].rfind("<w:r>").expect("a run");
+        xml[start..at].to_string()
+    }
+
+    /// #618 step 2: Bold on `quick`, then Ctrl+Y on `brown` with nothing
+    /// to redo repeats it.
+    #[test]
+    fn ctrl_y_repeats_bold_on_the_new_selection_618() {
+        let mut ed = three();
+        let mut rec = None;
+        select(&mut ed, 0, 4, 9);
+        key(&mut ed, &mut rec, "b", true, false);
+        assert!(saved_run_of(&ed, "quick").contains("<w:b/>"));
+        assert!(!saved_run_of(&ed, "brown").contains("<w:b/>"));
+        select(&mut ed, 0, 10, 15);
+        assert!(redo_or_repeat(&mut ed, &mut rec), "Ctrl+Y repeats");
+        assert!(saved_run_of(&ed, "quick").contains("<w:b/>"));
+        assert!(saved_run_of(&ed, "brown").contains("<w:b/>"));
+        assert_eq!(ed.undo_names(), ["Bold", "Bold"], "the repeat is a step");
+    }
+
+    /// #618 step 3: `abc` then F4 types it again, as its own undo step;
+    /// F4 again repeats again.
+    #[test]
+    fn f4_repeats_typing_as_its_own_step_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abcabc");
+        assert_eq!(ed.undo_names()[..2], ["Typing \"abc\"", "Typing \"abc\""]);
+        assert!(ed.undo());
+        assert_eq!(text(&ed, 2), "Third one.abc", "one undo removes one abc");
+        // Now there is something to redo: F4 redoes, it does not repeat.
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abcabc");
+        assert!(!ed.can_redo());
+        assert!(redo_or_repeat(&mut ed, &mut rec), "redo, then repeat again");
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abcabcabcabc");
+    }
+
+    #[test]
+    fn ctrl_y_redoes_when_there_is_something_to_redo_618() {
+        let mut ed = three();
+        let mut rec = None;
+        select(&mut ed, 0, 4, 9);
+        key(&mut ed, &mut rec, "b", true, false);
+        let bold = ed.doc.clone();
+        assert!(ed.undo());
+        let plain = ed.doc.clone();
+        // A different selection: a repeat would bold `brown`; a redo puts
+        // back exactly what was undone.
+        select(&mut ed, 0, 10, 15);
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(ed.doc, bold);
+        assert_ne!(ed.doc, plain);
+        assert_eq!(ed.undo_names(), ["Bold"]);
+    }
+
+    /// An edit the record never saw (a picker, a dialog, an API call) makes
+    /// it stale: Ctrl+Y / F4 then do nothing at all.
+    #[test]
+    fn a_stale_record_never_replays_618() {
+        let mut ed = three();
+        let mut rec = None;
+        select(&mut ed, 0, 4, 9);
+        key(&mut ed, &mut rec, "b", true, false);
+        assert!(repeat_ready(&ed, &rec));
+        ed.set_space_after(Some(240));
+        assert!(!repeat_ready(&ed, &rec));
+        select(&mut ed, 0, 10, 15);
+        let before = ed.doc.clone();
+        assert!(!redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(ed.doc, before);
+        // Nor does a record from another editor.
+        let mut other = three();
+        let mut other_rec = None;
+        select(&mut other, 0, 4, 9);
+        key(&mut other, &mut other_rec, "b", true, false);
+        assert!(!repeat_ready(&ed, &other_rec));
+        assert!(!redo_or_repeat(&mut ed, &mut other_rec));
+        assert_eq!(ed.doc, before);
+    }
+
+    /// A host edit after typing (Insert ▸ Symbol) is a step of its own: it
+    /// does not grow `Typing "abc"`, and it makes the record of that typing
+    /// stale, so F4 does nothing rather than type `abc©` again.
+    #[test]
+    fn a_symbol_after_typing_is_its_own_step_and_stales_the_record_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        assert!(repeat_ready(&ed, &rec));
+        insert_symbol_into(&mut ed, "\u{00A9}");
+        assert_eq!(text(&ed, 2), "Third one.abc\u{00A9}");
+        assert_eq!(ed.undo_names()[..2], ["Insert Symbol", "Typing \"abc\""]);
+        assert!(!repeat_ready(&ed, &rec));
+        assert!(!redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abc\u{00A9}");
+        // Typing after it starts its own step again.
+        type_text(&mut ed, &mut rec, "d");
+        assert_eq!(ed.undo_names()[0], "Typing \"d\"");
+    }
+
+    /// Tab and Shift+Tab (action-bound, `with_editor_noted`): named, and Tab
+    /// recorded for Repeat; Shift+Tab repeats as Decrease Indent.
+    #[test]
+    fn tab_and_shift_tab_are_named_and_repeat_618_619() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], 0));
+        let since = docxcore::editor::undo_serial_counter();
+        ed.break_undo_group();
+        ed.insert_tab();
+        note_edit(&mut ed, &mut rec, since, Repeat::Tab);
+        assert_eq!(ed.undo_names(), ["Tab"]);
+        assert!(matches!(
+            rec,
+            Some(RepeatRecord {
+                what: Repeat::Tab,
+                ..
+            })
+        ));
+        let one_tab = ed.doc.clone();
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_ne!(ed.doc, one_tab, "F4 typed a second tab");
+        assert_eq!(ed.undo_names(), ["Tab", "Tab"]);
+
+        let tabbed = ed.doc.clone();
+        let since = docxcore::editor::undo_serial_counter();
+        ed.break_undo_group();
+        apply_doc_act(&mut ed, Act::IndentInc);
+        apply_doc_act(&mut ed, Act::IndentInc);
+        note_edit(&mut ed, &mut rec, since, Repeat::Act(Act::IndentInc));
+        let since = docxcore::editor::undo_serial_counter();
+        ed.break_undo_group();
+        apply_doc_act(&mut ed, Act::IndentDec);
+        note_edit(&mut ed, &mut rec, since, Repeat::Act(Act::IndentDec));
+        assert_eq!(ed.undo_names()[0], "Decrease Indent");
+        assert!(redo_or_repeat(&mut ed, &mut rec), "F4 outdents again");
+        assert_eq!(ed.undo_names()[..2], ["Decrease Indent", "Decrease Indent"]);
+        // Two indents in, two out: the paragraph's indent is back as it was.
+        assert_eq!(ed.doc, tabbed);
+        assert!(ed.undo());
+        assert_ne!(ed.doc, tabbed, "the repeat outdented");
+    }
+
+    /// An undo step pushed in another editor (another tab, the
+    /// header/footer editor) makes the record stale, though this editor's
+    /// newest step is still the recorded one.
+    #[test]
+    fn a_step_in_another_editor_stales_the_record_618() {
+        let mut ed = three();
+        let mut rec = None;
+        select(&mut ed, 0, 4, 9);
+        key(&mut ed, &mut rec, "b", true, false);
+        assert!(repeat_ready(&ed, &rec));
+        let mut header = Editor::new(docxcore::markdown::from_markdown("Header\n"));
+        insert_symbol_into(&mut header, "\u{00A9}");
+        assert_eq!(
+            ed.undo_serial(),
+            rec.as_ref().map(|r| r.serial),
+            "body untouched"
+        );
+        assert!(!repeat_ready(&ed, &rec));
+        select(&mut ed, 0, 10, 15);
+        let before = ed.doc.clone();
+        assert!(!redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(ed.doc, before);
+    }
+
+    /// Design > Page Color edits the package, pushes no undo step, and
+    /// marks the tab dirty: the record is stale after it.
+    #[test]
+    fn a_package_edit_without_an_undo_step_stales_the_record_618() {
+        let mut tab = tab_from_path(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
+        );
+        let mut rec = None;
+        {
+            let Surface::Doc(ed) = &mut tab.surface else {
+                panic!("basic.docx is a document")
+            };
+            type_text(ed, &mut rec, "fox");
+            key(ed, &mut rec, "a", true, false);
+            key(ed, &mut rec, "b", true, false);
+            assert_eq!(ed.undo_names()[0], "Bold");
+            assert!(repeat_ready(ed, &rec));
+        }
+        design_tab::design_apply(&mut tab, design_tab::DesignAct::PageColor(Some(0xFFEEDD)))
+            .unwrap();
+        assert!(tab.dirty);
+        let Surface::Doc(ed) = &mut tab.surface else {
+            unreachable!()
+        };
+        assert!(!repeat_ready(ed, &rec));
+        assert!(!redo_or_repeat(ed, &mut rec));
+    }
+
+    /// Bold, Undo, Ctrl+Y (redo), Ctrl+Y (repeat): the app's own
+    /// dirty-marking after each keeps the record current.
+    #[test]
+    fn undo_then_redo_then_repeat_618() {
+        let mut ed = three();
+        let mut rec = None;
+        select(&mut ed, 0, 4, 9);
+        key(&mut ed, &mut rec, "b", true, false);
+        // Each of these marks the tab dirty after it, as `on_key` does.
+        let history =
+            |ed: &mut Editor,
+             rec: &mut Option<RepeatRecord>,
+             f: &dyn Fn(&mut Editor, &mut Option<RepeatRecord>) -> bool| {
+                let untouched = repeat_untouched(rec);
+                assert!(f(ed, rec));
+                bump_edit_generation();
+                keep_current(rec, untouched);
+            };
+        history(&mut ed, &mut rec, &|ed, _| ed.undo());
+        assert!(!repeat_ready(&ed, &rec), "its step is undone");
+        history(&mut ed, &mut rec, &redo_or_repeat);
+        assert_eq!(ed.undo_names(), ["Bold"], "that was the redo");
+        select(&mut ed, 0, 10, 15);
+        history(&mut ed, &mut rec, &redo_or_repeat);
+        assert_eq!(ed.undo_names(), ["Bold", "Bold"], "and this the repeat");
+        assert!(saved_run_of(&ed, "brown").contains("<w:b/>"));
+        // An edit the handler did not make is not kept current.
+        bump_edit_generation();
+        keep_current(&mut rec, false);
+        assert!(!repeat_ready(&ed, &rec));
+    }
+
+    /// No Spacing edits through four editor calls: one `Style` step, one
+    /// undo restores the paragraph, and a repeat is one step too.
+    #[test]
+    fn no_spacing_is_one_step_and_repeats_as_one_619() {
+        let mut ed = three();
+        let mut rec = None;
+        let original = ed.doc.clone();
+        ed.set_caret(Caret::at(vec![1], 0));
+        let since = docxcore::editor::undo_serial_counter();
+        ed.break_undo_group();
+        apply_doc_act(&mut ed, Act::NoSpacing);
+        assert!(note_edit(
+            &mut ed,
+            &mut rec,
+            since,
+            Repeat::Act(Act::NoSpacing)
+        ));
+        assert_eq!(ed.undo_names(), ["Style"]);
+        let spaced = ed.doc.clone();
+        assert!(ed.undo());
+        assert_eq!(ed.doc, original, "one undo restores it exactly");
+        assert!(!ed.can_redo() || ed.redo());
+        assert_eq!(ed.doc, spaced);
+        ed.set_caret(Caret::at(vec![2], 0));
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(
+            ed.undo_names(),
+            ["Style", "Style"],
+            "the repeat is one step"
+        );
+        assert!(ed.undo());
+        assert_eq!(ed.doc, spaced);
+    }
+
+    /// Typing after an edit that pushed no step starts its own step and
+    /// record: it does not coalesce into the old run and revive a stale
+    /// record, so F4 repeats only the new characters.
+    #[test]
+    fn typing_after_a_non_step_edit_starts_a_new_run_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        // `on_key`'s typing path: break unless continuing, insert, record.
+        let press = |ed: &mut Editor, rec: &mut Option<RepeatRecord>, c: &str| {
+            let since = docxcore::editor::undo_serial_counter();
+            break_typing_unless_continuing(ed, rec);
+            ed.insert_str(c);
+            note_edit(ed, rec, since, Repeat::Typing);
+            bump_edit_generation(); // mark_dirty
+            keep_current(rec, true);
+        };
+        for c in ["a", "b", "c"] {
+            press(&mut ed, &mut rec, c);
+        }
+        assert_eq!(ed.undo_names(), ["Typing \"abc\""], "one run");
+        bump_edit_generation(); // e.g. Page Color
+        assert!(!repeat_ready(&ed, &rec));
+        press(&mut ed, &mut rec, "d");
+        assert_eq!(ed.undo_names(), ["Typing \"d\"", "Typing \"abc\""]);
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abcdd", "F4 repeats only d");
+    }
+
+    /// Typing over a selection is one step, and so is a repeat of it.
+    #[test]
+    fn typing_over_a_selection_is_one_step_and_repeats_as_one_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        select(&mut ed, 0, 10, 15);
+        let before = ed.doc.clone();
+        // Typing "xy" over `brown`.
+        ed.break_undo_group();
+        let since = docxcore::editor::undo_serial_counter();
+        ed.insert_str("x");
+        note_edit(&mut ed, &mut rec, since, Repeat::Typing);
+        ed.insert_str("y");
+        note_edit(&mut ed, &mut rec, since, Repeat::Typing);
+        assert_eq!(ed.undo_names()[0], "Typing \"xy\"");
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before, "one undo restores brown");
+        assert!(ed.redo());
+        // Repeat over another selection: one step again.
+        select(&mut ed, 1, 0, 6);
+        let before = ed.doc.clone();
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(ed.undo_names()[0], "Typing \"xy\"");
+        assert_eq!(text(&ed, 1), "xy paragraph here.");
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before, "one undo removes the repeat whole");
+    }
+
+    /// Typing after a typing repeat starts a step of its own: the repeat is
+    /// closed, so the next F4 repeats `d`, not `abcd`.
+    #[test]
+    fn typing_after_a_typing_repeat_is_its_own_step_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        let press = |ed: &mut Editor, rec: &mut Option<RepeatRecord>, c: &str| {
+            let since = docxcore::editor::undo_serial_counter();
+            break_typing_unless_continuing(ed, rec);
+            ed.insert_str(c);
+            note_edit(ed, rec, since, Repeat::Typing);
+            bump_edit_generation();
+            keep_current(rec, true);
+        };
+        type_text(&mut ed, &mut rec, "abc");
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        press(&mut ed, &mut rec, "d");
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abcabcdd");
+        assert_eq!(
+            ed.undo_names(),
+            [
+                "Typing \"d\"",
+                "Typing \"d\"",
+                "Typing \"abc\"",
+                "Typing \"abc\""
+            ]
+        );
+    }
+
+    /// Any caret move ends the typing run, by whatever path: a direct caret
+    /// assignment, as `move_vert` makes, does not reset docxcore's `last`,
+    /// so the record's caret is what ends it.
+    #[test]
+    fn a_caret_move_ends_the_typing_run_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        let press = |ed: &mut Editor, rec: &mut Option<RepeatRecord>, c: &str| {
+            let since = docxcore::editor::undo_serial_counter();
+            break_typing_unless_continuing(ed, rec);
+            ed.insert_str(c);
+            note_edit(ed, rec, since, Repeat::Typing);
+            bump_edit_generation();
+            keep_current(rec, true);
+        };
+        for c in ["a", "b", "c"] {
+            press(&mut ed, &mut rec, c);
+        }
+        assert_eq!(
+            ed.undo_names(),
+            ["Typing \"abc\""],
+            "normal typing coalesces"
+        );
+        ed.caret = Caret::at(vec![1], 3); // a direct move, `last` untouched
+        press(&mut ed, &mut rec, "d");
+        assert_eq!(ed.undo_names(), ["Typing \"d\"", "Typing \"abc\""]);
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 1), "Secddond paragraph here.");
+        assert_eq!(text(&ed, 2), "Third one.abc");
+    }
+
+    /// An active selection ends the typing run, though the caret is where
+    /// the last character left it and the record is ready.
+    #[test]
+    fn a_selection_ends_the_typing_run_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        assert!(repeat_ready(&ed, &rec));
+        // Same caret, same record: only a selection (anchor) differs.
+        ed.anchor = Some(Caret::at(vec![2], 0));
+        break_typing_unless_continuing(&mut ed, &rec);
+        ed.anchor = None;
+        ed.insert_str("d");
+        assert_eq!(
+            ed.undo_names(),
+            ["Typing \"d\"", "Typing \"abc\""],
+            "the selection broke the group"
+        );
+        // Without a selection the same call continues the run.
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        break_typing_unless_continuing(&mut ed, &rec);
+        ed.insert_str("d");
+        assert_eq!(ed.undo_names(), ["Typing \"abcd\""]);
+    }
+
+    #[test]
+    fn move_vert_ends_the_typing_run_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![0], 0));
+        type_text(&mut ed, &mut rec, "abc");
+        move_vert(&mut ed, true);
+        ed.insert_str("d");
+        assert_eq!(ed.undo_names(), ["Typing \"d\"", "Typing \"abc\""]);
+    }
+
+    #[test]
+    fn nothing_to_repeat_does_nothing_618() {
+        let mut ed = three();
+        let mut rec = None;
+        assert!(!redo_or_repeat(&mut ed, &mut rec));
+        // Selecting is no edit, and Sort is named but not repeated.
+        key(&mut ed, &mut rec, "a", true, false);
+        let since = docxcore::editor::undo_serial_counter();
+        apply_doc_act(&mut ed, Act::Sort);
+        note_edit(&mut ed, &mut rec, since, Repeat::Act(Act::Sort));
+        assert_eq!(ed.undo_names(), ["Sort"]);
+        assert!(rec.is_none());
+        assert!(!redo_or_repeat(&mut ed, &mut rec));
+    }
+
+    #[test]
+    fn repeat_keys_and_acts_618() {
+        assert!(matches!(
+            key_repeat("b", true, false),
+            Some(Repeat::Act(Act::Bold))
+        ));
+        assert!(matches!(
+            key_repeat("m", true, true),
+            Some(Repeat::Act(Act::IndentDec))
+        ));
+        assert!(matches!(
+            key_repeat("enter", false, false),
+            Some(Repeat::Enter)
+        ));
+        assert!(key_repeat("y", true, false).is_none());
+        assert!(key_repeat("f4", false, false).is_none());
+        assert!(key_repeat("left", false, false).is_none());
+        for act in [Act::Bold, Act::AlignC, Act::H1, Act::Bullets, Act::ClearFmt] {
+            assert!(repeatable_act(act), "{act:?}");
+        }
+        for act in [
+            Act::SelectAll,
+            Act::Sort,
+            Act::PageBreak,
+            Act::Paste,
+            Act::UndoTo(1),
+        ] {
+            assert!(!repeatable_act(act), "{act:?}");
+        }
+        // Protected View still refuses both (#633).
+        assert!(!open_mode::protected_allows_doc_key("f4", false, false));
+        assert!(!open_mode::protected_allows_doc_key("y", true, false));
+    }
+
+    /// #619's reproduction: `one`, Enter, `two`, Ctrl+A, Ctrl+B.
+    #[test]
+    fn the_undo_list_names_the_reproduction_619() {
+        let mut ed = Editor::new(docxcore::markdown::from_markdown("x\n"));
+        ed.set_caret(Caret::at(vec![0], 0));
+        ed.delete_forward();
+        let mut rec = None;
+        let fresh = ed.undo_names().len();
+        type_text(&mut ed, &mut rec, "one");
+        key(&mut ed, &mut rec, "enter", false, false);
+        type_text(&mut ed, &mut rec, "two");
+        key(&mut ed, &mut rec, "a", true, false);
+        key(&mut ed, &mut rec, "b", true, false);
+        let names = ed.undo_names();
+        assert_eq!(
+            names[..names.len() - fresh],
+            ["Bold", "Typing \"two\"", "Enter", "Typing \"one\""]
+        );
+        let items = menu::undo_menu(&names);
+        // Choosing `Typing "two"` (index 1) undoes it and Bold: `one` and
+        // an empty paragraph are left.
+        let path = menu::resolve_index(&items, 1).unwrap();
+        let Some(Act::UndoTo(n)) = menu::entry_at(&items, &path).unwrap().act else {
+            panic!("an undo entry");
+        };
+        assert!(ed.undo_to(n));
+        assert_eq!(text(&ed, 0), "one");
+        assert_eq!(text(&ed, 1), "");
+        assert_eq!(ed.undo_names()[0], "Enter");
+    }
+
+    #[test]
+    fn the_qat_reads_redo_or_repeat_618_619() {
+        let read = |state| {
+            qat_entries(state)
+                .into_iter()
+                .map(|e| (e.id, e.label, e.tip, e.enabled, e.menu))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            read(QatState::Plain),
+            [
+                ("qat-undo", "Undo", "Undo (Ctrl+Z)", true, false),
+                ("qat-redo", "Redo", "Redo (Ctrl+Y)", true, false),
+            ]
+        );
+        let doc = |can_redo, can_repeat| QatState::Doc {
+            can_redo,
+            can_repeat,
+        };
+        for can_repeat in [false, true] {
+            assert_eq!(
+                read(doc(true, can_repeat))[1],
+                ("qat-redo", "Redo", "Redo (Ctrl+Y)", true, false)
+            );
+        }
+        assert_eq!(
+            read(doc(false, true))[1],
+            ("qat-redo", "Repeat", "Repeat (Ctrl+Y)", true, false)
+        );
+        assert_eq!(
+            read(doc(false, false))[1],
+            ("qat-redo", "Repeat", "Can't Repeat", false, false)
+        );
+        assert_eq!(
+            read(doc(false, false))[0],
+            ("qat-undo", "Undo", "Undo (Ctrl+Z)", true, true)
+        );
+    }
+}
+
 // ---- the ribbon, defined once via ribbonspec (shared model) ----------------
 
 #[derive(Clone, Copy, Debug)]
@@ -20456,6 +21828,9 @@ enum Act {
     // dialog system).
     LaunchFont,
     LaunchParagraph,
+    /// Undo the `n` newest steps in one go: an entry in the Quick Access
+    /// Toolbar Undo drop-down (#619).
+    UndoTo(usize),
 }
 
 /// The gallery's selected item follows the paragraph formatting its actions set.
@@ -21222,6 +22597,7 @@ fn move_vert(ed: &mut Editor, down: bool) {
             let len = docxcore::editor::para_text_len(p);
             ed.caret = Caret::at(vec![j], col.min(len));
             ed.clear_selection();
+            ed.break_undo_group();
             return;
         }
     }
@@ -23173,11 +24549,12 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         self.mini_bar = None;
-        self.menu = Some(menu::Menu {
+        self.menu_scroll = ScrollHandle::new();
+        self.menu = Some(menu::Menu::new(
             target,
-            at: (f32::from(at.x), f32::from(at.y)),
+            (f32::from(at.x), f32::from(at.y)),
             items,
-        });
+        ));
         cx.notify();
     }
 
@@ -23198,6 +24575,25 @@ impl Docxy {
             Some(Surface::Project(v)) => Some(v.selected_uid()),
             _ => None,
         }
+    }
+
+    /// The Quick Access Toolbar Undo arrow, and `menu-open {"qat":
+    /// "qat-undo"}`: the active document's undo steps, newest first (#619).
+    /// Project and sheet tabs have no list.
+    pub(crate) fn open_undo_menu(
+        &mut self,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if !matches!(self.qat_state(), QatState::Doc { .. }) {
+            return Err("the Undo drop-down opens on a document tab".into());
+        }
+        let names = self
+            .edit_target()
+            .map(|ed| ed.undo_names())
+            .unwrap_or_default();
+        self.open_menu(menu::MenuTarget::QatUndo, at, menu::undo_menu(&names), cx);
+        Ok(())
     }
 
     /// The document body's right-click, and `menu-open "document"`.
@@ -23258,6 +24654,10 @@ impl Docxy {
         at: Point<Pixels>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        // The Quick Access Toolbar's Undo arrow opens the undo list (#619).
+        if primary_id == menu::QAT_UNDO_ID {
+            return self.open_undo_menu(at, cx);
+        }
         let (target, items) = self
             .split_menu_for(primary_id)
             .ok_or_else(|| format!("no split button '{primary_id}' on the ribbon"))?;
@@ -23351,10 +24751,54 @@ impl Docxy {
             if let Some(menu::MenuItem::Item(e)) = menu.items.get(i) {
                 if e.enabled && !e.submenu.is_empty() {
                     menu.items = e.submenu.clone();
+                    menu.hi = None;
+                    self.menu_scroll = ScrollHandle::new();
                 }
             }
         }
         cx.notify();
+    }
+
+    /// A key while a menu is open: Up and Down move the highlight, Enter
+    /// runs the highlighted item (an item with a submenu opens it in the
+    /// menu's place; Enter with nothing highlighted closes the menu), and
+    /// every other key closes the menu and is spent.
+    fn menu_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        match key {
+            "down" | "up" => {
+                menu.step(key == "down");
+                if let Some(i) = menu.hi {
+                    self.menu_scroll.scroll_to_item(i);
+                }
+                cx.notify();
+            }
+            "enter" => {
+                let hi = menu.hi;
+                let submenu = hi.is_some_and(|i| {
+                    matches!(menu.items.get(i), Some(menu::MenuItem::Item(e)) if !e.submenu.is_empty())
+                });
+                match hi {
+                    Some(i) if submenu => self.menu_enter_submenu(i, cx),
+                    Some(i) => {
+                        if let Err(e) = self.menu_activate(&[i], window, cx) {
+                            self.set_status(e);
+                        }
+                        cx.notify();
+                    }
+                    None => {
+                        self.close_menu();
+                        cx.notify();
+                    }
+                }
+            }
+            _ => {
+                self.close_menu();
+                cx.notify();
+            }
+        }
     }
 
     /// Click the open menu's item at `path` (indices through submenus): the
@@ -23389,8 +24833,14 @@ impl Docxy {
     /// click; a ticked item shows its tick where the icon goes.
     fn menu_el(&self, menu: &menu::Menu, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         use menu::MenuItem;
+        // Bounded and scrollable: a menu holding data (the pick list) can
+        // outgrow the window. Up/Down scroll the highlight into view.
         let mut list = v_flex()
+            .id("menu-list")
             .min_w(px(200.))
+            .max_h(px(320.))
+            .overflow_y_scroll()
+            .track_scroll(&self.menu_scroll)
             .py_1()
             .rounded_md()
             .bg(pal.panel)
@@ -23428,6 +24878,7 @@ impl Docxy {
                     };
                     let clickable = e.enabled;
                     let opens = !e.submenu.is_empty();
+                    let lit = menu.hi == Some(i);
                     div()
                         .id(SharedString::from(e.id.clone()))
                         .flex()
@@ -23436,6 +24887,7 @@ impl Docxy {
                         .px_3()
                         .py_1()
                         .rounded_sm()
+                        .when(lit, |d| d.bg(pal.hover))
                         .text_size(px(12.))
                         .text_color(color)
                         .child(lead)
@@ -23603,14 +25055,13 @@ impl Docxy {
     }
 
     fn dispatch(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
-        use Act::*;
         // A command run from anywhere ends an open menu's moment (#397).
         self.close_menu();
         // Protected View (#633): the ribbon is hidden, but shortcuts, KeyTips,
         // context menus and the harness's `ribbon-click` still come here.
         // Resolve and Delete all hold no text of the view: only Protected View
         // and Mark as Final refuse them.
-        let refused = if matches!(act, ResolveComment | DeleteAllComments) {
+        let refused = if matches!(act, Act::ResolveComment | Act::DeleteAllComments) {
             self.access_refused(cx)
         } else {
             !protected_view_allows_doc_act(act) && self.protected_refused(cx)
@@ -23618,6 +25069,31 @@ impl Docxy {
         if refused {
             return self.refocus(window, cx);
         }
+        // A document edit is its own undo step, named for the Undo drop-down
+        // (#619) and kept for Repeat (#618) when it can be repeated.
+        let since = docxcore::editor::undo_serial_counter();
+        let untouched = repeat_untouched(&self.repeat);
+        if act_undo_name(act).is_some() {
+            if let Some(ed) = self.edit_target() {
+                ed.break_undo_group();
+            }
+        }
+        self.run_act(act, window, cx);
+        if act_undo_name(act).is_some() {
+            if let (Some(ed), rec) = self.edit_target_and_repeat() {
+                note_edit(ed, rec, since, Repeat::Act(act));
+            }
+        }
+        // The Undo drop-down only undoes (#619).
+        if matches!(act, Act::UndoTo(_)) {
+            self.keep_repeat_current(untouched);
+        }
+    }
+
+    /// Run `act` (`dispatch` has already closed the menu and checked
+    /// Protected View).
+    fn run_act(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
+        use Act::*;
         match act {
             Project(p) => self.project_act(p, window, cx),
             Sheet(a) => self.run_sheet_act(a, window, cx),
@@ -23693,64 +25169,10 @@ impl Docxy {
                 self.show_notes = !self.show_notes;
                 self.refocus(window, cx);
             }
-            _ => self.with_editor(window, cx, |e| match act {
-                Bold => e.toggle_bold(),
-                Italic => e.toggle_italic(),
-                Underline => e.toggle_underline(),
-                Strike => e.toggle_strike(),
-                Super => e.toggle_vert_align(VertAlign::Superscript),
-                Sub => e.toggle_vert_align(VertAlign::Subscript),
-                Grow => e.resize_font(2),
-                Shrink => e.resize_font(-2),
-                AlignL => e.set_align(Align::Left),
-                AlignC => e.set_align(Align::Center),
-                AlignR => e.set_align(Align::Right),
-                AlignJ => e.set_align(Align::Justify),
-                Normal => e.set_para_style(None),
-                // No Spacing: Word's body style with single spacing and no space
-                // before/after. Modelled as Normal + explicit zeroed spacing.
-                NoSpacing => {
-                    e.set_para_style(None);
-                    e.set_space_before(Some(0));
-                    e.set_space_after(Some(0));
-                    e.set_line_spacing(240, "auto");
-                }
-                H1 => e.set_para_style(Some("Heading1")),
-                H2 => e.set_para_style(Some("Heading2")),
-                H3 => e.set_para_style(Some("Heading3")),
-                HRule => e.insert_hrule(),
-                SelectAll => e.select_all(),
-                Case => e.cycle_case(),
-                // Toggle: if every selected paragraph is already in this list, drop
-                // it; otherwise apply it.
-                Bullets => e.set_list((!e.all_in_list(NUM_BULLET)).then_some(NUM_BULLET)),
-                Numbers => e.set_list((!e.all_in_list(NUM_DECIMAL)).then_some(NUM_DECIMAL)),
-                IndentInc => e.change_indent(720),
-                IndentDec => e.change_indent(-720),
-                Sort => e.sort_paragraphs(),
-                ParaBorders => {
-                    let has = e.caret_para_props().borders.bottom.is_some();
-                    let b = if has {
-                        ParBorders::default()
-                    } else {
-                        ParBorders {
-                            top: None,
-                            bottom: Some(BorderKind::Single),
-                        }
-                    };
-                    e.set_para_border(b);
-                }
-                Title => e.set_para_style(Some("Title")),
-                Subtitle => e.set_para_style(Some("Subtitle")),
-                ClearFmt => e.clear_run_formatting(),
-                Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph
-                | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
-                | ResolveComment | DeleteAllComments | Markup(_) | ToggleTrack | ToggleComments
-                | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | BlankPage
-                | Cover(_) | ToggleNotes | InsertTable | InsertSymbol | InsertEquation
-                | LineSpacing | Hf(_) | Design(_) | Layout(_) | Mail(_) | Table(_)
-                | PrintLayout | ToggleRuler => {}
+            UndoTo(n) => self.with_editor(window, cx, |e| {
+                e.undo_to(n);
             }),
+            _ => self.with_editor(window, cx, |e| apply_doc_act(e, act)),
         }
     }
 
@@ -26443,8 +27865,11 @@ impl Docxy {
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A tab created since the last frame holds the app's Editing options
-        // before anything can reach it (#672).
+        // before anything can reach it (#672), and its AutoCorrect (#667).
         stamp_edit_opts(&mut self.tabs, self.edit_opts);
+        sheet_autocorrect::stamp_autocorrect(&mut self.tabs, &self.autocorrect);
+        sheet_flashfill::retire_stale_previews(&mut self.tabs);
+        sheet_complete::sync_lists(&mut self.tabs);
         // A new frame: what the probes recorded during the last one is now the
         // complete answer, and they start collecting this one afresh. Stale
         // entries cannot survive — a chart that was deleted simply does not
@@ -26523,6 +27948,7 @@ impl Render for Docxy {
 
         // --- title bar: wordmark + document tab chips + theme toggle ---
         let theme_pref = self.theme_pref;
+        let qat_state = self.qat_state();
         // The pinned TitleBar gives #bar flex-shrink:0. A definite width,
         // accounting for Root's client decoration insets, keeps the caption
         // controls inside the viewport.
@@ -26738,17 +28164,48 @@ impl Render for Docxy {
                                 .items_center()
                                 .gap_0p5()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .children(QAT_ITEMS.iter().map(|item| {
-                                    let action = item.action;
-                                    qat_btn(
-                                        item.id,
-                                        item.icon,
-                                        item.tip,
+                                .children(qat_entries(qat_state).into_iter().map(|entry| {
+                                    let action = entry.action;
+                                    let btn = qat_btn(
+                                        entry.id,
+                                        entry.icon,
+                                        entry.tip,
+                                        entry.enabled,
                                         pal,
                                         cx.listener(move |this, _, window, cx| {
                                             this.qat_action(action, window, cx)
                                         }),
-                                    )
+                                    );
+                                    if !entry.menu {
+                                        return btn.into_any_element();
+                                    }
+                                    // A split button: its arrow opens the
+                                    // Undo drop-down (#619).
+                                    h_flex()
+                                        .items_center()
+                                        .child(btn)
+                                        .child(
+                                            div()
+                                                .id("qat-undo-arrow")
+                                                .relative()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .w(px(10.))
+                                                .h(px(20.))
+                                                .rounded(px(3.))
+                                                .cursor_pointer()
+                                                .hover(|d| d.bg(pal.hover))
+                                                .text_size(px(8.))
+                                                .text_color(pal.fg)
+                                                .child(probe(&self.probes, "qat-undo-arrow"))
+                                                .child("\u{25BE}")
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    menu_toggle(menu::QAT_UNDO_ID, cx),
+                                                ),
+                                        )
+                                        .into_any_element()
                                 })),
                         ),
                 )
@@ -30634,6 +32091,7 @@ fn sheet_el(
                     .text_color(hsla_u(0x333333))
                     .child("\u{25bc}")
                     .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
                         ent_arrow.update(cx, |this, cx| this.sheet_dv_toggle(cx));
                     })
                     .into_any_element(),
@@ -30665,12 +32123,130 @@ fn sheet_el(
                             .hover(|d| d.bg(hsla_u(0xe8f0fe)))
                             .child(SharedString::from(val.clone()))
                             .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                                cx.stop_propagation();
                                 ent_pick.update(cx, |this, cx| this.sheet_dv_pick(v2.clone(), cx));
                             }),
                     );
                 }
                 dv_overlay.push(list.into_any_element());
             }
+        }
+    }
+    // Flash Fill's preview (#666, ENT-105): the values Enter would write,
+    // greyed in their empty cells.
+    if let Some(p) = view.live_preview() {
+        if let Some(cx0) = col_x(p.fill.col) {
+            let cw = col_px(sh.col_width(p.fill.col));
+            for (r, text) in &p.fill.fills {
+                let shown = text.strip_prefix('\'').unwrap_or(text);
+                dv_overlay.push(
+                    div()
+                        .absolute()
+                        .left(px(cx0 + 3.0))
+                        .top(px(row_y(*r)))
+                        .w(px((cw - 6.0).max(0.0)))
+                        .h(px(SHEET_ROW_H))
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .text_size(px(12.))
+                        .text_color(hsla_u(0xa0a0a0))
+                        .child(SharedString::from(shown.to_string()))
+                        .into_any_element(),
+                );
+            }
+        }
+    }
+    // The Flash Fill Options button (#666, ENT-109) by the last cell filled,
+    // while the fill stands; a press opens its menu.
+    if let Some((br, bc)) = view.live_flash().and_then(|f| f.button_cell()) {
+        if let Some(cx0) = col_x(bc) {
+            let cw = col_px(sh.col_width(bc));
+            let ent_btn = ent.clone();
+            dv_overlay.push(
+                div()
+                    .id("flash-fill-options")
+                    .absolute()
+                    .left(px(cx0 + cw + 2.0))
+                    .top(px(row_y(br) + 1.0))
+                    .w(px(18.))
+                    .h(px(SHEET_ROW_H - 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .bg(hsla_u(0xf1f1f1))
+                    .border_1()
+                    .border_color(hsla_u(0x9a9a9a))
+                    .rounded_sm()
+                    .text_size(px(10.))
+                    .text_color(hsla_u(0x333333))
+                    .child("\u{26a1}")
+                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        ent_btn.update(cx, |this, cx| {
+                            // The button is drawn only while a fill stands, so
+                            // the only refusal (no fill) cannot happen here.
+                            let _ = this.open_flash_menu(cx);
+                        });
+                    })
+                    .into_any_element(),
+            );
+        }
+    }
+    // Formula AutoComplete's list (#686) under the cell being edited: each
+    // name with its kind, the highlighted one marked. Keys drive it (Up/Down
+    // move, Tab inserts, Esc closes); a press inserts that item.
+    if let Some(c) = view.complete_view() {
+        let (er, ec) = view
+            .edit_origin
+            .filter(|o| o.0 == view.active)
+            .map_or(view.sel, |(_, r, c)| (r, c));
+        if let Some(cx0) = col_x(ec) {
+            let y = row_y(er);
+            let mut list = v_flex()
+                .id("fx-complete")
+                .absolute()
+                .left(px(cx0))
+                .top(px(y + SHEET_ROW_H))
+                .min_w(px(200.))
+                .max_h(px(220.))
+                .overflow_y_scroll()
+                .track_scroll(&view.fx_scroll)
+                .bg(hsla_u(0xffffff))
+                .border_1()
+                .border_color(hsla_u(0x9a9a9a))
+                .rounded_sm();
+            for (i, item) in c.list.items.iter().enumerate() {
+                let mark = match item.kind {
+                    gridcore::fcomplete::Kind::Function => "fx",
+                    gridcore::fcomplete::Kind::Name => "nm",
+                    gridcore::fcomplete::Kind::Table => "tb",
+                    gridcore::fcomplete::Kind::Column => "co",
+                    gridcore::fcomplete::Kind::Specifier => "",
+                };
+                let ent_pick = ent.clone();
+                list = list.child(
+                    div()
+                        .id(("fx-complete-item", i))
+                        .flex()
+                        .gap_2()
+                        .px_2()
+                        .py(px(2.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(hsla_u(0x1a1a1a))
+                        .when(i == c.sel, |d| d.bg(hsla_u(0xd2e3fc)))
+                        .hover(|d| d.bg(hsla_u(0xe8f0fe)))
+                        .child(div().w(px(16.)).text_color(hsla_u(0x777777)).child(mark))
+                        .child(SharedString::from(item.label.clone()))
+                        .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                            cx.stop_propagation();
+                            ent_pick.update(cx, |this, cx| this.sheet_complete_pick(i, cx));
+                        }),
+                );
+            }
+            dv_overlay.push(list.into_any_element());
         }
     }
     // AutoFilter buttons (#690): an arrow at the right of each header cell of

@@ -1870,32 +1870,50 @@ fn file_tab_json(kind: crate::Kind) -> Json {
     ])
 }
 
-/// A ribbon reply: the tabs, their count and the Quick Access Toolbar.
+/// A ribbon reply: the tabs, their count and the Quick Access Toolbar as a
+/// tab without live state shows it ([`set_live_qat`] gives the live one).
 fn ribbon_reply(tabs: Vec<Json>) -> Json {
     let tab_count = tabs.len();
-    let qat = crate::QAT_ITEMS
-        .iter()
-        .map(|item| {
-            Json::obj(vec![
-                ("id", Json::Str(item.id.into())),
-                ("label", Json::Str(item.label.into())),
-                (
-                    "tip",
-                    Json::obj(vec![
-                        ("title", Json::Str(item.tip.into())),
-                        ("body", Json::Str(String::new())),
-                    ]),
-                ),
-                ("key_tip", Json::Str(String::new())),
-                ("checked", Json::Bool(false)),
-            ])
-        })
-        .collect();
     Json::obj(vec![
         ("tabs", Json::Arr(tabs)),
         ("tab_count", Json::Num(tab_count as f64)),
-        ("qat", Json::Arr(qat)),
+        ("qat", qat_json(crate::QatState::Plain)),
     ])
+}
+
+/// The Quick Access Toolbar as drawn in `state`: a document's redo button
+/// reads Redo or Repeat (#618), and its Undo reports its drop-down (#619).
+fn qat_json(state: crate::QatState) -> Json {
+    Json::Arr(
+        crate::qat_entries(state)
+            .into_iter()
+            .map(|entry| {
+                Json::obj(vec![
+                    ("id", Json::Str(entry.id.into())),
+                    ("label", Json::Str(entry.label.into())),
+                    (
+                        "tip",
+                        Json::obj(vec![
+                            ("title", Json::Str(entry.tip.into())),
+                            ("body", Json::Str(String::new())),
+                        ]),
+                    ),
+                    ("key_tip", Json::Str(String::new())),
+                    ("checked", Json::Bool(false)),
+                    ("enabled", Json::Bool(entry.enabled)),
+                    ("menu", Json::Bool(entry.menu)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// Replace a ribbon reply's Quick Access Toolbar with the one `state` draws.
+fn set_live_qat(json: &mut Json, state: crate::QatState) {
+    let Json::Obj(fields) = json else { return };
+    if let Some((_, qat)) = fields.iter_mut().find(|(k, _)| k == "qat") {
+        *qat = qat_json(state);
+    }
 }
 
 /// Ribbon snapshot using the active tab and live checked states.
@@ -1916,6 +1934,7 @@ fn ribbon_json(app: &crate::Docxy) -> Json {
         |act| app.act_enabled_now(act),
     );
     add_combo_values(&mut json, app);
+    set_live_qat(&mut json, app.qat_state());
     json
 }
 
@@ -2128,6 +2147,17 @@ fn menu_open(
             app.open_cell_menu(at, cx);
             Ok(())
         }
+        // Pick From Drop-down List (#665): Alt+Down's menu over the selected
+        // cell, through the same opener.
+        Json::Str(name) if name == "pick-list" => {
+            if !app.active_is_sheet() {
+                return Err("the pick list opens on a sheet tab".into());
+            }
+            app.open_pick_menu(cx)
+        }
+        // The Flash Fill Options button's menu (#666): there is one only
+        // while the last fill stands.
+        Json::Str(name) if name == "flash-fill" => app.open_flash_menu(cx),
         Json::Str(name) if name == "document" => {
             if app.active_is_project() {
                 return Err(
@@ -2217,8 +2247,20 @@ fn menu_open(
                 let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
                 app.open_split_menu(id, at, cx)
             }
+            // The Quick Access Toolbar Undo arrow (#619).
+            "qat" => {
+                if fields[0].1.as_str() != Some(crate::menu::QAT_UNDO_ID) {
+                    return Err(format!(
+                        "'qat' names a Quick Access Toolbar split button; only \"{}\" has a menu",
+                        crate::menu::QAT_UNDO_ID
+                    ));
+                }
+                let anchor = crate::qat_undo_anchor(&app.probes.borrow());
+                let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
+                app.open_undo_menu(at, cx)
+            }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, cell, row and ribbon are)"
+                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, row, ribbon and qat are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
@@ -2298,6 +2340,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "autorecover"
             | "keep-drafts"
             | "user-name"
+            | "autocorrect"
             | "trusted-clear"
             | "open-draft"
             | "dialog-set"
@@ -2321,7 +2364,7 @@ fn menu_path(args: &Json) -> Result<Vec<&str>, String> {
                     .ok_or_else(|| "'path' must be an array of labels".to_string())
             })
             .collect(),
-        _ => Err("menu-click takes 'label' or 'path'".into()),
+        _ => Err("menu-click takes 'label', 'path' or 'index'".into()),
     }
 }
 
@@ -2442,6 +2485,11 @@ fn sheet_editing_json(o: &gridcore::options::EditOptions) -> Json {
         (k::KEY_EDIT_IN_CELL, Json::Bool(o.edit_in_cell)),
         (k::KEY_AUTOCOMPLETE, Json::Bool(o.autocomplete)),
         (k::KEY_FILL_HANDLE, Json::Bool(o.fill_handle)),
+        (k::KEY_FLASH_FILL_AUTO, Json::Bool(o.flash_fill_auto)),
+        (
+            k::KEY_FORMULA_AUTOCOMPLETE,
+            Json::Bool(o.formula_autocomplete),
+        ),
     ])
 }
 
@@ -2579,6 +2627,52 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ("range", Json::Str(a1_range(v.range()))),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
+            // Flash Fill's greyed preview (#666): the range it covers and the
+            // values Enter would write, or null.
+            (
+                "flash_preview",
+                v.live_preview().map_or(Json::Null, |p| {
+                    let span = p.fill.span().unwrap_or_default();
+                    Json::obj(vec![
+                        (
+                            "range",
+                            Json::Str(a1_range((span.0, p.fill.col, span.1, p.fill.col))),
+                        ),
+                        (
+                            "values",
+                            Json::Arr(
+                                p.fill
+                                    .fills
+                                    .iter()
+                                    .map(|(_, t)| {
+                                        Json::Str(t.strip_prefix('\'').unwrap_or(t).to_string())
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                    ])
+                }),
+            ),
+            // Formula AutoComplete's list (#686): its labels and highlighted
+            // index, or null while none shows.
+            (
+                "completions",
+                v.complete_view().map_or(Json::Null, |c| {
+                    Json::obj(vec![
+                        (
+                            "items",
+                            Json::Arr(
+                                c.list
+                                    .items
+                                    .into_iter()
+                                    .map(|i| Json::Str(i.label))
+                                    .collect(),
+                            ),
+                        ),
+                        ("sel", Json::Num(c.sel as f64)),
+                    ])
+                }),
+            ),
             // The sheet comment editor New Comment opens, and its text.
             ("comment_edit", str_or_null(app.sheet_comment_edit.clone())),
         ]);
@@ -3067,9 +3161,15 @@ fn dispatch_verb(
         "menu-click" => {
             app.refuse_under_dialog()?;
             refuse_under_cover(app)?;
-            let labels = menu_path(args)?;
             let menu = app.menu.as_ref().ok_or("no menu is open")?;
-            let path = crate::menu::resolve(&menu.items, &labels)?;
+            // `index` picks among items whose labels repeat (#619).
+            let path = match args.get("index") {
+                Some(_) if args.get("label").is_some() || args.get("path").is_some() => {
+                    return Err("menu-click takes 'label', 'path' or 'index'".into());
+                }
+                Some(_) => crate::menu::resolve_index(&menu.items, arg_usize(args, "index")?)?,
+                None => crate::menu::resolve(&menu.items, &menu_path(args)?)?,
+            };
             app.menu_activate(&path, window, cx)?;
             Done::ok(state(app, window))
         }
@@ -3152,6 +3252,13 @@ fn dispatch_verb(
         // tab, which `dialog-set` and `dialog-click` then drive.
         "user-name" => {
             app.open_user_name_dialog()?;
+            cx.notify();
+            Done::ok(state(app, window))
+        }
+        // Settings' AutoCorrect Options... (#667): the same opener as the
+        // backstage row.
+        "autocorrect" => {
+            app.open_autocorrect_dialog()?;
             cx.notify();
             Done::ok(state(app, window))
         }
@@ -3715,6 +3822,11 @@ fn dispatch_verb(
                 ("text", Json::Str(v.cell_text(r, c))),
                 ("value", Json::Str(raw.clone())),
                 ("empty", Json::Bool(raw.is_empty())),
+                // The cell's hyperlink target, or null (#667: a typed URL).
+                (
+                    "hyperlink",
+                    str_or_null(v.sheet().hyperlinks.get(&(r, c)).cloned()),
+                ),
             ]))
         }
 
@@ -4078,7 +4190,7 @@ mod tests {
         };
         let mut word = doc(crate::Kind::Docx, "a.docx");
         word.path = Some("C:/work/a.docx".into());
-        word.dirty = true;
+        word.set_dirty();
         let book = doc(crate::Kind::Xlsx, "Untitled.xlsx");
         let blank = crate::new_project_tab();
         let mut mpp = doc(crate::Kind::Project, "plan.mpp");
@@ -4474,6 +4586,57 @@ mod tests {
         );
     }
 
+    /// #618, #619: `ribbon-read`'s Quick Access Toolbar is the one drawn: a
+    /// document's live state replaces the plain Undo and Redo.
+    #[test]
+    fn ribbon_read_reports_the_live_qat_618_619() {
+        let item = |json: &Json, id: &str| {
+            json.get("qat")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q.get_str("id") == Some(id))
+                .cloned()
+                .unwrap()
+        };
+        let mut json = ribbon_json_for(crate::Kind::Docx, false, false, false, |_| false);
+        let redo = item(&json, "qat-redo");
+        assert_eq!(redo.get_str("label"), Some("Redo"));
+        assert_eq!(redo.get("enabled"), Some(&Json::Bool(true)));
+        assert_eq!(
+            item(&json, "qat-undo").get("menu"),
+            Some(&Json::Bool(false))
+        );
+        set_live_qat(
+            &mut json,
+            crate::QatState::Doc {
+                can_redo: false,
+                can_repeat: false,
+            },
+        );
+        let redo = item(&json, "qat-redo");
+        assert_eq!(redo.get_str("label"), Some("Repeat"));
+        assert_eq!(
+            redo.get("tip").unwrap().get_str("title"),
+            Some("Can't Repeat")
+        );
+        assert_eq!(redo.get("enabled"), Some(&Json::Bool(false)));
+        assert_eq!(item(&json, "qat-undo").get("menu"), Some(&Json::Bool(true)));
+        set_live_qat(
+            &mut json,
+            crate::QatState::Doc {
+                can_redo: false,
+                can_repeat: true,
+            },
+        );
+        let redo = item(&json, "qat-redo");
+        assert_eq!(
+            redo.get("tip").unwrap().get_str("title"),
+            Some("Repeat (Ctrl+Y)")
+        );
+        assert_eq!(redo.get("enabled"), Some(&Json::Bool(true)));
+    }
     #[test]
     fn ribbon_lists_gantt_chart_format_only_with_a_project_gantt() {
         let names = |ribbon: &Json| {

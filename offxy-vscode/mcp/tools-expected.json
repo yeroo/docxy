@@ -2107,5 +2107,77 @@
         "path"
       ]
     }
+  },
+  {
+    "name": "xlsxy_flash_fill",
+    "description": "Flash Fill (Ctrl+E): fill the rest of the column of `ref` from the examples typed at its top, by the pattern they show in the columns next to it. One undo group; cells that already hold values are kept. Returns the cells filled (changed) and those the pattern could not fill (blank); no pattern is an error with Excel's message.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "description": "A cell of the column to fill, e.g. \"B1\"."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "ref"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_autocorrect",
+    "description": "Read or change AutoCorrect (File > Options > Proofing): its switches, replace list and exceptions. With no arguments, returns the state. Everything given is checked before anything is set; saved with the app's preferences.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "options": {
+          "type": "object",
+          "description": "Switches by key, e.g. {\"ac_replace_text\": false, \"ac_hyperlinks\": false}."
+        },
+        "add": {
+          "type": "object",
+          "properties": {
+            "replace": {
+              "type": "string",
+              "description": "The word to replace."
+            },
+            "with": {
+              "type": "string",
+              "description": "What replaces it."
+            },
+            "overwrite": {
+              "type": "boolean",
+              "description": "Replace an existing entry for the word."
+            }
+          },
+          "required": [
+            "replace",
+            "with"
+          ],
+          "description": "Add a replace-list entry. An existing entry with another With is replaced only with overwrite:true."
+        },
+        "delete": {
+          "type": "string",
+          "description": "Remove the replace-list entry for this Replace text."
+        },
+        "exception": {
+          "type": "object",
+          "description": "Add or delete an exception: {kind: first_letter|initial_caps, add: word} or {kind, delete: word}."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
   }
 ]

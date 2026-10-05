@@ -162,7 +162,7 @@ pub(super) fn convert_tab(tab: &mut DocTab) -> Result<String, String> {
         .ok_or("this document has no package to convert")?;
     pkg.set_compatibility_mode(15);
     tab.import.compat = false;
-    tab.dirty = true;
+    tab.set_dirty();
     let status = "converted to the newest file format; saving writes .docx".to_string();
     tab.status = status.clone().into();
     Ok(status)
