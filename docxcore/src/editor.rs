@@ -592,8 +592,7 @@ impl Editor {
             *last = new_idx;
         }
         self.caret.offset = 0;
-        self.unshare_insert_ids();
-        self.doc.initialize_revision_targets();
+        self.settle_revisions();
     }
 
     /// Word-style autoformat: if the current paragraph's whole text is three or
@@ -1204,7 +1203,7 @@ impl Editor {
         }
         self.checkpoint(EditKind::Structural);
         self.paste_at_caret(clip);
-        self.unshare_insert_ids();
+        self.settle_revisions();
     }
 
     /// [`Editor::paste`]'s insertion at the caret, with no undo step of its

@@ -84,18 +84,7 @@ impl Docxy {
             self.user_name = name;
             self.user_initials = initials;
             crate::set_configured_identity(&self.user_name, &self.user_initials);
-            // Tabs already recording keep recording, as the new reviewer.
-            let author = crate::track_author(&crate::review_identity(
-                &self.user_name,
-                &self.user_initials,
-            ));
-            for tab in &mut self.tabs {
-                if let crate::Surface::Doc(ed) = &mut tab.surface {
-                    if ed.track_changes() {
-                        ed.set_track_changes(Some(author.clone()));
-                    }
-                }
-            }
+            crate::reauthor_tracking(&mut self.tabs, &self.user_name, &self.user_initials);
             self.persist();
         }
         Some(done)

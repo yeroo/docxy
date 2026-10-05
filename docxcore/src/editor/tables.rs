@@ -522,7 +522,7 @@ impl Editor {
         }
         table_path.extend([0, 0, 0]);
         self.caret = Caret::at(table_path, 0);
-        self.doc.initialize_revision_targets();
+        self.settle_revisions();
         Ok(())
     }
 }

@@ -5052,6 +5052,15 @@ fn is_markdown_path(path: &std::path::Path) -> bool {
 static CONFIGURED_IDENTITY: std::sync::Mutex<(String, String)> =
     std::sync::Mutex::new((String::new(), String::new()));
 
+/// The raw configured name and initials (empty when none), to put back.
+#[cfg(test)]
+fn configured_identity_raw() -> (String, String) {
+    CONFIGURED_IDENTITY
+        .lock()
+        .map(|id| id.clone())
+        .unwrap_or_default()
+}
+
 fn set_configured_identity(name: &str, initials: &str) {
     if let Ok(mut id) = CONFIGURED_IDENTITY.lock() {
         *id = (name.to_string(), initials.to_string());
@@ -5064,6 +5073,19 @@ fn configured_identity() -> (String, String) {
         .map(|id| id.clone())
         .unwrap_or_default();
     review_identity(&name, &initials)
+}
+
+/// Tabs already recording tracked changes keep recording, as the reviewer
+/// now configured (the user-name dialog changed it).
+fn reauthor_tracking(tabs: &mut [DocTab], user_name: &str, user_initials: &str) {
+    let author = track_author(&review_identity(user_name, user_initials));
+    for tab in tabs {
+        if let Surface::Doc(ed) = &mut tab.surface {
+            if ed.track_changes() {
+                ed.set_track_changes(Some(author.clone()));
+            }
+        }
+    }
 }
 
 /// A document editor over `doc`, recording tracked changes when the file's

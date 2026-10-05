@@ -121,52 +121,68 @@ impl Editor {
         }
     }
 
-    /// After an Enter or a multi-paragraph paste: a recorded insertion that
-    /// now spans paragraphs becomes one insertion per paragraph, each with its
-    /// own `w:id`, so a save writes distinct ids and a reload lists exactly
-    /// the revisions the editor does.
+    /// Every edit that splits a paragraph or inserts blocks (Enter, a paste,
+    /// a table, a section break) ends here: recorded insertions are made one
+    /// per `w:id` again ([`Editor::unshare_insert_ids`]) and revision targets
+    /// assigned. A new splitter calls this and inherits the rule.
+    pub(super) fn settle_revisions(&mut self) {
+        self.unshare_insert_ids();
+        self.doc.initialize_revision_targets();
+    }
+
+    /// A save writes each stretch of adjacent recorded runs as one `<w:ins>`,
+    /// and a reload lists each as one revision, so a `w:id` must name exactly
+    /// one stretch. An Enter or a block insert in the middle of an insertion
+    /// leaves both halves with its id; so does anything that comes between two
+    /// of its runs (untracked typing, another reviewer's text). Each later
+    /// stretch with an id already used gets a fresh one, above every id in the
+    /// document.
     pub(super) fn unshare_insert_ids(&mut self) {
-        let has_records = |c: &[Inline]| {
-            c.iter().any(|i| {
-                matches!(i, Inline::Run(r) if r.props.tracked_insert.is_some())
-                    || matches!(i, Inline::Tab(p) | Inline::Break(_, p) if p.tracked_insert.is_some())
-            })
+        let has_record = |i: &Inline| match i {
+            Inline::Run(r) => r.props.tracked_insert.is_some(),
+            Inline::Tab(p) | Inline::Break(_, p) => p.tracked_insert.is_some(),
+            _ => false,
         };
         let paths = super::all_paragraph_paths(&self.doc.body);
-        let any = paths
-            .iter()
-            .any(|p| resolve_para(&self.doc.body, p).is_some_and(|p| has_records(&p.content)));
+        let any = paths.iter().any(|p| {
+            resolve_para(&self.doc.body, p).is_some_and(|p| p.content.iter().any(has_record))
+        });
         if !any {
             return;
         }
         let mut next = self.max_annotation_id();
-        let mut seen: std::collections::HashSet<Option<String>> = Default::default();
+        let mut used: std::collections::HashSet<Option<String>> = Default::default();
         for path in paths {
             let Some(para) = para_mut(&mut self.doc.body, &path) else {
                 continue;
             };
-            let mut renamed: std::collections::HashMap<Option<String>, String> = Default::default();
-            let mut here: Vec<Option<String>> = Vec::new();
+            // The id the current stretch of adjacent runs has, and had.
+            let mut open: Option<(Option<String>, Option<String>)> = None;
             for inline in &mut para.content {
+                if !has_record(inline) {
+                    open = None;
+                    continue;
+                }
                 with_props(inline, |props| {
                     let Some(t) = &mut props.tracked_insert else {
                         return;
                     };
-                    let id = t.metadata.id.clone();
-                    if seen.contains(&id) {
-                        let new = renamed.entry(id.clone()).or_insert_with(|| {
-                            next += 1;
-                            next.to_string()
-                        });
-                        t.metadata.id = Some(new.clone());
-                        t.metadata.target = Default::default();
+                    let old = t.metadata.id.clone();
+                    match &open {
+                        Some((was, now)) if *was == old => t.metadata.id = now.clone(),
+                        _ => {
+                            if used.contains(&old) {
+                                next += 1;
+                                t.metadata.id = Some(next.to_string());
+                                t.metadata.target = Default::default();
+                            }
+                            used.insert(t.metadata.id.clone());
+                            open = Some((old, t.metadata.id.clone()));
+                        }
                     }
-                    here.push(t.metadata.id.clone());
                 });
             }
-            seen.extend(here);
         }
-        self.doc.initialize_revision_targets();
     }
 
     /// Delete the character at editor offset `idx` of the paragraph at `path`:

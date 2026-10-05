@@ -1281,9 +1281,9 @@ fn assign_run_props_target(
     seen: &mut std::collections::HashSet<RevisionTarget>,
 ) {
     assign_property_target(&mut props.property_change, next, seen);
-    // The runs of one recorded insertion share its target on purpose (a split
-    // or an Enter in the middle keeps both halves), so a repeat is not a
-    // clone to renumber.
+    // The runs of one recorded insertion share its target on purpose (a
+    // format change splits a run in two), so a repeat is not a clone to
+    // renumber.
     if let Some(insert) = &mut props.tracked_insert {
         if !insert.metadata.target.is_assigned() {
             insert.metadata.target = RevisionTarget(*next);

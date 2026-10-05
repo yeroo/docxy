@@ -392,3 +392,63 @@ fn enter_in_the_middle_of_a_recorded_insertion_gives_each_half_its_own_id() {
     assert_eq!(ins_ids.len(), 2, "{xml}");
     assert_ne!(ins_ids[0], ins_ids[1], "{xml}");
 }
+
+fn insert_ids(xml: &str) -> Vec<String> {
+    xml.split("<w:ins w:id=\"")
+        .skip(1)
+        .filter_map(|r| r.split('"').next().map(String::from))
+        .collect()
+}
+
+fn assert_distinct_ins(ed: &Editor, what: &str, n: usize) {
+    let ids = insert_ids(&xml(ed));
+    assert_eq!(ids.len(), n, "{what}: {}", xml(ed));
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), n, "{what}: {}", xml(ed));
+    let inserts = kinds(&ed.doc)
+        .into_iter()
+        .filter(|k| *k == RevisionKind::Insert)
+        .count();
+    assert_eq!(inserts, n, "{what}: the editor lists what a reload will");
+}
+
+#[test]
+fn a_table_or_section_break_in_the_middle_of_an_insertion_unshares_its_id() {
+    let mut ed = editor();
+    at(&mut ed, 8);
+    ed.insert_str("abcd");
+    ed.caret.offset = 10;
+    ed.insert_table(1, 1, docxcore::table::AutoFit::Default)
+        .unwrap();
+    assert_distinct_ins(&ed, "table", 2);
+
+    let mut ed = editor();
+    at(&mut ed, 8);
+    ed.insert_str("abcd");
+    ed.caret.offset = 10;
+    ed.insert_section_break(docxcore::sect::SectionStart::Continuous)
+        .unwrap();
+    assert_distinct_ins(&ed, "section break", 2);
+}
+
+#[test]
+fn text_that_comes_between_two_runs_of_an_insertion_splits_its_id() {
+    let mut ed = editor();
+    at(&mut ed, 8);
+    ed.insert_str("abcd");
+    // Untracked typing in the middle of it: the insertion is now two
+    // stretches with something between.
+    ed.set_track_changes(None);
+    ed.caret.offset = 10;
+    ed.insert_char('X');
+    ed.set_track_changes(Some(TrackAuthor {
+        author: "Ada".into(),
+        clock,
+    }));
+    ed.insert_newline();
+    ed.undo();
+    // A later recorded edit settles the ids.
+    at(&mut ed, 0);
+    ed.paste(&Clip::from_text("z"));
+    assert_distinct_ins(&ed, "untracked text between", 3);
+}

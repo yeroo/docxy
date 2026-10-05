@@ -107,11 +107,32 @@ fn a_loaded_tracked_file_records_as_the_configured_reviewer() {
     let (mut tab, path) = docx_tab(&dir);
     track_on(&mut tab, "Anyone");
     assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let before = crate::configured_identity_raw();
     crate::set_configured_identity("Jane Doe", "JD");
     let mut again = tab_from_path(&path);
-    crate::set_configured_identity("", "");
+    crate::set_configured_identity(&before.0, &before.1);
     type_at(&mut again, 8, "x");
     assert!(save_doc_tab(&mut again, None), "{}", again.status);
     let (doc, _) = saved(&path);
     assert!(doc.contains("w:author=\"Jane Doe\""), "{doc}");
+}
+
+/// Changing the reviewer name re-authors tabs that are recording.
+#[test]
+fn changing_the_reviewer_reauthors_a_recording_tab() {
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir);
+    track_on(&mut tab, "Old");
+    type_at(&mut tab, 8, "a");
+    let mut tabs = vec![tab];
+    crate::reauthor_tracking(&mut tabs, "New", "N");
+    let tab = &mut tabs[0];
+    type_at(tab, 0, "b");
+    assert!(save_doc_tab(tab, None), "{}", tab.status);
+    let (doc, _) = saved(&path);
+    assert!(doc.contains("w:author=\"New\""), "{doc}");
+    assert!(
+        doc.contains("w:author=\"Old\""),
+        "earlier text keeps its author: {doc}"
+    );
 }
