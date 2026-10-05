@@ -2175,3 +2175,23 @@ fn project_verbs_that_would_drop_a_close_prompt_are_refused() {
     // Reads still answer.
     assert_eq!(close_prompt_refusal(&tabs, "proj.path"), Ok(()));
 }
+
+#[test]
+fn a_quits_own_save_under_a_new_name_is_not_a_change_of_tabs() {
+    let mut tabs = vec![untitled("Document1", "Quarterly report\n"), tab(Kind::Docx)];
+    let mut ids = tab_ids(&tabs);
+    // Save named the never-saved document, and saved the other as a copy.
+    tabs[0].title = "Quarterly report.docx".into();
+    tabs[0].path = Some(PathBuf::from("/docs/Quarterly report.docx"));
+    refresh_tab_id(&mut ids, &tabs, 0);
+    assert_eq!(tab_ids(&tabs), ids);
+    tabs[1].title = "renamed.docx".into();
+    tabs[1].path = Some(PathBuf::from("/docs/renamed.docx"));
+    refresh_tab_id(&mut ids, &tabs, 1);
+    assert_eq!(tab_ids(&tabs), ids);
+    // Anything else still is.
+    tabs.swap(0, 1);
+    assert_ne!(tab_ids(&tabs), ids);
+    // Out of range: nothing to refresh, nothing panics.
+    refresh_tab_id(&mut ids, &tabs, 9);
+}

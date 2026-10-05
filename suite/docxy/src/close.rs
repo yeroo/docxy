@@ -649,7 +649,11 @@ impl Docxy {
                 self.close_tab_with(i, Some(answer), window, cx);
             }
             (CloseAnswer::Cancel, true) => self.quit_cancelled(),
-            (CloseAnswer::Save, true) => self.next_quit_prompt(window, cx),
+            (CloseAnswer::Save, true) => {
+                // The quit's own Save may have named the tab anew.
+                refresh_tab_id(&mut self.quit_tabs, &self.tabs, i);
+                self.next_quit_prompt(window, cx);
+            }
             (CloseAnswer::Discard, true) => {
                 self.quit_discards.push(i);
                 self.next_quit_prompt(window, cx);
@@ -782,6 +786,15 @@ pub(crate) fn tab_ids(tabs: &[DocTab]) -> Vec<TabId> {
     tabs.iter()
         .map(|t| (t.title.clone(), t.path.clone()))
         .collect()
+}
+
+/// Tab `i` was saved by the quit's own question: a never-saved document,
+/// or one saved under a new name, has a new title and file, and that is no
+/// change of the tabs the quit is asking about.
+fn refresh_tab_id(ids: &mut [TabId], tabs: &[DocTab], i: usize) {
+    if let (Some(id), Some(t)) = (ids.get_mut(i), tabs.get(i)) {
+        *id = (t.title.clone(), t.path.clone());
+    }
 }
 
 /// Whether a window close's question is open on some tab: the quit is live
