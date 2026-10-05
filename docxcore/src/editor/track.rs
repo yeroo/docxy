@@ -222,8 +222,9 @@ impl Editor {
     /// Delete the text of the selection `lo..hi` as tracked deletions in every
     /// body or table-cell paragraph from `lo` to `hi` in document order (a
     /// table between them stays, its cells' text recorded), keeping the
-    /// paragraph marks. A text box's paragraphs are not part of the text
-    /// between two points, so they are skipped. `false`, and nothing done,
+    /// paragraph marks. The text box an endpoint is in is walked like the body;
+    /// every other text box (a nested one included) is skipped, its paragraphs
+    /// not being part of the text between two points. `false`, and nothing done,
     /// when not tracking or an endpoint is not a paragraph the walk reaches
     /// (the untracked delete then applies).
     pub(super) fn delete_text_across_paragraphs(
@@ -659,11 +660,12 @@ impl Stretches {
     }
 }
 
-/// The text box (its host paragraph's path and the inline's index) `path`
-/// reaches its paragraph through, if it does so through an inline rather than
-/// through blocks and table cells.
+/// The innermost text box (its host paragraph's path and the inline's index)
+/// `path` reaches its paragraph through, if it does so through an inline
+/// rather than through blocks and table cells.
 fn text_box_of(body: &[crate::model::Block], path: &[usize]) -> Option<Vec<usize>> {
     (1..path.len())
+        .rev()
         .find(|&n| resolve_para(body, &path[..n]).is_some())
-        .map(|n| path[..=n.min(path.len() - 1)].to_vec())
+        .map(|n| path[..=n].to_vec())
 }

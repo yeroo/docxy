@@ -791,3 +791,50 @@ fn a_tracked_selection_within_one_text_box_is_recorded() {
     assert_eq!(blocks[0].plain_text(), "alpha");
     assert_eq!(blocks[1].plain_text(), "beta");
 }
+
+/// A text box nested in the box the selection is in is skipped like any
+/// other: its text is not between the endpoints.
+#[test]
+fn a_tracked_selection_in_a_text_box_skips_a_box_nested_in_it() {
+    let para = |content: Vec<Inline>| {
+        Block::Paragraph(docxcore::model::Paragraph {
+            props: Default::default(),
+            content,
+        })
+    };
+    let run = |t: &str| {
+        Inline::Run(docxcore::model::Run {
+            text: t.into(),
+            props: Default::default(),
+        })
+    };
+    let inner = Inline::TextBox {
+        raw: "<w:r><w:txbxContent></w:txbxContent></w:r>".into(),
+        blocks: vec![para(vec![run("inner")])],
+    };
+    let mut doc = Document {
+        body: vec![para(vec![Inline::TextBox {
+            raw: "<w:r><w:txbxContent></w:txbxContent></w:r>".into(),
+            blocks: vec![para(vec![inner, run("first")]), para(vec![run("second")])],
+        }])],
+    };
+    doc.initialize_revision_targets();
+    let mut ed = Editor::new(doc);
+    as_author(&mut ed, "Ada");
+    ed.anchor = Some(Caret {
+        path: vec![0, 0, 0],
+        offset: 2,
+    });
+    ed.caret = Caret {
+        path: vec![0, 0, 1],
+        offset: 3,
+    };
+    ed.delete_selection();
+    assert_eq!(
+        kinds(&ed.doc).len(),
+        2,
+        "first's tail and second's head: {}",
+        xml(&ed)
+    );
+    assert!(!xml(&ed).contains(">inner</w:delText>"), "{}", xml(&ed));
+}

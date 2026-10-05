@@ -12349,7 +12349,7 @@ mod tests {
         pkg.insert_comment_xml(word_comment);
         let extensible = "<w16cex:commentExtensible w16cex:durableId=\"7C7C7C7C\" \
             w16cex:dateUtc=\"2020-01-02T03:04:05Z\"><w16cex:extLst><w16cex:ext uri=\"{1}\">\
-            <w16cr:reactions xmlns:w16cr=\"urn:cr\"/></w16cex:ext></w16cex:extLst>\
+            <w16cr:reactions/></w16cex:ext></w16cex:extLst>\
             </w16cex:commentExtensible>";
         let extensible_root = "<w16cex:commentsExtensible \
             xmlns:w16cex=\"http://schemas.microsoft.com/office/word/2018/wordml/cex\" \
@@ -12393,9 +12393,10 @@ mod tests {
             .part_text("word/commentsExtensible.xml")
             .expect("part back");
         assert!(
-            cex.contains("w16cex:dateUtc=\"2020-01-02T03:04:05Z\""),
-            "{cex}"
+            cex.contains(extensible),
+            "the whole entry, children and close tag: {cex}"
         );
+        assert!(cex.contains(extensible_root), "the original root: {cex}");
         let ct = pkg.part_text("[Content_Types].xml").unwrap();
         assert!(
             ct.contains("/word/commentsExtended.xml") && ct.contains("/word/commentsIds.xml"),
