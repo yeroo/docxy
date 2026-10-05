@@ -501,7 +501,15 @@ closing?`. A tab with another dialog open is not closed: it comes to the
 front with `Close the open dialog first`.
 An optional `index` targets an inactive tab; it defaults to the active tab.
 `call backstage-close {}` calls the Backstage Close handler without supplying
-an answer. `call ask-on-close {"on":true}` uses the same setting handler as
+an answer. `call close-window {}` is the window's close button (#630): with
+`ask-on-close` on and work unsaved, it brings the first unsaved tab to the front
+with the close prompt (`quit` in its owner) and replies; each Save or Don't
+Save goes on to the next unsaved tab in tab order (a clean tab is never asked),
+Cancel keeps the window, and once the last is answered the process ends after
+that reply, as after `quit`. Don't Save there keeps a file-backed tab in the
+session as its file alone (it reopens clean) and drops a never-saved one.
+Otherwise `close-window` exits at once (hot exit). The window's own close in a
+harness instance never asks: `quit` must end the run it waits on. `call ask-on-close {"on":true}` uses the same setting handler as
 Settings; closing a dirty single tab always asks regardless of this window setting.
 
 `call autorecover {"minutes":N}` sets the Settings AutoRecover interval (`0`

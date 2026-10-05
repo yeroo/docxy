@@ -3306,6 +3306,15 @@ struct Docxy {
     /// The number the next new document's `Document<n>` title takes (#631):
     /// it only goes up, so a number is never reused in a session.
     next_document: u32,
+    /// The window is closing through its per-document questions (#630):
+    /// a close prompt with `quit` is on the tab being asked about.
+    quitting: bool,
+    /// The tabs answered Don't Save while quitting, by index: their unsaved
+    /// work is forgotten, but only once the quit goes ahead.
+    quit_discards: Vec<usize>,
+    /// A harness quit that went ahead (#630): the harness ends the process
+    /// after the reply, rather than the window removing itself under it.
+    quit_ready: bool,
     /// Minutes between AutoRecover writes while a tab is unsaved (#632); 0 is off.
     autorecover_minutes: u32,
     /// Keep a workbook's last AutoRecover copy as a draft when it is closed
@@ -8379,12 +8388,29 @@ fn hot_dir_in(root: &std::path::Path) -> PathBuf {
 /// after a tab close or reorder, the old session can pair `tab-N` with another
 /// tab's `path`. The AutoRecover tick never reorders, so it does not widen this.
 fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: Prefs) {
+    write_session_forgetting(root, tabs, active, prefs, &[]);
+}
+
+/// [`write_session`], with the unsaved work of the tabs at `forget` left out
+/// (#630): Don't Save on quit. Such a tab is kept as its file alone, so it
+/// reopens clean from disk.
+fn write_session_forgetting(
+    root: &std::path::Path,
+    tabs: &[DocTab],
+    active: usize,
+    prefs: Prefs,
+    forget: &[usize],
+) {
     let hd = hot_dir_in(root);
     let _ = std::fs::create_dir_all(&hd);
     let tabs = tabs
         .iter()
         .enumerate()
         .map(|(i, t)| {
+            if forget.contains(&i) {
+                *t.last_hot.borrow_mut() = None;
+                return forgotten(persist_tab_meta(t));
+            }
             let persisted = persist_tab(&hd, i, t);
             // Every tab is rewritten in this one call, so the path names this
             // tab's content even after a later close shifts the indices.
@@ -8964,11 +8990,30 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         Surface::Placeholder => None,
     };
     PersistTab {
+        hot,
+        ..persist_tab_meta(t)
+    }
+}
+
+/// A tab answered Don't Save on quit (#630): its file alone, clean, so the
+/// next launch reopens what is on disk.
+fn forgotten(p: PersistTab) -> PersistTab {
+    PersistTab {
+        hot: None,
+        dirty: false,
+        ..p
+    }
+}
+
+/// What the session keeps of tab `t` besides its live content: everything
+/// [`persist_tab`] writes but the sidecar.
+fn persist_tab_meta(t: &DocTab) -> PersistTab {
+    PersistTab {
         kind: t.kind,
         title: t.title.to_string(),
         path: t.path.as_ref().map(|p| p.display().to_string()),
         dirty: t.dirty,
-        hot,
+        hot: None,
         unreadable: match &t.surface {
             Surface::Project(v) => v.ed.project().package.unreadable.clone(),
             _ => Vec::new(),
@@ -9133,6 +9178,9 @@ impl Docxy {
             theme_pref,
             ask_on_close,
             next_document: 1,
+            quitting: false,
+            quit_discards: Vec::new(),
+            quit_ready: false,
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
             edit_opts: EditOptions::default(),
@@ -25919,7 +25967,7 @@ impl Docxy {
                         })),
                 )
                 .child(div().text_size(px(11.)).text_color(dim).child(
-                    "Off: closing the window is silent — your work is kept and reopened next launch. Closing a single tab with unsaved changes always asks.",
+                    "On: closing the window asks \u{201C}Save your changes to this file?\u{201D} for each unsaved document in turn; Don't Save leaves its file as it is. Off: closing the window is silent — your work is kept and reopened next launch. Closing a single tab with unsaved changes always asks.",
                 ))
                 // One button that cycles the interval, as simple as the
                 // toggle above; Word's File › Options › Save equivalent.
@@ -30758,44 +30806,21 @@ fn main() {
             }
             // Open any command-line files on top of the restored session.
             if !startup_files.is_empty() {
-                view.update(cx, move |this, cx| this.open_args(startup_files, cli_read_only, cx));
+                view.update(cx, move |this, cx| {
+                    this.open_args(startup_files, cli_read_only, cx)
+                });
             }
             // Hot-exit: capture the latest (possibly unsaved) content when the
             // window is closed, so a restart restores exactly what was open. By
-            // default closing is silent; with "ask before closing" on, confirm
-            // when there are unsaved tabs.
+            // default closing is silent; with "ask before closing" on, each
+            // unsaved document is asked about in turn (#630).
             let on_close = view.clone();
-            window.on_window_should_close(cx, move |_window, cx| {
+            window.on_window_should_close(cx, move |window, cx| {
                 on_close.update(cx, |this, cx| {
-                    close::commit_pending_for_exit(&mut this.tabs);
-                    // A cancelled close keeps the window: repaint the committed cell.
-                    cx.notify();
-                    this.persist();
-                    // ⚠️ Not in a harness instance — the same modal-loop trap as
-                    // `save_sheet_tab` describes, and here it would wedge the
-                    // shutdown the runner waits on after the `quit` verb.
-                    let close = if this.harness.is_none()
-                        && this.ask_on_close
-                        && this.tabs.iter().any(|t| t.dirty)
-                    {
-                        matches!(
-                            rfd::MessageDialog::new()
-                                .set_title("docxy")
-                                .set_description("You have unsaved changes.\n\nClose anyway? Your work is kept and reopened next launch.")
-                                .set_buttons(rfd::MessageButtons::YesNo)
-                                .show(),
-                            rfd::MessageDialogResult::Yes
-                        )
-                    } else {
-                        true
-                    };
-                    // Only an accepted close is a clean exit; a cancelled one
-                    // keeps running, marker and all. The persist above is the
-                    // final one, so only the marker is left.
-                    if close {
-                        this.mark_clean_exit();
-                    }
-                    close
+                    // Not asked in a harness instance: its `quit` must end the
+                    // run it waits on. Its `close-window` verb asks instead.
+                    let ask = this.harness.is_none();
+                    this.window_should_close(ask, window, cx)
                 })
             });
             // AutoRecover (#632): wake when the interval is up (and at least

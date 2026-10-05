@@ -2244,6 +2244,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "ribbon-click"
             | "title-tab"
             | "close-tab"
+            | "close-window"
             | "selection-set"
             | "open"
             | "backstage-close"
@@ -2632,6 +2633,23 @@ fn open_dialogs(app: &mut crate::Docxy) -> Result<&mut crate::dialog::DialogStac
 /// the handler under test was broken — the one way this harness could be worse
 /// than nothing.
 pub fn dispatch(
+    app: &mut crate::Docxy,
+    verb: &str,
+    args: &Json,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) -> Result<Done, String> {
+    let mut done = dispatch_verb(app, verb, args, window, cx)?;
+    // The window's close went ahead (#630): its last question was answered
+    // by this verb, or `close-window` found nothing to ask. The process ends
+    // once this reply is out, as after `quit`.
+    if app.quit_ready {
+        done.quit = true;
+    }
+    Ok(done)
+}
+
+fn dispatch_verb(
     app: &mut crate::Docxy,
     verb: &str,
     args: &Json,
@@ -3035,6 +3053,18 @@ pub fn dispatch(
         "backstage-close" => {
             app.refuse_under_dialog()?;
             app.backstage_close(window, cx);
+            Done::ok(state(app, window))
+        }
+        // The window's close button, as `on_window_should_close` runs it
+        // outside the harness (#630): with "ask before closing" on and work
+        // unsaved, Word's question for each unsaved tab, driven with
+        // `dialog-click`; otherwise, or once the last one is answered, a clean
+        // exit, and the process ends after the reply.
+        "close-window" => {
+            app.refuse_under_dialog()?;
+            if app.window_should_close(true, window, cx) {
+                app.quit_ready = true;
+            }
             Done::ok(state(app, window))
         }
         "ask-on-close" => {
@@ -4679,6 +4709,7 @@ mod tests {
             "ribbon-click",
             "title-tab",
             "close-tab",
+            "close-window",
             "selection-set",
             "open",
             "select-chart",

@@ -2037,3 +2037,81 @@ fn a_workbook_or_project_prompt_names_the_tab() {
         assert!(d.buttons[0].default);
     }
 }
+
+/// A file-backed document tab on a private copy of basic.docx, with `text`
+/// typed into it (unsaved).
+fn edited_copy(root: &Root, name: &str, text: &str) -> DocTab {
+    let path = root.0.join(name);
+    std::fs::copy(fixtures().join("basic.docx"), &path).unwrap();
+    let mut t = tab_from_path(&path);
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!("{}", t.status)
+    };
+    ed.insert_str(text);
+    t.dirty = true;
+    t
+}
+
+#[test]
+fn quitting_asks_each_unsaved_tab_once_in_order() {
+    let mut tabs = vec![
+        tab(Kind::Docx),
+        tab(Kind::Xlsx),
+        tab(Kind::Docx),
+        tab(Kind::Project),
+    ];
+    tabs[1].dirty = true;
+    tabs[3].dirty = true;
+    assert_eq!(next_to_ask(&tabs, &[]), Some(1));
+    // Answered Don't Save: the next one; a clean tab is never asked.
+    assert_eq!(next_to_ask(&tabs, &[1]), Some(3));
+    assert_eq!(next_to_ask(&tabs, &[1, 3]), None);
+    // Answered Save: it is clean now.
+    tabs[1].dirty = false;
+    assert_eq!(next_to_ask(&tabs, &[]), Some(3));
+}
+
+#[test]
+fn dont_save_on_quit_drops_a_never_saved_tab_and_forgets_a_files_edits() {
+    let root = Root::new("quit-forget");
+    let mut tabs = vec![
+        untitled("Document1", "never saved\n"),
+        edited_copy(&root, "kept.docx", "QuitKeptMarker"),
+        edited_copy(&root, "forgotten.docx", "QuitForgottenMarker"),
+        untitled("Document2", "also never saved\n"),
+    ];
+    let before = std::fs::read(root.0.join("forgotten.docx")).unwrap();
+    let mut active = 2;
+    let forget = forget_on_quit(&mut tabs, &mut active, vec![0, 2, 3]);
+    let titles: Vec<&str> = tabs.iter().map(|t| t.title.as_ref()).collect();
+    assert_eq!(titles, ["kept.docx", "forgotten.docx"]);
+    assert_eq!(forget, [1]);
+    assert_eq!(active, 1);
+
+    write_session_forgetting(&root.0, &tabs, active, prefs(), &forget);
+    let session = root.session();
+    assert!(session.tabs[0].dirty);
+    assert!(
+        session.tabs[0].hot.is_some(),
+        "an unanswered tab keeps its work"
+    );
+    assert!(!session.tabs[1].dirty);
+    assert!(session.tabs[1].hot.is_none());
+    assert!(tabs[1].last_hot.borrow().is_none());
+
+    // The next launch reopens the file as it is on disk, and the file was
+    // never written.
+    let restored = restore_session(
+        &session,
+        false,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    );
+    assert!(doc_text(&restored[0]).contains("QuitKeptMarker"));
+    assert!(!restored[1].dirty);
+    assert!(!doc_text(&restored[1]).contains("QuitForgottenMarker"));
+    assert_eq!(
+        std::fs::read(root.0.join("forgotten.docx")).unwrap(),
+        before
+    );
+}

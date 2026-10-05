@@ -631,23 +631,153 @@ impl Docxy {
         Ok(())
     }
 
-    /// Tab `i`'s close prompt was answered (and closed): close the tab as
-    /// answered. A Save has already saved it, so it closes clean.
+    /// Tab `i`'s close prompt was answered (and closed). A tab's own close
+    /// closes it as answered; a Save has already saved it, so it closes
+    /// clean. While quitting (#630), Cancel stops the quit, and the other
+    /// answers go on to the next unsaved tab.
     fn close_prompt_answered(
         &mut self,
         i: usize,
         answer: CloseAnswer,
-        _quit: bool,
+        quit: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match answer {
-            CloseAnswer::Cancel => {}
-            CloseAnswer::Save | CloseAnswer::Discard => {
+        match (answer, quit) {
+            (CloseAnswer::Cancel, false) => {}
+            (CloseAnswer::Save | CloseAnswer::Discard, false) => {
                 self.close_tab_with(i, Some(answer), window, cx);
+            }
+            (CloseAnswer::Cancel, true) => self.quit_cancelled(),
+            (CloseAnswer::Save, true) => self.next_quit_prompt(window, cx),
+            (CloseAnswer::Discard, true) => {
+                self.quit_discards.push(i);
+                self.next_quit_prompt(window, cx);
             }
         }
     }
+
+    /// The window's close (its X, Alt+F4, the harness `close-window`): fold
+    /// every pending edit into the session and persist it. With `ask` and
+    /// "Ask before closing the window" on and something unsaved, ask about
+    /// each unsaved tab in turn instead (#630): `false` now, and the window
+    /// goes when the last one is answered. Otherwise it is a clean exit
+    /// (hot exit keeps the unsaved work), and `true`.
+    pub(crate) fn window_should_close(
+        &mut self,
+        ask: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // A cancelled close keeps the window: repaint the committed cell.
+        cx.notify();
+        if self.quitting {
+            // Already asking: the X again changes nothing.
+            return false;
+        }
+        commit_pending_for_exit(&mut self.tabs);
+        self.persist();
+        if !(ask && self.ask_on_close && self.tabs.iter().any(|t| t.dirty)) {
+            // The persist above is the final one, so only the marker is left.
+            self.mark_clean_exit();
+            return true;
+        }
+        self.quitting = true;
+        self.quit_discards.clear();
+        self.next_quit_prompt(window, cx);
+        false
+    }
+
+    /// Ask about the next unsaved tab, in tab order, or go when none is left.
+    fn next_quit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next = next_to_ask(&self.tabs, &self.quit_discards);
+        match next {
+            None => self.finish_quit(window),
+            Some(i) if self.tabs[i].dialogs.is_open() => {
+                self.quit_cancelled();
+                self.refuse_close_under_dialog(i, window, cx);
+            }
+            Some(i) => {
+                if self.active != i {
+                    self.active = i;
+                    self.drop_grid_state();
+                }
+                let prompt = close_prompt(
+                    &self.tabs[i],
+                    true,
+                    &known_locations(self.harness.is_some()),
+                );
+                self.tabs[i].dialogs.push(prompt);
+                self.refocus(window, cx);
+            }
+        }
+    }
+
+    /// Cancel while quitting: the window stays. Tabs already saved stay
+    /// saved; those answered Don't Save keep their unsaved work.
+    fn quit_cancelled(&mut self) {
+        self.quitting = false;
+        self.quit_discards.clear();
+    }
+
+    /// Every unsaved tab is answered: keep the drafts of workbooks answered
+    /// Don't Save (#613), drop never-saved tabs answered so, persist the
+    /// others as their files alone, and go as a clean exit.
+    fn finish_quit(&mut self, window: &mut Window) {
+        let root = config_root();
+        let now = std::time::SystemTime::now();
+        for &i in &self.quit_discards {
+            // Nowhere left to report one that could not be kept: the user
+            // chose to discard, as with a tab's own Don't Save.
+            let _ = keep_closed_draft(
+                &root,
+                &self.tabs[i],
+                &CloseStep::Discard,
+                self.autorecover_minutes,
+                self.keep_drafts,
+                now,
+            );
+        }
+        let forget = forget_on_quit(
+            &mut self.tabs,
+            &mut self.active,
+            std::mem::take(&mut self.quit_discards),
+        );
+        write_session_forgetting(&root, &self.tabs, self.active, self.prefs(), &forget);
+        self.last_persist.set(std::time::Instant::now());
+        self.mark_clean_exit();
+        self.quitting = false;
+        if self.harness.is_some() {
+            // The harness ends the process once its reply is out.
+            self.quit_ready = true;
+        } else {
+            window.remove_window();
+        }
+    }
+}
+
+/// The next tab the window's close asks about: the first unsaved one not
+/// already answered Don't Save (`discarded`).
+fn next_to_ask(tabs: &[DocTab], discarded: &[usize]) -> Option<usize> {
+    (0..tabs.len()).find(|&i| tabs[i].dirty && !discarded.contains(&i))
+}
+
+/// Apply the quit's Don't Save answers (`discarded`, by index) to `tabs`: a
+/// never-saved tab goes, and the indexes of the file-backed ones, whose
+/// unsaved work the session forgets, are returned as they are after that.
+fn forget_on_quit(tabs: &mut Vec<DocTab>, active: &mut usize, discarded: Vec<usize>) -> Vec<usize> {
+    let mut forget: Vec<bool> = (0..tabs.len()).map(|i| discarded.contains(&i)).collect();
+    for i in (0..tabs.len()).rev() {
+        if forget[i] && tabs[i].path.is_none() {
+            remove_tab(tabs, active, i);
+            forget.remove(i);
+        }
+    }
+    forget
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| f.then_some(i))
+        .collect()
 }
 
 #[cfg(test)]
