@@ -85,3 +85,63 @@ test one selection at a time
   assert chart_sel is 0
   key escape
   assert chart_sel is nothing
+
+# ---------------------------------------------------------------------------
+# #670: multi-area selections and dragging cells by the selection's border.
+# ---------------------------------------------------------------------------
+test ctrl+click adds areas and shift extends only the active one
+  open ../fixtures/basic.xlsx
+  click A1
+  click C3 ctrl
+  assert areas.0 is A1
+  assert areas.1 is C3
+  click D5 shift
+  assert areas.1 is C3:D5
+  drag F1 -> F2 ctrl
+  assert areas.2 is F1:F2
+  click B2
+  assert areas.1 is nothing
+
+test delete clears every area and a multi-area cut is refused
+  open ../fixtures/basic.xlsx
+  click B2
+  click B4 ctrl
+  key delete
+  assert cell B2 is nothing
+  assert cell B4 is nothing
+  assert cell B3 is 20
+  key ctrl+x
+  assert status is This action won't work on multiple selections.
+
+test a multi-area copy needs shared rows or columns
+  open ../fixtures/basic.xlsx
+  click A2
+  click A3 shift
+  click C2 ctrl
+  click C3 shift
+  key ctrl+c
+  click J2
+  key ctrl+v
+  assert cell J2 is North
+  assert cell K2 is 14
+  click A2
+  click C4 ctrl
+  key ctrl+c
+  assert status is This action won't work on multiple selections.
+
+test dragging the selection by its border moves it and ctrl copies
+  open ../fixtures/basic.xlsx
+  call border-drag {"from":"B2:B3","to":"J2"}
+  assert cell J2 is 10
+  assert cell B2 is nothing
+  key ctrl+z
+  assert cell B2 is 10
+  call border-drag {"from":"B2","to":"J3","ctrl":true}
+  assert cell J3 is 10
+  assert cell B2 is 10
+  call border-drag {"from":"B2","to":"A2"}
+  assert dialog is drop-replace
+  call dialog-click {"button":"Cancel"}
+  assert cell A2 is North
+  call border-drag {"from":"C2","to":"K5","right":true,"choice":"Copy Here as Values Only"}
+  assert cell K5 is 14

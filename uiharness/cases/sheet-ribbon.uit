@@ -39,9 +39,26 @@ test sheet ribbon click selects the tab and reads a toggle's current label
   call ribbon-read {}
   assert reply.tabs.4.groups.0.commands.0.label is Freeze Panes
 
-test sheet ribbon refuses a placeholder, a missing command and a split menu
+test sheet ribbon refuses a placeholder, a missing command and a command with no menu
   open ../fixtures/basic.xlsx
   call-error ribbon-click {"tab":"Review","command":"Spelling"} => 'Spelling' is not implemented
   call-error ribbon-click {"tab":"Home","command":"Spelling"} => command 'Spelling' is not on tab 'Home'
   call-error ribbon-click {"tab":"Table","command":"Bold"} => 'Table' is not a ribbon tab
-  call-error menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}} => the sheet ribbon has no split buttons
+  call-error menu-open {"target":{"ribbon":["Home","Font","Bold"]}} => sheet command 'Bold' opens no menu
+
+# #707: Paste is a split button; Fill, Clear and Find & Select open menus.
+test sheet ribbon menus open through menu-open and the button's own click
+  open ../fixtures/basic.xlsx
+  call menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}}
+  assert reply.open is true
+  assert reply.items.0.label is Paste
+  call menu-close {}
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-read {}
+  assert reply.items.2.label is Up
+  call menu-close {}
+  call menu-open {"target":{"ribbon":["Home","Editing","Clear"]}}
+  assert reply.items.0.label is Clear All
+  call menu-close {}
+  call menu-open {"target":{"ribbon":["Home","Editing","Find & Select"]}}
+  assert reply.items.1.label is Go To Special…

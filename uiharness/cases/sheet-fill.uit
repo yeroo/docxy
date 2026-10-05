@@ -48,10 +48,114 @@ test fill-drag refuses while the handle is not drawn
   assert reply.filled is B4:B6
   assert cell B6 is 50
 
-test fill-drag refuses a protected sheet and AutoFill Options
+test fill-drag refuses a protected sheet and an unknown option
   open ../fixtures/basic.xlsx
+  call-error fill-drag {"from":"B2:B3","to":"B6","option":"sideways"} => no Auto Fill Options kind 'sideways'
   call ribbon-click {"tab":"Review","command":"Protect Sheet"}
   call-error fill-drag {"from":"B2:B3","to":"B6"} => the fill did not arm: the sheet is protected
   assert cell B6 is nothing
   assert filling is false
-  call-error fill-drag {"to":"B6","option":"copy"} => AutoFill Options are not implemented in this app
+  call-error fill-drag {"to":"B6","option":"copy"} => the fill did not arm: the sheet is protected
+
+# ---------------------------------------------------------------------------
+# #668: AutoFill and series like Excel's. Each case works in J:Q, clear of the
+# fixture's data (A1:C5) and its chart.
+# ---------------------------------------------------------------------------
+test fill-drag counts text and fits a trend (#668's reproduction)
+  open ../fixtures/basic.xlsx
+  click J1
+  type Item 1
+  key enter
+  call fill-drag {"from":"J1","to":"J4"}
+  assert reply.filled is J1:J4
+  assert cell J2 is Item 2
+  assert cell J4 is Item 4
+  assert fill_options is Auto Fill
+  click K1
+  type 1
+  key enter
+  type 2
+  key enter
+  type 4
+  key enter
+  call fill-drag {"from":"K1:K3","to":"K5"}
+  call cell {"cell":"K4"}
+  assert reply.value is 5.33333333333333
+  call cell {"cell":"K5"}
+  assert reply.value is 6.83333333333333
+
+test the Auto Fill Options button and Ctrl swap copy and series
+  open ../fixtures/basic.xlsx
+  click L1
+  type Q3
+  key enter
+  call fill-drag {"from":"L1","to":"L3","option":"copy"}
+  assert cell L3 is Q3
+  assert fill_options is Copy Cells
+  call menu-open {"target":{"grid":"fill-options"}}
+  call menu-click {"label":"Fill Series"}
+  assert cell L2 is Q4
+  assert cell L3 is Q1
+  key ctrl+z
+  assert cell L2 is nothing
+  click M1
+  type 7
+  key enter
+  call fill-drag {"from":"M1","to":"M3","ctrl":true}
+  assert cell M3 is 9
+
+test a right-drag of the handle asks how to fill
+  open ../fixtures/basic.xlsx
+  click N1
+  type Mon
+  key enter
+  call fill-drag {"from":"N1","to":"N3","right":true}
+  assert reply.open is true
+  assert reply.target.grid is fill-drop
+  call menu-click {"label":"Fill Series"}
+  assert cell N2 is Tue
+  assert cell N3 is Wed
+
+test fill up, drag back to clear, and a double-click on the handle
+  open ../fixtures/basic.xlsx
+  click O5
+  type 3
+  key enter
+  type 4
+  key enter
+  call fill-drag {"from":"O5:O6","to":"O3"}
+  assert reply.filled is O3:O6
+  assert cell O3 is 1
+  call fill-drag {"from":"O3:O6","to":"O4"}
+  assert cell O5 is nothing
+  assert range is O3:O4
+  click D2
+  type x
+  key enter
+  call fill-drag {"from":"D2","double":true}
+  assert reply.filled is D2:D5
+  assert cell D5 is x
+
+test Home Fill Up, Series and Justify
+  open ../fixtures/basic.xlsx
+  click P3
+  type 5
+  key enter
+  click P1
+  click P3 shift
+  call menu-open {"target":{"ribbon":["Home","Editing","Fill"]}}
+  call menu-click {"label":"Up"}
+  assert cell P1 is 5
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-set {"control":"step","value":"2"}
+  call dialog-set {"control":"stop","value":"7"}
+  call dialog-click {"button":"OK"}
+  assert cell Q4 is 7
+  assert cell Q5 is nothing
