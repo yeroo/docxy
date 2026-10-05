@@ -35,8 +35,10 @@
 //! | `range.set` | `{start,rows:[[string]],sheet?}` | `{set}` — atomic, one undo group |
 //! | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a new sheet; fields convert as a `.csv` open does (`sep=`, typed-entry rules, File › Options › Data) |
 //! | `sheet.import-text` | `{text\|path,options?,name?}` | `{sheet,name,rows,cols}` — the Text Import Wizard's options (see `text_options`) into a new sheet |
-//! | `app.options` | `{convert_leading_zeros?,convert_long_numbers?,convert_e_notation?,convert_dates?,edit_fixed_decimal?,edit_fixed_decimal_places?,edit_move_after_enter?,edit_move_direction?,edit_in_cell?,edit_autocomplete?}` | all of them — File › Options › Data › Automatic Data Conversion and Advanced › Editing (places -300..=300, direction `down`/`right`/`up`/`left`); every given key is checked before any is set |
+//! | `app.options` | `{convert_leading_zeros?,convert_long_numbers?,convert_e_notation?,convert_dates?,edit_fixed_decimal?,edit_fixed_decimal_places?,edit_move_after_enter?,edit_move_direction?,edit_in_cell?,edit_autocomplete?,edit_formula_autocomplete?}` | all of them — File › Options › Data › Automatic Data Conversion and Advanced › Editing (places -300..=300, direction `down`/`right`/`up`/`left`); every given key is checked before any is set |
 //! | `range.text-to-columns` | `{range,options?,dest?,replace?,sheet?}` | `{rows}` — one column; refuses with "Do you want to replace the contents of the destination cells?" unless `replace:true`; one undo step |
+//! | `range.flash-fill` | `{ref,sheet?}` | `{changed:[ref], blank:[ref]}` — Data › Flash Fill (Ctrl+E) on the column of `ref`: the examples at the top of the column, the non-empty columns next to it as sources, down to their last row; cells holding values are kept; results are typed like entries (text when the examples were typed with `'`); one undo step. No pattern errors with "Flash Fill didn't see a pattern…"; a protected sheet is refused |
+//! | `app.autocorrect` | `{options?:{ac_*:bool}, add?:{replace,with,overwrite?}, delete?, exception?:{kind:first_letter\|initial_caps, add?\|delete?}}` | `{options, entries:[{replace,with}], exceptions:{first_letter, initial_caps}}` — File › Options › Proofing › AutoCorrect: switches, the replace list (re-adding a word with another With needs `overwrite:true`, as the dialog asks) and the exceptions; everything given is checked before anything is set; saved with the app's preferences on exit |
 //! | `wb.consolidate` | `{refs,dest?,fn?,top?,left?,links?}` | `{sheet,range}` — Data › Consolidate: `refs` like `East!A1:C4` (a bare range is on the destination's sheet); `dest` a cell, `Sheet!B2` or `B2` (default: the cursor on the active sheet); `fn` a dialog name or file token (`Sum` default, `Count Numbers`/`countNums`, …); `top`/`left` match by labels; `links` writes linked formulas in an outline (refused for a source on the destination sheet). A refusal changes nothing. One undo step |
 //! | `wb.replace-all` | `{query,text}` | `{replaced}` — every sheet, one undo group |
 //! | `sheet.add` | `{name?}` | `{sheet,name}` |
@@ -122,6 +124,7 @@ fn edits(verb: &str) -> bool {
             | "sheet.import-csv"
             | "sheet.import-text"
             | "range.text-to-columns"
+            | "range.flash-fill"
             | "wb.replace-all"
             | "wb.consolidate"
             | "sheet.add"
@@ -176,6 +179,7 @@ pub fn keeps_cells_in_place(verb: &str) -> bool {
             | "col.width"
             | "comment.add"
             | "wb.replace-all"
+            | "range.flash-fill"
             | "sheet.add"
             | "table.rename"
     )
@@ -207,6 +211,8 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "sheet.import-text" => sheet_import_text(app, args),
         "range.text-to-columns" => range_text_to_columns(app, args),
         "app.options" => app_options(app, args),
+        "app.autocorrect" => app_autocorrect(app, args),
+        "range.flash-fill" => range_flash_fill(app, args),
         "wb.replace-all" => wb_replace_all(app, args),
         "wb.consolidate" => wb_consolidate(app, args),
         "sheet.add" => sheet_add(app, args),
@@ -1260,11 +1266,12 @@ fn text_options(
 fn app_options(app: &mut App, args: &Json) -> Result<Json, String> {
     use gridcore::options::{self as o, EnterMove};
     const CONVERT: [&str; 4] = crate::CONVERT_KEYS;
-    const EDIT_FLAGS: [&str; 4] = [
+    const EDIT_FLAGS: [&str; 5] = [
         o::KEY_FIXED_DECIMAL,
         o::KEY_MOVE_AFTER_ENTER,
         o::KEY_EDIT_IN_CELL,
         o::KEY_AUTOCOMPLETE,
+        o::KEY_FORMULA_AUTOCOMPLETE,
     ];
     let given = |key: &str| args.get(key).filter(|v| **v != Json::Null);
     let flag = |key: &str| match given(key) {
@@ -1277,7 +1284,7 @@ fn app_options(app: &mut App, args: &Json) -> Result<Json, String> {
     for (slot, key) in convert.iter_mut().zip(CONVERT) {
         *slot = flag(key)?;
     }
-    let mut edit = [None; 4];
+    let mut edit = [None; 5];
     for (slot, key) in edit.iter_mut().zip(EDIT_FLAGS) {
         *slot = flag(key)?;
     }
@@ -1323,11 +1330,12 @@ fn app_options(app: &mut App, args: &Json) -> Result<Json, String> {
         out.push((key, Json::Bool(*slot)));
     }
     let e = &mut app.edit_opts;
-    let fields: [&mut bool; 4] = [
+    let fields: [&mut bool; 5] = [
         &mut e.fixed_decimal,
         &mut e.move_after_enter,
         &mut e.edit_in_cell,
         &mut e.autocomplete,
+        &mut e.formula_autocomplete,
     ];
     for ((key, slot), want) in EDIT_FLAGS.into_iter().zip(fields).zip(edit) {
         if let Some(b) = want {
@@ -1347,6 +1355,131 @@ fn app_options(app: &mut App, args: &Json) -> Result<Json, String> {
         Json::Str(e.enter_move.label().to_ascii_lowercase()),
     ));
     Ok(Json::obj(out))
+}
+
+/// Data › Flash Fill (Ctrl+E, #666) on the column of `ref`: the examples
+/// typed at the top of the column against the columns next to it, as one
+/// undo step. The reply names the cells filled (`changed`) and those the
+/// pattern could not fill (`blank`); no pattern is an error with Excel's
+/// message, and a protected sheet is refused.
+fn range_flash_fill(app: &mut App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let (r, c) = ref_arg(args)?;
+    if app.pkg.workbook.sheets[si].is_protected() {
+        return Err("range.flash-fill: the sheet is protected".into());
+    }
+    let f = app
+        .flash_fill_on(si, r, c)
+        .map_err(|e| format!("range.flash-fill: {e}"))?;
+    let refs = |rows: Vec<u32>| {
+        Json::Arr(
+            rows.into_iter()
+                .map(|r| Json::Str(cell_name(r, f.col)))
+                .collect(),
+        )
+    };
+    Ok(Json::obj(vec![
+        ("changed", refs(f.changed())),
+        ("blank", refs(f.blank.clone())),
+    ]))
+}
+
+/// File › Options › Proofing › AutoCorrect Options (#667): read the
+/// AutoCorrect state, or change it. `options` sets switches by key
+/// (`ac_replace_text`, `ac_hyperlinks`, …); `delete` removes an entry;
+/// `add: {replace, with, overwrite?}` adds one, refusing to replace an
+/// existing entry unless `overwrite` (the dialog asks first);
+/// `exception: {kind: first_letter|initial_caps, add?|delete?}` edits an
+/// exceptions list. Everything is checked before anything is set. The reply
+/// is the whole state; it is saved with the app's preferences on exit.
+fn app_autocorrect(app: &mut App, args: &Json) -> Result<Json, String> {
+    use gridcore::autocorrect::{ExceptionKind, SWITCHES};
+    let given = |key: &str| args.get(key).filter(|v| **v != Json::Null);
+    let mut ac = app.autocorrect.clone();
+    if let Some(opts) = given("options") {
+        let Json::Obj(pairs) = opts else {
+            return Err("'options' must be an object of switches".into());
+        };
+        for (k, v) in pairs {
+            let Some(slot) = ac.opts.slot(k) else {
+                let keys: Vec<&str> = SWITCHES.iter().map(|(k, _, _)| *k).collect();
+                return Err(format!(
+                    "unknown AutoCorrect option '{k}' ({})",
+                    keys.join(", ")
+                ));
+            };
+            *slot = v
+                .as_bool()
+                .ok_or_else(|| format!("'{k}' must be true or false"))?;
+        }
+    }
+    if let Some(d) = given("delete") {
+        let word = d.as_str().ok_or("'delete' must be the Replace text")?;
+        if !ac.delete(word) {
+            return Err(format!("'{word}' is not in the AutoCorrect list"));
+        }
+    }
+    if let Some(add) = given("add") {
+        let replace = add.get_str("replace").ok_or("'add' needs 'replace'")?;
+        let with = add.get_str("with").ok_or("'add' needs 'with'")?;
+        let overwrite = add
+            .get("overwrite")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        if let Some(old) = ac.lookup(replace).filter(|old| *old != with) {
+            if !overwrite {
+                return Err(format!(
+                    "'{replace}' is already in the list (as '{old}'); pass overwrite:true to \
+                     replace it"
+                ));
+            }
+        }
+        ac.add(replace, with).map_err(|e| e.to_string())?;
+    }
+    if let Some(ex) = given("exception") {
+        let kind = ex
+            .get_str("kind")
+            .and_then(ExceptionKind::from_name)
+            .ok_or("'exception' needs a 'kind': first_letter or initial_caps")?;
+        match (ex.get_str("add"), ex.get_str("delete")) {
+            (Some(w), None) => {
+                ac.add_exception(kind, w).map_err(|e| e.to_string())?;
+            }
+            (None, Some(w)) => {
+                if !ac.delete_exception(kind, w) {
+                    return Err(format!("'{w}' is not a {} exception", kind.name()));
+                }
+            }
+            _ => return Err("'exception' takes one of 'add' or 'delete'".into()),
+        }
+    }
+    app.autocorrect = ac;
+    Ok(autocorrect_json(&app.autocorrect))
+}
+
+fn autocorrect_json(ac: &gridcore::autocorrect::AutoCorrect) -> Json {
+    use gridcore::autocorrect::{ExceptionKind, SWITCHES};
+    let options = SWITCHES
+        .iter()
+        .map(|(k, _, _)| (*k, Json::Bool(ac.opts.get(k).unwrap_or(false))))
+        .collect();
+    let entries = ac
+        .entries()
+        .into_iter()
+        .map(|(r, w)| Json::obj(vec![("replace", Json::Str(r)), ("with", Json::Str(w))]))
+        .collect();
+    let list = |kind| Json::Arr(ac.exceptions(kind).into_iter().map(Json::Str).collect());
+    Json::obj(vec![
+        ("options", Json::obj(options)),
+        ("entries", Json::Arr(entries)),
+        (
+            "exceptions",
+            Json::obj(vec![
+                ("first_letter", list(ExceptionKind::FirstLetter)),
+                ("initial_caps", list(ExceptionKind::InitialCaps)),
+            ]),
+        ),
+    ])
 }
 
 /// The Text Import Wizard without the dialog: `text` (or the file at
@@ -2662,7 +2795,7 @@ mod tests {
             cursor: 3,
             replace: false,
             seed: None,
-            proposal: None,
+            ..Default::default()
         });
         assert!(a.commit_edit());
         assert_eq!(get(&mut a, "A1").get_str("value"), Some("=1+"));
@@ -3645,6 +3778,134 @@ mod tests {
             assert!(dispatch(&mut a, "app.options", &args).is_err());
             assert!(a.edit_opts.fixed_decimal, "a refused call sets nothing");
         }
+    }
+
+    /// #686: `app.options` reads and sets Formula AutoComplete.
+    #[test]
+    fn app_options_set_formula_autocomplete() {
+        let mut a = app();
+        let all = dispatch(&mut a, "app.options", &Json::Null).unwrap();
+        assert_eq!(
+            all.get("edit_formula_autocomplete"),
+            Some(&Json::Bool(true))
+        );
+        let off = Json::obj(vec![("edit_formula_autocomplete", Json::Bool(false))]);
+        dispatch(&mut a, "app.options", &off).unwrap();
+        assert!(!a.edit_opts.formula_autocomplete);
+    }
+
+    /// #666: `range.flash-fill` fills like Ctrl+E and names what it did.
+    #[test]
+    fn range_flash_fill_fills_and_reports() {
+        let mut a = app();
+        for (r, t) in ["Ada Lovelace", "Alan Turing", "Grace Hopper"]
+            .iter()
+            .enumerate()
+        {
+            set(&mut a, &format!("A{}", r + 1), t);
+        }
+        set(&mut a, "B1", "Ada");
+        let args = Json::obj(vec![("ref", Json::Str("B1".into()))]);
+        let r = dispatch(&mut a, "range.flash-fill", &args).unwrap();
+        assert_eq!(r.get("changed").unwrap().to_string(), r#"["B2","B3"]"#);
+        assert_eq!(r.get("blank").unwrap().to_string(), "[]");
+        assert_eq!(get(&mut a, "B3").get_str("value"), Some("Grace"));
+        assert!(mutates("range.flash-fill") && keeps_cells_in_place("range.flash-fill"));
+        // Nothing left to fill, no pattern, a protected sheet: errors.
+        assert!(dispatch(&mut a, "range.flash-fill", &args).is_err());
+        set(&mut a, "C1", "zzz");
+        let c1 = Json::obj(vec![("ref", Json::Str("C1".into()))]);
+        let err = dispatch(&mut a, "range.flash-fill", &c1).unwrap_err();
+        assert!(err.contains("didn't see a pattern"), "{err}");
+        a.pkg.workbook.sheets[0].set_protected(true);
+        let err = dispatch(&mut a, "range.flash-fill", &c1).unwrap_err();
+        assert!(err.contains("protected"), "{err}");
+    }
+
+    /// #667, ENT-CASE-056: `app.autocorrect` adds, replaces (only when told
+    /// to), deletes, edits exceptions and switches, all or nothing.
+    #[test]
+    fn app_autocorrect_edits_the_list_exceptions_and_switches() {
+        let mut a = app();
+        let state = dispatch(&mut a, "app.autocorrect", &Json::Null).unwrap();
+        assert_eq!(
+            state.get("options").unwrap().get("ac_replace_text"),
+            Some(&Json::Bool(true))
+        );
+        let entries = state.get("entries").unwrap().to_string();
+        assert!(
+            entries.contains(r#"{"replace":"teh","with":"the"}"#),
+            "{entries}"
+        );
+        let add = |with: &str, overwrite: bool| {
+            Json::obj(vec![(
+                "add",
+                Json::obj(vec![
+                    ("replace", Json::Str("cdp".into())),
+                    ("with", Json::Str(with.into())),
+                    ("overwrite", Json::Bool(overwrite)),
+                ]),
+            )])
+        };
+        dispatch(
+            &mut a,
+            "app.autocorrect",
+            &add("Consolidated Data Processing", false),
+        )
+        .unwrap();
+        assert_eq!(
+            a.autocorrect.lookup("cdp"),
+            Some("Consolidated Data Processing")
+        );
+        let err = dispatch(&mut a, "app.autocorrect", &add("Other", false)).unwrap_err();
+        assert!(err.contains("overwrite"), "{err}");
+        assert_eq!(
+            a.autocorrect.lookup("cdp"),
+            Some("Consolidated Data Processing")
+        );
+        dispatch(&mut a, "app.autocorrect", &add("Other", true)).unwrap();
+        assert_eq!(a.autocorrect.lookup("cdp"), Some("Other"));
+        let del = Json::obj(vec![("delete", Json::Str("cdp".into()))]);
+        dispatch(&mut a, "app.autocorrect", &del).unwrap();
+        assert_eq!(a.autocorrect.lookup("cdp"), None);
+        assert!(dispatch(&mut a, "app.autocorrect", &del).is_err());
+        let exc = Json::obj(vec![(
+            "exception",
+            Json::obj(vec![
+                ("kind", Json::Str("initial_caps".into())),
+                ("add", Json::Str("ABc".into())),
+            ]),
+        )]);
+        let r = dispatch(&mut a, "app.autocorrect", &exc).unwrap();
+        assert_eq!(
+            r.get("exceptions")
+                .unwrap()
+                .get("initial_caps")
+                .unwrap()
+                .to_string(),
+            r#"["ABc"]"#
+        );
+        // A bad key refuses the whole call.
+        let bad = Json::obj(vec![
+            (
+                "options",
+                Json::obj(vec![("ac_hyperlinks", Json::Bool(false))]),
+            ),
+            ("delete", Json::Str("nope".into())),
+        ]);
+        assert!(dispatch(&mut a, "app.autocorrect", &bad).is_err());
+        assert!(a.autocorrect.opts.hyperlinks, "nothing was set");
+        let unknown = Json::obj(vec![(
+            "options",
+            Json::obj(vec![("ac_x", Json::Bool(true))]),
+        )]);
+        assert!(dispatch(&mut a, "app.autocorrect", &unknown).is_err());
+        let off = Json::obj(vec![(
+            "options",
+            Json::obj(vec![("ac_hyperlinks", Json::Bool(false))]),
+        )]);
+        dispatch(&mut a, "app.autocorrect", &off).unwrap();
+        assert!(!a.autocorrect.opts.hyperlinks);
     }
 
     /// #672: automation never shifts a number, whatever the user's fixed

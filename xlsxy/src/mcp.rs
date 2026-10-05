@@ -75,6 +75,8 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "xlsxy_page_break_reset" => "page-break.reset",
         "xlsxy_print_pages" => "print.pages",
         "xlsxy_export_pdf" => "wb.export-pdf",
+        "xlsxy_flash_fill" => "range.flash-fill",
+        "xlsxy_autocorrect" => "app.autocorrect",
         _ => return None,
     })
 }
@@ -936,6 +938,63 @@ fn tool_defs() -> Json {
             ],
             &["path"],
         ),
+        tool(
+            "xlsxy_flash_fill",
+            "Flash Fill (Ctrl+E): fill the rest of the column of `ref` from the examples typed at its top, by the pattern they show in the columns next to it. One undo group; cells that already hold values are kept. Returns the cells filled (changed) and those the pattern could not fill (blank); no pattern is an error with Excel's message.",
+            vec![
+                (
+                    "ref",
+                    prop("string", "A cell of the column to fill, e.g. \"B1\"."),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["ref"],
+        ),
+        tool(
+            "xlsxy_autocorrect",
+            "Read or change AutoCorrect (File > Options > Proofing): its switches, replace list and exceptions. With no arguments, returns the state. Everything given is checked before anything is set; saved with the app's preferences.",
+            vec![
+                (
+                    "options",
+                    prop(
+                        "object",
+                        "Switches by key, e.g. {\"ac_replace_text\": false, \"ac_hyperlinks\": false}.",
+                    ),
+                ),
+                (
+                    "add",
+                    prop_obj(
+                        vec![
+                            ("replace", prop("string", "The word to replace.")),
+                            ("with", prop("string", "What replaces it.")),
+                            (
+                                "overwrite",
+                                prop("boolean", "Replace an existing entry for the word."),
+                            ),
+                        ],
+                        &["replace", "with"],
+                        "Add a replace-list entry. An existing entry with another With is replaced only with overwrite:true.",
+                    ),
+                ),
+                (
+                    "delete",
+                    prop(
+                        "string",
+                        "Remove the replace-list entry for this Replace text.",
+                    ),
+                ),
+                (
+                    "exception",
+                    prop(
+                        "object",
+                        "Add or delete an exception: {kind: first_letter|initial_caps, add: word} or {kind, delete: word}.",
+                    ),
+                ),
+                target(),
+            ],
+            &[],
+        ),
     ])
 }
 
@@ -1055,12 +1114,15 @@ mod tests {
             "xlsxy_page_break_reset",
             "xlsxy_print_pages",
             "xlsxy_export_pdf",
+            // #712: Flash Fill and AutoCorrect.
+            "xlsxy_flash_fill",
+            "xlsxy_autocorrect",
         ];
         let save_pos = names.iter().position(|n| *n == "xlsxy_save").unwrap();
         assert_eq!(
             &names[save_pos + 1..],
             &expected_tail,
-            "wave-1/wave-2/wave-3/#600/#612 tools must be appended right after xlsxy_save, in this order"
+            "wave-1/wave-2/wave-3/#600/#612/#712 tools must be appended right after xlsxy_save, in this order"
         );
         for t in tools {
             assert_eq!(
@@ -1316,6 +1378,8 @@ mod tests {
         ("xlsxy_page_break_reset", "page-break.reset"),
         ("xlsxy_print_pages", "print.pages"),
         ("xlsxy_export_pdf", "wb.export-pdf"),
+        ("xlsxy_flash_fill", "range.flash-fill"),
+        ("xlsxy_autocorrect", "app.autocorrect"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.
