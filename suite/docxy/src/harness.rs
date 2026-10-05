@@ -2140,6 +2140,9 @@ fn menu_open(
             }
             Ok(())
         }
+        // The Flash Fill Options button's menu (#666): there is one only
+        // while the last fill stands.
+        Json::Str(name) if name == "flash-fill" => app.open_flash_menu(cx),
         Json::Str(name) if name == "document" => {
             if app.active_is_project() {
                 return Err(
@@ -2230,7 +2233,7 @@ fn menu_open(
                 app.open_split_menu(id, at, cx)
             }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, cell, pick-list, row and ribbon are)"
+                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, row and ribbon are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
@@ -2580,6 +2583,32 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ("range", Json::Str(a1_range(v.range()))),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
+            // Flash Fill's greyed preview (#666): the range it covers and the
+            // values Enter would write, or null.
+            (
+                "flash_preview",
+                v.live_preview().map_or(Json::Null, |p| {
+                    let span = p.fill.span().unwrap_or_default();
+                    Json::obj(vec![
+                        (
+                            "range",
+                            Json::Str(a1_range((span.0, p.fill.col, span.1, p.fill.col))),
+                        ),
+                        (
+                            "values",
+                            Json::Arr(
+                                p.fill
+                                    .fills
+                                    .iter()
+                                    .map(|(_, t)| {
+                                        Json::Str(t.strip_prefix('\'').unwrap_or(t).to_string())
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                    ])
+                }),
+            ),
             // Formula AutoComplete's list (#686): its labels and highlighted
             // index, or null while none shows.
             (

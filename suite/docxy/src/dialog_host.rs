@@ -106,6 +106,7 @@ fn apply_dialog(
         | DialogOwner::DesignBorderOptions => {
             Err("a Design dialog applies through the Design tab".into())
         }
+        DialogOwner::Message => Ok(false),
         // Handled in `user_name::click`, before this: it is the app's.
         DialogOwner::UserName => Err("the user name is an app setting".into()),
         #[cfg(test)]

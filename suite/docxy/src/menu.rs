@@ -16,6 +16,8 @@ pub(crate) enum MenuTarget {
     /// Pick From Drop-down List (Alt+Down, #665): the column block's
     /// distinct text entries over the selected cell.
     PickList,
+    /// The Flash Fill Options button's menu (#666, ENT-109).
+    FlashFill,
 
     /// A Project task row's context menu; `None` is the entry row.
     Row(Option<i32>),
@@ -35,6 +37,7 @@ impl MenuTarget {
             Self::Document => Json::Str("document".into()),
             Self::Cell => Json::Str("cell".into()),
             Self::PickList => Json::Str("pick-list".into()),
+            Self::FlashFill => Json::Str("flash-fill".into()),
 
             Self::Row(uid) => Json::obj(vec![(
                 "row",
@@ -240,13 +243,14 @@ pub(crate) fn target_stands(
         (MenuTarget::Document, Some(_)) => {
             Err("the document menu does not run on a Project tab".into())
         }
-        (MenuTarget::Cell | MenuTarget::PickList, Some(_)) => {
+        (MenuTarget::Cell | MenuTarget::PickList | MenuTarget::FlashFill, Some(_)) => {
             Err("this menu runs on a sheet tab".into())
         }
         (
             MenuTarget::Document
             | MenuTarget::Cell
             | MenuTarget::PickList
+            | MenuTarget::FlashFill
             | MenuTarget::Ribbon { .. },
             _,
         ) => Ok(()),

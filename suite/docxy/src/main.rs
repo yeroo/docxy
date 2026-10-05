@@ -67,6 +67,7 @@ mod sheet_consolidate;
 #[cfg(test)]
 mod sheet_entry_tests;
 mod sheet_filter;
+mod sheet_flashfill;
 mod sheet_outline;
 mod sheet_ribbon;
 mod sheet_sort;
@@ -625,6 +626,12 @@ struct SheetView {
     /// Formula AutoComplete's list for the open editor (#686), kept with the
     /// buffer it was made for ([`sheet_complete::CompleteList`]).
     edit_complete: Option<sheet_complete::CompleteList>,
+    /// Flash Fill's greyed preview after a typed commit, and the last fill
+    /// for its Options button (#666); each stands only while nothing has
+    /// moved on from it ([`SheetView::live_preview`],
+    /// [`SheetView::live_flash`]).
+    flash_preview: Option<sheet_flashfill::FlashPreview>,
+    last_flash: Option<sheet_flashfill::LastFlash>,
     /// Which workbook tab this is, for the grid clip: a cut moves cells only
     /// within the workbook it came from ([`next_sheet_view_id`]).
     id: u64,
@@ -1544,6 +1551,13 @@ enum SheetAct {
     /// over the selected cell, and entry `n` of it chosen.
     PickList,
     PickItem(u16),
+    /// Data › Flash Fill and Ctrl+E (#666), and the Flash Fill Options
+    /// menu's items.
+    FlashFill,
+    FlashUndo,
+    FlashAccept,
+    FlashSelectBlank,
+    FlashSelectChanged,
     Todo,
 }
 
@@ -8016,6 +8030,8 @@ fn new_sheet_surface() -> Surface {
         edit_opts: EditOptions::default(),
         edit_proposal: None,
         edit_complete: None,
+        flash_preview: None,
+        last_flash: None,
         id: next_sheet_view_id(),
         edit_gen: 0,
     })
@@ -8085,6 +8101,8 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     edit_opts: EditOptions::default(),
                     edit_proposal: None,
                     edit_complete: None,
+                    flash_preview: None,
+                    last_flash: None,
                     id: next_sheet_view_id(),
                     edit_gen: 0,
                 };
@@ -12195,12 +12213,19 @@ impl Docxy {
     /// Commit and move; false (the editor left open, the status saying why)
     /// when the entry was refused.
     fn sheet_commit_move(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) -> bool {
+        let origin = self
+            .active_sheet()
+            .and_then(|v| v.editing.as_ref().and(v.edit_origin));
         let res = self.active_sheet_mut().map(|v| v.commit_and_move(dr, dc));
         cx.notify();
         match res {
             Some(Some(committed)) => {
                 if committed {
                     self.mark_sheet_dirty();
+                    // A typed entry may be Flash Fill's second example.
+                    if let (Some(origin), Some(v)) = (origin, self.active_sheet_mut()) {
+                        v.flash_preview_after(origin);
+                    }
                 }
                 true
             }
@@ -14488,6 +14513,11 @@ impl Docxy {
         }
         match act {
             SheetAct::PickList => self.open_pick_menu(cx),
+            SheetAct::FlashFill => self.sheet_flash_fill(cx),
+            SheetAct::FlashUndo
+            | SheetAct::FlashAccept
+            | SheetAct::FlashSelectBlank
+            | SheetAct::FlashSelectChanged => self.flash_option(act, cx),
             SheetAct::PickItem(i) => self.sheet_pick_item(usize::from(i), cx),
             SheetAct::Cut => self.sheet_copy(true, cx),
             SheetAct::Copy => self.sheet_copy(false, cx),
@@ -14713,6 +14743,13 @@ impl Docxy {
         let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
         // Alt+Down opens a drop-down list (#665), before point mode or the
         // type-over arrows can take the Down.
+        // Flash Fill's preview stands for one key: Enter takes it, any
+        // other key (but a lone modifier) leaves it behind (ENT-105).
+        if key != "enter" && !matches!(key, "shift" | "control" | "alt" | "platform" | "function") {
+            if let Some(v) = self.active_sheet_mut() {
+                v.flash_preview = None;
+            }
+        }
         if alt && !ctrl && !shift && key == "down" {
             return self.sheet_alt_down(cx);
         }
@@ -14815,6 +14852,11 @@ impl Docxy {
                     }
                     cx.notify();
                     return;
+                }
+                // Flash Fill (#666): an open entry is committed first.
+                "e" => {
+                    self.chart_hand_back(cx);
+                    return self.sheet_flash_fill(cx);
                 }
                 "d" | "r" if !editing => {
                     if !protected {
@@ -14974,6 +15016,8 @@ impl Docxy {
                 }
                 cx.notify();
             }
+            // Enter on Flash Fill's preview accepts it (#666, ENT-105).
+            "enter" if !editing && self.sheet_accept_preview(cx) => {}
             // Enter in copy mode pastes and ends it (#664).
             "enter" if !editing && self.sheet_enter_paste(cx) => {}
             "enter" => {
@@ -30137,6 +30181,65 @@ fn sheet_el(
                 }
                 dv_overlay.push(list.into_any_element());
             }
+        }
+    }
+    // Flash Fill's preview (#666, ENT-105): the values Enter would write,
+    // greyed in their empty cells.
+    if let Some(p) = view.live_preview() {
+        if let Some(cx0) = col_x(p.fill.col) {
+            let cw = col_px(sh.col_width(p.fill.col));
+            for (r, text) in &p.fill.fills {
+                let shown = text.strip_prefix('\'').unwrap_or(text);
+                dv_overlay.push(
+                    div()
+                        .absolute()
+                        .left(px(cx0 + 3.0))
+                        .top(px(row_y(*r)))
+                        .w(px((cw - 6.0).max(0.0)))
+                        .h(px(SHEET_ROW_H))
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .text_size(px(12.))
+                        .text_color(hsla_u(0xa0a0a0))
+                        .child(SharedString::from(shown.to_string()))
+                        .into_any_element(),
+                );
+            }
+        }
+    }
+    // The Flash Fill Options button (#666, ENT-109) by the last cell filled,
+    // while the fill stands; a press opens its menu.
+    if let Some((br, bc)) = view.live_flash().and_then(|f| f.button_cell()) {
+        if let Some(cx0) = col_x(bc) {
+            let cw = col_px(sh.col_width(bc));
+            let ent_btn = ent.clone();
+            dv_overlay.push(
+                div()
+                    .id("flash-fill-options")
+                    .absolute()
+                    .left(px(cx0 + cw + 2.0))
+                    .top(px(row_y(br) + 1.0))
+                    .w(px(18.))
+                    .h(px(SHEET_ROW_H - 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .bg(hsla_u(0xf1f1f1))
+                    .border_1()
+                    .border_color(hsla_u(0x9a9a9a))
+                    .rounded_sm()
+                    .text_size(px(10.))
+                    .text_color(hsla_u(0x333333))
+                    .child("\u{26a1}")
+                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        ent_btn.update(cx, |this, cx| {
+                            let _ = this.open_flash_menu(cx);
+                        });
+                    })
+                    .into_any_element(),
+            );
         }
     }
     // Formula AutoComplete's list (#686) under the cell being edited: each

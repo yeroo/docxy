@@ -165,6 +165,9 @@ pub(crate) enum DialogOwner {
     OutlineAxis {
         ungroup: bool,
     },
+    /// A message whose only button is OK, which just closes it (Flash
+    /// Fill's "didn't see a pattern", #666).
+    Message,
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
     Test,

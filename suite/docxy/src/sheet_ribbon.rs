@@ -592,11 +592,11 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             None,
                             SheetAct::TextToColumns,
                         )),
-                        // Flash Fill is #666.
+                        // Flash Fill (#666).
                         Item::Col {
                             gap: COL,
                             cmds: &[
-                                row("flash-fill", "Flash Fill", None, SheetAct::Todo),
+                                row("flash-fill", "Flash Fill", None, SheetAct::FlashFill),
                                 row(
                                     "data-remove-duplicates",
                                     "Remove Duplicates",
@@ -920,7 +920,6 @@ mod tests {
                 "fill",
                 "clear",
                 "find-select",
-                "flash-fill",
                 "circle-invalid",
                 "clear-validation-circles",
                 "spelling",
@@ -1015,11 +1014,8 @@ mod tests {
         assert_eq!(act("Text to Columns"), Ok(SheetAct::TextToColumns));
         assert_eq!(act("Data Validation"), Ok(SheetAct::DataValidation));
         assert_eq!(act("Consolidate"), Ok(SheetAct::Consolidate));
-        for todo in [
-            "Flash Fill",
-            "Circle Invalid Data",
-            "Clear Validation Circles",
-        ] {
+        assert_eq!(act("Flash Fill"), Ok(SheetAct::FlashFill));
+        for todo in ["Circle Invalid Data", "Clear Validation Circles"] {
             assert_eq!(act(todo), Err(format!("'{todo}' is not implemented")));
         }
     }
