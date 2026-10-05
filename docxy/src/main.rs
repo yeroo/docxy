@@ -840,7 +840,13 @@ enum ConfirmAction {
         original: String,
         revised: String,
     },
+    /// Edit Anyway on a document marked as final (#617).
+    EditAnyway,
 }
+
+/// The question a refused edit asks on a document marked as final.
+const MARKED_FINAL_PROMPT: &str =
+    "An author has marked this document as final to discourage editing. Edit anyway?";
 
 // The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
 // across all apps); docxy only supplies the action carried on Yes.
@@ -1398,6 +1404,9 @@ struct App {
     /// Structured document-protection policy metadata. Display text is derived
     /// from its compatibility label; authorization never compares UI strings.
     doc_protection: Protection,
+    /// Word marked the document as final (#617): every mutation is refused
+    /// until Edit Anyway, which also removes the mark from `pkg`.
+    marked_final: bool,
     /// Structured page/header-scoped watermark state used by both the TUI
     /// overlay renderer and compatibility status labels.
     watermark_state: watermark::State,
@@ -1573,6 +1582,7 @@ impl App {
         let comments = docxcore::comments::parse_comments(&pkg);
         let notes = docxcore::notes::parse_notes(&pkg);
         let doc_protection = pkg.protection();
+        let marked_final = pkg.marked_final();
         // Recompute fields that depend on the clock / document properties (DATE,
         // TIME, AUTHOR, CREATEDATE, …) so they show a live value like Word does,
         // rather than the value last cached in the file. This is a content
@@ -1632,6 +1642,7 @@ impl App {
             quit_requested: false,
             status: None,
             doc_protection,
+            marked_final,
             watermark_state,
             doc_page_borders,
             scroll: 0,
@@ -2532,6 +2543,10 @@ impl App {
                         self.run_compare(&original, &revised, true);
                         false
                     }
+                    ConfirmAction::EditAnyway => {
+                        self.edit_anyway();
+                        false
+                    }
                 }
             }
         }
@@ -2691,6 +2706,7 @@ impl App {
         self.comment_sel = 0;
         self.comment_active = false;
         self.doc_protection = pkg.protection();
+        self.marked_final = pkg.marked_final();
         self.watermark_state = watermark::State::from_package(&pkg);
         self.doc_page_borders = pkg.has_page_borders();
         let mut doc = std::mem::take(&mut pkg.document);
@@ -2780,6 +2796,9 @@ impl App {
     /// watermark, page borders) — empty when the document has none.
     fn doc_notice(&self) -> String {
         let mut parts = Vec::new();
+        if self.marked_final {
+            parts.push("Marked as Final".to_string());
+        }
         if let Some(p) = self.doc_protection.label() {
             parts.push(format!("Protected: {p}"));
         }
@@ -2805,7 +2824,25 @@ impl App {
         &self,
         mutation: protection::MutationKind,
     ) -> Result<(), protection::ProtectionDenial> {
+        if self.marked_final {
+            return Err(protection::ProtectionDenial::MarkedFinal);
+        }
         protection::authorize(&self.doc_protection, mutation)
+    }
+
+    /// Word's Edit Anyway on a document marked as final (#617): editing is
+    /// allowed again, and the mark leaves the package so a later save writes
+    /// an ordinary document. Not an edit: the document stays unmodified.
+    /// Returns whether the document was final.
+    pub(crate) fn edit_anyway(&mut self) -> bool {
+        if !self.marked_final {
+            return false;
+        }
+        self.marked_final = false;
+        self.pkg.clear_marked_final();
+        self.status = Some("Editing enabled: the document is no longer marked as final".into());
+        self.dirty = true;
+        true
     }
 
     /// Check a requested interactive mutation before it reaches the editor,
@@ -2814,6 +2851,20 @@ impl App {
     fn mutation_allowed(&mut self, mutation: protection::MutationKind) -> bool {
         match self.authorize_mutation(mutation) {
             Ok(()) => true,
+            Err(protection::ProtectionDenial::MarkedFinal) => {
+                // Word's question, asked where the edit was refused; the
+                // refused key stays dropped either way.
+                if self.confirm.is_none() {
+                    self.confirm = Some(backstage::Confirm::new(
+                        MARKED_FINAL_PROMPT,
+                        ConfirmAction::EditAnyway,
+                        Color::LightBlue,
+                    ));
+                }
+                self.status = Some(protection::ProtectionDenial::MarkedFinal.tui_status());
+                self.dirty = true;
+                false
+            }
             Err(denial) => {
                 self.status = Some(denial.tui_status());
                 false
@@ -13041,6 +13092,44 @@ mod tests {
         // confirming with 'y' quits
         assert!(app.on_key(key(KeyCode::Char('y'))));
         assert!(app.quit_requested);
+    }
+
+    fn final_tui_app() -> App {
+        let mut app = App::new(
+            crate::test_fixtures::marked_final_package(),
+            "final.docx",
+            false,
+        );
+        app.os_clip = None;
+        app
+    }
+
+    #[test]
+    fn a_final_document_asks_edit_anyway_and_refuses_until_yes() {
+        let mut app = final_tui_app();
+        assert!(app.doc_notice().contains("Marked as Final"));
+        let before = app.editor.doc.clone();
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.editor.doc, before, "a final document took a key");
+        assert!(!app.modified);
+        let confirm = app.confirm.as_ref().expect("Edit Anyway question");
+        assert!(confirm.prompt().contains("marked this document as final"));
+        // No keeps it final, and the next refused key asks again.
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.confirm.is_none());
+        assert!(app.marked_final);
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.confirm.is_some());
+        // Yes: Edit Anyway. The refused key stays dropped.
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.confirm.is_none());
+        assert!(!app.marked_final);
+        assert!(!app.pkg.marked_final(), "the mark is still in the package");
+        assert_eq!(app.editor.doc, before);
+        assert!(!app.modified, "Edit Anyway is not an edit");
+        assert!(!app.doc_notice().contains("Marked as Final"));
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.modified);
     }
 
     #[test]

@@ -252,7 +252,8 @@ One JSON object per line; one reply line per request:
 
 | Verb | Args | Result |
 |---|---|---|
-| `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?}` |
+| `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?, final?}` — `final: true` only when Word marked the document as final |
+| `doc.edit-anyway` | — | `{path, …, was_final}` — Word's Edit Anyway: clears Mark as Final so edits are allowed and a save writes the document without the mark |
 | `doc.outline` | — | `{headings:[{index, level, text}]}` |
 | `doc.read` | `{start?, end?}` or `{range?:"a..b"}` (default: whole doc) | `{total, start, end, text, blocks:[{index, kind, text, heading?}]}` |
 | `doc.find` | `{query, case_sensitive?}` | `{query, count, matches:[{path, start, end, block?, text?}]}` — `start`/`end` are editor offsets (see notes) |
@@ -371,11 +372,19 @@ document XML is preserved verbatim rather than regenerated.
 Denied control and MCP requests return
 `protection_denied:<stable_code>: <explanation>`, where `<stable_code>` is one
 of `read_only`, `comments_only`, `formatting_locked`, `forms_unsupported`,
-`tracked_changes_unsupported`, or `unsupported_mode`. The check runs before
+`tracked_changes_unsupported`, `unsupported_mode`, or `marked_final`. The check runs before
 argument parsing and before any mutation, so a rejected request does not alter
 the document, package parts, caret, undo/redo stacks, dirty state, or save
 state. Invalid arguments and unknown verbs retain their existing non-protection
 errors.
+
+A document Word marked as final (`_MarkAsFinal` = true in
+`docProps/custom.xml`) refuses every mutating verb with
+`protection_denied:marked_final` until `doc.edit-anyway`, which removes the mark
+from the package without modifying the document; a later save writes it as an
+ordinary document. The TUI asks "Edit anyway?" at the first refused edit. There
+is deliberately no MCP tool for Edit Anyway: unlocking a final document is a
+control-surface decision.
 
 Forms-only, tracked-changes-only, and unknown enforced modes deliberately fail
 closed. docxy cannot yet make conforming form-field-only edits or automatically

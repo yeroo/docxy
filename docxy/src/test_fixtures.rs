@@ -524,6 +524,29 @@ fn package_bytes_with_styles_extra(
     write_zip(&parts)
 }
 
+/// A document Word marked as final (#617): `_MarkAsFinal` = true in
+/// `docProps/custom.xml`, beside another custom property that must survive
+/// Edit Anyway.
+pub(crate) fn marked_final_bytes() -> Vec<u8> {
+    let custom = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="2" name="_MarkAsFinal"><vt:bool>true</vt:bool></property><property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="3" name="Client"><vt:lpwstr>Acme</vt:lpwstr></property></Properties>"#;
+    package_bytes_with_extra(
+        "marked-final",
+        &single_section_document(None),
+        &empty_settings(),
+        &empty_document_relationships(),
+        &[],
+        &[(
+            "docProps/custom.xml",
+            "application/vnd.openxmlformats-officedocument.custom-properties+xml",
+            custom.to_string(),
+        )],
+    )
+}
+
+pub(crate) fn marked_final_package() -> Package {
+    load_package(&marked_final_bytes()).expect("the marked-final fixture loads")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,3 +774,4 @@ mod tests {
         }
     }
 }
+
