@@ -94,6 +94,20 @@ test switching pages resets the scroll
   call backstage-layout {}
   assert reply.at_top is true
 
+# While File is open every key belongs to the File screen: typing and Ctrl+W
+# must not reach the document hidden under it.
+test keys pressed in the Backstage do not reach the hidden tab
+  open copy:../fixtures/basic.docx
+  type hello
+  assert text is hello
+  call backstage {"action":"open"}
+  type abc
+  key ctrl+w
+  call backstage {"action":"close"}
+  assert text is hello
+  assert dialog is none
+  assert title is basic.docx
+
 # The window cannot be shorter than 420 (`window_min_size`) and the rail's six
 # or seven items fit in that, so this only asserts the rail fits at the
 # minimum window (`rail_last_item_visible` is true for a rail that fits). It
