@@ -3483,6 +3483,7 @@ fn dispatch_verb(
             if !app.backstage {
                 return Err("the File screen is not open (backstage open)".into());
             }
+            app.refuse_under_dialog()?;
             match arg_str(args, "page")? {
                 "new" => app.backstage_rail_action(crate::BackstageRailAction::New, window, cx),
                 "info" => {
@@ -4023,13 +4024,19 @@ fn click_cell(
 }
 
 /// Deliver one keystroke the way the platform would: through the bound action
-/// if gpui would match a binding first, otherwise through `on_key`.
+/// if gpui would match a binding first, otherwise through `on_key`. While the
+/// File screen is open it owns every key (`backstage_key`): nothing reaches the
+/// tab hidden under it, as in the real window.
 fn press(
     app: &mut crate::Docxy,
     stroke: Keystroke,
     window: &mut Window,
     cx: &mut Context<crate::Docxy>,
 ) {
+    if app.backstage {
+        app.backstage_key(&key_event(stroke), window, cx);
+        return;
+    }
     if is_action_key(&stroke) {
         // The only bindings are Tab and Shift-Tab; `is_action_key` has already
         // ruled out every other modifier combination.
@@ -4040,11 +4047,7 @@ fn press(
         }
         return;
     }
-    let ev = key_event(stroke);
-    if app.backstage && app.backstage_key(&ev, window, cx) {
-        return;
-    }
-    app.on_key(&ev, window, cx);
+    app.on_key(&key_event(stroke), window, cx);
 }
 
 /// Render the last drawn frame to an offscreen texture and leave the RGBA in

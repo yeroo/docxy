@@ -17,7 +17,7 @@ the File screen.
 3. Press PageDown, PageUp, End and Home: the page scrolls by a screenful, to
    the bottom and back to the top.
 4. Click Info, then New: each page starts at the top, even after you scrolled
-   the previous one. Scroll the Open page down, close File (Back or Esc) and
+   the previous one. Scroll the Open page down, click ← Back in the rail and
    click File again: the default page is back at the top. (Open… in the rail
    opens a file picker, not a page.)
 5. Make the window as short as it goes (it stops at 420 px): the rail's

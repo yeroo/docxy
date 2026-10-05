@@ -9427,18 +9427,17 @@ impl Docxy {
         cx.notify();
     }
 
-    /// A key pressed while the File screen is open (#1028): the real root's
-    /// key listener and the harness's `key` verb both come here. The same
-    /// early-outs as `on_key` come first (a dialog, the more-tabs list or an
-    /// open menu owns the key); then PageUp/PageDown/Home/End scroll the
-    /// content pane. True when the key was taken; false leaves it to
-    /// `on_key` (the harness) or drops it (the real root).
-    fn backstage_key(
+    /// A dialog, the more-tabs list or an open menu owns the key before any
+    /// surface sees it (#393, #397): true when one took it. `on_key` and
+    /// `backstage_key` share these early-outs.
+    fn modal_takes_key(
         &mut self,
         ev: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // An open dialog takes every key first (#393): nothing under it, not
+        // the tab list, KeyTips or a Project shortcut, may see one.
         if self.dialog_takes_key(
             &ev.keystroke.key,
             ev.keystroke.key_char.as_deref(),
@@ -9452,17 +9451,30 @@ impl Docxy {
             if ev.keystroke.key == "escape" {
                 self.tab_more_close(cx);
             }
-            return true;
+            return true; // the modal list owns keys; do not edit the surface below
         }
+        // An open menu takes the key: Esc closes it, and so, until menus
+        // take arrows and Enter, does any other key; none reaches the
+        // document or cell under it (#397).
         if self.close_menu() {
             cx.notify();
             return true;
         }
+        false
+    }
+
+    /// A key pressed while the File screen is open (#1028): the real root's
+    /// key listener and the harness's `key` verb both come here, and nothing
+    /// else sees the key (the tab hidden under the File screen must not get
+    /// Ctrl+W, Ctrl+S or typing). The modal early-outs come first, then
+    /// PageUp/PageDown/Home/End scroll the content pane.
+    fn backstage_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_takes_key(ev, window, cx) {
+            return;
+        }
         if self.backstage_scroll_key(&ev.keystroke) {
             cx.notify();
-            return true;
         }
-        false
     }
 
     /// PageUp/PageDown/Home/End scroll the backstage's content pane.
@@ -9500,10 +9512,7 @@ impl Docxy {
 
     fn backstage_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.backstage = false;
-        self.bs_new = false;
-        self.bs_info = false;
-        self.bs_info_status = None;
-        self.reset_backstage_scroll();
+        self.show_backstage_open_page();
         self.refocus(window, cx);
     }
 
@@ -18182,28 +18191,7 @@ impl Docxy {
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // An open dialog takes every key first (#393): nothing under it, not
-        // the tab list, KeyTips or a Project shortcut, may see one.
-        if self.dialog_takes_key(
-            &ev.keystroke.key,
-            ev.keystroke.key_char.as_deref(),
-            ev.keystroke.modifiers,
-            window,
-            cx,
-        ) {
-            return;
-        }
-        if self.tab_more_open {
-            if ev.keystroke.key == "escape" {
-                self.tab_more_close(cx);
-            }
-            return; // the modal list owns keys; do not edit the surface below
-        }
-        // An open menu takes the key: Esc closes it, and so, until menus
-        // take arrows and Enter, does any other key; none reaches the
-        // document or cell under it (#397).
-        if self.close_menu() {
-            cx.notify();
+        if self.modal_takes_key(ev, window, cx) {
             return;
         }
         // Word's and Excel's document keys come before every surface's own,
