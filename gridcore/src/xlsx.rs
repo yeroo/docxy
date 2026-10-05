@@ -23,6 +23,8 @@ use opccore::zip::ZipArchive;
 use opccore::zipwrite::write_zip;
 
 mod consolidate;
+#[cfg(test)]
+mod filter_tests;
 mod page;
 mod repair;
 pub use repair::{Repairs, load_xlsx_repair};
@@ -331,10 +333,10 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         let mut sheet = parse_worksheet(&xml, &shared, &hlink_targets);
         sheet.name = name;
         sheet.hidden = hidden;
-        sheet.auto_filter =
-            sheet_auto_filter_span(&xml).and_then(|(s, e)| auto_filter_position(&xml[s..e]));
+        sheet.auto_filter = sheet_auto_filter_span(&xml)
+            .and_then(|(s, e)| auto_filter_position(&xml[s..e], &styles.dxfs));
         let sheet_idx = sheets.len();
-        if let Some(af) = crate::filter::parse_auto_filter(&xml) {
+        if let Some(af) = crate::filter::parse_auto_filter(&xml, &styles.dxfs) {
             auto_filters.push((sheet_idx, af));
         }
         orig_to_model.push(Some(sheet_idx));
@@ -352,7 +354,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
                     if let Some(t) = parse_table_xml(&txml, sheet_idx, &table_part) {
                         tables.push(t);
                     }
-                    if let Some(af) = crate::filter::parse_auto_filter(&txml) {
+                    if let Some(af) = crate::filter::parse_auto_filter(&txml, &styles.dxfs) {
                         auto_filters.push((sheet_idx, af));
                     }
                 }
@@ -2913,6 +2915,31 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         None
     };
 
+    // --- colour filters' <dxf>s: an equal one the styles part has, or new
+    let styles_src = pkg
+        .part("xl/styles.xml")
+        .map(|b| String::from_utf8_lossy(b).into_owned());
+    let have_dxfs: Vec<String> = styles_src
+        .as_deref()
+        .map(|x| dxf_elements(x).into_iter().map(str::to_string).collect())
+        .unwrap_or_default();
+    let mut new_dxfs: Vec<String> = Vec::new();
+    let mut dxf_for = |cell: bool, rgb: Option<(u8, u8, u8)>| -> Option<u32> {
+        styles_src.as_ref()?;
+        let x = crate::filter::color_dxf_xml(cell, rgb);
+        if let Some(i) = have_dxfs.iter().position(|d| *d == x) {
+            return Some(i as u32);
+        }
+        let k = match new_dxfs.iter().position(|d| *d == x) {
+            Some(k) => k,
+            None => {
+                new_dxfs.push(x);
+                new_dxfs.len() - 1
+            }
+        };
+        Some((have_dxfs.len() + k) as u32)
+    };
+
     // --- regenerate each worksheet's sheetData (and cols/dimension) -------
     let mut any_formulas = false;
     for (idx, sheet) in wb.sheets.iter().enumerate() {
@@ -2924,7 +2951,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
         let sheet_data = sheet_data_xml(sheet, &mut index_of, &mut any_formulas, new_cm.as_deref());
-        let updated = splice_worksheet(&source, sheet, &sheet_data);
+        let updated = splice_worksheet(&source, sheet, &sheet_data, &wb.styles.dxfs, &mut dxf_for);
         let updated = if tabs_selected {
             set_tab_selected(&updated, idx == active_tab)
         } else {
@@ -2987,6 +3014,12 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/styles.xml") {
                 p.1 = updated.into_bytes();
             }
+        }
+    }
+    if !new_dxfs.is_empty() {
+        if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/styles.xml") {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            p.1 = append_dxfs(&xml, &new_dxfs).into_bytes();
         }
     }
 
@@ -3088,7 +3121,12 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         let xml = set_active_tab(&xml, active_tab);
         // Same for defined names: a structural edit or a rename moves them in
         // the model (print area and titles included).
-        let xml = patch_defined_names(&xml, &wb.defined_names, wb.sheets.len());
+        let filtered: Vec<bool> = wb
+            .sheets
+            .iter()
+            .map(|s| s.auto_filter.is_some() || s.filter_mode == Some(true))
+            .collect();
+        let xml = patch_defined_names(&xml, &wb.defined_names, wb.sheets.len(), &filtered);
         // The date system too: an imported 1904 workbook (#603) starts from
         // new_xlsx's 1900 part, and its dates would shift by 1462 days.
         p.1 = set_date1904(&xml, wb.date1904).into_bytes();
@@ -3598,7 +3636,13 @@ fn cell_xml(
 /// do merges and protection ([`sync_worksheet_child`]). `<cols>` and a new
 /// `<sheetViews>` follow [`put_worksheet_child`]: on a malformed part with no
 /// known position for them they are left as they were.
-fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
+fn splice_worksheet(
+    source: &str,
+    sheet: &Sheet,
+    sheet_data: &str,
+    dxfs: &[crate::sheet::Dxf],
+    dxf_for: &mut DxfFor,
+) -> String {
     // Found by local name, so `<x:sheetData>` is replaced, not joined by a
     // second one. A worksheet that has none gets ours at its schema position.
     let walk_found = worksheet_child_span(source, "sheetData").is_some();
@@ -3693,7 +3737,8 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
         sheet.consolidate_loaded.as_ref(),
     );
     // The sheet's autoFilter: rewritten only where a structural edit moved it.
-    let out = set_auto_filter(out, sheet.auto_filter.as_ref());
+    let out = set_auto_filter(out, sheet.auto_filter.as_ref(), dxfs, dxf_for);
+    let out = set_filter_mode(out, sheet.filter_mode);
     // Conditional formatting and data validation: likewise.
     let out = set_cond_formats(out, sheet);
     set_validations(out, sheet)
@@ -4062,9 +4107,12 @@ fn sheet_auto_filter_span(xml: &str) -> Option<(usize, usize)> {
     worksheet_child_span(xml, "autoFilter")
 }
 
-/// The position an `<autoFilter>` element (the whole element, from its start
-/// tag) holds; `None` when its `ref` is not a range.
-fn auto_filter_position(element: &str) -> Option<crate::sheet::SheetAutoFilter> {
+/// The position and criteria an `<autoFilter>` element (the whole element,
+/// from its start tag) holds; `None` when its `ref` is not a range.
+fn auto_filter_position(
+    element: &str,
+    dxfs: &[crate::sheet::Dxf],
+) -> Option<crate::sheet::SheetAutoFilter> {
     let range = crate::sheet::parse_range_name(attr_at(element, 0, "ref")?)?;
     let columns = element_children(element)
         .into_iter()
@@ -4079,7 +4127,17 @@ fn auto_filter_position(element: &str) -> Option<crate::sheet::SheetAutoFilter> 
             )
         })
         .collect();
-    Some(crate::sheet::SheetAutoFilter { range, columns })
+    let mut criteria: Vec<(u32, crate::filter::ColumnFilter)> =
+        crate::filter::filter_columns(element, dxfs)
+            .into_iter()
+            .map(|(id, f)| (range.1 + id, f))
+            .collect();
+    criteria.sort_by_key(|(c, _)| *c);
+    Some(crate::sheet::SheetAutoFilter {
+        range,
+        columns,
+        criteria,
+    })
 }
 
 /// The direct children of the element that `xml` starts with, as (local
@@ -4115,20 +4173,42 @@ fn element_children(xml: &str) -> Vec<(String, usize, usize)> {
     out
 }
 
+/// A colour criterion's `<dxf>` index for a save: `(cell, rgb)` → the id of
+/// an equal `<dxf>` the styles part has, or of one the save appends.
+type DxfFor<'a> = dyn FnMut(bool, Option<(u8, u8, u8)>) -> Option<u32> + 'a;
+
 /// Sync the sheet's `<autoFilter>` with the model. It is left byte-for-byte
-/// alone while it holds the model's position, dropped once a delete took its
-/// whole range, and otherwise rewritten in place: a new `ref`, each
-/// `<filterColumn>` renumbered to the column it filtered (or dropped with that
-/// column), everything else kept. Its nested `<sortState>` goes with a
-/// rewrite, since it would still name the old cells. Never created: the
-/// editor adds no filters, and a restored sheet's fresh part has none to move.
-/// One whose `ref` doesn't read as a range is left as it is.
-fn set_auto_filter(mut xml: String, model: Option<&crate::sheet::SheetAutoFilter>) -> String {
+/// alone while it holds the model's position and criteria, and dropped once
+/// the model has none (a delete took its whole range, or the filter was
+/// turned off). When only its position changed (a structural edit), it is
+/// rewritten in place: a new `ref`, each `<filterColumn>` renumbered to the
+/// column it filtered (or dropped with that column), everything else kept.
+/// When its criteria changed, the element is written from the model, with
+/// what we don't model ([`crate::filter::ColumnFilter::Raw`]) as it was.
+/// Either rewrite drops the nested `<sortState>`, which would still name the
+/// old cells. A model filter the part lacks (one the filter commands made, or
+/// a restored sheet's) is added at its schema position. One whose `ref`
+/// doesn't read as a range is left as it is.
+fn set_auto_filter(
+    mut xml: String,
+    model: Option<&crate::sheet::SheetAutoFilter>,
+    dxfs: &[crate::sheet::Dxf],
+    dxf_for: &mut DxfFor,
+) -> String {
     let Some((start, end)) = sheet_auto_filter_span(&xml) else {
-        return xml;
+        return match model {
+            Some(af) => put_worksheet_child(
+                &xml,
+                "autoFilter",
+                &auto_filter_block(af, dxf_for),
+                None,
+                false,
+            ),
+            None => xml,
+        };
     };
     let element = &xml[start..end];
-    let Some(held) = auto_filter_position(element) else {
+    let Some(held) = auto_filter_position(element, dxfs) else {
         return xml;
     };
     if model == Some(&held) {
@@ -4137,41 +4217,163 @@ fn set_auto_filter(mut xml: String, model: Option<&crate::sheet::SheetAutoFilter
     let block = match model {
         None => String::new(),
         Some(af) => {
-            let mut block = element.to_string();
-            let mut column = 0;
-            let mut edits: Vec<(usize, usize, Option<String>)> = Vec::new();
-            for (name, s, e) in element_children(element) {
-                match name.as_str() {
-                    "filterColumn" => {
-                        match af.columns.get(column) {
-                            Some(None) => edits.push((s, e, None)),
-                            Some(Some(c)) => {
-                                let id = c.saturating_sub(af.range.1).to_string();
-                                if attr_at(element, s, "colId") != Some(&id) {
-                                    edits.push((s, e, Some(id)));
-                                }
-                            }
-                            None => {}
-                        }
-                        column += 1;
-                    }
-                    "sortState" => edits.push((s, e, None)),
-                    _ => {}
+            // The criteria the part's columns would have if only their
+            // positions moved.
+            let doc = crate::filter::filter_columns(element, dxfs);
+            let mut moved: Vec<(u32, crate::filter::ColumnFilter)> = doc
+                .iter()
+                .zip(&af.columns)
+                .filter_map(|((_, f), c)| c.map(|c| (c, f.clone())))
+                .collect();
+            moved.sort_by_key(|(c, _)| *c);
+            if doc.len() == af.columns.len() && moved == af.criteria {
+                moved_auto_filter(element, af)
+            } else {
+                let block = auto_filter_block(af, dxf_for);
+                match worksheet_root(&xml) {
+                    Some(root) => in_worksheet_ns(&root, &block),
+                    None => block,
                 }
             }
-            for (s, e, id) in edits.into_iter().rev() {
-                match id {
-                    Some(id) => block = set_tag_attr(&block, s, "colId", Some(&id)),
-                    None => block.replace_range(s..e, ""),
-                }
-            }
-            let (r1, c1, r2, c2) = af.range;
-            let r = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
-            set_tag_attr(&block, 0, "ref", Some(&r))
         }
     };
     xml.replace_range(start..end, &block);
     xml
+}
+
+/// `element`, an `<autoFilter>` whose criteria are unchanged, moved to the
+/// model's position: a new `ref`, each `<filterColumn>` renumbered or
+/// dropped with its column, and no `<sortState>`.
+fn moved_auto_filter(element: &str, af: &crate::sheet::SheetAutoFilter) -> String {
+    let mut block = element.to_string();
+    let mut column = 0;
+    let mut edits: Vec<(usize, usize, Option<String>)> = Vec::new();
+    for (name, s, e) in element_children(element) {
+        match name.as_str() {
+            "filterColumn" => {
+                match af.columns.get(column) {
+                    Some(None) => edits.push((s, e, None)),
+                    Some(Some(c)) => {
+                        let id = c.saturating_sub(af.range.1).to_string();
+                        if attr_at(element, s, "colId") != Some(&id) {
+                            edits.push((s, e, Some(id)));
+                        }
+                    }
+                    None => {}
+                }
+                column += 1;
+            }
+            "sortState" => edits.push((s, e, None)),
+            _ => {}
+        }
+    }
+    for (s, e, id) in edits.into_iter().rev() {
+        match id {
+            Some(id) => block = set_tag_attr(&block, s, "colId", Some(&id)),
+            None => block.replace_range(s..e, ""),
+        }
+    }
+    let (r1, c1, r2, c2) = af.range;
+    let r = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+    set_tag_attr(&block, 0, "ref", Some(&r))
+}
+
+/// An `<autoFilter>` written from the model: its range and a
+/// `<filterColumn>` per criterion inside it. A colour criterion with no
+/// `<dxf>` of its own gets one from `dxf_for`.
+fn auto_filter_block(af: &crate::sheet::SheetAutoFilter, dxf_for: &mut DxfFor) -> String {
+    use crate::filter::ColumnFilter;
+    let (r1, c1, r2, c2) = af.range;
+    let mut cols = String::new();
+    for (c, f) in &af.criteria {
+        if *c < c1 || *c > c2 {
+            continue;
+        }
+        let dxf_id = match f {
+            ColumnFilter::Color { cell, rgb, dxf_id } => dxf_id.or_else(|| dxf_for(*cell, *rgb)),
+            _ => None,
+        };
+        if let Some(x) = crate::filter::filter_column_xml(c - c1, f, dxf_id) {
+            cols.push_str(&x);
+        }
+    }
+    let r = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+    if cols.is_empty() {
+        format!("<autoFilter ref=\"{r}\"/>")
+    } else {
+        format!("<autoFilter ref=\"{r}\">{cols}</autoFilter>")
+    }
+}
+
+/// Sync `<sheetPr filterMode>` (some rows of the sheet are filtered) with
+/// what the filter commands last left; `None` leaves the part alone.
+fn set_filter_mode(xml: String, mode: Option<bool>) -> String {
+    let Some(now) = mode else {
+        return xml;
+    };
+    let Some((start, _)) = worksheet_child_span(&xml, "sheetPr") else {
+        if !now {
+            return xml;
+        }
+        return put_worksheet_child(&xml, "sheetPr", "<sheetPr filterMode=\"1\"/>", None, false);
+    };
+    let was = matches!(attr_at(&xml, start, "filterMode"), Some("1" | "true"));
+    if was == now {
+        return xml;
+    }
+    let out = set_tag_attr(&xml, start, "filterMode", now.then_some("1"));
+    // A `sheetPr` left with nothing goes.
+    match worksheet_child_span(&out, "sheetPr") {
+        Some((s, e)) if !now && page::is_bare(&out[s..e]) => {
+            remove_worksheet_child(&out, "sheetPr")
+        }
+        _ => out,
+    }
+}
+
+/// The `<dxf>` elements of a styles part's `<dxfs>`, in order.
+fn dxf_elements(styles: &str) -> Vec<&str> {
+    let Some(s) = styles.find("<dxfs") else {
+        return Vec::new();
+    };
+    element_children(&styles[s..])
+        .into_iter()
+        .filter(|(n, _, _)| n == "dxf")
+        .map(|(_, a, b)| &styles[s + a..s + b])
+        .collect()
+}
+
+/// `styles` with `added` `<dxf>` elements appended to its `<dxfs>` (its
+/// `count` bumped), or a new `<dxfs>` at its schema position. The existing
+/// ones are left byte-for-byte.
+fn append_dxfs(styles: &str, added: &[String]) -> String {
+    if added.is_empty() {
+        return styles.to_string();
+    }
+    let body: String = added.concat();
+    if let Some(s) = styles.find("<dxfs") {
+        let open_end = s + styles[s..].find('>').map_or(0, |i| i + 1);
+        let have = dxf_elements(styles).len();
+        let count = (have + added.len()).to_string();
+        if styles[..open_end].ends_with("/>") {
+            let block = format!("<dxfs count=\"{count}\">{body}</dxfs>");
+            return format!("{}{block}{}", &styles[..s], &styles[open_end..]);
+        }
+        let Some(close) = styles[s..].find("</dxfs>").map(|i| s + i) else {
+            return styles.to_string();
+        };
+        let out = format!("{}{body}{}", &styles[..close], &styles[close..]);
+        return set_tag_attr(&out, s, "count", Some(&count));
+    }
+    let block = format!("<dxfs count=\"{}\">{body}</dxfs>", added.len());
+    let anchor = ["<tableStyles", "<colors", "<extLst"]
+        .iter()
+        .find_map(|t| styles.find(t))
+        .or_else(|| styles.find("</styleSheet>"));
+    match anchor {
+        Some(pos) => format!("{}{block}{}", &styles[..pos], &styles[pos..]),
+        None => styles.to_string(),
+    }
 }
 
 /// Sync one `<rowBreaks>` / `<colBreaks>` element from the model. It is left
@@ -5133,13 +5335,21 @@ fn patch_sheet_names(xml: &str, sheets: &[Sheet]) -> String {
 /// name only when no element of that name exists in any scope (the loader
 /// makes an unresolvable scope global, so its element carries some other
 /// `localSheetId`), a scoped one only when the scopes line up and no element
-/// has that name and scope. `_xlnm._FilterDatabase` is never added, since a
-/// save never adds the `<autoFilter>` it backs.
+/// has that name and scope. `_xlnm._FilterDatabase` is added only for a
+/// sheet in `filtered` (one with an AutoFilter, or rows an Advanced Filter
+/// hid), and hidden as Excel writes it: it backs that filter, and a stray
+/// one would make Excel see a filter that isn't there.
 ///
-/// One kind of element is removed: a sheet's print area or print titles
-/// that the model no longer holds, under the same alignment rule (see
-/// [`patch_defined_name`]).
-fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> String {
+/// One kind of element is removed: a sheet's print area, print titles or
+/// `_FilterDatabase` that the model no longer holds, under the same
+/// alignment rule (see [`patch_defined_name`]); the filter commands drop
+/// `_FilterDatabase` when the filter is turned off.
+fn patch_defined_names(
+    xml: &str,
+    names: &[DefinedName],
+    sheet_count: usize,
+    filtered: &[bool],
+) -> String {
     let aligned = xml.matches("<sheet ").count() == sheet_count;
     // (start, end, replacement): element contents, and where new names go.
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
@@ -5226,9 +5436,10 @@ fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> 
             None => !named(None),
             Some(i) => aligned && i < sheet_count && !named(Some(Some(i))),
         };
+        let filter_db = d.name.eq_ignore_ascii_case("_xlnm._FilterDatabase");
         if missing
             && !d.formula.is_empty()
-            && !d.name.eq_ignore_ascii_case("_xlnm._FilterDatabase")
+            && (!filter_db || d.scope.is_some_and(|i| filtered.get(i) == Some(&true)))
             && !added
                 .iter()
                 .any(|a| a.scope == d.scope && a.name.eq_ignore_ascii_case(&d.name))
@@ -5244,10 +5455,13 @@ fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> 
         if let Some(pfx) = element_prefix {
             let mut block = String::new();
             for d in &added {
-                let scope = d
+                let mut scope = d
                     .scope
                     .map(|i| format!(" localSheetId=\"{i}\""))
                     .unwrap_or_default();
+                if d.name.eq_ignore_ascii_case("_xlnm._FilterDatabase") {
+                    scope.push_str(" hidden=\"1\"");
+                }
                 block.push_str(&format!(
                     "<{pfx}definedName name=\"{}\"{scope}>{}</{pfx}definedName>",
                     esc_attr(&d.name),
@@ -5281,18 +5495,22 @@ struct NameCtx {
 }
 
 /// The built-in names a save deletes once the model has none of them for a
-/// sheet: Clear Print Area, and clearing the print titles.
+/// sheet: Clear Print Area, clearing the print titles, and turning a filter
+/// off.
 fn removable_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("_xlnm.Print_Area") || name.eq_ignore_ascii_case("_xlnm.Print_Titles")
+    name.eq_ignore_ascii_case("_xlnm.Print_Area")
+        || name.eq_ignore_ascii_case("_xlnm.Print_Titles")
+        || name.eq_ignore_ascii_case("_xlnm._FilterDatabase")
 }
 
 /// Queue the new content of the `<definedName>` whose start tag the parser is
 /// on (not a self-closing one) where the model's definition differs, and
 /// leave the parser past its end tag. `false` when the part ends first.
 ///
-/// A `_xlnm.Print_Area` or `_xlnm.Print_Titles` element whose (name, scope)
-/// the model no longer has is queued for removal instead: Clear Print Area
-/// and clearing the titles delete the name. Only for a scoped key naming a
+/// A `_xlnm.Print_Area`, `_xlnm.Print_Titles` or `_xlnm._FilterDatabase`
+/// element whose (name, scope) the model no longer has is queued for removal
+/// instead: Clear Print Area, clearing the titles and turning a filter off
+/// delete the name. Only for a scoped key naming a
 /// model sheet (`scope < sheet_count`), which `key` already is only while the
 /// sheets line up; any other name the model lacks stays.
 fn patch_defined_name(

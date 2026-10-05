@@ -1325,6 +1325,13 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
                     for c in &mut af.columns {
                         *c = c.and_then(|v| point(v, &shift));
                     }
+                    af.criteria.retain_mut(|(c, _)| match point(*c, &shift) {
+                        Some(v) => {
+                            *c = v;
+                            true
+                        }
+                        None => false,
+                    });
                 }
             }
             None => sheet.auto_filter = None,
@@ -3228,9 +3235,11 @@ mod tests {
     fn a_sheet_auto_filter_moves_and_its_columns_follow_their_data() {
         let mut w = wb(&[("A1", Cell::number(1.0))]);
         // B2:D9, filtering B and D.
+        let crit = |v: &str| crate::filter::ColumnFilter::values(vec![v.to_string()]);
         w.sheets[0].auto_filter = Some(crate::sheet::SheetAutoFilter {
             range: (1, 1, 8, 3),
             columns: vec![Some(1), Some(3)],
+            criteria: vec![(1, crit("b")), (3, crit("d"))],
         });
         let af = |w: &Workbook| {
             w.sheets[0]
@@ -3238,12 +3247,29 @@ mod tests {
                 .clone()
                 .map(|a| (a.range, a.columns))
         };
+        let on = |w: &Workbook| -> Vec<u32> {
+            w.sheets[0]
+                .auto_filter
+                .as_ref()
+                .unwrap()
+                .criteria
+                .iter()
+                .map(|c| c.0)
+                .collect()
+        };
         insert_rows(&mut w, 0, 0, 2);
         assert_eq!(af(&w), Some(((3, 1, 10, 3), vec![Some(1), Some(3)])));
         insert_cols(&mut w, 0, 2, 1); // inside, between the filtered columns
         assert_eq!(af(&w), Some(((3, 1, 10, 4), vec![Some(1), Some(4)])));
+        // The criteria move with their columns, and go with a deleted one.
+        assert_eq!(on(&w), vec![1, 4]);
         delete_cols(&mut w, 0, 1, 1); // the first filtered column
         assert_eq!(af(&w), Some(((3, 1, 10, 3), vec![None, Some(3)])));
+        assert_eq!(on(&w), vec![3]);
+        assert_eq!(
+            w.sheets[0].auto_filter.as_ref().unwrap().criteria[0].1,
+            crit("d")
+        );
         insert_rows(&mut w, 0, 20, 5); // below: nothing moves
         assert_eq!(af(&w), Some(((3, 1, 10, 3), vec![None, Some(3)])));
         delete_rows(&mut w, 0, 3, 8); // every row it had

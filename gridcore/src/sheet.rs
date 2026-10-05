@@ -596,12 +596,18 @@ pub struct Sheet {
     /// filter. In memory only. `SUBTOTAL(1..11)` skips these rows but counts
     /// hand-hidden ones. See [`Sheet::row_filtered`].
     pub filtered_rows: std::collections::BTreeSet<u32>,
-    /// Where the sheet's own top-level `<autoFilter>` sits (not a custom
-    /// view's or a table's), so structural edits can move it. `None` when the
-    /// part has none, or once a delete took all of its rows or columns. A save
-    /// rewrites the element only when this differs from what the part holds,
-    /// and never adds one the file didn't have.
+    /// The sheet's own top-level `<autoFilter>` (not a custom view's or a
+    /// table's): where it sits, so structural edits can move it, and its
+    /// criteria. `None` when there is none, or once a delete took all of its
+    /// rows or columns. A save leaves the element alone while this matches
+    /// what the part holds, moves it when only its position changed, and
+    /// otherwise writes it from the model (adding one the filter commands
+    /// created).
     pub auto_filter: Option<SheetAutoFilter>,
+    /// `<sheetPr filterMode>` (some rows are filtered) as a filter command
+    /// last left it; `None` while none has run, so a save leaves the
+    /// attribute as the part has it.
+    pub filter_mode: Option<bool>,
     /// `<sheetPr><outlinePr>`: where a group's summary row and column sit.
     /// Edit this; a save writes it only when it differs from
     /// [`Sheet::outline_loaded`].
@@ -656,9 +662,9 @@ impl Default for SheetFormat {
     }
 }
 
-/// The position of a sheet's `<autoFilter>`: its range and the column each
-/// `<filterColumn>` filters.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A sheet's `<autoFilter>`: its range, the column each `<filterColumn>`
+/// the part holds filters, and the live criteria.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SheetAutoFilter {
     /// (r1, c1, r2, c2), 0-based, header row included.
     pub range: (u32, u32, u32, u32),
@@ -666,6 +672,11 @@ pub struct SheetAutoFilter {
     /// range's left column plus its `colId`); `None` once a delete removed
     /// that column.
     pub columns: Vec<Option<u32>>,
+    /// The criteria by absolute column, in column order. Loaded from the
+    /// part (one per `<filterColumn>`), moved by structural edits, and set
+    /// by the filter commands ([`crate::filter`]). A save writes the element
+    /// from these once they differ from what the part holds.
+    pub criteria: Vec<(u32, crate::filter::ColumnFilter)>,
 }
 
 /// One `<brk>`: `id` is the 0-based first row (column) of the page that starts

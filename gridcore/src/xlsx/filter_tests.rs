@@ -1,0 +1,215 @@
+//! Saving the AutoFilter the filter commands create or change (#690): the
+//! `<autoFilter>` element, `_xlnm._FilterDatabase`, `<sheetPr filterMode>`
+//! and the `<dxf>` a colour criterion needs.
+
+use super::*;
+use crate::filter::ColumnFilter;
+use crate::sheet::{Cell, DefinedName, SheetAutoFilter};
+
+fn text(pkg: &SheetPackage, part: &str) -> String {
+    String::from_utf8_lossy(pkg.part(part).expect("part present")).into_owned()
+}
+
+/// Save, reload, and the reloaded package with the text of `part`.
+fn saved(pkg: &SheetPackage, part: &str) -> (SheetPackage, String) {
+    let re = load_xlsx(&save_xlsx(pkg)).expect("saved file reloads");
+    let xml = text(&re, part);
+    (re, xml)
+}
+
+/// A new workbook whose Sheet1 holds the list `A1:B3` (Rep, Units), with
+/// `body` replacing the worksheet's `<sheetData/>` tail (`after`) and
+/// `dxfs` as the styles part's `<dxfs>` block.
+fn list(after: &str, dxfs: &str) -> SheetPackage {
+    let mut pkg = new_xlsx();
+    for (p, xml) in pkg.parts.iter_mut() {
+        if p == "xl/worksheets/sheet1.xml" {
+            let s = String::from_utf8_lossy(xml)
+                .replace("<sheetData/>", &format!("<sheetData/>{after}"));
+            *xml = s.into_bytes();
+        }
+        if p == "xl/styles.xml" && !dxfs.is_empty() {
+            let s = String::from_utf8_lossy(xml)
+                .replace("</styleSheet>", &format!("{dxfs}</styleSheet>"));
+            *xml = s.into_bytes();
+        }
+    }
+    let mut pkg = load_xlsx(&write_zip(&pkg.parts)).unwrap();
+    let s = &mut pkg.workbook.sheets[0];
+    s.set_cell(0, 0, Cell::text("Rep"));
+    s.set_cell(0, 1, Cell::text("Units"));
+    s.set_cell(1, 0, Cell::text("Ann"));
+    s.set_cell(1, 1, Cell::number(5.0));
+    s.set_cell(2, 0, Cell::text("Bo"));
+    s.set_cell(2, 1, Cell::number(9.0));
+    pkg
+}
+
+fn filter_db(range: &str) -> DefinedName {
+    DefinedName {
+        name: "_xlnm._FilterDatabase".into(),
+        scope: Some(0),
+        formula: format!("Sheet1!{range}"),
+    }
+}
+
+#[test]
+fn a_new_auto_filter_saves_its_element_hidden_name_and_filter_mode() {
+    let mut pkg = list("", "");
+    let s = &mut pkg.workbook.sheets[0];
+    s.auto_filter = Some(SheetAutoFilter {
+        range: (0, 0, 2, 1),
+        criteria: vec![(0, ColumnFilter::values(vec!["Ann".into()]))],
+        ..SheetAutoFilter::default()
+    });
+    s.filter_mode = Some(true);
+    s.set_row_filtered(2, true);
+    pkg.workbook.defined_names.push(filter_db("$A$1:$B$3"));
+    let (re, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+    assert!(
+        ws.contains(r#"<autoFilter ref="A1:B3"><filterColumn colId="0"><filters><filter val="Ann"/></filters></filterColumn></autoFilter>"#),
+        "{ws}"
+    );
+    assert!(ws.contains(r#"<sheetPr filterMode="1"/>"#), "{ws}");
+    let wb = text(&re, "xl/workbook.xml");
+    assert!(
+        wb.contains(r#"<definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">Sheet1!$A$1:$B$3</definedName>"#),
+        "{wb}"
+    );
+    let af = re.workbook.sheets[0].auto_filter.as_ref().unwrap();
+    assert_eq!(af.range, (0, 0, 2, 1));
+    assert_eq!(
+        af.criteria,
+        pkg.workbook.sheets[0]
+            .auto_filter
+            .as_ref()
+            .unwrap()
+            .criteria
+    );
+    // The hidden row comes back filtered, not hidden by hand.
+    assert!(re.workbook.sheets[0].row_filtered(2));
+    // Saving the reloaded file again changes nothing.
+    assert_eq!(
+        text(
+            &load_xlsx(&save_xlsx(&re)).unwrap(),
+            "xl/worksheets/sheet1.xml"
+        ),
+        ws
+    );
+}
+
+#[test]
+fn turning_the_filter_off_drops_the_element_the_name_and_filter_mode() {
+    let mut pkg = list("", "");
+    let s = &mut pkg.workbook.sheets[0];
+    s.auto_filter = Some(SheetAutoFilter {
+        range: (0, 0, 2, 1),
+        ..SheetAutoFilter::default()
+    });
+    s.filter_mode = Some(true);
+    pkg.workbook.defined_names.push(filter_db("$A$1:$B$3"));
+    let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+    assert!(text(&pkg, "xl/workbook.xml").contains("_FilterDatabase"));
+    pkg.workbook.sheets[0].auto_filter = None;
+    pkg.workbook.sheets[0].filter_mode = Some(false);
+    pkg.workbook
+        .defined_names
+        .retain(|d| d.name != "_xlnm._FilterDatabase");
+    let (re, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+    assert!(!ws.contains("autoFilter"), "{ws}");
+    assert!(!ws.contains("sheetPr"), "{ws}");
+    assert!(!text(&re, "xl/workbook.xml").contains("_FilterDatabase"));
+}
+
+#[test]
+fn a_changed_criterion_rewrites_the_element_keeping_what_we_do_not_model() {
+    let filter = concat!(
+        r#"<autoFilter ref="A1:C3"><filterColumn colId="0" hiddenButton="1"/>"#,
+        r#"<filterColumn colId="2"><customFilters><customFilter operator="greaterThan" val="5"/></customFilters></filterColumn>"#,
+        r#"<sortState ref="A2:C3"><sortCondition ref="B2:B3"/></sortState></autoFilter>"#
+    );
+    let mut pkg = list(filter, "");
+    let af = pkg.workbook.sheets[0].auto_filter.as_mut().unwrap();
+    assert_eq!(af.criteria.len(), 2);
+    af.criteria
+        .insert(1, (1, ColumnFilter::values(vec!["5".into()])));
+    let (re, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+    assert!(
+        ws.contains(concat!(
+            r#"<autoFilter ref="A1:C3"><filterColumn colId="0" hiddenButton="1"/>"#,
+            r#"<filterColumn colId="1"><filters><filter val="5"/></filters></filterColumn>"#,
+            r#"<filterColumn colId="2"><customFilters><customFilter operator="greaterThan" val="5"/></customFilters></filterColumn>"#,
+            r#"</autoFilter>"#
+        )),
+        "{ws}"
+    );
+    assert_eq!(
+        re.workbook.sheets[0]
+            .auto_filter
+            .as_ref()
+            .unwrap()
+            .criteria
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn a_colour_criterion_appends_its_dxf_and_leaves_the_others_byte_for_byte() {
+    let cf_dxf = r#"<dxf><font><b/><color theme="5"/></font><numFmt numFmtId="164" formatCode="0.0%"/><border><left style="thin"><color auto="1"/></left></border></dxf>"#;
+    let mut pkg = list("", &format!(r#"<dxfs count="1">{cf_dxf}</dxfs>"#));
+    pkg.workbook.sheets[0].auto_filter = Some(SheetAutoFilter {
+        range: (0, 0, 2, 1),
+        criteria: vec![(
+            0,
+            ColumnFilter::Color {
+                cell: true,
+                rgb: Some((0, 0xB0, 0x50)),
+                dxf_id: None,
+            },
+        )],
+        ..SheetAutoFilter::default()
+    });
+    let (re, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+    assert!(ws.contains(r#"<colorFilter dxfId="1"/>"#), "{ws}");
+    let styles = text(&re, "xl/styles.xml");
+    assert!(
+        styles.contains(&format!(
+            r#"<dxfs count="2">{cf_dxf}{}</dxfs>"#,
+            crate::filter::color_dxf_xml(true, Some((0, 0xB0, 0x50)))
+        )),
+        "{styles}"
+    );
+    // It loads back as the same colour.
+    let af = re.workbook.sheets[0].auto_filter.as_ref().unwrap();
+    assert_eq!(
+        af.criteria[0].1,
+        ColumnFilter::Color {
+            cell: true,
+            rgb: Some((0, 0xB0, 0x50)),
+            dxf_id: Some(1),
+        }
+    );
+    // A second save reuses that dxf rather than adding another.
+    let again = text(&load_xlsx(&save_xlsx(&re)).unwrap(), "xl/styles.xml");
+    assert_eq!(again.matches("<dxf>").count(), 2);
+}
+
+#[test]
+fn an_added_auto_filter_leaves_the_other_elements_in_place() {
+    let others = concat!(
+        r#"<mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>"#,
+        r#"<conditionalFormatting sqref="B2:B3"><cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>6</formula></cfRule></conditionalFormatting>"#,
+        r#"<dataValidations count="1"><dataValidation type="whole" sqref="B2:B3"><formula1>0</formula1></dataValidation></dataValidations>"#,
+    );
+    let mut pkg = list(others, r#"<dxfs count="1"><dxf/></dxfs>"#);
+    pkg.workbook.sheets[0].auto_filter = Some(SheetAutoFilter {
+        range: (0, 0, 2, 1),
+        ..SheetAutoFilter::default()
+    });
+    let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+    assert!(
+        ws.contains(&format!(r#"<autoFilter ref="A1:B3"/>{others}"#)),
+        "{ws}"
+    );
+}
