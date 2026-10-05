@@ -41,8 +41,8 @@
 //! | `open copy:<path>` | a private copy of that file in the run directory |
 //! | `open copy:"<path>" as <name>` | a distinct named copy of a fixture; the quoted source may contain ` as ` |
 //! | `call <verb> <json-object>` | a verb with its verbatim JSON payload, parsed before launch |
-//! | `click <cell> [shift] [double]` | the cell's click handler |
-//! | `drag <from> -> <to>` | press, one move per cell crossed, release |
+//! | `click <cell> [shift] [double] [ctrl]` | the cell's click handler (`ctrl` adds an area) |
+//! | `drag <from> -> <to> [ctrl]` | press, one move per cell crossed, release (`ctrl` adds an area) |
 //! | `type <text>` | one key event per character |
 //! | `key <k> [k…]` | those keys, in order |
 //! | `select chart <n>` | the press on a chart card |
@@ -125,10 +125,14 @@ pub enum Action {
         cell: String,
         shift: bool,
         double: bool,
+        /// Ctrl held: the click adds an area to the selection (#670).
+        ctrl: bool,
     },
     Drag {
         from: String,
         to: String,
+        /// Ctrl held: the sweep adds an area (#670).
+        ctrl: bool,
     },
     Type(String),
     Key(Vec<String>),
@@ -420,15 +424,16 @@ fn parse_step(head: &str, rest: &str, line: usize) -> Result<Action, ScriptError
                 .next()
                 .ok_or_else(|| err(line, "'click' needs a cell, e.g. 'click B2'"))?;
             let cell = validate_cell(cell).map_err(|e| err(line, e))?;
-            let (mut shift, mut double) = (false, false);
+            let (mut shift, mut double, mut ctrl) = (false, false, false);
             for w in words {
                 match w.to_ascii_lowercase().as_str() {
                     "shift" => shift = true,
                     "double" | "dbl" => double = true,
+                    "ctrl" => ctrl = true,
                     other => {
                         return Err(err(
                             line,
-                            format!("'{other}' is not a click modifier (shift, double)"),
+                            format!("'{other}' is not a click modifier (shift, double, ctrl)"),
                         ));
                     }
                 }
@@ -437,6 +442,7 @@ fn parse_step(head: &str, rest: &str, line: usize) -> Result<Action, ScriptError
                 cell,
                 shift,
                 double,
+                ctrl,
             })
         }
 
@@ -444,19 +450,26 @@ fn parse_step(head: &str, rest: &str, line: usize) -> Result<Action, ScriptError
             // `drag A1 -> C5`, `drag A1 to C5` and `drag A1 C5` all read the
             // same way to someone skimming; the arrow is the one the plan's own
             // example uses.
-            let words: Vec<&str> = rest_trim
+            // A trailing `ctrl` sweeps a new area (#670).
+            let mut words: Vec<&str> = rest_trim
                 .split_whitespace()
                 .filter(|w| *w != "->" && !w.eq_ignore_ascii_case("to"))
                 .collect();
+            let ctrl = words.last().is_some_and(|w| w.eq_ignore_ascii_case("ctrl"));
+            if ctrl {
+                words.pop();
+            }
             if words.len() != 2 {
                 return Err(err(
                     line,
-                    "'drag' needs two cells: 'drag A1 -> C5'".to_string(),
+                    "'drag' needs two cells: 'drag A1 -> C5' (then 'ctrl' to add an area)"
+                        .to_string(),
                 ));
             }
             Ok(Action::Drag {
                 from: validate_cell(words[0]).map_err(|e| err(line, e))?,
                 to: validate_cell(words[1]).map_err(|e| err(line, e))?,
+                ctrl,
             })
         }
 
@@ -918,7 +931,8 @@ test a pointed range dashes
             s.cases[0].steps[2].action,
             Action::Drag {
                 from: "A1".to_string(),
-                to: "C5".to_string()
+                to: "C5".to_string(),
+                ctrl: false
             },
             "the trailing comment is not part of the step"
         );
@@ -1270,7 +1284,8 @@ test Smoke-Case
                 Action::Click {
                     cell: "A1".to_string(),
                     shift: false,
-                    double: false
+                    double: false,
+                    ctrl: false
                 },
                 "{gap:?}"
             );
@@ -1296,7 +1311,8 @@ test Smoke-Case
                 s.cases[0].steps[0].action,
                 Action::Drag {
                     from: "A1".to_string(),
-                    to: "C5".to_string()
+                    to: "C5".to_string(),
+                    ctrl: false
                 },
                 "{text}"
             );
@@ -1315,10 +1331,20 @@ test Smoke-Case
             Action::Click {
                 cell: "B2".to_string(),
                 shift: true,
-                double: true
+                double: true,
+                ctrl: false
             }
         );
-        let e = parse_script("test t\n  click B2 ctrl\n").unwrap_err();
+        let s = parse_script("test t\n  click B2 ctrl\n  drag A1 -> C3 ctrl\n").unwrap();
+        assert!(matches!(
+            s.cases[0].steps[0].action,
+            Action::Click { ctrl: true, .. }
+        ));
+        assert!(matches!(
+            s.cases[0].steps[1].action,
+            Action::Drag { ctrl: true, .. }
+        ));
+        let e = parse_script("test t\n  click B2 alt\n").unwrap_err();
         assert!(e.message.contains("not a click modifier"), "{e}");
     }
 

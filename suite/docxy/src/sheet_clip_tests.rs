@@ -556,7 +556,7 @@ fn an_edit_after_a_cut_makes_it_stale_for_enter() {
 fn a_copy_of_only_filtered_out_rows_is_nothing_to_copy() {
     let mut v = filtered_book();
     select(&mut v, "A3", "B3");
-    assert!(v.grid_clip(false).is_none());
+    assert!(v.grid_clip(false).is_err());
     // A cut of the same rows still moves them.
-    assert!(v.grid_clip(true).is_some());
+    assert!(v.grid_clip(true).is_ok());
 }

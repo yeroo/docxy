@@ -2547,6 +2547,16 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ("sel", Json::Str(a1(v.sel))),
             ("anchor", Json::Str(a1(v.anchor))),
             ("range", Json::Str(a1_range(v.range()))),
+            // Every area of the selection, the active one last (#670).
+            (
+                "areas",
+                Json::Arr(
+                    v.areas_all()
+                        .into_iter()
+                        .map(|a| Json::Str(a1_range(a)))
+                        .collect(),
+                ),
+            ),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
         ]);
@@ -3253,8 +3263,9 @@ pub fn dispatch(
                 return Done::ok(state(app, window));
             }
             let cell = cell_arg(args, "cell")?;
+            let ctrl = arg_flag(args, "ctrl")?;
             sheet(app)?;
-            click_cell(app, cell, shift, dbl, window, cx);
+            click_cell(app, cell, shift, ctrl, dbl, window, cx);
             Done::ok(state(app, window))
         }
 
@@ -3432,9 +3443,9 @@ pub fn dispatch(
                 from.is_some(),
             )?;
             if let Some((start, end)) = from {
-                click_cell(app, start, false, false, window, cx);
+                click_cell(app, start, false, false, false, window, cx);
                 if end != start {
-                    click_cell(app, end, true, false, window, cx);
+                    click_cell(app, end, true, false, false, window, cx);
                 }
             }
             fill_press_refusal(
@@ -3503,8 +3514,9 @@ pub fn dispatch(
         "drag" => {
             app.refuse_under_dialog()?;
             let (from, to) = drag_args(args)?;
+            let ctrl = arg_flag(args, "ctrl")?;
             sheet(app)?;
-            app.grid_press_cell(from, cx);
+            app.grid_press_cell(from, ctrl, cx);
             for (r, c) in drag_path(from, to) {
                 app.grid_drag_over(r, c, cx);
             }
@@ -3794,16 +3806,18 @@ fn fill_press_refusal(
 
 /// A click on a sheet cell, as the pointer makes it: press, the cell's click
 /// handler, release.
+#[allow(clippy::too_many_arguments)]
 fn click_cell(
     app: &mut crate::Docxy,
     cell: (u32, u32),
     shift: bool,
+    ctrl: bool,
     double: bool,
     window: &mut Window,
     cx: &mut Context<crate::Docxy>,
 ) {
-    app.grid_press_cell(cell, cx);
-    app.cell_click(cell.0, cell.1, shift, double, window, cx);
+    app.grid_press_cell(cell, ctrl, cx);
+    app.cell_click(cell.0, cell.1, shift, ctrl, double, window, cx);
     app.grid_release(cx);
 }
 

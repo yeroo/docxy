@@ -67,6 +67,8 @@ mod sheet_consolidate;
 mod sheet_entry_tests;
 #[cfg(test)]
 mod sheet_fill_tests;
+#[cfg(test)]
+mod sheet_select_tests;
 // #707: the drop and option menus are wired by the commits that follow.
 #[allow(dead_code)]
 mod sheet_menus;
@@ -630,6 +632,33 @@ struct SheetView {
     /// Bumped by every undo step pushed and every undo or redo: a pending
     /// cut is cancelled once its workbook changes, as Excel's is (#664).
     edit_gen: u64,
+    /// The earlier areas of a multi-area selection (#670); `anchor`/`sel`
+    /// are the active (last) one. Live only while `areas_at` still matches
+    /// the sheet, `sel` and `anchor` (R5): any write to the selection that
+    /// does not go through the area methods leaves one area, so no stale
+    /// area is ever acted on.
+    areas: Vec<(u32, u32, u32, u32)>,
+    areas_at: (usize, (u32, u32), (u32, u32)),
+}
+
+/// The column spans of `areas` on each row below `rows` (#670, R17): what
+/// the row renderer asks, one row at a time.
+fn area_row_index(
+    areas: &[(u32, u32, u32, u32)],
+    rows: u32,
+) -> std::collections::HashMap<u32, Vec<(u32, u32)>> {
+    let mut index: std::collections::HashMap<u32, Vec<(u32, u32)>> = Default::default();
+    for &(r0, c0, r1, c1) in areas {
+        for r in r0..=r1.min(rows.saturating_sub(1)) {
+            index.entry(r).or_default().push((c0, c1));
+        }
+    }
+    index
+}
+
+/// Whether a pointer event's modifiers hold Excel's Ctrl (Cmd on macOS).
+fn ctrl_held(m: &Modifiers) -> bool {
+    m.control || (cfg!(target_os = "macos") && m.platform)
 }
 
 /// A fresh [`SheetView::id`].
@@ -745,6 +774,8 @@ struct SheetSnapshot {
     active: usize,
     sel: (u32, u32),
     anchor: (u32, u32),
+    /// The selection's other areas (#670), so undo restores them too.
+    areas: Vec<(u32, u32, u32, u32)>,
 }
 
 /// What an undo step puts back of the package.
@@ -890,6 +921,88 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
             // `run_sheet_act` asks Protected View itself.
             | Act::Sheet(_)
     )
+}
+
+/// Whether a sheet command runs on a multi-area selection (#670, R4).
+/// Exhaustive, with no catch-all, so a new command cannot be added without
+/// being sorted. Those that act on every area, or never on the selection's
+/// cells, run; the rest would act on the active area alone, so they are
+/// refused with Excel's [`gridcore::edit::MULTI_SELECTION`].
+fn multi_area_ok(act: SheetAct) -> bool {
+    match act {
+        // Every area: formats, Delete-like clears, and Copy, which checks
+        // the areas' shape itself.
+        SheetAct::Copy
+        | SheetAct::Bold
+        | SheetAct::Italic
+        | SheetAct::AlignL
+        | SheetAct::AlignC
+        | SheetAct::AlignR
+        | SheetAct::WrapText
+        | SheetAct::GrowFont
+        | SheetAct::ShrinkFont
+        | SheetAct::Percent
+        | SheetAct::Currency
+        | SheetAct::Comma
+        | SheetAct::FillColor
+        | SheetAct::FontColor
+        | SheetAct::ToggleBorder
+        | SheetAct::FormatCells
+        | SheetAct::NumberFormatMenu
+        | SheetAct::Clear(_)
+        // Not the cells: menus, the sheet, navigation, panes and dialogs
+        // that pick a new selection.
+        | SheetAct::Menu(_)
+        | SheetAct::FreezePanes
+        | SheetAct::PrevComment
+        | SheetAct::NextComment
+        | SheetAct::ProtectSheet
+        | SheetAct::ShowLevel(_)
+        | SheetAct::ClearOutline
+        | SheetAct::OutlineSettings
+        | SheetAct::GoTo
+        | SheetAct::GoToSpecial
+        | SheetAct::OfficeClipboard
+        | SheetAct::CustomLists
+        | SheetAct::Todo => true,
+        // One rectangle only.
+        SheetAct::Cut
+        | SheetAct::Paste
+        | SheetAct::PasteAs(_)
+        | SheetAct::PasteSpecial
+        | SheetAct::Drop(_)
+        | SheetAct::RowHeight
+        | SheetAct::InsertPivot
+        | SheetAct::InsertChart(_)
+        | SheetAct::NewComment
+        | SheetAct::DeleteComment
+        | SheetAct::InsertRow
+        | SheetAct::DeleteRow
+        | SheetAct::InsertCol
+        | SheetAct::DeleteCol
+        | SheetAct::SortAsc
+        | SheetAct::SortDesc
+        | SheetAct::CustomSort
+        | SheetAct::AutoSum
+        | SheetAct::Merge
+        | SheetAct::CondFormat
+        | SheetAct::DataValidation
+        | SheetAct::Filter
+        | SheetAct::RemoveDuplicates
+        | SheetAct::TextToColumns
+        | SheetAct::FormatAsTable
+        | SheetAct::Consolidate
+        | SheetAct::Subtotal
+        | SheetAct::Group
+        | SheetAct::Ungroup
+        | SheetAct::ShowDetail
+        | SheetAct::HideDetail
+        | SheetAct::AutoOutline
+        | SheetAct::Fill(_)
+        | SheetAct::FillSeries
+        | SheetAct::FillJustify
+        | SheetAct::FillAs(_) => false,
+    }
 }
 
 /// Whether a ribbon command reads or writes the cell selection.
@@ -1196,6 +1309,8 @@ enum HandleHidden {
     ChartSelected,
     /// File › Options turned the fill handle off (#672).
     Disabled,
+    /// The selection has more than one area (#670): Excel draws no handle.
+    MultiArea,
 }
 
 impl HandleHidden {
@@ -1205,6 +1320,7 @@ impl HandleHidden {
             HandleHidden::Pointing => "a reference is being pointed at",
             HandleHidden::ChartSelected => "a chart is selected",
             HandleHidden::Disabled => "the fill handle is turned off in Settings",
+            HandleHidden::MultiArea => "the selection has more than one area",
         }
     }
 
@@ -1268,6 +1384,9 @@ fn fill_dest(src: (u32, u32, u32, u32), bx: (u32, u32, u32, u32)) -> (u32, u32, 
     }
 }
 
+/// Why a copy took nothing: a filter hides every selected row.
+const NOTHING_TO_COPY: &str = "Nothing to copy: a filter hides every selected row";
+
 /// The grid clipboard: a rectangular block of cells copied from a sheet.
 #[derive(Clone)]
 #[cfg_attr(test, derive(Default))]
@@ -1287,6 +1406,9 @@ struct GridClip {
     /// The sheet row each row of `cells` came from: a copy leaves out the
     /// rows a filter hides (#664), so rows may be missing.
     rows: Vec<u32>,
+    /// The sheet column each column of `cells` came from: a multi-area copy
+    /// joins areas side by side (#670), so columns may be missing.
+    cols: Vec<u32>,
     /// A cut: its paste moves the cells, once (#664).
     cut: bool,
     /// The source's [`SheetView::edit_gen`] when it was taken (or last
@@ -2065,11 +2187,14 @@ impl SheetView {
     /// The blanks clearing the selected range writes: each cell's content
     /// goes, its style stays.
     fn clear_changes(&self) -> Vec<(u32, u32, gridcore::sheet::Cell)> {
-        let (r0, c0, r1, c1) = self.range();
         let mut changes = Vec::new();
-        for (&(r, c), cell) in self.sheet().cells.range((r0, 0)..=(r1, u32::MAX)) {
-            if (c0..=c1).contains(&c) {
-                changes.push((r, c, cell.blank_like()));
+        let mut seen = std::collections::BTreeSet::new();
+        // Every area of a multi-area selection (#670).
+        for (r0, c0, r1, c1) in self.areas_all() {
+            for (&(r, c), cell) in self.sheet().cells.range((r0, 0)..=(r1, u32::MAX)) {
+                if (c0..=c1).contains(&c) && seen.insert((r, c)) {
+                    changes.push((r, c, cell.blank_like()));
+                }
             }
         }
         changes
@@ -2548,9 +2673,13 @@ impl SheetView {
         let (s, r, c) = self
             .edit_origin
             .unwrap_or((self.active, self.sel.0, self.sel.1));
-        let range = self.range();
-        let inside = (range.0..=range.2).contains(&r) && (range.1..=range.3).contains(&c);
-        if !self.has_range() || s != self.active || !inside {
+        // Every area of a multi-area selection (#670), each relative to the
+        // active cell: Go To Special › Blanks, `=A1`, Ctrl+Enter.
+        let areas = self.areas_all();
+        let inside = areas
+            .iter()
+            .any(|a| (a.0..=a.2).contains(&r) && (a.1..=a.3).contains(&c));
+        if (!self.has_range() && areas.len() == 1) || s != self.active || !inside {
             return self.commit_edit();
         }
         if let Err(e) = gridcore::entry::check_len(&buf) {
@@ -2559,13 +2688,26 @@ impl SheetView {
         }
         // Every cell of the range, not just the active one: a Text-formatted
         // active cell takes `=SUM(B1` as text while the others would not.
-        if let Some(e) = self.formula_error(s, range, &buf) {
+        if let Some(e) = areas
+            .iter()
+            .find_map(|&range| self.formula_error(s, range, &buf))
+        {
             self.entry_error = Some(e);
             return false;
         }
         let ctx = self.typed_ctx();
         let wb = &mut self.pkg.workbook;
-        let cells = gridcore::entry::entry_range_ctx(wb, s, range, (r, c), &buf, &ctx).ok();
+        let mut cells = Some(Vec::new());
+        for &range in &areas {
+            match gridcore::entry::entry_range_ctx(wb, s, range, (r, c), &buf, &ctx) {
+                Ok(more) => {
+                    if let Some(all) = cells.as_mut() {
+                        all.extend(more);
+                    }
+                }
+                Err(_) => cells = None,
+            }
+        }
         if cells.as_ref().is_some_and(|cells| self.refuses(s, cells)) {
             return false;
         }
@@ -2598,10 +2740,14 @@ impl SheetView {
     /// of each cell's `Xf`, intern it (dedup), and re-point the cell's style.
     /// Values and formulas are untouched, so no recalc is needed.
     fn format_selection(&mut self, apply: &dyn Fn(&mut gridcore::sheet::Xf)) {
-        let (r0, c0, r1, c1) = self.range();
         let s = self.active;
-        for r in r0..=r1 {
-            for c in c0..=c1 {
+        let mut seen = std::collections::BTreeSet::new();
+        // Every area of a multi-area selection (#670), each cell once.
+        for (r0, c0, r1, c1) in self.areas_all() {
+            for (r, c) in (r0..=r1).flat_map(|r| (c0..=c1).map(move |c| (r, c))) {
+                if !seen.insert((r, c)) {
+                    continue;
+                }
                 let cur = self.sheet().cell(r, c).cloned();
                 let mut xf = self
                     .pkg
@@ -2829,6 +2975,7 @@ impl SheetView {
             active: self.active,
             sel: self.sel,
             anchor: self.anchor,
+            areas: self.extra_areas(),
         }
     }
 
@@ -2847,34 +2994,113 @@ impl SheetView {
             .min(self.pkg.workbook.sheets.len().saturating_sub(1));
         self.sel = snap.sel;
         self.anchor = snap.anchor;
+        self.areas = snap.areas;
+        self.stamp_areas();
         self.end_cell_edit();
     }
-    /// The selection rectangle as (r0, c0, r1, c1), top-left to bottom-right.
+    /// The selection rectangle as (r0, c0, r1, c1), top-left to bottom-right:
+    /// the active area of a multi-area selection.
     fn range(&self) -> (u32, u32, u32, u32) {
         sel_range(self.sel, self.anchor)
+    }
+
+    /// Whether the earlier areas still belong to the selection (R5).
+    fn areas_live(&self) -> bool {
+        !self.areas.is_empty() && self.areas_at == (self.active, self.sel, self.anchor)
+    }
+
+    /// The selection's areas other than the active one; empty for a
+    /// one-area selection.
+    fn extra_areas(&self) -> Vec<(u32, u32, u32, u32)> {
+        if self.areas_live() {
+            self.areas.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Every area of the selection, the active one last.
+    fn areas_all(&self) -> Vec<(u32, u32, u32, u32)> {
+        let mut all = self.extra_areas();
+        all.push(self.range());
+        all
+    }
+
+    /// Whether the selection has more than one area.
+    fn multi_area(&self) -> bool {
+        self.areas_live()
+    }
+
+    /// Take the selection as it is now as the one the areas belong to:
+    /// after an edit of the active area that keeps the others (Shift+click,
+    /// a Ctrl+drag's sweep).
+    fn stamp_areas(&mut self) {
+        self.areas_at = (self.active, self.sel, self.anchor);
+    }
+
+    /// Ctrl+click (or the press of a Ctrl+drag): the selection so far stays,
+    /// and `cell` starts a new active area.
+    fn add_area(&mut self, cell: (u32, u32)) {
+        self.areas = self.areas_all();
+        self.sel = cell;
+        self.anchor = cell;
+        self.stamp_areas();
+        self.end_cell_edit();
+    }
+
+    /// Move the active area's moving corner to `cell`, keeping the other
+    /// areas (Shift+click, a sweep, Shift+arrow).
+    fn extend_active(&mut self, cell: (u32, u32)) {
+        let live = self.areas_live();
+        self.sel = cell;
+        if live {
+            self.stamp_areas();
+        }
+    }
+
+    /// Back to one area.
+    fn clear_areas(&mut self) {
+        self.areas.clear();
     }
 
     /// The selection as a grid clip (Ctrl+C, Ctrl+X): its cells, and as TSV
     /// the text it puts on the clipboard. A copy leaves out the rows a filter
     /// hides, as Excel does (rows hidden by Hide are copied); a cut keeps
-    /// every row, since it moves the whole range (#664). `None` when a
-    /// filter hides every selected row: there is nothing to copy.
-    fn grid_clip(&self, cut: bool) -> Option<GridClip> {
-        let rect = self.range();
-        let (r0, c0, r1, c1) = rect;
+    /// every row, since it moves the whole range (#664). A multi-area copy
+    /// joins areas that share their rows (or their columns) into one block,
+    /// and refuses any other, as a cut of more than one area is refused
+    /// ([`gridcore::edit::MULTI_SELECTION`], #670). Refused too when a filter
+    /// hides every selected row: there is nothing to copy.
+    fn grid_clip(&self, cut: bool) -> Result<GridClip, &'static str> {
+        let (all_rows, cols) = if self.multi_area() {
+            if cut {
+                return Err(gridcore::edit::MULTI_SELECTION);
+            }
+            gridcore::edit::multi_area_shape(&self.areas_all())?
+        } else {
+            let (r0, c0, r1, c1) = self.range();
+            ((r0..=r1).collect(), (c0..=c1).collect())
+        };
+        let rect = (
+            all_rows[0],
+            cols[0],
+            *all_rows.last().unwrap_or(&all_rows[0]),
+            *cols.last().unwrap_or(&cols[0]),
+        );
         let sheet = self.sheet();
-        let rows: Vec<u32> = (r0..=r1)
+        let rows: Vec<u32> = all_rows
+            .into_iter()
             .filter(|&r| cut || !sheet.row_filtered(r))
             .collect();
         if rows.is_empty() {
-            return None;
+            return Err(NOTHING_TO_COPY);
         }
         let mut cells = Vec::with_capacity(rows.len());
         let mut tsv = String::new();
         for &r in &rows {
             let mut row = Vec::new();
-            for c in c0..=c1 {
-                if c > c0 {
+            for (j, &c) in cols.iter().enumerate() {
+                if j > 0 {
                     tsv.push('\t');
                 }
                 // With the `'` a paste needs to read the text back.
@@ -2891,7 +3117,7 @@ impl SheetView {
             cells.push(row);
             tsv.push('\n');
         }
-        Some(GridClip {
+        Ok(GridClip {
             cells,
             text: tsv,
             view: self.id,
@@ -2899,6 +3125,7 @@ impl SheetView {
             sheet_name: sheet.name.clone(),
             rect,
             rows,
+            cols,
             cut,
             view_gen: self.edit_gen,
             spent: false,
@@ -2991,8 +3218,7 @@ impl SheetView {
             )));
         }
         let at = (sel.0, sel.1);
-        let cols: Vec<u32> = (clip.rect.1..=clip.rect.3).collect();
-        let block = tiled_block(&clip.cells, &clip.rows, &cols, at, tiles);
+        let block = tiled_block(&clip.cells, &clip.rows, &clip.cols, at, tiles);
         self.write_block(at, &block).map(|()| GridPasted::Done)
     }
 
@@ -3398,6 +3624,8 @@ struct Docxy {
     ref_msg: Option<(RefTarget, bool, String)>,
     // The cell a left press landed on, so a drag-select starts there.
     drag_anchor: Option<(u32, u32)>,
+    // Ctrl was held at that press: the sweep adds an area (#670).
+    drag_ctrl: bool,
     // A reference being pointed at while a formula is being typed: the buffer
     // and caret as they were when the press landed, plus the anchor cell. Each
     // move re-splices from those, so a drag rewrites one reference rather than
@@ -8115,6 +8343,8 @@ fn new_sheet_surface() -> Surface {
         edit_proposal: None,
         id: next_sheet_view_id(),
         edit_gen: 0,
+        areas: Vec::new(),
+        areas_at: (0, (0, 0), (0, 0)),
     })
 }
 
@@ -8183,6 +8413,8 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     edit_proposal: None,
                     id: next_sheet_view_id(),
                     edit_gen: 0,
+                    areas: Vec::new(),
+                    areas_at: (0, (0, 0), (0, 0)),
                 };
                 let mut status = format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" });
                 if repair {
@@ -9159,6 +9391,7 @@ impl Docxy {
             ref_msg: None,
             formula_pick: None,
             drag_anchor: None,
+            drag_ctrl: false,
             range_pick: None,
             keytips: KeyTip::Off,
             keytip_prefix: String::new(),
@@ -9674,7 +9907,26 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             v.sel = (row, col);
             v.anchor = (row, col);
+            v.clear_areas();
             v.end_cell_edit();
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+click on `(row, col)`, or the first move of a Ctrl+drag: the
+    /// selection so far stays and the cell starts a new area (#670), as a
+    /// plain click's [`Self::select_cell`] would start the only one.
+    fn add_area_at(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        if self.chart_sel.is_some() {
+            // A chart holds the selection: the grid's is not shown, so
+            // there is nothing to add to.
+            return self.select_cell(row, col, cx);
+        }
+        if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
+            self.sheet_commit(0, 0, cx);
+        }
+        if let Some(v) = self.active_sheet_mut() {
+            v.add_area((row, col));
         }
         cx.notify();
     }
@@ -9722,7 +9974,7 @@ impl Docxy {
     /// verbs cannot see a handler added here. This guard can. See
     /// `docs/ui-test-harness.md`.
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
-        if self.protected_refused(cx) {
+        if self.protected_refused(cx) || self.multi_area_refused(cx) {
             return;
         }
         let gesture_in_flight = self.grid_gesture_in_flight();
@@ -9751,6 +10003,11 @@ impl Docxy {
             self.formula_pick_active(),
             self.chart_sel,
         )
+        .or_else(|| {
+            self.active_sheet()
+                .is_some_and(SheetView::multi_area)
+                .then_some(HandleHidden::MultiArea)
+        })
     }
 
     /// Update the auto-fill target as the handle is dragged. Nothing is
@@ -9861,6 +10118,7 @@ impl Docxy {
         self.col_resize_end(cx);
         self.sheet_dragging = false; // end any drag-select
         self.drag_anchor = None;
+        self.drag_ctrl = false;
         self.sheet_fill_end(cx); // commit an auto-fill drag, if any
         self.chart_drag_end(cx); // commit a chart move, if any
         self.range_pick_end(cx); // replot a range picked off the grid
@@ -10826,11 +11084,11 @@ impl Docxy {
     /// A press landed on the grid: remember which cell, so the drag that may
     /// follow extends from there rather than from wherever the pointer first
     /// crossed a boundary.
-    fn grid_press(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+    fn grid_press(&mut self, pos: Point<Pixels>, ctrl: bool, cx: &mut Context<Self>) {
         let Some(cell) = self.cell_at(pos) else {
             return;
         };
-        self.grid_press_cell(cell, cx);
+        self.grid_press_cell(cell, ctrl, cx);
     }
 
     /// The press, once it has been located. Split out of [`grid_press`] so the
@@ -10838,7 +11096,8 @@ impl Docxy {
     /// pixel hit-test is not what a test asserts on, and a harness that
     /// reproduced this body instead of calling it would keep passing after this
     /// one changed.
-    fn grid_press_cell(&mut self, cell: (u32, u32), _cx: &mut Context<Self>) {
+    fn grid_press_cell(&mut self, cell: (u32, u32), ctrl: bool, _cx: &mut Context<Self>) {
+        self.drag_ctrl = ctrl;
         if self.formula_pick_active() {
             // Anchor the reference on the pressed cell, with the buffer as it
             // stands, so the drag rewrites from there.
@@ -10859,17 +11118,25 @@ impl Docxy {
     /// it. The body of the cell's own `on_click`, lifted to a method so the UI
     /// test harness's `click-cell` verb drives the same code the pointer does
     /// rather than a second copy of these rules.
+    #[allow(clippy::too_many_arguments)]
     fn cell_click(
         &mut self,
         r: u32,
         c: u32,
         shift: bool,
+        ctrl: bool,
         dbl: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if shift {
             self.extend_to(r, c, cx)
+        } else if ctrl && !self.formula_pick_active() && !self.range_field_active() {
+            // Ctrl+click adds a one-cell area (#670). A Ctrl+drag that ends
+            // where it began already added its area at its first move.
+            if !self.sheet_dragging {
+                self.add_area_at(r, c, cx);
+            }
         } else {
             // While a formula is being typed — or a range field has the
             // keyboard — a click POINTS at this cell: the selection never
@@ -11607,9 +11874,16 @@ impl Docxy {
             // in-cell edit, so without this a drag that starts on those few
             // pixels writes cells instead of picking them.
             handle_hidden: !self.edit_opts.fill_handle
-                || fill_handle_pointing(self.range_field_active(), self.formula_pick_active()),
+                || fill_handle_pointing(self.range_field_active(), self.formula_pick_active())
+                || self.active_sheet().is_some_and(SheetView::multi_area),
             edit_in_cell: self.edit_opts.edit_in_cell,
             fx_expanded: self.fx_expanded,
+            extra_areas: std::rc::Rc::new(
+                self.active_sheet()
+                    .map(SheetView::extra_areas)
+                    .unwrap_or_default(),
+            ),
+            area_rows: Default::default(),
             // The border's range and the cap on its dashes both need the
             // visible-row list and the column window, which only `sheet_el`
             // has.
@@ -11713,7 +11987,12 @@ impl Docxy {
             // The press located the origin; fall back to this cell when it
             // couldn't (frozen rows, or a press outside the grid).
             let (ar, ac) = self.drag_anchor.unwrap_or((row, col));
-            self.select_cell(ar, ac, cx);
+            if self.drag_ctrl {
+                // Ctrl+drag sweeps a new area (#670).
+                self.add_area_at(ar, ac, cx);
+            } else {
+                self.select_cell(ar, ac, cx);
+            }
             if (ar, ac) != (row, col) {
                 self.extend_to(row, col, cx);
             }
@@ -11751,7 +12030,8 @@ impl Docxy {
             self.ref_msg = None;
         }
         if let Some(v) = self.active_sheet_mut() {
-            v.sel = (row, col);
+            // Only the active area moves; the others stay (#670).
+            v.extend_active((row, col));
             v.end_cell_edit();
         }
         cx.notify();
@@ -12333,7 +12613,8 @@ impl Docxy {
         }
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
-            v.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
+            // Only the active area grows; the others stay (#670).
+            v.extend_active(((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32));
             v.end_cell_edit();
         }
         cx.notify();
@@ -12412,10 +12693,13 @@ impl Docxy {
         };
         // A filter hiding every selected row leaves nothing to copy; the
         // clipboard and copy mode stay as they were.
-        let Some(mut clip) = v.grid_clip(cut) else {
-            self.set_status("Nothing to copy: a filter hides every selected row");
-            cx.notify();
-            return;
+        let mut clip = match v.grid_clip(cut) {
+            Ok(clip) => clip,
+            Err(why) => {
+                self.set_status(why);
+                cx.notify();
+                return;
+            }
         };
         clip.text = self.clipboard_write_recorded(std::mem::take(&mut clip.text), cx);
         self.grid_clip = Some(clip);
@@ -12575,6 +12859,10 @@ impl Docxy {
         let now = self.clipboard_read(cx);
         if self.sheet_protected() || self.protected_view() || self.grid_clip_live(&now).is_none() {
             return false;
+        }
+        // A paste lands in one rectangle (#670).
+        if self.multi_area_refused(cx) {
+            return true;
         }
         if self.sheet_paste(cx) {
             self.grid_clip_spend();
@@ -14742,6 +15030,17 @@ impl Docxy {
         .map(|()| cx.notify())
     }
 
+    /// Refuse what would act on one area of a multi-area selection, with
+    /// Excel's message; false when the selection has one area.
+    fn multi_area_refused(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.active_sheet().is_some_and(SheetView::multi_area) {
+            return false;
+        }
+        self.set_status(gridcore::edit::MULTI_SELECTION);
+        cx.notify();
+        true
+    }
+
     /// What a paste could take now: a live grid clip, and clipboard text.
     fn paste_sources(&mut self, cx: &mut Context<Self>) -> (bool, bool) {
         let now = self.clipboard_read(cx);
@@ -14754,6 +15053,10 @@ impl Docxy {
         // Protected View (#610): the ribbon is hidden, but shortcuts, KeyTips
         // and the harness's `ribbon-click` still come here.
         if !protected_view_allows_act(act) && self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        // A multi-area selection runs only what acts on every area (#670).
+        if !multi_area_ok(act) && self.multi_area_refused(cx) {
             return self.refocus(window, cx);
         }
         // Before anything reads the selection — including the bar seeding below
@@ -15111,19 +15414,22 @@ impl Docxy {
                     self.find_field = FindField::Query;
                     cx.notify();
                 }
-                "c" => self.sheet_copy(false, cx),
-                "x" => self.sheet_copy(true, cx),
-                "v" => {
-                    self.sheet_paste(cx);
-                }
+                // The shortcuts of ribbon commands run the commands' own
+                // acts, so they share their checks (a multi-area selection,
+                // #670).
+                "c" => return self.run_sheet_act(SheetAct::Copy, window, cx),
+                "x" => return self.run_sheet_act(SheetAct::Cut, window, cx),
+                "v" => return self.run_sheet_act(SheetAct::Paste, window, cx),
                 "z" => self.sheet_undo(cx),
                 "y" => self.sheet_redo(cx),
-                "b" => self.sheet_toggle_bold(cx),
-                "i" => self.sheet_toggle_italic(cx),
+                "b" => return self.run_sheet_act(SheetAct::Bold, window, cx),
+                "i" => return self.run_sheet_act(SheetAct::Italic, window, cx),
                 // Insert a PivotTable for the selection (also on the Insert ribbon).
-                "p" if shift => self.sheet_insert_pivot(cx),
+                "p" if shift => return self.run_sheet_act(SheetAct::InsertPivot, window, cx),
                 // Insert a chart of the selection (also on the Insert ribbon).
-                "k" if shift => self.sheet_insert_chart("column", cx),
+                "k" if shift => {
+                    return self.run_sheet_act(SheetAct::InsertChart("column"), window, cx);
+                }
                 "a" => {
                     // Select the whole used range.
                     if let Some(v) = self.active_sheet_mut() {
@@ -28011,6 +28317,13 @@ struct GridOverlay {
     edit_in_cell: bool,
     /// Ctrl+Shift+U: the formula bar is about four lines tall (#672).
     fx_expanded: bool,
+    /// The selection's areas other than the active one (#670), shaded like
+    /// it. An INPUT to `area_rows`, which `sheet_el` builds for the rows it
+    /// draws; the row renderer reads that.
+    extra_areas: std::rc::Rc<Vec<(u32, u32, u32, u32)>>,
+    /// `extra_areas` by row: each row's column spans, for the rows drawn
+    /// (R17), so a cell asks only its own row.
+    area_rows: std::rc::Rc<std::collections::HashMap<u32, Vec<(u32, u32)>>>,
     /// What the dashed brand border outlines this frame: the pointed range,
     /// else a selection spanning more than one cell (`border_range`), with its
     /// rows snapped onto the ones the grid draws (`snap_range_rows`).
@@ -28138,7 +28451,12 @@ fn sheet_row(
         // While a range is being picked the active cell keeps its place with a
         // wash instead of the ring, so only the picked range reads as an outline.
         let ring = selected && !ov.picking && !ov.sel_hidden;
-        let in_range = !ov.sel_hidden && r >= r0 && r <= r1 && c >= c0 && c <= c1;
+        let in_range = !ov.sel_hidden
+            && ((r >= r0 && r <= r1 && c >= c0 && c <= c1)
+                || ov
+                    .area_rows
+                    .get(&r)
+                    .is_some_and(|spans| spans.iter().any(|&(a, b)| c >= a && c <= b)));
         // Cells the fill drag would reach: shaded while the button is down, so
         // the drag reads as a preview and nothing has actually moved yet.
         let in_preview = !in_range
@@ -28339,8 +28657,11 @@ fn sheet_row(
         let ent2 = ent.clone();
         cell = cell.on_click(move |ev, window, cx| {
             let shift = ev.modifiers().shift;
+            let ctrl = ctrl_held(&ev.modifiers());
             let dbl = ev.click_count() >= 2;
-            ent2.update(cx, |this, cx| this.cell_click(r, c, shift, dbl, window, cx));
+            ent2.update(cx, |this, cx| {
+                this.cell_click(r, c, shift, ctrl, dbl, window, cx)
+            });
         });
         // Drag-select: while the left button is held, extend the selection to
         // whatever cell the pointer is over (on_mouse_move is hitbox-scoped, so
@@ -30053,7 +30374,9 @@ fn sheet_el(
                 .collect(),
         )
     };
+    let area_rows = std::rc::Rc::new(area_row_index(&ov.extra_areas, total_rows as u32));
     let ov = GridOverlay {
+        area_rows,
         handle_hidden: ov.handle_hidden || corner_under_chart,
         border_rg,
         range_dashed,
@@ -30531,7 +30854,8 @@ fn sheet_el(
         .on_mouse_down(MouseButton::Left, {
             let ent_dn = ent.clone();
             move |ev, _w, cx| {
-                ent_dn.update(cx, |this, cx| this.grid_press(ev.position, cx));
+                let ctrl = ctrl_held(&ev.modifiers);
+                ent_dn.update(cx, |this, cx| this.grid_press(ev.position, ctrl, cx));
             }
         })
         // Column-resize drag: track the pointer and release anywhere in the grid.
