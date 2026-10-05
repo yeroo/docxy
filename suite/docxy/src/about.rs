@@ -131,29 +131,58 @@ fn stdout_usable(handle: isize, file_type: u32) -> bool {
 pub(crate) fn print_version() {
     let text = version_text(info());
     #[cfg(windows)]
+    if !windows_console::stdout_is_usable()
+        && windows_console::write_to_parent_console(&text)
     {
-        use std::io::Write;
-        unsafe extern "system" {
-            fn GetStdHandle(which: u32) -> isize;
-            fn GetFileType(handle: isize) -> u32;
-            fn AttachConsole(process_id: u32) -> i32;
-        }
-        // STD_OUTPUT_HANDLE is (DWORD)-11; ATTACH_PARENT_PROCESS is (DWORD)-1.
-        // SAFETY: plain Win32 calls with no pointers; an invalid handle is checked
-        // before it is passed to GetFileType.
-        let (handle, file_type) = unsafe {
-            let h = GetStdHandle(-11i32 as u32);
-            (h, if h != 0 && h != -1 { GetFileType(h) } else { 0 })
-        };
-        if !stdout_usable(handle, file_type)
-            && unsafe { AttachConsole(u32::MAX) } != 0
-            && let Ok(mut out) = std::fs::OpenOptions::new().write(true).open("CONOUT$")
-            && out.write_all(text.as_bytes()).is_ok()
-        {
-            return;
-        }
+        return;
     }
     print!("{text}");
+}
+
+/// The Win32 calls `print_version` makes, declared as `convert_child.rs` declares its own.
+#[cfg(windows)]
+mod windows_console {
+    use std::ffi::c_void;
+    use std::io::Write;
+
+    type Handle = *mut c_void;
+    /// `(DWORD)-11`.
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    /// `(DWORD)-1`.
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    const FILE_TYPE_UNKNOWN: u32 = 0;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(which: u32) -> Handle;
+        fn GetFileType(handle: Handle) -> u32;
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+
+    /// Whether stdout already goes somewhere (see [`super::stdout_usable`]).
+    pub(super) fn stdout_is_usable() -> bool {
+        // SAFETY: plain Win32 calls; the handle is checked before GetFileType.
+        let (handle, file_type) = unsafe {
+            let h = GetStdHandle(STD_OUTPUT_HANDLE);
+            let valid = !h.is_null() && h as isize != INVALID_HANDLE_VALUE;
+            (h as isize, if valid { GetFileType(h) } else { FILE_TYPE_UNKNOWN })
+        };
+        super::stdout_usable(handle, file_type)
+    }
+
+    /// Attach to the parent's console and write `text` to it; false if either fails.
+    pub(super) fn write_to_parent_console(text: &str) -> bool {
+        // SAFETY: a plain Win32 call with no pointers.
+        if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } == 0 {
+            return false;
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("CONOUT$")
+            .and_then(|mut out| out.write_all(text.as_bytes()))
+            .is_ok()
+    }
 }
 
 #[cfg(test)]

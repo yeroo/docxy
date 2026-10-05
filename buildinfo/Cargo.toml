@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["build-info", "git", "version", "build-script"]
+categories = ["development-tools::build-utils"]
 build = "build.rs"
 
 [lints]

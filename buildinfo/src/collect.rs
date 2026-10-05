@@ -246,7 +246,7 @@ mod tests {
         std::fs::write(d.join("a.txt"), "1").unwrap();
         std::fs::write(d.join("build.rs"), "fn main() {}").unwrap();
         assert!(run(&d, &["add", "."]));
-        // A branch commit naming an issue must not read as a PR ...
+        // With no merge commit in range, a `Title (#N)` subject counts as a squashed PR ...
         assert!(run(&d, &["commit", "-qm", "Fix the thing (#42)"]));
         let f = collect(&d, &no_env);
         assert_eq!(
@@ -286,7 +286,7 @@ mod tests {
                 .iter()
                 .any(|p| p.ends_with("a.txt"))
         );
-        // The branch's own issue number is not a PR.
+        // The issue number comes from the branch name.
         assert!(run(&d, &["checkout", "-q", "-b", "issue-99-later"]));
         assert_eq!(collect(&d, &no_env).issue, Some(99));
         let _ = std::fs::remove_dir_all(&d);

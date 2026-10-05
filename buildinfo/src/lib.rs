@@ -74,7 +74,7 @@ pub struct BuildInfo {
 impl BuildInfo {
     /// The recorded build info for a host whose own version is `version`
     /// (`env!("CARGO_PKG_VERSION")` at the call site: the suite is 0.1.0, the
-    /// terminal editors 0.5.0).
+    /// terminal editors each have their own: docxy 0.5.0, xlsxy 0.1.0).
     pub fn new(version: &str) -> BuildInfo {
         BuildInfo::from_raw(&RAW, version)
     }
