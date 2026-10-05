@@ -1,0 +1,166 @@
+# Word's document lifecycle (#709): new-document names and Ctrl+N (#631).
+# Run against a fresh harness instance, whose one tab is the never-saved sample.
+
+test new blank documents are Document1 Document2 and never reuse a number
+  assert tabs is 1
+  key ctrl+n
+  assert tabs is 2
+  assert title is Document1
+  assert dirty is false
+  key ctrl+n
+  assert title is Document2
+  call close-tab {}
+  assert tabs is 2
+  assert title is Document1
+  key ctrl+n
+  assert title is Document3
+  call close-tab {}
+  call close-tab {}
+  call close-tab {}
+  assert tabs is 0
+
+test Ctrl+N on a workbook makes a workbook and on a Project nothing
+  open ../fixtures/basic.xlsx
+  assert tabs is 1
+  key ctrl+n
+  assert sheet_tab is true
+  assert title is Untitled.xlsx
+  open ../fixtures/gantt-summary.xml
+  assert tabs is 3
+  key ctrl+n
+  assert tabs is 3
+  assert title is gantt-summary.xml
+  call close-tab {}
+  call close-tab {}
+  call close-tab {}
+  assert tabs is 0
+  key ctrl+n
+  assert title is Document4
+  call close-tab {}
+
+test Ctrl+W closes a clean tab and asks Words question for a dirty one
+  key ctrl+n
+  key ctrl+n
+  assert tabs is 2
+  assert title is Document6
+  key ctrl+w
+  assert tabs is 1
+  assert title is Document5
+  type Quarterly report for the north region
+  assert dirty is true
+  key ctrl+w
+  assert tabs is 1
+  assert dialog is save-on-close
+  call dialog-read {}
+  assert reply.title is Save your changes to this file?
+  assert reply.controls.0.label is File name:
+  assert reply.controls.0.text is Quarterly report for the north region
+  assert reply.controls.1.text is .docx
+  assert reply.controls.2.label is Choose a Location:
+  assert reply.buttons.0.label is Save
+  assert reply.buttons.0.default is true
+  assert reply.buttons.1.label is Don't Save
+  assert reply.buttons.2.label is Cancel
+  assert reply.buttons.3.label is More options...
+  key escape
+  assert dialog is none
+  assert tabs is 1
+  assert dirty is true
+  key ctrl+w
+  call-error dialog-click {"button":"More options..."} => a harness instance cannot open the Save As dialog; use the File name and location
+  assert dialog is save-on-close
+  call dialog-click {"button":"Don't Save"}
+  assert dialog is none
+  assert tabs is 0
+
+test the prompts Save writes the File name in the location and refuses an existing file
+  key ctrl+n
+  type Lifecycle save marker
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-set {"control":"file-name","value":"Lifecycle a:b"}
+  call-error dialog-click {"button":"Save"} => A file name can't contain any of these characters: \ / : * ? " < > |
+  assert dialog is save-on-close
+  assert dirty is true
+  call dialog-set {"control":"file-name","value":"Lifecycle saved"}
+  key enter
+  assert dialog is none
+  assert tabs is 0
+  key ctrl+n
+  type Second
+  key ctrl+w
+  call dialog-set {"control":"file-name","value":"Lifecycle saved"}
+  call-error dialog-click {"button":"Save"} => Lifecycle saved.docx already exists; choose another name, or use More options... to replace it
+  assert dialog is save-on-close
+  assert tabs is 1
+  call dialog-click {"button":"Don't Save"}
+  assert tabs is 0
+
+test a workbook asks with its own message in the app
+  open copy:../fixtures/basic.xlsx
+  click A1
+  type LifecycleBook
+  key enter
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-read {}
+  assert reply.text is Save changes to basic.xlsx before closing?
+  call dialog-click {"button":"Cancel"}
+  assert tabs is 1
+  assert dirty is true
+  key ctrl+w
+  call dialog-click {"button":"Save"}
+  assert dialog is none
+  assert tabs is 0
+
+
+test a document marked as final refuses every edit until Edit Anyway
+  open copy:../fixtures/final.docx
+  assert final is true
+  assert protected is false
+  assert caption is final.docx [Read-Only]
+  type X
+  assert dirty is false
+  assert status is Marked as Final — select Edit Anyway to edit
+  call doc {}
+  assert reply.text is Final text.
+  call ribbon-click {"tab":"Home","command":"Bold"}
+  assert dirty is false
+  key ctrl+s
+  assert dirty is false
+  assert status is Marked as Final — select Edit Anyway to edit
+  call edit-anyway {}
+  assert final is false
+  assert caption is final.docx
+  assert dirty is false
+  type X
+  assert dirty is true
+  call-error edit-anyway {} => the active document is not marked as final
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-click {"button":"Don't Save"}
+  assert tabs is 0
+
+test Ctrl+W closes a document marked as final
+  open ../fixtures/final.docx
+  assert final is true
+  key ctrl+w
+  assert tabs is 0
+
+test a Project control verb cannot drop the window close question
+  call ask-on-close {"on":true}
+  open copy:../fixtures/gantt-summary.xml
+  click C2
+  type QuitProjectMarker
+  key enter
+  assert dirty is true
+  call close-window {}
+  assert dialog is save-on-close
+  call-error proj.reload {} => a dialog is open: docxy
+  call-error proj.save {} => a dialog is open: docxy
+  assert dialog is save-on-close
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  call ask-on-close {"on":false}
+  call close-tab {"answer":"discard"}
+  assert tabs is 0

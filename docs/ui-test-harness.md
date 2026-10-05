@@ -323,7 +323,7 @@ State keys, as the app reports them after every driving verb:
 | Key | |
 |---|---|
 | `tab`, `title`, `dirty`, `status`, `sheet_tab` | the active tab |
-| `caption`, `read_only`, `protected`, `repaired` | the active tab's caption as the strip draws it (`book.xlsx [Read-Only]`, or `Report.doc [Compatibility Mode]` for a document imported from Word 97-2003 until Convert, #634) and its open mode; see [Open modes](#open-modes-and-protected-view) |
+| `caption`, `read_only`, `protected`, `repaired`, `final` | `final` is a document Word marked as final (#617), locked like Protected View until Edit Anyway and captioned `[Read-Only]`; the active tab's caption as the strip draws it (`book.xlsx [Read-Only]`, or `Report.doc [Compatibility Mode]` for a document imported from Word 97-2003 until Convert, #634) and its open mode; see [Open modes](#open-modes-and-protected-view) |
 | `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor, prompt or dialog is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
 | `dialog` | the active tab's top dialog's id, or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
@@ -438,7 +438,7 @@ footer editor; `selection-set` refuses while it is open.
 | `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
 | `title-bar {}` | read the measured title content, active chip, tab strip, theme button and drag space; reports tab count, active/first/visible indices, layout mode, `overflow`, `controls_clear`, `active_visible`, `active_dirty_visible` (the active tab is dirty and its bullet lies inside the chip), `theme_visible`, `drag_w`, `drag_ok`, and logical-pixel right edges. `caption_left` comes from a separate probe of Root's inner box minus the pinned caption-control width (102 px on Windows/Linux, zero on macOS) |
 | `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
-| `tab-list {}` | read every open tab in strip order: `{active, tabs:[{index, title, kind, path, dirty, imported, caption, read_only, protected, repaired}]}`. `kind` is `docx`, `xlsx`, `project` or `mail`; `path` is `null` for a tab never saved; `imported` is true for a Project read from `.mpp` and for a document whose file is a Word 97-2003 binary it was imported from (#634; a `.doc`, or one renamed), until a save rebinds the tab to the file it wrote |
+| `tab-list {}` | read every open tab in strip order: `{active, tabs:[{index, title, kind, path, dirty, imported, caption, read_only, protected, final, repaired}]}`. `kind` is `docx`, `xlsx`, `project` or `mail`; `path` is `null` for a tab never saved; `imported` is true for a Project read from `.mpp` and for a document whose file is a Word 97-2003 binary it was imported from (#634; a `.doc`, or one renamed), until a save rebinds the tab to the file it wrote |
 | `tab-select {"tab":"schedule"}` | make a tab active as clicking its chip does, and reply with the state. `tab` is an index or a case-insensitive title/path substring over **all** tabs, the rule the `proj.*` verbs use; a miss (`no tab matches 'x'`), an ambiguous match (`several tabs match 'x' (2, 3)`) and an index past the end (`no tab at index 9`) are refused. The Backstage stays as it was, as it does for a chip click |
 | `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog; a press reaches an open menu's own item or backdrop, so it does not pre-close menus |
 | `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 8 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The drag arms once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of about 2.25px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
@@ -488,10 +488,32 @@ every plain `assert <key>`, sees `Ready` and the levelled plan. Assert Busy
 with `assert reply.app_state is Busy` on that verb's own reply.
 
 Close a dirty tab with `call close-tab {"answer":"save"}` (`discard` and
-`cancel` are the other answers; omitting the answer refuses a dirty close).
+`cancel` are the other answers). Without an answer a dirty close opens the
+in-app close prompt (#629), as Ctrl+W, File > Close and the tab's X do:
+`dialog is save-on-close`, driven with `dialog-read`, `dialog-set` and
+`dialog-click`. A document's prompt is Word's `Save your changes to this
+file?` with `file-name`, `extension` (a label) and `location`, and the buttons
+Save, Don't Save, Cancel and More options... (refused under the harness, like
+every native dialog); its Save writes `<location>/<file-name><extension>`, or
+the tab's own file in place when that is what they name and the tab saves in
+place (`extension` is then the file's own, whatever it is), and refuses an
+existing other file. A tab whose Save is Save As (opened read-only, repaired
+or converted) proposes `<name> (copy)` beside its file and refuses its own
+file's name. Under the harness the only location offered after the tab's own folder
+is the sandbox. A workbook or a Project asks `Save changes to <title> before
+closing?`. A tab with another dialog open is not closed: it comes to the
+front with `Close the open dialog first`.
 An optional `index` targets an inactive tab; it defaults to the active tab.
 `call backstage-close {}` calls the Backstage Close handler without supplying
-an answer. `call ask-on-close {"on":true}` uses the same setting handler as
+an answer. `call close-window {}` is the window's close button (#630): with
+`ask-on-close` on and work unsaved, it brings the first unsaved tab to the front
+with the close prompt (`quit` in its owner) and replies; each Save or Don't
+Save goes on to the next unsaved tab in tab order (a clean tab is never asked),
+Cancel keeps the window, and once the last is answered the process ends after
+that reply, as after `quit`. Don't Save there keeps a file-backed tab in the
+session as its file alone (it reopens clean) and drops a never-saved one.
+Otherwise `close-window` exits at once (hot exit). The window's own close in a
+harness instance never asks: `quit` must end the run it waits on. `call ask-on-close {"on":true}` uses the same setting handler as
 Settings; closing a dirty single tab always asks regardless of this window setting.
 
 `call autorecover {"minutes":N}` sets the Settings AutoRecover interval (`0`
@@ -749,6 +771,7 @@ Repair… call after their file pick:
 | `open {"path":"book.xlsx","mode":"read-only"}` | `mode` is `normal` (the default), `read-only`, `copy`, `repair` or `recover-text`; a workbook ignores `recover-text`, a document takes only `recover-text` (Recover Text from Any File, #633), and a Project ignores every mode |
 | `open {"path":"book.xlsx","reopen":"ask"}` | a person's open of a file already open: a dirty tab asks first (the `reopen` dialog), a clean one reloads only in another mode |
 | `enable-editing {}` | the PROTECTED VIEW message bar's Enable Editing button; refused off a protected tab |
+| `edit-anyway {}` | the MARKED AS FINAL message bar's Edit Anyway button (#617); refused off a document marked as final, and in Protected View (whose bar shows first) |
 
 A relative `path` resolves against the active tab's folder, as `save-as`'s
 does, so after `open copy:` a case names its own copy; with no saved tab
@@ -930,11 +953,14 @@ While a dialog is open on the active tab:
 - **Pointer verbs are refused** with `a dialog is open: <title>`: `click-cell`,
   `drag`, `fill-drag`, `save-as`, `ribbon-click`, `select-chart`, `focus-field`, `title-tab`,
   `tab-select`, `proj.new`, `backstage {open}`, `backstage-close`, `close-tab`,
-  `selection-set` and `enable-editing`.
+  `close-window`, `selection-set`, `enable-editing` and `edit-anyway`.
 - The state reads `dialog: <id>` (`none` on every surface when nothing is open),
   and a Project's `app_state` reads `Edit`.
 - A control-pipe edit, reload or save of that Project dismisses its dialogs
-  unapplied, as it cancels a prompt.
+  unapplied, as it cancels a prompt. The exception is a close prompt
+  (`save-on-close`, #629/#630): while one is open on any tab, `proj.open`,
+  `proj.save`, `proj.reload` and every edit are refused with
+  `a dialog is open: <title>`, so the question cannot vanish under itself.
 
 ### Menus
 
@@ -1047,7 +1073,7 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `user-name`,
 `trusted-clear`,
 `open-draft`,
-`enable-editing` and the
+`enable-editing`, `edit-anyway`, `close-window` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 

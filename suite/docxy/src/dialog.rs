@@ -165,6 +165,13 @@ pub(crate) enum DialogOwner {
     OutlineAxis {
         ungroup: bool,
     },
+    /// Word's "Save your changes to this file?" before a dirty tab closes
+    /// (#629), or for a workbook or a Project "Save changes to … before
+    /// closing?"; `quit` when it is one of the window close's questions
+    /// (#630). Every press is handled in `close::close_prompt_click`.
+    SaveOnClose {
+        quit: bool,
+    },
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
     Test,

@@ -2960,7 +2960,7 @@ fn next_rid(rels: &str) -> String {
 /// Remove the first `<name/>`, `<name .../>`, or `<name ...>…</name>` element.
 /// An attribute's value out of a raw tag body (`w:val="false"`), either quote
 /// style. `None` when the attribute isn't there.
-fn tag_attr(attrs: &str, name: &str) -> Option<String> {
+pub(crate) fn tag_attr(attrs: &str, name: &str) -> Option<String> {
     let pat = format!("{name}=");
     let mut from = 0usize;
     while let Some(rel) = attrs[from..].find(&pat) {

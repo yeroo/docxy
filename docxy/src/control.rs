@@ -108,6 +108,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
 
     let out = match verb {
         "doc.path" => Ok(path_info(app)),
+        "doc.edit-anyway" => Ok(edit_anyway(app)),
         "doc.outline" => Ok(outline(app)),
         "doc.read" => read(app, args),
         "doc.find" => find(app, args),
@@ -210,7 +211,25 @@ fn path_info(app: &App) -> Json {
     if let Some(w) = app.watermark_state.label() {
         fields.push(("watermark", Json::Str(w)));
     }
+    if app.marked_final {
+        fields.push(("final", Json::Bool(true)));
+    }
     Json::obj(fields)
+}
+
+/// Word's Edit Anyway (#617): the document is no longer final, so mutating
+/// verbs work again and a save writes it without the mark. Answers
+/// `doc.path`'s shape, with `was_final` saying whether there was a mark.
+fn edit_anyway(app: &mut App) -> Json {
+    let was_final = app.edit_anyway();
+    if was_final {
+        ctlcore::signal_activity();
+    }
+    let Json::Obj(mut fields) = path_info(app) else {
+        unreachable!("path_info answers an object");
+    };
+    fields.push(("was_final".to_string(), Json::Bool(was_final)));
+    Json::Obj(fields)
 }
 
 fn outline(app: &App) -> Json {
@@ -2301,6 +2320,7 @@ mod tests {
 
         for verb in [
             "doc.path",
+            "doc.edit-anyway",
             "doc.outline",
             "doc.read",
             "doc.find",
@@ -2433,6 +2453,125 @@ mod tests {
         assert!(error.starts_with("protection_denied:read_only:"));
         clean.doc_protection = Default::default();
         assert!(!clean.editor.undo(), "a denial pushed an undo checkpoint");
+    }
+
+    /// #617: a document Word marked as final, opened from its file.
+    fn final_app(dir: &std::path::Path) -> App {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("final.docx");
+        std::fs::write(&path, crate::test_fixtures::marked_final_bytes()).unwrap();
+        let path = path.to_str().unwrap().to_string();
+        let input = crate::load_input(&path).unwrap();
+        let mut app = App::new(input.pkg, &path, false);
+        app.os_clip = None;
+        app
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("docxy-final-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn doc_path_reports_final_only_for_a_final_document() {
+        let dir = scratch("path");
+        let app = final_app(&dir);
+        assert_eq!(path_info(&app).get("final"), Some(&Json::Bool(true)));
+        assert_eq!(path_info(&app_with(&["plain"])).get("final"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn every_mutating_verb_is_refused_on_a_final_document() {
+        let dir = scratch("refused");
+        for verb in [
+            "doc.replace-range",
+            "doc.insert",
+            "doc.append",
+            "doc.replace-all",
+            "doc.format",
+            "doc.set-style",
+            "doc.page-color",
+            "doc.watermark",
+            "doc.page-borders",
+            "doc.undo",
+            "doc.redo",
+            "doc.revision-accept",
+            "doc.revision-reject",
+            "doc.revisions-accept-all",
+            "doc.revisions-reject-all",
+        ] {
+            assert!(mutation_kind_for_verb(verb).is_some(), "{verb}");
+            let mut app = final_app(&dir);
+            let document = app.editor.doc.clone();
+            let package = package_snapshot(&app);
+            let error = dispatch(
+                &mut app,
+                verb,
+                &args(vec![
+                    ("at", Json::Num(0.0)),
+                    ("start", Json::Num(0.0)),
+                    ("text", Json::Str("X".into())),
+                ]),
+            )
+            .unwrap_err();
+            assert!(
+                error.starts_with("protection_denied:marked_final: "),
+                "{verb}: {error}"
+            );
+            assert_eq!(app.editor.doc, document, "{verb} changed the document");
+            assert_eq!(
+                package_snapshot(&app),
+                package,
+                "{verb} changed the package"
+            );
+            assert!(!app.modified, "{verb} changed save state");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_anyway_allows_edits_and_the_save_is_no_longer_final() {
+        let dir = scratch("anyway");
+        let mut app = final_app(&dir);
+        let insert = args(vec![
+            ("at", Json::Num(0.0)),
+            ("text", Json::Str("X".into())),
+        ]);
+        assert!(dispatch(&mut app, "doc.insert", &insert).is_err());
+
+        let r = dispatch(&mut app, "doc.edit-anyway", &Json::Null).unwrap();
+        assert_eq!(r.get("was_final"), Some(&Json::Bool(true)));
+        assert_eq!(r.get("final"), None);
+        assert!(!app.modified, "Edit Anyway is not an edit");
+        // A second one has nothing to do.
+        let again = dispatch(&mut app, "doc.edit-anyway", &Json::Null).unwrap();
+        assert_eq!(again.get("was_final"), Some(&Json::Bool(false)));
+
+        dispatch(&mut app, "doc.insert", &insert).unwrap();
+        dispatch(&mut app, "doc.save", &Json::Null).unwrap();
+        let saved = load_package(&std::fs::read(dir.join("final.docx")).unwrap()).unwrap();
+        assert!(!saved.marked_final());
+        // The other custom property stays.
+        assert!(
+            saved
+                .part_text("docProps/custom.xml")
+                .unwrap()
+                .contains("Acme")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_save_without_edit_anyway_keeps_the_mark() {
+        let dir = scratch("kept");
+        let mut app = final_app(&dir);
+        dispatch(&mut app, "doc.save", &Json::Null).unwrap();
+        let saved = load_package(&std::fs::read(dir.join("final.docx")).unwrap()).unwrap();
+        assert!(saved.marked_final());
+        // Reload reads the mark again.
+        dispatch(&mut app, "doc.reload", &Json::Null).unwrap();
+        assert_eq!(path_info(&app).get("final"), Some(&Json::Bool(true)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

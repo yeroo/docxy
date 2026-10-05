@@ -63,7 +63,14 @@ fn tab_close_driver_preserves_work_and_persists_removals() {
         !sandbox.join("sample.docx").exists(),
         "pathless close/Save wrote into cwd"
     );
-    assert!(!sandbox.join("Untitled.docx").exists());
+    // Nothing a never-saved document could be named (Document1, its first
+    // words, the old Untitled) was written beside the sandbox's session.
+    let stray: Vec<_> = std::fs::read_dir(&sandbox)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "docx"))
+        .collect();
+    assert!(stray.is_empty(), "pathless close wrote {stray:?}");
 
     for (kind, fixture, cell) in [
         ("docx", "basic.docx", None),

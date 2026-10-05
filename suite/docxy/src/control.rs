@@ -426,6 +426,9 @@ impl Docxy {
         }
         // A control client reads and saves the plan: never half-leveled.
         self.flush_project_passes(cx);
+        if let Err(e) = crate::close::close_prompt_refusal(&self.tabs, verb) {
+            return Some(Err(e));
+        }
         let outcome = project_verb(&mut self.tabs, self.active, verb, args)?;
         Some(outcome.map(|(result, effect)| {
             // What drops the tab's dialogs (an edit, a reload, a save) or

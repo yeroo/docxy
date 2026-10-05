@@ -2285,6 +2285,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "ribbon-click"
             | "title-tab"
             | "close-tab"
+            | "close-window"
             | "selection-set"
             | "open"
             | "backstage-close"
@@ -2299,6 +2300,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "dialog-tab"
             | "dialog-click"
             | "enable-editing"
+            | "edit-anyway"
     )
 }
 
@@ -2511,6 +2513,15 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             "protected",
             Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.access.protected)),
         ),
+        // A document Word marked as final, until Edit Anyway (#617).
+        (
+            "final",
+            Json::Bool(
+                app.tabs
+                    .get(app.active)
+                    .is_some_and(|t| t.access.marked_final),
+            ),
+        ),
         (
             "repaired",
             Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.access.repaired)),
@@ -2638,6 +2649,7 @@ fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
                 ("caption", Json::Str(t.caption())),
                 ("read_only", Json::Bool(t.access.read_only)),
                 ("protected", Json::Bool(t.access.protected)),
+                ("final", Json::Bool(t.access.marked_final)),
                 ("repaired", Json::Bool(t.access.repaired)),
             ])
         })
@@ -2675,6 +2687,23 @@ fn open_dialogs(app: &mut crate::Docxy) -> Result<&mut crate::dialog::DialogStac
 /// the handler under test was broken — the one way this harness could be worse
 /// than nothing.
 pub fn dispatch(
+    app: &mut crate::Docxy,
+    verb: &str,
+    args: &Json,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) -> Result<Done, String> {
+    let mut done = dispatch_verb(app, verb, args, window, cx)?;
+    // The window's close went ahead (#630): its last question was answered
+    // by this verb, or `close-window` found nothing to ask. The process ends
+    // once this reply is out, as after `quit`.
+    if app.quit_ready {
+        done.quit = true;
+    }
+    Ok(done)
+}
+
+fn dispatch_verb(
     app: &mut crate::Docxy,
     verb: &str,
     args: &Json,
@@ -2883,12 +2912,16 @@ pub fn dispatch(
         "dialog-click" => {
             let button = arg_str(args, "button")?.to_string();
             open_dialogs(app)?;
-            app.dialog_press(&button)?;
+            app.dialog_press(&button, window, cx)?;
             app.refocus(window, cx);
             let Json::Obj(mut out) = state(app, window) else {
                 unreachable!("state is an object")
             };
-            let dialog = app.tabs[app.active].dialogs.to_json();
+            // A close prompt's Save or Don't Save may have closed the last tab.
+            let dialog = app.tabs.get(app.active).map_or_else(
+                || crate::dialog::DialogStack::default().to_json(),
+                |t| t.dialogs.to_json(),
+            );
             match out.iter_mut().find(|(k, _)| k == "dialog") {
                 Some((_, v)) => *v = dialog,
                 None => out.push(("dialog".into(), dialog)),
@@ -3076,6 +3109,18 @@ pub fn dispatch(
             app.backstage_close(window, cx);
             Done::ok(state(app, window))
         }
+        // The window's close button, as `on_window_should_close` runs it
+        // outside the harness (#630): with "ask before closing" on and work
+        // unsaved, Word's question for each unsaved tab, driven with
+        // `dialog-click`; otherwise, or once the last one is answered, a clean
+        // exit, and the process ends after the reply.
+        "close-window" => {
+            app.refuse_under_dialog()?;
+            if app.window_should_close(true, window, cx) {
+                app.quit_ready = true;
+            }
+            Done::ok(state(app, window))
+        }
         "ask-on-close" => {
             let Some(Json::Bool(on)) = args.get("on") else {
                 return Err("'on' must be a boolean".into());
@@ -3235,6 +3280,18 @@ pub fn dispatch(
             app.enable_editing(cx);
             Done::ok(state(app, window))
         }
+        // The MARKED AS FINAL bar's Edit Anyway (#617).
+        "edit-anyway" => {
+            app.refuse_under_dialog()?;
+            let Some(t) = app.tabs.get(app.active).filter(|t| t.access.marked_final) else {
+                return Err("the active document is not marked as final".into());
+            };
+            if t.access.protected {
+                return Err(crate::open_mode::PROTECTED_STATUS.into());
+            }
+            app.edit_anyway(cx);
+            Done::ok(state(app, window))
+        }
 
         // A click on a cell: press, click, release — the three events the
         // pointer delivers, in that order.
@@ -3350,8 +3407,8 @@ pub fn dispatch(
             };
             let tab = app.tabs.get_mut(app.active).ok_or("no tab is open")?;
             // Attaching a data source changes what the document saves (#633).
-            if tab.access.protected {
-                return Err(crate::open_mode::PROTECTED_STATUS.into());
+            if tab.access.locked() {
+                return Err(tab.access.locked_status().into());
             }
             if tab.kind != crate::Kind::Docx {
                 return Err("mail-attach needs a Word document".into());
@@ -3463,11 +3520,13 @@ pub fn dispatch(
             let src = sheet(app)?.range();
             app.sheet_fill_start(cx);
             if app.sheet_fill.is_none() {
-                return Err(if app.protected_view() {
-                    format!(
-                        "the fill did not arm: {}",
-                        crate::open_mode::PROTECTED_STATUS
-                    )
+                let locked = app
+                    .tabs
+                    .get(app.active)
+                    .map(|t| t.access)
+                    .filter(|a| a.locked());
+                return Err(if let Some(access) = locked {
+                    format!("the fill did not arm: {}", access.locked_status())
                 } else if app.sheet_protected() {
                     "the fill did not arm: the sheet is protected".into()
                 } else {
@@ -4718,6 +4777,7 @@ mod tests {
             "ribbon-click",
             "title-tab",
             "close-tab",
+            "close-window",
             "selection-set",
             "open",
             "select-chart",
