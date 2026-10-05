@@ -330,11 +330,13 @@ State keys, as the app reports them after every driving verb:
 | `autorecover_minutes` | minutes between AutoRecover writes while a tab is unsaved; `0` is off |
 | `keep_drafts` | whether Don't Save keeps a workbook's last AutoRecover copy as a draft |
 | `user_name`, `user_initials` | Settings' User name and Initials for new comments (#620); empty falls back to the OS account name and initials derived from it |
-| `sheet_editing` | Settings' Sheet editing options (#672), by their `session.json` keys: `edit_fixed_decimal`, `edit_fixed_decimal_places`, `edit_move_after_enter`, `edit_move_direction` (`down`/`right`/`up`/`left`), `edit_in_cell`, `edit_autocomplete`, `edit_fill_handle` |
+| `sheet_editing` | Settings' Sheet editing options (#672), by their `session.json` keys: `edit_fixed_decimal`, `edit_fixed_decimal_places`, `edit_move_after_enter`, `edit_move_direction` (`down`/`right`/`up`/`left`), `edit_in_cell`, `edit_autocomplete`, `edit_fill_handle`, `edit_flash_fill_auto`, `edit_formula_autocomplete` |
 | `fx_expanded` | whether Ctrl+Shift+U has expanded the sheet formula bar |
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
+| `flash_preview` | Flash Fill's greyed preview after the second example is typed (#666, ENT-105): `{range, values}`, the cells it covers and the values Enter writes, or null. Any other key, an edit or a selection change (mouse and Tab included) drops it for good: moving back does not revive it. Ctrl+E and Data › Flash Fill fill without one; no pattern opens the `flash-fill` message dialog (`dialog-read`, OK closes it), and the Flash Fill Options menu is `menu-open "flash-fill"` while the last fill stands |
+| `completions` | Formula AutoComplete's list under a formula being typed (#686): `{items: [labels], sel}` (`sel` the highlighted index), or null while none shows. Up/Down move `sel`, Tab inserts it, Esc closes the list and leaves the editor open; Alt+Down opens it on demand |
 | `comment_edit` | the sheet comment editor's text (`null` when closed) |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
 | `field`, `field_text` | the focused reference field, and its buffer |
@@ -556,6 +558,24 @@ fields and `dialog-click` OK to store and persist them. New Word comments are
 stamped with that name and those initials (else the OS account name, else
 `docxy`, with initials derived from the name) and the UTC time.
 
+`call autocorrect {}` opens Settings' AutoCorrect Options... dialog (#667,
+id `autocorrect`) on the active tab, as the backstage row does. Its tabs are
+AutoCorrect, AutoFormat As You Type, Actions and Math AutoCorrect; each
+switch is a checkbox named by its `session.json` key (`ac_replace_text`,
+`ac_hyperlinks`, …). `dialog-set` `replace` and `with` and press Add: a new
+word is added at once; a word already listed with another With opens
+`autocorrect-redefine` ("Do you want to redefine it?", Yes/No) first.
+Choosing an item of `entries` fills Replace and With, and Delete removes it.
+Exceptions... opens `autocorrect-exceptions` (tabs First Letter and INitial
+CAps, fields `first-word`/`caps-word`, lists `first-list`/`caps-list`, Add,
+Delete, OK). Add, Delete and the exceptions take effect at once, as Office's
+do; the checkboxes apply with OK, and Cancel keeps them. All of it persists
+with the Sheet editing options. A typed URL, `www.` address, e-mail address
+or UNC path becomes a hyperlink while `ac_hyperlinks` is on; such a
+hyperlink lives in the workbook model (clickable, undoable) but is not yet
+written to the file, since the xlsx writer keeps only the hyperlinks a file
+already had (a follow-up).
+
 `project-tabs.uit` drives several plans at once: a blank one from `proj.new`
 that takes tasks without a fixture, two opened plans switched between by title
 with `tab-select`, and `tab-list` read after each step. Assert one tab's entry
@@ -659,6 +679,11 @@ case). `cell` reads a task a collapsed summary hides (its reply's `cell` and
 `row` are then `null`); `click-cell` refuses one, since nothing is drawn to
 click. Giving both `cell` and `uid` is an error. The Project `cell` reply adds
 the task's `id` and `uid`, and `entry: true` on the entry row, which reads empty.
+On a sheet, `call cell {"cell":"B2"}` replies `{cell, row, col, text, value,
+empty, hyperlink}`: `text` is what the cell shows, `value` its input text (a
+formula with its `=`, a text a typed entry would read otherwise with its `'`,
+so a Flash Filled `'042` reads as text), and `hyperlink` its link target or
+null (#667).
 
 `call rows {}` lists the rows the entry table draws, top to bottom, without the
 entry row; an optional `tab` picks a Project tab as the control verbs do, without
@@ -994,7 +1019,16 @@ Menus open today:
 - **the cell menu** on a sheet (#690, #691): right-click a cell. A cell outside
   the selection is selected first (no link followed; while a formula or a range
   field is pointing, nothing moves). It lists Cut, Copy, Paste, the Filter and
-  Sort submenus and New Comment, each a sheet command as the ribbon runs it;
+  Sort submenus, New Comment and Pick From Drop-down List..., each a sheet
+  command as the ribbon runs it;
+- **the pick list** on a sheet (#665): Alt+Down, the cell menu's Pick From
+  Drop-down List..., or `menu-open "pick-list"`. One item per distinct text of
+  the column's block, sorted, nothing highlighted until Down (Enter then enters
+  the highlighted one); the menu scrolls and holds at most 10,000 entries;
+- **the Flash Fill Options menu** on a sheet (#666): the ⚡ button by the last
+  filled cell, or `menu-open "flash-fill"` while the fill stands. Undo Flash
+  Fill, Accept suggestions, Select all N blank cells, Select all N changed
+  cells;
 - **the Mailings tab's drop-downs** on a document (#628): Start Mail Merge,
   Select Recipients, Insert Merge Field (the attached list's columns), Rules,
   Finish & Merge, and the Preview Results record box (the attached rows).
@@ -1027,8 +1061,8 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment; #690, #691), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619) | the menu, as `menu-read` |
-| `menu-read` | `{}` | `{open: true, target, items}`, or `{open: false}` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619) | the menu, as `menu-read` |
+| `menu-read` | `{}` | `{open: true, target, items, highlight}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null |
 | `menu-click` | `{label}` among the top-level items, `{path: [labels]}` through submenus, or `{index}`: the top-level item at that 0-based index, separators and headings not counted, for labels that repeat | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
 
@@ -1096,15 +1130,19 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,
 `inspect` with `remove`,
 `theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `user-name`,
-`trusted-clear`,
+`autocorrect`, `trusted-clear`,
 `open-draft`,
 `enable-editing`, `edit-anyway`, `close-window` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 
-While a menu is open it takes every key: Esc closes it, and so, until menus
-take arrows and Enter, does any other key, Tab included. None reaches the
-document or cell under it. A press outside the menu closes it too.
+While a menu is open it takes every key. Down and Up move its highlight over
+the items that can run (past separators, headings and disabled items, wrapping
+at the ends; from none, Down takes the first and Up the last), and Enter runs
+the highlighted item — or opens its submenu in the menu's place — or, with
+nothing highlighted, closes the menu. Esc closes it, and so does any other key,
+Tab included. None reaches the document or cell under it. A press outside the
+menu closes it too.
 `project-menus.uit` drives all three menus.
 
 ### Headers and footers

@@ -2235,6 +2235,17 @@ fn menu_open(
             app.open_cell_menu(at, cx);
             Ok(())
         }
+        // Pick From Drop-down List (#665): Alt+Down's menu over the selected
+        // cell, through the same opener.
+        Json::Str(name) if name == "pick-list" => {
+            if !app.active_is_sheet() {
+                return Err("the pick list opens on a sheet tab".into());
+            }
+            app.open_pick_menu(cx)
+        }
+        // The Flash Fill Options button's menu (#666): there is one only
+        // while the last fill stands.
+        Json::Str(name) if name == "flash-fill" => app.open_flash_menu(cx),
         Json::Str(name) if name == "document" => {
             if app.active_is_project() {
                 return Err(
@@ -2335,7 +2346,7 @@ fn menu_open(
                 app.open_undo_menu(at, cx)
             }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, cell, row, ribbon and qat are)"
+                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, row, ribbon and qat are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
@@ -2419,6 +2430,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "autorecover"
             | "keep-drafts"
             | "user-name"
+            | "autocorrect"
             | "trusted-clear"
             | "open-draft"
             | "dialog-set"
@@ -2563,6 +2575,11 @@ fn sheet_editing_json(o: &gridcore::options::EditOptions) -> Json {
         (k::KEY_EDIT_IN_CELL, Json::Bool(o.edit_in_cell)),
         (k::KEY_AUTOCOMPLETE, Json::Bool(o.autocomplete)),
         (k::KEY_FILL_HANDLE, Json::Bool(o.fill_handle)),
+        (k::KEY_FLASH_FILL_AUTO, Json::Bool(o.flash_fill_auto)),
+        (
+            k::KEY_FORMULA_AUTOCOMPLETE,
+            Json::Bool(o.formula_autocomplete),
+        ),
     ])
 }
 
@@ -2700,6 +2717,52 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ("range", Json::Str(a1_range(v.range()))),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
+            // Flash Fill's greyed preview (#666): the range it covers and the
+            // values Enter would write, or null.
+            (
+                "flash_preview",
+                v.live_preview().map_or(Json::Null, |p| {
+                    let span = p.fill.span().unwrap_or_default();
+                    Json::obj(vec![
+                        (
+                            "range",
+                            Json::Str(a1_range((span.0, p.fill.col, span.1, p.fill.col))),
+                        ),
+                        (
+                            "values",
+                            Json::Arr(
+                                p.fill
+                                    .fills
+                                    .iter()
+                                    .map(|(_, t)| {
+                                        Json::Str(t.strip_prefix('\'').unwrap_or(t).to_string())
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                    ])
+                }),
+            ),
+            // Formula AutoComplete's list (#686): its labels and highlighted
+            // index, or null while none shows.
+            (
+                "completions",
+                v.complete_view().map_or(Json::Null, |c| {
+                    Json::obj(vec![
+                        (
+                            "items",
+                            Json::Arr(
+                                c.list
+                                    .items
+                                    .into_iter()
+                                    .map(|i| Json::Str(i.label))
+                                    .collect(),
+                            ),
+                        ),
+                        ("sel", Json::Num(c.sel as f64)),
+                    ])
+                }),
+            ),
             // The sheet comment editor New Comment opens, and its text.
             ("comment_edit", str_or_null(app.sheet_comment_edit.clone())),
         ]);
@@ -3340,6 +3403,13 @@ fn dispatch_verb(
             cx.notify();
             Done::ok(state(app, window))
         }
+        // Settings' AutoCorrect Options... (#667): the same opener as the
+        // backstage row.
+        "autocorrect" => {
+            app.open_autocorrect_dialog()?;
+            cx.notify();
+            Done::ok(state(app, window))
+        }
         // Settings' Trusted Documents Clear (#895): the same handler as the
         // backstage button.
         "trusted-clear" => {
@@ -3900,6 +3970,11 @@ fn dispatch_verb(
                 ("text", Json::Str(v.cell_text(r, c))),
                 ("value", Json::Str(raw.clone())),
                 ("empty", Json::Bool(raw.is_empty())),
+                // The cell's hyperlink target, or null (#667: a typed URL).
+                (
+                    "hyperlink",
+                    str_or_null(v.sheet().hyperlinks.get(&(r, c)).cloned()),
+                ),
             ]))
         }
 

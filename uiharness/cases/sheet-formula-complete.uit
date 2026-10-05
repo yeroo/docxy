@@ -1,0 +1,58 @@
+# Formula AutoComplete (#686): TBL-CASE-021 on fixtures/sales.xlsx (table
+# Sales: Item, Qty, Price, Region over A1:D4), and the list's keys.
+
+test TBL-CASE-021 table names then columns and specifiers
+  open copy:../fixtures/sales.xlsx
+  click H1
+  type =SUM(Sal
+  assert completions.items.0 is Sales
+  type es[
+  assert completions.items.0 is Item
+  assert completions.items.1 is Qty
+  assert completions.items.2 is Price
+  assert completions.items.3 is Region
+  assert completions.items.4 is "#All"
+  assert completions.items.5 is "#Data"
+  assert completions.items.6 is "#Headers"
+  assert completions.items.7 is "#Totals"
+  assert completions.items.8 is @ - This Row
+  assert completions.sel is 0
+  key down
+  assert completions.sel is 1
+  assert editing is true
+  key tab
+  assert edit is =SUM(Sales[Qty
+  assert completions is nothing
+  type ])
+  key enter
+  assert cell H1 is 10
+
+test the list keys, Esc and Enter
+  open copy:../fixtures/sales.xlsx
+  click H2
+  type =su
+  assert completions.items.0 is SUBSTITUTE
+  assert completions.items.1 is SUBTOTAL
+  assert completions.items.2 is SUM
+  key down down
+  assert completions.sel is 2
+  key tab
+  assert edit is =SUM(
+  type B2:B4
+  assert completions is nothing
+  type )
+  key escape
+  assert editing is false
+  click H3
+  type =Sa
+  assert completions.items.0 is Sales
+  key escape
+  assert editing is true
+  assert completions is nothing
+  key alt+down
+  assert completions.items.0 is Sales
+  key escape
+  key escape
+  click H4
+  type su
+  assert completions is nothing
