@@ -65,6 +65,11 @@ mod sheet_clip_tests;
 mod sheet_consolidate;
 #[cfg(test)]
 mod sheet_entry_tests;
+#[cfg(test)]
+mod sheet_fill_tests;
+// #707: the drop and option menus are wired by the commits that follow.
+#[allow(dead_code)]
+mod sheet_menus;
 mod sheet_outline;
 mod sheet_ribbon;
 mod style_gallery;
@@ -882,6 +887,8 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
             | Act::PrintLayout
             | Act::ToggleRuler
             | Act::Project(_)
+            // `run_sheet_act` asks Protected View itself.
+            | Act::Sheet(_)
     )
 }
 
@@ -911,6 +918,9 @@ fn act_targets_cells(act: SheetAct) -> bool {
             | SheetAct::ClearOutline
             | SheetAct::OutlineSettings
             | SheetAct::NumberFormatMenu
+            | SheetAct::Menu(_)
+            | SheetAct::OfficeClipboard
+            | SheetAct::CustomLists
             | SheetAct::Todo
     )
 }
@@ -1522,6 +1532,36 @@ enum SheetAct {
     OutlineSettings,
     /// The Number group's format combo: opens or closes the format strip.
     NumberFormatMenu,
+    /// A ribbon command that opens a menu (#707): the Paste gallery, Fill,
+    /// Clear, Find & Select.
+    Menu(sheet_menus::SheetMenu),
+    /// Home › Fill › Down, Right, Up, Left.
+    Fill(gridcore::edit::FillDir),
+    /// Home › Fill › Series… (the Series dialog) and Justify.
+    FillSeries,
+    FillJustify,
+    /// Auto Fill Options (and the fill handle's right-drag menu): redo the
+    /// last fill as this kind.
+    #[allow(dead_code)] // #707: wired by a later commit
+    FillAs(gridcore::edit::FillKind),
+    /// A Home › Clear item.
+    Clear(gridcore::edit::ClearWhat),
+    /// Home › Find & Select › Go To… and Go To Special….
+    GoTo,
+    GoToSpecial,
+    /// A Paste gallery or Paste Options item.
+    PasteAs(sheet_menus::PasteItem),
+    /// Paste Special… (Ctrl+Alt+V).
+    PasteSpecial,
+    /// The Clipboard group's launcher: the Office Clipboard pane.
+    #[allow(dead_code)] // #707: wired by a later commit
+    OfficeClipboard,
+    /// File › Options › Advanced › Edit Custom Lists….
+    #[allow(dead_code)] // #707: wired by a later commit
+    CustomLists,
+    /// A border right-drag's drop menu item.
+    #[allow(dead_code)] // #707: wired by a later commit
+    Drop(sheet_menus::DropChoice),
     Todo,
 }
 
@@ -2538,19 +2578,12 @@ impl SheetView {
         true
     }
 
-    /// Ctrl+D / Ctrl+R over the selection (one undo step). False when there
-    /// was nothing to fill, or the fill was refused as part of an array
-    /// ([`SheetView::entry_error`] says so).
-    fn fill_selection(&mut self, down: bool) -> bool {
-        let changes = gridcore::edit::fill_changes(
-            self.sheet(),
-            self.range(),
-            if down {
-                gridcore::edit::FillDir::Down
-            } else {
-                gridcore::edit::FillDir::Right
-            },
-        );
+    /// Ctrl+D / Ctrl+R and Home › Fill › Down, Right, Up, Left over the
+    /// selection (one undo step). False when there was nothing to fill, or
+    /// the fill was refused as part of an array ([`SheetView::entry_error`]
+    /// says so).
+    fn fill_selection(&mut self, dir: gridcore::edit::FillDir) -> bool {
+        let changes = gridcore::edit::fill_changes(self.sheet(), self.range(), dir);
         if changes.is_empty() || self.refuses(self.active, &changes) {
             return false;
         }
@@ -14640,6 +14673,82 @@ impl Docxy {
     }
 
     /// Dispatch a spreadsheet ribbon command.
+    /// Home › Fill › Down, Right, Up, Left (and Ctrl+D, Ctrl+R).
+    fn sheet_fill_dir(&mut self, dir: gridcore::edit::FillDir, cx: &mut Context<Self>) {
+        if self.sheet_protected() {
+            return;
+        }
+        if self
+            .active_sheet_mut()
+            .is_some_and(|v| v.fill_selection(dir))
+        {
+            self.mark_sheet_dirty();
+        }
+        self.sheet_entry_refused(cx);
+        cx.notify();
+    }
+
+    /// The sheet ribbon command `id`'s menu, with what it is drawn in.
+    fn sheet_menu_target(m: sheet_menus::SheetMenu) -> menu::MenuTarget {
+        let (id, group, label) = match m {
+            sheet_menus::SheetMenu::Paste => ("paste", "Clipboard", "Paste"),
+            sheet_menus::SheetMenu::Fill => ("fill", "Editing", "Fill"),
+            sheet_menus::SheetMenu::Clear => ("clear", "Editing", "Clear"),
+            sheet_menus::SheetMenu::FindSelect => ("find-select", "Editing", "Find & Select"),
+        };
+        menu::MenuTarget::Ribbon {
+            id: id.into(),
+            tab: "Home".into(),
+            group: group.into(),
+            label: label.into(),
+        }
+    }
+
+    /// Open a sheet ribbon menu at `at` (#707).
+    pub(crate) fn open_sheet_menu(
+        &mut self,
+        m: sheet_menus::SheetMenu,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let items = match m {
+            sheet_menus::SheetMenu::Paste => {
+                let (clip, text) = self.paste_sources(cx);
+                sheet_menus::paste_gallery(clip, text)
+            }
+            sheet_menus::SheetMenu::Fill => sheet_menus::fill_menu(),
+            sheet_menus::SheetMenu::Clear => sheet_menus::clear_menu(),
+            sheet_menus::SheetMenu::FindSelect => sheet_menus::find_select_menu(),
+        };
+        self.open_menu(Self::sheet_menu_target(m), at, items, cx);
+    }
+
+    /// Open the grid menu `kind` where its button is (#707): the Auto Fill
+    /// Options or Paste Options button, or a right-drag's drop menu. Refused
+    /// when nothing shows it.
+    pub(crate) fn open_grid_menu(
+        &mut self,
+        kind: menu::GridMenu,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        Err(match kind {
+            menu::GridMenu::FillOptions => "no Auto Fill Options button is showing",
+            menu::GridMenu::PasteOptions => "no Paste Options button is showing",
+            menu::GridMenu::FillDrop | menu::GridMenu::BorderDrop => {
+                "a drop menu opens only when a right-drag ends"
+            }
+        }
+        .to_string())
+        .map(|()| cx.notify())
+    }
+
+    /// What a paste could take now: a live grid clip, and clipboard text.
+    fn paste_sources(&mut self, cx: &mut Context<Self>) -> (bool, bool) {
+        let now = self.clipboard_read(cx);
+        let clip = self.grid_clip_live(&now).is_some();
+        (clip, matches!(now, ClipRead::Text(_)))
+    }
+
     fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
         // Protected View (#610): the ribbon is hidden, but shortcuts, KeyTips
@@ -14784,6 +14893,27 @@ impl Docxy {
             }
             SheetAct::NumberFormatMenu => {
                 self.sheet_numfmt_open = !self.sheet_numfmt_open;
+                cx.notify();
+            }
+            SheetAct::Menu(m) => {
+                let at = window.mouse_position();
+                self.open_sheet_menu(m, at, cx);
+                // The menu has the pointer now; refocusing would close it.
+                return;
+            }
+            SheetAct::Fill(dir) => self.sheet_fill_dir(dir, cx),
+            SheetAct::FillSeries
+            | SheetAct::FillJustify
+            | SheetAct::FillAs(_)
+            | SheetAct::Clear(_)
+            | SheetAct::GoTo
+            | SheetAct::GoToSpecial
+            | SheetAct::PasteAs(_)
+            | SheetAct::PasteSpecial
+            | SheetAct::OfficeClipboard
+            | SheetAct::CustomLists
+            | SheetAct::Drop(_) => {
+                self.set_status("Not available yet");
                 cx.notify();
             }
             SheetAct::Todo => {}
@@ -14953,18 +15083,14 @@ impl Docxy {
                     return;
                 }
                 "d" | "r" if !editing => {
-                    if !protected {
-                        self.chart_hand_back(cx);
-                        if self
-                            .active_sheet_mut()
-                            .is_some_and(|v| v.fill_selection(key == "d"))
-                        {
-                            self.mark_sheet_dirty();
-                        }
-                        self.sheet_entry_refused(cx);
-                    }
-                    cx.notify();
-                    return;
+                    use gridcore::edit::FillDir;
+                    let dir = if key == "d" {
+                        FillDir::Down
+                    } else {
+                        FillDir::Right
+                    };
+                    // Home › Fill's own act, so the same checks run.
+                    return self.run_sheet_act(SheetAct::Fill(dir), window, cx);
                 }
                 _ => {}
             }
@@ -20077,6 +20203,10 @@ fn no(mut f: impl FnMut()) -> bool {
 #[derive(Clone, Copy, Debug)]
 enum Act {
     Project(ProjectAct),
+    /// A sheet command, from a sheet menu (#707): the sheet's menus are
+    /// drawn and clicked through the shared menu model, whose items run
+    /// `Act`s.
+    Sheet(SheetAct),
     Bold,
     Italic,
     Underline,
@@ -23211,6 +23341,7 @@ impl Docxy {
         }
         match act {
             Project(p) => self.project_act(p, window, cx),
+            Sheet(a) => self.run_sheet_act(a, window, cx),
             Cut => self.do_copy(true, window, cx),
             Copy => self.do_copy(false, window, cx),
             Paste => self.do_paste(window, cx),
@@ -23325,8 +23456,8 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Project(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
-                | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
+                Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph
+                | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
                 | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField
                 | PageBreak | BlankPage | Cover(_) | ToggleNotes | InsertTable | InsertSymbol
                 | InsertEquation | LineSpacing | Hf(_) | Design(_) | Layout(_) | Mail(_)
@@ -24723,6 +24854,29 @@ impl Docxy {
             Shape::Glyph(glyph) => self.sheet_gb(glyph, c.act, pal, cx),
             Shape::Combo { value, wide } => self.sheet_combo(value, wide, c.act, pal, cx),
             Shape::NumFmt => self.sheet_numfmt_combo(pal, cx),
+            Shape::Split { icon, menu } => v_flex()
+                .h_full()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .child(self.sheet_lb(icon, text, c.act, pal, cx)),
+                )
+                .child(
+                    div()
+                        .id(ElementId::Name(format!("slb-arrow-{}", c.id).into()))
+                        .px_2()
+                        .rounded(px(3.))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(pal.hover))
+                        .text_size(px(10.))
+                        .text_color(pal.fg)
+                        .child("\u{25BE}")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.run_sheet_act(SheetAct::Menu(menu), window, cx)
+                        })),
+                )
+                .into_any_element(),
         }
     }
 

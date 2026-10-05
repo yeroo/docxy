@@ -13,6 +13,7 @@
 //! stack of small-button rows (`Body::Rows`), and each keeps the spacing it was
 //! drawn with before it became a table.
 
+use crate::sheet_menus::SheetMenu;
 use crate::{RibbonTab, SheetAct};
 
 /// A flex gap, in the unit the hand-drawn ribbon used for it (`gap_1` is a
@@ -38,6 +39,12 @@ pub(crate) enum Shape {
     Combo { value: &'static str, wide: bool },
     /// The Number group's format combo, showing the selection's format.
     NumFmt,
+    /// A Large split button: the icon and text run the command, the arrow
+    /// under them opens `menu` (Home › Paste and its gallery, #707).
+    Split {
+        icon: Option<&'static str>,
+        menu: crate::sheet_menus::SheetMenu,
+    },
 }
 
 /// One sheet ribbon command.
@@ -237,7 +244,15 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
-                        Item::One(large("paste", "Paste", Some("paste"), SheetAct::Paste)),
+                        Item::One(cmd(
+                            "paste",
+                            "Paste",
+                            Shape::Split {
+                                icon: Some("paste"),
+                                menu: SheetMenu::Paste,
+                            },
+                            SheetAct::Paste,
+                        )),
                         Item::Col {
                             gap: COL,
                             cmds: &[
@@ -415,8 +430,13 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                     None,
                                     SheetAct::AutoSum,
                                 ),
-                                row("fill", "Fill", None, SheetAct::Todo),
-                                row("clear", "Clear", Some("clear-format"), SheetAct::Todo),
+                                row("fill", "Fill", None, SheetAct::Menu(SheetMenu::Fill)),
+                                row(
+                                    "clear",
+                                    "Clear",
+                                    Some("clear-format"),
+                                    SheetAct::Menu(SheetMenu::Clear),
+                                ),
                             ],
                         },
                         Item::Col {
@@ -457,7 +477,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             "find-select",
                             "Find & Select",
                             Some("find"),
-                            SheetAct::Todo,
+                            SheetAct::Menu(SheetMenu::FindSelect),
                         )),
                     ],
                 },
@@ -835,9 +855,6 @@ mod tests {
                 "increase-decimal",
                 "decrease-decimal",
                 "cell-styles",
-                "fill",
-                "clear",
-                "find-select",
                 "spelling",
                 "protect-workbook",
             ]

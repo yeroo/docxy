@@ -2162,7 +2162,23 @@ fn menu_open(
                     return Err("'ribbon' must be [tab, group, command]".into());
                 };
                 if ribbon_surface(app)? == RibbonSurface::Sheet {
-                    return Err("the sheet ribbon has no split buttons".into());
+                    // A sheet command that opens a menu (#707): Paste's
+                    // arrow, Fill, Clear, Find & Select.
+                    let ribbon_tab = ribbon_tab_by_name(crate::Kind::Xlsx, tab)?;
+                    let commands = crate::sheet_ribbon::tab_def(ribbon_tab).commands();
+                    let cmd = crate::sheet_ribbon::resolve(&commands, tab, label, |act| {
+                        app.sheet_act_toggled(act)
+                    })?;
+                    let m = match (cmd.shape, cmd.act) {
+                        (crate::sheet_ribbon::Shape::Split { menu, .. }, _) => menu,
+                        (_, crate::SheetAct::Menu(m)) => m,
+                        _ => return Err(format!("sheet command '{label}' opens no menu")),
+                    };
+                    let _ = group;
+                    app.select_ribbon_tab(ribbon_tab, window, cx);
+                    let at = menu_point(app, window, None, |b| b.center());
+                    app.open_sheet_menu(m, at, cx);
+                    return Ok(());
                 }
                 let def = ribbon_tab_def(app, tab)?;
                 let id = split_primary(&def, group, label)?;
@@ -2172,8 +2188,18 @@ fn menu_open(
                 let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
                 app.open_split_menu(id, at, cx)
             }
+            "grid" => {
+                let name = fields[0].1.as_str().unwrap_or_default();
+                let kind = crate::menu::GridMenu::from_name(name).ok_or_else(|| {
+                    format!(
+                        "no grid menu '{name}' (fill-options, paste-options, fill-drop, border-drop)"
+                    )
+                })?;
+                sheet(app)?;
+                app.open_grid_menu(kind, cx)
+            }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, row and ribbon are)"
+                "menu target '{other}' is not supported yet (document, row, ribbon and grid are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
