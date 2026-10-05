@@ -763,6 +763,40 @@
     }
   },
   {
+    "name": "docxy_track_changes",
+    "description": "Report whether Track Changes is on (edits are recorded as tracked changes) and the reviewer they are recorded as. Returns {enabled, author}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_track_changes_set",
+    "description": "Turn Track Changes on or off (Review > Track Changes): typing and deletions are then recorded as tracked insertions and deletions (w:ins / w:del, stamped with the reviewer and the time), and the document saves with w:trackRevisions. Paragraph marks, text in hyperlinks and formatting are not recorded. Not an undo step. Returns {enabled, author}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "true to record, false to stop."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "enabled"
+      ]
+    }
+  },
+  {
     "name": "xlsxy_list",
     "description": "List the xlsxy editors currently running on this machine (instance/pane id, port, pid).",
     "inputSchema": {

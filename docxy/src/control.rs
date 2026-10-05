@@ -39,6 +39,8 @@
 //! | `doc.undo` / `doc.redo` | — | `{done}` (false = nothing to undo/redo) |
 //! | `doc.revisions` / `doc.revision-current` | — | stable revision ids, kinds, metadata, and current selection |
 //! | `doc.revision-next` / `doc.revision-previous` | — | navigate and return the selected stable revision |
+//! | `doc.track-changes` | — | `{enabled,author}` |
+//! | `doc.track-changes-set` | `{enabled}` | `{enabled,author}`; records typing and deletions as tracked changes (`w:ins` / `w:del`) and sets `w:trackRevisions` |
 //! | `doc.display-mode` | `{mode?}` | `{mode,label,editable}`; `mode` is `all`, `simple`, `none` or `original` (a view only) |
 //! | `doc.display-mode` | `{mode?}` | `{mode,label,editable}`; `mode` is `all`, `simple`, `none` or `original` (a view only, never saved) |
 //! | `doc.comment-resolve` | `{id, resolved?}` | `{id,resolved}`; no `resolved` toggles |
@@ -96,6 +98,7 @@ pub(crate) fn mutation_kind_for_verb(verb: &str) -> Option<MutationKind> {
         | "doc.revisions-accept-all"
         | "doc.revisions-reject-all" => MutationKind::Content,
         "doc.comment-resolve" | "doc.comments-delete-all" => MutationKind::Comment,
+        "doc.track-changes-set" => MutationKind::PackageMetadata,
         "doc.format" | "doc.set-style" | "doc.page-color" | "doc.watermark"
         | "doc.page-borders" => MutationKind::Formatting,
         _ => return None,
@@ -123,6 +126,8 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "doc.export" => export(app, args),
         "doc.comments" => Ok(comments(app)),
         "doc.display-mode" => display_mode(app, args),
+        "doc.track-changes" => Ok(track_changes(app)),
+        "doc.track-changes-set" => set_track_changes(app, args),
         "doc.comment-resolve" => resolve_comment(app, args),
         "doc.comments-delete-all" => Ok(delete_all_comments(app)),
         "doc.notes" => Ok(notes(app)),
@@ -679,6 +684,32 @@ fn review_revision(app: &mut App, args: &Json, action: RevisionAction) -> Result
         ctlcore::signal_activity();
     }
     Ok(revision_outcome_json(&outcome))
+}
+
+/// `doc.track-changes`: whether edits are recorded as tracked changes, and as
+/// whom.
+fn track_changes(app: &App) -> Json {
+    let editor = app.body_editor();
+    Json::obj(vec![
+        ("enabled", Json::Bool(editor.track_changes())),
+        (
+            "author",
+            Json::Str(editor.track_author().unwrap_or_default().to_string()),
+        ),
+    ])
+}
+
+/// `doc.track-changes-set`: turn Track Changes on or off (`enabled`), as
+/// Review ▸ Track does: the document's `w:trackRevisions` setting and the
+/// editor's recording. Not an undo step.
+fn set_track_changes(app: &mut App, args: &Json) -> Result<Json, String> {
+    let enabled = args
+        .get("enabled")
+        .and_then(Json::as_bool)
+        .ok_or("doc.track-changes-set needs 'enabled' (true or false)")?;
+    app.set_track_setting(enabled)?;
+    ctlcore::signal_activity();
+    Ok(track_changes(app))
 }
 
 /// `doc.display-mode`: Display for Review. With `mode` (`all`, `simple`,
@@ -2410,11 +2441,12 @@ mod tests {
 
     #[test]
     fn control_mutation_classification_covers_every_mutating_dispatch_verb() {
-        use MutationKind::{Comment, Content, Formatting, Structure};
+        use MutationKind::{Comment, Content, Formatting, PackageMetadata, Structure};
 
         let mutating = [
             ("doc.comment-resolve", Comment),
             ("doc.comments-delete-all", Comment),
+            ("doc.track-changes-set", PackageMetadata),
             ("doc.replace-range", Structure),
             ("doc.insert", Structure),
             ("doc.append", Structure),
@@ -2444,6 +2476,7 @@ mod tests {
             "doc.export",
             "doc.comments",
             "doc.display-mode",
+            "doc.track-changes",
             "doc.notes",
             "doc.header",
             "doc.footer",
@@ -2528,6 +2561,10 @@ mod tests {
                 args(vec![("id", Json::Str("1".into()))]),
             ),
             ("doc.comments-delete-all", Json::Null),
+            (
+                "doc.track-changes-set",
+                args(vec![("enabled", Json::Bool(true))]),
+            ),
         ];
 
         for (verb, verb_args) in cases {
@@ -2624,6 +2661,7 @@ mod tests {
             "doc.revisions-reject-all",
             "doc.comment-resolve",
             "doc.comments-delete-all",
+            "doc.track-changes-set",
         ] {
             assert!(mutation_kind_for_verb(verb).is_some(), "{verb}");
             let mut app = final_app(&dir);
@@ -3270,6 +3308,48 @@ mod tests {
         app.modified = false;
         mode(&mut app, Some("none")).unwrap();
         assert!(!app.modified);
+    }
+
+    /// #624 D: `doc.track-changes-set` turns recording on, ordinary edits are
+    /// recorded, and `doc.track-changes` reports it.
+    #[test]
+    fn doc_track_changes_verbs_record_edits() {
+        let mut app = app_with(&["One two three."]);
+        let r = dispatch(&mut app, "doc.track-changes", &Json::Null).unwrap();
+        assert_eq!(r.get("enabled").and_then(Json::as_bool), Some(false));
+        let r = dispatch(
+            &mut app,
+            "doc.track-changes-set",
+            &args(vec![("enabled", Json::Bool(true))]),
+        )
+        .unwrap();
+        assert_eq!(r.get("enabled").and_then(Json::as_bool), Some(true));
+        assert!(!r.get_str("author").unwrap().is_empty());
+        assert!(app.pkg.track_revisions());
+        dispatch(
+            &mut app,
+            "doc.insert",
+            &args(vec![
+                ("at", Json::Num(0.0)),
+                ("text", Json::Str("New".into())),
+            ]),
+        )
+        .unwrap();
+        let revisions = dispatch(&mut app, "doc.revisions", &Json::Null).unwrap();
+        assert!(
+            !revisions.to_string().contains("\"revisions\":[]"),
+            "{revisions}"
+        );
+        let err = dispatch(&mut app, "doc.track-changes-set", &Json::Null).unwrap_err();
+        assert!(err.contains("enabled"), "{err}");
+        // Off again.
+        dispatch(
+            &mut app,
+            "doc.track-changes-set",
+            &args(vec![("enabled", Json::Bool(false))]),
+        )
+        .unwrap();
+        assert!(!app.pkg.track_revisions());
     }
 
     #[test]

@@ -37,7 +37,7 @@ use std::process::ExitCode;
 use backstage::BackstageHost as _;
 
 use docxcore::compare::{CompareOptions, CompareResult, CompareSkip, compare_packages};
-use docxcore::editor::{Caret, Clip, Editor, FoundMatch};
+use docxcore::editor::{Caret, Clip, Editor, FoundMatch, TrackAuthor};
 use docxcore::export::{PdfOptions, to_pdf};
 #[cfg(test)]
 use docxcore::load::parse_header_footer;
@@ -1611,9 +1611,16 @@ impl App {
         let watermark_state = watermark::State::from_package(&pkg);
         let doc_page_borders = pkg.has_page_borders();
         let used_comment_ids = used_comment_ids(&comments, &doc);
+        let mut editor = Editor::new(doc);
+        if pkg.track_revisions() && format_for(path) != DocFormat::Markdown {
+            editor.set_track_changes(Some(TrackAuthor {
+                author: os_user_name().unwrap_or_else(|| DEFAULT_AUTHOR.to_string()),
+                clock: utc_now_iso,
+            }));
+        }
         App {
             pkg,
-            editor: Editor::new(doc),
+            editor,
             path: path.to_string(),
             format: format_for(path),
             bundle_html: None,
@@ -1878,6 +1885,47 @@ impl App {
     }
 
     /// Toggle the footnotes/endnotes side panel.
+    /// Track Changes on or off (Review ▸ Track): the settings flag the file
+    /// saves with, and recording in the editor. Not an undo step.
+    fn toggle_track(&mut self) {
+        let on = !self.body_editor().track_changes();
+        self.set_track(on);
+    }
+
+    fn set_track(&mut self, on: bool) {
+        if self.format != DocFormat::Markdown
+            && !self.mutation_allowed(protection::MutationKind::PackageMetadata)
+        {
+            return;
+        }
+        self.status = Some(match self.set_track_setting(on) {
+            Ok(()) => format!("Track Changes: {}", if on { "On" } else { "Off" }),
+            Err(e) => e,
+        });
+        self.dirty = true;
+    }
+
+    /// [`App::set_track`] without the protection check (callers authorize).
+    pub(crate) fn set_track_setting(&mut self, on: bool) -> Result<(), String> {
+        if self.format == DocFormat::Markdown {
+            return Err("Track Changes needs a Word document".to_string());
+        }
+        self.pkg.set_track_revisions(on);
+        self.apply_track(on);
+        self.modified = true;
+        Ok(())
+    }
+
+    /// Record edits in the body editor as this reviewer, or stop.
+    fn apply_track(&mut self, on: bool) {
+        let author = self.review_author();
+        self.body_editor_mut()
+            .set_track_changes(on.then_some(TrackAuthor {
+                author,
+                clock: utc_now_iso,
+            }));
+    }
+
     /// Choose Display for Review. A view only: the document, its history and
     /// what a save writes are untouched.
     fn set_markup(&mut self, view: docxcore::markup::MarkupView) {
@@ -2230,6 +2278,7 @@ impl App {
             ResolveComment => self.resolve_comment(),
             DeleteAllComments => self.delete_all_comments(),
             CycleMarkup => self.set_markup(self.markup.next()),
+            ToggleTrack => self.toggle_track(),
             PrevRevision => self.navigate_revision(true),
             NextRevision => self.navigate_revision(false),
             AcceptRevision => self.review_current_revision(RevisionAction::Accept),
@@ -2757,6 +2806,10 @@ impl App {
         self.hf_edit = None;
         self.path = path;
         self.modified = false;
+        // A file saved with Track Changes on opens with it on.
+        if self.format != DocFormat::Markdown && self.pkg.track_revisions() {
+            self.apply_track(true);
+        }
         self.scroll = 0;
         self.find = None;
         self.img_cache.clear();
@@ -6582,6 +6635,9 @@ impl App {
         if self.markup != docxcore::markup::MarkupView::All {
             toggles.push(ribbon::Act::CycleMarkup);
         }
+        if self.body_editor().track_changes() {
+            toggles.push(ribbon::Act::ToggleTrack);
+        }
         // Markdown files get a contextual View ▸ Markdown group; highlight whichever
         // of Rendered/Source is active.
         let is_md = self.format == DocFormat::Markdown;
@@ -6823,8 +6879,13 @@ impl App {
             Some(_) => "[FOOTER] ",
             None => "",
         };
+        let tracking = if self.body_editor().track_changes() {
+            "  │  Track Changes: On"
+        } else {
+            ""
+        };
         let left = format!(
-            " {}{}{}  │  ln {cr} col {cc}  │  {} lines  │  pg:{} marks:{} brd:{} ",
+            " {}{}{}  │  ln {cr} col {cc}  │  {} lines  │  pg:{} marks:{} brd:{}{tracking} ",
             surface,
             dirty_mark,
             self.path,
@@ -13583,6 +13644,105 @@ mod tests {
                 assert_ne!(app.editor.doc, before, "{view:?}");
             }
         }
+    }
+
+    /// The bottom row of the screen as text.
+    fn status_row(app: &mut App) -> String {
+        let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let y = buf.area.height - 1;
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// #624 B1/B3: Track on, type before `three` and delete `two `: the save
+    /// has `w:ins`, `w:del`/`w:delText`, the author and a date, and
+    /// `<w:trackRevisions/>`; the status bar says so; a reload starts with
+    /// tracking on; toggling off removes the setting.
+    #[test]
+    fn track_changes_records_typing_and_deleting_and_round_trips() {
+        let mut app = app_with(&["One two three."]);
+        assert!(!status_row(&mut app).contains("Track Changes: On"));
+        app.run_act(ribbon::Act::ToggleTrack);
+        assert!(app.body_editor().track_changes());
+        assert!(status_row(&mut app).contains("Track Changes: On"));
+        app.editor.caret.offset = 8;
+        type_text(&mut app, "and a half ");
+        app.editor.anchor = Some(Caret {
+            path: vec![0],
+            offset: 4,
+        });
+        app.editor.caret.offset = 8;
+        app.on_key(key(KeyCode::Backspace));
+        let path = save_to_temp(&mut app, "track-record");
+        let pkg = saved_pkg(&path);
+        let doc = pkg.part_text("word/document.xml").unwrap();
+        assert!(doc.contains("<w:ins "), "{doc}");
+        assert!(
+            doc.contains("<w:del ")
+                && doc.contains("<w:delText xml:space=\"preserve\">two </w:delText>"),
+            "{doc}"
+        );
+        assert!(
+            doc.contains(&format!("w:author=\"{}\"", app.review_author())),
+            "{doc}"
+        );
+        let date = doc
+            .split("w:date=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap();
+        assert!(is_utc_date_time(date), "{date}");
+        let settings = pkg.part_text("word/settings.xml").unwrap();
+        assert!(settings.contains("<w:trackRevisions/>"), "{settings}");
+        // The revisions are listed, and Accept All takes them.
+        assert_eq!(app.editor.doc.revisions().len(), 2);
+
+        let mut reopened = App::new(saved_pkg(&path), "test.docx", false);
+        reopened.os_clip = None;
+        assert!(
+            reopened.body_editor().track_changes(),
+            "starts with tracking on"
+        );
+
+        reopened.path = path.to_string_lossy().into_owned();
+        reopened.run_act(ribbon::Act::ToggleTrack);
+        assert!(!status_row(&mut reopened).contains("Track Changes: On"));
+        reopened.save();
+        let settings = saved_pkg(&path)
+            .part_text("word/settings.xml")
+            .unwrap_or_default();
+        assert!(!settings.contains("trackRevisions"), "{settings}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #624 B2: one undo takes a recorded edit back to the exact prior text.
+    #[test]
+    fn undo_of_a_recorded_edit_restores_the_document() {
+        let mut app = app_with(&["One two three."]);
+        let before = app.editor.doc.clone();
+        app.run_act(ribbon::Act::ToggleTrack);
+        app.editor.caret.offset = 8;
+        type_text(&mut app, "xy");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(app.editor.doc, before);
+    }
+
+    /// Track Changes is for Word documents: a Markdown file says so.
+    #[test]
+    fn markdown_refuses_track_changes() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_markdown_package(Document { body }), "a.md", false);
+        app.run_act(ribbon::Act::ToggleTrack);
+        assert!(!app.body_editor().track_changes());
+        assert!(
+            app.status
+                .clone()
+                .unwrap_or_default()
+                .contains("Word document")
+        );
     }
 
     /// `x ` + a tracked insertion `x` + ` x`: Find shows all three (#211).

@@ -129,6 +129,7 @@ fn only_commands_that_look_pass_protected_view() {
         Act::ClearFmt,
         Act::ResolveComment,
         Act::DeleteAllComments,
+        Act::ToggleTrack,
     ] {
         assert!(!protected_view_allows_doc_act(act), "{act:?}");
     }

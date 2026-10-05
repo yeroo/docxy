@@ -18,11 +18,13 @@ mod sections;
 mod table_design;
 mod table_layout;
 mod tables;
+mod track;
 mod visible;
 pub use flat::{FlatDocument, FlatStory, StoryOffset};
 pub use table_design::BorderCmd;
 pub use table_layout::{AutoFitKind, CellSep, DeleteShift, SortKey, SortKind, SortSpec};
 pub use tables::{CellRange, TablePos};
+pub use track::TrackAuthor;
 pub use visible::{FoundMatch, step_found};
 
 /// A path into the document tree (to a paragraph) plus a character offset.
@@ -166,6 +168,10 @@ pub struct Editor {
     /// A preview has been shown since this editor opened, so merge fields'
     /// text may need putting back.
     merge_previewed: bool,
+    /// Track Changes (#624): edits are recorded as tracked changes by this
+    /// reviewer while `Some`. Not saved with the document: the host sets it
+    /// from the settings and its own identity.
+    track: Option<TrackAuthor>,
 }
 
 impl Editor {
@@ -182,6 +188,7 @@ impl Editor {
             review_target: None,
             merge_preview: None,
             merge_previewed: false,
+            track: None,
         }
     }
 
@@ -514,6 +521,8 @@ impl Editor {
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
             content_insert(&mut p.content, off, ch);
             self.caret.offset += 1;
+            let path = self.caret.path.clone();
+            self.settle_inserted(&path, off, 1);
         }
     }
 
@@ -683,9 +692,8 @@ impl Editor {
                 return;
             }
             self.checkpoint(EditKind::Delete);
-            if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
-                content_delete(&mut p.content, off - 1);
-            }
+            let path = self.caret.path.clone();
+            self.delete_char_at(&path, off - 1);
             self.caret.offset -= 1;
             return;
         }
@@ -734,9 +742,8 @@ impl Editor {
                 return;
             }
             self.checkpoint(EditKind::Delete);
-            if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
-                content_delete(&mut p.content, off);
-            }
+            let path = self.caret.path.clone();
+            self.delete_char_at(&path, off);
             return;
         }
         // At the end: pull up the next sibling paragraph.
@@ -1045,10 +1052,8 @@ impl Editor {
 
         if lo.path == hi.path {
             self.checkpoint(EditKind::Structural);
-            if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
-                for _ in lo.offset..hi.offset {
-                    content_delete(&mut p.content, lo.offset);
-                }
+            for _ in lo.offset..hi.offset {
+                self.delete_char_at(&lo.path, lo.offset);
             }
             self.caret = lo;
             return true;
@@ -1063,6 +1068,12 @@ impl Editor {
         }
 
         self.checkpoint(EditKind::Structural);
+        // Tracked: the text of each paragraph is recorded as deleted and the
+        // paragraph marks stay (see the `track` module).
+        if self.delete_text_across_paragraphs(&lo, &hi) {
+            self.caret = lo;
+            return true;
+        }
         let li = *lo.path.last().unwrap();
         let hii = *hi.path.last().unwrap();
         if let Some((cont, _)) = container_mut(&mut self.doc.body, &lo.path) {
@@ -1153,7 +1164,13 @@ impl Editor {
         let mut paras = Vec::new();
         for (path, s, e) in spans {
             if let Some(p) = resolve_para(&self.doc.body, &path) {
-                paras.push(extract_range(&p.content, s, e));
+                let mut inlines = extract_range(&p.content, s, e);
+                // A copy of a recorded insertion is plain text, not a second
+                // record of it.
+                for inline in &mut inlines {
+                    track::with_props(inline, track::clear_insert_record);
+                }
+                paras.push(inlines);
             }
         }
         // A previewed record is display only: copied merge fields carry
@@ -1194,6 +1211,10 @@ impl Editor {
         if clip.paras.is_empty() {
             return;
         }
+        // Recorded as one tracked insertion when tracking; a copy of recorded
+        // text is not itself a record when not.
+        let recorded = self.clip_for_insertion(clip);
+        let clip = &recorded;
         let off = self.caret.offset;
         let n = clip.paras.len();
         let in_cover = self.caret_in_cover();
@@ -1776,9 +1797,7 @@ impl Editor {
         let text = &without_field_chars(text);
         if lo.path == hi.path && !text.contains('\n') {
             self.checkpoint(EditKind::Structural);
-            if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
-                replace_range_in_content(&mut p.content, lo.offset, hi.offset, text);
-            }
+            self.replace_text_range(&lo.path, lo.offset, hi.offset, text);
             self.anchor = None;
             self.caret = Caret {
                 offset: lo.offset + text.chars().count(),

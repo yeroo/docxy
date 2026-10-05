@@ -3038,6 +3038,21 @@
           "launcher": null,
           "items": [
             {
+              "kind": "large",
+              "cmd": {
+                "id": "tracktoggle",
+                "label": "Track Changes",
+                "icon": "paragraph",
+                "act": "ToggleTrack",
+                "keyTip": "T",
+                "tip": {
+                  "title": "Track Changes",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
               "kind": "column",
               "cmds": [
                 {

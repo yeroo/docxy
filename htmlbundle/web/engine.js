@@ -612,6 +612,7 @@
     DeleteAllComments: NOT_YET,
     ToggleComments: NOT_YET,
     ToggleNotes: NOT_YET,
+    ToggleTrack: NOT_YET,
     'Markup(All)': NOT_YET,
     'Markup(NoMarkup)': NOT_YET,
     'Markup(Original)': NOT_YET,

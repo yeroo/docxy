@@ -1845,6 +1845,44 @@ impl Package {
         self.set_part_text(&name, &xml)
     }
 
+    /// Whether the settings ask for Track Changes (`w:trackRevisions`), so a
+    /// document saved with it on opens with it on (#624).
+    pub fn track_revisions(&self) -> bool {
+        self.settings_flag("w:trackRevisions").unwrap_or(false)
+    }
+
+    /// Turn Track Changes on or off in the settings: `w:trackRevisions` at its
+    /// `CT_Settings` position (after `w:revisionView`, before
+    /// `w:doNotTrackMoves` and the rest), creating the settings part when
+    /// needed; off removes the element, an explicit `w:val="false"` included.
+    /// Whether the settings changed.
+    pub fn set_track_revisions(&mut self, on: bool) -> bool {
+        const ELEM: &str = "w:trackRevisions";
+        if self.track_revisions() == on && (on || self.settings_flag(ELEM).is_none()) {
+            return false;
+        }
+        let name = if on {
+            self.ensure_settings_part()
+        } else {
+            self.settings_part_name().ok().flatten()
+        };
+        let Some(name) = name else {
+            return false;
+        };
+        let Some(mut xml) = self.part_text(&name) else {
+            return false;
+        };
+        while crate::sect::find_element(&xml, ELEM).is_some() {
+            xml = crate::sect::remove_element(&xml, ELEM);
+        }
+        if on {
+            let mut before = SETTINGS_BEFORE_MAIL_MERGE.to_vec();
+            before.extend(["w:mailMerge", "w:revisionView"]);
+            xml = insert_settings_child(&xml, &format!("<{ELEM}/>"), &before);
+        }
+        self.set_part_text(&name, &xml)
+    }
+
     /// Add or remove a boolean flag element (e.g. `w:evenAndOddHeaders`,
     /// `w:autoHyphenation`) in `word/settings.xml`, creating the part (+ its
     /// content-type and relationship) if it doesn't exist yet.
@@ -6765,5 +6803,71 @@ mod tests {
         let rels = p.part_text("word/_rels/document.xml.rels").unwrap();
         assert!(!rels.contains("comments"), "{rels}");
         assert!(crate::comments::parse_comments(&p).is_empty());
+    }
+
+    // ---- Track Changes setting (#624) --------------------------------------
+
+    fn settings_package(settings: &str) -> Package {
+        load_package(&make_metadata_docx(
+            "<w:document/>",
+            Some(settings),
+            None,
+            &[],
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn track_revisions_sits_at_its_schema_position() {
+        let mut p = settings_package(
+            "<w:settings xmlns:w=\"w\"><w:zoom w:percent=\"100\"/><w:revisionView w:markup=\"0\"/>\
+             <w:defaultTabStop w:val=\"720\"/><w:autoHyphenation/></w:settings>",
+        );
+        assert!(!p.track_revisions());
+        assert!(p.set_track_revisions(true));
+        assert!(p.track_revisions());
+        let xml = p.part_text("word/settings.xml").unwrap();
+        let at = |n: &str| xml.find(n).unwrap_or_else(|| panic!("{n} in {xml}"));
+        assert!(
+            at("<w:revisionView") < at("<w:trackRevisions/>")
+                && at("<w:trackRevisions/>") < at("<w:defaultTabStop"),
+            "{xml}"
+        );
+        assert!(!p.set_track_revisions(true), "already on");
+        assert!(p.set_track_revisions(false));
+        assert!(!p.track_revisions());
+        assert!(
+            !p.part_text("word/settings.xml")
+                .unwrap()
+                .contains("trackRevisions")
+        );
+    }
+
+    #[test]
+    fn track_revisions_replaces_an_explicit_off_and_creates_the_part() {
+        let mut p = settings_package(
+            "<w:settings xmlns:w=\"w\"><w:trackRevisions w:val=\"false\"/></w:settings>",
+        );
+        assert!(!p.track_revisions());
+        assert!(p.set_track_revisions(true));
+        let xml = p.part_text("word/settings.xml").unwrap();
+        assert_eq!(xml.matches("trackRevisions").count(), 1, "{xml}");
+        assert!(p.track_revisions());
+        // Off over an explicit off removes it; no part: nothing to turn off.
+        let mut off = settings_package(
+            "<w:settings xmlns:w=\"w\"><w:trackRevisions w:val=\"0\"/></w:settings>",
+        );
+        assert!(off.set_track_revisions(false));
+        assert!(
+            !off.part_text("word/settings.xml")
+                .unwrap()
+                .contains("track")
+        );
+        let mut none = load_package(&make_metadata_docx("<w:document/>", None, None, &[])).unwrap();
+        assert!(!none.set_track_revisions(false));
+        assert!(none.part("word/settings.xml").is_none());
+        // And turning it on creates the part with the flag in it.
+        assert!(none.set_track_revisions(true));
+        assert!(none.track_revisions());
     }
 }

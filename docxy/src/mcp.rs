@@ -69,6 +69,8 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "docxy_comment_resolve" => "doc.comment-resolve",
         "docxy_comments_delete_all" => "doc.comments-delete-all",
         "docxy_display_mode" => "doc.display-mode",
+        "docxy_track_changes" => "doc.track-changes",
+        "docxy_track_changes_set" => "doc.track-changes-set",
         _ => return None,
     })
 }
@@ -613,6 +615,26 @@ fn tool_defs() -> Json {
             ],
             &[],
         ),
+        tool(
+            "docxy_track_changes",
+            "Report whether Track Changes is on (edits are recorded as tracked changes) and the \
+             reviewer they are recorded as. Returns {enabled, author}.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_track_changes_set",
+            "Turn Track Changes on or off (Review > Track Changes): typing and deletions are \
+             then recorded as tracked insertions and deletions (w:ins / w:del, stamped with the \
+             reviewer and the time), and the document saves with w:trackRevisions. Paragraph \
+             marks, text in hyperlinks and formatting are not recorded. Not an undo step. \
+             Returns {enabled, author}.",
+            vec![
+                ("enabled", prop("boolean", "true to record, false to stop.")),
+                target(),
+            ],
+            &["enabled"],
+        ),
     ])
 }
 
@@ -728,6 +750,9 @@ mod tests {
             "docxy_comments_delete_all",
             // #625: Display for Review.
             "docxy_display_mode",
+            // #624: Track Changes.
+            "docxy_track_changes",
+            "docxy_track_changes_set",
         ];
         let save_pos = names.iter().position(|n| *n == "docxy_save").unwrap();
         assert_eq!(
@@ -786,6 +811,8 @@ mod tests {
         assert_eq!(required_of("docxy_comment_resolve"), "[\"id\"]");
         assert_eq!(required_of("docxy_comments_delete_all"), "[]");
         assert_eq!(required_of("docxy_display_mode"), "[]");
+        assert_eq!(required_of("docxy_track_changes"), "[]");
+        assert_eq!(required_of("docxy_track_changes_set"), "[\"enabled\"]");
     }
 
     /// Wave-2: `docxy_insert`/`docxy_replace_range`/`docxy_append` gain an
@@ -958,6 +985,8 @@ mod tests {
         ("docxy_comment_resolve", "doc.comment-resolve"),
         ("docxy_comments_delete_all", "doc.comments-delete-all"),
         ("docxy_display_mode", "doc.display-mode"),
+        ("docxy_track_changes", "doc.track-changes"),
+        ("docxy_track_changes_set", "doc.track-changes-set"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.
@@ -1005,9 +1034,12 @@ mod tests {
 
     #[test]
     fn mutating_mcp_tools_forward_to_control_authorized_verbs() {
-        use crate::protection::MutationKind::{Comment, Content, Formatting, Structure};
+        use crate::protection::MutationKind::{
+            Comment, Content, Formatting, PackageMetadata, Structure,
+        };
 
         let expected = [
+            ("docxy_track_changes_set", PackageMetadata),
             ("docxy_comment_resolve", Comment),
             ("docxy_comments_delete_all", Comment),
             ("docxy_replace_range", Structure),
