@@ -196,7 +196,10 @@ test sheet Home ribbon-click reaches a Sort & Filter menu item by id and by labe
 
 test sheet Home Clear stays the AutoSum column's button
   open ../fixtures/basic.xlsx
-  call-error ribbon-click {"tab":"Home","command":"Clear"} => 'Clear' is not implemented
+  call ribbon-click {"tab":"Home","command":"Clear"}
+  call menu-read {}
+  assert reply.open is true
+  assert reply.items.0.label is Clear All
 
 test sheet Home has no Remove Duplicates and Data keeps it
   open ../fixtures/basic.xlsx

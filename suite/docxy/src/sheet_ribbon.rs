@@ -1372,15 +1372,12 @@ mod tests {
         assert_eq!(act("home-reapply-filter"), Ok(SheetAct::ReapplyFilter));
         assert_eq!(act("home-clear-filter"), Ok(SheetAct::ClearFilter));
         // The menu's Clear shares its name with the AutoSum column's: the
-        // ribbon button wins, and that one is not implemented yet.
-        assert_eq!(
-            resolve_on(home, "Home", "Clear", off).unwrap_err(),
-            "'Clear' is not implemented"
-        );
-        assert_eq!(
-            resolve_on(home, "Home", "clear", off).unwrap_err(),
-            "'Clear' is not implemented"
-        );
+        // ribbon button wins, and that one opens the Clear menu (#707).
+        for q in ["Clear", "clear"] {
+            let c = resolve_on(home, "Home", q, off).unwrap();
+            assert_eq!(c.id, "clear");
+            assert!(matches!(c.act, SheetAct::Menu(_)));
+        }
         // The drop-down button itself resolves, enabled: it opens its menu.
         let button = resolve_on(home, "Home", "Sort & Filter", off).unwrap();
         assert!(button.enabled() && matches!(button.shape, Shape::Menu(_)));
