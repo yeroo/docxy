@@ -1,6 +1,7 @@
 # No ribbon group draws its content taller than its body (#1018). Each tab
-# is shown (ribbon-layout selects it; when that switched tabs it answers
-# `settled: false`), a frame is drawn, and the second call reads where every group's content landed.
+# is shown (ribbon-layout selects it), a frame is drawn, and the second call
+# reads where every group's content landed. Any call whose last frame is not
+# the shown tab's answers `settled: false` with no groups.
 
 test sheet ribbon: no tab is clipped vertically
   open ../fixtures/basic.xlsx
@@ -113,3 +114,26 @@ test Project ribbon: no tab is clipped vertically
 test document ribbon: a contextual tab out of context is refused
   open ../fixtures/basic.docx
   call-error ribbon-layout {"tab":"Table Design"} => Table Design tab is not active outside a table
+
+test ribbon-layout is unsettled until a frame shows the tab, whatever the call
+  open ../fixtures/basic.xlsx
+  call window-size {"w":1600,"h":900}
+  shot window
+  call ribbon-click {"tab":"Data","command":"Filter"}
+  call ribbon-layout {}
+  assert reply.settled is false
+  shot window
+  call ribbon-layout {}
+  assert reply.settled is true
+  assert reply.tab is Data
+  assert reply.any_clipped_v is false
+
+test ribbon-layout reads under a dialog and refuses to show a tab under one
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call ribbon-layout {}
+  call-error ribbon-layout {"tab":"Data"} => a dialog is open

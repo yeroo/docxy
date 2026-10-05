@@ -61,8 +61,6 @@ pub(crate) struct SheetCmd {
     pub alt: Option<&'static str>,
     pub shape: Shape,
     pub act: SheetAct,
-    /// Listed in a drop-down's menu, not drawn on the ribbon itself.
-    pub in_menu: bool,
 }
 
 impl SheetCmd {
@@ -250,16 +248,12 @@ const fn cmd(id: &'static str, label: &'static str, shape: Shape, act: SheetAct)
         alt: None,
         shape,
         act,
-        in_menu: false,
     }
 }
 
 /// An item of a drop-down menu, named as its menu shows it.
 const fn menu_item(id: &'static str, label: &'static str, act: SheetAct) -> SheetCmd {
-    SheetCmd {
-        in_menu: true,
-        ..cmd(id, label, Shape::Row(None), act)
-    }
+    cmd(id, label, Shape::Row(None), act)
 }
 
 /// A menu item whose menu text differs from its name.
@@ -925,21 +919,19 @@ pub(crate) fn act_on(act: SheetAct, xf: &gridcore::sheet::Xf) -> bool {
     }
 }
 
-/// Resolve `query` on `tab` by id, else by label as it reads now, else by
-/// drawn text, as the document ribbon resolves by id, label, then screentip.
-/// `toggled` gives a command's state for its current label.
-pub(crate) fn resolve<'a>(
+/// The commands matching `query` in the first tier that has any: by id, else
+/// by label as it reads now, else by drawn text.
+fn tier_matches<'a>(
     commands: &[&'a SheetCmd],
-    tab_name: &str,
     query: &str,
-    toggled: impl Fn(SheetAct) -> bool,
-) -> Result<&'a SheetCmd, String> {
+    toggled: &impl Fn(SheetAct) -> bool,
+) -> Vec<&'a SheetCmd> {
     let tiers: [&dyn Fn(&SheetCmd) -> bool; 3] = [
         &|c| c.id == query,
         &|c| c.label(toggled(c.act)) == query,
         &|c| c.text(toggled(c.act)) == query,
     ];
-    let matches: Vec<&'a SheetCmd> = tiers
+    tiers
         .iter()
         .map(|hit| {
             commands
@@ -949,15 +941,16 @@ pub(crate) fn resolve<'a>(
                 .collect::<Vec<_>>()
         })
         .find(|m| !m.is_empty())
-        .unwrap_or_default();
-    // A menu item may repeat the name of a ribbon button (Home's AutoSum
-    // column has a Clear, so does Sort & Filter): the button wins.
-    let on_ribbon: Vec<&'a SheetCmd> = matches.iter().copied().filter(|c| !c.in_menu).collect();
-    let matches = if on_ribbon.len() == 1 {
-        on_ribbon
-    } else {
-        matches
-    };
+        .unwrap_or_default()
+}
+
+/// One match, or why there is not one.
+fn single<'a>(
+    matches: Vec<&'a SheetCmd>,
+    tab_name: &str,
+    query: &str,
+    toggled: &impl Fn(SheetAct) -> bool,
+) -> Result<&'a SheetCmd, String> {
     match matches.as_slice() {
         [only] if !only.enabled() => Err(format!(
             "'{}' is not implemented",
@@ -970,6 +963,47 @@ pub(crate) fn resolve<'a>(
             many.iter().map(|c| c.id).collect::<Vec<_>>().join(", ")
         )),
     }
+}
+
+/// Resolve `query` on `tab` by id, else by label as it reads now, else by
+/// drawn text, as the document ribbon resolves by id, label, then screentip.
+/// `toggled` gives a command's state for its current label. The app resolves
+/// through [`resolve_on`]; this takes any list, for the tests.
+#[cfg(test)]
+pub(crate) fn resolve<'a>(
+    commands: &[&'a SheetCmd],
+    tab_name: &str,
+    query: &str,
+    toggled: impl Fn(SheetAct) -> bool,
+) -> Result<&'a SheetCmd, String> {
+    single(
+        tier_matches(commands, query, &toggled),
+        tab_name,
+        query,
+        &toggled,
+    )
+}
+
+/// [`resolve`] on a tab of the table. A drop-down's items are looked at only
+/// when no button of the tab matches: Home's AutoSum column has a Clear and
+/// so does Sort & Filter, and the button wins.
+pub(crate) fn resolve_on(
+    tab: &'static Tab,
+    tab_name: &str,
+    query: &str,
+    toggled: impl Fn(SheetAct) -> bool,
+) -> Result<&'static SheetCmd, String> {
+    let all = tab.commands();
+    let buttons: Vec<&'static SheetCmd> = all
+        .iter()
+        .copied()
+        .filter(|c| !tab.groups.iter().any(|g| g.menu_owner(c).is_some()))
+        .collect();
+    let mut matches = tier_matches(&buttons, query, &toggled);
+    if matches.is_empty() {
+        matches = tier_matches(&all, query, &toggled);
+    }
+    single(matches, tab_name, query, &toggled)
 }
 
 #[cfg(test)]
@@ -1011,7 +1045,11 @@ mod tests {
                 let mut seen = HashSet::new();
                 // A menu item may repeat a ribbon button's name (Home's Clear);
                 // `resolve` prefers the button.
-                for c in tab.commands().into_iter().filter(|c| !c.in_menu) {
+                for c in tab
+                    .commands()
+                    .into_iter()
+                    .filter(|c| !tab.groups.iter().any(|g| g.menu_owner(c).is_some()))
+                {
                     assert!(
                         seen.insert(c.label(toggled)),
                         "label {} repeats on a tab",
@@ -1057,7 +1095,10 @@ mod tests {
 
     #[test]
     fn resolution_takes_an_id_then_a_label_then_the_drawn_text() {
-        let home = tab_def(RibbonTab::Home).commands();
+        let home = tab_def(RibbonTab::Home);
+        let resolve =
+            |_: &[&SheetCmd], t: &str, q: &str, f: fn(SheetAct) -> bool| resolve_on(home, t, q, f);
+        let home = home.commands();
         let off = |_| false;
         assert_eq!(resolve(&home, "Home", "bold", off).unwrap().id, "bold");
         assert_eq!(resolve(&home, "Home", "Bold", off).unwrap().id, "bold");
@@ -1265,7 +1306,14 @@ mod tests {
             let c = editing.commands().into_iter().find(|c| c.id == id).unwrap();
             editing.menu_owner(c).map(|m| m.button.id)
         };
-        for id in ["sort-a-z", "sort-z-a", "custom-sort", "filter", "home-clear-filter", "home-reapply-filter"] {
+        for id in [
+            "sort-a-z",
+            "sort-z-a",
+            "custom-sort",
+            "filter",
+            "home-clear-filter",
+            "home-reapply-filter",
+        ] {
             assert_eq!(owner(id), Some("sort-filter"), "{id}");
         }
         for id in ["autosum", "fill", "clear", "sort-filter", "find-select"] {
@@ -1275,8 +1323,12 @@ mod tests {
 
     #[test]
     fn the_sort_filter_menu_keeps_the_ribbon_click_ids_and_runs_the_data_tabs_acts() {
-        let home = tab_def(RibbonTab::Home).commands();
+        let home_tab = tab_def(RibbonTab::Home);
+        let home = home_tab.commands();
         let off = |_| false;
+        let resolve = |_: &[&SheetCmd], t: &str, q: &str, f: fn(SheetAct) -> bool| {
+            resolve_on(home_tab, t, q, f)
+        };
         let act = |q| resolve(&home, "Home", q, off).map(|c| c.act);
         assert_eq!(act("sort-a-z"), Ok(SheetAct::SortAsc));
         assert_eq!(act("Sort Z to A"), Ok(SheetAct::SortDesc));

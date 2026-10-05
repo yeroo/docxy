@@ -1602,7 +1602,9 @@ fn sheet_ribbon_json(app: &crate::Docxy) -> Json {
                         Json::Arr(
                             g.commands()
                                 .into_iter()
-                                .map(|c| sheet_command_json(app, c, g.menu_owner(c).map(|m| m.button.id)))
+                                .map(|c| {
+                                    sheet_command_json(app, c, g.menu_owner(c).map(|m| m.button.id))
+                                })
                                 .collect(),
                         ),
                     ),
@@ -1630,9 +1632,12 @@ fn resolve_sheet_command(
         return Err("File is backstage; use the backstage verb".into());
     }
     let tab = ribbon_tab_by_name(crate::Kind::Xlsx, tab_name)?;
-    let commands = crate::sheet_ribbon::tab_def(tab).commands();
-    let cmd =
-        crate::sheet_ribbon::resolve(&commands, tab_name, query, |act| app.sheet_act_toggled(act))?;
+    let cmd = crate::sheet_ribbon::resolve_on(
+        crate::sheet_ribbon::tab_def(tab),
+        tab_name,
+        query,
+        |act| app.sheet_act_toggled(act),
+    )?;
     Ok((tab, cmd))
 }
 
@@ -1689,7 +1694,7 @@ fn sheet_menu_open(
     let id = g
         .commands()
         .into_iter()
-        .find(|c| !c.in_menu && c.label == label)
+        .find(|c| g.menu_owner(c).is_none() && c.label == label)
         .ok_or_else(|| format!("no command '{label}' in group '{group}'"))?
         .id;
     if g.dropdown(id).is_none() {
@@ -3128,12 +3133,18 @@ fn dispatch_verb(
         // Where each group of the shown ribbon tab drew its content, from the
         // last frame (settle with a `shot` first, as for `title-bar`).
         "ribbon-layout" => {
-            app.refuse_under_dialog()?;
             let surface = ribbon_surface(app)?;
+            // Protected View and a final document hide the ribbon's body, so
+            // no group is ever drawn to measure.
+            if !app.active_is_project() && app.active_locked() {
+                return Err("the ribbon is hidden while the document is in Protected View or marked as final".into());
+            }
             // `tab` shows that tab first, as `ribbon-click` does. Its groups
             // are drawn a frame later, so that call answers `settled: false`
             // and a `shot window` then a second call reads them.
             if let Some(want) = args.get("tab") {
+                // Showing a tab is a press; the plain read works under a dialog.
+                app.refuse_under_dialog()?;
                 let want = want.as_str().ok_or("'tab' must be a tab name")?;
                 let kind = match surface {
                     RibbonSurface::Sheet => crate::Kind::Xlsx,
@@ -3168,7 +3179,8 @@ fn dispatch_verb(
             // the view dirty): then it is not this tab's layout.
             let probes = app.probes.borrow();
             let measured = crate::ribbon_layout::measure(&probes.last);
-            if !crate::ribbon_layout::is_frame_of(&measured, &titles) {
+            // A tab with no groups (Project's Report) has nothing to wait for.
+            if !titles.is_empty() && !crate::ribbon_layout::is_frame_of(&measured, &titles) {
                 cx.notify();
                 return Done::ok(crate::ribbon_layout::unsettled_json(&name));
             }

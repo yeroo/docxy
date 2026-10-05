@@ -213,7 +213,10 @@ mod tests {
     fn a_frame_of_another_tab_or_none_is_not_settled() {
         let m = measure(&frame(62.));
         assert!(is_frame_of(&m, &["Editing", "Cells"]));
-        assert!(!is_frame_of(&m, &["Cells"]), "another tab's group is on record");
+        assert!(
+            !is_frame_of(&m, &["Cells"]),
+            "another tab's group is on record"
+        );
         assert!(!is_frame_of(&[], &["Editing"]), "nothing measured yet");
         let json = unsettled_json("Data");
         assert_eq!(json.get("settled"), Some(&Json::Bool(false)));
