@@ -1744,6 +1744,9 @@ struct PivotEdit {
     sel: usize,
 }
 
+/// [`ClipData::sheet`] of a copy whose sheet was deleted.
+const SHEET_GONE: usize = usize::MAX;
+
 /// An internal clipboard: a rect of cells plus its source sheet and corner so
 /// pasted formulas can shift their relative references (Excel semantics) and
 /// a cut clears the sheet it came from.
@@ -7490,16 +7493,15 @@ impl App {
         let gone = self.sheet;
         if self.pkg.remove_sheet(gone) {
             self.cancel_cut();
-            // The copy names its sheet by index: one deleted takes the copy
-            // with it, and one before it renumbers it (#707 r1).
-            match self.clip.as_ref().map(|c| c.sheet) {
-                Some(s) if s == gone => self.clip = None,
-                Some(s) if s > gone => {
-                    if let Some(clip) = self.clip.as_mut() {
-                        clip.sheet -= 1;
-                    }
+            // The copy names its sheet by index: one deleted leaves it no
+            // sheet (it still pastes its cells as a copy, but Paste Special
+            // has nothing to read), and one before it renumbers it (#707 r1).
+            if let Some(clip) = self.clip.as_mut() {
+                if clip.sheet == gone {
+                    clip.sheet = SHEET_GONE;
+                } else if clip.sheet > gone && clip.sheet != SHEET_GONE {
+                    clip.sheet -= 1;
                 }
-                _ => {}
             }
             self.sheet = self.sheet.min(self.pkg.workbook.sheets.len() - 1);
             self.cur = (0, 0);
@@ -12260,10 +12262,12 @@ mod tests {
         app.anchor = Some((0, 0));
         app.copy(false);
         app.delete_current_sheet();
-        assert!(app.clip.is_none(), "the copy went with its sheet");
+        assert_eq!(app.clip.as_ref().map(|c| c.sheet), Some(SHEET_GONE));
         app.anchor = None;
         app.open_paste_special();
+        app.outline_dialog_key(KeyCode::Enter);
         assert!(app.outline_dialog.is_none());
+        assert!(app.status.as_deref().unwrap_or("").contains("gone"));
         // Even a clip left pointing past the sheets is refused, not a panic.
         app.clip = Some(ClipData {
             cells: vec![vec![Some(Cell::number(1.0))]],
