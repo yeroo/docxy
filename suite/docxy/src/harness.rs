@@ -4252,6 +4252,7 @@ fn dispatch_verb(
 
         // Persist and go. The reply is written first (see the pump).
         "quit" => {
+            app.commit_dialog_buffers_for_exit(cx);
             crate::close::commit_pending_for_exit(&mut app.tabs);
             // Not through `on_window_should_close`: clear the run marker here
             // too, or every harness relaunch would look like a crash (#632).

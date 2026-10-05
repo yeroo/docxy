@@ -3902,6 +3902,12 @@ struct Docxy {
     // In-progress cell-comment entry for the selected cell (the input buffer);
     // None = the comment bar is closed.
     sheet_comment_edit: Option<String>,
+    // The raw text a comment bar opened with (its seed): the selection moves
+    // freely while the bar is open, and an exit commit uses the seed only to
+    // tell an untouched buffer from an edit — so a bar merely open never
+    // deletes or copies onto a clicked cell. Set where the buffer opens,
+    // cleared with it.
+    sheet_comment_seed: Option<String>,
     // Whether the data-validation list dropdown is open on the selected cell.
     sheet_dv_open: bool,
     // Whether the Number-group format picker strip is open.
@@ -9877,6 +9883,7 @@ impl Docxy {
             sheet_rename: None,
             sheet_grid_w: 1000.0,
             sheet_comment_edit: None,
+            sheet_comment_seed: None,
             sheet_dv_open: false,
             sheet_numfmt_open: false,
             sheet_fmt_open: false,
@@ -10871,7 +10878,7 @@ impl Docxy {
         // there, a Protected View tab included (#610).
         self.sheet_rename = None;
         self.sheet_rowh_edit = None;
-        self.sheet_comment_edit = None;
+        self.sheet_comment_bar_close();
         self.sheet_fill = None;
         self.formula_pick = None;
         // A drag by the selection's border, or a drop waiting on its menu or
@@ -11484,7 +11491,7 @@ impl Docxy {
     fn typing_bars_close(&mut self) {
         self.project_prompt_cancel();
         self.bar_close();
-        self.sheet_comment_edit = None;
+        self.sheet_comment_bar_close();
         self.sheet_rowh_edit = None;
         self.find_open = false;
     }
@@ -12966,20 +12973,12 @@ impl Docxy {
                     self.sheet_rename = None;
                     return;
                 }
-                if let Some(v) = self.active_sheet_mut() {
-                    let old = v.pkg.workbook.sheets.get(idx).map(|s| s.name.clone());
-                    // `rename_sheet` follows the refs inside the workbook (and
-                    // declines a name already taken); a chart this session
-                    // authored isn't in there yet, and would save pointing at a
-                    // sheet name that no longer exists.
-                    if let (true, Some(old)) = (v.pkg.rename_sheet(idx, &buf), old) {
-                        let new = buf.trim().to_string();
-                        for c in &mut v.charts {
-                            gridcore::edit::rename_sheet_in_chart(&mut c.data, &old, &new);
-                        }
-                    }
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    crate::close::commit_rename_buffer(t, idx, &buf);
                 }
                 self.sheet_rename = None;
+                // Enter marks the tab dirty even when the name was declined;
+                // that quirk predates the extraction and stays.
                 self.mark_sheet_dirty();
             }
             "backspace" => {
@@ -13871,13 +13870,25 @@ impl Docxy {
             .map(|cm| cm.text)
     }
 
-    /// Open the comment entry bar for the selected cell, seeded with its existing
-    /// comment text (so New Comment doubles as Edit).
+    /// Open the comment entry bar for the selected cell, seeded with its
+    /// existing comment text (so New Comment doubles as Edit). The seed — the
+    /// raw text — is remembered with the buffer: the selection moves freely
+    /// while the bar is open, and an exit commit uses it only to skip a
+    /// buffer that is the seed, untouched, after a click moved on.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
         if self.active_sheet().is_some() {
-            self.sheet_comment_edit = Some(self.selected_comment().unwrap_or_default());
+            let text = self.selected_comment().unwrap_or_default();
+            self.sheet_comment_seed = Some(text.clone());
+            self.sheet_comment_edit = Some(text);
             cx.notify();
         }
+    }
+
+    /// Drop the comment bar: its buffer and, with it, the seed that says
+    /// what text it opened with.
+    fn sheet_comment_bar_close(&mut self) {
+        self.sheet_comment_edit = None;
+        self.sheet_comment_seed = None;
     }
 
     /// Route a keystroke into the conditional-format entry bar; Enter applies the
@@ -14040,7 +14051,7 @@ impl Docxy {
         };
         match key {
             "escape" => {
-                self.sheet_comment_edit = None;
+                self.sheet_comment_bar_close();
                 cx.notify();
             }
             "enter" => self.sheet_commit_comment(cx),
@@ -14069,9 +14080,11 @@ impl Docxy {
         let Some(text) = self.sheet_comment_edit.take() else {
             return;
         };
+        self.sheet_comment_bar_close();
         let author = self.comment_author();
-        // The view takes the undo step itself: the whole package.
-        self.sheet_try_edit(false, |v| v.comment_cell(&author, &text));
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            crate::close::commit_comment_buffer(t, &author, &text);
+        }
         cx.notify();
     }
 
@@ -27183,7 +27196,7 @@ impl Docxy {
             .child(
                 btn("Cancel", false).on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
                     ent_cancel.update(cx, |this, cx| {
-                        this.sheet_comment_edit = None;
+                        this.sheet_comment_bar_close();
                         cx.notify();
                     });
                 }),
