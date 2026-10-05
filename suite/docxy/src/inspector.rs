@@ -236,7 +236,7 @@ pub(crate) fn inspect_remove(
         }
     };
     if changed {
-        tab.dirty = true;
+        tab.set_dirty();
     }
     tab.status = status.clone().into();
     Ok(status)

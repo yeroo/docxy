@@ -231,7 +231,7 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
         Ok(())
     })?;
     if changed {
-        tab.dirty = true;
+        tab.set_dirty();
     }
     complete_project(tab, true);
     Ok(())

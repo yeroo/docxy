@@ -148,6 +148,9 @@ fn commit_changed_cell(tab: &mut DocTab) -> Result<(), String> {
         }
         tab.dirty |= changed;
         if changed {
+            // A cell entry is an edit outside any document's undo history:
+            // a document's Repeat record is stale after it (#618).
+            crate::bump_edit_generation();
             v.anchor = v.sel;
             v.clear_areas();
         }

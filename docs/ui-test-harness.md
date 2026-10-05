@@ -432,7 +432,7 @@ footer editor; `selection-set` refuses while it is open.
 | Call | Effect |
 |---|---|
 | `selection-set {"start":5,"end":1}` | set main-story anchor and caret through `Editor`; backward selections keep the larger anchor; an empty range leaves a collapsed caret, the state a click leaves; both offsets are validated before either changes |
-| `ribbon-read {}` | list File, ribbon tabs and the contextual tabs — Header & Footer while a header or footer is being edited, Table while the caret is in a table, Gantt Chart Format while a Project's Gantt shows — with groups, commands, galleries and Quick Access Toolbar. The Header from Top and Footer from Bottom boxes carry the `value` they show (`0.5"`) |
+| `ribbon-read {}` | list File, ribbon tabs and the contextual tabs — Header & Footer while a header or footer is being edited, Table while the caret is in a table, Gantt Chart Format while a Project's Gantt shows — with groups, commands, galleries and Quick Access Toolbar. The Header from Top and Footer from Bottom boxes carry the `value` they show (`0.5"`). Each `qat` item carries `enabled` and `menu` (a split button with a drop-down). On a document tab `qat-undo` has `menu: true`, and `qat-redo` reads `Redo` (tip `Redo (Ctrl+Y)`) while there is something to redo, else `Repeat` (#618): tip `Repeat (Ctrl+Y)` when Ctrl+Y / F4 would repeat the last action, or `Can't Repeat` with `enabled: false` |
 | `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command on a valid tab, contextual tabs included, by id, else by unique label, else by unique screentip title, and invoke the same action handler as its button |
 | `status-read {}` | read the tab's status line as an ordered `items` array of `{id, text}`: on a Project tab `state` (Ready/Edit/Busy), `new-tasks` (`New Tasks: …`) and `message`; on other tabs only `message` (a document's word-count stats are not reported) |
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items (`Info` only while the active tab is a document); `close` returns to the tab |
@@ -1089,9 +1089,9 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment; #690, #691), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select) or `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) | the menu, as `menu-read` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment; #690, #691), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619) | the menu, as `menu-read` |
 | `menu-read` | `{}` | `{open: true, target, items}`, or `{open: false}` |
-| `menu-click` | `{label}` among the top-level items, or `{path: [labels]}` through submenus | `state` after the item's handler; the menu closes first |
+| `menu-click` | `{label}` among the top-level items, `{path: [labels]}` through submenus, or `{index}`: the top-level item at that 0-based index, separators and headings not counted, for labels that repeat | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
 
 Each item is `{id, label, enabled, checked, key_tip, submenu}` (`submenu` null
@@ -1117,6 +1117,17 @@ first, in the `delete-summary` dialog.
   Numbers... (the `page-number-format` dialog) and Remove Page Numbers. The contextual tab's
   Header from Top and Footer from Bottom boxes open a menu of distances, the
   current one `checked`, and Custom... (the `hf-distance` dialog).
+
+- **the Undo drop-down** (#619), on the Quick Access Toolbar of a document
+  tab: the undo steps' names, newest first (`Bold`, `Typing "two"`, `Enter`,
+  `Typing "one"`), at most 100. Typing is named by its text (shortened to 30
+  characters with `…`), a command by its name; Backspace and Delete of single
+  characters read `Delete`; deleting a selection, joining paragraphs and any
+  other edit with no name of its own read `Edit`. The
+  item at index `k` undoes `k + 1` steps, back to and including it; Redo
+  then brings them back one at a time. With nothing to undo it lists one
+  disabled `Can't Undo`. Two steps can share a name, so pick those with
+  `menu-click {"index": k}`. Project and sheet tabs have no list.
 
 A press on a split button's arrow or a drop-down button while its own menu is
 open shuts the menu, as in Office; the harness's `menu-open` always opens.

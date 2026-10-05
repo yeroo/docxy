@@ -76,7 +76,7 @@ pub(crate) fn run(
         v.engine.recalc_all(&mut v.pkg.workbook);
     }
     if changed {
-        tab.dirty = true;
+        tab.set_dirty();
     }
     tab.status = gridcore::filter::status_text(&outcome).into();
     Ok(outcome)

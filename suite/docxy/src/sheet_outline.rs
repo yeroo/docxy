@@ -100,7 +100,7 @@ fn edit_sheet(
     v.push_undo_snapshot(snap);
     // Hidden rows change what SUBTOTAL(101..111) and AGGREGATE return.
     v.engine = crate::sheet_engine(&v.pkg.workbook);
-    tab.dirty = true;
+    tab.set_dirty();
     Ok(true)
 }
 
@@ -519,7 +519,7 @@ fn apply_subtotal(
     }
     v.push_undo_snapshot(snap);
     v.engine = crate::sheet_engine(&v.pkg.workbook);
-    tab.dirty = true;
+    tab.set_dirty();
     tab.status = status.into();
     tab.dialogs.pop();
     Ok(())
