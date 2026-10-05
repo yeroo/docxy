@@ -33,6 +33,11 @@ test PageDown PageUp Home and End scroll the Backstage page
   shot window
   call backstage-layout {}
   assert reply.last_item_visible is true
+  key pageup
+  shot window
+  call backstage-layout {}
+  assert reply.scrolled is true
+  assert reply.last_item_visible is false
   key home
   shot window
   call backstage-layout {}
@@ -101,11 +106,12 @@ test the rail fits in the shortest window
   call backstage-layout {}
   assert reply.rail_last_item_visible is true
 
-# The generic guard: every page the rail can show either fits a 1000x500
-# window or scrolls until its last row is in view, so a new page cannot be
-# added without scrolling. The wheel, not a key, drives it: a key sets the
-# offset whether or not the pane can scroll. (`last_item_visible` is true for
-# a page that fits.)
+# The generic guard: each page the rail can show either fits a 1000x500 window
+# or scrolls to its end under the wheel (`last_item_visible` is true for a page
+# that fits). It catches a page whose root cannot scroll; a page root must take
+# its natural height (no h_full/flex_1) for the end to be measurable. The
+# wheel, not a key, drives it: a key sets the offset whether or not the pane
+# can scroll.
 test every Backstage page is reachable at 1000x500
   open ../fixtures/basic.docx
   call window-size {"w":1000,"h":500}

@@ -208,6 +208,11 @@ pass against a perfectly correct app. `ACTION_KEYS` in `harness.rs` lists what
 gets re-routed, and a test fails if it drifts from what `cx.bind_keys`
 registers.
 
+While the File screen is open, every key — Tab and Shift-Tab included — goes
+to `backstage_key` instead (a dialog, the more-tabs list or an open menu first,
+then PageUp/PageDown/Home/End scroll the page), so nothing reaches the tab
+hidden under it.
+
 Reference fields, for `focus`: `chart-range`, `chart-title`, `categories`,
 `series-name:N`, `series-values:N`, `cond-format`, `validation`.
 Data › Text to Columns is a dialog (`text-to-columns`), driven with the

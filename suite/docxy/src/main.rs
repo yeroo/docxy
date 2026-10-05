@@ -18033,14 +18033,14 @@ impl Docxy {
     /// Insert a tab at the caret (bound to the Tab key via an action, since gpui
     /// swallows Tab for focus traversal before on_key_down sees it).
     fn tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // An open dialog takes Tab too; see `on_key`.
+        // An open dialog takes Tab too; see `modal_takes_key`.
         if self.dialog_takes_key("tab", None, Modifiers::default(), window, cx) {
             return;
         }
         if self.tab_more_open {
             return;
         }
-        // An open menu takes Tab as it takes every key; see `on_key`.
+        // An open menu takes Tab as it takes every key; see `modal_takes_key`.
         if self.close_menu() {
             cx.notify();
             return;
@@ -18150,7 +18150,7 @@ impl Docxy {
         if self.tab_more_open {
             return;
         }
-        // An open menu takes Tab as it takes every key; see `on_key`.
+        // An open menu takes Tab as it takes every key; see `modal_takes_key`.
         if self.close_menu() {
             cx.notify();
             return;
