@@ -1758,7 +1758,6 @@ fn every_sheet_tab_is_stamped_with_the_app_options() {
 /// moved off, so moving back cannot revive it.
 #[test]
 fn the_frame_step_retires_a_preview_the_selection_left() {
-    use gridcore::options::EditOptions;
     let mut tabs = vec![tab(Kind::Xlsx)];
     let Surface::Sheet(v) = &mut tabs[0].surface else {
         panic!("a sheet tab")
