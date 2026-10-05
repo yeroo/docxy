@@ -1,0 +1,106 @@
+# #1028: the File screen's content pane and rail scroll when they are taller
+# than the window. `shot window` settles a frame before each layout read.
+test the Backstage page scrolls when it is taller than the window
+  open ../fixtures/basic.docx
+  call window-size {"w":1000,"h":500}
+  call backstage {"action":"open"}
+  shot window
+  call backstage-layout {}
+  assert reply.page is open
+  assert reply.scrollable is true
+  assert reply.scroll_y is 0
+  assert reply.last_item_visible is false
+  call pointer-wheel {"region":"backstage-content","dy":-600}
+  shot window
+  call backstage-layout {}
+  assert reply.scrolled is true
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.last_item_visible is true
+  shot window
+
+test PageDown PageUp Home and End scroll the Backstage page
+  open ../fixtures/basic.docx
+  call window-size {"w":1000,"h":500}
+  call backstage {"action":"open"}
+  shot window
+  key pagedown
+  shot window
+  call backstage-layout {}
+  assert reply.scrolled is true
+  key end
+  shot window
+  call backstage-layout {}
+  assert reply.last_item_visible is true
+  key home
+  shot window
+  call backstage-layout {}
+  assert reply.at_top is true
+
+test switching pages resets the scroll
+  open ../fixtures/basic.docx
+  call window-size {"w":1000,"h":500}
+  call backstage {"action":"open"}
+  shot window
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.scrolled is true
+  call backstage-page {"page":"info"}
+  shot window
+  call backstage-layout {}
+  assert reply.page is info
+  assert reply.at_top is true
+  call backstage-page {"page":"open"}
+  shot window
+  call backstage-layout {}
+  assert reply.at_top is true
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage {"action":"close"}
+  call backstage {"action":"open"}
+  shot window
+  call backstage-layout {}
+  assert reply.at_top is true
+
+# The window cannot be shorter than 420 (`window_min_size`), and the rail's
+# six or seven items fit in that, so `rail_scrollable` is false today. The
+# guard is `rail_last_item_visible`: true when the rail fits, and when it grows
+# past the window it stays false until the rail is scrolled, so a rail that
+# cannot scroll fails here.
+test the rail's last item is reachable in the shortest window
+  open ../fixtures/basic.docx
+  call window-size {"w":1000,"h":300}
+  call backstage {"action":"open"}
+  shot window
+  call backstage-layout {}
+  assert reply.rail_last_item_visible is true
+
+# The generic guard: every page the rail can show either fits a 1000x500
+# window or scrolls until its last row is in view, so a new page cannot be
+# added without scrolling. (`last_item_visible` is true for a page that fits.)
+test every Backstage page is reachable at 1000x500
+  open ../fixtures/basic.docx
+  call window-size {"w":1000,"h":500}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"open"}
+  shot window
+  key end
+  shot window
+  call backstage-layout {}
+  assert reply.last_item_visible is true
+  call backstage-page {"page":"new"}
+  shot window
+  key end
+  shot window
+  call backstage-layout {}
+  assert reply.page is new
+  assert reply.last_item_visible is true
+  call backstage-page {"page":"info"}
+  shot window
+  key end
+  shot window
+  call backstage-layout {}
+  assert reply.page is info
+  assert reply.last_item_visible is true

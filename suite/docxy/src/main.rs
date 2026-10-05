@@ -3243,6 +3243,10 @@ struct Docxy {
     ribbon_min: bool,
     backstage: bool,
     bs_new: bool,
+    /// Vertical scroll of the backstage's content pane and of its rail
+    /// (#1028). The content one is reset when the page changes.
+    bs_scroll: ScrollHandle,
+    bs_rail_scroll: ScrollHandle,
     /// The backstage shows the Info page (Inspect Document, #627). Cleared
     /// wherever `bs_new` is; New and Info clear each other.
     bs_info: bool,
@@ -3507,6 +3511,113 @@ impl Probes {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, b)| *b)
+    }
+}
+
+/// Where PageUp/PageDown/Home/End leave the backstage pane's scroll offset
+/// (gpui offsets run from 0 down to `-max_y`), or `None` for any other key.
+/// A page is the viewport less a 40px overlap, as a browser scrolls it.
+fn backstage_scroll_target(key: &str, cur_y: f32, view_h: f32, max_y: f32) -> Option<f32> {
+    let page = (view_h - 40.0).max(40.0);
+    let y = match key {
+        "pageup" => cur_y + page,
+        "pagedown" => cur_y - page,
+        "home" => 0.0,
+        "end" => -max_y,
+        _ => return None,
+    };
+    Some(y.clamp(-max_y.max(0.0), 0.0))
+}
+
+/// The backstage content pane's layout, as `backstage-layout` reports it.
+struct BackstageLayout {
+    viewport_h: f32,
+    content_h: f32,
+    scroll_y: f32,
+}
+
+impl BackstageLayout {
+    fn read(scroll: &ScrollHandle) -> Self {
+        let viewport_h = f32::from(scroll.bounds().size.height);
+        BackstageLayout {
+            viewport_h,
+            content_h: viewport_h + f32::from(scroll.max_offset().y).max(0.0),
+            scroll_y: -f32::from(scroll.offset().y),
+        }
+    }
+
+    fn scrollable(&self) -> bool {
+        self.content_h > self.viewport_h + 0.5
+    }
+
+    /// The page's last row is inside the viewport: it fits, or the scroll has
+    /// reached the end.
+    fn last_item_visible(&self) -> bool {
+        !self.scrollable() || self.scroll_y >= self.content_h - self.viewport_h - 1.0
+    }
+}
+
+#[cfg(test)]
+mod backstage_scroll_tests {
+    use super::{BackstageLayout, backstage_scroll_target};
+
+    /// #1028: offsets run 0 → -max; PageDown moves a viewport less 40px.
+    #[test]
+    fn keys_move_the_pane_within_its_range() {
+        // viewport 440, content 1000 → max 560, page 400.
+        assert_eq!(
+            backstage_scroll_target("pagedown", 0.0, 440.0, 560.0),
+            Some(-400.0)
+        );
+        assert_eq!(
+            backstage_scroll_target("pagedown", -400.0, 440.0, 560.0),
+            Some(-560.0)
+        );
+        assert_eq!(
+            backstage_scroll_target("pageup", -560.0, 440.0, 560.0),
+            Some(-160.0)
+        );
+        assert_eq!(
+            backstage_scroll_target("pageup", -100.0, 440.0, 560.0),
+            Some(0.0)
+        );
+        assert_eq!(
+            backstage_scroll_target("home", -300.0, 440.0, 560.0),
+            Some(0.0)
+        );
+        assert_eq!(
+            backstage_scroll_target("end", 0.0, 440.0, 560.0),
+            Some(-560.0)
+        );
+        assert_eq!(backstage_scroll_target("a", 0.0, 440.0, 560.0), None);
+        // A page that fits has nowhere to go.
+        assert_eq!(backstage_scroll_target("end", 0.0, 440.0, 0.0), Some(0.0));
+        assert_eq!(
+            backstage_scroll_target("pagedown", 0.0, 440.0, 0.0),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn layout_reports_fit_scrollable_and_reached_the_end() {
+        let fits = BackstageLayout {
+            viewport_h: 400.0,
+            content_h: 400.0,
+            scroll_y: 0.0,
+        };
+        assert!(!fits.scrollable() && fits.last_item_visible());
+        let top = BackstageLayout {
+            viewport_h: 400.0,
+            content_h: 900.0,
+            scroll_y: 0.0,
+        };
+        assert!(top.scrollable() && !top.last_item_visible());
+        let end = BackstageLayout {
+            viewport_h: 400.0,
+            content_h: 900.0,
+            scroll_y: 500.0,
+        };
+        assert!(end.scrollable() && end.last_item_visible());
     }
 }
 
@@ -9150,6 +9261,8 @@ impl Docxy {
             ribbon_min: false,
             backstage: false,
             bs_new: false,
+            bs_scroll: ScrollHandle::new(),
+            bs_rail_scroll: ScrollHandle::new(),
             bs_info: false,
             bs_info_status: None,
             clip: None,
@@ -9309,6 +9422,7 @@ impl Docxy {
         self.backstage = true;
         self.bs_new = false;
         self.bs_info = false;
+        self.reset_backstage_scroll();
         self.bs_info_status = None;
         self.refresh_drafts();
         self.trusted_count = trusted::count(&config_root());
@@ -9316,11 +9430,45 @@ impl Docxy {
         cx.notify();
     }
 
+    /// PageUp/PageDown/Home/End scroll the backstage's content pane (#1028).
+    /// True when the key was one of those and moved (or held) the pane.
+    fn backstage_scroll_key(&self, stroke: &Keystroke) -> bool {
+        let m = stroke.modifiers;
+        if m.control || m.alt || m.shift || m.platform {
+            return false;
+        }
+        let key = stroke.key.as_str();
+        let max_y = f32::from(self.bs_scroll.max_offset().y);
+        let view_h = f32::from(self.bs_scroll.bounds().size.height);
+        let cur = f32::from(self.bs_scroll.offset().y);
+        match backstage_scroll_target(key, cur, view_h, max_y) {
+            Some(y) => {
+                self.bs_scroll.set_offset(point(px(0.), px(y)));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The default (Open) page, as `open_backstage` leaves it.
+    fn show_backstage_open_page(&mut self) {
+        self.bs_new = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
+        self.reset_backstage_scroll();
+    }
+
+    /// Every backstage page starts at the top (#1028).
+    fn reset_backstage_scroll(&self) {
+        self.bs_scroll.set_offset(point(px(0.), px(0.)));
+    }
+
     fn backstage_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.backstage = false;
         self.bs_new = false;
         self.bs_info = false;
         self.bs_info_status = None;
+        self.reset_backstage_scroll();
         self.refocus(window, cx);
     }
 
@@ -9357,12 +9505,14 @@ impl Docxy {
                 self.bs_info = true;
                 self.bs_info_status = None;
                 self.bs_new = false;
+                self.reset_backstage_scroll();
                 cx.notify();
             }
             BackstageRailAction::New => {
                 self.bs_new = true;
                 self.bs_info = false;
                 self.bs_info_status = None;
+                self.reset_backstage_scroll();
                 cx.notify();
             }
             BackstageRailAction::Open => self.open_file(window, cx),
@@ -11126,6 +11276,11 @@ impl Docxy {
             | Region::ProjectTimeline
             | Region::ProjectSplit => self.project_region_bounds(region, lookup),
             Region::Grid => self.grid_bounds(),
+            Region::BackstageContent | Region::BackstageRail => lookup(
+                &self.probes.borrow(),
+                &harness::region_name(region),
+            )
+            .ok_or_else(|| "the File screen is not open".to_string()),
             Region::Gallery => lookup(&self.probes.borrow(), "gallery").ok_or_else(|| {
                 "the Styles gallery is not shown (it is on a document's Home tab, with the ribbon expanded)"
                     .to_string()
@@ -18013,6 +18168,12 @@ impl Docxy {
         // take arrows and Enter, does any other key; none reaches the
         // document or cell under it (#397).
         if self.close_menu() {
+            cx.notify();
+            return;
+        }
+        // The File screen scrolls on PageUp/PageDown/Home/End (#1028); those
+        // keys must not reach the document hidden under it.
+        if self.backstage && self.backstage_scroll_key(&ev.keystroke) {
             cx.notify();
             return;
         }
@@ -26413,8 +26574,7 @@ impl Docxy {
         }
         Some(
             v_flex()
-                .flex_1()
-                .h_full()
+                .w_full()
                 .p_8()
                 .gap_4()
                 .bg(bg)
@@ -26544,7 +26704,7 @@ impl Docxy {
         sidebar: Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut rail = v_flex().w(px(220.)).h_full().py_3().gap_1().bg(sidebar);
+        let mut rail = v_flex().w_full().py_3().gap_1();
         for item in backstage_rail_items(self.active_is_project(), self.active_is_doc()) {
             let action = item.action;
             rail = rail.child(
@@ -26601,8 +26761,7 @@ impl Docxy {
                     )
             };
             v_flex()
-                .flex_1()
-                .h_full()
+                .w_full()
                 .p_8()
                 .gap_4()
                 .bg(bg)
@@ -26744,8 +26903,7 @@ impl Docxy {
                     })
             };
             v_flex()
-                .flex_1()
-                .h_full()
+                .w_full()
                 .p_8()
                 .gap_4()
                 .bg(bg)
@@ -27004,11 +27162,76 @@ impl Docxy {
                 .into_any_element()
         };
 
+        // One scroll container per column, built here so no page can skip
+        // it (#1028): a page taller than the window scrolls instead of being
+        // clipped. The pane takes its natural height inside, so the
+        // container's `max_offset` is the overflow the harness reports.
+        let rail_col = div()
+            .id("backstage-rail")
+            .relative()
+            .w(px(220.))
+            .h_full()
+            .min_h(px(0.))
+            .flex_shrink_0()
+            .bg(sidebar)
+            .child(probe(&self.probes, "backstage-rail"))
+            .child(
+                div()
+                    .id("backstage-rail-scroll")
+                    .size_full()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.bs_rail_scroll)
+                    .child(rail),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(12.))
+                    .child(
+                        gpui_component::scroll::Scrollbar::vertical(&self.bs_rail_scroll)
+                            .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
+                    ),
+            );
+        let content_col = div()
+            .id("backstage-content")
+            .relative()
+            .flex_1()
+            .h_full()
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .bg(bg)
+            .child(probe(&self.probes, "backstage-content"))
+            .child(
+                div()
+                    .id("backstage-content-scroll")
+                    .size_full()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.bs_scroll)
+                    .child(pane),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(12.))
+                    .child(
+                        gpui_component::scroll::Scrollbar::vertical(&self.bs_scroll)
+                            .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
+                    ),
+            );
         h_flex()
             .size_full()
+            .min_h(px(0.))
             .bg(bg)
-            .child(rail)
-            .child(pane)
+            .child(rail_col)
+            .child(content_col)
             .into_any_element()
     }
 }
@@ -27587,6 +27810,11 @@ impl Render for Docxy {
                 .relative()
                 .bg(bg)
                 .track_focus(&self.focus)
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                    if this.backstage_scroll_key(&ev.keystroke) {
+                        cx.notify();
+                    }
+                }))
                 .child(probe_tracked(
                     &self.probes,
                     "suite-root",

@@ -33,7 +33,8 @@ use docxcore::editor::{Editor, FlatDocument, StoryOffset};
 use docxcore::model::{Align, VertAlign};
 use gpui::{
     App, Context, Entity, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point, Window, point, px, size,
+    MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent,
+    TouchPhase, Window, point, px, size,
 };
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
@@ -800,12 +801,17 @@ pub enum Region {
     Gallery,
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
+    /// The File screen's scrolling content pane (#1028).
+    BackstageContent,
+    /// The File screen's left rail (#1028).
+    BackstageRail,
 }
 
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
 /// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-hbar-table`,
 /// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`,
-/// `gallery`, `tab-chip:0`, `filter-button:B`.
+/// `gallery`, `tab-chip:0`, `filter-button:B`, `backstage-content`,
+/// `backstage-rail`.
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.
@@ -844,11 +850,12 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         "project-timeline" if arg.is_none() => Ok(Region::ProjectTimeline),
         "project-split" if arg.is_none() => Ok(Region::ProjectSplit),
         "gallery" if arg.is_none() => Ok(Region::Gallery),
+        "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
+        "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
         "window" | "grid" | "chart-panel" | "title-tabs" | "tab-prev" | "tab-next" | "tab-more"
         | "gantt" | "project-hbar-table" | "project-hbar-chart" | "project-vbar"
-        | "project-timeline" | "project-split" | "gallery" => {
-            Err(format!("'{head}' does not take an argument; use '{head}'"))
-        }
+        | "project-timeline" | "project-split" | "gallery" | "backstage-content"
+        | "backstage-rail" => Err(format!("'{head}' does not take an argument; use '{head}'")),
         "cell" | "cells" => {
             let a = arg.filter(|a| !a.is_empty()).ok_or_else(|| {
                 format!("'{head}' needs a cell or a range, e.g. {head}:B3 or {head}:A1:C5")
@@ -916,6 +923,8 @@ pub fn region_name(region: Region) -> String {
         Region::ProjectTimeline => "project-timeline".into(),
         Region::ProjectSplit => "project-split".into(),
         Region::Gallery => "gallery".into(),
+        Region::BackstageContent => "backstage-content".into(),
+        Region::BackstageRail => "backstage-rail".into(),
         Region::FilterButton(c) => format!("filter-button:{}", gridcore::sheet::col_name(c)),
     }
 }
@@ -997,6 +1006,21 @@ fn click_events(p: Point<Pixels>) -> Vec<PlatformInput> {
     vec![mouse_move(p, None), mouse_down(p), mouse_up(p)]
 }
 
+/// The wheel notch a `pointer-wheel` dispatches at `p`: the pointer moves
+/// there first, as it would before a real wheel turn. A negative `dy` scrolls
+/// the content down (gpui's own sign).
+fn wheel_events(p: Point<Pixels>, dy: f32) -> Vec<PlatformInput> {
+    vec![
+        mouse_move(p, None),
+        PlatformInput::ScrollWheel(ScrollWheelEvent {
+            position: p,
+            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        }),
+    ]
+}
+
 /// The press-moves-release a `pointer-drag` dispatches along `path`: an
 /// unpressed hover and the press at the start, pressed moves (which arm and
 /// carry the drag) along the middle, the release at the end.
@@ -1017,6 +1041,37 @@ fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
 /// presses or releases. Errors name the region. Probe-backed regions read
 /// the frame that is on screen now (see `Docxy::region_bounds_live`), the
 /// one dispatched input hit-tests against.
+/// `backstage-layout`'s reply: the open page, the content pane's viewport and
+/// content heights, its scroll offset, and the same for the rail.
+fn backstage_layout_json(app: &crate::Docxy) -> Json {
+    let pane = crate::BackstageLayout::read(&app.bs_scroll);
+    let rail = crate::BackstageLayout::read(&app.bs_rail_scroll);
+    let page = if app.bs_new {
+        "new"
+    } else if app.bs_info {
+        "info"
+    } else {
+        "open"
+    };
+    Json::obj(vec![
+        ("page", Json::Str(page.into())),
+        ("viewport_h", Json::Num(f64::from(pane.viewport_h))),
+        ("content_h", Json::Num(f64::from(pane.content_h))),
+        ("scroll_y", Json::Num(f64::from(pane.scroll_y))),
+        ("scrollable", Json::Bool(pane.scrollable())),
+        ("at_top", Json::Bool(pane.scroll_y < 0.5)),
+        ("scrolled", Json::Bool(pane.scroll_y > 0.5)),
+        ("last_item_visible", Json::Bool(pane.last_item_visible())),
+        ("rail_viewport_h", Json::Num(f64::from(rail.viewport_h))),
+        ("rail_content_h", Json::Num(f64::from(rail.content_h))),
+        ("rail_scrollable", Json::Bool(rail.scrollable())),
+        (
+            "rail_last_item_visible",
+            Json::Bool(rail.last_item_visible()),
+        ),
+    ])
+}
+
 fn region_point(app: &crate::Docxy, name: &str, window: &Window) -> Result<Point<Pixels>, String> {
     let region = parse_region(name)?;
     let bounds = app
@@ -3403,6 +3458,50 @@ fn dispatch_verb(
             done.pointer = click_events(p);
             Ok(done)
         }
+        // A real wheel turn over a region (#1028), dispatched like the click.
+        "pointer-wheel" => {
+            app.refuse_under_dialog()?;
+            let name = arg_str(args, "region")?;
+            let dy = args
+                .get("dy")
+                .and_then(Json::as_f64)
+                .ok_or("'dy' must be a number of logical pixels")? as f32;
+            let p = region_point(app, name, window)?;
+            let mut done = Done::ok(Json::obj(vec![
+                ("x", Json::Num(f64::from(p.x))),
+                ("y", Json::Num(f64::from(p.y))),
+                ("dy", Json::Num(f64::from(dy))),
+            ]))?;
+            done.pointer = wheel_events(p, dy);
+            Ok(done)
+        }
+        // The File screen's scroll state, read from the pane's own scroll
+        // handle and recorded bounds (#1028).
+        // Switch the File screen's page as the rail does (#1028): `new`,
+        // `info` (a document tab only) or `open`, the default page.
+        "backstage-page" => {
+            if !app.backstage {
+                return Err("the File screen is not open (backstage open)".into());
+            }
+            match arg_str(args, "page")? {
+                "new" => app.backstage_rail_action(crate::BackstageRailAction::New, window, cx),
+                "info" => {
+                    if !app.active_is_doc() {
+                        return Err("the Info page is for a document tab".into());
+                    }
+                    app.backstage_rail_action(crate::BackstageRailAction::Info, window, cx)
+                }
+                "open" => app.show_backstage_open_page(),
+                _ => return Err("'page' must be new, info or open".into()),
+            }
+            Done::ok(backstage_layout_json(app))
+        }
+        "backstage-layout" => {
+            if !app.backstage {
+                return Err("the File screen is not open (backstage open)".into());
+            }
+            Done::ok(backstage_layout_json(app))
+        }
         "pointer-drag" => {
             app.refuse_under_dialog()?;
             let from_name = arg_str(args, "from")?;
@@ -4894,6 +4993,8 @@ mod tests {
             "task.set",
             "pointer-click",
             "pointer-drag",
+            "pointer-wheel",
+            "backstage-layout",
         ] {
             assert!(!closes_menu(verb, &Json::obj(vec![])), "{verb}");
         }
@@ -4941,6 +5042,7 @@ mod tests {
         let no_args = Json::obj(vec![]);
         assert!(!closes_menu("pointer-click", &no_args));
         assert!(!closes_menu("pointer-drag", &no_args));
+        assert!(!closes_menu("pointer-wheel", &no_args));
     }
 
     /// #397: no menu opens or runs while File or the more-tabs list covers
@@ -5999,6 +6101,11 @@ mod tests {
         // Case and surrounding space are noise, as everywhere else here.
         assert_eq!(parse_region("  Chart-Panel "), Ok(Region::ChartPanel));
         assert_eq!(parse_region("gallery"), Ok(Region::Gallery));
+        assert_eq!(
+            parse_region("backstage-content"),
+            Ok(Region::BackstageContent)
+        );
+        assert!(parse_region("backstage-rail:1").is_err());
         assert!(
             parse_region("gallery:1")
                 .unwrap_err()
@@ -6109,6 +6216,8 @@ mod tests {
             Region::ProjectTimeline,
             Region::ProjectSplit,
             Region::Gallery,
+            Region::BackstageContent,
+            Region::BackstageRail,
             Region::FilterButton(1),
         ] {
             assert_eq!(parse_region(&region_name(r)), Ok(r));
