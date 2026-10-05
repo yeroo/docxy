@@ -29,8 +29,14 @@
 //! - [`legacy`] — import of `.xls`, `.xlsb` and `.ods` workbooks.
 //! - [`docprops`] — document properties (`docProps/` core, app, custom).
 //! - [`options`] — the per-user Editing options (File › Options › Advanced).
+//! - [`autocorrect`] — AutoCorrect for typed entries: replace list,
+//!   capitalisation rules, exceptions, hyperlinks.
+//! - [`flashfill`] — Flash Fill: a column's pattern from typed examples.
+//! - [`fcomplete`] — Formula AutoComplete: the names offered while a
+//!   formula is typed.
 //! - [`print`] — page setup, print areas and breaks, pagination, sheet PDF.
 
+pub mod autocorrect;
 pub mod cf;
 pub mod clock;
 pub mod comments;
@@ -39,7 +45,9 @@ pub mod drawing;
 pub mod edit;
 pub mod engine;
 pub mod entry;
+pub mod fcomplete;
 pub mod filter;
+pub mod flashfill;
 pub mod format;
 pub mod formula;
 pub mod frame;

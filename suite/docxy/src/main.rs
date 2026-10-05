@@ -22,6 +22,7 @@ compile_error!(
      whose draw-without-present would make Windows captures read stale pixels"
 );
 
+mod about;
 mod close;
 #[cfg(test)]
 mod comment_tests;
@@ -63,12 +64,15 @@ mod recover;
 mod ribbon_export;
 #[cfg(test)]
 mod sect_pr_tests;
+mod sheet_autocorrect;
 #[cfg(test)]
 mod sheet_clip_tests;
+mod sheet_complete;
 mod sheet_consolidate;
 #[cfg(test)]
 mod sheet_entry_tests;
 mod sheet_filter;
+mod sheet_flashfill;
 mod sheet_outline;
 mod sheet_ribbon;
 mod sheet_sort;
@@ -78,6 +82,8 @@ mod table_dialogs;
 mod table_tab;
 mod table_view;
 mod tabstrip;
+#[cfg(test)]
+mod track_tests;
 mod trusted;
 mod ttc_dialog;
 mod user_name;
@@ -88,6 +94,7 @@ use std::path::PathBuf;
 
 use docxcore::comments::Comment;
 use docxcore::editor::{Caret, Clip, Editor, FoundMatch, step_found};
+use docxcore::markup::MarkupView;
 use docxcore::model::{
     Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign,
 };
@@ -371,6 +378,10 @@ struct Prefs {
     autorecover_minutes: u32,
     keep_drafts: bool,
     edit_opts: EditOptions,
+    /// AutoCorrect's changes from its defaults (#667), as
+    /// [`gridcore::autocorrect::AutoCorrect::to_lines`] writes them; saved
+    /// in `sheet_editing` with the Editing options.
+    autocorrect: String,
     user_name: String,
     user_initials: String,
 }
@@ -455,6 +466,8 @@ enum BackstageRailAction {
     Save,
     SaveAs,
     Export,
+    /// Build info and the About dialog (#1023); on every tab kind.
+    Account,
     Close,
 }
 
@@ -515,6 +528,13 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         display: "Export…",
         action: BackstageRailAction::Export,
         project_only: true,
+        doc_only: false,
+    },
+    BackstageRailItem {
+        id: "bs-account",
+        display: "Account",
+        action: BackstageRailAction::Account,
+        project_only: false,
         doc_only: false,
     },
     BackstageRailItem {
@@ -669,6 +689,30 @@ struct SheetView {
     /// commit takes the value; Backspace or Delete drops the suffix; a caret
     /// move keeps the text and drops the marker.
     edit_proposal: Option<(usize, String)>,
+    /// Formula AutoComplete's list for the open editor (#686), kept with the
+    /// buffer it was made for ([`sheet_complete::CompleteList`]).
+    edit_complete: Option<sheet_complete::CompleteList>,
+    /// That list's scroll. A list rebuilt for new typing starts at the top and
+    /// scrolls once to the highlight it carries ([`SheetView::complete_now`]);
+    /// nothing scrolls it per frame, so the mouse wheel is free.
+    fx_scroll: ScrollHandle,
+    /// Flash Fill's greyed preview after a typed commit, and the last fill
+    /// for its Options button (#666); each stands only while nothing has
+    /// moved on from it ([`SheetView::live_preview`],
+    /// [`SheetView::live_flash`]).
+    flash_preview: Option<sheet_flashfill::FlashPreview>,
+    last_flash: Option<sheet_flashfill::LastFlash>,
+    /// The app's AutoCorrect (#667), stamped like `edit_opts`.
+    autocorrect: std::rc::Rc<gridcore::autocorrect::AutoCorrect>,
+    /// The last correction while typing, with the buffer and caret it left
+    /// (before AutoComplete proposed): Ctrl+Z takes back just it while they
+    /// stand.
+    edit_correction: Option<(gridcore::autocorrect::Correction, String, usize)>,
+    /// Where Ctrl+Z took a correction back: that word is not corrected again.
+    edit_kept: Option<usize>,
+    /// The buffer and caret the last character typed at the end left: the
+    /// commit corrects the last word only while they stand.
+    edit_typed_tail: Option<(String, usize)>,
     /// Which workbook tab this is, for the grid clip: a cut moves cells only
     /// within the workbook it came from ([`next_sheet_view_id`]).
     id: u64,
@@ -922,6 +966,7 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
             | Act::ToggleComments
             | Act::ToggleNav
             | Act::ToggleNotes
+            | Act::Markup(_)
             | Act::DarkMode
             | Act::AutoHideRibbon
             | Act::PrintLayout
@@ -1611,6 +1656,17 @@ enum SheetAct {
     OutlineSettings,
     /// The Number group's format combo: opens or closes the format strip.
     NumberFormatMenu,
+    /// Pick From Drop-down List... (the cell menu, Alt+Down; #665): its menu
+    /// over the selected cell, and entry `n` of it chosen.
+    PickList,
+    PickItem(u32),
+    /// Data › Flash Fill and Ctrl+E (#666), and the Flash Fill Options
+    /// menu's items.
+    FlashFill,
+    FlashUndo,
+    FlashAccept,
+    FlashSelectBlank,
+    FlashSelectChanged,
     Todo,
 }
 
@@ -1683,6 +1739,10 @@ impl SheetView {
         self.edit_overtype = false;
         self.edit_point = None;
         self.edit_proposal = None;
+        self.edit_complete = None;
+        self.edit_correction = None;
+        self.edit_kept = None;
+        self.edit_typed_tail = None;
     }
 
     /// The context a typed commit reads its entry under: the workbook's, with
@@ -1706,11 +1766,17 @@ impl SheetView {
     fn type_char(&mut self, c: &str) {
         if self.editing.is_some() {
             self.drop_proposal();
+            let at_end = self
+                .editing
+                .as_deref()
+                .is_some_and(|b| self.edit_caret == b.chars().count());
             self.edit_type(c);
+            self.autocorrect_typed(c, at_end);
         } else {
             self.begin_cell_edit(Some(String::new()));
             self.edit_caret = 0;
             self.edit_insert(c);
+            self.autocorrect_typed(c, true);
         }
         self.propose();
     }
@@ -1768,17 +1834,23 @@ impl SheetView {
     /// feed, the Ctrl+; / Ctrl+' entry chords — drops the suffix first, as
     /// typing does, so it lands after the typed text. A key that moves the
     /// caret or rewrites the buffer (Home/End, F2/F4/F9, Insert, Edit-mode
-    /// Left/Right, Ctrl+Left/Right/Delete/Z) keeps the text and drops only
-    /// the marker. Every other key leaves it live: the keys that commit
+    /// Left/Right, Ctrl+Left/Right/Delete) keeps the text and drops only
+    /// the marker. Ctrl+Z drops the suffix too, as a typed character does:
+    /// it may take back the AutoCorrect change the proposal was made from,
+    /// and the suffix is not part of what was typed. Every other key leaves
+    /// it live: the keys that commit
     /// (Enter, Tab, Ctrl+Enter, Ctrl+S's save) take it in `commit_edit`, and
     /// Backspace, Delete and typing handle it themselves.
     fn proposal_before_key(&mut self, key: &str, ctrl: bool, alt: bool) {
         if self.edit_proposal.is_none() {
             return;
         }
-        let inserts = (alt && key == "enter") || (ctrl && matches!(key, "'" | "\"" | ";" | ":"));
+        // Ctrl+Z drops the suffix too: it may take back the AutoCorrect
+        // change the proposal was made from, which the suffix is not part of.
+        let inserts =
+            (alt && key == "enter") || (ctrl && matches!(key, "'" | "\"" | ";" | ":" | "z"));
         let caret_move = if ctrl {
-            matches!(key, "left" | "right" | "delete" | "z")
+            matches!(key, "left" | "right" | "delete")
         } else {
             matches!(key, "home" | "end" | "f2" | "f4" | "f9" | "insert")
                 || (self.edit_arrows_move_caret() && matches!(key, "left" | "right"))
@@ -1792,13 +1864,15 @@ impl SheetView {
 
     /// A commit takes a live AutoComplete proposal: the buffer becomes the
     /// value it completes to, in that value's case.
-    fn take_proposal(&mut self) {
-        if let Some((_, value)) = self.edit_proposal.take() {
-            if self.editing.is_some() {
-                self.editing = Some(value);
-                self.edit_caret_to_end();
-            }
+    fn take_proposal(&mut self) -> bool {
+        let Some((_, value)) = self.edit_proposal.take() else {
+            return false;
+        };
+        if self.editing.is_some() {
+            self.editing = Some(value);
+            self.edit_caret_to_end();
         }
+        true
     }
 
     /// Where a double-click on (r, c) goes with editing directly in cells
@@ -1856,6 +1930,16 @@ impl SheetView {
         self.edit_overtype = false;
         self.edit_point = None;
         self.edit_proposal = None;
+        self.edit_complete = None;
+        self.edit_correction = None;
+        self.edit_kept = None;
+        self.edit_typed_tail = None;
+    }
+
+    /// A caret move or a deletion: the last word is no longer the one just
+    /// typed, so the commit's AutoCorrect leaves it (#667).
+    fn edit_tail_left(&mut self) {
+        self.edit_typed_tail = None;
     }
 
     fn edit_untouched(&self) -> bool {
@@ -2059,7 +2143,15 @@ impl SheetView {
     fn commit_edit(&mut self) -> bool {
         self.entry_error = None;
         self.dv_pending = None;
-        self.take_proposal();
+        let took = self.take_proposal();
+        self.autocorrect_commit(took);
+        self.commit_edit_taken(took)
+    }
+
+    /// [`SheetView::commit_edit`] after the proposal was taken (`took`) and
+    /// AutoCorrect ran: the rest of the commit, which Ctrl+Enter on one cell
+    /// shares so neither takes a proposal twice.
+    fn commit_edit_taken(&mut self, took: bool) -> bool {
         let untouched = self.edit_untouched();
         debug_assert!(self.editing.is_none() || self.edit_origin.is_some());
         let Some(buf) = self.editing.as_deref() else {
@@ -2101,11 +2193,16 @@ impl SheetView {
                 return false;
             }
         }
+        let link = self.typed_link(&buf, took, cell.as_ref());
         self.editing = None;
         self.end_cell_edit();
         self.push_undo();
         if let Some(cell) = cell {
             self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
+        }
+        // A typed URL is a hyperlink (ENT-120), in the same undo step.
+        if let (Some(url), Some(sh)) = (link, self.pkg.workbook.sheets.get_mut(s)) {
+            sh.hyperlinks.insert((r, c), url);
         }
         true
     }
@@ -2373,6 +2470,7 @@ impl SheetView {
 
     /// Ctrl+Left / Ctrl+Right: to the start of the previous / next word.
     fn edit_word_move(&mut self, forward: bool) {
+        self.edit_tail_left();
         let chars: Vec<char> = self.editing.as_deref().unwrap_or("").chars().collect();
         let word = |c: char| c.is_alphanumeric() || c == '_';
         let mut i = self.edit_caret.min(chars.len());
@@ -2396,6 +2494,7 @@ impl SheetView {
 
     /// Ctrl+Delete: delete from the caret to the end of the text.
     fn edit_delete_to_end(&mut self) {
+        self.edit_tail_left();
         let caret = self.edit_caret;
         if let Some(buf) = self.editing.as_mut() {
             let at = char_to_byte(buf, caret);
@@ -2407,6 +2506,10 @@ impl SheetView {
     /// opened with; the editor stays open and the workbook's undo is untouched.
     fn edit_revert(&mut self) {
         if self.editing.is_some() {
+            // Right after an AutoCorrect change, only it goes (ENT-119).
+            if self.undo_correction() {
+                return;
+            }
             self.edit_proposal = None;
             self.editing = Some(self.edit_start.clone());
             self.edit_caret_to_end();
@@ -2682,7 +2785,8 @@ impl SheetView {
     fn commit_edit_to_selection(&mut self) -> bool {
         self.entry_error = None;
         self.dv_pending = None;
-        self.take_proposal();
+        let took = self.take_proposal();
+        self.autocorrect_commit(took);
         let Some(buf) = self.editing.clone() else {
             return false;
         };
@@ -2692,7 +2796,7 @@ impl SheetView {
         let range = self.range();
         let inside = (range.0..=range.2).contains(&r) && (range.1..=range.3).contains(&c);
         if !self.has_range() || s != self.active || !inside {
-            return self.commit_edit();
+            return self.commit_edit_taken(took);
         }
         if let Err(e) = gridcore::entry::check_len(&buf) {
             self.entry_error = Some(e.to_string());
@@ -2717,6 +2821,12 @@ impl SheetView {
                 return false;
             }
         }
+        // A typed URL is a link in each cell it fills (ENT-120).
+        let link = cells
+            .as_ref()
+            .and_then(|cells| cells.first())
+            .and_then(|(_, _, cell)| self.typed_link(&buf, took, Some(cell)));
+        let filled: Vec<(u32, u32)> = cells.iter().flatten().map(|(r, c, _)| (*r, *c)).collect();
         self.end_cell_edit();
         self.push_undo();
         if let Some(cells) = cells {
@@ -2724,6 +2834,11 @@ impl SheetView {
                 .set_cells_prechecked(&mut self.pkg.workbook, s, cells);
         }
         self.prune_circles();
+        if let (Some(url), Some(sh)) = (link, self.pkg.workbook.sheets.get_mut(s)) {
+            for at in filled {
+                sh.hyperlinks.insert(at, url.clone());
+            }
+        }
         true
     }
 
@@ -2870,12 +2985,14 @@ impl SheetView {
     }
     /// Delete the char before the caret (Backspace).
     fn edit_backspace(&mut self) {
+        self.edit_tail_left();
         if let Some(buf) = self.editing.as_mut() {
             buf_backspace(buf, &mut self.edit_caret);
         }
     }
     /// Delete the char at the caret (Delete).
     fn edit_delete(&mut self) {
+        self.edit_tail_left();
         let caret = self.edit_caret;
         if let Some(buf) = self.editing.as_mut() {
             buf_delete(buf, caret);
@@ -2883,6 +3000,7 @@ impl SheetView {
     }
     /// Move the caret by `delta` chars, clamped to the buffer.
     fn edit_move(&mut self, delta: i32) {
+        self.edit_tail_left();
         let n = self.edit_len() as i32;
         self.edit_caret = (self.edit_caret as i32 + delta).clamp(0, n) as usize;
     }
@@ -3427,10 +3545,17 @@ struct Docxy {
     ribbon_tab: RibbonTab,
     ribbon_min: bool,
     backstage: bool,
+    /// Dialogs the app owns: the Settings' User name opened with no document
+    /// open, where there is no tab's stack to hold it (#1027). While one is
+    /// open it is the one shown and keyed, even if a tab arrives under it.
+    app_dialogs: dialog::DialogStack,
     bs_new: bool,
     /// The backstage shows the Info page (Inspect Document, #627). Cleared
     /// wherever `bs_new` is; New and Info clear each other.
     bs_info: bool,
+    /// The backstage shows the Account page: the build line and About (#1023).
+    /// New, Info and Account clear one another.
+    bs_account: bool,
     /// The last Remove All on the Info page and the tab index it ran on:
     /// the backstage draws no status bar, so the page shows it under the
     /// rows. Cleared with `bs_info`, on a tab switch, and when a tab is
@@ -3468,6 +3593,9 @@ struct Docxy {
     /// keeps a copy that [`stamp_edit_opts`] refreshes on restore, on a
     /// change and every frame (and `active_sheet_mut` on each use).
     edit_opts: EditOptions,
+    /// AutoCorrect (#667): the app's, stamped into every sheet tab, saved
+    /// with the Editing options. Its dialogs change it.
+    autocorrect: std::rc::Rc<gridcore::autocorrect::AutoCorrect>,
     /// The reviewer's name and initials for new comments (#620), as set in
     /// Settings › User name; empty falls back ([`review_identity`]).
     user_name: String,
@@ -3503,8 +3631,19 @@ struct Docxy {
     picker: Option<PickKind>,
     // Scroll handle for the document body, so the caret can be kept in view.
     doc_scroll: ScrollHandle,
+    /// The open menu's scroll: Up/Down scroll the highlighted row into view,
+    /// and each menu (or submenu) starts at the top.
+    menu_scroll: ScrollHandle,
     // New-comment entry bar (Review ▸ New comment); routes keys while open.
     comment_open: bool,
+    /// The comment the Review tab's Resolve acts on: the one last clicked in
+    /// the Comments pane, with the tab it is in (ids are per document). The tab
+    /// is named by its title and file ([`close::TabId`]), not its index, so
+    /// closing or moving tabs never points it at another document.
+    selected_comment: Option<(close::TabId, String)>,
+    /// Display for Review (#625): how tracked changes are shown. A view only,
+    /// not saved; No Markup and Original refuse edits.
+    markup: docxcore::markup::MarkupView,
     comment_text: String,
     // Show formatting marks (¶, tab arrows) — View ▸ Show/Hide.
     show_marks: bool,
@@ -5230,7 +5369,7 @@ impl Loaded {
             kind,
             title,
             path,
-            surface: Surface::Doc(Editor::new(self.doc)),
+            surface: Surface::Doc(new_doc_editor(self.doc, self.pkg.as_ref())),
             dirty,
             status: self.status,
             comments: self.comments,
@@ -5263,6 +5402,70 @@ impl Loaded {
 fn is_markdown_path(path: &std::path::Path) -> bool {
     let l = path.to_string_lossy().to_lowercase();
     l.ends_with(".md") || l.ends_with(".markdown") || l.ends_with(".mdown")
+}
+
+/// The reviewer name and initials the user configured (#620), for the
+/// editors built where no [`Docxy`] is at hand (a load, a restore). Set when
+/// the session is read and whenever the user changes it, so a file that opens
+/// with Track Changes on records as the same reviewer as its comments and
+/// the Track Changes toggle do.
+static CONFIGURED_IDENTITY: std::sync::Mutex<(String, String)> =
+    std::sync::Mutex::new((String::new(), String::new()));
+
+/// The raw configured name and initials (empty when none), to put back.
+#[cfg(test)]
+fn configured_identity_raw() -> (String, String) {
+    CONFIGURED_IDENTITY
+        .lock()
+        .map(|id| id.clone())
+        .unwrap_or_default()
+}
+
+fn set_configured_identity(name: &str, initials: &str) {
+    if let Ok(mut id) = CONFIGURED_IDENTITY.lock() {
+        *id = (name.to_string(), initials.to_string());
+    }
+}
+
+fn configured_identity() -> (String, String) {
+    let (name, initials) = CONFIGURED_IDENTITY
+        .lock()
+        .map(|id| id.clone())
+        .unwrap_or_default();
+    review_identity(&name, &initials)
+}
+
+/// Tabs already recording tracked changes keep recording, as the reviewer
+/// now configured (the user-name dialog changed it).
+fn reauthor_tracking(tabs: &mut [DocTab], user_name: &str, user_initials: &str) {
+    let author = track_author(&review_identity(user_name, user_initials));
+    for tab in tabs {
+        if let Surface::Doc(ed) = &mut tab.surface {
+            if ed.track_changes() {
+                ed.set_track_changes(Some(author.clone()));
+            }
+        }
+    }
+}
+
+/// A document editor over `doc`, recording tracked changes when the file's
+/// settings ask for it (`w:trackRevisions`, #624), as the configured reviewer
+/// ([`configured_identity`]). The Review tab's Track Changes turns it on or
+/// off after that.
+fn new_doc_editor(doc: Document, pkg: Option<&Package>) -> Editor {
+    let mut editor = Editor::new(doc);
+    if pkg.is_some_and(Package::track_revisions) {
+        editor.set_track_changes(Some(track_author(&configured_identity())));
+    }
+    editor
+}
+
+/// Who Track Changes records as: the reviewer identity (#620).
+fn track_author(identity: &(String, String)) -> docxcore::editor::TrackAuthor {
+    docxcore::editor::TrackAuthor {
+        author: identity.0.clone(),
+        clock: utc_now_iso,
+    }
 }
 
 /// Load a `.docx` from bytes, keeping the whole package so save stays lossless.
@@ -5376,7 +5579,7 @@ fn finish_pending_conversion(tab: &mut DocTab) {
     // The whole document is replaced: nothing of the placeholder is kept.
     tab.dirty = false;
     tab.hf_edit = None;
-    tab.surface = Surface::Doc(Editor::new(l.doc));
+    tab.surface = Surface::Doc(new_doc_editor(l.doc, l.pkg.as_ref()));
     tab.comments = l.comments;
     tab.tracked_comment_ids.clear();
     tab.comments_removed_all = false;
@@ -5943,6 +6146,7 @@ fn fx_segment(
                 if let Some(v) = this.active_sheet_mut() {
                     v.edit_caret = idx;
                     v.edit_proposal = None;
+                    v.edit_tail_left();
                 }
                 cx.notify();
             });
@@ -8265,6 +8469,14 @@ fn new_sheet_surface() -> Surface {
         reveal_col: None,
         edit_opts: EditOptions::default(),
         edit_proposal: None,
+        edit_complete: None,
+        fx_scroll: ScrollHandle::new(),
+        flash_preview: None,
+        last_flash: None,
+        autocorrect: Default::default(),
+        edit_correction: None,
+        edit_kept: None,
+        edit_typed_tail: None,
         id: next_sheet_view_id(),
         edit_gen: 0,
     })
@@ -8336,6 +8548,14 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     reveal_col: None,
                     edit_opts: EditOptions::default(),
                     edit_proposal: None,
+                    edit_complete: None,
+                    fx_scroll: ScrollHandle::new(),
+                    flash_preview: None,
+                    last_flash: None,
+                    autocorrect: Default::default(),
+                    edit_correction: None,
+                    edit_kept: None,
+                    edit_typed_tail: None,
                     id: next_sheet_view_id(),
                     edit_gen: 0,
                 };
@@ -8381,7 +8601,7 @@ fn protected_rollback(tab: &mut DocTab) {
             (Some(_), None) | (None, _) => tab.path.clone().map(|p| reload_without_converting(&p)),
         };
         if let Some(l) = reloaded {
-            tab.surface = Surface::Doc(Editor::new(l.doc));
+            tab.surface = Surface::Doc(new_doc_editor(l.doc, l.pkg.as_ref()));
             tab.comments = l.comments;
             tab.tracked_comment_ids.clear();
             tab.comments_removed_all = false;
@@ -8487,7 +8707,7 @@ fn build_surface(
             Some(p) => {
                 let l = doc_from_path(p);
                 (
-                    Surface::Doc(Editor::new(l.doc)),
+                    Surface::Doc(new_doc_editor(l.doc, l.pkg.as_ref())),
                     l.comments,
                     l.notes,
                     l.pkg,
@@ -8582,7 +8802,7 @@ fn write_session_forgetting(
         ask_on_close: prefs.ask_on_close,
         autorecover_minutes: prefs.autorecover_minutes,
         keep_drafts: prefs.keep_drafts,
-        sheet_editing: prefs.edit_opts.to_lines(),
+        sheet_editing: format!("{}{}", prefs.edit_opts.to_lines(), prefs.autocorrect),
         user_name: prefs.user_name,
         user_initials: prefs.user_initials,
     };
@@ -8651,25 +8871,51 @@ fn save_base<'a>(
     doc: &Document,
     live: &[Comment],
 ) -> Option<std::borrow::Cow<'a, Package>> {
-    let pkg = tab.pkg.as_ref()?;
+    use std::borrow::Cow;
+    // Track Changes is the editor's state; the package carries it as
+    // `w:trackRevisions` (#624). A new document has no package yet: one
+    // is made for it, as the save would make.
+    let track = matches!(&tab.surface, Surface::Doc(ed) if ed.track_changes());
+    let mut base: Cow<'a, Package> = match (tab.pkg.as_ref(), track) {
+        (Some(pkg), _) => Cow::Borrowed(pkg),
+        (None, true) => Cow::Owned(blank_base(doc)),
+        (None, false) => return None,
+    };
+    if base.track_revisions() != track {
+        base.to_mut().set_track_revisions(track);
+    }
     if !tab.comments_removed_all {
-        return Some(std::borrow::Cow::Borrowed(pkg));
+        return Some(base);
     }
     let mut keep = docxcore::inspect::comment_marker_ids(doc);
     keep.extend(live.iter().map(|c| c.id.clone()));
-    let stale: Vec<String> = pkg
+    let stale: Vec<String> = base
         .comment_ids()
         .into_iter()
         .filter(|id| !keep.contains(id))
         .collect();
     if stale.is_empty() {
-        return Some(std::borrow::Cow::Borrowed(pkg));
+        return Some(base);
     }
-    let mut pruned = pkg.clone();
+    let pruned = base.to_mut();
     for id in &stale {
         pruned.remove_comment_id(id);
     }
-    Some(std::borrow::Cow::Owned(pruned))
+    Some(base)
+}
+
+/// The package a new document is saved into (what [`doc_to_docx_styled`]
+/// builds without a base).
+fn blank_base(doc: &Document) -> Package {
+    let has_list = doc
+        .body
+        .iter()
+        .any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
+    if has_list {
+        docxcore::package::new_markdown_package(doc.clone())
+    } else {
+        docxcore::package::new_package(doc.clone())
+    }
 }
 
 /// Add a comment on `tab`'s selection: its markers go around the selection
@@ -8720,6 +8966,7 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
         date: utc_now_iso(),
         text,
         quoted,
+        ..Comment::default()
     });
     tab.tracked_comment_ids.insert(id.to_string());
     tab.used_comment_ids.insert(id.to_string());
@@ -8735,6 +8982,30 @@ fn delete_doc_comment(tab: &mut DocTab, id: &str) {
     }
     tab.tracked_comment_ids.insert(id.to_string());
     tab.mark_dirty();
+}
+
+/// The id of the selected comment when it belongs to the active tab (the tab
+/// the selection was made in, by title and file), else `None`.
+fn selected_comment_id(
+    tabs: &[DocTab],
+    active: usize,
+    selected: &Option<(close::TabId, String)>,
+) -> Option<String> {
+    let (tab, id) = selected.as_ref()?;
+    let here = tabs.get(active)?;
+    (here.title == tab.0 && here.path == tab.1).then(|| id.clone())
+}
+
+/// Set comment `id` of `tab` resolved (`Some(true)`), reopened (`Some(false)`)
+/// or the other of the two (`None`). The new state, `None` when `tab` lists
+/// no such comment. The state lives on the comment, so it follows the record
+/// through a delete and its undo, and a save writes it ([`doc_to_docx`]).
+fn set_doc_comment_resolved(tab: &mut DocTab, id: &str, resolved: Option<bool>) -> Option<bool> {
+    let c = tab.comments.iter_mut().find(|c| c.id == id)?;
+    c.resolved = resolved.unwrap_or(!c.resolved);
+    let now = c.resolved;
+    tab.mark_dirty();
+    Some(now)
 }
 
 /// The name and initials new comments are stamped with (#620), as Word's
@@ -8794,14 +9065,10 @@ fn doc_to_docx_styled(
             p
         }
         None => {
-            let has_list = doc
-                .body
-                .iter()
-                .any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
-            if has_list || converted {
+            if converted {
                 docxcore::package::new_markdown_package(doc.clone())
             } else {
-                docxcore::package::new_package(doc.clone())
+                blank_base(doc)
             }
         }
     };
@@ -8831,6 +9098,19 @@ fn doc_to_docx_styled(
                 pkg.add_comment(id, &c.author, &c.initials, &c.date, &c.text);
             }
         }
+    }
+    // Resolved state: `w15:done`, written where it differs from the part.
+    let stored: std::collections::HashMap<String, bool> = docxcore::comments::parse_comments(&pkg)
+        .into_iter()
+        .map(|c| (c.id, c.resolved))
+        .collect();
+    for c in comments {
+        if stored.get(&c.id).is_some_and(|&r| r != c.resolved) {
+            pkg.set_comment_resolved(&c.id, c.resolved);
+        }
+    }
+    if comments.is_empty() {
+        pkg.drop_empty_comment_parts();
     }
     docxcore::package::save_package(&pkg)
 }
@@ -9284,6 +9564,7 @@ impl Docxy {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        set_configured_identity(&session.user_name, &session.user_initials);
         // Asked before this run writes its own marker.
         let crashed = recover::was_unclean(&root);
         recover::mark_running(&root);
@@ -9310,6 +9591,10 @@ impl Docxy {
         this.keep_drafts = session.keep_drafts;
         this.edit_opts = EditOptions::from_text(&session.sheet_editing);
         stamp_edit_opts(&mut this.tabs, this.edit_opts);
+        this.autocorrect = std::rc::Rc::new(gridcore::autocorrect::AutoCorrect::from_text(
+            &session.sheet_editing,
+        ));
+        sheet_autocorrect::stamp_autocorrect(&mut this.tabs, &this.autocorrect);
         this.user_name = session.user_name;
         this.user_initials = session.user_initials;
         this.persist_to(&root);
@@ -9337,8 +9622,10 @@ impl Docxy {
             ribbon_tab: RibbonTab::Home,
             ribbon_min: false,
             backstage: false,
+            app_dialogs: dialog::DialogStack::default(),
             bs_new: false,
             bs_info: false,
+            bs_account: false,
             bs_info_status: None,
             clip: None,
             theme_pref,
@@ -9351,6 +9638,7 @@ impl Docxy {
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
             edit_opts: EditOptions::default(),
+            autocorrect: Default::default(),
             user_name: String::new(),
             user_initials: String::new(),
             fx_expanded: false,
@@ -9367,7 +9655,10 @@ impl Docxy {
             find_cur: None,
             picker: None,
             doc_scroll: ScrollHandle::new(),
+            menu_scroll: ScrollHandle::new(),
             comment_open: false,
+            selected_comment: None,
+            markup: Default::default(),
             comment_text: String::new(),
             show_marks: false,
             show_comments: false,
@@ -9436,6 +9727,7 @@ impl Docxy {
             autorecover_minutes: self.autorecover_minutes,
             keep_drafts: self.keep_drafts,
             edit_opts: self.edit_opts,
+            autocorrect: self.autocorrect.to_lines(),
             user_name: self.user_name.clone(),
             user_initials: self.user_initials.clone(),
         }
@@ -9496,6 +9788,7 @@ impl Docxy {
         self.backstage = true;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_account = false;
         self.bs_info_status = None;
         self.refresh_drafts();
         self.trusted_count = trusted::count(&config_root());
@@ -9507,6 +9800,7 @@ impl Docxy {
         self.backstage = false;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_account = false;
         self.bs_info_status = None;
         self.refocus(window, cx);
     }
@@ -9532,6 +9826,16 @@ impl Docxy {
         }
     }
 
+    /// File > Account (#1023): the build line and the About button. The rail
+    /// item and the harness's `account` verb both come here.
+    fn open_account(&mut self, cx: &mut Context<Self>) {
+        self.bs_account = true;
+        self.bs_info = false;
+        self.bs_info_status = None;
+        self.bs_new = false;
+        cx.notify();
+    }
+
     fn backstage_rail_action(
         &mut self,
         action: BackstageRailAction,
@@ -9544,10 +9848,13 @@ impl Docxy {
                 self.bs_info = true;
                 self.bs_info_status = None;
                 self.bs_new = false;
+                self.bs_account = false;
                 cx.notify();
             }
+            BackstageRailAction::Account => self.open_account(cx),
             BackstageRailAction::New => {
                 self.bs_new = true;
+                self.bs_account = false;
                 self.bs_info = false;
                 self.bs_info_status = None;
                 cx.notify();
@@ -9780,6 +10087,31 @@ impl Docxy {
                 |o| o.fill_handle = !o.fill_handle,
                 cx,
             ))
+            .child(check_row(
+                "bs-flash-fill-auto",
+                o.flash_fill_auto,
+                "Automatically Flash Fill",
+                |o| o.flash_fill_auto = !o.flash_fill_auto,
+                cx,
+            ))
+            .child(check_row(
+                "bs-formula-autocomplete",
+                o.formula_autocomplete,
+                "Formula AutoComplete",
+                |o| o.formula_autocomplete = !o.formula_autocomplete,
+                cx,
+            ))
+            // Proofing › AutoCorrect Options... (#667).
+            .child(
+                row("bs-autocorrect")
+                    .child(div().text_color(fg).child("AutoCorrect Options..."))
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        if let Err(e) = this.open_autocorrect_dialog() {
+                            this.set_status(e);
+                        }
+                        cx.notify();
+                    })),
+            )
             .into_any_element()
     }
 
@@ -12280,7 +12612,11 @@ impl Docxy {
     }
     fn active_sheet_mut(&mut self) -> Option<&mut SheetView> {
         let opts = self.edit_opts;
-        sheet_with_opts(self.tabs.get_mut(self.active), opts)
+        let ac = self.autocorrect.clone();
+        let v = sheet_with_opts(self.tabs.get_mut(self.active), opts)?;
+        v.autocorrect = ac;
+        v.retire_stale_preview();
+        Some(v)
     }
     /// Whether the active sheet is protected (cells read-only until unprotected).
     fn sheet_protected(&self) -> bool {
@@ -12380,10 +12716,33 @@ impl Docxy {
             .is_some_and(|t| t.access.locked())
     }
 
-    /// Refuse an edit in Protected View or a document marked as final,
-    /// saying how to edit; `true` when it was refused. Every gate that would
-    /// change the workbook or document asks this first.
+    /// Refuse an edit in Protected View, in a document marked as final, or
+    /// while Display for Review shows No Markup or Original (text that is not
+    /// the document's), saying how to edit; `true` when it was refused. Every
+    /// gate that would change the workbook or document asks this first.
     fn protected_refused(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.view_only_active() {
+            self.set_status(VIEW_ONLY_STATUS);
+            cx.notify();
+            return true;
+        }
+        self.access_refused(cx)
+    }
+
+    /// The active tab is a document shown as No Markup or Original: text that
+    /// is not the document's, so it is looked at and not edited (#625).
+    fn view_only_active(&self) -> bool {
+        !self.markup.is_editable()
+            && matches!(
+                self.tabs.get(self.active).map(|t| &t.surface),
+                Some(Surface::Doc(_))
+            )
+    }
+
+    /// [`Self::protected_refused`] for what holds no text of the view (a
+    /// comment's Resolve and Delete all): only Protected View or Mark as
+    /// Final refuse it.
+    fn access_refused(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(access) = self
             .tabs
             .get(self.active)
@@ -12622,12 +12981,19 @@ impl Docxy {
     /// Commit and move; false (the editor left open, the status saying why)
     /// when the entry was refused.
     fn sheet_commit_move(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) -> bool {
+        let origin = self
+            .active_sheet()
+            .and_then(|v| v.editing.as_ref().and(v.edit_origin));
         let res = self.active_sheet_mut().map(|v| v.commit_and_move(dr, dc));
         cx.notify();
         match res {
             Some(Some(committed)) => {
                 if committed {
                     self.mark_sheet_dirty();
+                    // A typed entry may be Flash Fill's second example.
+                    if let (Some(origin), Some(v)) = (origin, self.active_sheet_mut()) {
+                        v.flash_preview_after(origin);
+                    }
                 }
                 true
             }
@@ -14898,6 +15264,15 @@ impl Docxy {
             self.bar_open(target);
         }
         match act {
+            SheetAct::PickList => {
+                let _ = self.open_pick_menu(cx);
+            }
+            SheetAct::FlashFill => self.sheet_flash_fill(cx),
+            SheetAct::FlashUndo
+            | SheetAct::FlashAccept
+            | SheetAct::FlashSelectBlank
+            | SheetAct::FlashSelectChanged => self.flash_option(act, cx),
+            SheetAct::PickItem(i) => self.sheet_pick_item(i as usize, cx),
             SheetAct::Cut => self.sheet_copy(true, cx),
             SheetAct::Copy => self.sheet_copy(false, cx),
             SheetAct::Paste => {
@@ -15115,6 +15490,39 @@ impl Docxy {
             return self.sheet_find_key(ev, shift, key, cx);
         }
         let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
+        // Flash Fill's preview stands for one key: Enter takes it, any
+        // other key (but a lone modifier) leaves it behind (ENT-105).
+        if key != "enter" && !matches!(key, "shift" | "control" | "alt" | "platform" | "function") {
+            if let Some(v) = self.active_sheet_mut() {
+                v.flash_preview = None;
+            }
+        }
+        // Alt+Down opens a drop-down list (#665), before point mode or the
+        // type-over arrows can take the Down.
+        if alt && !ctrl && !shift && key == "down" {
+            return self.sheet_alt_down(cx);
+        }
+        // Formula AutoComplete's list (#686) takes Up, Down and Esc while it
+        // shows: they move its highlight or close it, and neither commit,
+        // point nor cancel the entry.
+        if editing
+            && !ctrl
+            && !alt
+            && matches!(key, "up" | "down" | "escape")
+            && self
+                .active_sheet_mut()
+                .is_some_and(SheetView::complete_open)
+        {
+            if let Some(v) = self.active_sheet_mut() {
+                match key {
+                    "up" => v.complete_step(false),
+                    "down" => v.complete_step(true),
+                    _ => v.complete_close(),
+                }
+            }
+            cx.notify();
+            return;
+        }
         let caret_keys = editing
             && self
                 .active_sheet()
@@ -15193,6 +15601,11 @@ impl Docxy {
                     }
                     cx.notify();
                     return;
+                }
+                // Flash Fill (#666): an open entry is committed first.
+                "e" => {
+                    self.chart_hand_back(cx);
+                    return self.sheet_flash_fill(cx);
                 }
                 "d" | "r" if !editing => {
                     if !protected {
@@ -15352,6 +15765,8 @@ impl Docxy {
                 }
                 cx.notify();
             }
+            // Enter on Flash Fill's preview accepts it (#666, ENT-105).
+            "enter" if !editing && self.sheet_accept_preview(cx) => {}
             // Enter in copy mode pastes and ends it (#664).
             "enter" if !editing && self.sheet_enter_paste(cx) => {}
             "enter" => {
@@ -15446,12 +15861,14 @@ impl Docxy {
             "home" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_caret = 0;
+                    v.edit_tail_left();
                 }
                 cx.notify();
             }
             "end" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_caret_to_end();
+                    v.edit_tail_left();
                 }
                 cx.notify();
             }
@@ -17507,6 +17924,83 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Resolve the selected comment, or reopen it when it is resolved. The
+    /// state is written to `commentsExtended.xml` on save.
+    fn resolve_selected_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.access_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        let active = self.active;
+        let id = selected_comment_id(&self.tabs, active, &self.selected_comment);
+        if let Some(t) = self.tabs.get_mut(active) {
+            t.status = match id.and_then(|id| set_doc_comment_resolved(t, &id, None)) {
+                Some(true) => "Comment resolved".into(),
+                Some(false) => "Comment reopened".into(),
+                None => "Select a comment in the Comments pane first".into(),
+            };
+        }
+        self.refocus(window, cx);
+    }
+
+    /// The Resolve button of one comment card: select it and toggle it.
+    fn resolve_comment(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_comment = close::tab_ids(&self.tabs)
+            .into_iter()
+            .nth(self.active)
+            .map(|tab| (tab, id));
+        self.resolve_selected_comment(window, cx);
+    }
+
+    /// Track Changes on or off for the active document (#624): the editor
+    /// records typing and deletions as tracked changes, and a save writes
+    /// `w:trackRevisions` ([`save_base`]).
+    fn toggle_track(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        let identity = review_identity(&self.user_name, &self.user_initials);
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            if t.markdown {
+                t.status = "Track Changes needs a Word document".into();
+            } else if let Surface::Doc(ed) = &mut t.surface {
+                let on = !ed.track_changes();
+                ed.set_track_changes(on.then(|| track_author(&identity)));
+                t.mark_dirty();
+                t.status = format!("Track Changes: {}", if on { "On" } else { "Off" }).into();
+            }
+        }
+        self.refocus(window, cx);
+    }
+
+    /// Whether the active document records its edits as tracked changes.
+    fn active_track_changes(&self) -> bool {
+        matches!(
+            self.tabs.get(self.active).map(|t| &t.surface),
+            Some(Surface::Doc(ed)) if ed.track_changes()
+        )
+    }
+
+    /// Whether the selected comment is resolved (Resolve shows pressed).
+    fn selected_comment_resolved(&self) -> bool {
+        let Some(id) = selected_comment_id(&self.tabs, self.active, &self.selected_comment) else {
+            return false;
+        };
+        self.tabs
+            .get(self.active)
+            .is_some_and(|t| t.comments.iter().any(|c| c.id == id && c.resolved))
+    }
+
+    /// Delete every comment (Review ▸ Comments ▸ Delete all): the Document
+    /// Inspector's Remove All for comments, one undo step.
+    fn delete_all_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.access_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        let _ = self.inspect_remove_active(inspector::InspectCategory::Comments);
+        self.selected_comment = None;
+        self.refocus(window, cx);
+    }
+
     /// Select the text a comment is anchored to (find its quoted run).
     fn goto_comment(&mut self, quoted: String, window: &mut Window, cx: &mut Context<Self>) {
         if !quoted.is_empty() {
@@ -17548,63 +18042,88 @@ impl Docxy {
         for c in &comments {
             let id = c.id.clone();
             let quoted = c.quoted.clone();
-            list =
-                list.child(
-                    v_flex()
-                        .id(("cmt", id.parse::<usize>().unwrap_or(0)))
-                        .gap_1()
-                        .p_2()
-                        .rounded(px(4.))
-                        .border_1()
-                        .border_color(pal.border)
-                        .bg(pal.panel)
-                        .cursor_pointer()
-                        .hover(|d| d.border_color(hsla_u(BRAND)))
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(hsla_u(BRAND))
-                                        .child(SharedString::from(c.author.clone())),
-                                )
-                                .child(
-                                    div()
-                                        .id(("cmtx", id.parse::<usize>().unwrap_or(0)))
-                                        .px_1()
-                                        .rounded_sm()
-                                        .text_color(pal.dim)
-                                        .hover(|d| d.bg(pal.hover))
-                                        .child("\u{00d7}")
-                                        .on_click(cx.listener({
-                                            let id = id.clone();
-                                            move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.delete_comment(id.clone(), window, cx);
-                                            }
-                                        })),
-                                ),
-                        )
-                        .when(!c.quoted.is_empty(), |d| {
-                            d.child(
-                                div().text_size(px(11.)).italic().text_color(pal.dim).child(
-                                    SharedString::from(format!("\u{201C}{}\u{201D}", c.quoted)),
-                                ),
+            list = list.child(
+                v_flex()
+                    .id(("cmt", id.parse::<usize>().unwrap_or(0)))
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(pal.border)
+                    .bg(pal.panel)
+                    .cursor_pointer()
+                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(hsla_u(BRAND))
+                                    .child(SharedString::from(c.author.clone())),
                             )
-                        })
-                        .child(
+                            .child(
+                                div()
+                                    .id(("cmtr", id.parse::<usize>().unwrap_or(0)))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_size(px(11.))
+                                    .text_color(if c.resolved { hsla_u(BRAND) } else { pal.dim })
+                                    .hover(|d| d.bg(pal.hover))
+                                    .child(if c.resolved { "Reopen" } else { "Resolve" })
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.resolve_comment(id.clone(), window, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("cmtx", id.parse::<usize>().unwrap_or(0)))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_color(pal.dim)
+                                    .hover(|d| d.bg(pal.hover))
+                                    .child("\u{00d7}")
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.delete_comment(id.clone(), window, cx);
+                                        }
+                                    })),
+                            ),
+                    )
+                    .when(!c.quoted.is_empty(), |d| {
+                        d.child(
                             div()
-                                .text_size(px(13.))
-                                .text_color(pal.fg)
-                                .child(SharedString::from(c.text.clone())),
+                                .text_size(px(11.))
+                                .italic()
+                                .text_color(pal.dim)
+                                .child(SharedString::from(format!("\u{201C}{}\u{201D}", c.quoted))),
                         )
-                        .on_click(cx.listener(move |this, _, window, cx| {
+                    })
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(pal.fg)
+                            .child(SharedString::from(c.text.clone())),
+                    )
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, window, cx| {
+                            this.selected_comment = close::tab_ids(&this.tabs)
+                                .into_iter()
+                                .nth(this.active)
+                                .map(|tab| (tab, id.clone()));
                             this.goto_comment(quoted.clone(), window, cx)
-                        })),
-                );
+                        }
+                    })),
+            );
         }
         v_flex()
             .w(px(280.))
@@ -17989,6 +18508,10 @@ impl Docxy {
         if self.tab_more_open {
             return;
         }
+        // File (backstage) covers the window; Tab there edits nothing under it.
+        if self.backstage {
+            return;
+        }
         // An open menu takes Tab as it takes every key; see `on_key`.
         if self.close_menu() {
             cx.notify();
@@ -17999,7 +18522,7 @@ impl Docxy {
         }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
-            if self.keytips == KeyTip::Off && !self.backstage {
+            if self.keytips == KeyTip::Off {
                 self.mini_bar = None;
                 self.project_tab_key(false, window, cx);
             }
@@ -18015,7 +18538,7 @@ impl Docxy {
             cx.notify();
             return;
         }
-        if self.keytips != KeyTip::Off || self.comment_open || self.backstage {
+        if self.keytips != KeyTip::Off || self.comment_open {
             return;
         }
         self.mini_bar = None;
@@ -18033,6 +18556,15 @@ impl Docxy {
                 // The dismissals above are the only state this arm changes, and
                 // nothing further repaints — say so, or a menu cleared here
                 // stays on screen until the next unrelated frame.
+                cx.notify();
+                return;
+            }
+            // Formula AutoComplete's list takes Tab: the highlighted name
+            // goes in, the editor stays (#686, FRM-151).
+            if self
+                .active_sheet_mut()
+                .is_some_and(|v| v.complete_open() && v.complete_insert())
+            {
                 cx.notify();
                 return;
             }
@@ -18099,6 +18631,10 @@ impl Docxy {
         if self.tab_more_open {
             return;
         }
+        // File (backstage) covers the window; Tab there edits nothing under it.
+        if self.backstage {
+            return;
+        }
         // An open menu takes Tab as it takes every key; see `on_key`.
         if self.close_menu() {
             cx.notify();
@@ -18109,13 +18645,13 @@ impl Docxy {
         }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
-            if self.keytips == KeyTip::Off && !self.backstage {
+            if self.keytips == KeyTip::Off {
                 self.mini_bar = None;
                 self.project_tab_key(true, window, cx);
             }
             return;
         }
-        if self.keytips != KeyTip::Off || self.find_open || self.comment_open || self.backstage {
+        if self.keytips != KeyTip::Off || self.find_open || self.comment_open {
             return;
         }
         self.mini_bar = None;
@@ -18157,12 +18693,17 @@ impl Docxy {
             }
             return; // the modal list owns keys; do not edit the surface below
         }
-        // An open menu takes the key: Esc closes it, and so, until menus
-        // take arrows and Enter, does any other key; none reaches the
-        // document or cell under it (#397).
-        if self.close_menu() {
-            cx.notify();
+        // File (backstage) covers the window: with no dialog up, a key there
+        // edits nothing under it (#1027; its root takes keys for the dialogs).
+        if self.backstage {
             return;
+        }
+        // An open menu takes the key (#397): Up and Down move its highlight,
+        // Enter runs the highlighted item (or opens its submenu), and any
+        // other key — Esc among them — closes it. None reaches the document
+        // or cell under it.
+        if self.menu.is_some() {
+            return self.menu_key(&ev.keystroke.key, window, cx);
         }
         // Word's and Excel's document keys come before every surface's own,
         // so they work on any tab, in Protected View and in a document
@@ -18170,7 +18711,7 @@ impl Docxy {
         if let Some(done) = self.document_key(ev, window, cx) {
             return done;
         }
-        if self.project_edit_open() && !self.backstage {
+        if self.project_edit_open() {
             return self.project_key(ev, window, cx);
         }
         let m = &ev.keystroke.modifiers;
@@ -18184,6 +18725,11 @@ impl Docxy {
         // Alt+Shift+Right/Left group and ungroup (#693). Alt has raised the
         // KeyTips by the time the arrow comes, so they go down unasked.
         if self.active_is_sheet() && sheet_outline::group_key(&key, ctrl, shift, m.alt).is_some() {
+            self.keytips = KeyTip::Off;
+            return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
+        }
+        // Alt+Down: the drop-down lists (#665), for the same reason.
+        if self.active_is_sheet() && sheet_complete::alt_down_key(&key, *m) {
             self.keytips = KeyTip::Off;
             return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
         }
@@ -18236,7 +18782,7 @@ impl Docxy {
         // Protected View (#633), or a document marked as final (#617): only
         // keys that look, move or copy reach the document. The find bar still
         // takes typing; its Replace is refused where it would write.
-        if self.active_locked()
+        if (self.active_locked() || self.view_only_active())
             && !self.find_open
             && !open_mode::protected_allows_doc_key(key.as_str(), ctrl, m.alt)
         {
@@ -18379,6 +18925,9 @@ impl Docxy {
         cx.notify();
     }
 }
+
+/// What a refused edit says while Display for Review is No Markup or Original.
+const VIEW_ONLY_STATUS: &str = "Edit blocked: Display for Review is No Markup or Original; switch to All Markup or Simple Markup to edit.";
 
 /// What a harness instance says when asked to Save As a document.
 const DOC_SAVE_AS_HARNESS: &str = "This document needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
@@ -20462,10 +21011,10 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         ClearFmt => e.clear_run_formatting(),
         Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
         | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments
-        | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | BlankPage
-        | Cover(_) | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing
-        | Hf(_) | Design(_) | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler
-        | UndoTo(_) => {}
+        | ResolveComment | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | DarkMode
+        | AutoHideRibbon | InsertField | PageBreak | BlankPage | Cover(_) | ToggleNotes
+        | InsertTable | InsertSymbol | InsertEquation | LineSpacing | Hf(_) | Design(_)
+        | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler | UndoTo(_) => {}
     }
 }
 
@@ -21427,6 +21976,14 @@ enum Act {
     Super,
     Sub,
     NewComment,
+    /// Resolve the selected comment, or reopen it.
+    ResolveComment,
+    /// Delete every comment in the document.
+    DeleteAllComments,
+    /// Display for Review: how tracked changes are shown.
+    Markup(docxcore::markup::MarkupView),
+    /// Track Changes on or off.
+    ToggleTrack,
     Sort,
     LineSpacing,
     ParaBorders,
@@ -21775,6 +22332,64 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                             )
                             .key("P"),
                             cmdt("togglenotes", "comment", "Notes pane", ToggleNotes, "").key("O"),
+                        ]),
+                        rs::column(vec![
+                            cmdt("resolvecomment", "comment", "Resolve", ResolveComment, "")
+                                .key("V"),
+                            cmdt(
+                                "deleteallcomments",
+                                "table-dismiss",
+                                "Delete all",
+                                DeleteAllComments,
+                                "",
+                            )
+                            .key("X"),
+                        ]),
+                    ],
+                ),
+                rs::group(
+                    "Tracking",
+                    35,
+                    vec![
+                        Control::Large(
+                            cmdt("tracktoggle", "paragraph", "Track Changes", ToggleTrack, "")
+                                .key("T"),
+                        ),
+                        rs::column(vec![
+                            cmdt(
+                                "markupall",
+                                "paragraph",
+                                "All markup",
+                                Markup(MarkupView::All),
+                                "",
+                            )
+                            .key("KA"),
+                            cmdt(
+                                "markupsimple",
+                                "paragraph",
+                                "Simple markup",
+                                Markup(MarkupView::Simple),
+                                "",
+                            )
+                            .key("KS"),
+                            cmdt(
+                                "markupnone",
+                                "paragraph",
+                                "No markup",
+                                Markup(MarkupView::NoMarkup),
+                                "",
+                            )
+                            .key("KN"),
+                        ]),
+                        rs::column(vec![
+                            cmdt(
+                                "markuporiginal",
+                                "paragraph",
+                                "Original",
+                                Markup(MarkupView::Original),
+                                "",
+                            )
+                            .key("KO"),
                         ]),
                     ],
                 ),
@@ -23252,6 +23867,31 @@ fn flat_inlines(content: &[Inline]) -> Vec<(Cow<'_, Inline>, bool)> {
     out
 }
 
+/// The runs under a tracked change, drawn as plain text with no caret mapping.
+fn emit_revision_text(out: &mut Vec<AnyElement>, content: &[Inline], base: f32, pal: Pal) {
+    for inline in content {
+        match inline {
+            Inline::Run(r) => {
+                let (mut idx, mut caret) = (0, None);
+                emit_run(
+                    out, &r.text, &r.props, base, false, &mut idx, &mut caret, None, None, pal,
+                );
+            }
+            Inline::Hyperlink(h) => {
+                for r in &h.runs {
+                    let (mut idx, mut caret) = (0, None);
+                    emit_run(
+                        out, &r.text, &r.props, base, true, &mut idx, &mut caret, None, None, pal,
+                    );
+                }
+                emit_revision_text(out, &h.content, base, pal);
+            }
+            Inline::Revision { content, .. } => emit_revision_text(out, content, base, pal),
+            _ => {}
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paragraph_el(
     p: &Paragraph,
@@ -23418,6 +24058,12 @@ fn paragraph_el(
             Inline::Break(..) => {
                 emit_break(&mut spans, &mut idx, &mut caret);
                 x = 0.0; // a hard break restarts the line
+            }
+            Inline::Revision { content, .. } => {
+                // A tracked change is shown, not edited here: its text takes no
+                // caret offsets (the engine counts it as none), and carries the
+                // underline / strike cue the loader gave its runs.
+                emit_revision_text(&mut spans, content, base, pal);
             }
             Inline::Raw(xml) => {
                 // Comment reference → a small badge; other raw XML (range markers,
@@ -24098,11 +24744,12 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         self.mini_bar = None;
-        self.menu = Some(menu::Menu {
+        self.menu_scroll = ScrollHandle::new();
+        self.menu = Some(menu::Menu::new(
             target,
-            at: (f32::from(at.x), f32::from(at.y)),
+            (f32::from(at.x), f32::from(at.y)),
             items,
-        });
+        ));
         cx.notify();
     }
 
@@ -24299,10 +24946,54 @@ impl Docxy {
             if let Some(menu::MenuItem::Item(e)) = menu.items.get(i) {
                 if e.enabled && !e.submenu.is_empty() {
                     menu.items = e.submenu.clone();
+                    menu.hi = None;
+                    self.menu_scroll = ScrollHandle::new();
                 }
             }
         }
         cx.notify();
+    }
+
+    /// A key while a menu is open: Up and Down move the highlight, Enter
+    /// runs the highlighted item (an item with a submenu opens it in the
+    /// menu's place; Enter with nothing highlighted closes the menu), and
+    /// every other key closes the menu and is spent.
+    fn menu_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        match key {
+            "down" | "up" => {
+                menu.step(key == "down");
+                if let Some(i) = menu.hi {
+                    self.menu_scroll.scroll_to_item(i);
+                }
+                cx.notify();
+            }
+            "enter" => {
+                let hi = menu.hi;
+                let submenu = hi.is_some_and(|i| {
+                    matches!(menu.items.get(i), Some(menu::MenuItem::Item(e)) if !e.submenu.is_empty())
+                });
+                match hi {
+                    Some(i) if submenu => self.menu_enter_submenu(i, cx),
+                    Some(i) => {
+                        if let Err(e) = self.menu_activate(&[i], window, cx) {
+                            self.set_status(e);
+                        }
+                        cx.notify();
+                    }
+                    None => {
+                        self.close_menu();
+                        cx.notify();
+                    }
+                }
+            }
+            _ => {
+                self.close_menu();
+                cx.notify();
+            }
+        }
     }
 
     /// Click the open menu's item at `path` (indices through submenus): the
@@ -24337,8 +25028,14 @@ impl Docxy {
     /// click; a ticked item shows its tick where the icon goes.
     fn menu_el(&self, menu: &menu::Menu, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         use menu::MenuItem;
+        // Bounded and scrollable: a menu holding data (the pick list) can
+        // outgrow the window. Up/Down scroll the highlight into view.
         let mut list = v_flex()
+            .id("menu-list")
             .min_w(px(200.))
+            .max_h(px(320.))
+            .overflow_y_scroll()
+            .track_scroll(&self.menu_scroll)
             .py_1()
             .rounded_md()
             .bg(pal.panel)
@@ -24376,6 +25073,7 @@ impl Docxy {
                     };
                     let clickable = e.enabled;
                     let opens = !e.submenu.is_empty();
+                    let lit = menu.hi == Some(i);
                     div()
                         .id(SharedString::from(e.id.clone()))
                         .flex()
@@ -24384,6 +25082,7 @@ impl Docxy {
                         .px_3()
                         .py_1()
                         .rounded_sm()
+                        .when(lit, |d| d.bg(pal.hover))
                         .text_size(px(12.))
                         .text_color(color)
                         .child(lead)
@@ -24555,7 +25254,14 @@ impl Docxy {
         self.close_menu();
         // Protected View (#633): the ribbon is hidden, but shortcuts, KeyTips,
         // context menus and the harness's `ribbon-click` still come here.
-        if !protected_view_allows_doc_act(act) && self.protected_refused(cx) {
+        // Resolve and Delete all hold no text of the view: only Protected View
+        // and Mark as Final refuse them.
+        let refused = if matches!(act, Act::ResolveComment | Act::DeleteAllComments) {
+            self.access_refused(cx)
+        } else {
+            !protected_view_allows_doc_act(act) && self.protected_refused(cx)
+        };
+        if refused {
             return self.refocus(window, cx);
         }
         // A document edit is its own undo step, named for the Undo drop-down
@@ -24599,6 +25305,14 @@ impl Docxy {
             FontName => self.toggle_picker(PickKind::FontName, window, cx),
             FontSize => self.toggle_picker(PickKind::FontSize, window, cx),
             NewComment => self.start_comment(window, cx),
+            ResolveComment => self.resolve_selected_comment(window, cx),
+            ToggleTrack => self.toggle_track(window, cx),
+            Markup(view) => {
+                self.markup = view;
+                self.set_status(format!("Display for Review: {}", view.label()));
+                self.refocus(window, cx);
+            }
+            DeleteAllComments => self.delete_all_comments(window, cx),
             ShowHide => {
                 self.show_marks = !self.show_marks;
                 self.refocus(window, cx);
@@ -26321,8 +27035,8 @@ impl Docxy {
             ),
             Bold => rp.is_some_and(|p| p.bold),
             Italic => rp.is_some_and(|p| p.italic),
-            Underline => rp.is_some_and(|p| p.underline),
-            Strike => rp.is_some_and(|p| p.strike),
+            Underline => rp.is_some_and(|p| p.user_underline()),
+            Strike => rp.is_some_and(|p| p.user_strike()),
             Super => rp.is_some_and(|p| p.vert_align == VertAlign::Superscript),
             Sub => rp.is_some_and(|p| p.vert_align == VertAlign::Subscript),
             AlignL => pp.is_some_and(|p| p.align == Align::Left),
@@ -26334,6 +27048,9 @@ impl Docxy {
             ParaBorders => pp.is_some_and(|p| p.borders.bottom.is_some()),
             ShowHide => self.show_marks,
             ToggleComments => self.show_comments,
+            ResolveComment => self.selected_comment_resolved(),
+            Markup(view) => self.markup == view,
+            ToggleTrack => self.active_track_changes(),
             ToggleNav => self.show_nav,
             ToggleNotes => self.show_notes,
             PrintLayout => self.page_view,
@@ -26417,6 +27134,81 @@ impl Docxy {
                 d.on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
             })
             .into_any_element()
+    }
+
+    /// File > Account (#1023), for every tab kind: the build's one-line summary, a
+    /// "Manual build" badge when it is one, and the About docxy suite button,
+    /// whose dialog lists every field with a Copy button. `None` unless the
+    /// Account page is selected.
+    fn account_page(
+        &self,
+        bg: Hsla,
+        fg: Hsla,
+        dim: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.bs_account {
+            return None;
+        }
+        let info = about::info();
+        let page = v_flex()
+            .relative()
+            .flex_1()
+            .h_full()
+            .p_8()
+            .gap_4()
+            .bg(bg)
+            .child(
+                div()
+                    .text_size(px(20.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(fg)
+                    .child("Account"),
+            )
+            .child(
+                div()
+                    .id("account-line")
+                    .text_color(fg)
+                    .child(info.short_line()),
+            )
+            .when(info.manual(), |d| {
+                d.child(
+                    h_flex().child(
+                        div()
+                            .id("account-manual-badge")
+                            .relative()
+                            .child(probe(&self.probes, "account-manual-badge"))
+                            .px_2()
+                            .py_0p5()
+                            .rounded_sm()
+                            .bg(rgb(0xB45309))
+                            .text_color(rgb(FILE_FG))
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::BOLD)
+                            .child("Manual build"),
+                    ),
+                )
+            })
+            // The dialog lives on a tab's stack, so with no tab there is nothing to open it on.
+            .when(!self.tabs.is_empty(), |d| {
+                d.child(
+                    h_flex().child(
+                        div()
+                            .id("account-about")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(dim)
+                            .text_color(fg)
+                            .cursor_pointer()
+                            .hover(|d| d.border_color(rgb(BRAND)))
+                            .child("About docxy suite")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_about_clicked(cx))),
+                    ),
+                )
+            });
+        Some(page.into_any_element())
     }
 
     /// File > Info for a document tab (#627): its name and path, then Word's
@@ -26722,6 +27514,8 @@ impl Docxy {
                         )),
                 )
                 .into_any_element()
+        } else if let Some(page) = self.account_page(bg, fg, dim, cx) {
+            page
         } else if let Some(page) = self.info_page(bg, fg, dim, cx) {
             page
         } else {
@@ -26996,13 +27790,14 @@ impl Docxy {
                 )
                 // Word's File › Options › General › User name and Initials
                 // (#620), stamped on new comments. Its dialog sits on a tab's
-                // stack, so the row needs a tab.
-                .when(!self.tabs.is_empty(), |d| {
+                // stack, or the app's when none is open (#1027).
+                .map(|d| {
                     let (name, initials) =
                         review_identity(&self.user_name, &self.user_initials);
                     d.child(
                         div()
                             .id("bs-user-name")
+                            .relative()
                             .flex()
                             .items_center()
                             .gap_2()
@@ -27011,6 +27806,7 @@ impl Docxy {
                             .cursor_pointer()
                             .rounded_sm()
                             .hover(|d| d.bg(sidebar))
+                            .child(probe(&self.probes, "bs-user-name"))
                             .child(div().text_color(fg).child("User name..."))
                             .child(
                                 div()
@@ -27267,8 +28063,11 @@ impl Docxy {
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A tab created since the last frame holds the app's Editing options
-        // before anything can reach it (#672).
+        // before anything can reach it (#672), and its AutoCorrect (#667).
         stamp_edit_opts(&mut self.tabs, self.edit_opts);
+        sheet_autocorrect::stamp_autocorrect(&mut self.tabs, &self.autocorrect);
+        sheet_flashfill::retire_stale_previews(&mut self.tabs);
+        sheet_complete::sync_lists(&mut self.tabs);
         // A new frame: what the probes recorded during the last one is now the
         // complete answer, and they start collecting this one afresh. Stale
         // entries cannot survive — a chart that was deleted simply does not
@@ -27659,6 +28458,7 @@ impl Render for Docxy {
                 .relative()
                 .bg(bg)
                 .track_focus(&self.focus)
+                .key_routing(cx)
                 .child(probe_tracked(
                     &self.probes,
                     "suite-root",
@@ -27750,8 +28550,15 @@ impl Render for Docxy {
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
                 Surface::Doc(editor) => {
-                    let spans = editor.selection_spans();
-                    let markers = list_markers(&editor.doc.body);
+                    // Display for Review: the document, or a clone shown as No
+                    // Markup / Original / Simple; never saved.
+                    let shown = editor.doc.markup_view(self.markup);
+                    let spans = if self.markup.is_editable() {
+                        editor.selection_spans()
+                    } else {
+                        Vec::new()
+                    };
+                    let markers = list_markers(&shown.body);
                     let ent = cx.entity();
                     // In Print Layout the sheet is white, or the document's page
                     // colour (#651), whatever the app theme, like Word's document
@@ -27786,14 +28593,14 @@ impl Render for Docxy {
                         pal: doc_pal,
                         marks: self.show_marks,
                         zoom: self.zoom,
-                        active: hf.is_none(),
+                        active: hf.is_none() && self.markup.is_editable(),
                         meas: &measurer,
                         hf_width: None,
                         tbl: &tbl,
                         cell_range: body_range.as_ref(),
                         merge_hl: tab.mail.highlight,
                     };
-                    let body = &editor.doc.body;
+                    let body = &shown.body;
                     if self.page_view {
                         // Print Layout: split the body into discrete page sheets
                         // (section margins), stacked on a grey canvas. A sheet is
@@ -28214,6 +29021,16 @@ impl Render for Docxy {
                 }
                 _ => None,
             });
+        // Track Changes and Display for Review, when they are not the default.
+        let mut review_chips: Vec<String> = Vec::new();
+        if is_doc {
+            if self.active_track_changes() {
+                review_chips.push("Track Changes: On".to_string());
+            }
+            if self.markup != MarkupView::All {
+                review_chips.push(self.markup.label().to_string());
+            }
+        }
         let stats_text = doc_stats.map(|(w, p)| {
             SharedString::from(format!(
                 "{} page{} \u{00b7} {} word{}",
@@ -28293,6 +29110,19 @@ impl Render for Docxy {
                 d.child(div().text_color(dim).child("·"))
                     .child(div().text_color(dim).child(s))
             })
+            .children(review_chips.into_iter().flat_map(|chip| {
+                [
+                    div().text_color(dim).child("·").into_any_element(),
+                    div()
+                        .id(SharedString::from(format!(
+                            "status-{}",
+                            chip.to_lowercase().replace([' ', ':'], "-")
+                        )))
+                        .text_color(fg)
+                        .child(SharedString::from(chip))
+                        .into_any_element(),
+                ]
+            }))
             // Excel's status-bar words for the Editing options (#672).
             .when(self.active_is_sheet(), |d| {
                 d.children(sheet_status_words(&self.edit_opts).into_iter().map(|w| {
@@ -28379,9 +29209,7 @@ impl Render for Docxy {
             .size_full()
             .relative()
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(Self::on_key))
-            .on_action(cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)))
-            .on_action(cx.listener(|this, _: &OutdentAction, window, cx| this.shift_tab_key(window, cx)))
+            .key_routing(cx)
             // Ruler drags are tracked at the window level so they keep working when
             // the pointer leaves the thin ruler strip (gpui move events are
             // hitbox-scoped, so a ruler-only handler would stop the moment the
@@ -28453,6 +29281,27 @@ impl Render for Docxy {
 /// Excel column width (character units) → pixels, clamped to a sane range.
 fn col_px(units: f64) -> f32 {
     ((units * 7.0 + 6.0) as f32).clamp(28.0, 320.0)
+}
+
+/// The window root's keyboard: every key to [`Docxy::on_key`] and the two
+/// bound actions (Tab, Shift+Tab), which gpui matches before it delivers a
+/// key-down. Both of `render`'s roots, the Backstage one too, take it from
+/// here: Backstage without it dropped every key a dialog opened from it
+/// should have had (#1027).
+trait KeyRouting: Sized {
+    fn key_routing(self, cx: &mut Context<Docxy>) -> Self;
+}
+
+impl KeyRouting for Div {
+    fn key_routing(self, cx: &mut Context<Docxy>) -> Self {
+        self.on_key_down(cx.listener(Docxy::on_key))
+            .on_action(
+                cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &OutdentAction, window, cx| this.shift_tab_key(window, cx)),
+            )
+    }
 }
 
 // ---- grid geometry (pure; unit-tested in `grid_geom_tests`) --------------
@@ -31455,6 +32304,7 @@ fn sheet_el(
                     .text_color(hsla_u(0x333333))
                     .child("\u{25bc}")
                     .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
                         ent_arrow.update(cx, |this, cx| this.sheet_dv_toggle(cx));
                     })
                     .into_any_element(),
@@ -31486,6 +32336,7 @@ fn sheet_el(
                             .hover(|d| d.bg(hsla_u(0xe8f0fe)))
                             .child(SharedString::from(val.label.clone()))
                             .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                                cx.stop_propagation();
                                 ent_pick.update(cx, |this, cx| this.sheet_dv_pick(v2.clone(), cx));
                             }),
                     );
@@ -31556,6 +32407,123 @@ fn sheet_el(
                     dv_overlay.push(tip.into_any_element());
                 }
             }
+        }
+    }
+    // Flash Fill's preview (#666, ENT-105): the values Enter would write,
+    // greyed in their empty cells.
+    if let Some(p) = view.live_preview() {
+        if let Some(cx0) = col_x(p.fill.col) {
+            let cw = col_px(sh.col_width(p.fill.col));
+            for (r, text) in &p.fill.fills {
+                let shown = text.strip_prefix('\'').unwrap_or(text);
+                dv_overlay.push(
+                    div()
+                        .absolute()
+                        .left(px(cx0 + 3.0))
+                        .top(px(row_y(*r)))
+                        .w(px((cw - 6.0).max(0.0)))
+                        .h(px(SHEET_ROW_H))
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .text_size(px(12.))
+                        .text_color(hsla_u(0xa0a0a0))
+                        .child(SharedString::from(shown.to_string()))
+                        .into_any_element(),
+                );
+            }
+        }
+    }
+    // The Flash Fill Options button (#666, ENT-109) by the last cell filled,
+    // while the fill stands; a press opens its menu.
+    if let Some((br, bc)) = view.live_flash().and_then(|f| f.button_cell()) {
+        if let Some(cx0) = col_x(bc) {
+            let cw = col_px(sh.col_width(bc));
+            let ent_btn = ent.clone();
+            dv_overlay.push(
+                div()
+                    .id("flash-fill-options")
+                    .absolute()
+                    .left(px(cx0 + cw + 2.0))
+                    .top(px(row_y(br) + 1.0))
+                    .w(px(18.))
+                    .h(px(SHEET_ROW_H - 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .bg(hsla_u(0xf1f1f1))
+                    .border_1()
+                    .border_color(hsla_u(0x9a9a9a))
+                    .rounded_sm()
+                    .text_size(px(10.))
+                    .text_color(hsla_u(0x333333))
+                    .child("\u{26a1}")
+                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        ent_btn.update(cx, |this, cx| {
+                            // The button is drawn only while a fill stands, so
+                            // the only refusal (no fill) cannot happen here.
+                            let _ = this.open_flash_menu(cx);
+                        });
+                    })
+                    .into_any_element(),
+            );
+        }
+    }
+    // Formula AutoComplete's list (#686) under the cell being edited: each
+    // name with its kind, the highlighted one marked. Keys drive it (Up/Down
+    // move, Tab inserts, Esc closes); a press inserts that item.
+    if let Some(c) = view.complete_view() {
+        let (er, ec) = view
+            .edit_origin
+            .filter(|o| o.0 == view.active)
+            .map_or(view.sel, |(_, r, c)| (r, c));
+        if let Some(cx0) = col_x(ec) {
+            let y = row_y(er);
+            let mut list = v_flex()
+                .id("fx-complete")
+                .absolute()
+                .left(px(cx0))
+                .top(px(y + SHEET_ROW_H))
+                .min_w(px(200.))
+                .max_h(px(220.))
+                .overflow_y_scroll()
+                .track_scroll(&view.fx_scroll)
+                .bg(hsla_u(0xffffff))
+                .border_1()
+                .border_color(hsla_u(0x9a9a9a))
+                .rounded_sm();
+            for (i, item) in c.list.items.iter().enumerate() {
+                let mark = match item.kind {
+                    gridcore::fcomplete::Kind::Function => "fx",
+                    gridcore::fcomplete::Kind::Name => "nm",
+                    gridcore::fcomplete::Kind::Table => "tb",
+                    gridcore::fcomplete::Kind::Column => "co",
+                    gridcore::fcomplete::Kind::Specifier => "",
+                };
+                let ent_pick = ent.clone();
+                list = list.child(
+                    div()
+                        .id(("fx-complete-item", i))
+                        .flex()
+                        .gap_2()
+                        .px_2()
+                        .py(px(2.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(hsla_u(0x1a1a1a))
+                        .when(i == c.sel, |d| d.bg(hsla_u(0xd2e3fc)))
+                        .hover(|d| d.bg(hsla_u(0xe8f0fe)))
+                        .child(div().w(px(16.)).text_color(hsla_u(0x777777)).child(mark))
+                        .child(SharedString::from(item.label.clone()))
+                        .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                            cx.stop_propagation();
+                            ent_pick.update(cx, |this, cx| this.sheet_complete_pick(i, cx));
+                        }),
+                );
+            }
+            dv_overlay.push(list.into_any_element());
         }
     }
     // AutoFilter buttons (#690): an arrow at the right of each header cell of
@@ -31843,6 +32811,12 @@ fn main() {
     // A converting child (#633): the importer and nothing else, no window.
     if let Some(code) = convert_child::child_main(&std::env::args_os().collect::<Vec<_>>()) {
         std::process::exit(code);
+    }
+    // `--version`: the build block, before the crash hook, the control server or
+    // any window (#1023).
+    if harness::parse_args(std::env::args_os().skip(1)).version {
+        about::print_version();
+        return;
     }
     // First, before anything can panic: the release build has no console, so
     // a panic's only trace is the crash log (#733).

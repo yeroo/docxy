@@ -1,0 +1,43 @@
+test display for review: No Markup and Original are view-only, All and Simple edit
+  open copy:../fixtures/basic.docx
+  type hello
+  assert text is hello
+  assert view.display_mode is all
+  call ribbon-click {"tab":"Review","command":"markupsimple"}
+  assert view.display_mode is simple
+  type a
+  assert text is helloa
+  call ribbon-click {"tab":"Review","command":"markupnone"}
+  assert view.display_mode is none
+  type b
+  assert text is helloa
+  call status-read {}
+  assert reply.items.0.text is "Edit blocked: Display for Review is No Markup or Original; switch to All Markup or Simple Markup to edit."
+  call ribbon-click {"tab":"Review","command":"markuporiginal"}
+  assert view.display_mode is original
+  key backspace
+  assert text is helloa
+  call ribbon-click {"tab":"Review","command":"markupall"}
+  assert view.display_mode is all
+  type c
+  assert text is helloac
+
+test track changes records typing and Resolve / Delete all are on the Review tab
+  open copy:../fixtures/basic.docx
+  type hello
+  call ribbon-click {"tab":"Review","command":"tracktoggle"}
+  call status-read {}
+  assert reply.items.0.text is "Track Changes: On"
+  type there
+  assert text is hellothere
+  call inspect {}
+  assert reply.revisions.found is true
+  call ribbon-click {"tab":"Review","command":"tracktoggle"}
+  call status-read {}
+  assert reply.items.0.text is "Track Changes: Off"
+  call ribbon-click {"tab":"Review","command":"resolvecomment"}
+  call status-read {}
+  assert reply.items.0.text is "Select a comment in the Comments pane first"
+  call ribbon-click {"tab":"Review","command":"deleteallcomments"}
+  call status-read {}
+  assert reply.items.0.text is "Comments: nothing to remove"

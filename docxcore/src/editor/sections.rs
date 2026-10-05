@@ -228,7 +228,7 @@ impl Editor {
         };
         self.set_sect_raw(moved, closing);
         self.caret = Caret::at(vec![block + 1], 0);
-        self.doc.initialize_revision_targets();
+        self.settle_revisions();
         Ok(())
     }
 

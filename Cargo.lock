@@ -101,6 +101,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "buildinfo"
+version = "0.5.0"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -434,6 +438,7 @@ version = "0.5.0"
 dependencies = [
  "arboard",
  "backstagecore",
+ "buildinfo",
  "ctlcore",
  "docxcore",
  "htmlbundle",
@@ -893,6 +898,7 @@ name = "lookxy"
 version = "0.1.0"
 dependencies = [
  "backstagecore",
+ "buildinfo",
  "ctlcore",
  "editcore",
  "image",
@@ -2445,6 +2451,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "backstagecore",
+ "buildinfo",
  "ctlcore",
  "gridcore",
  "image",
@@ -2483,6 +2490,7 @@ name = "yppxy"
 version = "0.1.0"
 dependencies = [
  "backstagecore",
+ "buildinfo",
  "ctlcore",
  "dirs",
  "mppread",

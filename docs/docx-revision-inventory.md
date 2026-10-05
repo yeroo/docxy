@@ -1,6 +1,8 @@
 # DOCX tracked-change support and review semantics
 
-docxy imports WordprocessingML tracked changes as reviewable document state.
+docxy imports WordprocessingML tracked changes as reviewable document state, and
+records new ones while Track Changes is on (see [Track Changes](#track-changes)).
+Display for Review (see [below](#display-for-review)) shows them as Word does.
 Untouched records retain their source metadata and unknown XML, while supported
 records can be accepted or rejected from the terminal Review ribbon or through
 the control/MCP surface. Review changes survive DOCX save and reload.
@@ -69,11 +71,66 @@ returns `unsupported_revision` and does not remove or reinterpret the record.
 Malformed property snapshots similarly return `malformed_revision`. A target
 removed by an earlier action returns `stale_revision`.
 
-docxy reviews imported changes but does not record new edits as tracked changes.
-Consequently, an enforced tracked-changes-only protection mode still fails
-closed for ordinary edits and for accept/reject actions. Move tracking,
-revision balloons, real-time collaboration, authorship configuration, and
-automatic tracking of new edits are out of scope.
+An enforced tracked-changes-only protection mode still fails closed for
+ordinary edits and for accept/reject actions. Move tracking, tracked formatting
+changes (`rPrChange` and the other property records), revision balloons,
+real-time collaboration, and per-reviewer filters are out of scope.
+
+## Track Changes
+
+Review ▸ Track (terminal) and Review ▸ Tracking ▸ Track Changes (suite) turn
+recording on; `doc.track-changes-set` / `docxy_track_changes_set` do the same.
+The state is the document's `<w:trackRevisions/>` setting (written at its
+`CT_Settings` position, removed when turned off), so a file saved with it on
+opens with it on, and the status bar says `Track Changes: On`. Edits are
+recorded as the review identity (the OS user, or the suite's configured name),
+stamped with the time of the edit (UTC), with a `w:id` above every revision and
+comment-marker id in the document.
+
+- **Typing, paste and Replace** record a tracked insertion: ordinary editable
+  text whose runs carry `RunProps::tracked_insert`. Consecutive typing extends
+  one insertion; a save writes it as one `<w:ins>`; it is listed as one
+  revision and Accept / Reject act on all its runs. An insertion that is
+  split (Enter, a table or a section break in the middle of it, a
+  multi-paragraph paste) or interrupted (untracked text typed inside it)
+  becomes one insertion per stretch, each with its own `w:id`, so a reload
+  lists the same revisions. Text loaded from a file keeps its `Inline::Revision` wrapper instead, so
+  loaded `w:ins` text is still not addressable by the caret.
+- **Deletions** (Backspace, Delete, Cut, a selection) move the text into a
+  `<w:del>` with `<w:delText>`; the editor counts it as zero-width, so the caret
+  steps over it, and adjacent deletions by the author merge into one.
+  Deleting text inside the author's own insertion removes it outright, as Word
+  does.
+- **Undo** of a recorded edit restores the exact prior document in one step
+  (typing coalesces into one step as it always has).
+- **Not recorded**, and edited as without tracking: paragraph marks (Enter, and
+  Backspace / Delete across a paragraph boundary), text inside a hyperlink, a
+  field or other one-unit inline, formatting, table structure and a table cell
+  range's Delete. A selection across paragraphs records the deletion of its
+  text in each paragraph (the paragraphs of a table between them included; the
+  table stays) and keeps the paragraph marks. Text deleted from another
+  reviewer's recorded insertion stays inside it (`<w:ins><w:del>`), so Reject
+  All and Original still drop it. `doc.insert` / `doc.append` /
+  `doc.replace-range` with `markdown: true` are refused while Track Changes is
+  on (the splice overwrites whole paragraphs); plain text is recorded. Header and footer edits
+  are not recorded. A copy of recorded text carries no record. Markdown
+  documents refuse Track Changes.
+- The editor never saves its own `RunProps::tracked_insert` as formatting: the
+  underline shown for an insertion is a display cue, not written.
+
+## Display for Review
+
+All Markup (as loaded), Simple Markup, No Markup and Original are a view built
+on a clone (`docxcore::markup::MarkupView`, `Document::markup_view`): never
+saved, never changing the revision list. Simple Markup drops deletions and
+unmarks insertions in place, keeping the document's paragraphs and offsets, so
+it can be edited; No Markup is the text as if every change were accepted and
+Original as if every change were rejected, which merge paragraphs and restore
+text, so they are view-only: edits are refused with a status
+(`ProtectionDenial::DisplayMode`, `protection_denied:display_mode`) until All or
+Simple Markup is chosen. The suite draws tracked changes (underline for
+insertions, strike for deletions) in All Markup; before #625 it drew them as an
+`[image]` chip.
 
 ## Compare
 

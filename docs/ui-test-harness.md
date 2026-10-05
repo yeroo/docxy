@@ -274,7 +274,8 @@ that call GPUI window APIs. `title-tab` calls the same handler methods as the
 title-bar arrows and dropdown items, and `tab-select` calls `select_tab`, the
 tab chip's click handler. `pointer-click`/`pointer-drag` are the hit-testing
 exception (#545): real `PlatformInput` events dispatched through gpui, for
-overlap order a handler call cannot see. `proj.new` calls `add_tab(Kind::Project)`, the
+overlap order a handler call cannot see; `real-key`/`real-type` (#1027) are the
+same for the keyboard, for which root handles a key (`key`/`type` call `on_key`). `proj.new` calls `add_tab(Kind::Project)`, the
 Backstage › New › Project card's handler; F11 also commits the active plan's
 pending cell edit first, and `proj.new` does not.
 
@@ -286,8 +287,8 @@ and cannot see **which elements carry handlers at all**. `drag A1 -> C5` runs
 deferred fill-handle hitbox that sits over the cells, so a case's `assert cells
 unchanged` would stay green if someone put a second handler back on that handle.
 
-The exception is `pointer-click`/`pointer-drag` (#545): they queue real
-`PlatformInput` mouse events on the control reply, and the pump dispatches them
+The exception is `pointer-click`/`pointer-drag` (#545) and `real-key`/`real-type`
+(#1027): they queue real `PlatformInput` mouse and key-down events on the control reply, and the pump dispatches them
 through `Window::dispatch_event` once the entity borrow ends — so hit testing
 runs against the last rendered frame exactly as an OS click would. They exist
 precisely for what handler-calling verbs cannot express: hit order between
@@ -326,16 +327,18 @@ State keys, as the app reports them after every driving verb:
 | `tab`, `title`, `dirty`, `status`, `sheet_tab` | the active tab |
 | `caption`, `read_only`, `protected`, `repaired`, `final` | `final` is a document Word marked as final (#617), locked like Protected View until Edit Anyway and captioned `[Read-Only]`; the active tab's caption as the strip draws it (`book.xlsx [Read-Only]`, or `Report.doc [Compatibility Mode]` for a document imported from Word 97-2003 until Convert, #634) and its open mode; see [Open modes](#open-modes-and-protected-view) |
 | `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor, prompt or dialog is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
-| `dialog` | the active tab's top dialog's id, or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
+| `dialog` | the top dialog's id (the app's own, #1027, else the active tab's), or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
 | `autorecover_minutes` | minutes between AutoRecover writes while a tab is unsaved; `0` is off |
 | `keep_drafts` | whether Don't Save keeps a workbook's last AutoRecover copy as a draft |
 | `user_name`, `user_initials` | Settings' User name and Initials for new comments (#620); empty falls back to the OS account name and initials derived from it |
-| `sheet_editing` | Settings' Sheet editing options (#672), by their `session.json` keys: `edit_fixed_decimal`, `edit_fixed_decimal_places`, `edit_move_after_enter`, `edit_move_direction` (`down`/`right`/`up`/`left`), `edit_in_cell`, `edit_autocomplete`, `edit_fill_handle` |
+| `sheet_editing` | Settings' Sheet editing options (#672), by their `session.json` keys: `edit_fixed_decimal`, `edit_fixed_decimal_places`, `edit_move_after_enter`, `edit_move_direction` (`down`/`right`/`up`/`left`), `edit_in_cell`, `edit_autocomplete`, `edit_fill_handle`, `edit_flash_fill_auto`, `edit_formula_autocomplete` |
 | `fx_expanded` | whether Ctrl+Shift+U has expanded the sheet formula bar |
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
+| `flash_preview` | Flash Fill's greyed preview after the second example is typed (#666, ENT-105): `{range, values}`, the cells it covers and the values Enter writes, or null. Any other key, an edit or a selection change (mouse and Tab included) drops it for good: moving back does not revive it. Ctrl+E and Data › Flash Fill fill without one; no pattern opens the `flash-fill` message dialog (`dialog-read`, OK closes it), and the Flash Fill Options menu is `menu-open "flash-fill"` while the last fill stands |
+| `completions` | Formula AutoComplete's list under a formula being typed (#686): `{items: [labels], sel}` (`sel` the highlighted index), or null while none shows. Up/Down move `sel`, Tab inserts it, Esc closes the list and leaves the editor open; Alt+Down opens it on demand |
 | `comment_edit` | the sheet comment editor's text (`null` when closed) |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
 | `field`, `field_text` | the focused reference field, and its buffer |
@@ -380,7 +383,8 @@ right}` (grid columns; `null` when the selection is not across cells), and
 describes that one table: a selection from an outer table's cell into a table
 nested in another cell reports the nested table, with `range` `null` (the
 range belongs to the outer table, which the table commands act on). `view`
-carries `gridlines`, the Table Layout tab's View Gridlines.
+carries `gridlines`, the Table Layout tab's View Gridlines, and `display_mode`,
+Display for Review (`all`, `simple`, `none` or `original`).
 
 `mail` is the tab's mail merge (#628): `doc_type` (`Letters`, `E-mail
 Messages`, `Envelopes`, `Labels`, `Directory`, or `null` for a Normal Word
@@ -434,6 +438,8 @@ footer editor; `selection-set` refuses while it is open.
 | `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command on a valid tab, contextual tabs included, by id, else by unique label, else by unique screentip title, and invoke the same action handler as its button |
 | `status-read {}` | read the tab's status line as an ordered `items` array of `{id, text}`: on a Project tab `state` (Ready/Edit/Busy), `new-tasks` (`New Tasks: …`) and `message`; on other tabs only `message` (a document's word-count stats are not reported) |
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items (`Info` only while the active tab is a document); `close` returns to the tab |
+| `app-info {}` | the build this suite is (#1023): `{version, commit, short_commit, commit_len, commit_hex, branch, commit_date, dirty, last_pr, last_pr_title, issue, ahead, built_at, profile, target, host, kind, manual, summary}`; `kind` is `release`, `ci` or `local`, `manual` is `kind == local \|\| dirty`. Served by normal Project control too |
+| `account {"action":"open"}` | File > Account while the backstage is open (#1023): `open` is the rail item's handler, `about` the page's About docxy suite button, `read` only reports. The About dialog is an ordinary dialog (`dialog-read`, `dialog-click {"button":"Copy"}` copies the build text to the private clipboard and leaves it open, `Close` or Escape closes it); its controls are the build's rows, headed by a `manual` row on a manual build. Replies `{open, line, manual, badge}`; `badge` is whether the "Manual build" badge was drawn in the last frame (its own probe), so read it after a settled frame (`shot window`), not in the same call that opened the page |
 | `convert {}` | File > Info > Convert on the active tab (#634), the same handler as the page's button: an imported Word 97-2003 document leaves Compatibility Mode (`compatibilityMode` 15 on the next save), its caption drops ` [Compatibility Mode]` and it is dirty. Answers `{status, caption, dirty}`; refused, with the tab's status line saying why, on a tab that is not in Compatibility Mode or not a document |
 | `inspect {}` | File > Info > Inspect Document on the active document tab (refused for any other tab): `{comments:{found,count}, revisions:{found,count}, hidden:{found,count,unremovable}, properties:{found}}`; hidden's `count` includes the `unremovable` runs inside tracked moves, fields, a group shape's other text boxes or other preserved XML (`w:customXml`, unmodeled blocks), which Remove All leaves in place. With `"remove":"comments"` (or `revisions`, `hidden`, `properties`) it runs that category's Remove All, the same handler as the page's button, and adds the `status` line it left; revisions are accepted. A category not found changes nothing but the tab's status line, which says `<Category>: nothing to remove`; the Info page shows the last Remove All's line under its rows |
 | `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
@@ -441,7 +447,7 @@ footer editor; `selection-set` refuses while it is open.
 | `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
 | `tab-list {}` | read every open tab in strip order: `{active, tabs:[{index, title, kind, path, dirty, imported, caption, read_only, protected, final, repaired}]}`. `kind` is `docx`, `xlsx`, `project` or `mail`; `path` is `null` for a tab never saved; `imported` is true for a Project read from `.mpp` and for a document whose file is a Word 97-2003 binary it was imported from (#634; a `.doc`, or one renamed), until a save rebinds the tab to the file it wrote |
 | `tab-select {"tab":"schedule"}` | make a tab active as clicking its chip does, and reply with the state. `tab` is an index or a case-insensitive title/path substring over **all** tabs, the rule the `proj.*` verbs use; a miss (`no tab matches 'x'`), an ambiguous match (`several tabs match 'x' (2, 3)`) and an index past the end (`no tab at index 9`) are refused. The Backstage stays as it was, as it does for a chip click |
-| `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog; a press reaches an open menu's own item or backdrop, so it does not pre-close menus |
+| `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point; or `{"at":"user-name-row"}`: Backstage's User name... row, #1027); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog, except the `{"dialog-field":"user-name","x":N}` form (#1027), which clicks the open dialog's text field `N` pixels in from its left edge (its middle without `x`) and replies `{x, y}`; a press reaches an open menu's own item or backdrop, so it does not pre-close menus |
 | `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 8 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The drag arms once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of about 2.25px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
 | `proj.new {}` | make a blank Project and activate it, as Backstage › New › Project does; replies with `proj.path` for it (`tab`, `path: null`, `name: Project1`, 0 `tasks`, `imported`, the cell state). It takes no `tab` and no `name`: the plan is the app's, so name it by saving it (`proj.save {"path":…}`). The Project control server accepts it too |
 | `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
@@ -542,10 +548,43 @@ Recover Unsaved Workbooks does. The ignored desktop test in
 `uiharness/tests/autorecover.rs` walks the issue's scenario.
 
 `call user-name {}` opens Settings' User name... dialog (#620) on the active
-tab, as the backstage row does: `dialog-set` its `user-name` and `initials`
+tab (or the app's own stack when no document is open, #1027), as the backstage
+row does: `dialog-set` its `user-name` and `initials`
 fields and `dialog-click` OK to store and persist them. New Word comments are
 stamped with that name and those initials (else the OS account name, else
 `docxy`, with initials derived from the name) and the UTC time.
+
+`key` and `type` call the key handler directly, so they pass when a window root
+has no key handler. `call real-key {"key":"ctrl+a"}` (or `"keys":[...]`) and
+`call real-type {"text":"…"}` queue the same strokes as real `KeyDown` input,
+which gpui dispatches through the focused window root and its bound actions
+(Tab, Shift+Tab) as the OS's keys go. `call pointer-click {"dialog-field":"user-name"}`
+clicks the open dialog's text field (`"x":N` pixels in from its left edge, else
+its middle), which focuses it and puts the caret under the click; it needs a
+drawn frame, so `shot window` first. `call pointer-click {"at":"user-name-row"}`
+clicks Backstage's User name... row (open File first). Keys pressed in
+Backstage with no dialog up edit nothing under it. `call comments {}` reads the
+active document's comments `{comments:[{id,author,initials,text}]}`. The cases are in
+`uiharness/cases/user-name.uit`; `user-name-no-document.uit` closes every tab,
+so it has its own file (cases in one file share one instance).
+
+`call autocorrect {}` opens Settings' AutoCorrect Options... dialog (#667,
+id `autocorrect`) on the active tab, as the backstage row does. Its tabs are
+AutoCorrect, AutoFormat As You Type, Actions and Math AutoCorrect; each
+switch is a checkbox named by its `session.json` key (`ac_replace_text`,
+`ac_hyperlinks`, …). `dialog-set` `replace` and `with` and press Add: a new
+word is added at once; a word already listed with another With opens
+`autocorrect-redefine` ("Do you want to redefine it?", Yes/No) first.
+Choosing an item of `entries` fills Replace and With, and Delete removes it.
+Exceptions... opens `autocorrect-exceptions` (tabs First Letter and INitial
+CAps, fields `first-word`/`caps-word`, lists `first-list`/`caps-list`, Add,
+Delete, OK). Add, Delete and the exceptions take effect at once, as Office's
+do; the checkboxes apply with OK, and Cancel keeps them. All of it persists
+with the Sheet editing options. A typed URL, `www.` address, e-mail address
+or UNC path becomes a hyperlink while `ac_hyperlinks` is on; such a
+hyperlink lives in the workbook model (clickable, undoable) but is not yet
+written to the file, since the xlsx writer keeps only the hyperlinks a file
+already had (a follow-up).
 
 `project-tabs.uit` drives several plans at once: a blank one from `proj.new`
 that takes tasks without a fixture, two opened plans switched between by title
@@ -650,6 +689,11 @@ case). `cell` reads a task a collapsed summary hides (its reply's `cell` and
 `row` are then `null`); `click-cell` refuses one, since nothing is drawn to
 click. Giving both `cell` and `uid` is an error. The Project `cell` reply adds
 the task's `id` and `uid`, and `entry: true` on the entry row, which reads empty.
+On a sheet, `call cell {"cell":"B2"}` replies `{cell, row, col, text, value,
+empty, hyperlink}`: `text` is what the cell shows, `value` its input text (a
+formula with its `=`, a text a typed entry would read otherwise with its `'`,
+so a Flash Filled `'042` reads as text), and `hyperlink` its link target or
+null (#667).
 
 `call rows {}` lists the rows the entry table draws, top to bottom, without the
 entry row; an optional `tab` picks a Project tab as the control verbs do, without
@@ -980,7 +1024,16 @@ Menus open today:
 - **the cell menu** on a sheet (#690, #691): right-click a cell. A cell outside
   the selection is selected first (no link followed; while a formula or a range
   field is pointing, nothing moves). It lists Cut, Copy, Paste, the Filter and
-  Sort submenus and New Comment, each a sheet command as the ribbon runs it;
+  Sort submenus, New Comment and Pick From Drop-down List..., each a sheet
+  command as the ribbon runs it;
+- **the pick list** on a sheet (#665): Alt+Down, the cell menu's Pick From
+  Drop-down List..., or `menu-open "pick-list"`. One item per distinct text of
+  the column's block, sorted, nothing highlighted until Down (Enter then enters
+  the highlighted one); the menu scrolls and holds at most 10,000 entries;
+- **the Flash Fill Options menu** on a sheet (#666): the ⚡ button by the last
+  filled cell, or `menu-open "flash-fill"` while the fill stands. Undo Flash
+  Fill, Accept suggestions, Select all N blank cells, Select all N changed
+  cells;
 - **the Mailings tab's drop-downs** on a document (#628): Start Mail Merge,
   Select Recipients, Insert Merge Field (the attached list's columns), Rules,
   Finish & Merge, and the Preview Results record box (the attached rows).
@@ -1013,8 +1066,8 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment; #690, #691), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619) | the menu, as `menu-read` |
-| `menu-read` | `{}` | `{open: true, target, items}`, or `{open: false}` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619) | the menu, as `menu-read` |
+| `menu-read` | `{}` | `{open: true, target, items, highlight}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null |
 | `menu-click` | `{label}` among the top-level items, `{path: [labels]}` through submenus, or `{index}`: the top-level item at that 0-based index, separators and headings not counted, for labels that repeat | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
 
@@ -1082,15 +1135,19 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,
 `inspect` with `remove`,
 `theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `user-name`,
-`trusted-clear`,
+`autocorrect`, `trusted-clear`,
 `open-draft`,
 `enable-editing`, `edit-anyway`, `close-window` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 
-While a menu is open it takes every key: Esc closes it, and so, until menus
-take arrows and Enter, does any other key, Tab included. None reaches the
-document or cell under it. A press outside the menu closes it too.
+While a menu is open it takes every key. Down and Up move its highlight over
+the items that can run (past separators, headings and disabled items, wrapping
+at the ends; from none, Down takes the first and Up the last), and Enter runs
+the highlighted item — or opens its submenu in the menu's place — or, with
+nothing highlighted, closes the menu. Esc closes it, and so does any other key,
+Tab included. None reaches the document or cell under it. A press outside the
+menu closes it too.
 `project-menus.uit` drives all three menus.
 
 ### Headers and footers

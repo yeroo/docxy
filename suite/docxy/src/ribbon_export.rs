@@ -267,6 +267,8 @@ pub(crate) fn docx_snapshot() -> Result<String, String> {
     // Not a document rail: the editable-HTML page has no Info page (#627),
     // so its snapshot keeps the rail it can act on.
     let backstage: Vec<Value> = crate::backstage_rail_items(false, false)
+        // Nor an Account page (#1023): the editable-HTML page is not stamped.
+        .filter(|item| !matches!(item.action, crate::BackstageRailAction::Account))
         .map(|item| {
             json!({
                 "id": item.id,
@@ -279,6 +281,7 @@ pub(crate) fn docx_snapshot() -> Result<String, String> {
                     crate::BackstageRailAction::Save => "save",
                     crate::BackstageRailAction::SaveAs => "saveAs",
                     crate::BackstageRailAction::Export => "export",
+                    crate::BackstageRailAction::Account => "account",
                     crate::BackstageRailAction::Close => "close",
                 },
             })
