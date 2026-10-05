@@ -9312,7 +9312,7 @@ impl Docxy {
             // nothing happens and the tab stays clean.
             QatAction::Redo => {
                 let ready = match self.edit_target_and_repeat() {
-                    (Some(ed), rec) => ed.can_redo() || repeat_ready(ed, &rec),
+                    (Some(ed), rec) => ed.can_redo() || repeat_ready(ed, rec),
                     (None, _) => false,
                 };
                 if !ready {
@@ -20290,7 +20290,7 @@ fn break_typing_unless_continuing(ed: &mut Editor, rec: &Option<RepeatRecord>) {
             && !r.selecting
             && !ed.has_selection()
             && ed.caret == r.caret
-    }) && repeat_ready(ed, &rec);
+    }) && repeat_ready(ed, rec);
     if !continuing {
         ed.break_undo_group();
     }
@@ -20312,7 +20312,7 @@ fn redo_or_repeat(ed: &mut Editor, rec: &mut Option<RepeatRecord>) -> bool {
     if ed.can_redo() {
         return ed.redo();
     }
-    let Some(r) = rec.clone().filter(|_| repeat_ready(ed, &rec)) else {
+    let Some(r) = rec.clone().filter(|_| repeat_ready(ed, rec)) else {
         return false;
     };
     let since = docxcore::editor::undo_serial_counter();
