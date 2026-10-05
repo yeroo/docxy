@@ -2361,7 +2361,13 @@ fn exit_commits_typed_sheet_rename_and_follows_chart_refs() {
 }
 
 #[test]
-fn exit_leaves_cf_dv_and_rowh_buffers_unapplied() {
+fn tab_level_exit_commits_leave_cf_dv_and_rowh_alone() {
+    // What this pins: the tab-level exit commits (`commit_comment_buffer_for_exit`,
+    // `commit_rename_buffer`) never touch conditional formats, validations or
+    // row heights. The other half of the decision — that the app drops the
+    // cf/dv/rowh BUFFERS without committing them — lives in
+    // `Docxy::commit_dialog_buffers_for_exit` over gpui state and has no
+    // suite-level guard (same seam as the chart field, agreed in pin 4).
     let mut t = tab(Kind::Xlsx);
     {
         let Surface::Sheet(v) = &mut t.surface else {
@@ -2431,6 +2437,8 @@ fn exit_with_empty_comment_buffer_does_not_dirty_clean_tab() {
         "Jane Doe",
         "Check this"
     ));
+    // The delete must be what dirties: reset, then commit the empty buffer.
+    t.dirty = false;
     assert!(commit_comment_buffer_for_exit(&mut t, "Jane Doe", ""));
     assert!(t.dirty);
     assert!(cell_comment(&t).is_none());
@@ -2481,4 +2489,90 @@ fn exit_does_not_edit_a_protected_sheet() {
         };
         assert_eq!(v.pkg.workbook.sheets[0].name, old);
     }
+}
+
+#[test]
+fn exit_with_unchanged_rename_buffer_leaves_clean_tab_clean() {
+    let mut t = tab(Kind::Xlsx);
+    let name = {
+        let Surface::Sheet(v) = &t.surface else {
+            panic!()
+        };
+        v.pkg.workbook.sheets[0].name.clone()
+    };
+    // The rename bar seeds the buffer with the sheet's name; a bar merely
+    // OPEN at exit must not dirty the tab or rewrite the workbook — the
+    // taken-name check looks at the OTHER sheets, so `rename_sheet` itself
+    // would take the same-name rename.
+    assert!(!commit_rename_buffer_for_exit(&mut t, 0, &name));
+    assert!(!commit_rename_buffer_for_exit(
+        &mut t,
+        0,
+        &format!(" {name} ")
+    ));
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.pkg.workbook.sheets[0].name, name);
+
+    // A case-only rename is not "unchanged" — the compare is exact — so it
+    // still commits and is taken (only names the other sheets hold decline).
+    let case = name.to_lowercase();
+    assert_ne!(case, name);
+    assert!(commit_rename_buffer_for_exit(&mut t, 0, &case));
+    assert!(t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.pkg.workbook.sheets[0].name, case);
+}
+
+#[test]
+fn exit_with_unchanged_prefilled_comment_keeps_author_undo_and_clean_tab() {
+    let mut t = tab(Kind::Xlsx);
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.sel = (0, 0);
+    }
+    // A colleague's comment, opened in the bar to read: the buffer is seeded
+    // with the note's text. Exiting with it untouched must not restamp the
+    // author, spend an undo step, or dirty the tab — committing would do all
+    // three for nothing.
+    assert!(commit_comment_buffer(&mut t, "Jane Doe", "Original note"));
+    t.dirty = false;
+    assert!(!commit_comment_buffer_for_exit(
+        &mut t,
+        "John Smith",
+        "Original note"
+    ));
+    assert!(!commit_comment_buffer_for_exit(
+        &mut t,
+        "John Smith",
+        "  Original note  "
+    ));
+    assert!(!t.dirty);
+    {
+        let Surface::Sheet(v) = &t.surface else {
+            panic!()
+        };
+        let cm = v
+            .pkg
+            .comments()
+            .into_iter()
+            .find(|cm| cm.sheet == v.active && cm.row == 0 && cm.col == 0)
+            .expect("the comment");
+        assert_eq!(cm.text, "Original note");
+        assert_eq!(cm.author, "Jane Doe");
+    }
+    // Undo holds exactly the one step Jane's commit took: the skipped commit
+    // added none (the second undo finds nothing).
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    assert!(v.undo_step());
+    assert!(!v.undo_step());
+    assert!(cell_comment(&t).is_none());
 }

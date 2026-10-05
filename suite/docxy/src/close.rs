@@ -154,6 +154,30 @@ pub(crate) fn commit_rename_buffer(tab: &mut DocTab, idx: usize, buf: &str) -> b
     true
 }
 
+/// The exit path's rename commit ([`commit_rename_buffer`] minus one quirk).
+/// The rename bar seeds its buffer with the sheet's current name, so a merely
+/// OPEN bar holds an unchanged buffer — and `rename_sheet` takes a same-name
+/// rename (its taken-name check looks at the OTHER sheets), which would dirty
+/// the tab and ask about a change that never happened. So a buffer that
+/// equals the current name is skipped; the compare is on the trimmed buffer,
+/// exact, so a case-only rename still commits. Enter's path keeps the quirk,
+/// Must-not-change.
+pub(crate) fn commit_rename_buffer_for_exit(tab: &mut DocTab, idx: usize, buf: &str) -> bool {
+    let unchanged = match &tab.surface {
+        Surface::Sheet(v) => v
+            .pkg
+            .workbook
+            .sheets
+            .get(idx)
+            .is_some_and(|s| s.name == buf.trim()),
+        _ => true,
+    };
+    if unchanged {
+        return false;
+    }
+    commit_rename_buffer(tab, idx, buf)
+}
+
 /// What the cell-comment bar's Enter commits: the buffer onto the selected
 /// cell, an empty one deleting the comment there. `false` — nothing changed —
 /// when the tab takes no edits or isn't a workbook; a damaged sheet's refusal
@@ -174,23 +198,30 @@ pub(crate) fn commit_comment_buffer(tab: &mut DocTab, author: &str, text: &str) 
     true
 }
 
-/// The exit path's comment commit ([`commit_comment_buffer`] minus one quirk).
-/// Enter marks the tab dirty whenever its commit returns `true`, and an empty
-/// buffer returns `true` even when there is no comment to delete — harmless
-/// for a keypress, but at exit the bar may merely have been OPEN on such a
-/// cell, and a dirty tab then asks about changes that never happened. So the
-/// one case where the commit cannot change anything (an empty buffer on a
-/// cell with no comment) is skipped; a cell WITH a comment still commits —
-/// the empty buffer deletes it, as Enter would.
+/// The exit path's comment commit ([`commit_comment_buffer`] minus two
+/// quirks). Enter marks the tab dirty whenever its commit returns `true`, and
+/// its commit returns `true` even when nothing changes — an empty buffer
+/// deletes a comment that isn't there, and a re-set comment restamps its
+/// author — harmless for a keypress, but at exit the bar may merely have been
+/// OPEN (to read a colleague's note, say), and a dirty tab then asks about
+/// changes that never happened. So the commit is skipped in the two cases
+/// where it cannot change anything (`commit_changed_cell`'s seeded-and-
+/// unchanged rule): an empty buffer on a cell with no comment, and a buffer
+/// that equals the comment already there. A cell WITH a comment and an empty
+/// buffer still commits — that deletes, as Enter would.
 pub(crate) fn commit_comment_buffer_for_exit(tab: &mut DocTab, author: &str, text: &str) -> bool {
     let noop = match &tab.surface {
         Surface::Sheet(v) => {
-            text.trim().is_empty()
-                && !v
-                    .pkg
-                    .comments()
-                    .iter()
-                    .any(|cm| cm.sheet == v.active && cm.row == v.sel.0 && cm.col == v.sel.1)
+            let trimmed = text.trim();
+            match v
+                .pkg
+                .comments()
+                .iter()
+                .find(|cm| cm.sheet == v.active && cm.row == v.sel.0 && cm.col == v.sel.1)
+            {
+                Some(cm) => cm.text == trimmed,
+                None => trimmed.is_empty(),
+            }
         }
         _ => true,
     };
@@ -548,7 +579,11 @@ impl Docxy {
     /// live on the tabs and are folded by [`commit_pending_for_exit`]; what
     /// remains lives on the app: the cell-comment bar, the sheet-rename bar
     /// and a Chart panel range field. All three commit, as their Enter would
-    /// ([`ref_commit`] changes nothing on an invalid ref). The app's
+    /// ([`ref_commit`] changes nothing on an invalid ref) — unless the buffer
+    /// is the seed and untouched (a bar or field merely OPEN), in which case
+    /// committing would dirty the tab, restamp a comment's author, or rebuild
+    /// a chart for nothing; that skip is the rule `commit_changed_cell`
+    /// already follows for the cell editor. The app's
     /// rule/format bars (conditional formatting, data validation, row height)
     /// and their range fields are NOT committed — a half-typed rule would
     /// apply formatting the user never confirmed — and drop as Esc would.
@@ -567,12 +602,18 @@ impl Docxy {
         }
         if let Some((idx, buf)) = self.sheet_rename.take() {
             if let Some(t) = self.tabs.get_mut(self.active) {
-                commit_rename_buffer(t, idx, &buf);
+                commit_rename_buffer_for_exit(t, idx, &buf);
             }
         }
         if let Some(f) = self.range_edit.take()
             && !f.target.is_bar()
             && !self.active_locked()
+            // Seeded and untouched, the rule the cell editor and the comment
+            // bar follow: a merely focused field holds its seed text, and
+            // committing that can rebuild a file-loaded chart's cached data
+            // (`chart_apply_range` re-reads the cells), marking it edited and
+            // regenerating — losing — its unmodeled part on save.
+            && self.ref_field_seed(f.target).is_none_or(|seed| seed != f.buf)
         {
             self.ref_commit(f.target, &f.buf, cx);
             // What Esc does when the field goes: its last commit's message
