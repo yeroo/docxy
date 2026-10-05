@@ -152,6 +152,7 @@ fn commit_changed_cell(tab: &mut DocTab) -> Result<(), String> {
             // a document's Repeat record is stale after it (#618).
             crate::bump_edit_generation();
             v.anchor = v.sel;
+            v.clear_areas();
         }
     }
     Ok(())

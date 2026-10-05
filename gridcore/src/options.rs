@@ -196,6 +196,76 @@ impl EditOptions {
     }
 }
 
+/// The persisted key of one custom list (File › Options › Advanced › Edit
+/// Custom Lists, #668): one `edit_custom_list=a,b,c` line per list, a `,` or
+/// `\` inside an item escaped with `\`.
+pub const KEY_CUSTOM_LIST: &str = "edit_custom_list";
+
+/// The user's custom lists in a preferences text, in order; empty lists and
+/// items are dropped.
+pub fn custom_lists_from_text(text: &str) -> Vec<Vec<String>> {
+    text.lines()
+        .filter_map(|line| {
+            let (k, v) = line.split_once('=')?;
+            (k.trim() == KEY_CUSTOM_LIST).then(|| split_list(v))
+        })
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// `lists` as `key=value` lines, each ending in `\n`; what
+/// [`custom_lists_from_text`] reads back. A backslash, comma or line break
+/// in an item is escaped, so an item imported from a cell with a line break
+/// keeps its list on one line (#707 r6 m1).
+pub fn custom_lists_to_lines(lists: &[Vec<String>]) -> String {
+    let mut out = String::new();
+    for list in lists.iter().filter(|l| !l.is_empty()) {
+        let items: Vec<String> = list
+            .iter()
+            .map(|i| {
+                i.replace('\\', "\\\\")
+                    .replace(',', "\\,")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+            })
+            .collect();
+        out.push_str(&format!("{KEY_CUSTOM_LIST}={}\n", items.join(",")));
+    }
+    out
+}
+
+fn split_list(v: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut cur = String::new();
+    let mut chars = v.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some('n') => cur.push('\n'),
+                Some('r') => cur.push('\r'),
+                next => cur.extend(next),
+            },
+            ',' => items.push(std::mem::take(&mut cur)),
+            _ => cur.push(ch),
+        }
+    }
+    items.push(cur);
+    items
+        .into_iter()
+        .map(|i| i.trim().to_string())
+        .filter(|i| !i.is_empty())
+        .collect()
+}
+
+/// The items an Edit Custom Lists entry box holds: one per line, or
+/// separated by commas.
+pub fn parse_list_entries(text: &str) -> Vec<String> {
+    text.split(['\n', ','])
+        .map(|i| i.trim().to_string())
+        .filter(|i| !i.is_empty())
+        .collect()
+}
+
 pub(crate) fn parse_bool(v: &str) -> Option<bool> {
     match v {
         "1" => Some(true),
@@ -300,5 +370,68 @@ mod tests {
             ..EditOptions::default()
         };
         assert_eq!(o.fixed_places(), Some(-2));
+    }
+
+    /// #707 (4th update): the editing options, the custom lists and the
+    /// AutoCorrect lines share one preferences text, each reader taking its
+    /// own keys, whatever the others' values hold (`=`, `,`, `\`, a tab).
+    #[test]
+    fn options_custom_lists_and_autocorrect_share_one_text() {
+        use crate::autocorrect::AutoCorrect;
+        let opts = EditOptions {
+            flash_fill_auto: false,
+            formula_autocomplete: false,
+            ..EditOptions::default()
+        };
+        let lists = vec![
+            vec!["a=b".to_string(), "c,d".into(), "e\\f".into()],
+            vec!["x".to_string(), "y\nz".into()],
+        ];
+        let mut ac = AutoCorrect::default();
+        ac.add("(zz)", "a=b, c\\d").unwrap();
+        let text = format!(
+            "{}{}{}",
+            opts.to_lines(),
+            custom_lists_to_lines(&lists),
+            ac.to_lines()
+        );
+        assert_eq!(EditOptions::from_text(&text), opts);
+        assert_eq!(custom_lists_from_text(&text), lists);
+        assert_eq!(AutoCorrect::from_text(&text).to_lines(), ac.to_lines());
+        // Either side's text alone still reads.
+        let ours = format!("{}{}", opts.to_lines(), custom_lists_to_lines(&lists));
+        assert_eq!(custom_lists_from_text(&ours), lists);
+        assert_eq!(
+            AutoCorrect::from_text(&ours).to_lines(),
+            AutoCorrect::default().to_lines()
+        );
+        assert!(
+            custom_lists_from_text(&format!("{}{}", opts.to_lines(), ac.to_lines())).is_empty()
+        );
+    }
+
+    #[test]
+    fn custom_lists_round_trip_and_escape_commas() {
+        let lists = vec![
+            vec!["North".to_string(), "East".into(), "South".into()],
+            vec!["a, b".to_string(), "c\\d".into()],
+            // Imported from cells with line breaks (#707 r6 m1).
+            vec![
+                "two\nlines".to_string(),
+                "cr\r\nlf".into(),
+                "back\\n".into(),
+            ],
+        ];
+        let text = custom_lists_to_lines(&lists);
+        assert_eq!(text.lines().count(), 3, "{text}");
+        assert_eq!(custom_lists_from_text(&text), lists);
+        // Alongside the other options, each reader takes its own keys.
+        let both = format!("{}{text}", EditOptions::default().to_lines());
+        assert_eq!(custom_lists_from_text(&both), lists);
+        assert_eq!(EditOptions::from_text(&both), EditOptions::default());
+        assert_eq!(
+            parse_list_entries("Low\n Mid ,High,,"),
+            vec!["Low", "Mid", "High"]
+        );
     }
 }

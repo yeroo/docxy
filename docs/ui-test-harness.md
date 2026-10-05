@@ -182,8 +182,8 @@ cold start, and every accepted and rejected form is a unit test.
 | `open copy:"<path>" as <name>` | copy the same fixture under a distinct plain filename (no separators or `..`), so a case can open multiple tabs without the suite focusing an existing path; quotes keep a source path containing ` as ` unambiguous |
 | `call <verb> <json-object>` | send a raw control request, including Project verbs such as `call task.set {"uid":2,"duration":"3d"}`. JSON is parsed before launch and retained verbatim, including quoted `#`; trailing comments are not allowed. Non-object/invalid JSON is a script error; a refused request is an `ERROR` with the server message |
 | `call-error <verb> <json-object> => <message>` | require the app to refuse the request with a message containing the given text; a successful request or different refusal fails the step |
-| `click <cell> [shift] [double]` | the cell's click handler (press, click, release) |
-| `drag <from> -> <to>` | press, one move per cell crossed, release. `to` and a bare space read the same |
+| `click <cell> [shift] [double] [ctrl]` | the cell's click handler (press, click, release); `ctrl` adds an area |
+| `drag <from> -> <to> [ctrl]` | press, one move per cell crossed, release; `ctrl` adds an area. `to` and a bare space read the same |
 | `type <text>` | one key event per character. The text is taken verbatim between its ends; the whitespace on either side of it is trimmed, so `type   =SUM(` types `=SUM(` |
 | `key <k> [k…]` | those keys, in order: `escape`, `enter`, `tab`, `up`, `alt`, `f2`, `ctrl+c`, `shift+down`, … (`tab` and `shift+tab` go through the app's bound *action*, which is where gpui sends them — see below) |
 | `select chart <n>` | the press on a chart card, counting from 0 |
@@ -334,7 +334,10 @@ State keys, as the app reports them after every driving verb:
 | `sheet_editing` | Settings' Sheet editing options (#672), by their `session.json` keys: `edit_fixed_decimal`, `edit_fixed_decimal_places`, `edit_move_after_enter`, `edit_move_direction` (`down`/`right`/`up`/`left`), `edit_in_cell`, `edit_autocomplete`, `edit_fill_handle`, `edit_flash_fill_auto`, `edit_formula_autocomplete` |
 | `fx_expanded` | whether Ctrl+Shift+U has expanded the sheet formula bar |
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
-| `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
+| `sheet`, `sel`, `anchor`, `range` | the sheet and its selection (`range` is the active area) |
+| `areas` | every area of the selection as A1 ranges, the active one last (#670); one entry for a one-area selection |
+| `fill_options`, `paste_options` | the Auto Fill Options (#668) or Paste Options (#669) button's current choice (`Auto Fill`, `Copy Cells`, …; `Paste`, `Values`, …), or `null` when no button shows |
+| `office_clipboard` | how many items the Office Clipboard holds (#669) |
 | `editing`, `edit` | whether a cell edit is open, and its text |
 | `flash_preview` | Flash Fill's greyed preview after the second example is typed (#666, ENT-105): `{range, values}`, the cells it covers and the values Enter writes, or null. Any other key, an edit or a selection change (mouse and Tab included) drops it for good: moving back does not revive it. Ctrl+E and Data › Flash Fill fill without one; no pattern opens the `flash-fill` message dialog (`dialog-read`, OK closes it), and the Flash Fill Options menu is `menu-open "flash-fill"` while the last fill stands |
 | `completions` | Formula AutoComplete's list under a formula being typed (#686): `{items: [labels], sel}` (`sel` the highlighted index), or null while none shows. Up/Down move `sel`, Tab inserts it, Esc closes the list and leaves the editor open; Alt+Down opens it on demand |
@@ -483,8 +486,10 @@ implemented`) instead of replying green over a no-op. `ribbon-click` resolves
 by id, else label, else the drawn text (`Σ AutoSum`), selects the tab and runs
 the button's own `run_sheet_act`. Buttons that open a bar (Filter, Custom
 Sort, Data Validation, …) leave it open for `type` and `key enter`, as a click
-does. The sheet ribbon has no split buttons, so `menu-open {"ribbon": …}`
-refuses a sheet tab. `sheet-ribbon.uit` covers these.
+does. Home's Paste is a split button, and Fill, Clear and Find & Select open
+menus (#707): `menu-open {"ribbon": [tab, group, command]}` opens them, and a
+`ribbon-click` of Fill, Clear or Find & Select opens its menu as the click
+does. `sheet-ribbon.uit` covers these.
 
 Levelling (Level, Level All, Clear Leveling, Ctrl+Shift+L) is asked for, not
 run, so the Project status bar can draw `Busy`; render schedules the pass for
@@ -724,7 +729,9 @@ pointer on a few pixels, each driven through the app's own handlers (#699).
 | `save-as {"path":"out.md"}` | Save As the active tab to `path` without the native dialog: the path goes to the same save function the dialog's answer feeds (`save_doc_to`, `save_sheet_as`, `save_project_to`), and the tab is rebound (title, path, clean, a document's Markdown flag) exactly as after a dialog Save As. Optional `format` and `overwrite` |
 | `clipboard {"action":"read"}` | the clipboard's text and what the active tab's paste would use |
 | `clipboard {"action":"write","text":"a\tb\n"}` | put text on the clipboard, as another app's copy would |
-| `fill-drag {"from":"B4:B5","to":"B8"}` | press the fill handle, cross each cell to `to`, release. Optional `from` |
+| `fill-drag {"from":"B4:B5","to":"B8"}` | press the fill handle, cross each cell to `to`, release. Optional `from`, `option`, `ctrl`, `right`, `double` (#668) |
+| `border-drag {"from":"B2:B3","to":"J2"}` | press the selection's edge, drop the block with its top-left on `to` (#670). Optional `from`, `ctrl`, `right`, `choice`, `replace` |
+| `office-clipboard {"action":"open"}` | the Office Clipboard pane's own handlers (#669): `read` (the default), `open`, `close`, `paste` item `index`, `paste-all`, `clear-all`, `delete` item `index`. Replies `{open, items, state}`. It collects sheet copies and cuts only, not a document's |
 
 **`save-as`.** `path` is required; a relative one resolves against the folder
 of the tab's own file, where the dialog would open, so after `open copy:` it
@@ -771,14 +778,33 @@ is `none`, and a paste does nothing. The exception is a document copy of only
 an image, whose own text is empty: its clip stays ours.
 `write` needs `text` (an empty one is such a copy) and replies the same. Copy, cut and paste are the app's own keys and
 buttons (`key ctrl+c`, `ribbon-click {"tab":"Home","command":"Copy"}`), not
-actions of this verb, which refuses them and `paste-special` (`paste special is
-not implemented in this app`). `clipboard.uit` covers these.
+actions of this verb, which refuses them and `paste-special` (press the app's
+own key, `key ctrl+alt+v`, or the gallery's Paste Special… through
+`menu-click`). `clipboard.uit` covers these.
+
+**Paste Special, the gallery, Paste Options, the Office Clipboard (#669).**
+`key ctrl+alt+v` (or `menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}}`
+and `menu-click {"label":"Paste Special…"}`) opens the `paste-special` dialog:
+`dialog-set` its `paste` (All, Formulas, Values, Formats, Comments and Notes,
+Validation, All except borders, Column widths, Formulas and number formats,
+Values and number formats) and `operation` (None, Add, Subtract, Multiply,
+Divide) radios and its `skip-blanks` and `transpose` boxes, then `dialog-click`
+OK or Paste Link. Without a live copy only plain text is on the clipboard: All,
+Values and Transpose paste it, the other choices are refused and Paste Link is
+disabled. The gallery's items paste through `menu-click` on the Paste
+split button's menu. After a copy's paste, `menu-open {"target":{"grid":
+"paste-options"}}` opens the Paste Options button's menu (`paste_options` in
+the state says it shows), whose items paste the last paste again that way as
+one undo step. `office-clipboard` drives the Clipboard group launcher's pane;
+an item pastes as values.
 
 **`fill-drag`.** The `drag` verb presses the grid, so it only sweeps a
 selection; `fill-drag` does what a pointer on the fill handle does:
-`sheet_fill_start` (the handle's press), `grid_drag_over` for each cell of the
-straight path from the selection's bottom-right corner to `to`, and
-`grid_release`, which commits the fill as a series (`gridcore::edit::autofill`).
+`sheet_fill_start` (the handle's left press; `sheet_fill_start_right` with
+`right`), `grid_left_drag_over` (the cells' left-button move, which takes
+`ctrl`) for each cell of the straight path from the selection's bottom-right
+corner to `to` (`sheet_fill_over` with `right`), and `grid_release`, which
+commits the fill as a series (`gridcore::edit::autofill`).
 `from`, a cell or range, is selected first with `click-cell`'s own
 press/click/release (then the same with Shift for the far corner). The reply is
 the state plus `filled`, the filled box (`B4:B8`), or `null` when released on
@@ -800,9 +826,59 @@ the source. Refused:
   select Enable Editing to edit` (#610), `the fill did not arm: the sheet is
   protected` (a protected sheet refuses a fill from the pointer too), or
   `… another gesture is in flight`;
-- an `option`: `AutoFill Options are not implemented in this app`.
+- an `option` that names no Auto Fill Options kind (`copy`, `series`,
+  `formats`, `values`, `days`, `weekdays`, `months`, `years`, `linear`,
+  `growth`, or a menu label);
+- flags that don't go together: `right` with `double`, `right` with
+  `option` (a right drag ends in the fill menu: `menu-click` its kind), or
+  `ctrl` with `right` or `double` (Ctrl only swaps copy and series on a left
+  drag). `option` with `double` picks the kind after the double-click's
+  fill, as its Auto Fill Options button does.
+
+The fill runs gridcore's series rules (#668): counted text, ordinals,
+quarters, day/month and custom lists, the least-squares trend, dates by day,
+month or year. A drag above or left of the source fills backwards; one back
+inside the source clears what it leaves (`filled` then names the box left
+selected). `option` picks the Auto Fill Options button's kind after the fill,
+as its menu does (`menu-open {"target":{"grid":"fill-options"}}` opens that
+menu too); `ctrl` holds Ctrl, which swaps copy and series; `right` drags with
+the right button, and the reply is the fill menu it opens on release
+(`menu-click` a kind); `double` double-clicks the handle, filling down to the
+end of the neighbouring column's block (no `to`). Home › Fill's menu (Down,
+Right, Up, Left, Series…, Justify) opens with `menu-open {"target":{"ribbon":
+["Home","Editing","Fill"]}}`; Series… is the `series` dialog (`series-in`,
+`type`, `unit`, `trend`, `step`, `stop`), Justify may ask the `justify`
+question, and Settings' Edit Custom Lists… is `custom-lists` (Add, Delete,
+Import, OK).
 
 `sheet-fill.uit` covers these.
+
+**Multi-area selections and `border-drag` (#670).** `click-cell` and `drag`
+take `ctrl`: a Ctrl+click adds a one-cell area, a Ctrl+drag a swept one;
+`shift` then extends only the active area, and the state's `areas` lists
+them. Copy joins areas that share their rows or columns; a cut, a paste, and
+any command that acts on one rectangle refuse a multi-area selection with
+`This action won't work on multiple selections.` in the status. `border-drag`
+selects `from` (or keeps the selection), grabs it by its top-left and drops
+it with its top-left on `to`: a move (references follow), or with `ctrl` a
+copy; `right` opens the drop menu (its reply), whose `choice` (Move Here,
+Copy Here, Copy Here as Values Only, Copy Here as Formats Only, Link Here,
+Cancel) it then clicks. A drop on other data asks the `drop-replace`
+question: `replace: true` presses OK, `false` Cancel, and without it the
+question stays open. `sheet-selection.uit` covers these.
+
+**Clear and Go To Special (#671).** Home › Clear's menu (Clear All, Clear
+Formats, Clear Contents, Clear Comments and Notes, Clear Hyperlinks, Remove
+Hyperlinks) and Find & Select's (Go To…, Go To Special…) open through
+`menu-open` with the ribbon path or a `ribbon-click` of the command. F5 and
+Ctrl+G open the `goto` dialog (`names`, `reference`, Special…, OK);
+`goto-special` has the `select` radio (Notes, Constants, Formulas, Blanks,
+Current region, Current array, Row differences, Column differences,
+Precedents, Dependents, Last cell, Visible cells only, Conditional formats,
+Data validation), the `numbers`, `text`, `logicals` and `errors` boxes and the
+`levels` and `rules` radios. Its OK selects what it finds as the areas (the
+first found cell active) or puts `No cells were found.` in the status.
+`sheet-clear.uit` covers these.
 
 ### Open modes and Protected View
 
@@ -1066,7 +1142,7 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619) | the menu, as `menu-read` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619) | the menu, as `menu-read` |
 | `menu-read` | `{}` | `{open: true, target, items, highlight}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null |
 | `menu-click` | `{label}` among the top-level items, `{path: [labels]}` through submenus, or `{index}`: the top-level item at that 0-based index, separators and headings not counted, for labels that repeat | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
@@ -1130,6 +1206,7 @@ A menu belongs to the moment it opened in. What moves on from it closes it:
 another tab, the backstage, a command run from anywhere, a control-pipe verb
 that edits, reloads, saves or focuses the plan, and every harness verb that
 stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
+`border-drag`, `office-clipboard` (not `read`),
 `save-as`, `select-chart`,
 `focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,

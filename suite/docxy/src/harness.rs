@@ -2291,7 +2291,23 @@ fn menu_open(
                     return Err("'ribbon' must be [tab, group, command]".into());
                 };
                 if ribbon_surface(app)? == RibbonSurface::Sheet {
-                    return Err("the sheet ribbon has no split buttons".into());
+                    // A sheet command that opens a menu (#707): Paste's
+                    // arrow, Fill, Clear, Find & Select.
+                    let ribbon_tab = ribbon_tab_by_name(crate::Kind::Xlsx, tab)?;
+                    let commands = crate::sheet_ribbon::tab_def(ribbon_tab).commands();
+                    let cmd = crate::sheet_ribbon::resolve(&commands, tab, label, |act| {
+                        app.sheet_act_toggled(act)
+                    })?;
+                    let m = match (cmd.shape, cmd.act) {
+                        (crate::sheet_ribbon::Shape::Split { menu, .. }, _) => menu,
+                        (_, crate::SheetAct::Menu(m)) => m,
+                        _ => return Err(format!("sheet command '{label}' opens no menu")),
+                    };
+                    let _ = group;
+                    app.select_ribbon_tab(ribbon_tab, window, cx);
+                    let at = menu_point(app, window, None, |b| b.center());
+                    app.open_sheet_menu(m, at, cx);
+                    return Ok(());
                 }
                 let def = ribbon_tab_def(app, tab)?;
                 let id = split_primary(&def, group, label)?;
@@ -2300,6 +2316,17 @@ fn menu_open(
                 let anchor = crate::split_menu_anchor(&app.probes.borrow(), id);
                 let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
                 app.open_split_menu(id, at, cx)
+            }
+            "grid" => {
+                let name = fields[0].1.as_str().unwrap_or_default();
+                let kind = crate::menu::GridMenu::from_name(name).ok_or_else(|| {
+                    format!(
+                        "no grid menu '{name}' (fill-options, paste-options, fill-drop, border-drop)"
+                    )
+                })?;
+                sheet(app)?;
+                let at = menu_point(app, window, None, |b| b.center());
+                app.open_grid_menu(kind, at, cx)
             }
             // The Quick Access Toolbar Undo arrow (#619).
             "qat" => {
@@ -2314,7 +2341,7 @@ fn menu_open(
                 app.open_undo_menu(at, cx)
             }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, row, ribbon and qat are)"
+                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, row, ribbon, grid and qat are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
@@ -2393,10 +2420,15 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
     if verb == "inspect" {
         return args.get_str("remove").is_some();
     }
+    // Reading the Office Clipboard is a read; its buttons are presses.
+    if verb == "office-clipboard" {
+        return args.get_str("action").is_some_and(|a| a != "read");
+    }
     matches!(
         verb,
         "click-cell"
             | "drag"
+            | "border-drag"
             | "fill-drag"
             | "save-as"
             | "convert"
@@ -2501,10 +2533,10 @@ fn clipboard_app_json(
                 return Json::obj(vec![
                     ("kind", Json::Str("grid".into())),
                     ("text", Json::Str(clip.text.clone())),
-                    ("rows", Json::Num(clip.cells.len() as f64)),
+                    ("rows", Json::Num(clip.block.cells.len() as f64)),
                     (
                         "cols",
-                        Json::Num(clip.cells.first().map_or(0, Vec::len) as f64),
+                        Json::Num(clip.block.cells.first().map_or(0, Vec::len) as f64),
                     ),
                 ]);
             }
@@ -2696,6 +2728,16 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ("sel", Json::Str(a1(v.sel))),
             ("anchor", Json::Str(a1(v.anchor))),
             ("range", Json::Str(a1_range(v.range()))),
+            // Every area of the selection, the active one last (#670).
+            (
+                "areas",
+                Json::Arr(
+                    v.areas_all()
+                        .into_iter()
+                        .map(|a| Json::Str(a1_range(a)))
+                        .collect(),
+                ),
+            ),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
             // Flash Fill's greyed preview (#666): the range it covers and the
@@ -2746,6 +2788,22 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ),
             // The sheet comment editor New Comment opens, and its text.
             ("comment_edit", str_or_null(app.sheet_comment_edit.clone())),
+        ]);
+        // The option buttons a fill or a paste leaves (#668, #669), and
+        // the Office Clipboard's count.
+        out.extend([
+            (
+                "fill_options",
+                str_or_null(app.fill_options_live().map(|o| o.kind.label().to_string())),
+            ),
+            (
+                "paste_options",
+                str_or_null(app.paste_options_live().map(|o| o.item.label().to_string())),
+            ),
+            (
+                "office_clipboard",
+                Json::Num(app.office_clip.items.len() as f64),
+            ),
         ]);
     }
     let ov = app.grid_overlay();
@@ -3547,8 +3605,9 @@ fn dispatch_verb(
                 return Done::ok(state(app, window));
             }
             let cell = cell_arg(args, "cell")?;
+            let ctrl = arg_flag(args, "ctrl")?;
             sheet(app)?;
-            click_cell(app, cell, shift, dbl, window, cx);
+            click_cell(app, cell, shift, ctrl, dbl, window, cx);
             Done::ok(state(app, window))
         }
 
@@ -3731,10 +3790,31 @@ fn dispatch_verb(
         // `drag` verb presses the grid instead, so it sweeps a selection.
         "fill-drag" => {
             app.refuse_under_dialog()?;
-            if args.get("option").is_some() {
-                return Err("AutoFill Options are not implemented in this app".into());
+            // #668: `option` picks an Auto Fill Options kind after the fill,
+            // `ctrl` holds Ctrl, `right` drags with the right button (its
+            // menu is open in the reply), `double` double-clicks the handle.
+            let option = match args.get("option") {
+                Some(_) => {
+                    let name = arg_str(args, "option")?;
+                    Some(gridcore::edit::FillKind::from_label(name).ok_or_else(|| {
+                        format!("no Auto Fill Options kind '{name}' (copy, series, formats, values, days, weekdays, months, years, linear, growth)")
+                    })?)
+                }
+                None => None,
+            };
+            let (ctrl, right, double) = (
+                arg_flag(args, "ctrl")?,
+                arg_flag(args, "right")?,
+                arg_flag(args, "double")?,
+            );
+            if let Some(why) = fill_flags_refusal(option.is_some(), ctrl, right, double) {
+                return Err(why.into());
             }
-            let to = cell_arg(args, "to")?;
+            let to = if double {
+                (0, 0)
+            } else {
+                cell_arg(args, "to")?
+            };
             let from = match args.get("from") {
                 Some(_) => Some(range_arg(args, "from")?),
                 None => None,
@@ -3749,9 +3829,9 @@ fn dispatch_verb(
                 from.is_some(),
             )?;
             if let Some((start, end)) = from {
-                click_cell(app, start, false, false, window, cx);
+                click_cell(app, start, false, false, false, window, cx);
                 if end != start {
-                    click_cell(app, end, true, false, window, cx);
+                    click_cell(app, end, true, false, false, window, cx);
                 }
             }
             fill_press_refusal(
@@ -3761,7 +3841,34 @@ fn dispatch_verb(
                 false,
             )?;
             let src = sheet(app)?.range();
-            app.sheet_fill_start(cx);
+            if double {
+                app.sheet_fill_double(cx);
+                let after = sheet(app)?.range();
+                // The Auto Fill Options button a double-click's fill leaves
+                // too; with nothing filled there is none to pick from.
+                if let Some(kind) = option {
+                    if after == src {
+                        return Err(
+                            "'option' has no fill to change: the double-click filled nothing"
+                                .into(),
+                        );
+                    }
+                    app.sheet_fill_as(kind, cx);
+                }
+                let mut reply = state(app, window);
+                if let Json::Obj(fields) = &mut reply {
+                    let filled = (after != src).then(|| a1_range(after));
+                    fields.push(("filled".into(), str_or_null(filled)));
+                }
+                return Done::ok(reply);
+            }
+            // Pressed and moved as the handle's and the cells' own handlers
+            // press and move: a right press, and Ctrl held in each move.
+            if right {
+                app.sheet_fill_start_right(cx);
+            } else {
+                app.sheet_fill_start(cx);
+            }
             if app.sheet_fill.is_none() {
                 let locked = app
                     .tabs
@@ -3777,9 +3884,21 @@ fn dispatch_verb(
                 });
             }
             for (r, c) in drag_path((src.2, src.3), to) {
-                app.grid_drag_over(r, c, cx);
+                if right {
+                    app.sheet_fill_over(r, c, cx);
+                } else {
+                    app.grid_left_drag_over(r, c, ctrl, cx);
+                }
+            }
+            if right {
+                app.last_pointer = menu_point(app, window, None, |b| b.center());
+                app.sheet_fill_end(cx);
+                return Done::ok(crate::menu::read_json(app.menu.as_ref()));
             }
             app.grid_release(cx);
+            if let Some(kind) = option {
+                app.sheet_fill_as(kind, cx);
+            }
             let after = sheet(app)?.range();
             let mut reply = state(app, window);
             if let Json::Obj(fields) = &mut reply {
@@ -3789,6 +3908,103 @@ fn dispatch_verb(
             Done::ok(reply)
         }
 
+        // A drag of the selection by its border (#670): select `from` (a
+        // cell or range; the selection as it is when absent), grab its
+        // top-left, and drop it with its top-left on `to`. `ctrl` copies;
+        // `right` opens the drop menu, whose `choice` (a label) is then
+        // clicked; `replace` answers the "There's already data here"
+        // question (left open when absent).
+        "border-drag" => {
+            app.refuse_under_dialog()?;
+            let to = cell_arg(args, "to")?;
+            let (ctrl, right) = (arg_flag(args, "ctrl")?, arg_flag(args, "right")?);
+            let choice = match args.get("choice") {
+                Some(_) => {
+                    let label = arg_str(args, "choice")?;
+                    Some(crate::sheet_menus::DropChoice::from_label(label).ok_or_else(|| {
+                        format!("no drop choice '{label}' (Move Here, Copy Here, Copy Here as Values Only, Copy Here as Formats Only, Link Here, Cancel)")
+                    })?)
+                }
+                None => None,
+            };
+            if choice.is_some() && !right {
+                return Err("'choice' is the right-drag menu's; add \"right\": true".into());
+            }
+            if args.get("from").is_some() {
+                let (start, end) = range_arg(args, "from")?;
+                sheet(app)?;
+                click_cell(app, start, false, false, false, window, cx);
+                if end != start {
+                    click_cell(app, end, true, false, false, window, cx);
+                }
+            }
+            let (r0, c0, _, _) = sheet(app)?.range();
+            app.border_drag_start((r0, c0), right, cx);
+            if app.drops.border_drag.is_none() {
+                return Err(format!(
+                    "the drag did not start: {}",
+                    app.tabs
+                        .get(app.active)
+                        .map(|t| t.status.to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "another gesture is in flight".into())
+                ));
+            }
+            app.border_drag_over(to, ctrl, cx);
+            app.last_pointer = menu_point(app, window, None, |b| b.center());
+            app.border_drag_end(cx);
+            if right {
+                match choice {
+                    Some(choice) => app.border_drop_choice(choice, cx),
+                    None => return Done::ok(crate::menu::read_json(app.menu.as_ref())),
+                }
+            }
+            match args.get("replace") {
+                Some(Json::Bool(yes)) => {
+                    let asked = app
+                        .active_dialogs()
+                        .and_then(|d| d.top())
+                        .is_some_and(|d| d.owner == crate::dialog::DialogOwner::DropReplace);
+                    if !asked {
+                        return Err("the drop asked nothing; leave out 'replace'".into());
+                    }
+                    app.dialog_press(if *yes { "OK" } else { "Cancel" }, window, cx)?;
+                }
+                Some(_) => return Err("'replace' must be true or false".into()),
+                None => {}
+            }
+            Done::ok(state(app, window))
+        }
+
+        // The Office Clipboard pane (#669): `read` (the default), `open`,
+        // `close`, `paste` item `index`, `paste-all`, `clear-all`, `delete`
+        // item `index`. The same handler the pane's buttons call.
+        "office-clipboard" => {
+            let action = args.get_str("action").unwrap_or("read");
+            if action != "read" {
+                app.refuse_under_dialog()?;
+                sheet(app)?;
+                let index = match args.get("index") {
+                    Some(_) => Some(arg_usize(args, "index")?),
+                    None => None,
+                };
+                app.office_clip_act(action, index, cx)?;
+            }
+            Done::ok(Json::obj(vec![
+                ("open", Json::Bool(app.office_clip.open)),
+                (
+                    "items",
+                    Json::Arr(
+                        app.office_clip
+                            .items
+                            .iter()
+                            .map(|t| Json::Str(t.clone()))
+                            .collect(),
+                    ),
+                ),
+                ("state", state(app, window)),
+            ]))
+        }
         // The clipboard (#699). A harness instance has a private one (it starts
         // empty and never touches the OS clipboard); `write` puts text on it
         // as another app's copy would. Copy, cut and paste are the app's own
@@ -3801,7 +4017,10 @@ fn dispatch_verb(
                     app.clipboard_write(text, cx);
                 }
                 "paste-special" => {
-                    return Err("paste special is not implemented in this app".into());
+                    return Err(
+                        "clipboard does not paste special: press the app's own key (key ctrl+alt+v) or menu-click Paste Special… on the Paste gallery"
+                            .into(),
+                    );
                 }
                 action @ ("copy" | "cut" | "paste") => {
                     return Err(format!(
@@ -3822,8 +4041,9 @@ fn dispatch_verb(
         "drag" => {
             app.refuse_under_dialog()?;
             let (from, to) = drag_args(args)?;
+            let ctrl = arg_flag(args, "ctrl")?;
             sheet(app)?;
-            app.grid_press_cell(from, cx);
+            app.grid_press_cell(from, ctrl, cx);
             for (r, c) in drag_path(from, to) {
                 app.grid_drag_over(r, c, cx);
             }
@@ -4088,6 +4308,25 @@ fn is_action_key(stroke: &Keystroke) -> bool {
             .any(|(key, shift)| *key == stroke.key && *shift == m.shift)
 }
 
+/// Why `fill-drag` refuses its flags together: a right drag ends in the
+/// fill menu, not the Auto Fill Options button `option` picks from, and a
+/// double-click or a right drag holds no Ctrl. `None` when they go together.
+fn fill_flags_refusal(option: bool, ctrl: bool, right: bool, double: bool) -> Option<&'static str> {
+    if right && double {
+        Some("'right' and 'double' don't go together: a double-click is a left press")
+    } else if right && option {
+        Some(
+            "'option' picks from the Auto Fill Options button; a right drag opens the fill menu instead (menu-click its kind)",
+        )
+    } else if ctrl && (right || double) {
+        Some(
+            "'ctrl' swaps copy and series on a left drag; it does nothing to a right drag or a double-click",
+        )
+    } else {
+        None
+    }
+}
+
 /// Why `fill-drag` cannot press the fill handle, or `Ok` when it can. The
 /// handle is not there to press while File (backstage) covers the sheet or the
 /// more-tabs list covers the window, or while the grid does not draw it
@@ -4116,16 +4355,18 @@ fn fill_press_refusal(
 
 /// A click on a sheet cell, as the pointer makes it: press, the cell's click
 /// handler, release.
+#[allow(clippy::too_many_arguments)]
 fn click_cell(
     app: &mut crate::Docxy,
     cell: (u32, u32),
     shift: bool,
+    ctrl: bool,
     double: bool,
     window: &mut Window,
     cx: &mut Context<crate::Docxy>,
 ) {
-    app.grid_press_cell(cell, cx);
-    app.cell_click(cell.0, cell.1, shift, double, window, cx);
+    app.grid_press_cell(cell, ctrl, cx);
+    app.cell_click(cell.0, cell.1, shift, ctrl, double, window, cx);
     app.grid_release(cx);
 }
 
@@ -4223,7 +4464,10 @@ mod tests {
             text: "one\ntwo".into(),
         };
         let grid = crate::GridClip {
-            cells: vec![vec![Default::default(); 3]; 2],
+            block: gridcore::edit::ClipBlock {
+                cells: vec![vec![Default::default(); 3]; 2],
+                ..Default::default()
+            },
             text: "a\tb\tc\nd\te\tf\n".into(),
             ..Default::default()
         };
@@ -5872,6 +6116,19 @@ mod tests {
             ok(Kind::Look, "x.docx", None),
             Err("this tab cannot be saved as a file".into())
         );
+    }
+
+    /// #707 r9 m4: `fill-drag`'s flags that cannot go together are refused
+    /// rather than dropped.
+    #[test]
+    fn fill_drag_refuses_flags_that_do_not_go_together() {
+        assert!(fill_flags_refusal(true, false, true, false).is_some());
+        assert!(fill_flags_refusal(false, true, true, false).is_some());
+        assert!(fill_flags_refusal(false, true, false, true).is_some());
+        assert!(fill_flags_refusal(false, false, true, true).is_some());
+        assert_eq!(fill_flags_refusal(true, false, false, true), None);
+        assert_eq!(fill_flags_refusal(true, true, false, false), None);
+        assert_eq!(fill_flags_refusal(false, false, true, false), None);
     }
 
     /// #699: `fill-drag` refuses before `from` is clicked when a click could

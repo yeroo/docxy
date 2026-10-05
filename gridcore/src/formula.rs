@@ -2401,6 +2401,101 @@ pub fn translate_formula(src: &str, dr: i64, dc: i64) -> Option<String> {
     Some(to_string(&translate(&ast, dr, dc)))
 }
 
+/// A transposed paste (Paste Special › Transpose), as seen by one pasted
+/// formula. `inside` maps a cell of the copy (read on the copy's own sheet)
+/// to where its transposed copy lands, `None` for a cell outside the copy;
+/// `(dr, dc)` is how far the formula's own cell moved.
+pub struct Transposed<'a> {
+    /// The copy's sheet: a reference qualified with another sheet is outside.
+    pub src_sheet: &'a str,
+    /// The sheet the paste lands on: a qualified reference into the copy
+    /// points at its transposed copy there.
+    pub dst_sheet: &'a str,
+    pub inside: &'a dyn Fn(i64, i64) -> Option<(i64, i64)>,
+    pub dr: i64,
+    pub dc: i64,
+}
+
+impl Transposed<'_> {
+    fn map(&self, r: &CellRef) -> Option<CellRef> {
+        let ours = r
+            .sheet
+            .as_deref()
+            .is_none_or(|s| s.eq_ignore_ascii_case(self.src_sheet));
+        if !ours || r.row < 0 {
+            return None;
+        }
+        let (row, col) = (self.inside)(r.row, r.col)?;
+        Some(CellRef {
+            // The transposed copy is on the paste's sheet (#707 r1 m12): an
+            // unqualified reference reads it there already.
+            sheet: r.sheet.as_ref().map(|_| self.dst_sheet.to_string()),
+            row,
+            col,
+            ..r.clone()
+        })
+    }
+}
+
+/// Rewrite `e`, a formula pasted transposed ([`Transposed`]): a reference to
+/// a copied cell points at that cell's transposed copy (a range whose both
+/// corners were copied, corner by corner, then put back in order), keeping
+/// its `$` flags; any other reference translates by the formula's own move,
+/// as a plain copy's does.
+pub fn transpose_ref_expr(e: &Expr, t: &Transposed) -> Expr {
+    let recur = |x: &Expr| transpose_ref_expr(x, t);
+    match e {
+        Expr::Ref(r) => Expr::Ref(t.map(r).unwrap_or_else(|| translate_ref(r, t.dr, t.dc))),
+        Expr::SpillRef(r) => {
+            Expr::SpillRef(t.map(r).unwrap_or_else(|| translate_ref(r, t.dr, t.dc)))
+        }
+        Expr::Range(p, q) => {
+            let q_in = CellRef {
+                sheet: q.sheet.clone().or_else(|| p.sheet.clone()),
+                ..q.clone()
+            };
+            match (t.map(p), t.map(&q_in)) {
+                (Some(a), Some(b)) => {
+                    let (r0, r1) = (a.row.min(b.row), a.row.max(b.row));
+                    let (c0, c1) = (a.col.min(b.col), a.col.max(b.col));
+                    Expr::Range(
+                        CellRef {
+                            row: r0,
+                            col: c0,
+                            ..a
+                        },
+                        CellRef {
+                            sheet: q.sheet.clone(),
+                            row: r1,
+                            col: c1,
+                            ..b
+                        },
+                    )
+                }
+                _ => translate(e, t.dr, t.dc),
+            }
+        }
+        Expr::ArrayLit(rows) => Expr::ArrayLit(
+            rows.iter()
+                .map(|row| row.iter().map(recur).collect())
+                .collect(),
+        ),
+        Expr::Func(n, args) => Expr::Func(n.clone(), args.iter().map(recur).collect()),
+        Expr::Call(callee, args) => {
+            Expr::Call(Box::new(recur(callee)), args.iter().map(recur).collect())
+        }
+        Expr::Un(op, x) => Expr::Un(*op, Box::new(recur(x))),
+        Expr::Bin(op, l, r) => Expr::Bin(*op, Box::new(recur(l)), Box::new(recur(r))),
+        other => translate(other, t.dr, t.dc),
+    }
+}
+
+/// [`transpose_ref_expr`] on formula text; `None` when it doesn't parse.
+pub fn transpose_formula(src: &str, t: &Transposed) -> Option<String> {
+    let ast = parse(src).ok()?;
+    Some(to_string(&transpose_ref_expr(&ast, t)))
+}
+
 // ---------------------------------------------------------------------------
 // Cut and paste (a move)
 // ---------------------------------------------------------------------------

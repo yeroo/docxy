@@ -164,6 +164,27 @@ pub(crate) enum DialogOwner {
     },
     /// The outline Settings (#693): where summary rows and columns sit.
     OutlineSettings,
+    /// Home › Find & Select › Go To… and Go To Special… (#671), applied in
+    /// `sheet_goto::click`.
+    GoTo,
+    GoToSpecial,
+    /// Home › Fill › Series… (#668); its OK needs the app's custom lists,
+    /// so `Docxy::fill_dialog_click` applies it.
+    Series,
+    /// Justify's "Text will extend below selected range." (#668).
+    JustifyOverflow,
+    /// File › Options › Edit Custom Lists (#668): an app setting, applied by
+    /// `Docxy::fill_dialog_click`.
+    CustomLists,
+    /// Paste Special… (#669); `clip` when a copy is live (else only text
+    /// is on the clipboard). Applied by `Docxy::paste_dialog_click`.
+    PasteSpecial {
+        clip: bool,
+    },
+    /// "There's already data here. Do you want to replace it?" before a
+    /// drop by the selection's border (#670), applied by
+    /// `Docxy::drop_dialog_click`.
+    DropReplace,
     /// Group's (Ungroup's) "Rows or Columns?" over a block selection (#693).
     OutlineAxis {
         ungroup: bool,

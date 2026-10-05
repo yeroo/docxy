@@ -71,6 +71,16 @@ impl std::fmt::Display for XlsxError {
 
 impl std::error::Error for XlsxError {}
 
+/// A data-validation rule for [`SheetPackage::add_data_validations`].
+#[derive(Clone, Copy, Debug)]
+pub struct NewValidation<'a> {
+    pub range: (u32, u32, u32, u32),
+    pub kind: &'a str,
+    pub operator: &'a str,
+    pub formula1: &'a str,
+    pub formula2: Option<&'a str>,
+}
+
 /// A loaded `.xlsx`: the editable [`Workbook`] plus all original parts (and
 /// the original worksheet XML sources for splicing) so save preserves what
 /// isn't modeled.
@@ -1912,6 +1922,7 @@ fn parse_worksheet(
                             None
                         };
                         if let Some(t) = target {
+                            sheet.hyperlink_refs.insert((r1, c1), (r1, c1, r2, c2));
                             // A whole-column hyperlink applies only to its anchor.
                             let cells = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
                             if cells > 4096 {
@@ -3800,7 +3811,61 @@ fn splice_worksheet(
     let out = set_filter_mode(out, sheet.filter_mode);
     // Conditional formatting and data validation: likewise.
     let out = set_cond_formats(out, sheet);
-    set_validations(out, sheet)
+    let out = set_validations(out, sheet);
+    // Hyperlinks: a removed link's element goes.
+    set_hyperlinks(out, sheet)
+}
+
+/// Strike the `<hyperlink>` elements whose links were removed
+/// ([`Sheet::hyperlinks_removed`]), and the `<hyperlinks>` block once it is
+/// empty. The external relationship a removed link used stays in the rels,
+/// unreferenced, which OPC allows. Every other element is left as it is.
+fn set_hyperlinks(xml: String, sheet: &Sheet) -> String {
+    if sheet.hyperlinks_removed.is_empty() {
+        return xml;
+    }
+    let Some((ws, we)) = worksheet_child_span(&xml, "hyperlinks") else {
+        return xml;
+    };
+    let block = &xml[ws..we];
+    let items: Vec<(usize, usize)> = element_children(block)
+        .into_iter()
+        .filter(|(name, _, _)| name == "hyperlink")
+        .map(|(_, a, b)| (a, b))
+        .collect();
+    // A set, and one pass over the block: a sheet of 50k links stays
+    // linear (#707 r6 M2).
+    let removed: std::collections::HashSet<(u32, u32, u32, u32)> =
+        sheet.hyperlinks_removed.iter().copied().collect();
+    let mut drop = Vec::new();
+    for &(a, b) in &items {
+        let Some(tag) = start_tag(&block[a..b]) else {
+            continue;
+        };
+        let Some(&(_, vs, ve)) = tag.attrs.iter().find(|(n, _, _)| *n == "ref") else {
+            continue;
+        };
+        let r = &block[a + vs..a + ve];
+        let rect = crate::sheet::parse_range_name(r)
+            .or_else(|| crate::sheet::parse_cell_name(r).map(|(r, c)| (r, c, r, c)));
+        if rect.is_some_and(|rect| removed.contains(&rect)) {
+            drop.push((a, b));
+        }
+    }
+    if drop.is_empty() {
+        return xml;
+    }
+    if drop.len() == items.len() {
+        return remove_worksheet_child(&xml, "hyperlinks");
+    }
+    let mut kept = String::with_capacity(block.len());
+    let mut from = 0;
+    for (a, b) in drop {
+        kept.push_str(&block[from..a]);
+        from = b;
+    }
+    kept.push_str(&block[from..]);
+    format!("{}{kept}{}", &xml[..ws], &xml[we..])
 }
 
 /// The worksheet's top-level `<conditionalFormatting>` elements (in any
@@ -4041,7 +4106,8 @@ fn sole_claim<T>(
 /// model block whose [`crate::sheet::CondFormat::ix`] names it, and left byte-for-byte
 /// alone while it holds that block's ranges and formulas. A moved block gets
 /// a new `sqref` and its changed `<formula>` texts, everything else kept; a
-/// block a structural edit deleted ([`Sheet::cf_removed`]) loses its element.
+/// block an edit deleted ([`Sheet::cf_removed`]: a row or column delete,
+/// Clear All or Clear Formats) loses its element.
 /// An element two model blocks claim, or whose `sqref` doesn't read, is left
 /// as it is.
 fn set_cond_formats(xml: String, sheet: &Sheet) -> String {
@@ -5028,9 +5094,34 @@ pub(crate) fn append_to_worksheet_child(
     if let Some(rels) = rels {
         item = bind_r(&mut out, &root, item, rels);
     }
+    insert_into_worksheet_child(out, tag, &item, 1)
+}
+
+/// [`append_to_worksheet_child`] for several items at once (none binding
+/// `r:`): one rewrite of the part, where an append each would rewrite it
+/// once per item (#707 r6).
+pub(crate) fn append_all_to_worksheet_child(
+    xml: &str,
+    tag: &str,
+    items: &[String],
+) -> Option<String> {
+    worksheet_child_span(xml, tag)?;
+    let root = worksheet_root(xml)?;
+    let item: String = items.iter().map(|i| in_worksheet_ns(&root, i)).collect();
+    insert_into_worksheet_child(xml.to_string(), tag, &item, items.len() as u32)
+}
+
+/// `item` (`added` elements) put at the end of the worksheet's `<tag>`
+/// child, its `count` bumped by them.
+fn insert_into_worksheet_child(
+    mut out: String,
+    tag: &str,
+    item: &str,
+    added: u32,
+) -> Option<String> {
     let (s, _) = worksheet_child_span(&out, tag)?;
     if let Some(n) = attr_at(&out, s, "count").and_then(|v| v.parse::<u32>().ok()) {
-        out = set_tag_attr(&out, s, "count", Some(&(n + 1).to_string()));
+        out = set_tag_attr(&out, s, "count", Some(&(n + added).to_string()));
     }
     let (s, e) = worksheet_child_span(&out, tag)?;
     if out[..e].ends_with("/>") {
@@ -5042,7 +5133,7 @@ pub(crate) fn append_to_worksheet_child(
         out.replace_range(e - 2..e, &format!(">{item}</{qname}>"));
     } else {
         let close = out[..e].rfind("</").unwrap_or(e);
-        out.insert_str(close, &item);
+        out.insert_str(close, item);
     }
     Some(out)
 }
@@ -7333,62 +7424,93 @@ impl SheetPackage {
         formula1: &str,
         formula2: Option<&str>,
     ) -> bool {
+        self.add_data_validations(
+            sheet,
+            &[NewValidation {
+                range,
+                kind,
+                operator,
+                formula1,
+                formula2,
+            }],
+        )
+    }
+
+    /// [`SheetPackage::add_data_validation`] for several rules at once, in
+    /// order: the worksheet part is rewritten once, not once per rule, so a
+    /// paste of many rules stays linear (#707 r6).
+    pub fn add_data_validations(&mut self, sheet: usize, rules: &[NewValidation]) -> bool {
         if sheet >= self.workbook.sheets.len() || !self.sheet_takes(sheet, "dataValidations", true)
         {
             return false;
         }
-        let (r1, c1, r2, c2) = range;
-        let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
-        let op_attr = if operator.is_empty() {
-            String::new()
-        } else {
-            format!(" operator=\"{operator}\"")
-        };
-        let mut fmls = format!("<formula1>{}</formula1>", esc_text(&file_formula(formula1)));
-        if let Some(f2) = formula2 {
-            fmls.push_str(&format!(
-                "<formula2>{}</formula2>",
-                esc_text(&file_formula(f2))
-            ));
+        if rules.is_empty() {
+            return true;
         }
-        let dv_xml = format!(
-            "<dataValidation type=\"{kind}\"{op_attr} allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"{sqref}\">{fmls}</dataValidation>"
-        );
+        let items: Vec<String> = rules
+            .iter()
+            .map(|r| {
+                let (r1, c1, r2, c2) = r.range;
+                let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+                let op_attr = if r.operator.is_empty() {
+                    String::new()
+                } else {
+                    format!(" operator=\"{}\"", r.operator)
+                };
+                let mut fmls = format!("<formula1>{}</formula1>", esc_text(&file_formula(r.formula1)));
+                if let Some(f2) = r.formula2 {
+                    fmls.push_str(&format!(
+                        "<formula2>{}</formula2>",
+                        esc_text(&file_formula(f2))
+                    ));
+                }
+                format!(
+                    "<dataValidation type=\"{}\"{op_attr} allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"{sqref}\">{fmls}</dataValidation>",
+                    r.kind
+                )
+            })
+            .collect();
+        let n = items.len();
         let sheet_part = self.sheet_parts[sheet].clone();
-        let mut ix = None;
+        let mut first_ix = None;
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             let before = validation_spans(&xml).map_or(0, |(_, items)| items.len());
             // Into the existing block (in any prefix), bumping its count, or a
             // new block at its schema position.
-            let xml = append_to_worksheet_child(&xml, "dataValidations", &dv_xml, None)
+            let xml = append_all_to_worksheet_child(&xml, "dataValidations", &items)
                 .unwrap_or_else(|| {
-                    let block = format!("<dataValidations count=\"1\">{dv_xml}</dataValidations>");
+                    let block = format!(
+                        "<dataValidations count=\"{n}\">{}</dataValidations>",
+                        items.concat()
+                    );
                     put_worksheet_child(&xml, "dataValidations", &block, None, false)
                 });
             // Appended before the block's end tag, so after its existing
-            // rules: the next ordinal, as long as it is really there.
+            // rules: the next ordinals, as long as they are really there.
             let after = validation_spans(&xml).map_or(0, |(_, items)| items.len());
-            ix = (after == before + 1).then_some(before);
+            first_ix = (after == before + n).then_some(before);
             p.1 = xml.into_bytes();
         }
         let s = &mut self.workbook.sheets[sheet];
-        if let Some(n) = ix {
+        if let Some(first) = first_ix {
             // Stale claims go, as in `add_conditional_format`.
             for dv in &mut s.validations {
-                dv.ix = dv.ix.filter(|&i| i < n);
+                dv.ix = dv.ix.filter(|&i| i < first);
             }
-            s.dv_removed.retain(|&i| i < n);
+            s.dv_removed.retain(|&i| i < first);
         }
-        s.validations.push(crate::sheet::DataValidation {
-            ranges: vec![range],
-            kind: kind.to_string(),
-            operator: operator.to_string(),
-            formula1: formula1.to_string(),
-            formula2: formula2.unwrap_or("").to_string(),
-            prompt: None,
-            ix,
-        });
+        for (k, r) in rules.iter().enumerate() {
+            s.validations.push(crate::sheet::DataValidation {
+                ranges: vec![r.range],
+                kind: r.kind.to_string(),
+                operator: r.operator.to_string(),
+                formula1: r.formula1.to_string(),
+                formula2: r.formula2.unwrap_or("").to_string(),
+                prompt: None,
+                ix: first_ix.map(|f| f + k),
+            });
+        }
         true
     }
 
@@ -8734,6 +8856,139 @@ mod tests {
     }
     use super::*;
 
+    /// #707 r9 M1: a rule whose anchor a cleared rectangle moves takes its
+    /// formulas along, in the model and through save and reload; an
+    /// absolute reference stays.
+    #[test]
+    fn a_trimmed_rule_keeps_reading_its_own_cells() {
+        let trimmed = |range, f: &str, cut| {
+            let mut pkg = new_xlsx();
+            assert!(pkg.add_data_validation(0, range, "custom", "", f, None));
+            crate::edit::clear_validation(&mut pkg.workbook.sheets[0], cut);
+            let dv = &pkg.workbook.sheets[0].validations[0];
+            let model = (dv.ranges.clone(), dv.formula1.clone());
+            let back = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+            let dv = &back.workbook.sheets[0].validations[0];
+            assert_eq!(
+                (dv.ranges.clone(), dv.formula1.clone()),
+                model,
+                "saved as held"
+            );
+            model
+        };
+        // The repro: A1>0 over A1:A10, A1:A3 cleared.
+        assert_eq!(
+            trimmed((0, 0, 9, 0), "A1>0", (0, 0, 2, 0)),
+            (vec![(3, 0, 9, 0)], "A4>0".to_string())
+        );
+        // A horizontal rule losing its left column.
+        assert_eq!(
+            trimmed((0, 0, 0, 9), "A1>0", (0, 0, 0, 0)),
+            (vec![(0, 1, 0, 9)], "B1>0".to_string())
+        );
+        // Absolute: unchanged.
+        assert_eq!(
+            trimmed((0, 0, 9, 0), "$A$1>0", (0, 0, 2, 0)),
+            (vec![(3, 0, 9, 0)], "$A$1>0".to_string())
+        );
+        // A cut that leaves the anchor where it was changes no formula.
+        assert_eq!(
+            trimmed((0, 0, 9, 0), "A1>0", (5, 0, 6, 0)),
+            (vec![(0, 0, 4, 0), (7, 0, 9, 0)], "A1>0".to_string())
+        );
+    }
+
+    /// #707 r9: Clear Formats and Clear All take the conditional formatting
+    /// off the cleared cells, a block whose anchor moved taking its formulas
+    /// along, and one left with nothing going; saved and reloaded as held.
+    /// Clear Contents leaves it.
+    #[test]
+    fn clearing_formats_trims_conditional_formatting() {
+        use crate::edit::{ClearWhat, apply_clear_sheet, clear_plan};
+        let cleared = |what, areas: &[(u32, u32, u32, u32)]| {
+            let mut pkg = new_xlsx();
+            assert!(pkg.add_conditional_format(
+                0,
+                (0, 0, 9, 0),
+                "greaterThan",
+                "B1",
+                None,
+                crate::sheet::Dxf::default()
+            ));
+            let plan = clear_plan(&pkg.workbook.sheets[0], areas, what, &[]).unwrap();
+            apply_clear_sheet(&mut pkg.workbook.sheets[0], &plan);
+            let held = |p: &SheetPackage| {
+                p.workbook.sheets[0]
+                    .cond_formats
+                    .iter()
+                    .map(|cf| (cf.ranges.clone(), cf.rules[0].formulas()[0].clone()))
+                    .collect::<Vec<_>>()
+            };
+            let model = held(&pkg);
+            let back = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+            assert_eq!(held(&back), model, "saved as held");
+            model
+        };
+        assert_eq!(
+            cleared(ClearWhat::Formats, &[(0, 0, 2, 0)]),
+            vec![(vec![(3, 0, 9, 0)], "B4".to_string())]
+        );
+        assert_eq!(
+            cleared(ClearWhat::All, &[(0, 0, 0, 0), (4, 0, 5, 0)]),
+            vec![(vec![(1, 0, 3, 0), (6, 0, 9, 0)], "B2".to_string())]
+        );
+        assert!(cleared(ClearWhat::All, &[(0, 0, 20, 3)]).is_empty());
+        assert_eq!(
+            cleared(ClearWhat::Contents, &[(0, 0, 2, 0)]),
+            vec![(vec![(0, 0, 9, 0)], "B1".to_string())]
+        );
+    }
+
+    /// #707 r6: rules added in one batch read and save as one call each
+    /// would, their ordinals claimed in order.
+    #[test]
+    fn add_data_validations_matches_one_call_per_rule() {
+        let rules = [
+            NewValidation {
+                range: (0, 0, 4, 0),
+                kind: "list",
+                operator: "",
+                formula1: "\"Laptop,Monitor,Dock\"",
+                formula2: None,
+            },
+            NewValidation {
+                range: (0, 1, 4, 1),
+                kind: "whole",
+                operator: "between",
+                formula1: "1",
+                formula2: Some("10"),
+            },
+        ];
+        let mut one = new_xlsx();
+        for r in &rules {
+            assert!(
+                one.add_data_validation(0, r.range, r.kind, r.operator, r.formula1, r.formula2)
+            );
+        }
+        let mut batch = new_xlsx();
+        assert!(batch.add_data_validations(0, &rules));
+        let dvs = |p: &SheetPackage| format!("{:?}", p.workbook.sheets[0].validations);
+        assert_eq!(dvs(&batch), dvs(&one));
+        assert!(
+            batch.workbook.sheets[0]
+                .validations
+                .iter()
+                .map(|d| d.ix)
+                .eq([Some(0), Some(1)])
+        );
+        assert_eq!(
+            batch.part("xl/worksheets/sheet1.xml"),
+            one.part("xl/worksheets/sheet1.xml")
+        );
+        let back = load_xlsx(&save_xlsx(&batch)).expect("reload");
+        assert_eq!(back.workbook.sheets[0].validations.len(), 2);
+    }
+
     #[test]
     fn add_data_validation_round_trips() {
         let mut pkg = new_xlsx();
@@ -9846,6 +10101,85 @@ mod tests {
             sheet.hyperlinks.get(&(1, 1)).map(String::as_str),
             Some("#Sheet2!C3")
         );
+    }
+
+    /// #671 R14: removing a link survives the save, a range link touched
+    /// anywhere goes whole, and the others stay byte for byte.
+    #[test]
+    fn removed_hyperlinks_are_struck_on_save() {
+        use crate::edit::{ClearWhat, apply_clear};
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let rns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let xml = format!(
+            "<worksheet xmlns=\"{ns}\" xmlns:r=\"{rns}\"><sheetData/><hyperlinks>\
+             <hyperlink ref=\"A1:B2\" r:id=\"rId1\"/>\
+             <hyperlink ref=\"D4\" location=\"Sheet2!C3\"/></hyperlinks></worksheet>"
+        );
+        let mut targets = std::collections::HashMap::new();
+        targets.insert("rId1".to_string(), "https://example.com".to_string());
+        let load = |xml: &str| parse_worksheet(xml, &[], &targets);
+        let book = |sheet: Sheet| crate::sheet::Workbook {
+            sheets: vec![sheet],
+            ..Default::default()
+        };
+        // A partial clear: B2 of A1:B2 takes the whole link.
+        let mut wb = book(load(&xml));
+        assert_eq!(wb.sheets[0].hyperlinks.len(), 5);
+        apply_clear(&mut wb, 0, &[(1, 1, 1, 1)], ClearWhat::Hyperlinks, &[]).unwrap();
+        assert_eq!(wb.sheets[0].hyperlinks.len(), 1, "A1:B2 went whole");
+        let saved = splice_worksheet(&xml, &wb.sheets[0], "<sheetData/>", &[], &mut |_, _| None);
+        assert!(!saved.contains("A1:B2"), "{saved}");
+        assert!(saved.contains("<hyperlink ref=\"D4\" location=\"Sheet2!C3\"/>"));
+        let back = load(&saved);
+        assert!(!back.hyperlinks.contains_key(&(1, 1)) && !back.hyperlinks.contains_key(&(0, 0)));
+        assert_eq!(back.hyperlinks.len(), 1);
+        // A full clear drops the block.
+        let mut wb = book(load(&xml));
+        apply_clear(
+            &mut wb,
+            0,
+            &[(0, 0, 9, 9)],
+            ClearWhat::RemoveHyperlinks,
+            &[],
+        )
+        .unwrap();
+        let saved = splice_worksheet(&xml, &wb.sheets[0], "<sheetData/>", &[], &mut |_, _| None);
+        assert!(!saved.contains("hyperlink"), "{saved}");
+        assert!(load(&saved).hyperlinks.is_empty());
+        // Nothing removed: the part is left alone.
+        let wb = book(load(&xml));
+        assert!(
+            splice_worksheet(&xml, &wb.sheets[0], "<sheetData/>", &[], &mut |_, _| None)
+                .contains("A1:B2")
+        );
+    }
+
+    /// #707 r6 M2: a column of 50,000 per-cell links clears and saves in
+    /// linear time, and the save keeps only the links left.
+    #[test]
+    fn clearing_50k_links_and_saving_is_fast() {
+        use crate::edit::{ClearWhat, apply_clear};
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let mut links = String::new();
+        for r in 1..=50_000 {
+            links.push_str(&format!("<hyperlink ref=\"A{r}\" location=\"Sheet2!A1\"/>"));
+        }
+        let xml = format!(
+            "<worksheet xmlns=\"{ns}\"><sheetData/><hyperlinks>{links}</hyperlinks></worksheet>"
+        );
+        let mut wb = crate::sheet::Workbook {
+            sheets: vec![parse_worksheet(&xml, &[], &Default::default())],
+            ..Default::default()
+        };
+        assert_eq!(wb.sheets[0].hyperlinks.len(), 50_000);
+        let t = std::time::Instant::now();
+        // All but the last link.
+        apply_clear(&mut wb, 0, &[(0, 0, 49_998, 0)], ClearWhat::Hyperlinks, &[]).unwrap();
+        let saved = splice_worksheet(&xml, &wb.sheets[0], "<sheetData/>", &[], &mut |_, _| None);
+        assert!(t.elapsed() < crate::edit::PERF_BOUND, "{:?}", t.elapsed());
+        let back = parse_worksheet(&saved, &[], &Default::default());
+        assert_eq!(back.hyperlinks.len(), 1);
+        assert!(back.hyperlinks.contains_key(&(49_999, 0)));
     }
 
     #[test]
@@ -13172,7 +13506,11 @@ b",
     fn autofill_copy_is_typed_and_drops_source_cm_vm() {
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         assert!(pkg.workbook.sheets[0].cell(0, 3).unwrap().meta.is_some());
-        crate::edit::autofill(&mut pkg.workbook, 0, (0, 3, 0, 3), (0, 4));
+        crate::edit::autofill(
+            &mut pkg.workbook,
+            0,
+            &crate::edit::FillReq::new((0, 3, 0, 3), (0, 4)),
+        );
         let copy = pkg.workbook.sheets[0].cell(0, 4).unwrap();
         assert!(copy.formula.is_some());
         // Typed there (#785): modern, and none of the source's `cm`/`vm`.
@@ -13218,16 +13556,22 @@ b",
                 })
                 .collect();
             let mut auto = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
-            crate::edit::autofill(&mut auto.workbook, 0, (0, 2, 0, 2), (0, 3));
+            crate::edit::autofill(
+                &mut auto.workbook,
+                0,
+                &crate::edit::FillReq::new((0, 2, 0, 2), (0, 3)),
+            );
             let mut eng = crate::engine::Engine::new(&auto.workbook);
             eng.recalc_all(&mut auto.workbook);
 
             let mut fill = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
             let mut eng = crate::engine::Engine::new(&fill.workbook);
             eng.recalc_all(&mut fill.workbook);
-            for (r, c, cell) in
-                crate::edit::fill_changes(&fill.workbook.sheets[0], (0, 2, 0, 3), false)
-            {
+            for (r, c, cell) in crate::edit::fill_changes(
+                &fill.workbook.sheets[0],
+                (0, 2, 0, 3),
+                crate::edit::FillDir::Right,
+            ) {
                 eng.set_cell(&mut fill.workbook, (0, r, c), cell);
             }
 
@@ -13834,7 +14178,15 @@ b",
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.recalc_all(&mut pkg.workbook);
         let sel = (target.0, target.1, target.0, target.1);
-        for (r, c, cell) in crate::edit::fill_changes(&pkg.workbook.sheets[0], sel, down) {
+        for (r, c, cell) in crate::edit::fill_changes(
+            &pkg.workbook.sheets[0],
+            sel,
+            if down {
+                crate::edit::FillDir::Down
+            } else {
+                crate::edit::FillDir::Right
+            },
+        ) {
             eng.set_cell(&mut pkg.workbook, (0, r, c), cell);
         }
     }
