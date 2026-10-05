@@ -5,8 +5,14 @@ real X server is needed. The fakes satisfy the contracts ui-linux.py relies on:
 Xvfb writes a decimal display number to the -displayfd fd, and xprop answers the
 _NET_SUPPORTING_WM_CHECK readiness probe.
 
+StopAll unit-tests stop_all() in-process by loading ui-linux.py as the module
+`ui_linux` and patching its stop() and os.killpg.
+
     python3 -m unittest discover -s scripts -p 'test_*.py' -v
 """
+import contextlib
+import importlib.util
+import io
 import os
 from pathlib import Path
 import signal
@@ -16,10 +22,15 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 WRAPPER = HERE / 'ui-linux.py'
 DEADLINE = 10.0
+
+_spec = importlib.util.spec_from_file_location('ui_linux', HERE / 'ui-linux.py')
+ui_linux = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ui_linux)
 
 XVFB = """\
 import os
@@ -209,6 +220,83 @@ class Teardown(unittest.TestCase):
         self._pid('child.pid')
         self.assertEqual(wrapper.wait(timeout=20), 7)
         self._assert_all_gone()
+
+
+@unittest.skipUnless(sys.platform.startswith('linux'), 'ui-linux.py is Linux-only')
+class StopAll(unittest.TestCase):
+    def test_oserror_does_not_skip_later_processes(self):
+        seen = []
+
+        def fake_stop(process):
+            seen.append(process)
+            if len(seen) == 1:
+                raise PermissionError('denied')
+
+        err = io.StringIO()
+        a, b, c = object(), object(), object()
+        with mock.patch.object(ui_linux, 'stop', fake_stop), \
+                contextlib.redirect_stderr(err):
+            stopped = ui_linux.stop_all([('command', a), ('openbox', b), ('xvfb', c)])
+        self.assertFalse(stopped)
+        self.assertEqual(seen, [a, b, c])
+        self.assertIn('ui-linux: could not stop command: denied', err.getvalue())
+
+    def test_permission_error_still_kills_real_later_processes(self):
+        def spawn():
+            return subprocess.Popen(
+                [sys.executable, '-c', 'import time; time.sleep(60)'],
+                start_new_session=True)
+
+        blocked, p1, p2 = spawn(), spawn(), spawn()
+        for proc in (blocked, p1, p2):
+            self.addCleanup(self._reap, proc)
+        real_killpg = os.killpg
+
+        def killpg(pgid, sig):
+            if pgid == blocked.pid:
+                raise PermissionError('denied')
+            return real_killpg(pgid, sig)
+
+        err = io.StringIO()
+        with mock.patch.object(ui_linux.os, 'killpg', killpg), \
+                contextlib.redirect_stderr(err):
+            stopped = ui_linux.stop_all([('command', blocked), ('openbox', p1), ('xvfb', p2)])
+        self.assertFalse(stopped)
+        self.assertIsNotNone(p1.poll())
+        self.assertIsNotNone(p2.poll())
+        self.assertIn('ui-linux: could not stop command: denied', err.getvalue())
+
+    def test_non_oserror_propagates(self):
+        def fake_stop(process):
+            raise RuntimeError('boom')
+
+        with mock.patch.object(ui_linux, 'stop', fake_stop):
+            with self.assertRaises(RuntimeError):
+                ui_linux.stop_all([('command', object())])
+
+    def test_none_processes_are_skipped(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            stopped = ui_linux.stop_all([('command', None), ('openbox', None), ('xvfb', None)])
+        self.assertTrue(stopped)
+        self.assertEqual(err.getvalue(), '')
+
+    def test_all_stopped_returns_true(self):
+        with mock.patch.object(ui_linux, 'stop', lambda process: None):
+            stopped = ui_linux.stop_all(
+                [('command', object()), ('openbox', object()), ('xvfb', object())])
+        self.assertTrue(stopped)
+
+    @staticmethod
+    def _reap(proc):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
 
 if __name__ == '__main__':

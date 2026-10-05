@@ -293,8 +293,8 @@ def run_one(cmd, transcript_path, timeout):
             return proc.returncode, True
         except KeyboardInterrupt:
             # A terminal Ctrl-C reached ui-linux.py too, and it is already
-            # tearing down. A SIGTERM now would interrupt that teardown and
-            # orphan Xvfb, so give it time to finish first.
+            # tearing down; it ignores further SIGTERM/SIGINT until that is
+            # done (#985), so wait for it before trying SIGTERM.
             stop(proc, signalled=True)
             raise
 

@@ -31,6 +31,21 @@ def stop(process):
     process.wait()
 
 
+def stop_all(processes):
+    """Stop each (name, process) in turn; one failure must not orphan the rest.
+
+    Returns True when every stop succeeded, False if any raised OSError.
+    """
+    ok = True
+    for name, process in processes:
+        try:
+            stop(process)
+        except OSError as exc:
+            print(f'ui-linux: could not stop {name}: {exc}', file=sys.stderr, flush=True)
+            ok = False
+    return ok
+
+
 def ignore_signals():
     """Ignore SIGTERM/SIGINT, even if one arrives while the old handler is still armed."""
     while True:
@@ -112,21 +127,24 @@ def main():
             print(f'Private X11 display {env["DISPLAY"]}; logs: {logs}', flush=True)
             child = subprocess.Popen(command, env=env, start_new_session=True)
             code = child.wait()
-            return code if code >= 0 else 128 - code
+            code = code if code >= 0 else 128 - code
     except KeyboardInterrupt:
-        return 130
+        code = 130
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         print(f'ui-linux: {exc}; see {logs}', file=sys.stderr)
-        return 1
+        code = 1
     finally:
         # Teardown must finish: a second SIGTERM/SIGINT here would abort it
         # and orphan Openbox and Xvfb.
         ignore_signals()
-        for process in (child, wm, xvfb):
-            stop(process)
+        stopped = stop_all((('command', child), ('openbox', wm), ('xvfb', xvfb)))
         os.close(read_fd)
         if write_fd is not None:
             os.close(write_fd)
+    if not stopped and code == 0:
+        # The command passed but teardown failed: something may be left running.
+        code = 1
+    return code
 
 
 if __name__ == '__main__':
