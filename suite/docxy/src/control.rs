@@ -416,6 +416,11 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Result<Json, String>> {
+        // The build this binary is (#1023): the same JSON in a harness and in
+        // normal Project control, whatever tab is open.
+        if verb == "app-info" {
+            return Some(Json::parse(&crate::about::info().json()));
+        }
         if verb == "proj.new" {
             return Some((|| {
                 check_new_project_args(args)?;
