@@ -2697,6 +2697,9 @@ fn hyperlink_prompt_parse_cases() {
             None,
             Some("Run book"),
         ),
+        // `| TEXT` without the leading space is text-only, like ` | TEXT`.
+        ("| Runbook", None, None, Some("Runbook")),
+        ("|Runbook", None, None, Some("Runbook")),
         ("", None, None, None),
     ] {
         assert_eq!(
@@ -2704,6 +2707,75 @@ fn hyperlink_prompt_parse_cases() {
             (opt(address), opt(location), opt(text)),
             "{buf}"
         );
+    }
+}
+
+/// #418 r1: the prefill must parse back to the stored parts for every shape
+/// a file can hold — including a text containing the grammar's own `|` and
+/// `#` — so looking at a link never recasts it.
+#[test]
+fn hyperlink_prefill_round_trips_through_parse() {
+    let opt = |s: Option<&str>| s.map(str::to_string);
+    for (text, address, location) in [
+        (Some("Runbook"), None, None),
+        (Some("a | b"), None, None),
+        (Some("a#b"), None, None),
+        (None, None, Some("Gantt Chart!4")),
+        (None, Some("https://x"), None),
+        (Some("docs"), Some("https://x"), None),
+        (Some("docs"), None, Some("loc")),
+        (Some("docs"), Some("https://x"), Some("loc")),
+    ] {
+        let task = projcore::model::Task {
+            hyperlink: text.map(str::to_string),
+            hyperlink_address: address.map(str::to_string),
+            hyperlink_sub_address: location.map(str::to_string),
+            ..projcore::model::Task::default()
+        };
+        assert_eq!(
+            parse_hyperlink(&hyperlink_hint(&task)),
+            (opt(address), opt(location), opt(text)),
+            "{text:?} {address:?} {location:?}"
+        );
+    }
+}
+
+/// #418 r1: Enter on the prefill the prompt opened with — an address-only
+/// link, the empty elements #408 keeps, an address holding `#` — changes
+/// nothing: no fabricated text, no dropped elements, no re-split, no undo
+/// step, no dirty flag.
+#[test]
+fn hyperlink_prompt_enter_on_unchanged_prefill_changes_nothing() {
+    for (text, address, location) in [
+        (None, Some("https://example.com"), None),
+        (Some(""), Some(""), Some("")),
+        (Some("docs"), Some("https://x/#/route"), Some("Sheet!1")),
+    ] {
+        let mut t = tab();
+        let mut p = v(&t).ed.project().clone();
+        p.tasks[1].hyperlink = text.map(str::to_string);
+        p.tasks[1].hyperlink_address = address.map(str::to_string);
+        p.tasks[1].hyperlink_sub_address = location.map(str::to_string);
+        vm(&mut t).ed = ProjectEditor::new(p);
+        vm(&mut t).ed.select(1);
+        let before = v(&t).ed.project().clone();
+        let status = t.status.clone();
+        let depth = v(&t).ed.undo_depth();
+        chord(&mut t, "k", ctrl());
+        press(&mut t, "enter");
+        assert_eq!(
+            hyperlink_parts(&t),
+            (
+                before.task(2).unwrap().hyperlink.clone(),
+                before.task(2).unwrap().hyperlink_address.clone(),
+                before.task(2).unwrap().hyperlink_sub_address.clone()
+            ),
+            "{text:?} {address:?} {location:?}"
+        );
+        assert_eq!(v(&t).ed.project(), &before);
+        assert_eq!(v(&t).ed.undo_depth(), depth);
+        assert_eq!(t.status, status);
+        assert!(!t.dirty);
     }
 }
 

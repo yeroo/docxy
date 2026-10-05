@@ -815,7 +815,9 @@ fn assign_status(ed: &mut ProjectEditor, uid: i32, text: &str) -> Result<Option<
 }
 
 /// The hyperlink prompt's initial text: `address#location | text`, parts
-/// omitted when the task does not store them.
+/// omitted when the task does not store them — except the text's ` | `
+/// separator, which stays, so a text-only link prefills as ` | text` and
+/// parses back text-only instead of becoming the address.
 fn hyperlink_hint(task: &projcore::model::Task) -> String {
     let mut buf = String::new();
     if let Some(address) = &task.hyperlink_address {
@@ -826,9 +828,7 @@ fn hyperlink_hint(task: &projcore::model::Task) -> String {
         buf.push_str(location);
     }
     if let Some(text) = &task.hyperlink {
-        if !buf.is_empty() {
-            buf.push_str(" | ");
-        }
+        buf.push_str(" | ");
         buf.push_str(text);
     }
     buf
@@ -837,11 +837,15 @@ fn hyperlink_hint(task: &projcore::model::Task) -> String {
 /// Parse the prompt's `ADDRESS[#LOCATION] [| TEXT]`: the first ` | ` splits
 /// the display text, the first `#` splits the address from the location
 /// (Project's own address#subaddress convention, so an address cannot hold
-/// `#`), ends trimmed, an empty part absent.
+/// `#`), ends trimmed, an empty part absent. ` | TEXT` typed without the
+/// leading space is text-only, like ` | TEXT`.
 fn parse_hyperlink(buf: &str) -> (Option<String>, Option<String>, Option<String>) {
-    let (link, text) = match buf.split_once(" | ") {
-        Some((link, text)) => (link, Some(text)),
-        None => (buf, None),
+    let (link, text) = match buf.trim_start().strip_prefix('|') {
+        Some(text) => ("", Some(text)),
+        None => match buf.split_once(" | ") {
+            Some((link, text)) => (link, Some(text)),
+            None => (buf, None),
+        },
     };
     let (address, location) = match link.split_once('#') {
         Some((address, location)) => (Some(address), Some(location)),
@@ -902,6 +906,12 @@ fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, 
         PromptKind::Assign => return assign_status(&mut v.ed, uid, &p.buf),
         PromptKind::Hyperlink => {
             let task = v.ed.project().task(uid).ok_or("No task selected")?;
+            // Enter on the prefill the prompt opened with changes nothing: a
+            // stored address can hold `#` or ` | `, which the grammar would
+            // re-split, and an address-only link would grow a display text.
+            if p.buf == hyperlink_hint(task) {
+                return Ok(None);
+            }
             let had_link = task.hyperlink.is_some()
                 || task.hyperlink_address.is_some()
                 || task.hyperlink_sub_address.is_some();

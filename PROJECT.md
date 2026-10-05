@@ -406,13 +406,17 @@ h/l and Alt+Home). The Report tab stays, with no groups yet.
 
 Ctrl+K (and a task row's menu › Hyperlink..., enabled like Information...)
 opens one prompt on the selected task: prefilled from its stored link as
-`address#location | text`, parts omitted when absent, committed with Enter,
+`address#location | text`, parts omitted when absent (a stored text keeps its
+` | `, so a text-only link prefills as ` | text`), committed with Enter,
 cancelled with Escape, never on the entry row. The buffer's grammar is
 `ADDRESS[#LOCATION] [| TEXT]`: the first ` | ` splits the display text (a
 later one stays in it), the first `#` splits the address from the location —
 Project's own address#subaddress convention, so an address cannot hold `#` —
 which makes an address-less `#Gantt Chart!4` a location-only link, as Project
-allows. Text omitted displays the address, else the location, as Project's
+allows. Neither can an address hold ` | `; Enter on an unchanged prompt
+always leaves the stored link alone, however it is shaped. `| TEXT` typed
+without the leading space is text-only, like ` | TEXT`. Text omitted displays
+the address, else the location, as Project's
 Text to display defaults; an empty buffer removes the link (`Hyperlink
 removed`, or no status when there was none) and a set reports
 `Hyperlink set: <text>`. The three parts are one undo step, kept on save
