@@ -79,6 +79,10 @@ pub struct NewValidation<'a> {
     pub operator: &'a str,
     pub formula1: &'a str,
     pub formula2: Option<&'a str>,
+    /// The rest of the rule (alert, input message, blanks, dropdown) when it
+    /// is a copy of one: written as the source has it. `None` is a rule with
+    /// the defaults of one typed in (blanks, input message and alert on).
+    pub settings: Option<&'a crate::sheet::DataValidation>,
 }
 
 /// A loaded `.xlsx`: the editable [`Workbook`] plus all original parts (and
@@ -7614,6 +7618,7 @@ impl SheetPackage {
                 operator,
                 formula1,
                 formula2,
+                settings: None,
             }],
         )
     }
@@ -7629,29 +7634,32 @@ impl SheetPackage {
         if rules.is_empty() {
             return true;
         }
-        let items: Vec<String> = rules
+        // The rule each entry stands for, as the model holds it.
+        let model: Vec<crate::sheet::DataValidation> = rules
             .iter()
             .map(|r| {
-                let (r1, c1, r2, c2) = r.range;
-                let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
-                let op_attr = if r.operator.is_empty() {
-                    String::new()
-                } else {
-                    format!(" operator=\"{}\"", r.operator)
-                };
-                let mut fmls = format!("<formula1>{}</formula1>", esc_text(&file_formula(r.formula1)));
-                if let Some(f2) = r.formula2 {
-                    fmls.push_str(&format!(
-                        "<formula2>{}</formula2>",
-                        esc_text(&file_formula(f2))
-                    ));
+                let base = r
+                    .settings
+                    .cloned()
+                    .unwrap_or_else(|| crate::sheet::DataValidation {
+                        allow_blank: true,
+                        show_input: true,
+                        show_error: true,
+                        ..Default::default()
+                    });
+                crate::sheet::DataValidation {
+                    ranges: vec![r.range],
+                    kind: r.kind.to_string(),
+                    operator: r.operator.to_string(),
+                    formula1: r.formula1.to_string(),
+                    formula2: r.formula2.unwrap_or("").to_string(),
+                    ix: None,
+                    orig: None,
+                    ..base
                 }
-                format!(
-                    "<dataValidation type=\"{}\"{op_attr} allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"{sqref}\">{fmls}</dataValidation>",
-                    r.kind
-                )
             })
             .collect();
+        let items: Vec<String> = model.iter().map(dv_element).collect();
         let n = items.len();
         let sheet_part = self.sheet_parts[sheet].clone();
         let mut first_ix = None;
@@ -7682,19 +7690,8 @@ impl SheetPackage {
             }
             s.dv_removed.retain(|&i| i < first);
         }
-        for (k, r) in rules.iter().enumerate() {
-            let mut dv = crate::sheet::DataValidation {
-                ranges: vec![r.range],
-                kind: r.kind.to_string(),
-                operator: r.operator.to_string(),
-                formula1: r.formula1.to_string(),
-                formula2: r.formula2.unwrap_or("").to_string(),
-                allow_blank: true,
-                show_input: true,
-                show_error: true,
-                ix: first_ix.map(|f| f + k),
-                ..Default::default()
-            };
+        for (k, mut dv) in model.into_iter().enumerate() {
+            dv.ix = first_ix.map(|f| f + k);
             // The element written above is the rule's original, when it is there.
             if dv.ix.is_some() {
                 dv.orig = Some(Box::new(dv.clone()));
@@ -9145,6 +9142,7 @@ mod tests {
                 operator: "",
                 formula1: "\"Laptop,Monitor,Dock\"",
                 formula2: None,
+                settings: None,
             },
             NewValidation {
                 range: (0, 1, 4, 1),
@@ -9152,6 +9150,7 @@ mod tests {
                 operator: "between",
                 formula1: "1",
                 formula2: Some("10"),
+                settings: None,
             },
         ];
         let mut one = new_xlsx();

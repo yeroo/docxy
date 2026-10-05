@@ -535,6 +535,7 @@ fn a_malformed_block_is_refused_and_never_panics() {
         prompt: None,
         cells: vec![(5, 5)],
         anchor: (0, 0),
+        settings: DataValidation::default(),
     }];
     let _ = paste_special_extras(&clip, at("C1"), &PasteSpec::of(PasteWhat::Validation));
 }

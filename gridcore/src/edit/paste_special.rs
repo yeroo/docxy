@@ -226,6 +226,26 @@ pub struct ClipRule {
     /// The source rule's anchor (the top-left of its ranges, as
     /// `shift_rule_ranges` reads it): its formulas are relative to it.
     pub anchor: (u32, u32),
+    /// The source rule with its ranges and element dropped: everything else
+    /// a paste of it carries (alert, input message, blanks, dropdown). Its
+    /// formulas are the source's; the rule's own `formula1`/`formula2` are
+    /// the ones to write.
+    pub settings: crate::sheet::DataValidation,
+}
+
+impl ClipRule {
+    /// The rule a paste of this adds over `ranges`: the source's settings
+    /// with this rule's (moved) formulas.
+    pub fn to_validation(&self) -> crate::sheet::DataValidation {
+        crate::sheet::DataValidation {
+            formula1: self.formula1.clone(),
+            formula2: self.formula2.clone(),
+            ranges: Vec::new(),
+            ix: None,
+            orig: None,
+            ..self.settings.clone()
+        }
+    }
 }
 
 /// The positions in sorted `v` of the values `lo..=hi`.
@@ -303,6 +323,12 @@ impl ClipBlock {
                     formula2: dv.formula2.clone(),
                     prompt: dv.prompt.clone(),
                     cells,
+                    settings: crate::sheet::DataValidation {
+                        ranges: Vec::new(),
+                        ix: None,
+                        orig: None,
+                        ..dv.clone()
+                    },
                 })
             })
             .collect();

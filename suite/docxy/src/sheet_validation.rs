@@ -1109,4 +1109,33 @@ mod tests {
         assert!(view(&mut t).structural_edit(crate::StructOp::InsertRow));
         assert!(view(&mut t).circles.is_empty());
     }
+
+    #[test]
+    fn paste_special_validation_carries_the_whole_rule() {
+        use gridcore::edit::{PasteSpec, PasteWhat};
+        let mut t = book(AlertStyle::Warning);
+        let v = view(&mut t);
+        v.anchor = at("B2");
+        v.sel = at("B2");
+        let clip = v.grid_clip(false).unwrap();
+        v.paste_special_at(&clip.block, &PasteSpec::of(PasteWhat::Validation), at("F4"))
+            .unwrap();
+        let (r, c) = at("F4");
+        let dv =
+            gridcore::validation::validation_at(view(&mut t).sheet(), r, c).expect("F4 validated");
+        assert_eq!(dv.error_style, AlertStyle::Warning);
+        assert_eq!(
+            (dv.error_title.as_str(), dv.error.as_str()),
+            ("Score", "10 to 90 only")
+        );
+        assert!(
+            dv.show_error && dv.ix.is_some(),
+            "written as an element of its own"
+        );
+        // And it survives a save.
+        let saved = gridcore::xlsx::save_xlsx(&view(&mut t).pkg);
+        let re = gridcore::xlsx::load_xlsx(&saved).unwrap();
+        let reloaded = gridcore::validation::validation_at(&re.workbook.sheets[0], r, c).unwrap();
+        assert_eq!(reloaded.error_style, AlertStyle::Warning);
+    }
 }
