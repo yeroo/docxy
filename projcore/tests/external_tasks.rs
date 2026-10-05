@@ -226,6 +226,27 @@ fn cross_project_name_round_trips_in_the_cell() {
 }
 
 #[test]
+fn cross_project_links_sharing_a_name_both_round_trip() {
+    let mut proj = read_mspdi(&fixture(r"C:\plans\other.mpp", "")).unwrap();
+    let task2 = proj.tasks.iter_mut().find(|t| t.uid == 2).unwrap();
+    let mut second = projcore::Predecessor::fs(4);
+    second.cross_project = Some(true);
+    second.cross_project_name = Some(r"C:\plans\other.mpp\7".into());
+    task2.predecessors.push(second);
+    proj.tasks.push(projcore::Task {
+        uid: 4,
+        id: 4,
+        name: "External 2".into(),
+        ..Default::default()
+    });
+    let task = proj.task(2).unwrap();
+    let shown = format_predecessors(task, &proj);
+    assert_eq!(shown, r"1, C:\plans\other.mpp\7, C:\plans\other.mpp\7");
+    let parsed = parse_task_predecessors(&shown, task, &proj).unwrap();
+    assert_eq!(parsed, task.predecessors);
+}
+
+#[test]
 fn cross_project_cell_rejects_duplicates_and_unknown_names() {
     let proj = read_mspdi(&fixture(r"C:\plans\other.mpp", "")).unwrap();
     let task = proj.task(2).unwrap();

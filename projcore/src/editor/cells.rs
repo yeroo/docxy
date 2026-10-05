@@ -858,12 +858,18 @@ fn split_predecessor_entries<'a>(
         .collect();
     let upper = text.to_ascii_uppercase();
     let mut entries = Vec::new();
+    // A link an earlier entry matched is skipped on ties, so two links with
+    // the same name each pair with their own entry; spelling one link twice
+    // still re-pairs the second entry with it and fails as a duplicate in
+    // the parser.
+    let mut matched_uids = Vec::new();
     let mut rest = upper.as_str();
     loop {
         rest = rest.trim_start();
         // A match needs a boundary after the name, so a name ending in
         // digits does not swallow a following ID or suffix; the longest
-        // matching name wins, first on ties.
+        // matching name wins, first on ties, preferring a link no earlier
+        // entry matched.
         let mut matched: Option<&(String, &'a Predecessor)> = None;
         for candidate in &names {
             let Some(tail) = rest.strip_prefix(candidate.0.as_str()) else {
@@ -876,13 +882,25 @@ fn split_predecessor_entries<'a>(
                 || ["FS", "SS", "FF", "SF"]
                     .into_iter()
                     .any(|code| tail.starts_with(code));
-            let longer = match matched {
-                Some(best) => candidate.0.len() > best.0.len(),
-                None => true,
-            };
-            if boundary && longer {
-                matched = Some(candidate);
+            if !boundary {
+                continue;
             }
+            matched = match matched {
+                None => Some(candidate),
+                Some(best) => {
+                    let fresher = candidate.0.len() == best.0.len()
+                        && !matched_uids.contains(&candidate.1.uid)
+                        && matched_uids.contains(&best.1.uid);
+                    if candidate.0.len() > best.0.len() || fresher {
+                        Some(candidate)
+                    } else {
+                        Some(best)
+                    }
+                }
+            };
+        }
+        if let Some((_, p)) = matched {
+            matched_uids.push(p.uid);
         }
         let end = match matched {
             Some((name, _)) => rest[name.len()..]
