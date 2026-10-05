@@ -278,7 +278,7 @@ fn apply(
     // save) blank.
     v.engine = crate::sheet_engine(&v.pkg.workbook);
     v.engine.recalc_all(&mut v.pkg.workbook);
-    tab.dirty = true;
+    tab.set_dirty();
     tab.status = format!(
         "Consolidated into {}:{}",
         cell_name(r1, c1),
