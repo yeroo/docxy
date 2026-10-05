@@ -170,8 +170,9 @@ impl Document {
         let targets = revision_postorder(&addresses, action);
         // Rejecting a recorded insertion takes with it a deletion that was
         // left with nothing (text deleted from it), which the batch then
-        // finds gone: that deletion was acted on, not stale. Only that case.
-        let mut rejected_an_insertion = false;
+        // finds gone: that deletion was acted on, not stale. Only a stale
+        // deletion that had one of the insertions rejected so far inside it.
+        let mut rejected: std::collections::HashSet<RevisionTarget> = Default::default();
         let mut outcomes = targets
             .into_iter()
             .map(|(ordinal, target)| {
@@ -184,11 +185,17 @@ impl Document {
                     (
                         RevisionOutcome::Applied { .. },
                         Some(RevisionCategory::Inline(RevisionKind::Insert)),
-                    ) if action == RevisionAction::Reject => rejected_an_insertion = true,
+                    ) if action == RevisionAction::Reject => {
+                        rejected.insert(target);
+                    }
                     (
                         RevisionOutcome::Stale { .. },
                         Some(category @ RevisionCategory::Inline(RevisionKind::Delete)),
-                    ) if action == RevisionAction::Reject && rejected_an_insertion => {
+                    ) if action == RevisionAction::Reject
+                        && addresses
+                            .iter()
+                            .any(|a| a.parent == Some(target) && rejected.contains(&a.target)) =>
+                    {
                         outcome = RevisionOutcome::Applied {
                             target,
                             action,

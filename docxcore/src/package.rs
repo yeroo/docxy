@@ -2412,11 +2412,13 @@ impl Package {
         }
     }
 
-    /// The `commentsExtended` / `commentsIds` entries of comment `id`, each as
-    /// (part name, element), for [`Package::restore_comment_extras`]: what a
-    /// removal takes (the reply link `w15:paraIdParent`, the durable id) and the
-    /// comment's own XML does not carry.
-    pub fn comment_extras(&self, id: &str) -> Vec<(String, String)> {
+    /// The `commentsExtended`, `commentsIds` and `commentsExtensible` entries
+    /// of comment `id` (each whole element, children included), with the root
+    /// start tag of the part it came from, for
+    /// [`Package::restore_comment_extras`]: what a removal takes (the reply
+    /// link `w15:paraIdParent`, the durable id, its UTC date) and the comment's
+    /// own XML does not carry.
+    pub fn comment_extras(&self, id: &str) -> Vec<CommentExtra> {
         let Some(xml) = self.part_text("word/comments.xml") else {
             return Vec::new();
         };
@@ -2427,45 +2429,55 @@ impl Package {
         else {
             return Vec::new();
         };
+        // Every element of `part` named `tag` whose `attr` is one of `keys`.
+        let entries = |part: &str, tag: &str, attr: &str, keys: &[String]| {
+            let mut out = Vec::new();
+            let Some(xml) = self.part_text(part) else {
+                return out;
+            };
+            let root = comment_part_root(&xml, part).unwrap_or_default();
+            let mut from = 0;
+            while let Some((a, b, _)) = crate::inspect::find_element_from(&xml, tag, from) {
+                let el = &xml[a..b];
+                if crate::load::xml_attr_value(el, attr).is_some_and(|v| keys.contains(&v)) {
+                    out.push(CommentExtra {
+                        part: part.to_string(),
+                        element: el.to_string(),
+                        root: root.clone(),
+                    });
+                }
+                from = b;
+            }
+            out
+        };
         let mut out = Vec::new();
         for (part, tag, attr) in COMMENT_EXTRAS {
-            let Some(xml) = self.part_text(part) else {
-                continue;
-            };
-            for (_, el) in crate::load::start_tags(&xml, tag) {
-                if crate::load::xml_attr_value(el, attr).as_deref() == Some(para_id.as_str()) {
-                    out.push((part.to_string(), el.to_string()));
-                }
-            }
+            out.extend(entries(part, tag, attr, std::slice::from_ref(&para_id)));
         }
         // `commentsExtensible` is keyed by the durable id `commentsIds` gave it.
         let durable: Vec<String> = out
             .iter()
-            .filter_map(|(_, el)| crate::load::xml_attr_value(el, "w16cid:durableId"))
+            .filter_map(|e| crate::load::xml_attr_value(&e.element, "w16cid:durableId"))
             .collect();
-        if let Some(xml) = self.part_text(COMMENTS_EXTENSIBLE.0) {
-            for (_, el) in crate::load::start_tags(&xml, COMMENTS_EXTENSIBLE.1) {
-                let key = crate::load::xml_attr_value(el, COMMENTS_EXTENSIBLE.2);
-                if key.is_some_and(|k| durable.contains(&k)) {
-                    out.push((COMMENTS_EXTENSIBLE.0.to_string(), el.to_string()));
-                }
-            }
-        }
+        let (part, tag, attr) = COMMENTS_EXTENSIBLE;
+        out.extend(entries(part, tag, attr, &durable));
         out
     }
 
     /// Put back entries [`Package::comment_extras`] returned, creating a part
-    /// (with its content-type override and relationship) the removal dropped.
-    pub fn restore_comment_extras(&mut self, extras: &[(String, String)]) {
-        for (part, el) in extras {
+    /// the removal dropped (with its content-type override and relationship)
+    /// under the root it had, so the namespaces its entries use stay declared.
+    pub fn restore_comment_extras(&mut self, extras: &[CommentExtra]) {
+        for extra in extras {
+            let part = extra.part.as_str();
             let Some((_, tag, attr)) = COMMENT_EXTRAS
                 .iter()
                 .chain([&COMMENTS_EXTENSIBLE])
-                .find(|(p, ..)| p == part)
+                .find(|(p, ..)| *p == part)
             else {
                 continue;
             };
-            let para = crate::load::xml_attr_value(el, attr);
+            let key = crate::load::xml_attr_value(&extra.element, attr);
             let root = match *tag {
                 "w15:commentEx" => "w15:commentsEx",
                 "w16cex:commentExtensible" => "w16cex:commentsExtensible",
@@ -2473,40 +2485,47 @@ impl Package {
             };
             match self.part_text(part) {
                 Some(xml) => {
-                    let present = crate::load::start_tags(&xml, tag)
-                        .into_iter()
-                        .any(|(_, t)| crate::load::xml_attr_value(t, attr) == para);
+                    let mut from = 0;
+                    let mut present = false;
+                    while let Some((a, b, _)) = crate::inspect::find_element_from(&xml, tag, from) {
+                        present |= crate::load::xml_attr_value(&xml[a..b], attr) == key;
+                        from = b;
+                    }
                     if present {
                         continue;
                     }
                     if let Some(close) = xml.rfind(&format!("</{root}>")) {
-                        let out = format!("{}{}{}", &xml[..close], el, &xml[close..]);
+                        let out = format!("{}{}{}", &xml[..close], extra.element, &xml[close..]);
                         self.set_part_text(part, &out);
                     }
                 }
                 None => {
-                    let (ns, ct, rel) = if root == "w15:commentsEx" {
-                        (
+                    let (ns, ct, rel) = match root {
+                        "w15:commentsEx" => (
                             "xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\"",
                             "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml",
                             "http://schemas.microsoft.com/office/2011/relationships/commentsExtended",
-                        )
-                    } else if root == "w16cex:commentsExtensible" {
-                        (
+                        ),
+                        "w16cex:commentsExtensible" => (
                             "xmlns:w16cex=\"http://schemas.microsoft.com/office/word/2018/wordml/cex\"",
                             "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtensible+xml",
                             "http://schemas.microsoft.com/office/2018/08/relationships/commentsExtensible",
-                        )
-                    } else {
-                        (
+                        ),
+                        _ => (
                             "xmlns:w16cid=\"http://schemas.microsoft.com/office/word/2016/wordml/cid\"",
                             "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsIds+xml",
                             "http://schemas.microsoft.com/office/2016/09/relationships/commentsIds",
-                        )
+                        ),
+                    };
+                    let open = if extra.root.starts_with(&format!("<{root}")) {
+                        extra.root.clone()
+                    } else {
+                        format!("<{root} {ns}>")
                     };
                     let body = format!(
                         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-                         <{root} {ns}>{el}</{root}>"
+                         {open}{}</{root}>",
+                        extra.element
                     );
                     self.add_part_with_rel(part, ct, rel, body);
                 }
@@ -3907,6 +3926,29 @@ const COMMENT_EXTRAS: [(&str, &str, &str); 2] = [
     ("word/commentsExtended.xml", "w15:commentEx", "w15:paraId"),
     ("word/commentsIds.xml", "w16cid:commentId", "w16cid:paraId"),
 ];
+
+/// The root start tag of one of the comment parts [`Package::comment_extras`]
+/// reads (`w15:commentsEx`, `w16cid:commentsIds`, `w16cex:commentsExtensible`).
+fn comment_part_root(xml: &str, part: &str) -> Option<String> {
+    let root = match part {
+        "word/commentsExtended.xml" => "w15:commentsEx",
+        "word/commentsExtensible.xml" => "w16cex:commentsExtensible",
+        _ => "w16cid:commentsIds",
+    };
+    crate::load::start_tags(xml, root)
+        .into_iter()
+        .next()
+        .map(|(_, t)| t.to_string())
+}
+
+/// One per-comment entry taken from a comment part, with that part's root: see
+/// [`Package::comment_extras`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentExtra {
+    pub part: String,
+    pub element: String,
+    pub root: String,
+}
 
 /// The part of per-comment entries keyed by the durable id (`commentsIds`)
 /// rather than the paragraph id: (part, entry element, its durableId attribute).

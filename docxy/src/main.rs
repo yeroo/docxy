@@ -826,7 +826,7 @@ struct TrackedComment {
     /// Its `commentsExtended` / `commentsIds` / `commentsExtensible` entries
     /// when it was deleted (the reply link, the durable id, its UTC date),
     /// put back with `raw` ([`Package::comment_extras`]).
-    extras: Vec<(String, String)>,
+    extras: Vec<docxcore::package::CommentExtra>,
     /// `comments.xml`'s root start tag then, so a part the delete dropped is
     /// rebuilt under the namespaces `raw` may use ([`Package::comments_root_tag`]).
     root: Option<String>,
@@ -12347,22 +12347,30 @@ mod tests {
             w:date=\"2020-01-02T03:04:05Z\"><w:p w14:paraId=\"1A2B\"><w:r><w:t>reply</w:t></w:r></w:p></w:comment>";
         let mut pkg = new_package(ed.doc);
         pkg.insert_comment_xml(word_comment);
+        let extensible = "<w16cex:commentExtensible w16cex:durableId=\"7C7C7C7C\" \
+            w16cex:dateUtc=\"2020-01-02T03:04:05Z\"><w16cex:extLst><w16cex:ext uri=\"{1}\">\
+            <w16cr:reactions xmlns:w16cr=\"urn:cr\"/></w16cex:ext></w16cex:extLst>\
+            </w16cex:commentExtensible>";
+        let extensible_root = "<w16cex:commentsExtensible \
+            xmlns:w16cex=\"http://schemas.microsoft.com/office/word/2018/wordml/cex\" \
+            xmlns:w16cr=\"urn:cr\">";
+        let extra = |part: &str, element: &str, root: &str| docxcore::package::CommentExtra {
+            part: part.to_string(),
+            element: element.to_string(),
+            root: root.to_string(),
+        };
         pkg.restore_comment_extras(&[
-            (
-                "word/commentsExtended.xml".to_string(),
-                "<w15:commentEx w15:paraId=\"1A2B\" w15:paraIdParent=\"0F0F\" w15:done=\"0\"/>"
-                    .to_string(),
+            extra(
+                "word/commentsExtended.xml",
+                "<w15:commentEx w15:paraId=\"1A2B\" w15:paraIdParent=\"0F0F\" w15:done=\"0\"/>",
+                "",
             ),
-            (
-                "word/commentsIds.xml".to_string(),
-                "<w16cid:commentId w16cid:paraId=\"1A2B\" w16cid:durableId=\"7C7C7C7C\"/>"
-                    .to_string(),
+            extra(
+                "word/commentsIds.xml",
+                "<w16cid:commentId w16cid:paraId=\"1A2B\" w16cid:durableId=\"7C7C7C7C\"/>",
+                "",
             ),
-            (
-                "word/commentsExtensible.xml".to_string(),
-                "<w16cex:commentExtensible w16cex:durableId=\"7C7C7C7C\" w16cex:dateUtc=\"2020-01-02T03:04:05Z\"/>"
-                    .to_string(),
-            ),
+            extra("word/commentsExtensible.xml", extensible, extensible_root),
         ]);
         assert!(!pkg.comment_extras("1").is_empty(), "the fixture has them");
         let mut app = App::new(pkg, "test.docx", false);

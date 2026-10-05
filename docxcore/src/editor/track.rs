@@ -211,8 +211,8 @@ impl Editor {
                     record_deletion(&mut p.content, idx, &author, meta);
                 }
                 if !merges {
-                    // A new revision: ids and targets (a deletion inside
-                    // another insertion also splits it, which unsharing sees).
+                    // A new revision: assign its id and target (one inside another
+                    // insertion stays in it; see `unshare_insert_ids`).
                     self.settle_revisions();
                 }
             }
@@ -236,9 +236,17 @@ impl Editor {
         }
         // Every paragraph from `lo` to `hi` in document order, the ones in a
         // table between them included: the table itself stays.
+        // A text box other than the one an endpoint is in is not between them.
+        let (lo_box, hi_box) = (
+            text_box_of(&self.doc.body, &lo.path),
+            text_box_of(&self.doc.body, &hi.path),
+        );
         let paths: Vec<Vec<usize>> = super::all_paragraph_paths(&self.doc.body)
             .into_iter()
-            .filter(|p| !in_text_box(&self.doc.body, p))
+            .filter(|p| match text_box_of(&self.doc.body, p) {
+                None => true,
+                Some(b) => Some(&b) == lo_box.as_ref() || Some(&b) == hi_box.as_ref(),
+            })
             .collect();
         let (Some(first), Some(last)) = (
             paths.iter().position(|p| *p == lo.path),
@@ -651,8 +659,11 @@ impl Stretches {
     }
 }
 
-/// Whether `path` reaches its paragraph through an inline (a text box) rather
-/// than through blocks and table cells.
-fn in_text_box(body: &[crate::model::Block], path: &[usize]) -> bool {
-    (1..path.len()).any(|n| resolve_para(body, &path[..n]).is_some())
+/// The text box (its host paragraph's path and the inline's index) `path`
+/// reaches its paragraph through, if it does so through an inline rather than
+/// through blocks and table cells.
+fn text_box_of(body: &[crate::model::Block], path: &[usize]) -> Option<Vec<usize>> {
+    (1..path.len())
+        .find(|&n| resolve_para(body, &path[..n]).is_some())
+        .map(|n| path[..=n.min(path.len() - 1)].to_vec())
 }

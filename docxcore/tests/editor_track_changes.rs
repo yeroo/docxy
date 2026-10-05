@@ -732,3 +732,62 @@ fn format_and_pressed_state_ignore_the_insertion_cue() {
     docxcore::agent::format_range(&mut ed, 0, 0, &off).unwrap();
     assert!(!xml(&ed).contains("<w:u "), "{}", xml(&ed));
 }
+
+/// Two paragraphs of one text box, selected across: both stay, the text is
+/// recorded as deleted (Reject All brings it back), nothing is removed outright.
+#[test]
+fn a_tracked_selection_within_one_text_box_is_recorded() {
+    let box_para = |t: &str| {
+        Block::Paragraph(docxcore::model::Paragraph {
+            props: Default::default(),
+            content: vec![Inline::Run(docxcore::model::Run {
+                text: t.into(),
+                props: Default::default(),
+            })],
+        })
+    };
+    let mut doc = Document {
+        body: vec![Block::Paragraph(docxcore::model::Paragraph {
+            props: Default::default(),
+            content: vec![Inline::TextBox {
+                raw: "<w:r><w:txbxContent></w:txbxContent></w:r>".into(),
+                blocks: vec![box_para("alpha"), box_para("beta")],
+            }],
+        })],
+    };
+    doc.initialize_revision_targets();
+    let mut ed = Editor::new(doc);
+    as_author(&mut ed, "Ada");
+    ed.anchor = Some(Caret {
+        path: vec![0, 0, 0],
+        offset: 3,
+    });
+    ed.caret = Caret {
+        path: vec![0, 0, 1],
+        offset: 2,
+    };
+    ed.delete_selection();
+    let Block::Paragraph(host) = &ed.doc.body[0] else {
+        panic!("paragraph")
+    };
+    let Some(Inline::TextBox { blocks, .. }) = host.content.first() else {
+        panic!("text box")
+    };
+    assert_eq!(blocks.len(), 2, "both paragraphs stay");
+    assert_eq!(
+        kinds(&ed.doc).len(),
+        2,
+        "recorded, not removed: {}",
+        xml(&ed)
+    );
+    let mut rejected = ed.doc.clone();
+    rejected.reject_all_revisions();
+    let Block::Paragraph(host) = &rejected.body[0] else {
+        panic!("paragraph")
+    };
+    let Some(Inline::TextBox { blocks, .. }) = host.content.first() else {
+        panic!("text box")
+    };
+    assert_eq!(blocks[0].plain_text(), "alpha");
+    assert_eq!(blocks[1].plain_text(), "beta");
+}
