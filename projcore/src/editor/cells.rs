@@ -829,8 +829,8 @@ pub(crate) fn parse_predecessors(text: &str, proj: &Project) -> Result<Vec<Prede
 /// that link as it is. A lag shown in a fallback unit (a working month in
 /// days, a fraction of a day in minutes) keeps its format unless it is
 /// edited. A cross-project link may be spelled by its external reference
-/// (its `CrossProjectName`), in any letter case, with an optional link
-/// type and lag.
+/// (its `CrossProjectName`), in any ASCII letter case, with an optional
+/// link type and lag.
 pub fn parse_task_predecessors(
     text: &str,
     task: &Task,
@@ -841,9 +841,9 @@ pub fn parse_task_predecessors(
 
 /// Split Predecessors cell text into trimmed, uppercased entries, pairing
 /// an entry that starts with one of the task's own cross-project link
-/// names with that link. Names match case-insensitively, longest first,
-/// and may contain `,`. Empty entries are kept, as a plain `,` split
-/// yields them.
+/// names with that link. Names match case-insensitively for ASCII letters,
+/// longest first, and may contain `,`. Empty entries are kept, as a plain
+/// `,` split yields them.
 fn split_predecessor_entries<'a>(
     text: &str,
     existing: &'a [Predecessor],
@@ -870,7 +870,7 @@ fn split_predecessor_entries<'a>(
                 continue;
             };
             let after_space = tail.trim_start();
-            let boundary = tail.is_empty()
+            let boundary = after_space.is_empty()
                 || after_space.starts_with(',')
                 || tail.starts_with(['+', '-'])
                 || ["FS", "SS", "FF", "SF"]

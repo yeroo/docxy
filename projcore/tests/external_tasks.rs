@@ -193,6 +193,36 @@ fn cross_project_name_round_trips_in_the_cell() {
             .as_deref(),
         Some(r"C:\a,b\other&more.mpp\7")
     );
+
+    // Trailing whitespace reaches the parser straight from the cell buffer;
+    // it must not break the name match (a bare ID tolerates it too).
+    for padded in [format!("{shown} "), format!("{shown}\t")] {
+        let parsed = parse_task_predecessors(&padded, task, &proj).unwrap();
+        assert_eq!(parsed, task.predecessors, "{padded}");
+    }
+
+    // A name that is a prefix of another name up to a link-type code still
+    // resolves to the longest match when only whitespace follows.
+    let mut prefixed = proj.clone();
+    let task2 = prefixed.tasks.iter_mut().find(|t| t.uid == 2).unwrap();
+    task2.predecessors[1].cross_project_name = Some(r"C:\X".into());
+    let mut second = projcore::Predecessor::fs(4);
+    second.cross_project = Some(true);
+    second.cross_project_name = Some(r"C:\XSS\4".into());
+    task2.predecessors.push(second);
+    prefixed.tasks.push(projcore::Task {
+        uid: 4,
+        id: 4,
+        name: "External 2".into(),
+        ..Default::default()
+    });
+    let task = prefixed.task(2).unwrap();
+    let shown = format_predecessors(task, &prefixed);
+    assert_eq!(shown, r"1, C:\X, C:\XSS\4");
+    for padded in [shown.clone(), format!("{shown} ")] {
+        let parsed = parse_task_predecessors(&padded, task, &prefixed).unwrap();
+        assert_eq!(parsed, task.predecessors, "{padded}");
+    }
 }
 
 #[test]
