@@ -161,18 +161,7 @@ fn list_items<'a>(
         *inline = items.into_iter().map(CellValue::Text).collect();
         return Some((inline, true));
     }
-    let (ar, ac) = anchor(dv);
-    let src = dv.formula1.trim().trim_start_matches('=');
-    let shifted = if (row, col) == (ar, ac) || ar == u32::MAX {
-        src.to_string()
-    } else {
-        translate_formula(
-            src,
-            i64::from(row) - i64::from(ar),
-            i64::from(col) - i64::from(ac),
-        )
-        .unwrap_or_else(|| src.to_string())
-    };
+    let shifted = list_source(dv, row, col);
     let key = format!("{sheet}!{shifted}");
     if !cache.0.contains_key(&key) {
         let items = resolve_ref(wb, sheet, &shifted)?;
@@ -225,32 +214,82 @@ fn resolve_ref(wb: &Workbook, sheet: usize, src: &str) -> Option<Vec<CellValue>>
     )
 }
 
+/// The source formula of a list rule for the cell (row, col): its formula
+/// without `=`, relative references shifted from the rule's anchor.
+fn list_source(dv: &DataValidation, row: u32, col: u32) -> String {
+    let (ar, ac) = anchor(dv);
+    let src = dv.formula1.trim().trim_start_matches('=');
+    if ar == u32::MAX || (row, col) == (ar, ac) {
+        return src.to_string();
+    }
+    translate_formula(
+        src,
+        i64::from(row) - i64::from(ar),
+        i64::from(col) - i64::from(ac),
+    )
+    .unwrap_or_else(|| src.to_string())
+}
+
+/// One choice of the in-cell dropdown: what it shows, the value it stands
+/// for (a label can round: `3.14` for 3.14127) and the number format of the
+/// cell it came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListChoice {
+    pub label: String,
+    pub value: CellValue,
+    /// The source cell's number-format code, when it isn't General.
+    pub code: Option<String>,
+}
+
+/// The cell picking `choice` puts at (row, col): the choice's value itself
+/// (not text read back, which would round a long number and turn `007` into
+/// 7), the cell's own style, and the source's number format when the cell has
+/// none, so a picked date shows as a date. The entry check accepts it.
+pub fn pick_cell(wb: &mut Workbook, sheet: usize, row: u32, col: u32, choice: &ListChoice) -> Cell {
+    let mut cell = wb
+        .sheets
+        .get(sheet)
+        .and_then(|s| s.cell(row, col))
+        .cloned()
+        .unwrap_or_default();
+    cell.value = choice.value.clone();
+    cell.formula = None;
+    cell.f_attrs = None;
+    cell.spill = None;
+    if let Some(code) = &choice.code {
+        let mut xf = wb.styles.xf(cell.style);
+        if crate::entry::is_general(&xf) {
+            xf.code = Some(code.clone());
+            cell.style = wb.styles.intern(xf);
+        }
+    }
+    cell
+}
+
 /// The choices of the in-cell dropdown at (row, col): the rule's inline items,
 /// or the non-blank cells of its source, read from that cell the way the entry
 /// check reads them (a relative source shifted, a defined name followed) and
-/// shown as the cells show them. `None` when the cell has no list rule or its
-/// source can't be read.
-pub fn list_choices(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<Vec<String>> {
+/// shown as the cells show them. Picking puts the choice's value ([`pick_cell`]). `None` when the cell has no
+/// list rule or its source can't be read.
+pub fn list_choices(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<Vec<ListChoice>> {
     let dv = validation_at(wb.sheets.get(sheet)?, row, col)?;
     if dv.kind != "list" {
         return None;
     }
     if let Some(items) = dv.list_values() {
-        return Some(items.into_iter().filter(|s| !s.is_empty()).collect());
+        return Some(
+            items
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| ListChoice {
+                    label: s.clone(),
+                    value: CellValue::Text(s),
+                    code: None,
+                })
+                .collect(),
+        );
     }
-    let (ar, ac) = anchor(dv);
-    let src = dv.formula1.trim().trim_start_matches('=');
-    let src = if ar == u32::MAX {
-        src.to_string()
-    } else {
-        translate_formula(
-            src,
-            i64::from(row) - i64::from(ar),
-            i64::from(col) - i64::from(ac),
-        )
-        .unwrap_or_else(|| src.to_string())
-    };
-    let (at, cells) = resolve_cells(wb, sheet, &src)?;
+    let (at, cells) = resolve_cells(wb, sheet, &list_source(dv, row, col))?;
     let sh = &wb.sheets[at];
     let mut out = Vec::new();
     for (r, c) in cells {
@@ -259,9 +298,17 @@ pub fn list_choices(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<V
             continue;
         }
         let xf = wb.styles.xf(sh.cell(r, c).map_or(0, |cl| cl.style));
-        let text = crate::sheet::format_with(&xf, &v, wb.date1904);
-        if !text.is_empty() {
-            out.push(text);
+        let label = crate::sheet::format_with(&xf, &v, wb.date1904);
+        if !label.is_empty() {
+            let code = xf
+                .code
+                .clone()
+                .filter(|c| !crate::entry::is_general(&xf) && !c.is_empty());
+            out.push(ListChoice {
+                label,
+                value: v,
+                code,
+            });
         }
     }
     Some(out)
@@ -1894,14 +1941,71 @@ mod tests {
         dv.ranges = vec![(0, 1, 9, 1)]; // B1:B10
         s.validations.push(dv);
         // At B5 the source is A5:A7.
-        assert_eq!(
-            list_choices(&wb, 0, 4, 1),
-            Some(vec!["5".into(), "6".into(), "7".into()])
-        );
-        assert_eq!(
-            list_choices(&wb, 0, 0, 1),
-            Some(vec!["1".into(), "2".into(), "3".into()])
-        );
+        let labels = |r| {
+            list_choices(&wb, 0, r, 1).map(|c| c.into_iter().map(|c| c.label).collect::<Vec<_>>())
+        };
+        assert_eq!(labels(4), Some(vec!["5".into(), "6".into(), "7".into()]));
+        assert_eq!(labels(0), Some(vec!["1".into(), "2".into(), "3".into()]));
         assert!(list_choices(&wb, 0, 20, 1).is_none());
+    }
+
+    // ---- review r5 ----
+
+    #[test]
+    fn a_picked_choice_enters_the_exact_value_and_passes_the_check() {
+        use crate::sheet::Xf;
+        let mut wb = book();
+        // Style 0 is General.
+        wb.styles.intern(Xf::default());
+        let mut styled = |code: &str| {
+            wb.styles.intern(Xf {
+                code: Some(code.to_string()),
+                ..Xf::default()
+            })
+        };
+        let (two, pct, dt) = (styled("0.00"), styled("0%"), styled("m/d/yyyy"));
+        let s = &mut wb.sheets[0];
+        let mut put = |r: u32, v: CellValue, style: u32| {
+            s.set_cell(
+                r,
+                0,
+                Cell {
+                    value: v,
+                    style,
+                    ..Cell::default()
+                },
+            )
+        };
+        put(0, CellValue::Number(3.14127), two);
+        put(1, CellValue::Number(0.125), pct);
+        put(2, CellValue::Number(45000.75), dt);
+        put(3, CellValue::Number(1.0 / 3.0), 0);
+        put(4, CellValue::Text("007".into()), 0);
+        put(5, CellValue::Text("1/2/2020".into()), 0);
+        put(6, CellValue::Text("plain".into()), 0);
+        let mut dv = rule("list", "", "$A$1:$A$7", "");
+        dv.ranges = vec![(0, 3, 9, 3)]; // D1:D10
+        wb.sheets[0].validations.push(dv);
+        let choices = list_choices(&wb, 0, 0, 3).unwrap();
+        assert_eq!(choices.len(), 7);
+        assert_eq!(choices[0].label, "3.14");
+        assert_eq!(choices[1].label, "13%");
+        assert_eq!(choices[2].label, "3/15/2023");
+        for (i, c) in choices.iter().enumerate() {
+            // Picking puts the choice's own value; the check accepts it.
+            let cell = pick_cell(&mut wb, 0, 9, 3, c);
+            assert_eq!(cell.value, c.value);
+            assert!(
+                check_entry(&mut wb, 0, 9, 3, &cell).is_none(),
+                "choice {i}: {:?}",
+                c.label
+            );
+        }
+        // A picked date shows as a date in a General cell.
+        let cell = pick_cell(&mut wb, 0, 9, 3, &choices[2]);
+        let xf = wb.styles.xf(cell.style);
+        assert_eq!(xf.code.as_deref(), Some("m/d/yyyy"));
+        // And a value near but not equal to an item still breaks the rule.
+        assert!(check(&mut wb, 9, 3, "3.14").is_some());
     }
 }

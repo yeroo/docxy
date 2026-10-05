@@ -2232,22 +2232,6 @@ impl SheetView {
             .map(|e| format!("formula error: {e}"))
     }
 
-    /// Type `text` as an entry into (row, col) of the active sheet, the way a
-    /// committed editor would, without touching the undo stack (the caller
-    /// snapshots). False when the cell cannot hold it.
-    fn enter_text_at(&mut self, row: u32, col: u32, text: &str) -> bool {
-        let s = self.active;
-        let today = self.engine.clock;
-        match gridcore::entry::entry_cell(&mut self.pkg.workbook, s, row, col, text, today) {
-            Ok(cell) => {
-                self.engine
-                    .set_cell(&mut self.pkg.workbook, (s, row, col), cell);
-                true
-            }
-            Err(_) => false,
-        }
-    }
-
     // ---- Excel's editor keys (#662) and entry shortcuts (#663) ----
 
     /// F2 while editing: switch between Enter and Edit mode, keeping the text.
@@ -6327,8 +6311,8 @@ fn unquote_sheet_name(prefix: &str) -> Option<String> {
 /// reference back out — so folding HERE alone would let resolution and the wash
 /// disagree about the same reference. The limit is stated rather than fixed in
 /// one place for that reason. (It is not universal: `sheet_follow_hyperlink`
-/// and `dv_list_values` still match a sheet name byte for byte, a separate and
-/// older inconsistency this reference syntax didn't reach.)
+/// still matches a sheet name byte for byte, a separate and older
+/// inconsistency this reference syntax didn't reach.)
 ///
 /// A name matching nothing is REFUSED rather than falling back to `active`:
 /// silently redirecting a qualifier someone typed is the bug this reference
@@ -13499,7 +13483,7 @@ impl Docxy {
 
     /// If the selected cell has a `list` data validation, the allowed values —
     /// an inline `"a,b,c"` list or the contents of a referenced range.
-    fn dv_list_values(&self) -> Option<Vec<String>> {
+    fn dv_list_values(&self) -> Option<Vec<gridcore::validation::ListChoice>> {
         let v = self.active_sheet()?;
         let (r, c) = v.sel;
         // `showDropDown="1"` hides the in-cell dropdown.
@@ -13538,27 +13522,29 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Set the selected cell to `value` (a picked validation option).
-    fn sheet_dv_pick(&mut self, value: String, cx: &mut Context<Self>) {
+    /// Pick a value from the in-cell dropdown. The cell takes the choice's own
+    /// value ([`gridcore::validation::pick_cell`]), not its label read back as
+    /// typed text, so what goes in is exactly an item of the list the entry
+    /// check reads and needs no second check.
+    fn sheet_dv_pick(&mut self, choice: gridcore::validation::ListChoice, cx: &mut Context<Self>) {
         if self.protected_refused(cx) {
             return;
         }
         self.sheet_dv_open = false;
-        if self.active_sheet_mut().is_some_and(|v| {
-            let (s, (r, c)) = (v.active, v.sel);
-            let today = v.engine.clock;
-            gridcore::entry::entry_cell(&mut v.pkg.workbook, s, r, c, &value, today)
-                .is_ok_and(|cell| v.refuses(s, &[(r, c, cell)]))
-        }) {
+        let Some(v) = self.active_sheet_mut() else {
+            return;
+        };
+        let (s, (r, c)) = (v.active, v.sel);
+        let cell = gridcore::validation::pick_cell(&mut v.pkg.workbook, s, r, c, &choice);
+        if v.refuses(s, &[(r, c, cell.clone())]) {
             self.sheet_entry_refused(cx);
             return;
         }
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
-            let (r, c) = v.sel;
-            v.enter_text_at(r, c, &value);
+            v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), cell);
+            v.prune_circles();
         }
-        self.sheet_dv_open = false;
         self.mark_sheet_dirty();
         cx.notify();
     }
@@ -30781,7 +30767,7 @@ fn sheet_el(
     ent: &Entity<Docxy>,
     rename: Option<(usize, String)>,
     comment_editing: bool,
-    dv_values: Option<Vec<String>>,
+    dv_values: Option<Vec<gridcore::validation::ListChoice>>,
     dv_open: bool,
     grid_w: f32,
     mut ov: GridOverlay,
@@ -31474,14 +31460,14 @@ fn sheet_el(
                     let v2 = val.clone();
                     list = list.child(
                         div()
-                            .id(ElementId::Name(format!("dv-{val}").into()))
+                            .id(ElementId::Name(format!("dv-{}", val.label).into()))
                             .px_2()
                             .py(px(2.))
                             .cursor_pointer()
                             .text_size(px(12.))
                             .text_color(hsla_u(0x1a1a1a))
                             .hover(|d| d.bg(hsla_u(0xe8f0fe)))
-                            .child(SharedString::from(val.clone()))
+                            .child(SharedString::from(val.label.clone()))
                             .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
                                 ent_pick.update(cx, |this, cx| this.sheet_dv_pick(v2.clone(), cx));
                             }),

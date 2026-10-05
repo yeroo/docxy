@@ -38,7 +38,7 @@ use gridcore::comments::Comment;
 use gridcore::docprops::{CustomProperty, CustomValue, DocProperties};
 use gridcore::edit::{fill_changes, replace_all_in_sheet};
 use gridcore::engine::{Engine, PART_OF_ARRAY};
-use gridcore::entry::{EntryCtx, entry_cell, entry_cell_ctx, entry_ctx, seed_text};
+use gridcore::entry::{EntryCtx, entry_cell_ctx, entry_ctx, seed_text};
 use gridcore::formula::{qualify_sheet_in_formula, translate_formula};
 use gridcore::frame::Agg;
 use gridcore::legacy::{SourceFormat, open_workbook as open_any};
@@ -1867,6 +1867,8 @@ struct DvAlert {
 /// The list-validation dropdown: the allowed values and the highlighted row.
 struct DvPicker {
     values: Vec<String>,
+    /// What each value stands for, so picking enters it exactly.
+    choices: Vec<gridcore::validation::ListChoice>,
     sel: usize,
 }
 
@@ -4970,7 +4972,7 @@ impl App {
     /// The allowed values for a `list` validation at the cursor: read the way
     /// the entry check reads them, so a picked value is one it accepts
     /// ([`gridcore::validation::list_choices`]).
-    fn resolve_list_values(&self) -> Vec<String> {
+    fn resolve_list_values(&self) -> Vec<gridcore::validation::ListChoice> {
         let (r, c) = self.cur;
         gridcore::validation::list_choices(&self.pkg.workbook, self.sheet, r, c).unwrap_or_default()
     }
@@ -5098,14 +5100,19 @@ impl App {
             return;
         }
         let dv = dv.clone();
-        let values = self.resolve_list_values();
+        let choices = self.resolve_list_values();
+        let values: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
         if values.is_empty() {
             self.status = Some(format!("List: {} (no resolvable values)", dv.formula1));
             return;
         }
         let current = self.current_input_text();
         let sel = values.iter().position(|v| *v == current).unwrap_or(0);
-        self.dv_picker = Some(DvPicker { values, sel });
+        self.dv_picker = Some(DvPicker {
+            values,
+            choices,
+            sel,
+        });
     }
 
     fn dv_picker_key(&mut self, code: KeyCode) {
@@ -5120,23 +5127,21 @@ impl App {
             KeyCode::Home => p.sel = 0,
             KeyCode::End => p.sel = n - 1,
             KeyCode::Enter | KeyCode::Tab => {
-                let value = p.values[p.sel].clone();
+                let choice = p.choices[p.sel].clone();
                 self.dv_picker = None;
                 let (r, c) = self.cur;
-                match entry_cell(
+                // The choice's own value, not its label read back as typed
+                // text (which would round a number and turn 007 into 7): what
+                // goes in is an item of the list the entry check reads.
+                let cell = gridcore::validation::pick_cell(
                     &mut self.pkg.workbook,
                     self.sheet,
                     r,
                     c,
-                    &value,
-                    now_serial(),
-                ) {
-                    Ok(cell) => {
-                        if self.apply(vec![(r, c, cell)]) {
-                            self.status = Some(format!("Set {} = {value}", cell_name(r, c)));
-                        }
-                    }
-                    Err(e) => self.status = Some(e.to_string()),
+                    &choice,
+                );
+                if self.apply(vec![(r, c, cell)]) {
+                    self.status = Some(format!("Set {} = {}", cell_name(r, c), choice.label));
                 }
             }
             _ => {}
@@ -17850,7 +17855,8 @@ mod tests {
     }
 
     fn put(app: &mut App, r: u32, c: u32, text: &str) {
-        let cell = entry_cell(&mut app.pkg.workbook, app.sheet, r, c, text, None).unwrap();
+        let cell = gridcore::entry::entry_cell(&mut app.pkg.workbook, app.sheet, r, c, text, None)
+            .unwrap();
         app.pkg.workbook.sheets[app.sheet].set_cell(r, c, cell);
         app.rebuild_engine();
     }
