@@ -19034,7 +19034,10 @@ mod rule_shift_tests {
         assert_eq!(dv.error_style, crate::sheet::AlertStyle::Warning);
         assert!(dv.allow_blank && dv.show_error && !dv.show_input);
         assert!(dv.show_dropdown);
-        assert_eq!((dv.error_title.as_str(), dv.error.as_str()), ("Score", "10 to 90 only"));
+        assert_eq!(
+            (dv.error_title.as_str(), dv.error.as_str()),
+            ("Score", "10 to 90 only")
+        );
         assert_eq!(dv.prompt_title, "P");
         assert_eq!(dv.prompt.as_deref(), Some("pick"));
         // showDropDown="1" hides the in-cell dropdown.
@@ -19075,7 +19078,10 @@ mod rule_shift_tests {
         ] {
             assert!(ws.contains(kept), "{kept} in {ws}");
         }
-        assert!(!ws.contains("errorStyle") && !ws.contains("<formula2>"), "{ws}");
+        assert!(
+            !ws.contains("errorStyle") && !ws.contains("<formula2>"),
+            "{ws}"
+        );
         let dv = &re.workbook.sheets[0].validations[0];
         assert_eq!(dv.error, "no");
         assert!(dv.show_input);
@@ -19115,16 +19121,18 @@ mod rule_shift_tests {
     #[test]
     fn dv_new_rule_on_a_sheet_without_a_block() {
         let mut pkg = one("S", "");
-        pkg.workbook.sheets[0].validations.push(crate::sheet::DataValidation {
-            ranges: vec![(1, 1, 3, 1)],
-            kind: "whole".into(),
-            operator: "between".into(),
-            formula1: "1".into(),
-            formula2: "5".into(),
-            allow_blank: true,
-            show_error: true,
-            ..Default::default()
-        });
+        pkg.workbook.sheets[0]
+            .validations
+            .push(crate::sheet::DataValidation {
+                ranges: vec![(1, 1, 3, 1)],
+                kind: "whole".into(),
+                operator: "between".into(),
+                formula1: "1".into(),
+                formula2: "5".into(),
+                allow_blank: true,
+                show_error: true,
+                ..Default::default()
+            });
         let (re, ws) = saved(&pkg, SHEET1);
         assert!(ws.contains(r#"sqref="B2:B4""#), "{ws}");
         let dv = &re.workbook.sheets[0].validations[0];
