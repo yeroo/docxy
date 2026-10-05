@@ -4,7 +4,9 @@
 
 use crate::engine::{cell_value_at, eval_formula_at};
 use crate::formula::{Value, translate_formula};
-use crate::sheet::{AlertStyle, Cell, CellValue, DataValidation, Sheet, Workbook};
+use crate::sheet::{
+    AlertStyle, Cell, CellValue, DataValidation, MAX_COLS, MAX_ROWS, Sheet, Workbook,
+};
 
 /// The title of an alert whose rule gives none. Excel's own is "Microsoft
 /// Excel"; this one is product-neutral.
@@ -575,12 +577,15 @@ pub fn paste_rules(
                     .iter()
                     .filter_map(|&(r1, c1, r2, c2)| {
                         let shift = |v: u32, d: i64| u32::try_from(i64::from(v) + d).ok();
-                        Some((
+                        let moved = (
                             shift(r1, dr)?,
                             shift(c1, dc)?,
                             shift(r2, dr)?,
                             shift(c2, dc)?,
-                        ))
+                        );
+                        // What the grid has room for: a paste cut short at
+                        // its edge doesn't name cells past it.
+                        intersect(moved, (0, 0, MAX_ROWS - 1, MAX_COLS - 1))
                     })
                     .collect();
                 add_ranges(dst, &moved, &ranges);

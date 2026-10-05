@@ -1318,7 +1318,7 @@ impl AlertStyle {
 }
 
 /// One data-validation rule over a set of cell ranges.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DataValidation {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     /// `list` / `whole` / `decimal` / `date` / `time` / `textLength` / `custom`.

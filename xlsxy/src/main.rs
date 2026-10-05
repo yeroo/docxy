@@ -1501,7 +1501,15 @@ struct UndoGroup {
     /// A restyle ([`App::apply_styles_on`]): undo/redo put back only each
     /// cell's style, so a spill the cells belong to stays whole.
     styles_only: bool,
+    /// The sheet's data-validation rules before and after the action, when it
+    /// changed them (a paste, the Data Validation dialog): undo and redo put
+    /// the matching state back.
+    rules: Option<(RuleState, RuleState)>,
 }
+
+/// A sheet's data-validation rules, and the elements of its part a save
+/// strikes ([`gridcore::sheet::Sheet::dv_removed`]).
+type RuleState = (Vec<gridcore::sheet::DataValidation>, Vec<usize>);
 
 /// The `(row, col, style)` a restyle group puts back: the style of each
 /// change's `before` or `after` cell (picked by `side`), default if absent.
@@ -1793,6 +1801,9 @@ struct PivotEdit {
 #[derive(Clone)]
 struct ClipData {
     cells: Vec<Vec<Option<Cell>>>,
+    /// The data-validation rules of the copied cells
+    /// ([`gridcore::validation::copy_rules`]), which a paste puts on its target.
+    rules: Vec<gridcore::sheet::DataValidation>,
     sheet: usize,
     from: (u32, u32),
     cut: bool,
@@ -2688,6 +2699,7 @@ impl App {
                     .map(|(&(r, c), (b, a))| (r, c, b, a))
                     .collect(),
                 styles_only: false,
+                rules: None,
             })
             .collect();
         self.undo.push(UndoAction::Cells(undo));
@@ -2737,6 +2749,7 @@ impl App {
             sheet: sheet_idx,
             changes,
             styles_only: true,
+            rules: None,
         }]));
         self.redo.clear();
         self.modified = true;
@@ -3438,10 +3451,70 @@ impl App {
         self.ensure_visible();
     }
 
+    fn rule_state(&self, sheet: usize) -> RuleState {
+        let s = &self.pkg.workbook.sheets[sheet];
+        (s.validations.clone(), s.dv_removed.clone())
+    }
+
+    fn put_rules(&mut self, sheet: usize, state: &RuleState) {
+        if let Some(s) = self.pkg.workbook.sheets.get_mut(sheet) {
+            s.validations = state.0.clone();
+            s.dv_removed = state.1.clone();
+        }
+    }
+
+    /// Run `f`, which may change the data-validation rules of `sheets`, so that
+    /// one undo step puts them back with whatever cells `f` recorded; a step of
+    /// their own when it recorded none. A structural step already holds them.
+    fn with_rules<R>(&mut self, sheets: &[usize], f: impl FnOnce(&mut Self) -> R) -> R {
+        let before: Vec<RuleState> = sheets.iter().map(|&s| self.rule_state(s)).collect();
+        let depth = self.undo.len();
+        let out = f(self);
+        let changed: Vec<(usize, RuleState, RuleState)> = sheets
+            .iter()
+            .zip(before)
+            .map(|(&s, b)| (s, b, self.rule_state(s)))
+            .filter(|(_, b, a)| b != a)
+            .collect();
+        if changed.is_empty() {
+            return out;
+        }
+        let recorded = self.undo.len() > depth;
+        let mut groups = match (recorded, self.undo.last_mut()) {
+            (true, Some(UndoAction::Cells(groups))) => std::mem::take(groups),
+            (true, _) => return out,
+            _ => Vec::new(),
+        };
+        for (sheet, b, a) in changed {
+            match groups
+                .iter_mut()
+                .find(|g| g.sheet == sheet && g.rules.is_none())
+            {
+                Some(g) => g.rules = Some((b, a)),
+                None => groups.push(UndoGroup {
+                    sheet,
+                    changes: Vec::new(),
+                    styles_only: false,
+                    rules: Some((b, a)),
+                }),
+            }
+        }
+        if recorded {
+            self.undo.pop();
+        }
+        self.undo.push(UndoAction::Cells(groups));
+        self.redo.clear();
+        self.modified = true;
+        out
+    }
+
     fn undo(&mut self) {
         match self.undo.pop() {
             Some(UndoAction::Cells(groups)) => {
                 for group in groups.iter().rev() {
+                    if let Some((before, _)) = &group.rules {
+                        self.put_rules(group.sheet, before);
+                    }
                     if group.styles_only {
                         let styles = group_styles(group, |ch| &ch.2);
                         self.engine
@@ -3480,6 +3553,9 @@ impl App {
         match self.redo.pop() {
             Some(UndoAction::Cells(groups)) => {
                 for group in &groups {
+                    if let Some((_, after)) = &group.rules {
+                        self.put_rules(group.sheet, after);
+                    }
                     if group.styles_only {
                         let styles = group_styles(group, |ch| &ch.3);
                         self.engine
@@ -3529,8 +3605,10 @@ impl App {
             tsv.push('\n');
             rows.push(row);
         }
+        let rules = gridcore::validation::copy_rules(self.sheet(), (r1, c1, r2, c2));
         self.clip = Some(ClipData {
             cells: rows,
+            rules,
             sheet: self.sheet,
             from: (r1, c1),
             cut,
@@ -3686,20 +3764,49 @@ impl App {
                     let w = clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
                     (src, (fr, fc, fr + h - 1, fc + w - 1))
                 });
-                self.record_groups(keys, cut_from, |app| {
-                    let (clears, late) = if same_sheet {
+                // The rules of the cut or copied cells replace the target's;
+                // a cut also takes them off its source.
+                let rules_from = {
+                    let (fr, fc) = clip.from;
+                    let h = clip.cells.len().max(1) as u32;
+                    let w = clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
+                    (fr, fc, fr + h - 1, fc + w - 1)
+                };
+                let rules = clip.rules.clone();
+                let rule_sheets = if same_sheet || src >= self.pkg.workbook.sheets.len() {
+                    vec![here]
+                } else {
+                    vec![src, here]
+                };
+                self.with_rules(&rule_sheets, |app| {
+                    app.record_groups(keys, cut_from, |app| {
+                        if cut {
+                            gridcore::validation::clear_validation(
+                                &mut app.pkg.workbook.sheets[src],
+                                rules_from,
+                            );
+                        }
+                        gridcore::validation::paste_rules(
+                            &mut app.pkg.workbook.sheets[here],
+                            &rules,
+                            rules_from,
+                            (r0, c0),
+                            (1, 1),
+                        );
+                        let (clears, late) = if same_sheet {
+                            app.engine
+                                .split_frozen_blanks(&app.pkg.workbook, src, clears)
+                        } else {
+                            (clears, Vec::new())
+                        };
+                        // Checked whole above: each part is written without
+                        // deciding again against what the clears recalculated.
+                        let wb = &mut app.pkg.workbook;
+                        app.engine.set_cells_prechecked(wb, src, clears);
                         app.engine
-                            .split_frozen_blanks(&app.pkg.workbook, src, clears)
-                    } else {
-                        (clears, Vec::new())
-                    };
-                    // Checked whole above: each part is written without
-                    // deciding again against what the clears recalculated.
-                    let wb = &mut app.pkg.workbook;
-                    app.engine.set_cells_prechecked(wb, src, clears);
-                    app.engine
-                        .paste_block_prechecked(wb, here, (r0, c0), &block);
-                    app.engine.set_cells_prechecked(wb, src, late);
+                            .paste_block_prechecked(wb, here, (r0, c0), &block);
+                        app.engine.set_cells_prechecked(wb, src, late);
+                    })
                 });
                 self.status = Some(if source_locked {
                     "Pasted (source sheet is protected; cut kept as copy)".to_string()
@@ -18888,6 +18995,84 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(app.dv_alert.is_none());
         assert_eq!(value_at(&app, 1, 1), CellValue::Number(250.0));
+    }
+    // ---- #688: a paste replaces the target's data-validation rule ----
+
+    fn ranges_of(app: &App) -> Vec<Vec<(u32, u32, u32, u32)>> {
+        app.sheet()
+            .validations
+            .iter()
+            .map(|d| d.ranges.clone())
+            .collect()
+    }
+
+    #[test]
+    fn pasting_an_unvalidated_cell_splits_the_rule_and_undo_restores_it() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.apply(vec![(1, 7, Cell::number(1000.0))]); // H2, no rule
+        app.cur = (1, 7);
+        app.copy(false);
+        app.cur = (5, 1); // B6
+        app.paste_from(None);
+        assert_eq!(value_at(&app, 5, 1), CellValue::Number(1000.0));
+        assert_eq!(ranges_of(&app), vec![vec![(1, 1, 4, 1), (6, 1, 9, 1)]]);
+        // The save carries the split sqref.
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        assert_eq!(
+            re.workbook.sheets[0].validations[0].ranges,
+            vec![(1, 1, 4, 1), (6, 1, 9, 1)]
+        );
+        // One undo puts the cell and the rule back; redo does both again.
+        app.undo();
+        assert_eq!(value_at(&app, 5, 1), CellValue::Empty);
+        assert_eq!(ranges_of(&app), vec![vec![(1, 1, 9, 1)]]);
+        app.redo();
+        assert_eq!(ranges_of(&app), vec![vec![(1, 1, 4, 1), (6, 1, 9, 1)]]);
+    }
+
+    #[test]
+    fn pasting_a_validated_cell_gives_the_target_an_equal_rule_and_cut_moves_it() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.cur = (1, 1); // B2, validated
+        app.copy(false);
+        app.cur = (3, 5); // F4
+        app.paste_from(None);
+        let dv = app
+            .sheet()
+            .validations
+            .iter()
+            .find(|d| d.covers(3, 5))
+            .expect("F4 validated");
+        assert_eq!(
+            (dv.formula1.as_str(), dv.error_title.as_str()),
+            ("10", "Score")
+        );
+        assert!(app.sheet().validations.iter().any(|d| d.covers(1, 1)));
+
+        // A cut takes the rule off its source.
+        app.cur = (2, 1); // B3
+        app.copy(true);
+        app.cur = (12, 1); // B13, outside the rule
+        app.paste_from(None);
+        assert!(app.sheet().validations.iter().any(|d| d.covers(12, 1)));
+        assert!(!app.sheet().validations.iter().any(|d| d.covers(2, 1)));
+        app.undo();
+        assert!(app.sheet().validations.iter().any(|d| d.covers(2, 1)));
+        assert!(!app.sheet().validations.iter().any(|d| d.covers(12, 1)));
+    }
+
+    #[test]
+    fn external_text_paste_leaves_the_rule_alone() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.clip = None;
+        app.clip_text = None;
+        app.cur = (5, 1);
+        app.paste_from(Some("1000".into()));
+        assert_eq!(value_at(&app, 5, 1), CellValue::Number(1000.0));
+        assert_eq!(ranges_of(&app), vec![vec![(1, 1, 9, 1)]]);
     }
 }
 
