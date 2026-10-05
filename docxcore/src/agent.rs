@@ -673,11 +673,12 @@ fn parse_patch_bool(key: &str, value: &str) -> Result<bool, String> {
     }
 }
 
-/// Parse `"#RRGGBB"` (case-insensitive hex digits) into `(r, g, b)`. Copied
-/// byte-for-byte from `gridcore::format::parse_hex_color` (a sibling crate
-/// this one can't depend on) so `doc.format`'s `bad color '<v>'` wording and
-/// strict hex-digit rejection (no `u8::from_str_radix`-style leading `+`)
-/// match `cell.format`'s exactly.
+/// Parse `"#RRGGBB"` (case-insensitive hex digits) into `(r, g, b)`. Keeps
+/// the contract of `gridcore::format::parse_hex_color` (a sibling crate this
+/// one can't depend on; it is built on `gridcore::format::hex_rgb`): the same
+/// `bad color '<v>' (want "#RRGGBB")` message, and the same strict rule —
+/// exactly six ASCII hex digits after the `#`, no `u8::from_str_radix`-style
+/// leading `+` — so `doc.format` and `cell.format` accept the same colours.
 fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
     let bad = || format!("bad color '{s}' (want \"#RRGGBB\")");
     let hex = s.strip_prefix('#').ok_or_else(bad)?;

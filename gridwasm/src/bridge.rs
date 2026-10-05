@@ -2441,10 +2441,10 @@ impl Session {
     /// re-pointed at the restored sheet's NEW index (their old index may no
     /// longer even exist). They also survive a `save`: gridcore writes a
     /// model name that has no `<definedName>` element (the restored ones lost
-    /// theirs to `remove_sheet`). The restored sheet's autoFilter and its
-    /// `_xlnm._FilterDatabase` are not recreated, though: the sheet gets a
-    /// fresh part with no `<autoFilter>`, and a save never adds one or the
-    /// name that backs it. The stash is single-slot — a second
+    /// theirs to `remove_sheet`). The restored sheet's autoFilter is written
+    /// into its fresh part on save, with a hidden `_xlnm._FilterDatabase`
+    /// (#690: a save writes a filter the model holds). The stash is
+    /// single-slot — a second
     /// `sheet.remove` overwrites it, and a successful restore takes
     /// (clears) it via `Option::take` — so calling this with nothing
     /// stashed errors (`"nothing to restore"`).
@@ -5312,13 +5312,20 @@ mod tests {
         pkg.workbook.sheets[1].auto_filter = Some(gridcore::sheet::SheetAutoFilter {
             range: (0, 0, 4, 1),
             columns: Vec::new(),
+            criteria: Vec::new(),
         });
-        // Likewise the print area: a save drops one the model doesn't hold,
-        // as Clear Print Area does (#612).
+        // Likewise the print area and `_FilterDatabase`: a save drops one the
+        // model doesn't hold, as Clear Print Area (#612) and turning the
+        // filter off (#690) do.
         pkg.workbook.defined_names.push(DefinedName {
             name: "_xlnm.Print_Area".into(),
             scope: Some(1),
             formula: "Report!$A$1:$D$20".into(),
+        });
+        pkg.workbook.defined_names.push(DefinedName {
+            name: "_xlnm._FilterDatabase".into(),
+            scope: Some(1),
+            formula: "Report!$A$1:$B$5".into(),
         });
         let mut s = Session::open(&save_xlsx(&pkg)).expect("open");
         assert!(s.pkg.workbook.sheets[1].auto_filter.is_some());
@@ -5343,8 +5350,9 @@ mod tests {
             v.sort();
             v
         };
-        // The restored sheet's names, scoped to its new index; no
-        // `_FilterDatabase`, since its fresh part has no autoFilter to back.
+        // The restored sheet's names, scoped to its new index, and its
+        // autoFilter, written into its fresh part with its `_FilterDatabase`
+        // (#690: a save writes a filter the model holds).
         assert_eq!(
             scoped(2),
             vec![
@@ -5353,15 +5361,26 @@ mod tests {
                     "_xlnm.Print_Area".to_string(),
                     "Report!$A$1:$D$20".to_string()
                 ),
+                (
+                    "_xlnm._FilterDatabase".to_string(),
+                    "Report!$A$1:$B$5".to_string()
+                ),
             ]
+        );
+        assert_eq!(
+            re.workbook.sheets[2].auto_filter.as_ref().map(|a| a.range),
+            Some((0, 0, 4, 1))
         );
         assert_eq!(
             scoped(1),
             vec![("Mine".to_string(), "Tail!$C$3".to_string())]
         );
         let wb = String::from_utf8_lossy(re.part("xl/workbook.xml").unwrap()).into_owned();
-        assert!(!wb.contains("_FilterDatabase"), "{wb}");
-        assert_eq!(wb.matches("<definedName ").count(), 3, "{wb}");
+        assert!(
+            wb.contains(r#"<definedName name="_xlnm._FilterDatabase" localSheetId="2" hidden="1">Report!$A$1:$B$5</definedName>"#),
+            "{wb}"
+        );
+        assert_eq!(wb.matches("<definedName ").count(), 4, "{wb}");
     }
 
     #[test]

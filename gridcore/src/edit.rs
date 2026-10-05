@@ -20,12 +20,17 @@ pub use dataform::{
     is_formula_field, new_record_changes, record_matches,
 };
 mod consolidate;
+mod sort;
 mod subtotal;
 pub(crate) use consolidate::split_ref_text;
 pub use consolidate::{
     ConsolidateError, ConsolidateFunc, ConsolidateOptions, ConsolidateRef, ConsolidateSettings,
     canonical_consolidate_ref, consolidate, consolidate_fn_name, consolidate_token,
     format_consolidate_ref, parse_consolidate_func, parse_consolidate_ref,
+};
+pub use sort::{
+    BUILTIN_SORT_LISTS, SORT_MERGED, SORT_WARNING, SortError, SortLevel, SortOn, SortOptions,
+    builtin_sort_list, guess_header, sort_range, sort_region, sort_warning,
 };
 pub use subtotal::{
     Area, SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,
@@ -448,7 +453,7 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
         for (c, cell) in row.into_iter().enumerate() {
             match cell {
                 Some(mut cl) => {
-                    move_own_array_ref(&mut cl, (from, c as u32), r);
+                    move_own_array_ref(&mut cl, (from, c as u32), (r, c as u32));
                     s.set_cell(r, c as u32, cl)
                 }
                 None => {
@@ -513,24 +518,26 @@ fn sort_span(s: &Sheet, r1: u32, r2: u32) -> Option<(u32, u32)> {
     (r2 > r1).then_some((r2, cols - 1))
 }
 
-/// An array anchor moved from `from` to row `to` takes its block along: its
-/// `ref`, when the anchor owns it (starts there), is rewritten to its block
-/// ([`array_rect`]) at the new row. Left behind, it would name the old rows:
+/// An array anchor moved from cell `from` to cell `to` (a sort's row, a
+/// left-to-right sort's column, or a data form Delete's row) takes its
+/// block along: its `ref`, when the
+/// anchor owns it (starts there), is rewritten to its block ([`array_rect`])
+/// at the new cell. Left behind, it would name the old cells:
 /// the cached block of an anchor the engine can't evaluate would no longer
 /// count as its own, and a CSE block would save as its anchor alone.
-pub(super) fn move_own_array_ref(cell: &mut Cell, (from, col): (u32, u32), to: u32) {
-    let Some((h, w)) = array_rect(cell, (from, col)) else {
+pub(super) fn move_own_array_ref(cell: &mut Cell, from: (u32, u32), to: (u32, u32)) {
+    let Some((h, w)) = array_rect(cell, from) else {
         return;
     };
     let Some(fa) = cell.f_attrs.as_deref().filter(|fa| is_array_f(fa)) else {
         return;
     };
-    if from == to || !ref_starts_at(fa, &cell_name(from, col)) {
+    if from == to || !ref_starts_at(fa, &cell_name(from.0, from.1)) {
         return;
     }
-    let mut block = cell_name(to, col);
+    let mut block = cell_name(to.0, to.1);
     if (h, w) != (1, 1) {
-        block = format!("{block}:{}", cell_name(to + h - 1, col + w - 1));
+        block = format!("{block}:{}", cell_name(to.0 + h - 1, to.1 + w - 1));
     }
     cell.f_attrs = Some(with_ref(fa, &block));
 }
@@ -1330,6 +1337,13 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
                     for c in &mut af.columns {
                         *c = c.and_then(|v| point(v, &shift));
                     }
+                    af.criteria.retain_mut(|(c, _)| match point(*c, &shift) {
+                        Some(v) => {
+                            *c = v;
+                            true
+                        }
+                        None => false,
+                    });
                 }
             }
             None => sheet.auto_filter = None,
@@ -3261,9 +3275,11 @@ mod tests {
     fn a_sheet_auto_filter_moves_and_its_columns_follow_their_data() {
         let mut w = wb(&[("A1", Cell::number(1.0))]);
         // B2:D9, filtering B and D.
+        let crit = |v: &str| crate::filter::ColumnFilter::values(vec![v.to_string()]);
         w.sheets[0].auto_filter = Some(crate::sheet::SheetAutoFilter {
             range: (1, 1, 8, 3),
             columns: vec![Some(1), Some(3)],
+            criteria: vec![(1, crit("b")), (3, crit("d"))],
         });
         let af = |w: &Workbook| {
             w.sheets[0]
@@ -3271,12 +3287,29 @@ mod tests {
                 .clone()
                 .map(|a| (a.range, a.columns))
         };
+        let on = |w: &Workbook| -> Vec<u32> {
+            w.sheets[0]
+                .auto_filter
+                .as_ref()
+                .unwrap()
+                .criteria
+                .iter()
+                .map(|c| c.0)
+                .collect()
+        };
         insert_rows(&mut w, 0, 0, 2);
         assert_eq!(af(&w), Some(((3, 1, 10, 3), vec![Some(1), Some(3)])));
         insert_cols(&mut w, 0, 2, 1); // inside, between the filtered columns
         assert_eq!(af(&w), Some(((3, 1, 10, 4), vec![Some(1), Some(4)])));
+        // The criteria move with their columns, and go with a deleted one.
+        assert_eq!(on(&w), vec![1, 4]);
         delete_cols(&mut w, 0, 1, 1); // the first filtered column
         assert_eq!(af(&w), Some(((3, 1, 10, 3), vec![None, Some(3)])));
+        assert_eq!(on(&w), vec![3]);
+        assert_eq!(
+            w.sheets[0].auto_filter.as_ref().unwrap().criteria[0].1,
+            crit("d")
+        );
         insert_rows(&mut w, 0, 20, 5); // below: nothing moves
         assert_eq!(af(&w), Some(((3, 1, 10, 3), vec![None, Some(3)])));
         delete_rows(&mut w, 0, 3, 8); // every row it had

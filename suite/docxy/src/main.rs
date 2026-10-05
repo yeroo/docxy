@@ -65,8 +65,10 @@ mod sheet_clip_tests;
 mod sheet_consolidate;
 #[cfg(test)]
 mod sheet_entry_tests;
+mod sheet_filter;
 mod sheet_outline;
 mod sheet_ribbon;
+mod sheet_sort;
 mod style_gallery;
 mod table_dialogs;
 mod table_tab;
@@ -755,8 +757,8 @@ enum SnapshotBody {
 }
 
 impl SheetSnapshot {
-    /// The workbook this step restores.
-    #[cfg(test)]
+    /// The workbook this step restores: what a command compares against to
+    /// tell whether it changed anything, without a second copy.
     fn workbook(&self) -> &gridcore::sheet::Workbook {
         match &self.body {
             SnapshotBody::Workbook(wb) => wb,
@@ -820,8 +822,6 @@ enum RefTarget {
     CondFormat,
     /// The cells a data-validation list applies to.
     Validation,
-    /// The rows a sort runs over.
-    Sort,
 }
 
 impl RefTarget {
@@ -835,10 +835,7 @@ impl RefTarget {
     /// the keyboard while they are open, so their range field has to be asked
     /// first — otherwise what you type lands in the bar's own buffer.
     fn is_bar(self) -> bool {
-        matches!(
-            self,
-            RefTarget::CondFormat | RefTarget::Validation | RefTarget::Sort
-        )
+        matches!(self, RefTarget::CondFormat | RefTarget::Validation)
     }
 }
 
@@ -847,7 +844,6 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
     match act {
         SheetAct::CondFormat => Some(RefTarget::CondFormat),
         SheetAct::DataValidation => Some(RefTarget::Validation),
-        SheetAct::CustomSort => Some(RefTarget::Sort),
         _ => None,
     }
 }
@@ -866,8 +862,12 @@ fn protected_view_allows_act(act: SheetAct) -> bool {
 
 /// The document commands Protected View lets through (#633): copying,
 /// selecting, finding and what only changes the view. Everything else edits,
-/// or opens a picker, menu or dialog that would.
+/// or opens a picker, menu or dialog that would. A sheet command (the cell
+/// menu's) passes when [`protected_view_allows_act`] does.
 fn protected_view_allows_doc_act(act: Act) -> bool {
+    if let Act::Sheet(a) = act {
+        return protected_view_allows_act(a);
+    }
     matches!(
         act,
         Act::Copy
@@ -1501,11 +1501,21 @@ enum SheetAct {
     Merge,
     CondFormat,
     DataValidation,
+    /// Data › Sort & Filter › Filter (Ctrl+Shift+L): AutoFilter buttons on
+    /// over the selection or the list around the cursor, or off (#690).
     Filter,
-    /// Data › Sort & Filter › Clear: unhide every hidden row of the region
-    /// around the cursor (hand-hidden ones too) and drop its filter marks,
-    /// as `clear` typed in the Filter bar does (#696).
+    /// Data › Sort & Filter › Clear: every row of the filtered list shows
+    /// again (hand-hidden ones too, as in Excel); the buttons stay (#690).
     ClearFilter,
+    /// Data › Sort & Filter › Reapply and Advanced (#690).
+    ReapplyFilter,
+    AdvancedFilter,
+    /// The cell menu's Filter by Selected Cell's Value / Color / Font Color /
+    /// Icon (#690).
+    FilterBy(gridcore::filter::ByCell),
+    /// The cell menu's Put Selected Cell Color / Font Color / Icon On Top
+    /// (#691).
+    PutOnTop(sheet_sort::OnTop),
     RemoveDuplicates,
     TextToColumns,
     FormatAsTable,
@@ -1568,8 +1578,7 @@ fn cf_preset_dxf() -> gridcore::sheet::Dxf {
     gridcore::sheet::Dxf {
         fill: Some((0xFF, 0xC7, 0xCE)),
         color: Some((0x9C, 0x00, 0x06)),
-        bold: None,
-        italic: None,
+        ..Default::default()
     }
 }
 
@@ -2643,106 +2652,6 @@ impl SheetView {
         true
     }
 
-    /// The contiguous region around the selection to sort, as `(start, bottom)`
-    /// data-row bounds (header excluded). A header is inferred when the top row
-    /// carries a text label over numeric data in *any* column. `None` when
-    /// there's nothing to sort.
-    fn sort_bounds(&self) -> Option<(u32, u32)> {
-        use gridcore::sheet::CellValue;
-        let s = self.active;
-        let (max_r, max_c) = self.extent();
-        let sh = &self.pkg.workbook.sheets[s];
-        let row_used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-        let sr = self.sel.0;
-        if !row_used(sr) {
-            return None;
-        }
-        let mut top = sr;
-        while top > 0 && row_used(top - 1) {
-            top -= 1;
-        }
-        let mut bottom = sr;
-        while bottom < max_r && row_used(bottom + 1) {
-            bottom += 1;
-        }
-        let header = (0..=max_c).any(|c| {
-            matches!(
-                sh.cell(top, c).map(|cl| &cl.value),
-                Some(CellValue::Text(_))
-            ) && (top + 1..=bottom).any(|r| {
-                matches!(
-                    sh.cell(r, c).map(|cl| &cl.value),
-                    Some(CellValue::Number(_))
-                )
-            })
-        });
-        let start = if header { top + 1 } else { top };
-        (bottom > start).then_some((start, bottom))
-    }
-
-    /// The contiguous rows around the cursor a filter acts on, as
-    /// `(top, bottom)`; `None` when the cursor's row is empty.
-    fn filter_region(&self) -> Option<(u32, u32)> {
-        let (max_r, max_c) = self.extent();
-        let sh = self.sheet();
-        let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-        let cur_r = self.sel.0;
-        if !used(cur_r) {
-            return None;
-        }
-        let mut top = cur_r;
-        while top > 0 && used(top - 1) {
-            top -= 1;
-        }
-        let mut bottom = cur_r;
-        while bottom < max_r && used(bottom + 1) {
-            bottom += 1;
-        }
-        Some((top, bottom))
-    }
-
-    /// Data › Sort & Filter › Clear, and `clear` typed in the Filter bar:
-    /// unhide every row of the region around the cursor and drop its filter
-    /// marks. Whether any row changed.
-    fn clear_filter(&mut self) -> bool {
-        let Some((top, bottom)) = self.filter_region() else {
-            return false;
-        };
-        let s = self.active;
-        let sh = &mut self.pkg.workbook.sheets[s];
-        let rows: Vec<u32> = (top..=bottom)
-            .filter(|&r| sh.row_hidden(r) || sh.filtered_rows.contains(&r))
-            .collect();
-        for &r in &rows {
-            sh.set_row_filtered(r, false);
-        }
-        !rows.is_empty()
-    }
-
-    /// Commit the editor before computing bounds or sorting its row. Rows
-    /// that cut a spilled array are not sorted: `entry_error` says why.
-    fn sort_with_pending_edit(
-        &mut self,
-        field: Option<(u32, u32, u32, u32)>,
-        keys: &[(u32, bool)],
-    ) -> (bool, bool) {
-        let committed = self.commit_edit();
-        if self.editing.is_some() {
-            return (false, false); // refused: sorting would move its origin
-        }
-        let Some((start, bottom)) = sort_rows_from(field, self.sort_bounds()) else {
-            return (committed, false);
-        };
-        if gridcore::edit::sort_cuts_spill(&self.pkg.workbook, self.active, start, bottom) {
-            self.entry_error = Some(gridcore::edit::SORT_CUTS_SPILL.into());
-            return (committed, false);
-        }
-        self.push_undo();
-        gridcore::edit::sort_rows(&mut self.pkg.workbook, self.active, start, bottom, keys);
-        self.engine = sheet_engine(&self.pkg.workbook);
-        (committed, true)
-    }
-
     fn sheet(&self) -> &gridcore::sheet::Sheet {
         &self.pkg.workbook.sheets[self
             .active
@@ -3450,14 +3359,10 @@ struct Docxy {
     sheet_cf_edit: Option<String>,
     // In-progress data-validation list entry (comma-separated allowed values).
     sheet_dv_edit: Option<String>,
-    // In-progress AutoFilter criteria entry for the selected column.
-    sheet_filter_edit: Option<String>,
-    // In-progress multi-level sort spec entry ("B asc, C desc").
-    sheet_sort_edit: Option<String>,
     // In-progress row-height entry (points, or "auto").
     sheet_rowh_edit: Option<String>,
-    // Which entry bar's range field is on screen, if any. Its seed depends on
-    // the bar (a sort's is the region it would find, not the selection).
+    // Which entry bar's range field is on screen, if any; it starts on the
+    // selection.
     bar_field: Option<RefTarget>,
     // A range the user PINNED into that field, by typing it or pointing at it.
     // While this is None the bar keeps following the selection, which is what
@@ -7894,11 +7799,9 @@ fn bar_range_text(text: &str, sheet: &str) -> Result<String, String> {
 ///   validated are, and those are commonly on a different sheet from the one
 ///   the rule is built on (a lookup sheet holding the list, an entry sheet
 ///   holding the boxes).
-/// - `CondFormat` and `Sort` refuse. Each acts on the rows in front of you: a
-///   rule paints these cells, a sort reorders these rows. A qualifier naming
-///   elsewhere is a mistake,
-///   and the existing message says so rather than acting on the same-named
-///   cells here.
+/// - `CondFormat` refuses: a rule paints the cells in front of you. A
+///   qualifier naming elsewhere is a mistake, and the existing message says
+///   so rather than acting on the same-named cells here.
 /// - `ChartTitle` isn't a range at all, so nothing resolves; it answers `false`
 ///   only because the question doesn't apply to it.
 fn target_takes_foreign_sheet(target: RefTarget) -> bool {
@@ -7908,7 +7811,7 @@ fn target_takes_foreign_sheet(target: RefTarget) -> bool {
         | RefTarget::SeriesValues(_)
         | RefTarget::Categories
         | RefTarget::Validation => true,
-        RefTarget::CondFormat | RefTarget::Sort | RefTarget::ChartTitle => false,
+        RefTarget::CondFormat | RefTarget::ChartTitle => false,
     }
 }
 
@@ -7938,18 +7841,6 @@ fn bar_ref_text(
     };
     let i = sheet_index_of(names, r.sheet.as_deref(), active)?;
     Ok((i, ref_a1(names.get(i).map(String::as_str), r.range)))
-}
-
-/// The rows a sort runs over: a field naming more than one row sorts exactly
-/// those, anything else falls back to the region found around the cursor.
-fn sort_rows_from(
-    field: Option<(u32, u32, u32, u32)>,
-    region: Option<(u32, u32)>,
-) -> Option<(u32, u32)> {
-    match field {
-        Some((r0, _, r1, _)) if r1 > r0 => Some((r0, r1)),
-        _ => region,
-    }
 }
 
 /// The cells a range field's text points at ON THE SHEET IN FRONT OF YOU, or
@@ -9179,8 +9070,6 @@ impl Docxy {
             sheet_fmt_open: false,
             sheet_cf_edit: None,
             sheet_dv_edit: None,
-            sheet_filter_edit: None,
-            sheet_sort_edit: None,
             sheet_rowh_edit: None,
             bar_field: None,
             bar_range: None,
@@ -9978,11 +9867,10 @@ impl Docxy {
         self.chart_drop_selection();
         self.bar_close();
         // The bars that act on Enter point into the grid too: a rename names
-        // a sheet by index, and the filter, row-height and comment bars act
-        // on the selection. Carried into another tab, Enter would apply them
+        // a sheet by index, and the row-height and comment bars act on the
+        // selection. Carried into another tab, Enter would apply them
         // there, a Protected View tab included (#610).
         self.sheet_rename = None;
-        self.sheet_filter_edit = None;
         self.sheet_rowh_edit = None;
         self.sheet_comment_edit = None;
         self.sheet_fill = None;
@@ -10386,9 +10274,7 @@ impl Docxy {
             RefTarget::SeriesValues(i) => self.series_apply_values(i, text, cx),
             RefTarget::SeriesName(i) => self.series_apply_name(i, text, cx),
             RefTarget::Categories => self.categories_apply(text, cx),
-            RefTarget::CondFormat | RefTarget::Validation | RefTarget::Sort => {
-                self.bar_range_apply(target, text, cx)
-            }
+            RefTarget::CondFormat | RefTarget::Validation => self.bar_range_apply(target, text, cx),
         }
     }
 
@@ -10439,27 +10325,19 @@ impl Docxy {
             .or_else(|| self.bar_seed())
     }
 
-    /// What an untouched range field shows: the live selection, or for a sort
-    /// the region it would find (header already dropped).
+    /// What an untouched range field shows: the live selection.
     fn bar_seed(&self) -> Option<(u32, u32, u32, u32)> {
-        if self.bar_field == Some(RefTarget::Sort) {
-            if let Some((top, bottom)) = self.sheet_sort_bounds() {
-                if let Some(max_c) = self.active_sheet().map(|v| v.extent().1) {
-                    return Some((top, 0, bottom, max_c));
-                }
-            }
-        }
         self.active_sheet().map(|v| v.range())
     }
 
     /// Open a bar's range field. It starts unpinned, so until the user types a
     /// range or points at one the bar still acts on the selection.
     fn bar_open(&mut self, target: RefTarget) {
-        // The three bars share ONE `bar_field`/`bar_range`, and `sheet_key`
-        // routes to whichever is open first. Leaving a second one on screen
+        // The two bars share ONE `bar_field`/`bar_range`, and `sheet_key`
+        // routes to whichever is open first. Leaving the other on screen
         // therefore aims the first at cells pinned for the other — a
-        // conditional format painting the Sort bar's whole region, say. Only one at a
-        // time, which is also what the keyboard already assumed.
+        // conditional format painting the validation bar's range, say. Only
+        // one at a time, which is also what the keyboard already assumed.
         self.bar_close();
         // `bar_close` only drops a field belonging to a bar. A Chart panel field
         // left focused would keep `range_field_active` true, so the very first
@@ -10565,13 +10443,11 @@ impl Docxy {
     }
 
     /// A bar closed: drop the bar itself along with its range field. Closing the
-    /// field alone would leave a bar on screen whose seeding (`bar_seed` keys
-    /// off `bar_field`) had gone with it — a Sort bar still showing, now acting
-    /// on the selection rather than the region it found.
+    /// field alone would leave a bar on screen with no field to say which
+    /// cells it acts on.
     fn bar_close(&mut self) {
         self.sheet_cf_edit = None;
         self.sheet_dv_edit = None;
-        self.sheet_sort_edit = None;
         self.bar_field = None;
         self.bar_range = None;
         if matches!(&self.range_edit, Some(f) if f.target.is_bar()) {
@@ -10593,7 +10469,6 @@ impl Docxy {
         self.project_prompt_cancel();
         self.bar_close();
         self.sheet_comment_edit = None;
-        self.sheet_filter_edit = None;
         self.sheet_rowh_edit = None;
         self.find_open = false;
     }
@@ -10898,6 +10773,33 @@ impl Docxy {
         self.focus.focus(window, cx);
     }
 
+    /// A right-click on cell `(r, c)`: outside the selection it selects the
+    /// cell first (an open editor commits), so the cell menu's "Selected
+    /// Cell" commands act on the cell clicked; inside it the selection stays.
+    /// None of a left click's extras: a link isn't followed, and while a
+    /// formula or a range field is pointing the selection and the buffer stay
+    /// as they are — no reference is written. Then the cell menu opens at
+    /// `at`.
+    pub(crate) fn cell_right_click(
+        &mut self,
+        r: u32,
+        c: u32,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inside = self.active_sheet().is_some_and(|v| {
+            let (r1, c1, r2, c2) = sel_range(v.sel, v.anchor);
+            (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
+        });
+        let pointing = self.formula_pick_active() || self.range_field_active();
+        if !inside && !pointing {
+            self.select_cell(r, c, cx);
+            self.focus.focus(window, cx);
+        }
+        self.open_cell_menu(at, cx);
+    }
+
     /// The pointer moved over cell `(r, c)` with the left button down: the
     /// fill handle's drag if one is armed, a drag-select otherwise. Which of
     /// the two a sweep means is exactly what the auto-fill regression got
@@ -11012,6 +10914,16 @@ impl Docxy {
             Region::Cells(r0, c0, r1, c1) => self.cells_bounds((r0, c0), (r1, c1)),
             Region::ChartPanel => lookup(&self.probes.borrow(), "chart-panel")
                 .ok_or_else(|| "the Chart panel is not open".to_string()),
+            Region::FilterButton(c) => lookup(
+                &self.probes.borrow(),
+                &format!("filter-button:{}", gridcore::sheet::col_name(c)),
+            )
+            .ok_or_else(|| {
+                format!(
+                    "column {} has no filter button in view (Data › Filter puts them on)",
+                    gridcore::sheet::col_name(c)
+                )
+            }),
             Region::Chart(i) => {
                 let n = self.chart_count();
                 if i >= n {
@@ -12751,126 +12663,6 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Apply an AutoFilter criteria to the selected column: hide the rows of the
-    /// contiguous region whose value fails it (header kept). "clear" unhides.
-    fn sheet_apply_filter(&mut self, text: &str, cx: &mut Context<Self>) {
-        use gridcore::sheet::CellValue;
-        if text.trim().eq_ignore_ascii_case("clear") {
-            return self.sheet_clear_filter(cx);
-        }
-        if self.protected_refused(cx) {
-            return;
-        }
-        // An empty or unreadable criteria changes nothing, so it leaves the
-        // tab clean; the bar has already closed.
-        let Some((op, operand)) = gridcore::filter::parse(text) else {
-            return cx.notify();
-        };
-        let Some(v) = self.active_sheet_mut() else {
-            return;
-        };
-        let Some((top, bottom)) = v.filter_region() else {
-            return;
-        };
-        let s = v.active;
-        let sc = v.sel.1;
-        let sh = &v.pkg.workbook.sheets[s];
-        let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
-        let start = if header { top + 1 } else { top };
-        // Rows are marked filter-hidden (not hidden by hand) so SUBTOTAL
-        // 1-11 skips them and still counts hand-hidden rows.
-        let keep: Vec<bool> = (start..=bottom)
-            .map(|r| {
-                let val = v.pkg.workbook.sheets[s]
-                    .cell(r, sc)
-                    .map(|c| c.value.clone());
-                gridcore::filter::matches(val.as_ref(), op, &operand)
-            })
-            .collect();
-        for (i, r) in (start..=bottom).enumerate() {
-            v.pkg.workbook.sheets[s].set_row_filtered(r, !keep[i]);
-        }
-        self.mark_sheet_dirty();
-        cx.notify();
-    }
-
-    /// Data › Sort & Filter › Clear (and `clear` in the Filter bar): unhide
-    /// every hidden row of the region around the cursor (hand-hidden ones
-    /// too) and drop its filter marks; dirty only when a row changed.
-    fn sheet_clear_filter(&mut self, cx: &mut Context<Self>) {
-        if self.protected_refused(cx) {
-            return;
-        }
-        if self.active_sheet_mut().is_some_and(SheetView::clear_filter) {
-            self.mark_sheet_dirty();
-        }
-        cx.notify();
-    }
-
-    /// Route a keystroke into the AutoFilter criteria bar (Enter applies, Esc cancels).
-    fn sheet_filter_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
-        let Some(mut buf) = self.sheet_filter_edit.clone() else {
-            return;
-        };
-        match key {
-            "escape" => {
-                self.sheet_filter_edit = None;
-                cx.notify();
-            }
-            "enter" => {
-                self.sheet_filter_edit = None;
-                self.sheet_apply_filter(&buf, cx);
-            }
-            "backspace" => {
-                buf.pop();
-                self.sheet_filter_edit = Some(buf);
-                cx.notify();
-            }
-            _ => {
-                if let Some(c) = ev.keystroke.key_char.as_deref() {
-                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
-                        buf.push_str(c);
-                    }
-                }
-                self.sheet_filter_edit = Some(buf);
-                cx.notify();
-            }
-        }
-    }
-
-    /// Route a keystroke into the multi-level sort entry bar; Enter runs the sort.
-    fn sheet_sort_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
-        let Some(mut buf) = self.sheet_sort_edit.clone() else {
-            return;
-        };
-        match key {
-            "escape" => {
-                self.sheet_sort_edit = None;
-                self.bar_close();
-                cx.notify();
-            }
-            "enter" => {
-                self.sheet_sort_edit = None;
-                self.sheet_commit_sort(&buf, cx);
-                self.bar_close();
-            }
-            "backspace" => {
-                buf.pop();
-                self.sheet_sort_edit = Some(buf);
-                cx.notify();
-            }
-            _ => {
-                if let Some(c) = ev.keystroke.key_char.as_deref() {
-                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
-                        buf.push_str(c);
-                    }
-                }
-                self.sheet_sort_edit = Some(buf);
-                cx.notify();
-            }
-        }
-    }
-
     /// Route a keystroke into the row-height entry bar; Enter applies it.
     fn sheet_rowh_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
         let Some(mut buf) = self.sheet_rowh_edit.clone() else {
@@ -13231,50 +13023,6 @@ impl Docxy {
         cx.notify();
     }
 
-    fn sheet_sort_bounds(&self) -> Option<(u32, u32)> {
-        self.active_sheet()?.sort_bounds()
-    }
-
-    /// Sort the current region by the selected column (header-aware). Rows move
-    /// as whole units (all columns + styles); blanks sort last. Formula refs are
-    /// not re-based, so this targets value tables (the common case).
-    fn sheet_sort(&mut self, ascending: bool, cx: &mut Context<Self>) {
-        let Some(v) = self.active_sheet_mut() else {
-            return;
-        };
-        let keys = [(v.sel.1, ascending)];
-        let (committed, sorted) = v.sort_with_pending_edit(None, &keys);
-        if committed || sorted {
-            self.mark_sheet_dirty();
-        }
-        self.sheet_entry_refused(cx);
-        cx.notify();
-    }
-
-    /// Multi-level sort of the current region from a typed spec like
-    /// "B asc, C desc" (column letters, optional asc/desc, default ascending).
-    fn sheet_commit_sort(&mut self, text: &str, cx: &mut Context<Self>) {
-        let Some(keys) = gridcore::edit::parse_sort_spec(text) else {
-            return;
-        };
-        // Only a PINNED range overrides the region the sort would find on its
-        // own; the field showing that region is not the user choosing it.
-        let field = self
-            .bar_range
-            .as_deref()
-            .and_then(parse_ref_text)
-            .map(|r| r.range);
-        let Some(v) = self.active_sheet_mut() else {
-            return;
-        };
-        let (committed, sorted) = v.sort_with_pending_edit(field, &keys);
-        if committed || sorted {
-            self.mark_sheet_dirty();
-        }
-        self.sheet_entry_refused(cx);
-        cx.notify();
-    }
-
     /// Insert/delete a whole row or column at the selection (Home ▸ Cells), then
     /// rebuild the recalc engine so shifted formulas re-evaluate.
     fn sheet_structural(&mut self, op: StructOp, cx: &mut Context<Self>) {
@@ -13381,6 +13129,24 @@ impl Docxy {
             }
         }
         Some(out)
+    }
+
+    /// A press on column `col`'s filter button: its drop-down (#690).
+    fn sheet_filter_button(&mut self, col: u32, cx: &mut Context<Self>) {
+        // Protected View (#610) keeps the workbook as it opened.
+        if self.protected_refused(cx) {
+            return;
+        }
+        self.sheet_data_cmd(
+            |t| {
+                // A value being typed belongs in the list the drop-down shows.
+                sheet_sort::commit_first(t)?;
+                let d = sheet_filter::menu_dialog(t, col)?;
+                t.dialogs.push(d);
+                Ok(())
+            },
+            cx,
+        );
     }
 
     fn sheet_dv_toggle(&mut self, cx: &mut Context<Self>) {
@@ -14673,6 +14439,21 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// Run a Sort & Filter command on the active tab (#690, #691); a refusal
+    /// lands in the status line.
+    fn sheet_data_cmd(
+        &mut self,
+        op: impl FnOnce(&mut DocTab) -> Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if let Err(e) = op(tab) {
+                tab.status = e.into();
+            }
+        }
+        cx.notify();
+    }
+
     /// Dispatch a spreadsheet ribbon command.
     fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
@@ -14729,12 +14510,10 @@ impl Docxy {
             SheetAct::DeleteRow => self.sheet_structural(StructOp::DeleteRow, cx),
             SheetAct::InsertCol => self.sheet_structural(StructOp::InsertCol, cx),
             SheetAct::DeleteCol => self.sheet_structural(StructOp::DeleteCol, cx),
-            SheetAct::SortAsc => self.sheet_sort(true, cx),
-            SheetAct::SortDesc => self.sheet_sort(false, cx),
-            SheetAct::CustomSort => {
-                self.sheet_sort_edit = Some(String::new());
-                cx.notify();
-            }
+            SheetAct::SortAsc => self.sheet_data_cmd(|t| sheet_sort::quick(t, true), cx),
+            SheetAct::SortDesc => self.sheet_data_cmd(|t| sheet_sort::quick(t, false), cx),
+            SheetAct::CustomSort => self.sheet_data_cmd(sheet_sort::open_dialog, cx),
+            SheetAct::PutOnTop(by) => self.sheet_data_cmd(|t| sheet_sort::on_top(t, by), cx),
             SheetAct::AutoSum => self.sheet_autosum(cx),
             SheetAct::FormatCells => {
                 self.sheet_fmt_open = true;
@@ -14754,11 +14533,29 @@ impl Docxy {
                 self.sheet_dv_edit = Some(String::new());
                 cx.notify();
             }
-            SheetAct::Filter => {
-                self.sheet_filter_edit = Some(String::new());
-                cx.notify();
-            }
-            SheetAct::ClearFilter => self.sheet_clear_filter(cx),
+            SheetAct::Filter => self.sheet_data_cmd(sheet_filter::toggle, cx),
+            SheetAct::ClearFilter => self.sheet_data_cmd(
+                |t| {
+                    sheet_filter::run(t, |wb, s, today| {
+                        gridcore::filter::clear(wb, s, None, today)
+                    })
+                    .map(|_| ())
+                },
+                cx,
+            ),
+            SheetAct::ReapplyFilter => self.sheet_data_cmd(
+                |t| sheet_filter::run(t, gridcore::filter::reapply).map(|_| ()),
+                cx,
+            ),
+            SheetAct::AdvancedFilter => self.sheet_data_cmd(
+                |t| {
+                    let d = sheet_filter::advanced_dialog(t)?;
+                    t.dialogs.push(d);
+                    Ok(())
+                },
+                cx,
+            ),
+            SheetAct::FilterBy(by) => self.sheet_data_cmd(|t| sheet_filter::by_cell(t, by), cx),
             SheetAct::RemoveDuplicates => self.sheet_remove_duplicates(cx),
             SheetAct::FormatAsTable => self.sheet_format_as_table(cx),
             SheetAct::ProtectSheet => self.sheet_toggle_protection(cx),
@@ -14885,14 +14682,6 @@ impl Docxy {
         // The data-validation entry bar swallows typing too.
         if to_bar(self.sheet_dv_edit.is_some()) {
             return self.sheet_dv_edit_key(ev, key, cx);
-        }
-        // The AutoFilter criteria bar swallows typing too.
-        if self.sheet_filter_edit.is_some() {
-            return self.sheet_filter_key(ev, key, cx);
-        }
-        // The multi-level sort spec bar swallows typing too.
-        if to_bar(self.sheet_sort_edit.is_some()) {
-            return self.sheet_sort_key(ev, key, cx);
         }
         // The row-height entry bar swallows typing too.
         if self.sheet_rowh_edit.is_some() {
@@ -15033,6 +14822,8 @@ impl Docxy {
                 "p" if shift => self.sheet_insert_pivot(cx),
                 // Insert a chart of the selection (also on the Insert ribbon).
                 "k" if shift => self.sheet_insert_chart("column", cx),
+                // Data › Filter (#690).
+                "l" if shift => self.run_sheet_act(SheetAct::Filter, window, cx),
                 "a" => {
                     // Select the whole used range.
                     if let Some(v) = self.active_sheet_mut() {
@@ -20112,6 +19903,8 @@ fn no(mut f: impl FnMut()) -> bool {
 #[derive(Clone, Copy, Debug)]
 enum Act {
     Project(ProjectAct),
+    /// A sheet command from a menu (the cell menu, #690, #691).
+    Sheet(SheetAct),
     Bold,
     Italic,
     Underline,
@@ -22844,6 +22637,12 @@ impl Docxy {
         self.open_menu(menu::MenuTarget::Document, at, menu::document_menu(), cx);
     }
 
+    /// A right-click on a sheet, and `menu-open "cell"`: the cell menu
+    /// (#690, #691) for the selected cell.
+    pub(crate) fn open_cell_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.open_menu(menu::MenuTarget::Cell, at, menu::cell_menu(), cx);
+    }
+
     /// A right-click on a Project row's table (row `row` in task order; past
     /// the last task, the entry row), and `menu-open {"row"}`. The press
     /// selects the row as a left click does, committing an open cell edit;
@@ -23246,6 +23045,7 @@ impl Docxy {
         }
         match act {
             Project(p) => self.project_act(p, window, cx),
+            Sheet(a) => self.run_sheet_act(a, window, cx),
             Cut => self.do_copy(true, window, cx),
             Copy => self.do_copy(false, window, cx),
             Paste => self.do_paste(window, cx),
@@ -23360,8 +23160,8 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Project(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
-                | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
+                Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph
+                | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
                 | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField
                 | PageBreak | BlankPage | Cover(_) | ToggleNotes | InsertTable | InsertSymbol
                 | InsertEquation | LineSpacing | Hf(_) | Design(_) | Layout(_) | Mail(_)
@@ -24123,138 +23923,6 @@ impl Docxy {
             .unwrap_or_default();
         let hint = self.ref_example((0, 0, 4, 3));
         self.ref_field(id, target, value, hint, "", cx)
-    }
-
-    /// The AutoFilter criteria bar: type a comparison on the current column.
-    fn sheet_filter_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        use gridcore::sheet::col_name;
-        let col = self
-            .active_sheet()
-            .map(|v| col_name(v.sel.1))
-            .unwrap_or_default();
-        let ent = cx.entity();
-        let ent_cancel = ent.clone();
-        h_flex()
-            .w_full()
-            .h(px(30.))
-            .items_center()
-            .gap_2()
-            .px_2()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(pal.dim)
-                    .child(format!("Filter column {col} where value")),
-            )
-            .child(
-                div()
-                    .w(px(180.))
-                    .h(px(22.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .rounded_sm()
-                    .bg(hsla_u(0xffffff))
-                    .border_1()
-                    .border_color(hsla_u(BRAND))
-                    .text_size(px(12.))
-                    .text_color(hsla_u(0x1a1a1a))
-                    .child(div().child(SharedString::from(if buf.is_empty() {
-                        "=Laptop  (or >500, clear)".to_string()
-                    } else {
-                        buf.to_string()
-                    })))
-                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
-            )
-            .child(
-                div()
-                    .id("filter-cancel")
-                    .px_2()
-                    .py(px(2.))
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .bg(pal.panel)
-                    .text_color(pal.fg)
-                    .border_1()
-                    .border_color(pal.border)
-                    .child("Cancel")
-                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                        ent_cancel.update(cx, |this, cx| {
-                            this.sheet_filter_edit = None;
-                            cx.notify();
-                        });
-                    }),
-            )
-            .into_any_element()
-    }
-
-    /// The multi-level sort bar: type a spec like "B asc, C desc".
-    fn sheet_sort_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let ent = cx.entity();
-        let ent_cancel = ent.clone();
-        h_flex()
-            .w_full()
-            .min_h(px(30.))
-            .py(px(3.))
-            .items_center()
-            .gap_2()
-            .px_2()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .child(div().text_size(px(12.)).text_color(pal.dim).child("Sort"))
-            .child(
-                div()
-                    .w(px(160.))
-                    .child(self.bar_range_field("sort-range", RefTarget::Sort, cx)),
-            )
-            .child(div().text_size(px(12.)).text_color(pal.dim).child("by"))
-            .child(
-                div()
-                    .w(px(220.))
-                    .h(px(22.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .rounded_sm()
-                    .bg(hsla_u(0xffffff))
-                    .border_1()
-                    .border_color(hsla_u(BRAND))
-                    .text_size(px(12.))
-                    .text_color(hsla_u(0x1a1a1a))
-                    .child(div().child(SharedString::from(if buf.is_empty() {
-                        "B asc, C desc".to_string()
-                    } else {
-                        buf.to_string()
-                    })))
-                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
-            )
-            .child(
-                div()
-                    .id("sort-cancel")
-                    .px_2()
-                    .py(px(2.))
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .bg(pal.panel)
-                    .text_color(pal.fg)
-                    .border_1()
-                    .border_color(pal.border)
-                    .child("Cancel")
-                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                        ent_cancel.update(cx, |this, cx| {
-                            this.sheet_sort_edit = None;
-                            this.bar_close();
-                            cx.notify();
-                        });
-                    }),
-            )
-            .into_any_element()
     }
 
     /// The row-height entry bar: type a height in points (or "auto").
@@ -26618,14 +26286,6 @@ impl Render for Docxy {
             .sheet_dv_edit
             .clone()
             .map(|buf| self.sheet_dv_edit_bar(&buf, pal, cx));
-        let sheet_filter = self
-            .sheet_filter_edit
-            .clone()
-            .map(|buf| self.sheet_filter_bar(&buf, pal, cx));
-        let sheet_sort = self
-            .sheet_sort_edit
-            .clone()
-            .map(|buf| self.sheet_sort_bar(&buf, pal, cx));
         let sheet_rowh = self
             .sheet_rowh_edit
             .clone()
@@ -27234,14 +26894,15 @@ impl Render for Docxy {
             .flex_1()
             .min_h(px(0.))
             .overflow_hidden()
-            // Right-click in a document or sheet body opens the document's
-            // context menu. A Project's task rows open their own (the table
-            // pane's handler); nothing else on a Project has a menu yet, so
-            // the document's never opens there (#397).
+            // Right-click in a document body opens the document's context
+            // menu. A sheet's cells open the cell menu (each cell's own
+            // handler, which selects it first); a Project's task rows open
+            // their own (the table pane's handler); nothing else there has a
+            // menu yet (#397).
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                    if !this.active_is_project() {
+                    if !this.active_is_project() && !this.active_is_sheet() {
                         this.open_document_menu(ev.position, cx);
                     }
                 }),
@@ -27319,8 +26980,6 @@ impl Render for Docxy {
             .when_some(sheet_comment, |d, c| d.child(c))
             .when_some(sheet_cf, |d, c| d.child(c))
             .when_some(sheet_dv_bar, |d, c| d.child(c))
-            .when_some(sheet_filter, |d, c| d.child(c))
-            .when_some(sheet_sort, |d, c| d.child(c))
             .when_some(sheet_rowh, |d, c| d.child(c))
             .when_some(project_prompt, |d, c| d.child(c))
             .when_some(comment_bar, |d, c| d.child(c))
@@ -28222,6 +27881,13 @@ fn sheet_row(
             let shift = ev.modifiers().shift;
             let dbl = ev.click_count() >= 2;
             ent2.update(cx, |this, cx| this.cell_click(r, c, shift, dbl, window, cx));
+        });
+        // A right-click opens the cell menu over this cell (#690, #691).
+        let ent_menu = ent.clone();
+        cell = cell.on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+            cx.stop_propagation();
+            let at = ev.position;
+            ent_menu.update(cx, |this, cx| this.cell_right_click(r, c, at, window, cx));
         });
         // Drag-select: while the left button is held, extend the selection to
         // whatever cell the pointer is over (on_mouse_move is hitbox-scoped, so
@@ -30377,6 +30043,58 @@ fn sheet_el(
             }
         }
     }
+    // AutoFilter buttons (#690): an arrow at the right of each header cell of
+    // the sheet's filter, a funnel once its column filters; a press opens the
+    // column's drop-down.
+    let mut filter_buttons: Vec<AnyElement> = Vec::new();
+    if let Some(af) = sh
+        .auto_filter
+        .as_ref()
+        .filter(|af| !sh.row_hidden(af.range.0))
+    {
+        let (r1, c1, _, c2) = af.range;
+        let y = row_y(r1);
+        for c in c1..=c2 {
+            let Some(x0) = col_x(c).filter(|_| !sh.col_hidden(c)) else {
+                continue;
+            };
+            let cw = col_px(sh.col_width(c));
+            // A column that only hides its button is not filtering.
+            let filtered = af.criteria.iter().any(|(k, f)| {
+                *k == c && (!matches!(f, gridcore::filter::ColumnFilter::Raw(_)) || f.is_opaque())
+            });
+            let ent_btn = ent.clone();
+            filter_buttons.push(
+                div()
+                    .id(("filter-button", c as usize))
+                    .absolute()
+                    .left(px(x0 + cw - 17.0))
+                    .top(px(y + 1.0))
+                    .w(px(16.))
+                    .h(px(SHEET_ROW_H - 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .bg(hsla_u(0xf1f1f1))
+                    .border_1()
+                    .border_color(hsla_u(if filtered { 0x217346 } else { 0x9a9a9a }))
+                    .rounded_sm()
+                    .text_size(px(8.))
+                    .text_color(hsla_u(if filtered { 0x217346 } else { 0x333333 }))
+                    .child(probe(
+                        probes,
+                        format!("filter-button:{}", gridcore::sheet::col_name(c)),
+                    ))
+                    .child(if filtered { "\u{29e9}" } else { "\u{25bc}" })
+                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        ent_btn.update(cx, |this, cx| this.sheet_filter_button(c, cx));
+                    })
+                    .into_any_element(),
+            );
+        }
+    }
     // (The auto-fill handle is drawn inside its own cell — see sheet_row — where
     // its position is exact; it uses `deferred` to escape occlusion.)
 
@@ -30391,7 +30109,8 @@ fn sheet_el(
         .overflow_hidden()
         .children(cards)
         .children(note)
-        .children(dv_overlay);
+        .children(dv_overlay)
+        .children(filter_buttons);
 
     let ent_move = ent.clone();
     let ent_up = ent.clone();
@@ -34463,7 +34182,8 @@ mod grid_geom_tests {
             bar_target(SheetAct::DataValidation),
             Some(RefTarget::Validation)
         );
-        assert_eq!(bar_target(SheetAct::CustomSort), Some(RefTarget::Sort));
+        // The Sort dialog replaced the sort bar (#691).
+        assert_eq!(bar_target(SheetAct::CustomSort), None);
         // Text to Columns opens a wizard dialog, not a bar (#692).
         assert_eq!(bar_target(SheetAct::TextToColumns), None);
         // The bars without a range field — and everything else — get none.
@@ -34509,12 +34229,20 @@ mod grid_geom_tests {
         }
         // Every command that opens a bar seeded from the selection is one, or
         // the bar would open on cells nothing on screen marked.
-        for act in [
-            SheetAct::CondFormat,
-            SheetAct::DataValidation,
-            SheetAct::CustomSort,
-        ] {
+        for act in [SheetAct::CondFormat, SheetAct::DataValidation] {
             assert!(super::bar_target(act).is_some() && act_targets_cells(act));
+        }
+        // So does every Sort & Filter command: the Sort dialog and A to Z
+        // sort the selection, Filter puts buttons over it (#690, #691).
+        for act in [
+            SheetAct::CustomSort,
+            SheetAct::SortAsc,
+            SheetAct::Filter,
+            SheetAct::AdvancedFilter,
+            SheetAct::FilterBy(gridcore::filter::ByCell::Value),
+            SheetAct::PutOnTop(crate::sheet_sort::OnTop::Icon),
+        ] {
+            assert!(act_targets_cells(act));
         }
         // The Text to Columns wizard converts the selected column.
         assert!(act_targets_cells(SheetAct::TextToColumns));
@@ -34540,38 +34268,6 @@ mod grid_geom_tests {
     }
 
     #[test]
-    fn clear_filter_unhides_the_filtered_rows_of_the_region_around_the_cursor() {
-        use super::{Surface, new_sheet_surface};
-        use gridcore::sheet::Cell;
-        let Surface::Sheet(mut v) = new_sheet_surface() else {
-            unreachable!()
-        };
-        // Two regions, A1:A4 and A6:A7, split by the blank row 5.
-        for r in [0, 1, 2, 3, 5, 6] {
-            let s = v.active;
-            v.engine
-                .set_cell(&mut v.pkg.workbook, (s, r, 0), Cell::number(f64::from(r)));
-        }
-        let sh = &mut v.pkg.workbook.sheets[0];
-        sh.set_row_filtered(1, true);
-        sh.set_row_filtered(3, true);
-        sh.set_row_filtered(6, true);
-        v.sel = (2, 0);
-        assert!(v.clear_filter());
-        let sh = &v.pkg.workbook.sheets[0];
-        for r in 0..=3 {
-            assert!(!sh.row_hidden(r) && !sh.row_filtered(r), "row {r}");
-        }
-        assert!(sh.row_filtered(6), "the other region keeps its filter");
-        // Nothing left to clear: no change, so the tab is not dirtied.
-        assert!(!v.clear_filter());
-        // An empty cursor row has no region.
-        v.sel = (4, 0);
-        assert!(!v.clear_filter());
-        assert!(v.pkg.workbook.sheets[0].row_filtered(6));
-    }
-
-    #[test]
     fn protected_view_refuses_every_outline_command() {
         use super::SheetAct;
         // Each writes the outline, `hidden` or `collapsed` into the file.
@@ -34589,6 +34285,15 @@ mod grid_geom_tests {
             SheetAct::Consolidate,
             // Clear writes `hidden` too (#696).
             SheetAct::ClearFilter,
+            // Every Sort & Filter command writes rows or cells (#690, #691).
+            SheetAct::Filter,
+            SheetAct::ReapplyFilter,
+            SheetAct::AdvancedFilter,
+            SheetAct::FilterBy(gridcore::filter::ByCell::Value),
+            SheetAct::PutOnTop(crate::sheet_sort::OnTop::CellColor),
+            SheetAct::SortAsc,
+            SheetAct::SortDesc,
+            SheetAct::CustomSort,
         ] {
             assert!(!super::protected_view_allows_act(act), "{act:?}");
         }
@@ -34596,13 +34301,25 @@ mod grid_geom_tests {
     }
 
     #[test]
+    fn protected_view_lets_the_cell_menus_copy_through_and_nothing_else() {
+        // The cell menu's items are `Act::Sheet`, gated by the menu click.
+        use crate::{Act, SheetAct, protected_view_allows_doc_act as allows};
+        assert!(allows(Act::Sheet(SheetAct::Copy)));
+        for act in [
+            SheetAct::Cut,
+            SheetAct::Paste,
+            SheetAct::NewComment,
+            SheetAct::SortAsc,
+            SheetAct::FilterBy(gridcore::filter::ByCell::Value),
+        ] {
+            assert!(!allows(Act::Sheet(act)), "{act:?}");
+        }
+    }
+
+    #[test]
     fn bar_fields_are_ranges_and_take_the_keyboard_first() {
         use super::RefTarget;
-        for t in [
-            RefTarget::CondFormat,
-            RefTarget::Validation,
-            RefTarget::Sort,
-        ] {
+        for t in [RefTarget::CondFormat, RefTarget::Validation] {
             assert!(
                 t.is_bar(),
                 "{t:?} sits inside a bar, so it is asked before the bar's own buffer"
@@ -34733,9 +34450,8 @@ mod grid_geom_tests {
         // A dropdown is read where the boxes are, which is commonly not the
         // sheet the list was typed on.
         assert!(takes(Validation));
-        // A rule and a sort act on the rows in front of you.
+        // A rule acts on the rows in front of you.
         assert!(!takes(CondFormat));
-        assert!(!takes(Sort));
         // Not a range at all — the question doesn't apply.
         assert!(!takes(ChartTitle));
     }
@@ -34795,28 +34511,26 @@ mod grid_geom_tests {
     }
 
     #[test]
-    fn a_rule_a_sort_and_a_split_still_refuse_another_sheet() {
+    fn a_rule_still_refuses_another_sheet() {
         use super::{RefTarget, bar_ref_text};
         let wb: Vec<String> = ["Sheet1", "Lookup"].iter().map(|s| s.to_string()).collect();
-        for target in [RefTarget::CondFormat, RefTarget::Sort] {
-            // Refused even though the sheet EXISTS — the objection is that
-            // these act on the rows in view, not that the name is unknown.
-            assert_eq!(
-                bar_ref_text("Lookup!A1:A9", target, &wb, 0),
-                Err("\"Lookup\" is another sheet; this acts on Sheet1".to_string()),
-                "{target:?} took a foreign sheet"
-            );
-            // A range on the sheet in front of you is what they want, and the
-            // index they answer with is always that sheet.
-            assert_eq!(
-                bar_ref_text("B2:D5", target, &wb, 0),
-                Ok((0, "=Sheet1!$B$2:$D$5".to_string()))
-            );
-            assert_eq!(
-                bar_ref_text("A1:A9", target, &wb, 1),
-                Ok((1, "=Lookup!$A$1:$A$9".to_string()))
-            );
-        }
+        let target = RefTarget::CondFormat;
+        // Refused even though the sheet EXISTS — the objection is that a
+        // rule acts on the rows in view, not that the name is unknown.
+        assert_eq!(
+            bar_ref_text("Lookup!A1:A9", target, &wb, 0),
+            Err("\"Lookup\" is another sheet; this acts on Sheet1".to_string()),
+        );
+        // A range on the sheet in front of you is what it wants, and the
+        // index it answers with is always that sheet.
+        assert_eq!(
+            bar_ref_text("B2:D5", target, &wb, 0),
+            Ok((0, "=Sheet1!$B$2:$D$5".to_string()))
+        );
+        assert_eq!(
+            bar_ref_text("A1:A9", target, &wb, 1),
+            Ok((1, "=Lookup!$A$1:$A$9".to_string()))
+        );
     }
 
     #[test]
@@ -34829,11 +34543,7 @@ mod grid_geom_tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        for target in [
-            RefTarget::CondFormat,
-            RefTarget::Validation,
-            RefTarget::Sort,
-        ] {
+        for target in [RefTarget::CondFormat, RefTarget::Validation] {
             for active in 0..wb.len() {
                 let seed = ref_a1(Some(wb[active].as_str()), (1, 1, 4, 3));
                 assert_eq!(
@@ -34843,22 +34553,6 @@ mod grid_geom_tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn sort_uses_the_field_only_when_it_names_rows() {
-        use super::sort_rows_from;
-        let region = Some((1, 8));
-        // An explicit multi-row range sorts exactly those rows.
-        assert_eq!(sort_rows_from(Some((3, 0, 6, 2)), region), Some((3, 6)));
-        // One row, or one cell, says nothing useful — keep the found region.
-        assert_eq!(sort_rows_from(Some((3, 0, 3, 2)), region), region);
-        assert_eq!(sort_rows_from(None, region), region);
-        // With no region either, there is nothing to sort.
-        assert_eq!(sort_rows_from(Some((3, 0, 3, 2)), None), None);
-        assert_eq!(sort_rows_from(None, None), None);
-        // A field range still wins when no region was found.
-        assert_eq!(sort_rows_from(Some((0, 0, 4, 1)), None), Some((0, 4)));
     }
 
     #[test]
@@ -35313,11 +35007,7 @@ mod grid_geom_tests {
         assert!(keeps_panel_field(Some(3), 3, None));
 
         // A sheet bar pointing at the grid over an open panel: dropped.
-        for f in [
-            RefTarget::CondFormat,
-            RefTarget::Validation,
-            RefTarget::Sort,
-        ] {
+        for f in [RefTarget::CondFormat, RefTarget::Validation] {
             assert!(
                 !keeps_panel_field(Some(3), 3, Some(f)),
                 "{f:?} is the sheet's"

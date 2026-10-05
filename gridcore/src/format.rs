@@ -81,9 +81,19 @@ fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
 fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
     let bad = || format!("bad color '{s}' (want \"#RRGGBB\")");
     let hex = s.strip_prefix('#').ok_or_else(bad)?;
-    if hex.len() != 6 || !hex.is_ascii() {
+    if hex.len() != 6 {
         return Err(bad());
     }
+    hex_rgb(hex).ok_or_else(bad)
+}
+
+/// `RRGGBB`, or Excel's `AARRGGBB` (the alpha is dropped), with an optional
+/// leading `#`, as `(r, g, b)`. Strict: ASCII hex digits only, so neither a
+/// `+` (which `u8::from_str_radix` accepts) nor a multi-byte character (which
+/// a byte slice would split) gets through. A colour argument's parser for
+/// every host (#690, #691).
+pub fn hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
+    let hex = s.trim().strip_prefix('#').unwrap_or(s.trim());
     // Strict two-hex-digit parsing, byte by byte — NOT `u8::from_str_radix`,
     // which accepts a leading '+' (`from_str_radix("+0", 16)` is `Ok(0)`),
     // letting a code like "#+00000" sneak through as black instead of being
@@ -97,12 +107,20 @@ fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
         }
     }
     let bytes = hex.as_bytes();
-    let byte =
-        |i: usize| -> Option<u8> { Some((hex_digit(bytes[i])? << 4) | hex_digit(bytes[i + 1])?) };
-    match (byte(0), byte(2), byte(4)) {
-        (Some(r), Some(g), Some(b)) => Ok((r, g, b)),
-        _ => Err(bad()),
+    let skip = match bytes.len() {
+        6 => 0,
+        8 => 2,
+        _ => return None,
+    };
+    let byte = |i: usize| -> Option<u8> {
+        Some((hex_digit(bytes[skip + i])? << 4) | hex_digit(bytes[skip + i + 1])?)
+    };
+    // The alpha must be hex digits too.
+    if skip == 2 {
+        hex_digit(bytes[0])?;
+        hex_digit(bytes[1])?;
     }
+    Some((byte(0)?, byte(2)?, byte(4)?))
 }
 
 /// The largest inclusive rectangle a single `cell.format` call may
@@ -624,5 +642,16 @@ mod tests {
             "a patch that never touches numFmt must not inherit the loaded \
              default style's synthesized 'General' code: {xf:?}"
         );
+    }
+
+    #[test]
+    fn hex_rgb_is_strict() {
+        assert_eq!(hex_rgb("FF00B050"), Some((0, 0xB0, 0x50)));
+        assert_eq!(hex_rgb("#00b050"), Some((0, 0xB0, 0x50)));
+        // Non-ASCII (an 8-byte string whose byte 2 is inside '€'), a '+',
+        // a split character, a bad alpha: refused, never a panic.
+        for bad in ["€12345", "1é234", "+1+2+3", "GG00B050", "00B05", "", "#"] {
+            assert_eq!(hex_rgb(bad), None, "{bad}");
+        }
     }
 }

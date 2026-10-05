@@ -798,12 +798,14 @@ pub enum Region {
     ProjectSplit,
     /// The Home ribbon's Styles gallery: the well its tiles sit in.
     Gallery,
+    /// The AutoFilter button on column `.0`'s header cell (#690).
+    FilterButton(u32),
 }
 
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
 /// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-hbar-table`,
 /// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`,
-/// `gallery`, `tab-chip:0`.
+/// `gallery`, `tab-chip:0`, `filter-button:B`.
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.
@@ -866,6 +868,16 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .map_err(|_| format!("'{a}' is not a task ID"))?;
             Ok(Region::Bar(id))
         }
+        "filter-button" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'filter-button' needs a column, e.g. filter-button:B")?;
+            let up = a.to_ascii_uppercase();
+            match gridcore::sheet::parse_col(&up) {
+                Some((c, n)) if n == up.len() => Ok(Region::FilterButton(c)),
+                _ => Err(format!("'{a}' is not a column letter")),
+            }
+        }
         "chart" => {
             let a = arg
                 .filter(|a| !a.is_empty())
@@ -876,7 +888,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, filter-button:B)"
         )),
     }
 }
@@ -904,6 +916,7 @@ pub fn region_name(region: Region) -> String {
         Region::ProjectTimeline => "project-timeline".into(),
         Region::ProjectSplit => "project-split".into(),
         Region::Gallery => "gallery".into(),
+        Region::FilterButton(c) => format!("filter-button:{}", gridcore::sheet::col_name(c)),
     }
 }
 
@@ -1122,10 +1135,9 @@ pub fn parse_field(name: &str) -> Result<RefTarget, String> {
         "series-values" => indexed(RefTarget::SeriesValues),
         "cond-format" => Ok(RefTarget::CondFormat),
         "validation" => Ok(RefTarget::Validation),
-        "sort" => Ok(RefTarget::Sort),
         other => Err(format!(
             "unknown field '{other}' (chart-range, chart-title, categories, \
-             series-name:N, series-values:N, cond-format, validation, sort)"
+             series-name:N, series-values:N, cond-format, validation)"
         )),
     }
 }
@@ -1141,7 +1153,6 @@ pub fn field_name(target: RefTarget) -> String {
         RefTarget::SeriesValues(i) => format!("series-values:{i}"),
         RefTarget::CondFormat => "cond-format".into(),
         RefTarget::Validation => "validation".into(),
-        RefTarget::Sort => "sort".into(),
     }
 }
 
@@ -2105,10 +2116,25 @@ fn menu_open(
     cx: &mut Context<crate::Docxy>,
 ) -> Result<(), String> {
     match target {
+        Json::Str(name) if name == "cell" => {
+            if !app.active_is_sheet() {
+                return Err("the cell menu opens on a sheet tab".into());
+            }
+            let at = menu_point(app, window, None, |b| b.center());
+            app.open_cell_menu(at, cx);
+            Ok(())
+        }
         Json::Str(name) if name == "document" => {
             if app.active_is_project() {
                 return Err(
                     r#"the document menu does not open on a Project tab; a task row's is {"row": uid}"#
+                        .into(),
+                );
+            }
+            // A right-click on a sheet's body opens the cell menu instead.
+            if app.active_is_sheet() {
+                return Err(
+                    r#"the document menu does not open on a sheet tab; a cell's is {"cell": "D7"}"#
                         .into(),
                 );
             }
@@ -2117,6 +2143,21 @@ fn menu_open(
             Ok(())
         }
         Json::Obj(fields) if fields.len() == 1 => match fields[0].0.as_str() {
+            // A right-click on that cell: outside the selection it selects
+            // it, then the cell menu opens (#690, #691).
+            "cell" => {
+                if !app.active_is_sheet() {
+                    return Err("the cell menu opens on a sheet tab".into());
+                }
+                let name = fields[0]
+                    .1
+                    .as_str()
+                    .ok_or("'cell' must be a cell, e.g. D7")?;
+                let (r, c) = parse_cell(name)?;
+                let at = menu_point(app, window, None, |b| b.center());
+                app.cell_right_click(r, c, at, window, cx);
+                Ok(())
+            }
             "row" => {
                 let uid = match &fields[0].1 {
                     Json::Null => None,
@@ -2173,7 +2214,7 @@ fn menu_open(
                 app.open_split_menu(id, at, cx)
             }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, row and ribbon are)"
+                "menu target '{other}' is not supported yet (document, cell, row and ribbon are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
@@ -2523,6 +2564,8 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ("range", Json::Str(a1_range(v.range()))),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
+            // The sheet comment editor New Comment opens, and its text.
+            ("comment_edit", str_or_null(app.sheet_comment_edit.clone())),
         ]);
     }
     let ov = app.grid_overlay();
@@ -5758,7 +5801,8 @@ mod tests {
             parse_field(" series-values:2 "),
             Ok(RefTarget::SeriesValues(2))
         );
-        assert_eq!(parse_field("sort"), Ok(RefTarget::Sort));
+        // The sort bar's field went with the bar (#691).
+        assert!(parse_field("sort").is_err());
     }
 
     #[test]
@@ -5782,7 +5826,6 @@ mod tests {
             RefTarget::SeriesValues(3),
             RefTarget::CondFormat,
             RefTarget::Validation,
-            RefTarget::Sort,
         ] {
             assert_eq!(parse_field(&field_name(t)), Ok(t));
         }
@@ -5918,6 +5961,7 @@ mod tests {
             Region::ProjectTimeline,
             Region::ProjectSplit,
             Region::Gallery,
+            Region::FilterButton(1),
         ] {
             assert_eq!(parse_region(&region_name(r)), Ok(r));
         }
