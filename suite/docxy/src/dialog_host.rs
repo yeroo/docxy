@@ -62,6 +62,10 @@ fn apply_dialog(
         DialogOwner::TextToColumns { .. } | DialogOwner::TextToColumnsReplace => {
             Err("Text to Columns applies through its own wizard".into())
         }
+        // Handled in `sheet_goto::click`, before this.
+        DialogOwner::GoTo | DialogOwner::GoToSpecial => {
+            Err("Go To applies through Find & Select".into())
+        }
         // Handled in `sheet_consolidate::click`, before this.
         DialogOwner::Consolidate { .. } => Err("Consolidate applies through the Data tab".into()),
         // Handled in `sheet_outline::click`, before this.
@@ -145,6 +149,10 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
     }
     // So do the outline dialogs (#693): Subtotal's OK and Remove All.
     if let Some(done) = crate::sheet_outline::click(tab, button) {
+        return done;
+    }
+    // Go To's OK selects; its Special… opens Go To Special (#671).
+    if let Some(done) = crate::sheet_goto::click(tab, button) {
         return done;
     }
     // Consolidate's Add and Delete edit its list; OK consolidates (#694).

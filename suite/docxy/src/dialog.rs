@@ -124,6 +124,10 @@ pub(crate) enum DialogOwner {
     },
     /// The outline Settings (#693): where summary rows and columns sit.
     OutlineSettings,
+    /// Home › Find & Select › Go To… and Go To Special… (#671), applied in
+    /// `sheet_goto::click`.
+    GoTo,
+    GoToSpecial,
     /// Group's (Ungroup's) "Rows or Columns?" over a block selection (#693).
     OutlineAxis {
         ungroup: bool,

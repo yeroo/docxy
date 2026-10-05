@@ -454,6 +454,35 @@ fn rule_ranges<'a>(
     cells_to_rects(&cells)
 }
 
+/// Where Go To's Reference box (or a chosen name) goes: a cell or range,
+/// optionally `Sheet!`-qualified (`$` signs allowed), or a defined name
+/// (scoped to `active` first) whose definition is one. `(sheet, rect)`;
+/// `None` when the text names nothing there.
+pub fn resolve_reference(wb: &Workbook, active: usize, text: &str) -> Option<(usize, Rect)> {
+    let text = text.trim().trim_start_matches('=');
+    if text.is_empty() {
+        return None;
+    }
+    let named = wb
+        .defined_names
+        .iter()
+        .filter(|d| d.name.eq_ignore_ascii_case(text))
+        .min_by_key(|d| d.scope != Some(active))
+        .map(|d| d.formula.as_str());
+    let target = named.unwrap_or(text);
+    let (sheet, cells) = match target.rsplit_once('!') {
+        Some((name, cells)) => {
+            let name = name.trim().trim_matches('\'');
+            (wb.sheet_index(&name.replace("''", "'"))?, cells)
+        }
+        None => (active, target),
+    };
+    let cells = cells.replace('$', "");
+    let rect = crate::sheet::parse_range_name(&cells)
+        .or_else(|| crate::sheet::parse_cell_name(&cells).map(|(r, c)| (r, c, r, c)))?;
+    (sheet < wb.sheets.len()).then_some((sheet, rect))
+}
+
 #[cfg(test)]
 #[path = "goto_special/tests.rs"]
 mod tests;

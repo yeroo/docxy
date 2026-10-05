@@ -67,6 +67,7 @@ mod sheet_consolidate;
 mod sheet_entry_tests;
 #[cfg(test)]
 mod sheet_fill_tests;
+mod sheet_goto;
 #[cfg(test)]
 mod sheet_select_tests;
 // #707: the drop and option menus are wired by the commits that follow.
@@ -3056,6 +3057,19 @@ impl SheetView {
         if live {
             self.stamp_areas();
         }
+    }
+
+    /// Select `rects` as one multi-area selection (Go To Special): the first
+    /// is active, with the active cell at its top-left (R6).
+    fn set_areas(&mut self, rects: &[(u32, u32, u32, u32)]) {
+        let Some((&(r0, c0, r1, c1), rest)) = rects.split_first() else {
+            return;
+        };
+        self.sel = (r0, c0);
+        self.anchor = (r1, c1);
+        self.areas = rest.to_vec();
+        self.stamp_areas();
+        self.end_cell_edit();
     }
 
     /// Back to one area.
@@ -15030,6 +15044,20 @@ impl Docxy {
         .map(|()| cx.notify())
     }
 
+    /// A Home › Clear item other than Clear Contents (which is Delete): one
+    /// undo step over every area, or the status says why not.
+    fn sheet_clear_what(&mut self, what: gridcore::edit::ClearWhat, cx: &mut Context<Self>) {
+        let Some(v) = self.active_sheet_mut() else {
+            return;
+        };
+        match v.clear_what(what) {
+            Ok(true) => self.mark_sheet_dirty(),
+            Ok(false) => self.set_status("Nothing to clear"),
+            Err(e) => self.set_status(e),
+        }
+        cx.notify();
+    }
+
     /// Refuse what would act on one area of a multi-area selection, with
     /// Excel's message; false when the selection has one area.
     fn multi_area_refused(&mut self, cx: &mut Context<Self>) -> bool {
@@ -15205,12 +15233,25 @@ impl Docxy {
                 return;
             }
             SheetAct::Fill(dir) => self.sheet_fill_dir(dir, cx),
+            SheetAct::Clear(gridcore::edit::ClearWhat::Contents) => self.sheet_clear(cx),
+            SheetAct::Clear(what) => self.sheet_clear_what(what, cx),
+            SheetAct::GoTo | SheetAct::GoToSpecial => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    let d = if act == SheetAct::GoTo {
+                        sheet_goto::goto_dialog(tab)
+                    } else {
+                        sheet_goto::special_dialog(tab)
+                    };
+                    match d {
+                        Ok(d) => tab.dialogs.push(d),
+                        Err(e) => tab.status = e.into(),
+                    }
+                }
+                cx.notify();
+            }
             SheetAct::FillSeries
             | SheetAct::FillJustify
             | SheetAct::FillAs(_)
-            | SheetAct::Clear(_)
-            | SheetAct::GoTo
-            | SheetAct::GoToSpecial
             | SheetAct::PasteAs(_)
             | SheetAct::PasteSpecial
             | SheetAct::OfficeClipboard
@@ -15418,6 +15459,7 @@ impl Docxy {
                 // acts, so they share their checks (a multi-area selection,
                 // #670).
                 "c" => return self.run_sheet_act(SheetAct::Copy, window, cx),
+                "g" => return self.run_sheet_act(SheetAct::GoTo, window, cx),
                 "x" => return self.run_sheet_act(SheetAct::Cut, window, cx),
                 "v" => return self.run_sheet_act(SheetAct::Paste, window, cx),
                 "z" => self.sheet_undo(cx),
@@ -15556,6 +15598,8 @@ impl Docxy {
                 cx.notify();
             }
             "f2" => self.sheet_begin_edit(None, cx),
+            // Go To (#671), as Ctrl+G is.
+            "f5" if !editing => self.run_sheet_act(SheetAct::GoTo, window, cx),
             // F9 while editing a formula: its value replaces the text.
             "f9" if editing => {
                 if let Some(v) = self.active_sheet_mut() {

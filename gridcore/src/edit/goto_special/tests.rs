@@ -298,3 +298,26 @@ fn names_parse() {
         None
     );
 }
+
+#[test]
+fn go_to_resolves_cells_ranges_sheets_and_names() {
+    let mut wb = book(&[]);
+    wb.sheets.push(Sheet {
+        name: "Q 2".into(),
+        ..Sheet::default()
+    });
+    wb.defined_names.push(crate::sheet::DefinedName {
+        name: "Totals".into(),
+        scope: None,
+        formula: "'Q 2'!$B$2:$C$4".into(),
+    });
+    assert_eq!(resolve_reference(&wb, 0, "b3"), Some((0, rect("B3"))));
+    assert_eq!(resolve_reference(&wb, 0, "A1:C2"), Some((0, rect("A1:C2"))));
+    assert_eq!(resolve_reference(&wb, 0, "'Q 2'!D4"), Some((1, rect("D4"))));
+    assert_eq!(
+        resolve_reference(&wb, 0, "totals"),
+        Some((1, rect("B2:C4")))
+    );
+    assert_eq!(resolve_reference(&wb, 0, "Nowhere!A1"), None);
+    assert_eq!(resolve_reference(&wb, 0, "banana"), None);
+}
