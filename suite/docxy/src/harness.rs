@@ -2312,6 +2312,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "autorecover"
             | "keep-drafts"
             | "user-name"
+            | "autocorrect"
             | "trusted-clear"
             | "open-draft"
             | "dialog-set"
@@ -2455,6 +2456,11 @@ fn sheet_editing_json(o: &gridcore::options::EditOptions) -> Json {
         (k::KEY_EDIT_IN_CELL, Json::Bool(o.edit_in_cell)),
         (k::KEY_AUTOCOMPLETE, Json::Bool(o.autocomplete)),
         (k::KEY_FILL_HANDLE, Json::Bool(o.fill_handle)),
+        (k::KEY_FLASH_FILL_AUTO, Json::Bool(o.flash_fill_auto)),
+        (
+            k::KEY_FORMULA_AUTOCOMPLETE,
+            Json::Bool(o.formula_autocomplete),
+        ),
     ])
 }
 
@@ -3168,6 +3174,13 @@ pub fn dispatch(
         // tab, which `dialog-set` and `dialog-click` then drive.
         "user-name" => {
             app.open_user_name_dialog()?;
+            cx.notify();
+            Done::ok(state(app, window))
+        }
+        // Settings' AutoCorrect Options... (#667): the same opener as the
+        // backstage row.
+        "autocorrect" => {
+            app.open_autocorrect_dialog()?;
             cx.notify();
             Done::ok(state(app, window))
         }

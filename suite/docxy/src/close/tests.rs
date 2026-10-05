@@ -1365,6 +1365,7 @@ fn prefs() -> Prefs {
         autorecover_minutes: 10,
         keep_drafts: true,
         edit_opts: gridcore::options::EditOptions::default(),
+        autocorrect: String::new(),
         user_name: String::new(),
         user_initials: String::new(),
     }
@@ -1689,6 +1690,33 @@ fn sheet_editing_options_round_trip_through_the_session() {
     };
     write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
     assert_eq!(EditOptions::from_text(&root.session().sheet_editing), opts);
+}
+
+/// #667: AutoCorrect's changes persist in `sheet_editing` beside the
+/// Editing options, and each reads its own keys back.
+#[test]
+fn autocorrect_persists_with_the_sheet_editing_options() {
+    use gridcore::autocorrect::{AutoCorrect, ExceptionKind};
+    use gridcore::options::EditOptions;
+    let root = Root::new("autocorrect");
+    let mut ac = AutoCorrect::default();
+    ac.add("cdp", "Consolidated Data Processing").unwrap();
+    ac.delete("adn");
+    ac.add_exception(ExceptionKind::InitialCaps, "ABc").unwrap();
+    ac.opts.hyperlinks = false;
+    let opts = EditOptions {
+        flash_fill_auto: false,
+        ..EditOptions::default()
+    };
+    let prefs = Prefs {
+        edit_opts: opts,
+        autocorrect: ac.to_lines(),
+        ..prefs()
+    };
+    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
+    let saved = root.session().sheet_editing;
+    assert_eq!(AutoCorrect::from_text(&saved), ac);
+    assert_eq!(EditOptions::from_text(&saved), opts);
 }
 
 /// #672: a sheet tab reached through the app gets the app's Editing options,

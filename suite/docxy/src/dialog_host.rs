@@ -107,6 +107,10 @@ fn apply_dialog(
             Err("a Design dialog applies through the Design tab".into())
         }
         DialogOwner::Message => Ok(false),
+        // Handled in `sheet_autocorrect::click`, before this: the app's.
+        DialogOwner::AutoCorrect
+        | DialogOwner::AutoCorrectExceptions
+        | DialogOwner::AutoCorrectRedefine => Err("AutoCorrect is an app setting".into()),
         // Handled in `user_name::click`, before this: it is the app's.
         DialogOwner::UserName => Err("the user name is an app setting".into()),
         #[cfg(test)]
@@ -281,6 +285,10 @@ impl Docxy {
         if let Some(done) = self.user_name_click(button) {
             return done;
         }
+        // So is AutoCorrect (#667).
+        if let Some(done) = self.autocorrect_click(button) {
+            return done;
+        }
         let reopen = reopen_on_top(self.tabs.get(self.active));
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
         dialog_click(tab, button)?;
@@ -313,13 +321,17 @@ impl Docxy {
             .tabs
             .get(self.active)
             .filter(|t| {
-                t.dialogs
-                    .top()
-                    .is_some_and(|d| d.owner == DialogOwner::UserName)
+                t.dialogs.top().is_some_and(|d| {
+                    d.owner == DialogOwner::UserName
+                        || crate::sheet_autocorrect::is_autocorrect(d.owner)
+                })
             })
             .and_then(|t| t.dialogs.key_button(key, plain));
         if let Some(label) = user_name_button {
-            if let Some(Err(e)) = self.user_name_click(&label) {
+            let done = self
+                .user_name_click(&label)
+                .or_else(|| self.autocorrect_click(&label));
+            if let Some(Err(e)) = done {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.status = e.into();
                 }

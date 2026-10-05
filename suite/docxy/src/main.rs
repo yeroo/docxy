@@ -60,6 +60,7 @@ mod recover;
 mod ribbon_export;
 #[cfg(test)]
 mod sect_pr_tests;
+mod sheet_autocorrect;
 #[cfg(test)]
 mod sheet_clip_tests;
 mod sheet_complete;
@@ -335,6 +336,10 @@ struct Prefs {
     autorecover_minutes: u32,
     keep_drafts: bool,
     edit_opts: EditOptions,
+    /// AutoCorrect's changes from its defaults (#667), as
+    /// [`gridcore::autocorrect::AutoCorrect::to_lines`] writes them; saved
+    /// in `sheet_editing` with the Editing options.
+    autocorrect: String,
     user_name: String,
     user_initials: String,
 }
@@ -632,6 +637,17 @@ struct SheetView {
     /// [`SheetView::live_flash`]).
     flash_preview: Option<sheet_flashfill::FlashPreview>,
     last_flash: Option<sheet_flashfill::LastFlash>,
+    /// The app's AutoCorrect (#667), stamped like `edit_opts`.
+    autocorrect: std::rc::Rc<gridcore::autocorrect::AutoCorrect>,
+    /// The last correction while typing, with the buffer and caret it left
+    /// (before AutoComplete proposed): Ctrl+Z takes back just it while they
+    /// stand.
+    edit_correction: Option<(gridcore::autocorrect::Correction, String, usize)>,
+    /// Where Ctrl+Z took a correction back: that word is not corrected again.
+    edit_kept: Option<usize>,
+    /// The buffer and caret the last character typed at the end left: the
+    /// commit corrects the last word only while they stand.
+    edit_typed_tail: Option<(String, usize)>,
     /// Which workbook tab this is, for the grid clip: a cut moves cells only
     /// within the workbook it came from ([`next_sheet_view_id`]).
     id: u64,
@@ -1629,6 +1645,9 @@ impl SheetView {
         self.edit_point = None;
         self.edit_proposal = None;
         self.edit_complete = None;
+        self.edit_correction = None;
+        self.edit_kept = None;
+        self.edit_typed_tail = None;
     }
 
     /// The context a typed commit reads its entry under: the workbook's, with
@@ -1652,11 +1671,17 @@ impl SheetView {
     fn type_char(&mut self, c: &str) {
         if self.editing.is_some() {
             self.drop_proposal();
+            let at_end = self
+                .editing
+                .as_deref()
+                .is_some_and(|b| self.edit_caret == b.chars().count());
             self.edit_type(c);
+            self.autocorrect_typed(c, at_end);
         } else {
             self.begin_cell_edit(Some(String::new()));
             self.edit_caret = 0;
             self.edit_insert(c);
+            self.autocorrect_typed(c, true);
         }
         self.propose();
     }
@@ -1722,9 +1747,12 @@ impl SheetView {
         if self.edit_proposal.is_none() {
             return;
         }
-        let inserts = (alt && key == "enter") || (ctrl && matches!(key, "'" | "\"" | ";" | ":"));
+        // Ctrl+Z drops the suffix too: it may take back the AutoCorrect
+        // change the proposal was made from, which the suffix is not part of.
+        let inserts =
+            (alt && key == "enter") || (ctrl && matches!(key, "'" | "\"" | ";" | ":" | "z"));
         let caret_move = if ctrl {
-            matches!(key, "left" | "right" | "delete" | "z")
+            matches!(key, "left" | "right" | "delete")
         } else {
             matches!(key, "home" | "end" | "f2" | "f4" | "f9" | "insert")
                 || (self.edit_arrows_move_caret() && matches!(key, "left" | "right"))
@@ -1738,13 +1766,15 @@ impl SheetView {
 
     /// A commit takes a live AutoComplete proposal: the buffer becomes the
     /// value it completes to, in that value's case.
-    fn take_proposal(&mut self) {
-        if let Some((_, value)) = self.edit_proposal.take() {
-            if self.editing.is_some() {
-                self.editing = Some(value);
-                self.edit_caret_to_end();
-            }
+    fn take_proposal(&mut self) -> bool {
+        let Some((_, value)) = self.edit_proposal.take() else {
+            return false;
+        };
+        if self.editing.is_some() {
+            self.editing = Some(value);
+            self.edit_caret_to_end();
         }
+        true
     }
 
     /// Where a double-click on (r, c) goes with editing directly in cells
@@ -1803,6 +1833,9 @@ impl SheetView {
         self.edit_point = None;
         self.edit_proposal = None;
         self.edit_complete = None;
+        self.edit_correction = None;
+        self.edit_kept = None;
+        self.edit_typed_tail = None;
     }
 
     fn edit_untouched(&self) -> bool {
@@ -2003,7 +2036,8 @@ impl SheetView {
     /// text and [`SheetView::entry_error`] says why.
     fn commit_edit(&mut self) -> bool {
         self.entry_error = None;
-        self.take_proposal();
+        let took = self.take_proposal();
+        self.autocorrect_commit(took);
         let untouched = self.edit_untouched();
         debug_assert!(self.editing.is_none() || self.edit_origin.is_some());
         let Some(buf) = self.editing.as_deref() else {
@@ -2038,11 +2072,16 @@ impl SheetView {
                 return false;
             }
         }
+        let link = self.typed_link(&buf, took, cell.as_ref());
         self.editing = None;
         self.end_cell_edit();
         self.push_undo();
         if let Some(cell) = cell {
             self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
+        }
+        // A typed URL is a hyperlink (ENT-120), in the same undo step.
+        if let (Some(url), Some(sh)) = (link, self.pkg.workbook.sheets.get_mut(s)) {
+            sh.hyperlinks.insert((r, c), url);
         }
         true
     }
@@ -2233,6 +2272,9 @@ impl SheetView {
 
     /// Ctrl+Left / Ctrl+Right: to the start of the previous / next word.
     fn edit_word_move(&mut self, forward: bool) {
+        // A caret move or a deletion: the last word is no longer the one
+        // just typed (the commit's AutoCorrect, #667).
+        self.edit_typed_tail = None;
         let chars: Vec<char> = self.editing.as_deref().unwrap_or("").chars().collect();
         let word = |c: char| c.is_alphanumeric() || c == '_';
         let mut i = self.edit_caret.min(chars.len());
@@ -2256,6 +2298,9 @@ impl SheetView {
 
     /// Ctrl+Delete: delete from the caret to the end of the text.
     fn edit_delete_to_end(&mut self) {
+        // A caret move or a deletion: the last word is no longer the one
+        // just typed (the commit's AutoCorrect, #667).
+        self.edit_typed_tail = None;
         let caret = self.edit_caret;
         if let Some(buf) = self.editing.as_mut() {
             let at = char_to_byte(buf, caret);
@@ -2267,6 +2312,10 @@ impl SheetView {
     /// opened with; the editor stays open and the workbook's undo is untouched.
     fn edit_revert(&mut self) {
         if self.editing.is_some() {
+            // Right after an AutoCorrect change, only it goes (ENT-119).
+            if self.undo_correction() {
+                return;
+            }
             self.edit_proposal = None;
             self.editing = Some(self.edit_start.clone());
             self.edit_caret_to_end();
@@ -2538,7 +2587,8 @@ impl SheetView {
     /// selection kept. False when nothing was entered (no editor, or refused).
     fn commit_edit_to_selection(&mut self) -> bool {
         self.entry_error = None;
-        self.take_proposal();
+        let took = self.take_proposal();
+        self.autocorrect_commit(took);
         let Some(buf) = self.editing.clone() else {
             return false;
         };
@@ -2716,12 +2766,18 @@ impl SheetView {
     }
     /// Delete the char before the caret (Backspace).
     fn edit_backspace(&mut self) {
+        // A caret move or a deletion: the last word is no longer the one
+        // just typed (the commit's AutoCorrect, #667).
+        self.edit_typed_tail = None;
         if let Some(buf) = self.editing.as_mut() {
             buf_backspace(buf, &mut self.edit_caret);
         }
     }
     /// Delete the char at the caret (Delete).
     fn edit_delete(&mut self) {
+        // A caret move or a deletion: the last word is no longer the one
+        // just typed (the commit's AutoCorrect, #667).
+        self.edit_typed_tail = None;
         let caret = self.edit_caret;
         if let Some(buf) = self.editing.as_mut() {
             buf_delete(buf, caret);
@@ -2729,6 +2785,9 @@ impl SheetView {
     }
     /// Move the caret by `delta` chars, clamped to the buffer.
     fn edit_move(&mut self, delta: i32) {
+        // A caret move or a deletion: the last word is no longer the one
+        // just typed (the commit's AutoCorrect, #667).
+        self.edit_typed_tail = None;
         let n = self.edit_len() as i32;
         self.edit_caret = (self.edit_caret as i32 + delta).clamp(0, n) as usize;
     }
@@ -3245,6 +3304,9 @@ struct Docxy {
     /// keeps a copy that [`stamp_edit_opts`] refreshes on restore, on a
     /// change and every frame (and `active_sheet_mut` on each use).
     edit_opts: EditOptions,
+    /// AutoCorrect (#667): the app's, stamped into every sheet tab, saved
+    /// with the Editing options. Its dialogs change it.
+    autocorrect: std::rc::Rc<gridcore::autocorrect::AutoCorrect>,
     /// The reviewer's name and initials for new comments (#620), as set in
     /// Settings › User name; empty falls back ([`review_identity`]).
     user_name: String,
@@ -5709,6 +5771,7 @@ fn fx_segment(
                 if let Some(v) = this.active_sheet_mut() {
                     v.edit_caret = idx;
                     v.edit_proposal = None;
+                    v.edit_typed_tail = None;
                 }
                 cx.notify();
             });
@@ -8032,6 +8095,10 @@ fn new_sheet_surface() -> Surface {
         edit_complete: None,
         flash_preview: None,
         last_flash: None,
+        autocorrect: Default::default(),
+        edit_correction: None,
+        edit_kept: None,
+        edit_typed_tail: None,
         id: next_sheet_view_id(),
         edit_gen: 0,
     })
@@ -8103,6 +8170,10 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     edit_complete: None,
                     flash_preview: None,
                     last_flash: None,
+                    autocorrect: Default::default(),
+                    edit_correction: None,
+                    edit_kept: None,
+                    edit_typed_tail: None,
                     id: next_sheet_view_id(),
                     edit_gen: 0,
                 };
@@ -8317,7 +8388,7 @@ fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: 
         ask_on_close: prefs.ask_on_close,
         autorecover_minutes: prefs.autorecover_minutes,
         keep_drafts: prefs.keep_drafts,
-        sheet_editing: prefs.edit_opts.to_lines(),
+        sheet_editing: format!("{}{}", prefs.edit_opts.to_lines(), prefs.autocorrect),
         user_name: prefs.user_name,
         user_initials: prefs.user_initials,
     };
@@ -9006,6 +9077,10 @@ impl Docxy {
         this.keep_drafts = session.keep_drafts;
         this.edit_opts = EditOptions::from_text(&session.sheet_editing);
         stamp_edit_opts(&mut this.tabs, this.edit_opts);
+        this.autocorrect = std::rc::Rc::new(gridcore::autocorrect::AutoCorrect::from_text(
+            &session.sheet_editing,
+        ));
+        sheet_autocorrect::stamp_autocorrect(&mut this.tabs, &this.autocorrect);
         this.user_name = session.user_name;
         this.user_initials = session.user_initials;
         this.persist_to(&root);
@@ -9042,6 +9117,7 @@ impl Docxy {
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
             edit_opts: EditOptions::default(),
+            autocorrect: Default::default(),
             user_name: String::new(),
             user_initials: String::new(),
             fx_expanded: false,
@@ -9127,6 +9203,7 @@ impl Docxy {
             autorecover_minutes: self.autorecover_minutes,
             keep_drafts: self.keep_drafts,
             edit_opts: self.edit_opts,
+            autocorrect: self.autocorrect.to_lines(),
             user_name: self.user_name.clone(),
             user_initials: self.user_initials.clone(),
         }
@@ -9439,6 +9516,31 @@ impl Docxy {
                 |o| o.fill_handle = !o.fill_handle,
                 cx,
             ))
+            .child(check_row(
+                "bs-flash-fill-auto",
+                o.flash_fill_auto,
+                "Automatically Flash Fill",
+                |o| o.flash_fill_auto = !o.flash_fill_auto,
+                cx,
+            ))
+            .child(check_row(
+                "bs-formula-autocomplete",
+                o.formula_autocomplete,
+                "Formula AutoComplete",
+                |o| o.formula_autocomplete = !o.formula_autocomplete,
+                cx,
+            ))
+            // Proofing › AutoCorrect Options... (#667).
+            .child(
+                row("bs-autocorrect")
+                    .child(div().text_color(fg).child("AutoCorrect Options..."))
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        if let Err(e) = this.open_autocorrect_dialog() {
+                            this.set_status(e);
+                        }
+                        cx.notify();
+                    })),
+            )
             .into_any_element()
     }
 
@@ -11919,7 +12021,10 @@ impl Docxy {
     }
     fn active_sheet_mut(&mut self) -> Option<&mut SheetView> {
         let opts = self.edit_opts;
-        sheet_with_opts(self.tabs.get_mut(self.active), opts)
+        let ac = self.autocorrect.clone();
+        let v = sheet_with_opts(self.tabs.get_mut(self.active), opts)?;
+        v.autocorrect = ac;
+        Some(v)
     }
     /// Whether the active sheet is protected (cells read-only until unprotected).
     fn sheet_protected(&self) -> bool {
@@ -15112,12 +15217,14 @@ impl Docxy {
             "home" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_caret = 0;
+                    v.edit_typed_tail = None;
                 }
                 cx.notify();
             }
             "end" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_caret_to_end();
+                    v.edit_typed_tail = None;
                 }
                 cx.notify();
             }
@@ -25996,8 +26103,9 @@ impl Docxy {
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A tab created since the last frame holds the app's Editing options
-        // before anything can reach it (#672).
+        // before anything can reach it (#672), and its AutoCorrect (#667).
         stamp_edit_opts(&mut self.tabs, self.edit_opts);
+        sheet_autocorrect::stamp_autocorrect(&mut self.tabs, &self.autocorrect);
         // A new frame: what the probes recorded during the last one is now the
         // complete answer, and they start collecting this one afresh. Stale
         // entries cannot survive — a chart that was deleted simply does not

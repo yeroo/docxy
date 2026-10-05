@@ -330,7 +330,7 @@ State keys, as the app reports them after every driving verb:
 | `autorecover_minutes` | minutes between AutoRecover writes while a tab is unsaved; `0` is off |
 | `keep_drafts` | whether Don't Save keeps a workbook's last AutoRecover copy as a draft |
 | `user_name`, `user_initials` | Settings' User name and Initials for new comments (#620); empty falls back to the OS account name and initials derived from it |
-| `sheet_editing` | Settings' Sheet editing options (#672), by their `session.json` keys: `edit_fixed_decimal`, `edit_fixed_decimal_places`, `edit_move_after_enter`, `edit_move_direction` (`down`/`right`/`up`/`left`), `edit_in_cell`, `edit_autocomplete`, `edit_fill_handle` |
+| `sheet_editing` | Settings' Sheet editing options (#672), by their `session.json` keys: `edit_fixed_decimal`, `edit_fixed_decimal_places`, `edit_move_after_enter`, `edit_move_direction` (`down`/`right`/`up`/`left`), `edit_in_cell`, `edit_autocomplete`, `edit_fill_handle`, `edit_flash_fill_auto`, `edit_formula_autocomplete` |
 | `fx_expanded` | whether Ctrl+Shift+U has expanded the sheet formula bar |
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
@@ -526,6 +526,24 @@ tab, as the backstage row does: `dialog-set` its `user-name` and `initials`
 fields and `dialog-click` OK to store and persist them. New Word comments are
 stamped with that name and those initials (else the OS account name, else
 `docxy`, with initials derived from the name) and the UTC time.
+
+`call autocorrect {}` opens Settings' AutoCorrect Options... dialog (#667,
+id `autocorrect`) on the active tab, as the backstage row does. Its tabs are
+AutoCorrect, AutoFormat As You Type, Actions and Math AutoCorrect; each
+switch is a checkbox named by its `session.json` key (`ac_replace_text`,
+`ac_hyperlinks`, …). `dialog-set` `replace` and `with` and press Add: a new
+word is added at once; a word already listed with another With opens
+`autocorrect-redefine` ("Do you want to redefine it?", Yes/No) first.
+Choosing an item of `entries` fills Replace and With, and Delete removes it.
+Exceptions... opens `autocorrect-exceptions` (tabs First Letter and INitial
+CAps, fields `first-word`/`caps-word`, lists `first-list`/`caps-list`, Add,
+Delete, OK). Add, Delete and the exceptions take effect at once, as Office's
+do; the checkboxes apply with OK, and Cancel keeps them. All of it persists
+with the Sheet editing options. A typed URL, `www.` address, e-mail address
+or UNC path becomes a hyperlink while `ac_hyperlinks` is on; such a
+hyperlink lives in the workbook model (clickable, undoable) but is not yet
+written to the file, since the xlsx writer keeps only the hyperlinks a file
+already had (a follow-up).
 
 `project-tabs.uit` drives several plans at once: a blank one from `proj.new`
 that takes tasks without a fixture, two opened plans switched between by title
@@ -1047,7 +1065,7 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,
 `inspect` with `remove`,
 `theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `user-name`,
-`trusted-clear`,
+`autocorrect`, `trusted-clear`,
 `open-draft`,
 `enable-editing` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press

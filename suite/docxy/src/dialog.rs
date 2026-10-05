@@ -168,6 +168,11 @@ pub(crate) enum DialogOwner {
     /// A message whose only button is OK, which just closes it (Flash
     /// Fill's "didn't see a pattern", #666).
     Message,
+    /// The AutoCorrect dialog, its Exceptions and its "redefine it?"
+    /// question (#667): app settings, pressed in `sheet_autocorrect::click`.
+    AutoCorrect,
+    AutoCorrectExceptions,
+    AutoCorrectRedefine,
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
     Test,
