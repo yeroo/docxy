@@ -794,7 +794,7 @@ mod tests {
         assert!(view(&mut t).circles.is_empty());
         put(&mut t, "B4", Cell::number(1.0));
         assert_eq!(view(&mut t).circle_invalid(), 1);
-        view(&mut t).circles.clear();
+        view(&mut t).clear_circles();
         assert!(view(&mut t).circles.is_empty());
     }
 
@@ -1098,5 +1098,15 @@ mod tests {
         assert_eq!(v.editing.as_deref(), Some("250"));
         assert_eq!(v.sel, at("B2"));
         assert_eq!(value(&mut t, "B2"), CellValue::Number(50.0));
+    }
+
+    #[test]
+    fn circles_go_when_rows_move_under_them() {
+        let mut t = book(AlertStyle::Stop);
+        put(&mut t, "B3", Cell::number(250.0));
+        assert_eq!(view(&mut t).circle_invalid(), 1);
+        select(&mut t, "A1");
+        assert!(view(&mut t).structural_edit(crate::StructOp::InsertRow));
+        assert!(view(&mut t).circles.is_empty());
     }
 }

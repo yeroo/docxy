@@ -2492,6 +2492,11 @@ impl SheetView {
         n
     }
 
+    /// Clear Validation Circles.
+    fn clear_circles(&mut self) {
+        self.circles.clear();
+    }
+
     /// Drop the circles round cells that are valid now.
     fn prune_circles(&mut self) {
         if self.circles.is_empty() {
@@ -3145,6 +3150,8 @@ impl SheetView {
             self.dv_pending = None;
             return false;
         }
+        // Rows or columns are about to move: circles name cells, not rules.
+        self.circles.clear();
         self.push_undo();
         let s = self.active;
         let (r, c) = self.sel;
@@ -13537,6 +13544,10 @@ impl Docxy {
             }
             t.set_dirty();
         }
+        // An edit may have made a circled value valid (Delete, a fill, a sort).
+        if let Some(v) = self.active_sheet_mut() {
+            v.prune_circles();
+        }
     }
 
     /// Whether the active tab takes no edits: Protected View (#610), or a
@@ -16114,7 +16125,7 @@ impl Docxy {
     fn sheet_clear_circles(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             if let Surface::Sheet(v) = &mut tab.surface {
-                v.circles.clear();
+                v.clear_circles();
                 tab.status = "Validation circles cleared".into();
             }
         }

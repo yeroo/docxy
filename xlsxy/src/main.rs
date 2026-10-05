@@ -3029,6 +3029,14 @@ impl App {
             after.model_rename = Some((old.to_string(), new.to_string()));
         }
         self.rebuild_engine();
+        // Validation circles name cells: an edit that moved them leaves them
+        // pointing at the wrong ones, and one that wrote in place may have
+        // made a circled value valid.
+        if sync_headers {
+            self.prune_circles();
+        } else {
+            self.circles.clear();
+        }
         if self.circles_shown() && self.engine.circular_refs().len() > circles_before {
             self.circle_warning_pending = true;
         }
@@ -3124,6 +3132,7 @@ impl App {
     }
 
     fn restore(&mut self, snap: &WbSnapshot) {
+        self.circles.clear();
         self.cancel_cut();
         self.put_back(snap);
         if let Some((old, new)) = &snap.model_rename {
@@ -3585,6 +3594,8 @@ impl App {
         let before: Vec<RuleState> = sheets.iter().map(|&s| self.rule_state(s)).collect();
         let depth = self.undo.len();
         let out = f(self);
+        // Rules changed: a circled cell may be valid now (or a clean one not).
+        self.prune_circles();
         let changed: Vec<(usize, RuleState, RuleState)> = sheets
             .iter()
             .zip(before)
@@ -20667,6 +20678,39 @@ mod tests {
         // A2's cell was not moved, so its rule stays at A2.
         assert!(gridcore::validation::validation_at(sheet, 1, 0).is_some());
         assert!(gridcore::validation::validation_at(sheet, 0, 0).is_none());
+    }
+    #[test]
+    fn circles_follow_the_dialog_and_structural_edits() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.apply(vec![(2, 1, Cell::number(250.0))]);
+        app.circle_invalid();
+        assert_eq!(app.circles.len(), 1);
+        // Loosening the rule through the dialog makes B3 valid: its circle goes.
+        app.cur = (1, 1);
+        app.anchor = Some((9, 1));
+        app.open_validation_dialog();
+        dialog_keys(&mut app, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "1");
+        dialog_keys(&mut app, &[KeyCode::Down]);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "500");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.validation_dialog.is_none(), "{:?}", app.status);
+        assert!(app.circles.is_empty());
+        // A row inserted above clears circles: they name cells that moved.
+        app.apply(vec![(3, 1, Cell::number(600.0))]);
+        app.circle_invalid();
+        assert_eq!(app.circles.len(), 1);
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.row_op(true);
+        assert!(app.circles.is_empty());
     }
 }
 
