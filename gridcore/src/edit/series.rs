@@ -1044,6 +1044,30 @@ fn growth_trend(ys: &[f64], n: f64) -> f64 {
     a + b * n
 }
 
+/// Where a double-click on the fill handle of `src` fills down to: the last
+/// row of the block in the neighbouring column (left first, then right)
+/// that runs on below the source. `None` when neither neighbour runs on.
+pub fn fill_down_to(sheet: &crate::sheet::Sheet, src: Rect) -> Option<u32> {
+    let (_, c0, r1, c1) = src;
+    let filled = |r: u32, c: u32| {
+        sheet
+            .cell(r, c)
+            .is_some_and(|x| !x.value.is_empty() || x.formula.is_some())
+    };
+    let mut cols = Vec::new();
+    if c0 > 0 {
+        cols.push(c0 - 1);
+    }
+    cols.push(c1 + 1);
+    cols.into_iter().find_map(|c| {
+        let mut end = r1;
+        while end + 1 < crate::sheet::MAX_ROWS && filled(end + 1, c) {
+            end += 1;
+        }
+        (end > r1).then_some(end)
+    })
+}
+
 /// Excel's question when Home › Fill › Justify needs more rows than the
 /// selection has.
 pub const JUSTIFY_OVERFLOW: &str = "Text will extend below selected range.";

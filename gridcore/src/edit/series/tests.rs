@@ -672,3 +672,22 @@ fn builtin_lists_are_excels_four() {
     assert_eq!(l[3][11], "December");
     let _ = cell_name(0, 0);
 }
+
+// ---- criterion 8: double-clicking the handle ------------------------------------
+
+#[test]
+fn a_double_click_fills_to_the_neighbours_block() {
+    let mut wb = book(&[("B1", Cell::number(1.0))]);
+    for r in 0..5 {
+        wb.sheets[0].set_cell(r, 0, Cell::number(f64::from(r)));
+    }
+    assert_eq!(fill_down_to(&wb.sheets[0], (0, 1, 0, 1)), Some(4));
+    // Right when the left runs out first.
+    let mut wb = book(&[("A1", Cell::number(1.0))]);
+    for r in 0..3 {
+        wb.sheets[0].set_cell(r, 1, Cell::number(1.0));
+    }
+    assert_eq!(fill_down_to(&wb.sheets[0], (0, 0, 0, 0)), Some(2));
+    let wb = book(&[("A1", Cell::number(1.0))]);
+    assert_eq!(fill_down_to(&wb.sheets[0], (0, 0, 0, 0)), None);
+}

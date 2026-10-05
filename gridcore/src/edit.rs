@@ -26,7 +26,7 @@ pub use clip::{
 };
 pub use series::{
     FillDir, FillKind, FillTarget, JUSTIFY_OVERFLOW, SeriesSpec, SeriesType, builtin_lists,
-    fill_target, justify_lines, series_rows_for,
+    fill_down_to, fill_target, justify_lines, series_rows_for,
 };
 mod consolidate;
 mod paste_special;

@@ -1255,13 +1255,22 @@ fn a_drag_fill_from_a_source_holding_the_anchor_is_refused() {
     let src = (0, 3, 1, 3);
     let bx = fill_box(src, (5, 3));
     assert_eq!(bx, (0, 3, 5, 3));
-    let dest = fill_dest(src, bx);
+    let gridcore::edit::FillTarget::Extend { dest, .. } = gridcore::edit::fill_target(src, (5, 3))
+    else {
+        panic!("a fill down")
+    };
     assert_eq!(dest, (2, 3, 5, 3));
     assert!(v.engine.refuses_area(&v.pkg.workbook, s, dest));
     // The whole box would count the anchor as replaced: the r7 bug.
     assert!(!v.engine.refuses_area(&v.pkg.workbook, s, bx));
     // Right: the columns past the source.
-    assert_eq!(fill_dest((0, 0, 1, 1), (0, 0, 1, 4)), (0, 2, 1, 4));
+    assert!(matches!(
+        gridcore::edit::fill_target((0, 0, 1, 1), (1, 4)),
+        gridcore::edit::FillTarget::Extend {
+            dest: (0, 2, 1, 4),
+            ..
+        }
+    ));
 }
 
 // ---- #672: Excel's editing options ----------------------------------------

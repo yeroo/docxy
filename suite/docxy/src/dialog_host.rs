@@ -66,6 +66,10 @@ fn apply_dialog(
         DialogOwner::GoTo | DialogOwner::GoToSpecial => {
             Err("Go To applies through Find & Select".into())
         }
+        // Handled in `Docxy::fill_dialog_click`, before this.
+        DialogOwner::Series | DialogOwner::JustifyOverflow | DialogOwner::CustomLists => {
+            Err("a Fill dialog applies through Home › Fill".into())
+        }
         // Handled in `sheet_consolidate::click`, before this.
         DialogOwner::Consolidate { .. } => Err("Consolidate applies through the Data tab".into()),
         // Handled in `sheet_outline::click`, before this.
@@ -273,6 +277,10 @@ impl Docxy {
         if let Some(done) = self.user_name_click(button) {
             return done;
         }
+        // So are the custom lists, which the Series dialog reads (#668).
+        if let Some(done) = self.fill_dialog_click(button) {
+            return done;
+        }
         let reopen = reopen_on_top(self.tabs.get(self.active));
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
         dialog_click(tab, button)?;
@@ -305,13 +313,19 @@ impl Docxy {
             .tabs
             .get(self.active)
             .filter(|t| {
-                t.dialogs
-                    .top()
-                    .is_some_and(|d| d.owner == DialogOwner::UserName)
+                t.dialogs.top().is_some_and(|d| {
+                    matches!(
+                        d.owner,
+                        DialogOwner::UserName
+                            | DialogOwner::Series
+                            | DialogOwner::JustifyOverflow
+                            | DialogOwner::CustomLists
+                    )
+                })
             })
             .and_then(|t| t.dialogs.key_button(key, plain));
         if let Some(label) = user_name_button {
-            if let Some(Err(e)) = self.user_name_click(&label) {
+            if let Err(e) = self.dialog_press(&label) {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.status = e.into();
                 }

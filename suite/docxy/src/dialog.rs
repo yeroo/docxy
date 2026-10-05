@@ -128,6 +128,14 @@ pub(crate) enum DialogOwner {
     /// `sheet_goto::click`.
     GoTo,
     GoToSpecial,
+    /// Home › Fill › Series… (#668); its OK needs the app's custom lists,
+    /// so `Docxy::fill_dialog_click` applies it.
+    Series,
+    /// Justify's "Text will extend below selected range." (#668).
+    JustifyOverflow,
+    /// File › Options › Edit Custom Lists (#668): an app setting, applied by
+    /// `Docxy::fill_dialog_click`.
+    CustomLists,
     /// Group's (Ungroup's) "Rows or Columns?" over a block selection (#693).
     OutlineAxis {
         ungroup: bool,

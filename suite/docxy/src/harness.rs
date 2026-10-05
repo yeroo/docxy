@@ -2196,7 +2196,8 @@ fn menu_open(
                     )
                 })?;
                 sheet(app)?;
-                app.open_grid_menu(kind, cx)
+                let at = menu_point(app, window, None, |b| b.center());
+                app.open_grid_menu(kind, at, cx)
             }
             other => Err(format!(
                 "menu target '{other}' is not supported yet (document, row, ribbon and grid are)"
@@ -3425,10 +3426,28 @@ pub fn dispatch(
         // `drag` verb presses the grid instead, so it sweeps a selection.
         "fill-drag" => {
             app.refuse_under_dialog()?;
-            if args.get("option").is_some() {
-                return Err("AutoFill Options are not implemented in this app".into());
-            }
-            let to = cell_arg(args, "to")?;
+            // #668: `option` picks an Auto Fill Options kind after the fill,
+            // `ctrl` holds Ctrl, `right` drags with the right button (its
+            // menu is open in the reply), `double` double-clicks the handle.
+            let option = match args.get("option") {
+                Some(_) => {
+                    let name = arg_str(args, "option")?;
+                    Some(gridcore::edit::FillKind::from_label(name).ok_or_else(|| {
+                        format!("no Auto Fill Options kind '{name}' (copy, series, formats, values, days, weekdays, months, years, linear, growth)")
+                    })?)
+                }
+                None => None,
+            };
+            let (ctrl, right, double) = (
+                arg_flag(args, "ctrl")?,
+                arg_flag(args, "right")?,
+                arg_flag(args, "double")?,
+            );
+            let to = if double {
+                (0, 0)
+            } else {
+                cell_arg(args, "to")?
+            };
             let from = match args.get("from") {
                 Some(_) => Some(range_arg(args, "from")?),
                 None => None,
@@ -3455,7 +3474,21 @@ pub fn dispatch(
                 false,
             )?;
             let src = sheet(app)?.range();
+            if double {
+                app.sheet_fill_double(cx);
+                let after = sheet(app)?.range();
+                let mut reply = state(app, window);
+                if let Json::Obj(fields) = &mut reply {
+                    let filled = (after != src).then(|| a1_range(after));
+                    fields.push(("filled".into(), str_or_null(filled)));
+                }
+                return Done::ok(reply);
+            }
             app.sheet_fill_start(cx);
+            if let Some(f) = app.sheet_fill.as_mut() {
+                f.ctrl = ctrl;
+                f.right = right;
+            }
             if app.sheet_fill.is_none() {
                 return Err(if app.protected_view() {
                     format!(
@@ -3469,9 +3502,21 @@ pub fn dispatch(
                 });
             }
             for (r, c) in drag_path((src.2, src.3), to) {
-                app.grid_drag_over(r, c, cx);
+                if right {
+                    app.sheet_fill_over(r, c, cx);
+                } else {
+                    app.grid_drag_over(r, c, cx);
+                }
+            }
+            if right {
+                app.last_pointer = menu_point(app, window, None, |b| b.center());
+                app.sheet_fill_end(cx);
+                return Done::ok(crate::menu::read_json(app.menu.as_ref()));
             }
             app.grid_release(cx);
+            if let Some(kind) = option {
+                app.sheet_fill_as(kind, cx);
+            }
             let after = sheet(app)?.range();
             let mut reply = state(app, window);
             if let Json::Obj(fields) = &mut reply {

@@ -65,6 +65,7 @@ mod sheet_clip_tests;
 mod sheet_consolidate;
 #[cfg(test)]
 mod sheet_entry_tests;
+mod sheet_fill;
 #[cfg(test)]
 mod sheet_fill_tests;
 mod sheet_goto;
@@ -339,6 +340,9 @@ struct Prefs {
     autorecover_minutes: u32,
     keep_drafts: bool,
     edit_opts: EditOptions,
+    /// File › Options › Advanced › Edit Custom Lists (#668), saved with the
+    /// editing options in `sheet_editing`.
+    custom_lists: Vec<Vec<String>>,
     user_name: String,
     user_initials: String,
 }
@@ -817,6 +821,10 @@ struct ColDrag {
 struct FillDrag {
     src: (u32, u32, u32, u32),
     to: (u32, u32),
+    /// Ctrl held as it moved: copy and series swap (#668).
+    ctrl: bool,
+    /// Dragged with the right button: its release opens the fill menu.
+    right: bool,
 }
 
 /// An in-progress chart drag: which chart on the active sheet, where the press
@@ -1289,6 +1297,8 @@ fn arm_fill(
     *fill = Some(FillDrag {
         src,
         to: (src.2, src.3),
+        ctrl: false,
+        right: false,
     });
     true
 }
@@ -1358,31 +1368,12 @@ fn fill_handle_hidden(
     }
 }
 
-/// The dominant-axis fill box for `src` dragged to `to`: extend rows (down) or
-/// columns (right), whichever the handle was pulled furthest along. Returns the
-/// full box (source + filled cells), 0-based inclusive.
+/// The box a fill-handle drag from `src` to `to` leaves selected
+/// ([`gridcore::edit::fill_target`]): the source and the cells it fills, along
+/// the axis pulled furthest (down or up, right or left), or, dragged back
+/// inside, the source without the cells it clears.
 fn fill_box(src: (u32, u32, u32, u32), to: (u32, u32)) -> (u32, u32, u32, u32) {
-    let (sr0, sc0, sr1, sc1) = src;
-    let (tr, tc) = to;
-    let dr = tr.saturating_sub(sr1);
-    let dc = tc.saturating_sub(sc1);
-    if dr >= dc {
-        (sr0, sc0, sr1.max(tr), sc1)
-    } else {
-        (sr0, sc0, sr1, sc1.max(tc))
-    }
-}
-
-/// The cells a drag fill from `src` over `bx` ([`fill_box`]) writes: the rows
-/// below the source, or the columns right of it (`gridcore::edit::autofill`).
-fn fill_dest(src: (u32, u32, u32, u32), bx: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
-    let (_, sc0, sr1, sc1) = src;
-    let (br0, _, br1, bc1) = bx;
-    if br1 > sr1 {
-        (sr1 + 1, sc0, br1, sc1)
-    } else {
-        (br0, sc1 + 1, br1, bc1)
-    }
+    gridcore::edit::fill_target(src, to).selection(src)
 }
 
 /// Why a copy took nothing: a filter hides every selected row.
@@ -1665,7 +1656,6 @@ enum SheetAct {
     FillJustify,
     /// Auto Fill Options (and the fill handle's right-drag menu): redo the
     /// last fill as this kind.
-    #[allow(dead_code)] // #707: wired by a later commit
     FillAs(gridcore::edit::FillKind),
     /// A Home › Clear item.
     Clear(gridcore::edit::ClearWhat),
@@ -1680,7 +1670,6 @@ enum SheetAct {
     #[allow(dead_code)] // #707: wired by a later commit
     OfficeClipboard,
     /// File › Options › Advanced › Edit Custom Lists….
-    #[allow(dead_code)] // #707: wired by a later commit
     CustomLists,
     /// A border right-drag's drop menu item.
     #[allow(dead_code)] // #707: wired by a later commit
@@ -3619,6 +3608,16 @@ struct Docxy {
     sheet_dragging: bool,
     // An in-progress auto-fill drag from the selection's fill handle.
     sheet_fill: Option<FillDrag>,
+    // The Auto Fill Options button of the last fill (#668), and a
+    // right-drag of the fill handle waiting on its menu.
+    fill_options: Option<sheet_fill::FillOptions>,
+    fill_drop: Option<FillDrag>,
+    // Where the pointer last was over the grid, window coordinates: where a
+    // menu a release opens is drawn.
+    last_pointer: Point<Pixels>,
+    // File › Options › Advanced › Edit Custom Lists: AutoFill continues them
+    // in every workbook (#668).
+    custom_lists: Vec<Vec<String>>,
     // The selected chart on the active sheet, as an index into that sheet's
     // chart list (UI-authored charts first, then the ones loaded from the file).
     chart_sel: Option<usize>,
@@ -8641,7 +8640,11 @@ fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: 
         ask_on_close: prefs.ask_on_close,
         autorecover_minutes: prefs.autorecover_minutes,
         keep_drafts: prefs.keep_drafts,
-        sheet_editing: prefs.edit_opts.to_lines(),
+        sheet_editing: format!(
+            "{}{}",
+            prefs.edit_opts.to_lines(),
+            gridcore::options::custom_lists_to_lines(&prefs.custom_lists)
+        ),
         user_name: prefs.user_name,
         user_initials: prefs.user_initials,
     };
@@ -9329,6 +9332,7 @@ impl Docxy {
         this.autorecover_minutes = session.autorecover_minutes;
         this.keep_drafts = session.keep_drafts;
         this.edit_opts = EditOptions::from_text(&session.sheet_editing);
+        this.custom_lists = gridcore::options::custom_lists_from_text(&session.sheet_editing);
         stamp_edit_opts(&mut this.tabs, this.edit_opts);
         this.user_name = session.user_name;
         this.user_initials = session.user_initials;
@@ -9398,6 +9402,10 @@ impl Docxy {
             selecting: false,
             sheet_dragging: false,
             sheet_fill: None,
+            fill_options: None,
+            fill_drop: None,
+            last_pointer: point(px(0.), px(0.)),
+            custom_lists: Vec::new(),
             chart_sel: None,
             panel_chart: None,
             chart_drag: None,
@@ -9454,6 +9462,7 @@ impl Docxy {
             autorecover_minutes: self.autorecover_minutes,
             keep_drafts: self.keep_drafts,
             edit_opts: self.edit_opts,
+            custom_lists: self.custom_lists.clone(),
             user_name: self.user_name.clone(),
             user_initials: self.user_initials.clone(),
         }
@@ -9766,6 +9775,22 @@ impl Docxy {
                 |o| o.fill_handle = !o.fill_handle,
                 cx,
             ))
+            // Advanced › General › Edit Custom Lists… (#668): the lists
+            // AutoFill continues in every workbook.
+            .when(!self.tabs.is_empty(), |d| {
+                d.child(
+                    row("bs-custom-lists")
+                        .child(div().text_color(fg).child("Edit Custom Lists\u{2026}"))
+                        .child(div().text_color(dim).child(SharedString::from(format!(
+                            "{} of your own",
+                            self.custom_lists.len()
+                        ))))
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            this.fill_menu_act(SheetAct::CustomLists);
+                            cx.notify();
+                        })),
+                )
+            })
             .into_any_element()
     }
 
@@ -11898,6 +11923,9 @@ impl Docxy {
                     .unwrap_or_default(),
             ),
             area_rows: Default::default(),
+            options_button: self
+                .fill_options_live()
+                .map(|o| ((o.dest.2, o.dest.3), menu::GridMenu::FillOptions)),
             // The border's range and the cap on its dashes both need the
             // visible-row list and the column window, which only `sheet_el`
             // has.
@@ -11924,46 +11952,142 @@ impl Docxy {
         let Some(f) = self.sheet_fill.take() else {
             return;
         };
-        let (br0, bc0, br1, bc1) = fill_box(f.src, f.to);
-        // Dragged back onto the source, or up/left off it — either way the box
-        // is the source and `autofill` would write nothing. Bail before the
-        // snapshot, or an idle flick of the handle costs an undo step and marks
-        // a clean workbook dirty.
-        if (br0, bc0, br1, bc1) == f.src {
-            return;
+        if f.right {
+            // A right-drag's release opens the fill menu; its choice fills.
+            return self.sheet_fill_drop(f, cx);
         }
-        // A fill over part of an array is refused whole. `autofill` writes
-        // the destination's cells itself, so that area is asked; an anchor in
-        // the source is not rewritten, so it is not replaced.
-        let dest = fill_dest(f.src, (br0, bc0, br1, bc1));
-        if self.active_sheet_mut().is_some_and(|v| {
-            let refused = v.engine.refuses_area(&v.pkg.workbook, v.active, dest);
-            if refused {
-                v.entry_error = Some(gridcore::engine::PART_OF_ARRAY.to_string());
+        self.sheet_fill_run(f, gridcore::edit::FillKind::Auto, f.ctrl, cx);
+    }
+
+    /// Fill as the handle's drag `f` asks, as `kind`, leaving the Auto Fill
+    /// Options button on the cells it filled (#668). An idle flick of the
+    /// handle costs no undo step; a fill over part of an array is refused
+    /// whole.
+    fn sheet_fill_run(
+        &mut self,
+        f: FillDrag,
+        kind: gridcore::edit::FillKind,
+        ctrl: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let lists = self.custom_lists.clone();
+        let req = gridcore::edit::FillReq {
+            src: f.src,
+            to: f.to,
+            kind,
+            ctrl,
+            lists: &lists,
+        };
+        let Some(v) = self.active_sheet_mut() else {
+            return;
+        };
+        let (dates, numbers) = v.seed_kinds(f.src);
+        match v.fill_drag(&req) {
+            Ok(Some(gridcore::edit::Filled::Extended(dest))) => {
+                self.fill_options = Some(sheet_fill::FillOptions {
+                    view: v.id,
+                    edit_gen: v.edit_gen,
+                    src: f.src,
+                    to: f.to,
+                    kind,
+                    ctrl,
+                    dest,
+                    dates,
+                    numbers,
+                });
+                self.mark_sheet_dirty();
             }
-            refused
-        }) {
-            self.sheet_entry_refused(cx);
+            Ok(Some(gridcore::edit::Filled::Cleared(_))) => {
+                self.fill_options = None;
+                self.mark_sheet_dirty();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                v.entry_error = Some(e);
+                self.sheet_entry_refused(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// A right-drag of the fill handle let go: the fill menu, whose choice
+    /// fills ([`SheetAct::FillAs`]).
+    fn sheet_fill_drop(&mut self, f: FillDrag, cx: &mut Context<Self>) {
+        if gridcore::edit::fill_target(f.src, f.to) == gridcore::edit::FillTarget::None {
             return;
         }
-        self.sheet_snapshot();
-        if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            // Only now does anything move: the cells fill and the selection grows
-            // to cover them (during the drag it was just an outline).
-            v.anchor = (br0, bc0);
-            v.sel = (br1, bc1);
-            gridcore::edit::autofill(
-                &mut v.pkg.workbook,
-                s,
-                &gridcore::edit::FillReq::new(f.src, f.to),
-            );
-            // Filled formulas were re-based, so their copied results are stale.
-            v.engine = sheet_engine(&v.pkg.workbook);
-            v.engine.recalc_all(&mut v.pkg.workbook);
+        let (dates, numbers) = self
+            .active_sheet()
+            .map_or((false, false), |v| v.seed_kinds(f.src));
+        self.fill_drop = Some(f);
+        let items = sheet_menus::fill_options(&sheet_menus::fill_kinds(dates, numbers), None);
+        let at = self.last_pointer;
+        self.open_menu(
+            menu::MenuTarget::Grid(menu::GridMenu::FillDrop),
+            at,
+            items,
+            cx,
+        );
+    }
+
+    /// A choice from the Auto Fill Options button or the right-drag menu.
+    fn sheet_fill_as(&mut self, kind: gridcore::edit::FillKind, cx: &mut Context<Self>) {
+        if let Some(f) = self.fill_drop.take() {
+            return self.sheet_fill_run(f, kind, false, cx);
         }
-        self.mark_sheet_dirty();
+        let Some(opts) = self.fill_options.clone() else {
+            self.set_status("There is no fill to change");
+            return cx.notify();
+        };
+        let lists = self.custom_lists.clone();
+        let Some(v) = self.active_sheet_mut() else {
+            return;
+        };
+        match v.refill(&opts, kind, &lists) {
+            Ok(_) => {
+                self.fill_options = Some(sheet_fill::FillOptions {
+                    edit_gen: v.edit_gen,
+                    kind,
+                    ..opts
+                });
+                self.mark_sheet_dirty();
+            }
+            Err(e) => {
+                self.fill_options = None;
+                self.set_status(e);
+            }
+        }
         cx.notify();
+    }
+
+    /// The Auto Fill Options button, while the fill it stands for is what
+    /// the workbook still holds.
+    fn fill_options_live(&self) -> Option<&sheet_fill::FillOptions> {
+        let v = self.active_sheet()?;
+        self.fill_options.as_ref().filter(|o| o.stands(v))
+    }
+
+    /// A double-click on the fill handle: fill down to the end of the block
+    /// in the neighbouring column (#668).
+    fn sheet_fill_double(&mut self, cx: &mut Context<Self>) {
+        self.sheet_fill = None;
+        if self.sheet_protected() || self.protected_refused(cx) || self.multi_area_refused(cx) {
+            return;
+        }
+        let Some(v) = self.active_sheet() else {
+            return;
+        };
+        let src = v.range();
+        let Some(end) = gridcore::edit::fill_down_to(v.sheet(), src) else {
+            return;
+        };
+        let f = FillDrag {
+            src,
+            to: (end, src.3),
+            ctrl: false,
+            right: false,
+        };
+        self.sheet_fill_run(f, gridcore::edit::FillKind::Auto, false, cx);
     }
 
     /// Left-drag over a cell: the first cell of the drag plants the anchor (and
@@ -15031,17 +15155,23 @@ impl Docxy {
     pub(crate) fn open_grid_menu(
         &mut self,
         kind: menu::GridMenu,
+        at: Point<Pixels>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        Err(match kind {
-            menu::GridMenu::FillOptions => "no Auto Fill Options button is showing",
-            menu::GridMenu::PasteOptions => "no Paste Options button is showing",
-            menu::GridMenu::FillDrop | menu::GridMenu::BorderDrop => {
-                "a drop menu opens only when a right-drag ends"
+        let items = match kind {
+            menu::GridMenu::FillOptions => {
+                let opts = self
+                    .fill_options_live()
+                    .ok_or("no Auto Fill Options button is showing")?;
+                sheet_menus::fill_options(&opts.kinds(), Some(opts.kind))
             }
-        }
-        .to_string())
-        .map(|()| cx.notify())
+            menu::GridMenu::PasteOptions => return Err("no Paste Options button is showing".into()),
+            menu::GridMenu::FillDrop | menu::GridMenu::BorderDrop => {
+                return Err("a drop menu opens only when a right-drag ends".into());
+            }
+        };
+        self.open_menu(menu::MenuTarget::Grid(kind), at, items, cx);
+        Ok(())
     }
 
     /// A Home › Clear item other than Clear Contents (which is Delete): one
@@ -15249,13 +15379,14 @@ impl Docxy {
                 }
                 cx.notify();
             }
-            SheetAct::FillSeries
-            | SheetAct::FillJustify
-            | SheetAct::FillAs(_)
-            | SheetAct::PasteAs(_)
+            SheetAct::FillSeries | SheetAct::FillJustify | SheetAct::CustomLists => {
+                self.fill_menu_act(act);
+                cx.notify();
+            }
+            SheetAct::FillAs(kind) => self.sheet_fill_as(kind, cx),
+            SheetAct::PasteAs(_)
             | SheetAct::PasteSpecial
             | SheetAct::OfficeClipboard
-            | SheetAct::CustomLists
             | SheetAct::Drop(_) => {
                 self.set_status("Not available yet");
                 cx.notify();
@@ -28365,6 +28496,10 @@ struct GridOverlay {
     /// it. An INPUT to `area_rows`, which `sheet_el` builds for the rows it
     /// draws; the row renderer reads that.
     extra_areas: std::rc::Rc<Vec<(u32, u32, u32, u32)>>,
+    /// The cell the Auto Fill Options button (#668) or the Paste Options
+    /// button (#669) hangs off: the bottom-right of what was filled or
+    /// pasted, and which menu it opens.
+    options_button: Option<((u32, u32), menu::GridMenu)>,
     /// `extra_areas` by row: each row's column spans, for the rows drawn
     /// (R17), so a cell asks only its own row.
     area_rows: std::rc::Rc<std::collections::HashMap<u32, Vec<(u32, u32)>>>,
@@ -28712,8 +28847,21 @@ fn sheet_row(
         // one fires per cell crossed).
         let ent_drag = ent.clone();
         cell = cell.on_mouse_move(move |ev, _window, cx| {
-            if ev.pressed_button == Some(MouseButton::Left) {
-                ent_drag.update(cx, |this, cx| this.grid_drag_over(r, c, cx));
+            let ctrl = ctrl_held(&ev.modifiers);
+            match ev.pressed_button {
+                Some(MouseButton::Left) => ent_drag.update(cx, |this, cx| {
+                    // Ctrl as a fill moves swaps copy and series (#668).
+                    if let Some(f) = this.sheet_fill.as_mut() {
+                        f.ctrl = ctrl;
+                    }
+                    this.grid_drag_over(r, c, cx)
+                }),
+                Some(MouseButton::Right) => ent_drag.update(cx, |this, cx| {
+                    if this.sheet_fill.is_some_and(|f| f.right) {
+                        this.sheet_fill_over(r, c, cx)
+                    }
+                }),
+                _ => {}
             }
         });
         // A formula's references, each in its own colour — drawn per edge cell
@@ -28828,9 +28976,30 @@ fn sheet_row(
                     // its hitboxes; `pointer-click`/`pointer-drag` do
                     // hit-test, see docs/ui-test-harness.md #545), so the app
                     // has to.
-                    .on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
+                    .on_mouse_down(MouseButton::Left, {
+                        let ent_fill_dn = ent_fill_dn.clone();
+                        move |ev, _w, cx2| {
+                            cx2.stop_propagation();
+                            // A double-click fills down to the neighbour's end.
+                            let dbl = ev.click_count >= 2;
+                            ent_fill_dn.update(cx2, |this, cx2| {
+                                if dbl {
+                                    this.sheet_fill_double(cx2)
+                                } else {
+                                    this.sheet_fill_start(cx2)
+                                }
+                            });
+                        }
+                    })
+                    // A right-drag opens the fill menu where it is let go.
+                    .on_mouse_down(MouseButton::Right, move |_ev, _w, cx2| {
                         cx2.stop_propagation();
-                        ent_fill_dn.update(cx2, |this, cx2| this.sheet_fill_start(cx2));
+                        ent_fill_dn.update(cx2, |this, cx2| {
+                            this.sheet_fill_start(cx2);
+                            if let Some(f) = this.sheet_fill.as_mut() {
+                                f.right = true;
+                            }
+                        });
                     })
                     .child(
                         // A 6px square in a 1px white surround, so it reads against
@@ -28850,6 +29019,44 @@ fn sheet_row(
                                     .hover(|d| d.bg(hsla_u(BRAND))),
                             ),
                     ),
+            ));
+        }
+        // The Auto Fill / Paste Options button, just past the corner of what
+        // was filled or pasted (#668, #669). A press opens its menu.
+        if let Some((_, kind)) = ov.options_button.filter(|&(at, _)| at == (r, c)) {
+            let ent_opts = ent.clone();
+            cell = cell.relative().child(deferred(
+                div()
+                    .id("options-button")
+                    .absolute()
+                    .right(px(-22.))
+                    .bottom(px(-18.))
+                    .w(px(20.))
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(2.))
+                    .border_1()
+                    .border_color(hsla_u(0x7a7a7a))
+                    .bg(hsla_u(0xffffff))
+                    .text_size(px(10.))
+                    .text_color(hsla_u(0x1a1a1a))
+                    .cursor_pointer()
+                    .child(if kind == menu::GridMenu::FillOptions {
+                        "\u{229E}\u{25BE}"
+                    } else {
+                        "\u{1F4CB}\u{25BE}"
+                    })
+                    .on_mouse_down(MouseButton::Left, move |ev, _w, cx2| {
+                        cx2.stop_propagation();
+                        let at = ev.position;
+                        ent_opts.update(cx2, |this, cx2| {
+                            if let Err(e) = this.open_grid_menu(kind, at, cx2) {
+                                this.set_status(e);
+                            }
+                        });
+                    }),
             ));
         }
         // Red corner marker for a commented cell (Excel's note indicator).
@@ -30905,7 +31112,9 @@ fn sheet_el(
         // Column-resize drag: track the pointer and release anywhere in the grid.
         .on_mouse_move(move |ev, _w, cx| {
             let at = (f32::from(ev.position.x), f32::from(ev.position.y));
+            let pos = ev.position;
             ent_move.update(cx, |this, cx| {
+                this.last_pointer = pos;
                 this.col_resize_move(at.0, cx);
                 // A chart move is tracked here rather than on the card, so the
                 // pointer can outrun it without dropping the drag.
@@ -30914,8 +31123,25 @@ fn sheet_el(
                 }
             });
         })
-        .on_mouse_up(MouseButton::Left, move |_ev, _w, cx| {
-            ent_up.update(cx, |this, cx| this.grid_release(cx));
+        .on_mouse_up(MouseButton::Left, {
+            let ent_up = ent_up.clone();
+            move |ev, _w, cx| {
+                let pos = ev.position;
+                ent_up.update(cx, |this, cx| {
+                    this.last_pointer = pos;
+                    this.grid_release(cx)
+                });
+            }
+        })
+        // A right-drag of the fill handle (#668) ends here too.
+        .on_mouse_up(MouseButton::Right, move |ev, _w, cx| {
+            let pos = ev.position;
+            ent_up.update(cx, |this, cx| {
+                this.last_pointer = pos;
+                if this.sheet_fill.is_some_and(|f| f.right) {
+                    this.sheet_fill_end(cx);
+                }
+            });
         })
         .child(bar)
         .child(grid_area)
@@ -33682,11 +33908,14 @@ mod grid_geom_tests {
         assert_eq!(fill_box(src, (6, 4)), (1, 1, 6, 2));
         assert_eq!(fill_box(src, (4, 6)), (1, 1, 2, 6));
         assert_eq!(fill_box(src, (4, 4)), (1, 1, 4, 2));
-        // Back onto the source, or up/left off it, is the source itself — which
-        // is how `sheet_fill_end` knows there is nothing to fill.
+        // Back onto the handle's own cell is the source itself — which is
+        // how `sheet_fill_end` knows there is nothing to fill.
         assert_eq!(fill_box(src, (2, 2)), src);
-        assert_eq!(fill_box(src, (0, 0)), src);
-        assert_eq!(fill_box(src, (1, 0)), src);
+        // Up and left fill backwards (#668).
+        assert_eq!(fill_box(src, (0, 1)), (0, 1, 2, 2));
+        assert_eq!(fill_box(src, (1, 0)), (1, 0, 2, 2));
+        // Back inside: the cells it leaves are cleared.
+        assert_eq!(fill_box(src, (1, 2)), (1, 1, 1, 2));
     }
 
     #[test]
