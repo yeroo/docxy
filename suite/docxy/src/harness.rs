@@ -2259,6 +2259,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "dialog-tab"
             | "dialog-click"
             | "enable-editing"
+            | "edit-anyway"
     )
 }
 
@@ -2471,6 +2472,15 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             "protected",
             Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.access.protected)),
         ),
+        // A document Word marked as final, until Edit Anyway (#617).
+        (
+            "final",
+            Json::Bool(
+                app.tabs
+                    .get(app.active)
+                    .is_some_and(|t| t.access.marked_final),
+            ),
+        ),
         (
             "repaired",
             Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.access.repaired)),
@@ -2596,6 +2606,7 @@ fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
                 ("caption", Json::Str(t.caption())),
                 ("read_only", Json::Bool(t.access.read_only)),
                 ("protected", Json::Bool(t.access.protected)),
+                ("final", Json::Bool(t.access.marked_final)),
                 ("repaired", Json::Bool(t.access.repaired)),
             ])
         })
@@ -3226,6 +3237,18 @@ fn dispatch_verb(
             app.enable_editing(cx);
             Done::ok(state(app, window))
         }
+        // The MARKED AS FINAL bar's Edit Anyway (#617).
+        "edit-anyway" => {
+            app.refuse_under_dialog()?;
+            let Some(t) = app.tabs.get(app.active).filter(|t| t.access.marked_final) else {
+                return Err("the active document is not marked as final".into());
+            };
+            if t.access.protected {
+                return Err(crate::open_mode::PROTECTED_STATUS.into());
+            }
+            app.edit_anyway(cx);
+            Done::ok(state(app, window))
+        }
 
         // A click on a cell: press, click, release — the three events the
         // pointer delivers, in that order.
@@ -3341,8 +3364,8 @@ fn dispatch_verb(
             };
             let tab = app.tabs.get_mut(app.active).ok_or("no tab is open")?;
             // Attaching a data source changes what the document saves (#633).
-            if tab.access.protected {
-                return Err(crate::open_mode::PROTECTED_STATUS.into());
+            if tab.access.locked() {
+                return Err(tab.access.locked_status().into());
             }
             if tab.kind != crate::Kind::Docx {
                 return Err("mail-attach needs a Word document".into());

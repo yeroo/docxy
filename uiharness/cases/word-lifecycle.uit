@@ -113,3 +113,36 @@ test a workbook asks with its own message in the app
   assert dialog is none
   assert tabs is 0
 
+
+test a document marked as final refuses every edit until Edit Anyway
+  open copy:../fixtures/final.docx
+  assert final is true
+  assert protected is false
+  assert caption is final.docx [Read-Only]
+  type X
+  assert dirty is false
+  assert status is Marked as Final — select Edit Anyway to edit
+  call doc {}
+  assert reply.text is Final text.
+  call ribbon-click {"tab":"Home","command":"Bold"}
+  assert dirty is false
+  key ctrl+s
+  assert dirty is false
+  assert status is Marked as Final — select Edit Anyway to edit
+  call edit-anyway {}
+  assert final is false
+  assert caption is final.docx
+  assert dirty is false
+  type X
+  assert dirty is true
+  call-error edit-anyway {} => the active document is not marked as final
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-click {"button":"Don't Save"}
+  assert tabs is 0
+
+test Ctrl+W closes a document marked as final
+  open ../fixtures/final.docx
+  assert final is true
+  key ctrl+w
+  assert tabs is 0

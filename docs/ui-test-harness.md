@@ -323,7 +323,7 @@ State keys, as the app reports them after every driving verb:
 | Key | |
 |---|---|
 | `tab`, `title`, `dirty`, `status`, `sheet_tab` | the active tab |
-| `caption`, `read_only`, `protected`, `repaired` | the active tab's caption as the strip draws it (`book.xlsx [Read-Only]`, or `Report.doc [Compatibility Mode]` for a document imported from Word 97-2003 until Convert, #634) and its open mode; see [Open modes](#open-modes-and-protected-view) |
+| `caption`, `read_only`, `protected`, `repaired`, `final` | `final` is a document Word marked as final (#617), locked like Protected View until Edit Anyway and captioned `[Read-Only]`; the active tab's caption as the strip draws it (`book.xlsx [Read-Only]`, or `Report.doc [Compatibility Mode]` for a document imported from Word 97-2003 until Convert, #634) and its open mode; see [Open modes](#open-modes-and-protected-view) |
 | `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor, prompt or dialog is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
 | `dialog` | the active tab's top dialog's id, or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
@@ -767,6 +767,7 @@ Repair… call after their file pick:
 | `open {"path":"book.xlsx","mode":"read-only"}` | `mode` is `normal` (the default), `read-only`, `copy`, `repair` or `recover-text`; a workbook ignores `recover-text`, a document takes only `recover-text` (Recover Text from Any File, #633), and a Project ignores every mode |
 | `open {"path":"book.xlsx","reopen":"ask"}` | a person's open of a file already open: a dirty tab asks first (the `reopen` dialog), a clean one reloads only in another mode |
 | `enable-editing {}` | the PROTECTED VIEW message bar's Enable Editing button; refused off a protected tab |
+| `edit-anyway {}` | the MARKED AS FINAL message bar's Edit Anyway button (#617); refused off a document marked as final, and in Protected View (whose bar shows first) |
 
 A relative `path` resolves against the active tab's folder, as `save-as`'s
 does, so after `open copy:` a case names its own copy; with no saved tab
@@ -939,7 +940,7 @@ While a dialog is open on the active tab:
 - **Pointer verbs are refused** with `a dialog is open: <title>`: `click-cell`,
   `drag`, `fill-drag`, `save-as`, `ribbon-click`, `select-chart`, `focus-field`, `title-tab`,
   `tab-select`, `proj.new`, `backstage {open}`, `backstage-close`, `close-tab`,
-  `selection-set` and `enable-editing`.
+  `close-window`, `selection-set`, `enable-editing` and `edit-anyway`.
 - The state reads `dialog: <id>` (`none` on every surface when nothing is open),
   and a Project's `app_state` reads `Edit`.
 - A control-pipe edit, reload or save of that Project dismisses its dialogs
@@ -1051,7 +1052,7 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `user-name`,
 `trusted-clear`,
 `open-draft`,
-`enable-editing` and the
+`enable-editing`, `edit-anyway`, `close-window` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 

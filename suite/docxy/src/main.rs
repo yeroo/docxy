@@ -35,6 +35,8 @@ mod design_dialogs;
 mod design_tab;
 mod dialog;
 mod dialog_host;
+#[cfg(test)]
+mod doc_final_tests;
 mod doc_import;
 #[cfg(test)]
 mod doc_import_tests;
@@ -3249,11 +3251,12 @@ impl DocTab {
         caption
     }
 
-    /// A document edit landed. In Protected View (#633) a gate before it
-    /// leaked, so the edit is rolled back instead ([`protected_rollback`])
-    /// and the tab never turns dirty.
+    /// A document edit landed. In Protected View (#633), or in a document
+    /// marked as final (#617), a gate before it leaked, so the edit is
+    /// rolled back instead ([`protected_rollback`]) and the tab never turns
+    /// dirty.
     fn mark_dirty(&mut self) {
-        if self.access.protected {
+        if self.access.locked() {
             protected_rollback(self);
         } else {
             self.dirty = true;
@@ -5080,6 +5083,9 @@ impl Loaded {
         path: Option<PathBuf>,
         dirty: bool,
     ) -> DocTab {
+        // Word's Mark as Final (#617), from whatever the tab loaded: its
+        // file, or its hot-exit copy.
+        let marked_final = self.pkg.as_ref().is_some_and(Package::marked_final);
         let mut tab = DocTab {
             kind,
             title,
@@ -5101,6 +5107,7 @@ impl Loaded {
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access {
                 converted: self.converted,
+                marked_final,
                 ..Default::default()
             },
             last_hot: Default::default(),
@@ -8250,6 +8257,7 @@ fn protected_rollback(tab: &mut DocTab) {
             seed_used_comment_ids(tab);
             tab.notes = l.notes;
             tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
+            tab.access.marked_final = l.pkg.as_ref().is_some_and(Package::marked_final);
             tab.pkg = l.pkg;
             tab.markdown = l.markdown;
             tab.bundle_html = l.bundle_html;
@@ -8257,7 +8265,7 @@ fn protected_rollback(tab: &mut DocTab) {
         }
         tab.hf_edit = None;
         tab.dirty = false;
-        tab.status = open_mode::PROTECTED_STATUS.into();
+        tab.status = tab.access.locked_status().into();
         return;
     }
     let reloaded = tab
@@ -8283,6 +8291,20 @@ fn protected_rollback(tab: &mut DocTab) {
     }
     tab.dirty = false;
     tab.status = open_mode::PROTECTED_STATUS.into();
+}
+
+/// Edit Anyway on `tab` (#617): see [`Docxy::edit_anyway`]. `false` when it
+/// is not marked as final, or still in Protected View.
+fn edit_anyway_tab(tab: &mut DocTab) -> bool {
+    if !tab.access.marked_final || tab.access.protected {
+        return false;
+    }
+    tab.access.marked_final = false;
+    if let Some(pkg) = tab.pkg.as_mut() {
+        pkg.clear_marked_final();
+    }
+    tab.status = "editing enabled: the document is no longer marked as final".into();
+    true
 }
 
 /// Excel's question before reopening `path` over a tab with unsaved changes
@@ -8919,6 +8941,9 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
             // A sidecar loads as a plain .docx; the session says what it was
             // converted from, and a fresh load of the file says so too.
             converted: t.converted.or(tab.access.converted),
+            // The loaded package's own mark (#617): a sidecar written after
+            // Edit Anyway no longer carries it.
+            marked_final: tab.access.marked_final,
         };
     }
     (tab, from_hot)
@@ -12170,20 +12195,27 @@ impl Docxy {
         }
     }
 
-    /// Whether the active tab is in Protected View (#610).
+    /// Whether the active tab takes no edits: Protected View (#610), or a
+    /// document marked as final (#617).
     fn protected_view(&self) -> bool {
         self.tabs
             .get(self.active)
-            .is_some_and(|t| t.access.protected)
+            .is_some_and(|t| t.access.locked())
     }
 
-    /// Refuse an edit in Protected View, saying how to edit; `true` when it
-    /// was refused. Every gate that would change the workbook asks this first.
+    /// Refuse an edit in Protected View or a document marked as final,
+    /// saying how to edit; `true` when it was refused. Every gate that would
+    /// change the workbook or document asks this first.
     fn protected_refused(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.protected_view() {
+        let Some(access) = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.access)
+            .filter(|a| a.locked())
+        else {
             return false;
-        }
-        self.set_status(open_mode::PROTECTED_STATUS);
+        };
+        self.set_status(access.locked_status());
         cx.notify();
         true
     }
@@ -12239,6 +12271,69 @@ impl Docxy {
                     })),
             )
             .into_any_element()
+    }
+
+    /// Word's MARKED AS FINAL message bar (#617), under the ribbon while the
+    /// active document is marked as final: what it is, and Edit Anyway.
+    fn marked_final_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let ink = hsla_u(0x3B3B3B);
+        h_flex()
+            .id("final-bar")
+            .w_full()
+            .h(px(36.))
+            .flex_none()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .bg(hsla_u(0xFFF4CE))
+            .border_b_1()
+            .border_color(pal.border)
+            .text_size(px(12.))
+            .text_color(ink)
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::BOLD)
+                    .child(open_mode::MARKED_FINAL_LABEL),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(open_mode::MARKED_FINAL_TEXT),
+            )
+            .child(
+                div()
+                    .id("final-edit-anyway")
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .border_1()
+                    .border_color(hsla_u(0x8A8886))
+                    .rounded_sm()
+                    .bg(hsla_u(0xFFFFFF))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(hsla_u(0xF3F2F1)))
+                    .child("Edit Anyway")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.edit_anyway(cx);
+                        this.refocus(window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// The final bar's Edit Anyway (#617): the document takes edits, and the
+    /// mark leaves its package, so a later save writes an ordinary document
+    /// as Word's does. Not an edit: the tab stays clean. In Protected View
+    /// it waits for Enable Editing, whose bar shows first.
+    pub(crate) fn edit_anyway(&mut self, cx: &mut Context<Self>) {
+        if self.tabs.get_mut(self.active).is_some_and(edit_anyway_tab) {
+            self.persist();
+            cx.notify();
+        }
     }
 
     /// The message bar's Enable Editing (#610): the tab leaves Protected View
@@ -15646,8 +15741,8 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
         tab.status = "this document has not been converted yet: open its tab first".into();
         return false;
     }
-    if tab.access.protected {
-        tab.status = open_mode::PROTECTED_STATUS.into();
+    if tab.access.locked() {
+        tab.status = tab.access.locked_status().into();
         return false;
     }
     if tab.access.converted.is_some() && writes_own_file(tab.path.as_deref(), target.as_deref()) {
@@ -26317,7 +26412,7 @@ impl Render for Docxy {
         // the tab's other modules) is rolled back before it is ever drawn,
         // saved or written to the hot-exit sidecar as unsaved work.
         for t in self.tabs.iter_mut() {
-            if t.access.protected && t.dirty {
+            if t.access.locked() && t.dirty {
                 protected_rollback(t);
             }
         }
@@ -26705,7 +26800,19 @@ impl Render for Docxy {
             }
         });
         let project_prompt = self.project_prompt_bar(pal, cx);
-        let protected_bar = protected.then(|| self.protected_view_bar(pal, cx));
+        // Protected View's bar comes first; once editing is enabled, a
+        // document marked as final shows Word's bar (#617).
+        let protected_bar = protected.then(|| {
+            if self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| t.access.protected)
+            {
+                self.protected_view_bar(pal, cx)
+            } else {
+                self.marked_final_bar(pal, cx)
+            }
+        });
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
         let picker_bar = (is_doc)
             .then_some(self.picker)
