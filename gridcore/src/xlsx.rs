@@ -979,13 +979,16 @@ fn parse_styles(xml: &str) -> Styles {
         bold: bool,
         italic: bool,
         color: Option<(u8, u8, u8)>,
+        color_unresolved: bool,
         size: Option<f64>,
         name: Option<String>,
     }
     let mut numfmts: BTreeMap<u32, NumFmt> = BTreeMap::new();
     let mut codes: BTreeMap<u32, String> = BTreeMap::new();
     let mut fonts: Vec<Font> = Vec::new();
-    let mut fills: Vec<Option<(u8, u8, u8)>> = Vec::new();
+    // Each fill's colour, and whether it is one we can't resolve.
+    type Fill = (Option<(u8, u8, u8)>, bool);
+    let mut fills: Vec<Fill> = Vec::new();
     let mut xfs: Vec<Xf> = Vec::new();
 
     let mut dxfs: Vec<crate::sheet::Dxf> = Vec::new();
@@ -998,7 +1001,19 @@ fn parse_styles(xml: &str) -> Styles {
     let mut in_fills = false;
     let mut in_cellxfs = false;
     let mut cur_font: Option<Font> = None;
-    let mut cur_fill: Option<Option<(u8, u8, u8)>> = None;
+    let mut cur_fill: Option<Fill> = None;
+    // A theme or indexed colour, which we don't resolve. For a font, the
+    // default text colour (theme 1, indexed 8 or 64, `auto`) is no colour.
+    let unresolved = |p: &XmlParser, font: bool| -> bool {
+        if !p.attr("rgb").is_empty() || p.attr("auto") == "1" {
+            return false;
+        }
+        match (p.attr("theme"), p.attr("indexed")) {
+            ("", "") => false,
+            (t, "") => !(font && t == "1"),
+            (_, i) => !(matches!(i, "64") || (font && i == "8")),
+        }
+    };
     let parse_rgb = |rgb: &str| -> Option<(u8, u8, u8)> {
         if rgb.len() == 8 && rgb.is_ascii() {
             if let (Ok(r), Ok(g), Ok(b)) = (
@@ -1050,6 +1065,7 @@ fn parse_styles(xml: &str) -> Styles {
                 "color" => {
                     if let Some(f) = &mut cur_font {
                         f.color = parse_rgb(p.attr("rgb"));
+                        f.color_unresolved = f.color.is_none() && unresolved(&p, true);
                     } else if dxf_in_font {
                         if let Some(d) = &mut cur_dxf {
                             d.color = parse_rgb(p.attr("rgb"));
@@ -1070,12 +1086,13 @@ fn parse_styles(xml: &str) -> Styles {
                     }
                 }
                 "fills" => in_fills = true,
-                "fill" if in_fills => cur_fill = Some(None),
+                "fill" if in_fills => cur_fill = Some((None, false)),
                 // dxf solid fills carry the colour in `<bgColor>` (or `<fgColor>`).
                 "bgColor" | "fgColor" => {
                     if let Some(fl) = &mut cur_fill {
                         if p.name().ends_with("fgColor") {
-                            *fl = parse_rgb(p.attr("rgb"));
+                            fl.0 = parse_rgb(p.attr("rgb"));
+                            fl.1 = fl.0.is_none() && unresolved(&p, false);
                         }
                     } else if dxf_in_fill {
                         let rgb = p.attr("rgb");
@@ -1111,7 +1128,9 @@ fn parse_styles(xml: &str) -> Styles {
                         bold: font.bold,
                         italic: font.italic,
                         color: font.color,
-                        fill: fills.get(fill_id).copied().flatten(),
+                        fill: fills.get(fill_id).and_then(|f| f.0),
+                        fill_unresolved: fills.get(fill_id).is_some_and(|f| f.1),
+                        color_unresolved: font.color_unresolved,
                         align: crate::sheet::Align::General,
                         font_size: font.size,
                         font_name: font.name.clone(),
@@ -1698,6 +1717,8 @@ fn parse_worksheet(
     // (type, operator, dxfId, priority) of the rule being read.
     let mut cf_rule: Option<(String, String, Option<usize>, i32)> = None;
     let mut cf_formulas: Vec<String> = Vec::new();
+    // An `<iconSet>` rule's set, `reverse`, and `<cfvo>` thresholds.
+    let mut cf_icons: Option<(String, bool, Vec<crate::sheet::Cfvo>)> = None;
     let mut in_cf_formula = false;
     let mut cf_formula_buf = String::new();
 
@@ -1924,6 +1945,27 @@ fn parse_worksheet(
                         p.attr("priority").parse::<i32>().unwrap_or(0),
                     ));
                     cf_formulas.clear();
+                    cf_icons = None;
+                }
+                "iconSet" if cf_rule.is_some() => {
+                    let set = match p.attr("iconSet") {
+                        "" => "3TrafficLights1",
+                        s => s,
+                    };
+                    cf_icons = Some((
+                        set.to_string(),
+                        matches!(p.attr("reverse"), "1" | "true"),
+                        Vec::new(),
+                    ));
+                }
+                "cfvo" if cf_icons.is_some() => {
+                    if let Some((_, _, cfvos)) = cf_icons.as_mut() {
+                        cfvos.push(crate::sheet::Cfvo {
+                            kind: p.attr("type").to_string(),
+                            val: decode(p.attr("val")),
+                            gte: !matches!(p.attr("gte"), "0" | "false"),
+                        });
+                    }
                 }
                 "formula" if cf_rule.is_some() => {
                     in_cf_formula = true;
@@ -1991,6 +2033,15 @@ fn parse_worksheet(
                             "expression" => CfKind::Expression {
                                 formula: cf_formulas.first().cloned().unwrap_or_default(),
                             },
+                            "iconSet" if cf_icons.is_some() => {
+                                let (set, reverse, cfvos) = cf_icons.take().unwrap_or_default();
+                                CfKind::IconSet {
+                                    set,
+                                    reverse,
+                                    cfvos,
+                                    formulas: std::mem::take(&mut cf_formulas),
+                                }
+                            }
                             _ => CfKind::Other {
                                 formulas: std::mem::take(&mut cf_formulas),
                             },

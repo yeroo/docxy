@@ -1919,6 +1919,14 @@ pub struct Xf {
     pub color: Option<(u8, u8, u8)>,
     /// Solid fill (background) color as (r, g, b), when set.
     pub fill: Option<(u8, u8, u8)>,
+    /// The file gives the fill colour as a theme or indexed colour, which we
+    /// don't resolve: with `fill` `None`, the cell has *some* fill, just not
+    /// one we know. Filtering and sorting by colour treat it as unknown
+    /// (neither No Fill nor any colour); rendering ignores it.
+    pub fill_unresolved: bool,
+    /// Likewise for the font colour (`color` `None`): a theme or indexed
+    /// colour other than the default text colour.
+    pub color_unresolved: bool,
     pub align: Align,
     /// Font size in points (`None` = the default 11).
     pub font_size: Option<f64>,
@@ -1984,18 +1992,39 @@ pub enum CfKind {
     CellIs { op: String, formulas: Vec<String> },
     /// `expression`: a formula truthy when the rule applies.
     Expression { formula: String },
-    /// Anything else (colorScale/dataBar/iconSet/top10/…) — not evaluated.
+    /// `iconSet`: the icon of a cell is picked by its value against the
+    /// `<cfvo>` thresholds (see [`crate::cf::cell_icon`]). It sets no format,
+    /// and the rule saves as the file had it; `formulas` are its `<formula>`
+    /// children (it normally has none), moved like any rule's. A `cfvo`'s
+    /// `val` is read only.
+    IconSet {
+        set: String,
+        reverse: bool,
+        cfvos: Vec<Cfvo>,
+        formulas: Vec<String>,
+    },
+    /// Anything else (colorScale/dataBar/top10/…) — not evaluated.
     /// Its `<formula>` children are kept so structural edits can move them.
     Other { formulas: Vec<String> },
+}
+
+/// One `<cfvo>` of an icon set: a threshold of type `num`, `percent`,
+/// `percentile` or `formula` (`min`/`max` for the first), compared with `>=`
+/// unless `gte` is off.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Cfvo {
+    pub kind: String,
+    pub val: String,
+    pub gte: bool,
 }
 
 impl CfRule {
     /// The rule's formulas in document order, whatever its kind.
     pub fn formulas(&self) -> Vec<&String> {
         match &self.kind {
-            CfKind::CellIs { formulas, .. } | CfKind::Other { formulas } => {
-                formulas.iter().collect()
-            }
+            CfKind::CellIs { formulas, .. }
+            | CfKind::IconSet { formulas, .. }
+            | CfKind::Other { formulas } => formulas.iter().collect(),
             CfKind::Expression { formula } => vec![formula],
         }
     }
@@ -2003,9 +2032,9 @@ impl CfRule {
     /// [`Self::formulas`], mutably.
     pub fn formulas_mut(&mut self) -> Vec<&mut String> {
         match &mut self.kind {
-            CfKind::CellIs { formulas, .. } | CfKind::Other { formulas } => {
-                formulas.iter_mut().collect()
-            }
+            CfKind::CellIs { formulas, .. }
+            | CfKind::IconSet { formulas, .. }
+            | CfKind::Other { formulas } => formulas.iter_mut().collect(),
             CfKind::Expression { formula } => vec![formula],
         }
     }

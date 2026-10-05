@@ -213,3 +213,92 @@ fn an_added_auto_filter_leaves_the_other_elements_in_place() {
         "{ws}"
     );
 }
+
+#[test]
+fn an_icon_set_rule_loads_as_one_and_saves_as_it_was() {
+    let rule = r#"<conditionalFormatting sqref="B2:B3"><cfRule type="iconSet" priority="1"><iconSet iconSet="3Arrows" reverse="1"><cfvo type="percent" val="0"/><cfvo type="percentile" val="40"/><cfvo type="num" val="8" gte="0"/></iconSet></cfRule></conditionalFormatting>"#;
+    let mut pkg = list(rule, "");
+    let cf = &pkg.workbook.sheets[0].cond_formats[0];
+    match &cf.rules[0].kind {
+        crate::sheet::CfKind::IconSet {
+            set,
+            reverse,
+            cfvos,
+            ..
+        } => {
+            assert_eq!((set.as_str(), *reverse, cfvos.len()), ("3Arrows", true, 3));
+            assert_eq!(
+                cfvos[2],
+                crate::sheet::Cfvo {
+                    kind: "num".into(),
+                    val: "8".into(),
+                    gte: false
+                }
+            );
+        }
+        k => panic!("{k:?}"),
+    }
+    // 9 > 8 is the top band, reversed to the first icon.
+    assert_eq!(
+        crate::cf::cell_icon(&pkg.workbook, 0, 2, 1),
+        Some(("3Arrows".to_string(), 0))
+    );
+    let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+    assert!(ws.contains(rule), "{ws}");
+    // A row inserted below it moves nothing.
+    crate::edit::insert_rows(&mut pkg.workbook, 0, 10, 1);
+    let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+    assert!(ws.contains(rule), "{ws}");
+}
+
+#[test]
+fn theme_colours_load_as_unresolved_and_save_unchanged() {
+    // cellXfs 1: a theme-coloured solid fill and a theme 5 font; the default
+    // font's theme 1 colour is the ordinary text colour.
+    let mut pkg = new_xlsx();
+    for (p, xml) in pkg.parts.iter_mut() {
+        if p == "xl/styles.xml" {
+            let s = String::from_utf8_lossy(xml)
+                .replace(
+                    r#"<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>"#,
+                    r#"<fonts count="2"><font><sz val="11"/><color theme="1"/><name val="Calibri"/></font><font><sz val="11"/><color theme="5"/><name val="Calibri"/></font></fonts>"#,
+                )
+                .replace(
+                    r#"<fill><patternFill patternType="gray125"/></fill></fills>"#,
+                    r#"<fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor theme="4" tint="0.4"/><bgColor indexed="64"/></patternFill></fill></fills>"#,
+                )
+                .replace(
+                    r#"<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>"#,
+                    r#"<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1"/></cellXfs>"#,
+                );
+            *xml = s.into_bytes();
+        }
+        if p == "xl/worksheets/sheet1.xml" {
+            let s = String::from_utf8_lossy(xml).replace(
+                "<sheetData/>",
+                r#"<sheetData><row r="1"><c r="A1" s="1"><v>1</v></c><c r="B1"><v>2</v></c></row></sheetData>"#,
+            );
+            *xml = s.into_bytes();
+        }
+    }
+    let file = write_zip(&pkg.parts);
+    let pkg = load_xlsx(&file).unwrap();
+    let (x0, x1) = (pkg.workbook.styles.xf(0), pkg.workbook.styles.xf(1));
+    assert!(!x0.fill_unresolved && !x0.color_unresolved);
+    assert!(x1.fill_unresolved && x1.color_unresolved);
+    assert_eq!(
+        crate::cf::cell_fill(&pkg.workbook, 0, 0, 0),
+        crate::cf::Shown::Unknown
+    );
+    assert_eq!(
+        crate::cf::cell_fill(&pkg.workbook, 0, 0, 1),
+        crate::cf::Shown::None
+    );
+    assert_eq!(
+        crate::cf::cell_font_color(&pkg.workbook, 0, 0, 1),
+        crate::cf::Shown::None
+    );
+    let before = text(&pkg, "xl/styles.xml");
+    let (_, after) = saved(&pkg, "xl/styles.xml");
+    assert_eq!(after, before);
+}

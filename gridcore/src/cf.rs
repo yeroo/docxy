@@ -138,7 +138,182 @@ fn rule_matches(
                 _ => false,
             }
         }
-        CfKind::Other { .. } => false,
+        CfKind::IconSet { .. } | CfKind::Other { .. } => false,
+    }
+}
+
+/// A cell's displayed fill or font colour, as filtering and sorting by
+/// colour compare it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shown {
+    /// No fill, or the automatic font colour.
+    None,
+    Rgb((u8, u8, u8)),
+    /// A theme or indexed colour we don't resolve: it is some colour, so it
+    /// matches neither No Fill nor any colour.
+    Unknown,
+}
+
+impl Shown {
+    /// Whether this is the colour a filter or sort level names (`None`: No
+    /// Fill, or the automatic font colour).
+    pub fn is(self, rgb: Option<(u8, u8, u8)>) -> bool {
+        match (self, rgb) {
+            (Shown::None, None) => true,
+            (Shown::Rgb(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// As a criterion's colour: `None` for no colour; an unknown one has none.
+    pub fn rgb(self) -> Option<Option<(u8, u8, u8)>> {
+        match self {
+            Shown::None => Some(None),
+            Shown::Rgb(c) => Some(Some(c)),
+            Shown::Unknown => None,
+        }
+    }
+}
+
+/// The fill a cell shows: conditional formatting's when a matching rule sets
+/// one, else its own.
+pub fn cell_fill(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Shown {
+    shown_color(wb, sheet, row, col, true)
+}
+
+/// The font colour a cell shows, conditional formatting's first.
+pub fn cell_font_color(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Shown {
+    shown_color(wb, sheet, row, col, false)
+}
+
+fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> Shown {
+    if let Some(d) = cell_dxf(wb, sheet, row, col) {
+        if let Some(c) = if fill { d.fill } else { d.color } {
+            return Shown::Rgb(c);
+        }
+    }
+    let style = wb
+        .sheets
+        .get(sheet)
+        .and_then(|s| s.cell(row, col))
+        .map_or(0, |c| c.style);
+    let xf = wb.styles.xf(style);
+    let (rgb, unresolved) = if fill {
+        (xf.fill, xf.fill_unresolved)
+    } else {
+        (xf.color, xf.color_unresolved)
+    };
+    match rgb {
+        Some(c) => Shown::Rgb(c),
+        None if unresolved => Shown::Unknown,
+        None => Shown::None,
+    }
+}
+
+/// The conditional-formatting icon a cell shows, as (`iconSet`, `iconId`):
+/// from the highest-precedence icon-set rule over it. `iconId` 0 is the
+/// set's first icon (for `3Arrows`, the red down arrow), which goes to the
+/// lowest values unless the rule is `reverse`. Only a number gets an icon.
+pub fn cell_icon(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<(String, u32)> {
+    let s = wb.sheets.get(sheet)?;
+    let mut best: Option<(i32, &crate::sheet::CondFormat, &CfKind)> = None;
+    for cf in &s.cond_formats {
+        let covers = cf
+            .ranges
+            .iter()
+            .any(|&(r1, c1, r2, c2)| row >= r1 && row <= r2 && col >= c1 && col <= c2);
+        if !covers {
+            continue;
+        }
+        for rule in &cf.rules {
+            if matches!(rule.kind, CfKind::IconSet { .. })
+                && best.is_none_or(|(p, _, _)| rule.priority < p)
+            {
+                best = Some((rule.priority, cf, &rule.kind));
+            }
+        }
+    }
+    let (
+        _,
+        cf,
+        CfKind::IconSet {
+            set,
+            reverse,
+            cfvos,
+            ..
+        },
+    ) = best?
+    else {
+        return None;
+    };
+    let Value::Num(v) = cell_value_at(wb, sheet, row, col) else {
+        return None;
+    };
+    // The numbers of the rule's whole range, for percent and percentile.
+    let mut nums: Vec<f64> = Vec::new();
+    let last_row = s.used_size().0.saturating_sub(1);
+    for &(r1, c1, r2, c2) in &cf.ranges {
+        for r in r1..=r2.min(last_row) {
+            for (&(_, c), _) in s.cells.range((r, c1)..=(r, c2)) {
+                if let Value::Num(n) = cell_value_at(wb, sheet, r, c) {
+                    nums.push(n);
+                }
+            }
+        }
+    }
+    nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let (lo, hi) = (*nums.first()?, *nums.last()?);
+    let anchor = cf
+        .ranges
+        .iter()
+        .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, ..)| {
+            (r.min(r1), c.min(c1))
+        });
+    let threshold = |c: &crate::sheet::Cfvo| -> Option<f64> {
+        let num = || match c.val.trim().parse::<f64>() {
+            Ok(n) => Some(n),
+            Err(_) => match eval_cf(wb, sheet, row, col, anchor, &c.val) {
+                Value::Num(n) => Some(n),
+                _ => None,
+            },
+        };
+        match c.kind.as_str() {
+            "num" | "formula" => num(),
+            "percent" => Some(lo + (hi - lo) * num()? / 100.0),
+            "percentile" => Some(percentile(&nums, num()? / 100.0)),
+            "min" => Some(lo),
+            "max" => Some(hi),
+            _ => None,
+        }
+    };
+    let n = cfvos.len();
+    // The highest band whose threshold the value reaches; the first cfvo is
+    // the floor of band 0.
+    let mut band = 0;
+    for (i, c) in cfvos.iter().enumerate().skip(1) {
+        let Some(t) = threshold(c) else { continue };
+        if if c.gte { v >= t } else { v > t } {
+            band = i;
+        }
+    }
+    let id = if *reverse {
+        n.saturating_sub(1) - band
+    } else {
+        band
+    };
+    Some((set.clone(), id as u32))
+}
+
+/// Excel's `PERCENTILE.INC` of sorted `nums` at `p` (0..=1).
+fn percentile(nums: &[f64], p: f64) -> f64 {
+    if nums.is_empty() {
+        return 0.0;
+    }
+    let rank = p.clamp(0.0, 1.0) * (nums.len() - 1) as f64;
+    let (i, frac) = (rank.floor() as usize, rank.fract());
+    match nums.get(i + 1) {
+        Some(next) => nums[i] + (next - nums[i]) * frac,
+        None => nums[i],
     }
 }
 
@@ -487,5 +662,115 @@ mod tests {
         };
         let wb = wb_with_cells(&[("A1", Cell::number(3.0))], cf, vec![d]);
         assert_eq!(cell_dxf(&wb, 0, 0, 0), None);
+    }
+
+    fn icon_wb(vals: &[f64], set: &str, reverse: bool, cfvos: &[(&str, &str)]) -> Workbook {
+        let cells: Vec<(String, f64)> = vals
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (format!("A{}", i + 1), *v))
+            .collect();
+        let cells: Vec<(&str, f64)> = cells.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        let cf = CondFormat {
+            ix: None,
+            ranges: vec![(0, 0, 99, 0)],
+            rules: vec![CfRule {
+                kind: CfKind::IconSet {
+                    set: set.into(),
+                    reverse,
+                    cfvos: cfvos
+                        .iter()
+                        .map(|(k, v)| crate::sheet::Cfvo {
+                            kind: (*k).into(),
+                            val: (*v).into(),
+                            gte: true,
+                        })
+                        .collect(),
+                    formulas: Vec::new(),
+                },
+                dxf_id: None,
+                priority: 1,
+            }],
+        };
+        wb_with_cf(&cells, cf, Vec::new())
+    }
+
+    fn icons(wb: &Workbook, n: u32) -> Vec<u32> {
+        (0..n).map(|r| cell_icon(wb, 0, r, 0).unwrap().1).collect()
+    }
+
+    #[test]
+    fn icon_sets_by_percent_percentile_and_number() {
+        // Excel's default 3Arrows thresholds: 33% and 67% of the range.
+        let vals = [0.0, 10.0, 33.0, 34.0, 66.0, 67.0, 100.0];
+        let wb = icon_wb(
+            &vals,
+            "3Arrows",
+            false,
+            &[("percent", "0"), ("percent", "33"), ("percent", "67")],
+        );
+        assert_eq!(icons(&wb, 7), vec![0, 0, 1, 1, 1, 2, 2]);
+        // Reversed, the top values get the first icon.
+        let wb = icon_wb(
+            &vals,
+            "3Arrows",
+            true,
+            &[("percent", "0"), ("percent", "33"), ("percent", "67")],
+        );
+        assert_eq!(icons(&wb, 7), vec![2, 2, 1, 1, 1, 0, 0]);
+        // Percentile of 1..=5: the 50th is 3.
+        let wb = icon_wb(
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            "3TrafficLights1",
+            false,
+            &[("percent", "0"), ("percentile", "50"), ("num", "5")],
+        );
+        assert_eq!(icons(&wb, 5), vec![0, 0, 1, 1, 2]);
+        // Text and blanks get no icon.
+        let mut wb = icon_wb(&[1.0], "3Arrows", false, &[("percent", "0"), ("num", "1")]);
+        wb.sheets[0].set_cell(1, 0, Cell::text("x"));
+        assert_eq!(cell_icon(&wb, 0, 1, 0), None);
+        assert_eq!(cell_icon(&wb, 0, 5, 0), None);
+        assert_eq!(cell_icon(&wb, 0, 0, 1), None);
+    }
+
+    #[test]
+    fn displayed_colours_come_from_conditional_formatting_first() {
+        let red = Dxf {
+            fill: Some((255, 0, 0)),
+            color: Some((0, 0, 255)),
+            ..Dxf::default()
+        };
+        let mut wb = wb_with_cf(
+            &[("A1", 10.0), ("A2", 3.0)],
+            cell_is("greaterThan", &["5"]),
+            vec![red],
+        );
+        wb.styles.xfs.push(crate::sheet::Xf::default());
+        let green = wb.styles.intern(crate::sheet::Xf {
+            fill: Some((0, 176, 80)),
+            ..crate::sheet::Xf::default()
+        });
+        let themed = wb.styles.intern(crate::sheet::Xf {
+            fill_unresolved: true,
+            color_unresolved: true,
+            ..crate::sheet::Xf::default()
+        });
+        wb.sheets[0].cells.get_mut(&(1, 0)).unwrap().style = green;
+        wb.sheets[0].set_cell(
+            2,
+            0,
+            Cell {
+                style: themed,
+                ..Cell::number(1.0)
+            },
+        );
+        assert_eq!(cell_fill(&wb, 0, 0, 0), Shown::Rgb((255, 0, 0)));
+        assert_eq!(cell_font_color(&wb, 0, 0, 0), Shown::Rgb((0, 0, 255)));
+        assert_eq!(cell_fill(&wb, 0, 1, 0), Shown::Rgb((0, 176, 80)));
+        assert_eq!(cell_font_color(&wb, 0, 1, 0), Shown::None);
+        assert_eq!(cell_fill(&wb, 0, 2, 0), Shown::Unknown);
+        assert!(!cell_fill(&wb, 0, 2, 0).is(None));
+        assert!(cell_fill(&wb, 0, 9, 9).is(None));
     }
 }
