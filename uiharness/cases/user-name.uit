@@ -1,0 +1,112 @@
+# File > Settings > User name... (#620) takes typed text from Backstage (#1027).
+# The keys go through `real-key` / `real-type` and the field is clicked with
+# `pointer-click`, so they reach the window the way the OS's do: through the
+# root's own key handler, which Backstage's root once lacked. `key` and
+# `dialog-set` call handlers directly and would pass with that bug.
+
+test the user name dialog takes typed text from Backstage
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call user-name {}
+  assert dialog is user-name
+  shot window
+  call pointer-click {"dialog-field":"user-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Jane Doe"}
+  call real-key {"key":"tab"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"JD"}
+  call dialog-read {}
+  assert reply.controls.0.value is Jane Doe
+  assert reply.controls.1.value is JD
+  shot window
+  call real-key {"key":"enter"}
+  assert dialog is none
+  assert user_name is Jane Doe
+  assert user_initials is JD
+
+test a new comment carries the edited identity
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call user-name {}
+  shot window
+  call pointer-click {"dialog-field":"user-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Jane Doe"}
+  call real-key {"key":"tab"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"JD"}
+  call real-key {"key":"enter"}
+  call backstage {"action":"close"}
+  type hello
+  key shift+home
+  call ribbon-click {"tab":"Review","command":"newcomment"}
+  type Check this
+  key enter
+  call comments {}
+  assert reply.comments.0.author is Jane Doe
+  assert reply.comments.0.initials is JD
+  assert reply.comments.0.text is Check this
+
+test the first field has the focus and Backspace, Delete, arrows and Home/End edit it
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call user-name {}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call dialog-read {}
+  assert reply.controls.0.value is abc
+  call real-key {"keys":["home","right","delete"]}
+  call dialog-read {}
+  assert reply.controls.0.value is ac
+  call real-key {"keys":["end","left"]}
+  call real-type {"text":"X"}
+  call dialog-read {}
+  assert reply.controls.0.value is aXc
+  call real-key {"key":"shift+home"}
+  call real-key {"key":"backspace"}
+  call dialog-read {}
+  assert reply.controls.0.value is c
+
+test a click places the caret in the field
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call user-name {}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcdef"}
+  call real-key {"key":"tab"}
+  call pointer-click {"dialog-field":"user-name","x":5}
+  call real-type {"text":"X"}
+  call dialog-read {}
+  assert reply.controls.0.value is Xabcdef
+  call pointer-click {"dialog-field":"user-name","x":90}
+  call real-type {"text":"Y"}
+  call dialog-read {}
+  assert reply.controls.0.value is XabcdefY
+
+test Escape cancels and keeps the old name
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call user-name {}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Nobody"}
+  call real-key {"key":"escape"}
+  assert dialog is none
+  assert user_name is not Nobody
+
+test the user name dialog takes typed text with no document open
+  open copy:../fixtures/basic.docx
+  call close-tab {}
+  call backstage {"action":"open"}
+  call user-name {}
+  assert dialog is user-name
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Jane Doe"}
+  call real-key {"key":"tab"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"JD"}
+  call real-key {"key":"enter"}
+  assert dialog is none
+  assert user_name is Jane Doe
+  assert user_initials is JD

@@ -204,12 +204,25 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
 
 /// A key while the tab has a dialog open: Enter presses the default button,
 /// Escape the cancel one, Tab and Shift+Tab move the focus, and the focused
-/// widget takes the rest: typed characters and Backspace edit a field, Space
-/// toggles a checkbox, Up and Down step a radio group or dropdown. Every key
-/// (chords and Alt too) is swallowed, so nothing under the dialog sees it.
-/// `typed` is the character the key types, when it types one. `false` when
-/// no dialog is open and the key should go on as usual.
+/// widget takes the rest: a field takes typed characters, Backspace, Delete,
+/// the arrows, Home and End (Shift extends a selection), Ctrl+A and Ctrl+V;
+/// Space toggles a checkbox, Up and Down step a radio group or dropdown.
+/// Every key (chords and Alt too) is swallowed, so nothing under the dialog
+/// sees it. `typed` is the character the key types, when it types one.
+/// `false` when no dialog is open and the key should go on as usual.
+#[cfg(test)]
 pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Modifiers) -> bool {
+    dialog_key_with(tab, key, typed, m, None)
+}
+
+/// [`dialog_key`], with `clip` the text Ctrl+V pastes.
+pub(crate) fn dialog_key_with(
+    tab: &mut DocTab,
+    key: &str,
+    typed: Option<&str>,
+    m: Modifiers,
+    clip: Option<&str>,
+) -> bool {
     if !tab.dialogs.is_open() {
         return false;
     }
@@ -220,12 +233,40 @@ pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Mo
         }
         return true;
     }
-    if !plain {
-        return true;
+    if let Err(e) = edit_key(&mut tab.dialogs, key, typed, m, clip) {
+        tab.status = e.into();
     }
-    let Ok(d) = tab.dialogs.top_dialog_mut() else {
-        return true;
+    true
+}
+
+/// The part of [`dialog_key`] that edits the top dialog's focused widget.
+pub(crate) fn edit_key(
+    stack: &mut DialogStack,
+    key: &str,
+    typed: Option<&str>,
+    m: Modifiers,
+    clip: Option<&str>,
+) -> Result<(), String> {
+    let Ok(d) = stack.top_dialog_mut() else {
+        return Ok(());
     };
+    if m.alt {
+        return Ok(());
+    }
+    if m.control || m.platform {
+        // Only select-all and paste; any other chord is swallowed.
+        return match (key, clip) {
+            ("a", _) => {
+                d.select_all();
+                Ok(())
+            }
+            ("v", Some(text)) => {
+                let line: String = text.chars().filter(|c| !c.is_control()).collect();
+                d.insert_text(&line)
+            }
+            _ => Ok(()),
+        };
+    }
     let typed = typed.map(str::to_string).or_else(|| {
         // A synthetic key without its character: a one-letter key name.
         let mut chars = key.chars();
@@ -235,12 +276,21 @@ pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Mo
             _ => None,
         }
     });
-    let done = match key {
+    match key {
         "tab" => {
             d.focus_step(m.shift);
             Ok(())
         }
         "backspace" => d.backspace(),
+        "delete" => d.delete(),
+        "left" | "right" => {
+            d.move_caret(key == "right", m.shift);
+            Ok(())
+        }
+        "home" | "end" => {
+            d.move_caret_edge(key == "end", m.shift);
+            Ok(())
+        }
         "space" => d.space(),
         "up" => d.step_focused(false),
         "down" => d.step_focused(true),
@@ -251,20 +301,26 @@ pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Mo
             Some((Some(c), 1)) if !c.is_control() => d.type_char(c),
             _ => Ok(()),
         },
-    };
-    if let Err(e) = done {
-        tab.status = e.into();
     }
-    true
 }
 
 impl Docxy {
     /// The active tab's dialogs, when one is open.
     pub(crate) fn active_dialogs(&self) -> Option<&DialogStack> {
-        self.tabs
-            .get(self.active)
-            .map(|t| &t.dialogs)
-            .filter(|d| d.is_open())
+        match self.tabs.get(self.active) {
+            Some(t) => Some(&t.dialogs),
+            // Nothing open: the app's own stack (the Start page's User name).
+            None => Some(&self.app_dialogs),
+        }
+        .filter(|d| d.is_open())
+    }
+
+    /// The stack [`Docxy::active_dialogs`] reads, to change it.
+    pub(crate) fn active_dialogs_mut(&mut self) -> &mut DialogStack {
+        match self.tabs.get_mut(self.active) {
+            Some(t) => &mut t.dialogs,
+            None => &mut self.app_dialogs,
+        }
     }
 
     /// Refuse a verb a person could not reach while the active tab has a
@@ -324,17 +380,16 @@ impl Docxy {
         // prompt) presses through the app, as its drawn buttons do.
         let plain = !m.control && !m.alt && !m.platform;
         let app_button = self
-            .tabs
-            .get(self.active)
-            .filter(|t| {
-                t.dialogs.top().is_some_and(|d| {
+            .active_dialogs()
+            .filter(|s| {
+                s.top().is_some_and(|d| {
                     matches!(
                         d.owner,
                         DialogOwner::UserName | DialogOwner::SaveOnClose { .. }
                     )
                 })
             })
-            .and_then(|t| t.dialogs.key_button(key, plain));
+            .and_then(|s| s.key_button(key, plain));
         if let Some(label) = app_button {
             if let Err(e) = self.dialog_press(&label, window, cx) {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -344,11 +399,25 @@ impl Docxy {
             cx.notify();
             return true;
         }
+        // Ctrl+V pastes what the clipboard holds.
+        let clip = ((m.control || m.platform) && key == "v" && self.active_dialogs().is_some())
+            .then(|| match self.clipboard_read(cx) {
+                ClipRead::Text(t) => Some(t),
+                _ => None,
+            })
+            .flatten();
         let reopen = reopen_on_top(self.tabs.get(self.active));
         let Some(tab) = self.tabs.get_mut(self.active) else {
-            return false;
+            // No document: the app's own dialogs (the Start page's User name).
+            if !self.app_dialogs.is_open() {
+                return false;
+            }
+            // A refusal has no status line to go to without a document.
+            let _ = edit_key(&mut self.app_dialogs, key, typed, m, clip.as_deref());
+            cx.notify();
+            return true;
         };
-        let taken = dialog_key(tab, key, typed, m);
+        let taken = dialog_key_with(tab, key, typed, m, clip.as_deref());
         if taken {
             if reopen {
                 self.after_reopen();
@@ -370,24 +439,69 @@ impl Docxy {
 
     /// A press on one of the top dialog's widgets: see [`Dialog::click_control`].
     fn dialog_control_click(&mut self, index: usize, item: Option<usize>, cx: &mut Context<Self>) {
+        let done = self
+            .active_dialogs_mut()
+            .top_dialog_mut()
+            .and_then(|d| d.click_control(index, item));
+        if let Err(e) = done {
+            self.dialog_status(e);
+        }
+        cx.notify();
+    }
+
+    /// Say why a dialog refused, on the tab's status line; with no document
+    /// open there is none.
+    fn dialog_status(&mut self, e: String) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            let done = tab
-                .dialogs
-                .top_dialog_mut()
-                .and_then(|d| d.click_control(index, item));
-            if let Err(e) = done {
-                tab.status = e.into();
-            }
+            tab.status = e.into();
+        }
+    }
+
+    /// A click on a text field: focus it and put the caret where the click
+    /// fell, in the characters its text is drawn in.
+    fn dialog_field_click(
+        &mut self,
+        index: usize,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dialog_control_click(index, None, cx);
+        let Some(name) = self
+            .active_dialogs()
+            .and_then(|s| s.top())
+            .and_then(|d| d.controls.get(index))
+            .map(|c| c.name)
+        else {
+            return;
+        };
+        let Some(bounds) = self
+            .probes
+            .borrow()
+            .current(&format!("dialog-field:{name}"))
+        else {
+            return;
+        };
+        // The text starts a padding (and the border) in from the box's edge.
+        let x = f32::from(at.x - bounds.left()) - FIELD_INSET;
+        let measurer = Measurer::new(window);
+        if let Some(d) = self
+            .active_dialogs_mut()
+            .top_dialog_mut()
+            .ok()
+            .filter(|d| d.focus == Some(index))
+        {
+            let text = d.focused().map(|c| c.text()).unwrap_or_default();
+            let to = char_at_x(&text, x, |s| measurer.width(s, 12., false, false));
+            d.move_caret_to(to, false);
         }
         cx.notify();
     }
 
     /// A press on the top dialog's tab strip.
     fn dialog_tab_click(&mut self, label: &str, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            if let Err(e) = tab.dialogs.select_tab(label) {
-                tab.status = e.into();
-            }
+        if let Err(e) = self.active_dialogs_mut().select_tab(label) {
+            self.dialog_status(e);
         }
         cx.notify();
     }
@@ -418,11 +532,47 @@ impl Docxy {
         };
         match c.kind {
             k if k.is_text() => {
-                let caret = if focused { "|" } else { "" };
+                let name = c.name;
+                // The text, with the caret in it and the selection shaded.
+                let text = c.text();
+                let shown: AnyElement = if focused {
+                    let chars: Vec<char> = text.chars().collect();
+                    let caret = d.caret_at().min(chars.len());
+                    let (from, to) = d.selection().unwrap_or((caret, caret));
+                    let part = |a: usize, b: usize| {
+                        SharedString::from(chars[a..b].iter().collect::<String>())
+                    };
+                    let bar = || caret_bar(pal.fg);
+                    h_flex()
+                        .child(part(0, from))
+                        .when(caret == from, |r| r.child(bar()))
+                        .when(from != to, |r| {
+                            r.child(div().bg(hsla_u(BRAND).opacity(0.35)).child(part(from, to)))
+                        })
+                        .when(caret == to && from != to, |r| r.child(bar()))
+                        .child(part(to, chars.len()))
+                        .into_any_element()
+                } else {
+                    SharedString::from(text).into_any_element()
+                };
                 row.child(label)
-                    .child(boxed(format!("{}{caret}", c.text())))
+                    .child(
+                        div()
+                            .relative()
+                            .min_w(px(96.))
+                            .px_1()
+                            .border_1()
+                            .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
+                            .bg(pal.panel)
+                            .child(probe(&self.probes, format!("dialog-field:{name}")))
+                            .child(shown),
+                    )
                     .when(editable, |r| {
-                        r.cursor_text().on_click(on_widget(cx, i, None))
+                        r.cursor_text().on_click(cx.listener(
+                            move |this, ev: &ClickEvent, window, cx| {
+                                this.dialog_field_click(i, ev.position(), window, cx)
+                            },
+                        ))
                     })
                     .into_any_element()
             }
@@ -633,6 +783,30 @@ impl Docxy {
 }
 
 /// The click handler of a dialog widget: control `i`, and the radio item.
+/// How far in from a field box's edge its text starts: the box's one-pixel
+/// border and its `px_1` padding.
+const FIELD_INSET: f32 = 5.;
+
+/// The character gap nearest to `x` pixels along `text`, whose prefixes
+/// measure as `width` says.
+fn char_at_x(text: &str, x: f32, width: impl Fn(&str) -> f32) -> usize {
+    let ends: Vec<usize> = text.char_indices().map(|(i, c)| i + c.len_utf8()).collect();
+    let mut prev = 0.0;
+    for (n, &end) in ends.iter().enumerate() {
+        let w = width(&text[..end]);
+        if x < (prev + w) / 2.0 {
+            return n;
+        }
+        prev = w;
+    }
+    ends.len()
+}
+
+/// The caret of a focused text field: a thin bar between two characters.
+fn caret_bar(color: Hsla) -> Div {
+    div().w(px(1.)).h(px(14.)).bg(color)
+}
+
 fn on_widget(
     cx: &mut Context<Docxy>,
     i: usize,
@@ -740,5 +914,89 @@ mod tests {
         assert!(key(&mut t, "enter", None));
         assert!(!t.dialogs.is_open(), "Enter pressed OK");
         assert!(!key(&mut t, "a", Some("a")), "no dialog, the key goes on");
+    }
+    fn chord() -> Modifiers {
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        }
+    }
+
+    /// Ctrl+A selects the field's text and typing replaces it; Ctrl+V pastes
+    /// the clipboard's text (its line breaks dropped); other chords still
+    /// edit nothing (#1027).
+    #[test]
+    fn select_all_and_paste_edit_the_focused_field() {
+        let mut t = tab_with_form();
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "n", Some("n")));
+        assert!(dialog_key_with(&mut t, "a", None, chord(), None));
+        assert!(key(&mut t, "J", Some("J")));
+        assert_eq!(value(&t, "note"), Value::Text("J".into()));
+        assert!(dialog_key_with(
+            &mut t,
+            "v",
+            None,
+            chord(),
+            Some("ane\r\nDoe")
+        ));
+        assert_eq!(value(&t, "note"), Value::Text("JaneDoe".into()));
+        assert!(
+            dialog_key_with(&mut t, "v", None, chord(), None),
+            "an empty clipboard"
+        );
+        assert!(dialog_key_with(&mut t, "z", None, chord(), None));
+        assert_eq!(value(&t, "note"), Value::Text("JaneDoe".into()));
+    }
+
+    /// Home, End, Left, Right and Delete move and edit within a field.
+    #[test]
+    fn arrows_home_end_and_delete_edit_in_place() {
+        let mut t = tab_with_form();
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "tab", None));
+        for c in ["a", "b", "c"] {
+            assert!(key(&mut t, c, Some(c)));
+        }
+        assert!(key(&mut t, "home", None));
+        assert!(key(&mut t, "right", None));
+        assert!(key(&mut t, "delete", None));
+        assert_eq!(value(&t, "note"), Value::Text("ac".into()));
+        assert!(key(&mut t, "end", None));
+        assert!(key(&mut t, "left", None));
+        assert!(key(&mut t, "x", Some("x")));
+        assert_eq!(value(&t, "note"), Value::Text("axc".into()));
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert!(dialog_key(&mut t, "home", None, shift));
+        assert!(key(&mut t, "backspace", None));
+        assert_eq!(
+            value(&t, "note"),
+            Value::Text("c".into()),
+            "Shift+Home took 'ax'"
+        );
+    }
+
+    /// A click at `x` lands the caret in the nearest gap between characters.
+    #[test]
+    fn a_click_maps_to_the_nearest_character_gap() {
+        // Every character 10px wide.
+        let w = |s: &str| s.chars().count() as f32 * 10.0;
+        assert_eq!(char_at_x("abc", -4.0, w), 0);
+        assert_eq!(char_at_x("abc", 4.0, w), 0);
+        assert_eq!(char_at_x("abc", 6.0, w), 1);
+        assert_eq!(char_at_x("abc", 14.0, w), 1);
+        assert_eq!(char_at_x("abc", 16.0, w), 2);
+        assert_eq!(char_at_x("abc", 29.0, w), 3);
+        assert_eq!(char_at_x("abc", 500.0, w), 3);
+        assert_eq!(char_at_x("", 5.0, w), 0);
+        assert_eq!(
+            char_at_x("a\u{1F600}", 19.0, w),
+            2,
+            "one character past a wide one"
+        );
     }
 }

@@ -107,6 +107,9 @@ fn form() -> Dialog {
         ],
         owner: DialogOwner::Test,
         focus: None,
+        caret: None,
+        anchor: None,
+        caret_for: None,
         opened: Vec::new(),
         react: None,
     };
@@ -671,4 +674,123 @@ fn a_write_back_child_hands_its_values_to_the_open_parent() {
     s.set("Note", &args(r#"{"value":"dropped"}"#)).unwrap();
     s.click("Cancel", |_| Ok(())).unwrap();
     assert_eq!(text(&s, "name"), "from the child");
+}
+
+/// A stack whose `name` field (text "Design") has the focus.
+fn focused_on_name() -> DialogStack {
+    let mut s = stack();
+    s.top_dialog_mut().unwrap().focus_step(false);
+    assert_eq!(focused_name(&s), Some("name"));
+    s
+}
+
+/// A caret edits in the middle of a field, not just at its end (#1027).
+#[test]
+fn the_caret_edits_inside_a_field() {
+    let mut s = focused_on_name();
+    let d = s.top_dialog_mut().unwrap();
+    assert_eq!(d.caret_at(), 6, "after the opening text");
+    d.move_caret_edge(false, false);
+    d.type_char('X').unwrap();
+    assert_eq!(text(&s, "name"), "XDesign");
+    let d = s.top_dialog_mut().unwrap();
+    d.move_caret(true, false);
+    d.delete().unwrap();
+    assert_eq!(text(&s, "name"), "XDsign");
+    let d = s.top_dialog_mut().unwrap();
+    d.backspace().unwrap();
+    assert_eq!(text(&s, "name"), "Xsign");
+    let d = s.top_dialog_mut().unwrap();
+    d.backspace().unwrap();
+    assert_eq!(d.caret_at(), 0);
+    d.backspace().unwrap();
+    d.move_caret(false, false);
+    assert_eq!(
+        text(&s, "name"),
+        "sign",
+        "nothing before the first character"
+    );
+    let d = s.top_dialog_mut().unwrap();
+    d.move_caret_edge(true, false);
+    d.delete().unwrap();
+    d.type_char('!').unwrap();
+    assert_eq!(text(&s, "name"), "sign!");
+}
+
+/// Select-all then typing replaces the text; Shift+arrows extend a selection;
+/// a plain arrow drops it at its edge.
+#[test]
+fn a_selection_is_replaced_by_typing_and_dropped_by_an_arrow() {
+    let mut s = focused_on_name();
+    let d = s.top_dialog_mut().unwrap();
+    d.select_all();
+    assert_eq!(d.selection(), Some((0, 6)));
+    assert_eq!(d.selected_text().as_deref(), Some("Design"));
+    d.type_char('J').unwrap();
+    assert_eq!(text(&s, "name"), "J");
+    let d = s.top_dialog_mut().unwrap();
+    d.insert_text("ane Doe").unwrap();
+    d.select_all();
+    d.backspace().unwrap();
+    assert_eq!(text(&s, "name"), "");
+    let d = s.top_dialog_mut().unwrap();
+    d.insert_text("abcd").unwrap();
+    d.move_caret_edge(false, false);
+    d.move_caret(true, true);
+    d.move_caret(true, true);
+    assert_eq!(d.selection(), Some((0, 2)));
+    d.move_caret(true, false);
+    assert_eq!(d.selection(), None);
+    assert_eq!(d.caret_at(), 2, "the selection's right edge");
+    d.move_caret(false, true);
+    d.delete().unwrap();
+    assert_eq!(text(&s, "name"), "acd");
+}
+
+/// A paste replaces the selection and keeps the caret after it; characters
+/// beyond the BMP count as one.
+#[test]
+fn paste_inserts_at_the_caret_by_characters() {
+    let mut s = focused_on_name();
+    let d = s.top_dialog_mut().unwrap();
+    d.select_all();
+    d.insert_text("a\u{1F600}c").unwrap();
+    d.move_caret(false, false);
+    d.insert_text("-").unwrap();
+    assert_eq!(text(&s, "name"), "a\u{1F600}-c");
+    assert_eq!(s.top().unwrap().caret_at(), 3);
+}
+
+/// A field that refuses a character keeps its text and its caret, and a value
+/// set from outside (`dialog-set`) puts the caret at the end.
+#[test]
+fn a_refused_character_changes_nothing_and_a_set_value_moves_the_caret_to_the_end() {
+    let mut s = stack();
+    let n = index(&s, "percent");
+    s.top_dialog_mut().unwrap().click_control(n, None).unwrap();
+    let d = s.top_dialog_mut().unwrap();
+    d.select_all();
+    d.type_char('4').unwrap();
+    d.type_char('2').unwrap();
+    d.move_caret(false, false);
+    assert!(d.type_char('x').is_err());
+    assert_eq!(text(&s, "percent"), "42");
+    assert_eq!(s.top().unwrap().caret_at(), 1);
+    s.set("percent", &args(r#"{"value":"7"}"#)).unwrap();
+    assert_eq!(s.top().unwrap().caret_at(), 1, "the end of '7'");
+    s.set("percent", &args(r#"{"value":"1234"}"#)).unwrap();
+    assert_eq!(s.top().unwrap().caret_at(), 4);
+}
+
+/// Moving the focus puts the caret at the end of the field it lands on.
+#[test]
+fn the_focus_moving_resets_the_caret() {
+    let mut s = focused_on_name();
+    let d = s.top_dialog_mut().unwrap();
+    d.select_all();
+    d.focus_step(false);
+    assert_eq!(focused_name(&s), Some("percent"));
+    let d = s.top().unwrap();
+    assert_eq!(d.selection(), None);
+    assert_eq!(d.caret_at(), 1, "the end of '0'");
 }

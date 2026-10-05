@@ -678,6 +678,15 @@ pub(crate) struct Dialog {
     pub owner: DialogOwner,
     /// The control typed keys go to (an index into `controls`).
     pub focus: Option<usize>,
+    /// The caret in the focused text field, as a character index; `None` is
+    /// the end of the text. Reset whenever the focus moves or a value is set.
+    pub caret: Option<usize>,
+    /// The other end of the selection the caret extends from, when one is
+    /// made (Shift+arrow, Ctrl+A); `None` is no selection.
+    pub anchor: Option<usize>,
+    /// The control `caret` and `anchor` belong to: they mean nothing once the
+    /// focus is on another (however it got there).
+    caret_for: Option<usize>,
     /// The values the dialog opened on, one per control (see
     /// [`Dialog::changed`]); empty for a dialog that does not track them.
     pub opened: Vec<Value>,
@@ -731,6 +740,9 @@ impl Dialog {
                 .collect(),
             owner,
             focus: None,
+            caret: None,
+            anchor: None,
+            caret_for: None,
             opened: Vec::new(),
             react: None,
         }
@@ -810,6 +822,8 @@ impl Dialog {
     fn set_at(&mut self, i: usize, args: &Json) -> Result<(), String> {
         let before = self.controls[i].value.clone();
         self.controls[i].set(args)?;
+        self.caret = None;
+        self.anchor = None;
         if let Some(Reaction(react)) = self.react {
             react(self, i, &before);
         }
@@ -864,33 +878,151 @@ impl Dialog {
             (Some(i), true) => (i + order.len() - 1) % order.len(),
         };
         self.focus = Some(order[next]);
+        self.caret = None;
+        self.anchor = None;
     }
 
-    /// Change the focused field's text through its input handler.
-    fn edit_focused(&mut self, edit: impl FnOnce(&mut String)) -> Result<(), String> {
-        let Some(c) = self.focused() else {
+    /// The focused text field's text, when the focus is on one.
+    fn focused_text(&self) -> Option<String> {
+        self.focused()
+            .filter(|c| c.kind.is_text())
+            .map(Control::text)
+    }
+
+    /// The caret, when it belongs to the focused control.
+    fn live_caret(&self) -> Option<usize> {
+        self.caret.filter(|_| self.caret_for == self.focus)
+    }
+
+    /// Put the caret at character `at` of the focused control, with no selection.
+    fn put_caret(&mut self, at: usize) {
+        self.caret = Some(at);
+        self.anchor = None;
+        self.caret_for = self.focus;
+    }
+
+    /// The caret in the focused field: a character index, at most the text's
+    /// length (the text may have been set shorter since).
+    pub fn caret_at(&self) -> usize {
+        let len = self.focused_text().map_or(0, |t| t.chars().count());
+        self.live_caret().unwrap_or(len).min(len)
+    }
+
+    /// The selected character range `(from, to)` in the focused field.
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let len = self.focused_text()?.chars().count();
+        let anchor = self.live_caret().and(self.anchor)?;
+        let (a, c) = (anchor.min(len), self.caret_at());
+        (a != c).then(|| (a.min(c), a.max(c)))
+    }
+
+    /// Replace `from..to` (characters) of the focused field with `with`,
+    /// through its input handler, and put the caret after it. A refusal (a
+    /// letter in a number) is the error and leaves the text and caret as they were.
+    fn replace_range(&mut self, from: usize, to: usize, with: &str) -> Result<(), String> {
+        let Some(text) = self.focused_text() else {
             return Ok(());
         };
-        if !c.kind.is_text() {
-            return Ok(());
-        }
-        let mut text = c.text();
-        edit(&mut text);
+        let chars: Vec<char> = text.chars().collect();
+        let (from, to) = (from.min(chars.len()), to.min(chars.len()));
+        let mut next: String = chars[..from].iter().collect();
+        next.push_str(with);
+        next.extend(&chars[to..]);
         let i = self.focus.unwrap_or_default();
-        self.set_at(i, &Json::obj(vec![("value", Json::Str(text))]))
+        self.set_at(i, &Json::obj(vec![("value", Json::Str(next))]))?;
+        self.put_caret(from + with.chars().count());
+        Ok(())
     }
 
-    /// A typed character: appended to the focused field. A character the
-    /// field refuses (a letter in a number) is the error, and changes nothing.
+    /// The range an edit replaces: the selection, else `fallback` around the
+    /// caret.
+    fn edit_range(&self, fallback: impl FnOnce(usize) -> (usize, usize)) -> (usize, usize) {
+        self.selection()
+            .unwrap_or_else(|| fallback(self.caret_at()))
+    }
+
+    /// Text typed or pasted at the caret, replacing the selection. A
+    /// character the field refuses (a letter in a number) is the error, and
+    /// changes nothing.
+    pub fn insert_text(&mut self, text: &str) -> Result<(), String> {
+        let (from, to) = self.edit_range(|c| (c, c));
+        self.replace_range(from, to, text)
+    }
+
+    /// A typed character at the caret.
     pub fn type_char(&mut self, ch: char) -> Result<(), String> {
-        self.edit_focused(|t| t.push(ch))
+        self.insert_text(ch.encode_utf8(&mut [0; 4]))
     }
 
-    /// Backspace in the focused field.
+    /// Backspace in the focused field: the selection, else the character
+    /// before the caret.
     pub fn backspace(&mut self) -> Result<(), String> {
-        self.edit_focused(|t| {
-            t.pop();
-        })
+        let (from, to) = self.edit_range(|c| (c.saturating_sub(1), c));
+        self.replace_range(from, to, "")
+    }
+
+    /// Delete in the focused field: the selection, else the character after
+    /// the caret.
+    pub fn delete(&mut self) -> Result<(), String> {
+        let (from, to) = self.edit_range(|c| (c, c + 1));
+        self.replace_range(from, to, "")
+    }
+
+    /// Move the caret in the focused field to character `to`; `extend` keeps
+    /// (or starts) a selection from where it was, else the selection is dropped.
+    pub fn move_caret_to(&mut self, to: usize, extend: bool) {
+        let Some(len) = self.focused_text().map(|t| t.chars().count()) else {
+            return;
+        };
+        let from = self.caret_at();
+        let anchor = self.live_caret().and(self.anchor).or(Some(from));
+        self.put_caret(to.min(len));
+        self.anchor = anchor.filter(|_| extend);
+    }
+
+    /// Left or Right: one character, or to the selection's edge when one is
+    /// made and `extend` is off.
+    pub fn move_caret(&mut self, right: bool, extend: bool) {
+        let at = self.caret_at();
+        let len = self.focused_text().map_or(0, |t| t.chars().count());
+        if !extend {
+            if let Some((from, to)) = self.selection() {
+                return self.move_caret_to(if right { to } else { from }, false);
+            }
+        }
+        let to = if right {
+            (at + 1).min(len)
+        } else {
+            at.saturating_sub(1)
+        };
+        self.move_caret_to(to, extend);
+    }
+
+    /// Home or End.
+    pub fn move_caret_edge(&mut self, end: bool, extend: bool) {
+        let len = self.focused_text().map_or(0, |t| t.chars().count());
+        self.move_caret_to(if end { len } else { 0 }, extend);
+    }
+
+    /// Ctrl+A: the whole text selected, the caret at its end.
+    pub fn select_all(&mut self) {
+        let Some(len) = self.focused_text().map(|t| t.chars().count()) else {
+            return;
+        };
+        self.put_caret(len);
+        self.anchor = Some(0);
+    }
+
+    /// The selected text, for Ctrl+C and Ctrl+X.
+    pub fn selected_text(&self) -> Option<String> {
+        let (from, to) = self.selection()?;
+        Some(
+            self.focused_text()?
+                .chars()
+                .skip(from)
+                .take(to - from)
+                .collect(),
+        )
     }
 
     /// A press on a control, as the pointer makes it: a field takes the
@@ -900,6 +1032,10 @@ impl Dialog {
         let c = self.controls.get(index).ok_or("no such control")?;
         if !self.focusable().contains(&index) {
             return Err(format!("'{}' cannot be edited", shown(&c.label)));
+        }
+        if self.focus != Some(index) {
+            self.caret = None;
+            self.anchor = None;
         }
         self.focus = Some(index);
         let value = match (c.kind, &c.value) {
@@ -1197,6 +1333,9 @@ mod tests_support {
             ],
             owner: DialogOwner::Test,
             focus: None,
+            caret: None,
+            anchor: None,
+            caret_for: None,
             opened: Vec::new(),
             react: None,
         }

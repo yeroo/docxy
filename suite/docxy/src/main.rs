@@ -3242,6 +3242,9 @@ struct Docxy {
     ribbon_tab: RibbonTab,
     ribbon_min: bool,
     backstage: bool,
+    /// Dialogs the app owns while no document is open, where there is no
+    /// tab's stack to hold them: the Settings' User name (#1027).
+    app_dialogs: dialog::DialogStack,
     bs_new: bool,
     /// The backstage shows the Info page (Inspect Document, #627). Cleared
     /// wherever `bs_new` is; New and Info clear each other.
@@ -9149,6 +9152,7 @@ impl Docxy {
             ribbon_tab: RibbonTab::Home,
             ribbon_min: false,
             backstage: false,
+            app_dialogs: dialog::DialogStack::default(),
             bs_new: false,
             bs_info: false,
             bs_info_status: None,
@@ -26924,8 +26928,8 @@ impl Docxy {
                 )
                 // Word's File › Options › General › User name and Initials
                 // (#620), stamped on new comments. Its dialog sits on a tab's
-                // stack, so the row needs a tab.
-                .when(!self.tabs.is_empty(), |d| {
+                // stack, or the app's when none is open (#1027).
+                .map(|d| {
                     let (name, initials) =
                         review_identity(&self.user_name, &self.user_initials);
                     d.child(
@@ -27587,6 +27591,7 @@ impl Render for Docxy {
                 .relative()
                 .bg(bg)
                 .track_focus(&self.focus)
+                .key_routing(cx)
                 .child(probe_tracked(
                     &self.probes,
                     "suite-root",
@@ -28311,9 +28316,7 @@ impl Render for Docxy {
             .size_full()
             .relative()
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(Self::on_key))
-            .on_action(cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)))
-            .on_action(cx.listener(|this, _: &OutdentAction, window, cx| this.shift_tab_key(window, cx)))
+            .key_routing(cx)
             // Ruler drags are tracked at the window level so they keep working when
             // the pointer leaves the thin ruler strip (gpui move events are
             // hitbox-scoped, so a ruler-only handler would stop the moment the
@@ -28386,6 +28389,27 @@ impl Render for Docxy {
 /// Excel column width (character units) → pixels, clamped to a sane range.
 fn col_px(units: f64) -> f32 {
     ((units * 7.0 + 6.0) as f32).clamp(28.0, 320.0)
+}
+
+/// The window root's keyboard: every key to [`Docxy::on_key`] and the two
+/// bound actions (Tab, Shift+Tab), which gpui matches before it delivers a
+/// key-down. Both of `render`'s roots, the Backstage one too, take it from
+/// here: Backstage without it dropped every key a dialog opened from it
+/// should have had (#1027).
+trait KeyRouting: Sized {
+    fn key_routing(self, cx: &mut Context<Docxy>) -> Self;
+}
+
+impl KeyRouting for Div {
+    fn key_routing(self, cx: &mut Context<Docxy>) -> Self {
+        self.on_key_down(cx.listener(Docxy::on_key))
+            .on_action(
+                cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &OutdentAction, window, cx| this.shift_tab_key(window, cx)),
+            )
+    }
 }
 
 // ---- grid geometry (pure; unit-tested in `grid_geom_tests`) --------------

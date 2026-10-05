@@ -1013,6 +1013,25 @@ fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
     events
 }
 
+/// Where to click the open dialog's text field `name`: `x` pixels in from its
+/// left edge, or its middle, at the box's middle height.
+fn dialog_field_point(
+    app: &crate::Docxy,
+    name: &str,
+    x: Option<f64>,
+) -> Result<Point<Pixels>, String> {
+    if app.active_dialogs().is_none() {
+        return Err(crate::dialog::NONE_OPEN.into());
+    }
+    let b = app
+        .probes
+        .borrow()
+        .get(&format!("dialog-field:{name}"))
+        .ok_or_else(|| format!("no field '{name}' is drawn in the open dialog"))?;
+    let at = x.map_or_else(|| b.center().x, |x| b.left() + px(x as f32));
+    Ok(point(at, b.center().y))
+}
+
 /// The centre of a named region's recorded bounds — where a pointer verb
 /// presses or releases. Errors name the region. Probe-backed regions read
 /// the frame that is on screen now (see `Docxy::region_bounds_live`), the
@@ -2590,12 +2609,7 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
         // The active tab's top dialog's id, or `none`; `dialog-read` has the rest.
         (
             "dialog",
-            Json::Str(
-                app.tabs
-                    .get(app.active)
-                    .map_or("none", |t| t.dialogs.top_id())
-                    .into(),
-            ),
+            Json::Str(app.active_dialogs().map_or("none", |d| d.top_id()).into()),
         ),
     ];
     if let Some(v) = app.active_sheet() {
@@ -2693,9 +2707,7 @@ fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
 
 /// The active tab's dialogs, for a verb that drives one.
 fn open_dialogs(app: &mut crate::Docxy) -> Result<&mut crate::dialog::DialogStack, String> {
-    app.tabs
-        .get_mut(app.active)
-        .map(|t| &mut t.dialogs)
+    Some(app.active_dialogs_mut())
         .filter(|d| d.is_open())
         .ok_or_else(|| crate::dialog::NONE_OPEN.into())
 }
@@ -2882,6 +2894,26 @@ fn dispatch_verb(
             Done::ok(state(app, window))
         }
         "doc" => Done::ok(live_doc_state(app, window)?),
+        // The active document's comments, as a save would write them (#1027):
+        // `{comments:[{id, author, initials, text}]}`, in document order.
+        "comments" => {
+            let tab = app.tabs.get(app.active).ok_or(crate::dialog::NONE_OPEN)?;
+            let crate::Surface::Doc(ed) = &tab.surface else {
+                return Err("the active tab is not a document".into());
+            };
+            let items = crate::live_comments(tab, &ed.doc)
+                .iter()
+                .map(|c| {
+                    Json::obj(vec![
+                        ("id", Json::Str(c.id.clone())),
+                        ("author", Json::Str(c.author.clone())),
+                        ("initials", Json::Str(c.initials.clone())),
+                        ("text", Json::Str(c.text.clone())),
+                    ])
+                })
+                .collect();
+            Done::ok(Json::obj(vec![("comments", Json::Arr(items))]))
+        }
         // Header/footer editing state (#641): which area of which section and
         // variant, its labels, and the contextual tab's Options and Position.
         "hf-state" => Done::ok(crate::hf_tab::hf_state(app.tabs.get(app.active))),
@@ -2915,10 +2947,7 @@ fn dispatch_verb(
         }
         // Dialogs (#393). There is no `dialog-open`: a dialog opens through
         // the verb a person would use (`key`, `ribbon-click`, `click-cell`).
-        "dialog-read" => Done::ok(app.tabs.get(app.active).map_or_else(
-            || crate::dialog::DialogStack::default().to_json(),
-            |t| t.dialogs.to_json(),
-        )),
+        "dialog-read" => Done::ok(app.active_dialogs_mut().to_json()),
         // The control's input handler, the one the overlay's editable widgets
         // call too (#649).
         "dialog-set" => {
@@ -2949,10 +2978,7 @@ fn dispatch_verb(
                 unreachable!("state is an object")
             };
             // A close prompt's Save or Don't Save may have closed the last tab.
-            let dialog = app.tabs.get(app.active).map_or_else(
-                || crate::dialog::DialogStack::default().to_json(),
-                |t| t.dialogs.to_json(),
-            );
+            let dialog = app.active_dialogs_mut().to_json();
             match out.iter_mut().find(|(k, _)| k == "dialog") {
                 Some((_, v)) => *v = dialog,
                 None => out.push(("dialog".into(), dialog)),
@@ -3374,6 +3400,20 @@ fn dispatch_verb(
         // exactly like an OS click. `item` is the drift guard for the
         // fill-handle case: which more-tabs item the point landed on.
         "pointer-click" => {
+            // A field of the open dialog: where a person clicks it, a number
+            // of pixels `x` in from its left edge (its middle without one).
+            if let Some(field) = args.get("dialog-field") {
+                let name = field
+                    .as_str()
+                    .ok_or("'dialog-field' must be a field name")?;
+                let p = dialog_field_point(app, name, args.get("x").and_then(Json::as_f64))?;
+                let mut done = Done::ok(Json::obj(vec![
+                    ("x", Json::Num(f64::from(p.x))),
+                    ("y", Json::Num(f64::from(p.y))),
+                ]))?;
+                done.pointer = click_events(p);
+                return Ok(done);
+            }
             app.refuse_under_dialog()?;
             let p = match (args.get("region"), args.get("at")) {
                 (Some(region), None) => {
@@ -3623,6 +3663,35 @@ fn dispatch_verb(
             }
             app.grid_release(cx);
             Done::ok(state(app, window))
+        }
+
+        // `key` and `type` through the window's own input path, as the OS
+        // delivers them (#1027): the events queue on the reply and the pump
+        // dispatches them through gpui, so a root that lacks its key handler
+        // (Backstage's once did) never sees them, where `key` calls `on_key`.
+        "real-key" | "real-type" => {
+            let strokes = if verb == "real-type" {
+                typed_keys(arg_str(args, "text")?)?
+            } else {
+                let spec = match args.get("keys") {
+                    Some(Json::Arr(items)) => items
+                        .iter()
+                        .map(|v| v.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or("'keys' must be an array of strings")?,
+                    Some(_) => return Err("'keys' must be an array of strings".to_string()),
+                    None => vec![arg_str(args, "key")?.to_string()],
+                };
+                spec.iter()
+                    .map(|s| parse_key(s))
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let mut done = Done::ok(Json::obj(vec![("keys", Json::Num(strokes.len() as f64))]))?;
+            done.pointer = strokes
+                .into_iter()
+                .map(|keystroke| PlatformInput::KeyDown(key_event(keystroke)))
+                .collect();
+            Ok(done)
         }
 
         // Type text, one key event per character.

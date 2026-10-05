@@ -542,10 +542,22 @@ Recover Unsaved Workbooks does. The ignored desktop test in
 `uiharness/tests/autorecover.rs` walks the issue's scenario.
 
 `call user-name {}` opens Settings' User name... dialog (#620) on the active
-tab, as the backstage row does: `dialog-set` its `user-name` and `initials`
+tab (or the app's own stack when no document is open, #1027), as the backstage
+row does: `dialog-set` its `user-name` and `initials`
 fields and `dialog-click` OK to store and persist them. New Word comments are
 stamped with that name and those initials (else the OS account name, else
 `docxy`, with initials derived from the name) and the UTC time.
+
+`key` and `type` call the key handler directly, so they pass when a window root
+has no key handler. `call real-key {"key":"ctrl+a"}` (or `"keys":[...]`) and
+`call real-type {"text":"…"}` queue the same strokes as real `KeyDown` input,
+which gpui dispatches through the focused window root and its bound actions
+(Tab, Shift+Tab) as the OS's keys go. `call pointer-click {"dialog-field":"user-name"}`
+clicks the open dialog's text field (`"x":N` pixels in from its left edge, else
+its middle), which focuses it and puts the caret under the click; it needs a
+drawn frame, so `shot window` first. `call comments {}` reads the active
+document's comments `{comments:[{id,author,initials,text}]}`. The cases are in
+`uiharness/cases/user-name.uit`.
 
 `project-tabs.uit` drives several plans at once: a blank one from `proj.new`
 that takes tasks without a fixture, two opened plans switched between by title
