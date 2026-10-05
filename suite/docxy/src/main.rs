@@ -3391,8 +3391,8 @@ struct Docxy {
     // The menu the backdrop last closed and where that press was, so a press
     // on a split button's arrow can tell it just shut the arrow's own menu.
     menu_closed_at: Option<(menu::MenuTarget, Point<Pixels>)>,
-    // What Ctrl+Y / F4 repeat when there is nothing to redo (#618), valid
-    // while the step it made is still its editor's newest.
+    // What Ctrl+Y / F4 repeat when there is nothing to redo (#618); see
+    // `RepeatRecord` for when it is still valid.
     repeat: Option<RepeatRecord>,
     // Floating mini formatting toolbar shown after a drag-selection (window coords).
     mini_bar: Option<Point<Pixels>>,
@@ -9318,12 +9318,26 @@ impl Docxy {
                 if !ready {
                     return self.refocus(window, cx);
                 }
-                let mut rec = self.repeat.take();
-                self.with_editor(window, cx, |ed| {
-                    redo_or_repeat(ed, &mut rec);
-                });
-                self.repeat = rec;
+                // Protected View refuses it as any edit; the tab turns dirty
+                // only when something changed.
+                if self.protected_refused(cx) {
+                    return self.refocus(window, cx);
+                }
+                let changed = match self.edit_target_and_repeat() {
+                    (Some(ed), rec) => {
+                        let changed = redo_or_repeat(ed, rec);
+                        ed.refresh_merge_preview();
+                        changed
+                    }
+                    (None, _) => false,
+                };
+                if changed {
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.mark_dirty();
+                    }
+                }
                 self.keep_repeat_current(untouched);
+                self.refocus(window, cx);
             }
         }
     }
@@ -17985,6 +17999,7 @@ impl Docxy {
                 // Non-breaking space (Ctrl+Shift+Space), a typesetting staple.
                 "space" if shift => {
                     noted = Some(Repeat::Typing);
+                    break_typing_unless_continuing(ed, *repeat);
                     yes(|| ed.insert_str("\u{00A0}"))
                 }
                 // Word- and document-wise motion (Ctrl+←/→, Ctrl+Home/End).
@@ -18011,6 +18026,7 @@ impl Docxy {
                 "down" => no(|| move_vert(ed, true)),
                 _ => match ev.keystroke.key_char.as_deref() {
                     Some(c) if !c.is_empty() && !c.chars().next().unwrap().is_control() => {
+                        break_typing_unless_continuing(ed, *repeat);
                         ed.insert_str(c);
                         noted = Some(Repeat::Typing);
                         true
@@ -20252,6 +20268,18 @@ fn keep_current(rec: &mut Option<RepeatRecord>, keep: bool) {
     }
 }
 
+/// Before a typed character: typing grows the newest typing step only while
+/// nothing happened since the last character (the Repeat record of that
+/// typing is still ready). After an edit that pushed no step (Page Color, an
+/// edit in another tab) the open run is over, so the character starts a step
+/// and a record of its own instead of reviving a stale one (#618).
+fn break_typing_unless_continuing(ed: &mut Editor, rec: Option<RepeatRecord>) {
+    let continuing = rec.is_some_and(|r| matches!(r.what, Repeat::Typing)) && repeat_ready(ed, rec);
+    if !continuing {
+        ed.break_undo_group();
+    }
+}
+
 /// Whether Ctrl+Y / F4 would repeat on `ed` now (nothing to redo).
 fn repeat_ready(ed: &Editor, rec: Option<RepeatRecord>) -> bool {
     rec.is_some_and(|r| {
@@ -20720,6 +20748,65 @@ mod repeat_tests {
         );
         assert!(ed.undo());
         assert_eq!(ed.doc, spaced);
+    }
+
+    /// Typing after an edit that pushed no step starts its own step and
+    /// record: it does not coalesce into the old run and revive a stale
+    /// record, so F4 repeats only the new characters.
+    #[test]
+    fn typing_after_a_non_step_edit_starts_a_new_run_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        // `on_key`'s typing path: break unless continuing, insert, record.
+        let press = |ed: &mut Editor, rec: &mut Option<RepeatRecord>, c: &str| {
+            let since = docxcore::editor::undo_serial_counter();
+            break_typing_unless_continuing(ed, *rec);
+            ed.insert_str(c);
+            note_edit(ed, rec, since, Repeat::Typing);
+            bump_edit_generation(); // mark_dirty
+            keep_current(rec, true);
+        };
+        for c in ["a", "b", "c"] {
+            press(&mut ed, &mut rec, c);
+        }
+        assert_eq!(ed.undo_names(), ["Typing \"abc\""], "one run");
+        bump_edit_generation(); // e.g. Page Color
+        assert!(!repeat_ready(&ed, rec));
+        press(&mut ed, &mut rec, "d");
+        assert_eq!(ed.undo_names(), ["Typing \"d\"", "Typing \"abc\""]);
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abcdd", "F4 repeats only d");
+    }
+
+    /// Typing over a selection is one step, and so is a repeat of it.
+    #[test]
+    fn typing_over_a_selection_is_one_step_and_repeats_as_one_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        select(&mut ed, 0, 10, 15);
+        let before = ed.doc.clone();
+        // Typing "xy" over `brown`.
+        ed.break_undo_group();
+        let since = docxcore::editor::undo_serial_counter();
+        ed.insert_str("x");
+        note_edit(&mut ed, &mut rec, since, Repeat::Typing);
+        ed.insert_str("y");
+        note_edit(&mut ed, &mut rec, since, Repeat::Typing);
+        assert_eq!(ed.undo_names()[0], "Typing \"xy\"");
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before, "one undo restores brown");
+        assert!(ed.redo());
+        // Repeat over another selection: one step again.
+        select(&mut ed, 1, 0, 6);
+        let before = ed.doc.clone();
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(ed.undo_names()[0], "Typing \"xy\"");
+        assert_eq!(text(&ed, 1), "xy paragraph here.");
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before, "one undo removes the repeat whole");
     }
 
     #[test]

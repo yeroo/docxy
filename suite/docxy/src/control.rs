@@ -260,6 +260,7 @@ pub(crate) fn project_verb(
                 let mut effect = Effect::default();
                 if projctl::MUTATING.contains(&verb) {
                     tab.dirty = v.ed.dirty();
+                    crate::bump_edit_generation();
                     v.cancel_prompt();
                     tab.dialogs.clear();
                     v.cell = None;

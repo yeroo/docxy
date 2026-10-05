@@ -641,12 +641,22 @@ impl Editor {
             return;
         }
         self.drop_collapsed_anchor();
+        let pushed_before = undo_serial_counter();
         if self.has_selection() {
             self.delete_selection();
         }
         if ch == '\n' {
             self.insert_newline();
             return;
+        }
+        // Typing over a selection is one step, as in Word: the step the
+        // deletion pushed (its snapshot is the state before it) becomes the
+        // typing step, and the characters coalesce into it.
+        if undo_serial_counter() > pushed_before {
+            if let Some(step) = self.undo.last_mut() {
+                step.name = StepName::Typing(String::new());
+                self.last = EditKind::Insert;
+            }
         }
         self.checkpoint(EditKind::Insert);
         let off = self.caret.offset;
@@ -4782,6 +4792,22 @@ mod tests {
         // Nothing new since: nothing changes.
         ed.name_command(undo_serial_counter(), "Other");
         assert_eq!(ed.undo_names(), vec!["Style", "Typing \"x\""]);
+    }
+
+    /// Typing over a selection is one `Typing` step: one undo puts the
+    /// selected text back and removes what was typed.
+    #[test]
+    fn typing_over_a_selection_is_one_typing_step() {
+        let mut ed = Editor::new(doc(&["hello world"]));
+        let before = ed.doc.clone();
+        ed.anchor = Some(Caret::at(vec![0], 6));
+        ed.caret = Caret::at(vec![0], 11);
+        ed.insert_str("rust");
+        assert_eq!(top_text(&ed), vec!["hello rust"]);
+        assert_eq!(ed.undo_names(), vec!["Typing \"rust\""]);
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert!(!ed.undo());
     }
 
     #[test]

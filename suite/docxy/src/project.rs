@@ -406,6 +406,7 @@ pub(super) fn indent_project(tab: &mut DocTab, delta: i32) {
         tab.status = e.into();
     }
     tab.dirty = v.ed.dirty();
+    crate::bump_edit_generation();
 }
 
 impl Docxy {
