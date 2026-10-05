@@ -273,3 +273,54 @@ fn advanced_filter_in_place_and_to_another_sheet() {
     assert_eq!(e, gridcore::filter::ADVANCED_OTHER_SHEET);
     assert_eq!(top_id(&t), "advanced-filter");
 }
+
+#[test]
+fn filter_and_sort_by_a_colour_from_the_drop_down() {
+    let mut t = list();
+    let v = view(&mut t);
+    let green = v.pkg.workbook.styles.intern(Xf {
+        fill: Some((0, 176, 80)),
+        ..Xf::default()
+    });
+    for r in [2, 5] {
+        v.pkg.workbook.sheets[0]
+            .cells
+            .get_mut(&(r, 0))
+            .unwrap()
+            .style = green;
+    }
+    toggle(&mut t).unwrap();
+    t.dialogs.push(menu_dialog(&t, 0).unwrap());
+    let d = t.dialogs.top().unwrap();
+    let color = d.controls.iter().find(|c| c.name == "color").unwrap();
+    assert_eq!(
+        color.items,
+        [
+            "Cell Color No Fill",
+            "Cell Color 00B050",
+            "Font Color Automatic"
+        ]
+    );
+    set(&mut t, "color", Json::Str("Cell Color 00B050".into()));
+    press(&mut t, "Filter by Color").unwrap();
+    assert_eq!(shown(&mut t), vec![3, 6]);
+    // No Fill replaces it.
+    t.dialogs.push(menu_dialog(&t, 0).unwrap());
+    set(&mut t, "color", Json::Str("Cell Color No Fill".into()));
+    press(&mut t, "Filter by Color").unwrap();
+    assert_eq!(shown(&mut t), vec![2, 4, 5, 7]);
+    // Sort by Color: the green records on top, the rest in their order.
+    t.dialogs.push(menu_dialog(&t, 0).unwrap());
+    press(&mut t, "Clear Filter").unwrap();
+    t.dialogs.push(menu_dialog(&t, 0).unwrap());
+    set(&mut t, "color", Json::Str("Cell Color 00B050".into()));
+    press(&mut t, "Sort by Color").unwrap();
+    let v = view(&mut t);
+    let reps: Vec<String> = (1..=6)
+        .map(|r| match v.sheet().cell(r, 0).map(|c| &c.value) {
+            Some(gridcore::sheet::CellValue::Text(s)) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert_eq!(reps, ["Cy", "Ann", "Noor", "Bo", "Noor", "Cy"]);
+}

@@ -55,6 +55,77 @@ pub struct FilterMenu {
     pub total: usize,
     /// The column has criteria.
     pub filtered: bool,
+    /// Filter by Color / Sort by Color's choices: the cell colours, then
+    /// the font colours, then the icons the listed records show, each once,
+    /// in the order met. Empty when none shows a colour or an icon (only No
+    /// Fill and the automatic font colour). A colour we can't read is not
+    /// offered.
+    pub colors: Vec<ColorChoice>,
+}
+
+/// A colour or icon to filter or sort by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColorChoice {
+    /// A fill; `None` is No Fill.
+    Fill(Option<(u8, u8, u8)>),
+    /// A font colour; `None` is the automatic colour.
+    Font(Option<(u8, u8, u8)>),
+    Icon(String, u32),
+}
+
+impl ColorChoice {
+    /// How a host lists it: `Cell Color 00B050`, `Cell Color No Fill`,
+    /// `Font Color Automatic`, `Icon 3Arrows/2`.
+    pub fn label(&self) -> String {
+        let hex = |(r, g, b): (u8, u8, u8)| format!("{r:02X}{g:02X}{b:02X}");
+        match self {
+            ColorChoice::Fill(Some(c)) => format!("Cell Color {}", hex(*c)),
+            ColorChoice::Fill(None) => "Cell Color No Fill".into(),
+            ColorChoice::Font(Some(c)) => format!("Font Color {}", hex(*c)),
+            ColorChoice::Font(None) => "Font Color Automatic".into(),
+            ColorChoice::Icon(set, id) => format!("Icon {set}/{id}"),
+        }
+    }
+
+    /// The criterion that keeps the cells showing it.
+    pub fn criterion(&self) -> ColumnFilter {
+        match self {
+            ColorChoice::Fill(rgb) => ColumnFilter::Color {
+                cell: true,
+                rgb: *rgb,
+                dxf_id: None,
+            },
+            ColorChoice::Font(rgb) => ColumnFilter::Color {
+                cell: false,
+                rgb: *rgb,
+                dxf_id: None,
+            },
+            ColorChoice::Icon(set, id) => ColumnFilter::Icon {
+                set: set.clone(),
+                id: *id,
+            },
+        }
+    }
+
+    /// The sort level that puts the cells showing it on top.
+    pub fn sort_on(&self) -> crate::edit::SortOn {
+        use crate::edit::SortOn;
+        match self {
+            ColorChoice::Fill(rgb) => SortOn::CellColor {
+                rgb: *rgb,
+                top: true,
+            },
+            ColorChoice::Font(rgb) => SortOn::FontColor {
+                rgb: *rgb,
+                top: true,
+            },
+            ColorChoice::Icon(set, id) => SortOn::Icon {
+                set: set.clone(),
+                id: *id,
+                top: true,
+            },
+        }
+    }
 }
 
 const MONTHS: [&str; 12] = [
@@ -102,6 +173,9 @@ pub fn menu(
         .collect();
     let mine = af.criteria.iter().find(|(c, _)| *c == col).map(|x| &x.1);
     let icons = crate::cf::Icons::new(wb, sheet);
+    let mut fills: Vec<Option<(u8, u8, u8)>> = Vec::new();
+    let mut fonts: Vec<Option<(u8, u8, u8)>> = Vec::new();
+    let mut icon_list: Vec<(String, u32)> = Vec::new();
     let (mut n_date, mut n_num, mut n_text) = (0usize, 0usize, 0usize);
     let mut blanks = false;
     let mut days: BTreeSet<(i64, u32, u32)> = BTreeSet::new();
@@ -121,6 +195,21 @@ pub fn menu(
             .all(|(c, t)| passes(wb, sheet, r, *c, t, &icons))
         {
             continue;
+        }
+        for (shown, list) in [
+            (crate::cf::cell_fill(wb, sheet, r, col), &mut fills),
+            (crate::cf::cell_font_color(wb, sheet, r, col), &mut fonts),
+        ] {
+            if let Some(rgb) = shown.rgb() {
+                if !list.contains(&rgb) {
+                    list.push(rgb);
+                }
+            }
+        }
+        if let Some(icon) = icons.icon(r, col) {
+            if !icon_list.contains(&icon) {
+                icon_list.push(icon);
+            }
         }
         if is_blank_value(value) {
             blanks = true;
@@ -261,6 +350,19 @@ pub fn menu(
         items.truncate(MENU_LIMIT - usize::from(blank.is_some()));
         items.extend(blank);
     }
+    // Colours only when some record shows one: a column of No Fill and the
+    // automatic font colour has nothing to filter by.
+    let any = fills.iter().chain(&fonts).any(Option::is_some) || !icon_list.is_empty();
+    let colors = if any {
+        fills
+            .into_iter()
+            .map(ColorChoice::Fill)
+            .chain(fonts.into_iter().map(ColorChoice::Font))
+            .chain(icon_list.into_iter().map(|(s, i)| ColorChoice::Icon(s, i)))
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(FilterMenu {
         col,
         header: shown_text(wb, sheet, r1, col),
@@ -269,5 +371,6 @@ pub fn menu(
         truncated,
         total,
         filtered: mine.is_some(),
+        colors,
     })
 }

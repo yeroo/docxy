@@ -61,7 +61,7 @@
 //! | `wb.export-pdf` | `{path, …print.pages args}` | `{path, pages}` — refuses to overwrite; nothing to print errors with "We didn't find anything to print." and writes no file; so does a job over 100,000 pages (the `print.pages` error) |
 //! | `filter.set` | `{range?, col, criteria, sheet?}` | `{shown, total, status, changed}` — AutoFilter on over `range` if needed, then column `col` (header text or letter) set to `criteria` (`values`, `custom`, `top`, `dynamic`, `cellColor`, `fontColor`, `icon`, `search`, or `null` to clear) and the filter applied. One undo step when it changes something |
 //! | `filter.reapply` / `filter.clear` / `filter.off` | `{col?, sheet?}` | `{shown, total, status, changed}` (`filter.off`: `{off, range, changed}`) — one undo step each when it changes something |
-//! | `filter.menu` | `{col, search?, sheet?}` | `{col, header, submenu, items:[{label,depth,checked}], truncated, total, filtered}` |
+//! | `filter.menu` | `{col, search?, sheet?}` | `{col, header, submenu, items:[{label,depth,checked}], truncated, total, filtered, colors}` |
 //! | `filter.by-cell` | `{ref, by?, sheet?}` | `{shown, total, status, changed}` — Filter by Selected Cell's value/colour/font colour/icon |
 //! | `filter.advanced` | `{list, criteria?, copyTo?, unique?, sheet?}` | `{shown, total, status, changed}` — copying to another sheet is refused |
 //! | `sheet.rows` | `{range, sheet?}` | `{rows:[{row, hidden, hiddenBy}]}` |

@@ -332,6 +332,25 @@ fn dat_case_016_colours_and_the_selected_cell() {
         r#"{"col":"Item","criteria":{"cellColor":null}}"#,
     );
     assert_eq!(shown(&mut a, "A2:A6"), vec![3, 4, 6]);
+    // The drop-down's colour choices, from every record (the column's own
+    // criterion doesn't narrow its menu).
+    let m = ok(&mut a, "filter.menu", r#"{"col":"Item"}"#);
+    let colors: Vec<&str> = m
+        .get("colors")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Json::as_str)
+        .collect();
+    assert_eq!(
+        colors,
+        [
+            "Cell Color 00B050",
+            "Cell Color No Fill",
+            "Font Color Automatic"
+        ]
+    );
     ok(&mut a, "filter.clear", "{}");
     ok(
         &mut a,

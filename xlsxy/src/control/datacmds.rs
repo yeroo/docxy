@@ -327,6 +327,10 @@ pub(super) fn filter_menu(app: &App, args: &Json) -> Result<Json, String> {
         ("truncated", Json::Bool(m.truncated)),
         ("total", Json::Num(m.total as f64)),
         ("filtered", Json::Bool(m.filtered)),
+        (
+            "colors",
+            Json::Arr(m.colors.iter().map(|c| Json::Str(c.label())).collect()),
+        ),
     ]))
 }
 

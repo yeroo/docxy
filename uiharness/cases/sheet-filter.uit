@@ -15,9 +15,9 @@ test sheet filter button opens the drop-down and its checklist filters
   call pointer-click {"region":"filter-button:A"}
   assert dialog is filter-menu
   call dialog-read {}
-  assert reply.controls.0.label is Text Filters:
-  assert reply.controls.3.items.0 is (Select All)
-  assert reply.controls.3.items.1 is East
+  assert reply.controls.1.label is Text Filters:
+  assert reply.controls.4.items.0 is (Select All)
+  assert reply.controls.4.items.1 is East
   call dialog-set {"control":"values","value":["North","East"]}
   call dialog-click {"button":"OK"}
   assert dialog is none
@@ -35,7 +35,7 @@ test sheet filter custom autofilter from the typed submenu
   shot filter-button:B
   call pointer-click {"region":"filter-button:B"}
   call dialog-read {}
-  assert reply.controls.0.label is Number Filters:
+  assert reply.controls.1.label is Number Filters:
   call dialog-set {"control":"typed","value":"Greater Than..."}
   call dialog-click {"button":"Apply Filter"}
   assert dialog is custom-autofilter
@@ -92,3 +92,36 @@ test sheet filter advanced filter in place
   assert status is 1 of 4 records found
   call ribbon-click {"tab":"Data","command":"Clear"}
   assert status is 4 of 4 records found
+
+# colors.xlsx is basic.xlsx without its chart, with South (A3) and West (A5)
+# filled green. The drop-down's By color lists the colours the records show.
+test sheet filter and sort by colour from the drop-down
+  open ../fixtures/colors.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  call dialog-read {}
+  assert reply.controls.0.items.0 is Cell Color No Fill
+  assert reply.controls.0.items.1 is Cell Color 00B050
+  call dialog-set {"control":"color","value":"Cell Color 00B050"}
+  call dialog-click {"button":"Filter by Color"}
+  assert status is 2 of 4 records found
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  call dialog-set {"control":"color","value":"Cell Color No Fill"}
+  call dialog-click {"button":"Filter by Color"}
+  assert status is 2 of 4 records found
+  click A1
+  click C5 shift
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.app.rows is 3
+  call ribbon-click {"tab":"Data","command":"Clear"}
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  call dialog-set {"control":"color","value":"Cell Color 00B050"}
+  call dialog-click {"button":"Sort by Color"}
+  assert cell A2 is South
+  assert cell A3 is West
+  assert cell A4 is North

@@ -22,7 +22,7 @@ pub use apply::{
     auto_filter_on_range, clear, filter_by_cell, reapply, search, set_criterion, status_text,
 };
 pub use dates::DYNAMIC_KINDS;
-pub use menu::{FilterMenu, MENU_LIMIT, MenuItem, Submenu, menu};
+pub use menu::{ColorChoice, FilterMenu, MENU_LIMIT, MenuItem, Submenu, menu};
 
 /// Parse a filter criteria into `(operator, operand)`: ">500", "<=100", "<>X",
 /// "=Laptop", or a plain value. Unlike the CF parser, the default operator is

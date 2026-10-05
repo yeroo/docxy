@@ -947,3 +947,32 @@ fn filter_by_a_cell_typed_below_the_list_keeps_the_other_criteria() {
     assert_eq!(af.range, (0, 7, 1, 7));
     assert_eq!(af.criteria.len(), 1);
 }
+
+#[test]
+fn the_menu_lists_the_colours_its_records_show() {
+    let wb = colours();
+    let m = menu(&wb, 0, 0, None).unwrap();
+    let labels: Vec<String> = m.colors.iter().map(|c| c.label()).collect();
+    assert_eq!(
+        labels,
+        [
+            "Cell Color 00B050",
+            "Cell Color FFFF00",
+            "Cell Color No Fill",
+            "Cell Color FF0000",
+            "Font Color Automatic",
+        ]
+    );
+    // Icons on C; B's red font; nothing on a plain column.
+    let c = menu(&wb, 0, 2, None).unwrap();
+    assert!(c.colors.iter().any(|x| x.label() == "Icon 3Arrows/2"));
+    let b = menu(&wb, 0, 1, None).unwrap();
+    assert!(
+        b.colors
+            .contains(&crate::filter::ColorChoice::Font(Some((255, 0, 0))))
+    );
+    let plain = filterlist();
+    let mut plain = plain;
+    auto_filter_on(&mut plain, 0, (0, 0)).unwrap();
+    assert!(menu(&plain, 0, 0, None).unwrap().colors.is_empty());
+}

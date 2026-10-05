@@ -308,6 +308,8 @@ pub(crate) fn menu_dialog(tab: &DocTab, col: u32) -> Result<Dialog, String> {
             ("Sort A to Z", ButtonRole::Apply),
             ("Sort Z to A", ButtonRole::Apply),
             ("Clear Filter", ButtonRole::Apply),
+            ("Sort by Color", ButtonRole::Apply),
+            ("Filter by Color", ButtonRole::Apply),
             ("Apply Filter", ButtonRole::Apply),
             ("Search", ButtonRole::Apply),
             ("OK", ButtonRole::Accept),
@@ -339,7 +341,25 @@ pub(crate) fn menu_dialog(tab: &DocTab, col: u32) -> Result<Dialog, String> {
         }),
     );
     note.visible = m.truncated;
+    // Sort by Color and Filter by Color: the colours the records show.
+    let mut color = Control::new(
+        "color",
+        "By color:",
+        ControlKind::Dropdown,
+        Value::Choice(None),
+    );
+    color.items = m.colors.iter().map(|c| c.label()).collect();
+    if !color.items.is_empty() {
+        color.value = Value::Choice(Some(0));
+    }
+    color.enabled = !color.items.is_empty();
+    for b in d.buttons.iter_mut() {
+        if matches!(b.label.as_str(), "Sort by Color" | "Filter by Color") {
+            b.enabled = !m.colors.is_empty();
+        }
+    }
     d.controls = vec![
+        color,
         typed,
         Control::new(
             "search",
@@ -701,6 +721,8 @@ fn menu_click(
     let label = [
         "Sort A to Z",
         "Sort Z to A",
+        "Sort by Color",
+        "Filter by Color",
         "Clear Filter",
         "Apply Filter",
         "Search",
@@ -735,6 +757,35 @@ fn menu_click(
         "Clear Filter" => apply_and_close(tab, move |wb, s, today| {
             gridcore::filter::clear(wb, s, Some(col), today)
         }),
+        "Sort by Color" | "Filter by Color" => {
+            let Some(choice) = choice_of(top, "color")
+                .and_then(|l| m.colors.iter().find(|c| c.label() == l).cloned())
+            else {
+                return Some(Err("Choose a colour".into()));
+            };
+            if label == "Filter by Color" {
+                // One colour per column: it replaces the column's criteria.
+                return Some(apply_and_close(tab, move |wb, s, today| {
+                    gridcore::filter::set_criterion(wb, s, col, Some(choice.criterion()), today)
+                }));
+            }
+            let range = v.sheet().auto_filter.as_ref().map(|a| a.range);
+            tab.dialogs.pop();
+            match range {
+                Some(r) => {
+                    let level = [gridcore::edit::SortLevel {
+                        key: col,
+                        on: choice.sort_on(),
+                    }];
+                    let opts = gridcore::edit::SortOptions {
+                        header: true,
+                        ..Default::default()
+                    };
+                    crate::sheet_sort::run(tab, r, &level, &opts)
+                }
+                None => Err(FilterError::NoFilter.to_string()),
+            }
+        }
         "Search" => {
             // The list narrows to what the search matches, all checked.
             let searching = !search.is_empty();
