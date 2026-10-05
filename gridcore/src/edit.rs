@@ -25,7 +25,7 @@ pub use consolidate::{
 };
 pub use sort::{
     BUILTIN_SORT_LISTS, SORT_MERGED, SORT_WARNING, SortError, SortLevel, SortOn, SortOptions,
-    builtin_sort_list, sort_range, sort_region, sort_warning,
+    builtin_sort_list, guess_header, sort_range, sort_region, sort_warning,
 };
 pub use subtotal::{
     Area, SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,

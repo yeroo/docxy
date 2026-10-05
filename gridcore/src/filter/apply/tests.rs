@@ -2,7 +2,7 @@
 //! (DAT-CASE-012 to 017, 019 and 039), with each case's data built here.
 
 use super::*;
-use crate::filter::{AdvancedFilter, MENU_LIMIT, Submenu, advanced, menu};
+use crate::filter::{AdvancedFilter, MENU_LIMIT, Submenu, advanced, filter_range, menu, menu_all};
 use crate::sheet::{Cell, Sheet, Xf, parts_to_serial};
 
 fn day(y: i64, m: u32, d: u32) -> f64 {
@@ -975,4 +975,57 @@ fn the_menu_lists_the_colours_its_records_show() {
     let mut plain = plain;
     auto_filter_on(&mut plain, 0, (0, 0)).unwrap();
     assert!(menu(&plain, 0, 0, None).unwrap().colors.is_empty());
+}
+
+#[test]
+fn the_menu_lists_a_record_typed_below_the_list() {
+    let mut wb = filterlist();
+    auto_filter_on_range(&mut wb, 0, (0, 0, 20, 4)).unwrap();
+    wb.sheets[0].set_cell(21, 0, t("Zed"));
+    let m = menu(&wb, 0, 0, None).unwrap();
+    assert!(m.items.iter().any(|i| i.label == "Zed"), "{:?}", m.items);
+    assert_eq!(filter_range(&wb, 0), Some((0, 0, 21, 4)));
+}
+
+#[test]
+fn menu_all_lists_past_the_limit() {
+    let mut rows = vec![vec![t("Code")]];
+    for i in 0..10_050u32 {
+        rows.push(vec![t(&format!("C{i:05}"))]);
+    }
+    let mut wb = book(&rows);
+    auto_filter_on(&mut wb, 0, (0, 0)).unwrap();
+    let cut = menu(&wb, 0, 0, None).unwrap();
+    let all = menu_all(&wb, 0, 0, None).unwrap();
+    assert!(cut.truncated && !all.truncated);
+    assert_eq!((cut.items.len(), all.items.len()), (MENU_LIMIT, 10_050));
+    assert_eq!(cut.items[..], all.items[..MENU_LIMIT]);
+}
+
+#[test]
+fn a_cut_short_checklist_keeps_what_it_did_not_show() {
+    let mut rows = vec![vec![t("Code")]];
+    for i in 0..12_000u32 {
+        rows.push(vec![t(&format!("C{i:05}"))]);
+    }
+    let mut wb = book(&rows);
+    auto_filter_on(&mut wb, 0, (0, 0)).unwrap();
+    let m = menu(&wb, 0, 0, None).unwrap();
+    assert!(m.truncated);
+    // Everything checked: the column is cleared, not cut to 10,000 values.
+    let all = vec![true; m.items.len()];
+    let f = crate::filter::checklist_criteria(&wb, 0, 0, None, &m.items, &all, true).unwrap();
+    assert_eq!(f, None);
+    // One listed value unchecked: the 2,000 unlisted ones stay shown.
+    let mut some = all.clone();
+    some[0] = false;
+    let f = crate::filter::checklist_criteria(&wb, 0, 0, None, &m.items, &some, true).unwrap();
+    let out = set_criterion(&mut wb, 0, 0, f, today()).unwrap();
+    assert_eq!(
+        out,
+        FilterOutcome {
+            shown: 11_999,
+            total: 12_000
+        }
+    );
 }

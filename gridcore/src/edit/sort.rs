@@ -147,14 +147,35 @@ pub fn sort_warning(wb: &Workbook, sheet: usize, sel: Area) -> Option<(Area, boo
         return None;
     }
     let s = wb.sheets.get(sheet)?;
-    let (region, header) = subtotal_region(s, r1, c1)?;
-    (region.1 < c1 || region.3 > c2).then_some((region, header))
+    let (region, _) = subtotal_region(s, r1, c1)?;
+    (region.1 < c1 || region.3 > c2).then(|| (region, guess_header(wb, sheet, region)))
 }
 
 /// The range a single-cell sort acts on: the current region around `at`,
-/// and whether its first row is a header (Excel's guess).
+/// and whether its first row is a header ([`guess_header`]).
 pub fn sort_region(wb: &Workbook, sheet: usize, at: (u32, u32)) -> Option<(Area, bool)> {
-    subtotal_region(wb.sheets.get(sheet)?, at.0, at.1)
+    let (region, _) = subtotal_region(wb.sheets.get(sheet)?, at.0, at.1)?;
+    Some((region, guess_header(wb, sheet, region)))
+}
+
+/// Whether `area`'s first row is a header, for a sort that isn't told: the
+/// header row of the sheet's AutoFilter when the area starts there; else
+/// Excel's guess, text over a number in some column.
+pub fn guess_header(wb: &Workbook, sheet: usize, (r1, c1, r2, c2): Area) -> bool {
+    let Some(s) = wb.sheets.get(sheet) else {
+        return false;
+    };
+    if s.auto_filter.as_ref().is_some_and(|af| {
+        let (fr, fc1, _, fc2) = af.range;
+        fr == r1 && fc1 <= c1 && c2 <= fc2
+    }) {
+        return true;
+    }
+    (c1..=c2).any(|c| {
+        matches!(s.cell(r1, c).map(|x| &x.value), Some(CellValue::Text(_)))
+            && (r1 + 1..=r2)
+                .any(|r| matches!(s.cell(r, c).map(|x| &x.value), Some(CellValue::Number(_))))
+    })
 }
 
 /// Sort `area` of `sheet` by `levels` (the first decides, the rest break

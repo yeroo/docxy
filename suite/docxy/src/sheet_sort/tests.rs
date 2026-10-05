@@ -4,7 +4,7 @@
 use super::*;
 use crate::sheet_filter::tests::{tab, view};
 use ctlcore::json::Json;
-use gridcore::sheet::Cell;
+use gridcore::sheet::{Cell, CellValue};
 
 /// DAT-CASE-037's list A1:C6 (Region, Rep, Amount), the cursor on B2.
 fn regions() -> DocTab {
@@ -159,4 +159,33 @@ fn left_to_right_lists_rows_and_merged_cells_refuse() {
     assert_eq!(e, gridcore::edit::SORT_MERGED);
     assert_eq!(col(&mut t, 1)[0], "Eve");
     assert!(!t.dirty);
+}
+
+#[test]
+fn a_to_z_on_a_filtered_list_keeps_its_header_even_all_text() {
+    // Name, City: all text, so the text-over-number guess finds no header;
+    // the AutoFilter's header row is one.
+    let mut t = tab();
+    let v = view(&mut t);
+    let sh = &mut v.pkg.workbook.sheets[0];
+    for (r, (a, b)) in [("Name", "City"), ("Zoe", "Oslo"), ("Amy", "Rome")]
+        .iter()
+        .enumerate()
+    {
+        sh.set_cell(r as u32, 0, Cell::text(a));
+        sh.set_cell(r as u32, 1, Cell::text(b));
+    }
+    v.engine = crate::sheet_engine(&v.pkg.workbook);
+    crate::sheet_filter::toggle(&mut t).unwrap();
+    view(&mut t).sel = (1, 0);
+    view(&mut t).anchor = (1, 0);
+    quick(&mut t, true).unwrap();
+    let v = view(&mut t);
+    let names: Vec<String> = (0..3)
+        .map(|r| match v.sheet().cell(r, 0).map(|x| &x.value) {
+            Some(CellValue::Text(s)) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert_eq!(names, ["Name", "Amy", "Zoe"]);
 }

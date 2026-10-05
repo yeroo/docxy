@@ -199,7 +199,17 @@ fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> S
     // A rule we don't evaluate (Duplicate Values, a colour scale, …) that
     // takes precedence over the one that matched, or any such rule when
     // none did, may be colouring the cell: then its colour is unknown.
-    if unevaluated_could_color(wb, sheet, row, col, fill, winner.as_ref().map(|w| w.0)) {
+    // The winner bounds them only when it sets that colour itself: a
+    // bold-only or font-only winner leaves the fill to the others.
+    let sets = |d: &Dxf| {
+        if fill {
+            d.fill.is_some() || d.fill_unresolved
+        } else {
+            d.color.is_some() || d.color_unresolved
+        }
+    };
+    let bound = winner.as_ref().filter(|(_, d)| sets(d)).map(|w| w.0);
+    if unevaluated_could_color(wb, sheet, row, col, fill, bound) {
         return Shown::Unknown;
     }
     if let Some((_, d)) = winner {

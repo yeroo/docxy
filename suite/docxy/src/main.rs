@@ -3355,12 +3355,10 @@ struct Docxy {
     sheet_cf_edit: Option<String>,
     // In-progress data-validation list entry (comma-separated allowed values).
     sheet_dv_edit: Option<String>,
-    // In-progress AutoFilter criteria entry for the selected column.
-    // In-progress multi-level sort spec entry ("B asc, C desc").
     // In-progress row-height entry (points, or "auto").
     sheet_rowh_edit: Option<String>,
-    // Which entry bar's range field is on screen, if any. Its seed depends on
-    // the bar (a sort's is the region it would find, not the selection).
+    // Which entry bar's range field is on screen, if any; it starts on the
+    // selection.
     bar_field: Option<RefTarget>,
     // A range the user PINNED into that field, by typing it or pointing at it.
     // While this is None the bar keeps following the selection, which is what
@@ -10333,11 +10331,11 @@ impl Docxy {
     /// Open a bar's range field. It starts unpinned, so until the user types a
     /// range or points at one the bar still acts on the selection.
     fn bar_open(&mut self, target: RefTarget) {
-        // The three bars share ONE `bar_field`/`bar_range`, and `sheet_key`
-        // routes to whichever is open first. Leaving a second one on screen
+        // The two bars share ONE `bar_field`/`bar_range`, and `sheet_key`
+        // routes to whichever is open first. Leaving the other on screen
         // therefore aims the first at cells pinned for the other — a
-        // conditional format painting the Sort bar's whole region, say. Only one at a
-        // time, which is also what the keyboard already assumed.
+        // conditional format painting the validation bar's range, say. Only
+        // one at a time, which is also what the keyboard already assumed.
         self.bar_close();
         // `bar_close` only drops a field belonging to a bar. A Chart panel field
         // left focused would keep `range_field_active` true, so the very first
@@ -10443,9 +10441,8 @@ impl Docxy {
     }
 
     /// A bar closed: drop the bar itself along with its range field. Closing the
-    /// field alone would leave a bar on screen whose seeding (`bar_seed` keys
-    /// off `bar_field`) had gone with it — a Sort bar still showing, now acting
-    /// on the selection rather than the region it found.
+    /// field alone would leave a bar on screen with no field to say which
+    /// cells it acts on.
     fn bar_close(&mut self) {
         self.sheet_cf_edit = None;
         self.sheet_dv_edit = None;
@@ -10772,6 +10769,28 @@ impl Docxy {
         // Keep keyboard focus on the grid after a click inside the virtualized
         // list (which would otherwise capture it).
         self.focus.focus(window, cx);
+    }
+
+    /// A right-click on cell `(r, c)`: outside the selection it selects the
+    /// cell first, as a left click does (an open editor commits or closes),
+    /// so the cell menu's "Selected Cell" commands act on the cell clicked;
+    /// inside it the selection stays. Then the cell menu opens at `at`.
+    pub(crate) fn cell_right_click(
+        &mut self,
+        r: u32,
+        c: u32,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inside = self.active_sheet().is_some_and(|v| {
+            let (r1, c1, r2, c2) = sel_range(v.sel, v.anchor);
+            (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
+        });
+        if !inside {
+            self.cell_click(r, c, false, false, window, cx);
+        }
+        self.open_cell_menu(at, cx);
     }
 
     /// The pointer moved over cell `(r, c)` with the left button down: the
@@ -13107,8 +13126,14 @@ impl Docxy {
 
     /// A press on column `col`'s filter button: its drop-down (#690).
     fn sheet_filter_button(&mut self, col: u32, cx: &mut Context<Self>) {
+        // Protected View (#610) keeps the workbook as it opened.
+        if self.protected_refused(cx) {
+            return;
+        }
         self.sheet_data_cmd(
             |t| {
+                // A value being typed belongs in the list the drop-down shows.
+                sheet_sort::commit_first(t)?;
                 let d = sheet_filter::menu_dialog(t, col)?;
                 t.dialogs.push(d);
                 Ok(())
@@ -26862,16 +26887,15 @@ impl Render for Docxy {
             .flex_1()
             .min_h(px(0.))
             .overflow_hidden()
-            // Right-click in a document or sheet body opens the document's
-            // context menu. A Project's task rows open their own (the table
-            // pane's handler); nothing else on a Project has a menu yet, so
-            // the document's never opens there (#397).
+            // Right-click in a document body opens the document's context
+            // menu. A sheet's cells open the cell menu (each cell's own
+            // handler, which selects it first); a Project's task rows open
+            // their own (the table pane's handler); nothing else there has a
+            // menu yet (#397).
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                    if this.active_is_sheet() {
-                        this.open_cell_menu(ev.position, cx);
-                    } else if !this.active_is_project() {
+                    if !this.active_is_project() && !this.active_is_sheet() {
                         this.open_document_menu(ev.position, cx);
                     }
                 }),
@@ -27850,6 +27874,13 @@ fn sheet_row(
             let shift = ev.modifiers().shift;
             let dbl = ev.click_count() >= 2;
             ent2.update(cx, |this, cx| this.cell_click(r, c, shift, dbl, window, cx));
+        });
+        // A right-click opens the cell menu over this cell (#690, #691).
+        let ent_menu = ent.clone();
+        cell = cell.on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+            cx.stop_propagation();
+            let at = ev.position;
+            ent_menu.update(cx, |this, cx| this.cell_right_click(r, c, at, window, cx));
         });
         // Drag-select: while the left button is held, extend the selection to
         // whatever cell the pointer is over (on_mouse_move is hitbox-scoped, so
@@ -34247,6 +34278,15 @@ mod grid_geom_tests {
             SheetAct::Consolidate,
             // Clear writes `hidden` too (#696).
             SheetAct::ClearFilter,
+            // Every Sort & Filter command writes rows or cells (#690, #691).
+            SheetAct::Filter,
+            SheetAct::ReapplyFilter,
+            SheetAct::AdvancedFilter,
+            SheetAct::FilterBy(gridcore::filter::ByCell::Value),
+            SheetAct::PutOnTop(crate::sheet_sort::OnTop::CellColor),
+            SheetAct::SortAsc,
+            SheetAct::SortDesc,
+            SheetAct::CustomSort,
         ] {
             assert!(!super::protected_view_allows_act(act), "{act:?}");
         }

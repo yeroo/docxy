@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use super::apply::{Area, FilterError, cell_date, passes, shown_text, test_for};
+use super::apply::{Area, FilterError, cell_date, grown_range, passes, shown_text, test_for};
 use super::{ColumnFilter, DateGroup, is_blank_value};
 use crate::sheet::{CellValue, Workbook};
 
@@ -156,12 +156,36 @@ pub fn menu(
     col: u32,
     search: Option<&str>,
 ) -> Result<FilterMenu, FilterError> {
+    menu_up_to(wb, sheet, col, search, Some(MENU_LIMIT))
+}
+
+/// [`menu`] with every value listed, however many: what a host needs to
+/// keep the values the drop-down didn't show as they are when a cut-short
+/// list is applied.
+pub fn menu_all(
+    wb: &Workbook,
+    sheet: usize,
+    col: u32,
+    search: Option<&str>,
+) -> Result<FilterMenu, FilterError> {
+    menu_up_to(wb, sheet, col, search, None)
+}
+
+fn menu_up_to(
+    wb: &Workbook,
+    sheet: usize,
+    col: u32,
+    search: Option<&str>,
+    limit: Option<usize>,
+) -> Result<FilterMenu, FilterError> {
     let af = wb
         .sheets
         .get(sheet)
         .and_then(|s| s.auto_filter.as_ref())
         .ok_or(FilterError::NoFilter)?;
-    let (r1, c1, r2, c2): Area = af.range;
+    // Rows typed directly below the list are in it, as applying it will take
+    // them.
+    let (r1, c1, r2, c2): Area = grown_range(wb, sheet, af.range);
     if col < c1 || col > c2 {
         return Err(FilterError::NotInFilter);
     }
@@ -343,11 +367,15 @@ pub fn menu(
         });
     }
     let total = items.len();
-    let truncated = total > MENU_LIMIT;
-    if truncated {
+    let truncated = limit.is_some_and(|l| total > l);
+    if let Some(limit) = limit.filter(|_| truncated) {
         // `(Blanks)` stays listed at the end.
-        let blank = items.pop().filter(|i| i.blank);
-        items.truncate(MENU_LIMIT - usize::from(blank.is_some()));
+        let blank = items
+            .last()
+            .is_some_and(|i| i.blank)
+            .then(|| items.pop())
+            .flatten();
+        items.truncate(limit - usize::from(blank.is_some()));
         items.extend(blank);
     }
     // Colours only when some record shows one: a column of No Fill and the
@@ -373,4 +401,59 @@ pub fn menu(
         filtered: mine.is_some(),
         colors,
     })
+}
+
+/// The criteria a drop-down's checklist makes on OK: `listed` are the
+/// lines it showed (a [`menu`]'s items, for `search`) and `checks` whether
+/// each is checked. Every line checked clears the column (`None`), cut-short
+/// list or not. Otherwise a value checklist of the checked values, dates and
+/// `(Blanks)`; on a cut-short list the values it didn't show keep their
+/// current state, read from [`menu_all`].
+pub fn checklist_criteria(
+    wb: &Workbook,
+    sheet: usize,
+    col: u32,
+    search: Option<&str>,
+    listed: &[MenuItem],
+    checks: &[bool],
+    truncated: bool,
+) -> Result<Option<ColumnFilter>, FilterError> {
+    if checks.iter().all(|c| *c) && checks.len() >= listed.len() {
+        return Ok(None);
+    }
+    // Each line with its check: the listed ones as shown, the rest as the
+    // column's criterion leaves them.
+    let key = |i: &MenuItem| (i.label.clone(), i.date, i.blank);
+    let lines: Vec<(MenuItem, bool)> = if truncated {
+        let shown: HashMap<_, bool> = listed
+            .iter()
+            .zip(checks)
+            .map(|(i, c)| (key(i), *c))
+            .collect();
+        menu_all(wb, sheet, col, search)?
+            .items
+            .into_iter()
+            .map(|i| {
+                let on = shown.get(&key(&i)).copied().unwrap_or(i.checked);
+                (i, on)
+            })
+            .collect()
+    } else {
+        listed.iter().cloned().zip(checks.iter().copied()).collect()
+    };
+    let mut vals = Vec::new();
+    let mut dates = Vec::new();
+    let mut blank = false;
+    for (item, on) in lines {
+        if !on {
+            continue;
+        }
+        match item.date {
+            Some(g @ DateGroup { day: Some(_), .. }) => dates.push(g),
+            Some(_) => {}
+            None if item.blank => blank = true,
+            None => vals.push(item.label),
+        }
+    }
+    Ok(Some(ColumnFilter::Values { vals, blank, dates }))
 }

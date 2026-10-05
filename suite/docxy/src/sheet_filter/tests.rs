@@ -324,3 +324,113 @@ fn filter_and_sort_by_a_colour_from_the_drop_down() {
         .collect();
     assert_eq!(reps, ["Cy", "Ann", "Noor", "Bo", "Noor", "Cy"]);
 }
+
+/// The `values` check list's labels and checks.
+fn checklist(t: &DocTab) -> Vec<(String, bool)> {
+    let c = t
+        .dialogs
+        .top()
+        .unwrap()
+        .controls
+        .iter()
+        .find(|c| c.name == "values")
+        .unwrap();
+    let Value::Checks(checks) = &c.value else {
+        panic!("a check list")
+    };
+    c.items
+        .iter()
+        .cloned()
+        .zip(checks.iter().copied())
+        .collect()
+}
+
+#[test]
+fn ok_reads_the_list_shown_not_the_search_typed_since() {
+    // A search typed but not run: OK unchecks Bo from the full list.
+    let mut t = list();
+    toggle(&mut t).unwrap();
+    t.dialogs.push(menu_dialog(&t, 0).unwrap());
+    set(&mut t, "search", Json::Str("No".into()));
+    t.dialogs
+        .set(
+            "values",
+            &Json::obj(vec![
+                ("item", Json::Str("Bo".into())),
+                ("checked", Json::Bool(false)),
+            ]),
+        )
+        .unwrap();
+    press(&mut t, "OK").unwrap();
+    assert_eq!(shown(&mut t), vec![2, 3, 5, 6, 7]);
+    // A search run, then the box cleared: OK keeps the search's results.
+    t.dialogs.push(menu_dialog(&t, 0).unwrap());
+    set(&mut t, "search", Json::Str("oo".into()));
+    press(&mut t, "Search").unwrap();
+    assert_eq!(checklist(&t)[1].0, "Noor");
+    set(&mut t, "search", Json::Str(String::new()));
+    press(&mut t, "OK").unwrap();
+    assert_eq!(shown(&mut t), vec![2, 5]);
+}
+
+#[test]
+fn ok_on_an_untouched_list_keeps_a_non_checklist_criterion() {
+    let mut t = list();
+    toggle(&mut t).unwrap();
+    run(&mut t, |wb, s, today| {
+        let top = ColumnFilter::Top10 {
+            top: true,
+            percent: false,
+            val: 2.0,
+            filter_val: None,
+        };
+        gridcore::filter::set_criterion(wb, s, 1, Some(top), today)
+    })
+    .unwrap();
+    assert_eq!(shown(&mut t), vec![4, 5]);
+    t.dialogs.push(menu_dialog(&t, 1).unwrap());
+    // Nothing is checked: the column's filter isn't a checklist.
+    assert!(checklist(&t).iter().all(|(_, on)| !on));
+    press(&mut t, "OK").unwrap();
+    assert!(t.dialogs.top().is_none());
+    assert_eq!(shown(&mut t), vec![4, 5], "the Top 10 stays");
+}
+
+#[test]
+fn a_filter_command_that_fails_still_keeps_the_typed_value() {
+    let mut t = list();
+    let v = view(&mut t);
+    v.sel = (3, 0);
+    v.begin_cell_edit(None);
+    v.editing = Some("Zed".into());
+    // No filter on the sheet: Reapply refuses, but the typed value is in.
+    assert!(run(&mut t, gridcore::filter::reapply).is_err());
+    assert!(t.dirty, "the committed value makes the tab dirty");
+    let v = view(&mut t);
+    assert!(v.editing.is_none());
+    assert_eq!(
+        v.sheet().cell(3, 0).map(|c| c.value.clone()),
+        Some(gridcore::sheet::CellValue::Text("Zed".into()))
+    );
+}
+
+#[test]
+fn a_typed_date_compares_as_a_date_only_on_a_date_column() {
+    let mut t = list();
+    // Rep is text: `1-2-3` is matched as typed.
+    view(&mut t).pkg.workbook.sheets[0].set_cell(6, 0, Cell::text("x1-2-3y"));
+    toggle(&mut t).unwrap();
+    t.dialogs.push(custom_dialog(0, 0, "Rep", 10, false));
+    set(&mut t, "val1", Json::Str("1-2-3".into()));
+    press(&mut t, "OK").unwrap();
+    assert_eq!(shown(&mut t), vec![7]);
+    // When is a date column: `2024-03-13` is that date.
+    run(&mut t, |wb, s, today| {
+        gridcore::filter::clear(wb, s, None, today)
+    })
+    .unwrap();
+    t.dialogs.push(custom_dialog(0, 2, "When", 0, true));
+    set(&mut t, "val1", Json::Str("2024-03-13".into()));
+    press(&mut t, "OK").unwrap();
+    assert_eq!(shown(&mut t), vec![3]);
+}

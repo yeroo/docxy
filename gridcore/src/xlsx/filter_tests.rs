@@ -442,3 +442,19 @@ fn a_rule_we_do_not_evaluate_wins_by_precedence() {
         );
     }
 }
+
+#[test]
+fn a_winning_rule_that_sets_no_fill_does_not_hide_an_unevaluated_fill() {
+    // B2:B3: `> 1` sets only a red font at priority 1; Duplicate Values sets
+    // a pink fill at priority 2. The fill is unknown, the font red.
+    let rules = r#"<conditionalFormatting sqref="B2:B3"><cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>1</formula></cfRule><cfRule type="duplicateValues" dxfId="1" priority="2"/></conditionalFormatting>"#;
+    let dxfs = r#"<dxfs count="2"><dxf><font><color rgb="FFFF0000"/></font></dxf><dxf><fill><patternFill><bgColor rgb="FFFFC7CE"/></patternFill></fill></dxf></dxfs>"#;
+    let mut pkg = list(rules, dxfs);
+    pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+    let wb = &pkg.workbook;
+    assert_eq!(crate::cf::cell_fill(wb, 0, 1, 1), crate::cf::Shown::Unknown);
+    assert_eq!(
+        crate::cf::cell_font_color(wb, 0, 1, 1),
+        crate::cf::Shown::Rgb((255, 0, 0))
+    );
+}

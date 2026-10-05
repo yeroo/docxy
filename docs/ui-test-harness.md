@@ -209,7 +209,7 @@ gets re-routed, and a test fails if it drifts from what `cx.bind_keys`
 registers.
 
 Reference fields, for `focus`: `chart-range`, `chart-title`, `categories`,
-`series-name:N`, `series-values:N`, `cond-format`, `validation`, `sort`.
+`series-name:N`, `series-values:N`, `cond-format`, `validation`.
 Data › Text to Columns is a dialog (`text-to-columns`), driven with the
 `dialog-*` verbs like the others.
 
@@ -981,7 +981,7 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu: Cut, Copy, Paste, the Filter and Sort submenus, New Comment; #690, #691), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task) or `{"ribbon": [tab, group, command]}` | the menu, as `menu-read` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment; #690, #691), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task) or `{"ribbon": [tab, group, command]}` | the menu, as `menu-read` |
 | `menu-read` | `{}` | `{open: true, target, items}`, or `{open: false}` |
 | `menu-click` | `{label}` among the top-level items, or `{path: [labels]}` through submenus | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |

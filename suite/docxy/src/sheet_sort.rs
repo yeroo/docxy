@@ -15,7 +15,7 @@ use crate::{DocTab, Surface};
 use gridcore::edit::{
     SORT_WARNING, SortLevel, SortOn, SortOptions, sort_range, sort_region, sort_warning,
 };
-use gridcore::sheet::{CellValue, Workbook, col_name};
+use gridcore::sheet::{Workbook, col_name};
 
 type Area = (u32, u32, u32, u32);
 
@@ -39,16 +39,6 @@ pub(crate) enum OnTop {
 }
 
 const PROTECTED: &str = "The sheet is protected: unprotect it (Review › Protect Sheet) to sort it.";
-
-/// Excel's guess at a header row: text over a number in some column.
-fn guess_header(wb: &Workbook, s: usize, (r1, c1, r2, c2): Area) -> bool {
-    let sh = &wb.sheets[s];
-    (c1..=c2).any(|c| {
-        matches!(sh.cell(r1, c).map(|x| &x.value), Some(CellValue::Text(_)))
-            && (r1 + 1..=r2)
-                .any(|r| matches!(sh.cell(r, c).map(|x| &x.value), Some(CellValue::Number(_))))
-    })
-}
 
 /// Sort `area` of the view's sheet by `levels` as one undo step, after
 /// committing an open cell editor. A refusal (the editor can't commit, a cut
@@ -104,12 +94,14 @@ pub(crate) fn run(
     levels: &[SortLevel],
     opts: &SortOptions,
 ) -> Result<(), String> {
+    // A typed value the sort commits is an edit even if the sort refuses.
+    commit_first(tab)?;
     let Surface::Sheet(v) = &mut tab.surface else {
         return Err("Sort needs a spreadsheet".into());
     };
     match sort_view(v, area, levels, opts) {
-        Ok((n, changed, committed)) => {
-            if changed || committed {
+        Ok((n, changed, _)) => {
+            if changed {
                 tab.dirty = true;
             }
             tab.status = format!(
@@ -132,7 +124,7 @@ pub(crate) fn run(
 
 /// Commit an open cell editor before a sort works out its range (its row
 /// may move); refused while the entry can't commit. Whether it committed.
-fn commit_first(tab: &mut DocTab) -> Result<bool, String> {
+pub(crate) fn commit_first(tab: &mut DocTab) -> Result<bool, String> {
     let Surface::Sheet(v) = &mut tab.surface else {
         return Err("Sort needs a spreadsheet".into());
     };
@@ -185,10 +177,10 @@ fn target(tab: &DocTab, then: SortThen) -> Result<Result<(Area, bool), Dialog>, 
         if let Some((region, header)) = sort_warning(wb, s, sel) {
             return Ok(Err(warning_dialog(s, sel, region, header, then)));
         }
-        return Ok(Ok((sel, guess_header(wb, s, sel))));
+        return Ok(Ok((sel, gridcore::edit::guess_header(wb, s, sel))));
     }
-    let (region, _) = sort_region(wb, s, v.sel).ok_or("Select a cell in the data to sort")?;
-    Ok(Ok((region, guess_header(wb, s, region))))
+    let found = sort_region(wb, s, v.sel).ok_or("Select a cell in the data to sort")?;
+    Ok(Ok(found))
 }
 
 /// Sort A to Z / Z to A by the cursor's column.
@@ -641,7 +633,7 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
                 let Surface::Sheet(v) = &tab.surface else {
                     return Some(Err("Sort needs a spreadsheet".into()));
                 };
-                guess_header(&v.pkg.workbook, v.active, area)
+                gridcore::edit::guess_header(&v.pkg.workbook, v.active, area)
             };
             tab.dialogs.pop();
             Some(match then {

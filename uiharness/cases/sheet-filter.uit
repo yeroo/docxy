@@ -76,6 +76,16 @@ test sheet filter cell menu filters by the selected cell's value
   assert status is 1 of 4 records found
   assert dirty is true
 
+# A right-click on a cell outside the selection selects it first, as Excel
+# does: the filter takes the cell under the pointer, not A2.
+test sheet filter cell menu right-clicked without a click first
+  open ../fixtures/basic.xlsx
+  click A2
+  call menu-open {"cell":"A4"}
+  assert sel is A4
+  call menu-click {"path":["Filter","Filter by Selected Cell's Value"]}
+  assert status is 1 of 4 records found
+
 test sheet filter advanced filter in place
   open ../fixtures/basic.xlsx
   click E1

@@ -132,6 +132,8 @@ pub(crate) enum DialogOwner {
     CustomFilter {
         sheet: usize,
         col: u32,
+        /// The column holds dates: a typed `YYYY-MM-DD` compares as a date.
+        date: bool,
     },
     Top10Filter {
         sheet: usize,
@@ -643,8 +645,6 @@ fn shown(label: &str) -> String {
     label.replace('&', "")
 }
 
-/// How a label is matched: case-insensitive, without `&` accelerator marks or
-/// a trailing colon, so `"&Name:"` answers to `name`.
 /// Check (or clear) item `k` of a check list and the items under it, then
 /// mark each item that has items under it checked exactly when they all are.
 pub(crate) fn check_tree(checks: &mut [bool], depths: &[u8], k: usize, on: bool) {
@@ -675,6 +675,8 @@ pub(crate) fn check_tree(checks: &mut [bool], depths: &[u8], k: usize, on: bool)
     }
 }
 
+/// How a label is matched: case-insensitive, without `&` accelerator marks or
+/// a trailing colon, so `"&Name:"` answers to `name`.
 fn fold(label: &str) -> String {
     label
         .replace('&', "")

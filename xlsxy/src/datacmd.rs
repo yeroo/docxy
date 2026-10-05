@@ -3,7 +3,7 @@
 //! leaves its outcome in the status line.
 
 use gridcore::edit::{SortLevel, SortOn, SortOptions};
-use gridcore::filter::{ColumnFilter, DateGroup, FilterError, FilterMenu, FilterOutcome};
+use gridcore::filter::{ColumnFilter, FilterError, FilterMenu, FilterOutcome};
 use gridcore::sheet::Workbook;
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
@@ -149,6 +149,9 @@ pub(crate) struct FilterPicker {
     /// "Add current selection to filter" for a search.
     pub add: bool,
     pub sel: usize,
+    /// A check was changed since the picker opened (or the search moved
+    /// it): Enter on an untouched list leaves the column's criterion alone.
+    pub touched: bool,
 }
 
 impl FilterPicker {
@@ -365,18 +368,6 @@ pub(crate) fn parse_sort_text(
     Ok((levels, opts, header))
 }
 
-/// Excel's guess at a header: the first row holds text over a number in
-/// some column.
-fn guess_header(wb: &Workbook, si: usize, (r1, c1, r2, c2): Area) -> bool {
-    use gridcore::sheet::CellValue;
-    let s = &wb.sheets[si];
-    (c1..=c2).any(|c| {
-        matches!(s.cell(r1, c).map(|x| &x.value), Some(CellValue::Text(_)))
-            && (r1 + 1..=r2)
-                .any(|r| matches!(s.cell(r, c).map(|x| &x.value), Some(CellValue::Number(_))))
-    })
-}
-
 impl App {
     /// Sort ↑ / ↓: the cursor's column ascending or descending.
     pub(crate) fn quick_sort(&mut self, asc: bool) {
@@ -427,7 +418,8 @@ impl App {
             }
             sel
         };
-        opts.header = header.unwrap_or_else(|| !opts.left_to_right && guess_header(wb, si, area));
+        opts.header = header
+            .unwrap_or_else(|| !opts.left_to_right && gridcore::edit::guess_header(wb, si, area));
         self.run_sort(area, &levels, &opts);
     }
 
@@ -456,7 +448,8 @@ impl App {
         let area = match text.trim().to_lowercase().chars().next() {
             Some('e') => {
                 if !p.header_given {
-                    opts.header = p.region_header && guess_header(&self.pkg.workbook, si, p.region);
+                    opts.header = p.region_header
+                        && gridcore::edit::guess_header(&self.pkg.workbook, si, p.region);
                 }
                 p.region
             }
@@ -496,6 +489,7 @@ impl App {
                     search: String::new(),
                     add: false,
                     sel: PICKER_ACTIONS,
+                    touched: false,
                 });
                 true
             }
@@ -539,6 +533,7 @@ impl App {
             KeyCode::End => p.sel = n - 1,
             KeyCode::Tab => p.add = !p.add,
             KeyCode::Char(' ') if p.sel >= PICKER_ACTIONS => {
+                p.touched = true;
                 let i = p.sel - PICKER_ACTIONS;
                 let on = !p.checks[i];
                 if i == 0 {
@@ -577,10 +572,8 @@ impl App {
         match p.sel {
             0 | 1 => {
                 let si = self.sheet;
-                let range = self.pkg.workbook.sheets[si]
-                    .auto_filter
-                    .as_ref()
-                    .map(|a| a.range);
+                // The list as the filter takes it: rows typed below included.
+                let range = gridcore::filter::filter_range(&self.pkg.workbook, si);
                 if let Some((r1, c1, r2, c2)) = range {
                     let opts = SortOptions {
                         header: true,
@@ -611,29 +604,28 @@ impl App {
                     gridcore::filter::search(wb, si, col, &pattern, add, today)
                 });
             }
+            // An untouched list keeps the column's criterion (a Top 10 or a
+            // colour filter shows here as nothing checked).
+            _ if !p.touched => {}
             _ => {
-                let f = if p.checks[0] && !p.menu.truncated {
-                    None
-                } else {
-                    let mut vals = Vec::new();
-                    let mut dates = Vec::new();
-                    let mut blank = false;
-                    for (item, on) in p.menu.items.iter().zip(&p.checks[1..]) {
-                        if !on {
-                            continue;
-                        }
-                        match item.date {
-                            Some(g @ DateGroup { day: Some(_), .. }) => dates.push(g),
-                            Some(_) => {}
-                            None if item.blank => blank = true,
-                            None => vals.push(item.label.clone()),
-                        }
+                let si = self.sheet;
+                let f = gridcore::filter::checklist_criteria(
+                    &self.pkg.workbook,
+                    si,
+                    col,
+                    None,
+                    &p.menu.items,
+                    &p.checks[1..],
+                    p.menu.truncated,
+                );
+                match f {
+                    Ok(f) => {
+                        let _ = self.filter_command(|wb, si, today| {
+                            gridcore::filter::set_criterion(wb, si, col, f, today)
+                        });
                     }
-                    Some(ColumnFilter::Values { vals, blank, dates })
-                };
-                let _ = self.filter_command(|wb, si, today| {
-                    gridcore::filter::set_criterion(wb, si, col, f, today)
-                });
+                    Err(e) => self.status = Some(e.to_string()),
+                }
             }
         }
     }
@@ -1072,5 +1064,24 @@ mod tests {
         a.commit_filter_by_cell("v");
         assert_eq!(a.status.as_deref(), Some("1 of 5 records found"));
         assert!(a.sheet().auto_filter.is_some());
+    }
+
+    #[test]
+    fn enter_on_an_untouched_list_keeps_a_non_checklist_criterion() {
+        let mut a = regions();
+        a.ribbon_act(crate::ribbon::Act::Filter);
+        a.cur = (0, 2); // Amount's button
+        assert!(a.open_filter_picker());
+        a.filter_picker.as_mut().unwrap().sel = 3;
+        a.filter_picker_key(KeyCode::Enter);
+        a.prompt = None;
+        a.commit_custom_filter("top 2");
+        assert_eq!(a.status.as_deref(), Some("2 of 5 records found"));
+        // Reopen: nothing is checked (it isn't a checklist); Enter leaves it.
+        assert!(a.open_filter_picker());
+        a.filter_picker_key(KeyCode::Enter);
+        assert_eq!(a.status.as_deref(), Some("2 of 5 records found"));
+        let af = a.sheet().auto_filter.as_ref().unwrap();
+        assert!(matches!(af.criteria[0].1, ColumnFilter::Top10 { .. }));
     }
 }

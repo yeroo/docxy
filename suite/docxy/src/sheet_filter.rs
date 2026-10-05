@@ -11,14 +11,12 @@
 
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::{DocTab, Surface};
-use gridcore::filter::{
-    AdvancedFilter, ByCell, ColumnFilter, DateGroup, FilterError, FilterOutcome, Submenu,
-};
+use gridcore::filter::{AdvancedFilter, ByCell, ColumnFilter, FilterError, FilterOutcome, Submenu};
 use gridcore::sheet::{Workbook, cell_name, col_name};
 
-/// Excel's refusal on a protected sheet.
 type Area = (u32, u32, u32, u32);
 
+/// Excel's refusal on a protected sheet.
 const PROTECTED: &str =
     "The sheet is protected: unprotect it (Review › Protect Sheet) to filter it.";
 
@@ -48,7 +46,10 @@ pub(crate) fn run(
     if v.pkg.workbook.sheets[s].is_protected() {
         return Err(PROTECTED.into());
     }
-    let committed = v.commit_edit();
+    // The typed value is an edit whatever the command then does.
+    if v.commit_edit() {
+        tab.dirty = true;
+    }
     if v.editing.is_some() {
         return Err("Finish the cell you are typing in first".into());
     }
@@ -76,7 +77,7 @@ pub(crate) fn run(
         v.engine.clock = clock;
         v.engine.recalc_all(&mut v.pkg.workbook);
     }
-    if changed || committed {
+    if changed {
         tab.dirty = true;
     }
     tab.status = gridcore::filter::status_text(&outcome).into();
@@ -358,6 +359,15 @@ pub(crate) fn menu_dialog(tab: &DocTab, col: u32) -> Result<Dialog, String> {
             b.enabled = !m.colors.is_empty();
         }
     }
+    // The search the checklist was last built for: OK reads the list it
+    // shows, not what the box says now.
+    let mut searched = Control::new(
+        "searched",
+        "",
+        ControlKind::Text,
+        Value::Text(String::new()),
+    );
+    searched.visible = false;
     d.controls = vec![
         color,
         typed,
@@ -375,6 +385,7 @@ pub(crate) fn menu_dialog(tab: &DocTab, col: u32) -> Result<Dialog, String> {
         ),
         values_control(&m, false),
         note,
+        searched,
     ];
     d.mark_opened();
     Ok(d)
@@ -410,12 +421,18 @@ fn values_control(m: &gridcore::filter::FilterMenu, searching: bool) -> Control 
 }
 
 /// Custom AutoFilter for column `col`, its first operator preset.
-pub(crate) fn custom_dialog(sheet: usize, col: u32, header: &str, op1: usize) -> Dialog {
+pub(crate) fn custom_dialog(
+    sheet: usize,
+    col: u32,
+    header: &str,
+    op1: usize,
+    date: bool,
+) -> Dialog {
     let mut d = dialog(
         "custom-autofilter",
         "Custom AutoFilter".into(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],
-        DialogOwner::CustomFilter { sheet, col },
+        DialogOwner::CustomFilter { sheet, col, date },
     );
     let ops: Vec<String> = OPERATORS.iter().map(|o| o.0.to_string()).collect();
     let mut first = Control::new(
@@ -566,7 +583,10 @@ fn operand(text: &str, date1904: bool) -> String {
 }
 
 /// The Custom AutoFilter dialog's criteria.
-fn custom_criteria(d: &Dialog, date1904: bool) -> Result<ColumnFilter, String> {
+/// The Custom AutoFilter dialog's criteria. On a date column (`date`) a
+/// typed `YYYY-MM-DD` compares as that date; a wildcard pattern (begins
+/// with, contains, …) and any other column keep the text as typed.
+fn custom_criteria(d: &Dialog, date1904: bool, date: bool) -> Result<ColumnFilter, String> {
     let mut conds = Vec::new();
     for (op, val) in [("op1", "val1"), ("op2", "val2")] {
         let Some(label) = choice_of(d, op) else {
@@ -575,7 +595,12 @@ fn custom_criteria(d: &Dialog, date1904: bool) -> Result<ColumnFilter, String> {
         let Some((_, stored, pat)) = OPERATORS.iter().find(|o| o.0 == label) else {
             continue;
         };
-        let v = operand(&text_of(d, val), date1904);
+        let typed = text_of(d, val);
+        let v = if date && *pat == "{}" {
+            operand(&typed, date1904)
+        } else {
+            typed
+        };
         conds.push((stored.to_string(), pat.replace("{}", &v)));
     }
     if conds.is_empty() {
@@ -585,32 +610,6 @@ fn custom_criteria(d: &Dialog, date1904: bool) -> Result<ColumnFilter, String> {
         and: choice_of(d, "join").as_deref() != Some("Or"),
         conds,
     })
-}
-
-/// The value checklist as criteria: `None` when every value is checked.
-fn checklist_criteria(d: &Dialog, m: &gridcore::filter::FilterMenu) -> Option<ColumnFilter> {
-    let checks = match control(d, "values").map(|c| &c.value) {
-        Some(Value::Checks(c)) => c.clone(),
-        _ => return None,
-    };
-    if checks.first() == Some(&true) && !m.truncated {
-        return None;
-    }
-    let mut vals = Vec::new();
-    let mut dates = Vec::new();
-    let mut blank = false;
-    for (item, on) in m.items.iter().zip(checks.iter().skip(1)) {
-        if !on {
-            continue;
-        }
-        match item.date {
-            Some(g @ DateGroup { day: Some(_), .. }) => dates.push(g),
-            Some(_) => {}
-            None if item.blank => blank = true,
-            None => vals.push(item.label.clone()),
-        }
-    }
-    Some(ColumnFilter::Values { vals, blank, dates })
 }
 
 fn presses(d: &Dialog, button: &str, label: &str) -> bool {
@@ -624,7 +623,7 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
     let top = tab.dialogs.top()?;
     match top.owner {
         DialogOwner::FilterMenu { sheet, col } => menu_click(tab, sheet, col, button),
-        DialogOwner::CustomFilter { col, .. } => {
+        DialogOwner::CustomFilter { col, date, .. } => {
             if !presses(top, button, "OK") {
                 return None;
             }
@@ -632,7 +631,7 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
                 Surface::Sheet(v) => v.pkg.workbook.date1904,
                 _ => false,
             };
-            let f = match custom_criteria(top, date1904) {
+            let f = match custom_criteria(top, date1904, date) {
                 Ok(f) => f,
                 Err(e) => return Some(Err(e)),
             };
@@ -733,7 +732,13 @@ fn menu_click(
     let Surface::Sheet(v) = &tab.surface else {
         return Some(Err("Filter needs a spreadsheet".into()));
     };
-    let search = text_of(top, "search");
+    // Search builds the list for the box's text; everything else reads the
+    // list the checklist shows, built for the last Search.
+    let search = if label == "Search" {
+        text_of(top, "search")
+    } else {
+        text_of(top, "searched")
+    };
     let m = match gridcore::filter::menu(
         &v.pkg.workbook,
         sheet,
@@ -747,7 +752,8 @@ fn menu_click(
     Some(match label {
         "Sort A to Z" | "Sort Z to A" => {
             let asc = label == "Sort A to Z";
-            let range = v.sheet().auto_filter.as_ref().map(|a| a.range);
+            // The list as the filter takes it: rows typed below included.
+            let range = gridcore::filter::filter_range(&v.pkg.workbook, sheet);
             tab.dialogs.pop();
             match range {
                 Some(r) => crate::sheet_sort::sort_now(tab, r, true, col, asc),
@@ -769,7 +775,7 @@ fn menu_click(
                     gridcore::filter::set_criterion(wb, s, col, Some(choice.criterion()), today)
                 }));
             }
-            let range = v.sheet().auto_filter.as_ref().map(|a| a.range);
+            let range = gridcore::filter::filter_range(&v.pkg.workbook, sheet);
             tab.dialogs.pop();
             match range {
                 Some(r) => {
@@ -792,6 +798,9 @@ fn menu_click(
             if let Ok(d) = tab.dialogs.top_dialog_mut() {
                 if let Some(c) = control_mut(d, "values") {
                     *c = values_control(&m, searching);
+                }
+                if let Some(c) = control_mut(d, "searched") {
+                    c.value = Value::Text(search);
                 }
             }
             Ok(())
@@ -829,7 +838,8 @@ fn menu_click(
                             "Does Not Contain..." => 11,
                             _ => 0,
                         };
-                    let mut d = custom_dialog(sheet, col, &header, op);
+                    let date = m.submenu == Submenu::Date;
+                    let mut d = custom_dialog(sheet, col, &header, op, date);
                     if entry == "Between..." {
                         if let Some(c) = control_mut(&mut d, "op2") {
                             c.value = Value::Choice(Some(5));
@@ -843,21 +853,37 @@ fn menu_click(
         }
         _ => {
             // OK: a search applies its results (added to the current
-            // checklist with "Add current selection"); else the checklist.
-            let all_checked = matches!(
-                control(top, "values").map(|c| &c.value),
-                Some(Value::Checks(c)) if c.first() == Some(&true)
-            );
+            // checklist with "Add current selection"); an untouched list
+            // leaves the column's criterion as it is (a Top 10 or a colour
+            // filter shows there as nothing checked); else the checklist.
+            let checks = match control(top, "values").map(|c| &c.value) {
+                Some(Value::Checks(c)) => c.clone(),
+                _ => Vec::new(),
+            };
             let add = checked(top, "add");
-            if !search.is_empty() && all_checked {
+            if !search.is_empty() && checks.first() == Some(&true) {
                 apply_and_close(tab, move |wb, s, today| {
                     gridcore::filter::search(wb, s, col, &search, add, today)
                 })
+            } else if search.is_empty() && !top.changed("values") {
+                tab.dialogs.pop();
+                Ok(())
             } else {
-                let f = checklist_criteria(top, &m);
-                apply_and_close(tab, move |wb, s, today| {
-                    gridcore::filter::set_criterion(wb, s, col, f, today)
-                })
+                let f = gridcore::filter::checklist_criteria(
+                    &v.pkg.workbook,
+                    sheet,
+                    col,
+                    (!search.is_empty()).then_some(search.as_str()),
+                    &m.items,
+                    checks.get(1..).unwrap_or_default(),
+                    m.truncated,
+                );
+                match f {
+                    Ok(f) => apply_and_close(tab, move |wb, s, today| {
+                        gridcore::filter::set_criterion(wb, s, col, f, today)
+                    }),
+                    Err(e) => Err(e.to_string()),
+                }
             }
         }
     })

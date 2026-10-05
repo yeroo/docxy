@@ -2136,6 +2136,21 @@ fn menu_open(
             Ok(())
         }
         Json::Obj(fields) if fields.len() == 1 => match fields[0].0.as_str() {
+            // A right-click on that cell: outside the selection it selects
+            // it, then the cell menu opens (#690, #691).
+            "cell" => {
+                if !app.active_is_sheet() {
+                    return Err("the cell menu opens on a sheet tab".into());
+                }
+                let name = fields[0]
+                    .1
+                    .as_str()
+                    .ok_or("'cell' must be a cell, e.g. D7")?;
+                let (r, c) = parse_cell(name)?;
+                let at = menu_point(app, window, None, |b| b.center());
+                app.cell_right_click(r, c, at, window, cx);
+                Ok(())
+            }
             "row" => {
                 let uid = match &fields[0].1 {
                     Json::Null => None,

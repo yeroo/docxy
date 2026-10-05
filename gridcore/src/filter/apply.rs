@@ -232,6 +232,14 @@ pub fn auto_filter_extend(wb: &mut Workbook, sheet: usize, last: u32) -> Result<
     Ok(af.range)
 }
 
+/// The sheet's AutoFilter range as the next filter command will take it:
+/// grown over rows typed directly below it. What a sort of the filtered
+/// list should cover.
+pub fn filter_range(wb: &Workbook, sheet: usize) -> Option<Area> {
+    let af = wb.sheets.get(sheet)?.auto_filter.as_ref()?;
+    Some(grown_range(wb, sheet, af.range))
+}
+
 /// Turn AutoFilter off: every row of its range is shown again (Excel keeps no
 /// record of why a row is hidden), and the filter and its name go. Whether
 /// the sheet had one.
@@ -465,7 +473,7 @@ pub fn filter_by_cell(
 /// `range` grown down over the rows typed directly below it: a non-blank
 /// cell in its columns on the next row extends it (Excel takes such rows
 /// into the list the next time the filter is applied).
-fn grown_range(wb: &Workbook, sheet: usize, range: Area) -> Area {
+pub(crate) fn grown_range(wb: &Workbook, sheet: usize, range: Area) -> Area {
     let (r1, c1, mut r2, c2) = range;
     let Some(s) = wb.sheets.get(sheet) else {
         return range;

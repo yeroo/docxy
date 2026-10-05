@@ -19,10 +19,13 @@ pub use advanced::{ADVANCED_OTHER_SHEET, AdvancedFilter, advanced};
 pub(crate) use apply::shown_text;
 pub use apply::{
     ByCell, FilterError, FilterOutcome, auto_filter_extend, auto_filter_off, auto_filter_on,
-    auto_filter_on_range, clear, filter_by_cell, reapply, search, set_criterion, status_text,
+    auto_filter_on_range, clear, filter_by_cell, filter_range, reapply, search, set_criterion,
+    status_text,
 };
 pub use dates::DYNAMIC_KINDS;
-pub use menu::{ColorChoice, FilterMenu, MENU_LIMIT, MenuItem, Submenu, menu};
+pub use menu::{
+    ColorChoice, FilterMenu, MENU_LIMIT, MenuItem, Submenu, checklist_criteria, menu, menu_all,
+};
 
 /// Parse a filter criteria into `(operator, operand)`: ">500", "<=100", "<>X",
 /// "=Laptop", or a plain value. Unlike the CF parser, the default operator is
@@ -107,7 +110,7 @@ pub struct AutoFilter {
 
 /// One `<dateGroupItem>` of a value checklist: a whole year, a month of it,
 /// or a day of that month.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DateGroup {
     pub year: i64,
     pub month: Option<u32>,
