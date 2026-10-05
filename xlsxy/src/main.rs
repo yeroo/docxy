@@ -5132,7 +5132,8 @@ impl App {
                 self.dv_picker = None;
                 let (r, c) = self.cur;
                 // A range choice goes in as its own value, an inline item as
-                // typing it would: an item of the list the entry check reads.
+                // typing its label would be (stored as text where typing would
+                // make a formula or quote-prefixed text): what passes the check.
                 let Ok(cell) = gridcore::validation::pick_cell(
                     &mut self.pkg.workbook,
                     self.sheet,

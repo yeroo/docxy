@@ -231,8 +231,15 @@ fn resolve_ref(wb: &Workbook, sheet: usize, src: &str) -> Option<Vec<CellValue>>
 /// The source formula of a list rule for the cell (row, col): its formula
 /// without `=`, relative references shifted from the rule's anchor.
 fn list_source(dv: &DataValidation, row: u32, col: u32) -> String {
+    formula_at(dv, &dv.formula1, row, col)
+}
+
+/// A rule's formula `src` (without any `=`) as it reads at (row, col):
+/// written for the rule's anchor, its relative references shifted by how far
+/// the cell is from it.
+fn formula_at(dv: &DataValidation, src: &str, row: u32, col: u32) -> String {
     let (ar, ac) = anchor(dv);
-    let src = dv.formula1.trim().trim_start_matches('=');
+    let src = src.trim().trim_start_matches('=');
     if ar == u32::MAX || (row, col) == (ar, ac) {
         return src.to_string();
     }
@@ -247,7 +254,8 @@ fn list_source(dv: &DataValidation, row: u32, col: u32) -> String {
 /// One choice of the in-cell dropdown: what it shows, and (for a choice read
 /// from a range) the value it stands for, since a label can round (`3.14` for
 /// 3.14127). An inline item has no value: picking it enters its label as
-/// typing it would.
+/// typing it would, or stores it as text where typing would make a formula or
+/// quote-prefixed text ([`pick_cell`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ListChoice {
     pub label: String,
@@ -263,8 +271,10 @@ pub struct ListChoice {
 /// with the cell's own style, and the source's number format when the cell has
 /// none, so a picked date shows as a date. An inline item is entered as typing
 /// its label would be: under the cell's own style (`@` keeps `001` text, `0%`
-/// reads `10` as 10%), today's date for a yearless one. Either way the entry
-/// check accepts it.
+/// reads `10` as 10%), today's date for a yearless one; except that an item
+/// typing would make a formula or quote-prefixed text (`=1+1`, `'01`) is
+/// stored as its text ([`inline_pick`]). Either way the entry check accepts
+/// it.
 pub fn pick_cell(
     wb: &mut Workbook,
     sheet: usize,
@@ -273,23 +283,17 @@ pub fn pick_cell(
     choice: &ListChoice,
     today: Option<f64>,
 ) -> Result<Cell, crate::entry::EntryError> {
-    let Some(value) = &choice.value else {
-        let xf = target_xf(wb, sheet, row, col);
-        if !inline_pick(wb, &xf, &choice.label, today).1 {
-            return crate::entry::entry_cell(wb, sheet, row, col, &choice.label, today);
+    let value = match &choice.value {
+        Some(v) => v.clone(),
+        None => {
+            // Typing the label, unless that would make a formula or
+            // quote-prefixed text: those are stored as the label's text.
+            let xf = target_xf(wb, sheet, row, col);
+            if !inline_pick(wb, &xf, &choice.label, today).1 {
+                return crate::entry::entry_cell(wb, sheet, row, col, &choice.label, today);
+            }
+            CellValue::Text(choice.label.clone())
         }
-        // Stored as the label's text, in the cell's own style.
-        let mut cell = wb
-            .sheets
-            .get(sheet)
-            .and_then(|s| s.cell(row, col))
-            .cloned()
-            .unwrap_or_default();
-        cell.value = CellValue::Text(choice.label.clone());
-        cell.formula = None;
-        cell.f_attrs = None;
-        cell.spill = None;
-        return Ok(cell);
     };
     let mut cell = wb
         .sheets
@@ -297,7 +301,7 @@ pub fn pick_cell(
         .and_then(|s| s.cell(row, col))
         .cloned()
         .unwrap_or_default();
-    cell.value = value.clone();
+    cell.value = value;
     cell.formula = None;
     cell.f_attrs = None;
     cell.spill = None;
@@ -385,17 +389,7 @@ fn eval_rule(
     dv: &DataValidation,
     src: &str,
 ) -> Value {
-    let (ar, ac) = anchor(dv);
-    let (dr, dc) = (
-        i64::from(row) - i64::from(ar),
-        i64::from(col) - i64::from(ac),
-    );
-    let src = src.trim().trim_start_matches('=');
-    let shifted = if ar == u32::MAX || (dr, dc) == (0, 0) {
-        src.to_string()
-    } else {
-        translate_formula(src, dr, dc).unwrap_or_else(|| src.to_string())
-    };
+    let shifted = formula_at(dv, src, row, col);
     eval_formula_at(wb, sheet, row, col, &shifted)
 }
 
@@ -477,8 +471,8 @@ fn target_xf(wb: &Workbook, sheet: usize, row: u32, col: u32) -> crate::sheet::X
 
 /// What typing the inline list item `item` into a cell formatted `xf` gives
 /// (at the host's clock `today`), when it is a number, boolean, date or error
-/// rather than text: the reading the entry check and a dropdown pick (which
-/// enters the label as typed) share.
+/// rather than text: the entry check's reading of an inline item. (What a pick
+/// stores is [`inline_pick`]'s.)
 fn inline_entry(
     wb: &Workbook,
     xf: &crate::sheet::Xf,
@@ -2242,23 +2236,33 @@ mod tests {
     fn every_offered_inline_item_passes_the_check_after_a_pick_and_when_typed() {
         let items = [
             "3/15", "-1/2", "'01", "@home", "=1+1", "1/2", "TRUE", "10%", "001", "#N/A", "1e3",
-            " padded ", "plain",
+            "padded", "plain",
         ];
-        let mut offered = 0;
+        // What is offered, per target format: everything but `#N/A`, which
+        // typed into a General or percent cell is an error the check refuses
+        // (under `@` it is text).
+        let not_offered = |code: Option<&str>| -> Vec<&str> {
+            if code == Some("@") {
+                vec![]
+            } else {
+                vec!["#N/A"]
+            }
+        };
         for code in [None, Some("@"), Some("0%")] {
+            let mut offered_labels = Vec::new();
             for item in items {
                 let mut wb = inline_book(&format!("{item},zzz"), code);
                 let choices = list_choices(&wb, 0, 9, 3, Some(CLOCK)).unwrap();
-                for (n, c) in choices.iter().enumerate() {
-                    offered += 1;
+                for c in choices.iter().filter(|c| c.label != "zzz") {
+                    offered_labels.push(c.label.clone());
                     let cell = pick_cell(&mut wb, 0, 9, 3, c, Some(CLOCK)).unwrap();
                     assert!(
                         check_entry(&mut wb, 0, 9, 3, &cell, Some(CLOCK)).is_none(),
-                        "pick of {:?} (#{n}) under {code:?} gives {:?}",
+                        "pick of {:?} under {code:?} gives {:?}",
                         c.label,
                         cell.value
                     );
-                    // Typing the label passes too, wherever typing it gives the
+                    // Typing the label passes too, wherever typing gives the
                     // value the pick stores. Where it can't (`=1+1` and `-1/2`
                     // type as formulas, `'01` as quote-prefixed `01`), the pick
                     // stores the label as text and typing is not comparable:
@@ -2275,7 +2279,12 @@ mod tests {
                     }
                 }
             }
+            let want: Vec<&str> = items
+                .iter()
+                .copied()
+                .filter(|i| !not_offered(code).contains(i))
+                .collect();
+            assert_eq!(offered_labels, want, "offered under {code:?}");
         }
-        assert!(offered > 20, "the table offers most items ({offered})");
     }
 }
