@@ -524,9 +524,7 @@ mod tests {
             kind: "custom".into(),
             operator: String::new(),
             formula1: "ISNUMBER(B2)".into(),
-            formula2: String::new(),
-            prompt: None,
-            ix: None,
+            ..DataValidation::default()
         });
         delete_record(&mut wb, 0, AREA, 1);
         let s = &wb.sheets[0];

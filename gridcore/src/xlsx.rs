@@ -1997,7 +1997,16 @@ fn parse_worksheet(
                         formula1: String::new(),
                         formula2: String::new(),
                         prompt,
+                        prompt_title: decode(p.attr("promptTitle")),
+                        allow_blank: flag_attr(p.attr("allowBlank")),
+                        show_input: flag_attr(p.attr("showInputMessage")),
+                        show_error: flag_attr(p.attr("showErrorMessage")),
+                        show_dropdown: !flag_attr(p.attr("showDropDown")),
+                        error_style: crate::sheet::AlertStyle::from_attr(p.attr("errorStyle")),
+                        error_title: decode(p.attr("errorTitle")),
+                        error: decode(p.attr("error")),
                         ix: dv_spans.iter().position(|&(s, _)| s == start),
+                        orig: None,
                     });
                 }
                 "formula1" if cur_dv.is_some() => {
@@ -2081,8 +2090,9 @@ fn parse_worksheet(
                     }
                 }
                 "dataValidation" => {
-                    if let Some(dv) = cur_dv.take() {
+                    if let Some(mut dv) = cur_dv.take() {
                         if !dv.ranges.is_empty() && dv.is_meaningful() {
+                            dv.orig = Some(Box::new(dv.clone()));
                             sheet.validations.push(dv);
                         }
                     }
@@ -3820,6 +3830,11 @@ fn cond_format_spans(xml: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// An XML boolean attribute's value (`1` / `true`).
+fn flag_attr(v: &str) -> bool {
+    matches!(v, "1" | "true")
+}
+
 /// A (start, end) byte span in a part.
 type Span = (usize, usize);
 
@@ -4097,8 +4112,150 @@ fn set_cond_formats(xml: String, sheet: &Sheet) -> String {
 /// [`set_cond_formats`] does the conditional formatting: `sqref`,
 /// `<formula1>` and `<formula2>` follow a moved rule, a deleted one
 /// ([`Sheet::dv_removed`]) loses its element, and the `<dataValidations>`
-/// around them keeps a right `count`, or goes once it holds none.
+/// around them keeps a right `count`, or goes once it holds none. A rule the
+/// dialog edited has the attributes that differ from the part
+/// ([`crate::sheet::DataValidation::orig`]) written in place, every other
+/// attribute (unknown ones too) kept; a rule built in memory is appended.
 fn set_validations(xml: String, sheet: &Sheet) -> String {
+    let xml = edit_validations(xml, sheet);
+    let new: Vec<&crate::sheet::DataValidation> = sheet
+        .validations
+        .iter()
+        .filter(|dv| dv.ix.is_none() && dv.orig.is_none() && !dv.ranges.is_empty())
+        .collect();
+    let mut xml = xml;
+    for dv in new {
+        let item = dv_element(dv);
+        xml = match append_to_worksheet_child(&xml, "dataValidations", &item, None) {
+            Some(xml) => xml,
+            None if worksheet_takes(&xml, "dataValidations", true) => {
+                let block = format!("<dataValidations count=\"1\">{item}</dataValidations>");
+                put_worksheet_child(&xml, "dataValidations", &block, None, false)
+            }
+            None => xml,
+        };
+    }
+    xml
+}
+
+/// A new `<dataValidation>` element for `dv`, attributes at their defaults
+/// left out.
+fn dv_element(dv: &crate::sheet::DataValidation) -> String {
+    let mut attrs = String::new();
+    let mut put = |name: &str, value: &str| {
+        attrs.push_str(&format!(" {name}=\"{}\"", esc_attr(value)));
+    };
+    for (name, value) in dv_attrs(dv) {
+        if let Some(value) = value {
+            put(name, &value);
+        }
+    }
+    put("sqref", &sqref_of(&dv.ranges));
+    let mut kids = String::new();
+    for (tag, f) in [("formula1", &dv.formula1), ("formula2", &dv.formula2)] {
+        if !f.is_empty() {
+            kids.push_str(&format!("<{tag}>{}</{tag}>", esc_text(&file_formula(f))));
+        }
+    }
+    format!("<dataValidation{attrs}>{kids}</dataValidation>")
+}
+
+/// The attributes of `dv` other than `sqref`, in schema order, each `None`
+/// when it is at its default and so absent from the element.
+fn dv_attrs(dv: &crate::sheet::DataValidation) -> [(&'static str, Option<String>); 11] {
+    use crate::sheet::AlertStyle;
+    let text = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    let flag = |on: bool| on.then(|| "1".to_string());
+    [
+        ("type", text(&dv.kind).filter(|k| k != "none")),
+        (
+            "errorStyle",
+            (dv.error_style != AlertStyle::Stop).then(|| dv.error_style.attr().to_string()),
+        ),
+        ("operator", text(&dv.operator)),
+        ("allowBlank", flag(dv.allow_blank)),
+        ("showDropDown", flag(!dv.show_dropdown)),
+        ("showInputMessage", flag(dv.show_input)),
+        ("showErrorMessage", flag(dv.show_error)),
+        ("errorTitle", text(&dv.error_title)),
+        ("error", text(&dv.error)),
+        ("promptTitle", text(&dv.prompt_title)),
+        ("prompt", dv.prompt.clone()),
+    ]
+}
+
+/// `element` with its start tag's `attr` taken out; unchanged when absent.
+fn remove_tag_attr(mut element: String, attr: &str) -> String {
+    let Some(tag) = start_tag(&element) else {
+        return element;
+    };
+    let Some(&(_, vs, ve)) = tag.attrs.iter().find(|(name, _, _)| *name == attr) else {
+        return element;
+    };
+    let Some(name_at) = element[..vs].rfind(attr) else {
+        return element;
+    };
+    // The whitespace before the name goes with it; the closing quote too.
+    let from = element[..name_at].trim_end().len();
+    element.replace_range(from..ve + 1, "");
+    element
+}
+
+/// `element` with the attributes of `dv` that differ from `orig` written.
+fn dv_attr_edits(
+    mut element: String,
+    dv: &crate::sheet::DataValidation,
+    orig: &crate::sheet::DataValidation,
+) -> String {
+    for ((name, new), (_, old)) in dv_attrs(dv).into_iter().zip(dv_attrs(orig)) {
+        if new == old {
+            continue;
+        }
+        element = match new {
+            Some(v) => set_tag_attr_in_place(element, name, &esc_attr(&v)),
+            None => remove_tag_attr(element, name),
+        };
+    }
+    element
+}
+
+/// The element's formulas when the model has a different number of them than
+/// the part (an operator that takes one bound or two, a rule that gained or
+/// lost its formula): every `<formula1>`/`<formula2>` child replaced.
+fn dv_rebuild_formulas(element: &str, dv: &crate::sheet::DataValidation) -> String {
+    let Some(open) = start_tag_end(element) else {
+        return element.to_string();
+    };
+    let head = &element[..open];
+    let name = head[1..]
+        .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .next()
+        .unwrap_or("dataValidation");
+    let prefix = name.rsplit_once(':').map_or("", |(p, _)| p);
+    let tag = |local: &str| {
+        if prefix.is_empty() {
+            local.to_string()
+        } else {
+            format!("{prefix}:{local}")
+        }
+    };
+    let head = match head.strip_suffix("/>") {
+        Some(h) => format!("{}>", h.trim_end()),
+        None => head.to_string(),
+    };
+    let mut out = head;
+    for (local, f) in [("formula1", &dv.formula1), ("formula2", &dv.formula2)] {
+        if !f.is_empty() {
+            let t = tag(local);
+            out.push_str(&format!("<{t}>{}</{t}>", esc_text(&file_formula(f))));
+        }
+    }
+    out.push_str(&format!("</{name}>"));
+    out
+}
+
+/// [`set_validations`]'s edits to the elements the part already holds.
+fn edit_validations(xml: String, sheet: &Sheet) -> String {
     if sheet.validations.iter().all(|dv| dv.ix.is_none()) && sheet.dv_removed.is_empty() {
         return xml;
     }
@@ -4124,19 +4281,35 @@ fn set_validations(xml: String, sheet: &Sheet) -> String {
             }
             Ok(Some(dv)) => dv,
         };
-        let mut inner = formula_edits(&held_formulas(element, "formula1"), &[&dv.formula1]);
+        let f1 = held_formulas(element, "formula1");
         let f2 = held_formulas(element, "formula2");
-        if !(f2.is_empty() && dv.formula2.is_empty()) {
-            inner.extend(formula_edits(&f2, &[&dv.formula2]));
+        let count_differs = f1.len() != usize::from(!dv.formula1.is_empty())
+            || f2.len() != usize::from(!dv.formula2.is_empty());
+        // Only a rule edited since the load has its formula count rewritten:
+        // a part's odd one is left as it is.
+        let rebuild = count_differs
+            && dv
+                .orig
+                .as_deref()
+                .is_some_and(|o| o.formula1 != dv.formula1 || o.formula2 != dv.formula2);
+        let mut block = if rebuild {
+            dv_rebuild_formulas(element, dv)
+        } else {
+            let mut inner = formula_edits(&f1, &[&dv.formula1]);
+            if !(f2.is_empty() && dv.formula2.is_empty()) {
+                inner.extend(formula_edits(&f2, &[&dv.formula2]));
+            }
+            apply_edits(element.to_string(), inner)
+        };
+        if let Some(orig) = dv.orig.as_deref() {
+            block = dv_attr_edits(block, dv, orig);
         }
-        if held == dv.ranges && inner.is_empty() {
-            continue;
-        }
-        let mut block = apply_edits(element.to_string(), inner);
         if held != dv.ranges {
             block = set_tag_attr_in_place(block, "sqref", &sqref_of(&dv.ranges));
         }
-        edits.push((start - ws, end - ws, block));
+        if block != element {
+            edits.push((start - ws, end - ws, block));
+        }
     }
     if edits.is_empty() {
         return xml;
@@ -7380,15 +7553,23 @@ impl SheetPackage {
             }
             s.dv_removed.retain(|&i| i < n);
         }
-        s.validations.push(crate::sheet::DataValidation {
+        let mut dv = crate::sheet::DataValidation {
             ranges: vec![range],
             kind: kind.to_string(),
             operator: operator.to_string(),
             formula1: formula1.to_string(),
             formula2: formula2.unwrap_or("").to_string(),
-            prompt: None,
+            allow_blank: true,
+            show_input: true,
+            show_error: true,
             ix,
-        });
+            ..Default::default()
+        };
+        // The element written above is the rule's original, when it is there.
+        if ix.is_some() {
+            dv.orig = Some(Box::new(dv.clone()));
+        }
+        s.validations.push(dv);
         true
     }
 
@@ -18842,6 +19023,113 @@ mod rule_shift_tests {
     /// The text of a rule's first formula.
     fn first_formula(cf: &CondFormat) -> String {
         cf.rules[0].formulas()[0].clone()
+    }
+
+    const DV_RULE: &str = r#"<dataValidations count="1"><dataValidation type="whole" operator="between" errorStyle="warning" allowBlank="1" showErrorMessage="1" errorTitle="Score" error="10 to 90 only" promptTitle="P" prompt="pick" xr:uid="{1}" sqref="B2:B10"><formula1>10</formula1><formula2>90</formula2></dataValidation></dataValidations>"#;
+
+    #[test]
+    fn dv_reads_every_attribute() {
+        let pkg = one("S", DV_RULE);
+        let dv = &pkg.workbook.sheets[0].validations[0];
+        assert_eq!(dv.error_style, crate::sheet::AlertStyle::Warning);
+        assert!(dv.allow_blank && dv.show_error && !dv.show_input);
+        assert!(dv.show_dropdown);
+        assert_eq!((dv.error_title.as_str(), dv.error.as_str()), ("Score", "10 to 90 only"));
+        assert_eq!(dv.prompt_title, "P");
+        assert_eq!(dv.prompt.as_deref(), Some("pick"));
+        // showDropDown="1" hides the in-cell dropdown.
+        let hidden = one(
+            "S",
+            r#"<dataValidations count="1"><dataValidation type="list" showDropDown="1" sqref="A1"><formula1>"a,b"</formula1></dataValidation></dataValidations>"#,
+        );
+        assert!(!hidden.workbook.sheets[0].validations[0].show_dropdown);
+    }
+
+    #[test]
+    fn dv_untouched_element_is_byte_identical() {
+        let pkg = one("S", DV_RULE);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(DV_RULE), "{ws}");
+    }
+
+    #[test]
+    fn dv_edited_rule_rewrites_changed_attributes_only() {
+        let mut pkg = one("S", DV_RULE);
+        {
+            let dv = &mut pkg.workbook.sheets[0].validations[0];
+            dv.error_style = crate::sheet::AlertStyle::Stop;
+            dv.error = "no".into();
+            dv.show_input = true;
+            dv.operator = "greaterThan".into();
+            dv.formula2.clear();
+        }
+        let (re, ws) = saved(&pkg, SHEET1);
+        for kept in [
+            r#"xr:uid="{1}""#,
+            r#"errorTitle="Score""#,
+            r#"promptTitle="P""#,
+            r#"operator="greaterThan""#,
+            r#"showInputMessage="1""#,
+            r#"error="no""#,
+            r#"<formula1>10</formula1></dataValidation>"#,
+        ] {
+            assert!(ws.contains(kept), "{kept} in {ws}");
+        }
+        assert!(!ws.contains("errorStyle") && !ws.contains("<formula2>"), "{ws}");
+        let dv = &re.workbook.sheets[0].validations[0];
+        assert_eq!(dv.error, "no");
+        assert!(dv.show_input);
+        assert_eq!(dv.formula2, "");
+        assert_eq!(dv.error_style, crate::sheet::AlertStyle::Stop);
+    }
+
+    #[test]
+    fn dv_new_rule_is_appended_and_a_cleared_one_goes() {
+        let mut pkg = one("S", DV_RULE);
+        let s = &mut pkg.workbook.sheets[0];
+        s.validations.push(crate::sheet::DataValidation {
+            ranges: vec![(0, 0, 0, 0)],
+            kind: "list".into(),
+            formula1: "\"a,b\"".into(),
+            show_error: true,
+            error_title: "T".into(),
+            ..Default::default()
+        });
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"<dataValidations count="2">"#), "{ws}");
+        let s = &re.workbook.sheets[0];
+        assert_eq!(s.validations.len(), 2);
+        assert_eq!(s.validations[1].error_title, "T");
+        assert!(s.validations[1].show_error);
+
+        // Clear the original: its element goes, the new one stays.
+        let mut pkg = re;
+        let s = &mut pkg.workbook.sheets[0];
+        let gone = s.validations.remove(0);
+        s.dv_removed.extend(gone.ix);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert_eq!(count(&ws, "<dataValidation "), 1, "{ws}");
+        assert_eq!(re.workbook.sheets[0].validations.len(), 1);
+    }
+
+    #[test]
+    fn dv_new_rule_on_a_sheet_without_a_block() {
+        let mut pkg = one("S", "");
+        pkg.workbook.sheets[0].validations.push(crate::sheet::DataValidation {
+            ranges: vec![(1, 1, 3, 1)],
+            kind: "whole".into(),
+            operator: "between".into(),
+            formula1: "1".into(),
+            formula2: "5".into(),
+            allow_blank: true,
+            show_error: true,
+            ..Default::default()
+        });
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"sqref="B2:B4""#), "{ws}");
+        let dv = &re.workbook.sheets[0].validations[0];
+        assert_eq!((dv.formula1.as_str(), dv.formula2.as_str()), ("1", "5"));
+        assert!(dv.allow_blank && dv.show_error);
     }
 
     #[test]

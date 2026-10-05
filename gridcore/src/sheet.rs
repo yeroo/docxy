@@ -547,8 +547,9 @@ pub struct Sheet {
     /// opens the URL (external) or jumps (internal).
     pub hyperlinks: std::collections::BTreeMap<(u32, u32), String>,
     /// Data-validation rules (`<dataValidation>`): the constraint on a cell's
-    /// value (a dropdown list, a number range, …). Surfaced in the UI, not
-    /// enforced on edit.
+    /// value (a dropdown list, a number range, …). Typed entries are checked
+    /// against them ([`crate::validation::check_entry`]); a save writes edits
+    /// back to the part.
     pub validations: Vec<DataValidation>,
     /// Floating drawings anchored to the grid (`xl/drawings/*`): pictures and
     /// charts. Rendered as an overlay; only their anchors are editable.
@@ -1283,8 +1284,41 @@ pub struct ChartSeries {
     pub points_ref_unheld: bool,
 }
 
+/// How a data-validation rule reacts to an entry that breaks it
+/// (`errorStyle`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlertStyle {
+    /// Refuses the entry: Retry / Cancel.
+    #[default]
+    Stop,
+    /// Asks Yes / No / Cancel.
+    Warning,
+    /// Informs, then lets the entry in: OK / Cancel.
+    Information,
+}
+
+impl AlertStyle {
+    /// The `errorStyle` attribute value; `stop` is the file's default.
+    pub fn attr(self) -> &'static str {
+        match self {
+            AlertStyle::Stop => "stop",
+            AlertStyle::Warning => "warning",
+            AlertStyle::Information => "information",
+        }
+    }
+
+    /// Read an `errorStyle` value; anything unknown is the default, Stop.
+    pub fn from_attr(s: &str) -> Self {
+        match s {
+            "warning" => AlertStyle::Warning,
+            "information" => AlertStyle::Information,
+            _ => AlertStyle::Stop,
+        }
+    }
+}
+
 /// One data-validation rule over a set of cell ranges.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DataValidation {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     /// `list` / `whole` / `decimal` / `date` / `time` / `textLength` / `custom`.
@@ -1295,14 +1329,76 @@ pub struct DataValidation {
     pub formula2: String,
     /// The input-message prompt, if the file supplies one.
     pub prompt: Option<String>,
+    /// The input message's title (`promptTitle`).
+    pub prompt_title: String,
+    /// `allowBlank`: a blank entry passes.
+    pub allow_blank: bool,
+    /// `showInputMessage`: the prompt shows when the cell is selected.
+    pub show_input: bool,
+    /// `showErrorMessage`: a breaking entry raises the alert. Off lets
+    /// anything in.
+    pub show_error: bool,
+    /// The in-cell dropdown of a list rule is shown. The file's
+    /// `showDropDown` attribute is the inverse (`1` hides it).
+    pub show_dropdown: bool,
+    pub error_style: AlertStyle,
+    /// The alert's title and message (`errorTitle` / `error`); empty takes
+    /// the default text.
+    pub error_title: String,
+    pub error: String,
     /// The ordinal of this rule's element among the `<dataValidation>`
     /// children of the worksheet's top-level `<dataValidations>`, so a save
     /// can write a structural edit's move back to it. `None` for a rule the
     /// part doesn't hold (an x14 one in `extLst`, one built in memory).
     pub ix: Option<usize>,
+    /// The rule as the part held it, so a save rewrites only the attributes
+    /// that differ and leaves an untouched element byte for byte. `None` for
+    /// a rule built in memory, which a save appends.
+    pub orig: Option<Box<DataValidation>>,
+}
+
+impl Default for DataValidation {
+    fn default() -> Self {
+        DataValidation {
+            ranges: Vec::new(),
+            kind: String::new(),
+            operator: String::new(),
+            formula1: String::new(),
+            formula2: String::new(),
+            prompt: None,
+            prompt_title: String::new(),
+            allow_blank: false,
+            show_input: false,
+            show_error: false,
+            show_dropdown: true,
+            error_style: AlertStyle::Stop,
+            error_title: String::new(),
+            error: String::new(),
+            ix: None,
+            orig: None,
+        }
+    }
 }
 
 impl DataValidation {
+    /// Whether `other` imposes the same settings, whatever cells each covers
+    /// ("Apply these changes to all other cells with the same settings").
+    pub fn same_settings(&self, other: &DataValidation) -> bool {
+        self.kind == other.kind
+            && self.operator == other.operator
+            && self.formula1 == other.formula1
+            && self.formula2 == other.formula2
+            && self.prompt == other.prompt
+            && self.prompt_title == other.prompt_title
+            && self.allow_blank == other.allow_blank
+            && self.show_input == other.show_input
+            && self.show_error == other.show_error
+            && self.show_dropdown == other.show_dropdown
+            && self.error_style == other.error_style
+            && self.error_title == other.error_title
+            && self.error == other.error
+    }
+
     /// Whether any of this rule's ranges covers cell (row, col).
     pub fn covers(&self, row: u32, col: u32) -> bool {
         self.ranges
@@ -1321,10 +1417,15 @@ impl DataValidation {
         Some(inner.split(',').map(|s| s.trim().to_string()).collect())
     }
 
-    /// Whether this rule imposes anything worth surfacing (a real constraint or
-    /// an input message). A bare `type="none"` with no prompt is inert.
+    /// Whether this rule imposes anything worth surfacing: a real constraint,
+    /// an input message or a custom alert. A bare `type="none"` is inert.
     pub fn is_meaningful(&self) -> bool {
-        !matches!(self.kind.as_str(), "" | "none") || self.prompt.is_some()
+        !matches!(self.kind.as_str(), "" | "none")
+            || self.prompt.is_some()
+            || !self.prompt_title.is_empty()
+            || !self.error.is_empty()
+            || !self.error_title.is_empty()
+            || self.error_style != AlertStyle::Stop
     }
 
     /// A short human description of the constraint, for the status bar. The
