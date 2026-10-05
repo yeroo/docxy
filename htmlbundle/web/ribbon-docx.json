@@ -3232,7 +3232,12 @@
                     "body": "",
                     "shortcut": ""
                   }
-                },
+                }
+              ]
+            },
+            {
+              "kind": "column",
+              "cmds": [
                 {
                   "id": "viewcomments",
                   "label": "Comments pane",
