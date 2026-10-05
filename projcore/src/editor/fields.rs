@@ -7,8 +7,9 @@
 //! the grid's (`2d`, `2026-03-02`). Dates show `YYYY-MM-DD`, `NA` when unset.
 //!
 //! `value` is [`FieldValue::Null`] only for a date that shows `NA`, for a
-//! stored quantity the plan does not have (percents, actuals, remaining
-//! values, work, cost, fixed cost, baseline values, notes), and for Status
+//! stored value the plan does not have (percents, actuals, remaining
+//! values, work, cost, fixed cost, baseline values, notes, hyperlink parts),
+//! and for Status
 //! when the plan has no StatusDate or CurrentDate (or the task no start), so a
 //! test can tell it from `0`; such a field's `text` is what Project shows for
 //! it (`0%`, `0 days`, `0 hrs`, `$0.00`), empty for Status. Fields with a
@@ -106,6 +107,9 @@ pub enum Field {
     EffortDriven,
     Priority,
     Notes,
+    Hyperlink,
+    HyperlinkAddress,
+    HyperlinkSubAddress,
     Milestone,
     Summary,
     Estimated,
@@ -198,6 +202,9 @@ const TAIL: &[(Field, &str)] = &[
     (Field::EffortDriven, "Effort Driven"),
     (Field::Priority, "Priority"),
     (Field::Notes, "Notes"),
+    (Field::Hyperlink, "Hyperlink"),
+    (Field::HyperlinkAddress, "Hyperlink Address"),
+    (Field::HyperlinkSubAddress, "Hyperlink SubAddress"),
     (Field::Milestone, "Milestone"),
     (Field::Summary, "Summary"),
     (Field::Estimated, "Estimated"),
@@ -458,6 +465,9 @@ impl<'a> FieldReader<'a> {
             }
             Field::Priority => int(i64::from(task.priority.unwrap_or(500))),
             Field::Notes => optional_text(task.notes.as_deref()),
+            Field::Hyperlink => optional_text(task.hyperlink.as_deref()),
+            Field::HyperlinkAddress => optional_text(task.hyperlink_address.as_deref()),
+            Field::HyperlinkSubAddress => optional_text(task.hyperlink_sub_address.as_deref()),
             // A summary's stored duration is stale and may be 0, so only a
             // leaf is a milestone by length, as the grid's Duration reads it.
             Field::Milestone => flag(task.milestone || (!task.summary && task.duration_min == 0)),
