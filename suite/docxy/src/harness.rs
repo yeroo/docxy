@@ -2207,7 +2207,7 @@ fn menu_open(
                 app.open_split_menu(id, at, cx)
             }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, row and ribbon are)"
+                "menu target '{other}' is not supported yet (document, cell, row and ribbon are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),

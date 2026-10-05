@@ -81,7 +81,7 @@ test sheet filter cell menu filters by the selected cell's value
 test sheet filter cell menu right-clicked without a click first
   open ../fixtures/basic.xlsx
   click A2
-  call menu-open {"cell":"A4"}
+  call menu-open {"target":{"cell":"A4"}}
   assert sel is A4
   call menu-click {"path":["Filter","Filter by Selected Cell's Value"]}
   assert status is 1 of 4 records found
