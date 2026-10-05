@@ -1562,7 +1562,7 @@ fn wb_changed(before: &WbSnapshot, wb: &gridcore::sheet::Workbook) -> bool {
                 || a.merges != b.merges
                 || a.filtered_rows != b.filtered_rows
                 || a.auto_filter != b.auto_filter
-                || a.filter_mode != b.filter_mode
+                || a.filter_mode.unwrap_or(false) != b.filter_mode.unwrap_or(false)
         })
 }
 
@@ -1923,9 +1923,6 @@ struct App {
     pending_sort: Option<datacmd::PendingSort>,
     /// The column the Custom AutoFilter prompt filters.
     custom_filter_col: Option<u32>,
-    /// Whether the last filter or sort command changed the workbook, so the
-    /// control verbs flash the activity dot only then.
-    last_changed: bool,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
@@ -2070,7 +2067,6 @@ impl App {
             filter_picker: None,
             pending_sort: None,
             custom_filter_col: None,
-            last_changed: false,
             grid_area: Rect::default(),
             gutter_w: 4,
             outline_w: 0,

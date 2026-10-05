@@ -59,13 +59,13 @@
 //! | `page-break.reset` | `{sheet?}` | `{rowBreaks, colBreaks, changed}` — every manual break goes |
 //! | `print.pages` | `{what?:active\|workbook\|selection, sheet?\|sheets?, range?, ignorePrintAreas?, from?, to?}` | `{total, pages:[{sheet, name, range, number, titleRows, titleCols, scale}]}` — the pages printing lays out (hidden sheets print only when named; titles that would fill a page by themselves, at the print scale, don't repeat); `selection` needs `range` (only its printed cells print); a job over 100,000 pages errors with "This would print more than 100000 pages; …" |
 //! | `wb.export-pdf` | `{path, …print.pages args}` | `{path, pages}` — refuses to overwrite; nothing to print errors with "We didn't find anything to print." and writes no file; so does a job over 100,000 pages (the `print.pages` error) |
-//! | `filter.set` | `{range?, col, criteria, sheet?}` | `{shown, total, status}` — AutoFilter on over `range` if needed, then column `col` (header text or letter) set to `criteria` (`values`, `custom`, `top`, `dynamic`, `cellColor`, `fontColor`, `icon`, `search`, or `null` to clear) and the filter applied. One undo step |
-//! | `filter.reapply` / `filter.clear` / `filter.off` | `{col?, sheet?}` | `{shown, total, status}` (`filter.off`: `{off, range}`) — one undo step each |
+//! | `filter.set` | `{range?, col, criteria, sheet?}` | `{shown, total, status, changed}` — AutoFilter on over `range` if needed, then column `col` (header text or letter) set to `criteria` (`values`, `custom`, `top`, `dynamic`, `cellColor`, `fontColor`, `icon`, `search`, or `null` to clear) and the filter applied. One undo step when it changes something |
+//! | `filter.reapply` / `filter.clear` / `filter.off` | `{col?, sheet?}` | `{shown, total, status, changed}` (`filter.off`: `{off, range, changed}`) — one undo step each when it changes something |
 //! | `filter.menu` | `{col, search?, sheet?}` | `{col, header, submenu, items:[{label,depth,checked}], truncated, total, filtered}` |
-//! | `filter.by-cell` | `{ref, by?, sheet?}` | `{shown, total, status}` — Filter by Selected Cell's value/colour/font colour/icon |
-//! | `filter.advanced` | `{list, criteria?, copyTo?, unique?, sheet?}` | `{shown, total, status}` — copying to another sheet is refused |
+//! | `filter.by-cell` | `{ref, by?, sheet?}` | `{shown, total, status, changed}` — Filter by Selected Cell's value/colour/font colour/icon |
+//! | `filter.advanced` | `{list, criteria?, copyTo?, unique?, sheet?}` | `{shown, total, status, changed}` — copying to another sheet is refused |
 //! | `sheet.rows` | `{range, sheet?}` | `{rows:[{row, hidden, hiddenBy}]}` |
-//! | `range.sort` | `{range, keys, header?, caseSensitive?, orientation?, expand?, sheet?}` | `{sorted, range, count}`, or `{sorted:false, warning, expanded}` for a selection inside a wider list |
+//! | `range.sort` | `{range, keys, header?, caseSensitive?, orientation?, expand?, sheet?}` | `{sorted, range, count, changed}`, or `{sorted:false, warning, expanded}` for a selection inside a wider list |
 //! | `wb.clock` | `{date}` | `{date}` — fixes today (`null`: the local clock) |
 //! | `wb.recalc` | — | `{recalculated:true}` |
 //! | `wb.properties` | — | `{title, tags, categories, subject, comments, company, manager, hyperlinkBase, author, lastModifiedBy, created, modified, custom:[{name,type,value}]}` — File › Info; an absent property is `null`; `type` is `text`/`number`/`bool`/`date`/`other` |
@@ -113,7 +113,6 @@ mod datacmds;
 /// Route one control verb against the live workbook, returning the JSON result
 /// or an error message.
 pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> {
-    app.last_changed = false;
     let out = match verb {
         "wb.path" => Ok(path_info(app)),
         "sheet.list" => Ok(sheet_list(app)),
@@ -227,12 +226,10 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         ) {
             ctlcore::signal_activity();
         }
-        // The filter verbs and `range.sort` signal only when they changed
-        // something: Clear with nothing filtered, a Sort Warning reply, or a
-        // sort that left every row in place moved nothing.
-        if (verb.starts_with("filter.") || verb == "range.sort") && app.last_changed {
-            ctlcore::signal_activity();
-        }
+        // The filter verbs and `range.sort` signal themselves, only when
+        // they changed something (their replies say `changed`): Clear with
+        // nothing filtered, a Sort Warning reply, or a sort that left every
+        // row in place moved nothing.
         // `comment.remove` can legitimately no-op (nothing on the cell), so it
         // signals itself inside `comment_remove`, gated on `removed:true` — a
         // no-op must not flash the activity dot (docxy's no-op principle).

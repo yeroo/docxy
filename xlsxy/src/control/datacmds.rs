@@ -1,46 +1,30 @@
 //! The Sort & Filter verbs (#690, #691): `filter.*`, `range.sort`,
-//! `sheet.rows` and `wb.clock`. Each mutating verb is one undo step
+//! `sheet.rows` and `wb.clock`. Each mutating verb is one undo step when it
+//! changes something, and its reply's `changed` says whether it did
 //! ([`App::filter_command`], [`App::sort_command`]).
 
 use super::{App, Json, sheet_arg};
-use crate::datacmd::Area;
-use gridcore::edit::{BUILTIN_SORT_LISTS, SORT_WARNING, SortLevel, SortOn, SortOptions};
+use crate::datacmd::{Area, area, qualified};
+use gridcore::edit::{SORT_WARNING, SortLevel, SortOn, SortOptions};
 use gridcore::filter::{AdvancedFilter, ByCell, ColumnFilter, DateGroup, FilterOutcome};
-use gridcore::sheet::{Workbook, cell_name, parse_cell_name, parse_col, parse_range_name};
+use gridcore::sheet::{Workbook, cell_name, parse_col};
 
 /// `A1:C9` or `B4` (one cell), 0-based.
-fn area(s: &str) -> Result<Area, String> {
-    let s = s.trim().replace('$', "");
-    parse_range_name(&s)
-        .or_else(|| parse_cell_name(&s).map(|(r, c)| (r, c, r, c)))
-        .ok_or_else(|| format!("bad range '{s}'"))
-}
-
-/// `Sheet2!A1:B3` (or a range on `default`) as (sheet, area).
-fn qualified(wb: &Workbook, s: &str, default: usize) -> Result<(usize, Area), String> {
-    match s.rsplit_once('!') {
-        Some((sheet, refs)) => {
-            let name = sheet.trim().trim_matches('\'').replace("''", "'");
-            let si = wb
-                .sheets
-                .iter()
-                .position(|x| x.name.eq_ignore_ascii_case(&name))
-                .ok_or_else(|| format!("no sheet named '{name}'"))?;
-            Ok((si, area(refs)?))
-        }
-        None => Ok((default, area(s)?)),
-    }
-}
-
 fn area_name((r1, c1, r2, c2): Area) -> String {
     format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
 }
 
-fn outcome_json(o: &FilterOutcome) -> Json {
+/// A filter verb's reply: `{shown, total, status, changed}`. A verb that
+/// changed something flashes the activity dot.
+fn outcome_json((o, changed): (FilterOutcome, bool)) -> Json {
+    if changed {
+        ctlcore::signal_activity();
+    }
     Json::obj(vec![
         ("shown", Json::Num(o.shown as f64)),
         ("total", Json::Num(o.total as f64)),
-        ("status", Json::Str(gridcore::filter::status_text(o))),
+        ("status", Json::Str(gridcore::filter::status_text(&o))),
+        ("changed", Json::Bool(changed)),
     ])
 }
 
@@ -82,13 +66,9 @@ fn rgb_arg(j: &Json) -> Result<Option<(u8, u8, u8)>, String> {
             _ => Err("a colour is a hex string like \"FF00B050\", or null".into()),
         };
     };
-    let hex = s.trim().trim_start_matches('#');
-    let hex = if hex.len() == 8 { &hex[2..] } else { hex };
-    let byte = |i: usize| u8::from_str_radix(hex.get(i..i + 2).unwrap_or("x"), 16);
-    match (hex.len(), byte(0), byte(2), byte(4)) {
-        (6, Ok(r), Ok(g), Ok(b)) => Ok(Some((r, g, b))),
-        _ => Err(format!("bad colour '{s}'")),
-    }
+    gridcore::format::hex_rgb(s)
+        .map(Some)
+        .ok_or_else(|| format!("bad colour '{s}'"))
 }
 
 /// What `filter.set`'s `criteria` asks for.
@@ -213,8 +193,10 @@ fn criteria_arg(j: &Json) -> Result<Criteria, String> {
 }
 
 /// `filter.set {sheet?, range?, col, criteria}`: turn the filter on over
-/// `range` when the sheet's isn't already there, then set (or with `null`
-/// clear) column `col`'s criteria and apply the filter.
+/// `range` when the sheet has none, then set (or with `null` clear) column
+/// `col`'s criteria and apply the filter. A `range` with the filter's header
+/// row and columns names the filter even after it grew; any other replaces
+/// the filter and its criteria.
 pub(super) fn filter_set(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
     let range = args.get_str("range").map(area).transpose()?;
@@ -224,6 +206,10 @@ pub(super) fn filter_set(app: &mut App, args: &Json) -> Result<Json, String> {
     // turns it on there).
     let wb = &app.pkg.workbook;
     let have = wb.sheets[si].auto_filter.as_ref().map(|a| a.range);
+    // A range with the filter's header row and columns is the filter, even
+    // when it has grown over rows typed below it; any other range replaces
+    // the filter and its criteria.
+    let range = range.filter(|r| have.is_none_or(|h| (h.0, h.1, h.3) != (r.0, r.1, r.3)));
     let target = range.or(have).ok_or_else(|| {
         format!(
             "{} Pass a 'range' to turn it on.",
@@ -245,14 +231,14 @@ pub(super) fn filter_set(app: &mut App, args: &Json) -> Result<Json, String> {
             }
         }
     })?;
-    Ok(outcome_json(&o))
+    Ok(outcome_json(o))
 }
 
 /// `filter.reapply {sheet?}`.
 pub(super) fn filter_reapply(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
     let o = app.filter_command_on(si, gridcore::filter::reapply)?;
-    Ok(outcome_json(&o))
+    Ok(outcome_json(o))
 }
 
 /// `filter.clear {sheet?, col?}`: one column's criteria, or (no `col`)
@@ -269,7 +255,7 @@ pub(super) fn filter_clear(app: &mut App, args: &Json) -> Result<Json, String> {
     let o = app.filter_command_on(si, |wb, si, today| {
         gridcore::filter::clear(wb, si, col, today)
     })?;
-    Ok(outcome_json(&o))
+    Ok(outcome_json(o))
 }
 
 /// `filter.off {sheet?}`: no AutoFilter remains; every row of its range
@@ -277,7 +263,7 @@ pub(super) fn filter_clear(app: &mut App, args: &Json) -> Result<Json, String> {
 pub(super) fn filter_off(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
     let range = filter_range(&app.pkg.workbook, si)?;
-    app.filter_command_on(si, |wb, si, _| {
+    let (_, changed) = app.filter_command_on(si, |wb, si, _| {
         gridcore::filter::auto_filter_off(wb, si);
         let total = range.2.saturating_sub(range.0) as usize;
         Ok(FilterOutcome {
@@ -285,10 +271,14 @@ pub(super) fn filter_off(app: &mut App, args: &Json) -> Result<Json, String> {
             total,
         })
     })?;
+    if changed {
+        ctlcore::signal_activity();
+    }
     app.status = Some("Filter off".into());
     Ok(Json::obj(vec![
         ("off", Json::Bool(true)),
         ("range", Json::Str(area_name(range))),
+        ("changed", Json::Bool(changed)),
     ]))
 }
 
@@ -342,7 +332,7 @@ pub(super) fn filter_by_cell(app: &mut App, args: &Json) -> Result<Json, String>
     let o = app.filter_command_on(si, |wb, si, today| {
         gridcore::filter::filter_by_cell(wb, si, at, by, today)
     })?;
-    Ok(outcome_json(&o))
+    Ok(outcome_json(o))
 }
 
 /// `filter.advanced {sheet?, list, criteria?, copyTo?, unique?}`: an
@@ -369,7 +359,7 @@ pub(super) fn filter_advanced(app: &mut App, args: &Json) -> Result<Json, String
         unique: args.get("unique").and_then(Json::as_bool).unwrap_or(false),
     };
     let o = app.filter_command_on(si, |wb, si, _| gridcore::filter::advanced(wb, si, &a))?;
-    Ok(outcome_json(&o))
+    Ok(outcome_json(o))
 }
 
 /// `sheet.rows {sheet?, range}`: each row's visibility, and why a hidden
@@ -433,18 +423,9 @@ fn level_arg(
             // or `days`, `weekdays`, `months`, `monthnames`), reversed by
             // `direction:"desc"`.
             let order = k.get_str("order").unwrap_or("asc");
-            let builtin = |i: usize| {
-                BUILTIN_SORT_LISTS[i]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            };
-            let list = order.strip_prefix("list:").map(|items| match items.trim() {
-                "days" => builtin(0),
-                "weekdays" => builtin(1),
-                "months" => builtin(2),
-                "monthnames" => builtin(3),
-                items => items.split(',').map(|s| s.trim().to_string()).collect(),
+            let list = order.strip_prefix("list:").map(|items| {
+                gridcore::edit::builtin_sort_list(items)
+                    .unwrap_or_else(|| items.split(',').map(|s| s.trim().to_string()).collect())
             });
             let asc = order != "desc" && k.get_str("direction") != Some("desc");
             SortOn::Value { asc, list }
@@ -514,7 +495,10 @@ pub(super) fn range_sort(app: &mut App, args: &Json) -> Result<Json, String> {
         left_to_right: ltr,
         header: header.unwrap_or(false),
     };
-    let n = app.sort_command(si, range, &levels, &opts)?;
+    let (n, changed) = app.sort_command(si, range, &levels, &opts)?;
+    if changed {
+        ctlcore::signal_activity();
+    }
     app.status = Some(format!(
         "Sorted {n} {}",
         if ltr { "columns" } else { "rows" }
@@ -523,6 +507,7 @@ pub(super) fn range_sort(app: &mut App, args: &Json) -> Result<Json, String> {
         ("sorted", Json::Bool(true)),
         ("range", Json::Str(area_name(range))),
         ("count", Json::Num(n as f64)),
+        ("changed", Json::Bool(changed)),
     ]))
 }
 

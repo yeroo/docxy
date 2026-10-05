@@ -40,6 +40,25 @@ pub const BUILTIN_SORT_LISTS: [&[&str]; 4] = [
     ],
 ];
 
+/// A built-in custom list by the name hosts accept: `days` (Sun..Sat),
+/// `weekdays` (Sunday..Saturday), `months` (Jan..Dec) or `monthnames`
+/// (January..December), case-insensitive.
+pub fn builtin_sort_list(name: &str) -> Option<Vec<String>> {
+    let i = match name.trim().to_ascii_lowercase().as_str() {
+        "days" => 0,
+        "weekdays" => 1,
+        "months" => 2,
+        "monthnames" => 3,
+        _ => return None,
+    };
+    Some(
+        BUILTIN_SORT_LISTS[i]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    )
+}
+
 /// Excel's refusal for a range whose merged cells differ.
 pub const SORT_MERGED: &str = "To do this, all the merged cells need to be the same size.";
 
@@ -259,9 +278,8 @@ pub fn sort_range(
         for (p, cell) in across.clone().zip(cells) {
             if let Some(mut cl) = cell {
                 let (r, c) = at(to, p);
-                if !ltr {
-                    move_own_array_ref(&mut cl, (src, p), to);
-                }
+                // An array anchor takes its block's `ref` along, either way.
+                move_own_array_ref(&mut cl, at(src, p), (r, c));
                 s.set_cell(r, c, cl);
             }
         }

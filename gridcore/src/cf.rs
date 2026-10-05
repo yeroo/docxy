@@ -200,6 +200,11 @@ fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> S
             None => {}
         }
     }
+    // A rule we don't evaluate (Duplicate Values, a colour scale, …) may be
+    // colouring the cell: then its colour is unknown, not the cell's own.
+    if unevaluated_could_color(wb, sheet, row, col, fill) {
+        return Shown::Unknown;
+    }
     let style = wb
         .sheets
         .get(sheet)
@@ -218,6 +223,40 @@ fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> S
     }
 }
 
+/// Does a conditional-formatting rule over the cell that we don't evaluate
+/// set the fill (`fill`) or the font colour? Its format does, or for a fill
+/// it is a colour scale.
+fn unevaluated_could_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> bool {
+    let Some(s) = wb.sheets.get(sheet) else {
+        return false;
+    };
+    s.cond_formats
+        .iter()
+        .filter(|cf| {
+            cf.ranges
+                .iter()
+                .any(|&(r1, c1, r2, c2)| row >= r1 && row <= r2 && col >= c1 && col <= c2)
+        })
+        .flat_map(|cf| &cf.rules)
+        .any(|rule| {
+            let CfKind::Other { rule_type, .. } = &rule.kind else {
+                return false;
+            };
+            if fill && rule_type == "colorScale" {
+                return true;
+            }
+            rule.dxf_id
+                .and_then(|i| wb.styles.dxfs.get(i))
+                .is_some_and(|d| {
+                    if fill {
+                        d.fill.is_some() || d.fill_unresolved
+                    } else {
+                        d.color.is_some() || d.color_unresolved
+                    }
+                })
+        })
+}
+
 /// The conditional-formatting icon a cell shows, as (`iconSet`, `iconId`):
 /// from the highest-precedence icon-set rule over it. `iconId` 0 is the
 /// set's first icon (for `3Arrows`, the red down arrow), which goes to the
@@ -226,6 +265,12 @@ fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> S
 /// once.
 pub fn cell_icon(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<(String, u32)> {
     Icons::new(wb, sheet).icon(row, col)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`Icons`] has read a rule's numbers on this thread.
+    pub(crate) static ICON_RANGE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The icons of one sheet's cells, for a command that asks about many
@@ -252,6 +297,8 @@ impl<'a> Icons<'a> {
         if let Some(n) = self.nums.borrow().get(&i) {
             return n.clone();
         }
+        #[cfg(test)]
+        ICON_RANGE_READS.with(|n| n.set(n.get() + 1));
         let (wb, sheet) = (self.wb, self.sheet);
         let s = &wb.sheets[sheet];
         let mut nums: Vec<f64> = Vec::new();
@@ -644,7 +691,10 @@ mod tests {
             ix: None,
             ranges: vec![(0, 0, 9, 0)],
             rules: vec![CfRule {
-                kind: CfKind::Other { formulas: vec![] },
+                kind: CfKind::Other {
+                    rule_type: "dataBar".into(),
+                    formulas: vec![],
+                },
                 dxf_id: Some(0),
                 priority: 1,
             }],

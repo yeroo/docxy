@@ -604,9 +604,10 @@ pub struct Sheet {
     /// otherwise writes it from the model (adding one the filter commands
     /// created).
     pub auto_filter: Option<SheetAutoFilter>,
-    /// `<sheetPr filterMode>` (some rows are filtered) as a filter command
-    /// last left it; `None` while none has run, so a save leaves the
-    /// attribute as the part has it.
+    /// `<sheetPr filterMode>` (some rows are filtered): what the part said at
+    /// load, then what a filter command last left. A save writes it when it
+    /// differs from the part. `None` for a sheet built in memory that no
+    /// filter command has touched, which means no filtering.
     pub filter_mode: Option<bool>,
     /// `<sheetPr><outlinePr>`: where a group's summary row and column sit.
     /// Edit this; a save writes it only when it differs from
@@ -2010,9 +2011,13 @@ pub enum CfKind {
         cfvos: Vec<Cfvo>,
         formulas: Vec<String>,
     },
-    /// Anything else (colorScale/dataBar/top10/…) — not evaluated.
-    /// Its `<formula>` children are kept so structural edits can move them.
-    Other { formulas: Vec<String> },
+    /// Anything else (colorScale/dataBar/top10/duplicateValues/…) — not
+    /// evaluated. `rule_type` is its `type`; its `<formula>` children are
+    /// kept so structural edits can move them.
+    Other {
+        rule_type: String,
+        formulas: Vec<String>,
+    },
 }
 
 /// One `<cfvo>` of an icon set: a threshold of type `num`, `percent`,
@@ -2031,7 +2036,7 @@ impl CfRule {
         match &self.kind {
             CfKind::CellIs { formulas, .. }
             | CfKind::IconSet { formulas, .. }
-            | CfKind::Other { formulas } => formulas.iter().collect(),
+            | CfKind::Other { formulas, .. } => formulas.iter().collect(),
             CfKind::Expression { formula } => vec![formula],
         }
     }
@@ -2041,7 +2046,7 @@ impl CfRule {
         match &mut self.kind {
             CfKind::CellIs { formulas, .. }
             | CfKind::IconSet { formulas, .. }
-            | CfKind::Other { formulas } => formulas.iter_mut().collect(),
+            | CfKind::Other { formulas, .. } => formulas.iter_mut().collect(),
             CfKind::Expression { formula } => vec![formula],
         }
     }

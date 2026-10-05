@@ -560,9 +560,60 @@ fn an_icon_level_over_ten_thousand_rows_reads_the_rule_once() {
             top: true,
         },
     };
+    let reads = || crate::cf::ICON_RANGE_READS.with(|n| n.get());
+    let before = reads();
     sort_range(&mut wb, 0, area("A1:A10001"), &[up], &HEADER).unwrap();
+    assert_eq!(reads() - before, 1, "the rule's numbers are read once");
     let first = crate::cf::cell_icon(&wb, 0, 1, 0);
     assert_eq!(first, Some(("3Arrows".to_string(), 2)));
     let last = crate::cf::cell_icon(&wb, 0, 10_000, 0);
     assert_ne!(last, first);
+}
+
+#[test]
+fn a_left_to_right_sort_moves_a_cse_blocks_ref_with_its_column() {
+    // A1:E3 left to right by row 1; a legacy CSE block in C1:C3.
+    let mut wb = book(&[
+        ("A1", n(5.0)),
+        ("B1", n(4.0)),
+        ("D1", n(2.0)),
+        ("E1", n(1.0)),
+        ("C1", Cell::formula("ROW(A1:A3)")),
+        ("C2", n(2.0)),
+        ("C3", n(3.0)),
+    ]);
+    let anchor = wb.sheets[0].cells.get_mut(&(0, 2)).unwrap();
+    anchor.value = CellValue::Number(3.0);
+    anchor.f_attrs = Some(r#" t="array" ref="C1:C3""#.into());
+    let ltr = SortOptions {
+        left_to_right: true,
+        ..SortOptions::default()
+    };
+    // Ascending, the block's 3 sorts third: it stays in column C.
+    sort_range(
+        &mut wb,
+        0,
+        area("A1:E3"),
+        &[SortLevel { key: 0, on: asc() }],
+        &ltr,
+    )
+    .unwrap();
+    let desc = SortLevel {
+        key: 0,
+        on: SortOn::Value {
+            asc: false,
+            list: None,
+        },
+    };
+    assert_eq!(row(&wb, 1, 0, 4), ["1", "2", "3", "4", "5"]);
+    assert_eq!(
+        wb.sheets[0].cell(0, 2).unwrap().f_attrs.as_deref(),
+        Some(r#" t="array" ref="C1:C3""#)
+    );
+    // Descending, with the block's value 9, it moves to column A.
+    wb.sheets[0].cells.get_mut(&(0, 2)).unwrap().value = CellValue::Number(9.0);
+    sort_range(&mut wb, 0, area("A1:E3"), &[desc], &ltr).unwrap();
+    let anchor = wb.sheets[0].cell(0, 0).unwrap();
+    assert_eq!(anchor.formula.as_deref(), Some("ROW(A1:A3)"));
+    assert_eq!(anchor.f_attrs.as_deref(), Some(r#" t="array" ref="A1:A3""#));
 }

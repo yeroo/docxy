@@ -25,7 +25,7 @@ pub use consolidate::{
 };
 pub use sort::{
     BUILTIN_SORT_LISTS, SORT_MERGED, SORT_WARNING, SortError, SortLevel, SortOn, SortOptions,
-    sort_range, sort_region, sort_warning,
+    builtin_sort_list, sort_range, sort_region, sort_warning,
 };
 pub use subtotal::{
     Area, SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,
@@ -448,7 +448,7 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
         for (c, cell) in row.into_iter().enumerate() {
             match cell {
                 Some(mut cl) => {
-                    move_own_array_ref(&mut cl, (from, c as u32), r);
+                    move_own_array_ref(&mut cl, (from, c as u32), (r, c as u32));
                     s.set_cell(r, c as u32, cl)
                 }
                 None => {
@@ -518,19 +518,19 @@ fn sort_span(s: &Sheet, r1: u32, r2: u32) -> Option<(u32, u32)> {
 /// ([`array_rect`]) at the new row. Left behind, it would name the old rows:
 /// the cached block of an anchor the engine can't evaluate would no longer
 /// count as its own, and a CSE block would save as its anchor alone.
-fn move_own_array_ref(cell: &mut Cell, (from, col): (u32, u32), to: u32) {
-    let Some((h, w)) = array_rect(cell, (from, col)) else {
+fn move_own_array_ref(cell: &mut Cell, from: (u32, u32), to: (u32, u32)) {
+    let Some((h, w)) = array_rect(cell, from) else {
         return;
     };
     let Some(fa) = cell.f_attrs.as_deref().filter(|fa| is_array_f(fa)) else {
         return;
     };
-    if from == to || !ref_starts_at(fa, &cell_name(from, col)) {
+    if from == to || !ref_starts_at(fa, &cell_name(from.0, from.1)) {
         return;
     }
-    let mut block = cell_name(to, col);
+    let mut block = cell_name(to.0, to.1);
     if (h, w) != (1, 1) {
-        block = format!("{block}:{}", cell_name(to + h - 1, col + w - 1));
+        block = format!("{block}:{}", cell_name(to.0 + h - 1, to.1 + w - 1));
     }
     cell.f_attrs = Some(with_ref(fa, &block));
 }

@@ -4,7 +4,7 @@
 
 use super::super::dispatch;
 use super::*;
-use gridcore::sheet::{Cell, Xf};
+use gridcore::sheet::{Cell, Xf, parse_cell_name};
 use gridcore::xlsx::new_xlsx;
 
 fn app_with(cells: &[(u32, u32, Cell)]) -> App {
@@ -673,31 +673,125 @@ fn dat_case_010_colour_sort() {
 #[test]
 fn a_command_that_changes_nothing_leaves_the_workbook_clean() {
     let mut a = filterlist();
-    ok(
+    let r = ok(
         &mut a,
         "filter.set",
         r#"{"range":"A1:D21","col":"Rep","criteria":null}"#,
     );
-    assert!(a.modified, "turning the filter on is an edit");
+    assert_eq!(
+        r.get("changed"),
+        Some(&Json::Bool(true)),
+        "turning it on is an edit"
+    );
     a.modified = false;
     let undo = a.undo.len();
     // Nothing is filtered: Clear and Reapply change no row.
     let r = ok(&mut a, "filter.clear", "{}");
     assert_eq!(r.get_str("status"), Some("20 of 20 records found"));
-    assert!(!a.last_changed);
-    ok(&mut a, "filter.reapply", "{}");
-    assert!(!a.last_changed);
+    assert_eq!(r.get("changed"), Some(&Json::Bool(false)));
+    let r = ok(&mut a, "filter.reapply", "{}");
+    assert_eq!(r.get("changed"), Some(&Json::Bool(false)));
     assert!(!a.modified);
     assert_eq!(a.undo.len(), undo);
     // A sort moves rows once; the same sort again moves nothing.
     let sort = r#"{"range":"A1:D21","header":true,"keys":[{"col":"Rep","order":"asc"}]}"#;
-    ok(&mut a, "range.sort", sort);
-    assert!(a.last_changed && a.modified);
+    let r = ok(&mut a, "range.sort", sort);
+    assert_eq!(r.get("changed"), Some(&Json::Bool(true)));
+    assert!(a.modified);
     a.modified = false;
     let undo = a.undo.len();
-    ok(&mut a, "range.sort", sort);
-    assert!(!a.last_changed && !a.modified);
+    let r = ok(&mut a, "range.sort", sort);
+    assert_eq!(r.get("changed"), Some(&Json::Bool(false)));
+    assert!(!a.modified);
     assert_eq!(a.undo.len(), undo);
+}
+
+#[test]
+fn a_loaded_filter_cleared_or_reapplied_unchanged_leaves_it_clean() {
+    // Saved with an AutoFilter and nothing filtered, then opened again.
+    let mut a = filterlist();
+    ok(
+        &mut a,
+        "filter.set",
+        r#"{"range":"A1:D21","col":"Rep","criteria":null}"#,
+    );
+    let bytes = gridcore::xlsx::save_xlsx(&a.pkg);
+    let mut b = App::new(gridcore::xlsx::load_xlsx(&bytes).unwrap(), "loaded.xlsx");
+    b.os_clip = None;
+    assert!(b.pkg.workbook.sheets[0].auto_filter.is_some());
+    for verb in ["filter.clear", "filter.reapply"] {
+        let r = ok(&mut b, verb, "{}");
+        assert_eq!(r.get("changed"), Some(&Json::Bool(false)), "{verb}");
+    }
+    assert!(!b.modified);
+    assert!(b.undo.is_empty());
+}
+
+#[test]
+fn a_grown_filter_keeps_its_criteria_when_named_by_its_first_range() {
+    let mut a = filterlist();
+    ok(
+        &mut a,
+        "filter.set",
+        r#"{"range":"A1:D20","col":"Rep","criteria":{"values":["Noor"]}}"#,
+    );
+    // Row 21 has data: the filter grew over it.
+    assert_eq!(
+        a.pkg.workbook.sheets[0]
+            .auto_filter
+            .as_ref()
+            .unwrap()
+            .range
+            .2,
+        20
+    );
+    ok(
+        &mut a,
+        "filter.set",
+        r#"{"range":"A1:D20","col":"Product","criteria":{"values":["Stapler"]}}"#,
+    );
+    let af = a.pkg.workbook.sheets[0].auto_filter.as_ref().unwrap();
+    assert_eq!(af.criteria.len(), 2, "Rep's criterion stays");
+    // Other columns: the filter is replaced, criteria and all.
+    ok(
+        &mut a,
+        "filter.set",
+        r#"{"range":"A1:C21","col":"Rep","criteria":null}"#,
+    );
+    assert!(
+        a.pkg.workbook.sheets[0]
+            .auto_filter
+            .as_ref()
+            .unwrap()
+            .criteria
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_colour_that_is_not_ascii_hex_is_refused_not_a_crash() {
+    let mut a = filterlist();
+    ok(
+        &mut a,
+        "filter.set",
+        r#"{"range":"A1:D21","col":"Rep","criteria":null}"#,
+    );
+    for bad in ["€12345", "1é234", "+1+2+3", "GGGGGG"] {
+        let e = call(
+            &mut a,
+            "filter.set",
+            &format!(r#"{{"col":"Rep","criteria":{{"cellColor":"{bad}"}}}}"#),
+        );
+        assert_eq!(e.unwrap_err(), format!("bad colour '{bad}'"));
+        let e = call(
+            &mut a,
+            "range.sort",
+            &format!(
+                r#"{{"range":"A1:D21","header":true,"keys":[{{"col":"Rep","on":"cell-color","color":"{bad}"}}]}}"#
+            ),
+        );
+        assert_eq!(e.unwrap_err(), format!("bad colour '{bad}'"));
+    }
 }
 
 #[test]

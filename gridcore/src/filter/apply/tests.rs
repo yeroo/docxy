@@ -913,7 +913,10 @@ fn an_icon_filter_over_ten_thousand_rows_reads_the_rule_once() {
         set: "3Arrows".into(),
         id: 2,
     };
+    let reads = || crate::cf::ICON_RANGE_READS.with(|n| n.get());
+    let before = reads();
     let out = set_criterion(&mut wb, 0, 0, Some(up), today()).unwrap();
     assert!(out.shown > 0 && out.shown < 10_000);
+    assert_eq!(reads() - before, 1, "the rule's numbers are read once");
     menu(&wb, 0, 0, None).unwrap();
 }

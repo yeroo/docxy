@@ -333,6 +333,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         let mut sheet = parse_worksheet(&xml, &shared, &hlink_targets);
         sheet.name = name;
         sheet.hidden = hidden;
+        sheet.filter_mode = Some(read_filter_mode(&xml));
         sheet.auto_filter = sheet_auto_filter_span(&xml)
             .and_then(|(s, e)| auto_filter_position(&xml[s..e], &styles.dxfs));
         let sheet_idx = sheets.len();
@@ -2048,6 +2049,7 @@ fn parse_worksheet(
                                 }
                             }
                             _ => CfKind::Other {
+                                rule_type: ty.clone(),
                                 formulas: std::mem::take(&mut cf_formulas),
                             },
                         };
@@ -4360,6 +4362,15 @@ fn auto_filter_block(af: &crate::sheet::SheetAutoFilter, dxf_for: &mut DxfFor) -
     } else {
         format!("<autoFilter ref=\"{r}\">{cols}</autoFilter>")
     }
+}
+
+/// `<sheetPr filterMode>`: whether the part says some rows are filtered.
+fn read_filter_mode(xml: &str) -> bool {
+    if !xml.contains("filterMode") {
+        return false;
+    }
+    worksheet_child_span(xml, "sheetPr")
+        .is_some_and(|(start, _)| matches!(attr_at(xml, start, "filterMode"), Some("1" | "true")))
 }
 
 /// Sync `<sheetPr filterMode>` (some rows of the sheet are filtered) with

@@ -2,7 +2,7 @@
 //! command is one undo step over gridcore's filter and sort engines, and
 //! leaves its outcome in the status line.
 
-use gridcore::edit::{BUILTIN_SORT_LISTS, SortLevel, SortOn, SortOptions};
+use gridcore::edit::{SortLevel, SortOn, SortOptions};
 use gridcore::filter::{ColumnFilter, DateGroup, FilterError, FilterMenu, FilterOutcome};
 use gridcore::sheet::Workbook;
 use ratatui::Frame;
@@ -17,6 +17,31 @@ use crate::{App, now_serial};
 /// Area (r1, c1, r2, c2), 0-based.
 pub type Area = (u32, u32, u32, u32);
 
+/// `A1:C9` or `B4` (one cell), 0-based; `$` anchors are ignored.
+pub(crate) fn area(s: &str) -> Result<Area, String> {
+    let s = s.trim().replace('$', "");
+    gridcore::sheet::parse_range_name(&s)
+        .or_else(|| gridcore::sheet::parse_cell_name(&s).map(|(r, c)| (r, c, r, c)))
+        .ok_or_else(|| format!("bad range '{s}'"))
+}
+
+/// `Sheet2!A1:B3` or `'It''s'!A1` (or a bare range on `default`) as
+/// (sheet, area).
+pub(crate) fn qualified(wb: &Workbook, s: &str, default: usize) -> Result<(usize, Area), String> {
+    match s.rsplit_once('!') {
+        Some((sheet, refs)) => {
+            let name = sheet.trim().trim_matches('\'').replace("''", "'");
+            let si = wb
+                .sheets
+                .iter()
+                .position(|x| x.name.eq_ignore_ascii_case(&name))
+                .ok_or_else(|| format!("no sheet named '{name}'"))?;
+            Ok((si, area(refs)?))
+        }
+        None => Ok((default, area(s)?)),
+    }
+}
+
 /// "Today" for the date filters: the local clock, or `wb.clock`'s date.
 pub fn today() -> f64 {
     now_serial().unwrap_or(0.0)
@@ -27,11 +52,11 @@ impl App {
     /// line says `<n> of <m> records found`. A command that changed nothing
     /// (Clear with nothing filtered) puts nothing on the undo stack and
     /// leaves the workbook unmodified; so does a refused one, whose reason is
-    /// the error and the status. [`Self::last_changed`] says which.
+    /// the error and the status. Also whether it changed anything.
     pub(crate) fn filter_command(
         &mut self,
         op: impl FnOnce(&mut Workbook, usize, f64) -> Result<FilterOutcome, FilterError>,
-    ) -> Result<FilterOutcome, String> {
+    ) -> Result<(FilterOutcome, bool), String> {
         let si = self.sheet;
         self.filter_command_on(si, op)
     }
@@ -41,7 +66,7 @@ impl App {
         &mut self,
         si: usize,
         op: impl FnOnce(&mut Workbook, usize, f64) -> Result<FilterOutcome, FilterError>,
-    ) -> Result<FilterOutcome, String> {
+    ) -> Result<(FilterOutcome, bool), String> {
         let today = today();
         let mut got = None;
         let res = self.try_structural_if_changed(|wb| {
@@ -49,11 +74,10 @@ impl App {
             got = Some(o);
             Ok(())
         });
-        self.last_changed = *res.as_ref().unwrap_or(&false);
-        match res.and_then(|_| got.ok_or_else(String::new)) {
-            Ok(o) => {
+        match res.and_then(|changed| Ok((got.ok_or_else(String::new)?, changed))) {
+            Ok((o, changed)) => {
                 self.status = Some(gridcore::filter::status_text(&o));
-                Ok(o)
+                Ok((o, changed))
             }
             Err(e) => {
                 self.status = Some(e.clone());
@@ -85,25 +109,26 @@ impl App {
         Ok(!on)
     }
 
-    /// Sort `area` by `levels` as one undo step. A refusal (a cut spill,
-    /// merged cells of different sizes) changes nothing; its message is the
-    /// error and the status.
+    /// Sort `area` by `levels` as one undo step (none when no cell moved).
+    /// A refusal (a cut spill, merged cells of different sizes) changes
+    /// nothing; its message is the error and the status. How many rows
+    /// (columns) it sorted, and whether anything moved.
     pub(crate) fn sort_command(
         &mut self,
         si: usize,
         area: Area,
         levels: &[SortLevel],
         opts: &SortOptions,
-    ) -> Result<usize, String> {
+    ) -> Result<(usize, bool), String> {
         let mut n = 0;
-        self.last_changed = self
+        let changed = self
             .try_structural_if_changed(|wb| {
                 n = gridcore::edit::sort_range(wb, si, area, levels, opts)
                     .map_err(|e| e.message().to_string())?;
                 Ok(())
             })
             .inspect_err(|e| self.status = Some(e.clone()))?;
-        Ok(n)
+        Ok((n, changed))
     }
 }
 
@@ -141,17 +166,6 @@ pub(crate) struct PendingSort {
     pub levels: Vec<SortLevel>,
     pub opts: SortOptions,
     pub header_given: bool,
-}
-
-/// A colour like `FF00B050` or `00B050`.
-fn hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
-    let h = s.trim().trim_start_matches('#');
-    let h = if h.len() == 8 { &h[2..] } else { h };
-    if h.len() != 6 {
-        return None;
-    }
-    let b = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
-    Some((b(0)?, b(2)?, b(4)?))
 }
 
 /// The Custom AutoFilter / Top 10 / date-period prompt's text as criteria:
@@ -289,7 +303,7 @@ pub(crate) fn parse_sort_text(
                 rgb: if v == "none" {
                     None
                 } else {
-                    Some(hex_rgb(v).ok_or("Sort: bad colour")?)
+                    Some(gridcore::format::hex_rgb(v).ok_or("Sort: bad colour")?)
                 },
                 top,
             }
@@ -298,7 +312,7 @@ pub(crate) fn parse_sort_text(
                 rgb: if v == "auto" {
                     None
                 } else {
-                    Some(hex_rgb(v).ok_or("Sort: bad colour")?)
+                    Some(gridcore::format::hex_rgb(v).ok_or("Sort: bad colour")?)
                 },
                 top,
             }
@@ -313,19 +327,8 @@ pub(crate) fn parse_sort_text(
             }
         } else if lower.starts_with("list:") {
             let items = &first[5..];
-            let builtin = |i: usize| {
-                BUILTIN_SORT_LISTS[i]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            };
-            let list = match items.to_lowercase().as_str() {
-                "days" => builtin(0),
-                "weekdays" => builtin(1),
-                "months" => builtin(2),
-                "monthnames" => builtin(3),
-                _ => items.split('/').map(|s| s.trim().to_string()).collect(),
-            };
+            let list = gridcore::edit::builtin_sort_list(items)
+                .unwrap_or_else(|| items.split('/').map(|s| s.trim().to_string()).collect());
             let asc = !rest.iter().skip(1).any(|w| w.eq_ignore_ascii_case("desc"));
             SortOn::Value {
                 asc,
@@ -420,7 +423,7 @@ impl App {
 
     fn run_sort(&mut self, area: Area, levels: &[SortLevel], opts: &SortOptions) {
         let si = self.sheet;
-        if let Ok(n) = self.sort_command(si, area, levels, opts) {
+        if let Ok((n, _)) = self.sort_command(si, area, levels, opts) {
             self.status = Some(format!(
                 "Sorted {n} {}",
                 if opts.left_to_right {
@@ -674,33 +677,15 @@ impl App {
     fn advanced_from_text(&self, text: &str) -> Result<gridcore::filter::AdvancedFilter, String> {
         let si = self.sheet;
         let wb = &self.pkg.workbook;
-        let area = |s: &str| -> Option<Area> {
-            let s = s.replace('$', "");
-            gridcore::sheet::parse_range_name(&s)
-                .or_else(|| gridcore::sheet::parse_cell_name(&s).map(|(r, c)| (r, c, r, c)))
-        };
-        let on = |s: &str| -> Option<(usize, Area)> {
-            match s.rsplit_once('!') {
-                Some((sh, r)) => {
-                    let name = sh.trim().trim_matches('\'').replace("''", "'");
-                    let i = wb
-                        .sheets
-                        .iter()
-                        .position(|x| x.name.eq_ignore_ascii_case(&name))?;
-                    Some((i, area(r)?))
-                }
-                None => Some((si, area(s)?)),
-            }
-        };
         let mut a = gridcore::filter::AdvancedFilter::default();
         let mut list = None;
         for w in text.split_whitespace() {
             let (k, v) = w.split_once('=').unwrap_or((w, ""));
-            let bad = || format!("Advanced: bad {k} '{v}'");
+            let bad = |e: String| format!("Advanced: {k}: {e}");
             match k.to_lowercase().as_str() {
-                "list" => list = Some(area(v).ok_or_else(bad)?),
-                "criteria" => a.criteria = Some(on(v).ok_or_else(bad)?),
-                "copy" => a.copy_to = Some(on(v).ok_or_else(bad)?),
+                "list" => list = Some(area(v).map_err(bad)?),
+                "criteria" => a.criteria = Some(qualified(wb, v, si).map_err(bad)?),
+                "copy" => a.copy_to = Some(qualified(wb, v, si).map_err(bad)?),
                 "unique" => a.unique = true,
                 _ => return Err(format!("Advanced: unknown '{w}'")),
             }
@@ -955,6 +940,14 @@ mod tests {
         let (levels, ..) = parse_sort_text("A list:months").unwrap();
         assert!(matches!(&levels[0].on, SortOn::Value { list: Some(l), .. } if l.len() == 12));
         assert!(parse_sort_text("A sideways").is_err());
+        // A colour that is not ASCII hex is refused, never a crash.
+        for bad in ["A fill:1é234", "A font:€12345", "A fill:+1+2+3"] {
+            assert_eq!(
+                parse_sort_text(bad).err().as_deref(),
+                Some("Sort: bad colour"),
+                "{bad}"
+            );
+        }
     }
 
     /// DAT-CASE-037's list A1:C6 in the TUI.

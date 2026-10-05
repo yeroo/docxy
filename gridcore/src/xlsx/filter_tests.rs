@@ -386,3 +386,35 @@ fn a_loaded_filter_on_a_theme_colour_is_kept_as_it_was() {
     let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
     assert!(ws.contains(filter), "{ws}");
 }
+
+#[test]
+fn a_rule_we_do_not_evaluate_makes_its_cells_colour_unknown() {
+    // Duplicate Values over B2:B3 with a red fill, and a colour scale on C.
+    let cf = concat!(
+        r#"<conditionalFormatting sqref="B2:B3"><cfRule type="duplicateValues" dxfId="0" priority="1"/></conditionalFormatting>"#,
+        r#"<conditionalFormatting sqref="A2:A3"><cfRule type="colorScale" priority="2"><colorScale><cfvo type="min"/><cfvo type="max"/><color rgb="FFF8696B"/><color rgb="FF63BE7B"/></colorScale></cfRule></conditionalFormatting>"#,
+    );
+    let mut pkg = list(
+        cf,
+        r#"<dxfs count="1"><dxf><fill><patternFill><bgColor rgb="FFFFC7CE"/></patternFill></fill></dxf></dxfs>"#,
+    );
+    pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+    let wb = &mut pkg.workbook;
+    use crate::cf::{Shown, cell_fill, cell_font_color};
+    assert_eq!(cell_fill(wb, 0, 1, 1), Shown::Unknown);
+    assert_eq!(cell_fill(wb, 0, 1, 0), Shown::Unknown, "a colour scale");
+    // The rule sets no font colour: that stays readable.
+    assert_eq!(cell_font_color(wb, 0, 1, 1), Shown::None);
+    crate::filter::auto_filter_on(wb, 0, (0, 0)).unwrap();
+    let none = ColumnFilter::Color {
+        cell: true,
+        rgb: None,
+        dxf_id: None,
+    };
+    let out = crate::filter::set_criterion(wb, 0, 1, Some(none), 45000.0).unwrap();
+    assert_eq!(out.shown, 0, "No Fill keeps no possibly-highlighted cell");
+    assert_eq!(
+        crate::filter::filter_by_cell(wb, 0, (1, 1), crate::filter::ByCell::CellColor, 45000.0),
+        Err(crate::filter::FilterError::NoColor)
+    );
+}
