@@ -28,7 +28,7 @@ fn cell(wb: &Workbook, name: &str) -> Cell {
     wb.sheets[0].cell(r, c).cloned().unwrap_or_default()
 }
 
-const A1B2: Rect = (0, 0, 1, 1);
+const A1B2: Area = (0, 0, 1, 1);
 const NOTES: &[(u32, u32)] = &[(0, 0), (5, 5)];
 
 #[test]

@@ -18,14 +18,14 @@ fn book(cells: &[(&str, Cell)]) -> Workbook {
     }
 }
 
-fn rect(s: &str) -> Rect {
+fn rect(s: &str) -> Area {
     let (a, b) = s.split_once(':').unwrap_or((s, s));
     let (r0, c0) = parse_cell_name(a).unwrap();
     let (r1, c1) = parse_cell_name(b).unwrap();
     (r0, c0, r1, c1)
 }
 
-fn rects(v: &[&str]) -> Vec<Rect> {
+fn rects(v: &[&str]) -> Vec<Area> {
     v.iter().map(|s| rect(s)).collect()
 }
 
@@ -34,7 +34,7 @@ fn go(
     sel: &[&str],
     active: &str,
     kind: GoSpecial,
-) -> Result<Vec<Rect>, &'static str> {
+) -> Result<Vec<Area>, &'static str> {
     go_to_special(
         wb,
         0,
@@ -322,10 +322,11 @@ fn go_to_resolves_cells_ranges_sheets_and_names() {
     assert_eq!(resolve_reference(&wb, 0, "banana"), None);
 }
 
-/// #707 r3 M3: a whole-sheet selection, and a rule over whole columns,
-/// are searched within the used range, quickly.
+/// #707 r3 M3 and r4 M2: whole-sheet scopes stay fast, and give Excel's
+/// results: the differences within the used range, Visible cells over the
+/// selection itself, a rule's or a precedent's whole range.
 #[test]
-fn whole_sheet_scopes_are_clipped_to_the_used_range() {
+fn whole_sheet_scopes_are_fast_and_keep_excels_results() {
     use crate::sheet::{MAX_COLS, MAX_ROWS};
     let wb = book(&[
         ("A1", Cell::number(1.0)),
@@ -340,14 +341,14 @@ fn whole_sheet_scopes_are_clipped_to_the_used_range() {
     let found = go_to_special(&wb, 0, &[all], (0, 0), GoSpecial::RowDifferences, &[]);
     assert_eq!(found, Ok(rects(&["C1", "B2"])));
     let found = go_to_special(&wb, 0, &[all], (0, 0), GoSpecial::VisibleCells, &[]);
-    assert_eq!(found, Ok(rects(&["A1:C2"])));
+    assert_eq!(found, Ok(vec![all]), "the selection, hidden nothing");
+    // A whole-column rule, Same, from a cell outside the data.
     let mut wb = wb;
     wb.sheets[0].cond_formats.push(CondFormat {
         ranges: vec![(0, 0, MAX_ROWS - 1, 1)],
         rules: Vec::new(),
         ix: None,
     });
-    wb.sheets[0].set_cell(0, 3, Cell::formula("SUM(A:A)"));
     let found = go_to_special(
         &wb,
         0,
@@ -356,19 +357,93 @@ fn whole_sheet_scopes_are_clipped_to_the_used_range() {
         GoSpecial::ConditionalFormats { same: true },
         &[],
     );
-    assert_eq!(found, Ok(rects(&["A1:B2"])));
+    assert_eq!(found, Ok(vec![(0, 0, MAX_ROWS - 1, 1)]));
+    wb.sheets[0].set_cell(0, 3, Cell::formula("SUM(A:A)"));
     let found = go_to_special(
         &wb,
         0,
         &[rect("D1")],
         (0, 3),
-        GoSpecial::Precedents { all: false },
+        GoSpecial::Precedents { all: true },
         &[],
     );
-    assert_eq!(found, Ok(rects(&["A1:A2"])));
+    assert_eq!(found, Ok(vec![(0, 0, MAX_ROWS - 1, 0)]));
     assert!(
         t.elapsed() < std::time::Duration::from_secs(2),
         "{:?}",
         t.elapsed()
     );
+}
+
+/// #707 r4 M2: the planner's three cases.
+#[test]
+fn visible_cells_rules_and_precedents_reach_past_the_data() {
+    // Visible cells over A1:D20 with row 5 hidden.
+    let mut wb = book(&[("A1", Cell::number(1.0))]);
+    wb.sheets[0]
+        .row_attrs
+        .insert(4, " hidden=\"1\"".to_string());
+    assert_eq!(
+        go(&wb, &["A1:D20"], "A1", GoSpecial::VisibleCells),
+        Ok(rects(&["A1:D4", "A6:D20"]))
+    );
+    // Validation on B2:B100 of an empty form, Same.
+    let mut wb = book(&[]);
+    wb.sheets[0].validations.push(DataValidation {
+        ranges: vec![rect("B2:B100")],
+        kind: "whole".into(),
+        operator: String::new(),
+        formula1: "1".into(),
+        formula2: String::new(),
+        prompt: None,
+        ix: None,
+    });
+    assert_eq!(
+        go(&wb, &["B2"], "B2", GoSpecial::DataValidation { same: true }),
+        Ok(rects(&["B2:B100"]))
+    );
+    // =SUM(A1:A10) with A1:A3 filled.
+    let mut wb = book(&[
+        ("A1", Cell::number(1.0)),
+        ("A2", Cell::number(2.0)),
+        ("A3", Cell::number(3.0)),
+    ]);
+    wb.sheets[0].set_cell(0, 2, Cell::formula("SUM(A1:A10)"));
+    assert_eq!(
+        go(&wb, &["C1"], "C1", GoSpecial::Precedents { all: false }),
+        Ok(rects(&["A1:A10"]))
+    );
+}
+
+/// #707 r4 M3: the current region of a long column is found fast.
+#[test]
+fn the_current_region_of_a_long_column_is_fast() {
+    let mut wb = book(&[]);
+    for r in 0..50_000 {
+        wb.sheets[0].set_cell(r, 0, Cell::number(f64::from(r)));
+    }
+    let t = std::time::Instant::now();
+    assert_eq!(
+        go(&wb, &["A1"], "A1", GoSpecial::CurrentRegion),
+        Ok(vec![(0, 0, 49_999, 0)])
+    );
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        t.elapsed()
+    );
+}
+
+#[test]
+fn union_rects_merges_without_walking_cells() {
+    use crate::sheet::MAX_ROWS;
+    assert_eq!(
+        union_rects(&[(0, 0, 9, 0), (5, 0, MAX_ROWS - 1, 0), (0, 2, 0, 2)]),
+        vec![(0, 0, MAX_ROWS - 1, 0), (0, 2, 0, 2)]
+    );
+    assert_eq!(
+        union_rects(&[(0, 0, 1, 1), (0, 0, 1, 1)]),
+        vec![(0, 0, 1, 1)]
+    );
+    assert!(union_rects(&[]).is_empty());
 }

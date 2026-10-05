@@ -955,3 +955,17 @@ fn weekdays_off_the_calendar_and_huge_steps() {
     assert_eq!(r, Err(STEP_OUT_OF_RANGE));
     assert_eq!(shown(&wb, "A2"), CellValue::Empty);
 }
+
+/// #707 r4 m1: uneven month seeds continue from the last, by the last step.
+#[test]
+fn uneven_month_seeds_continue_from_the_last() {
+    let mut wb = book(&[]);
+    let s = style(&mut wb, "yyyy-mm-dd");
+    for (r, m) in [(0u32, 1u32), (1, 3), (2, 4)] {
+        let mut c = Cell::number(parts_to_serial(2024, m, 15, 0, false));
+        c.style = s;
+        wb.sheets[0].set_cell(r, 0, c);
+    }
+    fill_with(&mut wb, "A1:A3", "A4", FillKind::Months, false, &[]);
+    assert_eq!(nums(&wb, &["A4"]), [parts_to_serial(2024, 5, 15, 0, false)]);
+}

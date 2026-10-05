@@ -553,3 +553,76 @@ fn transpose_onto_another_sheet_requalifies_references_into_the_copy() {
     );
     assert_eq!(formula(&wb, 1, "D1").as_deref(), Some("Dst!C1+C1+Src!AC8"));
 }
+
+/// #707 r4 M1: the cells a copied array spills into are pasted blank with
+/// its formula, so it spills again where it lands; a paste of values
+/// writes what they show. Dynamic arrays and legacy CSE blocks alike.
+#[test]
+fn a_pasted_array_spills_again_over_its_members() {
+    use crate::engine::Engine;
+    for what in [PasteWhat::All, PasteWhat::Formulas] {
+        let mut wb = book(&[("Sheet1", &[])]);
+        let mut eng = Engine::new(&wb);
+        eng.set_cell(&mut wb, (0, 0, 0), Cell::formula("SEQUENCE(3)"));
+        assert_eq!(wb.sheets[0].cell(0, 0).unwrap().spill, Some((3, 1)));
+        let clip = copy(&wb, 0, "A1:A3");
+        paste(&mut wb, 0, "C1", &clip, PasteSpec::of(what));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(
+            [
+                value(&wb, 0, "C1"),
+                value(&wb, 0, "C2"),
+                value(&wb, 0, "C3")
+            ],
+            [1.0, 2.0, 3.0].map(CellValue::Number),
+            "{what:?}"
+        );
+        assert_eq!(formula(&wb, 0, "C2"), None);
+    }
+    // A legacy CSE block over A1:A3.
+    let mut wb = book(&[(
+        "Sheet1",
+        &[
+            ("B1", Cell::number(1.0)),
+            ("B2", Cell::number(2.0)),
+            ("B3", Cell::number(3.0)),
+        ],
+    )]);
+    wb.sheets[0].set_cell(
+        0,
+        0,
+        Cell {
+            value: CellValue::Number(2.0),
+            formula: Some("B1:B3*2".into()),
+            f_attrs: Some(" t=\"array\" ref=\"A1:A3\"".into()),
+            spill: Some((3, 1)),
+            ..Cell::default()
+        },
+    );
+    wb.sheets[0].set_cell(1, 0, Cell::number(4.0));
+    wb.sheets[0].set_cell(2, 0, Cell::number(6.0));
+    let clip = copy(&wb, 0, "A1:B3");
+    paste(&mut wb, 0, "D1", &clip, PasteSpec::default());
+    let d1 = cell(&wb, 0, "D1");
+    assert!(d1.f_attrs.is_none(), "the source's ref does not come along");
+    assert_eq!(formula(&wb, 0, "D2"), None);
+    let mut eng = Engine::new(&wb);
+    eng.recalc_all(&mut wb);
+    assert_eq!(
+        [
+            value(&wb, 0, "D1"),
+            value(&wb, 0, "D2"),
+            value(&wb, 0, "D3")
+        ],
+        [2.0, 4.0, 6.0].map(CellValue::Number)
+    );
+    // Values write what the cells show.
+    let mut wb = book(&[("Sheet1", &[])]);
+    let mut eng = Engine::new(&wb);
+    eng.set_cell(&mut wb, (0, 0, 0), Cell::formula("SEQUENCE(3)"));
+    let clip = copy(&wb, 0, "A1:A3");
+    paste(&mut wb, 0, "C1", &clip, PasteSpec::of(PasteWhat::Values));
+    assert_eq!(value(&wb, 0, "C3"), CellValue::Number(3.0));
+    assert_eq!(formula(&wb, 0, "C1"), None);
+}

@@ -12300,6 +12300,39 @@ mod tests {
         assert!(app.status.as_deref().unwrap_or("").contains("cut"));
     }
 
+    /// #707 r4 M1: Paste Special › All of a spilling array pastes its
+    /// members blank, so the pasted formula spills again; Values writes
+    /// what they show.
+    #[test]
+    fn paste_special_of_a_spill_spills_again() {
+        for (what, formula_kept) in [
+            (gridcore::edit::PasteWhat::All, true),
+            (gridcore::edit::PasteWhat::Formulas, true),
+            (gridcore::edit::PasteWhat::Values, false),
+        ] {
+            let mut app = App::new(new_xlsx(), "spill.xlsx");
+            app.os_clip = None;
+            app.engine.set_cell(
+                &mut app.pkg.workbook,
+                (0, 0, 0),
+                Cell::formula("SEQUENCE(3)"),
+            );
+            app.cur = (2, 0);
+            app.anchor = Some((0, 0));
+            app.copy(false);
+            app.anchor = None;
+            app.cur = (0, 2);
+            app.paste_special(gridcore::edit::PasteSpec::of(what));
+            let v = |r| app.sheet().cell(r, 2).map(|c| c.value.clone());
+            let n = |x: f64| Some(CellValue::Number(x));
+            assert_eq!([v(0), v(1), v(2)], [n(1.0), n(2.0), n(3.0)], "{what:?}");
+            assert_eq!(
+                app.sheet().cell(0, 2).is_some_and(|c| c.formula.is_some()),
+                formula_kept
+            );
+        }
+    }
+
     /// #707 r3 m5: Fill (Ctrl+D/R, Up, Left) refuses a protected sheet.
     #[test]
     fn fill_refuses_a_protected_sheet() {

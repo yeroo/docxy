@@ -13,7 +13,7 @@
 use crate::formula::{Expr, Transposed, to_string, translate_formula, transpose_formula};
 use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Workbook, cell_name};
 
-use super::{Rect, rects_overlap as overlaps};
+use super::{Area, rects_overlap as overlaps};
 
 /// Excel's refusal of a multi-area copy whose areas share neither their rows
 /// nor their columns, of any multi-area cut, and of a paste or a drag over a
@@ -301,6 +301,33 @@ impl ClipBlock {
             && self.cells.iter().all(|row| row.len() <= self.cols.len())
     }
 
+    /// The block positions an array formula of the copy spills into (its
+    /// own cell aside): a dynamic array's spill, or a legacy CSE block.
+    fn spill_members(&self) -> std::collections::HashSet<(usize, usize)> {
+        let mut members = std::collections::HashSet::new();
+        for (i, row) in self.cells.iter().enumerate() {
+            for (j, cell) in row.iter().enumerate() {
+                let (Some((h, w)), Some(_), Some(&r0), Some(&c0)) = (
+                    cell.spill,
+                    &cell.formula,
+                    self.rows.get(i),
+                    self.cols.get(j),
+                ) else {
+                    continue;
+                };
+                for (ii, &r) in self.rows.iter().enumerate() {
+                    for (jj, &c) in self.cols.iter().enumerate() {
+                        let inside = (r0..r0 + h).contains(&r) && (c0..c0 + w).contains(&c);
+                        if inside && (ii, jj) != (i, j) {
+                            members.insert((ii, jj));
+                        }
+                    }
+                }
+            }
+        }
+        members
+    }
+
     /// (rows, cols) of the copy.
     pub fn size(&self) -> (u32, u32) {
         (self.rows.len() as u32, self.cols.len() as u32)
@@ -322,7 +349,7 @@ impl ClipBlock {
     }
 
     /// The rectangle a paste at `at` covers, cut at the grid's edge.
-    pub fn pasted_rect(&self, at: (u32, u32), transpose: bool) -> Rect {
+    pub fn pasted_rect(&self, at: (u32, u32), transpose: bool) -> Area {
         let (h, w) = self.pasted_size(transpose);
         let r1 = (u64::from(at.0) + u64::from(h.max(1)) - 1).min(u64::from(MAX_ROWS - 1));
         let c1 = (u64::from(at.1) + u64::from(w.max(1)) - 1).min(u64::from(MAX_COLS - 1));
@@ -367,7 +394,7 @@ impl ClipBlock {
 /// sheet order: allowed only when every area spans the same rows (the
 /// columns are joined) or the same columns (the rows are joined), as Excel
 /// has it; otherwise [`MULTI_SELECTION`].
-pub fn multi_area_shape(areas: &[Rect]) -> Result<(Vec<u32>, Vec<u32>), &'static str> {
+pub fn multi_area_shape(areas: &[Area]) -> Result<(Vec<u32>, Vec<u32>), &'static str> {
     let Some(&(r0, c0, r1, c1)) = areas.first() else {
         return Err(MULTI_SELECTION);
     };
@@ -451,10 +478,6 @@ fn apply_op(op: PasteOp, d: Operand, s: Operand) -> Option<Result<f64, String>> 
     }
 }
 
-fn is_blank(cell: &Cell) -> bool {
-    cell.value.is_empty() && cell.formula.is_none()
-}
-
 /// The `(row, col, cell)` writes a Paste Special of `clip` at `at` on
 /// `sheet` makes (styles it needs are interned into `wb`'s styles). Notes,
 /// validation and column widths are not cells: [`paste_special_extras`].
@@ -473,13 +496,14 @@ pub fn paste_special_changes(
     let Some(s) = sheets.get(sheet) else {
         return out;
     };
+    let members = clip.spill_members();
     // Only the cells that know where they came from.
     for (i, row) in clip.cells.iter().enumerate().take(clip.rows.len()) {
         for (j, src) in row.iter().enumerate().take(clip.cols.len()) {
             let Some(dest) = clip.dest(at, (i, j), spec.transpose) else {
                 continue;
             };
-            if spec.skip_blanks && is_blank(src) {
+            if spec.skip_blanks && src.is_blank() {
                 continue;
             }
             let d = s.cell(dest.0, dest.1).cloned().unwrap_or_default();
@@ -540,13 +564,29 @@ pub fn paste_special_changes(
                 out.push((dest.0, dest.1, cell));
                 continue;
             }
+            // A cell an array formula of the copy spills into is left blank
+            // where that formula is pasted with it: the pasted formula
+            // spills there again, where a constant would block it (#707 r4
+            // M1). A paste of values writes what the cells show.
+            if !values_only && members.contains(&(i, j)) {
+                out.push((
+                    dest.0,
+                    dest.1,
+                    Cell {
+                        style,
+                        ..Cell::default()
+                    },
+                ));
+                continue;
+            }
             let mut cell = match formula {
                 Some(f) => {
                     let mut c = src.clone();
                     c.formula = Some(f);
-                    if !spec.what.all() {
-                        c.spill = None;
-                    }
+                    // An array's `<f>` attributes name the source's block
+                    // (a legacy CSE `ref`): the copy is a formula of its own
+                    // that spills where it lands, as a filled one is.
+                    super::rebase(&mut c, 0, 0);
                     c
                 }
                 None if values_only || !spec.what.all() => Cell {
@@ -569,8 +609,8 @@ pub struct PasteExtras {
     pub notes: Vec<(u32, u32, String, String)>,
     /// Validation to clear from these cells first, then rules to add, one
     /// rectangle each.
-    pub clear_rules: Option<Rect>,
-    pub rules: Vec<(Rect, ClipRule)>,
+    pub clear_rules: Option<Area>,
+    pub rules: Vec<(Area, ClipRule)>,
     /// Column widths to set: (column, width in characters).
     pub widths: Vec<(u32, f64)>,
 }
@@ -643,7 +683,7 @@ pub fn paste_special_extras(clip: &ClipBlock, at: (u32, u32), spec: &PasteSpec) 
 /// Take `rect` out of every validation rule on `sheet`: a rule's ranges are
 /// cut around it, and a rule left with no range goes (its element named in
 /// `dv_removed` for the save).
-pub fn clear_validation(sheet: &mut Sheet, rect: Rect) {
+pub fn clear_validation(sheet: &mut Sheet, rect: Area) {
     let removed = &mut sheet.dv_removed;
     sheet.validations.retain_mut(|dv| {
         if !dv.ranges.iter().any(|&r| overlaps(r, rect)) {
@@ -659,7 +699,7 @@ pub fn clear_validation(sheet: &mut Sheet, rect: Rect) {
 }
 
 /// `a` without `b`: up to four rectangles (above, below, left, right).
-pub(crate) fn subtract(a: Rect, b: Rect) -> Vec<Rect> {
+pub(crate) fn subtract(a: Area, b: Area) -> Vec<Area> {
     if !overlaps(a, b) {
         return vec![a];
     }
@@ -684,7 +724,7 @@ pub(crate) fn subtract(a: Rect, b: Rect) -> Vec<Rect> {
 
 /// `cells` as rectangles: each row's runs of adjacent columns, then runs
 /// that repeat on consecutive rows joined.
-pub fn cells_to_rects(cells: &[(u32, u32)]) -> Vec<Rect> {
+pub fn cells_to_rects(cells: &[(u32, u32)]) -> Vec<Area> {
     let mut sorted = cells.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
@@ -696,7 +736,7 @@ pub fn cells_to_rects(cells: &[(u32, u32)]) -> Vec<Rect> {
             _ => runs.push((r, c, c)),
         }
     }
-    let mut rects: Vec<Rect> = Vec::new();
+    let mut rects: Vec<Area> = Vec::new();
     // Open rectangles by their column span, extended while the next row has
     // the same run.
     let mut open: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
@@ -757,17 +797,19 @@ pub fn paste_link_changes(
 /// What [`paste_special`] did beyond the cells it wrote: the rectangle it
 /// covered, and the notes and validation rules for a host with a package to
 /// write (a workbook alone has nowhere to keep them).
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pasted {
-    pub rect: Rect,
+    pub rect: Area,
     pub notes: Vec<(u32, u32, String, String)>,
-    pub rules: Vec<(Rect, ClipRule)>,
+    pub rules: Vec<(Area, ClipRule)>,
 }
 
 /// Paste Special `clip` at `at` on `sheet` of `wb`: the cell writes, the
 /// column widths and the validation cleared from the destination; the
 /// notes and rules to add come back for the host. Refused when nothing of
 /// the copy would land on the grid.
+#[cfg(test)]
 pub fn paste_special(
     wb: &mut Workbook,
     sheet: usize,

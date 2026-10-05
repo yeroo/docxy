@@ -8,7 +8,7 @@ use crate::sheet_menus::DropChoice;
 use crate::{Docxy, GridPasteError, SheetView};
 use gridcore::edit::{PasteSpec, PasteWhat};
 
-type Rect = (u32, u32, u32, u32);
+use gridcore::edit::Area;
 
 /// Excel's question before a drop overwrites data.
 pub(crate) const REPLACE_DATA: &str = "There's already data here. Do you want to replace it?";
@@ -17,7 +17,7 @@ pub(crate) const REPLACE_DATA: &str = "There's already data here. Do you want to
 /// press grabbed it by and the cell the pointer is over now.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BorderDrag {
-    pub src: Rect,
+    pub src: Area,
     pub grab: (u32, u32),
     pub over: (u32, u32),
     pub ctrl: bool,
@@ -53,7 +53,7 @@ impl BorderDrag {
     }
 
     /// The rectangle the block would cover where it is now.
-    pub fn dest(&self) -> Rect {
+    pub fn dest(&self) -> Area {
         let (r0, c0, r1, c1) = self.src;
         let (dr, dc) = self.dest_at();
         (dr, dc, dr + r1 - r0, dc + c1 - c0)
@@ -62,16 +62,14 @@ impl BorderDrag {
 
 impl SheetView {
     /// Whether dropping `src` on `dest` would overwrite data outside `src`.
-    pub(crate) fn drop_hits_data(&self, src: Rect, dest: Rect) -> bool {
+    pub(crate) fn drop_hits_data(&self, src: Area, dest: Area) -> bool {
         let (r0, c0, r1, c1) = dest;
         self.sheet()
             .cells
             .range((r0, 0)..=(r1, u32::MAX))
             .any(|(&(r, c), cell)| {
                 let in_src = (src.0..=src.2).contains(&r) && (src.1..=src.3).contains(&c);
-                (c0..=c1).contains(&c)
-                    && !in_src
-                    && (!cell.value.is_empty() || cell.formula.is_some())
+                (c0..=c1).contains(&c) && !in_src && !cell.is_blank()
             })
     }
 
@@ -80,7 +78,7 @@ impl SheetView {
     /// linked. One undo step; `Ok(false)` for Cancel or a drop in place.
     pub(crate) fn border_drop(
         &mut self,
-        src: Rect,
+        src: Area,
         at: (u32, u32),
         choice: DropChoice,
     ) -> Result<bool, String> {

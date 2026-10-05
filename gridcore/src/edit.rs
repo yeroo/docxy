@@ -12,14 +12,16 @@
 
 use std::collections::BTreeMap;
 
-/// A rectangle of cells (r0, c0, r1, c1), inclusive: the selection, a
-/// copy, an area.
-pub type Rect = (u32, u32, u32, u32);
+/// A rectangle of cells `(r1, c1, r2, c2)`, 0-based and inclusive: a
+/// selection, a copy, a Subtotal region.
+pub type Area = (u32, u32, u32, u32);
 
 mod clear;
 mod clip;
 mod goto_special;
-pub use clear::{ClearPlan, ClearWhat, MERGED_PART, apply_clear, apply_clear_sheet, clear_plan};
+#[cfg(test)]
+pub(crate) use clear::apply_clear;
+pub use clear::{ClearPlan, ClearWhat, MERGED_PART, apply_clear_sheet, clear_plan};
 pub use goto_special::{
     GoSpecial, MAX_AREAS, NO_CELLS, TOO_MANY_AREAS, Types, current_region, go_to_special,
     resolve_reference, special_scope,
@@ -35,8 +37,8 @@ mod consolidate;
 mod paste_special;
 pub use paste_special::{
     ClipBlock, ClipNote, ClipRule, MULTI_SELECTION, PasteExtras, PasteOp, PasteSpec, PasteWhat,
-    Pasted, cells_to_rects, clear_validation, multi_area_shape, paste_link_changes, paste_special,
-    paste_special_changes, paste_special_extras,
+    cells_to_rects, clear_validation, multi_area_shape, paste_link_changes, paste_special_changes,
+    paste_special_extras,
 };
 mod subtotal;
 pub(crate) use consolidate::split_ref_text;
@@ -46,7 +48,7 @@ pub use consolidate::{
     format_consolidate_ref, parse_consolidate_func, parse_consolidate_ref,
 };
 pub use subtotal::{
-    Area, SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,
+    SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,
     remove_subtotals, sheets_differ, subtotal, subtotal_columns, subtotal_region,
 };
 
@@ -1916,7 +1918,7 @@ pub fn sync_table_headers(wb: &mut Workbook, sheet: usize, cells: &[(u32, u32)])
     renamed
 }
 
-fn rects_overlap(a: Rect, b: Rect) -> bool {
+fn rects_overlap(a: Area, b: Area) -> bool {
     a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
 }
 

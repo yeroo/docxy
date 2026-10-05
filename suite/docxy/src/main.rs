@@ -3652,8 +3652,7 @@ struct Docxy {
     sheet_dragging: bool,
     // An in-progress auto-fill drag from the selection's fill handle.
     sheet_fill: Option<FillDrag>,
-    // The Auto Fill Options button of the last fill (#668), and a
-    // right-drag of the fill handle waiting on its menu.
+    // The Auto Fill Options button of the last fill (#668).
     fill_options: Option<sheet_fill::FillOptions>,
     // The pending drops of the grid's drags (#670, #668): a border drag
     // in flight, a drop waiting on its menu or question, a fill-handle
@@ -3664,8 +3663,6 @@ struct Docxy {
     paste_options: Option<sheet_paste::PasteOptions>,
     paste_special_source: Option<sheet_paste::PasteSource>,
     office_clip: sheet_paste::OfficeClipboard,
-    // A drag of the selection by its border (#670), and a drop waiting on
-    // its menu or on the replace question.
     // Where the pointer last was over the grid, window coordinates: where a
     // menu a release opens is drawn.
     last_pointer: Point<Pixels>,

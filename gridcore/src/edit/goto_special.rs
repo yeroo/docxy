@@ -1,7 +1,7 @@
 //! Home › Find & Select › Go To Special (#671): the cells of a kind, as the
 //! rectangles of a multi-area selection.
 
-use super::Rect;
+use super::Area;
 use super::paste_special::cells_to_rects;
 use crate::formula::{collect_refs, parse, translate_formula};
 use crate::sheet::{Cell, CellValue, Sheet, Workbook};
@@ -107,7 +107,7 @@ impl GoSpecial {
 
 /// The cells Go To Special searches: the selection when it is more than one
 /// cell, otherwise the used range.
-pub fn special_scope(sheet: &Sheet, areas: &[Rect]) -> Vec<Rect> {
+pub fn special_scope(sheet: &Sheet, areas: &[Area]) -> Vec<Area> {
     let single = areas.len() == 1 && {
         let a = areas[0];
         a.0 == a.2 && a.1 == a.3
@@ -118,22 +118,22 @@ pub fn special_scope(sheet: &Sheet, areas: &[Rect]) -> Vec<Rect> {
     used_rect(sheet).into_iter().collect()
 }
 
-fn used_rect(sheet: &Sheet) -> Option<Rect> {
+fn used_rect(sheet: &Sheet) -> Option<Area> {
     let (rows, cols) = sheet.used_size();
     (rows > 0 && cols > 0).then(|| (0, 0, rows - 1, cols - 1))
 }
 
-fn inside(r: u32, c: u32, a: Rect) -> bool {
+fn inside(r: u32, c: u32, a: Area) -> bool {
     (a.0..=a.2).contains(&r) && (a.1..=a.3).contains(&c)
 }
 
-fn clip(a: Rect, b: Rect) -> Option<Rect> {
+fn clip(a: Area, b: Area) -> Option<Area> {
     let r = (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3));
     (r.0 <= r.2 && r.1 <= r.3).then_some(r)
 }
 
 /// The existing cells of `scope`, each once.
-fn cells_in<'a>(sheet: &'a Sheet, scope: &'a [Rect]) -> Vec<((u32, u32), &'a Cell)> {
+fn cells_in<'a>(sheet: &'a Sheet, scope: &'a [Area]) -> Vec<((u32, u32), &'a Cell)> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for &(r0, c0, r1, c1) in scope {
@@ -148,7 +148,7 @@ fn cells_in<'a>(sheet: &'a Sheet, scope: &'a [Rect]) -> Vec<((u32, u32), &'a Cel
 
 /// The references a formula on `sheet` makes to cells of that same sheet,
 /// as rectangles.
-fn same_sheet_refs(wb: &Workbook, sheet: usize, f: &str) -> Vec<Rect> {
+fn same_sheet_refs(wb: &Workbook, sheet: usize, f: &str) -> Vec<Area> {
     let Ok(e) = parse(f) else {
         return Vec::new();
     };
@@ -163,38 +163,51 @@ fn same_sheet_refs(wb: &Workbook, sheet: usize, f: &str) -> Vec<Rect> {
 
 /// The rectangle of the current region around `(r, c)`: grown while any
 /// cell touching it, diagonals included, holds something.
-pub fn current_region(sheet: &Sheet, (r, c): (u32, u32)) -> Rect {
-    let filled = |r: i64, c: i64| {
-        r >= 0
-            && c >= 0
-            && sheet
-                .cell(r as u32, c as u32)
-                .is_some_and(|x| !x.value.is_empty() || x.formula.is_some())
-    };
-    let (mut r0, mut c0, mut r1, mut c1) = (r as i64, c as i64, r as i64, c as i64);
-    loop {
-        let mut grew = false;
-        if (c0 - 1..=c1 + 1).any(|c| filled(r0 - 1, c)) {
-            r0 -= 1;
-            grew = true;
-        }
-        if (c0 - 1..=c1 + 1).any(|c| filled(r1 + 1, c)) {
-            r1 += 1;
-            grew = true;
-        }
-        if (r0 - 1..=r1 + 1).any(|r| filled(r, c0 - 1)) {
-            c0 -= 1;
-            grew = true;
-        }
-        if (r0 - 1..=r1 + 1).any(|r| filled(r, c1 + 1)) {
-            c1 += 1;
-            grew = true;
-        }
-        if !grew {
-            break;
+pub fn current_region(sheet: &Sheet, (r, c): (u32, u32)) -> Area {
+    // Subtotal's own region, which grows rows to a fixpoint before it scans
+    // columns (#707 r4 M3), diagonals included.
+    super::subtotal_region(sheet, r, c).map_or((r, c, r, c), |(area, _)| area)
+}
+
+/// The union of `rects` as non-overlapping rectangles, in sheet order,
+/// without walking their cells: over the grid their edges cut the sheet
+/// into, which has at most (2n)² pieces for n rectangles (#707 r4 M2).
+pub(crate) fn union_rects(rects: &[Area]) -> Vec<Area> {
+    let mut rows: Vec<u64> = rects
+        .iter()
+        .flat_map(|r| [u64::from(r.0), u64::from(r.2) + 1])
+        .collect();
+    let mut cols: Vec<u64> = rects
+        .iter()
+        .flat_map(|r| [u64::from(r.1), u64::from(r.3) + 1])
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    cols.sort_unstable();
+    cols.dedup();
+    let at = |v: &[u64], x: u64| v.binary_search(&x).unwrap_or(0) as u32;
+    let mut pieces = std::collections::BTreeSet::new();
+    for r in rects {
+        for ri in at(&rows, u64::from(r.0))..at(&rows, u64::from(r.2) + 1) {
+            for ci in at(&cols, u64::from(r.1))..at(&cols, u64::from(r.3) + 1) {
+                pieces.insert((ri, ci));
+            }
         }
     }
-    (r0 as u32, c0 as u32, r1 as u32, c1 as u32)
+    let pieces: Vec<(u32, u32)> = pieces.into_iter().collect();
+    let mut out: Vec<Area> = cells_to_rects(&pieces)
+        .into_iter()
+        .map(|(r0, c0, r1, c1)| {
+            (
+                rows[r0 as usize] as u32,
+                cols[c0 as usize] as u32,
+                (rows[r1 as usize + 1] - 1) as u32,
+                (cols[c1 as usize + 1] - 1) as u32,
+            )
+        })
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 /// Go To Special `kind` on `sheet` of `wb` for the selection `areas`, with
@@ -207,21 +220,21 @@ pub fn current_region(sheet: &Sheet, (r, c): (u32, u32)) -> Rect {
 pub fn go_to_special(
     wb: &Workbook,
     sheet: usize,
-    areas: &[Rect],
+    areas: &[Area],
     active: (u32, u32),
     kind: GoSpecial,
     note_cells: &[(u32, u32)],
-) -> Result<Vec<Rect>, &'static str> {
+) -> Result<Vec<Area>, &'static str> {
     let s = wb.sheets.get(sheet).ok_or(NO_CELLS)?;
     let scope_v = special_scope(s, areas);
     let scope = scope_v.as_slice();
     // Every cell-by-cell walk stays inside the used range: a whole-sheet
     // selection must not walk 17 billion cells (#707 r3 M3).
     let used = used_rect(s);
-    let clip_used = |a: Rect| used.and_then(|u| clip(a, u));
-    let scope_used: Vec<Rect> = scope.iter().filter_map(|&a| clip_used(a)).collect();
+    let clip_used = |a: Area| used.and_then(|u| clip(a, u));
+    let scope_used: Vec<Area> = scope.iter().filter_map(|&a| clip_used(a)).collect();
     let in_scope = |r: u32, c: u32| scope.iter().any(|&a| inside(r, c, a));
-    let rects: Vec<Rect> = match kind {
+    let rects: Vec<Area> = match kind {
         GoSpecial::Notes => cells_to_rects(
             &note_cells
                 .iter()
@@ -251,9 +264,7 @@ pub fn go_to_special(
             for a in scope.iter().filter_map(|&a| clip(a, used)) {
                 for r in a.0..=a.2 {
                     for c in a.1..=a.3 {
-                        let blank = s
-                            .cell(r, c)
-                            .is_none_or(|x| x.value.is_empty() && x.formula.is_none());
+                        let blank = s.cell(r, c).is_none_or(Cell::is_blank);
                         if blank {
                             cells.push((r, c));
                         }
@@ -312,10 +323,13 @@ pub fn go_to_special(
         }
         GoSpecial::Precedents { all } => {
             // From the formulas of the selection's cells (the active cell
-            // when one cell is selected).
+            // when one cell is selected): each range they read, whole, as a
+            // rectangle (#707 r4 M2). All levels follows on through the
+            // cells of those ranges that hold formulas; an empty cell has
+            // none, so only the used range is looked at for them.
             let mut frontier: Vec<(u32, u32)> =
                 cells_in(s, areas).into_iter().map(|(rc, _)| rc).collect();
-            let mut found = std::collections::BTreeSet::new();
+            let mut found: Vec<Area> = Vec::new();
             let mut visited = std::collections::BTreeSet::new();
             while let Some((r, c)) = frontier.pop() {
                 if !visited.insert((r, c)) {
@@ -324,23 +338,24 @@ pub fn go_to_special(
                 let Some(f) = s.cell(r, c).and_then(|x| x.formula.as_deref()) else {
                     continue;
                 };
-                for (r0, c0, r1, c1) in same_sheet_refs(wb, sheet, f)
-                    .into_iter()
-                    .filter_map(clip_used)
-                {
-                    for rr in r0..=r1 {
-                        for cc in c0..=c1 {
-                            if found.insert((rr, cc)) && all {
+                for rect in same_sheet_refs(wb, sheet, f) {
+                    found.push(rect);
+                    if !all {
+                        continue;
+                    }
+                    if let Some((r0, c0, r1, c1)) = clip_used(rect) {
+                        for (&(rr, cc), cell) in s.cells.range((r0, c0)..=(r1, c1)) {
+                            if (c0..=c1).contains(&cc) && cell.formula.is_some() {
                                 frontier.push((rr, cc));
                             }
                         }
                     }
                 }
             }
-            cells_to_rects(&found.into_iter().collect::<Vec<_>>())
+            union_rects(&found)
         }
         GoSpecial::Dependents { all } => {
-            let formulas: Vec<((u32, u32), Vec<Rect>)> = s
+            let formulas: Vec<((u32, u32), Vec<Area>)> = s
                 .cells
                 .iter()
                 .filter_map(|(&rc, cell)| {
@@ -349,7 +364,7 @@ pub fn go_to_special(
                         .map(|f| (rc, same_sheet_refs(wb, sheet, f)))
                 })
                 .collect();
-            let mut targets: Vec<Rect> = areas.to_vec();
+            let mut targets: Vec<Area> = areas.to_vec();
             let mut found = std::collections::BTreeSet::new();
             loop {
                 let mut next = Vec::new();
@@ -379,8 +394,10 @@ pub fn go_to_special(
             .into_iter()
             .collect(),
         GoSpecial::VisibleCells => {
+            // By rows and columns, never cells: cheap over any scope, so
+            // the selection's own extent is kept (#707 r4 M2).
             let mut rects = Vec::new();
-            for &a in &scope_used {
+            for &a in scope {
                 let mut row_runs: Vec<(u32, u32)> = Vec::new();
                 for r in a.0..=a.2 {
                     if s.row_hidden(r) {
@@ -414,15 +431,13 @@ pub fn go_to_special(
             s.cond_formats.iter().map(|cf| &cf.ranges),
             same,
             active,
-            &scope_used,
-            used,
+            areas,
         ),
         GoSpecial::DataValidation { same } => rule_ranges(
             s.validations.iter().map(|dv| &dv.ranges),
             same,
             active,
-            &scope_used,
-            used,
+            areas,
         ),
     };
     if rects.is_empty() {
@@ -435,43 +450,40 @@ pub fn go_to_special(
 }
 
 /// The ranges of every rule (or, `same`, of the rules covering `active`),
-/// clipped to `scope` for All, and always to the `used` range, so a rule
-/// over whole columns is not walked cell by cell (#707 r3 M3).
+/// within the selection `areas` when it is more than one cell (the whole
+/// sheet otherwise), as rectangles: a rule's ranges are never walked cell
+/// by cell, so a rule over whole columns is as cheap as one cell (#707 r4
+/// M2).
 fn rule_ranges<'a>(
-    rules: impl Iterator<Item = &'a Vec<Rect>>,
+    rules: impl Iterator<Item = &'a Vec<Area>>,
     same: bool,
     active: (u32, u32),
-    scope: &[Rect],
-    used: Option<Rect>,
-) -> Vec<Rect> {
-    let mut cells = Vec::new();
+    areas: &[Area],
+) -> Vec<Area> {
+    let whole = (0, 0, crate::sheet::MAX_ROWS - 1, crate::sheet::MAX_COLS - 1);
+    let single = areas.len() == 1 && areas[0].0 == areas[0].2 && areas[0].1 == areas[0].3;
+    let scope: Vec<Area> = if single || areas.is_empty() {
+        vec![whole]
+    } else {
+        areas.to_vec()
+    };
+    let mut parts = Vec::new();
     for ranges in rules {
         if same && !ranges.iter().any(|&a| inside(active.0, active.1, a)) {
             continue;
         }
         for &a in ranges {
-            let parts: Vec<Rect> = if same {
-                used.and_then(|u| clip(a, u)).into_iter().collect()
-            } else {
-                scope.iter().filter_map(|&s| clip(a, s)).collect()
-            };
-            for p in parts {
-                for r in p.0..=p.2 {
-                    for c in p.1..=p.3 {
-                        cells.push((r, c));
-                    }
-                }
-            }
+            parts.extend(scope.iter().filter_map(|&s| clip(a, s)));
         }
     }
-    cells_to_rects(&cells)
+    union_rects(&parts)
 }
 
 /// Where Go To's Reference box (or a chosen name) goes: a cell or range,
 /// optionally `Sheet!`-qualified (`$` signs allowed), or a defined name
 /// (scoped to `active` first) whose definition is one. `(sheet, rect)`;
 /// `None` when the text names nothing there.
-pub fn resolve_reference(wb: &Workbook, active: usize, text: &str) -> Option<(usize, Rect)> {
+pub fn resolve_reference(wb: &Workbook, active: usize, text: &str) -> Option<(usize, Area)> {
     let text = text.trim().trim_start_matches('=');
     if text.is_empty() {
         return None;

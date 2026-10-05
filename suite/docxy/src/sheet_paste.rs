@@ -9,9 +9,7 @@ use crate::{Docxy, SheetView};
 use gridcore::edit::{ClipBlock, PasteOp, PasteSpec, PasteWhat};
 use gridcore::sheet::Cell;
 
-/// Where a Paste Special, a gallery item or Paste Options writes; what it
-/// pasted.
-type Rect = (u32, u32, u32, u32);
+use gridcore::edit::Area;
 
 /// The Paste Options button after a paste of a copy: what was pasted where,
 /// so a choice from its menu pastes it again another way (R3). It stands
@@ -23,7 +21,7 @@ pub(crate) struct PasteOptions {
     pub block: ClipBlock,
     pub at: (u32, u32),
     /// The pasted cells; the button sits at their bottom-right.
-    pub rect: Rect,
+    pub rect: Area,
     pub item: PasteItem,
     /// The copy came from another workbook: no Paste Link.
     pub foreign: bool,
@@ -159,7 +157,7 @@ impl SheetView {
         block: &ClipBlock,
         spec: &PasteSpec,
         at: (u32, u32),
-    ) -> Result<Rect, String> {
+    ) -> Result<Area, String> {
         let s = self.active;
         if self.sheet().is_protected() {
             return Err(crate::sheet_goto::SHEET_PROTECTED.into());
@@ -212,7 +210,7 @@ impl SheetView {
         &mut self,
         block: &ClipBlock,
         at: (u32, u32),
-    ) -> Result<Rect, String> {
+    ) -> Result<Area, String> {
         let s = self.active;
         if self.sheet().is_protected() {
             return Err(crate::sheet_goto::SHEET_PROTECTED.into());
@@ -237,7 +235,7 @@ impl SheetView {
         block: &ClipBlock,
         item: PasteItem,
         at: (u32, u32),
-    ) -> Result<Rect, String> {
+    ) -> Result<Area, String> {
         match item.spec() {
             Some(spec) => self.paste_special_at(block, &spec, at),
             None => self.paste_link_at(block, at),
@@ -247,7 +245,7 @@ impl SheetView {
     /// Paste Options: paste what `opts` pasted again as `item`, in place of
     /// the first paste: its undo step is taken back and the new paste takes
     /// it, so one undo returns to before either (R3).
-    pub(crate) fn repaste(&mut self, opts: &PasteOptions, item: PasteItem) -> Result<Rect, String> {
+    pub(crate) fn repaste(&mut self, opts: &PasteOptions, item: PasteItem) -> Result<Area, String> {
         if !opts.stands(self) {
             return Err("The paste has changed since; there is nothing to redo".into());
         }

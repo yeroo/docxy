@@ -11,7 +11,7 @@
 
 use crate::sheet::{Cell, CellValue, NumFmt, Styles, classify_format_code, parts_to_serial};
 
-use super::Rect;
+use super::Area;
 
 /// How a fill writes its cells: what the Auto Fill Options button, the
 /// fill handle's right-drag menu and the Series dialog offer.
@@ -499,14 +499,7 @@ fn ymd(serial: f64, date1904: bool) -> Option<(i64, u32, u32, u32)> {
     ))
 }
 
-fn days_in_month(y: i64, m: u32) -> u32 {
-    match m {
-        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
-}
+use crate::formula::days_in_month;
 
 /// `serial` moved by `months`, its day clamped to the target month's end.
 pub(crate) fn add_months(serial: f64, months: i64, date1904: bool) -> f64 {
@@ -669,9 +662,19 @@ fn date_at(ys: &[f64], n: f64, t: Temporal, kind: FillKind, date1904: bool, dir:
                     _ => unit,
                 }
             };
-            // From the first seed, so a clamped month end does not stick:
-            // 31 Jan, 29 Feb, 31 Mar.
-            add_months(ys[0], step * n.round() as i64, date1904)
+            // Seeds a whole step apart run on from the first, so a clamped
+            // month end does not stick (31 Jan, 29 Feb, 31 Mar); uneven ones
+            // continue from the last, as Days does (#707 r4 m1).
+            let months = |y: f64| ymd(y, date1904).map(|(yy, mm, ..)| yy * 12 + i64::from(mm));
+            let even = ys.windows(2).all(|w| match (months(w[0]), months(w[1])) {
+                (Some(a), Some(b)) => b - a == step,
+                _ => false,
+            });
+            if m == 1 || even {
+                add_months(ys[0], step * n.round() as i64, date1904)
+            } else {
+                add_months(last, step * ahead.round() as i64, date1904)
+            }
         }
         FillKind::LinearTrend => linear_at(ys, n, dir),
         FillKind::GrowthTrend => growth_at(ys, n),
@@ -766,10 +769,10 @@ pub enum FillTarget {
     /// Nothing changes: the handle is back where it started.
     None,
     /// A fill into `dest`, in `dir` (beside the source, along one axis).
-    Extend { dir: FillDir, dest: Rect },
+    Extend { dir: FillDir, dest: Area },
     /// The handle was dragged back inside the source: `cells` leave the
     /// selection and are cleared (contents only).
-    Clear(Rect),
+    Clear(Area),
 }
 
 /// The direction a fill runs in.
@@ -795,7 +798,7 @@ impl FillDir {
 impl FillTarget {
     /// The selection the gesture leaves: the source and the filled cells, or
     /// the source without the cleared ones.
-    pub fn selection(self, src: Rect) -> Rect {
+    pub fn selection(self, src: Area) -> Area {
         let (r0, c0, r1, c1) = src;
         match self {
             FillTarget::None => src,
@@ -819,7 +822,7 @@ impl FillTarget {
 /// Where the fill handle of `src`, dragged to `to`, fills: along the axis
 /// pulled furthest out of the source (down/up wins a tie, as before), or,
 /// dragged back inside, the rows (or columns) it left behind.
-pub fn fill_target(src: Rect, to: (u32, u32)) -> FillTarget {
+pub fn fill_target(src: Area, to: (u32, u32)) -> FillTarget {
     let (r0, c0, r1, c1) = src;
     if r0 > r1 || c0 > c1 {
         return FillTarget::None;
@@ -905,7 +908,7 @@ impl Default for SeriesSpec {
 
 /// The Series dialog's default orientation for a selection: rows when it is
 /// wider than tall, as Excel guesses.
-pub fn series_rows_for(rect: Rect) -> bool {
+pub fn series_rows_for(rect: Area) -> bool {
     let (r0, c0, r1, c1) = rect;
     (c1 - c0) > (r1 - r0)
 }
@@ -921,7 +924,7 @@ pub fn series_rows_for(rect: Rect) -> bool {
 /// `(row, col, cell)` writes; a line with no seed writes nothing.
 pub(crate) fn series_changes(
     sheet: &crate::sheet::Sheet,
-    rect: Rect,
+    rect: Area,
     spec: &SeriesSpec,
     ctx: &SeedCtx,
 ) -> Result<Vec<(u32, u32, Cell)>, &'static str> {
@@ -967,10 +970,7 @@ pub(crate) fn series_changes(
         let seeds: Vec<Cell> = (0..len)
             .map_while(|i| {
                 let (r, c) = at(i);
-                sheet
-                    .cell(r, c)
-                    .filter(|c| !c.value.is_empty() || c.formula.is_some())
-                    .cloned()
+                sheet.cell(r, c).filter(|c| !c.is_blank()).cloned()
             })
             .collect();
         let Some(first) = seeds.first() else {
@@ -1166,13 +1166,9 @@ fn growth_trend(ys: &[f64], n: f64) -> f64 {
 /// Where a double-click on the fill handle of `src` fills down to: the last
 /// row of the block in the neighbouring column (left first, then right)
 /// that runs on below the source. `None` when neither neighbour runs on.
-pub fn fill_down_to(sheet: &crate::sheet::Sheet, src: Rect) -> Option<u32> {
+pub fn fill_down_to(sheet: &crate::sheet::Sheet, src: Area) -> Option<u32> {
     let (_, c0, r1, c1) = src;
-    let filled = |r: u32, c: u32| {
-        sheet
-            .cell(r, c)
-            .is_some_and(|x| !x.value.is_empty() || x.formula.is_some())
-    };
+    let filled = |r: u32, c: u32| sheet.cell(r, c).is_some_and(|x| !x.is_blank());
     let mut cols = Vec::new();
     if c0 > 0 {
         cols.push(c0 - 1);

@@ -1,7 +1,7 @@
 //! Home › Clear, as Excel has it (#671): each item removes exactly its part
 //! of the cells in the selected areas, and no cell moves.
 
-use super::{Rect, rects_overlap as overlaps};
+use super::{Area, rects_overlap as overlaps};
 use crate::sheet::{Cell, Sheet};
 
 /// Excel's refusal of a clear that would split a merged cell.
@@ -69,10 +69,10 @@ pub struct ClearPlan {
     /// Cell writes (a default cell clears one).
     pub cells: Vec<(u32, u32, Cell)>,
     /// Merges to undo.
-    pub unmerge: Vec<Rect>,
+    pub unmerge: Vec<Area>,
     /// Cells whose hyperlink goes, and the loaded `ref`s that go with them.
     pub unlink: Vec<(u32, u32)>,
-    pub unlinked_refs: Vec<Rect>,
+    pub unlinked_refs: Vec<Area>,
     /// Cells whose notes go (the host removes them from its package).
     pub notes: Vec<(u32, u32)>,
 }
@@ -87,7 +87,7 @@ impl ClearPlan {
     }
 }
 
-fn inside(r: u32, c: u32, a: Rect) -> bool {
+fn inside(r: u32, c: u32, a: Area) -> bool {
     (a.0..=a.2).contains(&r) && (a.1..=a.3).contains(&c)
 }
 
@@ -98,7 +98,7 @@ fn inside(r: u32, c: u32, a: Rect) -> bool {
 /// refuse ([`MERGED_PART`]) one that only partly is.
 pub fn clear_plan(
     sheet: &Sheet,
-    areas: &[Rect],
+    areas: &[Area],
     what: ClearWhat,
     note_cells: &[(u32, u32)],
 ) -> Result<ClearPlan, &'static str> {
@@ -220,10 +220,11 @@ pub fn apply_clear_sheet(sheet: &mut Sheet, plan: &ClearPlan) {
 
 /// Home › Clear `what` over `areas` of `wb`'s sheet `sheet`, cells and all.
 /// Notes are the host's (it removes [`ClearPlan::notes`] from its package).
+#[cfg(test)]
 pub fn apply_clear(
     wb: &mut crate::sheet::Workbook,
     sheet: usize,
-    areas: &[Rect],
+    areas: &[Area],
     what: ClearWhat,
     note_cells: &[(u32, u32)],
 ) -> Result<ClearPlan, &'static str> {
