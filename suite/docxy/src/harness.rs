@@ -1660,9 +1660,7 @@ fn click_sheet_command(
         app.run_sheet_act(cmd.act, window, cx);
         return Ok(());
     };
-    let anchor = crate::split_menu_anchor(&app.probes.borrow(), id);
-    let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
-    app.open_split_menu(id, at, cx)?;
+    open_ribbon_split_menu(app, id, window, cx)?;
     if let Some(m) = owner {
         let i = m
             .items
@@ -1703,6 +1701,17 @@ fn sheet_menu_open(
         ));
     }
     app.select_ribbon_tab(ribbon_tab, window, cx);
+    open_ribbon_split_menu(app, id, window, cx)
+}
+
+/// Open split button or drop-down `id`'s menu where its arrow is drawn (the
+/// pointer's anchor), else mid-window.
+fn open_ribbon_split_menu(
+    app: &mut crate::Docxy,
+    id: &str,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) -> Result<(), String> {
     let anchor = crate::split_menu_anchor(&app.probes.borrow(), id);
     let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
     app.open_split_menu(id, at, cx)
@@ -2311,9 +2320,7 @@ fn menu_open(
                 let id = split_primary(&def, group, label)?;
                 app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), tab)?, window, cx);
                 // Where the pointer's press on the arrow opens it too.
-                let anchor = crate::split_menu_anchor(&app.probes.borrow(), id);
-                let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
-                app.open_split_menu(id, at, cx)
+                open_ribbon_split_menu(app, id, window, cx)
             }
             // The Quick Access Toolbar Undo arrow (#619).
             "qat" => {
@@ -3136,7 +3143,7 @@ fn dispatch_verb(
             let surface = ribbon_surface(app)?;
             // Protected View and a final document hide the ribbon's body, so
             // no group is ever drawn to measure.
-            if !app.active_is_project() && app.active_locked() {
+            if app.ribbon_body_hidden() {
                 return Err("the ribbon is hidden while the document is in Protected View or marked as final".into());
             }
             // `tab` shows that tab first, as `ribbon-click` does. Its groups

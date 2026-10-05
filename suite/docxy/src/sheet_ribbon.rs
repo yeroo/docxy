@@ -156,10 +156,16 @@ pub(crate) const fn rows(rows: &'static [&'static [SheetCmd]]) -> Body {
     })
 }
 
-/// A Large drop-down: `button` opens a menu of `items`.
-pub(crate) const fn menu(button: SheetCmd, items: &'static [SheetCmd]) -> Item {
+/// A Large drop-down: a button named `label` opens a menu of `items`. Only
+/// here is a `Shape::Menu` command made.
+pub(crate) const fn menu(
+    id: &'static str,
+    label: &'static str,
+    icon: Option<&'static str>,
+    items: &'static [SheetCmd],
+) -> Item {
     Item::Menu(Dropdown {
-        button,
+        button: cmd(id, label, Shape::Menu(icon), SheetAct::Todo),
         items,
         _built_by_menu: (),
     })
@@ -267,11 +273,6 @@ const fn menu_item_as(
         text: Some(text),
         ..menu_item(id, label, act)
     }
-}
-
-/// A Large button that opens a menu.
-const fn drop_large(id: &'static str, label: &'static str, icon: Option<&'static str>) -> SheetCmd {
-    cmd(id, label, Shape::Menu(icon), SheetAct::Todo)
 }
 
 const fn large(
@@ -544,7 +545,9 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             ],
                         ),
                         menu(
-                            drop_large("sort-filter", "Sort & Filter", Some("sort")),
+                            "sort-filter",
+                            "Sort & Filter",
+                            Some("sort"),
                             &[
                                 menu_item("sort-a-z", "Sort A to Z", SheetAct::SortAsc),
                                 menu_item("sort-z-a", "Sort Z to A", SheetAct::SortDesc),

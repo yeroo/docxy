@@ -12206,6 +12206,28 @@ impl Docxy {
         }
     }
 
+    /// Whether Protected View (#610, #633) or a final document (#617) hides the
+    /// active document or workbook's ribbon commands.
+    fn ribbon_locked(&self) -> bool {
+        let is_doc = matches!(
+            self.tabs.get(self.active).map(|t| &t.surface),
+            Some(Surface::Doc(_))
+        );
+        (self.active_is_sheet() || is_doc) && self.active_locked()
+    }
+
+    /// Whether the window draws no ribbon body now: collapsed, locked, or a tab
+    /// with no ribbon. Render and `ribbon-layout` both ask this.
+    pub(crate) fn ribbon_body_hidden(&self) -> bool {
+        let is_doc = matches!(
+            self.tabs.get(self.active).map(|t| &t.surface),
+            Some(Surface::Doc(_))
+        );
+        self.ribbon_min
+            || self.ribbon_locked()
+            || !(is_doc || self.active_is_sheet() || self.active_is_project())
+    }
+
     /// Whether the active tab takes no edits: Protected View (#610), or a
     /// document marked as final (#617).
     fn active_locked(&self) -> bool {
@@ -25861,8 +25883,8 @@ impl Docxy {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let content = probe(&self.probes, format!("ribbon-content:{}:{i}", g.title));
-                self.render_control(c, icon_only, content, pal, cx)
+                let slot = format!("ribbon-content:{}:{i}", g.title);
+                self.render_control(c, icon_only, slot, pal, cx)
             })
             .collect();
         // group title row + optional dialog-box launcher (⤢)
@@ -25901,13 +25923,13 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// `content` is the probe that measures a column or a rows stack, the two
+    /// `slot` names the probe that measures a column or a rows stack, the two
     /// controls whose height grows with their rows (`ribbon-layout`).
     fn render_control(
         &self,
         c: &Control<Act>,
         icon_only: bool,
-        content: AnyElement,
+        slot: String,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -25937,7 +25959,7 @@ impl Docxy {
                     .items_start()
                     .gap_1()
                     .children(cols)
-                    .child(content)
+                    .child(probe(&self.probes, slot))
                     .into_any_element()
             }
             // The Office two-row layout: each inner Vec is one left-to-right row.
@@ -25957,7 +25979,7 @@ impl Docxy {
                     .items_start()
                     .gap(px(2.))
                     .children(rendered)
-                    .child(content)
+                    .child(probe(&self.probes, slot))
                     .into_any_element()
             }
             Control::Gallery(gal) if gal.id == "tablestyles" => {
@@ -27722,11 +27744,8 @@ impl Render for Docxy {
         // Protected View (#610, documents #633), or a document marked as
         // final (#617), hides the ribbon's commands, as Excel and Word grey
         // them out; its message bar takes their place.
-        let protected = (self.active_is_sheet() || is_doc) && self.active_locked();
-        let ribbon_body = (!self.ribbon_min
-            && !protected
-            && (is_doc || self.active_is_sheet() || self.active_is_project()))
-        .then(|| {
+        let protected = self.ribbon_locked();
+        let ribbon_body = (!self.ribbon_body_hidden()).then(|| {
             if is_doc || self.active_is_project() {
                 self.ribbon_body(vw, pal, cx)
             } else {
