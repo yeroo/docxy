@@ -4002,7 +4002,8 @@ fn sole_claim<T>(
 /// model block whose [`crate::sheet::CondFormat::ix`] names it, and left byte-for-byte
 /// alone while it holds that block's ranges and formulas. A moved block gets
 /// a new `sqref` and its changed `<formula>` texts, everything else kept; a
-/// block a structural edit deleted ([`Sheet::cf_removed`]) loses its element.
+/// block an edit deleted ([`Sheet::cf_removed`]: a row or column delete,
+/// Clear All or Clear Formats) loses its element.
 /// An element two model blocks claim, or whose `sqref` doesn't read, is left
 /// as it is.
 fn set_cond_formats(xml: String, sheet: &Sheet) -> String {

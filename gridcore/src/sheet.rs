@@ -566,10 +566,12 @@ pub struct Sheet {
     /// [`Drawing::anchor_ix`] of drawings deleted since the file was loaded —
     /// the same round-trip means a save has to strike them from the part too.
     pub drawings_removed: Vec<usize>,
-    /// [`CondFormat::ix`] of blocks a structural edit deleted (every range
-    /// gone): the worksheet part still holds them, so a save strikes them.
+    /// [`CondFormat::ix`] of blocks an edit deleted (every range gone: a
+    /// row or column delete, Clear All or Clear Formats): the worksheet
+    /// part still holds them, so a save strikes them.
     pub cf_removed: Vec<usize>,
-    /// [`DataValidation::ix`] of rules a structural edit deleted, likewise.
+    /// [`DataValidation::ix`] of rules an edit deleted (a row or column
+    /// delete, a paste of validation over them), likewise.
     pub dv_removed: Vec<usize>,
     /// Sheet protection: `Some(attrs)` holds the raw attribute string of the
     /// worksheet's `<sheetProtection>` element (e.g. `sheet="1" objects="1"`),

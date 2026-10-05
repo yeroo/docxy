@@ -294,7 +294,7 @@ impl ClipBlock {
                     cells.sort_unstable();
                     cells.dedup();
                 }
-                let anchor = rule_anchor(&dv.ranges);
+                let anchor = super::rule_anchor(&dv.ranges);
                 (!cells.is_empty()).then(|| ClipRule {
                     anchor,
                     kind: dv.kind.clone(),
@@ -490,12 +490,23 @@ fn num_text(n: f64) -> String {
     to_string(&Expr::Num(n))
 }
 
+/// What a Paste Special operation writes in a cell.
+enum OpOut {
+    Num(f64),
+    /// An error value: `#DIV/0!`, or `#NUM!` for a result past the
+    /// numbers a cell holds (#707 r10 m3).
+    Error(&'static str),
+    /// A formula's text.
+    Formula(String),
+}
+
 /// `d op s`, as Excel's Paste Special operations write it: two numbers
-/// (a blank is 0) give the number, `#DIV/0!` for a division by zero; a
+/// (a blank is 0) give the number, `#DIV/0!` for a division by zero and
+/// `#NUM!` for a result that is not a finite number; a
 /// formula on either side gives a formula, each formula's text bracketed:
 /// `=(B9*2)*1.05`, `=10+(A1)`, `=0+(A1)`. Text, a logical or an error on
 /// either side leaves the destination alone (`None`).
-fn apply_op(op: PasteOp, d: Operand, s: Operand) -> Option<Result<f64, String>> {
+fn apply_op(op: PasteOp, d: Operand, s: Operand) -> Option<OpOut> {
     let side = |o: &Operand, formula_paren: bool| match o {
         Operand::Num(n) => Some(num_text(*n)),
         Operand::Blank => Some("0".to_string()),
@@ -505,7 +516,7 @@ fn apply_op(op: PasteOp, d: Operand, s: Operand) -> Option<Result<f64, String>> 
     };
     match (&d, &s) {
         (Operand::Other, _) | (_, Operand::Other) => None,
-        (Operand::Formula(_), _) | (_, Operand::Formula(_)) => Some(Err(format!(
+        (Operand::Formula(_), _) | (_, Operand::Formula(_)) => Some(OpOut::Formula(format!(
             "{}{}{}",
             side(&d, true)?,
             op.sign(),
@@ -517,14 +528,19 @@ fn apply_op(op: PasteOp, d: Operand, s: Operand) -> Option<Result<f64, String>> 
                 _ => 0.0,
             };
             let (a, b) = (n(&d), n(&s));
-            Some(Ok(match op {
+            let v = match op {
                 PasteOp::None => b,
                 PasteOp::Add => a + b,
                 PasteOp::Subtract => a - b,
                 PasteOp::Multiply => a * b,
-                PasteOp::Divide if b == 0.0 => f64::NAN,
+                PasteOp::Divide if b == 0.0 => return Some(OpOut::Error("#DIV/0!")),
                 PasteOp::Divide => a / b,
-            }))
+            };
+            Some(if v.is_finite() {
+                OpOut::Num(v)
+            } else {
+                OpOut::Error("#NUM!")
+            })
         }
     }
 }
@@ -647,12 +663,12 @@ pub fn paste_special_changes(
                     continue;
                 };
                 let mut cell = match res {
-                    Ok(n) if n.is_nan() => Cell {
-                        value: CellValue::Error("#DIV/0!".into()),
+                    OpOut::Error(e) => Cell {
+                        value: CellValue::Error(e.into()),
                         ..Cell::default()
                     },
-                    Ok(n) => Cell::number(n),
-                    Err(f) => {
+                    OpOut::Num(n) => Cell::number(n),
+                    OpOut::Formula(f) => {
                         // Typed here, as a filled formula is: an array one
                         // spills where it lands.
                         let mut c = Cell::formula(&f);
@@ -716,7 +732,9 @@ pub fn paste_special_extras(clip: &ClipBlock, at: (u32, u32), spec: &PasteSpec) 
             }
         }
     }
-    if what == PasteWhat::Validation || what.all() {
+    // Clipboard text carries no validation, notes or widths: a paste of it
+    // leaves the destination's as they are (#707 r10 M1).
+    if !clip.typed && (what == PasteWhat::Validation || what.all()) {
         ex.clear_rules = Some(clip.pasted_rect(at, spec.transpose));
         for rule in &clip.rules {
             let cells: Vec<(u32, u32)> = rule
@@ -753,6 +771,7 @@ pub fn paste_special_extras(clip: &ClipBlock, at: (u32, u32), spec: &PasteSpec) 
         what,
         PasteWhat::ColumnWidths | PasteWhat::AllAndColumnWidths
     ) && !spec.transpose
+        && !clip.typed
     {
         for (j, &w) in clip.widths.iter().enumerate() {
             let c = u64::from(at.1) + j as u64;
@@ -768,44 +787,22 @@ pub fn paste_special_extras(clip: &ClipBlock, at: (u32, u32), spec: &PasteSpec) 
 /// cut around it, and a rule left with no range goes (its element named in
 /// `dv_removed` for the save).
 pub fn clear_validation(sheet: &mut Sheet, rect: Area) {
+    let cut = super::areas::RectIndex::new(&[rect]);
     let removed = &mut sheet.dv_removed;
     sheet.validations.retain_mut(|dv| {
         if !dv.ranges.iter().any(|&r| overlaps(r, rect)) {
             return true;
         }
-        let before = rule_anchor(&dv.ranges);
-        dv.ranges = dv.ranges.iter().flat_map(|&r| subtract(r, rect)).collect();
-        if dv.ranges.is_empty() {
+        // The formulas follow a moved anchor, so every cell left still
+        // reads the cells it read (#707 r9 M1).
+        let Some(by) = super::cut_rule_ranges(&mut dv.ranges, &cut) else {
             removed.extend(dv.ix);
             return false;
-        }
-        // The formulas read relative to the anchor: one that moved takes
-        // them along, so every cell left still reads the cells it read
-        // (#707 r9 M1).
-        let after = rule_anchor(&dv.ranges);
-        let dr = i64::from(after.0) - i64::from(before.0);
-        let dc = i64::from(after.1) - i64::from(before.1);
-        if (dr, dc) != (0, 0) {
-            for f in [&mut dv.formula1, &mut dv.formula2] {
-                if !f.is_empty() {
-                    if let Some(moved) = translate_formula(f, dr, dc) {
-                        *f = moved;
-                    }
-                }
-            }
-        }
+        };
+        super::reanchor(&mut dv.formula1, by);
+        super::reanchor(&mut dv.formula2, by);
         true
     });
-}
-
-/// A rule's anchor: the top-left of its ranges, which its formulas are
-/// relative to (as `shift_rule_ranges` reads it).
-pub(crate) fn rule_anchor(ranges: &[Area]) -> (u32, u32) {
-    ranges
-        .iter()
-        .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, _, _)| {
-            (r.min(r1), c.min(c1))
-        })
 }
 
 /// `a` without `b`: up to four rectangles (above, below, left, right).

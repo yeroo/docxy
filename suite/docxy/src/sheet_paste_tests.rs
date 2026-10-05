@@ -462,3 +462,36 @@ fn typed_formulas_in_text_paste_as_typed() {
     assert_eq!(formula(&v, "E9"), None);
     assert_eq!(value(&v, "E9"), CellValue::Number(7.0));
 }
+
+/// #707 r10 M1: text from another program, pasted transposed or with All,
+/// leaves the destination's validation as it was, saved and reloaded too.
+#[test]
+fn a_text_paste_keeps_the_destinations_validation() {
+    for spec in [
+        PasteSpec {
+            transpose: true,
+            ..PasteSpec::default()
+        },
+        PasteSpec::of(PasteWhat::All),
+        PasteSpec::of(PasteWhat::AllAndColumnWidths),
+    ] {
+        let mut v = view();
+        assert!(
+            v.pkg
+                .add_data_validation(0, (1, 1, 9, 1), "list", "", "\"a,b,c,d\"", None)
+        );
+        let width = v.sheet().col_width(2);
+        let block = v.text_clip_block("a\tb\nc\td\n", at("B2"));
+        v.paste_special_at(&block, &spec, at("B2")).unwrap();
+        let rules = |dvs: &[gridcore::sheet::DataValidation]| -> Vec<_> {
+            dvs.iter()
+                .map(|dv| (dv.ranges.clone(), dv.formula1.clone()))
+                .collect()
+        };
+        let want = vec![(vec![(1, 1, 9, 1)], "\"a,b,c,d\"".to_string())];
+        assert_eq!(rules(&v.sheet().validations), want, "{spec:?}");
+        assert_eq!(v.sheet().col_width(2), width, "no widths from text");
+        let back = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&v.pkg)).unwrap();
+        assert_eq!(rules(&back.workbook.sheets[0].validations), want);
+    }
+}

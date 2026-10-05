@@ -814,6 +814,15 @@ pub(crate) fn extend_line(
                     ys[m - 1] + step * (n - (m - 1) as f64)
                 }
             };
+            // A value past the numbers a cell holds is Excel's #NUM!, not a
+            // number a save would write as 0 (#707 r10 m3).
+            if !v.is_finite() {
+                return LineOut::Value(Cell {
+                    value: CellValue::Error("#NUM!".into()),
+                    style: src[k].as_ref().map_or(0, |c| c.style),
+                    ..Cell::default()
+                });
+            }
             LineOut::Value(render(seed, v, src[k].as_ref(), &lists))
         })
         .collect()
@@ -1129,8 +1138,10 @@ pub(crate) fn series_changes(
                 }
             };
             // Past the stop; and, the safety net, a series that has stopped
-            // moving never reaches it (#707 r3 M2).
-            if past(v) || (stop.is_some() && prev == Some(v)) {
+            // moving never reaches it (#707 r3 M2). A value past the numbers
+            // a cell holds ends the series too: a cell would save it as 0
+            // (#707 r10 m3).
+            if !v.is_finite() || past(v) || (stop.is_some() && prev == Some(v)) {
                 break;
             }
             prev = Some(v);

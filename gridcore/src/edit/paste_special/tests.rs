@@ -839,3 +839,24 @@ fn pasted_validation_reads_from_the_rules_anchor() {
         vec![((4, 2, 4, 2), "$A$1>0".to_string())]
     );
 }
+
+/// #707 r10 m3: an operation whose result is past the numbers a cell holds
+/// writes `#NUM!`, not a number a save would turn into 0; a division by
+/// zero is still `#DIV/0!`.
+#[test]
+fn an_operation_past_the_largest_number_is_num() {
+    for (o, d, want) in [
+        (PasteOp::Multiply, 1e308, "#NUM!"),
+        (PasteOp::Add, 1.7e308, "#NUM!"),
+        (PasteOp::Divide, 1.0, "#DIV/0!"),
+    ] {
+        let src = if o == PasteOp::Divide { 0.0 } else { 1.7e308 };
+        let mut wb = book(&[(
+            "Sheet1",
+            &[("A1", Cell::number(src)), ("C1", Cell::number(d))],
+        )]);
+        let clip = copy(&wb, 0, "A1");
+        paste(&mut wb, 0, "C1", &clip, op(o));
+        assert_eq!(value(&wb, 0, "C1"), CellValue::Error(want.into()), "{o:?}");
+    }
+}

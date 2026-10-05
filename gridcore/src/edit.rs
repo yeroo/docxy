@@ -1592,6 +1592,60 @@ fn for_each_rule_formula(sheet: &mut Sheet, mut f: impl FnMut(&mut String)) {
     }
 }
 
+/// A rule's anchor: the top-left of its ranges, (min r1, min c1) over them
+/// all, which its formulas are relative to.
+pub(crate) fn rule_anchor(ranges: &[Area]) -> (u32, u32) {
+    ranges
+        .iter()
+        .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, _, _)| {
+            (r.min(r1), c.min(c1))
+        })
+}
+
+/// Cut the rectangles of `cut` out of a rule's ranges, and return how far
+/// its formulas have to be translated so each cell left reads what it read
+/// (the move of its anchor), or `None` when nothing of it is left. A
+/// worklist splits each fragment only by an area that meets it, so the cost
+/// follows the fragments made, not the areas times the fragments (#707 r10).
+pub(crate) fn cut_rule_ranges(
+    ranges: &mut Vec<Area>,
+    cut: &areas::RectIndex,
+) -> Option<(i64, i64)> {
+    let before = rule_anchor(ranges);
+    let mut kept = Vec::new();
+    let mut work: Vec<Area> = std::mem::take(ranges);
+    let mut met = Vec::new();
+    while let Some(frag) = work.pop() {
+        met.clear();
+        cut.meeting(frag, &mut met);
+        match met.first() {
+            None => kept.push(frag),
+            Some(&a) => work.extend(paste_special::subtract(frag, a)),
+        }
+    }
+    kept.sort_unstable();
+    *ranges = kept;
+    if ranges.is_empty() {
+        return None;
+    }
+    let after = rule_anchor(ranges);
+    Some((
+        i64::from(after.0) - i64::from(before.0),
+        i64::from(after.1) - i64::from(before.1),
+    ))
+}
+
+/// `f` translated by `by` (a rule formula following its anchor); kept as it
+/// is when empty, unmoved or untranslatable.
+pub(crate) fn reanchor(f: &mut String, by: (i64, i64)) {
+    if f.is_empty() || by == (0, 0) {
+        return;
+    }
+    if let Some(moved) = crate::formula::translate_formula(f, by.0, by.1) {
+        *f = moved;
+    }
+}
+
 /// Move a rule's ranges (`sqref`) through the edit, as merges move, and
 /// return how far its formulas have to be translated first. The formulas
 /// are relative to the ranges' top-left, (min r1, min c1) over them all (the
@@ -1608,13 +1662,7 @@ fn shift_rule_ranges(
     if ranges.is_empty() {
         return Some((0, 0));
     }
-    let anchor = |rs: &[(u32, u32, u32, u32)]| {
-        rs.iter()
-            .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, _, _)| {
-                (r.min(r1), c.min(c1))
-            })
-    };
-    let before = anchor(ranges);
+    let before = rule_anchor(ranges);
     let moved: Vec<_> = ranges
         .iter()
         .filter_map(|&(r1, c1, r2, c2)| {
@@ -1633,7 +1681,7 @@ fn shift_rule_ranges(
     if shift.delta >= 0 {
         return Some((0, 0));
     }
-    let after = anchor(ranges);
+    let after = rule_anchor(ranges);
     // The new anchor's position before the edit: on the edited axis, past
     // the deleted band when it sits at or after it; the other axis wasn't
     // edited.

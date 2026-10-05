@@ -1043,3 +1043,29 @@ fn justifying_50k_words_is_fast() {
     assert_eq!(lines.len(), 3);
     assert!(lines.iter().all(|l| l.chars().count() <= 130_000));
 }
+
+/// #707 r10 m3: a series past the numbers a cell holds ends there (Series)
+/// or shows `#NUM!` (a fill's growth trend), never an infinity a save would
+/// write as 0.
+#[test]
+fn a_series_past_the_largest_number_stops_or_is_num() {
+    let mut wb = book(&[("A1", Cell::number(1e300))]);
+    fill_series(
+        &mut wb,
+        0,
+        (0, 0, 9, 0),
+        &spec(false, SeriesType::Growth, 1e5, None, false),
+        &[],
+    )
+    .unwrap();
+    let a2 = nums(&wb, &["A2"])[0];
+    assert!((a2 / 1e305 - 1.0).abs() < 1e-12, "{a2}");
+    assert_eq!(
+        shown(&wb, "A3"),
+        CellValue::Empty,
+        "1e310 is past the largest"
+    );
+    let mut wb = book(&[("A1", Cell::number(1.0)), ("A2", Cell::number(1e200))]);
+    fill_with(&mut wb, "A1:A2", "A3", FillKind::GrowthTrend, false, &[]);
+    assert_eq!(shown(&wb, "A3"), CellValue::Error("#NUM!".into()));
+}

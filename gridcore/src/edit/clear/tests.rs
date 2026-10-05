@@ -160,3 +160,47 @@ fn clearing_10k_areas_over_50k_cells_links_notes_and_merges_is_fast() {
     assert_eq!((plan.notes.len(), plan.unlink.len()), (50_000, 50_000));
     assert!(plan.unmerge.is_empty());
 }
+
+/// #707 r10 m1: Clear Formats over 10,000 scattered cells of a conditional
+/// format's range splits each fragment only by the areas that meet it: fast,
+/// and the fragments left cover exactly the cells not cleared.
+#[test]
+fn clearing_10k_areas_out_of_conditional_formatting_is_fast() {
+    use crate::sheet::{CfKind, CfRule, CondFormat};
+    let mut wb = book();
+    wb.sheets[0].cond_formats.push(CondFormat {
+        ranges: vec![(0, 0, 49_999, 25)],
+        rules: vec![CfRule {
+            kind: CfKind::Expression {
+                formula: "A1>0".into(),
+            },
+            dxf_id: None,
+            priority: 1,
+        }],
+        ix: None,
+    });
+    let areas: Vec<Area> = (0..10_000u32)
+        .map(|k| {
+            let (r, c) = (k * 5 + 1, (k * 7) % 26);
+            (r, c, r, c)
+        })
+        .collect();
+    let t = std::time::Instant::now();
+    let plan = clear_plan(&wb.sheets[0], &areas, ClearWhat::Formats, &[]).unwrap();
+    apply_clear_sheet(&mut wb.sheets[0], &plan);
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        t.elapsed()
+    );
+    let cf = &wb.sheets[0].cond_formats[0];
+    let size = |a: &Area| u64::from(a.2 - a.0 + 1) * u64::from(a.3 - a.1 + 1);
+    assert_eq!(
+        cf.ranges.iter().map(size).sum::<u64>(),
+        50_000 * 26 - 10_000
+    );
+    let ix = crate::edit::areas::RectIndex::new(&areas);
+    assert!(cf.ranges.iter().all(|&r| !ix.meets(r)));
+    // The anchor stayed at A1: the formula reads as before.
+    assert!(matches!(&cf.rules[0].kind, CfKind::Expression { formula } if formula == "A1>0"));
+}

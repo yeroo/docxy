@@ -3,8 +3,7 @@
 
 use super::Area;
 use super::areas::{RectIndex, entries_in};
-use super::paste_special::{rule_anchor, subtract};
-use crate::formula::translate_formula;
+use super::{cut_rule_ranges, reanchor};
 use crate::sheet::{Cell, Sheet};
 
 /// Excel's refusal of a clear that would split a merged cell.
@@ -13,9 +12,11 @@ pub(crate) const MERGED_PART: &str = "Cannot change part of a merged cell.";
 /// A Home › Clear menu item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ClearWhat {
-    /// Contents, formats, notes and hyperlinks.
+    /// Contents, formats (the conditional formatting over the cells and
+    /// the merges inside them too), notes and hyperlinks.
     All,
-    /// Formats only (style 0); merges inside go too.
+    /// Formats only (style 0); the merges inside and the conditional
+    /// formatting over the cells go too.
     Formats,
     /// Contents only (Delete).
     Contents,
@@ -221,8 +222,9 @@ pub fn clear_plan(
     Ok(plan)
 }
 
-/// The sheet-level part of a clear: merges undone and links removed (the
-/// cells are the host's to write, through its engine).
+/// The sheet-level part of a clear: merges undone, links removed and the
+/// conditional formatting taken off the cleared areas (the cells are the
+/// host's to write, through its engine).
 pub fn apply_clear_sheet(sheet: &mut Sheet, plan: &ClearPlan) {
     clear_cond_formats(sheet, &plan.uncond);
     let unmerge: std::collections::HashSet<Area> = plan.unmerge.iter().copied().collect();
@@ -250,37 +252,17 @@ pub(crate) fn clear_cond_formats(sheet: &mut Sheet, areas: &[Area]) {
     }
     let ix = RectIndex::new(areas);
     let removed = &mut sheet.cf_removed;
-    let mut met = Vec::new();
     sheet.cond_formats.retain_mut(|cf| {
         if !cf.ranges.iter().any(|&r| ix.meets(r)) {
             return true;
         }
-        let before = rule_anchor(&cf.ranges);
-        let mut ranges = Vec::new();
-        for &r in &cf.ranges {
-            met.clear();
-            ix.meeting(r, &mut met);
-            let mut parts = vec![r];
-            for &a in &met {
-                parts = parts.into_iter().flat_map(|p| subtract(p, a)).collect();
-            }
-            ranges.extend(parts);
-        }
-        cf.ranges = ranges;
-        if cf.ranges.is_empty() {
+        let Some(by) = cut_rule_ranges(&mut cf.ranges, &ix) else {
             removed.extend(cf.ix);
             return false;
-        }
-        let after = rule_anchor(&cf.ranges);
-        let dr = i64::from(after.0) - i64::from(before.0);
-        let dc = i64::from(after.1) - i64::from(before.1);
-        if (dr, dc) != (0, 0) {
-            for rule in &mut cf.rules {
-                for f in rule.formulas_mut() {
-                    if let Some(moved) = translate_formula(f, dr, dc) {
-                        *f = moved;
-                    }
-                }
+        };
+        for rule in &mut cf.rules {
+            for f in rule.formulas_mut() {
+                reanchor(f, by);
             }
         }
         true
