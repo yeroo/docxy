@@ -1423,7 +1423,14 @@ impl DataValidation {
         }
         let f = self.formula1.trim();
         let inner = f.strip_prefix('"').and_then(|s| s.strip_suffix('"'))?;
-        Some(inner.split(',').map(|s| s.trim().to_string()).collect())
+        // A quote inside the list is doubled, as in any formula string.
+        Some(
+            inner
+                .replace("\"\"", "\"")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect(),
+        )
     }
 
     /// Whether this rule imposes anything worth surfacing: a real constraint,

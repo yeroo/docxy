@@ -203,22 +203,16 @@ impl SheetView {
         // Rules and notes each go in with one rewrite of their parts, not
         // one per rule or note (#707 r6). A rule carries everything the
         // source has (alert, input message, blanks, dropdown).
-        let settings: Vec<gridcore::sheet::DataValidation> = extras
-            .rules
-            .iter()
-            .map(|(_, rule)| rule.settings.clone())
-            .collect();
         let rules: Vec<gridcore::xlsx::NewValidation> = extras
             .rules
             .iter()
-            .zip(&settings)
-            .map(|((rect, rule), settings)| gridcore::xlsx::NewValidation {
+            .map(|(rect, rule)| gridcore::xlsx::NewValidation {
                 range: *rect,
                 kind: &rule.kind,
                 operator: &rule.operator,
                 formula1: &rule.formula1,
                 formula2: (!rule.formula2.is_empty()).then_some(rule.formula2.as_str()),
-                settings: Some(settings),
+                settings: Some(&rule.settings),
             })
             .collect();
         self.pkg.add_data_validations(s, &rules);

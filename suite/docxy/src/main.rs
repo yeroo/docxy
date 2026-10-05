@@ -678,8 +678,9 @@ struct SheetView {
     /// the alert the tab shows for it (#687). The editor stays open with its
     /// text meanwhile.
     dv_pending: Option<DvPending>,
-    /// The move the commit now running makes once its entry is in, which a
-    /// data-validation alert holds for Yes or OK; (0, 0) when none runs.
+    /// What the commit now running goes on to do once its entry is in (a key's
+    /// move, a click's selection change), which a data-validation alert holds
+    /// for Yes or OK; `Move(0, 0)`, nothing, when no commit runs.
     dv_then: DvThen,
     /// Circle Invalid Data's circles: (sheet, row, col). View state, never
     /// saved, and a circle goes when its cell is valid (#689).
@@ -13837,7 +13838,9 @@ impl Docxy {
     /// Commit the open editor before a pointer gesture changes the selection
     /// (`then`). False when the entry was refused or is waiting on its
     /// data-validation alert: the gesture then stops, and Yes or OK on the
-    /// alert goes on to make it.
+    /// alert makes the selection change `then` names. A press on a chart card
+    /// has no selection change to replay (`Move(0, 0)`): Yes or OK enters the
+    /// value, and the press is made again.
     fn sheet_commit_then(&mut self, then: DvThen, cx: &mut Context<Self>) -> bool {
         let origin = self
             .active_sheet()

@@ -532,7 +532,6 @@ fn a_malformed_block_is_refused_and_never_panics() {
         operator: String::new(),
         formula1: "\"a\"".into(),
         formula2: String::new(),
-        prompt: None,
         cells: vec![(5, 5)],
         anchor: (0, 0),
         settings: DataValidation::default(),

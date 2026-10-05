@@ -715,7 +715,8 @@ pub fn formulas_from_boxes(
                 if items.is_empty() {
                     return Err("Data validation: enter the list's source".to_string());
                 }
-                format!("\"{}\"", items.join(","))
+                // A quote in an item is doubled inside the formula's string.
+                format!("\"{}\"", items.join(",").replace('"', "\"\""))
             }
         }
     } else {
@@ -2471,5 +2472,27 @@ mod tests {
             check(&mut wb, 1, 1, "=SEQUENCE(2,1,100)").is_some(),
             "100 is not"
         );
+    }
+
+    #[test]
+    fn inline_items_with_quotes_round_trip_and_agree_between_dropdown_and_check() {
+        let ctx = crate::entry::EntryCtx::default();
+        let (f1, _) = formulas_from_boxes("list", "", "He said \"yes\",No", "", &ctx).unwrap();
+        assert_eq!(f1, "\"He said \"\"yes\"\",No\"");
+        let mut dv = rule("list", "", &f1, "");
+        dv.ranges = vec![(0, 3, 9, 3)];
+        assert_eq!(dv.list_values().unwrap(), ["He said \"yes\"", "No"]);
+        // The box shows the items again as typed.
+        assert_eq!(first_box(&dv, false), "He said \"yes\",No");
+        let mut wb = book();
+        wb.sheets[0].validations.push(dv);
+        let labels: Vec<_> = list_choices(&wb, 0, 0, 3, None)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        assert_eq!(labels, ["He said \"yes\"", "No"]);
+        assert!(check(&mut wb, 0, 3, "He said \"yes\"").is_none());
+        assert!(check(&mut wb, 0, 3, "He said yes").is_some());
     }
 }
