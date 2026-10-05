@@ -131,9 +131,7 @@ fn stdout_usable(handle: isize, file_type: u32) -> bool {
 pub(crate) fn print_version() {
     let text = version_text(info());
     #[cfg(windows)]
-    if !windows_console::stdout_is_usable()
-        && windows_console::write_to_parent_console(&text)
-    {
+    if !windows_console::stdout_is_usable() && windows_console::write_to_parent_console(&text) {
         return;
     }
     print!("{text}");
@@ -166,7 +164,14 @@ mod windows_console {
         let (handle, file_type) = unsafe {
             let h = GetStdHandle(STD_OUTPUT_HANDLE);
             let valid = !h.is_null() && h as isize != INVALID_HANDLE_VALUE;
-            (h as isize, if valid { GetFileType(h) } else { FILE_TYPE_UNKNOWN })
+            (
+                h as isize,
+                if valid {
+                    GetFileType(h)
+                } else {
+                    FILE_TYPE_UNKNOWN
+                },
+            )
         };
         super::stdout_usable(handle, file_type)
     }
