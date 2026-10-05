@@ -2222,16 +2222,14 @@ impl SheetView {
         let Some(cell) = cells.iter().find(|(cr, cc, _)| (*cr, *cc) == (r, c)) else {
             return false;
         };
-        let Some(violation) =
-            gridcore::validation::check_entry(
-                &mut self.pkg.workbook,
-                s,
-                r,
-                c,
-                &cell.2,
-                self.engine.clock,
-            )
-        else {
+        let Some(violation) = gridcore::validation::check_entry(
+            &mut self.pkg.workbook,
+            s,
+            r,
+            c,
+            &cell.2,
+            self.engine.clock,
+        ) else {
             return false;
         };
         self.entry_error = Some(violation.message.clone());
@@ -2274,7 +2272,8 @@ impl SheetView {
     /// breaks its rule, in place of this sheet's circles. How many.
     fn circle_invalid(&mut self) -> usize {
         let sheet = self.active;
-        let cells = gridcore::validation::invalid_cells(&self.pkg.workbook, sheet, self.engine.clock);
+        let cells =
+            gridcore::validation::invalid_cells(&self.pkg.workbook, sheet, self.engine.clock);
         self.circles.retain(|&(s, ..)| s != sheet);
         let n = cells.len();
         self.circles
@@ -13915,7 +13914,8 @@ impl Docxy {
         };
         let (s, (r, c)) = (v.active, v.sel);
         let today = v.engine.clock;
-        let Ok(cell) = gridcore::validation::pick_cell(&mut v.pkg.workbook, s, r, c, &choice, today)
+        let Ok(cell) =
+            gridcore::validation::pick_cell(&mut v.pkg.workbook, s, r, c, &choice, today)
         else {
             return;
         };
@@ -36784,13 +36784,12 @@ mod grid_geom_tests {
     #[test]
     fn bar_fields_are_ranges_and_take_the_keyboard_first() {
         use super::RefTarget;
-        for t in [RefTarget::CondFormat] {
-            assert!(
-                t.is_bar(),
-                "{t:?} sits inside a bar, so it is asked before the bar's own buffer"
-            );
-            assert!(t.is_range(), "{t:?} points at cells");
-        }
+        let t = RefTarget::CondFormat;
+        assert!(
+            t.is_bar(),
+            "{t:?} sits inside a bar, so it is asked before the bar's own buffer"
+        );
+        assert!(t.is_range(), "{t:?} points at cells");
         // The Chart panel's fields are not in a bar and must not steal its keys.
         for t in [
             RefTarget::ChartRange,
@@ -37469,12 +37468,11 @@ mod grid_geom_tests {
         assert!(keeps_panel_field(Some(3), 3, None));
 
         // A sheet bar pointing at the grid over an open panel: dropped.
-        for f in [RefTarget::CondFormat] {
-            assert!(
-                !keeps_panel_field(Some(3), 3, Some(f)),
-                "{f:?} is the sheet's"
-            );
-        }
+        let f = RefTarget::CondFormat;
+        assert!(
+            !keeps_panel_field(Some(3), 3, Some(f)),
+            "{f:?} is the sheet's"
+        );
 
         // A different chart, or no panel: the field belongs to what is left.
         assert!(!keeps_panel_field(Some(3), 4, Some(RefTarget::ChartRange)));
