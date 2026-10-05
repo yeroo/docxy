@@ -115,7 +115,7 @@ test a document cut with nothing selected leaves the document clean
 
 test the clipboard verb refuses what it does not do
   open ../fixtures/basic.xlsx
-  call-error clipboard {"action":"paste-special"} => paste special is not implemented in this app
+  call-error clipboard {"action":"paste-special"} => press the app's own key (key ctrl+alt+v)
   call-error clipboard {"action":"copy"} => press the app's own key
   call-error clipboard {"action":"write"} => text
   call-error clipboard {"action":"shuffle"} => unknown clipboard action
@@ -348,3 +348,74 @@ test enter in copy mode on a protected sheet moves
   assert cell P20 is nothing
   call clipboard {"action":"read"}
   assert reply.app.kind is grid
+
+# #669: Paste Special, the gallery, Paste Options and the Office Clipboard,
+# in an unused corner (M30:T40).
+test paste special pastes values, operations and transposed
+  open ../fixtures/basic.xlsx
+  click M30
+  type 2
+  key enter
+  type =M30*3
+  key enter
+  click M30
+  click M31 shift
+  key ctrl+c
+  click O30
+  key ctrl+alt+v
+  assert dialog is paste-special
+  call dialog-set {"control":"paste","value":"Values"}
+  call dialog-set {"control":"transpose","value":true}
+  call dialog-click {"button":"OK"}
+  assert cell O30 is 2
+  assert cell P30 is 6
+  call cell {"cell":"P30"}
+  assert reply.value is 6
+
+test the gallery and the Paste Options button paste another way
+  open ../fixtures/basic.xlsx
+  click M32
+  type 5
+  key enter
+  type =M32*10
+  key enter
+  click M33
+  key ctrl+c
+  click O33
+  key ctrl+v
+  call cell {"cell":"O33"}
+  assert reply.value is =O32*10
+  assert paste_options is Paste
+  call menu-open {"target":{"grid":"paste-options"}}
+  call menu-click {"label":"Values"}
+  call cell {"cell":"O33"}
+  # Values pastes what the copied M33 shows: =M32*10 is 50.
+  assert reply.value is 50
+  assert paste_options is Values
+  click Q33
+  call menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}}
+  call menu-click {"label":"Paste Link"}
+  call cell {"cell":"Q33"}
+  assert reply.value is =$M$33
+  assert paste_options is Paste Link
+  # Esc dismisses the button (R3).
+  key escape
+  assert paste_options is null
+
+test the Office Clipboard keeps copies and pastes them as values
+  open ../fixtures/basic.xlsx
+  # The pane is the app's, not the workbook's: it keeps the copies earlier
+  # cases made, as Excel's does across workbooks.
+  call office-clipboard {"action":"clear-all"}
+  click A2
+  key ctrl+c
+  click B2
+  key ctrl+c
+  call office-clipboard {"action":"open"}
+  assert reply.open is true
+  assert office_clipboard is 2
+  click M40
+  call office-clipboard {"action":"paste","index":1}
+  assert cell M40 is North
+  call office-clipboard {"action":"clear-all"}
+  assert office_clipboard is 0

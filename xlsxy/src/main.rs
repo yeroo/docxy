@@ -38,7 +38,7 @@ use backstage::BackstageHost as _;
 use gridcore::autocorrect::{AutoCorrect, Correction};
 use gridcore::comments::Comment;
 use gridcore::docprops::{CustomProperty, CustomValue, DocProperties};
-use gridcore::edit::{fill_changes, replace_all_in_sheet};
+use gridcore::edit::{FillDir, fill_changes, replace_all_in_sheet};
 use gridcore::engine::{Engine, PART_OF_ARRAY};
 use gridcore::entry::{EntryCtx, entry_cell_ctx, entry_ctx, seed_text};
 use gridcore::fcomplete::Completions;
@@ -1824,6 +1824,9 @@ struct PivotEdit {
     pane: usize,
     sel: usize,
 }
+
+/// [`ClipData::sheet`] of a copy whose sheet was deleted.
+const SHEET_GONE: usize = usize::MAX;
 
 /// An internal clipboard: a rect of cells plus its source sheet and corner so
 /// pasted formulas can shift their relative references (Excel semantics) and
@@ -5614,8 +5617,11 @@ impl App {
             Replace => self.open_prompt(PromptKind::ReplaceFind),
             GoTo => self.open_prompt(PromptKind::GoTo),
             ClearContents => self.clear_selection(),
-            FillDown => self.fill(true),
-            FillRight => self.fill(false),
+            FillDown => self.fill(FillDir::Down),
+            FillRight => self.fill(FillDir::Right),
+            FillUp => self.fill(FillDir::Up),
+            FillLeft => self.fill(FillDir::Left),
+            PasteSpecial => self.open_paste_special(),
             InsertRow => self.row_op(true),
             InsertCol => self.col_op(true),
             DeleteRow => self.row_op(false),
@@ -7062,6 +7068,80 @@ impl App {
         }
     }
 
+    /// Home › Paste Special (Ctrl+Alt+V): the dialog, over xlsxy's own copy
+    /// (a paste special needs its formulas and formats; text from another
+    /// program has neither).
+    fn open_paste_special(&mut self) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
+        match &self.clip {
+            None => {
+                self.status = Some("Paste Special pastes a copy made here: copy first".into());
+                return;
+            }
+            // Excel offers only Paste for a cut (#707 r1).
+            Some(clip) if clip.cut => {
+                self.status = Some("A cut pastes with Paste only (Ctrl+V)".into());
+                return;
+            }
+            _ => {}
+        }
+        self.outline_dialog = Some(outlinedlg::Dialog::PasteSpecial(
+            outlinedlg::PasteSpecialDialog::default(),
+        ));
+    }
+
+    /// Paste Special `spec` of the copy at the cursor, through gridcore's
+    /// [`gridcore::edit::paste_special_changes`], as one undo step.
+    fn paste_special(&mut self, spec: gridcore::edit::PasteSpec) {
+        let Some(clip) = self.clip.clone() else {
+            return;
+        };
+        if clip.sheet >= self.pkg.workbook.sheets.len() {
+            self.status = Some("The copy's sheet is gone: copy again".into());
+            return;
+        }
+        let rows: Vec<u32> = (0..clip.cells.len() as u32)
+            .map(|i| clip.from.0 + i)
+            .collect();
+        let w = clip.cells.iter().map(Vec::len).max().unwrap_or(0) as u32;
+        let cols: Vec<u32> = (0..w).map(|j| clip.from.1 + j).collect();
+        let mut block =
+            gridcore::edit::ClipBlock::capture(&self.pkg.workbook, clip.sheet, rows, cols);
+        // The cells as they were copied.
+        block.cells = clip
+            .cells
+            .iter()
+            .map(|row| {
+                let mut row: Vec<Cell> =
+                    row.iter().map(|c| c.clone().unwrap_or_default()).collect();
+                row.resize(w as usize, Cell::default());
+                row
+            })
+            .collect();
+        let s = self.sheet;
+        let changes = match gridcore::edit::paste_special_changes(
+            &mut self.pkg.workbook,
+            s,
+            self.cur,
+            &block,
+            &spec,
+        ) {
+            Ok(changes) => changes,
+            Err(why) => {
+                self.status = Some(why.into());
+                return;
+            }
+        };
+        let n = changes.len();
+        if self.apply(changes) {
+            self.status = Some(format!("Pasted {} into {n} cell(s)", spec.what.label()));
+        }
+    }
+
     /// A key for the open outline dialog.
     fn outline_dialog_key(&mut self, code: KeyCode) {
         let Some(d) = self.outline_dialog.as_mut() else {
@@ -7071,6 +7151,10 @@ impl App {
         match outcome {
             outlinedlg::Outcome::Pending => {}
             outlinedlg::Outcome::Cancel => self.outline_dialog = None,
+            outlinedlg::Outcome::PasteSpecial(spec) => {
+                self.outline_dialog = None;
+                self.paste_special(spec);
+            }
             outlinedlg::Outcome::Subtotal(opts) => {
                 let Some(outlinedlg::Dialog::Subtotal(d)) = self.outline_dialog.clone() else {
                     return;
@@ -7794,12 +7878,18 @@ impl App {
         self.status = Some(format!("Inserted {kind} chart"));
     }
 
-    /// Ctrl-D / Ctrl-R: fill the selection from its first row/column,
-    /// translating relative refs — or, when the selection is one row high
-    /// (Ctrl-D) or one column wide (Ctrl-R), a single cell included, pull
-    /// each cell from the row above / the column to the left.
-    fn fill(&mut self, down: bool) {
-        let changes = fill_changes(self.sheet(), self.selection(), down);
+    /// Ctrl-D / Ctrl-R and Fill Up / Left: fill the selection from its first
+    /// row/column (last, for Up and Left), translating relative refs — or,
+    /// when the selection is one cell deep along the fill, pull each cell
+    /// from its neighbour before it.
+    fn fill(&mut self, dir: FillDir) {
+        // A protected sheet refuses, as Delete does (#707 r3 m5).
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
+        let changes = fill_changes(self.sheet(), self.selection(), dir);
         if changes.is_empty() {
             return;
         }
@@ -7810,7 +7900,7 @@ impl App {
         self.status = Some(format!(
             "Filled {n} cell{} {}",
             if n == 1 { "" } else { "s" },
-            if down { "down" } else { "right" }
+            dir.label().to_ascii_lowercase()
         ));
     }
 
@@ -8421,8 +8511,19 @@ impl App {
 
     fn delete_current_sheet(&mut self) {
         let name = self.pkg.workbook.sheets[self.sheet].name.clone();
-        if self.pkg.remove_sheet(self.sheet) {
+        let gone = self.sheet;
+        if self.pkg.remove_sheet(gone) {
             self.cancel_cut();
+            // The copy names its sheet by index: one deleted leaves it no
+            // sheet (it still pastes its cells as a copy, but Paste Special
+            // has nothing to read), and one before it renumbers it (#707 r1).
+            if let Some(clip) = self.clip.as_mut() {
+                if clip.sheet == gone {
+                    clip.sheet = SHEET_GONE;
+                } else if clip.sheet > gone && clip.sheet != SHEET_GONE {
+                    clip.sheet -= 1;
+                }
+            }
             self.sheet = self.sheet.min(self.pkg.workbook.sheets.len() - 1);
             self.cur = (0, 0);
             self.top = 0;
@@ -10492,9 +10593,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('y') | KeyCode::Char('Y') if ctrl => app.redo(),
         KeyCode::Char('c') | KeyCode::Char('C') if ctrl => app.copy(false),
         KeyCode::Char('x') | KeyCode::Char('X') if ctrl => app.copy(true),
+        // Ctrl+Alt+V, when the terminal reports it: Paste Special (#669).
+        KeyCode::Char('v') | KeyCode::Char('V') if ctrl && alt => app.open_paste_special(),
         KeyCode::Char('v') | KeyCode::Char('V') if ctrl => app.paste(),
-        KeyCode::Char('d') | KeyCode::Char('D') if ctrl => app.fill(true),
-        KeyCode::Char('r') | KeyCode::Char('R') if ctrl => app.fill(false),
+        KeyCode::Char('d') | KeyCode::Char('D') if ctrl => app.fill(FillDir::Down),
+        KeyCode::Char('r') | KeyCode::Char('R') if ctrl => app.fill(FillDir::Right),
         KeyCode::Char('f') | KeyCode::Char('F') if alt => app.open_backstage(),
         KeyCode::Char('o') | KeyCode::Char('O') if ctrl => {
             app.open_backstage();
@@ -13434,6 +13537,180 @@ mod tests {
         assert_eq!(f_attrs_at(&app, 0, 0, 3), None);
     }
 
+    /// #669: Paste Special over xlsxy's own copy, through gridcore's rules.
+    #[test]
+    fn paste_special_values_transpose_and_an_operation() {
+        let mut app = App::new(new_xlsx(), "ps.xlsx");
+        app.os_clip = None;
+        let s = &mut app.pkg.workbook.sheets[0];
+        s.set_cell(0, 0, Cell::number(2.0));
+        s.set_cell(1, 0, Cell::formula("A1*3"));
+        app.engine = Engine::new(&app.pkg.workbook);
+        app.engine.recalc_all(&mut app.pkg.workbook);
+        app.cur = (1, 0);
+        app.anchor = Some((0, 0));
+        app.copy(false);
+        app.anchor = None;
+        app.cur = (0, 2);
+        app.open_paste_special();
+        assert!(matches!(
+            app.outline_dialog,
+            Some(outlinedlg::Dialog::PasteSpecial(_))
+        ));
+        // Values, transposed: C1 2, D1 6 (no formula).
+        app.outline_dialog_key(KeyCode::Right);
+        app.outline_dialog_key(KeyCode::Right);
+        for _ in 0..3 {
+            app.outline_dialog_key(KeyCode::Down);
+        }
+        app.outline_dialog_key(KeyCode::Char(' '));
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        let cell = |app: &App, r, c| app.sheet().cell(r, c).cloned().unwrap_or_default();
+        assert_eq!(cell(&app, 0, 3).value, CellValue::Number(6.0));
+        assert!(cell(&app, 0, 3).formula.is_none());
+        // Multiply onto a constant.
+        app.pkg.workbook.sheets[0].set_cell(5, 0, Cell::number(10.0));
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.copy(false);
+        app.cur = (5, 0);
+        app.paste_special(gridcore::edit::PasteSpec {
+            op: gridcore::edit::PasteOp::Multiply,
+            ..Default::default()
+        });
+        assert_eq!(cell(&app, 5, 0).value, CellValue::Number(20.0));
+        assert!(app.undo.len() >= 2, "each paste is an undo step");
+    }
+
+    /// #707 r1 C1: a copy whose sheet is deleted keeps its cells but marks
+    /// its sheet gone (`SHEET_GONE`), so Paste Special refuses it rather
+    /// than read a sheet that is not there (it panicked); a copy on a later
+    /// sheet follows the renumbering. M5: a cut takes Paste only.
+    #[test]
+    fn paste_special_after_the_copys_sheet_is_deleted() {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Sheet2");
+        pkg.add_sheet("Sheet3");
+        let mut app = App::new(pkg, "del.xlsx");
+        app.os_clip = None;
+        app.sheet = 1;
+        app.pkg.workbook.sheets[1].set_cell(0, 0, Cell::number(2.0));
+        app.pkg.workbook.sheets[1].set_cell(1, 0, Cell::formula("A1*3"));
+        app.cur = (1, 0);
+        app.anchor = Some((0, 0));
+        app.copy(false);
+        app.delete_current_sheet();
+        assert_eq!(app.clip.as_ref().map(|c| c.sheet), Some(SHEET_GONE));
+        app.anchor = None;
+        app.open_paste_special();
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        assert!(app.status.as_deref().unwrap_or("").contains("gone"));
+        // Even a clip left pointing past the sheets is refused, not a panic.
+        app.clip = Some(ClipData {
+            cells: vec![vec![Some(Cell::number(1.0))]],
+            rules: Vec::new(),
+            sheet: 9,
+            from: (0, 0),
+            cut: false,
+        });
+        app.paste_special(gridcore::edit::PasteSpec::default());
+        assert!(app.status.as_deref().unwrap_or("").contains("gone"));
+        // A copy on Sheet3 survives deleting Sheet1, renumbered.
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Sheet2");
+        let mut app = App::new(pkg, "renum.xlsx");
+        app.os_clip = None;
+        app.sheet = 1;
+        app.pkg.workbook.sheets[1].set_cell(0, 0, Cell::number(5.0));
+        app.copy(false);
+        app.sheet = 0;
+        app.delete_current_sheet();
+        assert_eq!(app.clip.as_ref().map(|c| c.sheet), Some(0));
+        // M5: a cut refuses Paste Special.
+        app.copy(true);
+        app.open_paste_special();
+        assert!(app.outline_dialog.is_none());
+        assert!(app.status.as_deref().unwrap_or("").contains("cut"));
+    }
+
+    /// #707 r4 M1: Paste Special › All of a spilling array pastes its
+    /// members blank, so the pasted formula spills again; Values writes
+    /// what they show.
+    #[test]
+    fn paste_special_of_a_spill_spills_again() {
+        for (what, formula_kept) in [
+            (gridcore::edit::PasteWhat::All, true),
+            (gridcore::edit::PasteWhat::Formulas, true),
+            (gridcore::edit::PasteWhat::Values, false),
+        ] {
+            let mut app = App::new(new_xlsx(), "spill.xlsx");
+            app.os_clip = None;
+            app.engine.set_cell(
+                &mut app.pkg.workbook,
+                (0, 0, 0),
+                Cell::formula("SEQUENCE(3)"),
+            );
+            app.cur = (2, 0);
+            app.anchor = Some((0, 0));
+            app.copy(false);
+            app.anchor = None;
+            app.cur = (0, 2);
+            app.paste_special(gridcore::edit::PasteSpec::of(what));
+            let v = |r| app.sheet().cell(r, 2).map(|c| c.value.clone());
+            let n = |x: f64| Some(CellValue::Number(x));
+            assert_eq!([v(0), v(1), v(2)], [n(1.0), n(2.0), n(3.0)], "{what:?}");
+            assert_eq!(
+                app.sheet().cell(0, 2).is_some_and(|c| c.formula.is_some()),
+                formula_kept
+            );
+        }
+    }
+
+    /// #707 r3 m5: Fill (Ctrl+D/R, Up, Left) refuses a protected sheet.
+    #[test]
+    fn fill_refuses_a_protected_sheet() {
+        let mut app = App::new(new_xlsx(), "prot.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(7.0));
+        app.pkg.workbook.sheets[0].set_protected(true);
+        for dir in [FillDir::Down, FillDir::Right, FillDir::Up, FillDir::Left] {
+            app.cur = (2, 2);
+            app.anchor = Some((0, 0));
+            app.fill(dir);
+            assert_eq!(app.sheet().cells.len(), 1, "{dir:?}");
+            assert!(app.status.as_deref().unwrap_or("").contains("protected"));
+        }
+        assert!(app.undo.is_empty());
+    }
+
+    /// #668: Fill Up and Fill Left.
+    #[test]
+    fn fill_up_and_left() {
+        let mut app = App::new(new_xlsx(), "fill.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_cell(2, 0, Cell::number(7.0));
+        app.pkg.workbook.sheets[0].set_cell(0, 3, Cell::formula("E1+1"));
+        app.cur = (0, 0);
+        app.anchor = Some((2, 0));
+        app.fill(FillDir::Up);
+        assert_eq!(
+            app.sheet().cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(7.0))
+        );
+        app.cur = (0, 1);
+        app.anchor = Some((0, 3));
+        app.fill(FillDir::Left);
+        assert_eq!(
+            app.sheet()
+                .cell(0, 1)
+                .and_then(|c| c.formula.clone())
+                .as_deref(),
+            Some("C1+1")
+        );
+    }
+
     /// A1:A3 = 1, 2, 3 and a legacy CSE block `{=A1:A3*2}` over D1:D3, as
     /// load_xlsx reads it, spilling 2, 4, 6.
     fn app_with_spilling_cse() -> App {
@@ -13552,7 +13829,7 @@ mod tests {
         let before = app.sheet().cells.clone();
         app.cur = (3, 3);
         app.anchor = Some((1, 2));
-        app.fill(true);
+        app.fill(FillDir::Down);
         assert_refused(&app, &before);
         app.cur = (2, 3);
         app.anchor = Some((1, 2));
@@ -16887,7 +17164,7 @@ mod tests {
         app.pkg.workbook.sheets[0].set_cell(2, 3, Cell::number(5.0));
         app.anchor = Some((1, 3));
         app.cur = (2, 4);
-        app.fill(false);
+        app.fill(FillDir::Right);
         let filled = vec![n(7.0), CellValue::Empty, n(5.0)];
         assert_eq!(col_values(&app, 4, 0, 2), filled, "fill");
         app.undo();
@@ -17005,7 +17282,7 @@ mod tests {
         // Select B1:B4 and fill down.
         app.cur = (3, 1);
         app.anchor = Some((0, 1));
-        app.fill(true);
+        app.fill(FillDir::Down);
         let s = &app.pkg.workbook.sheets[0];
         assert_eq!(s.cell(2, 1).unwrap().formula.as_deref(), Some("A3*2"));
         assert_eq!(s.cell(3, 1).unwrap().value, CellValue::Number(8.0));

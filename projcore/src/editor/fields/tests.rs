@@ -230,6 +230,53 @@ fn unset_fields_read_null_but_show_what_project_shows() {
 }
 
 #[test]
+fn hyperlink_fields_read_the_corpus_values() {
+    let proj =
+        crate::mspdi::read_mspdi(include_str!("../../../../corpus/mspdi/20-task-fields.xml"))
+            .unwrap();
+    let ed = Editor::new(proj);
+    let text = |t: &str| (s(t), FieldValue::Text(s(t)));
+    // Pour (uid 4) stores all three parts, read as Project names them.
+    assert_eq!(tv(&ed, 4, "Hyperlink"), text("Pour instructions"));
+    assert_eq!(
+        tv(&ed, 4, "Hyperlink Address"),
+        text("https://example.com/a?x=1&y=2")
+    );
+    assert_eq!(tv(&ed, 4, "Hyperlink SubAddress"), text("Gantt Chart!4"));
+    // The names parse loosely, like every other field's.
+    assert_eq!(Field::parse("Hyperlink"), Ok(Field::Hyperlink));
+    assert_eq!(
+        Field::parse("hyperlink address"),
+        Ok(Field::HyperlinkAddress)
+    );
+    assert_eq!(
+        Field::parse("  HYPERLINK subaddress "),
+        Ok(Field::HyperlinkSubAddress)
+    );
+    // A task without a link reads empty text and Null; so does the blank row.
+    for uid in [2, 3] {
+        for name in ["Hyperlink", "Hyperlink Address", "Hyperlink SubAddress"] {
+            assert_eq!(
+                tv(&ed, uid, name),
+                (s(""), FieldValue::Null),
+                "uid {uid} {name}"
+            );
+        }
+    }
+    // The registry lists the three names, directly after Notes.
+    let names = field_names();
+    let notes = names.iter().position(|n| n == "Notes").unwrap();
+    assert_eq!(
+        names[notes + 1..notes + 4],
+        [
+            s("Hyperlink"),
+            s("Hyperlink Address"),
+            s("Hyperlink SubAddress")
+        ]
+    );
+}
+
+#[test]
 fn defaults_read_their_effective_value() {
     let mut p = untitled_project();
     p.default_task_type = Some(TaskType::FixedDuration);
@@ -322,7 +369,7 @@ fn every_name_reads_on_a_leaf_a_summary_a_milestone_and_a_blank_row() {
 #[test]
 fn names_list_the_families_and_match_loosely() {
     let names = field_names();
-    assert_eq!(names.len(), 23 + 11 * 5 + 31);
+    assert_eq!(names.len(), 23 + 11 * 5 + 34);
     assert_eq!(names[..3], [s("ID"), s("Task Mode"), s("Name")]);
     for name in [
         "Baseline Start",

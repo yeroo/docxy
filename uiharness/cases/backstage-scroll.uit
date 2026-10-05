@@ -1,0 +1,163 @@
+# #1028: the File screen's content pane and rail scroll when they are taller
+# than the window. `shot window` settles a frame before each layout read.
+test the Backstage page scrolls when it is taller than the window
+  open ../fixtures/basic.docx
+  call window-size {"w":1000,"h":500}
+  call backstage {"action":"open"}
+  shot window
+  call backstage-layout {}
+  assert reply.page is open
+  assert reply.scrollable is true
+  assert reply.scroll_y is 0
+  assert reply.last_item_visible is false
+  call pointer-wheel {"region":"backstage-content","dy":-600}
+  shot window
+  call backstage-layout {}
+  assert reply.scrolled is true
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.last_item_visible is true
+  shot window
+
+test PageDown PageUp Home and End scroll the Backstage page
+  open ../fixtures/basic.docx
+  call window-size {"w":1000,"h":500}
+  call backstage {"action":"open"}
+  shot window
+  key pagedown
+  shot window
+  call backstage-layout {}
+  assert reply.scrolled is true
+  key end
+  shot window
+  call backstage-layout {}
+  assert reply.last_item_visible is true
+  key pageup
+  shot window
+  call backstage-layout {}
+  assert reply.scrolled is true
+  assert reply.last_item_visible is false
+  key home
+  shot window
+  call backstage-layout {}
+  assert reply.at_top is true
+
+test switching pages resets the scroll
+  open ../fixtures/basic.docx
+  call window-size {"w":1000,"h":500}
+  call backstage {"action":"open"}
+  shot window
+  # At 1000x500 Open and Info overflow; New fits. gpui clamps a fitting
+  # page's offset to 0 whatever the code did, so at_top on New cannot show a
+  # dropped reset (it only checks the page shows). The proofs are on the
+  # overflowing pages: Open -> Info (rail's Info reset) and reopening File or
+  # the open-page shortcut (Open's reset).
+  call backstage-layout {}
+  assert reply.scrollable is true
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.scrolled is true
+  call backstage-page {"page":"info"}
+  shot window
+  call backstage-layout {}
+  assert reply.page is info
+  assert reply.scrollable is true
+  assert reply.at_top is true
+  call backstage-page {"page":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.scrolled is true
+  call backstage-page {"page":"new"}
+  shot window
+  call backstage-layout {}
+  assert reply.page is new
+  assert reply.at_top is true
+  call backstage-page {"page":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.scrolled is true
+  call backstage-page {"page":"open"}
+  shot window
+  call backstage-layout {}
+  assert reply.at_top is true
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.scrolled is true
+  call backstage {"action":"close"}
+  call backstage {"action":"open"}
+  shot window
+  call backstage-layout {}
+  assert reply.at_top is true
+
+# While File is open every key belongs to the File screen: typing and Ctrl+W
+# must not reach the document hidden under it.
+test keys pressed in the Backstage do not reach the hidden tab
+  open copy:../fixtures/basic.docx
+  type hello
+  assert text is hello
+  call backstage {"action":"open"}
+  type abc
+  key ctrl+w
+  call backstage {"action":"close"}
+  assert text is hello
+  assert dialog is none
+  assert title is basic.docx
+
+# The window cannot be shorter than 420 (`window_min_size`), and the rail's
+# items (Account included) overflow that, so the rail must scroll: it is not at
+# its end until the wheel takes it there.
+test the rail scrolls in the shortest window
+  open ../fixtures/basic.docx
+  call window-size {"w":1000,"h":300}
+  call backstage {"action":"open"}
+  shot window
+  call backstage-layout {}
+  assert reply.rail_scrollable is true
+  assert reply.rail_last_item_visible is false
+  call pointer-wheel {"region":"backstage-rail","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.rail_last_item_visible is true
+
+# The generic guard: each page the rail can show either fits a 1000x500 window
+# or scrolls to its end under the wheel (`last_item_visible` is true for a page
+# that fits). It catches a page whose root cannot scroll; a page root must take
+# its natural height (no h_full/flex_1) for the end to be measurable. The
+# wheel, not a key, drives it: a key sets the offset whether or not the pane
+# can scroll.
+test every Backstage page is reachable at 1000x500
+  open ../fixtures/basic.docx
+  call window-size {"w":1000,"h":500}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"open"}
+  shot window
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.last_item_visible is true
+  call backstage-page {"page":"new"}
+  shot window
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.page is new
+  assert reply.last_item_visible is true
+  call backstage-page {"page":"info"}
+  shot window
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.page is info
+  assert reply.last_item_visible is true
+  call backstage-page {"page":"account"}
+  shot window
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call backstage-layout {}
+  assert reply.page is account
+  assert reply.last_item_visible is true

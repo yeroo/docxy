@@ -814,7 +814,7 @@ fn ctrl_d_and_ctrl_r_fill_with_moved_references_and_styles() {
     v.sel = (0, 1);
     v.anchor = (3, 1);
     let undo = v.undo.len();
-    assert!(v.fill_selection(true));
+    assert!(v.fill_selection(gridcore::edit::FillDir::Down));
     assert_eq!(v.undo.len(), undo + 1);
     assert_eq!(
         v.sheet().cell(2, 1).unwrap().formula.as_deref(),
@@ -826,11 +826,11 @@ fn ctrl_d_and_ctrl_r_fill_with_moved_references_and_styles() {
     put(&mut v, 0, 3, Cell::text("x"));
     v.sel = (0, 3);
     v.anchor = (0, 5);
-    assert!(v.fill_selection(false));
+    assert!(v.fill_selection(gridcore::edit::FillDir::Right));
     assert_eq!(value(&v, 0, 5), CellValue::Text("x".into()));
     // A single cell copies the cell above.
     select(&mut v, 1, 3);
-    assert!(v.fill_selection(true));
+    assert!(v.fill_selection(gridcore::edit::FillDir::Down));
     assert_eq!(value(&v, 1, 3), CellValue::Text("x".into()));
 }
 
@@ -1102,7 +1102,7 @@ fn a_fill_mixing_a_blank_into_a_frozen_block_clears_it() {
     v.engine = sheet_engine(&v.pkg.workbook);
     v.sel = (1, 3);
     v.anchor = (2, 4);
-    assert!(v.fill_selection(false));
+    assert!(v.fill_selection(gridcore::edit::FillDir::Right));
     assert_eq!(value(&v, 0, 4), CellValue::Number(7.0));
     assert_eq!(value(&v, 1, 4), CellValue::Empty);
     assert_eq!(value(&v, 2, 4), CellValue::Number(5.0));
@@ -1221,7 +1221,7 @@ fn a_range_entry_or_fill_over_part_of_an_array_is_refused_whole() {
     let before = v.sheet().cells.clone();
     v.anchor = (1, 2);
     v.sel = (3, 3);
-    assert!(!v.fill_selection(true));
+    assert!(!v.fill_selection(gridcore::edit::FillDir::Down));
     assert_refused(&mut v, &before);
 }
 
@@ -1259,13 +1259,36 @@ fn a_drag_fill_from_a_source_holding_the_anchor_is_refused() {
     let src = (0, 3, 1, 3);
     let bx = fill_box(src, (5, 3));
     assert_eq!(bx, (0, 3, 5, 3));
-    let dest = fill_dest(src, bx);
+    let gridcore::edit::FillTarget::Extend { dest, .. } = gridcore::edit::fill_target(src, (5, 3))
+    else {
+        panic!("a fill down")
+    };
     assert_eq!(dest, (2, 3, 5, 3));
     assert!(v.engine.refuses_area(&v.pkg.workbook, s, dest));
     // The whole box would count the anchor as replaced: the r7 bug.
     assert!(!v.engine.refuses_area(&v.pkg.workbook, s, bx));
+    // The drag itself: refused whole, nothing written, no undo step.
+    let before = v.sheet().cells.clone();
+    assert_eq!(
+        v.fill_drag(&gridcore::edit::FillReq {
+            src,
+            to: (5, 3),
+            kind: gridcore::edit::FillKind::Auto,
+            ctrl: false,
+            lists: &[],
+        }),
+        Err(gridcore::engine::PART_OF_ARRAY.to_string())
+    );
+    assert_eq!(v.sheet().cells, before);
+    assert!(v.undo.is_empty());
     // Right: the columns past the source.
-    assert_eq!(fill_dest((0, 0, 1, 1), (0, 0, 1, 4)), (0, 2, 1, 4));
+    assert!(matches!(
+        gridcore::edit::fill_target((0, 0, 1, 1), (1, 4)),
+        gridcore::edit::FillTarget::Extend {
+            dest: (0, 2, 1, 4),
+            ..
+        }
+    ));
 }
 
 // ---- #672: Excel's editing options ----------------------------------------

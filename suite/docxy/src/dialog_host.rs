@@ -62,6 +62,18 @@ fn apply_dialog(
         DialogOwner::TextToColumns { .. } | DialogOwner::TextToColumnsReplace => {
             Err("Text to Columns applies through its own wizard".into())
         }
+        // Handled in `sheet_goto::click`, before this.
+        DialogOwner::GoTo | DialogOwner::GoToSpecial => {
+            Err("Go To applies through Find & Select".into())
+        }
+        // Handled in `Docxy::paste_dialog_click`, before this.
+        DialogOwner::PasteSpecial { .. } => Err("Paste Special applies through Paste".into()),
+        // Handled in `Docxy::drop_dialog_click`, before this.
+        DialogOwner::DropReplace => Err("the drop applies through the grid".into()),
+        // Handled in `Docxy::fill_dialog_click`, before this.
+        DialogOwner::Series | DialogOwner::JustifyOverflow | DialogOwner::CustomLists => {
+            Err("a Fill dialog applies through Home › Fill".into())
+        }
         // Handled in `sheet_consolidate::click`, before this.
         DialogOwner::Consolidate { .. } => Err("Consolidate applies through the Data tab".into()),
         // Handled in `sheet_validation::click` and `alert_click`, before this.
@@ -150,6 +162,27 @@ fn reopen_click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
     Some(crate::tab_from_path_mode(&path, mode, &trusted).map(|fresh| *tab = fresh))
 }
 
+/// Whether Enter and Escape on a dialog of `owner` press through
+/// `Docxy::dialog_press`, which the app's own dialogs need (the user name,
+/// About, AutoCorrect, the close prompt, the fill, paste and drop dialogs),
+/// as does Go To's move to another sheet (#707 r6 m2).
+pub(crate) fn presses_through_app(owner: &DialogOwner) -> bool {
+    crate::sheet_autocorrect::is_autocorrect(*owner)
+        || matches!(
+            owner,
+            DialogOwner::UserName
+                | DialogOwner::About
+                | DialogOwner::SaveOnClose { .. }
+                | DialogOwner::Series
+                | DialogOwner::JustifyOverflow
+                | DialogOwner::CustomLists
+                | DialogOwner::PasteSpecial { .. }
+                | DialogOwner::DropReplace
+                | DialogOwner::GoTo
+                | DialogOwner::GoToSpecial
+        )
+}
+
 /// Whether the active tab's top dialog is the reopen question, whose Yes
 /// replaces the tab under any grid state the window keeps for it.
 fn reopen_on_top(tab: Option<&DocTab>) -> bool {
@@ -167,6 +200,10 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
     }
     // So do the outline dialogs (#693): Subtotal's OK and Remove All.
     if let Some(done) = crate::sheet_outline::click(tab, button) {
+        return done;
+    }
+    // Go To's OK selects; its Special… opens Go To Special (#671).
+    if let Some(done) = crate::sheet_goto::click(tab, button) {
         return done;
     }
     // Consolidate's Add and Delete edit its list; OK consolidates (#694).
@@ -387,11 +424,29 @@ impl Docxy {
         if let Some(done) = self.close_prompt_click(button, window, cx) {
             return done;
         }
+        // So are the custom lists, which the Series dialog reads (#668).
+        if let Some(done) = self.fill_dialog_click(button) {
+            return done;
+        }
+        // And the copy Paste Special pastes (#669).
+        if let Some(done) = self.paste_dialog_click(button) {
+            return done;
+        }
+        // And a drop by the selection's border waiting on its question (#670).
+        if let Some(done) = self.drop_dialog_click(button) {
+            return done;
+        }
         let reopen = reopen_on_top(self.tabs.get(self.active));
+        let sheet_before = self.active_sheet().map(|v| v.active);
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
         dialog_click(tab, button)?;
         if reopen {
             self.after_reopen();
+        }
+        // A dialog that moved to another sheet (Go To) leaves the grid state
+        // of the one it left behind, as a sheet-tab click does (#707 r5 M3).
+        if !reopen && self.active_sheet().map(|v| v.active) != sheet_before {
+            self.drop_grid_state();
         }
         // A merge or a sheet of labels opens as a new document.
         self.take_mail_outputs();
@@ -415,21 +470,15 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        // Enter or Escape on a dialog the app owns (the user name, About, AutoCorrect,
-        // the close prompt) presses through the app, as its drawn buttons do.
+        // Enter or Escape on a dialog the app applies (the user name, About,
+        // AutoCorrect, the close prompt, the fill, paste and drop dialogs)
+        // presses through the app, as its drawn buttons do; so do Go To and
+        // Go To Special, whose OK may move to another sheet and must drop the
+        // grid state left behind, as a click does (#707 r6 m2).
         let plain = !m.control && !m.alt && !m.platform;
         let app_button = self
             .active_dialogs()
-            .filter(|s| {
-                s.top().is_some_and(|d| {
-                    matches!(
-                        d.owner,
-                        DialogOwner::UserName
-                            | DialogOwner::About
-                            | DialogOwner::SaveOnClose { .. }
-                    ) || crate::sheet_autocorrect::is_autocorrect(d.owner)
-                })
-            })
+            .filter(|s| s.top().is_some_and(|d| presses_through_app(&d.owner)))
             .and_then(|s| s.key_button(key, plain));
         if let Some(label) = app_button {
             if let Err(e) = self.dialog_press(&label, window, cx) {

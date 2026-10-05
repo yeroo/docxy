@@ -546,6 +546,13 @@ pub struct Sheet {
     /// or an in-workbook location as `#Sheet!A1`. Rendered underlined; a click
     /// opens the URL (external) or jumps (internal).
     pub hyperlinks: std::collections::BTreeMap<(u32, u32), String>,
+    /// The `ref` each loaded `<hyperlink>` covers, keyed by its top-left
+    /// cell: a link over a range spreads over its cells in `hyperlinks`, and
+    /// removing it from one cell removes it from all of them (#671).
+    pub hyperlink_refs: std::collections::BTreeMap<(u32, u32), (u32, u32, u32, u32)>,
+    /// The `ref`s of loaded `<hyperlink>` elements whose link was removed: the
+    /// worksheet part still holds them, so a save strikes them.
+    pub hyperlinks_removed: Vec<(u32, u32, u32, u32)>,
     /// Data-validation rules (`<dataValidation>`): the constraint on a cell's
     /// value (a dropdown list, a number range, …). Typed entries are checked
     /// against them ([`crate::validation::check_entry`]); a save writes edits
@@ -560,10 +567,12 @@ pub struct Sheet {
     /// [`Drawing::anchor_ix`] of drawings deleted since the file was loaded —
     /// the same round-trip means a save has to strike them from the part too.
     pub drawings_removed: Vec<usize>,
-    /// [`CondFormat::ix`] of blocks a structural edit deleted (every range
-    /// gone): the worksheet part still holds them, so a save strikes them.
+    /// [`CondFormat::ix`] of blocks an edit deleted (every range gone: a
+    /// row or column delete, Clear All or Clear Formats): the worksheet
+    /// part still holds them, so a save strikes them.
     pub cf_removed: Vec<usize>,
-    /// [`DataValidation::ix`] of rules a structural edit deleted, likewise.
+    /// [`DataValidation::ix`] of rules an edit deleted (a row or column
+    /// delete, a paste of validation over them), likewise.
     pub dv_removed: Vec<usize>,
     /// Sheet protection: `Some(attrs)` holds the raw attribute string of the
     /// worksheet's `<sheetProtection>` element (e.g. `sheet="1" objects="1"`),

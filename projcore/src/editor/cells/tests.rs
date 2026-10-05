@@ -55,6 +55,104 @@ fn predecessor_validation_is_atomic_and_replacement_is_one_step() {
 }
 
 #[test]
+fn set_hyperlink_is_one_undo_step() {
+    let mut ed = editor();
+    let before = ed.project().clone();
+    ed.set_hyperlink(10, " docs ", "https://example.com", " Gantt Chart!4 ")
+        .unwrap();
+    // Ends are trimmed; the three parts land as ONE undo step.
+    assert_eq!(ed.undo_depth(), 1);
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.hyperlink.as_deref(), Some("docs"));
+    assert_eq!(
+        task.hyperlink_address.as_deref(),
+        Some("https://example.com")
+    );
+    assert_eq!(task.hyperlink_sub_address.as_deref(), Some("Gantt Chart!4"));
+    let after = ed.project().clone();
+    assert!(ed.undo());
+    assert_eq!(ed.project(), &before);
+    assert!(ed.redo());
+    assert_eq!(ed.project(), &after);
+}
+
+#[test]
+fn set_hyperlink_empty_removes_and_noop_pushes_nothing() {
+    let mut ed = editor();
+    ed.set_hyperlink(10, "docs", "https://example.com", "loc")
+        .unwrap();
+    let depth = ed.undo_depth();
+    // The values a task already has change nothing, pushing no undo step.
+    ed.set_hyperlink(10, "docs", "https://example.com", "loc")
+        .unwrap();
+    assert_eq!(ed.undo_depth(), depth);
+    // Empty strings clear a part; clearing all three removes the link.
+    ed.set_hyperlink(10, "", "", "").unwrap();
+    assert_eq!(ed.undo_depth(), depth + 1);
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(
+        (
+            &task.hyperlink,
+            &task.hyperlink_address,
+            &task.hyperlink_sub_address
+        ),
+        (&None, &None, &None)
+    );
+    assert!(ed.undo());
+    assert_eq!(
+        ed.project().task(10).unwrap().hyperlink.as_deref(),
+        Some("docs")
+    );
+    // Removing a link that is not there is a no-op too.
+    ed.set_hyperlink(10, "", "", "").unwrap();
+    let depth = ed.undo_depth();
+    ed.set_hyperlink(10, "", "", "").unwrap();
+    assert_eq!(ed.undo_depth(), depth);
+}
+
+#[test]
+fn set_hyperlink_rejects_blank_row_and_unknown_uid() {
+    let mut ed = editor();
+    let i = ed.insert_blank_row(Some(10)).unwrap();
+    let blank = ed.project().tasks[i].uid;
+    // Both rejections leave the plan and its history untouched.
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    assert_eq!(
+        ed.set_hyperlink(999, "t", "a", "s").unwrap_err(),
+        "no task with uid 999"
+    );
+    assert_eq!(
+        ed.set_hyperlink(blank, "t", "a", "s").unwrap_err(),
+        "A blank row cannot take a hyperlink"
+    );
+    unchanged(&ed, &before, history);
+}
+
+#[test]
+fn edited_hyperlink_survives_save_and_reload() {
+    let proj =
+        crate::mspdi::read_mspdi(include_str!("../../../../corpus/mspdi/20-task-fields.xml"))
+            .unwrap();
+    let mut ed = Editor::new(proj);
+    let other = ed.project().task(2).unwrap().clone();
+    ed.set_hyperlink(4, "New runbook", "https://example.com/b", "Gantt Chart!5")
+        .unwrap();
+    let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
+    let pour = back.task(4).unwrap();
+    assert_eq!(pour.hyperlink.as_deref(), Some("New runbook"));
+    assert_eq!(
+        pour.hyperlink_address.as_deref(),
+        Some("https://example.com/b")
+    );
+    assert_eq!(pour.hyperlink_sub_address.as_deref(), Some("Gantt Chart!5"));
+    // The rest of the plan is untouched: another task's fields and its
+    // absent link read back exactly.
+    assert_eq!(back.task(2).unwrap(), &other);
+    assert_eq!(back.task(2).unwrap().hyperlink, None);
+}
+
+#[test]
 fn resources_preserve_allocations_and_undo_creation_together() {
     let mut ed = editor();
     ed.set_resources(10, &["Alice".into(), "Bob".into()])

@@ -80,7 +80,8 @@ Baseline and Baseline1–Baseline10 Start/Finish/Duration/Work/Cost, Start,
 Finish, Duration, Work and Cost Variance, Total, Free, Start and Finish Slack,
 Early and Late Start/Finish, Critical, Constraint Type and Date, Deadline,
 Active, Outline Number, Outline Level, WBS, Leveling Delay, Type, Effort Driven,
-Priority, Notes, Milestone, Summary, Estimated, Status and Unique ID. Status is
+Priority, Notes, Hyperlink, Hyperlink Address, Hyperlink SubAddress, Milestone,
+Summary, Estimated, Status and Unique ID. Status is
 measured at the plan's StatusDate, else its CurrentDate, and is empty when the
 plan has neither. Earned-value and custom fields are not readable yet.
 
@@ -94,8 +95,9 @@ plan has neither. Earned-value and custom fields are not readable yet.
   and slack signed minutes; money a number of currency units; percents
   integers; flags booleans; enums (Task Mode, Constraint Type, Type, Fixed
   Cost Accrual, Status) their display names; text strings. It is `null` only
-  for a date that shows `NA`, for a stored quantity the plan does not have
-  (unset % Complete reads `"0%"` and `null`; a stored 0 reads `"0%"` and `0`),
+  for a date that shows `NA`, for a stored value the plan does not have
+  (unset % Complete reads `"0%"` and `null`; a stored 0 reads `"0%"` and `0`;
+  unset hyperlink parts read `""` and `null`),
   and for Status when the plan has no StatusDate or CurrentDate (or the task
   no start), which then reads `""` and `null`. Fields
   with a Project default read the default: Active Yes, Priority 500, Type and
