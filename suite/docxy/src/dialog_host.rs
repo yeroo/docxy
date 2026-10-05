@@ -106,11 +106,18 @@ fn apply_dialog(
         | DialogOwner::DesignBorderOptions => {
             Err("a Design dialog applies through the Design tab".into())
         }
+        DialogOwner::Message => Ok(false),
+        // Handled in `sheet_autocorrect::click`, before this: the app's.
+        DialogOwner::AutoCorrect
+        | DialogOwner::AutoCorrectExceptions
+        | DialogOwner::AutoCorrectRedefine => Err("AutoCorrect is an app setting".into()),
         // Handled in `close::close_prompt_click`, before this: it closes
         // the tab, or goes on with the window's close.
         DialogOwner::SaveOnClose { .. } => Err("closing a tab applies through the app".into()),
         // Handled in `user_name::click`, before this: it is the app's.
         DialogOwner::UserName => Err("the user name is an app setting".into()),
+        // Handled in `Docxy::about_click`, before this: it only copies or closes.
+        DialogOwner::About => Err("the About dialog only copies or closes".into()),
         #[cfg(test)]
         DialogOwner::Test | DialogOwner::TestChild => Ok(false),
     }
@@ -356,6 +363,14 @@ impl Docxy {
         if let Some(done) = self.user_name_click(button) {
             return done;
         }
+        // About's Copy and Close are the app's too (#1023).
+        if let Some(done) = self.about_click(button, cx) {
+            return done;
+        }
+        // So is AutoCorrect (#667).
+        if let Some(done) = self.autocorrect_click(button) {
+            return done;
+        }
         // The close prompt closes the tab, or goes on with the window's
         // close (#629, #630).
         if let Some(done) = self.close_prompt_click(button, window, cx) {
@@ -389,8 +404,8 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        // Enter or Escape on a dialog the app owns (the user name, the close
-        // prompt) presses through the app, as its drawn buttons do.
+        // Enter or Escape on a dialog the app owns (the user name, About, AutoCorrect,
+        // the close prompt) presses through the app, as its drawn buttons do.
         let plain = !m.control && !m.alt && !m.platform;
         let app_button = self
             .active_dialogs()
@@ -398,8 +413,10 @@ impl Docxy {
                 s.top().is_some_and(|d| {
                     matches!(
                         d.owner,
-                        DialogOwner::UserName | DialogOwner::SaveOnClose { .. }
-                    )
+                        DialogOwner::UserName
+                            | DialogOwner::About
+                            | DialogOwner::SaveOnClose { .. }
+                    ) || crate::sheet_autocorrect::is_autocorrect(d.owner)
                 })
             })
             .and_then(|s| s.key_button(key, plain));

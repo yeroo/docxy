@@ -20,6 +20,8 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+# The MCP `version` field carries the build info.
+buildinfo = { version = "0.5.0", path = "../buildinfo" }
 # Shared backstage chrome (the styled left-menu column), also used by
 # docxy/xlsxy/yppxy's File backstage.
 backstagecore = { version = "0.1.0", path = "../backstagecore" }

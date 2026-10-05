@@ -31,7 +31,8 @@ accepts the Project verbs. A harness instance ignores `AGWINTERM_SESSION_ID`
 and is always `suite-<pid>` (#697). Normal control does not expose harness operations
 such as `open`, `key`, `type`, or `quit`.
 
-Every verb except `proj.open` and `proj.new` accepts optional `tab`: an absolute zero-based
+Every verb except `proj.open`, `proj.new` and `app-info` (the build of the whole
+suite process, which ignores `tab`) accepts optional `tab`: an absolute zero-based
 index among **all** tabs, or a case-insensitive substring of a Project tab's
 title/path. Omit it to use the active tab. Ambiguous strings, empty strings,
 invalid indices, non-Project targets, and failed-load placeholders are errors.
@@ -42,7 +43,7 @@ Supported verbs are `proj.path`, `task.list`, `task.get`, `task.fields`, `task.s
 `task.add`, `task.del`, `link.add`, `link.del`, `find`, `assign.list`,
 `assign.get`, `assign.fields`, `assign.add`, `assign.set`, `assign.del`,
 `proj.save`, `proj.reload`, `proj.open` and `proj.new`, with the yppxy
-argument/result shapes. `proj.path` additionally
+argument/result shapes, plus `app-info` (the build: version, commit, last merged PR, kind, `manual`; #1023). `proj.path` additionally
 reports `tab`, `imported`, `cell` (active column name), `cell_row` (zero-based row),
 and `cell_edit` (pending cell buffer, or `null` when closed). Reads and rejected
 edits leave selection, prompts, pending cell edits, history and scroll unchanged.
@@ -257,6 +258,7 @@ One JSON object per line; one reply line per request:
 
 | Verb | Args | Result |
 |---|---|---|
+| `app-info` | — | the build: `{version, commit, short_commit, branch, commit_date, dirty, last_pr, issue, ahead, built_at, profile, target, host, kind, manual, summary, …}`: `kind` is `release`, `ci` or `local`; `manual` is `kind == local \|\| dirty` (#1023) |
 | `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?, final?}` — `final: true` only when Word marked the document as final |
 | `doc.edit-anyway` | — | `{path, …, was_final}` — Word's Edit Anyway: clears Mark as Final so edits are allowed and a save writes the document without the mark |
 | `doc.outline` | — | `{headings:[{index, level, text}]}` |
@@ -616,7 +618,8 @@ page-layout and printing verbs (`page.*`, `print-area.*`, `print-titles.set`,
 (`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`), which only a terminal
 xlsxy answers so far; and docxy's `doc.page-color`, `doc.watermark`,
 `doc.page-borders` and `doc.compare`, which only a terminal docxy answers so
-far — a tab answers `unknown verb`): a couple of internal-only verbs the extension host
+far, and the `app-info` build verb (#1023), which only a terminal instance and
+the suite answer — a tab answers `unknown verb`): a couple of internal-only verbs the extension host
 uses to compose its own `doc.path`/`wb.path` replies (`doc.blocks`, `wb.info`)
 are deliberately not in the tab's exposed verb set, and are rejected as
 `"unknown verb"` — same as a terminal instance, which has no arm for them at
@@ -775,8 +778,8 @@ Differences from a terminal pane:
 **Excel tabs** (`xlsxy-jetbrains-<basename>-<pid>-<n>` in xlsxy's ctl dir)
 serve the full xlsxy verb surface through `grid_ctl` (except
 `wb.properties`/`wb.set-properties`, the page-layout and printing verbs and the
-filter and sort verbs (`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`),
-terminal xlsxy only for now: a tab answers `unknown verb`), with the same host-verb
+filter and sort verbs (`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`) and
+`app-info`, terminal xlsxy only for now: a tab answers `unknown verb`), with the same host-verb
 split (`wb.path`/`wb.save`/`wb.reload`/`wb.open`; `wb.open` opens a new tab;
 `wb.info` internal). Every mutating agent verb lands as **one IDE undo step**
 driving the engine's own undo stack — the same mechanism the grid UI uses,
@@ -792,6 +795,7 @@ name and defaults to the active sheet):
 
 | Verb | Args | Result |
 |---|---|---|
+| `app-info` | — | the build: `{version, commit, short_commit, branch, commit_date, dirty, last_pr, issue, ahead, built_at, profile, target, host, kind, manual, summary, …}`: `kind` is `release`, `ci` or `local`; `manual` is `kind == local \|\| dirty` (#1023) |
 | `wb.path` | — | `{path, modified, read_only, sheets, active, active_name, circular}` — `read_only` is true while the workbook is bound to the file `xlsxy --read-only` opened (terminal xlsxy; see `wb.save`);  `circular` lists the cells on circular references (active sheet first, bare `E1`; other sheets as `Sheet2!A1`), empty when there are none. It lists them whether or not the workbook enables iterative calculation (the TUI's warning and footer note appear only when it does not, as in Excel). Without iterative calculation those cells are 0, as in Excel |
 | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
@@ -820,8 +824,10 @@ name and defaults to the active sheet):
 | `range.set` | `{start,rows:[[string]],sheet?}` | `{set:N}` — each string typed like `cell.set`; **atomic**: every formula and length validated first, any invalid (a bad formula, or an entry over 32,767 characters) → an error naming the cell and nothing applied; a group that would change part of a legacy CSE array (not its anchor) is refused with `range.set: You can't change part of an array.` and nothing applied; one undo group |
 | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a **new** sheet, never overwrites ; fields convert as opening a `.csv` does (a `sep=` first line, typed-entry dates/percentages/formulas, 15 digits, File › Options › Data) |
 | `sheet.import-text` | `{text\|path,options?,name?}` | `{sheet,name,rows,cols}` — the Text Import Wizard without the dialog, into a **new** sheet. `options`: `kind` (`delimited`/`fixed`), `delimiters` (`tab`, `semicolon`, `comma`, `space` or a character), `consecutive`, `qualifier` (`"`, `'`, `none`), `breaks`, `start_row`, `origin` (`auto`, `utf-8`, `utf-16le`, `windows-1252`), `columns` (`general`, `text`, `date:dmy`…, `skip`), `decimal`, `thousands`, `trailing_minus` |
-| `app.options` | `{convert_leading_zeros?,convert_long_numbers?,convert_e_notation?,convert_dates?,edit_fixed_decimal?,edit_fixed_decimal_places?,edit_move_after_enter?,edit_move_direction?,edit_in_cell?,edit_autocomplete?}` | every option — File › Options › Data › Automatic Data Conversion (four booleans, followed by the next `.csv`/text open and `sheet.import-csv`/`sheet.import-text`) and Advanced › Editing (booleans, places a whole number -300..=300, direction `down`/`right`/`up`/`left`); every given key is checked before any is set; saved with the app's preferences on exit. The fixed decimal point shifts only numbers typed into the grid, never `cell.set`/`range.set` |
+| `app.options` | `{convert_leading_zeros?,convert_long_numbers?,convert_e_notation?,convert_dates?,edit_fixed_decimal?,edit_fixed_decimal_places?,edit_move_after_enter?,edit_move_direction?,edit_in_cell?,edit_autocomplete?,edit_formula_autocomplete?}` | every option — File › Options › Data › Automatic Data Conversion (four booleans, followed by the next `.csv`/text open and `sheet.import-csv`/`sheet.import-text`) and Advanced › Editing (booleans, places a whole number -300..=300, direction `down`/`right`/`up`/`left`); every given key is checked before any is set; saved with the app's preferences on exit. The fixed decimal point shifts only numbers typed into the grid, never `cell.set`/`range.set` |
 | `range.text-to-columns` | `{range,options?,dest?,replace?,sheet?}` | `{rows}` — Data › Text to Columns on **one** column with the same `options`; refuses with "Do you want to replace the contents of the destination cells?" unless `replace:true`; one undo step |
+| `range.flash-fill` | `{ref,sheet?}` | `{changed:[ref], blank:[ref]}` — Data › Flash Fill (Ctrl+E) on the column of `ref`: the examples typed at the top of the data (or below a header row: the column's top cell empty, or the examples showing no pattern with it), the non-empty columns next to it as sources, down to their last row; cells holding values are kept; results are typed like entries: text when every example is text that would not stay text typed bare (`'007`), and never with an apostrophe in a Text-formatted cell; one undo step. No pattern errors with "Flash Fill didn't see a pattern…"; a protected sheet is refused |
+| `app.autocorrect` | `{options?:{ac_*:bool}, add?:{replace,with,overwrite?}, delete?, exception?:{kind:first_letter\|initial_caps, add?\|delete?}}` | `{options, entries:[{replace,with}], exceptions:{first_letter, initial_caps}}` — File › Options › Proofing › AutoCorrect: switches, the replace list (re-adding a word with another With needs `overwrite:true`, as the dialog asks) and the exceptions; everything given is checked before anything is set; saved with the app's preferences on exit |
 | `wb.consolidate` | `{refs,dest?,fn?,top?,left?,links?}` | Terminal xlsxy only for now. `{sheet,range}` — Data › Consolidate: `refs` are source references such as `East!A1:C4` or `'My sheet'!$A$1:$D$9` (a bare range is on the destination's sheet; other workbooks and defined names are not supported); `dest` is the output's top-left cell, `Sheet!B2` or `B2` (default: the cursor on the active sheet); `fn` is a dialog name or file token, case-insensitive (`Sum` by default, `Count`, `Average`, `Max`, `Min`, `Product`, `Count Numbers`/`countNums`, `StdDev`, `StdDevp`, `Var`, `Varp`); `top`/`left` match rows and columns by the labels in each source's top row / left column (case-insensitive, whole label, any order); `links` writes `=Sheet!$B$2` detail formulas in hidden outline rows under a summary formula, and is refused for a source on the destination sheet. A refusal (no or bad references, a source overlapping the output) changes nothing. The settings are kept on the destination sheet (`<dataConsolidate>`). One undo step |
 | `wb.replace-all` | `{query,text}` | `{replaced}` — spans **all sheets**, one undo group; the match runs on each cell's own input text (never on the `'` a quote prefix adds, which is kept on the result), and the replaced text is re-read with the entry rules of `cell.set`, except that a percent cell's number constant is not divided again; a result over the cell limit leaves that cell as it was |
 | `sheet.add` | `{name?}` | `{sheet,name}` — deduplicates a taken name, never errors |
@@ -972,8 +978,8 @@ MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
 `xlsxy_page_header`, `xlsxy_print_area_set`, `xlsxy_print_area_add`,
 `xlsxy_print_area_clear`, `xlsxy_print_titles`, `xlsxy_page_break_insert`,
 `xlsxy_page_break_remove`, `xlsxy_page_break_reset`, `xlsxy_print_pages`,
-`xlsxy_export_pdf` (46 total; docxy's 31 + xlsxy's 46 = **77 tools** total
-across both apps).
+`xlsxy_export_pdf`, `xlsxy_flash_fill`, `xlsxy_autocorrect` (48 total;
+docxy's 35 + xlsxy's 48 = **83 tools** total across both apps).
 Skill: `xlsxy install skill`.
 
 **yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):
@@ -982,7 +988,7 @@ Skill: `xlsxy install skill`.
 `fields: [...]` to read any listed field by Project's name), `link.add {uid, pred, type?, lag?}` / `link.del`,
 `find {query}`, `assign.list/get/add/set/del` and `assign.fields` (a task's
 resource assignments, by assignment UID), `proj.save {path?}`, `proj.reload`,
-`proj.open {path}`. Edits
+`proj.open {path}`, `app-info` (the build; #1023). Edits
 reschedule the plan (CPM) live. MCP: `claude mcp add yppxy -- yppxy --mcp` →
 `yppxy_list`, `yppxy_status`, `yppxy_tasks`, `yppxy_get`, `yppxy_set`,
 `yppxy_fields`, `yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`,

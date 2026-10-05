@@ -195,7 +195,7 @@ for the two ways a tab's semantics differ from a terminal instance.
   sidesteps the versioned-path problem entirely — see
   [docs/agent-control.md](../docs/agent-control.md#mcp-native-tools-in-claude-code).
 - **Tools** — the bundled server (`serverInfo.name` `"offxy"`) exposes exactly
-  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (81
+  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (83
   tools total): `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`,
   `docxy_read`, `docxy_find`, `docxy_replace_range`, `docxy_insert`,
   `docxy_append`, `docxy_save`, `docxy_export`, `docxy_export_pdf`,
@@ -228,8 +228,10 @@ for the two ways a tab's semantics differ from a terminal instance.
   `xlsxy_page_header`, `xlsxy_print_area_set`, `xlsxy_print_area_add`,
   `xlsxy_print_area_clear`, `xlsxy_print_titles`, `xlsxy_page_break_insert`,
   `xlsxy_page_break_remove`, `xlsxy_page_break_reset`, `xlsxy_print_pages`,
-  `xlsxy_export_pdf`
-  (46) — `xlsxy_pivot_create` builds a REAL, persistent workbook pivot table
+  `xlsxy_export_pdf`, `xlsxy_flash_fill`, `xlsxy_autocorrect`
+  (48) — `xlsxy_flash_fill` runs Flash Fill on a column and
+  `xlsxy_autocorrect` reads and edits AutoCorrect's switches, list and
+  exceptions (both on a terminal `xlsxy`), `xlsxy_pivot_create` builds a REAL, persistent workbook pivot table
   on a new sheet (unlike the read-only, ad-hoc `xlsxy_pivot`),
   `xlsxy_properties`/`xlsxy_set_properties` read and set the document
   properties (File › Info), and the page-layout tools edit page setup,

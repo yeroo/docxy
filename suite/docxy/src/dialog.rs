@@ -102,6 +102,9 @@ pub(crate) enum DialogOwner {
     /// Settings' User name... (#620): the reviewer name and initials new
     /// comments carry. An app setting, applied by `user_name::click`.
     UserName,
+    /// File > Account's About docxy suite (#1023): the build's rows, Copy and
+    /// Close. Its presses are the app's (`Docxy::about_click`), before the tab's.
+    About,
     /// Excel's Subtotal dialog (#693) over the region `(r1, c1, r2, c2)` of
     /// `sheet`: its column choices start at `c1` (at most 64 of them), and
     /// `c2` ends the region, so total rows are found only in `c1..=c2`;
@@ -165,6 +168,14 @@ pub(crate) enum DialogOwner {
     OutlineAxis {
         ungroup: bool,
     },
+    /// A message whose only button is OK, which just closes it (Flash
+    /// Fill's "didn't see a pattern", #666).
+    Message,
+    /// The AutoCorrect dialog, its Exceptions and its "redefine it?"
+    /// question (#667): app settings, pressed in `sheet_autocorrect::click`.
+    AutoCorrect,
+    AutoCorrectExceptions,
+    AutoCorrectRedefine,
     /// Word's "Save your changes to this file?" before a dirty tab closes
     /// (#629), or for a workbook or a Project "Save changes to … before
     /// closing?"; `quit` when it is one of the window close's questions
