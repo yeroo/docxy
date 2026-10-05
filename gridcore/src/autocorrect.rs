@@ -630,6 +630,13 @@ impl AutoCorrect {
     }
 }
 
+/// Does typing `ch` end the word before it, so the host asks
+/// [`AutoCorrect::correct`] about that word? A space or line break, or
+/// punctuation that closes a word (ENT-114).
+pub fn ends_word(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '"')
+}
+
 /// A buffer AutoCorrect never touches: a formula (`=`, or the `+`, `-`, `@`
 /// that start one while typing, ENT-118) or an apostrophe entry, which is
 /// typed exactly.
@@ -769,7 +776,7 @@ mod tests {
         let mut buf = String::new();
         for ch in text.chars() {
             buf.push(ch);
-            if ends_word(ch) {
+            if super::ends_word(ch) {
                 let at = buf.chars().count() - 1;
                 if let Some(c) = ac.correct(&buf, at) {
                     buf = c.apply(&buf);
@@ -780,10 +787,6 @@ mod tests {
             Some(c) => c.apply(&buf),
             None => buf,
         }
-    }
-
-    fn ends_word(ch: char) -> bool {
-        ch.is_whitespace() || matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | ')' | '"')
     }
 
     #[test]
