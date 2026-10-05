@@ -4,11 +4,11 @@
 //! every example row's sources into its example, then running it on the rows
 //! below.
 //!
-//! The search is deterministic and bounded. A piece ([`Atom::Sub`]) is a
+//! The search is deterministic and bounded. A piece (`Atom::Sub`) is a
 //! token of one source column's shown text (a word, a run of letters, digits
 //! or both, a field between one delimiter, the whole value, or the first
 //! character of a word or run), counted from the start or the end, in one of
-//! four cases; the rest is [`Atom::Const`] text. Each example gives a graph
+//! four cases; the rest is constant text (`Atom::Const`). Each example gives a graph
 //! of the pieces that produce its text at each position, and the program is
 //! the cheapest path through all of them at once: fewest constant
 //! characters, then fewest atoms, then the plainest token, case and index.
