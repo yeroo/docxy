@@ -1173,6 +1173,8 @@ mod tests {
     /// ribbon body (#1018). Names the tab, the group and the count.
     #[test]
     fn no_ribbon_column_has_more_than_three_rows() {
+        // ribbonspec's limit, not the table's own: the table's const is part of what is checked.
+        const LIMIT: usize = ribbonspec::MAX_COLUMN_ROWS;
         let mut bad: Vec<String> = Vec::new();
         for tab in SHEET_RIBBON {
             let name = ribbon_tab_set(Kind::Xlsx)
@@ -1181,9 +1183,9 @@ mod tests {
                 .map_or("Home", |(_, n, _)| *n);
             for g in tab.groups {
                 if let Body::Rows(r) = &g.body {
-                    if r.rows.len() > MAX_COL_ROWS {
+                    if r.rows.len() > LIMIT {
                         bad.push(format!(
-                            "sheet tab '{name}', group '{}': {} rows (max {MAX_COL_ROWS})",
+                            "sheet tab '{name}', group '{}': {} rows (max {LIMIT})",
                             g.title,
                             r.rows.len()
                         ));
@@ -1192,9 +1194,9 @@ mod tests {
                 if let Body::Strip { items, .. } = &g.body {
                     for item in *items {
                         if let Item::Col(c) = item {
-                            if c.cmds.len() > MAX_COL_ROWS {
+                            if c.cmds.len() > LIMIT {
                                 bad.push(format!(
-                                    "sheet tab '{name}', group '{}': {} rows (max {MAX_COL_ROWS})",
+                                    "sheet tab '{name}', group '{}': {} rows (max {LIMIT})",
                                     g.title,
                                     c.cmds.len()
                                 ));
