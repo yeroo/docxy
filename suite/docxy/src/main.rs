@@ -184,29 +184,6 @@ fn qat_btn(
         .on_click(on_click)
 }
 
-/// The press on the Quick Access Toolbar Undo arrow (#619): opens the undo
-/// list, or shuts it when it is the one open, as a ribbon split arrow does.
-fn qat_undo_toggle(
-    cx: &mut Context<Docxy>,
-) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
-    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-        cx.stop_propagation();
-        let closed = this
-            .menu_closed_at
-            .take()
-            .filter(|(_, at)| *at == ev.position)
-            .map(|(t, _)| t);
-        let open = this.menu.as_ref().map(|m| &m.target);
-        if menu::split_arrow_opens(menu::QAT_UNDO_ID, open, closed.as_ref()) {
-            let at = qat_undo_anchor(&this.probes.borrow()).unwrap_or(ev.position);
-            let _ = this.open_undo_menu(at, cx);
-        } else {
-            this.close_menu();
-            cx.notify();
-        }
-    })
-}
-
 /// Where the Undo drop-down opens: below the arrow, when the last frame drew
 /// it.
 fn qat_undo_anchor(probes: &Probes) -> Option<Point<Pixels>> {
@@ -3225,8 +3202,9 @@ impl DocTab {
         }
     }
 
-    /// The tab has unsaved changes. Every change goes through here, so it
-    /// also makes a Repeat record taken before it stale (#618).
+    /// A document tab's changes go through here; sheet commits and Project
+    /// edits sync `dirty` themselves and call `bump_edit_generation`
+    /// directly. Either way a Repeat record taken before goes stale (#618).
     fn set_dirty(&mut self) {
         self.dirty = true;
         bump_edit_generation();
@@ -3517,6 +3495,9 @@ impl Probes {
 /// toggles it. The pointer and `menu-open` both anchor here; `None` when the
 /// button has not been laid out.
 fn split_menu_anchor(probes: &Probes, primary_id: &str) -> Option<Point<Pixels>> {
+    if primary_id == menu::QAT_UNDO_ID {
+        return qat_undo_anchor(probes);
+    }
     probes
         .current(&format!("ribbon-split:{primary_id}"))
         .map(|b| b.bottom_left())
@@ -20892,10 +20873,35 @@ mod repeat_tests {
         assert!(redo_or_repeat(&mut ed, &mut rec));
         assert_eq!(text(&ed, 1), "Secddond paragraph here.");
         assert_eq!(text(&ed, 2), "Third one.abc");
-        // A selection ends it too.
-        ed.anchor = Some(Caret::at(vec![1], 0));
-        press(&mut ed, &mut rec, "e");
-        assert_eq!(ed.undo_names()[0], "Typing \"e\"");
+    }
+
+    /// An active selection ends the typing run, though the caret is where
+    /// the last character left it and the record is ready.
+    #[test]
+    fn a_selection_ends_the_typing_run_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        assert!(repeat_ready(&ed, &rec));
+        // Same caret, same record: only a selection (anchor) differs.
+        ed.anchor = Some(Caret::at(vec![2], 0));
+        break_typing_unless_continuing(&mut ed, &rec);
+        ed.anchor = None;
+        ed.insert_str("d");
+        assert_eq!(
+            ed.undo_names(),
+            ["Typing \"d\"", "Typing \"abc\""],
+            "the selection broke the group"
+        );
+        // Without a selection the same call continues the run.
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        break_typing_unless_continuing(&mut ed, &rec);
+        ed.insert_str("d");
+        assert_eq!(ed.undo_names(), ["Typing \"abcd\""]);
     }
 
     #[test]
@@ -23844,6 +23850,10 @@ impl Docxy {
         at: Point<Pixels>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        // The Quick Access Toolbar's Undo arrow opens the undo list (#619).
+        if primary_id == menu::QAT_UNDO_ID {
+            return self.open_undo_menu(at, cx);
+        }
         let (target, items) = self
             .split_menu_for(primary_id)
             .ok_or_else(|| format!("no split button '{primary_id}' on the ribbon"))?;
@@ -27315,7 +27325,7 @@ impl Render for Docxy {
                                                 .child("\u{25BE}")
                                                 .on_mouse_down(
                                                     MouseButton::Left,
-                                                    qat_undo_toggle(cx),
+                                                    menu_toggle(menu::QAT_UNDO_ID, cx),
                                                 ),
                                         )
                                         .into_any_element()
