@@ -127,16 +127,52 @@ pub(crate) struct Menu {
     pub target: MenuTarget,
     pub at: (f32, f32),
     pub items: Vec<MenuItem>,
+    /// The item Up and Down have highlighted (an index into `items`), for
+    /// Enter to run; `None` until the first arrow.
+    pub hi: Option<usize>,
 }
 
 impl Menu {
+    /// A menu on `target` at `at`, nothing highlighted.
+    pub fn new(target: MenuTarget, at: (f32, f32), items: Vec<MenuItem>) -> Self {
+        Self {
+            target,
+            at,
+            items,
+            hi: None,
+        }
+    }
+
     /// The menu as `menu-open` and `menu-read` report it.
     pub fn to_json(&self) -> Json {
         Json::obj(vec![
             ("open", Json::Bool(true)),
             ("target", self.target.to_json()),
             ("items", items_json(&self.items)),
+            (
+                "highlight",
+                self.hi.map_or(Json::Null, |i| Json::Num(i as f64)),
+            ),
         ])
+    }
+
+    /// Down (`down`) or Up: the highlight moves to the next enabled item,
+    /// over separators, headings and disabled items, wrapping at the ends as
+    /// Office's menus do. With nothing highlighted, Down takes the first and
+    /// Up the last. No enabled item: nothing is highlighted.
+    pub fn step(&mut self, down: bool) {
+        let n = self.items.len();
+        let usable = |i: usize| matches!(&self.items[i], MenuItem::Item(e) if e.enabled);
+        let order: Vec<usize> = if down {
+            (0..n).collect()
+        } else {
+            (0..n).rev().collect()
+        };
+        let from = self
+            .hi
+            .and_then(|h| order.iter().position(|&i| i == h))
+            .map_or(0, |p| p + 1);
+        self.hi = (0..n).map(|k| order[(from + k) % n]).find(|&i| usable(i));
     }
 }
 
@@ -579,11 +615,7 @@ mod tests {
 
     #[test]
     fn menu_json_lists_items_separators_and_submenus_in_order() {
-        let menu = Menu {
-            target: MenuTarget::Row(Some(7)),
-            at: (0., 0.),
-            items: sample(),
-        };
+        let menu = Menu::new(MenuTarget::Row(Some(7)), (0., 0.), sample());
         let json = menu.to_json();
         assert_eq!(json.get("open"), Some(&Json::Bool(true)));
         assert_eq!(
@@ -622,12 +654,41 @@ mod tests {
     }
 
     #[test]
+    fn up_and_down_step_over_what_cannot_run() {
+        // sample(): Cut, separator, Insert (submenu), Font... (disabled),
+        // Twice, Twice, a heading.
+        let mut m = Menu::new(MenuTarget::Document, (0., 0.), sample());
+        assert_eq!(m.to_json().get("highlight"), Some(&Json::Null));
+        m.step(true);
+        assert_eq!(m.hi, Some(0), "Down from nothing: the first");
+        m.step(true);
+        assert_eq!(m.hi, Some(2), "over the separator");
+        m.step(true);
+        assert_eq!(m.hi, Some(4), "over the disabled item");
+        m.step(true);
+        m.step(true);
+        assert_eq!(m.hi, Some(0), "over the heading, wrapping");
+        m.step(false);
+        assert_eq!(m.hi, Some(5), "Up wraps back");
+        assert_eq!(m.to_json().get("highlight"), Some(&Json::Num(5.0)));
+        let mut up = Menu::new(MenuTarget::Document, (0., 0.), sample());
+        up.step(false);
+        assert_eq!(up.hi, Some(5), "Up from nothing: the last that runs");
+        let mut none = Menu::new(
+            MenuTarget::Document,
+            (0., 0.),
+            vec![
+                MenuItem::Separator,
+                MenuItem::Item(Entry::unavailable("x", "X")),
+            ],
+        );
+        none.step(true);
+        assert_eq!(none.hi, None);
+    }
+
+    #[test]
     fn menu_read_after_close_is_closed() {
-        let mut open = Some(Menu {
-            target: MenuTarget::Document,
-            at: (0., 0.),
-            items: document_menu(),
-        });
+        let mut open = Some(Menu::new(MenuTarget::Document, (0., 0.), document_menu()));
         assert_eq!(
             read_json(open.as_ref()).get("open"),
             Some(&Json::Bool(true))

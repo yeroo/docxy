@@ -17677,12 +17677,12 @@ impl Docxy {
             }
             return; // the modal list owns keys; do not edit the surface below
         }
-        // An open menu takes the key: Esc closes it, and so, until menus
-        // take arrows and Enter, does any other key; none reaches the
-        // document or cell under it (#397).
-        if self.close_menu() {
-            cx.notify();
-            return;
+        // An open menu takes the key (#397): Up and Down move its highlight,
+        // Enter runs the highlighted item (or opens its submenu), and any
+        // other key — Esc among them — closes it. None reaches the document
+        // or cell under it.
+        if self.menu.is_some() {
+            return self.menu_key(&ev.keystroke.key, window, cx);
         }
         if self.project_edit_open() && !self.backstage {
             return self.project_key(ev, window, cx);
@@ -22605,11 +22605,11 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         self.mini_bar = None;
-        self.menu = Some(menu::Menu {
+        self.menu = Some(menu::Menu::new(
             target,
-            at: (f32::from(at.x), f32::from(at.y)),
+            (f32::from(at.x), f32::from(at.y)),
             items,
-        });
+        ));
         cx.notify();
     }
 
@@ -22783,10 +22783,50 @@ impl Docxy {
             if let Some(menu::MenuItem::Item(e)) = menu.items.get(i) {
                 if e.enabled && !e.submenu.is_empty() {
                     menu.items = e.submenu.clone();
+                    menu.hi = None;
                 }
             }
         }
         cx.notify();
+    }
+
+    /// A key while a menu is open: Up and Down move the highlight, Enter
+    /// runs the highlighted item (an item with a submenu opens it in the
+    /// menu's place; Enter with nothing highlighted closes the menu), and
+    /// every other key closes the menu and is spent.
+    fn menu_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        match key {
+            "down" | "up" => {
+                menu.step(key == "down");
+                cx.notify();
+            }
+            "enter" => {
+                let hi = menu.hi;
+                let submenu = hi.is_some_and(|i| {
+                    matches!(menu.items.get(i), Some(menu::MenuItem::Item(e)) if !e.submenu.is_empty())
+                });
+                match hi {
+                    Some(i) if submenu => self.menu_enter_submenu(i, cx),
+                    Some(i) => {
+                        if let Err(e) = self.menu_activate(&[i], window, cx) {
+                            self.set_status(e);
+                        }
+                        cx.notify();
+                    }
+                    None => {
+                        self.close_menu();
+                        cx.notify();
+                    }
+                }
+            }
+            _ => {
+                self.close_menu();
+                cx.notify();
+            }
+        }
     }
 
     /// Click the open menu's item at `path` (indices through submenus): the
@@ -22860,6 +22900,7 @@ impl Docxy {
                     };
                     let clickable = e.enabled;
                     let opens = !e.submenu.is_empty();
+                    let lit = menu.hi == Some(i);
                     div()
                         .id(SharedString::from(e.id.clone()))
                         .flex()
@@ -22868,6 +22909,7 @@ impl Docxy {
                         .px_3()
                         .py_1()
                         .rounded_sm()
+                        .when(lit, |d| d.bg(pal.hover))
                         .text_size(px(12.))
                         .text_color(color)
                         .child(lead)

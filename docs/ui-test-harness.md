@@ -988,7 +988,7 @@ Menus open today:
 | Verb | Args | Reply |
 |---|---|---|
 | `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment; #690, #691), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task) or `{"ribbon": [tab, group, command]}` | the menu, as `menu-read` |
-| `menu-read` | `{}` | `{open: true, target, items}`, or `{open: false}` |
+| `menu-read` | `{}` | `{open: true, target, items, highlight}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null |
 | `menu-click` | `{label}` among the top-level items, or `{path: [labels]}` through submenus | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
 
@@ -1051,9 +1051,13 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 
-While a menu is open it takes every key: Esc closes it, and so, until menus
-take arrows and Enter, does any other key, Tab included. None reaches the
-document or cell under it. A press outside the menu closes it too.
+While a menu is open it takes every key. Down and Up move its highlight over
+the items that can run (past separators, headings and disabled items, wrapping
+at the ends; from none, Down takes the first and Up the last), and Enter runs
+the highlighted item — or opens its submenu in the menu's place — or, with
+nothing highlighted, closes the menu. Esc closes it, and so does any other key,
+Tab included. None reaches the document or cell under it. A press outside the
+menu closes it too.
 `project-menus.uit` drives all three menus.
 
 ### Headers and footers
