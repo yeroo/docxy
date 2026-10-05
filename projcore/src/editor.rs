@@ -1215,6 +1215,27 @@ impl Editor {
         Ok(())
     }
 
+    /// Set a task's notes as ONE undo step. The text is newline-normalised
+    /// but not trimmed: a note of only a line break stays. Empty text removes
+    /// the notes; the value a task already has (an empty stored note counts
+    /// as no note) changes nothing. A blank row cannot take notes.
+    pub fn set_notes(&mut self, uid: i32, text: &str) -> Result<(), String> {
+        let i = self.index(uid)?;
+        if self.proj.tasks[i].is_null {
+            return Err("A blank row cannot take notes".into());
+        }
+        let notes = crate::text::normalize_newlines(text);
+        let notes = (!notes.is_empty()).then_some(notes);
+        let task = &self.proj.tasks[i];
+        if task.notes.as_deref().unwrap_or("") == notes.as_deref().unwrap_or("") {
+            return Ok(());
+        }
+        self.snapshot();
+        self.proj.tasks[i].notes = notes;
+        self.changed();
+        Ok(())
+    }
+
     /// Project › Schedule › Set Baseline: record the plan as it is scheduled
     /// now (CPM, the dates a save writes) in the Baseline (slot 0) of every
     /// scheduled task, with its stored work and cost (absent ones stay
