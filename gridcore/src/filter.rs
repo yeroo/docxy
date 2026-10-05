@@ -10,44 +10,18 @@ use opccore::xml::{Event, XmlParser};
 
 use crate::sheet::{CellValue, Dxf, Sheet, Styles};
 
-/// The `<dynamicFilter type>`s Excel writes.
-pub const DYNAMIC_KINDS: &[&str] = &[
-    "null",
-    "aboveAverage",
-    "belowAverage",
-    "tomorrow",
-    "today",
-    "yesterday",
-    "nextWeek",
-    "thisWeek",
-    "lastWeek",
-    "nextMonth",
-    "thisMonth",
-    "lastMonth",
-    "nextQuarter",
-    "thisQuarter",
-    "lastQuarter",
-    "nextYear",
-    "thisYear",
-    "lastYear",
-    "yearToDate",
-    "Q1",
-    "Q2",
-    "Q3",
-    "Q4",
-    "M1",
-    "M2",
-    "M3",
-    "M4",
-    "M5",
-    "M6",
-    "M7",
-    "M8",
-    "M9",
-    "M10",
-    "M11",
-    "M12",
-];
+mod advanced;
+mod apply;
+mod dates;
+mod menu;
+
+pub use advanced::{ADVANCED_OTHER_SHEET, AdvancedFilter, advanced};
+pub use apply::{
+    ByCell, FilterError, FilterOutcome, auto_filter_off, auto_filter_on, auto_filter_on_range,
+    clear, filter_by_cell, reapply, search, set_criterion, status_text,
+};
+pub use dates::DYNAMIC_KINDS;
+pub use menu::{FilterMenu, MENU_LIMIT, MenuItem, Submenu, menu};
 
 /// Parse a filter criteria into `(operator, operand)`: ">500", "<=100", "<>X",
 /// "=Laptop", or a plain value. Unlike the CF parser, the default operator is

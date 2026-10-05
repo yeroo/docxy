@@ -302,3 +302,31 @@ fn theme_colours_load_as_unresolved_and_save_unchanged() {
     let (_, after) = saved(&pkg, "xl/styles.xml");
     assert_eq!(after, before);
 }
+
+#[test]
+fn a_filter_the_commands_set_survives_a_save_with_its_hidden_rows() {
+    let mut pkg = list("", "");
+    let wb = &mut pkg.workbook;
+    crate::filter::auto_filter_on(wb, 0, (0, 0)).unwrap();
+    let top = ColumnFilter::Top10 {
+        top: true,
+        percent: false,
+        val: 1.0,
+        filter_val: None,
+    };
+    let out = crate::filter::set_criterion(wb, 0, 1, Some(top), 45000.0).unwrap();
+    assert_eq!(crate::filter::status_text(&out), "1 of 2 records found");
+    let (re, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+    assert!(
+        ws.contains(r#"<autoFilter ref="A1:B3"><filterColumn colId="1"><top10 val="1" filterVal="9"/></filterColumn></autoFilter>"#),
+        "{ws}"
+    );
+    let (a, b) = (&pkg.workbook.sheets[0], &re.workbook.sheets[0]);
+    let (fa, fb) = (
+        a.auto_filter.as_ref().unwrap(),
+        b.auto_filter.as_ref().unwrap(),
+    );
+    assert_eq!((fa.range, &fa.criteria), (fb.range, &fb.criteria));
+    assert_eq!(a.filtered_rows, b.filtered_rows);
+    assert!(b.row_filtered(1) && !b.row_hidden(2));
+}
