@@ -24,7 +24,6 @@ pub(crate) enum MenuTarget {
     /// A menu the sheet grid opens (#707): the Auto Fill Options and Paste
     /// Options buttons, and the menus a right-drag of the fill handle or of
     /// the selection's border opens on release.
-    #[allow(dead_code)] // #707: wired by a later commit
     Grid(GridMenu),
 }
 

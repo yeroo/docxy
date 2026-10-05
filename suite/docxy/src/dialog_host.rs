@@ -68,6 +68,7 @@ fn apply_dialog(
         }
         // Handled in `Docxy::fill_dialog_click`, before this.
         DialogOwner::PasteSpecial { .. } => Err("Paste Special applies through Paste".into()),
+        DialogOwner::DropReplace => Err("the drop applies through the grid".into()),
         DialogOwner::Series | DialogOwner::JustifyOverflow | DialogOwner::CustomLists => {
             Err("a Fill dialog applies through Home › Fill".into())
         }
@@ -286,6 +287,10 @@ impl Docxy {
         if let Some(done) = self.paste_dialog_click(button) {
             return done;
         }
+        // And a drop by the selection's border waiting on its question (#670).
+        if let Some(done) = self.drop_dialog_click(button) {
+            return done;
+        }
         let reopen = reopen_on_top(self.tabs.get(self.active));
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
         dialog_click(tab, button)?;
@@ -326,6 +331,7 @@ impl Docxy {
                             | DialogOwner::JustifyOverflow
                             | DialogOwner::CustomLists
                             | DialogOwner::PasteSpecial { .. }
+                            | DialogOwner::DropReplace
                     )
                 })
             })

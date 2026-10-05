@@ -63,20 +63,19 @@ mod sect_pr_tests;
 #[cfg(test)]
 mod sheet_clip_tests;
 mod sheet_consolidate;
+mod sheet_drag;
 #[cfg(test)]
 mod sheet_entry_tests;
 mod sheet_fill;
 #[cfg(test)]
 mod sheet_fill_tests;
 mod sheet_goto;
-#[cfg(test)]
-mod sheet_select_tests;
-// #707: the drop and option menus are wired by the commits that follow.
-#[allow(dead_code)]
 mod sheet_menus;
 mod sheet_outline;
 mod sheet_paste;
 mod sheet_ribbon;
+#[cfg(test)]
+mod sheet_select_tests;
 mod style_gallery;
 mod table_dialogs;
 mod table_tab;
@@ -1679,7 +1678,6 @@ enum SheetAct {
     /// File › Options › Advanced › Edit Custom Lists….
     CustomLists,
     /// A border right-drag's drop menu item.
-    #[allow(dead_code)] // #707: wired by a later commit
     Drop(sheet_menus::DropChoice),
     Todo,
 }
@@ -3625,6 +3623,11 @@ struct Docxy {
     paste_options: Option<sheet_paste::PasteOptions>,
     paste_special_source: Option<(gridcore::edit::ClipBlock, bool)>,
     office_clip: sheet_paste::OfficeClipboard,
+    // A drag of the selection by its border (#670), and a drop waiting on
+    // its menu or on the replace question.
+    border_drag: Option<sheet_drag::BorderDrag>,
+    border_pending: Option<sheet_drag::BorderDrag>,
+    border_pending_choice: sheet_menus::DropChoice,
     // Where the pointer last was over the grid, window coordinates: where a
     // menu a release opens is drawn.
     last_pointer: Point<Pixels>,
@@ -9418,6 +9421,9 @@ impl Docxy {
             fill_options: None,
             fill_drop: None,
             paste_options: None,
+            border_drag: None,
+            border_pending: None,
+            border_pending_choice: sheet_menus::DropChoice::Move,
             paste_special_source: None,
             office_clip: Default::default(),
             last_pointer: point(px(0.), px(0.)),
@@ -10175,6 +10181,7 @@ impl Docxy {
         self.drag_anchor = None;
         self.drag_ctrl = false;
         self.sheet_fill_end(cx); // commit an auto-fill drag, if any
+        self.border_drag_end(cx); // drop a block dragged by its border
         self.chart_drag_end(cx); // commit a chart move, if any
         self.range_pick_end(cx); // replot a range picked off the grid
         self.formula_pick = None; // the reference stays; the drag is over
@@ -11939,6 +11946,15 @@ impl Docxy {
                     .unwrap_or_default(),
             ),
             area_rows: Default::default(),
+            border_grips: self.edit_opts.fill_handle
+                && cell_selection_shown(self.chart_sel)
+                && !self.grid_gesture_in_flight()
+                && self.sheet_fill.is_none()
+                && self.border_drag.is_none()
+                && !fill_handle_pointing(self.range_field_active(), self.formula_pick_active())
+                && self
+                    .active_sheet()
+                    .is_some_and(|v| v.editing.is_none() && !v.multi_area()),
             options_button: self
                 .fill_options_live()
                 .map(|o| ((o.dest.2, o.dest.3), menu::GridMenu::FillOptions))
@@ -11959,6 +11975,10 @@ impl Docxy {
 
     /// The box the in-progress fill drag would cover, for the preview outline.
     fn sheet_fill_preview(&self) -> Option<(u32, u32, u32, u32)> {
+        // A block dragged by its border outlines where it would land (#670).
+        if let Some(d) = self.border_drag {
+            return (d.dest_at() != (d.src.0, d.src.1)).then(|| d.dest());
+        }
         let f = self.sheet_fill?;
         if f.to == (f.src.2, f.src.3) {
             return None; // still on the source — nothing to outline
@@ -15431,10 +15451,7 @@ impl Docxy {
                 self.office_clip.open = !self.office_clip.open;
                 cx.notify();
             }
-            SheetAct::Drop(_) => {
-                self.set_status("Not available yet");
-                cx.notify();
-            }
+            SheetAct::Drop(choice) => self.border_drop_choice(choice, cx),
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -28721,6 +28738,10 @@ struct GridOverlay {
     /// button (#669) hangs off: the bottom-right of what was filled or
     /// pasted, and which menu it opens.
     options_button: Option<((u32, u32), menu::GridMenu)>,
+    /// The selection's edges take a press that drags the block (#670):
+    /// one area, the fill handle and drag-and-drop on, nothing being edited
+    /// or pointed at, and no gesture in flight.
+    border_grips: bool,
     /// `extra_areas` by row: each row's column spans, for the rows drawn
     /// (R17), so a cell asks only its own row.
     area_rows: std::rc::Rc<std::collections::HashMap<u32, Vec<(u32, u32)>>>,
@@ -29071,6 +29092,10 @@ fn sheet_row(
             let ctrl = ctrl_held(&ev.modifiers);
             match ev.pressed_button {
                 Some(MouseButton::Left) => ent_drag.update(cx, |this, cx| {
+                    // A block dragged by its border goes where this is (#670).
+                    if this.border_drag.is_some() {
+                        return this.border_drag_over((r, c), ctrl, cx);
+                    }
                     // Ctrl as a fill moves swaps copy and series (#668).
                     if let Some(f) = this.sheet_fill.as_mut() {
                         f.ctrl = ctrl;
@@ -29078,6 +29103,9 @@ fn sheet_row(
                     this.grid_drag_over(r, c, cx)
                 }),
                 Some(MouseButton::Right) => ent_drag.update(cx, |this, cx| {
+                    if this.border_drag.is_some_and(|d| d.right) {
+                        return this.border_drag_over((r, c), ctrl, cx);
+                    }
                     if this.sheet_fill.is_some_and(|f| f.right) {
                         this.sheet_fill_over(r, c, cx)
                     }
@@ -29241,6 +29269,45 @@ fn sheet_row(
                             ),
                     ),
             ));
+        }
+        // The selection's edges: a press there drags the block (#670). Thin
+        // strips over each edge cell's outer side, deferred so they see the
+        // press the list would swallow, arming on the press only (as the
+        // fill handle does: they follow the selection, so a sweep passes
+        // under them, and `border_grips` is off while one is in flight).
+        if ov.border_grips && in_range && !ov.sel_hidden {
+            let sides = [
+                (r == r0, "top"),
+                (r == r1, "bottom"),
+                (c == c0, "left"),
+                (c == c1, "right"),
+            ];
+            for (on, side) in sides {
+                if !on {
+                    continue;
+                }
+                let ent_l = ent.clone();
+                let ent_r = ent.clone();
+                let strip = div()
+                    .id(SharedString::from(format!("border-grip-{side}")))
+                    .absolute()
+                    .cursor(CursorStyle::OpenHand)
+                    .map(|d| match side {
+                        "top" => d.top(px(-2.)).left_0().right_0().h(px(4.)),
+                        "bottom" => d.bottom(px(-2.)).left_0().right_0().h(px(4.)),
+                        "left" => d.left(px(-2.)).top_0().bottom_0().w(px(4.)),
+                        _ => d.right(px(-2.)).top_0().bottom_0().w(px(4.)),
+                    })
+                    .on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
+                        cx2.stop_propagation();
+                        ent_l.update(cx2, |this, cx2| this.border_drag_start((r, c), false, cx2));
+                    })
+                    .on_mouse_down(MouseButton::Right, move |_ev, _w, cx2| {
+                        cx2.stop_propagation();
+                        ent_r.update(cx2, |this, cx2| this.border_drag_start((r, c), true, cx2));
+                    });
+                cell = cell.relative().child(deferred(strip));
+            }
         }
         // The Auto Fill / Paste Options button, just past the corner of what
         // was filled or pasted (#668, #669). A press opens its menu.
@@ -31361,6 +31428,9 @@ fn sheet_el(
                 this.last_pointer = pos;
                 if this.sheet_fill.is_some_and(|f| f.right) {
                     this.sheet_fill_end(cx);
+                }
+                if this.border_drag.is_some_and(|d| d.right) {
+                    this.border_drag_end(cx);
                 }
             });
         })

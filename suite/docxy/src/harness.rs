@@ -2266,6 +2266,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
         verb,
         "click-cell"
             | "drag"
+            | "border-drag"
             | "fill-drag"
             | "save-as"
             | "convert"
@@ -3544,6 +3545,74 @@ pub fn dispatch(
                 fields.push(("filled".into(), str_or_null(filled)));
             }
             Done::ok(reply)
+        }
+
+        // A drag of the selection by its border (#670): select `from` (a
+        // cell or range; the selection as it is when absent), grab its
+        // top-left, and drop it with its top-left on `to`. `ctrl` copies;
+        // `right` opens the drop menu, whose `choice` (a label) is then
+        // clicked; `replace` answers the "There's already data here"
+        // question (left open when absent).
+        "border-drag" => {
+            app.refuse_under_dialog()?;
+            let to = cell_arg(args, "to")?;
+            let (ctrl, right) = (arg_flag(args, "ctrl")?, arg_flag(args, "right")?);
+            let choice = match args.get("choice") {
+                Some(_) => {
+                    let label = arg_str(args, "choice")?;
+                    Some(crate::sheet_menus::DropChoice::from_label(label).ok_or_else(|| {
+                        format!("no drop choice '{label}' (Move Here, Copy Here, Copy Here as Values Only, Copy Here as Formats Only, Link Here, Cancel)")
+                    })?)
+                }
+                None => None,
+            };
+            if choice.is_some() && !right {
+                return Err("'choice' is the right-drag menu's; add \"right\": true".into());
+            }
+            if args.get("from").is_some() {
+                let (start, end) = range_arg(args, "from")?;
+                sheet(app)?;
+                click_cell(app, start, false, false, false, window, cx);
+                if end != start {
+                    click_cell(app, end, true, false, false, window, cx);
+                }
+            }
+            let (r0, c0, _, _) = sheet(app)?.range();
+            app.border_drag_start((r0, c0), right, cx);
+            if app.border_drag.is_none() {
+                return Err(format!(
+                    "the drag did not start: {}",
+                    app.tabs
+                        .get(app.active)
+                        .map(|t| t.status.to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "another gesture is in flight".into())
+                ));
+            }
+            app.border_drag_over(to, ctrl, cx);
+            app.last_pointer = menu_point(app, window, None, |b| b.center());
+            app.border_drag_end(cx);
+            if right {
+                match choice {
+                    Some(choice) => app.border_drop_choice(choice, cx),
+                    None => return Done::ok(crate::menu::read_json(app.menu.as_ref())),
+                }
+            }
+            match args.get("replace") {
+                Some(Json::Bool(yes)) => {
+                    let asked = app
+                        .active_dialogs()
+                        .and_then(|d| d.top())
+                        .is_some_and(|d| d.owner == crate::dialog::DialogOwner::DropReplace);
+                    if !asked {
+                        return Err("the drop asked nothing; leave out 'replace'".into());
+                    }
+                    app.dialog_press(if *yes { "OK" } else { "Cancel" })?;
+                }
+                Some(_) => return Err("'replace' must be true or false".into()),
+                None => {}
+            }
+            Done::ok(state(app, window))
         }
 
         // The clipboard (#699). A harness instance has a private one (it starts

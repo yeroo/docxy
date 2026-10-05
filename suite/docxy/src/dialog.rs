@@ -141,6 +141,10 @@ pub(crate) enum DialogOwner {
     PasteSpecial {
         clip: bool,
     },
+    /// "There's already data here. Do you want to replace it?" before a
+    /// drop by the selection's border (#670), applied by
+    /// `Docxy::drop_dialog_click`.
+    DropReplace,
     /// Group's (Ungroup's) "Rows or Columns?" over a block selection (#693).
     OutlineAxis {
         ungroup: bool,
