@@ -22,6 +22,7 @@ compile_error!(
      whose draw-without-present would make Windows captures read stale pixels"
 );
 
+mod about;
 mod close;
 #[cfg(test)]
 mod comment_tests;
@@ -461,6 +462,8 @@ enum BackstageRailAction {
     Save,
     SaveAs,
     Export,
+    /// Build info and the About dialog (#1023); on every tab kind.
+    Account,
     Close,
 }
 
@@ -521,6 +524,13 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         display: "Export…",
         action: BackstageRailAction::Export,
         project_only: true,
+        doc_only: false,
+    },
+    BackstageRailItem {
+        id: "bs-account",
+        display: "Account",
+        action: BackstageRailAction::Account,
+        project_only: false,
         doc_only: false,
     },
     BackstageRailItem {
@@ -3350,6 +3360,9 @@ struct Docxy {
     /// The backstage shows the Info page (Inspect Document, #627). Cleared
     /// wherever `bs_new` is; New and Info clear each other.
     bs_info: bool,
+    /// The backstage shows the Account page: the build line and About (#1023).
+    /// New, Info and Account clear one another.
+    bs_account: bool,
     /// The last Remove All on the Info page and the tab index it ran on:
     /// the backstage draws no status bar, so the page shows it under the
     /// rows. Cleared with `bs_info`, on a tab switch, and when a tab is
@@ -9282,6 +9295,7 @@ impl Docxy {
             backstage: false,
             bs_new: false,
             bs_info: false,
+            bs_account: false,
             bs_info_status: None,
             clip: None,
             theme_pref,
@@ -9443,6 +9457,7 @@ impl Docxy {
         self.backstage = true;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_account = false;
         self.bs_info_status = None;
         self.refresh_drafts();
         self.trusted_count = trusted::count(&config_root());
@@ -9454,6 +9469,7 @@ impl Docxy {
         self.backstage = false;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_account = false;
         self.bs_info_status = None;
         self.refocus(window, cx);
     }
@@ -9479,6 +9495,16 @@ impl Docxy {
         }
     }
 
+    /// File > Account (#1023): the build line and the About button. The rail
+    /// item and the harness's `account` verb both come here.
+    fn open_account(&mut self, cx: &mut Context<Self>) {
+        self.bs_account = true;
+        self.bs_info = false;
+        self.bs_info_status = None;
+        self.bs_new = false;
+        cx.notify();
+    }
+
     fn backstage_rail_action(
         &mut self,
         action: BackstageRailAction,
@@ -9491,10 +9517,13 @@ impl Docxy {
                 self.bs_info = true;
                 self.bs_info_status = None;
                 self.bs_new = false;
+                self.bs_account = false;
                 cx.notify();
             }
+            BackstageRailAction::Account => self.open_account(cx),
             BackstageRailAction::New => {
                 self.bs_new = true;
+                self.bs_account = false;
                 self.bs_info = false;
                 self.bs_info_status = None;
                 cx.notify();
@@ -26635,6 +26664,81 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// File > Account (#1023), for every tab kind: the build's one-line summary, a
+    /// "Manual build" badge when it is one, and the About docxy suite button,
+    /// whose dialog lists every field with a Copy button. `None` unless the
+    /// Account page is selected.
+    fn account_page(
+        &self,
+        bg: Hsla,
+        fg: Hsla,
+        dim: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.bs_account {
+            return None;
+        }
+        let info = about::info();
+        let page = v_flex()
+            .relative()
+            .flex_1()
+            .h_full()
+            .p_8()
+            .gap_4()
+            .bg(bg)
+            .child(
+                div()
+                    .text_size(px(20.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(fg)
+                    .child("Account"),
+            )
+            .child(
+                div()
+                    .id("account-line")
+                    .text_color(fg)
+                    .child(info.short_line()),
+            )
+            .when(info.manual(), |d| {
+                d.child(
+                    h_flex().child(
+                        div()
+                            .id("account-manual-badge")
+                            .relative()
+                            .child(probe(&self.probes, "account-manual-badge"))
+                            .px_2()
+                            .py_0p5()
+                            .rounded_sm()
+                            .bg(rgb(0xB45309))
+                            .text_color(rgb(FILE_FG))
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::BOLD)
+                            .child("Manual build"),
+                    ),
+                )
+            })
+            // The dialog lives on a tab's stack, so with no tab there is nothing to open it on.
+            .when(!self.tabs.is_empty(), |d| {
+                d.child(
+                    h_flex().child(
+                        div()
+                            .id("account-about")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(dim)
+                            .text_color(fg)
+                            .cursor_pointer()
+                            .hover(|d| d.border_color(rgb(BRAND)))
+                            .child("About docxy suite")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_about_clicked(cx))),
+                    ),
+                )
+            });
+        Some(page.into_any_element())
+    }
+
     /// File > Info for a document tab (#627): its name and path, then Word's
     /// Inspect Document with a Remove All per category found. `None` unless
     /// the Info page is selected and the active tab is a document.
@@ -26938,6 +27042,8 @@ impl Docxy {
                         )),
                 )
                 .into_any_element()
+        } else if let Some(page) = self.account_page(bg, fg, dim, cx) {
+            page
         } else if let Some(page) = self.info_page(bg, fg, dim, cx) {
             page
         } else {
@@ -32122,6 +32228,12 @@ fn main() {
     // A converting child (#633): the importer and nothing else, no window.
     if let Some(code) = convert_child::child_main(&std::env::args_os().collect::<Vec<_>>()) {
         std::process::exit(code);
+    }
+    // `--version`: the build block, before the crash hook, the control server or
+    // any window (#1023).
+    if harness::parse_args(std::env::args_os().skip(1)).version {
+        about::print_version();
+        return;
     }
     // First, before anything can panic: the release build has no console, so
     // a panic's only trace is the crash log (#733).

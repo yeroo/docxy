@@ -59,18 +59,26 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// One log entry: a header line naming what, when, which process and thread,
-/// then `body`, then a blank line.
+/// then the build (commit, last merged PR, kind, manual-build marker: #1023, so
+/// a report names the exact binary), then `body`, then a blank line.
 pub(crate) fn format_entry(
     kind: &str,
     now_secs: u64,
     pid: u32,
     thread: &str,
+    build: &buildinfo::BuildInfo,
     body: &str,
 ) -> String {
+    let build_lines: String = build
+        .version_block("docxy suite")
+        .lines()
+        .skip(1)
+        .map(|l| format!("  {l}\n"))
+        .collect();
     format!(
-        "=== {kind} {} pid {pid} docxy {} thread {thread}\n{}\n\n",
+        "=== {kind} {} pid {pid} docxy {} thread {thread}\n{build_lines}{}\n\n",
         rfc3339_utc(now_secs),
-        env!("CARGO_PKG_VERSION"),
+        build.version,
         body.trim_end()
     )
 }
@@ -128,6 +136,7 @@ pub(crate) fn startup(root: &Path, message: &str) {
             now_secs(),
             std::process::id(),
             &thread_name(),
+            crate::about::info(),
             message,
         ),
     );
@@ -156,6 +165,7 @@ pub(crate) fn install(root: PathBuf) {
                 now_secs(),
                 std::process::id(),
                 &thread_name(),
+                crate::about::info(),
                 &body,
             ),
         );
@@ -203,15 +213,29 @@ mod tests {
 
     #[test]
     fn an_entry_has_its_header_fields_and_ends_in_a_blank_line() {
-        let e = format_entry("startup", 0, 4242, "main", "control unavailable\n");
-        assert_eq!(
-            e,
-            format!(
-                "=== startup 1970-01-01T00:00:00Z pid 4242 docxy {} thread main\n\
-                 control unavailable\n\n",
-                env!("CARGO_PKG_VERSION")
-            )
+        let info = crate::about::info();
+        let e = format_entry("startup", 0, 4242, "main", info, "control unavailable\n");
+        let head = format!(
+            "=== startup 1970-01-01T00:00:00Z pid 4242 docxy {} thread main\n",
+            env!("CARGO_PKG_VERSION")
         );
+        assert!(e.starts_with(&head), "{e}");
+        assert!(e.ends_with("control unavailable\n\n"), "{e}");
+        // The build follows the header, indented, ahead of the body (#1023).
+        let between = &e[head.len()..e.len() - "control unavailable\n\n".len()];
+        for line in between.lines() {
+            assert!(line.starts_with("  "), "{line:?} in {e}");
+        }
+        for key in ["commit:", "last PR:", "kind:", "dirty:"] {
+            assert!(between.contains(key), "{key} in {e}");
+        }
+    }
+
+    #[test]
+    fn a_manual_build_is_marked_in_the_entry() {
+        let info = crate::about::info();
+        let e = format_entry("panic", 0, 1, "main", info, "boom");
+        assert_eq!(e.contains("  manual build\n"), info.manual(), "{e}");
     }
 
     #[test]

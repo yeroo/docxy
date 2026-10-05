@@ -20,6 +20,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # What `--version` and File > Account report for this build (#1023).
+    env:
+      DOCXY_BUILD_KIND: ci
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -47,6 +50,9 @@ jobs:
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest
+    # What `--version` and File > Account report for this build (#1023).
+    env:
+      DOCXY_BUILD_KIND: ci
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -62,6 +68,9 @@ jobs:
   coverage:
     name: coverage
     runs-on: ubuntu-latest
+    # What `--version` and File > Account report for this build (#1023).
+    env:
+      DOCXY_BUILD_KIND: ci
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -95,6 +104,9 @@ jobs:
     # not be able to ship green. Windows because gpui builds and tests there and
     # that is where the desktop suite ships.
     runs-on: windows-latest
+    # What `--version` and File > Account report for this build (#1023).
+    env:
+      DOCXY_BUILD_KIND: ci
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -118,6 +130,9 @@ jobs:
     # x11/wayland backends are enabled. Tests run under Xvfb. The Windows job above is
     # the one that gates the harness isolation tests on the platform the suite ships on.
     runs-on: ubuntu-latest
+    # What `--version` and File > Account report for this build (#1023).
+    env:
+      DOCXY_BUILD_KIND: ci
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -143,6 +158,8 @@ jobs:
     # Openbox display, checked against uiharness/cases/expected-failures.txt (#979).
     # A job of its own so the release build runs beside suite-linux's debug tests.
     runs-on: ubuntu-latest
+    # No DOCXY_BUILD_KIND here on purpose: build-info.uit asserts this sweep's suite
+    # reports kind `local` (and so a manual build), the one kind only a hand build has (#1023).
     # Two cold release builds come first; the sweep itself took 105 s locally.
     timeout-minutes: 90
     steps:
@@ -183,6 +200,9 @@ jobs:
     # Releases already build the suite on macOS; this catches a macOS break in the PR
     # that causes it instead of at release time (#505).
     runs-on: macos-latest
+    # What `--version` and File > Account report for this build (#1023).
+    env:
+      DOCXY_BUILD_KIND: ci
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -207,6 +227,9 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    # What `--version` and File > Account report for this build (#1023).
+    env:
+      DOCXY_BUILD_KIND: ci
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
