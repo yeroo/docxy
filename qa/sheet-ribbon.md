@@ -14,7 +14,7 @@ The **Fails when** lines name the regression each one is meant to catch.
 most three small-button rows to a column.
 
 **Steps:**
-1. Open a workbook. Widen the window to at least 1600 px so nothing collapses.
+1. Open a workbook. Widen the window to at least 1400 px so nothing collapses.
 2. On Home, look at each group from Clipboard to Editing: no button is cut off
    at the top or bottom, and every group title is visible under its buttons.
 3. Visit Insert, Data, Review and View and look again.

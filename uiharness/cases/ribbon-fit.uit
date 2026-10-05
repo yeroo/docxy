@@ -5,7 +5,7 @@
 
 test sheet ribbon: no tab is clipped vertically
   open ../fixtures/basic.xlsx
-  call window-size {"w":1600,"h":900}
+  call window-size {"w":1400,"h":800}
   call ribbon-layout {"tab":"Home"}
   shot window
   call ribbon-layout {"tab":"Home"}
@@ -42,7 +42,7 @@ test sheet ribbon: no tab is clipped vertically
 
 test document ribbon: no tab is clipped vertically
   open ../fixtures/basic.docx
-  call window-size {"w":1600,"h":900}
+  call window-size {"w":1400,"h":800}
   call ribbon-layout {"tab":"Home"}
   shot window
   call ribbon-layout {"tab":"Home"}
@@ -88,7 +88,7 @@ test document ribbon: no tab is clipped vertically
 
 test Project ribbon: no tab is clipped vertically
   open ../fixtures/gantt-summary.xml
-  call window-size {"w":1600,"h":900}
+  call window-size {"w":1400,"h":800}
   call ribbon-layout {"tab":"Task"}
   shot window
   call ribbon-layout {"tab":"Task"}
@@ -130,7 +130,7 @@ test document ribbon: a contextual tab out of context is refused
 
 test ribbon-layout is unsettled until a frame shows the tab, whatever the call
   open ../fixtures/basic.xlsx
-  call window-size {"w":1600,"h":900}
+  call window-size {"w":1400,"h":800}
   shot window
   call ribbon-click {"tab":"Data","command":"Filter"}
   call ribbon-layout {}

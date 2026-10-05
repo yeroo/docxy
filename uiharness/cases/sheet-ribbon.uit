@@ -192,7 +192,7 @@ test sheet Home has no Remove Duplicates and Data keeps it
 # clipped_v true.
 test sheet Home ribbon: no group is clipped vertically
   open ../fixtures/basic.xlsx
-  call window-size {"w":1600,"h":900}
+  call window-size {"w":1400,"h":800}
   shot window
   call ribbon-layout {}
   assert reply.tab is Home
