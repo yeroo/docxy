@@ -208,6 +208,11 @@ pass against a perfectly correct app. `ACTION_KEYS` in `harness.rs` lists what
 gets re-routed, and a test fails if it drifts from what `cx.bind_keys`
 registers.
 
+While the File screen is open, every key — Tab and Shift-Tab included — goes
+to the File screen (`on_key`: a dialog or the more-tabs list first,
+then PageUp/PageDown/Home/End scroll the page), so nothing reaches the tab
+hidden under it.
+
 Reference fields, for `focus`: `chart-range`, `chart-title`, `categories`,
 `series-name:N`, `series-values:N`, `cond-format`, `validation`.
 Data › Text to Columns is a dialog (`text-to-columns`), driven with the
@@ -271,10 +276,12 @@ because the UI cannot place it by document offset, so it does not test clicking
 or dragging a selection. `window-size` and `window-zoom` are setup exceptions
 that call GPUI window APIs. `title-tab` calls the same handler methods as the
 title-bar arrows and dropdown items, and `tab-select` calls `select_tab`, the
-tab chip's click handler. `pointer-click`/`pointer-drag` are the hit-testing
-exception (#545): real `PlatformInput` events dispatched through gpui, for
+tab chip's click handler. `pointer-click`/`pointer-drag`/`pointer-wheel` are the hit-testing
+exception (#545, #1028): real `PlatformInput` events dispatched through gpui, for
 overlap order a handler call cannot see; `real-key`/`real-type` (#1027) are the
-same for the keyboard, for which root handles a key (`key`/`type` call `on_key`). `proj.new` calls `add_tab(Kind::Project)`, the
+same for the keyboard, for which root handles a key (`key`/`type` call `on_key`).
+`backstage-page {"page":"open"}` is a setup exception: it sets the default page
+directly, as opening File does. `proj.new` calls `add_tab(Kind::Project)`, the
 Backstage › New › Project card's handler; F11 also commits the active plan's
 pending cell edit first, and `proj.new` does not.
 
@@ -451,6 +458,9 @@ footer editor; `selection-set` refuses while it is open.
 | `tab-select {"tab":"schedule"}` | make a tab active as clicking its chip does, and reply with the state. `tab` is an index or a case-insensitive title/path substring over **all** tabs, the rule the `proj.*` verbs use; a miss (`no tab matches 'x'`), an ambiguous match (`several tabs match 'x' (2, 3)`) and an index past the end (`no tab at index 9`) are refused. The Backstage stays as it was, as it does for a chip click |
 | `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point; or `{"at":"user-name-row"}`: Backstage's User name... row, #1027); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog, except the `{"dialog-field":"user-name","x":N}` form (#1027), which clicks the open dialog's text field `N` pixels in from its left edge (its middle without `x`) and replies `{x, y}`; a press reaches an open menu's own item or backdrop, so it does not pre-close menus |
 | `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 8 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The drag arms once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of about 2.25px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
+| `pointer-wheel {"region":"backstage-content","dy":-600}` | dispatch a real mouse move and wheel notch at the region's centre through gpui's hit testing (#1028); a negative `dy` (logical pixels) scrolls the content down. Replies `{x, y, dy}`. Refuses under a dialog; does not pre-close menus |
+| `backstage-layout {}` | read the File screen's scroll state (refused while it is closed): `page` (`open`, `new`, `info`, `account`), the content pane's `viewport_h`, `content_h`, `scroll_y`, `scrollable`, `at_top`, `scrolled`, `last_item_visible` (true when the page fits or has been scrolled to its end), and the rail's `rail_viewport_h`, `rail_content_h`, `rail_scrollable`, `rail_last_item_visible`. Settle with `shot window` first; regions `backstage-content` and `backstage-rail` name the two columns |
+| `backstage-page {"page":"new"}` | switch the File screen's page: `new`, `info` (a document tab only) and `account` call the rail's handler; `open` (the default page) is a setup shortcut with no rail counterpart (the user closes and reopens File; the rail's Open… opens a file picker). Every page starts scrolled to the top. Replies like `backstage-layout`, whose sizes come from the last drawn frame: `shot window` before reading them |
 | `proj.new {}` | make a blank Project and activate it, as Backstage › New › Project does; replies with `proj.path` for it (`tab`, `path: null`, `name: Project1`, 0 `tasks`, `imported`, the cell state). It takes no `tab` and no `name`: the plan is the app's, so name it by saving it (`proj.save {"path":…}`). The Project control server accepts it too |
 | `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
 | `window-zoom {}` | call GPUI's zoom action; on Windows it maximizes, while the native caption Max button uses the OS control area. Use a fresh harness window for restored geometry on Windows |
@@ -1265,7 +1275,9 @@ collapsed ribbon hides it. `filter-button:<column>` (for example
 `filter-button:B`) is the AutoFilter button on that column's header cell
 (#690), an error while the sheet has no filter there or the button is
 scrolled out of view; `shot` it before a `pointer-click` so the click lands
-on the frame that drew it. Inside a
+on the frame that drew it. `backstage-content` and `backstage-rail` are the File
+screen's scrolling content pane and its left rail (#1028), an error ("the File
+screen is not open") while File is closed. Inside a
 border assertion the `cell:` may be dropped — `border A1:C5 solid` — because an
 assertion about a selection should read like the selection.
 
