@@ -1,0 +1,324 @@
+//! Build info stamped at compile time: which commit, which merged PR, which kind
+//! of build, and whether it is a "manual build". Dependency-free so every host
+//! (the suite, docxy, xlsxy, yppxy, lookxy) can share it; hosts map [`Value`] to
+//! their own JSON type.
+//!
+//! The dirty bit and build time are as of the last time `build.rs` ran. Cargo
+//! reruns it when HEAD, the ref HEAD points to, or the index changes (and when a
+//! file that was already modified changes), not on every source edit, so a first
+//! edit to a clean, unstaged tree is not noticed until `git add`, a commit, or
+//! `touch buildinfo/build.rs`. The dirty bit counts tracked files only: untracked
+//! scratch files do not turn a release build into a manual one.
+
+#[cfg(test)]
+mod collect;
+mod parse;
+
+pub use parse::{Kind, is_manual, issue_from_branch, kind_from_env, last_merged_pr, utc_timestamp};
+
+use std::sync::OnceLock;
+
+/// What `build.rs` recorded.
+pub struct Raw {
+    pub commit: &'static str,
+    pub branch: &'static str,
+    pub commit_date: &'static str,
+    pub dirty: bool,
+    pub last_pr: Option<u32>,
+    pub last_pr_title: Option<&'static str>,
+    pub issue: Option<u32>,
+    pub ahead: Option<u32>,
+    pub built_at: &'static str,
+    pub profile: &'static str,
+    pub target: &'static str,
+    pub host: &'static str,
+    pub kind: &'static str,
+}
+
+const RAW: Raw = include!(concat!(env!("OUT_DIR"), "/buildinfo.rs"));
+
+/// A JSON-shaped value, so hosts can build their own JSON without `buildinfo`
+/// depending on one.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Value {
+    Str(String),
+    Bool(bool),
+    Num(u64),
+    Null,
+}
+
+#[derive(Clone, Debug)]
+pub struct BuildInfo {
+    pub version: String,
+    pub commit: String,
+    pub branch: String,
+    pub commit_date: String,
+    pub dirty: bool,
+    pub last_pr: Option<u32>,
+    pub last_pr_title: Option<String>,
+    pub issue: Option<u32>,
+    pub ahead: Option<u32>,
+    pub built_at: String,
+    pub profile: String,
+    pub target: String,
+    pub host: String,
+    pub kind: Kind,
+}
+
+impl BuildInfo {
+    /// The recorded build info for a host whose own version is `version`
+    /// (`env!("CARGO_PKG_VERSION")` at the call site: the suite is 0.1.0, the
+    /// terminal editors 0.5.0).
+    pub fn new(version: &str) -> BuildInfo {
+        BuildInfo::from_raw(&RAW, version)
+    }
+
+    pub fn from_raw(raw: &Raw, version: &str) -> BuildInfo {
+        BuildInfo {
+            version: version.to_string(),
+            commit: raw.commit.to_string(),
+            branch: raw.branch.to_string(),
+            commit_date: raw.commit_date.to_string(),
+            dirty: raw.dirty,
+            last_pr: raw.last_pr,
+            last_pr_title: raw.last_pr_title.map(str::to_string),
+            issue: raw.issue,
+            ahead: raw.ahead,
+            built_at: raw.built_at.to_string(),
+            profile: raw.profile.to_string(),
+            target: raw.target.to_string(),
+            host: raw.host.to_string(),
+            kind: kind_from_env(Some(raw.kind)),
+        }
+    }
+
+    /// Built by hand or from a dirty tree.
+    pub fn manual(&self) -> bool {
+        is_manual(self.kind, self.dirty)
+    }
+
+    /// The first 7 characters of the commit (or `unknown`).
+    pub fn short_commit(&self) -> &str {
+        self.commit.get(..7).unwrap_or(&self.commit)
+    }
+
+    fn pr_text(&self) -> String {
+        match self.last_pr {
+            Some(n) => format!("after #{n}"),
+            None => "no merged PR".to_string(),
+        }
+    }
+
+    /// `v0.5.0 · abc1234 · after #1015 · release`, with ` · manual build` appended
+    /// when manual.
+    pub fn short_line(&self) -> String {
+        let mut s = format!(
+            "v{} · {} · {} · {}",
+            self.version,
+            self.short_commit(),
+            self.pr_text(),
+            self.kind.as_str()
+        );
+        if self.manual() {
+            s.push_str(" · manual build");
+        }
+        s
+    }
+
+    /// One line for the MCP `version` field: `0.5.0 (abc1234, after #1015, release)`.
+    pub fn long_version(&self) -> String {
+        let mut s = format!(
+            "{} ({}, {}, {}",
+            self.version,
+            self.short_commit(),
+            self.pr_text(),
+            self.kind.as_str()
+        );
+        if self.manual() {
+            s.push_str(", manual build");
+        }
+        s.push(')');
+        s
+    }
+
+    /// Every field, in display order.
+    pub fn fields(&self) -> Vec<(&'static str, Value)> {
+        let s = |v: &str| Value::Str(v.to_string());
+        let num = |v: Option<u32>| v.map_or(Value::Null, |n| Value::Num(u64::from(n)));
+        vec![
+            ("version", s(&self.version)),
+            ("commit", s(&self.commit)),
+            ("short_commit", s(self.short_commit())),
+            ("commit_len", Value::Num(self.commit.len() as u64)),
+            (
+                "commit_hex",
+                Value::Bool(
+                    !self.commit.is_empty() && self.commit.bytes().all(|b| b.is_ascii_hexdigit()),
+                ),
+            ),
+            ("branch", s(&self.branch)),
+            ("commit_date", s(&self.commit_date)),
+            ("dirty", Value::Bool(self.dirty)),
+            ("last_pr", num(self.last_pr)),
+            (
+                "last_pr_title",
+                self.last_pr_title.as_deref().map_or(Value::Null, s),
+            ),
+            ("issue", num(self.issue)),
+            ("ahead", num(self.ahead)),
+            ("built_at", s(&self.built_at)),
+            ("profile", s(&self.profile)),
+            ("target", s(&self.target)),
+            ("host", s(&self.host)),
+            ("kind", s(self.kind.as_str())),
+            ("manual", Value::Bool(self.manual())),
+            ("summary", s(&self.short_line())),
+        ]
+    }
+
+    /// The multi-line block `--version`, the About dialog's Copy and the crash log print.
+    /// `name` is the program (`docxy`, `suite`).
+    pub fn version_block(&self, name: &str) -> String {
+        let mut s = format!("{name} {}\n", self.version);
+        s.push_str(&format!("commit:      {}\n", self.commit));
+        s.push_str(&format!("branch:      {}\n", self.branch));
+        s.push_str(&format!("commit date: {}\n", self.commit_date));
+        match (self.last_pr, &self.last_pr_title) {
+            (Some(n), Some(t)) if !t.is_empty() => s.push_str(&format!("last PR:     #{n} {t}\n")),
+            (Some(n), _) => s.push_str(&format!("last PR:     #{n}\n")),
+            (None, _) => s.push_str("last PR:     none\n"),
+        }
+        if let Some(issue) = self.issue {
+            match self.ahead {
+                Some(a) => s.push_str(&format!(
+                    "issue:       #{issue} ({a} ahead of origin/main)\n"
+                )),
+                None => s.push_str(&format!("issue:       #{issue}\n")),
+            }
+        }
+        s.push_str(&format!(
+            "dirty:       {}\n",
+            if self.dirty { "yes" } else { "no" }
+        ));
+        s.push_str(&format!("built:       {}\n", self.built_at));
+        s.push_str(&format!("profile:     {}\n", self.profile));
+        s.push_str(&format!("target:      {}\n", self.target));
+        s.push_str(&format!("host:        {}\n", self.host));
+        s.push_str(&format!("kind:        {}\n", self.kind.as_str()));
+        if self.manual() {
+            s.push_str("manual build\n");
+        }
+        s
+    }
+}
+
+/// The process-wide build info; the first caller's `version` wins (every host
+/// passes its own `CARGO_PKG_VERSION`).
+pub fn get(version: &'static str) -> &'static BuildInfo {
+    static INFO: OnceLock<BuildInfo> = OnceLock::new();
+    INFO.get_or_init(|| BuildInfo::new(version))
+}
+
+/// [`BuildInfo::long_version`] as a `&'static str` (for APIs that want one).
+pub fn long_version(version: &'static str) -> &'static str {
+    static LONG: OnceLock<String> = OnceLock::new();
+    LONG.get_or_init(|| get(version).long_version())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(kind: &'static str, dirty: bool) -> Raw {
+        Raw {
+            commit: "0123456789abcdef0123456789abcdef01234567",
+            branch: "main",
+            commit_date: "2026-10-05T10:00:00+00:00",
+            dirty,
+            last_pr: Some(1015),
+            last_pr_title: Some("Batch Word repeat"),
+            issue: None,
+            ahead: None,
+            built_at: "2026-10-05T10:15:17Z",
+            profile: "release",
+            target: "x86_64-unknown-linux-gnu",
+            host: "box",
+            kind,
+        }
+    }
+
+    #[test]
+    fn release_clean_is_not_manual() {
+        let b = BuildInfo::from_raw(&raw("release", false), "0.5.0");
+        assert!(!b.manual());
+        assert_eq!(b.short_line(), "v0.5.0 · 0123456 · after #1015 · release");
+        assert!(!b.version_block("docxy").contains("manual build"));
+        assert_eq!(b.long_version(), "0.5.0 (0123456, after #1015, release)");
+    }
+
+    #[test]
+    fn local_and_dirty_are_manual() {
+        let local = BuildInfo::from_raw(&raw("local", false), "0.5.0");
+        assert!(local.manual());
+        assert!(local.short_line().ends_with(" · manual build"));
+        assert!(local.version_block("docxy").contains("manual build"));
+        let dirty = BuildInfo::from_raw(&raw("ci", true), "0.5.0");
+        assert!(dirty.manual());
+        assert!(dirty.long_version().contains("manual build"));
+    }
+
+    #[test]
+    fn fields_carry_the_documented_keys() {
+        let b = BuildInfo::from_raw(&raw("local", true), "0.1.0");
+        let f = b.fields();
+        let get = |k: &str| f.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+        for k in [
+            "version",
+            "commit",
+            "short_commit",
+            "branch",
+            "commit_date",
+            "dirty",
+            "last_pr",
+            "issue",
+            "ahead",
+            "built_at",
+            "profile",
+            "target",
+            "host",
+            "kind",
+            "manual",
+            "summary",
+            "commit_len",
+            "commit_hex",
+            "last_pr_title",
+        ] {
+            assert!(get(k).is_some(), "missing {k}");
+        }
+        assert_eq!(get("version"), Some(Value::Str("0.1.0".into())));
+        assert_eq!(get("commit_len"), Some(Value::Num(40)));
+        assert_eq!(get("commit_hex"), Some(Value::Bool(true)));
+        assert_eq!(get("manual"), Some(Value::Bool(true)));
+        assert_eq!(get("last_pr"), Some(Value::Num(1015)));
+        assert_eq!(get("issue"), Some(Value::Null));
+    }
+
+    #[test]
+    fn unknown_commit_is_not_hex() {
+        let mut r = raw("local", false);
+        r.commit = "unknown";
+        r.last_pr = None;
+        r.last_pr_title = None;
+        let b = BuildInfo::from_raw(&r, "0.5.0");
+        assert_eq!(b.short_commit(), "unknown");
+        assert!(b.short_line().contains("no merged PR"));
+        assert!(b.fields().contains(&("commit_hex", Value::Bool(false))));
+    }
+
+    #[test]
+    fn the_stamped_build_is_consistent() {
+        let b = BuildInfo::new("9.9.9");
+        assert_eq!(b.version, "9.9.9");
+        assert!(["release", "ci", "local"].contains(&b.kind.as_str()));
+    }
+}
