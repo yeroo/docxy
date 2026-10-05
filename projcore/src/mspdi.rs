@@ -189,13 +189,25 @@ fn leaf_text_of(p: &mut XmlParser) -> Option<String> {
     leaf.then_some(text)
 }
 
-/// The element's decoded text, and whether it had no child elements.
+/// Append an `Event::Text` to `out`: CDATA content is pushed verbatim, since
+/// entity references are literal there; ordinary character data is
+/// entity-decoded (#185).
+fn append_text(p: &XmlParser, out: &mut String) {
+    if p.is_cdata() {
+        out.push_str(p.text());
+    } else {
+        XmlParser::append_decoded(p.text(), out);
+    }
+}
+
+/// The element's text — entity references decoded, except inside CDATA,
+/// which is kept verbatim — and whether it had no child elements.
 fn element_text(p: &mut XmlParser) -> (String, bool) {
     let mut s = String::new();
     let mut leaf = true;
     loop {
         match p.next() {
-            Event::Text => XmlParser::append_decoded(p.text(), &mut s),
+            Event::Text => append_text(p, &mut s),
             Event::Start => {
                 leaf = false;
                 p.skip_element();
@@ -1014,7 +1026,8 @@ fn kept_as_element(p: &XmlParser) -> bool {
 const MAX_DEFINITION_DEPTH: usize = 32;
 
 /// Read the element whose `Start` was just consumed, at `depth`, and its
-/// children, as an [`XmlElement`]. A leaf keeps its decoded text verbatim; the
+/// children, as an [`XmlElement`]. A leaf keeps its text verbatim — entity
+/// references decoded, except inside CDATA, which is kept as written; the
 /// text between an element's children is dropped (even when every child
 /// was), and so is a child [`kept_as_element`] refuses, or one past
 /// [`MAX_DEFINITION_DEPTH`], with its whole subtree.
@@ -1026,7 +1039,7 @@ fn parse_element(p: &mut XmlParser, depth: usize) -> XmlElement {
     let mut leaf = true;
     loop {
         match p.next() {
-            Event::Text => XmlParser::append_decoded(p.text(), &mut element.text),
+            Event::Text => append_text(p, &mut element.text),
             Event::Start => {
                 leaf = false;
                 if depth < MAX_DEFINITION_DEPTH && kept_as_element(p) {
@@ -4477,6 +4490,64 @@ mod tests {
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.tasks, proj.tasks);
+    }
+
+    /// Issue #185: entity references inside a CDATA section are literal
+    /// text, not markup, so the reader keeps them verbatim; ordinary
+    /// character data still decodes.
+    #[test]
+    fn cdata_entities_are_kept_verbatim_in_task_name_and_notes() {
+        let proj = task_project(
+            "<Task><UID>1</UID><Name><![CDATA[R&amp;D]]></Name>\
+             <Contact>R&amp;D</Contact>\
+             <Notes><![CDATA[R&amp;D]]></Notes></Task>",
+        );
+        assert_eq!(proj.tasks[0].name, "R&amp;D");
+        assert_eq!(proj.tasks[0].contact.as_deref(), Some("R&D"));
+        assert_eq!(proj.tasks[0].notes.as_deref(), Some("R&amp;D"));
+    }
+
+    /// Issue #185: character data and CDATA in one element concatenate, each
+    /// kept the way it was written.
+    #[test]
+    fn cdata_and_character_data_mix_in_one_element() {
+        let proj =
+            task_project("<Task><UID>1</UID><Name>a&amp;<![CDATA[&amp;]]>b&amp;</Name></Task>");
+        assert_eq!(proj.tasks[0].name, "a&&amp;b&");
+    }
+
+    /// Issue #185: a CDATA value reads verbatim and the writer re-escapes it,
+    /// so the text survives the round trip unchanged.
+    #[test]
+    fn cdata_text_round_trips_through_write_mspdi() {
+        let proj = task_project("<Task><UID>1</UID><Name><![CDATA[R&amp;D]]></Name></Task>");
+        assert_eq!(proj.tasks[0].name, "R&amp;D");
+        let xml = write_mspdi(&proj);
+        assert!(xml.contains("<Name>R&amp;amp;D</Name>"), "{xml}");
+        assert_eq!(read_mspdi(&xml).unwrap().tasks[0].name, proj.tasks[0].name);
+    }
+
+    /// Issue #185: leaves of a kept definition element go through
+    /// `parse_element`, which must keep CDATA text verbatim too.
+    #[test]
+    fn cdata_text_is_kept_verbatim_in_kept_definition_leaves() {
+        let proj = read_mspdi(
+            "<Project><ExtendedAttributes>\
+               <ExtendedAttribute><FieldID>188743731</FieldID>\
+                 <Alias><![CDATA[Trade &amp; crew]]></Alias></ExtendedAttribute>\
+             </ExtendedAttributes><Tasks/></Project>",
+        )
+        .unwrap();
+        assert_eq!(
+            proj.extended_attribute_definitions,
+            vec![node(
+                "ExtendedAttribute",
+                vec![
+                    leaf("FieldID", "188743731"),
+                    leaf("Alias", "Trade &amp; crew"),
+                ],
+            )]
+        );
     }
 
     /// Issue #531: a note reads with `\n` line breaks whether the file holds
