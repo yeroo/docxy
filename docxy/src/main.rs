@@ -7,6 +7,7 @@
 //!   docxy <in> --md <out.md>       headless: convert to Markdown and exit
 //!   docxy <in> --docx <out.docx>   headless: convert to .docx and exit
 //!   docxy <in> --html <out.docx.html>  headless: export editable HTML and exit
+//!   docxy --version (-V)           print the build (commit, last merged PR, kind) and exit
 //!
 //! The logic lives in the pure `docxcore` crate; this binary is the TUI shell:
 //! it maps `docxcore::render` lines onto ratatui, draws a caret via the render
@@ -666,6 +667,7 @@ fn print_usage() {
                                            write a tracked-changes comparison and exit\n  \
            docxy merge <main.docx> <data.csv> -o <out.docx>\n  \
                                            mail-merge every CSV recipient and exit\n  \
+           docxy --version (-V)            print the build (commit, last merged PR, kind)\n  \
            docxy --mcp                      run the MCP bridge to drive a live docxy\n  \
            docxy install skill              install the agent SKILL.md (self-onboarding)\n  \
            (Save As to a .md/.docx/.docx.html name converts between the formats;\n   \

@@ -13,18 +13,31 @@ test About shows the build info and app-info matches it
   assert reply.open is true
   call account {"action":"open"}
   assert reply.open is true
-  assert reply.about is false
-  assert reply.badge is true
-  assert reply.rows.0.field is commit
-  call account {"action":"about"}
-  assert reply.about is true
+  # `badge` is the drawn badge: read it once a settled frame has been captured.
   shot window
-  call account {"action":"copy"}
-  assert reply.about is true
+  call account {"action":"read"}
+  assert reply.badge is true
+  call account {"action":"about"}
+  call dialog-read {}
+  assert reply.open is true
+  assert reply.id is about
+  assert reply.controls.0.name is manual
+  assert reply.controls.0.text is Manual build
+  assert reply.controls.1.name is commit
+  assert reply.buttons.0.label is Copy
+  assert reply.buttons.1.label is Close
+  assert reply.buttons.1.default is true
+  shot window
+  call dialog-click {"button":"Copy"}
+  assert reply.dialog.open is true
   call clipboard {"action":"read"}
   assert reply.text is not nothing
-  call account {"action":"close"}
-  assert reply.about is false
+  call dialog-click {"button":"Close"}
+  assert reply.dialog.open is false
+  call account {"action":"about"}
+  key escape
+  call dialog-read {}
+  assert reply.open is false
   call backstage {"action":"close"}
 
 test Account is on the backstage of a document too
@@ -32,8 +45,10 @@ test Account is on the backstage of a document too
   call backstage {"action":"open"}
   call account {"action":"open"}
   assert reply.open is true
+  shot window
+  call account {"action":"read"}
   assert reply.badge is true
-  call-error account {"action":"copy"} => the About dialog is not open
+  call-error dialog-click {"button":"Copy"} => no dialog is open
   call backstage {"action":"close"}
   call account {"action":"read"}
   assert reply.open is false

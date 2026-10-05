@@ -13,6 +13,7 @@
 //!                                      legacy .mpp (validated task tables)
 //!   yppxy <in> --gantt-md <out.md>     headless: export a Markdown Gantt chart
 //!   yppxy <in> --save <out.(yppx|xml)> headless: convert/save and exit
+//!   yppxy --version (-V)               print the build (commit, last merged PR, kind)
 
 use opccore::fsio::{export_atomic, write_atomic};
 use std::path::Path;
@@ -115,13 +116,15 @@ fn main() -> ExitCode {
         Err(m) => {
             eprintln!("{m}");
             eprintln!(
-                "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>]"
+                "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>] | --version (-V)"
             );
             return ExitCode::from(2);
         }
     };
     if parsed.help {
-        println!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>]");
+        println!(
+            "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>] | --version (-V)"
+        );
         return ExitCode::SUCCESS;
     }
 

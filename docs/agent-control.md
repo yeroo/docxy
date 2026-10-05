@@ -42,7 +42,7 @@ Supported verbs are `proj.path`, `task.list`, `task.get`, `task.fields`, `task.s
 `task.add`, `task.del`, `link.add`, `link.del`, `find`, `assign.list`,
 `assign.get`, `assign.fields`, `assign.add`, `assign.set`, `assign.del`,
 `proj.save`, `proj.reload`, `proj.open` and `proj.new`, with the yppxy
-argument/result shapes. `proj.path` additionally
+argument/result shapes, plus `app-info` (the build: version, commit, last merged PR, kind, `manual`; #1023). `proj.path` additionally
 reports `tab`, `imported`, `cell` (active column name), `cell_row` (zero-based row),
 and `cell_edit` (pending cell buffer, or `null` when closed). Reads and rejected
 edits leave selection, prompts, pending cell edits, history and scroll unchanged.
@@ -257,6 +257,7 @@ One JSON object per line; one reply line per request:
 
 | Verb | Args | Result |
 |---|---|---|
+| `app-info` | — | the build: `{version, commit, short_commit, branch, commit_date, dirty, last_pr, issue, ahead, built_at, profile, target, host, kind, manual, summary, …}`: `kind` is `release`, `ci` or `local`; `manual` is `kind == local \|\| dirty` (#1023) |
 | `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?, final?}` — `final: true` only when Word marked the document as final |
 | `doc.edit-anyway` | — | `{path, …, was_final}` — Word's Edit Anyway: clears Mark as Final so edits are allowed and a save writes the document without the mark |
 | `doc.outline` | — | `{headings:[{index, level, text}]}` |
@@ -792,6 +793,7 @@ name and defaults to the active sheet):
 
 | Verb | Args | Result |
 |---|---|---|
+| `app-info` | — | the build: `{version, commit, short_commit, branch, commit_date, dirty, last_pr, issue, ahead, built_at, profile, target, host, kind, manual, summary, …}`: `kind` is `release`, `ci` or `local`; `manual` is `kind == local \|\| dirty` (#1023) |
 | `wb.path` | — | `{path, modified, read_only, sheets, active, active_name, circular}` — `read_only` is true while the workbook is bound to the file `xlsxy --read-only` opened (terminal xlsxy; see `wb.save`);  `circular` lists the cells on circular references (active sheet first, bare `E1`; other sheets as `Sheet2!A1`), empty when there are none. It lists them whether or not the workbook enables iterative calculation (the TUI's warning and footer note appear only when it does not, as in Excel). Without iterative calculation those cells are 0, as in Excel |
 | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |

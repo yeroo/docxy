@@ -6,6 +6,7 @@
 //!   xlsxy <in.xlsx> --recalc <out>      headless: recalculate and save
 //!   xlsxy <in.xlsx> --csv <out.csv>     headless: export the active sheet as CSV UTF-8
 //!   xlsxy <in.xlsx> --pdf <out.pdf>     headless: print the active sheet to PDF
+//!   xlsxy --version (-V)                print the build (commit, last merged PR, kind)
 //!
 //! The engine lives in the pure `gridcore` crate; this binary is the TUI
 //! shell: a cell grid with Excel muscle memory (formula bar, A1 navigation,
@@ -1078,6 +1079,7 @@ fn print_usage() {
                                             and diff against Excel's cached values\n  \
            xlsxy <file> --vim               modal (vim) navigation: hjkl, v, dd, :w :q\n  \
            xlsxy <file> --read-only (-r)    open read-only: Save asks for a new name\n  \
+           xlsxy --version (-V)             print the build (commit, last merged PR, kind)\n  \
            xlsxy --mcp                      run the MCP bridge to drive a live xlsxy\n  \
            xlsxy install skill              install the agent SKILL.md (self-onboarding)\n\n\
          EDITOR KEYS:\n  \

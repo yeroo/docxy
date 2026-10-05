@@ -9,8 +9,8 @@ only a build can: that the stamp follows the tree.
 
 **Setup for every case:** a scratch clone, `cargo build --manifest-path suite/Cargo.toml`
 (the suite is its own workspace), and for the terminal editors `cargo build -p docxy`.
-Run the suite normally; the bottom line of `--version` and File › Account must
-agree with `git rev-parse HEAD`.
+Run the suite normally; the `commit:` line of `--version` (and the short SHA on
+File › Account's summary line) must match `git rev-parse HEAD`.
 
 None of these cases has been mutation-proven yet. The **Fails when** lines name the
 regression each one is meant to catch.

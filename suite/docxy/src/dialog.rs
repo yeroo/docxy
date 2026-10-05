@@ -102,6 +102,9 @@ pub(crate) enum DialogOwner {
     /// Settings' User name... (#620): the reviewer name and initials new
     /// comments carry. An app setting, applied by `user_name::click`.
     UserName,
+    /// File > Account's About docxy suite (#1023): the build's rows, Copy and
+    /// Close. Its presses are the app's (`about::click`), before the tab's.
+    About,
     /// Excel's Subtotal dialog (#693) over the region `(r1, c1, r2, c2)` of
     /// `sheet`: its column choices start at `c1` (at most 64 of them), and
     /// `c2` ends the region, so total rows are found only in `c1..=c2`;

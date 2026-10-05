@@ -2296,34 +2296,21 @@ fn inspection_json(found: &crate::inspector::Inspection) -> Json {
     )
 }
 
-/// `account`'s reply: whether the Account page and the About dialog are open,
-/// what the page shows, and (after a `copy`) the text copied.
-fn account_json(app: &crate::Docxy, copied: Option<String>) -> Json {
+/// `account`'s reply: whether the Account page is open and what it shows.
+/// `badge` is whether the "Manual build" badge was drawn in the last frame (its
+/// own probe), not a copy of `manual`.
+fn account_json(app: &crate::Docxy) -> Json {
     let info = crate::about::info();
-    let mut fields = vec![
-        ("open", Json::Bool(app.backstage && app.bs_account)),
-        (
-            "about",
-            Json::Bool(app.backstage && app.bs_account && app.about_open),
-        ),
+    let open = app.backstage && app.bs_account;
+    Json::obj(vec![
+        ("open", Json::Bool(open)),
         ("line", Json::Str(info.short_line())),
         ("manual", Json::Bool(info.manual())),
-        // The "Manual build" badge is drawn exactly when the build is manual.
-        ("badge", Json::Bool(info.manual())),
         (
-            "rows",
-            Json::Arr(
-                crate::about::rows(info)
-                    .into_iter()
-                    .map(|(k, v)| Json::obj(vec![("field", Json::Str(k)), ("value", Json::Str(v))]))
-                    .collect(),
-            ),
+            "badge",
+            Json::Bool(open && app.probes.borrow().get("account-manual-badge").is_some()),
         ),
-    ];
-    if let Some(text) = copied {
-        fields.push(("copied", Json::Str(text)));
-    }
-    Json::obj(fields)
+    ])
 }
 
 /// Whether `verb` stands for a press outside an open menu, which closes it
@@ -3061,36 +3048,28 @@ fn dispatch_verb(
                 ),
             ]))
         }
-        // File > Account and its About dialog (#1023), through the methods the
-        // rail item and the dialog's buttons call. Needs the backstage open.
+        // File > Account and its About dialog (#1023). `open` is the rail item's
+        // handler and `about` the page's About button; the dialog it opens is an
+        // ordinary one, driven with `dialog-read` and `dialog-click` (Copy, Close).
         "account" => {
             let action = arg_str(args, "action")?;
-            let mut copied = None;
             match action {
                 "read" => {}
-                "open" | "about" | "copy" | "close" => {
+                "open" | "about" => {
                     app.refuse_under_dialog()?;
                     if !app.backstage {
                         return Err("File (backstage) is not open; use backstage open".into());
                     }
-                    match action {
-                        "open" => app.open_account(cx),
-                        _ if !app.bs_account => {
-                            return Err("the Account page is not open; use account open".into());
-                        }
-                        "about" => app.open_about(cx),
-                        "copy" => {
-                            if !app.about_open {
-                                return Err("the About dialog is not open".into());
-                            }
-                            copied = Some(app.copy_about(cx));
-                        }
-                        _ => app.close_about(cx),
+                    if action == "open" {
+                        app.open_account(cx);
+                    } else {
+                        app.open_about()?;
+                        cx.notify();
                     }
                 }
-                _ => return Err("'action' must be open, about, copy, close or read".into()),
+                _ => return Err("'action' must be open, about or read".into()),
             }
-            Done::ok(account_json(app, copied))
+            Done::ok_drawn(account_json(app))
         }
         "theme-set" => {
             let pref = parse_theme_pref(arg_str(args, "theme")?)?;

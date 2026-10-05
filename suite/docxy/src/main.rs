@@ -3259,8 +3259,6 @@ struct Docxy {
     /// The backstage shows the Account page: the build line and About (#1023).
     /// New, Info and Account clear one another.
     bs_account: bool,
-    /// The About dialog is open over the Account page.
-    about_open: bool,
     /// The last Remove All on the Info page and the tab index it ran on:
     /// the backstage draws no status bar, so the page shows it under the
     /// rows. Cleared with `bs_info`, on a tab switch, and when a tab is
@@ -9167,7 +9165,6 @@ impl Docxy {
             bs_new: false,
             bs_info: false,
             bs_account: false,
-            about_open: false,
             bs_info_status: None,
             clip: None,
             theme_pref,
@@ -9327,7 +9324,6 @@ impl Docxy {
         self.bs_new = false;
         self.bs_info = false;
         self.bs_account = false;
-        self.about_open = false;
         self.bs_info_status = None;
         self.refresh_drafts();
         self.trusted_count = trusted::count(&config_root());
@@ -9340,7 +9336,6 @@ impl Docxy {
         self.bs_new = false;
         self.bs_info = false;
         self.bs_account = false;
-        self.about_open = false;
         self.bs_info_status = None;
         self.refocus(window, cx);
     }
@@ -9370,32 +9365,10 @@ impl Docxy {
     /// item and the harness's `account` verb both come here.
     fn open_account(&mut self, cx: &mut Context<Self>) {
         self.bs_account = true;
-        self.about_open = false;
         self.bs_info = false;
         self.bs_info_status = None;
         self.bs_new = false;
         cx.notify();
-    }
-
-    /// The About docxy suite dialog over the Account page.
-    fn open_about(&mut self, cx: &mut Context<Self>) {
-        if self.bs_account {
-            self.about_open = true;
-            cx.notify();
-        }
-    }
-
-    fn close_about(&mut self, cx: &mut Context<Self>) {
-        self.about_open = false;
-        cx.notify();
-    }
-
-    /// The About dialog's Copy: the build text on the clipboard (the private one
-    /// in a harness), returned so a caller can show what was copied.
-    fn copy_about(&mut self, cx: &mut Context<Self>) -> String {
-        let text = about::copy_text(about::info());
-        self.clipboard_write(text.clone(), cx);
-        text
     }
 
     fn backstage_rail_action(
@@ -9411,14 +9384,12 @@ impl Docxy {
                 self.bs_info_status = None;
                 self.bs_new = false;
                 self.bs_account = false;
-                self.about_open = false;
                 cx.notify();
             }
             BackstageRailAction::Account => self.open_account(cx),
             BackstageRailAction::New => {
                 self.bs_new = true;
                 self.bs_account = false;
-                self.about_open = false;
                 self.bs_info = false;
                 self.bs_info_status = None;
                 cx.notify();
@@ -26458,6 +26429,8 @@ impl Docxy {
                     h_flex().child(
                         div()
                             .id("account-manual-badge")
+                            .relative()
+                            .child(probe(&self.probes, "account-manual-badge"))
                             .px_2()
                             .py_0p5()
                             .rounded_sm()
@@ -26472,80 +26445,10 @@ impl Docxy {
             .child(
                 h_flex().child(
                     button("account-about", "About docxy suite")
-                        .on_click(cx.listener(|this, _, _, cx| this.open_about(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.open_about_clicked(cx))),
                 ),
             );
-        if !self.about_open {
-            return Some(page.into_any_element());
-        }
-        let mut rows = v_flex().gap_1();
-        for (label, value) in about::rows(info) {
-            rows = rows.child(
-                h_flex()
-                    .gap_3()
-                    .child(div().w(px(110.)).flex_none().text_color(dim).child(label))
-                    .child(div().text_color(fg).child(value)),
-            );
-        }
-        let card = v_flex()
-            .id("about-dialog")
-            .occlude()
-            .w(px(640.))
-            .p_6()
-            .gap_3()
-            .rounded_md()
-            .border_1()
-            .border_color(dim)
-            .bg(bg)
-            .child(
-                div()
-                    .text_size(px(18.))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(fg)
-                    .child(format!("About {} {}", about::PRODUCT, info.version)),
-            )
-            .when(info.manual(), |d| {
-                d.child(
-                    div()
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(0xB45309))
-                        .child("Manual build"),
-                )
-            })
-            .child(rows)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
-                    .child(
-                        button("about-copy", "Copy").on_click(cx.listener(|this, _, _, cx| {
-                            this.copy_about(cx);
-                        })),
-                    )
-                    .child(
-                        button("about-close", "Close")
-                            .on_click(cx.listener(|this, _, _, cx| this.close_about(cx))),
-                    ),
-            );
-        Some(
-            page.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(Hsla {
-                        a: 0.45,
-                        ..hsla(0., 0., 0., 1.)
-                    })
-                    .child(card),
-            )
-            .into_any_element(),
-        )
+        Some(page.into_any_element())
     }
 
     /// File > Info for a document tab (#627): its name and path, then Word's

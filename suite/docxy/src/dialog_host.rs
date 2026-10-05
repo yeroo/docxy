@@ -111,6 +111,8 @@ fn apply_dialog(
         DialogOwner::SaveOnClose { .. } => Err("closing a tab applies through the app".into()),
         // Handled in `user_name::click`, before this: it is the app's.
         DialogOwner::UserName => Err("the user name is an app setting".into()),
+        // Handled in `about::click`, before this: it only copies or closes.
+        DialogOwner::About => Err("the About dialog only copies or closes".into()),
         #[cfg(test)]
         DialogOwner::Test | DialogOwner::TestChild => Ok(false),
     }
@@ -288,6 +290,10 @@ impl Docxy {
         if let Some(done) = self.user_name_click(button) {
             return done;
         }
+        // About's Copy and Close are the app's too (#1023).
+        if let Some(done) = self.about_click(button, window, cx) {
+            return done;
+        }
         // The close prompt closes the tab, or goes on with the window's
         // close (#629, #630).
         if let Some(done) = self.close_prompt_click(button, window, cx) {
@@ -330,7 +336,9 @@ impl Docxy {
                 t.dialogs.top().is_some_and(|d| {
                     matches!(
                         d.owner,
-                        DialogOwner::UserName | DialogOwner::SaveOnClose { .. }
+                        DialogOwner::UserName
+                            | DialogOwner::About
+                            | DialogOwner::SaveOnClose { .. }
                     )
                 })
             })

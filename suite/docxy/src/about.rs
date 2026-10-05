@@ -3,6 +3,10 @@
 //! binary. The commit, last merged PR and build kind come from the `buildinfo`
 //! crate; this module names the product and shapes the text.
 
+use crate::dialog::{
+    ButtonRole, Control as Field, ControlKind, Dialog, DialogOwner, NONE_OPEN, Value,
+};
+use crate::{Context, Docxy, Window};
 use buildinfo::BuildInfo;
 
 /// The product name `--version` and the About dialog print.
@@ -25,15 +29,82 @@ pub(crate) fn copy_text(info: &BuildInfo) -> String {
     format!("{}summary:     {}\n", version_text(info), info.short_line())
 }
 
-/// The dialog's rows: every field of the block as `(label, value)`, in order.
-/// The title line and a trailing "manual build" marker are not rows.
-pub(crate) fn rows(info: &BuildInfo) -> Vec<(String, String)> {
-    version_text(info)
-        .lines()
-        .skip(1)
-        .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
+/// The About docxy suite dialog: every field of the build as a labelled row,
+/// the "Manual build" marker when it is one, and Copy / Close. Enter and Escape
+/// press Close.
+pub(crate) fn dialog(info: &BuildInfo) -> Dialog {
+    let mut d = Dialog::message(
+        "about",
+        &format!("About {PRODUCT} {}", info.version),
+        String::new(),
+        &[("Copy", ButtonRole::Apply), ("Close", ButtonRole::Cancel)],
+        DialogOwner::About,
+    );
+    d.text = None;
+    let mut controls = Vec::new();
+    if info.manual() {
+        controls.push(Field::new(
+            "manual",
+            "",
+            ControlKind::Label,
+            Value::Text("Manual build".into()),
+        ));
+    }
+    for (label, value) in info.rows() {
+        controls.push(Field::new(
+            label,
+            label,
+            ControlKind::Label,
+            Value::Text(value),
+        ));
+    }
+    d.controls = controls;
+    for b in &mut d.buttons {
+        b.default = b.label == "Close";
+    }
+    d.mark_opened();
+    d
+}
+
+impl Docxy {
+    /// The Account page's About docxy suite button: the dialog on the active tab.
+    pub(crate) fn open_about(&mut self) -> Result<(), String> {
+        if !self.bs_account {
+            return Err("the Account page is not open; use account open".into());
+        }
+        let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
+        tab.dialogs.push(dialog(info()));
+        Ok(())
+    }
+
+    /// The button's click: open the dialog, or say why not on the tab's status.
+    pub(crate) fn open_about_clicked(&mut self, cx: &mut Context<Self>) {
+        if let Err(e) = self.open_about()
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            tab.status = e.into();
+        }
+        cx.notify();
+    }
+
+    /// Copy puts [`copy_text`] on the clipboard (the private one in a harness) and
+    /// leaves the dialog open; Close closes it. `None` for any other dialog.
+    pub(crate) fn about_click(
+        &mut self,
+        button: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<(), String>> {
+        let tab = self.tabs.get_mut(self.active)?;
+        if tab.dialogs.top()?.owner != DialogOwner::About {
+            return None;
+        }
+        let done = tab.dialogs.click(button, |_| Ok(()));
+        if done.is_ok() && button == "Copy" {
+            self.clipboard_write(copy_text(info()), cx);
+        }
+        Some(done)
+    }
 }
 
 /// `--version`: print the block and return, for `main` to exit. A release build
@@ -61,6 +132,7 @@ pub(crate) fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dialog::DialogStack;
 
     #[test]
     fn the_suite_reports_its_own_version() {
@@ -112,8 +184,10 @@ mod tests {
     }
 
     #[test]
-    fn rows_list_every_field() {
-        let labels: Vec<String> = rows(info()).into_iter().map(|r| r.0).collect();
+    fn the_dialog_lists_every_field_with_copy_and_close() {
+        let i = info();
+        let d = dialog(i);
+        let names: Vec<&str> = d.controls.iter().map(|c| c.name).collect();
         for want in [
             "commit",
             "branch",
@@ -126,7 +200,20 @@ mod tests {
             "host",
             "kind",
         ] {
-            assert!(labels.iter().any(|l| l == want), "{want} in {labels:?}");
+            assert!(names.contains(&want), "{want} in {names:?}");
         }
+        // The marker is a row exactly when the build is manual.
+        assert_eq!(names.contains(&"manual"), i.manual());
+        let labels: Vec<&str> = d.buttons.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["Copy", "Close"]);
+        let mut stack = DialogStack::default();
+        stack.push(d);
+        // Enter and Escape both press Close; Copy leaves the dialog open.
+        assert_eq!(stack.key_button("enter", true).as_deref(), Some("Close"));
+        assert_eq!(stack.key_button("escape", true).as_deref(), Some("Close"));
+        stack.click("Copy", |_| Ok(())).unwrap();
+        assert!(stack.is_open());
+        stack.click("Close", |_| Ok(())).unwrap();
+        assert!(!stack.is_open());
     }
 }
