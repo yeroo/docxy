@@ -9602,7 +9602,8 @@ impl Docxy {
     }
 
     /// Ctrl+N (#631): a new blank document on a document tab, a new workbook
-    /// on a workbook tab; on any other tab it does nothing. `None` for a key
+    /// on a workbook tab; on any other tab it does nothing. Ctrl+W (#629):
+    /// close the active tab, as File > Close and its X do. `None` for a key
     /// that is not one of these.
     fn document_key(
         &mut self,
@@ -9620,6 +9621,14 @@ impl Docxy {
                 let kind = self.tabs.get(self.active).map_or(Kind::Docx, |t| t.kind);
                 if matches!(kind, Kind::Docx | Kind::Xlsx) {
                     self.add_tab(kind, window, cx);
+                }
+                Some(())
+            }
+            "w" => {
+                self.keytips = KeyTip::Off;
+                if self.active < self.tabs.len() {
+                    self.backstage = false;
+                    self.close_tab(self.active, window, cx);
                 }
                 Some(())
             }
@@ -17767,7 +17776,7 @@ impl Docxy {
     /// swallows Tab for focus traversal before on_key_down sees it).
     fn tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // An open dialog takes Tab too; see `on_key`.
-        if self.dialog_takes_key("tab", None, Modifiers::default(), cx) {
+        if self.dialog_takes_key("tab", None, Modifiers::default(), window, cx) {
             return;
         }
         if self.tab_more_open {
@@ -17877,7 +17886,7 @@ impl Docxy {
             shift: true,
             ..Modifiers::default()
         };
-        if self.dialog_takes_key("tab", None, shift, cx) {
+        if self.dialog_takes_key("tab", None, shift, window, cx) {
             return;
         }
         if self.tab_more_open {
@@ -17928,6 +17937,7 @@ impl Docxy {
             &ev.keystroke.key,
             ev.keystroke.key_char.as_deref(),
             ev.keystroke.modifiers,
+            window,
             cx,
         ) {
             return;

@@ -1,6 +1,14 @@
 //! Single-tab close always asks about dirty work: removing a tab also removes
 //! it from hot-exit recovery. `ask_on_close` only governs closing the window.
+//!
+//! The question is an in-app dialog on the tab's own [`DialogStack`] (#629),
+//! never a native box: Word's "Save your changes to this file?" with a File
+//! name, a location and More options... for a document, and the plain "Save
+//! changes to … before closing?" for a workbook or a Project. Its presses
+//! come through [`Docxy::close_prompt_click`].
 use super::*;
+use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CloseAnswer {
@@ -13,6 +21,8 @@ pub(crate) enum CloseAnswer {
 enum CloseStep {
     /// Clean: remove it.
     Remove,
+    /// Dirty, with no answer yet: open the close prompt.
+    Ask,
     /// Dirty, answered Don't Save: remove it, keeping a draft if it qualifies.
     Discard,
     Save,
@@ -151,22 +161,268 @@ pub(crate) fn prepare_sheet_save(tab: &mut DocTab) -> Result<(), String> {
     commit_changed_cell(tab)
 }
 
-fn close_step(
-    tab: &mut DocTab,
-    ask: impl FnOnce(&DocTab) -> Result<CloseAnswer, String>,
-) -> CloseStep {
+/// What closing `tab` does: `answer` is how a dirty tab was answered, or
+/// `None` when it has not been asked yet.
+fn close_step(tab: &mut DocTab, answer: impl FnOnce(&DocTab) -> Option<CloseAnswer>) -> CloseStep {
     if let Err(message) = commit_pending_for_close(tab) {
         return CloseStep::Refuse(message);
     }
     if !tab.dirty {
         return CloseStep::Remove;
     }
-    match ask(tab) {
-        Ok(CloseAnswer::Save) => CloseStep::Save,
-        Ok(CloseAnswer::Discard) => CloseStep::Discard,
-        Ok(CloseAnswer::Cancel) => CloseStep::Keep,
-        Err(message) => CloseStep::Refuse(message),
+    match answer(tab) {
+        Some(CloseAnswer::Save) => CloseStep::Save,
+        Some(CloseAnswer::Discard) => CloseStep::Discard,
+        Some(CloseAnswer::Cancel) => CloseStep::Keep,
+        None => CloseStep::Ask,
     }
+}
+
+/// What a tab with a dialog open says when it is asked to close: the
+/// dialog is staged work of its own, so it is closed first.
+pub(crate) const CLOSE_DIALOG_FIRST: &str = "Close the open dialog first";
+
+/// What More options... says under the harness, which cannot open a native
+/// Save As dialog.
+const MORE_OPTIONS_HARNESS: &str =
+    "a harness instance cannot open the Save As dialog; use the File name and location";
+
+/// Word's close prompt's title.
+pub(crate) const SAVE_PROMPT_TITLE: &str = "Save your changes to this file?";
+
+/// Whether the tab's Save writes its own file, as it is (not Save As): what
+/// an unchanged File name and location mean in the close prompt.
+fn saves_in_place(tab: &DocTab) -> bool {
+    tab.path.is_some() && !tab.access.save_needs_dialog() && !tab.import.binary_source
+}
+
+/// The close prompt's File name, its fixed extension and its locations for
+/// a document tab.
+#[derive(Debug, PartialEq, Eq)]
+struct PromptName {
+    stem: String,
+    /// The tab's own save extension (`.md`, `.html`, …) when it saves in
+    /// place, else `.docx`: a new name keeps it.
+    ext: String,
+    locations: Vec<PathBuf>,
+}
+
+/// [`PromptName`] for `tab`, offering `known` folders (Documents, Desktop)
+/// after its own.
+fn prompt_name(tab: &DocTab, known: &[PathBuf]) -> PromptName {
+    let in_place = saves_in_place(tab);
+    let own_ext = tab
+        .path
+        .as_deref()
+        .filter(|p| in_place && doc_target_allowed(p))
+        .and_then(|p| p.extension())
+        .map(|e| format!(".{}", e.to_string_lossy()));
+    let ext = own_ext.unwrap_or_else(|| ".docx".into());
+    let name = match tab.path.as_deref().filter(|_| in_place) {
+        Some(path) => file_name(path),
+        None => doc_save_as_name(tab),
+    };
+    let stem = name
+        .strip_suffix(&ext)
+        .or_else(|| {
+            let lower = name.to_ascii_lowercase();
+            lower
+                .ends_with(&ext.to_ascii_lowercase())
+                .then(|| &name[..name.len() - ext.len()])
+        })
+        .unwrap_or(&name)
+        .to_string();
+    // The tab's own folder first: its file's, or an imported document's
+    // original's.
+    let own_dir = doc_import::save_dir(tab)
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            tab.path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+        .map(|d| {
+            if d.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                d
+            }
+        });
+    let mut locations: Vec<PathBuf> = Vec::new();
+    for dir in own_dir.into_iter().chain(known.iter().cloned()) {
+        if !locations.iter().any(|l| l == &dir) {
+            locations.push(dir);
+        }
+    }
+    if locations.is_empty() {
+        locations.push(PathBuf::from("."));
+    }
+    PromptName {
+        stem,
+        ext,
+        locations,
+    }
+}
+
+/// The folders every close prompt offers after the tab's own. A harness
+/// instance offers its sandbox instead, so a script never writes into the
+/// user's own folders.
+fn known_locations(harness: bool) -> Vec<PathBuf> {
+    if harness {
+        return vec![config_root()];
+    }
+    let known: Vec<PathBuf> = [dirs::document_dir(), dirs::desktop_dir()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if known.is_empty() {
+        dirs::home_dir().into_iter().collect()
+    } else {
+        known
+    }
+}
+
+/// Where the close prompt's Save writes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PromptSave {
+    /// The tab's own file, as Save would.
+    InPlace,
+    /// A new file.
+    To(PathBuf),
+}
+
+/// The characters Word refuses in a file name.
+const BAD_NAME_CHARS: [char; 9] = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+
+/// Where Save goes for the File name `stem` in `location`, with the fixed
+/// extension `ext`: the tab's own file in place when that is what it names
+/// and the tab saves in place (`in_place`), else that new file. An existing
+/// file that is not the tab's own (`own`) is refused, as are an empty name
+/// and one with characters a file name cannot hold.
+fn prompt_target(
+    stem: &str,
+    ext: &str,
+    location: &Path,
+    own: Option<&Path>,
+    in_place: bool,
+) -> Result<PromptSave, String> {
+    let mut stem = stem.trim();
+    // A typed extension is the fixed one: `report.docx` is `report`.
+    if stem.len() > ext.len()
+        && stem
+            .to_ascii_lowercase()
+            .ends_with(&ext.to_ascii_lowercase())
+    {
+        stem = stem[..stem.len() - ext.len()].trim_end();
+    }
+    if stem.is_empty() {
+        return Err("Type a file name to save the document".into());
+    }
+    if stem.contains(BAD_NAME_CHARS) || stem.chars().any(char::is_control) {
+        return Err(
+            "A file name can't contain any of these characters: \\ / : * ? \" < > |".into(),
+        );
+    }
+    let target = location.join(format!("{stem}{ext}"));
+    let own_file = own.is_some_and(|own| writes_own_file(Some(own), Some(&target)));
+    if own_file && in_place {
+        return Ok(PromptSave::InPlace);
+    }
+    if !own_file && target.exists() {
+        return Err(format!(
+            "{} already exists; choose another name, or use More options... to replace it",
+            file_name(&target)
+        ));
+    }
+    Ok(PromptSave::To(target))
+}
+
+/// Word's close prompt for a document tab.
+fn doc_prompt(name: &PromptName, quit: bool) -> Dialog {
+    let mut d = Dialog::message(
+        "save-on-close",
+        SAVE_PROMPT_TITLE,
+        String::new(),
+        &[],
+        DialogOwner::SaveOnClose { quit },
+    );
+    d.text = None;
+    let mut location = Control::new(
+        "location",
+        "Choose a Location:",
+        ControlKind::Dropdown,
+        Value::Choice(Some(0)),
+    );
+    location.items = name
+        .locations
+        .iter()
+        .map(|l| l.display().to_string())
+        .collect();
+    d.controls = vec![
+        Control::new(
+            "file-name",
+            "File name:",
+            ControlKind::Text,
+            Value::Text(name.stem.clone()),
+        ),
+        Control::new(
+            "extension",
+            "",
+            ControlKind::Label,
+            Value::Text(name.ext.clone()),
+        ),
+        location,
+    ];
+    d.buttons = vec![
+        Button {
+            default: true,
+            ..Button::new("Save", ButtonRole::Accept)
+        },
+        Button::new("Don't Save", ButtonRole::Accept),
+        Button::new("Cancel", ButtonRole::Cancel),
+        Button::new("More options...", ButtonRole::Apply),
+    ];
+    d.focus = Some(0);
+    d.mark_opened();
+    d
+}
+
+/// The close prompt for a workbook or a Project tab titled `title`.
+fn message_prompt(title: &str, quit: bool) -> Dialog {
+    Dialog::message(
+        "save-on-close",
+        "docxy",
+        format!("Save changes to {title} before closing?"),
+        &[
+            ("Save", ButtonRole::Accept),
+            ("Don't Save", ButtonRole::Accept),
+            ("Cancel", ButtonRole::Cancel),
+        ],
+        DialogOwner::SaveOnClose { quit },
+    )
+}
+
+/// The close prompt for `tab`, offering `known` folders after its own.
+fn close_prompt(tab: &DocTab, quit: bool, known: &[PathBuf]) -> Dialog {
+    match &tab.surface {
+        Surface::Doc(_) => doc_prompt(&prompt_name(tab, known), quit),
+        _ => message_prompt(&tab.title, quit),
+    }
+}
+
+/// Where the open document close prompt `d` saves `tab`.
+fn prompt_dialog_target(tab: &DocTab, d: &Dialog) -> Result<PromptSave, String> {
+    let stem = crate::page_setup::text_of(d, "file-name");
+    let ext = crate::page_setup::text_of(d, "extension");
+    let location = crate::page_setup::text_of(d, "location");
+    prompt_target(
+        &stem,
+        &ext,
+        Path::new(&location),
+        tab.path.as_deref(),
+        saves_in_place(tab),
+    )
 }
 
 fn remove_tab(tabs: &mut Vec<DocTab>, active: &mut usize, i: usize) {
@@ -188,10 +444,11 @@ impl Docxy {
         self.close_tab_with(i, None, window, cx);
     }
 
-    /// Close tab `i`, asking about unsaved work (or taking `answer` under the
-    /// harness). Returns why a Don't Save draft was not kept, if it was not
-    /// (#613): the harness reports it, since with no tab left there is no
-    /// status line to carry it.
+    /// Close tab `i`. A dirty tab with no `answer` (the harness's
+    /// `close-tab` may give one) opens the close prompt on it, which answers
+    /// later through [`Self::close_prompt_click`]. Returns why a Don't Save
+    /// draft was not kept, if it was not (#613): the harness reports it,
+    /// since with no tab left there is no status line to carry it.
     pub(super) fn close_tab_with(
         &mut self,
         i: usize,
@@ -202,35 +459,15 @@ impl Docxy {
         if i >= self.tabs.len() {
             return None;
         }
+        if self.tabs[i].dialogs.is_open() {
+            self.refuse_close_under_dialog(i, window, cx);
+            return None;
+        }
         self.flush_project_passes(cx);
         self.project_prompt_cancel();
         let previous_active = self.active;
         let harness = self.harness.is_some();
-        let step = close_step(&mut self.tabs[i], |tab| {
-            if harness {
-                // A native modal dialog blocks the harness control pump.
-                return answer.ok_or_else(|| {
-                    "Unsaved changes: close refused; a harness close needs save, discard or cancel"
-                        .into()
-                });
-            }
-            let result = rfd::MessageDialog::new()
-                .set_title("docxy")
-                .set_description(format!("Save changes to {} before closing?", tab.title))
-                .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
-                    "Save".into(),
-                    "Don't Save".into(),
-                    "Cancel".into(),
-                ))
-                .show();
-            Ok(match result {
-                rfd::MessageDialogResult::Custom(label) if label == "Save" => CloseAnswer::Save,
-                rfd::MessageDialogResult::Custom(label) if label == "Don't Save" => {
-                    CloseAnswer::Discard
-                }
-                _ => CloseAnswer::Cancel,
-            })
-        });
+        let step = close_step(&mut self.tabs[i], |_| answer);
         if !step.removes() && self.active != i {
             self.active = i;
             self.drop_grid_state();
@@ -257,6 +494,11 @@ impl Docxy {
         let remove = match step {
             CloseStep::Remove | CloseStep::Discard => true,
             CloseStep::Keep => false,
+            CloseStep::Ask => {
+                let prompt = close_prompt(&self.tabs[i], false, &known_locations(harness));
+                self.tabs[i].dialogs.push(prompt);
+                false
+            }
             CloseStep::Refuse(message) => {
                 self.tabs[i].status = message.into();
                 false
@@ -292,6 +534,119 @@ impl Docxy {
         self.persist();
         self.refocus(window, cx);
         draft_error
+    }
+
+    /// A tab with a dialog open does not close: it comes to the front with
+    /// its dialog, and says so.
+    fn refuse_close_under_dialog(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active != i {
+            self.active = i;
+            self.drop_grid_state();
+        }
+        self.tabs[i].status = CLOSE_DIALOG_FIRST.into();
+        self.refocus(window, cx);
+    }
+
+    /// A press of `button` on the active tab's close prompt; `None` when
+    /// the dialog on top is not one. Save saves (in place, or to the File
+    /// name in the location) and then closes; a save that fails leaves the
+    /// prompt open with the reason. Don't Save closes without saving,
+    /// Cancel keeps the tab, and More options... asks for a file with Save
+    /// As and saves there.
+    pub(crate) fn close_prompt_click(
+        &mut self,
+        button: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<(), String>> {
+        let i = self.active;
+        let top = self.tabs.get(i)?.dialogs.top()?;
+        let DialogOwner::SaveOnClose { quit } = top.owner else {
+            return None;
+        };
+        let Some(pressed) = top
+            .buttons
+            .iter()
+            .find(|b| b.label.eq_ignore_ascii_case(button) && b.enabled)
+            .map(|b| b.label.clone())
+        else {
+            let labels: Vec<&str> = top.buttons.iter().map(|b| b.label.as_str()).collect();
+            return Some(Err(format!(
+                "no button '{button}'; buttons: {}",
+                labels.join(", ")
+            )));
+        };
+        let done = match pressed.as_str() {
+            "Cancel" => {
+                self.tabs[i].dialogs.pop();
+                self.close_prompt_answered(i, CloseAnswer::Cancel, quit, window, cx);
+                Ok(())
+            }
+            "Don't Save" => {
+                self.tabs[i].dialogs.pop();
+                self.close_prompt_answered(i, CloseAnswer::Discard, quit, window, cx);
+                Ok(())
+            }
+            "Save" => {
+                let target = match &self.tabs[i].surface {
+                    Surface::Doc(_) => prompt_dialog_target(&self.tabs[i], top),
+                    _ => Ok(PromptSave::InPlace),
+                };
+                target.and_then(|t| self.close_prompt_save(i, t, quit, window, cx))
+            }
+            _ if self.harness.is_some() => Err(MORE_OPTIONS_HARNESS.into()),
+            _ => match self.pick_doc_save_target() {
+                Some(path) => self.close_prompt_save(i, PromptSave::To(path), quit, window, cx),
+                // Cancelled: back to the prompt.
+                None => Ok(()),
+            },
+        };
+        cx.notify();
+        Some(done)
+    }
+
+    /// The close prompt's Save on tab `i` (the active one): save to
+    /// `target`, then close as answered. A save that does not leave the tab
+    /// clean keeps the prompt open and says why.
+    fn close_prompt_save(
+        &mut self,
+        i: usize,
+        target: PromptSave,
+        quit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        match target {
+            PromptSave::InPlace => self.save_active(window, cx),
+            PromptSave::To(path) => {
+                self.save_doc_to(Some(path), window, cx);
+            }
+        }
+        let tab = &mut self.tabs[i];
+        if tab.dirty {
+            return Err(tab.status.to_string());
+        }
+        tab.dialogs.pop();
+        self.close_prompt_answered(i, CloseAnswer::Save, quit, window, cx);
+        Ok(())
+    }
+
+    /// Tab `i`'s close prompt was answered (and closed): close the tab as
+    /// answered. A Save has already saved it, so it closes clean.
+    fn close_prompt_answered(
+        &mut self,
+        i: usize,
+        answer: CloseAnswer,
+        _quit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match answer {
+            CloseAnswer::Cancel => {}
+            CloseAnswer::Save | CloseAnswer::Discard => {
+                self.close_tab_with(i, Some(answer), window, cx);
+            }
+        }
     }
 }
 

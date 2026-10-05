@@ -11,7 +11,11 @@ test pathless document Ctrl+S and close Save refuse and Backstage Close uses the
   call backstage-close {}
   assert tabs is 1
   assert dirty is true
-  assert status is Unsaved changes: close refused; a harness close needs save, discard or cancel
+  assert dialog is save-on-close
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  assert tabs is 1
+  assert dirty is true
   call close-tab {"answer":"save"}
   assert tabs is 1
   assert dirty is true

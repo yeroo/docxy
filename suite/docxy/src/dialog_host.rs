@@ -98,6 +98,9 @@ fn apply_dialog(
         | DialogOwner::DesignBorderOptions => {
             Err("a Design dialog applies through the Design tab".into())
         }
+        // Handled in `close::close_prompt_click`, before this: it closes
+        // the tab, or goes on with the window's close.
+        DialogOwner::SaveOnClose { .. } => Err("closing a tab applies through the app".into()),
         // Handled in `user_name::click`, before this: it is the app's.
         DialogOwner::UserName => Err("the user name is an app setting".into()),
         #[cfg(test)]
@@ -260,9 +263,19 @@ impl Docxy {
     }
 
     /// Press a button on the active tab's top dialog.
-    pub(crate) fn dialog_press(&mut self, button: &str) -> Result<(), String> {
+    pub(crate) fn dialog_press(
+        &mut self,
+        button: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         // The user name is the app's setting, not the tab's (#620).
         if let Some(done) = self.user_name_click(button) {
+            return done;
+        }
+        // The close prompt closes the tab, or goes on with the window's
+        // close (#629, #630).
+        if let Some(done) = self.close_prompt_click(button, window, cx) {
             return done;
         }
         let reopen = reopen_on_top(self.tabs.get(self.active));
@@ -289,10 +302,30 @@ impl Docxy {
         key: &str,
         typed: Option<&str>,
         m: Modifiers,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         // Enter or Escape on the user name dialog presses through the app.
         let plain = !m.control && !m.alt && !m.platform;
+        // So do they on the close prompt (#629): Save, or Cancel.
+        let close_button = self
+            .tabs
+            .get(self.active)
+            .filter(|t| {
+                t.dialogs
+                    .top()
+                    .is_some_and(|d| matches!(d.owner, DialogOwner::SaveOnClose { .. }))
+            })
+            .and_then(|t| t.dialogs.key_button(key, plain));
+        if let Some(label) = close_button {
+            if let Some(Err(e)) = self.close_prompt_click(&label, window, cx) {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.status = e.into();
+                }
+            }
+            cx.notify();
+            return true;
+        }
         let user_name_button = self
             .tabs
             .get(self.active)
@@ -327,7 +360,7 @@ impl Docxy {
     }
 
     fn dialog_button_click(&mut self, button: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(e) = self.dialog_press(button) {
+        if let Err(e) = self.dialog_press(button, window, cx) {
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 tab.status = e.into();
             }

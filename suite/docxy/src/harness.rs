@@ -2840,12 +2840,16 @@ pub fn dispatch(
         "dialog-click" => {
             let button = arg_str(args, "button")?.to_string();
             open_dialogs(app)?;
-            app.dialog_press(&button)?;
+            app.dialog_press(&button, window, cx)?;
             app.refocus(window, cx);
             let Json::Obj(mut out) = state(app, window) else {
                 unreachable!("state is an object")
             };
-            let dialog = app.tabs[app.active].dialogs.to_json();
+            // A close prompt's Save or Don't Save may have closed the last tab.
+            let dialog = app.tabs.get(app.active).map_or_else(
+                || crate::dialog::DialogStack::default().to_json(),
+                |t| t.dialogs.to_json(),
+            );
             match out.iter_mut().find(|(k, _)| k == "dialog") {
                 Some((_, v)) => *v = dialog,
                 None => out.push(("dialog".into(), dialog)),
