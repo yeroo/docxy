@@ -446,6 +446,7 @@ footer editor; `selection-set` refuses while it is open.
 | `selection-set {"start":5,"end":1}` | set main-story anchor and caret through `Editor`; backward selections keep the larger anchor; an empty range leaves a collapsed caret, the state a click leaves; both offsets are validated before either changes |
 | `ribbon-read {}` | list File, ribbon tabs and the contextual tabs — Header & Footer while a header or footer is being edited, Table while the caret is in a table, Gantt Chart Format while a Project's Gantt shows — with groups, commands, galleries and Quick Access Toolbar. The Header from Top and Footer from Bottom boxes carry the `value` they show (`0.5"`). Each `qat` item carries `enabled` and `menu` (a split button with a drop-down). On a document tab `qat-undo` has `menu: true`, and `qat-redo` reads `Redo` (tip `Redo (Ctrl+Y)`) while there is something to redo, else `Repeat` (#618): tip `Repeat (Ctrl+Y)` when Ctrl+Y / F4 would repeat the last action, or `Can't Repeat` with `enabled: false` |
 | `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command on a valid tab, contextual tabs included, by id, else by unique label, else by unique screentip title, and invoke the same action handler as its button |
+| `ribbon-layout {}` (or `{"tab":"Data"}`) | where each group of the shown ribbon tab drew its content, from the last frame (#1018): per group `title`, `bounds`, `content_bounds` (the union of its button columns and row stacks, `null` for a group of lone large buttons), `clipped_v` (content taller than the group body: it runs past the title row or out of the group) and `clipped_h`; `hidden: true` for a group the responsive ribbon dropped; plus `any_clipped_v` and `any_clipped_h`. Works on document, Project and sheet tabs. With `tab` it shows that tab first; any call whose last frame is not the shown tab's (a tab was just switched, by `tab` or by another verb) answers `settled: false` with no groups, because the groups are drawn a frame later: take a `shot window`, then ask again. A contextual tab that is not active (Table outside a table), Protected View and a final document (no ribbon body is drawn) are refused; `tab` is refused under a dialog, the plain read is not. Like `title-bar` it reads probes, so settle with a `shot` after any verb that changes the ribbon. A debug build also prints a warning once per clipped group |
 | `status-read {}` | read the tab's status line as an ordered `items` array of `{id, text}`: on a Project tab `state` (Ready/Edit/Busy), `new-tasks` (`New Tasks: …`) and `message`; on other tabs only `message` (a document's word-count stats are not reported) |
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items (`Info` only while the active tab is a document); `close` returns to the tab |
 | `app-info {}` | the build this suite is (#1023): `{version, commit, short_commit, commit_len, commit_hex, branch, commit_date, dirty, last_pr, last_pr_title, issue, ahead, built_at, profile, target, host, kind, manual, summary}`; `kind` is `release`, `ci` or `local`, `manual` is `kind == local \|\| dirty`. Served by normal Project control too |
@@ -495,12 +496,21 @@ that do nothing yet (Format Painter, Underline, Cell Styles, Spelling, …) are
 `enabled: false`, and `ribbon-click` refuses them (`'Spelling' is not
 implemented`) instead of replying green over a no-op. `ribbon-click` resolves
 by id, else label, else the drawn text (`Σ AutoSum`), selects the tab and runs
-the button's own `run_sheet_act`. Buttons that open a bar (Conditional
+the button's own `run_sheet_act` (a drop-down button opens its menu; a menu item
+is clicked through the menu, see below). Buttons that open a bar (Conditional
 Formatting, …) leave it open for `type` and `key enter`, as a click
 does. Home's Paste is a split button, and Fill, Clear and Find & Select open
 menus (#707): `menu-open {"ribbon": [tab, group, command]}` opens them, and a
 `ribbon-click` of Fill, Clear or Find & Select opens its menu as the click
-does. `sheet-ribbon.uit` covers these.
+does. Home > Editing's Sort & Filter is a drop-down (#1018): `menu-open
+{"target":{"ribbon":["Home","Editing","Sort & Filter"]}}` opens it (a button
+with no menu is refused: `sheet command 'Bold' opens no menu`) and
+`menu-click` picks an item. Its items are listed after the button in
+`ribbon-read` and `ribbon-click` takes their ids (`sort-a-z`, `custom-sort`,
+`filter`, `home-clear-filter`, `home-reapply-filter`) or labels, opening the menu
+and clicking the item through `menu_activate`. A name that is both a ribbon
+button and a menu item (`Clear`) resolves to the button, which opens the Clear
+menu. `sheet-ribbon.uit` and `ribbon-fit.uit` cover these.
 
 Levelling (Level, Level All, Clear Leveling, Ctrl+Shift+L) is asked for, not
 run, so the Project status bar can draw `Busy`; render schedules the pass for
@@ -1105,6 +1115,11 @@ Menus open today:
   edit, and lists Project's Gantt Chart row menu in Project's order;
 - **Set Baseline's split menu**: the lower half of Project › Schedule › Set
   Baseline (`Set Baseline...`, `Clear Baseline...`);
+- **the sheet ribbon's Sort & Filter drop-down** (#1018): Home › Editing. Six
+  items (Sort A to Z, Sort Z to A, Custom Sort..., Filter, Clear, Reapply),
+  each running the Data tab's matching act (Custom Sort... is Data's Sort). `menu-open
+  {"target":{"ribbon":["Home","Editing","Sort & Filter"]}}` or `ribbon-click`
+  on the button opens it; `ribbon-click` on an item opens it and clicks it;
 - **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New
   Comment): right-click a document body. It never opens on a sheet or a
   Project, and `menu-open {"target":"document"}` refuses on both;
@@ -1153,7 +1168,7 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619) | the menu, as `menu-read` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select, Sort & Filter), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619) | the menu, as `menu-read` |
 | `menu-read` | `{}` | `{open: true, target, items, highlight}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null |
 | `menu-click` | `{label}` among the top-level items, `{path: [labels]}` through submenus, or `{index}`: the top-level item at that 0-based index, separators and headings not counted, for labels that repeat | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |

@@ -587,6 +587,26 @@ pub(crate) fn cell_menu() -> Vec<MenuItem> {
     ]
 }
 
+/// A sheet ribbon drop-down's menu (Sort & Filter), from the items of its
+/// `sheet_ribbon` table entry. An item shows the text its entry gives it
+/// (`Custom Sort...`) and runs the act the ribbon button would. `on` says
+/// whether an act's state is on (Filter while the sheet has an AutoFilter):
+/// that item is ticked.
+pub(crate) fn sheet_dropdown(
+    items: &[crate::sheet_ribbon::SheetCmd],
+    on: impl Fn(crate::SheetAct) -> bool,
+) -> Vec<MenuItem> {
+    items
+        .iter()
+        .map(|c| {
+            MenuItem::Item(
+                Entry::new(c.id, c.text(false), "", Act::Sheet(c.act), c.enabled())
+                    .checked(on(c.act)),
+            )
+        })
+        .collect()
+}
+
 /// Pick From Drop-down List's menu (#665): one item per entry, in order
 /// (gridcore bounds the list at `MENU_LIMIT`).
 pub(crate) fn pick_menu(values: &[String]) -> Vec<MenuItem> {
@@ -839,6 +859,29 @@ mod tests {
         );
         none.step(true);
         assert_eq!(none.hi, None);
+    }
+
+    #[test]
+    fn the_sort_filter_menu_ticks_only_the_item_whose_state_is_on() {
+        let home = crate::sheet_ribbon::tab_def(crate::RibbonTab::Home);
+        let dd = home
+            .groups
+            .iter()
+            .find_map(|g| g.dropdown("sort-filter"))
+            .unwrap();
+        let ticked = |on_filter: bool| -> Vec<String> {
+            sheet_dropdown(dd.items, |a| {
+                on_filter && matches!(a, crate::SheetAct::Filter)
+            })
+            .iter()
+            .filter_map(|i| match i {
+                MenuItem::Item(e) if e.checked => Some(e.label.clone()),
+                _ => None,
+            })
+            .collect()
+        };
+        assert!(ticked(false).is_empty());
+        assert_eq!(ticked(true), ["Filter"]);
     }
 
     #[test]
