@@ -3563,8 +3563,12 @@ impl App {
     }
 
     fn rule_state(&self, sheet: usize) -> RuleState {
-        let s = &self.pkg.workbook.sheets[sheet];
-        (s.validations.clone(), s.dv_removed.clone())
+        self.pkg
+            .workbook
+            .sheets
+            .get(sheet)
+            .map(|s| (s.validations.clone(), s.dv_removed.clone()))
+            .unwrap_or_default()
     }
 
     fn put_rules(&mut self, sheet: usize, state: &RuleState) {
@@ -6191,7 +6195,21 @@ impl App {
         }
     }
 
+    /// Close the data-validation dialog, alert and dropdown, which hold a
+    /// sheet, a cell and choices read from a workbook that has changed under
+    /// them; an alert takes its editor with it.
+    fn close_validation_ui(&mut self) {
+        self.validation_dialog = None;
+        self.dv_picker = None;
+        if self.dv_alert.take().is_some() {
+            self.edit = None;
+        }
+        self.commit_cont = Cont::Nothing;
+    }
+
     fn reset_view(&mut self) {
+        self.close_validation_ui();
+        self.circles.clear();
         // A workbook opens on the sheet it was saved on.
         let wb = &self.pkg.workbook;
         self.sheet = wb.active_tab.min(wb.sheets.len().saturating_sub(1));
@@ -10247,6 +10265,12 @@ fn run_control(
         } else {
             app.close_data_form();
         }
+    }
+    // The data-validation dialog, alert and dropdown hold a sheet or a cell:
+    // a verb that moves them (a sheet removed, a workbook opened or reloaded)
+    // closes them, the alert's editor with it.
+    if result.is_ok() && control::mutates(verb) && !control::keeps_cells_in_place(verb) {
+        app.close_validation_ui();
     }
     app.flush_circle_warning();
     result
@@ -20586,6 +20610,37 @@ mod tests {
             assert!(keys.contains(&k), "{k}");
         }
         assert!(!keys.contains(&gridcore::options::KEY_FLASH_FILL_AUTO));
+    }
+    #[test]
+    fn a_verb_that_moves_sheets_closes_the_validation_dialog_and_alert() {
+        use ctlcore::json::Json;
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Second");
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.sheet = 1;
+        app.cur = (1, 1);
+        app.open_validation_dialog();
+        assert!(app.validation_dialog.is_some());
+        // The sheet the dialog is over is removed: no panic, the dialog closes.
+        let args = Json::obj(vec![("sheet", Json::Num(1.0))]);
+        run_control(&mut app, "sheet.remove", &args).unwrap();
+        assert!(app.validation_dialog.is_none());
+        assert_eq!(app.sheet, 0);
+
+        // An alert pending on a typed entry goes when the workbook is reloaded.
+        let mut app = dv_app(gridcore::sheet::AlertStyle::Warning);
+        let dir = std::env::temp_dir().join(format!("xlsxy-dv-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("book.xlsx");
+        std::fs::write(&path, save_xlsx(&app.pkg)).unwrap();
+        app.path = path.to_string_lossy().into_owned();
+        type_text(&mut app, "250");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_some());
+        run_control(&mut app, "wb.reload", &Json::Null).unwrap();
+        assert!(app.dv_alert.is_none() && app.edit.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
