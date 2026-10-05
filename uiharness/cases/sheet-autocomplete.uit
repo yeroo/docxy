@@ -1,0 +1,80 @@
+# AutoComplete and Pick From Drop-down List (#665): ENT-CASE-029 and
+# ENT-CASE-030 on fixtures/autocomplete.xlsx (A1:A5 Widgets, Gadgets,
+# Gizmos, 100, Grommets; A6 empty; A7 Sprockets).
+
+# ENT-CASE-029: a unique prefix completes from the block the cell sits in.
+# While the proposal shows, the typed letters stay as typed (#672); the commit
+# takes the column's case.
+test ENT-CASE-029 autocomplete completes a unique prefix from the block
+  open copy:../fixtures/autocomplete.xlsx
+  click A8
+  type wid
+  assert edit is wid
+  key escape
+  click A8
+  type spr
+  assert edit is sprockets
+  key enter
+  assert cell A8 is Sprockets
+  click A6
+  type gadg
+  key enter
+  assert cell A6 is Gadgets
+  click A9
+  type g
+  assert edit is g
+  key escape
+  click A9
+  type giz
+  key enter
+  assert cell A9 is Gizmos
+  click A10
+  type 1
+  assert edit is 1
+  key escape
+  click A10
+  type widg
+  key enter
+  assert cell A10 is Widgets
+
+# ENT-CASE-030: Alt+Down lists the block's distinct text, sorted, without
+# numbers or duplicates; Down, Enter enters the first.
+test ENT-CASE-030 alt down picks from the column
+  open copy:../fixtures/autocomplete.xlsx
+  click A6
+  type Widgets
+  key enter
+  click A8
+  key alt+down
+  assert menu.target is pick-list
+  call menu-read {}
+  assert reply.items.0.label is Gadgets
+  assert reply.items.1.label is Gizmos
+  assert reply.items.2.label is Grommets
+  assert reply.items.3.label is Sprockets
+  assert reply.items.4.label is Widgets
+  assert reply.highlight is null
+  key down
+  key enter
+  assert menu is null
+  assert cell A8 is Gadgets
+  click A9
+  key alt+down down down enter
+  assert cell A9 is Gizmos
+
+test the cell menu and a typed entry open the pick list too
+  open copy:../fixtures/autocomplete.xlsx
+  click A8
+  call menu-open {"target":"cell"}
+  call menu-click {"label":"Pick From Drop-down List..."}
+  assert menu.target is pick-list
+  key escape
+  assert menu is null
+  type x
+  key alt+down
+  assert editing is true
+  key down enter
+  assert editing is false
+  assert cell A8 is Sprockets
+  click F3
+  call-error menu-open {"target":"pick-list"} => No entries

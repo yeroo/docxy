@@ -1232,6 +1232,35 @@ function xlsxyToolDefs() {
       ]),
       ['path'],
     ),
+    tool(
+      'xlsxy_flash_fill',
+      'Flash Fill (Ctrl+E): fill the rest of the column of `ref` from the examples typed at its top, by the pattern they show in the columns next to it. One undo group; cells that already hold values are kept. Returns the cells filled (changed) and those the pattern could not fill (blank); no pattern is an error with Excel\'s message.',
+      Object.fromEntries([['ref', prop('string', 'A cell of the column to fill, e.g. "B1".')], sheet(), target()]),
+      ['ref'],
+    ),
+    tool(
+      'xlsxy_autocorrect',
+      'Read or change AutoCorrect (File > Options > Proofing): its switches, replace list and exceptions. With no arguments, returns the state. Everything given is checked before anything is set; saved with the app\'s preferences.',
+      Object.fromEntries([
+        ['options', prop('object', 'Switches by key, e.g. {"ac_replace_text": false, "ac_hyperlinks": false}.')],
+        [
+          'add',
+          propObj(
+            Object.fromEntries([
+              ['replace', prop('string', 'The word to replace.')],
+              ['with', prop('string', 'What replaces it.')],
+              ['overwrite', prop('boolean', 'Replace an existing entry for the word.')],
+            ]),
+            ['replace', 'with'],
+            'Add a replace-list entry. An existing entry with another With is replaced only with overwrite:true.',
+          ),
+        ],
+        ['delete', prop('string', 'Remove the replace-list entry for this Replace text.')],
+        ['exception', prop('object', 'Add or delete an exception: {kind: first_letter|initial_caps, add: word} or {kind, delete: word}.')],
+        target(),
+      ]),
+      [],
+    ),
   ];
 }
 
@@ -1322,6 +1351,8 @@ const XLSXY_VERBS = {
   xlsxy_page_break_reset: 'page-break.reset',
   xlsxy_print_pages: 'print.pages',
   xlsxy_export_pdf: 'wb.export-pdf',
+  xlsxy_flash_fill: 'range.flash-fill',
+  xlsxy_autocorrect: 'app.autocorrect',
 };
 
 /** Execute a tool by forwarding to the control surface. Returns the result

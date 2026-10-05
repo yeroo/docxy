@@ -168,6 +168,14 @@ pub(crate) enum DialogOwner {
     OutlineAxis {
         ungroup: bool,
     },
+    /// A message whose only button is OK, which just closes it (Flash
+    /// Fill's "didn't see a pattern", #666).
+    Message,
+    /// The AutoCorrect dialog, its Exceptions and its "redefine it?"
+    /// question (#667): app settings, pressed in `sheet_autocorrect::click`.
+    AutoCorrect,
+    AutoCorrectExceptions,
+    AutoCorrectRedefine,
     /// Word's "Save your changes to this file?" before a dirty tab closes
     /// (#629), or for a workbook or a Project "Save changes to … before
     /// closing?"; `quit` when it is one of the window close's questions
