@@ -1,0 +1,51 @@
+# Excel's Sort options in the suite (#691): the Sort dialog's levels and
+# custom lists, the Sort Warning for a selection inside a wider list, and the
+# cell menu's sorts. basic.xlsx is A1:C5: Region, Q1, Q2 over North 10,
+# South 20, East 30, West 40.
+
+test sheet sort dialog sorts by a custom list
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-set {"control":"by1","value":"Region"}
+  call dialog-set {"control":"order1","value":"Custom List..."}
+  call dialog-set {"control":"with1","value":"West, East, South, North"}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert cell A2 is West
+  assert cell B2 is 40
+  assert cell A5 is North
+  assert dirty is true
+
+test sheet sort warning continues with the selection
+  open ../fixtures/basic.xlsx
+  click B2
+  click B5 shift
+  call ribbon-click {"tab":"Data","command":"Sort Z to A"}
+  assert dialog is sort-warning
+  assert cell B2 is 10
+  call dialog-set {"control":"what","value":"Continue with the current selection"}
+  call dialog-click {"button":"Sort"}
+  assert dialog is none
+  assert cell B2 is 40
+  assert cell A2 is North
+
+test sheet sort warning expands the selection
+  open ../fixtures/basic.xlsx
+  click B2
+  click B5 shift
+  call ribbon-click {"tab":"Data","command":"Sort Z to A"}
+  assert dialog is sort-warning
+  call dialog-click {"button":"Sort"}
+  assert cell B2 is 40
+  assert cell A2 is West
+  assert cell C2 is 44
+
+test sheet sort from the cell menu
+  open ../fixtures/basic.xlsx
+  click B3
+  call menu-open {"target":"cell"}
+  call menu-click {"path":["Sort","Sort Z to A"]}
+  assert cell A2 is West
+  assert cell A5 is North

@@ -59,6 +59,14 @@
 //! | `page-break.reset` | `{sheet?}` | `{rowBreaks, colBreaks, changed}` — every manual break goes |
 //! | `print.pages` | `{what?:active\|workbook\|selection, sheet?\|sheets?, range?, ignorePrintAreas?, from?, to?}` | `{total, pages:[{sheet, name, range, number, titleRows, titleCols, scale}]}` — the pages printing lays out (hidden sheets print only when named; titles that would fill a page by themselves, at the print scale, don't repeat); `selection` needs `range` (only its printed cells print); a job over 100,000 pages errors with "This would print more than 100000 pages; …" |
 //! | `wb.export-pdf` | `{path, …print.pages args}` | `{path, pages}` — refuses to overwrite; nothing to print errors with "We didn't find anything to print." and writes no file; so does a job over 100,000 pages (the `print.pages` error) |
+//! | `filter.set` | `{range?, col, criteria, sheet?}` | `{shown, total, status, changed}` — AutoFilter on over `range` if needed, then column `col` (header text or letter) set to `criteria` (`values`, `custom`, `top`, `dynamic`, `cellColor`, `fontColor`, `icon`, `search`, or `null` to clear) and the filter applied. One undo step when it changes something |
+//! | `filter.reapply` / `filter.clear` / `filter.off` | `{col?, sheet?}` | `{shown, total, status, changed}` (`filter.off`: `{off, range, changed}`) — one undo step each when it changes something |
+//! | `filter.menu` | `{col, search?, sheet?}` | `{col, header, submenu, items:[{label,depth,checked}], truncated, total, filtered, colors}` |
+//! | `filter.by-cell` | `{ref, by?, sheet?}` | `{shown, total, status, changed}` — Filter by Selected Cell's value/colour/font colour/icon |
+//! | `filter.advanced` | `{list, criteria?, copyTo?, unique?, sheet?}` | `{shown, total, status, changed}` — copying to another sheet is refused |
+//! | `sheet.rows` | `{range, sheet?}` | `{rows:[{row, hidden, hiddenBy}]}` |
+//! | `range.sort` | `{range, keys, header?, caseSensitive?, orientation?, expand?, sheet?}` | `{sorted, range, count, changed}`, or `{sorted:false, warning, expanded}` for a selection inside a wider list |
+//! | `wb.clock` | `{date}` | `{date}` — fixes today (`null`: the local clock) |
 //! | `wb.recalc` | — | `{recalculated:true}` |
 //! | `wb.properties` | — | `{title, tags, categories, subject, comments, company, manager, hyperlinkBase, author, lastModifiedBy, created, modified, custom:[{name,type,value}]}` — File › Info; an absent property is `null`; `type` is `text`/`number`/`bool`/`date`/`other` |
 //! | `wb.set-properties` | `{title?, tags?, categories?, subject?, comments?, company?, manager?, hyperlinkBase?, custom?:{name: value\|null}}` | `wb.properties` + `{changed}` — `null`/`""` removes; a custom value is a string (text), number, bool or `{"date":"YYYY-MM-DD[THH:MM:SSZ]"}`; marks the workbook modified when something changed; NOT on the undo stack (Excel's Info edits aren't either) |
@@ -99,6 +107,79 @@ use gridcore::sheet::{
 const READ_CAP: usize = 5000;
 /// The most matches one `find` returns.
 const FIND_CAP: usize = 200;
+
+mod datacmds;
+
+/// Whether `verb` is an agent edit of the workbook: its cells, sheets,
+/// tables or layout.
+fn edits(verb: &str) -> bool {
+    matches!(
+        verb,
+        "cell.set"
+            | "range.clear"
+            | "comment.add"
+            | "range.set"
+            | "sheet.import-csv"
+            | "sheet.import-text"
+            | "range.text-to-columns"
+            | "wb.replace-all"
+            | "wb.consolidate"
+            | "sheet.add"
+            | "sheet.remove"
+            | "sheet.rename"
+            | "table.rename"
+            | "table.resize"
+            | "table.convert"
+            | "pivot.create"
+            | "row.insert"
+            | "row.delete"
+            | "col.insert"
+            | "col.delete"
+            | "cell.format"
+            | "col.width"
+    )
+}
+
+/// Whether `verb` changes the workbook: an edit ([`edits`]), a filter or a
+/// sort (which hide or move rows, and signal activity themselves, only when
+/// they changed something), or another workbook opened or read back in its
+/// place. What a dialog over it shows may then be gone.
+pub fn mutates(verb: &str) -> bool {
+    edits(verb)
+        || matches!(
+            verb,
+            "filter.set"
+                | "filter.reapply"
+                | "filter.clear"
+                | "filter.off"
+                | "filter.by-cell"
+                | "filter.advanced"
+                | "range.sort"
+                | "wb.open"
+                | "wb.reload"
+        )
+}
+
+/// Whether `verb`, when it [`mutates`] the workbook, leaves every cell and
+/// sheet where it was: it writes, formats or annotates cells in place, or
+/// appends a sheet. A dialog over the workbook can stay open then, reading
+/// what it shows again; any other change (rows or columns moved, a sheet
+/// removed or renamed, a workbook opened, an import) may move what it
+/// shows.
+pub fn keeps_cells_in_place(verb: &str) -> bool {
+    matches!(
+        verb,
+        "cell.set"
+            | "range.set"
+            | "range.clear"
+            | "cell.format"
+            | "col.width"
+            | "comment.add"
+            | "wb.replace-all"
+            | "sheet.add"
+            | "table.rename"
+    )
+}
 
 /// Route one control verb against the live workbook, returning the JSON result
 /// or an error message.
@@ -152,6 +233,16 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "page-break.reset" => page_break_op(app, args, "reset"),
         "print.pages" => print_pages(app, args),
         "wb.export-pdf" => wb_export_pdf(app, args),
+        "filter.set" => datacmds::filter_set(app, args),
+        "filter.reapply" => datacmds::filter_reapply(app, args),
+        "filter.clear" => datacmds::filter_clear(app, args),
+        "filter.off" => datacmds::filter_off(app, args),
+        "filter.menu" => datacmds::filter_menu(app, args),
+        "filter.by-cell" => datacmds::filter_by_cell(app, args),
+        "filter.advanced" => datacmds::filter_advanced(app, args),
+        "sheet.rows" => datacmds::sheet_rows(app, args),
+        "range.sort" => datacmds::range_sort(app, args),
+        "wb.clock" => datacmds::wb_clock(app, args),
         "wb.properties" => Ok(properties_json(app)),
         "wb.set-properties" => set_properties(app, args),
         "wb.recalc" => {
@@ -179,33 +270,13 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
     if out.is_ok() {
         // An agent edit flashes this pane's status dot, so a watcher sees the
         // workbook being worked on.
-        if matches!(
-            verb,
-            "cell.set"
-                | "range.clear"
-                | "comment.add"
-                | "range.set"
-                | "sheet.import-csv"
-                | "sheet.import-text"
-                | "range.text-to-columns"
-                | "wb.replace-all"
-                | "wb.consolidate"
-                | "sheet.add"
-                | "sheet.remove"
-                | "sheet.rename"
-                | "table.rename"
-                | "table.resize"
-                | "table.convert"
-                | "pivot.create"
-                | "row.insert"
-                | "row.delete"
-                | "col.insert"
-                | "col.delete"
-                | "cell.format"
-                | "col.width"
-        ) {
+        if edits(verb) {
             ctlcore::signal_activity();
         }
+        // The filter verbs and `range.sort` signal themselves, only when
+        // they changed something (their replies say `changed`): Clear with
+        // nothing filtered, a Sort Warning reply, or a sort that left every
+        // row in place moved nothing.
         // `comment.remove` can legitimately no-op (nothing on the cell), so it
         // signals itself inside `comment_remove`, gated on `removed:true` — a
         // no-op must not flash the activity dot (docxy's no-op principle).

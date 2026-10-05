@@ -333,7 +333,7 @@ fn patch_attrs(
 
 /// An element with no attributes (namespace declarations count) and nothing
 /// but whitespace inside.
-fn is_bare(frag: &str) -> bool {
+pub(super) fn is_bare(frag: &str) -> bool {
     let mut p = XmlParser::new(frag);
     if p.next() != Event::Start || !p.attrs().is_empty() || !p.namespace_attrs().is_empty() {
         return false;

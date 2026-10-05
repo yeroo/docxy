@@ -76,6 +76,14 @@ fn apply_dialog(
         }
         // Handled in `sheet_consolidate::click`, before this.
         DialogOwner::Consolidate { .. } => Err("Consolidate applies through the Data tab".into()),
+        // Handled in `sheet_filter::click` and `sheet_sort::click`, before this.
+        DialogOwner::FilterMenu { .. }
+        | DialogOwner::CustomFilter { .. }
+        | DialogOwner::Top10Filter { .. }
+        | DialogOwner::AdvancedFilter { .. } => Err("a filter applies through the Data tab".into()),
+        DialogOwner::SortLevels { .. } | DialogOwner::SortWarning { .. } => {
+            Err("a sort applies through the Data tab".into())
+        }
         // Handled in `sheet_outline::click`, before this.
         DialogOwner::Subtotal { .. }
         | DialogOwner::OutlineSettings
@@ -182,6 +190,13 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
     }
     // Consolidate's Add and Delete edit its list; OK consolidates (#694).
     if let Some(done) = crate::sheet_consolidate::click(tab, button) {
+        return done;
+    }
+    // The filter drop-down and its dialogs (#690), and the sorts (#691).
+    if let Some(done) = crate::sheet_filter::click(tab, button) {
+        return done;
+    }
+    if let Some(done) = crate::sheet_sort::click(tab, button) {
         return done;
     }
     if let Some(done) = reopen_click(tab, button) {
@@ -488,6 +503,61 @@ impl Docxy {
                     r.cursor_pointer().on_click(on_widget(cx, i, None))
                 })
                 .into_any_element(),
+            ControlKind::CheckList => {
+                // Virtualised: an AutoFilter list holds up to 10,000 values.
+                let n = c.items.len();
+                let list = uniform_list(
+                    ("dialog-checklist", i),
+                    n,
+                    cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                        let Some(c) = this
+                            .active_dialogs()
+                            .and_then(|s| s.top())
+                            .and_then(|d| d.controls.get(i))
+                        else {
+                            return vec![];
+                        };
+                        let checks = match &c.value {
+                            dialog::Value::Checks(v) => v.clone(),
+                            _ => Vec::new(),
+                        };
+                        range
+                            .filter(|&k| k < c.items.len())
+                            .map(|k| {
+                                let on = checks.get(k).copied().unwrap_or(false);
+                                let depth = c.depths.get(k).copied().unwrap_or(0);
+                                h_flex()
+                                    .id(("dialog-check", k))
+                                    .h(px(18.))
+                                    .pl(px(4. + 12. * f32::from(depth)))
+                                    .gap_1()
+                                    .cursor_pointer()
+                                    .child(if on { "\u{2611}" } else { "\u{2610}" })
+                                    .child(SharedString::from(c.items[k].clone()))
+                                    .on_click(on_widget(cx, i, Some(k)))
+                                    .into_any_element()
+                            })
+                            .collect()
+                    }),
+                )
+                .h(px(220.))
+                .w_full();
+                v_flex()
+                    .id(("dialog-control", i))
+                    .gap_1()
+                    .text_size(px(12.))
+                    .text_color(fg)
+                    .child(probe(&self.probes, format!("dialog-control:{}", c.name)))
+                    .child(label)
+                    .child(
+                        div()
+                            .border_1()
+                            .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
+                            .bg(pal.panel)
+                            .child(list),
+                    )
+                    .into_any_element()
+            }
             _ => row
                 .child(label)
                 .child(SharedString::from(c.text()))

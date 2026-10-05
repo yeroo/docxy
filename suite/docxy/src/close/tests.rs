@@ -712,19 +712,37 @@ fn structural_edit_commits_the_open_editor_before_shifting_cells() {
 
 #[test]
 fn sort_commits_an_open_editor_before_moving_its_row() {
+    use gridcore::edit::{SortLevel, SortOn, SortOptions};
     use gridcore::sheet::CellValue;
 
+    // Sort A to Z from the cursor (the list around it), and a sort of the
+    // range A2:B5 given outright.
     for field in [None, Some((1, 0, 4, 1))] {
         let mut t = tab(Kind::Xlsx);
         let Surface::Sheet(v) = &mut t.surface else {
             panic!()
         };
         v.sel = (2, 0); // A3 is South; B3 is 20.
+        v.anchor = v.sel;
         v.begin_cell_edit(None);
         v.editing = Some("Zzz".into());
-        let keys = [(0, true)];
-
-        assert_eq!(v.sort_with_pending_edit(field, &keys), (true, true));
+        match field {
+            None => crate::sheet_sort::quick(&mut t, true).unwrap(),
+            Some(area) => {
+                let levels = [SortLevel {
+                    key: 0,
+                    on: SortOn::Value {
+                        asc: true,
+                        list: None,
+                    },
+                }];
+                crate::sheet_sort::run(&mut t, area, &levels, &SortOptions::default()).unwrap()
+            }
+        }
+        assert!(t.dirty);
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
         assert!(v.editing.is_none());
         assert_eq!(v.undo.len(), 2);
         for (row, name, number) in [
@@ -756,12 +774,13 @@ fn unsortable_region_still_closes_an_untouched_editor() {
     v.sel = (98, 25); // Z99 is empty, outside the used region.
     v.begin_cell_edit(None);
 
-    assert_eq!(
-        v.sort_with_pending_edit(None, &[(25, true)]),
-        (false, false)
-    );
+    assert!(crate::sheet_sort::quick(&mut t, true).is_err());
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
     assert!(v.editing.is_none());
     assert!(v.undo.is_empty());
+    assert!(!t.dirty);
 }
 
 #[test]

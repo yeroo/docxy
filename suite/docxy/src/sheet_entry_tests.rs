@@ -916,7 +916,7 @@ fn a_refused_entry_stays_open_and_nothing_moves() {
     // Inserting a row or sorting under it would move its origin: refused too.
     assert!(!v.structural_edit(StructOp::InsertRow));
     assert!(v.editing.is_some());
-    assert_eq!(v.sort_with_pending_edit(None, &[(2, true)]), (false, false));
+    assert!(crate::sheet_sort::sort_view(&mut v, (0, 2, 4, 2), &by(2), &no_header()).is_err());
     assert!(v.undo.is_empty(), "nothing was done");
     assert_eq!(value(&v, 0, 2), CellValue::Number(5.0), "not sorted");
     // Shortened, it commits and moves.
@@ -1120,7 +1120,11 @@ fn a_sort_across_a_spill_is_refused_with_a_reason() {
     assert_eq!(value(&v, 2, 2), CellValue::Number(3.0));
     select(&mut v, 0, 0);
     let undo = v.undo.len();
-    assert_eq!(v.sort_with_pending_edit(None, &[(0, true)]), (false, false));
+    // The list A1:C3 holds the spill.
+    assert_eq!(
+        crate::sheet_sort::sort_view(&mut v, (0, 0, 2, 2), &by(0), &no_header()),
+        Err(gridcore::edit::SORT_CUTS_SPILL.to_string())
+    );
     assert_eq!(
         v.entry_error.as_deref(),
         Some(gridcore::edit::SORT_CUTS_SPILL)
@@ -1595,4 +1599,19 @@ fn ctrl_shift_u_is_the_formula_bar_key_even_in_protected_view() {
     assert!(fx_toggle_key(true, true, "U"));
     assert!(!fx_toggle_key(true, false, "u"), "Ctrl+U alone is not it");
     assert!(!open_mode::protected_allows_key("u", true, false));
+}
+
+/// One A to Z level on column `col`.
+fn by(col: u32) -> [gridcore::edit::SortLevel; 1] {
+    [gridcore::edit::SortLevel {
+        key: col,
+        on: gridcore::edit::SortOn::Value {
+            asc: true,
+            list: None,
+        },
+    }]
+}
+
+fn no_header() -> gridcore::edit::SortOptions {
+    gridcore::edit::SortOptions::default()
 }

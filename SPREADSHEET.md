@@ -353,6 +353,12 @@ is data entry plus semantics tests, not architecture.
   Outline and Settings…. A row outline gutter sits left of the row numbers,
   and a column outline line above the headers, with clickable level and
   +/- buttons. Every command is one undo step; refusals record none.
+- **Data Form (Data tab, Form…):** Excel's data form over the list at the
+  cursor, one record at a time: Find Prev/Find Next, field edits (computed
+  fields read-only), New (appended below the list, formula fields filled
+  down), Delete (asks first; the list's rows below move up) and Criteria
+  (DGET's criteria: `>10`, `<>x`, `=abc`, wildcards, plain text begins
+  with). The record logic is `gridcore::edit::dataform`.
 - **Headless:** `--recalc out.xlsx` (load → full recalc → save) and
   `--csv out.csv` — the engine with no terminal, scriptable and CI-testable.
 - Cross-suggestion: `docxy book.xlsx` says "try xlsxy"; `xlsxy report.docx`

@@ -6907,6 +6907,14 @@ fn db_begins_with(v: &Value) -> bool {
     }
 }
 
+/// Whether `v` meets `criterion`, typed as text the way a D-function's
+/// criteria cell holds it (`>10`, `<>x`, `=abc`, `Sm*`, plain text begins
+/// with). The Data Form's Criteria use it, so they read as DGET's do.
+pub(crate) fn db_criterion_matches(criterion: &str, v: &Value) -> bool {
+    let crit = Value::Str(criterion.to_string());
+    db_criteria_match(&parse_criteria(&crit), db_begins_with(&crit), v)
+}
+
 /// [`criteria_match`] for the D-functions: a plain-text criterion matches a
 /// text cell that begins with it (wildcards still apply).
 fn db_criteria_match(c: &Criteria, begins_with: bool, v: &Value) -> bool {
@@ -11686,6 +11694,35 @@ impl<'a> Eval<'a> {
                 }
             }
         };
+        let matched = self.db_matches(&db, db_at, &crit, crit_at);
+        Ok(db[1..]
+            .iter()
+            .zip(matched)
+            .filter(|(_, m)| *m)
+            .map(|(row, _)| row.get(col).cloned().unwrap_or(Value::Empty))
+            .collect())
+    }
+
+    /// Which records of database `db` (its first row the headers) the
+    /// criteria range `crit` selects, as the D-functions and Advanced Filter
+    /// read it: criteria rows are OR'd, the cells of a row AND'd; a header
+    /// names a field, plain text means "begins with", and a formula under a
+    /// blank header (or one naming no field) is a computed criterion. `db_at`
+    /// / `crit_at` are where the grids sit (sheet, top row, left column),
+    /// which a computed criterion needs. One entry per record.
+    pub(crate) fn db_matches(
+        &mut self,
+        db: &[Vec<Value>],
+        db_at: Option<(usize, u32, u32)>,
+        crit: &[Vec<Value>],
+        crit_at: Option<(usize, u32, u32)>,
+    ) -> Vec<bool> {
+        let headers = &db[0];
+        let text_eq = |a: &Value, b: &str| {
+            to_text(a)
+                .map(|t| t.eq_ignore_ascii_case(b))
+                .unwrap_or(false)
+        };
         // Map each criteria column to a database column via its header text.
         let crit_headers = &crit[0];
         let crit_cols: Vec<Option<usize>> = crit_headers
@@ -11775,11 +11812,9 @@ impl<'a> Eval<'a> {
                     break;
                 }
             }
-            if matched {
-                out.push(row.get(col).cloned().unwrap_or(Value::Empty));
-            }
+            out.push(matched);
         }
-        Ok(out)
+        out
     }
 
     /// Two equal-shaped arrays reduced to the numeric pairs they share

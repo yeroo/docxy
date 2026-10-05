@@ -209,7 +209,7 @@ gets re-routed, and a test fails if it drifts from what `cx.bind_keys`
 registers.
 
 Reference fields, for `focus`: `chart-range`, `chart-title`, `categories`,
-`series-name:N`, `series-values:N`, `cond-format`, `validation`, `sort`.
+`series-name:N`, `series-values:N`, `cond-format`, `validation`.
 Data › Text to Columns is a dialog (`text-to-columns`), driven with the
 `dialog-*` verbs like the others.
 
@@ -338,6 +338,7 @@ State keys, as the app reports them after every driving verb:
 | `fill_options`, `paste_options` | the Auto Fill Options (#668) or Paste Options (#669) button's current choice (`Auto Fill`, `Copy Cells`, …; `Paste`, `Values`, …), or `null` when no button shows |
 | `office_clipboard` | how many items the Office Clipboard holds (#669) |
 | `editing`, `edit` | whether a cell edit is open, and its text |
+| `comment_edit` | the sheet comment editor's text (`null` when closed) |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
 | `field`, `field_text` | the focused reference field, and its buffer |
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
@@ -464,7 +465,7 @@ The Project ribbon holds only Project's commands, and its Report tab has no
 groups yet (`groups: []`). Extend Selection mode, native prompts,
 and backstage pages are not represented by these verbs.
 
-On a sheet tab the reply lists File, Home, Insert, Review and View from
+On a sheet tab the reply lists File, Home, Insert, Data, Review and View from
 `sheet_ribbon::SHEET_RIBBON`, the table the sheet ribbon is drawn from, so a
 button cannot be drawn without being listed. Ids are kebab-case and unique
 across the sheet ribbon (`bold`, `sort-a-z`, `freeze-panes`); icon and glyph
@@ -932,7 +933,7 @@ point. Four verbs read and drive it:
 | Verb | Args | Reply |
 |---|---|---|
 | `dialog-read` | `{}` | the top dialog, or `{open: false}` |
-| `dialog-set` | `{control, value}`; a grid takes `{control, row, column, value}`, `{control, insert_row: n}` or `{control, delete_row: n}` | the dialog after the edit |
+| `dialog-set` | `{control, value}`; a grid takes `{control, row, column, value}`, `{control, insert_row: n}` or `{control, delete_row: n}`; a check list `{control, value: true\|false\|[labels]}`, `{control, item, checked}` or `{control, index, checked}` | the dialog after the edit |
 | `dialog-tab` | `{tab}` | the dialog on that tab |
 | `dialog-click` | `{button}` | `state` after the button's handler, with `dialog` set to the dialog now on top (the child it opened, the parent, or `{open: false}`) |
 
@@ -943,12 +944,21 @@ a message box's message (null otherwise), and `tab` is the current tab's label
 Each control is `{name, label, kind, value, text, enabled, visible}`:
 
 - `kind` is one of `text`, `number`, `date`, `duration`, `checkbox`, `radio`,
-  `dropdown`, `list`, `grid` and `label`.
+  `dropdown`, `list`, `grid`, `checklist` and `label`.
 - `value` is typed: a checkbox's is a bool, a number's a number, an item
   control's the selected item's label (or null), and a grid's its rows.
   `text` is what the control shows.
 - `radio`, `dropdown` and `list` add `items` (in order) and `selected` (an
   index, or null). A `grid` adds `columns` and `rows`.
+- A `checklist` (the AutoFilter drop-down's values, #690) has a bool per item
+  as its `value`, and adds `items` and `depths`: the items form a tree by
+  depth (`(Select All)` at 0 over the values; a year › month › day date
+  tree under it), and checking an item checks the items under it, while an
+  item with items under it is checked exactly when they all are. `value:
+  true`/`false` checks or clears all, `value: [labels]` checks exactly those,
+  and `{item, checked}` one item (or `{index, checked}` for a label the tree
+  repeats, a day under two months). The overlay draws it virtualised (up to
+  10,000 values) and a click toggles an item.
 
 `controls` lists **only the current tab's controls**, because that is what a
 person sees. To read a staged value on another tab, `dialog-tab` to it first. A
@@ -1015,7 +1025,12 @@ Menus open today:
 - **Set Baseline's split menu**: the lower half of Project › Schedule › Set
   Baseline (`Set Baseline...`, `Clear Baseline...`);
 - **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New
-  Comment): right-click a document or sheet body. It never opens on a Project;
+  Comment): right-click a document body. It never opens on a sheet or a
+  Project, and `menu-open {"target":"document"}` refuses on both;
+- **the cell menu** on a sheet (#690, #691): right-click a cell. A cell outside
+  the selection is selected first (no link followed; while a formula or a range
+  field is pointing, nothing moves). It lists Cut, Copy, Paste, the Filter and
+  Sort submenus and New Comment, each a sheet command as the ribbon runs it;
 - **the Mailings tab's drop-downs** on a document (#628): Start Mail Merge,
   Select Recipients, Insert Merge Field (the attached list's columns), Rules,
   Finish & Merge, and the Preview Results record box (the attached rows).
@@ -1048,7 +1063,7 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select) or `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) | the menu, as `menu-read` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment; #690, #691), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select) or `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) | the menu, as `menu-read` |
 | `menu-read` | `{}` | `{open: true, target, items}`, or `{open: false}` |
 | `menu-click` | `{label}` among the top-level items, or `{path: [labels]}` through submenus | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
@@ -1087,8 +1102,8 @@ way it keeps itself inside the window.
 Refusals change nothing, and each names what it refuses: `menu-open` under a
 dialog, a `row` off a Project tab, an unknown uid, a task hidden under a
 collapsed summary (there is no row to right-click), a ribbon command that has
-no menu, `"document"` on a Project, and the targets without a menu yet
-(`cell`, `bar`, `column`, the ribbon's own right-click); `menu-click` with no
+no menu, `"document"` on a Project, `"cell"` off a sheet, and the targets
+without a menu yet (`bar`, `column`, the ribbon's own right-click); `menu-click` with no
 menu open, on a disabled item, an unknown or ambiguous label, a heading, or an
 item that opens a submenu; `menu-click` and `menu-close` under a dialog;
 `menu-open` and `menu-click` while File (the backstage) or the more-tabs list
@@ -1152,7 +1167,11 @@ View > Split View > Timeline has it hidden. `project-split` is the draggable bar
 between the entry table and the chart; its drags show in the `table_w` and `gantt_w`
 state entries. `gallery` is the Home ribbon's Styles gallery well on a
 document tab, and is an error while another ribbon tab, the Backstage or a
-collapsed ribbon hides it. Inside a
+collapsed ribbon hides it. `filter-button:<column>` (for example
+`filter-button:B`) is the AutoFilter button on that column's header cell
+(#690), an error while the sheet has no filter there or the button is
+scrolled out of view; `shot` it before a `pointer-click` so the click lands
+on the frame that drew it. Inside a
 border assertion the `cell:` may be dropped — `border A1:C5 solid` — because an
 assertion about a selection should read like the selection.
 

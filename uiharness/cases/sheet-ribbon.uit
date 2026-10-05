@@ -7,8 +7,10 @@ test sheet ribbon read lists the drawn Home tab
   call ribbon-read {}
   assert reply.tabs.0.name is File
   assert reply.tabs.1.name is Home
-  assert reply.tabs.4.name is View
-  assert reply.tab_count is 5
+  assert reply.tabs.3.name is Data
+  assert reply.tabs.4.name is Review
+  assert reply.tabs.5.name is View
+  assert reply.tab_count is 6
   assert reply.tabs.1.groups.0.title is Clipboard
   assert reply.tabs.1.groups.0.commands.0.id is paste
   assert reply.tabs.1.groups.1.commands.4.id is bold
@@ -34,10 +36,10 @@ test sheet ribbon click selects the tab and reads a toggle's current label
   call ribbon-click {"tab":"View","command":"Freeze Panes"}
   assert ribbon_tab is View
   call ribbon-read {}
-  assert reply.tabs.4.groups.0.commands.0.label is Unfreeze Panes
+  assert reply.tabs.5.groups.0.commands.0.label is Unfreeze Panes
   call ribbon-click {"tab":"View","command":"Unfreeze Panes"}
   call ribbon-read {}
-  assert reply.tabs.4.groups.0.commands.0.label is Freeze Panes
+  assert reply.tabs.5.groups.0.commands.0.label is Freeze Panes
 
 test sheet ribbon refuses a placeholder, a missing command and a command with no menu
   open ../fixtures/basic.xlsx
@@ -62,3 +64,82 @@ test sheet ribbon menus open through menu-open and the button's own click
   call menu-close {}
   call menu-open {"target":{"ribbon":["Home","Editing","Find & Select"]}}
   assert reply.items.1.label is Go To Special…
+
+# Excel's Data tab (#696): Sort & Filter, Data Tools and Outline, in Excel's
+# order and under Excel's names.
+test sheet ribbon data tab lists Excel's groups
+  open ../fixtures/basic.xlsx
+  call ribbon-read {}
+  assert reply.tabs.3.name is Data
+  assert reply.tabs.3.groups.0.title is Sort & Filter
+  assert reply.tabs.3.groups.1.title is Data Tools
+  assert reply.tabs.3.groups.2.title is Outline
+  assert reply.tabs.3.groups.3.title is Show Level
+  assert reply.tabs.3.groups.0.commands.0.label is Sort A to Z
+  assert reply.tabs.3.groups.0.commands.2.label is Sort
+  assert reply.tabs.3.groups.0.commands.4.label is Clear
+  assert reply.tabs.3.groups.0.commands.4.enabled is true
+  assert reply.tabs.3.groups.0.commands.5.label is Reapply
+  assert reply.tabs.3.groups.0.commands.5.enabled is true
+  assert reply.tabs.3.groups.0.commands.6.label is Advanced
+  assert reply.tabs.3.groups.0.commands.6.enabled is true
+  assert reply.tabs.3.groups.1.commands.1.label is Flash Fill
+  assert reply.tabs.3.groups.1.commands.2.label is Remove Duplicates
+  assert reply.tabs.3.groups.1.commands.4.label is Circle Invalid Data
+  assert reply.tabs.3.groups.1.commands.6.label is Consolidate
+  assert reply.tabs.3.groups.2.commands.0.label is Group
+  assert reply.tabs.3.groups.2.commands.4.label is Hide Detail
+
+test sheet ribbon data tab sorts the region by the cursor's column
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort A to Z"}
+  assert ribbon_tab is Data
+  assert cell A2 is East
+  assert cell B2 is 30
+  assert cell A5 is West
+  click B2
+  call ribbon-click {"tab":"Data","command":"Sort Z to A"}
+  assert cell B2 is 40
+  assert cell A2 is West
+
+# A copy leaves out the rows a filter hides, so its row count shows the
+# filter and Clear taking it off. Filter puts buttons on the list (#690); the
+# filter itself is set through a button's drop-down.
+test sheet ribbon data tab clears a filter
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Filter"}
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  call dialog-set {"control":"val1","value":"20"}
+  call dialog-click {"button":"OK"}
+  click A1
+  click B5 shift
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.app.rows is 3
+  click B4
+  call ribbon-click {"tab":"Data","command":"Clear"}
+  click A1
+  click B5 shift
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.app.rows is 5
+
+# Clear and Reapply with no filter change no row, so the workbook stays clean.
+test sheet ribbon data tab clear with no filter leaves the workbook clean
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Clear"}
+  assert dirty is false
+  assert status is There is no filter on this sheet.
+  call ribbon-click {"tab":"Data","command":"Reapply"}
+  assert dirty is false
+
+test sheet ribbon data tab refuses its placeholders
+  open ../fixtures/basic.xlsx
+  call-error ribbon-click {"tab":"Data","command":"Flash Fill"} => 'Flash Fill' is not implemented
+  call-error ribbon-click {"tab":"Data","command":"Circle Invalid Data"} => 'Circle Invalid Data' is not implemented

@@ -653,7 +653,7 @@ fn parse_is(rest: &str, line: usize, whole: &str) -> Result<(bool, String), Scri
 // ---------------------------------------------------------------------------
 
 /// The region names, for an error message. Mirrors `harness::parse_region`.
-pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery";
+pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, filter-button:B";
 
 /// A region name a script may use, normalized to the form the app's `rect`
 /// verb takes (`A1:C5` becomes `cell:A1:C5`).
@@ -722,6 +722,15 @@ pub fn validate_region(name: &str) -> Result<String, String> {
                 .ok_or("'tab-chip' needs an index")?;
             a.parse::<usize>()
                 .map_err(|_| "'tab-chip' needs a numeric index")?;
+            Ok(full.clone())
+        }
+        "filter-button" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'filter-button' needs a column, e.g. filter-button:B")?;
+            if !a.chars().all(|c| c.is_ascii_alphabetic()) {
+                return Err(format!("'{a}' is not a column letter"));
+            }
             Ok(full.clone())
         }
         other => Err(format!("unknown region '{other}' ({REGION_WORDS})")),
@@ -1462,6 +1471,7 @@ test Smoke-Case
             ("project-timeline", "project-timeline"),
             ("project-split", "project-split"),
             ("gallery", "gallery"),
+            ("filter-button:B", "filter-button:B"),
         ] {
             assert_eq!(validate_region(written).unwrap(), normalized, "{written}");
         }

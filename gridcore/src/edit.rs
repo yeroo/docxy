@@ -31,8 +31,14 @@ pub use series::{
     FillDir, FillKind, FillTarget, JUSTIFY_NUMBERS, JUSTIFY_OVERFLOW, SeriesSpec, SeriesType,
     builtin_lists, fill_down_to, fill_target, justify_lines, series_rows_for,
 };
+mod dataform;
+pub use dataform::{
+    CANNOT_EXTEND, criterion_matches, delete_record, delete_splits_array, find_record,
+    is_formula_field, new_record_changes, record_matches,
+};
 mod consolidate;
 mod paste_special;
+mod sort;
 pub use paste_special::{
     ClipBlock, ClipNote, ClipRule, MULTI_SELECTION, PasteExtras, PasteOp, PasteSpec, PasteWhat,
     clear_validation, multi_area_shape, paste_link_changes, paste_special_changes,
@@ -44,6 +50,10 @@ pub use consolidate::{
     ConsolidateError, ConsolidateFunc, ConsolidateOptions, ConsolidateRef, ConsolidateSettings,
     canonical_consolidate_ref, consolidate, consolidate_fn_name, consolidate_token,
     format_consolidate_ref, parse_consolidate_func, parse_consolidate_ref,
+};
+pub use sort::{
+    BUILTIN_SORT_LISTS, SORT_MERGED, SORT_WARNING, SortError, SortLevel, SortOn, SortOptions,
+    builtin_sort_list, guess_header, sort_range, sort_region, sort_warning,
 };
 pub use subtotal::{
     SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,
@@ -500,7 +510,7 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
         for (c, cell) in row.into_iter().enumerate() {
             match cell {
                 Some(mut cl) => {
-                    move_own_array_ref(&mut cl, (from, c as u32), r);
+                    move_own_array_ref(&mut cl, (from, c as u32), (r, c as u32));
                     s.set_cell(r, c as u32, cl)
                 }
                 None => {
@@ -539,7 +549,7 @@ pub fn sort_cuts_spill(wb: &Workbook, sheet: usize, r1: u32, r2: u32) -> bool {
 /// the `ref` it owns (one that starts at `at`). A CSE formula evaluated to
 /// one value (`SUM` over its block) has no extent, but save keeps that
 /// `ref`, and Excel fills the block from it.
-fn array_rect(cell: &Cell, at: (u32, u32)) -> Option<(u32, u32)> {
+pub(super) fn array_rect(cell: &Cell, at: (u32, u32)) -> Option<(u32, u32)> {
     if cell.spill.is_some() {
         return cell.spill;
     }
@@ -565,24 +575,26 @@ fn sort_span(s: &Sheet, r1: u32, r2: u32) -> Option<(u32, u32)> {
     (r2 > r1).then_some((r2, cols - 1))
 }
 
-/// An array anchor moved from `from` to row `to` takes its block along: its
-/// `ref`, when the anchor owns it (starts there), is rewritten to its block
-/// ([`array_rect`]) at the new row. Left behind, it would name the old rows:
+/// An array anchor moved from cell `from` to cell `to` (a sort's row, a
+/// left-to-right sort's column, or a data form Delete's row) takes its
+/// block along: its `ref`, when the
+/// anchor owns it (starts there), is rewritten to its block ([`array_rect`])
+/// at the new cell. Left behind, it would name the old cells:
 /// the cached block of an anchor the engine can't evaluate would no longer
 /// count as its own, and a CSE block would save as its anchor alone.
-fn move_own_array_ref(cell: &mut Cell, (from, col): (u32, u32), to: u32) {
-    let Some((h, w)) = array_rect(cell, (from, col)) else {
+pub(super) fn move_own_array_ref(cell: &mut Cell, from: (u32, u32), to: (u32, u32)) {
+    let Some((h, w)) = array_rect(cell, from) else {
         return;
     };
     let Some(fa) = cell.f_attrs.as_deref().filter(|fa| is_array_f(fa)) else {
         return;
     };
-    if from == to || !ref_starts_at(fa, &cell_name(from, col)) {
+    if from == to || !ref_starts_at(fa, &cell_name(from.0, from.1)) {
         return;
     }
-    let mut block = cell_name(to, col);
+    let mut block = cell_name(to.0, to.1);
     if (h, w) != (1, 1) {
-        block = format!("{block}:{}", cell_name(to + h - 1, col + w - 1));
+        block = format!("{block}:{}", cell_name(to.0 + h - 1, to.1 + w - 1));
     }
     cell.f_attrs = Some(with_ref(fa, &block));
 }
@@ -1058,7 +1070,7 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
     // too (a list on another sheet). Only one the rename touches is
     // reprinted, so the loaded spelling stays otherwise.
     for sheet in &mut wb.sheets {
-        for_each_rule_formula(sheet, |src| {
+        for_each_rule_formula(sheet, |_, src| {
             if let Some(updated) =
                 rewrite_if_changed(src, |e| rename_sheet_in_expr(e, &old, new_name))
             {
@@ -1462,6 +1474,13 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
                     for c in &mut af.columns {
                         *c = c.and_then(|v| point(v, &shift));
                     }
+                    af.criteria.retain_mut(|(c, _)| match point(*c, &shift) {
+                        Some(v) => {
+                            *c = v;
+                            true
+                        }
+                        None => false,
+                    });
                 }
             }
             None => sheet.auto_filter = None,
@@ -1546,9 +1565,11 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
             _ => false,
         };
         if deleted.iter().all(|&d| d) {
-            rewrite_workbook_formulas(wb, |e, site| {
-                crate::formula::delete_table_in_expr(e, &t.name, inside(site))
-            });
+            rewrite_workbook_formulas(
+                wb,
+                |_, _| true,
+                |e, site| crate::formula::delete_table_in_expr(e, &t.name, inside(site)),
+            );
             wb.tables.remove(i);
             wb.removed_tables.push(crate::sheet::RemovedTable {
                 table: t,
@@ -1556,15 +1577,19 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
             });
             continue;
         }
-        rewrite_workbook_formulas(wb, |e, site| {
-            crate::formula::delete_table_columns_in_expr(
-                e,
-                &t.name,
-                inside(site),
-                &t.columns,
-                &deleted,
-            )
-        });
+        rewrite_workbook_formulas(
+            wb,
+            |_, _| true,
+            |e, site| {
+                crate::formula::delete_table_columns_in_expr(
+                    e,
+                    &t.name,
+                    inside(site),
+                    &t.columns,
+                    &deleted,
+                )
+            },
+        );
         let kept = |j: usize| !deleted.get(j).copied().unwrap_or(false);
         let tm = &mut wb.tables[i];
         tm.columns = (t.columns.iter().enumerate())
@@ -1580,15 +1605,17 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
 }
 
 /// Every conditional-formatting and data-validation formula on `sheet`.
-fn for_each_rule_formula(sheet: &mut Sheet, mut f: impl FnMut(&mut String)) {
+fn for_each_rule_formula(sheet: &mut Sheet, mut f: impl FnMut(&[Area], &mut String)) {
     for cf in &mut sheet.cond_formats {
         for rule in &mut cf.rules {
-            rule.formulas_mut().into_iter().for_each(&mut f);
+            for src in rule.formulas_mut() {
+                f(&cf.ranges, src);
+            }
         }
     }
     for dv in &mut sheet.validations {
-        f(&mut dv.formula1);
-        f(&mut dv.formula2);
+        f(&dv.ranges, &mut dv.formula1);
+        f(&dv.ranges, &mut dv.formula2);
     }
 }
 
@@ -1950,13 +1977,17 @@ pub fn sync_table_headers(wb: &mut Workbook, sheet: usize, cells: &[(u32, u32)])
             }
             let t = wb.tables[ti].clone();
             let map = [(cur, name.clone())];
-            rewrite_workbook_formulas(wb, |e, (s, cell)| {
-                let inside = match (s, cell) {
-                    (Some(s), Some((r, c))) => t.contains(s, r, c),
-                    _ => false,
-                };
-                crate::formula::rename_table_columns_in_expr(e, &t.name, inside, &map)
-            });
+            rewrite_workbook_formulas(
+                wb,
+                |_, _| true,
+                |e, (s, cell)| {
+                    let inside = match (s, cell) {
+                        (Some(s), Some((r, c))) => t.contains(s, r, c),
+                        _ => false,
+                    };
+                    crate::formula::rename_table_columns_in_expr(e, &t.name, inside, &map)
+                },
+            );
             wb.tables[ti].columns[j] = name;
             renamed = true;
         }
@@ -2014,10 +2045,15 @@ type FormulaSite = (Option<usize>, Option<(u32, u32)>);
 
 /// Rewrite every formula a table edit can reach (a table or column rename, a
 /// conversion, a column delete through a table): cell
-/// formulas (array formulas included), defined names, and conditional-format
-/// and data-validation rules. A formula `f` leaves unchanged keeps its text
+/// formulas (array formulas included), defined names, and the
+/// conditional-format and data-validation rules `rules` takes (given the
+/// rule's sheet and ranges). A formula `f` leaves unchanged keeps its text
 /// exactly; one held verbatim (a shared or data-table formula) is left alone.
-fn rewrite_workbook_formulas(wb: &mut Workbook, f: impl Fn(&Expr, FormulaSite) -> Expr) {
+fn rewrite_workbook_formulas(
+    wb: &mut Workbook,
+    rules: impl Fn(usize, &[Area]) -> bool,
+    f: impl Fn(&Expr, FormulaSite) -> Expr,
+) {
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
         for (&(r, c), cell) in sheet.cells.iter_mut() {
             let Some(src) = &cell.formula else {
@@ -2030,7 +2066,10 @@ fn rewrite_workbook_formulas(wb: &mut Workbook, f: impl Fn(&Expr, FormulaSite) -
                 cell.formula = Some(updated);
             }
         }
-        for_each_rule_formula(sheet, |src| {
+        for_each_rule_formula(sheet, |ranges, src| {
+            if !rules(s, ranges) {
+                return;
+            }
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, (Some(s), None))) {
                 *src = updated;
             }
@@ -2081,7 +2120,11 @@ pub fn rename_table(wb: &mut Workbook, old: &str, new: &str) -> Result<(), Strin
         return Ok(());
     }
     let map = [(cur.clone(), new.to_string())];
-    rewrite_workbook_formulas(wb, |e, _| crate::formula::rename_tables_in_expr(e, &map));
+    rewrite_workbook_formulas(
+        wb,
+        |_, _| true,
+        |e, _| crate::formula::rename_tables_in_expr(e, &map),
+    );
     for piv in &mut wb.pivots {
         if let crate::pivot::PivotSource::Table(n) = &mut piv.source {
             if n.eq_ignore_ascii_case(&cur) {
@@ -2241,17 +2284,21 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
         sheet_name: &sheet_name,
         info: &info,
     };
-    rewrite_workbook_formulas(wb, |e, (s, cell)| {
-        let host = crate::formula::FormulaHost {
-            same_sheet: s == Some(t.sheet),
-            row: cell.map(|(r, _)| r),
-            inside: match (s, cell) {
-                (Some(s), Some((r, c))) => t.contains(s, r, c),
-                _ => false,
-            },
-        };
-        crate::formula::table_refs_to_cells_in_expr(e, &target, host)
-    });
+    rewrite_workbook_formulas(
+        wb,
+        |_, _| true,
+        |e, (s, cell)| {
+            let host = crate::formula::FormulaHost {
+                same_sheet: s == Some(t.sheet),
+                row: cell.map(|(r, _)| r),
+                inside: match (s, cell) {
+                    (Some(s), Some((r, c))) => t.contains(s, r, c),
+                    _ => false,
+                },
+            };
+            crate::formula::table_refs_to_cells_in_expr(e, &target, host)
+        },
+    );
     wb.tables.remove(idx);
     wb.removed_tables.push(crate::sheet::RemovedTable {
         table: t,
@@ -3421,9 +3468,11 @@ mod tests {
     fn a_sheet_auto_filter_moves_and_its_columns_follow_their_data() {
         let mut w = wb(&[("A1", Cell::number(1.0))]);
         // B2:D9, filtering B and D.
+        let crit = |v: &str| crate::filter::ColumnFilter::values(vec![v.to_string()]);
         w.sheets[0].auto_filter = Some(crate::sheet::SheetAutoFilter {
             range: (1, 1, 8, 3),
             columns: vec![Some(1), Some(3)],
+            criteria: vec![(1, crit("b")), (3, crit("d"))],
         });
         let af = |w: &Workbook| {
             w.sheets[0]
@@ -3431,12 +3480,29 @@ mod tests {
                 .clone()
                 .map(|a| (a.range, a.columns))
         };
+        let on = |w: &Workbook| -> Vec<u32> {
+            w.sheets[0]
+                .auto_filter
+                .as_ref()
+                .unwrap()
+                .criteria
+                .iter()
+                .map(|c| c.0)
+                .collect()
+        };
         insert_rows(&mut w, 0, 0, 2);
         assert_eq!(af(&w), Some(((3, 1, 10, 3), vec![Some(1), Some(3)])));
         insert_cols(&mut w, 0, 2, 1); // inside, between the filtered columns
         assert_eq!(af(&w), Some(((3, 1, 10, 4), vec![Some(1), Some(4)])));
+        // The criteria move with their columns, and go with a deleted one.
+        assert_eq!(on(&w), vec![1, 4]);
         delete_cols(&mut w, 0, 1, 1); // the first filtered column
         assert_eq!(af(&w), Some(((3, 1, 10, 3), vec![None, Some(3)])));
+        assert_eq!(on(&w), vec![3]);
+        assert_eq!(
+            w.sheets[0].auto_filter.as_ref().unwrap().criteria[0].1,
+            crit("d")
+        );
         insert_rows(&mut w, 0, 20, 5); // below: nothing moves
         assert_eq!(af(&w), Some(((3, 1, 10, 3), vec![None, Some(3)])));
         delete_rows(&mut w, 0, 3, 8); // every row it had
