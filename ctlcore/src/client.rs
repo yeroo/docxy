@@ -79,6 +79,11 @@ pub fn discover_live(dir: &Path) -> Vec<Instance> {
         .collect()
 }
 
+/// How long a call waits for the server's reply. A cold instance answering its first
+/// request - a fresh suite on a slow CI runner opening a document - has taken over 10 s,
+/// so this leaves room for that; a hung server still fails the call.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// A request/response client. Each [`call`](Client::call) opens a fresh
 /// short-lived connection, matching the server's one-request-per-line model.
 pub struct Client {
@@ -97,7 +102,7 @@ impl Client {
         let mut stream =
             TcpStream::connect_timeout(&self.instance.addr(), Duration::from_millis(500))
                 .map_err(|e| format!("connect failed: {e}"))?;
-        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        stream.set_read_timeout(Some(READ_TIMEOUT)).ok();
 
         let mut line = Json::obj(vec![
             ("token", Json::Str(self.instance.token.clone())),
@@ -113,9 +118,14 @@ impl Client {
 
         let mut reader = BufReader::new(stream);
         let mut resp = String::new();
-        reader
-            .read_line(&mut resp)
-            .map_err(|e| format!("read failed: {e}"))?;
+        reader.read_line(&mut resp).map_err(|e| match e.kind() {
+            // A read timeout surfaces as WouldBlock on Unix and TimedOut on Windows; the
+            // raw text ("Resource temporarily unavailable") hides that the server was slow.
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                format!("no reply within {}s to `{verb}`", READ_TIMEOUT.as_secs())
+            }
+            _ => format!("read failed: {e}"),
+        })?;
         let j = Json::parse(resp.trim()).map_err(|e| format!("bad response: {e}"))?;
         if j.get("ok").and_then(Json::as_bool) == Some(true) {
             Ok(j.get("result").cloned().unwrap_or(Json::Null))
