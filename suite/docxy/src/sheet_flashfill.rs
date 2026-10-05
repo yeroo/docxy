@@ -5,8 +5,11 @@
 //!
 //! The pattern comes from [`gridcore::flashfill`]; each result is committed
 //! as a typed entry, all of them as one undo step. The preview and the
-//! options button belong to the moment they were made for: any edit, a
-//! selection move or another key retires them.
+//! options button belong to the moment they were made for. The preview is
+//! dropped by any edit, selection change (mouse, Tab or keys) or other key,
+//! and does not come back if the selection returns
+//! ([`SheetView::retire_stale_preview`]); the Options button survives
+//! selection moves and goes with the next edit.
 
 use super::*;
 use crate::dialog::{ButtonRole, Dialog, DialogOwner};
@@ -147,6 +150,19 @@ impl SheetView {
                 at_gen: self.edit_gen,
                 sel: self.sel,
             });
+        }
+    }
+
+    /// Drop a preview the selection has moved off, so it cannot revive when
+    /// the selection comes back and Enter cannot accept a stale one. Run on
+    /// every access to the sheet and each frame.
+    pub(crate) fn retire_stale_preview(&mut self) {
+        if self
+            .flash_preview
+            .as_ref()
+            .is_some_and(|p| p.sel != self.sel || p.at_gen != self.edit_gen)
+        {
+            self.flash_preview = None;
         }
     }
 

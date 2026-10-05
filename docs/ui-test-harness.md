@@ -335,7 +335,7 @@ State keys, as the app reports them after every driving verb:
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
-| `flash_preview` | Flash Fill's greyed preview after the second example is typed (#666, ENT-105): `{range, values}`, the cells it covers and the values Enter writes, or null. Any other key, an edit or a selection move drops it. Ctrl+E and Data › Flash Fill fill without one; no pattern opens the `flash-fill` message dialog (`dialog-read`, OK closes it), and the Flash Fill Options menu is `menu-open "flash-fill"` while the last fill stands |
+| `flash_preview` | Flash Fill's greyed preview after the second example is typed (#666, ENT-105): `{range, values}`, the cells it covers and the values Enter writes, or null. Any other key, an edit or a selection change (mouse and Tab included) drops it for good: moving back does not revive it. Ctrl+E and Data › Flash Fill fill without one; no pattern opens the `flash-fill` message dialog (`dialog-read`, OK closes it), and the Flash Fill Options menu is `menu-open "flash-fill"` while the last fill stands |
 | `completions` | Formula AutoComplete's list under a formula being typed (#686): `{items: [labels], sel}` (`sel` the highlighted index), or null while none shows. Up/Down move `sel`, Tab inserts it, Esc closes the list and leaves the editor open; Alt+Down opens it on demand |
 | `comment_edit` | the sheet comment editor's text (`null` when closed) |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |

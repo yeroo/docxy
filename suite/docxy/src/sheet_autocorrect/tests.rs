@@ -139,6 +139,39 @@ fn ent_case_056_typed_urls_are_hyperlinks_in_one_undo_step() {
     assert_eq!(text(&v, 3, 0), "https://example.org");
 }
 
+/// FIX r3 m5: Ctrl+Enter takes a proposal once, and links like Enter.
+#[test]
+fn ctrl_enter_links_only_what_was_typed() {
+    let mut v = view();
+    put(&mut v, 3, 0, "https://example.com");
+    // J5-style: `h` proposes the column's URL; Ctrl+Enter takes it, and a
+    // taken proposal is not a typed link.
+    select(&mut v, 4, 0);
+    type_keys(&mut v, "h");
+    assert!(v.edit_proposal.is_some());
+    assert!(v.commit_edit_to_selection());
+    assert_eq!(text(&v, 4, 0), "https://example.com");
+    assert!(!v.sheet().hyperlinks.contains_key(&(4, 0)));
+    // Typed in full, a proposal never shows (it is already a value): linked.
+    select(&mut v, 6, 0);
+    type_keys(&mut v, "https://example.org");
+    assert!(v.commit_edit_to_selection());
+    assert!(v.sheet().hyperlinks.contains_key(&(6, 0)));
+    // Over a range: each cell gets the link, in one undo step.
+    v.sel = (8, 0);
+    v.anchor = (10, 0);
+    type_keys(&mut v, "https://example.net");
+    let steps = v.undo.len();
+    assert!(v.commit_edit_to_selection());
+    assert_eq!(v.undo.len(), steps + 1);
+    for r in 8..=10 {
+        assert_eq!(
+            v.sheet().hyperlinks.get(&(r, 0)).map(String::as_str),
+            Some("https://example.net")
+        );
+    }
+}
+
 fn set(stack: &mut DialogStack, name: &str, value: &str) {
     stack
         .set(name, &Json::obj(vec![("value", Json::Str(value.into()))]))

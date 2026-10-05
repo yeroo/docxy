@@ -315,9 +315,10 @@ impl Docxy {
         m: Modifiers,
         cx: &mut Context<Self>,
     ) -> bool {
-        // Enter or Escape on the user name dialog presses through the app.
+        // Enter or Escape on an app-setting dialog (User name, AutoCorrect)
+        // presses through the app.
         let plain = !m.control && !m.alt && !m.platform;
-        let user_name_button = self
+        let app_dialog_button = self
             .tabs
             .get(self.active)
             .filter(|t| {
@@ -327,7 +328,7 @@ impl Docxy {
                 })
             })
             .and_then(|t| t.dialogs.key_button(key, plain));
-        if let Some(label) = user_name_button {
+        if let Some(label) = app_dialog_button {
             let done = self
                 .user_name_click(&label)
                 .or_else(|| self.autocorrect_click(&label));

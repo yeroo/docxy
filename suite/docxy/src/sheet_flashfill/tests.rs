@@ -160,8 +160,13 @@ fn the_preview_goes_with_any_move_and_obeys_the_option() {
     assert!(v.live_preview().is_some());
     select(&mut v, 7, 7);
     assert!(v.live_preview().is_none(), "a selection move");
+    v.retire_stale_preview();
     select(&mut v, 2, 1);
-    assert!(v.live_preview().is_some(), "back where it was made");
+    assert!(
+        v.live_preview().is_none(),
+        "dropped, not hidden: no revival"
+    );
+    assert!(!v.accept_preview());
     put(&mut v, 9, 9, "x");
     v.push_undo();
     assert!(v.live_preview().is_none(), "an edit");

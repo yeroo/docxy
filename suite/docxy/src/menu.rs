@@ -507,7 +507,7 @@ pub(crate) fn pick_menu(values: &[String]) -> Vec<MenuItem> {
         .iter()
         .enumerate()
         .map(|(i, v)| {
-            let at = u16::try_from(i).unwrap_or(u16::MAX);
+            let at = u32::try_from(i).unwrap_or(u32::MAX);
             MenuItem::Item(Entry::new(
                 &format!("pick-{i}"),
                 v,

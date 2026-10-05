@@ -1136,6 +1136,7 @@ fn stamp_edit_opts(tabs: &mut [DocTab], opts: EditOptions) {
     for t in tabs {
         if let Surface::Sheet(v) = &mut t.surface {
             v.edit_opts = opts;
+            v.retire_stale_preview();
         }
     }
 }
@@ -1566,7 +1567,7 @@ enum SheetAct {
     /// Pick From Drop-down List... (the cell menu, Alt+Down; #665): its menu
     /// over the selected cell, and entry `n` of it chosen.
     PickList,
-    PickItem(u16),
+    PickItem(u32),
     /// Data › Flash Fill and Ctrl+E (#666), and the Flash Fill Options
     /// menu's items.
     FlashFill,
@@ -2038,6 +2039,13 @@ impl SheetView {
         self.entry_error = None;
         let took = self.take_proposal();
         self.autocorrect_commit(took);
+        self.commit_edit_taken(took)
+    }
+
+    /// [`SheetView::commit_edit`] after the proposal was taken (`took`) and
+    /// AutoCorrect ran: the rest of the commit, which Ctrl+Enter on one cell
+    /// shares so neither takes a proposal twice.
+    fn commit_edit_taken(&mut self, took: bool) -> bool {
         let untouched = self.edit_untouched();
         debug_assert!(self.editing.is_none() || self.edit_origin.is_some());
         let Some(buf) = self.editing.as_deref() else {
@@ -2598,7 +2606,7 @@ impl SheetView {
         let range = self.range();
         let inside = (range.0..=range.2).contains(&r) && (range.1..=range.3).contains(&c);
         if !self.has_range() || s != self.active || !inside {
-            return self.commit_edit();
+            return self.commit_edit_taken(took);
         }
         if let Err(e) = gridcore::entry::check_len(&buf) {
             self.entry_error = Some(e.to_string());
@@ -2616,11 +2624,22 @@ impl SheetView {
         if cells.as_ref().is_some_and(|cells| self.refuses(s, cells)) {
             return false;
         }
+        // A typed URL is a link in each cell it fills (ENT-120).
+        let link = cells
+            .as_ref()
+            .and_then(|cells| cells.first())
+            .and_then(|(_, _, cell)| self.typed_link(&buf, took, Some(cell)));
+        let filled: Vec<(u32, u32)> = cells.iter().flatten().map(|(r, c, _)| (*r, *c)).collect();
         self.end_cell_edit();
         self.push_undo();
         if let Some(cells) = cells {
             self.engine
                 .set_cells_prechecked(&mut self.pkg.workbook, s, cells);
+        }
+        if let (Some(url), Some(sh)) = (link, self.pkg.workbook.sheets.get_mut(s)) {
+            for at in filled {
+                sh.hyperlinks.insert(at, url.clone());
+            }
         }
         true
     }
@@ -12024,6 +12043,7 @@ impl Docxy {
         let ac = self.autocorrect.clone();
         let v = sheet_with_opts(self.tabs.get_mut(self.active), opts)?;
         v.autocorrect = ac;
+        v.retire_stale_preview();
         Some(v)
     }
     /// Whether the active sheet is protected (cells read-only until unprotected).
@@ -14623,7 +14643,7 @@ impl Docxy {
             | SheetAct::FlashAccept
             | SheetAct::FlashSelectBlank
             | SheetAct::FlashSelectChanged => self.flash_option(act, cx),
-            SheetAct::PickItem(i) => self.sheet_pick_item(usize::from(i), cx),
+            SheetAct::PickItem(i) => self.sheet_pick_item(i as usize, cx),
             SheetAct::Cut => self.sheet_copy(true, cx),
             SheetAct::Copy => self.sheet_copy(false, cx),
             SheetAct::Paste => {
@@ -14846,8 +14866,6 @@ impl Docxy {
             return self.sheet_find_key(ev, shift, key, cx);
         }
         let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
-        // Alt+Down opens a drop-down list (#665), before point mode or the
-        // type-over arrows can take the Down.
         // Flash Fill's preview stands for one key: Enter takes it, any
         // other key (but a lone modifier) leaves it behind (ENT-105).
         if key != "enter" && !matches!(key, "shift" | "control" | "alt" | "platform" | "function") {
@@ -14855,6 +14873,8 @@ impl Docxy {
                 v.flash_preview = None;
             }
         }
+        // Alt+Down opens a drop-down list (#665), before point mode or the
+        // type-over arrows can take the Down.
         if alt && !ctrl && !shift && key == "down" {
             return self.sheet_alt_down(cx);
         }
@@ -30252,6 +30272,7 @@ fn sheet_el(
                     .text_color(hsla_u(0x333333))
                     .child("\u{25bc}")
                     .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
                         ent_arrow.update(cx, |this, cx| this.sheet_dv_toggle(cx));
                     })
                     .into_any_element(),
@@ -30283,6 +30304,7 @@ fn sheet_el(
                             .hover(|d| d.bg(hsla_u(0xe8f0fe)))
                             .child(SharedString::from(val.clone()))
                             .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                                cx.stop_propagation();
                                 ent_pick.update(cx, |this, cx| this.sheet_dv_pick(v2.clone(), cx));
                             }),
                     );
@@ -30396,6 +30418,7 @@ fn sheet_el(
                         .child(div().w(px(16.)).text_color(hsla_u(0x777777)).child(mark))
                         .child(SharedString::from(item.label.clone()))
                         .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                            cx.stop_propagation();
                             ent_pick.update(cx, |this, cx| this.sheet_complete_pick(i, cx));
                         }),
                 );
