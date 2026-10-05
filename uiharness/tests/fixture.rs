@@ -600,10 +600,13 @@ fn check_sales(bytes: &[u8]) {
     assert_eq!(t.range, (0, 0, 3, 3));
 }
 
+/// A generated fixture: its file name, builder and check.
+type Generated = (&'static str, fn() -> Vec<u8>, fn(&[u8]));
+
 #[test]
 fn the_typing_assistance_fixtures_are_what_their_cases_assume() {
     let regen = std::env::var_os("UIHARNESS_REGEN_FIXTURE").is_some();
-    let fixtures: [(&str, fn() -> Vec<u8>, fn(&[u8])); 3] = [
+    let fixtures: [Generated; 3] = [
         ("autocomplete.xlsx", build_autocomplete, check_autocomplete),
         ("flash-fill.xlsx", build_flash_fill, check_flash_fill),
         ("sales.xlsx", build_sales, check_sales),
