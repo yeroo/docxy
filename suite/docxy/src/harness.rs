@@ -798,12 +798,14 @@ pub enum Region {
     ProjectSplit,
     /// The Home ribbon's Styles gallery: the well its tiles sit in.
     Gallery,
+    /// The AutoFilter button on column `.0`'s header cell (#690).
+    FilterButton(u32),
 }
 
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
 /// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-hbar-table`,
 /// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`,
-/// `gallery`, `tab-chip:0`.
+/// `gallery`, `tab-chip:0`, `filter-button:B`.
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.
@@ -866,6 +868,16 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .map_err(|_| format!("'{a}' is not a task ID"))?;
             Ok(Region::Bar(id))
         }
+        "filter-button" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'filter-button' needs a column, e.g. filter-button:B")?;
+            let up = a.to_ascii_uppercase();
+            match gridcore::sheet::parse_col(&up) {
+                Some((c, n)) if n == up.len() => Ok(Region::FilterButton(c)),
+                _ => Err(format!("'{a}' is not a column letter")),
+            }
+        }
         "chart" => {
             let a = arg
                 .filter(|a| !a.is_empty())
@@ -876,7 +888,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, filter-button:B)"
         )),
     }
 }
@@ -904,6 +916,7 @@ pub fn region_name(region: Region) -> String {
         Region::ProjectTimeline => "project-timeline".into(),
         Region::ProjectSplit => "project-split".into(),
         Region::Gallery => "gallery".into(),
+        Region::FilterButton(c) => format!("filter-button:{}", gridcore::sheet::col_name(c)),
     }
 }
 
@@ -1122,10 +1135,9 @@ pub fn parse_field(name: &str) -> Result<RefTarget, String> {
         "series-values" => indexed(RefTarget::SeriesValues),
         "cond-format" => Ok(RefTarget::CondFormat),
         "validation" => Ok(RefTarget::Validation),
-        "sort" => Ok(RefTarget::Sort),
         other => Err(format!(
             "unknown field '{other}' (chart-range, chart-title, categories, \
-             series-name:N, series-values:N, cond-format, validation, sort)"
+             series-name:N, series-values:N, cond-format, validation)"
         )),
     }
 }
@@ -1141,7 +1153,6 @@ pub fn field_name(target: RefTarget) -> String {
         RefTarget::SeriesValues(i) => format!("series-values:{i}"),
         RefTarget::CondFormat => "cond-format".into(),
         RefTarget::Validation => "validation".into(),
-        RefTarget::Sort => "sort".into(),
     }
 }
 
@@ -2105,10 +2116,25 @@ fn menu_open(
     cx: &mut Context<crate::Docxy>,
 ) -> Result<(), String> {
     match target {
+        Json::Str(name) if name == "cell" => {
+            if !app.active_is_sheet() {
+                return Err("the cell menu opens on a sheet tab".into());
+            }
+            let at = menu_point(app, window, None, |b| b.center());
+            app.open_cell_menu(at, cx);
+            Ok(())
+        }
         Json::Str(name) if name == "document" => {
             if app.active_is_project() {
                 return Err(
                     r#"the document menu does not open on a Project tab; a task row's is {"row": uid}"#
+                        .into(),
+                );
+            }
+            // A right-click on a sheet's body opens the cell menu instead.
+            if app.active_is_sheet() {
+                return Err(
+                    r#"the document menu does not open on a sheet tab; a cell's is {"cell": "D7"}"#
                         .into(),
                 );
             }
@@ -2117,6 +2143,21 @@ fn menu_open(
             Ok(())
         }
         Json::Obj(fields) if fields.len() == 1 => match fields[0].0.as_str() {
+            // A right-click on that cell: outside the selection it selects
+            // it, then the cell menu opens (#690, #691).
+            "cell" => {
+                if !app.active_is_sheet() {
+                    return Err("the cell menu opens on a sheet tab".into());
+                }
+                let name = fields[0]
+                    .1
+                    .as_str()
+                    .ok_or("'cell' must be a cell, e.g. D7")?;
+                let (r, c) = parse_cell(name)?;
+                let at = menu_point(app, window, None, |b| b.center());
+                app.cell_right_click(r, c, at, window, cx);
+                Ok(())
+            }
             "row" => {
                 let uid = match &fields[0].1 {
                     Json::Null => None,
@@ -2173,7 +2214,7 @@ fn menu_open(
                 app.open_split_menu(id, at, cx)
             }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, row and ribbon are)"
+                "menu target '{other}' is not supported yet (document, cell, row and ribbon are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
@@ -2244,6 +2285,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "ribbon-click"
             | "title-tab"
             | "close-tab"
+            | "close-window"
             | "selection-set"
             | "open"
             | "backstage-close"
@@ -2258,6 +2300,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "dialog-tab"
             | "dialog-click"
             | "enable-editing"
+            | "edit-anyway"
     )
 }
 
@@ -2470,6 +2513,15 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             "protected",
             Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.access.protected)),
         ),
+        // A document Word marked as final, until Edit Anyway (#617).
+        (
+            "final",
+            Json::Bool(
+                app.tabs
+                    .get(app.active)
+                    .is_some_and(|t| t.access.marked_final),
+            ),
+        ),
         (
             "repaired",
             Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.access.repaired)),
@@ -2523,6 +2575,8 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ("range", Json::Str(a1_range(v.range()))),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
+            // The sheet comment editor New Comment opens, and its text.
+            ("comment_edit", str_or_null(app.sheet_comment_edit.clone())),
         ]);
     }
     let ov = app.grid_overlay();
@@ -2595,6 +2649,7 @@ fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
                 ("caption", Json::Str(t.caption())),
                 ("read_only", Json::Bool(t.access.read_only)),
                 ("protected", Json::Bool(t.access.protected)),
+                ("final", Json::Bool(t.access.marked_final)),
                 ("repaired", Json::Bool(t.access.repaired)),
             ])
         })
@@ -2632,6 +2687,23 @@ fn open_dialogs(app: &mut crate::Docxy) -> Result<&mut crate::dialog::DialogStac
 /// the handler under test was broken — the one way this harness could be worse
 /// than nothing.
 pub fn dispatch(
+    app: &mut crate::Docxy,
+    verb: &str,
+    args: &Json,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) -> Result<Done, String> {
+    let mut done = dispatch_verb(app, verb, args, window, cx)?;
+    // The window's close went ahead (#630): its last question was answered
+    // by this verb, or `close-window` found nothing to ask. The process ends
+    // once this reply is out, as after `quit`.
+    if app.quit_ready {
+        done.quit = true;
+    }
+    Ok(done)
+}
+
+fn dispatch_verb(
     app: &mut crate::Docxy,
     verb: &str,
     args: &Json,
@@ -2840,12 +2912,16 @@ pub fn dispatch(
         "dialog-click" => {
             let button = arg_str(args, "button")?.to_string();
             open_dialogs(app)?;
-            app.dialog_press(&button)?;
+            app.dialog_press(&button, window, cx)?;
             app.refocus(window, cx);
             let Json::Obj(mut out) = state(app, window) else {
                 unreachable!("state is an object")
             };
-            let dialog = app.tabs[app.active].dialogs.to_json();
+            // A close prompt's Save or Don't Save may have closed the last tab.
+            let dialog = app.tabs.get(app.active).map_or_else(
+                || crate::dialog::DialogStack::default().to_json(),
+                |t| t.dialogs.to_json(),
+            );
             match out.iter_mut().find(|(k, _)| k == "dialog") {
                 Some((_, v)) => *v = dialog,
                 None => out.push(("dialog".into(), dialog)),
@@ -3033,6 +3109,18 @@ pub fn dispatch(
             app.backstage_close(window, cx);
             Done::ok(state(app, window))
         }
+        // The window's close button, as `on_window_should_close` runs it
+        // outside the harness (#630): with "ask before closing" on and work
+        // unsaved, Word's question for each unsaved tab, driven with
+        // `dialog-click`; otherwise, or once the last one is answered, a clean
+        // exit, and the process ends after the reply.
+        "close-window" => {
+            app.refuse_under_dialog()?;
+            if app.window_should_close(true, window, cx) {
+                app.quit_ready = true;
+            }
+            Done::ok(state(app, window))
+        }
         "ask-on-close" => {
             let Some(Json::Bool(on)) = args.get("on") else {
                 return Err("'on' must be a boolean".into());
@@ -3192,6 +3280,18 @@ pub fn dispatch(
             app.enable_editing(cx);
             Done::ok(state(app, window))
         }
+        // The MARKED AS FINAL bar's Edit Anyway (#617).
+        "edit-anyway" => {
+            app.refuse_under_dialog()?;
+            let Some(t) = app.tabs.get(app.active).filter(|t| t.access.marked_final) else {
+                return Err("the active document is not marked as final".into());
+            };
+            if t.access.protected {
+                return Err(crate::open_mode::PROTECTED_STATUS.into());
+            }
+            app.edit_anyway(cx);
+            Done::ok(state(app, window))
+        }
 
         // A click on a cell: press, click, release — the three events the
         // pointer delivers, in that order.
@@ -3307,8 +3407,8 @@ pub fn dispatch(
             };
             let tab = app.tabs.get_mut(app.active).ok_or("no tab is open")?;
             // Attaching a data source changes what the document saves (#633).
-            if tab.access.protected {
-                return Err(crate::open_mode::PROTECTED_STATUS.into());
+            if tab.access.locked() {
+                return Err(tab.access.locked_status().into());
             }
             if tab.kind != crate::Kind::Docx {
                 return Err("mail-attach needs a Word document".into());
@@ -3420,11 +3520,13 @@ pub fn dispatch(
             let src = sheet(app)?.range();
             app.sheet_fill_start(cx);
             if app.sheet_fill.is_none() {
-                return Err(if app.protected_view() {
-                    format!(
-                        "the fill did not arm: {}",
-                        crate::open_mode::PROTECTED_STATUS
-                    )
+                let locked = app
+                    .tabs
+                    .get(app.active)
+                    .map(|t| t.access)
+                    .filter(|a| a.locked());
+                return Err(if let Some(access) = locked {
+                    format!("the fill did not arm: {}", access.locked_status())
                 } else if app.sheet_protected() {
                     "the fill did not arm: the sheet is protected".into()
                 } else {
@@ -4675,6 +4777,7 @@ mod tests {
             "ribbon-click",
             "title-tab",
             "close-tab",
+            "close-window",
             "selection-set",
             "open",
             "select-chart",
@@ -5758,7 +5861,8 @@ mod tests {
             parse_field(" series-values:2 "),
             Ok(RefTarget::SeriesValues(2))
         );
-        assert_eq!(parse_field("sort"), Ok(RefTarget::Sort));
+        // The sort bar's field went with the bar (#691).
+        assert!(parse_field("sort").is_err());
     }
 
     #[test]
@@ -5782,7 +5886,6 @@ mod tests {
             RefTarget::SeriesValues(3),
             RefTarget::CondFormat,
             RefTarget::Validation,
-            RefTarget::Sort,
         ] {
             assert_eq!(parse_field(&field_name(t)), Ok(t));
         }
@@ -5918,6 +6021,7 @@ mod tests {
             Region::ProjectTimeline,
             Region::ProjectSplit,
             Region::Gallery,
+            Region::FilterButton(1),
         ] {
             assert_eq!(parse_region(&region_name(r)), Ok(r));
         }

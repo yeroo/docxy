@@ -63,7 +63,9 @@ test sheet ribbon data tab lists Excel's groups
   assert reply.tabs.3.groups.0.commands.4.label is Clear
   assert reply.tabs.3.groups.0.commands.4.enabled is true
   assert reply.tabs.3.groups.0.commands.5.label is Reapply
-  assert reply.tabs.3.groups.0.commands.5.enabled is false
+  assert reply.tabs.3.groups.0.commands.5.enabled is true
+  assert reply.tabs.3.groups.0.commands.6.label is Advanced
+  assert reply.tabs.3.groups.0.commands.6.enabled is true
   assert reply.tabs.3.groups.1.commands.1.label is Flash Fill
   assert reply.tabs.3.groups.1.commands.2.label is Remove Duplicates
   assert reply.tabs.3.groups.1.commands.4.label is Circle Invalid Data
@@ -85,13 +87,18 @@ test sheet ribbon data tab sorts the region by the cursor's column
   assert cell A2 is West
 
 # A copy leaves out the rows a filter hides, so its row count shows the
-# filter and Clear taking it off.
+# filter and Clear taking it off. Filter puts buttons on the list (#690); the
+# filter itself is set through a button's drop-down.
 test sheet ribbon data tab clears a filter
   open ../fixtures/basic.xlsx
   click B2
   call ribbon-click {"tab":"Data","command":"Filter"}
-  type >20
-  key enter
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  call dialog-set {"control":"val1","value":"20"}
+  call dialog-click {"button":"OK"}
   click A1
   click B5 shift
   key ctrl+c
@@ -105,19 +112,17 @@ test sheet ribbon data tab clears a filter
   call clipboard {"action":"read"}
   assert reply.app.rows is 5
 
-# Clear with nothing filtered, and an empty criteria, change no row, so the
-# workbook stays clean.
+# Clear and Reapply with no filter change no row, so the workbook stays clean.
 test sheet ribbon data tab clear with no filter leaves the workbook clean
   open ../fixtures/basic.xlsx
   click B2
   call ribbon-click {"tab":"Data","command":"Clear"}
   assert dirty is false
-  call ribbon-click {"tab":"Data","command":"Filter"}
-  key enter
+  assert status is There is no filter on this sheet.
+  call ribbon-click {"tab":"Data","command":"Reapply"}
   assert dirty is false
 
 test sheet ribbon data tab refuses its placeholders
   open ../fixtures/basic.xlsx
   call-error ribbon-click {"tab":"Data","command":"Flash Fill"} => 'Flash Fill' is not implemented
-  call-error ribbon-click {"tab":"Data","command":"Advanced"} => 'Advanced' is not implemented
   call-error ribbon-click {"tab":"Data","command":"Circle Invalid Data"} => 'Circle Invalid Data' is not implemented

@@ -177,7 +177,7 @@ pub fn delete_record(wb: &mut Workbook, sheet: usize, (_, c1, bottom, c2): Area,
                     cell.formula = Some(moved);
                 }
             }
-            move_own_array_ref(&mut cell, (r, c), r - 1);
+            move_own_array_ref(&mut cell, (r, c), (r - 1, c));
             s.cells.insert((r - 1, c), cell);
         }
     }

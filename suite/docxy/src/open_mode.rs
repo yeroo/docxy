@@ -51,6 +51,7 @@ impl OpenMode {
             protected: false,
             stamp: None,
             converted: None,
+            marked_final: false,
         }
     }
 }
@@ -105,6 +106,11 @@ pub(crate) struct Access {
     pub(crate) stamp: Option<crate::trusted::Stamp>,
     /// The tab was converted from another format, or recovered (#633).
     pub(crate) converted: Option<Converted>,
+    /// A document Word marked as final (#617): no edits and no saves until
+    /// Edit Anyway. The package's own mark, read at every load, never the
+    /// session's: Edit Anyway removes it from the package, so the hot-exit
+    /// copy carries the answer.
+    pub(crate) marked_final: bool,
 }
 
 impl Access {
@@ -113,13 +119,30 @@ impl Access {
         self.read_only || self.repaired || self.converted.is_some()
     }
 
+    /// No edit and no save reaches the tab: Protected View, or a document
+    /// marked as final. Every edit gate asks this.
+    pub(crate) fn locked(self) -> bool {
+        self.protected || self.marked_final
+    }
+
+    /// What a refused edit or save says on a [`Self::locked`] tab: how to
+    /// edit it. Protected View comes first, as its bar does.
+    pub(crate) fn locked_status(self) -> &'static str {
+        if self.protected {
+            PROTECTED_STATUS
+        } else {
+            MARKED_FINAL_STATUS
+        }
+    }
+
     /// The caption's suffix, Excel's words; Protected View says the most.
+    /// Word captions a document marked as final Read-Only too.
     pub(crate) fn caption_suffix(self) -> Option<&'static str> {
         if self.protected {
             Some("[Protected View]")
         } else if self.repaired {
             Some("[Repaired]")
-        } else if self.read_only {
+        } else if self.read_only || self.marked_final {
             Some("[Read-Only]")
         } else {
             None
@@ -186,6 +209,15 @@ pub(crate) fn caption(title: &str, access: Access) -> String {
 
 /// What every refused edit or save in Protected View says.
 pub(crate) const PROTECTED_STATUS: &str = "Protected View — select Enable Editing to edit";
+
+/// What every refused edit or save in a document marked as final says
+/// (#617).
+pub(crate) const MARKED_FINAL_STATUS: &str = "Marked as Final — select Edit Anyway to edit";
+
+/// Word's message bar over a document marked as final.
+pub(crate) const MARKED_FINAL_LABEL: &str = "MARKED AS FINAL";
+pub(crate) const MARKED_FINAL_TEXT: &str =
+    "An author has marked this document as final to discourage editing.";
 
 /// The message bar's label and text, Excel's words.
 pub(crate) const PROTECTED_LABEL: &str = "PROTECTED VIEW";

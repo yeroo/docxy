@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 mod backstage;
 mod control;
+mod datacmd;
 mod dataform;
 mod mcp;
 mod outlinedlg;
@@ -1083,14 +1084,30 @@ fn print_usage() {
            F5 insert rows  Shift-F5 delete rows  F6/Shift-F6 same for columns\n  \
            Ctrl-T add sheet  Shift-F2 rename sheet  Shift-Del delete sheet\n  \
            F12 Save As   F7 / F8 shrink / widen the current column\n  \
+           Ctrl-Shift-L filter buttons on/off   Alt-↓ on a header: its filter\n  \
            mouse: click to move · drag to select · double-click to edit · wheel to scroll"
     );
 }
 
-/// Current local time as an Excel serial: Excel's `TODAY()`/`NOW()`, and
-/// the year a typed `3/4` takes, follow the local clock.
+thread_local! {
+    /// `wb.clock`'s fixed date (a serial), standing in for the local clock
+    /// until it is cleared. Thread-local: the app runs on one thread, and
+    /// tests running side by side don't see each other's.
+    static CLOCK_OVERRIDE: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fix the clock at `serial` (`None`: the local clock again) — `wb.clock`.
+fn set_clock_override(serial: Option<f64>) {
+    CLOCK_OVERRIDE.with(|c| c.set(serial));
+}
+
+/// Current local time as an Excel serial: Excel's `TODAY()`/`NOW()`, the
+/// year a typed `3/4` takes, and a date filter's "today" follow the local
+/// clock, or the date `wb.clock` fixed.
 fn now_serial() -> Option<f64> {
-    gridcore::clock::local_now_serial()
+    CLOCK_OVERRIDE
+        .with(|c| c.get())
+        .or_else(gridcore::clock::local_now_serial)
 }
 
 fn entropy_seed() -> Option<u64> {
@@ -1533,6 +1550,23 @@ struct WbSnapshot {
     model_rename: Option<(String, String)>,
 }
 
+/// Whether `wb` differs from the snapshot `before` in what a filter or sort
+/// command can change: cells, rows' hidden state and attributes, columns,
+/// merges, the AutoFilter, and the defined names.
+fn wb_changed(before: &WbSnapshot, wb: &gridcore::sheet::Workbook) -> bool {
+    before.names != wb.defined_names
+        || before.sheets.len() != wb.sheets.len()
+        || before.sheets.iter().zip(&wb.sheets).any(|(a, b)| {
+            a.cells != b.cells
+                || a.row_attrs != b.row_attrs
+                || a.col_defs != b.col_defs
+                || a.merges != b.merges
+                || a.filtered_rows != b.filtered_rows
+                || a.auto_filter != b.auto_filter
+                || a.filter_mode.unwrap_or(false) != b.filter_mode.unwrap_or(false)
+        })
+}
+
 enum UndoAction {
     /// One undo step; more than one group when it touched several sheets
     /// (a cut pasted on another sheet). The view follows the last group.
@@ -1573,10 +1607,18 @@ enum PromptKind {
     CondFormat,
     /// Data validation: comma-separated allowed values → a dropdown list.
     DataValidation,
-    /// AutoFilter: a criteria on the current column ("=Laptop", ">500", "clear").
-    Filter,
-    /// Multi-level sort: a spec like "B asc, C desc" over the current region.
+    /// Custom AutoFilter, Top 10 or a date period for a filter column
+    /// (`>10 and <=30`, `begins a`, `top 3`, `above average`, `this week`).
+    CustomFilter,
+    /// Filter by Selected Cell's value, colour, font colour or icon.
+    FilterByCell,
+    /// Advanced Filter: `list=A1:C9 criteria=E1:E2 copy=H1:I1 unique`.
+    AdvancedFilter,
+    /// Multi-level sort: a spec like "B asc, C desc" over the selection or
+    /// the current region (see [`datacmd::parse_sort_text`]).
     SortKeys,
+    /// The Sort Warning: expand the selection, or continue with it.
+    SortWarning,
     /// Row height in points for the selected rows ("auto" clears it).
     RowHeight,
     /// File › Info: a new value for editable property `n` ([`INFO_FIELDS`]),
@@ -1880,6 +1922,12 @@ struct App {
     sheet_picker: Option<usize>,
     /// The list-validation dropdown, open on a `list`-validated cell.
     dv_picker: Option<DvPicker>,
+    /// A filter button's drop-down (Alt+Down on the filter's header row).
+    filter_picker: Option<datacmd::FilterPicker>,
+    /// A sort waiting on the Sort Warning's answer.
+    pending_sort: Option<datacmd::PendingSort>,
+    /// The column the Custom AutoFilter prompt filters.
+    custom_filter_col: Option<u32>,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
@@ -2022,6 +2070,9 @@ impl App {
             startup_import: false,
             sheet_picker: None,
             dv_picker: None,
+            filter_picker: None,
+            pending_sort: None,
+            custom_filter_col: None,
             grid_area: Rect::default(),
             gutter_w: 4,
             outline_w: 0,
@@ -2639,7 +2690,8 @@ impl App {
         model_rename: Option<(&str, &str)>,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.structural_step(model_rename, false, op)
+        self.structural_step(model_rename, false, false, op)
+            .map(|_| ())
     }
 
     /// [`Self::structural`] for an edit that writes cell content in place
@@ -2648,22 +2700,35 @@ impl App {
     /// ([`Self::sync_written_headers`]). An edit that moves cells (rows,
     /// columns, a sort) must not use it: its moved headers aren't written.
     fn structural_writing_cells(&mut self, op: impl FnOnce(&mut gridcore::sheet::Workbook)) {
-        let infallible = self.structural_step(None, true, |wb| {
+        let infallible = self.structural_step(None, true, false, |wb| {
             op(wb);
             Ok(())
         });
         debug_assert!(infallible.is_ok());
     }
 
-    /// The one structural step behind [`Self::try_structural`] and
-    /// [`Self::structural_writing_cells`]; `sync_headers` says whether the
-    /// edit wrote cells in place, whose header cells then rename columns.
+    /// [`Self::try_structural`] for an edit that may change nothing (a
+    /// filter command, a sort, #690/#691): then it pushes no undo step and
+    /// leaves the workbook unmodified. Whether it changed anything.
+    fn try_structural_if_changed(
+        &mut self,
+        op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        self.structural_step(None, false, true, op)
+    }
+
+    /// The one structural step behind [`Self::try_structural`],
+    /// [`Self::structural_writing_cells`] and
+    /// [`Self::try_structural_if_changed`]; `sync_headers` says whether the
+    /// edit wrote cells in place, whose header cells then rename columns, and
+    /// `skip_unchanged` that an edit that changed nothing is not one.
     fn structural_step(
         &mut self,
         model_rename: Option<(&str, &str)>,
         sync_headers: bool,
+        skip_unchanged: bool,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let mut before = self.wb_snapshot();
         // A structural edit moves cells, so compare how many cells sit on
         // circles rather than where: a circle that merely moved is not new.
@@ -2671,6 +2736,9 @@ impl App {
         if let Err(e) = op(&mut self.pkg.workbook) {
             self.put_back(&before);
             return Err(e);
+        }
+        if skip_unchanged && !wb_changed(&before, &self.pkg.workbook) {
+            return Ok(false);
         }
         if sync_headers {
             self.sync_written_headers(&before);
@@ -2690,7 +2758,7 @@ impl App {
         self.modified = true;
         self.clamp_cursor();
         self.cancel_cut();
-        Ok(())
+        Ok(true)
     }
 
     /// A structural edit that wrote cells in place (Replace All, Text to
@@ -4827,8 +4895,8 @@ impl App {
             InsertCol => self.col_op(true),
             DeleteRow => self.row_op(false),
             DeleteCol => self.col_op(false),
-            SortAsc => self.sort_region(true),
-            SortDesc => self.sort_region(false),
+            SortAsc => self.quick_sort(true),
+            SortDesc => self.quick_sort(false),
             CustomSort => self.open_prompt(PromptKind::SortKeys),
             AutoSum => self.autosum(),
             InsertChart(kind) => self.insert_chart(kind),
@@ -4849,7 +4917,20 @@ impl App {
             RowHeight => self.open_prompt(PromptKind::RowHeight),
             CondFormat => self.open_prompt(PromptKind::CondFormat),
             DataValidation => self.open_prompt(PromptKind::DataValidation),
-            Filter => self.open_prompt(PromptKind::Filter),
+            Filter => {
+                let sel = self.selection();
+                let range = ((sel.0, sel.1) != (sel.2, sel.3)).then_some(sel);
+                let _ = self.toggle_filter(range);
+            }
+            ClearFilter => {
+                let _ = self
+                    .filter_command(|wb, si, today| gridcore::filter::clear(wb, si, None, today));
+            }
+            ReapplyFilter => {
+                let _ = self.filter_command(gridcore::filter::reapply);
+            }
+            AdvancedFilter => self.open_prompt(PromptKind::AdvancedFilter),
+            FilterByCell => self.open_prompt(PromptKind::FilterByCell),
             RemoveDuplicates => self.remove_duplicates(),
             TextToColumns => self.open_text_to_columns(),
             FormatAsTable => self.format_as_table(),
@@ -5789,95 +5870,6 @@ impl App {
             "{} {count} column{}",
             if insert { "Inserted" } else { "Deleted" },
             if count == 1 { "" } else { "s" }
-        ));
-    }
-
-    /// Sort the contiguous region around the cursor by the cursor's column
-    /// (header-aware; rows move as whole units; blanks last). Value-table sort —
-    /// like the suite; formula refs in moved rows are not re-based.
-    /// The contiguous region around the cursor to sort, as `(start, bottom)`
-    /// data-row bounds (header excluded). A header is inferred when the top row
-    /// has a text label over numeric data in *any* column. `None` when there's
-    /// nothing to sort.
-    fn sort_bounds(&self) -> Option<(u32, u32)> {
-        use gridcore::sheet::CellValue;
-        let (rc, cc) = self.sheet().used_size();
-        if rc == 0 || cc == 0 {
-            return None;
-        }
-        let (max_r, max_c) = (rc - 1, cc - 1);
-        let cur_r = self.cur.0;
-        let sh = self.sheet();
-        let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-        if !used(cur_r) {
-            return None;
-        }
-        let mut top = cur_r;
-        while top > 0 && used(top - 1) {
-            top -= 1;
-        }
-        let mut bottom = cur_r;
-        while bottom < max_r && used(bottom + 1) {
-            bottom += 1;
-        }
-        let header = (0..=max_c).any(|c| {
-            matches!(
-                sh.cell(top, c).map(|cl| &cl.value),
-                Some(CellValue::Text(_))
-            ) && (top + 1..=bottom).any(|r| {
-                matches!(
-                    sh.cell(r, c).map(|cl| &cl.value),
-                    Some(CellValue::Number(_))
-                )
-            })
-        });
-        let start = if header { top + 1 } else { top };
-        (bottom > start).then_some((start, bottom))
-    }
-
-    fn sort_region(&mut self, ascending: bool) {
-        let sc = self.cur.1;
-        let Some((start, bottom)) = self.sort_bounds() else {
-            return;
-        };
-        let s = self.sheet;
-        if gridcore::edit::sort_cuts_spill(&self.pkg.workbook, s, start, bottom) {
-            self.status = Some(gridcore::edit::SORT_CUTS_SPILL.into());
-            return;
-        }
-        self.structural(move |wb| {
-            gridcore::edit::sort_rows(wb, s, start, bottom, &[(sc, ascending)]);
-        });
-        self.status = Some(format!(
-            "Sorted {}",
-            if ascending { "A->Z" } else { "Z->A" }
-        ));
-    }
-
-    /// Multi-level sort from a typed spec like "B asc, C desc" (column letters,
-    /// optional asc/desc, default ascending). The first key is primary.
-    fn commit_sort(&mut self, text: &str) {
-        let Some(keys) = gridcore::edit::parse_sort_spec(text) else {
-            self.status = Some("Sort: enter columns, e.g. \"B asc, C desc\"".into());
-            return;
-        };
-        let Some((start, bottom)) = self.sort_bounds() else {
-            self.status = Some("Sort: put the cursor in the data".into());
-            return;
-        };
-        let s = self.sheet;
-        if gridcore::edit::sort_cuts_spill(&self.pkg.workbook, s, start, bottom) {
-            self.status = Some(gridcore::edit::SORT_CUTS_SPILL.into());
-            return;
-        }
-        let keys2 = keys.clone();
-        self.structural(move |wb| {
-            gridcore::edit::sort_rows(wb, s, start, bottom, &keys2);
-        });
-        self.status = Some(format!(
-            "Sorted by {} key{}",
-            keys.len(),
-            if keys.len() == 1 { "" } else { "s" }
         ));
     }
 
@@ -6945,72 +6937,6 @@ impl App {
         });
     }
 
-    /// AutoFilter: hide the rows of the current region whose cursor-column value
-    /// fails the typed criteria (header row kept). "clear" unhides them all.
-    fn commit_filter(&mut self, text: &str) {
-        use gridcore::sheet::CellValue;
-        let s = self.sheet;
-        let sc = self.cur.1;
-        let cur_r = self.cur.0;
-        let (rc, cc) = self.sheet().used_size();
-        if rc == 0 || cc == 0 {
-            return;
-        }
-        let (max_r, max_c) = (rc - 1, cc - 1);
-        // Contiguous region around the cursor.
-        let (top, bottom, header) = {
-            let sh = self.sheet();
-            let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-            if !used(cur_r) {
-                return;
-            }
-            let mut top = cur_r;
-            while top > 0 && used(top - 1) {
-                top -= 1;
-            }
-            let mut bottom = cur_r;
-            while bottom < max_r && used(bottom + 1) {
-                bottom += 1;
-            }
-            let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
-            (top, bottom, header)
-        };
-        if text.trim().eq_ignore_ascii_case("clear") {
-            for r in top..=bottom {
-                self.pkg.workbook.sheets[s].set_row_filtered(r, false);
-            }
-            // SUBTOTAL(1..11) counts rows by whether a filter hid them.
-            self.engine.recalc_all(&mut self.pkg.workbook);
-            self.clamp_cursor();
-            self.modified = true;
-            self.status = Some("Filter cleared".into());
-            return;
-        }
-        let Some((op, operand)) = gridcore::filter::parse(text) else {
-            self.status = Some("Filter: enter a value or comparison".into());
-            return;
-        };
-        let start = if header { top + 1 } else { top };
-        let keep: Vec<bool> = (start..=bottom)
-            .map(|r| {
-                let v = self.sheet().cell(r, sc).map(|c| c.value.clone());
-                gridcore::filter::matches(v.as_ref(), op, &operand)
-            })
-            .collect();
-        let mut hidden = 0;
-        for (i, r) in (start..=bottom).enumerate() {
-            let hide = !keep[i];
-            if hide {
-                hidden += 1;
-            }
-            self.pkg.workbook.sheets[s].set_row_filtered(r, hide);
-        }
-        self.engine.recalc_all(&mut self.pkg.workbook);
-        self.clamp_cursor();
-        self.modified = true;
-        self.status = Some(format!("Filtered by column: {hidden} rows hidden"));
-    }
-
     /// Create a list data-validation (dropdown) over the selection from a
     /// comma-separated list of allowed values.
     fn commit_data_validation(&mut self, text: &str) {
@@ -7065,8 +6991,7 @@ impl App {
         let dxf = gridcore::sheet::Dxf {
             fill: Some((0xFF, 0xC7, 0xCE)),
             color: Some((0x9C, 0x00, 0x06)),
-            bold: None,
-            italic: None,
+            ..Default::default()
         };
         if !self
             .pkg
@@ -7557,11 +7482,26 @@ impl App {
             PromptKind::DataValidation => {
                 ("Dropdown list (comma-separated values): ", String::new())
             }
-            PromptKind::Filter => (
-                "Filter this column (=Laptop, >500, <>0, 'clear'): ",
+            PromptKind::CustomFilter => (
+                "Filter (>10 and <=30, begins a, top 3, top 25%, above average, this week): ",
                 String::new(),
             ),
-            PromptKind::SortKeys => ("Sort by (e.g. B asc, C desc): ", String::new()),
+            PromptKind::FilterByCell => (
+                "Filter by selected cell's (v)alue, (c)olor, (f)ont color, (i)con: ",
+                String::new(),
+            ),
+            PromptKind::AdvancedFilter => (
+                "Advanced Filter (list=A1:C9 criteria=E1:E2 copy=H1:I1 unique): ",
+                String::new(),
+            ),
+            PromptKind::SortKeys => (
+                "Sort by (B asc, C desc, A list:Jan/Feb, A fill:FF00B050 top; /case /ltr /noheader): ",
+                String::new(),
+            ),
+            PromptKind::SortWarning => (
+                "Data next to your selection won't be sorted: (e)xpand the selection / (c)ontinue: ",
+                String::new(),
+            ),
             PromptKind::RowHeight => ("Row height in points (or 'auto'): ", String::new()),
             PromptKind::DocProperty(i) => {
                 let mut p = self.pkg.doc_properties();
@@ -7607,8 +7547,11 @@ impl App {
             PromptKind::GoTo => self.goto(&text),
             PromptKind::CondFormat => self.commit_cond_format(&text),
             PromptKind::DataValidation => self.commit_data_validation(&text),
-            PromptKind::Filter => self.commit_filter(&text),
-            PromptKind::SortKeys => self.commit_sort(&text),
+            PromptKind::CustomFilter => self.commit_custom_filter(&text),
+            PromptKind::FilterByCell => self.commit_filter_by_cell(&text),
+            PromptKind::AdvancedFilter => self.commit_advanced_filter(&text),
+            PromptKind::SortKeys => self.commit_sort_text(&text),
+            PromptKind::SortWarning => self.answer_sort_warning(&text),
             PromptKind::RowHeight => self.commit_row_height(&text),
             PromptKind::DocProperty(i) => {
                 let message = self.commit_doc_property(i as usize, &text);
@@ -8302,6 +8245,14 @@ fn draw(app: &mut App, f: &mut Frame) {
                     Align::General => fit(&line_text, w as usize, numeric),
                 }
             };
+            // A filter button sits at the right edge of each header cell.
+            let display = match datacmd::filter_button(&app.pkg.workbook, app.sheet, row, col) {
+                Some(mark) if sub == 0 && w > 1 => {
+                    let (head, _) = truncate_width(&display, w as usize - 1);
+                    format!("{}{mark}", fit(&head, w as usize - 1, false))
+                }
+                _ => display,
+            };
             let mut style = base;
             if xf.bold {
                 style = style.add_modifier(Modifier::BOLD);
@@ -8396,6 +8347,9 @@ fn draw(app: &mut App, f: &mut Frame) {
     // --- data-validation dropdown ----------------------------------------------
     if let Some(p) = &app.dv_picker {
         draw_dv_picker(app, p, f, grid);
+    }
+    if let Some(p) = &app.filter_picker {
+        datacmd::draw_filter_picker(app, p, f, grid);
     }
 
     // --- sheet tabs + stats ---------------------------------------------------
@@ -8506,6 +8460,9 @@ fn draw(app: &mut App, f: &mut Frame) {
         s.clone()
     } else if app.edit.is_some() {
         "Enter commit ↓ · Tab commit → · Esc cancel".to_string()
+    } else if app.filter_picker.is_some() {
+        "Filter: ↑/↓ move · Space check · type to search · Tab add to filter · Enter apply · Esc close"
+            .to_string()
     } else if let Some(dv) = app.current_validation() {
         if dv.kind == "list" {
             format!("✔ {}   ·   Alt-↓ dropdown", dv.describe())
@@ -9361,7 +9318,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         || app.outline_dialog.is_some()
         || app.data_form.is_some()
         || app.sheet_picker.is_some()
-        || app.dv_picker.is_some();
+        || app.dv_picker.is_some()
+        || app.filter_picker.is_some();
     // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
     if key.code == KeyCode::F(9) && !overlay_open && !shift && !ctrl {
         app.ribbon_focus = if app.ribbon_focus == ribbon::Focus::None {
@@ -9407,6 +9365,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // --- data-validation dropdown ---------------------------------------------
     if app.dv_picker.is_some() {
         app.dv_picker_key(key.code);
+        return false;
+    }
+
+    // --- filter drop-down ------------------------------------------------------
+    if app.filter_picker.is_some() {
+        app.filter_picker_key(key.code);
         return false;
     }
 
@@ -9660,8 +9624,19 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.cur = (rows - 1, cols.max(1) - 1);
             }
         }
-        // Alt-↓ on a validated cell opens its dropdown (Excel parity).
-        KeyCode::Down if alt => app.open_dv_dropdown(),
+        // Alt-↓ on a filter button opens its drop-down, on a validated cell
+        // its list (Excel parity).
+        KeyCode::Down if alt => {
+            if !app.open_filter_picker() {
+                app.open_dv_dropdown();
+            }
+        }
+        // Ctrl+Shift+L: Data › Filter.
+        KeyCode::Char('l') | KeyCode::Char('L') if ctrl && shift => {
+            let sel = app.selection();
+            let range = ((sel.0, sel.1) != (sel.2, sel.3)).then_some(sel);
+            let _ = app.toggle_filter(range);
+        }
         // Excel's Group / Ungroup.
         KeyCode::Right if alt && shift => app.group_outline(false),
         KeyCode::Left if alt && shift => app.group_outline(true),
@@ -12815,7 +12790,7 @@ mod tests {
         app.rebuild_engine();
         app.cur = (1, 1); // a data cell in the Qty column
         app.anchor = None;
-        app.sort_region(true); // ascending by Qty
+        app.quick_sort(true); // ascending by Qty
 
         let v = |r, c| app.sheet().cell(r, c).unwrap().value.clone();
         assert_eq!(v(0, 0), CellValue::Text("Item".into())); // header stays put
@@ -12825,7 +12800,7 @@ mod tests {
         assert_eq!(v(2, 0), CellValue::Text("C".into()));
         assert_eq!(v(3, 0), CellValue::Text("B".into()));
 
-        app.sort_region(false); // descending => B, C, A
+        app.quick_sort(false); // descending => B, C, A
         let v = |r, c| app.sheet().cell(r, c).unwrap().value.clone();
         assert_eq!(v(1, 0), CellValue::Text("B".into()));
         assert_eq!(v(3, 0), CellValue::Text("A".into()));
@@ -12834,27 +12809,29 @@ mod tests {
     #[test]
     fn a_sort_across_a_spill_is_refused() {
         // #840: rows that cut a spilled array don't sort; the status says
-        // why and no undo step is pushed. A1:A3 = 3, 1, 2 beside C1
-        // `=SEQUENCE(3)`.
+        // why and no undo step is pushed. B1:B3 = 3, 1, 2 beside C1
+        // `=SEQUENCE(3)`, so the list B1:C3 holds the spill. (#691: a sort
+        // moves only its list's cells, so a list off to the side, past a
+        // blank column, would sort.)
         use gridcore::sheet::{Cell, CellValue};
         let mut app = app_with_sequence_in_c1();
         for (r, n) in [3.0, 1.0, 2.0].iter().enumerate() {
-            app.pkg.workbook.sheets[0].set_cell(r as u32, 0, Cell::number(*n));
+            app.pkg.workbook.sheets[0].set_cell(r as u32, 1, Cell::number(*n));
         }
         app.rebuild_engine();
         let before = app.sheet().cells.clone();
         let undo = app.undo.len();
-        app.cur = (0, 0);
+        app.cur = (0, 1);
         app.anchor = None;
-        app.sort_region(true);
+        app.quick_sort(true);
         assert_eq!(app.status.as_deref(), Some(gridcore::edit::SORT_CUTS_SPILL));
         app.status = None;
-        app.commit_sort("A desc");
+        app.commit_sort_text("B desc");
         assert_eq!(app.status.as_deref(), Some(gridcore::edit::SORT_CUTS_SPILL));
         assert_eq!(app.sheet().cells, before);
         assert_eq!(app.undo.len(), undo);
         assert_eq!(
-            app.sheet().cell(0, 0).unwrap().value,
+            app.sheet().cell(0, 1).unwrap().value,
             CellValue::Number(3.0)
         );
     }
@@ -12886,7 +12863,7 @@ mod tests {
         app.rebuild_engine();
         app.cur = (1, 0);
         app.anchor = None;
-        app.commit_sort("A asc, B desc"); // Grp asc, then Score desc
+        app.commit_sort_text("A asc, B desc"); // Grp asc, then Score desc
         let v = |r, c| app.sheet().cell(r, c).unwrap().value.clone();
         assert_eq!(v(0, 0), CellValue::Text("Grp".into())); // header kept
         assert_eq!(
@@ -13766,8 +13743,8 @@ mod tests {
         assert!(!app.sheet().col_hidden(1));
     }
     #[test]
-    fn commit_filter_hides_nonmatching_rows() {
-        use gridcore::sheet::Cell;
+    fn filter_commands_hide_rows_as_filtered() {
+        use gridcore::sheet::{Cell, CellValue};
         let mut app = App::new(new_xlsx(), "t.xlsx");
         app.os_clip = None;
         {
@@ -13782,7 +13759,28 @@ mod tests {
         app.rebuild_engine();
         app.cur = (1, 1); // Qty column, a data cell
         app.anchor = None;
-        app.commit_filter(">100");
+        // Data › Filter puts buttons on A1:B4; nothing hides yet.
+        app.ribbon_act(ribbon::Act::Filter);
+        let af = app.sheet().auto_filter.as_ref().unwrap();
+        assert_eq!(af.range, (0, 0, 3, 1));
+        assert_eq!(app.status.as_deref(), Some("Filter on"));
+        // Alt+Down on B1 opens its drop-down; its Number Filters item asks for
+        // the condition.
+        app.cur = (0, 1);
+        assert!(app.open_filter_picker());
+        assert_eq!(
+            app.filter_picker.as_ref().unwrap().menu.submenu,
+            gridcore::filter::Submenu::Number
+        );
+        app.filter_picker.as_mut().unwrap().sel = 3;
+        app.filter_picker_key(KeyCode::Enter);
+        assert!(matches!(
+            app.prompt.as_ref().map(|p| &p.kind),
+            Some(PromptKind::CustomFilter)
+        ));
+        app.prompt = None;
+        app.commit_custom_filter(">100");
+        assert_eq!(app.status.as_deref(), Some("2 of 3 records found"));
         // header visible; A(300),C(900) kept; B(50) hidden.
         let sh = app.sheet();
         assert!(!sh.row_hidden(0)); // header
@@ -13797,23 +13795,36 @@ mod tests {
         app.pkg.workbook.sheets[0].set_cell(6, 1, Cell::formula("SUBTOTAL(109,B2:B4)"));
         app.rebuild_engine();
         let v = |app: &App, r: u32| app.sheet().cell(r, 1).unwrap().value.clone();
-        use gridcore::sheet::CellValue;
         assert_eq!(v(&app, 5), CellValue::Number(1200.0));
         assert_eq!(v(&app, 6), CellValue::Number(300.0));
         app.pkg.workbook.sheets[0].set_row_hidden(3, false);
 
-        // Clear unhides everything, and the rows are no longer filtered.
-        app.commit_filter("clear");
+        // Clear shows everything; the buttons stay.
+        app.ribbon_act(ribbon::Act::ClearFilter);
         let sh = app.sheet();
         assert!(!sh.row_hidden(2));
         assert!(sh.filtered_rows.is_empty());
+        assert!(sh.auto_filter.is_some());
         assert_eq!(v(&app, 5), CellValue::Number(1250.0));
 
-        // Text equals filter on the Item column.
-        app.cur = (1, 0);
-        app.commit_filter("=C");
+        // The checklist on Item with only C checked.
+        app.cur = (0, 0);
+        assert!(app.open_filter_picker());
+        let p = app.filter_picker.as_mut().unwrap();
+        let labels: Vec<&str> = p.menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["A", "B", "C"]);
+        p.sel = 4; // (Select All) off
+        app.filter_picker_key(KeyCode::Char(' '));
+        app.filter_picker.as_mut().unwrap().sel = 7; // C on
+        app.filter_picker_key(KeyCode::Char(' '));
+        app.filter_picker_key(KeyCode::Enter);
         let sh = app.sheet();
         assert!(sh.row_hidden(1) && sh.row_hidden(2) && !sh.row_hidden(3));
+        // One undo step brings A and B back; Ctrl+Shift+L turns it all off.
+        app.undo();
+        assert!(!app.sheet().row_hidden(1));
+        app.ribbon_act(ribbon::Act::Filter);
+        assert!(app.sheet().auto_filter.is_none());
     }
 
     #[test]
@@ -14385,7 +14396,7 @@ mod tests {
         };
         let before = header(&app);
         app.cur = (1, 0);
-        app.sort_region(true);
+        app.quick_sort(true);
         assert_ne!(header(&app), before, "the sort moved the header row");
         assert_eq!(app.pkg.workbook.tables[0].columns, ["Name", "City"]);
         let f10 = app.pkg.workbook.sheets[0].cell(9, 5).unwrap();
@@ -14512,7 +14523,7 @@ mod tests {
         ]);
         clip_range(&mut app, (0, 0), (1, 1), true);
         app.cur = (0, 0);
-        app.sort_region(true);
+        app.quick_sort(true);
         app.cur = (0, 5);
         app.paste();
         let some = |v: [f64; 4]| v.map(Some).to_vec();
@@ -18462,6 +18473,33 @@ mod tests {
         assert!(!app.confirm_key(KeyEvent::from(KeyCode::Char('y'))));
         assert!(app.data_form.is_none());
         assert_eq!(value_at(&app, 1, 0), CellValue::Text("Ann".into()));
+    }
+
+    #[test]
+    fn data_form_closes_when_an_agent_sorts_or_filters_its_list() {
+        // A sort moves the records and a filter hides them: the form's
+        // record may be another one now (#690, #691).
+        for (verb, args) in [
+            (
+                "range.sort",
+                r#"{"range":"A1:C4","header":true,"keys":[{"col":"A","order":"desc"}]}"#,
+            ),
+            (
+                "filter.set",
+                r#"{"range":"A1:C4","col":"Name","criteria":{"values":["Bob"]}}"#,
+            ),
+        ] {
+            let mut app = data_form_app();
+            app.ribbon_act(ribbon::Act::DataForm);
+            let args = ctlcore::json::Json::parse(args).unwrap();
+            run_control(&mut app, verb, &args).unwrap();
+            assert!(app.data_form.is_none(), "{verb}");
+            assert_eq!(
+                app.status.as_deref(),
+                Some("Data Form closed: the workbook changed"),
+                "{verb}"
+            );
+        }
     }
 
     #[test]

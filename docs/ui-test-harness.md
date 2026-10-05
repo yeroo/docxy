@@ -209,7 +209,7 @@ gets re-routed, and a test fails if it drifts from what `cx.bind_keys`
 registers.
 
 Reference fields, for `focus`: `chart-range`, `chart-title`, `categories`,
-`series-name:N`, `series-values:N`, `cond-format`, `validation`, `sort`.
+`series-name:N`, `series-values:N`, `cond-format`, `validation`.
 Data › Text to Columns is a dialog (`text-to-columns`), driven with the
 `dialog-*` verbs like the others.
 
@@ -323,7 +323,7 @@ State keys, as the app reports them after every driving verb:
 | Key | |
 |---|---|
 | `tab`, `title`, `dirty`, `status`, `sheet_tab` | the active tab |
-| `caption`, `read_only`, `protected`, `repaired` | the active tab's caption as the strip draws it (`book.xlsx [Read-Only]`, or `Report.doc [Compatibility Mode]` for a document imported from Word 97-2003 until Convert, #634) and its open mode; see [Open modes](#open-modes-and-protected-view) |
+| `caption`, `read_only`, `protected`, `repaired`, `final` | `final` is a document Word marked as final (#617), locked like Protected View until Edit Anyway and captioned `[Read-Only]`; the active tab's caption as the strip draws it (`book.xlsx [Read-Only]`, or `Report.doc [Compatibility Mode]` for a document imported from Word 97-2003 until Convert, #634) and its open mode; see [Open modes](#open-modes-and-protected-view) |
 | `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor, prompt or dialog is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
 | `dialog` | the active tab's top dialog's id, or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
@@ -335,6 +335,7 @@ State keys, as the app reports them after every driving verb:
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
+| `comment_edit` | the sheet comment editor's text (`null` when closed) |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
 | `field`, `field_text` | the focused reference field, and its buffer |
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
@@ -437,7 +438,7 @@ footer editor; `selection-set` refuses while it is open.
 | `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
 | `title-bar {}` | read the measured title content, active chip, tab strip, theme button and drag space; reports tab count, active/first/visible indices, layout mode, `overflow`, `controls_clear`, `active_visible`, `active_dirty_visible` (the active tab is dirty and its bullet lies inside the chip), `theme_visible`, `drag_w`, `drag_ok`, and logical-pixel right edges. `caption_left` comes from a separate probe of Root's inner box minus the pinned caption-control width (102 px on Windows/Linux, zero on macOS) |
 | `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
-| `tab-list {}` | read every open tab in strip order: `{active, tabs:[{index, title, kind, path, dirty, imported, caption, read_only, protected, repaired}]}`. `kind` is `docx`, `xlsx`, `project` or `mail`; `path` is `null` for a tab never saved; `imported` is true for a Project read from `.mpp` and for a document whose file is a Word 97-2003 binary it was imported from (#634; a `.doc`, or one renamed), until a save rebinds the tab to the file it wrote |
+| `tab-list {}` | read every open tab in strip order: `{active, tabs:[{index, title, kind, path, dirty, imported, caption, read_only, protected, final, repaired}]}`. `kind` is `docx`, `xlsx`, `project` or `mail`; `path` is `null` for a tab never saved; `imported` is true for a Project read from `.mpp` and for a document whose file is a Word 97-2003 binary it was imported from (#634; a `.doc`, or one renamed), until a save rebinds the tab to the file it wrote |
 | `tab-select {"tab":"schedule"}` | make a tab active as clicking its chip does, and reply with the state. `tab` is an index or a case-insensitive title/path substring over **all** tabs, the rule the `proj.*` verbs use; a miss (`no tab matches 'x'`), an ambiguous match (`several tabs match 'x' (2, 3)`) and an index past the end (`no tab at index 9`) are refused. The Backstage stays as it was, as it does for a chip click |
 | `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog; a press reaches an open menu's own item or backdrop, so it does not pre-close menus |
 | `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 8 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The drag arms once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of about 2.25px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
@@ -487,10 +488,32 @@ every plain `assert <key>`, sees `Ready` and the levelled plan. Assert Busy
 with `assert reply.app_state is Busy` on that verb's own reply.
 
 Close a dirty tab with `call close-tab {"answer":"save"}` (`discard` and
-`cancel` are the other answers; omitting the answer refuses a dirty close).
+`cancel` are the other answers). Without an answer a dirty close opens the
+in-app close prompt (#629), as Ctrl+W, File > Close and the tab's X do:
+`dialog is save-on-close`, driven with `dialog-read`, `dialog-set` and
+`dialog-click`. A document's prompt is Word's `Save your changes to this
+file?` with `file-name`, `extension` (a label) and `location`, and the buttons
+Save, Don't Save, Cancel and More options... (refused under the harness, like
+every native dialog); its Save writes `<location>/<file-name><extension>`, or
+the tab's own file in place when that is what they name and the tab saves in
+place (`extension` is then the file's own, whatever it is), and refuses an
+existing other file. A tab whose Save is Save As (opened read-only, repaired
+or converted) proposes `<name> (copy)` beside its file and refuses its own
+file's name. Under the harness the only location offered after the tab's own folder
+is the sandbox. A workbook or a Project asks `Save changes to <title> before
+closing?`. A tab with another dialog open is not closed: it comes to the
+front with `Close the open dialog first`.
 An optional `index` targets an inactive tab; it defaults to the active tab.
 `call backstage-close {}` calls the Backstage Close handler without supplying
-an answer. `call ask-on-close {"on":true}` uses the same setting handler as
+an answer. `call close-window {}` is the window's close button (#630): with
+`ask-on-close` on and work unsaved, it brings the first unsaved tab to the front
+with the close prompt (`quit` in its owner) and replies; each Save or Don't
+Save goes on to the next unsaved tab in tab order (a clean tab is never asked),
+Cancel keeps the window, and once the last is answered the process ends after
+that reply, as after `quit`. Don't Save there keeps a file-backed tab in the
+session as its file alone (it reopens clean) and drops a never-saved one.
+Otherwise `close-window` exits at once (hot exit). The window's own close in a
+harness instance never asks: `quit` must end the run it waits on. `call ask-on-close {"on":true}` uses the same setting handler as
 Settings; closing a dirty single tab always asks regardless of this window setting.
 
 `call autorecover {"minutes":N}` sets the Settings AutoRecover interval (`0`
@@ -748,6 +771,7 @@ Repair… call after their file pick:
 | `open {"path":"book.xlsx","mode":"read-only"}` | `mode` is `normal` (the default), `read-only`, `copy`, `repair` or `recover-text`; a workbook ignores `recover-text`, a document takes only `recover-text` (Recover Text from Any File, #633), and a Project ignores every mode |
 | `open {"path":"book.xlsx","reopen":"ask"}` | a person's open of a file already open: a dirty tab asks first (the `reopen` dialog), a clean one reloads only in another mode |
 | `enable-editing {}` | the PROTECTED VIEW message bar's Enable Editing button; refused off a protected tab |
+| `edit-anyway {}` | the MARKED AS FINAL message bar's Edit Anyway button (#617); refused off a document marked as final, and in Protected View (whose bar shows first) |
 
 A relative `path` resolves against the active tab's folder, as `save-as`'s
 does, so after `open copy:` a case names its own copy; with no saved tab
@@ -856,7 +880,7 @@ point. Four verbs read and drive it:
 | Verb | Args | Reply |
 |---|---|---|
 | `dialog-read` | `{}` | the top dialog, or `{open: false}` |
-| `dialog-set` | `{control, value}`; a grid takes `{control, row, column, value}`, `{control, insert_row: n}` or `{control, delete_row: n}` | the dialog after the edit |
+| `dialog-set` | `{control, value}`; a grid takes `{control, row, column, value}`, `{control, insert_row: n}` or `{control, delete_row: n}`; a check list `{control, value: true\|false\|[labels]}`, `{control, item, checked}` or `{control, index, checked}` | the dialog after the edit |
 | `dialog-tab` | `{tab}` | the dialog on that tab |
 | `dialog-click` | `{button}` | `state` after the button's handler, with `dialog` set to the dialog now on top (the child it opened, the parent, or `{open: false}`) |
 
@@ -867,12 +891,21 @@ a message box's message (null otherwise), and `tab` is the current tab's label
 Each control is `{name, label, kind, value, text, enabled, visible}`:
 
 - `kind` is one of `text`, `number`, `date`, `duration`, `checkbox`, `radio`,
-  `dropdown`, `list`, `grid` and `label`.
+  `dropdown`, `list`, `grid`, `checklist` and `label`.
 - `value` is typed: a checkbox's is a bool, a number's a number, an item
   control's the selected item's label (or null), and a grid's its rows.
   `text` is what the control shows.
 - `radio`, `dropdown` and `list` add `items` (in order) and `selected` (an
   index, or null). A `grid` adds `columns` and `rows`.
+- A `checklist` (the AutoFilter drop-down's values, #690) has a bool per item
+  as its `value`, and adds `items` and `depths`: the items form a tree by
+  depth (`(Select All)` at 0 over the values; a year › month › day date
+  tree under it), and checking an item checks the items under it, while an
+  item with items under it is checked exactly when they all are. `value:
+  true`/`false` checks or clears all, `value: [labels]` checks exactly those,
+  and `{item, checked}` one item (or `{index, checked}` for a label the tree
+  repeats, a day under two months). The overlay draws it virtualised (up to
+  10,000 values) and a click toggles an item.
 
 `controls` lists **only the current tab's controls**, because that is what a
 person sees. To read a staged value on another tab, `dialog-tab` to it first. A
@@ -920,11 +953,14 @@ While a dialog is open on the active tab:
 - **Pointer verbs are refused** with `a dialog is open: <title>`: `click-cell`,
   `drag`, `fill-drag`, `save-as`, `ribbon-click`, `select-chart`, `focus-field`, `title-tab`,
   `tab-select`, `proj.new`, `backstage {open}`, `backstage-close`, `close-tab`,
-  `selection-set` and `enable-editing`.
+  `close-window`, `selection-set`, `enable-editing` and `edit-anyway`.
 - The state reads `dialog: <id>` (`none` on every surface when nothing is open),
   and a Project's `app_state` reads `Edit`.
 - A control-pipe edit, reload or save of that Project dismisses its dialogs
-  unapplied, as it cancels a prompt.
+  unapplied, as it cancels a prompt. The exception is a close prompt
+  (`save-on-close`, #629/#630): while one is open on any tab, `proj.open`,
+  `proj.save`, `proj.reload` and every edit are refused with
+  `a dialog is open: <title>`, so the question cannot vanish under itself.
 
 ### Menus
 
@@ -939,7 +975,12 @@ Menus open today:
 - **Set Baseline's split menu**: the lower half of Project › Schedule › Set
   Baseline (`Set Baseline...`, `Clear Baseline...`);
 - **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New
-  Comment): right-click a document or sheet body. It never opens on a Project;
+  Comment): right-click a document body. It never opens on a sheet or a
+  Project, and `menu-open {"target":"document"}` refuses on both;
+- **the cell menu** on a sheet (#690, #691): right-click a cell. A cell outside
+  the selection is selected first (no link followed; while a formula or a range
+  field is pointing, nothing moves). It lists Cut, Copy, Paste, the Filter and
+  Sort submenus and New Comment, each a sheet command as the ribbon runs it;
 - **the Mailings tab's drop-downs** on a document (#628): Start Mail Merge,
   Select Recipients, Insert Merge Field (the attached list's columns), Rules,
   Finish & Merge, and the Preview Results record box (the attached rows).
@@ -972,7 +1013,7 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task) or `{"ribbon": [tab, group, command]}` | the menu, as `menu-read` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment; #690, #691), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task) or `{"ribbon": [tab, group, command]}` | the menu, as `menu-read` |
 | `menu-read` | `{}` | `{open: true, target, items}`, or `{open: false}` |
 | `menu-click` | `{label}` among the top-level items, or `{path: [labels]}` through submenus | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
@@ -1011,8 +1052,8 @@ way it keeps itself inside the window.
 Refusals change nothing, and each names what it refuses: `menu-open` under a
 dialog, a `row` off a Project tab, an unknown uid, a task hidden under a
 collapsed summary (there is no row to right-click), a ribbon command that has
-no menu, `"document"` on a Project, and the targets without a menu yet
-(`cell`, `bar`, `column`, the ribbon's own right-click); `menu-click` with no
+no menu, `"document"` on a Project, `"cell"` off a sheet, and the targets
+without a menu yet (`bar`, `column`, the ribbon's own right-click); `menu-click` with no
 menu open, on a disabled item, an unknown or ambiguous label, a heading, or an
 item that opens a submenu; `menu-click` and `menu-close` under a dialog;
 `menu-open` and `menu-click` while File (the backstage) or the more-tabs list
@@ -1032,7 +1073,7 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `user-name`,
 `trusted-clear`,
 `open-draft`,
-`enable-editing` and the
+`enable-editing`, `edit-anyway`, `close-window` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 
@@ -1075,7 +1116,11 @@ View > Split View > Timeline has it hidden. `project-split` is the draggable bar
 between the entry table and the chart; its drags show in the `table_w` and `gantt_w`
 state entries. `gallery` is the Home ribbon's Styles gallery well on a
 document tab, and is an error while another ribbon tab, the Backstage or a
-collapsed ribbon hides it. Inside a
+collapsed ribbon hides it. `filter-button:<column>` (for example
+`filter-button:B`) is the AutoFilter button on that column's header cell
+(#690), an error while the sheet has no filter there or the button is
+scrolled out of view; `shot` it before a `pointer-click` so the click lands
+on the frame that drew it. Inside a
 border assertion the `cell:` may be dropped — `border A1:C5 solid` — because an
 assertion about a selection should read like the selection.
 
