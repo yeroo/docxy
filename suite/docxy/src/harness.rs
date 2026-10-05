@@ -1652,7 +1652,7 @@ fn click_sheet_command(
     cx: &mut Context<crate::Docxy>,
 ) -> Result<(), String> {
     let def = crate::sheet_ribbon::tab_def(tab);
-    let owner = def.groups.iter().find_map(|g| g.menu_owner(cmd));
+    let owner = def.menu_owner(cmd);
     let opens = owner
         .map(|m| m.button.id)
         .or_else(|| matches!(cmd.shape, crate::sheet_ribbon::Shape::Menu(_)).then_some(cmd.id));

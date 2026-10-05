@@ -985,7 +985,7 @@ Menus open today:
   Baseline (`Set Baseline...`, `Clear Baseline...`);
 - **the sheet ribbon's Sort & Filter drop-down** (#1018): Home › Editing. Six
   items (Sort A to Z, Sort Z to A, Custom Sort..., Filter, Clear, Reapply),
-  each running the Data tab's act of the same name. `menu-open
+  each running the Data tab's matching act (Custom Sort... is Data's Sort). `menu-open
   {"target":{"ribbon":["Home","Editing","Sort & Filter"]}}` or `ribbon-click`
   on the button opens it; `ribbon-click` on an item opens it and clicks it;
 - **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New

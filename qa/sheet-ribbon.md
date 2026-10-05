@@ -40,7 +40,7 @@ only `no_ribbon_column_has_more_than_three_rows` guards that.
 4. Open Data > Data Tools and check Remove Duplicates is there and not on Home.
 
 **Expect:** the menu lists Sort A to Z, Sort Z to A, Custom Sort..., Filter,
-Clear, Reapply, and each runs what the Data tab's button of the same name runs.
+Clear, Reapply, and each runs the Data tab's matching act (Custom Sort... is Data's Sort button).
 
 **Fails when:** the five-button column returns to Home, or the menu opens but an
 item does not run.

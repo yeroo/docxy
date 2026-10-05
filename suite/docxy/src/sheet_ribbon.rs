@@ -240,6 +240,11 @@ impl Group {
 }
 
 impl Tab {
+    /// The drop-down that lists `item`, in whichever group holds it.
+    pub fn menu_owner(&self, item: &SheetCmd) -> Option<&'static Dropdown> {
+        self.groups.iter().find_map(|g| g.menu_owner(item))
+    }
+
     /// The tab's commands in drawn order.
     pub fn commands(&self) -> Vec<&'static SheetCmd> {
         self.groups.iter().flat_map(Group::commands).collect()
@@ -983,7 +988,7 @@ pub(crate) fn resolve_on(
     let buttons: Vec<&'static SheetCmd> = all
         .iter()
         .copied()
-        .filter(|c| !tab.groups.iter().any(|g| g.menu_owner(c).is_some()))
+        .filter(|c| !tab.menu_owner(c).is_some())
         .collect();
     let mut matches = tier_matches(&buttons, query, &toggled);
     if matches.is_empty() {
@@ -1034,7 +1039,7 @@ mod tests {
                 for c in tab
                     .commands()
                     .into_iter()
-                    .filter(|c| !tab.groups.iter().any(|g| g.menu_owner(c).is_some()))
+                    .filter(|c| !tab.menu_owner(c).is_some())
                 {
                     assert!(
                         seen.insert(c.label(toggled)),
@@ -1042,13 +1047,14 @@ mod tests {
                         c.label(toggled)
                     );
                 }
-                // Menu items need distinct names among themselves too, or a
-                // `menu-click` by label could not tell them apart.
+                // Menu items need distinct names among themselves too: when no
+                // ribbon button matches, `ribbon-click` (`resolve_on`) looks
+                // over every item of the tab, and two alike would be ambiguous.
                 let mut items = HashSet::new();
                 for c in tab
                     .commands()
                     .into_iter()
-                    .filter(|c| tab.groups.iter().any(|g| g.menu_owner(c).is_some()))
+                    .filter(|c| tab.menu_owner(c).is_some())
                 {
                     assert!(
                         items.insert(c.label(toggled)),
