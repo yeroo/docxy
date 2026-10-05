@@ -2,7 +2,7 @@
 //! cells whose current value breaks one, and editing the rules themselves.
 //! Pure model work: the hosts own the alerts, the dialog and the circles.
 
-use crate::engine::{cell_value_at, eval_formula_at};
+use crate::engine::{cell_value_at, eval_formula_at_clock};
 use crate::formula::{Value, translate_formula};
 use crate::sheet::{
     AlertStyle, Cell, CellValue, DataValidation, MAX_COLS, MAX_ROWS, Sheet, Workbook,
@@ -54,7 +54,7 @@ pub fn check_entry(
         return None;
     }
     let value = match &cell.formula {
-        Some(f) => to_cell_value(eval_formula_at(wb, sheet, row, col, f)),
+        Some(f) => to_cell_value(eval_formula_at_clock(wb, sheet, row, col, f, today)),
         None => cell.value.clone(),
     };
     let custom = dv.kind == "custom";
@@ -387,9 +387,10 @@ fn eval_rule(
     col: u32,
     dv: &DataValidation,
     src: &str,
+    today: Option<f64>,
 ) -> Value {
     let shifted = formula_at(dv, src, row, col);
-    eval_formula_at(wb, sheet, row, col, &shifted)
+    eval_formula_at_clock(wb, sheet, row, col, &shifted, today)
 }
 
 /// Does `value` at (row, col) break `dv`?
@@ -406,7 +407,7 @@ fn breaks(
     if value.is_empty() {
         return !dv.allow_blank;
     }
-    let bound = |src: &str| match eval_rule(wb, sheet, row, col, dv, src) {
+    let bound = |src: &str| match eval_rule(wb, sheet, row, col, dv, src, lists.today) {
         Value::Num(n) => Some(n),
         Value::Bool(b) => Some(f64::from(u8::from(b))),
         _ => None,
@@ -449,7 +450,7 @@ fn breaks(
                 _ => text_of(item).eq_ignore_ascii_case(&text),
             })
         }
-        "custom" => match eval_rule(wb, sheet, row, col, dv, &dv.formula1) {
+        "custom" => match eval_rule(wb, sheet, row, col, dv, &dv.formula1, lists.today) {
             Value::Bool(b) => !b,
             Value::Num(n) => n == 0.0,
             _ => true,
@@ -2313,5 +2314,46 @@ mod tests {
                 .collect();
             assert_eq!(labels, ["Red", "Green", "Blue"], "{name}");
         }
+    }
+
+    // ---- review r11 ----
+
+    #[test]
+    fn today_in_a_rule_and_in_a_typed_formula_read_the_host_clock() {
+        // 45000 is 2023-03-15.
+        let mut wb = book();
+        wb.sheets[0]
+            .validations
+            .push(rule("date", "greaterThanOrEqual", "TODAY()", ""));
+        let typed = |wb: &mut Workbook, text: &str| {
+            let cell = crate::entry::entry_cell(wb, 0, 1, 1, text, Some(CLOCK)).unwrap();
+            check_entry(wb, 0, 1, 1, &cell, Some(CLOCK))
+        };
+        assert!(
+            typed(&mut wb, "2023-03-14").is_some(),
+            "yesterday is refused"
+        );
+        assert!(typed(&mut wb, "2023-03-15").is_none());
+        assert!(typed(&mut wb, "2023-04-01").is_none());
+        // A typed =TODAY()+1 is read at the clock too.
+        assert!(typed(&mut wb, "=TODAY()+1").is_none());
+        assert!(typed(&mut wb, "=TODAY()-1").is_some());
+
+        // A custom rule reading TODAY().
+        let mut wb = book();
+        let mut dv = rule("custom", "", "B2<=TODAY()", "");
+        dv.ranges = vec![(1, 1, 9, 1)];
+        wb.sheets[0].validations.push(dv);
+        assert!(typed(&mut wb, "44000").is_none());
+        assert!(typed(&mut wb, "46000").is_some());
+
+        // Circle Invalid Data reads the clock as well.
+        let mut wb = book();
+        wb.sheets[0]
+            .validations
+            .push(rule("date", "greaterThanOrEqual", "TODAY()", ""));
+        wb.sheets[0].set_cell(1, 1, Cell::number(44000.0)); // before today
+        wb.sheets[0].set_cell(2, 1, Cell::number(46000.0));
+        assert_eq!(invalid_cells(&wb, 0, Some(CLOCK)), vec![(1, 1)]);
     }
 }

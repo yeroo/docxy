@@ -4278,7 +4278,8 @@ fn dv_attr_edits(
             continue;
         }
         element = match new {
-            Some(v) => set_tag_attr_in_place(element, name, &esc_attr(&v)),
+            // The element's own delimiter is kept, which may be `'`: escape it.
+            Some(v) => set_tag_attr_in_place(element, name, &esc_attr(&v).replace('\'', "&apos;")),
             None => remove_tag_attr(element, name),
         };
     }
@@ -19433,6 +19434,39 @@ mod rule_shift_tests {
             r#"<dataValidations count="1"><dataValidation type="list" showDropDown="1" sqref="A1"><formula1>"a,b"</formula1></dataValidation></dataValidations>"#,
         );
         assert!(!hidden.workbook.sheets[0].validations[0].show_dropdown);
+    }
+
+    #[test]
+    fn dv_single_quoted_attributes_edited_with_awkward_text_stay_well_formed() {
+        let rule = r#"<dataValidations count="1"><dataValidation type="whole" operator="between" errorTitle='old t' error='old' promptTitle='old p' prompt='old m' showErrorMessage="1" sqref="B2:B10"><formula1>10</formula1><formula2>90</formula2></dataValidation></dataValidations>"#;
+        for text in [
+            "Can't enter that",
+            "say \"no\"",
+            "a & b",
+            "1 < 2 > 0",
+            "it's \"both\" & <more>",
+        ] {
+            let mut pkg = one("S", rule);
+            {
+                let dv = &mut pkg.workbook.sheets[0].validations[0];
+                dv.error = text.into();
+                dv.error_title = text.into();
+                dv.prompt = Some(text.into());
+                dv.prompt_title = text.into();
+            }
+            let (re, ws) = saved(&pkg, SHEET1);
+            let dv = &re.workbook.sheets[0].validations[0];
+            assert_eq!(
+                (
+                    dv.error.as_str(),
+                    dv.error_title.as_str(),
+                    dv.prompt.as_deref(),
+                    dv.prompt_title.as_str()
+                ),
+                (text, text, Some(text), text),
+                "{text}: {ws}"
+            );
+        }
     }
 
     #[test]
