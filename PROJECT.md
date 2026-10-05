@@ -454,7 +454,11 @@ On a manual task, Start moves the task to that day's first working time (08:00
 on a non-working day) keeping its duration, and Finish sets its finish at the
 day's last working time (17:00 on a non-working day) and its duration to the
 working time in between; neither adds a constraint. Predecessors use
-displayed task IDs, e.g. `2, 3SS+2h, 4FF-7m`. Resource names are comma-separated,
+displayed task IDs, e.g. `2, 3SS+2h, 4FF-7m`; a cross-project link shows its
+external reference (`CrossProjectName`) instead of the placeholder's local ID,
+it can be retyped in any ASCII letter case with a link type and lag, or
+replaced by the local ID, and an unknown reference is rejected. Resource names
+are comma-separated,
 and unknown names create resources. A new work assignment starts at the
 resource's Max. Units capped at 100%; `Name[NN%]` sets explicit units instead (NN > 0; over-allocation such as `Bob[150%]` is
 allowed). The cell shows `Name[NN%]` for a work assignment that is not at 100%,

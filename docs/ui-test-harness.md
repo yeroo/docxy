@@ -652,7 +652,8 @@ baseline commands are on the ribbon under Project's names; renaming and
 durations are cell edits, and there is no ribbon Delete Task, Clear Resources,
 Export Gantt, Scroll Left/Right or Go to Start (Project has none): use Delete on
 the ID or Resource Names cell, Ctrl+E, Alt+Left/Right and Alt+Home.
-Predecessors in cells use **displayed IDs**. Ctrl+F
+Predecessors in cells use **displayed IDs** (a cross-project link shows its
+external reference). Ctrl+F
 opens Find; F3 repeats and reveals the selected row. Ctrl+Z/Y undo/redo, Ctrl+S
 saves, and Ctrl+E exports Markdown. Use `open copy:` before save/export. Project
 ribbon KeyTips are File/Task/Resource/Report/Project/View = F/T/U/R/P/W after
