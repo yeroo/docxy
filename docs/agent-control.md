@@ -173,6 +173,11 @@ File handling differs from the TUI:
   with `proj.path` for the new tab. It takes neither `tab` nor `name`; save the
   plan with `proj.save {"path":"..."}` to give it a file. It is refused while a
   dialog is open on the active tab.
+- While the desktop suite's close prompt (`Save your changes to this file?`,
+  or a window close's per-document question) is open on any tab, `proj.open`,
+  `proj.save`, `proj.reload` and every editing verb are refused with
+  `a dialog is open: <title>`; reads still answer. Otherwise an edit, save or
+  reload dismisses the Project tab's dialogs unapplied.
 
 For example, the repository's CLI sends raw control requests (PowerShell;
 use your explicit config root in place of `$env:APPDATA` when overridden):

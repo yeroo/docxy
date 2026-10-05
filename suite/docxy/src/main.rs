@@ -3302,9 +3302,9 @@ struct Docxy {
     bs_info_status: Option<(usize, Result<String, String>)>,
     clip: Option<DocClip>,
     theme_pref: ThemePref,
-    /// When set, closing the window with unsaved tabs shows a confirm dialog.
-    /// Off by default: work is hot-persisted and restored regardless, so closing
-    /// is normally silent.
+    /// When set, closing the window with unsaved tabs asks about each unsaved
+    /// tab in turn (#630). Off by default: work is hot-persisted and restored
+    /// regardless, so closing is normally silent.
     ask_on_close: bool,
     /// The number the next new document's `Document<n>` title takes (#631):
     /// it only goes up, so a number is never reused in a session.
@@ -8231,8 +8231,8 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
     }
 }
 
-/// The backstop behind Protected View's gates (#610). An edit reached a
-/// protected workbook, so a gate leaked. Not every edit takes an undo
+/// The backstop behind the gates of Protected View (#610), or of a document
+/// marked as final (#617). An edit reached a locked tab, so a gate leaked. Not every edit takes an undo
 /// snapshot first (a sheet rename, an AutoFilter), so the workbook is loaded
 /// again from the tab's file, the way it was opened; the hot-exit sidecar
 /// then holds that too. Only a tab with no file to read (a template opened
@@ -26422,8 +26422,8 @@ impl Render for Docxy {
         // record itself again.
         self.frame = self.frame.wrapping_add(1);
         self.schedule_project_passes(window, cx);
-        // Protected View's last backstop (#633): an edit that reached a
-        // protected document by a way no gate or `mark_dirty` covers (one of
+        // The last backstop of Protected View (#633), or of a document marked
+        // as final (#617): an edit that reached a locked document by a way no gate or `mark_dirty` covers (one of
         // the tab's other modules) is rolled back before it is ever drawn,
         // saved or written to the hot-exit sidecar as unsaved work.
         for t in self.tabs.iter_mut() {
@@ -26801,8 +26801,9 @@ impl Render for Docxy {
         );
         let vw = f32::from(window.viewport_size().width);
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
-        // Protected View (#610, documents #633) hides the ribbon's commands,
-        // as Excel and Word grey them out; its message bar takes their place.
+        // Protected View (#610, documents #633), or a document marked as
+        // final (#617), hides the ribbon's commands, as Excel and Word grey
+        // them out; its message bar takes their place.
         let protected = (self.active_is_sheet() || is_doc) && self.active_locked();
         let ribbon_body = (!self.ribbon_min
             && !protected
