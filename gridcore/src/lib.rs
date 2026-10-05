@@ -29,8 +29,11 @@
 //! - [`legacy`] — import of `.xls`, `.xlsb` and `.ods` workbooks.
 //! - [`docprops`] — document properties (`docProps/` core, app, custom).
 //! - [`options`] — the per-user Editing options (File › Options › Advanced).
+//! - [`autocorrect`] — AutoCorrect for typed entries: replace list,
+//!   capitalisation rules, exceptions, hyperlinks.
 //! - [`print`] — page setup, print areas and breaks, pagination, sheet PDF.
 
+pub mod autocorrect;
 pub mod cf;
 pub mod clock;
 pub mod comments;
