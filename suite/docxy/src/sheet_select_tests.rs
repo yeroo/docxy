@@ -218,6 +218,13 @@ fn the_guard_sorts_every_command() {
     assert!(!multi_area_ok(SheetAct::Cut));
     assert!(!multi_area_ok(SheetAct::Paste));
     assert!(!multi_area_ok(SheetAct::SortAsc));
+    // Flash Fill and Pick From Drop-down List read one column block (#666,
+    // #665); the Flash Fill Options menu works on the fill that stands.
+    assert!(!multi_area_ok(SheetAct::FlashFill));
+    assert!(!multi_area_ok(SheetAct::PickList));
+    assert!(!multi_area_ok(SheetAct::PickItem(0)));
+    assert!(multi_area_ok(SheetAct::FlashUndo));
+    assert!(multi_area_ok(SheetAct::FlashAccept));
     assert!(!multi_area_ok(SheetAct::Fill(
         gridcore::edit::FillDir::Down
     )));

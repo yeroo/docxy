@@ -9,10 +9,7 @@
 //! carries the editor range it lives at, and a match is marked editable only
 //! when all of its chars are ones the editor can edit.
 
-use super::{
-    EditKind, Editor, Match, all_paragraph_paths, char_eq, para_mut, replace_range_in_content,
-    resolve_para,
-};
+use super::{EditKind, Editor, Match, all_paragraph_paths, char_eq, para_mut, resolve_para};
 use crate::model::{Block, Inline, RevisionTarget};
 
 /// A match of the UI's visible search, in editor offsets.
@@ -416,9 +413,9 @@ impl Editor {
         // paths still resolve to the same text box.
         for (path, mut ms) in groups.into_iter().rev() {
             ms.sort_by_key(|m| std::cmp::Reverse(m.start)); // back-to-front keeps offsets valid
-            if let Some(p) = para_mut(&mut self.doc.body, &path) {
+            if para_mut(&mut self.doc.body, &path).is_some() {
                 for m in ms {
-                    replace_range_in_content(&mut p.content, m.start, m.end, with);
+                    self.replace_text_range(&path, m.start, m.end, with);
                     count += 1;
                 }
             }

@@ -1336,6 +1336,7 @@ fn prefs() -> Prefs {
         keep_drafts: true,
         edit_opts: gridcore::options::EditOptions::default(),
         custom_lists: Vec::new(),
+        autocorrect: String::new(),
         user_name: String::new(),
         user_initials: String::new(),
     }
@@ -1662,6 +1663,33 @@ fn sheet_editing_options_round_trip_through_the_session() {
     assert_eq!(EditOptions::from_text(&root.session().sheet_editing), opts);
 }
 
+/// #667: AutoCorrect's changes persist in `sheet_editing` beside the
+/// Editing options, and each reads its own keys back.
+#[test]
+fn autocorrect_persists_with_the_sheet_editing_options() {
+    use gridcore::autocorrect::{AutoCorrect, ExceptionKind};
+    use gridcore::options::EditOptions;
+    let root = Root::new("autocorrect");
+    let mut ac = AutoCorrect::default();
+    ac.add("cdp", "Consolidated Data Processing").unwrap();
+    ac.delete("adn");
+    ac.add_exception(ExceptionKind::InitialCaps, "ABc").unwrap();
+    ac.opts.hyperlinks = false;
+    let opts = EditOptions {
+        flash_fill_auto: false,
+        ..EditOptions::default()
+    };
+    let prefs = Prefs {
+        edit_opts: opts,
+        autocorrect: ac.to_lines(),
+        ..prefs()
+    };
+    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
+    let saved = root.session().sheet_editing;
+    assert_eq!(AutoCorrect::from_text(&saved), ac);
+    assert_eq!(EditOptions::from_text(&saved), opts);
+}
+
 /// #672: a sheet tab reached through the app gets the app's Editing options,
 /// so one opened after they changed honours them on its first key.
 #[test]
@@ -1695,6 +1723,55 @@ fn every_sheet_tab_is_stamped_with_the_app_options() {
         }
     }
     assert!(matches!(tabs[2].surface, Surface::Sheet(_)));
+}
+
+/// FIX r5 m4: the per-frame step retires a Flash Fill preview the selection
+/// moved off, so moving back cannot revive it.
+#[test]
+fn the_frame_step_retires_a_preview_the_selection_left() {
+    let mut tabs = vec![tab(Kind::Xlsx)];
+    let Surface::Sheet(v) = &mut tabs[0].surface else {
+        panic!("a sheet tab")
+    };
+    for (r, t) in [
+        "Ada Lovelace",
+        "Alan Turing",
+        "Grace Hopper",
+        "Edsger Dijkstra",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let s = v.active;
+        let cell =
+            gridcore::entry::entry_cell(&mut v.pkg.workbook, s, r as u32, 10, t, None).unwrap();
+        v.engine
+            .set_cell(&mut v.pkg.workbook, (s, r as u32, 10), cell);
+    }
+    for (r, t) in ["Ada", "Alan"].iter().enumerate() {
+        v.sel = (r as u32, 11);
+        v.begin_cell_edit(Some(t.to_string()));
+        let origin = v.edit_origin.unwrap();
+        assert_eq!(v.commit_and_move(1, 0), Some(true));
+        v.flash_preview_after(origin);
+    }
+    assert!(
+        v.flash_preview.is_some(),
+        "a preview after the second example"
+    );
+    let at = v.sel;
+    v.sel = (9, 9);
+    crate::sheet_flashfill::retire_stale_previews(&mut tabs);
+    let Surface::Sheet(v) = &mut tabs[0].surface else {
+        unreachable!()
+    };
+    assert!(v.flash_preview.is_none(), "dropped by the frame step");
+    v.sel = at;
+    crate::sheet_flashfill::retire_stale_previews(&mut tabs);
+    let Surface::Sheet(v) = &tabs[0].surface else {
+        unreachable!()
+    };
+    assert!(v.live_preview().is_none(), "and not revived by moving back");
 }
 
 #[test]

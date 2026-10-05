@@ -37,6 +37,8 @@ pub(crate) fn dialog(user_name: &str, user_initials: &str) -> Dialog {
     ];
     d.buttons = ok_cancel();
     d.mark_opened();
+    // The first field has the focus, so typing edits it at once (#1027).
+    d.focus_step(false);
     d
 }
 
@@ -65,24 +67,22 @@ pub(crate) fn click(
 }
 
 impl Docxy {
-    /// Settings' User name... row: open the dialog on the active tab.
+    /// Settings' User name... row: open the dialog on the active tab's
+    /// stack, or, with no document open, on the app's own (#1027).
     pub(crate) fn open_user_name_dialog(&mut self) -> Result<(), String> {
         let d = dialog(&self.user_name, &self.user_initials);
-        let tab = self
-            .tabs
-            .get_mut(self.active)
-            .ok_or(crate::dialog::NONE_OPEN)?;
-        tab.dialogs.push(d);
+        self.active_dialogs_mut().push(d);
         Ok(())
     }
 
-    /// [`click`] on the active tab, storing and persisting an OK's values.
+    /// [`click`] on the active stack, storing and persisting an OK's values.
     pub(crate) fn user_name_click(&mut self, button: &str) -> Option<Result<(), String>> {
-        let tab = self.tabs.get_mut(self.active)?;
-        let (done, accepted) = click(&mut tab.dialogs, button)?;
+        let (done, accepted) = click(self.active_dialogs_mut(), button)?;
         if let Some((name, initials)) = accepted {
             self.user_name = name;
             self.user_initials = initials;
+            crate::set_configured_identity(&self.user_name, &self.user_initials);
+            crate::reauthor_tracking(&mut self.tabs, &self.user_name, &self.user_initials);
             self.persist();
         }
         Some(done)
@@ -93,6 +93,7 @@ impl Docxy {
 mod tests {
     use super::*;
     use ctlcore::json::Json;
+    use gpui::Modifiers;
 
     /// `dialog-set`'s arguments for a text field.
     fn value(text: &str) -> Json {
@@ -147,5 +148,29 @@ mod tests {
         ));
         assert!(click(&mut stack, "OK").is_none());
         assert!(stack.is_open());
+    }
+
+    #[test]
+    fn the_first_field_has_the_focus_and_typing_edits_it_in_place() {
+        let mut stack = opened("Jane", "J");
+        assert_eq!(
+            stack.top().unwrap().focused().map(|c| c.name),
+            Some("user-name")
+        );
+        let none = Modifiers::default();
+        let ctrl = Modifiers {
+            control: true,
+            ..none
+        };
+        crate::dialog_host::edit_key(&mut stack, "a", None, ctrl, None).unwrap();
+        for c in ["D", "o", "e"] {
+            crate::dialog_host::edit_key(&mut stack, c, Some(c), none, None).unwrap();
+        }
+        crate::dialog_host::edit_key(&mut stack, "tab", None, none, None).unwrap();
+        crate::dialog_host::edit_key(&mut stack, "v", None, ctrl, Some("DOE")).unwrap();
+        // The second field was "J": the paste goes after it.
+        let (done, accepted) = click(&mut stack, "OK").expect("ours");
+        done.unwrap();
+        assert_eq!(accepted, Some(("Doe".into(), "JDOE".into())));
     }
 }

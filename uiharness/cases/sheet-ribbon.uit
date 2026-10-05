@@ -141,5 +141,4 @@ test sheet ribbon data tab clear with no filter leaves the workbook clean
 
 test sheet ribbon data tab refuses its placeholders
   open ../fixtures/basic.xlsx
-  call-error ribbon-click {"tab":"Data","command":"Flash Fill"} => 'Flash Fill' is not implemented
   call-error ribbon-click {"tab":"Data","command":"Circle Invalid Data"} => 'Circle Invalid Data' is not implemented

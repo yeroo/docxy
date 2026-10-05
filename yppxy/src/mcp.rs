@@ -17,7 +17,7 @@ use std::path::PathBuf;
 pub fn run() -> std::io::Result<()> {
     McpServer {
         name: "yppxy",
-        version: env!("CARGO_PKG_VERSION"),
+        version: buildinfo::long_version(env!("CARGO_PKG_VERSION")),
         tools: tool_defs(),
         handler: &do_tool,
     }

@@ -13,6 +13,7 @@
 //!                                      legacy .mpp (validated task tables)
 //!   yppxy <in> --gantt-md <out.md>     headless: export a Markdown Gantt chart
 //!   yppxy <in> --save <out.(yppx|xml)> headless: convert/save and exit
+//!   yppxy --version (-V)               print the build (commit, last merged PR, kind)
 
 use opccore::fsio::{export_atomic, write_atomic};
 use std::path::Path;
@@ -75,6 +76,15 @@ const WARNING: Color = Color::Rgb(220, 50, 47);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--version` prints the build block (commit, last merged PR, build kind) and
+    // exits, before any file-oriented argument parsing or terminal setup.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        print!(
+            "{}",
+            buildinfo::get(env!("CARGO_PKG_VERSION")).version_block("yppxy")
+        );
+        return ExitCode::SUCCESS;
+    }
     // `--mcp` runs the headless MCP stdio bridge (a client of a running yppxy),
     // not the editor, so handle it before the file-oriented argument parsing.
     if args.iter().any(|a| a == "--mcp") {
@@ -106,13 +116,15 @@ fn main() -> ExitCode {
         Err(m) => {
             eprintln!("{m}");
             eprintln!(
-                "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>]"
+                "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>] | --version (-V)"
             );
             return ExitCode::from(2);
         }
     };
     if parsed.help {
-        println!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>]");
+        println!(
+            "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>] | --version (-V)"
+        );
         return ExitCode::SUCCESS;
     }
 
@@ -1141,14 +1153,20 @@ impl backstage::BackstageHost for App {
     }
 
     fn info_lines(&self) -> Vec<Line<'static>> {
-        project_preview(
+        let mut lines: Vec<Line<'static>> = project_preview(
             self.ed.project(),
             self.ed.schedule(),
             self.path.as_deref().map(Path::new),
         )
         .into_iter()
         .map(Line::from)
-        .collect()
+        .collect();
+        lines.push(Line::raw(String::new()));
+        lines.push(Line::raw(format!(
+            "  Build       {}",
+            buildinfo::get(env!("CARGO_PKG_VERSION")).short_line()
+        )));
+        lines
     }
 
     fn accent(&self) -> Color {
@@ -2921,6 +2939,18 @@ mod tests {
         let uid = app.ed.selected_uid().unwrap();
         assert_eq!(app.ed.project().task(uid).unwrap().estimated, None);
         assert_eq!(duration_suffix(app.ed.project(), uid), "");
+    }
+
+    #[test]
+    fn backstage_info_shows_the_build_line() {
+        let app = App::new(new_project(), None, false);
+        let info: Vec<String> = app.info_lines().iter().map(|l| l.to_string()).collect();
+        let line = buildinfo::get(env!("CARGO_PKG_VERSION")).short_line();
+        assert!(
+            info.iter()
+                .any(|l| l.contains("Build") && l.contains(&line)),
+            "{info:?}"
+        );
     }
 
     fn app_with_history_and_preferences() -> App {

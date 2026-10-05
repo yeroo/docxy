@@ -133,6 +133,17 @@ impl Document {
             };
         }
 
+        // A tracked insertion recorded on live runs (TrackedInsert) may be on
+        // runs in several paragraphs: act on every one of them.
+        if sweep_tracked_inserts(&mut self.body, target, action) > 0 {
+            self.initialize_revision_targets();
+            return RevisionOutcome::Applied {
+                target,
+                action,
+                category: RevisionCategory::Inline(RevisionKind::Insert),
+            };
+        }
+
         match transform_blocks(&mut self.body, target, action) {
             Some(Ok(category)) => {
                 // A rejected property snapshot can expose previously nested
@@ -157,9 +168,44 @@ impl Document {
         self.initialize_revision_targets();
         let addresses = self.revisions();
         let targets = revision_postorder(&addresses, action);
+        // Rejecting a recorded insertion takes with it a deletion that was
+        // left with nothing (text deleted from it), which the batch then
+        // finds gone: that deletion was acted on, not stale. Only a stale
+        // deletion that had one of the insertions rejected so far inside it.
+        let mut rejected: std::collections::HashSet<RevisionTarget> = Default::default();
         let mut outcomes = targets
             .into_iter()
-            .map(|(ordinal, target)| (ordinal, self.apply_revision_action(target, action)))
+            .map(|(ordinal, target)| {
+                let mut outcome = self.apply_revision_action(target, action);
+                let category = addresses
+                    .iter()
+                    .find(|a| a.target == target)
+                    .map(|a| a.category.clone());
+                match (&outcome, category) {
+                    (
+                        RevisionOutcome::Applied { .. },
+                        Some(RevisionCategory::Inline(RevisionKind::Insert)),
+                    ) if action == RevisionAction::Reject => {
+                        rejected.insert(target);
+                    }
+                    (
+                        RevisionOutcome::Stale { .. },
+                        Some(category @ RevisionCategory::Inline(RevisionKind::Delete)),
+                    ) if action == RevisionAction::Reject
+                        && addresses
+                            .iter()
+                            .any(|a| a.parent == Some(target) && rejected.contains(&a.target)) =>
+                    {
+                        outcome = RevisionOutcome::Applied {
+                            target,
+                            action,
+                            category,
+                        };
+                    }
+                    _ => {}
+                }
+                (ordinal, outcome)
+            })
             .collect::<Vec<_>>();
         outcomes.sort_by_key(|(ordinal, _)| *ordinal);
         outcomes.into_iter().map(|(_, outcome)| outcome).collect()
@@ -225,6 +271,86 @@ fn removes_mark(action: RevisionAction, kind: RevisionKind) -> bool {
         (RevisionAction::Accept, RevisionKind::Delete)
             | (RevisionAction::Reject, RevisionKind::Insert)
     )
+}
+
+/// Accept (keep the text, drop the record and its underline cue) or reject
+/// (remove the text) every run recorded as tracked insertion `target`,
+/// wherever it is. How many inlines it acted on.
+fn sweep_tracked_inserts(
+    blocks: &mut [Block],
+    target: RevisionTarget,
+    action: RevisionAction,
+) -> usize {
+    let mut n = 0;
+    for block in blocks {
+        match block {
+            Block::Paragraph(p) => n += sweep_inlines(&mut p.content, target, action),
+            Block::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        n += sweep_tracked_inserts(&mut cell.blocks, target, action);
+                    }
+                }
+            }
+            Block::SectionProperties(_) | Block::Raw(_) => {}
+        }
+    }
+    n
+}
+
+fn sweep_inlines(
+    content: &mut Vec<Inline>,
+    target: RevisionTarget,
+    action: RevisionAction,
+) -> usize {
+    let is_target = |inline: &Inline| {
+        let props = match inline {
+            Inline::Run(r) => &r.props,
+            Inline::Tab(props) | Inline::Break(_, props) => props,
+            _ => return false,
+        };
+        props
+            .tracked_insert
+            .as_ref()
+            .is_some_and(|t| t.metadata.target == target)
+    };
+    let mut n = 0;
+    if action == RevisionAction::Reject {
+        let before = content.len();
+        content.retain(|i| !is_target(i));
+        n += before - content.len();
+    } else {
+        for inline in content.iter_mut().filter(|i| is_target(i)) {
+            strip_revision_cue(inline, RevisionKind::Insert, false);
+            match inline {
+                Inline::Run(r) => r.props.tracked_insert = None,
+                Inline::Tab(props) | Inline::Break(_, props) => props.tracked_insert = None,
+                _ => {}
+            }
+            n += 1;
+        }
+    }
+    for inline in content.iter_mut() {
+        match inline {
+            Inline::Revision {
+                content,
+                content_changed,
+                ..
+            } => {
+                let swept = sweep_inlines(content, target, action);
+                if swept > 0 {
+                    *content_changed = true;
+                }
+                n += swept;
+            }
+            Inline::Hyperlink(h) => n += sweep_inlines(&mut h.content, target, action),
+            Inline::TextBox { blocks, .. } => n += sweep_tracked_inserts(blocks, target, action),
+            _ => {}
+        }
+    }
+    // A deletion of text that was in a rejected insertion has nothing left.
+    content.retain(|i| !matches!(i, Inline::Revision { kind: RevisionKind::Delete, content, content_changed: true, .. } if content.is_empty()));
+    n
 }
 
 fn transform_blocks(

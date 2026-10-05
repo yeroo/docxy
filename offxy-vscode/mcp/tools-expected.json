@@ -707,6 +707,96 @@
     }
   },
   {
+    "name": "docxy_comment_resolve",
+    "description": "Resolve a review comment, or reopen it (Review > Comments > Resolve): writes w15:done to commentsExtended.xml on save. Pass resolved to set the state; without it the comment toggles. Returns {id, resolved}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Comment id returned by docxy_comments."
+        },
+        "resolved": {
+          "type": "boolean",
+          "description": "Optional: true to resolve, false to reopen (default: toggle)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "id"
+      ]
+    }
+  },
+  {
+    "name": "docxy_comments_delete_all",
+    "description": "Delete every comment in the document (Review > Comments > Delete All): the comment records and their anchors, keeping the anchored text, as one undo step. Returns {deleted}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_display_mode",
+    "description": "Get or set Display for Review (Review > Tracking): how tracked changes are shown. A view only: the document, its revisions and its save are unchanged. No Markup and Original are view-only: edits are refused (protection_denied:display_mode) until All Markup or Simple Markup is chosen. Returns {mode, label, editable}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "description": "Optional: \"all\", \"simple\", \"none\" or \"original\" (default: report only)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_track_changes",
+    "description": "Report whether Track Changes is on (edits are recorded as tracked changes) and the reviewer they are recorded as. Returns {enabled, author}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_track_changes_set",
+    "description": "Turn Track Changes on or off (Review > Track Changes): typing and deletions are then recorded as tracked insertions and deletions (w:ins / w:del, stamped with the reviewer and the time), and the document saves with w:trackRevisions. Paragraph marks, text in hyperlinks and formatting are not recorded, and a Markdown splice (markdown: true on insert, append or replace_range) is refused while it is on. Not an undo step. Returns {enabled, author}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "true to record, false to stop."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "enabled"
+      ]
+    }
+  },
+  {
     "name": "xlsxy_list",
     "description": "List the xlsxy editors currently running on this machine (instance/pane id, port, pid).",
     "inputSchema": {
@@ -2016,6 +2106,78 @@
       "required": [
         "path"
       ]
+    }
+  },
+  {
+    "name": "xlsxy_flash_fill",
+    "description": "Flash Fill (Ctrl+E): fill the rest of the column of `ref` from the examples typed at its top, by the pattern they show in the columns next to it. One undo group; cells that already hold values are kept. Returns the cells filled (changed) and those the pattern could not fill (blank); no pattern is an error with Excel's message.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "description": "A cell of the column to fill, e.g. \"B1\"."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "ref"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_autocorrect",
+    "description": "Read or change AutoCorrect (File > Options > Proofing): its switches, replace list and exceptions. With no arguments, returns the state. Everything given is checked before anything is set; saved with the app's preferences.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "options": {
+          "type": "object",
+          "description": "Switches by key, e.g. {\"ac_replace_text\": false, \"ac_hyperlinks\": false}."
+        },
+        "add": {
+          "type": "object",
+          "properties": {
+            "replace": {
+              "type": "string",
+              "description": "The word to replace."
+            },
+            "with": {
+              "type": "string",
+              "description": "What replaces it."
+            },
+            "overwrite": {
+              "type": "boolean",
+              "description": "Replace an existing entry for the word."
+            }
+          },
+          "required": [
+            "replace",
+            "with"
+          ],
+          "description": "Add a replace-list entry. An existing entry with another With is replaced only with overwrite:true."
+        },
+        "delete": {
+          "type": "string",
+          "description": "Remove the replace-list entry for this Replace text."
+        },
+        "exception": {
+          "type": "object",
+          "description": "Add or delete an exception: {kind: first_letter|initial_caps, add: word} or {kind, delete: word}."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
     }
   }
 ]

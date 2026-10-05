@@ -13,6 +13,12 @@ pub(crate) enum MenuTarget {
     Document,
     /// A sheet cell's context menu (#690, #691): clipboard, Sort and Filter.
     Cell,
+    /// Pick From Drop-down List (Alt+Down, #665): the column block's
+    /// distinct text entries over the selected cell.
+    PickList,
+    /// The Flash Fill Options button's menu (#666, ENT-109).
+    FlashFill,
+
     /// A Project task row's context menu; `None` is the entry row.
     Row(Option<i32>),
     /// A ribbon split button's drop-down: tab, group and the primary's label
@@ -76,6 +82,9 @@ impl MenuTarget {
         match self {
             Self::Document => Json::Str("document".into()),
             Self::Cell => Json::Str("cell".into()),
+            Self::PickList => Json::Str("pick-list".into()),
+            Self::FlashFill => Json::Str("flash-fill".into()),
+
             Self::Row(uid) => Json::obj(vec![(
                 "row",
                 uid.map_or(Json::Null, |u| Json::Num(u as f64)),
@@ -175,16 +184,52 @@ pub(crate) struct Menu {
     pub target: MenuTarget,
     pub at: (f32, f32),
     pub items: Vec<MenuItem>,
+    /// The item Up and Down have highlighted (an index into `items`), for
+    /// Enter to run; `None` until the first arrow.
+    pub hi: Option<usize>,
 }
 
 impl Menu {
+    /// A menu on `target` at `at`, nothing highlighted.
+    pub fn new(target: MenuTarget, at: (f32, f32), items: Vec<MenuItem>) -> Self {
+        Self {
+            target,
+            at,
+            items,
+            hi: None,
+        }
+    }
+
     /// The menu as `menu-open` and `menu-read` report it.
     pub fn to_json(&self) -> Json {
         Json::obj(vec![
             ("open", Json::Bool(true)),
             ("target", self.target.to_json()),
             ("items", items_json(&self.items)),
+            (
+                "highlight",
+                self.hi.map_or(Json::Null, |i| Json::Num(i as f64)),
+            ),
         ])
+    }
+
+    /// Down (`down`) or Up: the highlight moves to the next enabled item,
+    /// over separators, headings and disabled items, wrapping at the ends as
+    /// Office's menus do. With nothing highlighted, Down takes the first and
+    /// Up the last. No enabled item: nothing is highlighted.
+    pub fn step(&mut self, down: bool) {
+        let n = self.items.len();
+        let usable = |i: usize| matches!(&self.items[i], MenuItem::Item(e) if e.enabled);
+        let order: Vec<usize> = if down {
+            (0..n).collect()
+        } else {
+            (0..n).rev().collect()
+        };
+        let from = self
+            .hi
+            .and_then(|h| order.iter().position(|&i| i == h))
+            .map_or(0, |p| p + 1);
+        self.hi = (0..n).map(|k| order[(from + k) % n]).find(|&i| usable(i));
     }
 }
 
@@ -247,11 +292,15 @@ pub(crate) fn target_stands(
             Err("the document menu does not run on a Project tab".into())
         }
         (MenuTarget::Grid(_), Some(_)) => Err("a grid menu does not run on a Project tab".into()),
-        (MenuTarget::Cell, Some(_)) => Err("the cell menu runs on a sheet tab".into()),
+        (MenuTarget::Cell | MenuTarget::PickList | MenuTarget::FlashFill, Some(_)) => {
+            Err("this menu runs on a sheet tab".into())
+        }
         (MenuTarget::QatUndo, Some(_)) => Err("the undo list does not run on a Project tab".into()),
         (
             MenuTarget::Document
             | MenuTarget::Cell
+            | MenuTarget::PickList
+            | MenuTarget::FlashFill
             | MenuTarget::Ribbon { .. }
             | MenuTarget::Grid(_)
             | MenuTarget::QatUndo,
@@ -529,7 +578,32 @@ pub(crate) fn cell_menu() -> Vec<MenuItem> {
             Act::Sheet(S::NewComment),
             true,
         )),
+        Separator,
+        Item(sheet(
+            "cm-pick-list",
+            "Pick From Drop-down List...",
+            S::PickList,
+        )),
     ]
+}
+
+/// Pick From Drop-down List's menu (#665): one item per entry, in order
+/// (gridcore bounds the list at `MENU_LIMIT`).
+pub(crate) fn pick_menu(values: &[String]) -> Vec<MenuItem> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let at = u32::try_from(i).unwrap_or(u32::MAX);
+            MenuItem::Item(Entry::new(
+                &format!("pick-{i}"),
+                v,
+                "",
+                Act::Sheet(crate::SheetAct::PickItem(at)),
+                true,
+            ))
+        })
+        .collect()
 }
 
 /// A split button's drop-down, from its menu commands on the ribbon.
@@ -630,7 +704,7 @@ mod tests {
         }
         let mut seen = 0;
         walk(&cell_menu(), &mut seen);
-        assert_eq!(seen, 15);
+        assert_eq!(seen, 16);
     }
 
     #[test]
@@ -696,11 +770,7 @@ mod tests {
 
     #[test]
     fn menu_json_lists_items_separators_and_submenus_in_order() {
-        let menu = Menu {
-            target: MenuTarget::Row(Some(7)),
-            at: (0., 0.),
-            items: sample(),
-        };
+        let menu = Menu::new(MenuTarget::Row(Some(7)), (0., 0.), sample());
         let json = menu.to_json();
         assert_eq!(json.get("open"), Some(&Json::Bool(true)));
         assert_eq!(
@@ -739,12 +809,41 @@ mod tests {
     }
 
     #[test]
+    fn up_and_down_step_over_what_cannot_run() {
+        // sample(): Cut, separator, Insert (submenu), Font... (disabled),
+        // Twice, Twice, a heading.
+        let mut m = Menu::new(MenuTarget::Document, (0., 0.), sample());
+        assert_eq!(m.to_json().get("highlight"), Some(&Json::Null));
+        m.step(true);
+        assert_eq!(m.hi, Some(0), "Down from nothing: the first");
+        m.step(true);
+        assert_eq!(m.hi, Some(2), "over the separator");
+        m.step(true);
+        assert_eq!(m.hi, Some(4), "over the disabled item");
+        m.step(true);
+        m.step(true);
+        assert_eq!(m.hi, Some(0), "over the heading, wrapping");
+        m.step(false);
+        assert_eq!(m.hi, Some(5), "Up wraps back");
+        assert_eq!(m.to_json().get("highlight"), Some(&Json::Num(5.0)));
+        let mut up = Menu::new(MenuTarget::Document, (0., 0.), sample());
+        up.step(false);
+        assert_eq!(up.hi, Some(5), "Up from nothing: the last that runs");
+        let mut none = Menu::new(
+            MenuTarget::Document,
+            (0., 0.),
+            vec![
+                MenuItem::Separator,
+                MenuItem::Item(Entry::unavailable("x", "X")),
+            ],
+        );
+        none.step(true);
+        assert_eq!(none.hi, None);
+    }
+
+    #[test]
     fn menu_read_after_close_is_closed() {
-        let mut open = Some(Menu {
-            target: MenuTarget::Document,
-            at: (0., 0.),
-            items: document_menu(),
-        });
+        let mut open = Some(Menu::new(MenuTarget::Document, (0., 0.), document_menu()));
         assert_eq!(
             read_json(open.as_ref()).get("open"),
             Some(&Json::Bool(true))

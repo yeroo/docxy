@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **New: Flash Fill and AutoCorrect over MCP (#712).** `xlsxy_flash_fill`
+  fills a column from the examples typed at its top (Data › Flash Fill) and
+  `xlsxy_autocorrect` reads and edits AutoCorrect's switches, replace list
+  and exceptions, of a terminal `xlsxy`, growing the combined Offxy surface
+  from 81 to **83 tools** (35 docxy + 48 xlsxy). A VS Code spreadsheet tab
+  does not answer them yet.
 - **New: page layout and printing over MCP (#612).** `xlsxy_page_setup`,
   `xlsxy_page_header`, `xlsxy_print_area_set`/`_add`/`_clear`,
   `xlsxy_print_titles`, `xlsxy_page_break_insert`/`_remove`/`_reset`,

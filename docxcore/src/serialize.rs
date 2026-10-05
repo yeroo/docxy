@@ -140,10 +140,81 @@ fn write_block(s: &mut String, block: &Block) {
 fn write_paragraph(s: &mut String, p: &Paragraph) {
     s.push_str("<w:p>");
     write_ppr(s, &p.props);
-    for item in &p.content {
-        write_inline(s, item);
-    }
+    write_inlines_tracking_inserts(s, &p.content);
     s.push_str("</w:p>");
+}
+
+/// The tracked insertion a run-like inline was recorded as (see
+/// [`crate::model::TrackedInsert`]).
+fn tracked_insert_of(item: &Inline) -> Option<&RevisionMetadata> {
+    fn props(i: &Inline) -> Option<Option<&RevisionMetadata>> {
+        match i {
+            Inline::Run(r) => Some(r.props.tracked_insert.as_ref().map(|t| &t.metadata)),
+            Inline::Tab(props) | Inline::Break(_, props) => {
+                Some(props.tracked_insert.as_ref().map(|t| &t.metadata))
+            }
+            _ => None,
+        }
+    }
+    match item {
+        // Text deleted from someone else's recorded insertion: Word's
+        // `<w:ins><w:del>…</w:del></w:ins>`.
+        Inline::Revision {
+            kind: RevisionKind::Delete,
+            content,
+            ..
+        } => {
+            let first = props(content.first()?)??;
+            content
+                .iter()
+                .all(|i| props(i).flatten().is_some_and(|m| m.id == first.id))
+                .then_some(first)
+        }
+        other => props(other).flatten(),
+    }
+}
+
+/// `content`, with each stretch of adjacent runs recorded as one tracked
+/// insertion wrapped in its `<w:ins>`.
+fn write_inlines_tracking_inserts(s: &mut String, content: &[Inline]) {
+    let same = |a: &RevisionMetadata, b: &RevisionMetadata| {
+        a.id == b.id && a.author == b.author && a.date == b.date
+    };
+    let mut i = 0;
+    while i < content.len() {
+        let Some(meta) = tracked_insert_of(&content[i]) else {
+            write_inline(s, &content[i]);
+            i += 1;
+            continue;
+        };
+        s.push_str("<w:ins");
+        for (name, value) in [
+            ("w:id", &meta.id),
+            ("w:author", &meta.author),
+            ("w:date", &meta.date),
+        ] {
+            if let Some(value) = value {
+                s.push(' ');
+                s.push_str(name);
+                s.push_str("=\"");
+                esc_attr(value, s);
+                s.push('"');
+            }
+        }
+        for (name, value) in &meta.unknown_attributes {
+            s.push(' ');
+            s.push_str(name);
+            s.push_str("=\"");
+            esc_attr(value, s);
+            s.push('"');
+        }
+        s.push('>');
+        while i < content.len() && tracked_insert_of(&content[i]).is_some_and(|m| same(m, meta)) {
+            write_inline(s, &content[i]);
+            i += 1;
+        }
+        s.push_str("</w:ins>");
+    }
 }
 
 /// Ordinal of a `CT_PPr` child element (local name, no `w:` prefix) in the
