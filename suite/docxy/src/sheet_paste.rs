@@ -166,7 +166,14 @@ impl SheetView {
         // refusal leaves nothing behind.
         let styles = self.pkg.workbook.styles.clone();
         let changes =
-            gridcore::edit::paste_special_changes(&mut self.pkg.workbook, s, at, block, spec);
+            match gridcore::edit::paste_special_changes(&mut self.pkg.workbook, s, at, block, spec)
+            {
+                Ok(changes) => changes,
+                Err(why) => {
+                    self.pkg.workbook.styles = styles;
+                    return Err(why.into());
+                }
+            };
         let extras = gridcore::edit::paste_special_extras(block, at, spec);
         if self.refuses(s, &changes) {
             self.pkg.workbook.styles = styles;

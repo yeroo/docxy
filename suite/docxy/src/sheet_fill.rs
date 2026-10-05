@@ -391,12 +391,9 @@ pub(crate) fn custom_lists_dialog(lists: &[Vec<String>], import: Vec<String>) ->
     );
     let mut data = Control::new("data", "", ControlKind::Grid, Value::Rows(lists.to_vec()));
     data.visible = false;
-    let mut imp = Control::new(
-        "import",
-        "",
-        ControlKind::Label,
-        Value::Text(import.join("\n")),
-    );
+    // The selected cells Import takes, one entry per cell: a cell's own
+    // comma stays in it (#707 r5 m3).
+    let mut imp = Control::new("import", "", ControlKind::Grid, Value::Rows(vec![import]));
     imp.visible = false;
     shown.items = list_labels(lists);
     d.controls = vec![
@@ -468,12 +465,20 @@ pub(crate) fn custom_lists_click(
     }
     let mut lists = staged_lists(top);
     if presses(top, button, "Add") || presses(top, button, "Import") {
-        let source = if presses(top, button, "Add") {
-            text(top, "entries")
+        // Typed entries split on commas and lines; imported cells are an
+        // entry each, as they are.
+        let items = if presses(top, button, "Add") {
+            gridcore::options::parse_list_entries(&text(top, "entries"))
         } else {
-            text(top, "import")
+            top.controls
+                .iter()
+                .find(|c| c.name == "import")
+                .and_then(|c| match &c.value {
+                    Value::Rows(rows) => rows.first().cloned(),
+                    _ => None,
+                })
+                .unwrap_or_default()
         };
-        let items = gridcore::options::parse_list_entries(&source);
         if items.is_empty() {
             return Some(Err("Type the list's entries first".into()));
         }
@@ -581,13 +586,17 @@ impl Docxy {
                 }
             }
             crate::SheetAct::CustomLists => {
+                // Only the cells the sheet stores: a whole-sheet selection
+                // is not walked cell by cell (#707 r5 M4).
                 let import = match &tab.surface {
                     Surface::Sheet(v) => {
                         let (r0, c0, r1, c1) = v.range();
-                        (r0..=r1)
-                            .flat_map(|r| (c0..=c1).map(move |c| (r, c)))
-                            .map(|(r, c)| v.cell_text(r, c))
-                            .filter(|t| !t.trim().is_empty())
+                        v.sheet()
+                            .cells
+                            .range((r0, c0)..=(r1, c1))
+                            .filter(|((_, c), _)| (c0..=c1).contains(c))
+                            .map(|(&(r, c), _)| v.cell_text(r, c).trim().to_string())
+                            .filter(|t| !t.is_empty())
                             .collect()
                     }
                     _ => Vec::new(),

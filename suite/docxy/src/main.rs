@@ -1396,7 +1396,7 @@ fn fill_box(src: (u32, u32, u32, u32), to: (u32, u32)) -> (u32, u32, u32, u32) {
 /// it, not several tiled over a bigger area.
 fn pasted_once(pasted: (u32, u32, u32, u32), clip: &GridClip) -> bool {
     let (r0, c0, r1, c1) = pasted;
-    (r1 - r0 + 1, c1 - c0 + 1) == (clip.rows.len() as u32, clip.cols.len() as u32)
+    (r1 - r0 + 1, c1 - c0 + 1) == (clip.block.rows.len() as u32, clip.block.cols.len() as u32)
 }
 
 /// Why a copy took nothing: a filter hides every selected row.
@@ -1406,9 +1406,8 @@ const NOTHING_TO_COPY: &str = "Nothing to copy: a filter hides every selected ro
 #[derive(Clone)]
 #[cfg_attr(test, derive(Default))]
 struct GridClip {
-    cells: Vec<Vec<gridcore::sheet::Cell>>,
     /// The TSV this copy put on the clipboard. While the clipboard still holds
-    /// it, a paste uses `cells` (formats and formulas intact); once something
+    /// it, a paste uses `block` (formats and formulas intact); once something
     /// else has been copied, the clipboard's text wins.
     text: String,
     /// The [`SheetView::id`] of the workbook it came from.
@@ -1418,14 +1417,11 @@ struct GridClip {
     sheet_name: String,
     /// The selection it was taken from, (r0, c0, r1, c1).
     rect: (u32, u32, u32, u32),
-    /// The sheet row each row of `cells` came from: a copy leaves out the
-    /// rows a filter hides (#664), so rows may be missing.
-    rows: Vec<u32>,
-    /// The sheet column each column of `cells` came from: a multi-area copy
-    /// joins areas side by side (#670), so columns may be missing.
-    cols: Vec<u32>,
-    /// The copy as Paste Special reads it (#669): the same cells, with the
-    /// source's column widths, validation and notes.
+    /// The copied cells, and for each row and column of them the sheet row
+    /// and column it came from: a copy leaves out the rows a filter hides
+    /// (#664) and a multi-area copy joins areas (#670), so rows and columns
+    /// may be missing. With the source's column widths, validation and notes
+    /// for Paste Special (#669); the only copy of the cells (#707 r5 i1).
     block: gridcore::edit::ClipBlock,
     /// A cut: its paste moves the cells, once (#664).
     cut: bool,
@@ -1469,8 +1465,6 @@ impl GridClip {
     /// End copy mode; only the text is kept, to recognise the clipboard.
     fn spend(&mut self) {
         self.spent = true;
-        self.cells = Vec::new();
-        self.rows = Vec::new();
         self.block = Default::default();
     }
 }
@@ -3100,6 +3094,20 @@ impl SheetView {
         self.areas = rest.to_vec();
         self.stamp_areas();
         self.end_cell_edit();
+        // The active area scrolled into view (#707 r5 M3).
+        self.reveal((r0, c0, r1, c1));
+    }
+
+    /// Scroll `rect` into view: its far end first, then its near one, so a
+    /// range that fits is wholly shown and one that doesn't shows its start;
+    /// a column to the right waits for the render pass, which knows the
+    /// grid's width (`reveal_col`).
+    fn reveal(&mut self, (r0, c0, r1, c1): (u32, u32, u32, u32)) {
+        let (near, far) = (self.row_list_index(r0), self.row_list_index(r1));
+        self.vlist.scroll_to_reveal_item(far);
+        self.vlist.scroll_to_reveal_item(near);
+        self.col0 = self.col0.min(c0);
+        self.reveal_col = Some(c1);
     }
 
     /// Back to one area.
@@ -3140,11 +3148,10 @@ impl SheetView {
         if rows.is_empty() {
             return Err(NOTHING_TO_COPY);
         }
-        let mut cells = Vec::with_capacity(rows.len());
+        let block = self.clip_block(rows, cols);
         let mut tsv = String::new();
-        for &r in &rows {
-            let mut row = Vec::new();
-            for (j, &c) in cols.iter().enumerate() {
+        for &r in &block.rows {
+            for (j, &c) in block.cols.iter().enumerate() {
                 if j > 0 {
                     tsv.push('\t');
                 }
@@ -3157,21 +3164,16 @@ impl SheetView {
                         self.cell_text(r, c),
                     ));
                 }
-                row.push(sheet.cell(r, c).cloned().unwrap_or_default());
             }
-            cells.push(row);
             tsv.push('\n');
         }
         Ok(GridClip {
-            cells,
             text: tsv,
             view: self.id,
             sheet: self.active,
             sheet_name: sheet.name.clone(),
             rect,
-            block: self.clip_block(rows.clone(), cols.clone()),
-            rows,
-            cols,
+            block,
             cut,
             view_gen: self.edit_gen,
             spent: false,
@@ -3252,8 +3254,8 @@ impl SheetView {
     /// written whatever its size, as before #664).
     fn paste_copy(&mut self, clip: &GridClip) -> Result<GridPasted, GridPasteError> {
         use gridcore::edit::{MAX_PASTE_CELLS, PASTE_SHAPE, paste_tiles, tiled_block};
-        let h = clip.cells.len() as u32;
-        let w = clip.cells.iter().map(Vec::len).max().unwrap_or(0) as u32;
+        let h = clip.block.cells.len() as u32;
+        let w = clip.block.cells.iter().map(Vec::len).max().unwrap_or(0) as u32;
         let sel = self.range();
         let used = self.sheet().used_size();
         let tiles = paste_tiles((h, w), sel, used)
@@ -3265,7 +3267,13 @@ impl SheetView {
             )));
         }
         let at = (sel.0, sel.1);
-        let block = tiled_block(&clip.cells, &clip.rows, &clip.cols, at, tiles);
+        let block = tiled_block(
+            &clip.block.cells,
+            &clip.block.rows,
+            &clip.block.cols,
+            at,
+            tiles,
+        );
         self.write_block(at, &block).map(|()| GridPasted::Done)
     }
 
@@ -3282,7 +3290,7 @@ impl SheetView {
             return false;
         };
         let (r0, c0, r1, c1) = clip.rect;
-        if sheet.name != clip.sheet_name || clip.cells.len() as u32 != r1 - r0 + 1 {
+        if sheet.name != clip.sheet_name || clip.block.cells.len() as u32 != r1 - r0 + 1 {
             return false;
         }
         let same = |a: &gridcore::sheet::Cell, b: &gridcore::sheet::Cell| {
@@ -3291,7 +3299,7 @@ impl SheetView {
                 && a.style == b.style
                 && (a.formula.is_some() || a.value == b.value)
         };
-        (r0..=r1).zip(&clip.cells).all(|(r, row)| {
+        (r0..=r1).zip(&clip.block.cells).all(|(r, row)| {
             (c0..=c1)
                 .zip(row)
                 .all(|(c, was)| same(was, &sheet.cell(r, c).cloned().unwrap_or_default()))

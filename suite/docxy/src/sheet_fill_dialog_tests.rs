@@ -346,3 +346,21 @@ fn the_series_dialog_and_an_unreachable_stop() {
         Err(gridcore::edit::STOP_UNREACHABLE.to_string())
     );
 }
+
+/// #707 r5 m3: Import keeps each cell one entry, its comma and all.
+#[test]
+fn custom_lists_import_keeps_a_cell_whole() {
+    let mut t = tab();
+    t.dialogs.push(custom_lists_dialog(
+        &[],
+        vec!["Smith, John".into(), "Doe, Jane".into()],
+    ));
+    assert_eq!(custom_lists_click(&mut t, "Import"), Some(Ok(None)));
+    let Some(Ok(Some(lists))) = custom_lists_click(&mut t, "OK") else {
+        panic!("OK hands the lists back")
+    };
+    assert_eq!(
+        lists,
+        vec![vec!["Smith, John".to_string(), "Doe, Jane".into()]]
+    );
+}

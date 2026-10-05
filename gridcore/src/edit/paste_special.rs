@@ -15,6 +15,9 @@ use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Workbook, cell_na
 
 use super::{Area, rects_overlap as overlaps};
 
+/// Why a transposed paste of a spilling array is refused (#707 r5 m1).
+pub const TRANSPOSE_ARRAY: &str = "You can't transpose part of an array: paste its values instead.";
+
 /// Excel's refusal of a multi-area copy whose areas share neither their rows
 /// nor their columns, of any multi-area cut, and of a paste or a drag over a
 /// multi-area selection.
@@ -487,16 +490,28 @@ pub fn paste_special_changes(
     at: (u32, u32),
     clip: &ClipBlock,
     spec: &PasteSpec,
-) -> Vec<(u32, u32, Cell)> {
+) -> Result<Vec<(u32, u32, Cell)>, &'static str> {
     let mut out = Vec::new();
     if !spec.what.pastes_contents() && spec.what != PasteWhat::Formats {
-        return out;
+        return Ok(out);
     }
     let Workbook { sheets, styles, .. } = wb;
     let Some(s) = sheets.get(sheet) else {
-        return out;
+        return Ok(out);
     };
     let members = clip.spill_members();
+    let values_only = matches!(
+        spec.what,
+        PasteWhat::Values
+            | PasteWhat::ValuesAndNumberFormats
+            | PasteWhat::ValuesAndSourceFormatting
+    );
+    // A transposed array formula would spill along the wrong axis over cells
+    // the paste never cleared: refused, as Excel refuses changing part of an
+    // array (#707 r5 m1). Values transpose what the cells show.
+    if spec.transpose && !values_only && !members.is_empty() {
+        return Err(TRANSPOSE_ARRAY);
+    }
     // Only the cells that know where they came from.
     for (i, row) in clip.cells.iter().enumerate().take(clip.rows.len()) {
         for (j, src) in row.iter().enumerate().take(clip.cols.len()) {
@@ -532,12 +547,6 @@ pub fn paste_special_changes(
                 }
                 continue;
             }
-            let values_only = matches!(
-                spec.what,
-                PasteWhat::Values
-                    | PasteWhat::ValuesAndNumberFormats
-                    | PasteWhat::ValuesAndSourceFormatting
-            );
             let formula = if values_only {
                 None
             } else {
@@ -546,6 +555,21 @@ pub fn paste_special_changes(
                         .unwrap_or_else(|| f.to_string())
                 })
             };
+            // A cell an array formula of the copy spills into is left blank
+            // where that formula is pasted with it: the pasted formula
+            // spills there again, where a constant would block it (#707 r4
+            // M1), with an operation too (r5 m1). A paste of values writes what the cells show.
+            if !values_only && members.contains(&(i, j)) {
+                out.push((
+                    dest.0,
+                    dest.1,
+                    Cell {
+                        style,
+                        ..Cell::default()
+                    },
+                ));
+                continue;
+            }
             if spec.op != PasteOp::None {
                 let dv = operand_of(&d, d.formula.clone());
                 let sv = operand_of(src, formula);
@@ -558,25 +582,16 @@ pub fn paste_special_changes(
                         ..Cell::default()
                     },
                     Ok(n) => Cell::number(n),
-                    Err(f) => Cell::formula(&f),
+                    Err(f) => {
+                        // Typed here, as a filled formula is: an array one
+                        // spills where it lands.
+                        let mut c = Cell::formula(&f);
+                        super::rebase(&mut c, 0, 0);
+                        c
+                    }
                 };
                 cell.style = style;
                 out.push((dest.0, dest.1, cell));
-                continue;
-            }
-            // A cell an array formula of the copy spills into is left blank
-            // where that formula is pasted with it: the pasted formula
-            // spills there again, where a constant would block it (#707 r4
-            // M1). A paste of values writes what the cells show.
-            if !values_only && members.contains(&(i, j)) {
-                out.push((
-                    dest.0,
-                    dest.1,
-                    Cell {
-                        style,
-                        ..Cell::default()
-                    },
-                ));
                 continue;
             }
             let mut cell = match formula {
@@ -599,7 +614,7 @@ pub fn paste_special_changes(
             out.push((dest.0, dest.1, cell));
         }
     }
-    out
+    Ok(out)
 }
 
 /// The parts of a Paste Special that are not cell writes.
@@ -724,7 +739,7 @@ pub(crate) fn subtract(a: Area, b: Area) -> Vec<Area> {
 
 /// `cells` as rectangles: each row's runs of adjacent columns, then runs
 /// that repeat on consecutive rows joined.
-pub fn cells_to_rects(cells: &[(u32, u32)]) -> Vec<Area> {
+pub(crate) fn cells_to_rects(cells: &[(u32, u32)]) -> Vec<Area> {
     let mut sorted = cells.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
@@ -826,7 +841,7 @@ pub fn paste_special(
     if !clip.is_consistent() {
         return Err("The copy no longer matches its cells: copy again".into());
     }
-    let changes = paste_special_changes(wb, sheet, at, clip, spec);
+    let changes = paste_special_changes(wb, sheet, at, clip, spec)?;
     let ex = paste_special_extras(clip, at, spec);
     let s = &mut wb.sheets[sheet];
     for (r, c, cell) in changes {

@@ -447,3 +447,104 @@ fn union_rects_merges_without_walking_cells() {
     );
     assert!(union_rects(&[]).is_empty());
 }
+
+// ---- #707 r5: worst-case costs, on realistic large sheets ----------------------
+
+fn fast(t: std::time::Instant, what: &str) {
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(3),
+        "{what}: {:?}",
+        t.elapsed()
+    );
+}
+
+/// M1: a running total's 50,000 nested ranges merge without walking them.
+#[test]
+fn precedents_of_a_50k_running_total_are_fast() {
+    let mut wb = book(&[]);
+    for r in 1..=50_000u32 {
+        wb.sheets[0].set_cell(r, 0, Cell::number(1.0));
+        wb.sheets[0].set_cell(r, 1, Cell::formula(&format!("SUM($A$2:A{})", r + 1)));
+    }
+    let t = std::time::Instant::now();
+    let found = go_to_special(
+        &wb,
+        0,
+        &[rect("B2:B50001")],
+        (1, 1),
+        GoSpecial::Precedents { all: true },
+        &[],
+    );
+    fast(t, "precedents");
+    assert_eq!(found, Ok(rects(&["A2:A50001"])));
+}
+
+/// M1: 5,000 nested 2-D rectangles, and 5,000 staircase ones, merge fast.
+#[test]
+fn union_of_thousands_of_nested_and_staggered_rects_is_fast() {
+    let nested: Vec<Area> = (0..5_000).map(|i| (0, 0, i, i)).collect();
+    let t = std::time::Instant::now();
+    assert_eq!(union_rects(&nested), vec![(0, 0, 4_999, 4_999)]);
+    fast(t, "nested");
+    let stairs: Vec<Area> = (0..5_000).map(|i| (i, i, i + 2, i + 2)).collect();
+    let t = std::time::Instant::now();
+    let u = union_rects(&stairs);
+    fast(t, "stairs");
+    // Every cell of every input is covered, and nothing else.
+    let covered = |r: u32, c: u32| u.iter().any(|&a| inside(r, c, a));
+    assert!(
+        stairs
+            .iter()
+            .all(|&(r0, c0, ..)| covered(r0, c0) && covered(r0 + 2, c0 + 2))
+    );
+    assert!(!covered(0, 3) && !covered(3, 0));
+}
+
+/// M2: a 50,000-long chain and derived columns, All levels, fast.
+#[test]
+fn dependents_of_a_50k_chain_and_derived_columns_are_fast() {
+    let mut wb = book(&[("A1", Cell::number(1.0))]);
+    wb.sheets[0].set_cell(0, 1, Cell::formula("A1"));
+    for r in 1..50_000u32 {
+        wb.sheets[0].set_cell(r, 0, Cell::number(1.0));
+        wb.sheets[0].set_cell(r, 1, Cell::formula(&format!("B{}+A{}", r, r + 1)));
+    }
+    let t = std::time::Instant::now();
+    let found = go_to_special(
+        &wb,
+        0,
+        &[rect("A1")],
+        (0, 0),
+        GoSpecial::Dependents { all: true },
+        &[],
+    );
+    fast(t, "chain");
+    assert_eq!(found, Ok(rects(&["B1:B50000"])));
+    let direct = go_to_special(
+        &wb,
+        0,
+        &[rect("A1")],
+        (0, 0),
+        GoSpecial::Dependents { all: false },
+        &[],
+    );
+    assert_eq!(direct, Ok(rects(&["B1"])));
+
+    let mut wb = book(&[]);
+    for r in 0..50_000u32 {
+        wb.sheets[0].set_cell(r, 0, Cell::number(1.0));
+        wb.sheets[0].set_cell(r, 1, Cell::formula(&format!("A{}*2", r + 1)));
+        wb.sheets[0].set_cell(r, 2, Cell::formula(&format!("B{}+1", r + 1)));
+    }
+    let t = std::time::Instant::now();
+    let found = go_to_special(
+        &wb,
+        0,
+        &[rect("A1:A50000")],
+        (0, 0),
+        GoSpecial::Dependents { all: true },
+        &[],
+    );
+    fast(t, "derived");
+    assert_eq!(found, Ok(rects(&["B1:C50000"])));
+}

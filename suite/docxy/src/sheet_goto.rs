@@ -251,6 +251,8 @@ fn go_to(v: &mut SheetView, sheet: usize, (r0, c0, r1, c1): (u32, u32, u32, u32)
     v.anchor = (r1, c1);
     v.clear_areas();
     v.end_cell_edit();
+    // Scrolled into view, as a jump to a precedent is (#707 r5 M3).
+    v.reveal((r0, c0, r1, c1));
 }
 
 /// A press the Go To dialogs handle: Go To's OK and Special…, Go To
@@ -392,6 +394,21 @@ mod tests {
         set(&mut t, "reference", Value::Text("banana".into()));
         assert_eq!(click(&mut t, "OK"), Some(Err(BAD_REFERENCE.into())));
         assert!(t.dialogs.top().is_some(), "stays open");
+    }
+
+    /// #707 r5 M3: Go To scrolls the target into view, on its own sheet.
+    #[test]
+    fn go_to_reveals_the_target_and_switches_sheets() {
+        let mut t = tab();
+        let v = view(&mut t);
+        v.pkg.add_sheet("Far");
+        t.dialogs.push(goto_dialog(&t).unwrap());
+        set(&mut t, "reference", Value::Text("Far!A5000:C5001".into()));
+        assert_eq!(click(&mut t, "OK"), Some(Ok(())));
+        let v = view(&mut t);
+        assert_eq!(v.active, 1);
+        assert_eq!(v.sel, at("A5000"));
+        assert_eq!(v.reveal_col, Some(2), "the far column waits for the render");
     }
 
     #[test]

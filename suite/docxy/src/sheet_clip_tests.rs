@@ -152,7 +152,7 @@ fn a_copy_bigger_than_the_cap_pasted_once_lands() {
     put(&mut v, "A1", Cell::number(1.0));
     put(&mut v, "B50001", Cell::formula("A1+1"));
     let clip = copy(&mut v, "A1", "B50001");
-    assert!(clip.cells.len() as u64 * 2 > gridcore::edit::MAX_PASTE_CELLS);
+    assert!(clip.block.cells.len() as u64 * 2 > gridcore::edit::MAX_PASTE_CELLS);
     select(&mut v, "D1", "D1");
     assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
     assert_eq!(value(&v, "D1"), CellValue::Number(1.0));
@@ -426,7 +426,7 @@ fn filtered_book() -> SheetView {
 fn a_filtered_copy_takes_only_the_rows_the_filter_shows() {
     let mut v = filtered_book();
     let clip = copy(&mut v, "A1", "B6");
-    assert_eq!(clip.rows, [0, 1, 3, 5]);
+    assert_eq!(clip.block.rows, [0, 1, 3, 5]);
     assert_eq!(clip.text, "1\t10\n2\t20\n4\t40\n6\t60\n");
     select(&mut v, "D1", "D1");
     v.paste_grid_clip(&clip).unwrap();
@@ -448,7 +448,7 @@ fn a_row_hidden_by_hide_is_copied() {
     let s = v.active;
     v.pkg.workbook.sheets[s].set_row_hidden(1, true);
     let clip = copy(&mut v, "A1", "A3");
-    assert_eq!(clip.rows, [0, 1, 2]);
+    assert_eq!(clip.block.rows, [0, 1, 2]);
     assert_eq!(clip.text, "1\n2\n3\n");
 }
 
@@ -456,7 +456,7 @@ fn a_row_hidden_by_hide_is_copied() {
 fn a_cut_of_a_filtered_range_moves_every_row() {
     let mut v = filtered_book();
     let clip = cut(&mut v, "A1", "B6");
-    assert_eq!(clip.rows, [0, 1, 2, 3, 4, 5]);
+    assert_eq!(clip.block.rows, [0, 1, 2, 3, 4, 5]);
 }
 
 // ---- r1 review: the grid's edge, edits ending copy mode, empty copies -------

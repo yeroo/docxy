@@ -519,7 +519,7 @@ fn a_malformed_block_is_refused_and_never_panics() {
             transpose,
             ..PasteSpec::default()
         };
-        let ch = paste_special_changes(&mut wb, 0, at("C1"), &clip, &spec);
+        let ch = paste_special_changes(&mut wb, 0, at("C1"), &clip, &spec).unwrap();
         assert_eq!(ch.len(), 1);
     }
     clip.rules = vec![ClipRule {
@@ -625,4 +625,39 @@ fn a_pasted_array_spills_again_over_its_members() {
     paste(&mut wb, 0, "C1", &clip, PasteSpec::of(PasteWhat::Values));
     assert_eq!(value(&wb, 0, "C3"), CellValue::Number(3.0));
     assert_eq!(formula(&wb, 0, "C1"), None);
+}
+
+/// #707 r5 m1: an operation pastes a spill's members blank too; a
+/// transposed paste of the formula is refused, and of values it is not.
+#[test]
+fn a_spill_with_an_operation_or_transposed() {
+    use crate::engine::Engine;
+    let mut wb = book(&[("Sheet1", &[])]);
+    let mut eng = Engine::new(&wb);
+    eng.set_cell(&mut wb, (0, 0, 0), Cell::formula("SEQUENCE(3)"));
+    let clip = copy(&wb, 0, "A1:A3");
+    let add = PasteSpec {
+        op: PasteOp::Add,
+        ..PasteSpec::default()
+    };
+    paste(&mut wb, 0, "C1", &clip, add);
+    assert_eq!(formula(&wb, 0, "C1").as_deref(), Some("0+(SEQUENCE(3))"));
+    assert_eq!(cell(&wb, 0, "C2").value, CellValue::Empty);
+    let mut eng = Engine::new(&wb);
+    eng.recalc_all(&mut wb);
+    assert_eq!(value(&wb, 0, "C3"), CellValue::Number(3.0));
+    let t = PasteSpec {
+        transpose: true,
+        ..PasteSpec::default()
+    };
+    assert_eq!(
+        paste_special(&mut wb, 0, at("E1"), &clip, &t),
+        Err(TRANSPOSE_ARRAY.to_string())
+    );
+    let tv = PasteSpec {
+        transpose: true,
+        ..PasteSpec::of(PasteWhat::Values)
+    };
+    paste(&mut wb, 0, "E1", &clip, tv);
+    assert_eq!(value(&wb, 0, "G1"), CellValue::Number(3.0));
 }

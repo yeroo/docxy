@@ -294,10 +294,16 @@ impl Docxy {
             return done;
         }
         let reopen = reopen_on_top(self.tabs.get(self.active));
+        let sheet_before = self.active_sheet().map(|v| v.active);
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
         dialog_click(tab, button)?;
         if reopen {
             self.after_reopen();
+        }
+        // A dialog that moved to another sheet (Go To) leaves the grid state
+        // of the one it left behind, as a sheet-tab click does (#707 r5 M3).
+        if !reopen && self.active_sheet().map(|v| v.active) != sheet_before {
+            self.drop_grid_state();
         }
         // A merge or a sheet of labels opens as a new document.
         self.take_mail_outputs();

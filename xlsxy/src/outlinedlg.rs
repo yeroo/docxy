@@ -583,7 +583,7 @@ pub const PASTE_WHATS: [PasteWhat; 4] = [
 ];
 
 /// Home › Paste Special (Ctrl+Alt+V): what to paste, the operation, Skip
-/// blanks and Transpose, applied through gridcore's `paste_special`.
+/// blanks and Transpose, applied through gridcore's `paste_special_changes`.
 #[derive(Clone, Debug, Default)]
 pub struct PasteSpecialDialog {
     /// Index into [`PASTE_WHATS`].

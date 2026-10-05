@@ -10,10 +10,10 @@ use crate::sheet::{Cell, CellValue, Sheet, Workbook};
 pub const NO_CELLS: &str = "No cells were found.";
 
 /// A result too fragmented to select (R17).
-pub const TOO_MANY_AREAS: &str = "Too many areas to select.";
+pub(crate) const TOO_MANY_AREAS: &str = "Too many areas to select.";
 
 /// The most rectangles a Go To Special result may hold.
-pub const MAX_AREAS: usize = 10_000;
+pub(crate) const MAX_AREAS: usize = 10_000;
 
 /// Which value types Constants and Formulas pick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -107,7 +107,7 @@ impl GoSpecial {
 
 /// The cells Go To Special searches: the selection when it is more than one
 /// cell, otherwise the used range.
-pub fn special_scope(sheet: &Sheet, areas: &[Area]) -> Vec<Area> {
+pub(crate) fn special_scope(sheet: &Sheet, areas: &[Area]) -> Vec<Area> {
     let single = areas.len() == 1 && {
         let a = areas[0];
         a.0 == a.2 && a.1 == a.3
@@ -163,58 +163,188 @@ fn same_sheet_refs(wb: &Workbook, sheet: usize, f: &str) -> Vec<Area> {
 
 /// The rectangle of the current region around `(r, c)`: grown while any
 /// cell touching it, diagonals included, holds something.
-pub fn current_region(sheet: &Sheet, (r, c): (u32, u32)) -> Area {
+pub(crate) fn current_region(sheet: &Sheet, (r, c): (u32, u32)) -> Area {
     // Subtotal's own region, which grows rows to a fixpoint before it scans
     // columns (#707 r4 M3), diagonals included.
     super::subtotal_region(sheet, r, c).map_or((r, c, r, c), |(area, _)| area)
 }
 
-/// The union of `rects` as non-overlapping rectangles, in sheet order,
-/// without walking their cells: over the grid their edges cut the sheet
-/// into, which has at most (2n)² pieces for n rectangles (#707 r4 M2).
+/// The union of `rects` as non-overlapping rectangles in sheet order,
+/// without walking their cells (#707 r4 M2, r5 M1). Rectangles with the
+/// same columns merge as row intervals first, and one inside a recent
+/// larger one is dropped, which takes nested families (a running total's
+/// `$A$2:A2` … `$A$2:A50001`) down to their largest. A sweep over the row
+/// bands the rest cut then keeps each band's merged column runs, extending
+/// a run that the band above had too. It costs the sum over bands of the
+/// rectangles active in them, and stops past [`MAX_AREAS`] output
+/// rectangles (the caller then refuses with [`TOO_MANY_AREAS`]).
 pub(crate) fn union_rects(rects: &[Area]) -> Vec<Area> {
-    let mut rows: Vec<u64> = rects
+    use std::collections::{BTreeMap, HashMap};
+    // Same columns: merge the row intervals.
+    let mut by_cols: BTreeMap<(u32, u32), Vec<(u32, u32)>> = BTreeMap::new();
+    for r in rects {
+        by_cols.entry((r.1, r.3)).or_default().push((r.0, r.2));
+    }
+    let mut merged: Vec<Area> = Vec::new();
+    for ((c0, c1), mut rows) in by_cols {
+        rows.sort_unstable();
+        let mut cur: Option<(u32, u32)> = None;
+        for (a, b) in rows {
+            match cur.as_mut() {
+                Some(run) if u64::from(a) <= u64::from(run.1) + 1 => run.1 = run.1.max(b),
+                _ => {
+                    if let Some((x, y)) = cur.take() {
+                        merged.push((x, c0, y, c1));
+                    }
+                    cur = Some((a, b));
+                }
+            }
+        }
+        if let Some((x, y)) = cur {
+            merged.push((x, c0, y, c1));
+        }
+    }
+    // Drop one inside a recent larger one (a bounded look-back: cheap, and
+    // the sweep stays exact whatever it misses).
+    let size = |r: &Area| u64::from(r.2 - r.0 + 1) * u64::from(r.3 - r.1 + 1);
+    merged.sort_unstable_by_key(|r| std::cmp::Reverse(size(r)));
+    let mut kept: Vec<Area> = Vec::new();
+    for r in merged {
+        let inside = kept
+            .iter()
+            .rev()
+            .take(64)
+            .any(|k| k.0 <= r.0 && k.1 <= r.1 && r.2 <= k.2 && r.3 <= k.3);
+        if !inside {
+            kept.push(r);
+        }
+    }
+    // The sweep over row bands.
+    let mut edges: Vec<u64> = kept
         .iter()
         .flat_map(|r| [u64::from(r.0), u64::from(r.2) + 1])
         .collect();
-    let mut cols: Vec<u64> = rects
-        .iter()
-        .flat_map(|r| [u64::from(r.1), u64::from(r.3) + 1])
-        .collect();
-    rows.sort_unstable();
-    rows.dedup();
-    cols.sort_unstable();
-    cols.dedup();
-    let at = |v: &[u64], x: u64| v.binary_search(&x).unwrap_or(0) as u32;
-    let mut pieces = std::collections::BTreeSet::new();
-    for r in rects {
-        for ri in at(&rows, u64::from(r.0))..at(&rows, u64::from(r.2) + 1) {
-            for ci in at(&cols, u64::from(r.1))..at(&cols, u64::from(r.3) + 1) {
-                pieces.insert((ri, ci));
+    edges.sort_unstable();
+    edges.dedup();
+    let mut starts: Vec<usize> = (0..kept.len()).collect();
+    starts.sort_unstable_by_key(|&i| kept[i].0);
+    let mut next_start = 0;
+    let mut active: Vec<usize> = Vec::new();
+    let mut out: Vec<Area> = Vec::new();
+    // Runs open from the band above: (c0, c1) -> index into `out`.
+    let mut open: HashMap<(u32, u32), usize> = HashMap::new();
+    for w in edges.windows(2) {
+        let (top, end) = (w[0], w[1]);
+        active.retain(|&i| u64::from(kept[i].2) + 1 > top);
+        while next_start < starts.len() && u64::from(kept[starts[next_start]].0) == top {
+            active.push(starts[next_start]);
+            next_start += 1;
+        }
+        let mut spans: Vec<(u32, u32)> = active.iter().map(|&i| (kept[i].1, kept[i].3)).collect();
+        spans.sort_unstable();
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for (a, b) in spans {
+            match runs.last_mut() {
+                Some(run) if u64::from(a) <= u64::from(run.1) + 1 => run.1 = run.1.max(b),
+                _ => runs.push((a, b)),
             }
         }
+        let mut now: HashMap<(u32, u32), usize> = HashMap::new();
+        for run in runs {
+            let idx = match open.get(&run) {
+                Some(&k) if u64::from(out[k].2) + 1 == top => {
+                    out[k].2 = (end - 1) as u32;
+                    k
+                }
+                _ => {
+                    out.push((top as u32, run.0, (end - 1) as u32, run.1));
+                    if out.len() > MAX_AREAS {
+                        return out;
+                    }
+                    out.len() - 1
+                }
+            };
+            now.insert(run, idx);
+        }
+        open = now;
     }
-    let pieces: Vec<(u32, u32)> = pieces.into_iter().collect();
-    let mut out: Vec<Area> = cells_to_rects(&pieces)
-        .into_iter()
-        .map(|(r0, c0, r1, c1)| {
-            (
-                rows[r0 as usize] as u32,
-                cols[c0 as usize] as u32,
-                (rows[r1 as usize + 1] - 1) as u32,
-                (cols[c1 as usize + 1] - 1) as u32,
-            )
-        })
-        .collect();
     out.sort_unstable();
     out
 }
 
+/// Where each formula on a sheet reads, indexed by what it reads, so "which
+/// formulas read cell (r, c)" is answered without scanning them all (#707
+/// r5 M2): single cells by cell, ranges up to 256 columns wide by column
+/// (sorted by first row), and wider ones in a short list.
+struct ReadIndex {
+    cells: Vec<(u32, u32)>,
+    refs: Vec<Vec<Area>>,
+    single: std::collections::HashMap<(u32, u32), Vec<usize>>,
+    by_col: std::collections::HashMap<u32, Vec<(u32, u32, usize)>>,
+    wide: Vec<(Area, usize)>,
+}
+
+impl ReadIndex {
+    fn new(wb: &Workbook, sheet: usize, s: &Sheet) -> ReadIndex {
+        let mut ix = ReadIndex {
+            cells: Vec::new(),
+            refs: Vec::new(),
+            single: Default::default(),
+            by_col: Default::default(),
+            wide: Vec::new(),
+        };
+        for (&rc, cell) in &s.cells {
+            let Some(f) = cell.formula.as_deref() else {
+                continue;
+            };
+            let refs = same_sheet_refs(wb, sheet, f);
+            let i = ix.cells.len();
+            for &a in &refs {
+                if a.0 == a.2 && a.1 == a.3 {
+                    ix.single.entry((a.0, a.1)).or_default().push(i);
+                } else if a.3 - a.1 < 256 {
+                    for c in a.1..=a.3 {
+                        ix.by_col.entry(c).or_default().push((a.0, a.2, i));
+                    }
+                } else {
+                    ix.wide.push((a, i));
+                }
+            }
+            ix.cells.push(rc);
+            ix.refs.push(refs);
+        }
+        for list in ix.by_col.values_mut() {
+            list.sort_unstable();
+        }
+        ix
+    }
+
+    /// The formulas that read cell (r, c).
+    fn readers(&self, (r, c): (u32, u32), out: &mut Vec<usize>) {
+        if let Some(v) = self.single.get(&(r, c)) {
+            out.extend(v);
+        }
+        if let Some(list) = self.by_col.get(&c) {
+            let upto = list.partition_point(|&(r0, _, _)| r0 <= r);
+            out.extend(list[..upto].iter().filter(|e| e.1 >= r).map(|e| e.2));
+        }
+        out.extend(
+            self.wide
+                .iter()
+                .filter(|(a, _)| inside(r, c, *a))
+                .map(|e| e.1),
+        );
+    }
+}
+
 /// Go To Special `kind` on `sheet` of `wb` for the selection `areas`, with
-/// `active` the active cell. Most kinds search [`special_scope`] (the
-/// selection, or the used range when one cell is selected); Precedents and
-/// Dependents start from the selected cells themselves: the cells found, as rectangles in sheet
-/// order (the first holds the first cell found). `note_cells` are the cells
+/// `active` the active cell: the cells found, as rectangles in sheet order
+/// (the first holds the first cell found). Most kinds search
+/// [`special_scope`] (the selection, or the used range when one cell is
+/// selected). The exceptions: Precedents and Dependents start from the
+/// selected cells themselves; Visible cells covers the selection as it is;
+/// Conditional formats and Data validation take each rule's ranges within
+/// the selection, or the whole sheet when one cell is selected. `note_cells` are the cells
 /// the package holds notes or comments on. [`NO_CELLS`] when nothing is
 /// found, [`TOO_MANY_AREAS`] past [`MAX_AREAS`] rectangles.
 pub fn go_to_special(
@@ -325,16 +455,27 @@ pub fn go_to_special(
             // From the formulas of the selection's cells (the active cell
             // when one cell is selected): each range they read, whole, as a
             // rectangle (#707 r4 M2). All levels follows on through the
-            // cells of those ranges that hold formulas; an empty cell has
-            // none, so only the used range is looked at for them.
+            // cells of those ranges that hold formulas, each visited once,
+            // found per column by range (#707 r5 M1).
             let mut frontier: Vec<(u32, u32)> =
                 cells_in(s, areas).into_iter().map(|(rc, _)| rc).collect();
-            let mut found: Vec<Area> = Vec::new();
-            let mut visited = std::collections::BTreeSet::new();
-            while let Some((r, c)) = frontier.pop() {
-                if !visited.insert((r, c)) {
-                    continue;
+            // The formula cells not yet followed, by column.
+            let mut unvisited: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>> =
+                Default::default();
+            if all {
+                for (&(r, c), cell) in &s.cells {
+                    if cell.formula.is_some() {
+                        unvisited.entry(c).or_default().insert(r);
+                    }
                 }
+                for &(r, c) in &frontier {
+                    if let Some(rows) = unvisited.get_mut(&c) {
+                        rows.remove(&r);
+                    }
+                }
+            }
+            let mut found: Vec<Area> = Vec::new();
+            while let Some((r, c)) = frontier.pop() {
                 let Some(f) = s.cell(r, c).and_then(|x| x.formula.as_deref()) else {
                     continue;
                 };
@@ -343,11 +484,12 @@ pub fn go_to_special(
                     if !all {
                         continue;
                     }
-                    if let Some((r0, c0, r1, c1)) = clip_used(rect) {
-                        for (&(rr, cc), cell) in s.cells.range((r0, c0)..=(r1, c1)) {
-                            if (c0..=c1).contains(&cc) && cell.formula.is_some() {
-                                frontier.push((rr, cc));
-                            }
+                    let (r0, c0, r1, c1) = rect;
+                    for (&col, rows) in unvisited.range_mut(c0..=c1) {
+                        let hit: Vec<u32> = rows.range(r0..=r1).copied().collect();
+                        for row in hit {
+                            rows.remove(&row);
+                            frontier.push((row, col));
                         }
                     }
                 }
@@ -355,39 +497,44 @@ pub fn go_to_special(
             union_rects(&found)
         }
         GoSpecial::Dependents { all } => {
-            let formulas: Vec<((u32, u32), Vec<Area>)> = s
+            // The formulas that read the selection, then (All levels) those
+            // that read them, each found once through an index of what every
+            // formula reads (#707 r5 M2).
+            let ix = ReadIndex::new(wb, sheet, s);
+            let mut found = vec![false; ix.cells.len()];
+            let mut queue: Vec<usize> = Vec::new();
+            for (i, refs) in ix.refs.iter().enumerate() {
+                let hits = refs.iter().any(|&a| {
+                    areas
+                        .iter()
+                        .any(|&t| a.0 <= t.2 && t.0 <= a.2 && a.1 <= t.3 && t.1 <= a.3)
+                });
+                if hits {
+                    found[i] = true;
+                    queue.push(i);
+                }
+            }
+            if all {
+                let mut readers = Vec::new();
+                while let Some(i) = queue.pop() {
+                    readers.clear();
+                    ix.readers(ix.cells[i], &mut readers);
+                    for &j in &readers {
+                        if !found[j] {
+                            found[j] = true;
+                            queue.push(j);
+                        }
+                    }
+                }
+            }
+            let cells: Vec<(u32, u32)> = ix
                 .cells
                 .iter()
-                .filter_map(|(&rc, cell)| {
-                    cell.formula
-                        .as_deref()
-                        .map(|f| (rc, same_sheet_refs(wb, sheet, f)))
-                })
+                .zip(&found)
+                .filter(|(_, f)| **f)
+                .map(|(&rc, _)| rc)
                 .collect();
-            let mut targets: Vec<Area> = areas.to_vec();
-            let mut found = std::collections::BTreeSet::new();
-            loop {
-                let mut next = Vec::new();
-                for (rc, refs) in &formulas {
-                    if found.contains(rc) {
-                        continue;
-                    }
-                    let hits = refs.iter().any(|&a| {
-                        targets
-                            .iter()
-                            .any(|&t| a.0 <= t.2 && t.0 <= a.2 && a.1 <= t.3 && t.1 <= a.3)
-                    });
-                    if hits {
-                        found.insert(*rc);
-                        next.push((rc.0, rc.1, rc.0, rc.1));
-                    }
-                }
-                if !all || next.is_empty() {
-                    break;
-                }
-                targets = next;
-            }
-            cells_to_rects(&found.into_iter().collect::<Vec<_>>())
+            cells_to_rects(&cells)
         }
         GoSpecial::LastCell => used_rect(s)
             .map(|(_, _, r, c)| (r, c, r, c))

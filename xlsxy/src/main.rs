@@ -6367,13 +6367,19 @@ impl App {
             })
             .collect();
         let s = self.sheet;
-        let changes = gridcore::edit::paste_special_changes(
+        let changes = match gridcore::edit::paste_special_changes(
             &mut self.pkg.workbook,
             s,
             self.cur,
             &block,
             &spec,
-        );
+        ) {
+            Ok(changes) => changes,
+            Err(why) => {
+                self.status = Some(why.into());
+                return;
+            }
+        };
         let n = changes.len();
         if self.apply(changes) {
             self.status = Some(format!("Pasted {} into {n} cell(s)", spec.what.label()));

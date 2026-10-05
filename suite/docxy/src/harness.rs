@@ -2368,10 +2368,10 @@ fn clipboard_app_json(
                 return Json::obj(vec![
                     ("kind", Json::Str("grid".into())),
                     ("text", Json::Str(clip.text.clone())),
-                    ("rows", Json::Num(clip.cells.len() as f64)),
+                    ("rows", Json::Num(clip.block.cells.len() as f64)),
                     (
                         "cols",
-                        Json::Num(clip.cells.first().map_or(0, Vec::len) as f64),
+                        Json::Num(clip.block.cells.first().map_or(0, Vec::len) as f64),
                     ),
                 ]);
             }
@@ -4081,7 +4081,10 @@ mod tests {
             text: "one\ntwo".into(),
         };
         let grid = crate::GridClip {
-            cells: vec![vec![Default::default(); 3]; 2],
+            block: gridcore::edit::ClipBlock {
+                cells: vec![vec![Default::default(); 3]; 2],
+                ..Default::default()
+            },
             text: "a\tb\tc\nd\te\tf\n".into(),
             ..Default::default()
         };

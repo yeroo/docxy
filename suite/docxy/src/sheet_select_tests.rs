@@ -163,8 +163,8 @@ fn a_multi_area_copy_needs_shared_rows_or_columns() {
     v.add_area(at("C1"));
     v.extend_active(at("C2"));
     let clip = v.grid_clip(false).expect("same rows: one block");
-    assert_eq!(clip.cols, vec![0, 2]);
-    assert_eq!(clip.rows, vec![0, 1]);
+    assert_eq!(clip.block.cols, vec![0, 2]);
+    assert_eq!(clip.block.rows, vec![0, 1]);
     assert_eq!(clip.text, "1\t3\n\t\n");
     // A cut of more than one area is refused, whatever its shape.
     assert_eq!(

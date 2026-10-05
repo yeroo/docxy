@@ -22,10 +22,7 @@ mod goto_special;
 #[cfg(test)]
 pub(crate) use clear::apply_clear;
 pub use clear::{ClearPlan, ClearWhat, MERGED_PART, apply_clear_sheet, clear_plan};
-pub use goto_special::{
-    GoSpecial, MAX_AREAS, NO_CELLS, TOO_MANY_AREAS, Types, current_region, go_to_special,
-    resolve_reference, special_scope,
-};
+pub use goto_special::{GoSpecial, NO_CELLS, Types, go_to_special, resolve_reference};
 mod series;
 pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
 pub use series::{
@@ -37,7 +34,7 @@ mod consolidate;
 mod paste_special;
 pub use paste_special::{
     ClipBlock, ClipNote, ClipRule, MULTI_SELECTION, PasteExtras, PasteOp, PasteSpec, PasteWhat,
-    cells_to_rects, clear_validation, multi_area_shape, paste_link_changes, paste_special_changes,
+    TRANSPOSE_ARRAY, clear_validation, multi_area_shape, paste_link_changes, paste_special_changes,
     paste_special_extras,
 };
 mod subtotal;
