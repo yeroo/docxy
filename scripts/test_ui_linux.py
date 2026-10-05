@@ -5,6 +5,9 @@ real X server is needed. The fakes satisfy the contracts ui-linux.py relies on:
 Xvfb writes a decimal display number to the -displayfd fd, and xprop answers the
 _NET_SUPPORTING_WM_CHECK readiness probe.
 
+StopAll unit-tests stop_all() in-process by loading ui-linux.py as the module
+`ui_linux` and patching its stop() and os.killpg.
+
     python3 -m unittest discover -s scripts -p 'test_*.py' -v
 """
 import contextlib
@@ -233,7 +236,8 @@ class StopAll(unittest.TestCase):
         a, b, c = object(), object(), object()
         with mock.patch.object(ui_linux, 'stop', fake_stop), \
                 contextlib.redirect_stderr(err):
-            ui_linux.stop_all([('command', a), ('openbox', b), ('xvfb', c)])
+            stopped = ui_linux.stop_all([('command', a), ('openbox', b), ('xvfb', c)])
+        self.assertFalse(stopped)
         self.assertEqual(seen, [a, b, c])
         self.assertIn('ui-linux: could not stop command: denied', err.getvalue())
 
@@ -256,7 +260,8 @@ class StopAll(unittest.TestCase):
         err = io.StringIO()
         with mock.patch.object(ui_linux.os, 'killpg', killpg), \
                 contextlib.redirect_stderr(err):
-            ui_linux.stop_all([('command', blocked), ('openbox', p1), ('xvfb', p2)])
+            stopped = ui_linux.stop_all([('command', blocked), ('openbox', p1), ('xvfb', p2)])
+        self.assertFalse(stopped)
         self.assertIsNotNone(p1.poll())
         self.assertIsNotNone(p2.poll())
         self.assertIn('ui-linux: could not stop command: denied', err.getvalue())
@@ -272,8 +277,15 @@ class StopAll(unittest.TestCase):
     def test_none_processes_are_skipped(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            ui_linux.stop_all([('command', None), ('openbox', None), ('xvfb', None)])
+            stopped = ui_linux.stop_all([('command', None), ('openbox', None), ('xvfb', None)])
+        self.assertTrue(stopped)
         self.assertEqual(err.getvalue(), '')
+
+    def test_all_stopped_returns_true(self):
+        with mock.patch.object(ui_linux, 'stop', lambda process: None):
+            stopped = ui_linux.stop_all(
+                [('command', object()), ('openbox', object()), ('xvfb', object())])
+        self.assertTrue(stopped)
 
     @staticmethod
     def _reap(proc):
