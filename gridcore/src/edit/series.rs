@@ -553,11 +553,22 @@ fn weekend(serial: f64, date1904: bool) -> bool {
     dow == 0 || dow == 6
 }
 
-/// `serial` moved by `k` weekdays (Monday to Friday).
+/// `serial` moved by `k` weekdays (Monday to Friday), in constant time
+/// (#707 r2 M2): a start on a weekend is first taken back to the weekday
+/// before it in the walk's direction (which moves to the same weekdays),
+/// every whole five weekdays is a week, and only the rest is walked.
 pub(crate) fn add_weekdays(serial: f64, k: i64, date1904: bool) -> f64 {
-    let mut s = serial;
+    if k == 0 {
+        return serial;
+    }
     let dir = if k < 0 { -1.0 } else { 1.0 };
-    let mut left = k.abs();
+    let mut s = serial;
+    while weekend(s, date1904) {
+        s -= dir;
+    }
+    let n = k.unsigned_abs();
+    s += dir * 7.0 * (n / 5) as f64;
+    let mut left = n % 5;
     while left > 0 {
         s += dir;
         if !weekend(s, date1904) {
@@ -565,6 +576,22 @@ pub(crate) fn add_weekdays(serial: f64, k: i64, date1904: bool) -> f64 {
         }
     }
     s
+}
+
+/// The weekdays in (`a`, `b`] (negative when `b` is before `a`), in
+/// constant time.
+fn weekdays_between(a: f64, b: f64, date1904: bool) -> i64 {
+    let (lo, hi, sign) = if b >= a { (a, b, 1) } else { (b, a, -1) };
+    let days = (hi - lo).round() as i64;
+    let mut n = days / 7 * 5;
+    let mut s = lo + (days / 7 * 7) as f64;
+    while s < hi {
+        s += 1.0;
+        if !weekend(s, date1904) {
+            n += 1;
+        }
+    }
+    sign * n
 }
 
 /// The whole-month step between date seeds that share a day of month and
@@ -605,16 +632,7 @@ fn date_at(ys: &[f64], n: f64, t: Temporal, kind: FillKind, date1904: bool, dir:
                 dir as i64
             } else {
                 // The weekdays between the last two seeds.
-                let (a, b) = (ys[m - 2], last);
-                let mut k = 0i64;
-                let mut s = a;
-                let dir = if b >= a { 1.0 } else { -1.0 };
-                while (dir > 0.0 && s < b) || (dir < 0.0 && s > b) {
-                    s += dir;
-                    if !weekend(s, date1904) {
-                        k += dir as i64;
-                    }
-                }
+                let k = weekdays_between(ys[m - 2], last, date1904);
                 if k == 0 { 1 } else { k }
             };
             add_weekdays(last, step * ahead.round() as i64, date1904)
@@ -890,10 +908,20 @@ pub(crate) fn series_changes(
     rect: Rect,
     spec: &SeriesSpec,
     ctx: &SeedCtx,
-) -> Vec<(u32, u32, Cell)> {
+) -> Result<Vec<(u32, u32, Cell)>, &'static str> {
     use crate::sheet::{MAX_COLS, MAX_ROWS};
     let (r0, c0, r1, c1) = rect;
     let single = r0 == r1 && c0 == c1;
+    // A step the arithmetic cannot take (#707 r2 M2).
+    if !spec.step.is_finite() || spec.step.abs() > MAX_STEP {
+        return Err(STEP_OUT_OF_RANGE);
+    }
+    // AutoFill fills the selection only; Trend fits it. The stop value
+    // bounds the other types' series, and with one cell selected it is
+    // what ends the series, so it has to be reachable (#707 r2 M1).
+    let stop = spec
+        .stop
+        .filter(|_| spec.kind != SeriesType::AutoFill && !spec.trend);
     let mut out = Vec::new();
     let lines: Vec<u32> = if spec.rows {
         (r0..=r1).collect()
@@ -909,16 +937,17 @@ pub(crate) fn series_changes(
             }
         };
         let mut len = if spec.rows { c1 - c0 + 1 } else { r1 - r0 + 1 };
-        if single && spec.stop.is_some() {
+        if single && stop.is_some() {
             // One cell and a stop value: the series runs on to the stop
-            // value, capped as a paste is.
-            let room = if spec.rows {
+            // value.
+            len = if spec.rows {
                 MAX_COLS - c0
             } else {
                 MAX_ROWS - r0
             };
-            len = room.min(super::MAX_PASTE_CELLS as u32);
         }
+        // Capped as a paste is, whatever the selection (#707 r2 M2).
+        len = len.min(super::MAX_PASTE_CELLS as u32);
         let seeds: Vec<Cell> = (0..len)
             .map_while(|i| {
                 let (r, c) = at(i);
@@ -963,6 +992,11 @@ pub(crate) fn series_changes(
         if first.formula.is_some() {
             continue;
         }
+        if let Some(stop) = stop {
+            if single && !stop_reachable(spec, v0, stop) {
+                return Err(STOP_UNREACHABLE);
+            }
+        }
         let style = first.style;
         let ys: Vec<f64> = seeds
             .iter()
@@ -976,8 +1010,8 @@ pub(crate) fn series_changes(
             SeriesType::Growth => spec.step >= 1.0,
             _ => spec.step >= 0.0,
         };
-        let past = |v: f64| match spec.stop {
-            Some(stop) if !spec.trend => {
+        let past = |v: f64| match stop {
+            Some(stop) => {
                 if rising {
                     v > stop
                 } else {
@@ -1028,7 +1062,42 @@ pub(crate) fn series_changes(
             out.push((r, c, cell));
         }
     }
-    out
+    Ok(out)
+}
+
+/// The largest step Series takes: past it a date step's whole-number
+/// arithmetic would saturate.
+const MAX_STEP: f64 = 1e12;
+
+/// Series' refusal of a step it cannot take.
+pub const STEP_OUT_OF_RANGE: &str = "The step value is out of range.";
+
+/// Series' refusal of a stop value its step never reaches.
+pub const STOP_UNREACHABLE: &str = "The stop value can never be reached with this step value.";
+
+/// Whether a series from `v0` stepping by `spec.step` ever reaches `stop`.
+fn stop_reachable(spec: &SeriesSpec, v0: f64, stop: f64) -> bool {
+    let step = spec.step;
+    match spec.kind {
+        SeriesType::Growth => {
+            if v0 == 0.0 || step <= 0.0 || step == 1.0 {
+                return stop == v0;
+            }
+            let ratio = stop / v0;
+            ratio > 0.0
+                && if step > 1.0 {
+                    ratio >= 1.0
+                } else {
+                    ratio <= 1.0
+                }
+        }
+        _ => {
+            if step == 0.0 {
+                return stop == v0;
+            }
+            (stop - v0) * step >= 0.0
+        }
+    }
 }
 
 /// The growth trend's value at `n`: the least-squares exponential through

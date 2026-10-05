@@ -27,16 +27,22 @@ pub(crate) struct PasteOptions {
     pub item: PasteItem,
     /// The copy came from another workbook: no Paste Link.
     pub foreign: bool,
+    /// Set the first time it does not stand: a return to the pasted range
+    /// does not bring it back (#707 r2 i2).
+    pub gone: std::cell::Cell<bool>,
 }
 
 impl PasteOptions {
     /// Whether the button still stands on `v`: the workbook as the paste
     /// left it, and the pasted range still the selection (R3).
     pub fn stands(&self, v: &SheetView) -> bool {
-        v.id == self.view
+        let stands = !self.gone.get()
+            && v.id == self.view
             && v.edit_gen == self.edit_gen
             && v.range() == self.rect
-            && !v.multi_area()
+            && !v.multi_area();
+        self.gone.set(!stands);
+        stands
     }
 }
 
@@ -393,9 +399,10 @@ pub(crate) const LINK_FOREIGN: &str =
 pub(crate) const CUT_PASTE_ONLY: &str = "A cut pastes with Paste only (Ctrl+V)";
 
 impl Docxy {
-    /// What a paste would take now, as a [`ClipBlock`]: the live copy, or
-    /// the clipboard's text read at the selection. `None` when there is
-    /// nothing to paste.
+    /// What a paste would take now ([`PasteSource`]): the live copy, with
+    /// whether it is a cut and whether it came from another workbook, or the
+    /// clipboard's text read at the selection. `None` when there is nothing
+    /// to paste.
     pub(crate) fn paste_source(&mut self, cx: &mut gpui::Context<Self>) -> Option<PasteSource> {
         let now = self.clipboard_read(cx);
         let here = self.active_sheet().map(|v| v.id);
@@ -449,8 +456,8 @@ impl Docxy {
         self.sheet_paste_block(src, item, cx);
     }
 
-    /// Paste `block` as `item` at the selection's top-left, leaving the Paste
-    /// Options button after a copy's paste.
+    /// Paste `src` as `item` at the selection's top-left, leaving the Paste
+    /// Options button after a copy's paste (not a text paste's).
     fn sheet_paste_block(
         &mut self,
         src: PasteSource,
@@ -467,6 +474,7 @@ impl Docxy {
                     view: v.id,
                     edit_gen: v.edit_gen,
                     foreign: src.foreign,
+                    gone: Default::default(),
                     block: src.block,
                     at: (r, c),
                     rect,
@@ -567,7 +575,7 @@ impl Docxy {
                 return Some(Err(why.into()));
             }
         }
-        let (block, clip) = (src.block, src.clip);
+        let block = src.block;
         if self.protected_view() {
             return Some(Err(crate::open_mode::PROTECTED_STATUS.into()));
         }
@@ -582,8 +590,9 @@ impl Docxy {
         let (r, c, _, _) = v.range();
         let done = match spec {
             Some(spec) => v.paste_special_at(&block, &spec, (r, c)),
-            None if clip => v.paste_link_at(&block, (r, c)),
-            None => Err("Paste Link needs a copy from this app".into()),
+            // `item_refusal` has refused Paste Link for anything but a copy
+            // from this workbook.
+            None => v.paste_link_at(&block, (r, c)),
         };
         Some(done.map(|_| {
             self.grid_clip_restamp();

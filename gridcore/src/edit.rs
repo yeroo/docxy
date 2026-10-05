@@ -27,8 +27,9 @@ pub use goto_special::{
 pub(crate) mod series;
 pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
 pub use series::{
-    FillDir, FillKind, FillTarget, JUSTIFY_OVERFLOW, SeriesSpec, SeriesType, builtin_lists,
-    fill_down_to, fill_target, justify_lines, series_rows_for,
+    FillDir, FillKind, FillTarget, JUSTIFY_OVERFLOW, STEP_OUT_OF_RANGE, STOP_UNREACHABLE,
+    SeriesSpec, SeriesType, builtin_lists, fill_down_to, fill_target, justify_lines,
+    series_rows_for,
 };
 mod consolidate;
 mod paste_special;
@@ -770,22 +771,23 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, req: &FillReq) -> Option<Filled
 }
 
 /// Home › Fill › Series… over `rect` ([`SeriesSpec`]): one call, the writes
-/// made. Returns how many cells were written.
+/// made. Returns how many cells were written, or why nothing was
+/// ([`series::STOP_UNREACHABLE`], [`series::STEP_OUT_OF_RANGE`]).
 pub fn fill_series(
     wb: &mut Workbook,
     sheet: usize,
     rect: (u32, u32, u32, u32),
     spec: &SeriesSpec,
     lists: &[Vec<String>],
-) -> usize {
-    let changes = series_changes_for(wb, sheet, rect, spec, lists);
+) -> Result<usize, &'static str> {
+    let changes = series_changes_for(wb, sheet, rect, spec, lists)?;
     let n = changes.len();
     if let Some(s) = wb.sheets.get_mut(sheet) {
         for (r, c, cell) in changes {
             s.set_cell(r, c, cell);
         }
     }
-    n
+    Ok(n)
 }
 
 /// The `(row, col, cell)` writes [`fill_series`] would make, for a host that
@@ -796,9 +798,9 @@ pub fn series_changes_for(
     rect: (u32, u32, u32, u32),
     spec: &SeriesSpec,
     lists: &[Vec<String>],
-) -> Vec<(u32, u32, Cell)> {
+) -> Result<Vec<(u32, u32, Cell)>, &'static str> {
     let Some(s) = wb.sheets.get(sheet) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let ctx = series::SeedCtx {
         styles: &wb.styles,

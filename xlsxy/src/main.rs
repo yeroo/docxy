@@ -12243,9 +12243,10 @@ mod tests {
         assert!(app.undo.len() >= 2, "each paste is an undo step");
     }
 
-    /// #707 r1 C1: a copy whose sheet is deleted goes with it, so Paste
-    /// Special cannot read a sheet that is not there (it panicked); a copy
-    /// on a later sheet follows the renumbering. M5: a cut takes Paste only.
+    /// #707 r1 C1: a copy whose sheet is deleted keeps its cells but marks
+    /// its sheet gone (`SHEET_GONE`), so Paste Special refuses it rather
+    /// than read a sheet that is not there (it panicked); a copy on a later
+    /// sheet follows the renumbering. M5: a cut takes Paste only.
     #[test]
     fn paste_special_after_the_copys_sheet_is_deleted() {
         let mut pkg = new_xlsx();

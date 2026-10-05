@@ -396,6 +396,10 @@ test the gallery and the Paste Options button paste another way
   call menu-click {"label":"Paste Link"}
   call cell {"cell":"Q33"}
   assert reply.value is =$M$33
+  assert paste_options is Paste Link
+  # Esc dismisses the button (R3).
+  key escape
+  assert paste_options is null
 
 test the Office Clipboard keeps copies and pastes them as values
   open ../fixtures/basic.xlsx

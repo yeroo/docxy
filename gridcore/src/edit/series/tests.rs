@@ -1,5 +1,6 @@
 use super::*;
 use crate::edit::{FillReq, Filled, autofill, fill_series};
+use crate::edit::{STEP_OUT_OF_RANGE, STOP_UNREACHABLE};
 use crate::sheet::{Sheet, Workbook, Xf, cell_name, parse_cell_name};
 
 fn book(cells: &[(&str, Cell)]) -> Workbook {
@@ -530,7 +531,8 @@ fn series_linear_growth_and_date_steps() {
         (0, 0, 4, 0),
         &spec(false, SeriesType::Linear, 2.5, None, false),
         &[],
-    );
+    )
+    .unwrap();
     assert_eq!(nums(&wb, &["A2", "A3", "A4", "A5"]), [3.5, 6.0, 8.5, 11.0]);
     let mut wb = book(&[("A1", Cell::number(1.0))]);
     fill_series(
@@ -539,7 +541,8 @@ fn series_linear_growth_and_date_steps() {
         (0, 0, 0, 3),
         &spec(true, SeriesType::Growth, 3.0, None, false),
         &[],
-    );
+    )
+    .unwrap();
     assert_eq!(nums(&wb, &["B1", "C1", "D1"]), [3.0, 9.0, 27.0]);
     let mut wb = book(&[]);
     let s = style(&mut wb, "yyyy-mm-dd");
@@ -552,7 +555,8 @@ fn series_linear_growth_and_date_steps() {
         (0, 0, 2, 0),
         &spec(false, SeriesType::Date(FillKind::Months), 1.0, None, false),
         &[],
-    );
+    )
+    .unwrap();
     assert_eq!(
         nums(&wb, &["A2", "A3"]),
         [date(2024, 2, 29), date(2024, 3, 31)]
@@ -569,7 +573,8 @@ fn series_stop_value_runs_past_a_single_cell() {
         (0, 0, 0, 0),
         &spec(false, SeriesType::Linear, 2.0, Some(8.0), false),
         &[],
-    );
+    )
+    .unwrap();
     assert_eq!(n, 3);
     assert_eq!(nums(&wb, &["A2", "A3", "A4"]), [3.0, 5.0, 7.0]);
     assert_eq!(shown(&wb, "A5"), CellValue::Empty);
@@ -581,7 +586,8 @@ fn series_stop_value_runs_past_a_single_cell() {
         (0, 0, 9, 0),
         &spec(false, SeriesType::Linear, -3.0, Some(2.0), false),
         &[],
-    );
+    )
+    .unwrap();
     assert_eq!(nums(&wb, &["A2", "A3"]), [7.0, 4.0]);
     assert_eq!(shown(&wb, "A4"), CellValue::Empty);
 }
@@ -599,7 +605,8 @@ fn series_trend_replaces_the_seeds_with_the_fit() {
         (0, 0, 4, 0),
         &spec(false, SeriesType::Linear, 99.0, None, true),
         &[],
-    );
+    )
+    .unwrap();
     let got = nums(&wb, &["A1", "A2", "A3", "A4", "A5"]);
     let want = [5.0 / 6.0, 7.0 / 3.0, 23.0 / 6.0, 16.0 / 3.0, 41.0 / 6.0];
     for (g, w) in got.iter().zip(want) {
@@ -616,7 +623,8 @@ fn series_autofill_type_extends_like_the_handle() {
         (0, 0, 3, 0),
         &spec(false, SeriesType::AutoFill, 1.0, None, false),
         &[],
-    );
+    )
+    .unwrap();
     assert_eq!(texts(&wb, &["A2", "A3", "A4"]), ["Q2", "Q3", "Q4"]);
 }
 
@@ -711,4 +719,122 @@ fn weekdays_in_a_1904_workbook() {
             parts_to_serial(2024, 10, 8, 0, true)
         ]
     );
+}
+
+// ---- #707 r2: a stop value that bounds, and steps that cannot run --------------
+
+/// M1: AutoFill fills the selection and ignores a stop value; with one cell
+/// selected it writes nothing, so a table below is safe.
+#[test]
+fn series_autofill_ignores_the_stop_value() {
+    let mut wb = book(&[("A1", Cell::text("Mon")), ("A30", Cell::text("table"))]);
+    let n = fill_series(
+        &mut wb,
+        0,
+        (0, 0, 0, 0),
+        &spec(false, SeriesType::AutoFill, 1.0, Some(5.0), false),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(n, 0);
+    assert_eq!(texts(&wb, &["A30"]), ["table"]);
+    assert_eq!(shown(&wb, "A2"), CellValue::Empty);
+}
+
+/// M1: a stop the step never reaches is refused, nothing written.
+#[test]
+fn an_unreachable_stop_is_refused() {
+    for (kind, step, stop) in [
+        (SeriesType::Linear, 0.0, 9.0),
+        (SeriesType::Linear, -1.0, 9.0),
+        (SeriesType::Growth, 1.0, 9.0),
+        (SeriesType::Growth, 2.0, 0.5),
+        (SeriesType::Date(FillKind::Days), 0.0, 99.0),
+    ] {
+        let mut wb = book(&[("A1", Cell::number(1.0))]);
+        assert_eq!(
+            fill_series(
+                &mut wb,
+                0,
+                (0, 0, 0, 0),
+                &spec(false, kind, step, Some(stop), false),
+                &[]
+            ),
+            Err(STOP_UNREACHABLE),
+            "{kind:?} {step} {stop}"
+        );
+        assert_eq!(shown(&wb, "A2"), CellValue::Empty);
+    }
+    // Reachable ones still run.
+    let mut wb = book(&[("A1", Cell::number(10.0))]);
+    let n = fill_series(
+        &mut wb,
+        0,
+        (0, 0, 0, 0),
+        &spec(false, SeriesType::Linear, -2.0, Some(5.0), false),
+        &[],
+    );
+    assert_eq!(n, Ok(2));
+}
+
+/// M2: a step that cannot run is refused; a whole column is capped.
+#[test]
+fn series_steps_out_of_range_and_the_cap() {
+    let mut wb = book(&[("A1", Cell::number(1.0))]);
+    for step in [f64::NAN, f64::INFINITY, 1e300] {
+        assert_eq!(
+            fill_series(
+                &mut wb,
+                0,
+                (0, 0, 9, 0),
+                &spec(false, SeriesType::Linear, step, None, false),
+                &[]
+            ),
+            Err(STEP_OUT_OF_RANGE)
+        );
+    }
+    let all = (0, 0, crate::sheet::MAX_ROWS - 1, 0);
+    let n = fill_series(
+        &mut wb,
+        0,
+        all,
+        &spec(false, SeriesType::Linear, 1.0, None, false),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(n, crate::edit::MAX_PASTE_CELLS as usize - 1);
+}
+
+/// M2: add_weekdays in constant time matches the day-by-day walk.
+#[test]
+fn add_weekdays_matches_the_walk() {
+    let walk = |serial: f64, k: i64, d1904: bool| {
+        let mut s = serial;
+        let dir = if k < 0 { -1.0 } else { 1.0 };
+        let mut left = k.abs();
+        while left > 0 {
+            s += dir;
+            if !weekend(s, d1904) {
+                left -= 1;
+            }
+        }
+        s
+    };
+    for d1904 in [false, true] {
+        let base = parts_to_serial(2024, 10, 1, 0, d1904);
+        for start in 0..7 {
+            let from = base + f64::from(start);
+            for k in -20..=20 {
+                assert_eq!(
+                    add_weekdays(from, k, d1904),
+                    walk(from, k, d1904),
+                    "{from} {k}"
+                );
+            }
+        }
+    }
+    let t = std::time::Instant::now();
+    let far = add_weekdays(parts_to_serial(2024, 10, 4, 0, false), 5_000_000, false);
+    assert!(t.elapsed() < std::time::Duration::from_millis(50));
+    assert_eq!(far - parts_to_serial(2024, 10, 4, 0, false), 7_000_000.0);
 }

@@ -136,6 +136,7 @@ fn auto_fill_options_redo_the_fill_as_one_step() {
         sel: rect("A1:A4"),
         dates: false,
         numbers: true,
+        gone: Default::default(),
     };
     assert!(opts.kinds().contains(&FillKind::GrowthTrend));
     v.refill(&opts, FillKind::Copy, &[]).unwrap();
@@ -160,6 +161,7 @@ fn auto_fill_options_redo_the_fill_as_one_step() {
         sel: rect("A1:A2"),
         dates: false,
         numbers: true,
+        gone: Default::default(),
     };
     v.push_undo();
     assert!(!stale.stands(v));
@@ -278,8 +280,69 @@ fn a_selection_change_dismisses_auto_fill_options() {
         sel: v.range(),
         dates: false,
         numbers: true,
+        gone: Default::default(),
     };
     assert!(opts.stands(v));
     v.move_sel(0, 1);
     assert!(!opts.stands(v));
+    // r2 i2: back on the filled range, it stays gone.
+    v.anchor = at("A1");
+    v.sel = at("A3");
+    assert!(!opts.stands(v));
+}
+
+/// #707 r2 M3: Series and Justify refuse a protected sheet, and so does
+/// opening the Series dialog.
+#[test]
+fn series_and_justify_refuse_a_protected_sheet() {
+    let mut t = tab();
+    let v = view(&mut t);
+    put(v, "A1", Cell::text("some words to wrap"));
+    put(v, "B1", Cell::number(1.0));
+    v.pkg.workbook.sheets[0].set_protected(true);
+    v.anchor = at("B1");
+    v.sel = at("B4");
+    let before = v.sheet().cells.clone();
+    assert!(v.fill_series(&SeriesSpec::default(), &[]).is_err());
+    v.anchor = at("A1");
+    v.sel = at("A3");
+    assert!(v.justify(true).is_err());
+    assert_eq!(v.sheet().cells, before);
+    assert!(v.undo.is_empty());
+    assert!(series_dialog(&t).is_err());
+}
+
+/// #707 r2 M1: the Series dialog greys out Stop for AutoFill, and an
+/// unreachable stop comes back as Excel's refusal.
+#[test]
+fn the_series_dialog_and_an_unreachable_stop() {
+    let mut t = tab();
+    put(view(&mut t), "A1", Cell::number(1.0));
+    t.dialogs.push(series_dialog(&t).unwrap());
+    let enabled = |t: &DocTab, n: &str| {
+        t.dialogs
+            .top()
+            .unwrap()
+            .controls
+            .iter()
+            .find(|c| c.name == n)
+            .unwrap()
+            .enabled
+    };
+    assert!(enabled(&t, "stop") && !enabled(&t, "unit"));
+    let d = t.dialogs.top_dialog_mut().unwrap();
+    let arg =
+        ctlcore::json::Json::obj(vec![("value", ctlcore::json::Json::Str("AutoFill".into()))]);
+    d.set("type", &arg).unwrap();
+    assert!(!enabled(&t, "stop"));
+    let v = view(&mut t);
+    let spec = SeriesSpec {
+        step: 0.0,
+        stop: Some(5.0),
+        ..SeriesSpec::default()
+    };
+    assert_eq!(
+        v.fill_series(&spec, &[]),
+        Err(gridcore::edit::STOP_UNREACHABLE.to_string())
+    );
 }

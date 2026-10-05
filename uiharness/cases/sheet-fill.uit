@@ -96,6 +96,9 @@ test the Auto Fill Options button and Ctrl swap copy and series
   call menu-click {"label":"Fill Series"}
   assert cell L2 is Q4
   assert cell L3 is Q1
+  # Esc dismisses the button (R3).
+  key escape
+  assert fill_options is null
   key ctrl+z
   assert cell L2 is nothing
   click M1

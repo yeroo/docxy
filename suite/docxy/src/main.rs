@@ -670,6 +670,13 @@ fn ctrl_held(m: &Modifiers) -> bool {
     m.control || (cfg!(target_os = "macos") && m.platform)
 }
 
+/// Whether a grid gesture started in sheet view `started` may end in the
+/// active one: only where it started, never in another tab or on a
+/// non-sheet tab (#707 r2 M4).
+fn gesture_stands(started: u64, active: Option<u64>) -> bool {
+    active == Some(started)
+}
+
 /// A fresh [`SheetView::id`].
 fn next_sheet_view_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -829,6 +836,8 @@ struct FillDrag {
     ctrl: bool,
     /// Dragged with the right button: its release opens the fill menu.
     right: bool,
+    /// The sheet view it started in: a release anywhere else does nothing.
+    view: u64,
 }
 
 /// An in-progress chart drag: which chart on the active sheet, where the press
@@ -1305,6 +1314,7 @@ fn arm_fill(
         to: (src.2, src.3),
         ctrl: false,
         right: false,
+        view: 0,
     });
     true
 }
@@ -1380,6 +1390,13 @@ fn fill_handle_hidden(
 /// inside, the source without the cells it clears.
 fn fill_box(src: (u32, u32, u32, u32), to: (u32, u32)) -> (u32, u32, u32, u32) {
     gridcore::edit::fill_target(src, to).selection(src)
+}
+
+/// Whether a paste of `clip` that left `pasted` selected wrote one copy of
+/// it, not several tiled over a bigger area.
+fn pasted_once(pasted: (u32, u32, u32, u32), clip: &GridClip) -> bool {
+    let (r0, c0, r1, c1) = pasted;
+    (r1 - r0 + 1, c1 - c0 + 1) == (clip.rows.len() as u32, clip.cols.len() as u32)
 }
 
 /// Why a copy took nothing: a filter hides every selected row.
@@ -1664,8 +1681,7 @@ enum SheetAct {
     /// Home › Fill › Series… (the Series dialog) and Justify.
     FillSeries,
     FillJustify,
-    /// Auto Fill Options (and the fill handle's right-drag menu): redo the
-    /// last fill as this kind.
+    /// Auto Fill Options: redo the last fill as this kind.
     FillAs(gridcore::edit::FillKind),
     /// The fill handle's right-drag menu: fill the waiting drag as this kind.
     FillDrop(gridcore::edit::FillKind),
@@ -10076,6 +10092,10 @@ impl Docxy {
             protected,
             self.edit_opts.fill_handle,
         ) {
+            let id = self.active_sheet().map_or(0, |v| v.id);
+            if let Some(f) = self.sheet_fill.as_mut() {
+                f.view = id;
+            }
             cx.notify();
         }
     }
@@ -10333,6 +10353,34 @@ impl Docxy {
         self.sheet_comment_edit = None;
         self.sheet_fill = None;
         self.formula_pick = None;
+        // A drag by the selection's border, or a drop waiting on its menu or
+        // question, belongs to the grid it started on (#707 r2 M4).
+        self.border_drag = None;
+        self.border_pending = None;
+        self.fill_drop = None;
+    }
+
+    /// A right-button release anywhere in the window. Over the grid its own
+    /// handler has already ended a right-drag (with its menu); one let go
+    /// off the grid is cancelled, as Excel drops it (#707 r2 M4).
+    fn right_release_off_grid(&mut self, cx: &mut Context<Self>) {
+        let mut dropped = false;
+        if self.sheet_fill.is_some_and(|f| f.right) {
+            self.sheet_fill = None;
+            dropped = true;
+        }
+        if self.border_drag.is_some_and(|d| d.right) {
+            self.border_drag = None;
+            dropped = true;
+        }
+        if dropped {
+            cx.notify();
+        }
+    }
+
+    /// Whether the active tab is the sheet view `id` a gesture started in.
+    fn gesture_view_is_active(&self, id: u64) -> bool {
+        gesture_stands(id, self.active_sheet().map(|v| v.id))
     }
 
     /// Where the idx-th chart of the active sheet lives. The overlay lays the
@@ -12019,6 +12067,9 @@ impl Docxy {
         let Some(f) = self.sheet_fill.take() else {
             return;
         };
+        if !self.gesture_view_is_active(f.view) {
+            return;
+        }
         if f.right {
             // A right-drag's release opens the fill menu; its choice fills.
             return self.sheet_fill_drop(f, cx);
@@ -12062,6 +12113,7 @@ impl Docxy {
                     sel: v.range(),
                     dates,
                     numbers,
+                    gone: Default::default(),
                 });
                 self.mark_sheet_dirty();
             }
@@ -12079,7 +12131,7 @@ impl Docxy {
     }
 
     /// A right-drag of the fill handle let go: the fill menu, whose choice
-    /// fills ([`SheetAct::FillAs`]).
+    /// fills ([`SheetAct::FillDrop`]).
     fn sheet_fill_drop(&mut self, f: FillDrag, cx: &mut Context<Self>) {
         if gridcore::edit::fill_target(f.src, f.to) == gridcore::edit::FillTarget::None {
             return;
@@ -12164,6 +12216,7 @@ impl Docxy {
             to: (end, src.3),
             ctrl: false,
             right: false,
+            view: v.id,
         };
         self.sheet_fill_run(f, gridcore::edit::FillKind::Auto, false, cx);
     }
@@ -12995,7 +13048,12 @@ impl Docxy {
             // the paste's own undo step does not end it.
             self.paste_options = None;
             if landed && !clip.cut {
-                if let Some(v) = self.active_sheet() {
+                // A paste tiled over a bigger area gets no button: its
+                // choices re-paste one copy (#707 r2 m3).
+                let untiled = self
+                    .active_sheet()
+                    .is_some_and(|v| pasted_once(v.range(), &clip));
+                if let Some(v) = self.active_sheet().filter(|_| untiled) {
                     let rect = v.range();
                     self.paste_options = Some(sheet_paste::PasteOptions {
                         view: v.id,
@@ -13005,6 +13063,7 @@ impl Docxy {
                         rect,
                         item: sheet_menus::PasteItem::Paste,
                         foreign: clip.view != v.id,
+                        gone: Default::default(),
                     });
                 }
                 self.grid_clip_restamp();
@@ -28165,6 +28224,10 @@ impl Render for Docxy {
                     drop(probe);
                     if old_page != new_page { cx.notify(); }
                 }
+            }))
+            // A right-drag of the grid released off it is cancelled (#707 r2).
+            .on_mouse_up(MouseButton::Right, cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                this.right_release_off_grid(cx);
             }))
             // End a text drag-selection or a ruler drag wherever the button is
             // released; a non-empty text selection pops the mini formatting toolbar.

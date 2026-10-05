@@ -22,6 +22,8 @@ pub(crate) struct BorderDrag {
     pub over: (u32, u32),
     pub ctrl: bool,
     pub right: bool,
+    /// The sheet view it started in: a release anywhere else does nothing.
+    pub view: u64,
 }
 
 impl BorderDrag {
@@ -171,6 +173,7 @@ impl Docxy {
             over: grab,
             ctrl: false,
             right,
+            view: v.id,
         });
         cx.notify();
     }
@@ -198,6 +201,10 @@ impl Docxy {
         let Some(d) = self.border_drag.take() else {
             return;
         };
+        // Released in another tab than it started in: nothing (#707 r2 M4).
+        if !self.gesture_view_is_active(d.view) {
+            return cx.notify();
+        }
         if d.dest_at() == (d.src.0, d.src.1) {
             return cx.notify();
         }
@@ -313,6 +320,15 @@ mod tests {
         v.sheet().cell(r, c).and_then(|c| c.formula.clone())
     }
 
+    /// #707 r2 M4: a drag released in another tab (or a document) than the
+    /// sheet it started in does nothing.
+    #[test]
+    fn a_gesture_ends_only_in_the_view_it_started_in() {
+        assert!(crate::gesture_stands(7, Some(7)));
+        assert!(!crate::gesture_stands(7, Some(8)), "another workbook tab");
+        assert!(!crate::gesture_stands(7, None), "a document tab");
+    }
+
     #[test]
     fn the_drop_lands_where_the_grab_moved() {
         let d = BorderDrag {
@@ -321,6 +337,7 @@ mod tests {
             over: (5, 4),
             ctrl: false,
             right: false,
+            view: 0,
         };
         assert_eq!(d.dest_at(), (4, 4));
         assert_eq!(d.dest(), (4, 4, 5, 5));

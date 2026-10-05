@@ -148,6 +148,7 @@ fn paste_options_repaste_in_place_as_one_step() {
         rect: v.range(),
         item: PasteItem::Paste,
         foreign: false,
+        gone: Default::default(),
     };
     v.repaste(&opts, PasteItem::Values).unwrap();
     assert_eq!(formula(&v, "C1"), None);
@@ -169,6 +170,7 @@ fn paste_options_repaste_in_place_as_one_step() {
         rect: (0, 1, 0, 1),
         item: PasteItem::Paste,
         foreign: false,
+        gone: Default::default(),
     };
     v.push_undo();
     assert!(v.repaste(&stale, PasteItem::Values).is_err());
@@ -250,9 +252,11 @@ fn a_refused_repaste_keeps_the_first_paste_and_its_step() {
     v.pkg.workbook.sheets[s].set_cell(2, 1, Cell::number(2.0));
     v.engine = crate::sheet_engine(&v.pkg.workbook);
     v.engine.recalc_all(&mut v.pkg.workbook);
-    let clip = copy(&mut v, "X1", "Z1");
+    let mut clip = copy(&mut v, "X1", "Z1");
     select(&mut v, "B2");
     assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    // As the app does after a copy's paste: copy mode stays on.
+    clip.restamp(&v);
     assert_eq!(value(&v, "D2"), CellValue::Number(3.0));
     let opts = PasteOptions {
         view: v.id,
@@ -262,9 +266,14 @@ fn a_refused_repaste_keeps_the_first_paste_and_its_step() {
         rect: v.range(),
         item: PasteItem::Paste,
         foreign: false,
+        gone: Default::default(),
     };
     assert_eq!(v.undo.len(), 1);
+    let gen_before = v.edit_gen;
     assert!(v.repaste(&opts, PasteItem::Transpose).is_err());
+    // r2 m1: nothing changed, so copy mode (which an edit ends) stays on.
+    assert_eq!(v.edit_gen, gen_before);
+    assert!(!clip.stale_in(&v));
     assert_eq!(value(&v, "D2"), CellValue::Number(3.0), "the paste stays");
     assert_eq!(v.undo.len(), 1, "and its step");
     assert!(v.redo.is_empty());
@@ -316,9 +325,28 @@ fn a_selection_change_dismisses_paste_options() {
         rect: v.range(),
         item: PasteItem::Paste,
         foreign: false,
+        gone: Default::default(),
     };
     assert!(opts.stands(&v));
     select(&mut v, "D4");
     assert!(!opts.stands(&v));
+    // r2 i2: back on the pasted cell, it stays gone.
+    select(&mut v, "C1");
+    assert!(!opts.stands(&v));
     assert!(v.repaste(&opts, PasteItem::Values).is_err());
+}
+
+/// #707 r2 m3: a paste tiled over a bigger area gets no Paste Options
+/// button, whose choices would re-paste one copy.
+#[test]
+fn a_tiled_paste_is_not_pasted_once() {
+    let mut v = view();
+    put(&mut v, "A1", Cell::number(1.0));
+    put(&mut v, "A2", Cell::number(2.0));
+    let clip = copy(&mut v, "A1", "A2");
+    assert!(crate::pasted_once((0, 3, 1, 3), &clip));
+    assert!(
+        !crate::pasted_once((0, 3, 5, 3), &clip),
+        "tiled three times"
+    );
 }

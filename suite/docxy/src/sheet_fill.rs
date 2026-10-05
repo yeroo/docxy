@@ -13,7 +13,8 @@ use gridcore::edit::{
 
 /// The Auto Fill Options button after a fill: what that fill was, so a
 /// choice from its menu runs it again as another kind. It stands only while
-/// the workbook is as the fill left it (`view` and `edit_gen`).
+/// the workbook and the selection are as the fill left it (`view`,
+/// `edit_gen`, `sel`); once it has not, it is gone for good (`gone`).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FillOptions {
     pub view: u64,
@@ -30,13 +31,22 @@ pub(crate) struct FillOptions {
     /// Whether the source holds dates, numbers: which kinds the menu offers.
     pub dates: bool,
     pub numbers: bool,
+    /// Set the first time it does not stand: a return to the same
+    /// selection does not bring it back (#707 r2 i2).
+    pub gone: std::cell::Cell<bool>,
 }
 
 impl FillOptions {
     /// Whether the button still stands on `v`: the workbook and the
     /// selection are as the fill left them.
     pub fn stands(&self, v: &SheetView) -> bool {
-        v.id == self.view && v.edit_gen == self.edit_gen && v.range() == self.sel && !v.multi_area()
+        let stands = !self.gone.get()
+            && v.id == self.view
+            && v.edit_gen == self.edit_gen
+            && v.range() == self.sel
+            && !v.multi_area();
+        self.gone.set(!stands);
+        stands
     }
 
     /// The kinds its menu offers.
@@ -124,6 +134,7 @@ impl SheetView {
         again: impl FnOnce(&mut Self) -> Result<T, String>,
     ) -> Option<Result<T, String>> {
         let snap = self.undo.pop()?;
+        let edit_gen = self.edit_gen;
         let now = self.snapshot_like(&snap);
         self.restore(snap);
         let before = self.snapshot_like(&now);
@@ -131,6 +142,9 @@ impl SheetView {
         if done.is_err() {
             self.restore(now);
             self.undo.push(before);
+            // Nothing changed after all: copy mode, which an edit ends,
+            // stays on (#707 r2 m1).
+            self.edit_gen = edit_gen;
         }
         Some(done)
     }
@@ -143,8 +157,11 @@ impl SheetView {
         lists: &[Vec<String>],
     ) -> Result<usize, String> {
         let s = self.active;
+        if self.sheet().is_protected() {
+            return Err(crate::sheet_goto::SHEET_PROTECTED.into());
+        }
         let changes =
-            gridcore::edit::series_changes_for(&self.pkg.workbook, s, self.range(), spec, lists);
+            gridcore::edit::series_changes_for(&self.pkg.workbook, s, self.range(), spec, lists)?;
         if changes.is_empty() {
             return Ok(0);
         }
@@ -166,6 +183,9 @@ impl SheetView {
     pub(crate) fn justify(&mut self, overflow: bool) -> Result<bool, String> {
         let (r0, c0, r1, c1) = self.range();
         let s = self.active;
+        if self.sheet().is_protected() {
+            return Err(crate::sheet_goto::SHEET_PROTECTED.into());
+        }
         let sheet = self.sheet();
         let texts: Vec<String> = (r0..=r1)
             .filter_map(|r| match sheet.cell(r, c0).map(|c| &c.value) {
@@ -221,6 +241,9 @@ pub(crate) fn series_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let Surface::Sheet(v) = &tab.surface else {
         return Err("Series needs a spreadsheet".into());
     };
+    if v.sheet().is_protected() {
+        return Err(crate::sheet_goto::SHEET_PROTECTED.into());
+    }
     let rows = gridcore::edit::series_rows_for(v.range());
     let mut d = Dialog::message(
         "series",
@@ -248,8 +271,23 @@ pub(crate) fn series_dialog(tab: &DocTab) -> Result<Dialog, String> {
             Value::Text(String::new()),
         ),
     ];
+    d.react = Some(crate::dialog::Reaction(series_react));
+    series_react(&mut d, 0, &Value::Bool(false));
     d.mark_opened();
     Ok(d)
+}
+
+/// Excel greys out the Stop value for AutoFill, which fills the selection
+/// only (#707 r2 M1), and the Date unit for anything but Date.
+fn series_react(d: &mut Dialog, _changed: usize, _before: &Value) {
+    let ty = choice(d, "type").unwrap_or(0);
+    for c in &mut d.controls {
+        match c.name {
+            "stop" => c.enabled = ty != 3,
+            "unit" => c.enabled = ty == 2,
+            _ => {}
+        }
+    }
 }
 
 fn choice(d: &Dialog, name: &str) -> Option<usize> {
