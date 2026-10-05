@@ -31,6 +31,15 @@ def stop(process):
     process.wait()
 
 
+def stop_all(processes):
+    """Stop each (name, process) in turn; one failure must not orphan the rest."""
+    for name, process in processes:
+        try:
+            stop(process)
+        except OSError as exc:
+            print(f'ui-linux: could not stop {name}: {exc}', file=sys.stderr, flush=True)
+
+
 def ignore_signals():
     """Ignore SIGTERM/SIGINT, even if one arrives while the old handler is still armed."""
     while True:
@@ -122,8 +131,7 @@ def main():
         # Teardown must finish: a second SIGTERM/SIGINT here would abort it
         # and orphan Openbox and Xvfb.
         ignore_signals()
-        for process in (child, wm, xvfb):
-            stop(process)
+        stop_all((('command', child), ('openbox', wm), ('xvfb', xvfb)))
         os.close(read_fd)
         if write_fd is not None:
             os.close(write_fd)
