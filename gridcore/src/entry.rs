@@ -616,7 +616,10 @@ pub fn autocomplete(sheet: &Sheet, row: u32, col: u32, typed: &str) -> Option<St
 /// case-insensitively. Values that differ only by case are one entry,
 /// spelled as the first one found (nearest above first), and the same
 /// entries are left out: numbers, booleans, errors, formulas and text that
-/// would not stay text when typed.
+/// would not stay text when typed. At most
+/// [`crate::filter::MENU_LIMIT`] entries are returned (the first in sorted
+/// order), the bound the filter's value list has, so a column of unique text
+/// keeps every host's list bounded.
 pub fn pick_list(sheet: &Sheet, row: u32, col: u32) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<(String, String)> = Vec::new();
@@ -629,7 +632,10 @@ pub fn pick_list(sheet: &Sheet, row: u32, col: u32) -> Vec<String> {
         out.push((lower, text.clone()));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    out.into_iter().map(|(_, text)| text).collect()
+    out.into_iter()
+        .take(crate::filter::MENU_LIMIT)
+        .map(|(_, text)| text)
+        .collect()
 }
 
 /// The constant text values of the column's contiguous non-empty block
@@ -2170,6 +2176,18 @@ mod tests {
         );
         // A6 now joins the blocks.
         assert_eq!(autocomplete(&sh, 9, 0, "widg").as_deref(), Some("Widgets"));
+    }
+
+    #[test]
+    fn pick_list_is_capped_at_the_filter_menu_limit() {
+        let mut sh = Sheet::default();
+        let n = crate::filter::MENU_LIMIT + 5;
+        for r in 0..n {
+            sh.set_cell(r as u32, 0, Cell::text(&format!("v{r:06}")));
+        }
+        let list = pick_list(&sh, n as u32, 0);
+        assert_eq!(list.len(), crate::filter::MENU_LIMIT);
+        assert_eq!(list[0], "v000000", "the first in sorted order");
     }
 
     #[test]

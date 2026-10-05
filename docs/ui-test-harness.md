@@ -979,7 +979,16 @@ Menus open today:
 - **the cell menu** on a sheet (#690, #691): right-click a cell. A cell outside
   the selection is selected first (no link followed; while a formula or a range
   field is pointing, nothing moves). It lists Cut, Copy, Paste, the Filter and
-  Sort submenus and New Comment, each a sheet command as the ribbon runs it;
+  Sort submenus, New Comment and Pick From Drop-down List..., each a sheet
+  command as the ribbon runs it;
+- **the pick list** on a sheet (#665): Alt+Down, the cell menu's Pick From
+  Drop-down List..., or `menu-open "pick-list"`. One item per distinct text of
+  the column's block, sorted, nothing highlighted until Down (Enter then enters
+  the highlighted one); the menu scrolls and holds at most 10,000 entries;
+- **the Flash Fill Options menu** on a sheet (#666): the ⚡ button by the last
+  filled cell, or `menu-open "flash-fill"` while the fill stands. Undo Flash
+  Fill, Accept suggestions, Select all N blank cells, Select all N changed
+  cells;
 - **the Mailings tab's drop-downs** on a document (#628): Start Mail Merge,
   Select Recipients, Insert Merge Field (the attached list's columns), Rules,
   Finish & Merge, and the Preview Results record box (the attached rows).

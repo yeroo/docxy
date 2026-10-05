@@ -159,6 +159,7 @@ impl SheetView {
         });
         if demand || stale {
             self.edit_complete = self.complete_fresh(demand);
+            self.fx_scroll = ScrollHandle::new();
         }
         self.edit_complete.as_ref().filter(|c| !c.closed)
     }
@@ -177,6 +178,8 @@ impl SheetView {
             } else {
                 c.sel.saturating_sub(1)
             };
+            // Event-side, so the mouse wheel is not undone by a re-render.
+            self.fx_scroll.scroll_to_item(c.sel);
         }
     }
 

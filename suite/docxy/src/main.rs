@@ -1679,6 +1679,7 @@ impl SheetView {
                 .as_deref()
                 .is_some_and(|b| self.edit_caret == b.chars().count());
             self.edit_type(c);
+            self.fx_scroll = ScrollHandle::new();
             self.autocorrect_typed(c, at_end);
         } else {
             self.begin_cell_edit(Some(String::new()));
@@ -1848,6 +1849,8 @@ impl SheetView {
     /// typed, so the commit's AutoCorrect leaves it (#667).
     fn edit_tail_left(&mut self) {
         self.edit_typed_tail = None;
+        // The completion list changes with the caret: it starts at the top.
+        self.fx_scroll = ScrollHandle::new();
     }
 
     fn edit_untouched(&self) -> bool {
@@ -3362,8 +3365,8 @@ struct Docxy {
     picker: Option<PickKind>,
     // Scroll handle for the document body, so the caret can be kept in view.
     doc_scroll: ScrollHandle,
-    /// The open menu's scroll, and Formula AutoComplete's list's (their
-    /// highlighted row is scrolled into view).
+    /// The open menu's scroll: Up/Down scroll the highlighted row into view,
+    /// and each menu (or submenu) starts at the top.
     menu_scroll: ScrollHandle,
     // New-comment entry bar (Review ▸ New comment); routes keys while open.
     comment_open: bool,
@@ -22837,6 +22840,7 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         self.mini_bar = None;
+        self.menu_scroll = ScrollHandle::new();
         self.menu = Some(menu::Menu::new(
             target,
             (f32::from(at.x), f32::from(at.y)),
@@ -23016,6 +23020,7 @@ impl Docxy {
                 if e.enabled && !e.submenu.is_empty() {
                     menu.items = e.submenu.clone();
                     menu.hi = None;
+                    self.menu_scroll = ScrollHandle::new();
                 }
             }
         }
@@ -30414,7 +30419,6 @@ fn sheet_el(
                 .border_1()
                 .border_color(hsla_u(0x9a9a9a))
                 .rounded_sm();
-            view.fx_scroll.scroll_to_item(c.sel);
             for (i, item) in c.list.items.iter().enumerate() {
                 let mark = match item.kind {
                     gridcore::fcomplete::Kind::Function => "fx",

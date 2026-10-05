@@ -1754,6 +1754,56 @@ fn every_sheet_tab_is_stamped_with_the_app_options() {
     assert!(matches!(tabs[2].surface, Surface::Sheet(_)));
 }
 
+/// FIX r5 m4: the per-frame stamp retires a Flash Fill preview the selection
+/// moved off, so moving back cannot revive it.
+#[test]
+fn the_frame_stamp_retires_a_preview_the_selection_left() {
+    use gridcore::options::EditOptions;
+    let mut tabs = vec![tab(Kind::Xlsx)];
+    let Surface::Sheet(v) = &mut tabs[0].surface else {
+        panic!("a sheet tab")
+    };
+    for (r, t) in [
+        "Ada Lovelace",
+        "Alan Turing",
+        "Grace Hopper",
+        "Edsger Dijkstra",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let s = v.active;
+        let cell =
+            gridcore::entry::entry_cell(&mut v.pkg.workbook, s, r as u32, 10, t, None).unwrap();
+        v.engine
+            .set_cell(&mut v.pkg.workbook, (s, r as u32, 10), cell);
+    }
+    for (r, t) in ["Ada", "Alan"].iter().enumerate() {
+        v.sel = (r as u32, 11);
+        v.begin_cell_edit(Some(t.to_string()));
+        let origin = v.edit_origin.unwrap();
+        assert_eq!(v.commit_and_move(1, 0), Some(true));
+        v.flash_preview_after(origin);
+    }
+    assert!(
+        v.flash_preview.is_some(),
+        "a preview after the second example"
+    );
+    let at = v.sel;
+    v.sel = (9, 9);
+    stamp_edit_opts(&mut tabs, EditOptions::default());
+    let Surface::Sheet(v) = &mut tabs[0].surface else {
+        unreachable!()
+    };
+    assert!(v.flash_preview.is_none(), "dropped by the stamp");
+    v.sel = at;
+    stamp_edit_opts(&mut tabs, EditOptions::default());
+    let Surface::Sheet(v) = &tabs[0].surface else {
+        unreachable!()
+    };
+    assert!(v.live_preview().is_none(), "and not revived by moving back");
+}
+
 #[test]
 fn a_persist_records_the_sidecar_only_while_the_tab_is_unsaved() {
     let root = Root::new("last-hot");
