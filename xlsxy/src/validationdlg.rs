@@ -56,20 +56,11 @@ pub struct ValidationDialog {
     pub sheet: usize,
     pub range: (u32, u32, u32, u32),
     tab: usize,
-    kind: usize,
-    op: usize,
-    first: String,
-    second: String,
-    ignore_blank: bool,
-    dropdown: bool,
+    /// What the boxes hold.
+    b: DialogBoxes,
+    /// The rule the dialog opened on, which a bound left as shown keeps.
+    current: Option<DataValidation>,
     pub apply_all: bool,
-    show_input: bool,
-    prompt_title: String,
-    prompt: String,
-    show_error: bool,
-    style: usize,
-    error_title: String,
-    error: String,
     focus: usize,
 }
 
@@ -82,31 +73,19 @@ impl ValidationDialog {
         current: Option<&DataValidation>,
         date1904: bool,
     ) -> ValidationDialog {
-        let b = DialogBoxes::of(current, (range.0, range.1), date1904);
         ValidationDialog {
             sheet,
             range,
             tab: 0,
-            kind: b.kind,
-            op: b.operator,
-            first: b.first,
-            second: b.second,
-            ignore_blank: b.ignore_blank,
-            dropdown: b.dropdown,
+            b: DialogBoxes::of(current, (range.0, range.1), date1904),
+            current: current.cloned(),
             apply_all: false,
-            show_input: b.show_input,
-            prompt_title: b.prompt_title,
-            prompt: b.prompt,
-            show_error: b.show_error,
-            style: b.style,
-            error_title: b.error_title,
-            error: b.error,
             focus: 0,
         }
     }
 
     fn kind_name(&self) -> &'static str {
-        KINDS[self.kind].0
+        KINDS[self.b.kind].0
     }
 
     fn takes_operator(&self) -> bool {
@@ -114,7 +93,7 @@ impl ValidationDialog {
     }
 
     fn takes_two(&self) -> bool {
-        gridcore::validation::takes_two(self.kind_name(), OPERATORS[self.op].0)
+        gridcore::validation::takes_two(self.kind_name(), OPERATORS[self.b.operator].0)
     }
 
     fn fields(&self) -> Vec<Field> {
@@ -158,12 +137,12 @@ impl ValidationDialog {
     fn text_box(&mut self) -> Option<(&mut String, usize)> {
         let field = self.focused();
         match field {
-            Field::First => Some((&mut self.first, MESSAGE_MAX)),
-            Field::Second => Some((&mut self.second, MESSAGE_MAX)),
-            Field::PromptTitle => Some((&mut self.prompt_title, TITLE_MAX)),
-            Field::Prompt => Some((&mut self.prompt, MESSAGE_MAX)),
-            Field::ErrorTitle => Some((&mut self.error_title, TITLE_MAX)),
-            Field::Error => Some((&mut self.error, MESSAGE_MAX)),
+            Field::First => Some((&mut self.b.first, MESSAGE_MAX)),
+            Field::Second => Some((&mut self.b.second, MESSAGE_MAX)),
+            Field::PromptTitle => Some((&mut self.b.prompt_title, TITLE_MAX)),
+            Field::Prompt => Some((&mut self.b.prompt, MESSAGE_MAX)),
+            Field::ErrorTitle => Some((&mut self.b.error_title, TITLE_MAX)),
+            Field::Error => Some((&mut self.b.error, MESSAGE_MAX)),
             _ => None,
         }
     }
@@ -180,9 +159,9 @@ impl ValidationDialog {
                 let cyc = |i: usize, len: usize| (i as i64 + step).rem_euclid(len as i64) as usize;
                 match field {
                     Field::Tab => self.tab = cyc(self.tab, TABS.len()),
-                    Field::Allow => self.kind = cyc(self.kind, KINDS.len()),
-                    Field::Operator => self.op = cyc(self.op, OPERATORS.len()),
-                    Field::Style => self.style = cyc(self.style, STYLES.len()),
+                    Field::Allow => self.b.kind = cyc(self.b.kind, KINDS.len()),
+                    Field::Operator => self.b.operator = cyc(self.b.operator, OPERATORS.len()),
+                    Field::Style => self.b.style = cyc(self.b.style, STYLES.len()),
                     _ => {}
                 }
             }
@@ -205,11 +184,11 @@ impl ValidationDialog {
                     }
                 } else if ch == ' ' {
                     match field {
-                        Field::IgnoreBlank => self.ignore_blank = !self.ignore_blank,
-                        Field::Dropdown => self.dropdown = !self.dropdown,
+                        Field::IgnoreBlank => self.b.ignore_blank = !self.b.ignore_blank,
+                        Field::Dropdown => self.b.dropdown = !self.b.dropdown,
                         Field::ApplyAll => self.apply_all = !self.apply_all,
-                        Field::ShowInput => self.show_input = !self.show_input,
-                        Field::ShowError => self.show_error = !self.show_error,
+                        Field::ShowInput => self.b.show_input = !self.b.show_input,
+                        Field::ShowError => self.b.show_error = !self.b.show_error,
                         Field::Ok => return Outcome::Ok,
                         Field::ClearAll => return Outcome::ClearAll,
                         Field::Cancel => return Outcome::Cancel,
@@ -229,27 +208,14 @@ impl ValidationDialog {
     /// The rule OK applies, its ranges left empty; the reason it can't be
     /// applied when a bound is missing or isn't a date or time.
     pub fn rule(&self, ctx: &gridcore::entry::EntryCtx) -> Result<DataValidation, String> {
-        DialogBoxes {
-            kind: self.kind,
-            operator: self.op,
-            first: self.first.clone(),
-            second: self.second.clone(),
-            ignore_blank: self.ignore_blank,
-            dropdown: self.dropdown,
-            show_input: self.show_input,
-            prompt_title: self.prompt_title.clone(),
-            prompt: self.prompt.clone(),
-            show_error: self.show_error,
-            style: self.style,
-            error_title: self.error_title.clone(),
-            error: self.error.clone(),
-        }
-        .rule(ctx)
+        self.b
+            .rule(ctx, self.current.as_ref(), (self.range.0, self.range.1))
     }
 
     fn line(&self, field: Field) -> String {
         let check = |on: bool| if on { "[x]" } else { "[ ]" };
-        let first_label = gridcore::validation::first_label(self.kind_name(), OPERATORS[self.op].0);
+        let first_label =
+            gridcore::validation::first_label(self.kind_name(), OPERATORS[self.b.operator].0);
         let second_label = "Maximum:";
         match field {
             Field::Tab => {
@@ -266,12 +232,12 @@ impl ValidationDialog {
                     .collect();
                 format!("Tab:  < {} >", tabs.join(""))
             }
-            Field::Allow => format!("Allow:        < {} >", KINDS[self.kind].1),
-            Field::Operator => format!("Data:         < {} >", OPERATORS[self.op].1),
-            Field::First => format!("{first_label:<13} {}", self.first),
-            Field::Second => format!("{second_label:<13} {}", self.second),
-            Field::IgnoreBlank => format!("{} Ignore blank", check(self.ignore_blank)),
-            Field::Dropdown => format!("{} In-cell dropdown", check(self.dropdown)),
+            Field::Allow => format!("Allow:        < {} >", KINDS[self.b.kind].1),
+            Field::Operator => format!("Data:         < {} >", OPERATORS[self.b.operator].1),
+            Field::First => format!("{first_label:<13} {}", self.b.first),
+            Field::Second => format!("{second_label:<13} {}", self.b.second),
+            Field::IgnoreBlank => format!("{} Ignore blank", check(self.b.ignore_blank)),
+            Field::Dropdown => format!("{} In-cell dropdown", check(self.b.dropdown)),
             Field::ApplyAll => format!(
                 "{} Apply these changes to all other cells with the same settings",
                 check(self.apply_all)
@@ -279,20 +245,20 @@ impl ValidationDialog {
             Field::ShowInput => {
                 format!(
                     "{} Show input message when cell is selected",
-                    check(self.show_input)
+                    check(self.b.show_input)
                 )
             }
-            Field::PromptTitle => format!("{:<13} {}", "Title:", self.prompt_title),
-            Field::Prompt => format!("{:<13} {}", "Input message:", self.prompt),
+            Field::PromptTitle => format!("{:<13} {}", "Title:", self.b.prompt_title),
+            Field::Prompt => format!("{:<13} {}", "Input message:", self.b.prompt),
             Field::ShowError => {
                 format!(
                     "{} Show error alert after invalid data is entered",
-                    check(self.show_error)
+                    check(self.b.show_error)
                 )
             }
-            Field::Style => format!("Style:        < {} >", STYLES[self.style].1),
-            Field::ErrorTitle => format!("{:<13} {}", "Title:", self.error_title),
-            Field::Error => format!("{:<13} {}", "Error message:", self.error),
+            Field::Style => format!("Style:        < {} >", STYLES[self.b.style].1),
+            Field::ErrorTitle => format!("{:<13} {}", "Title:", self.b.error_title),
+            Field::Error => format!("{:<13} {}", "Error message:", self.b.error),
             Field::Ok => "[ OK ]".into(),
             Field::ClearAll => "[ Clear All ]".into(),
             Field::Cancel => "[ Cancel ]".into(),
@@ -374,8 +340,8 @@ mod tests {
         type_into(&mut d, "Yes, No ,Maybe");
         assert_eq!(d.rule(&ctx()).unwrap().formula1, "\"Yes,No,Maybe\"");
         let mut d2 = ValidationDialog::new(0, (1, 1, 9, 1), Some(&d.rule(&ctx()).unwrap()), false);
-        assert_eq!(d2.first, "Yes,No,Maybe");
-        d2.first = "=$A$1:$A$5".into();
+        assert_eq!(d2.b.first, "Yes,No,Maybe");
+        d2.b.first = "=$A$1:$A$5".into();
         assert_eq!(d2.rule(&ctx()).unwrap().formula1, "$A$1:$A$5");
     }
 
@@ -423,7 +389,7 @@ mod tests {
         let dv = d.rule(&ctx()).unwrap();
         assert_eq!((dv.kind.as_str(), dv.formula1.as_str()), ("date", "43831"));
         let d2 = ValidationDialog::new(0, (1, 1, 9, 1), Some(&dv), false);
-        assert_eq!(d2.first, "1/1/2020");
+        assert_eq!(d2.b.first, "1/1/2020");
         // A relative formula is shown from the selected cell.
         let custom = DataValidation {
             ranges: vec![(1, 1, 9, 1)],
@@ -432,6 +398,6 @@ mod tests {
             ..DataValidation::default()
         };
         let d3 = ValidationDialog::new(0, (4, 1, 5, 1), Some(&custom), false);
-        assert_eq!(d3.first, "B5>A5");
+        assert_eq!(d3.b.first, "B5>A5");
     }
 }

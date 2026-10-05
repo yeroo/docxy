@@ -33,11 +33,7 @@ pub fn validation_at(sheet: &Sheet, row: u32, col: u32) -> Option<&DataValidatio
 /// of them): the cell its formulas are written for, as conditional
 /// formatting's are.
 pub fn anchor(dv: &DataValidation) -> (u32, u32) {
-    dv.ranges
-        .iter()
-        .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, ..)| {
-            (r.min(r1), c.min(c1))
-        })
+    anchor_of(&dv.ranges)
 }
 
 /// Check `cell`, about to be entered at (row, col) of `sheet`, against the
@@ -395,14 +391,15 @@ pub const ALERT_STYLES: [(AlertStyle, &str); 3] = [
     (AlertStyle::Information, "Information"),
 ];
 
-/// How a date or time bound is shown and typed back: a serial as the text
-/// someone would enter.
+/// How a date or time serial is shown: a date as `m/d/yyyy` (with its time of
+/// day when it has one), a time as `h:mm:ss AM/PM`, or as hours past a day.
 fn serial_text(kind: &str, serial: f64, date1904: bool) -> String {
     use crate::sheet::{Xf, format_with};
-    let code = if kind == "date" {
-        "m/d/yyyy"
-    } else {
-        "h:mm:ss AM/PM"
+    let code = match kind {
+        "date" if serial.fract() != 0.0 => "m/d/yyyy h:mm:ss AM/PM",
+        "date" => "m/d/yyyy",
+        _ if serial >= 1.0 => "[h]:mm:ss",
+        _ => "h:mm:ss AM/PM",
     };
     let xf = Xf {
         code: Some(code.to_string()),
@@ -411,20 +408,22 @@ fn serial_text(kind: &str, serial: f64, date1904: bool) -> String {
     format_with(&xf, &CellValue::Number(serial), date1904)
 }
 
-/// What a bound's box shows: an inline list as its items, a list reference
-/// behind `=`, a date or time serial as the date or time, anything else as
-/// the formula it is.
+/// What a bound's box shows: for a date or time rule a serial as the date or
+/// time, any other formula behind `=`; for the other kinds the formula as it
+/// is.
 fn bound_box(dv: &DataValidation, f: &str, date1904: bool) -> String {
-    if matches!(dv.kind.as_str(), "date" | "time") {
-        if let Ok(n) = f.trim().parse::<f64>() {
-            return serial_text(&dv.kind, n, date1904);
-        }
+    if matches!(dv.kind.as_str(), "date" | "time") && !f.trim().is_empty() {
+        return match f.trim().parse::<f64>() {
+            Ok(n) => serial_text(&dv.kind, n, date1904),
+            Err(_) => format!("={f}"),
+        };
     }
     f.to_string()
 }
 
 /// What the box for a rule's first formula shows: an inline list as its
-/// items, a reference or name behind `=`, a date or time bound as text.
+/// items, a list reference or name behind `=`, a date or time bound as text
+/// ([`bound_box`]).
 pub fn first_box(dv: &DataValidation, date1904: bool) -> String {
     if dv.kind == "list" {
         return match dv.list_values() {
@@ -571,8 +570,16 @@ impl DialogBoxes {
     }
 
     /// The rule OK applies (its ranges left empty, its formulas written for
-    /// the cell the dialog opened on), or why the boxes can't make one.
-    pub fn rule(&self, ctx: &crate::entry::EntryCtx) -> Result<DataValidation, String> {
+    /// the cell `at` the dialog opened on), or why the boxes can't make one.
+    /// `current` is the rule the dialog opened on: a bound whose box still
+    /// shows what [`DialogBoxes::of`] put there keeps its formula, since the
+    /// text can say less than the formula (a time of day, a serial past a day).
+    pub fn rule(
+        &self,
+        ctx: &crate::entry::EntryCtx,
+        current: Option<&DataValidation>,
+        at: (u32, u32),
+    ) -> Result<DataValidation, String> {
         let kind = KINDS[self.kind.min(KINDS.len() - 1)].0;
         let op = OPERATORS[self.operator.min(OPERATORS.len() - 1)].0;
         let mut dv = DataValidation {
@@ -597,6 +604,18 @@ impl DialogBoxes {
             dv.operator = op.to_string();
         }
         (dv.formula1, dv.formula2) = formulas_from_boxes(kind, op, &self.first, &self.second, ctx)?;
+        if let Some(cur) = current.filter(|c| c.kind == kind) {
+            let seen = as_seen_from(cur, at.0, at.1);
+            if self.first == first_box(&seen, ctx.date1904) && !seen.formula1.is_empty() {
+                dv.formula1.clone_from(&seen.formula1);
+            }
+            if takes_two(kind, op)
+                && self.second == second_box(&seen, ctx.date1904)
+                && !seen.formula2.is_empty()
+            {
+                dv.formula2.clone_from(&seen.formula2);
+            }
+        }
         Ok(dv)
     }
 }
@@ -705,6 +724,53 @@ pub fn as_seen_from(dv: &DataValidation, row: u32, col: u32) -> DataValidation {
     out
 }
 
+/// Does shifting `f` by (`dr`, `dc`) lose nothing: no reference falls off the
+/// grid (`#REF!`), and shifting back gives the formula again?
+fn lossless_shift(f: &str, dr: i64, dc: i64) -> bool {
+    if f.is_empty() || f.starts_with('"') || (dr, dc) == (0, 0) {
+        return true;
+    }
+    let Some(there) = translate_formula(f, dr, dc) else {
+        return true;
+    };
+    if there.contains("#REF!") && !f.contains("#REF!") {
+        return false;
+    }
+    match translate_formula(&there, -dr, -dc) {
+        Some(back) => {
+            back == f
+                || matches!(
+                    (crate::formula::parse(&back), crate::formula::parse(f)),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        }
+        None => false,
+    }
+}
+
+/// `dv` shifted by (`dr`, `dc`) when that loses nothing ([`lossless_shift`]).
+fn shifted(dv: &DataValidation, dr: i64, dc: i64) -> Option<DataValidation> {
+    if !lossless_shift(&dv.formula1, dr, dc) || !lossless_shift(&dv.formula2, dr, dc) {
+        return None;
+    }
+    let mut out = dv.clone();
+    shift_formulas(&mut out, dr, dc);
+    Some(out)
+}
+
+/// `dv` as seen from cell (`row`, `col`), when that loses nothing.
+fn seen_losslessly(dv: &DataValidation, row: u32, col: u32) -> Option<DataValidation> {
+    let (ar, ac) = anchor(dv);
+    if ar == u32::MAX {
+        return Some(dv.clone());
+    }
+    shifted(
+        dv,
+        i64::from(row) - i64::from(ar),
+        i64::from(col) - i64::from(ac),
+    )
+}
+
 /// Take every rule off the cells of `rect`: ranges are split around it and a
 /// rule left with none goes, its element named in `dv_removed` for the save.
 /// A rule whose top-left corner moves because of it keeps what its relative
@@ -737,10 +803,24 @@ pub fn add_ranges(sheet: &mut Sheet, rule: &DataValidation, ranges: &[Rect]) {
         return;
     }
     let corner = anchor_of(ranges);
+    // The same rule when it says the same thing from the new cells, and when
+    // joining them (which may move its corner) loses no reference.
     let same = |dv: &DataValidation| {
-        let mut probe = as_seen_from(dv, corner.0, corner.1);
+        let Some(mut probe) = seen_losslessly(dv, corner.0, corner.1) else {
+            return false;
+        };
         probe.ranges.clear();
-        probe.same_settings(rule)
+        if !probe.same_settings(rule) {
+            return false;
+        }
+        let joined = anchor_of(&[dv.ranges.as_slice(), ranges].concat());
+        let old = anchor(dv);
+        shifted(
+            dv,
+            i64::from(joined.0) - i64::from(old.0),
+            i64::from(joined.1) - i64::from(old.1),
+        )
+        .is_some()
     };
     match sheet.validations.iter_mut().find(|dv| same(dv)) {
         Some(dv) => {
@@ -768,7 +848,11 @@ pub fn add_ranges(sheet: &mut Sheet, rule: &DataValidation, ranges: &[Rect]) {
 /// without messages ([`DataValidation::is_meaningful`]) leaves the cells
 /// with no rule.
 pub fn set_validation(sheet: &mut Sheet, range: Rect, rule: &DataValidation, apply_to_all: bool) {
-    let base = validation_at(sheet, range.0, range.1).cloned();
+    let base_at = sheet
+        .validations
+        .iter()
+        .position(|dv| dv.covers(range.0, range.1));
+    let base = base_at.map(|i| sheet.validations[i].clone());
     let mut ranges = vec![range];
     if let (true, Some(b)) = (apply_to_all, &base) {
         for dv in sheet.validations.iter().filter(|dv| same_everywhere(dv, b)) {
@@ -788,15 +872,10 @@ pub fn set_validation(sheet: &mut Sheet, range: Rect, rule: &DataValidation, app
     let rule = &rule;
     // The rule being rewritten whole keeps its element (and any attribute
     // this code doesn't know): when everything it covers is covered again.
-    let keep = base
-        .as_ref()
-        .filter(|b| b.ranges.iter().all(|r| ranges.contains(r)))
-        .and_then(|b| {
-            sheet
-                .validations
-                .iter()
-                .position(|dv| dv.ix == b.ix && dv.same_settings(b))
-        });
+    let keep = base_at.filter(|_| {
+        base.as_ref()
+            .is_some_and(|b| b.ranges.iter().all(|r| ranges.contains(r)))
+    });
     let kept_ix = keep.map(|i| sheet.validations[i].ix);
     let held = keep.map(|i| sheet.validations.remove(i));
     for &r in &ranges {
@@ -838,7 +917,9 @@ fn same_everywhere(a: &DataValidation, b: &DataValidation) -> bool {
     if br == u32::MAX {
         return a.same_settings(b);
     }
-    let mut probe = as_seen_from(a, br, bc);
+    let Some(mut probe) = seen_losslessly(a, br, bc) else {
+        return false;
+    };
     probe.ranges.clear();
     probe.same_settings(b)
 }
@@ -884,19 +965,12 @@ pub fn copy_rules(sheet: &Sheet, rect: Rect) -> Vec<DataValidation> {
             // Formulas are written for the whole rule's anchor; the piece
             // keeps that meaning by recording how far its own corner is.
             let (ar, ac) = anchor(dv);
-            let (pr, pc) = ranges
-                .iter()
-                .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, ..)| {
-                    (r.min(r1), c.min(c1))
-                });
-            let (dr, dc) = (i64::from(pr) - i64::from(ar), i64::from(pc) - i64::from(ac));
-            if (dr, dc) != (0, 0) {
-                for f in [&mut piece.formula1, &mut piece.formula2] {
-                    if !f.is_empty() && !f.starts_with('"') {
-                        *f = translate_formula(f, dr, dc).unwrap_or_else(|| f.clone());
-                    }
-                }
-            }
+            let (pr, pc) = anchor_of(&ranges);
+            shift_formulas(
+                &mut piece,
+                i64::from(pr) - i64::from(ar),
+                i64::from(pc) - i64::from(ac),
+            );
             piece.ranges = ranges;
             piece.ix = None;
             piece.orig = None;
@@ -932,11 +1006,7 @@ pub fn paste_rules(
             );
             for rule in rules {
                 let mut moved = rule.clone();
-                for f in [&mut moved.formula1, &mut moved.formula2] {
-                    if !f.is_empty() && !f.starts_with('"') {
-                        *f = translate_formula(f, dr, dc).unwrap_or_else(|| f.clone());
-                    }
-                }
+                shift_formulas(&mut moved, dr, dc);
                 let ranges: Vec<Rect> = rule
                     .ranges
                     .iter()
@@ -1441,5 +1511,82 @@ mod tests {
         wb.sheets[0].validations.push(dv);
         assert!(check(&mut wb, 1, 1, "2019-12-31").is_some());
         assert!(check(&mut wb, 1, 1, "2020-01-01").is_none());
+    }
+
+    // ---- review r2 ----
+
+    #[test]
+    fn a_formula_bound_comes_back_from_its_box_as_the_formula_it_was() {
+        let ctx = crate::entry::EntryCtx::default();
+        for f in ["TODAY()", "$A$1", "DATE(2020,1,1)"] {
+            let dv = rule("date", "greaterThan", f, "");
+            let boxes = DialogBoxes::of(Some(&dv), (1, 1), false);
+            assert_eq!(boxes.first, format!("={f}"));
+            assert_eq!(boxes.rule(&ctx, Some(&dv), (1, 1)).unwrap().formula1, f);
+        }
+    }
+
+    #[test]
+    fn a_paste_off_the_top_of_the_grid_does_not_merge_into_a_healthy_rule() {
+        let mut s = Sheet::default();
+        let mut dv = rule("custom", "", "B2>B1", "");
+        dv.ranges = vec![(1, 1, 9, 1)]; // B2:B10
+        s.validations.push(dv);
+        let rules = copy_rules(&s, (1, 1, 1, 1)); // B2
+        paste_rules(&mut s, &rules, (1, 1, 1, 1), (0, 1), (1, 1)); // at B1
+        let b2 = validation_at(&s, 1, 1).unwrap();
+        assert_eq!(b2.formula1, "B2>B1", "the healthy rule is untouched");
+        assert!(!b2.formula1.contains("#REF!"));
+        let b1 = validation_at(&s, 0, 1).unwrap();
+        assert!(!std::ptr::eq(b1, b2), "B1 has its own rule");
+    }
+
+    #[test]
+    fn the_dialog_edits_the_rule_it_was_opened_on_among_identical_ones() {
+        let mut s = Sheet::default();
+        for r in [(1, 1, 1, 1), (6, 3, 6, 3)] {
+            // Two in-memory rules of the same text on B2 and D7.
+            let mut dv = rule("list", "", "$A$1:$A$5", "");
+            dv.ranges = vec![r];
+            s.validations.push(dv);
+        }
+        // Edit D7's rule (as the dialog would) to something else.
+        let mut edited = rule("list", "", "$A$1:$A$9", "");
+        edited.ranges.clear();
+        set_validation(&mut s, (6, 3, 6, 3), &edited, false);
+        assert_eq!(validation_at(&s, 1, 1).unwrap().formula1, "$A$1:$A$5");
+        assert_eq!(validation_at(&s, 6, 3).unwrap().formula1, "$A$1:$A$9");
+    }
+
+    #[test]
+    fn ok_with_untouched_boxes_keeps_the_bounds_it_was_opened_with() {
+        let ctx = crate::entry::EntryCtx::default();
+        // A time between 0 and 1 and a date with a time of day.
+        for (kind, f1, f2) in [("time", "0", "1"), ("date", "43831.5", "44196")] {
+            let mut dv = rule(kind, "between", f1, f2);
+            dv.error = "old".into();
+            let mut boxes = DialogBoxes::of(Some(&dv), (1, 1), false);
+            boxes.error = "new".into();
+            let out = boxes.rule(&ctx, Some(&dv), (1, 1)).unwrap();
+            assert_eq!(
+                (out.formula1.as_str(), out.formula2.as_str()),
+                (f1, f2),
+                "{kind}"
+            );
+            assert_eq!(out.error, "new");
+        }
+        // The time-of-day shows, and times past a day show as hours.
+        let dv = rule("date", "between", "43831.5", "44196");
+        assert_eq!(first_box(&dv, false), "1/1/2020 12:00:00 PM");
+        let dv = rule("time", "between", "0", "1.5");
+        assert_eq!(second_box(&dv, false), "36:00:00");
+        // A bound the user did change is read again.
+        let dv = rule("time", "between", "0", "1");
+        let mut boxes = DialogBoxes::of(Some(&dv), (1, 1), false);
+        boxes.second = "9:00".into();
+        assert_eq!(
+            boxes.rule(&ctx, Some(&dv), (1, 1)).unwrap().formula2,
+            "0.375"
+        );
     }
 }

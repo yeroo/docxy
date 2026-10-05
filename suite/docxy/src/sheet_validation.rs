@@ -272,7 +272,12 @@ pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
 
 /// The rule OK applies (its ranges left empty, its formulas written for the
 /// cell the dialog opened on), or why the boxes can't make one.
-pub(crate) fn rule(d: &Dialog, ctx: &gridcore::entry::EntryCtx) -> Result<DataValidation, String> {
+pub(crate) fn rule(
+    d: &Dialog,
+    ctx: &gridcore::entry::EntryCtx,
+    current: Option<&DataValidation>,
+    at: (u32, u32),
+) -> Result<DataValidation, String> {
     let ix = |name: &str| match d.value(name) {
         Some(Value::Choice(Some(i))) => *i,
         _ => 0,
@@ -292,7 +297,7 @@ pub(crate) fn rule(d: &Dialog, ctx: &gridcore::entry::EntryCtx) -> Result<DataVa
         error_title: text(d, "error-title"),
         error: text(d, "error-message"),
     }
-    .rule(ctx)
+    .rule(ctx, current, at)
 }
 
 /// A press the Data Validation dialog handles itself: OK and Clear All.
@@ -315,7 +320,15 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
         let Surface::Sheet(v) = &tab.surface else {
             return Some(Err("Data Validation needs a spreadsheet".into()));
         };
-        match rule(top, &v.typed_ctx()) {
+        // The workbook's own context: a fixed decimal point shifts what is
+        // typed into a cell, not a bound typed into this dialog.
+        let ctx = gridcore::entry::entry_ctx(&v.pkg.workbook, v.engine.clock);
+        let current = v.pkg
+            .workbook
+            .sheets
+            .get(sheet)
+            .and_then(|s| gridcore::validation::validation_at(s, range.0, range.1));
+        match rule(top, &ctx, current, (range.0, range.1)) {
             Ok(r) => Some(r),
             Err(e) => return Some(Err(e)),
         }
@@ -734,7 +747,7 @@ mod tests {
         set(&mut t, "input-message", Json::Str("m".repeat(300)));
         let top = t.dialogs.top().unwrap();
         assert_eq!(
-            rule(top, &Default::default()).map(|r| (r.prompt_title.len(), r.prompt.unwrap().len())),
+            rule(top, &Default::default(), None, (1, 1)).map(|r| (r.prompt_title.len(), r.prompt.unwrap().len())),
             Ok((32, 255))
         );
         // A bound missing keeps the dialog open and says why.
@@ -856,5 +869,50 @@ mod tests {
         // And the rule checks entries against it.
         select(&mut t, "B2");
         assert_eq!(enter(&mut t, "2019-12-31"), None);
+    }
+
+    #[test]
+    fn a_date_bound_is_not_shifted_by_the_fixed_decimal_point() {
+        let mut t = tab();
+        view(&mut t).edit_opts.fixed_decimal = true;
+        select(&mut t, "B2");
+        open(&mut t);
+        set(&mut t, "allow", Json::Str("Whole number".into()));
+        set(&mut t, "operator", Json::Str("greater than".into()));
+        set(&mut t, "first", Json::Str("1234".into()));
+        press(&mut t, "OK").unwrap();
+        assert_eq!(view(&mut t).sheet().validations[0].formula1, "1234");
+        let mut t = tab();
+        view(&mut t).edit_opts.fixed_decimal = true;
+        select(&mut t, "B2");
+        open(&mut t);
+        set(&mut t, "allow", Json::Str("Date".into()));
+        set(&mut t, "operator", Json::Str("greater than".into()));
+        set(&mut t, "first", Json::Str("43831".into()));
+        press(&mut t, "OK").unwrap();
+        assert_eq!(view(&mut t).sheet().validations[0].formula1, "43831");
+    }
+
+    #[test]
+    fn a_formula_date_bound_survives_ok_and_untouched_bounds_stay_as_stored() {
+        let mut t = tab();
+        view(&mut t).pkg.workbook.sheets[0].validations.push(DataValidation {
+            ranges: vec![(1, 1, 9, 1)],
+            kind: "date".into(),
+            operator: "between".into(),
+            formula1: "TODAY()".into(),
+            formula2: "43831.5".into(),
+            show_error: true,
+            ..Default::default()
+        });
+        select(&mut t, "B2");
+        open(&mut t);
+        assert_eq!(t.dialogs.top().unwrap().value("first"), Some(&Value::Text("=TODAY()".into())));
+        t.dialogs.select_tab("Error Alert").unwrap();
+        set(&mut t, "error-message", Json::Str("only the message".into()));
+        press(&mut t, "OK").unwrap();
+        let dv = gridcore::validation::validation_at(view(&mut t).sheet(), 1, 1).unwrap();
+        assert_eq!((dv.formula1.as_str(), dv.formula2.as_str()), ("TODAY()", "43831.5"));
+        assert_eq!(dv.error, "only the message");
     }
 }

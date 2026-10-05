@@ -3047,19 +3047,23 @@ impl SheetView {
             return self.paste_copy(clip);
         }
         if clip.view != self.id {
-            self.paste_copy(clip)?;
-            return Ok(GridPasted::KeptAsCopy(
-                "The cut was pasted as a copy: cells move only within their own workbook",
-            ));
+            let lost = matches!(self.paste_copy(clip)?, GridPasted::WithoutRules(_));
+            return Ok(GridPasted::KeptAsCopy(if lost {
+                "The cut was pasted as a copy, without its data validation (this sheet can't hold it): cells move only within their own workbook"
+            } else {
+                "The cut was pasted as a copy: cells move only within their own workbook"
+            }));
         }
         if !self.cut_still_live(clip) {
             return Err(GridPasteError::CutCancelled);
         }
         if self.pkg.workbook.sheets[clip.sheet].is_protected() {
-            self.paste_copy(clip)?;
-            return Ok(GridPasted::KeptAsCopy(
-                "The cut was pasted as a copy: its sheet is protected",
-            ));
+            let lost = matches!(self.paste_copy(clip)?, GridPasted::WithoutRules(_));
+            return Ok(GridPasted::KeptAsCopy(if lost {
+                "The cut was pasted as a copy, without its data validation (this sheet can't hold it): its sheet is protected"
+            } else {
+                "The cut was pasted as a copy: its sheet is protected"
+            }));
         }
         self.paste_move(clip)
     }
@@ -3095,6 +3099,7 @@ impl SheetView {
         if h == clip.rect.2 - clip.rect.0 + 1 {
             let dst = self.active;
             if !clip.rules.is_empty() && !self.pkg.takes_validations(dst) {
+                self.prune_circles();
                 return Ok(GridPasted::WithoutRules(NO_RULES_KEPT));
             }
             gridcore::validation::paste_rules(
