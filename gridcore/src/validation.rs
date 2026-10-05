@@ -2,7 +2,7 @@
 //! cells whose current value breaks one, and editing the rules themselves.
 //! Pure model work: the hosts own the alerts, the dialog and the circles.
 
-use crate::engine::{cell_value_at, eval_formula_at_clock};
+use crate::engine::{cell_value_at, eval_formula_at_clock, eval_typed_formula_at_clock};
 use crate::formula::{Value, translate_formula};
 use crate::sheet::{
     AlertStyle, Cell, CellValue, DataValidation, MAX_COLS, MAX_ROWS, Sheet, Workbook,
@@ -54,7 +54,7 @@ pub fn check_entry(
         return None;
     }
     let value = match &cell.formula {
-        Some(f) => to_cell_value(eval_formula_at_clock(wb, sheet, row, col, f, today)),
+        Some(f) => to_cell_value(eval_typed_formula_at_clock(wb, sheet, row, col, f, today)),
         None => cell.value.clone(),
     };
     let custom = dv.kind == "custom";
@@ -2455,5 +2455,21 @@ mod tests {
         dv.allow_blank = false;
         wb.sheets[0].validations.push(dv);
         assert!(check_entry(&mut wb, 0, 1, 1, &Cell::default(), None).is_none());
+    }
+
+    #[test]
+    fn a_typed_dynamic_array_formula_is_checked_by_its_first_element() {
+        let mut wb = book();
+        wb.sheets[0]
+            .validations
+            .push(rule("whole", "between", "10", "90"));
+        assert!(
+            check(&mut wb, 1, 1, "=SEQUENCE(2,1,10)").is_none(),
+            "10 is in 10..90"
+        );
+        assert!(
+            check(&mut wb, 1, 1, "=SEQUENCE(2,1,100)").is_some(),
+            "100 is not"
+        );
     }
 }

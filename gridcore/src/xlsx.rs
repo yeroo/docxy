@@ -4358,11 +4358,14 @@ fn edit_validations(xml: String, sheet: &Sheet) -> String {
             || f2.len() != usize::from(!dv.formula2.is_empty());
         // Only a rule edited since the load has its formula count rewritten:
         // a part's odd one is left as it is.
-        let rebuild = count_differs
-            && dv
-                .orig
-                .as_deref()
-                .is_some_and(|o| o.formula1 != dv.formula1 || o.formula2 != dv.formula2);
+        let edited = dv
+            .orig
+            .as_deref()
+            .is_some_and(|o| o.formula1 != dv.formula1 || o.formula2 != dv.formula2);
+        // A formula held as markup (a CDATA section) can't be rewritten in
+        // place: an edited one has its formulas rebuilt.
+        let opaque = f1.iter().chain(&f2).any(|f| f.content.is_none());
+        let rebuild = edited && (count_differs || opaque);
         let mut block = if rebuild {
             dv_rebuild_formulas(element, dv)
         } else {
@@ -19466,6 +19469,25 @@ mod rule_shift_tests {
                 "{text}: {ws}"
             );
         }
+    }
+
+    #[test]
+    fn dv_cdata_formulas_edited_round_trip() {
+        let rule = r#"<dataValidations count="1"><dataValidation type="whole" operator="between" sqref="B2:B10"><formula1><![CDATA[10]]></formula1><formula2><![CDATA[90]]></formula2></dataValidation></dataValidations>"#;
+        let mut pkg = one("S", rule);
+        assert_eq!(pkg.workbook.sheets[0].validations[0].formula1, "10");
+        {
+            let dv = &mut pkg.workbook.sheets[0].validations[0];
+            dv.formula1 = "20".into();
+            dv.formula2 = "80".into();
+        }
+        let (re, ws) = saved(&pkg, SHEET1);
+        let dv = &re.workbook.sheets[0].validations[0];
+        assert_eq!(
+            (dv.formula1.as_str(), dv.formula2.as_str()),
+            ("20", "80"),
+            "{ws}"
+        );
     }
 
     #[test]

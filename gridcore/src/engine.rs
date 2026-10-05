@@ -2861,6 +2861,37 @@ pub fn eval_formula_at_clock(
     }
 }
 
+/// [`eval_formula_at_clock`] for a typed formula that may be a dynamic array:
+/// the value of its top-left cell (an array's first element), which is what
+/// the cell would hold and so what a validation rule checks.
+pub fn eval_typed_formula_at_clock(
+    wb: &Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    src: &str,
+    clock: Option<f64>,
+) -> Value {
+    let Ok(ast) = formula::parse(src) else {
+        return Value::Err(ExcelError::Name);
+    };
+    let resolver = WbResolver {
+        wb,
+        clock,
+        rand_state: StdCell::new(0),
+        has_rand: false,
+    };
+    let mut ev = Eval::new(&resolver, sheet, (row, col));
+    match ev.eval_dynamic(&ast) {
+        formula::DynResult::Scalar(v) => v,
+        formula::DynResult::Array(m) => m
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next())
+            .unwrap_or(Value::Empty),
+    }
+}
+
 /// Which records of the list `list` on `sheet` (its first row the headers)
 /// the criteria range `crit` on `crit_sheet` selects, with the D-functions'
 /// rules (see [`formula::Eval::db_matches`]): one entry per record. Advanced
