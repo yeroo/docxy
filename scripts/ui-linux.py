@@ -108,6 +108,10 @@ def main():
         print(f'ui-linux: {exc}; see {logs}', file=sys.stderr)
         return 1
     finally:
+        # Teardown must finish: a second SIGTERM/SIGINT here would abort it
+        # and orphan Openbox and Xvfb.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, signal.SIG_IGN)
         for process in (child, wm, xvfb):
             stop(process)
         os.close(read_fd)
