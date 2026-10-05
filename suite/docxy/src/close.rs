@@ -201,19 +201,17 @@ pub(crate) fn commit_comment_buffer(tab: &mut DocTab, author: &str, text: &str) 
 /// The exit path's comment commit. A CHANGED buffer commits to the CURRENT
 /// SELECTION, exactly as Enter and the bar's own label do — the label reads
 /// "Comment on {cell}:" off the live selection, so that is the cell the user
-/// sees themselves editing. `cell`/`seed` — the cell the bar opened on and
-/// the raw text it opened with — serve ONLY the skip decision, so an
-/// untouched bar never deletes or copies after a click moved the selection:
-/// the commit is skipped when the buffer equals the seed (raw compare — a
-/// file-loaded note keeps its whitespace, so a note "note\n" seeds "note\n"
-/// and a bar opened to read it must not rewrite it as "note"), or the note on
-/// the bar's cell already trims to the buffer (retyped or unchanged text;
-/// committing would only restamp its author, wherever it landed), or the
-/// bar's cell has no note and the buffer is empty (the delete that isn't).
-/// Enter's own path is [`commit_comment_buffer`], unchanged.
+/// sees themselves editing. `seed` — the raw text the bar opened with —
+/// serves only the skip decision, so an untouched bar never deletes or copies
+/// after a click moved the selection: the commit is skipped when the buffer
+/// equals the seed (raw compare — a file-loaded note keeps its whitespace, so
+/// a note "note\n" seeds "note\n" and a bar opened to read it must not
+/// rewrite it as "note"), or the commit could not change the TARGET cell: the
+/// note on it already trims to the buffer (committing would only restamp its
+/// author), or it has no note and the buffer is empty (the delete that
+/// isn't). Enter's own path is [`commit_comment_buffer`], unchanged.
 pub(crate) fn commit_comment_buffer_for_exit(
     tab: &mut DocTab,
-    cell: (u32, u32),
     seed: &str,
     author: &str,
     text: &str,
@@ -226,13 +224,9 @@ pub(crate) fn commit_comment_buffer_for_exit(
                     .pkg
                     .comments()
                     .iter()
-                    .find(|cm| cm.sheet == v.active && cm.row == cell.0 && cm.col == cell.1)
+                    .find(|cm| cm.sheet == v.active && cm.row == v.sel.0 && cm.col == v.sel.1)
                 {
                     Some(cm) => cm.text.trim() == trimmed,
-                    // No note on the bar's cell: an empty buffer's delete is
-                    // the only no-op; the seed compare above covers the
-                    // empty-on-empty case, this covers a note deleted under
-                    // the bar while it was open.
                     None => trimmed.is_empty(),
                 }
         }
@@ -613,12 +607,12 @@ impl Docxy {
             // a buffer that is it. The commit itself lands on the current
             // selection, as Enter and the bar's label do. The fallback is
             // unreachable while the seed is set wherever the buffer is.
-            let (cell, seed) = self.sheet_comment_seed.take().unwrap_or_else(|| {
-                let cell = self.active_sheet().map(|v| v.sel).unwrap_or_default();
-                (cell, self.selected_comment().unwrap_or_default())
-            });
+            let seed = self
+                .sheet_comment_seed
+                .take()
+                .unwrap_or_else(|| self.selected_comment().unwrap_or_default());
             if let Some(t) = self.tabs.get_mut(self.active) {
-                commit_comment_buffer_for_exit(t, cell, &seed, &author, &text);
+                commit_comment_buffer_for_exit(t, &seed, &author, &text);
             }
         }
         if let Some((idx, buf)) = self.sheet_rename.take() {
@@ -626,19 +620,22 @@ impl Docxy {
                 commit_rename_buffer_for_exit(t, idx, &buf);
             }
         }
-        if let Some(f) = self.range_edit.take()
-            && !f.target.is_bar()
-            && !self.active_locked()
-            // Seeded and untouched, the rule the cell editor and the comment
-            // bar follow: a merely focused field holds its seed text, and
-            // committing that can rebuild a file-loaded chart's cached data
-            // (`chart_apply_range` re-reads the cells), marking it edited and
-            // regenerating — losing — its unmodeled part on save.
-            && self.ref_field_seed(f.target).is_none_or(|seed| seed != f.buf)
-        {
-            self.ref_commit(f.target, &f.buf, cx);
+        if let Some(f) = self.range_edit.take() {
+            if !f.target.is_bar()
+                && !self.active_locked()
+                // Seeded and untouched, the rule the cell editor and the
+                // comment bar follow: a merely focused field holds its seed
+                // text, and committing that can rebuild a file-loaded chart's
+                // cached data (`chart_apply_range` re-reads the cells),
+                // marking it edited and regenerating — losing — its unmodeled
+                // part on save.
+                && self.ref_field_seed(f.target).is_none_or(|seed| seed != f.buf)
+            {
+                self.ref_commit(f.target, &f.buf, cx);
+            }
             // What Esc does when the field goes: its last commit's message
-            // must not stand under a field nobody is in.
+            // must not stand under a field nobody is in — committed or
+            // dropped, the field is gone either way.
             if matches!(&self.ref_msg, Some((t, _, _)) if *t == f.target) {
                 self.ref_msg = None;
             }

@@ -3369,12 +3369,12 @@ struct Docxy {
     // In-progress cell-comment entry for the selected cell (the input buffer);
     // None = the comment bar is closed.
     sheet_comment_edit: Option<String>,
-    // The cell a comment bar opened on and the text it opened with (its
-    // seed): the selection moves freely while the bar is open, and an exit
-    // commit uses the seed only to tell an untouched buffer from an edit —
-    // so a bar merely open never deletes or copies onto a clicked cell.
-    // Set where the buffer opens, cleared with it.
-    sheet_comment_seed: Option<((u32, u32), String)>,
+    // The raw text a comment bar opened with (its seed): the selection moves
+    // freely while the bar is open, and an exit commit uses the seed only to
+    // tell an untouched buffer from an edit — so a bar merely open never
+    // deletes or copies onto a clicked cell. Set where the buffer opens,
+    // cleared with it.
+    sheet_comment_seed: Option<String>,
     // Whether the data-validation list dropdown is open on the selected cell.
     sheet_dv_open: bool,
     // Whether the Number-group format picker strip is open.
@@ -12790,20 +12790,20 @@ impl Docxy {
 
     /// Open the comment entry bar for the selected cell, seeded with its
     /// existing comment text (so New Comment doubles as Edit). The seed — the
-    /// cell and the raw text — is remembered with the buffer: the selection
-    /// moves freely while the bar is open, and an exit commit uses it only to
-    /// skip a buffer that is the seed, untouched, after a click moved on.
+    /// raw text — is remembered with the buffer: the selection moves freely
+    /// while the bar is open, and an exit commit uses it only to skip a
+    /// buffer that is the seed, untouched, after a click moved on.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
-        if let Some(cell) = self.active_sheet().map(|v| v.sel) {
+        if self.active_sheet().is_some() {
             let text = self.selected_comment().unwrap_or_default();
-            self.sheet_comment_seed = Some((cell, text.clone()));
+            self.sheet_comment_seed = Some(text.clone());
             self.sheet_comment_edit = Some(text);
             cx.notify();
         }
     }
 
     /// Drop the comment bar: its buffer and, with it, the seed that says
-    /// which note and text it opened on.
+    /// what text it opened with.
     fn sheet_comment_bar_close(&mut self) {
         self.sheet_comment_edit = None;
         self.sheet_comment_seed = None;
