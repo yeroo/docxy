@@ -16,7 +16,7 @@ use ctlcore::mcp::{McpServer, item_array, item_obj, item_ty, prop, prop_array, p
 pub fn run() -> std::io::Result<()> {
     McpServer {
         name: "xlsxy",
-        version: env!("CARGO_PKG_VERSION"),
+        version: buildinfo::long_version(env!("CARGO_PKG_VERSION")),
         tools: tool_defs(),
         handler: &do_tool,
     }

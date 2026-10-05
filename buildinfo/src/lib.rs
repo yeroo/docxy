@@ -176,6 +176,26 @@ impl BuildInfo {
         ]
     }
 
+    /// [`BuildInfo::fields`] as one JSON object (`{"version":"0.5.0",...}`), for
+    /// hosts that parse it into their own JSON type.
+    pub fn json(&self) -> String {
+        let mut s = String::from("{");
+        for (i, (k, v)) in self.fields().iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("\"{k}\":"));
+            match v {
+                Value::Str(t) => json_str(&mut s, t),
+                Value::Bool(b) => s.push_str(if *b { "true" } else { "false" }),
+                Value::Num(n) => s.push_str(&n.to_string()),
+                Value::Null => s.push_str("null"),
+            }
+        }
+        s.push('}');
+        s
+    }
+
     /// The multi-line block `--version`, the About dialog's Copy and the crash log print.
     /// `name` is the program (`docxy`, `suite`).
     pub fn version_block(&self, name: &str) -> String {
@@ -210,6 +230,22 @@ impl BuildInfo {
         }
         s
     }
+}
+
+fn json_str(out: &mut String, t: &str) {
+    out.push('"');
+    for c in t.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 /// The process-wide build info; the first caller's `version` wins (every host
@@ -301,6 +337,21 @@ mod tests {
         assert_eq!(get("manual"), Some(Value::Bool(true)));
         assert_eq!(get("last_pr"), Some(Value::Num(1015)));
         assert_eq!(get("issue"), Some(Value::Null));
+    }
+
+    #[test]
+    fn json_is_one_escaped_object() {
+        let mut r = raw("local", false);
+        r.last_pr_title = Some("say \"hi\"\\");
+        let j = BuildInfo::from_raw(&r, "0.5.0").json();
+        assert!(j.starts_with("{\"version\":\"0.5.0\","), "{j}");
+        assert!(
+            j.contains("\"last_pr_title\":\"say \\\"hi\\\"\\\\\""),
+            "{j}"
+        );
+        assert!(j.contains("\"issue\":null"), "{j}");
+        assert!(j.contains("\"manual\":true"), "{j}");
+        assert!(j.ends_with('}'));
     }
 
     #[test]

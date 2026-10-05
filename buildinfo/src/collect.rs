@@ -86,10 +86,23 @@ pub fn collect(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Fields {
         dir,
         &["log", "--first-parent", &max, "--format=%s%x1f%b%x1e"],
     ) {
-        f.last_pr = log.split('\x1e').find_map(|rec| {
-            let (subject, body) = rec.trim_start_matches(['\n', '\r']).split_once('\x1f')?;
-            crate::parse::last_merged_pr(subject, body)
-        });
+        let recs: Vec<(u32, String, bool)> = log
+            .split('\x1e')
+            .filter_map(|rec| {
+                let (subject, body) = rec.trim_start_matches(['\n', '\r']).split_once('\x1f')?;
+                let (n, t) = crate::parse::last_merged_pr(subject, body)?;
+                Some((n, t, subject.trim().starts_with("Merge pull request #")))
+            })
+            .collect();
+        // Merge commits are the project's way of landing a PR; a `Title (#N)` subject
+        // on a branch usually names an *issue*. So squash subjects only count when
+        // no merge commit is in range, and never when N is the branch's own issue.
+        let issue = crate::parse::issue_from_branch(&f.branch);
+        f.last_pr = recs
+            .iter()
+            .find(|r| r.2)
+            .or_else(|| recs.iter().find(|r| Some(r.0) != issue))
+            .map(|r| (r.0, r.1.clone()));
     }
 
     f.issue = crate::parse::issue_from_branch(&f.branch);
@@ -153,6 +166,75 @@ mod tests {
         assert_eq!(f, Fields::unknown());
         assert_eq!(f.commit, "unknown");
         assert!(watch_paths(&d).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `git -C dir <args>` with a fixed identity; false when git is not installed.
+    fn run(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn reads_a_scratch_repository() {
+        let d = temp_dir("repo");
+        if !run(&d, &["init", "-q", "-b", "main"]) {
+            return; // no git on this machine
+        }
+        std::fs::write(d.join("a.txt"), "1").unwrap();
+        assert!(run(&d, &["add", "."]));
+        // A branch commit naming an issue must not read as a PR ...
+        assert!(run(&d, &["commit", "-qm", "Fix the thing (#42)"]));
+        let f = collect(&d, &no_env);
+        assert_eq!(
+            f.last_pr,
+            Some((42, "Fix the thing".into())),
+            "squash fallback"
+        );
+        // ... once a real merge commit is in range, that wins.
+        assert!(run(
+            &d,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "Merge pull request #7 from o/issue-5-x",
+                "-m",
+                "Land the thing"
+            ],
+        ));
+        assert!(run(
+            &d,
+            &["commit", "-q", "--allow-empty", "-m", "Later work (#99)"]
+        ));
+        let f = collect(&d, &no_env);
+        assert_eq!(f.last_pr, Some((7, "Land the thing".into())));
+        assert_eq!(f.branch, "main");
+        assert_eq!(f.commit.len(), 40);
+        assert!(!f.dirty);
+        // Untracked files do not make the tree dirty; a tracked edit does.
+        std::fs::write(d.join("scratch.txt"), "x").unwrap();
+        assert!(!collect(&d, &no_env).dirty);
+        std::fs::write(d.join("a.txt"), "2").unwrap();
+        assert!(collect(&d, &no_env).dirty);
+        assert!(watch_paths(&d).iter().any(|p| p.ends_with("a.txt")));
+        // The branch's own issue number is not a PR.
+        assert!(run(&d, &["checkout", "-q", "-b", "issue-99-later"]));
+        assert_eq!(collect(&d, &no_env).issue, Some(99));
         let _ = std::fs::remove_dir_all(&d);
     }
 

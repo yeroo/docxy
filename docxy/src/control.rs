@@ -19,6 +19,7 @@
 //! | Verb | Args | Result |
 //! |---|---|---|
 //! | `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?}` |
+//! | `app-info` | — | the build: `{version, commit, short_commit, branch, commit_date, dirty, last_pr, issue, ahead, built_at, profile, target, host, kind, manual, summary, …}` |
 //! | `doc.outline` | — | `{headings:[{index, level, text}]}` |
 //! | `doc.read` | `{start?, end?, range?}` | `{total, start, end, text, blocks:[…]}` |
 //! | `doc.find` | `{query, case_sensitive?}` | `{query, count, matches:[…]}` |
@@ -97,6 +98,11 @@ pub(crate) fn mutation_kind_for_verb(verb: &str) -> Option<MutationKind> {
     })
 }
 
+/// `app-info`: the build this binary is (see the `buildinfo` crate), as JSON.
+fn app_info() -> Result<Json, String> {
+    Json::parse(&buildinfo::get(env!("CARGO_PKG_VERSION")).json())
+}
+
 /// Route one control verb against the live document, returning the JSON result
 /// or an error message. Mutating verbs set `modified`; every verb requests a
 /// repaint so pane B reflects the change immediately.
@@ -108,6 +114,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
 
     let out = match verb {
         "doc.path" => Ok(path_info(app)),
+        "app-info" => app_info(),
         "doc.edit-anyway" => Ok(edit_anyway(app)),
         "doc.outline" => Ok(outline(app)),
         "doc.read" => read(app, args),
@@ -1283,6 +1290,51 @@ mod tests {
             })
             .collect();
         Document { body }
+    }
+
+    #[test]
+    fn app_info_reports_the_build() {
+        let mut app = app_with(&["A"]);
+        let info = dispatch(&mut app, "app-info", &Json::Null).unwrap();
+        for k in [
+            "version",
+            "commit",
+            "short_commit",
+            "branch",
+            "commit_date",
+            "dirty",
+            "last_pr",
+            "issue",
+            "ahead",
+            "built_at",
+            "profile",
+            "target",
+            "host",
+            "kind",
+            "manual",
+            "summary",
+        ] {
+            assert!(info.get(k).is_some(), "app-info lacks {k}: {info:?}");
+        }
+        assert_eq!(info.get_str("version"), Some(env!("CARGO_PKG_VERSION")));
+        let kind = info.get_str("kind").unwrap();
+        assert!(["release", "ci", "local"].contains(&kind), "{kind}");
+        // manual == (kind is local || dirty)
+        let dirty = info.get("dirty").and_then(Json::as_bool).unwrap();
+        assert_eq!(
+            info.get("manual").and_then(Json::as_bool),
+            Some(kind == "local" || dirty)
+        );
+        let commit = info.get_str("commit").unwrap();
+        assert!(
+            commit == "unknown"
+                || (commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
+        );
+        assert!(
+            info.get_str("summary")
+                .unwrap()
+                .contains(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     fn app_with(paras: &[&str]) -> App {

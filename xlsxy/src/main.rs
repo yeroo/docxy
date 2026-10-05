@@ -475,6 +475,15 @@ fn is_text_import(path: &str) -> bool {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--version` prints the build block (commit, last merged PR, build kind) and
+    // exits, before any file-oriented argument parsing or terminal setup.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        print!(
+            "{}",
+            buildinfo::get(env!("CARGO_PKG_VERSION")).version_block("xlsxy")
+        );
+        return ExitCode::SUCCESS;
+    }
     // `--mcp` runs the headless MCP stdio bridge (a client of a running xlsxy),
     // not the editor, so handle it before the file-oriented argument parsing.
     if args.iter().any(|a| a == "--mcp") {
@@ -7797,6 +7806,10 @@ impl backstage::BackstageHost for App {
                 "  Modified    {}",
                 if self.modified { "yes" } else { "no" }
             )),
+            RLine::raw(format!(
+                "  Build       {}",
+                buildinfo::get(env!("CARGO_PKG_VERSION")).short_line()
+            )),
             RLine::raw(String::new()),
             RLine::raw(format!(
                 "  Sheets      {} ({})",
@@ -10113,6 +10126,18 @@ mod tests {
     use super::*;
     use gridcore::edit::parse_input;
     use gridcore::xlsx::{load_xlsx, save_xlsx};
+
+    #[test]
+    fn backstage_info_shows_the_build_line() {
+        let app = App::new(new_xlsx(), "untitled.xlsx");
+        let info: Vec<String> = app.info_lines().iter().map(|l| l.to_string()).collect();
+        let line = buildinfo::get(env!("CARGO_PKG_VERSION")).short_line();
+        assert!(
+            info.iter()
+                .any(|l| l.contains("Build") && l.contains(&line)),
+            "{info:?}"
+        );
+    }
 
     /// `Backup of <stem>.xlk` lives beside the file; the stem keeps any
     /// dots in the name.
