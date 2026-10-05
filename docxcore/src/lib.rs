@@ -30,6 +30,7 @@ pub mod editor;
 pub mod equation;
 pub mod export;
 pub mod field;
+pub mod final_mark;
 pub mod hf;
 pub mod import;
 pub mod inspect;

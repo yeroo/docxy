@@ -21,10 +21,7 @@ fn clean_tabs_never_ask_and_dirty_tabs_honor_each_answer() {
         let mut t = tab(kind);
         assert!(!matches!(t.surface, Surface::Placeholder), "{}", t.status);
         let status = t.status.clone();
-        assert_eq!(
-            close_step(&mut t, |_| panic!("clean tab asked")),
-            CloseStep::Remove
-        );
+        assert_eq!(close_step(&mut t, None), CloseStep::Remove);
         assert_eq!(t.status, status);
         for (answer, expected) in [
             (CloseAnswer::Save, CloseStep::Save),
@@ -34,23 +31,13 @@ fn clean_tabs_never_ask_and_dirty_tabs_honor_each_answer() {
             let mut t = tab(kind);
             t.dirty = true;
             let status = t.status.clone();
-            let mut asked = false;
-            assert_eq!(
-                close_step(&mut t, |_| {
-                    asked = true;
-                    Ok(answer)
-                }),
-                expected
-            );
-            assert!(asked);
+            assert_eq!(close_step(&mut t, Some(answer)), expected);
             assert_eq!(t.status, status);
             assert!(t.dirty); // Deciding to save is not a successful save.
         }
         t.dirty = true;
-        assert_eq!(
-            close_step(&mut t, |_| Err("no dialog".into())),
-            CloseStep::Refuse("no dialog".into())
-        );
+        // Not answered yet: the close prompt opens.
+        assert_eq!(close_step(&mut t, None), CloseStep::Ask);
     }
 }
 
@@ -65,18 +52,17 @@ fn sheet_pending_edit_commits_before_asking_and_is_undoable() {
     let before = v.edit_string(0, 0);
     v.redo.push(v.snapshot());
     v.begin_cell_edit(Some("12345".into()));
-    assert_eq!(
-        close_step(&mut t, |t| {
-            assert!(t.dirty);
-            let Surface::Sheet(v) = &t.surface else {
-                panic!()
-            };
-            assert!(v.editing.is_none());
-            assert_eq!(v.edit_string(0, 0), "12345");
-            Ok(CloseAnswer::Cancel)
-        }),
-        CloseStep::Keep
-    );
+    let step = close_step(&mut t, Some(CloseAnswer::Cancel));
+    // What it asked about: the pending edit, committed.
+    {
+        assert!(t.dirty);
+        let Surface::Sheet(v) = &t.surface else {
+            panic!()
+        };
+        assert!(v.editing.is_none());
+        assert_eq!(v.edit_string(0, 0), "12345");
+    }
+    assert_eq!(step, CloseStep::Keep);
     let Surface::Sheet(v) = &mut t.surface else {
         panic!()
     };
@@ -97,18 +83,17 @@ fn valid_project_buffer_commits_before_asking() {
     project_cell_click(&mut t, 1, Some(COL_NAME), false);
     project_input(&mut t, "text", Some("Pending name"), Modifiers::default());
     assert!(!t.dirty);
-    assert_eq!(
-        close_step(&mut t, |t| {
-            let Surface::Project(v) = &t.surface else {
-                panic!()
-            };
-            assert!(t.dirty);
-            assert!(v.cell.is_none());
-            assert_eq!(v.ed.project().tasks[1].name, "Pending name");
-            Ok(CloseAnswer::Cancel)
-        }),
-        CloseStep::Keep
-    );
+    let step = close_step(&mut t, Some(CloseAnswer::Cancel));
+    // What it asked about: the pending edit, committed.
+    {
+        let Surface::Project(v) = &t.surface else {
+            panic!()
+        };
+        assert!(t.dirty);
+        assert!(v.cell.is_none());
+        assert_eq!(v.ed.project().tasks[1].name, "Pending name");
+    }
+    assert_eq!(step, CloseStep::Keep);
 }
 
 #[test]
@@ -116,7 +101,7 @@ fn invalid_project_buffer_refuses_even_discard_and_correction_clears_status() {
     let mut t = tab(Kind::Project);
     project_cell_click(&mut t, 1, Some(COL_DURATION), false);
     project_input(&mut t, "text", Some("banana"), Modifiers::default());
-    let step = close_step(&mut t, |_| panic!("invalid buffer asked"));
+    let step = close_step(&mut t, None);
     assert_eq!(
         step,
         CloseStep::Refuse("Invalid duration (try 3d, 4h, 2w, 1mo)".into())
@@ -154,7 +139,7 @@ fn an_unfinished_formula_refuses_close_and_save_until_corrected() {
     let mut t = sheet_typing(&path, "=SUM(A1");
     // Close refuses, with Discard as the answer too: the editor keeps it.
     for answer in [CloseAnswer::Discard, CloseAnswer::Save] {
-        let step = close_step(&mut t, |_| Ok(answer));
+        let step = close_step(&mut t, Some(answer));
         let CloseStep::Refuse(message) = step else {
             panic!("{answer:?}: {step:?}")
         };
@@ -192,7 +177,7 @@ fn an_unfinished_formula_refuses_close_and_save_until_corrected() {
     ));
     assert!(path.is_file(), "{}", t.status);
     assert!(!t.dirty);
-    assert_eq!(close_step(&mut t, |_| panic!("asked")), CloseStep::Remove);
+    assert_eq!(close_step(&mut t, None), CloseStep::Remove);
     // Corrected in the editor and closed: the close commits it, so the tab
     // is dirty with the formula in A1 when it asks; Discard removes it.
     let mut t = sheet_typing(&path, "=SUM(A1");
@@ -200,19 +185,18 @@ fn an_unfinished_formula_refuses_close_and_save_until_corrected() {
         panic!()
     };
     v.editing = Some("=SUM(A1)".into());
-    assert_eq!(
-        close_step(&mut t, |t| {
-            assert!(t.dirty);
-            let Surface::Sheet(v) = &t.surface else {
-                panic!()
-            };
-            assert!(v.editing.is_none());
-            let a1 = v.sheet().cell(0, 0).and_then(|c| c.formula.clone());
-            assert_eq!(a1.as_deref(), Some("SUM(A1)"));
-            Ok(CloseAnswer::Discard)
-        }),
-        CloseStep::Discard
-    );
+    let step = close_step(&mut t, Some(CloseAnswer::Discard));
+    // What it asked about: the pending edit, committed.
+    {
+        assert!(t.dirty);
+        let Surface::Sheet(v) = &t.surface else {
+            panic!()
+        };
+        assert!(v.editing.is_none());
+        let a1 = v.sheet().cell(0, 0).and_then(|c| c.formula.clone());
+        assert_eq!(a1.as_deref(), Some("SUM(A1)"));
+    }
+    assert_eq!(step, CloseStep::Discard);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -232,18 +216,17 @@ fn header_and_footer_buffers_are_flushed_before_asking() {
             show_text: true,
         });
         t.status = "Editing header — press Esc to return to the document".into();
-        assert_eq!(
-            close_step(&mut t, |t| {
-                assert!(t.dirty);
-                assert!(t.hf_edit.is_none());
-                assert_eq!(t.status.as_ref(), "Closed header/footer");
-                let xml =
-                    std::str::from_utf8(t.pkg.as_ref().unwrap().part(&part_name).unwrap()).unwrap();
-                assert!(xml.contains("Pending margin text"));
-                Ok(CloseAnswer::Cancel)
-            }),
-            CloseStep::Keep
-        );
+        let step = close_step(&mut t, Some(CloseAnswer::Cancel));
+        // What it asked about: the pending edit, committed.
+        {
+            assert!(t.dirty);
+            assert!(t.hf_edit.is_none());
+            assert_eq!(t.status.as_ref(), "Closed header/footer");
+            let xml =
+                std::str::from_utf8(t.pkg.as_ref().unwrap().part(&part_name).unwrap()).unwrap();
+            assert!(xml.contains("Pending margin text"));
+        }
+        assert_eq!(step, CloseStep::Keep);
     }
 }
 
@@ -608,13 +591,12 @@ fn close_commits_fresh_entry_equal_to_stored_text() {
     v.begin_cell_edit(Some(String::new()));
     v.editing = Some("5".into());
 
-    assert_eq!(
-        close_step(&mut t, |t| {
-            assert!(t.dirty);
-            Ok(CloseAnswer::Cancel)
-        }),
-        CloseStep::Keep
-    );
+    let step = close_step(&mut t, Some(CloseAnswer::Cancel));
+    // What it asked about: the pending edit, committed.
+    {
+        assert!(t.dirty);
+    }
+    assert_eq!(step, CloseStep::Keep);
     let Surface::Sheet(v) = &t.surface else {
         panic!()
     };
@@ -809,10 +791,7 @@ fn single_close_of_an_untouched_header_editor_removes_without_asking_and_keeps_t
     for is_header in [true, false] {
         let (mut t, part_name, before) =
             untouched_existing_header(&format!("single-{is_header}"), is_header);
-        assert_eq!(
-            close_step(&mut t, |_| panic!("an untouched editor must not ask")),
-            CloseStep::Remove
-        );
+        assert_eq!(close_step(&mut t, None), CloseStep::Remove);
         assert!(!t.dirty, "{is_header}");
         assert!(t.hf_edit.is_none());
         assert_eq!(
@@ -851,10 +830,7 @@ fn exiting_or_saving_an_untouched_header_editor_keeps_the_tab_clean_and_the_part
 #[test]
 fn single_close_of_an_untouched_cell_editor_removes_without_asking_and_keeps_the_cell() {
     let mut t = untouched_text_cell();
-    assert_eq!(
-        close_step(&mut t, |_| panic!("an untouched editor must not ask")),
-        CloseStep::Remove
-    );
+    assert_eq!(close_step(&mut t, None), CloseStep::Remove);
     assert!(!t.dirty);
     let Surface::Sheet(v) = &t.surface else {
         panic!()
@@ -869,7 +845,7 @@ fn a_cancelled_single_close_keeps_an_untouched_cell_editor_open_as_seeded() {
     // Dirty for another reason, so the close asks.
     t.dirty = true;
     assert_eq!(
-        close_step(&mut t, |_| Ok(CloseAnswer::Cancel)),
+        close_step(&mut t, Some(CloseAnswer::Cancel)),
         CloseStep::Keep
     );
     let Surface::Sheet(v) = &t.surface else {
@@ -891,10 +867,7 @@ fn close_dialog_save_preserves_an_untouched_text_cell_on_disk() {
         panic!()
     };
     v.anchor = (2, 2);
-    assert_eq!(
-        close_step(&mut t, |_| Ok(CloseAnswer::Save)),
-        CloseStep::Save
-    );
+    assert_eq!(close_step(&mut t, Some(CloseAnswer::Save)), CloseStep::Save);
     assert!(save_sheet_tab(
         &mut t,
         false,
@@ -921,10 +894,7 @@ fn close_dialog_save_collapses_a_range_when_it_commits_a_changed_cell() {
     };
     v.anchor = (2, 2);
     v.begin_cell_edit(Some("abc".into()));
-    assert_eq!(
-        close_step(&mut t, |_| Ok(CloseAnswer::Save)),
-        CloseStep::Save
-    );
+    assert_eq!(close_step(&mut t, Some(CloseAnswer::Save)), CloseStep::Save);
     let Surface::Sheet(v) = &t.surface else {
         panic!()
     };
@@ -1850,7 +1820,7 @@ fn dont_save_keeps_the_last_autorecover_copy_as_a_read_only_draft() {
     assert!(autorecover_prepare(&mut tabs));
     write_session(&root.0, &tabs, 0, prefs());
     commit_a1(&mut tabs[0], "After the tick");
-    let step = close_step(&mut tabs[0], |_| Ok(CloseAnswer::Discard));
+    let step = close_step(&mut tabs[0], Some(CloseAnswer::Discard));
     assert_eq!(step, CloseStep::Discard);
     let now = std::time::SystemTime::now();
     let draft = keep_closed_draft(&root.0, &tabs[0], &step, 1, true, now)
@@ -1878,17 +1848,17 @@ fn no_draft_without_a_write_while_unsaved_or_without_discard() {
     // Typed and committed, but closed before any persist.
     let mut t = tab(Kind::Xlsx);
     commit_a1(&mut t, "Never written");
-    let step = close_step(&mut t, |_| Ok(CloseAnswer::Discard));
+    let step = close_step(&mut t, Some(CloseAnswer::Discard));
     assert_eq!(keep_closed_draft(&root.0, &t, &step, 1, true, now), None);
     // Written while unsaved, but the answer was Cancel.
     let tabs = vec![t];
     write_session(&root.0, &tabs, 0, prefs());
     let mut t = tabs.into_iter().next().unwrap();
-    let step = close_step(&mut t, |_| Ok(CloseAnswer::Cancel));
+    let step = close_step(&mut t, Some(CloseAnswer::Cancel));
     assert_eq!(keep_closed_draft(&root.0, &t, &step, 1, true, now), None);
     // A clean tab is removed without a draft.
     let mut clean = tab(Kind::Xlsx);
-    let step = close_step(&mut clean, |_| panic!("clean tab asked"));
+    let step = close_step(&mut clean, None);
     assert_eq!(
         keep_closed_draft(&root.0, &clean, &step, 1, true, now),
         None
@@ -1928,4 +1898,439 @@ fn only_a_draft_that_loads_is_labelled_recovered() {
     assert!(draft_loaded(&opened));
     let broken = tab_from_path_mode(&bad, OpenMode::ReadOnly, &trusted).unwrap();
     assert!(!draft_loaded(&broken), "{}", broken.status);
+}
+
+/// A never-saved document tab titled `title` holding `markdown`.
+fn untitled(title: &str, markdown: &str) -> DocTab {
+    let mut tab = sample_doc().into_tab(Kind::Docx, title.into(), None, false);
+    tab.surface = Surface::Doc(Editor::new(docxcore::markdown::from_markdown(markdown)));
+    tab
+}
+
+fn fixtures() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures")
+}
+
+fn known() -> Vec<PathBuf> {
+    vec![PathBuf::from("/docs"), PathBuf::from("/desk")]
+}
+
+#[test]
+fn a_never_saved_document_proposes_its_first_words() {
+    let tab = untitled("Document1", "Quarterly report for the north region\n");
+    let name = prompt_name(&tab, &known());
+    assert_eq!(name.stem, "Quarterly report for the north region");
+    assert_eq!(name.ext, ".docx");
+    assert_eq!(name.locations, known());
+    // An empty one keeps its title.
+    let empty = prompt_name(&untitled("Document3", ""), &known());
+    assert_eq!(empty.stem, "Document3");
+}
+
+#[test]
+fn a_saved_document_proposes_its_own_name_in_its_own_folder() {
+    let tab = tab(Kind::Docx);
+    let name = prompt_name(&tab, &known());
+    assert_eq!(name.stem, "basic");
+    assert_eq!(name.ext, ".docx");
+    assert_eq!(name.locations[0], fixtures());
+    assert_eq!(&name.locations[1..], known().as_slice());
+    // Its own folder is not offered twice.
+    let again = prompt_name(&tab, &[fixtures(), PathBuf::from("/docs")]);
+    assert_eq!(again.locations, vec![fixtures(), PathBuf::from("/docs")]);
+    // Unchanged, Save writes it in place.
+    assert_eq!(
+        prompt_target(
+            &name.stem,
+            &name.ext,
+            &name.locations[0],
+            tab.path.as_deref(),
+            true
+        ),
+        Ok(PromptSave::InPlace)
+    );
+}
+
+#[test]
+fn a_markdown_document_keeps_its_extension() {
+    let dir = crate::open_mode_tests::Scratch::new();
+    let path = dir.path("notes.md");
+    std::fs::write(&path, "# Notes\n").unwrap();
+    let tab = tab_from_path(&path);
+    assert!(tab.markdown);
+    let name = prompt_name(&tab, &known());
+    assert_eq!((name.stem.as_str(), name.ext.as_str()), ("notes", ".md"));
+    assert_eq!(
+        prompt_target(
+            "notes",
+            ".md",
+            &name.locations[0],
+            tab.path.as_deref(),
+            true
+        ),
+        Ok(PromptSave::InPlace)
+    );
+    assert_eq!(
+        prompt_target(
+            "renamed",
+            ".md",
+            &name.locations[0],
+            tab.path.as_deref(),
+            true
+        ),
+        Ok(PromptSave::To(dir.path("renamed.md")))
+    );
+}
+
+#[test]
+fn a_tab_that_saves_as_never_saves_in_place_from_the_prompt() {
+    // Read-only, repaired and converted tabs, and an imported .doc: Save is
+    // Save As today, so the prompt never writes over the tab's own file.
+    let mut cases = Vec::new();
+    let mut read_only = tab(Kind::Docx);
+    read_only.access.read_only = true;
+    cases.push(read_only);
+    let mut repaired = tab(Kind::Docx);
+    repaired.access.repaired = true;
+    cases.push(repaired);
+    let mut converted = tab(Kind::Docx);
+    converted.access.converted = Some(crate::open_mode::Converted::Rtf);
+    cases.push(converted);
+    for tab in cases {
+        assert!(!saves_in_place(&tab));
+        let name = prompt_name(&tab, &known());
+        assert_eq!(name.ext, ".docx");
+        assert_eq!(name.locations[0], fixtures());
+        // The proposed name is a copy beside it, so Save (Enter) works.
+        assert_eq!(name.stem, "basic (copy)", "{:?}", tab.access);
+        assert_eq!(
+            prompt_target(
+                &name.stem,
+                &name.ext,
+                &name.locations[0],
+                tab.path.as_deref(),
+                false
+            ),
+            Ok(PromptSave::To(fixtures().join("basic (copy).docx"))),
+            "{:?}",
+            tab.access
+        );
+        // Typing its own name back is refused, never a silent overwrite.
+        let own = prompt_target("basic", ".docx", &fixtures(), tab.path.as_deref(), false);
+        assert!(
+            own.as_ref()
+                .unwrap_err()
+                .contains("not opened for saving in place"),
+            "{own:?}"
+        );
+    }
+    let mut imported = tab(Kind::Docx);
+    imported.path = Some(fixtures().join("letter.doc"));
+    imported.import.binary_source = true;
+    assert!(!saves_in_place(&imported));
+    let name = prompt_name(&imported, &known());
+    assert_eq!((name.stem.as_str(), name.ext.as_str()), ("letter", ".docx"));
+    assert_eq!(name.locations[0], fixtures());
+}
+
+#[test]
+fn the_prompts_default_save_leaves_a_read_only_original_alone() {
+    let dir = crate::open_mode_tests::Scratch::new();
+    let src = dir.path("report.docx");
+    std::fs::copy(fixtures().join("basic.docx"), &src).unwrap();
+    let before = std::fs::read(&src).unwrap();
+    let mut t = tab_from_path(&src);
+    t.access.read_only = true;
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!("{}", t.status)
+    };
+    ed.insert_str("Edited read-only");
+    t.dirty = true;
+    let name = prompt_name(&t, &known());
+    let PromptSave::To(target) = prompt_target(
+        &name.stem,
+        &name.ext,
+        &name.locations[0],
+        t.path.as_deref(),
+        saves_in_place(&t),
+    )
+    .unwrap() else {
+        panic!("a read-only tab never saves in place")
+    };
+    assert_eq!(target, dir.path("report (copy).docx"));
+    assert!(save_doc_tab(&mut t, Some(target.clone())), "{}", t.status);
+    assert_eq!(
+        std::fs::read(&src).unwrap(),
+        before,
+        "the original was written"
+    );
+    assert!(target.exists());
+}
+
+#[test]
+fn the_prompt_target_refuses_what_save_cannot_write() {
+    let dir = crate::open_mode_tests::Scratch::new();
+    let own = dir.path("mine.docx");
+    std::fs::write(&own, b"x").unwrap();
+    std::fs::write(dir.path("other.docx"), b"x").unwrap();
+    let at = |stem: &str| prompt_target(stem, ".docx", &dir.path(""), Some(&own), true);
+    assert_eq!(at("mine"), Ok(PromptSave::InPlace));
+    // A typed extension is the fixed one.
+    assert_eq!(at("mine.DOCX"), Ok(PromptSave::InPlace));
+    assert_eq!(at("  fresh "), Ok(PromptSave::To(dir.path("fresh.docx"))));
+    assert!(
+        at("other")
+            .unwrap_err()
+            .contains("other.docx already exists")
+    );
+    assert!(at("   ").unwrap_err().contains("Type a file name"));
+    for bad in [
+        "a/b", "a:b", "a*b", "a?b", "a\"b", "a<b", "a>b", "a|b", "a\\b",
+    ] {
+        assert!(at(bad).unwrap_err().contains("can't contain"), "{bad}");
+    }
+    // A never-saved document has no file of its own to write in place.
+    assert!(
+        prompt_target("other", ".docx", &dir.path(""), None, false)
+            .unwrap_err()
+            .contains("already exists")
+    );
+}
+
+#[test]
+fn the_document_prompt_is_words() {
+    let name = prompt_name(
+        &untitled("Document1", "Quarterly report for the north region\n"),
+        &known(),
+    );
+    let d = doc_prompt(&name, false);
+    assert_eq!(d.title, "Save your changes to this file?");
+    assert_eq!(d.owner, DialogOwner::SaveOnClose { quit: false });
+    let names: Vec<&str> = d.controls.iter().map(|c| c.name).collect();
+    assert_eq!(names, ["file-name", "extension", "location"]);
+    assert_eq!(d.controls[0].label, "File name:");
+    assert_eq!(
+        d.controls[0].text(),
+        "Quarterly report for the north region"
+    );
+    assert_eq!(d.controls[1].kind, ControlKind::Label);
+    assert_eq!(d.controls[1].text(), ".docx");
+    assert_eq!(d.controls[2].label, "Choose a Location:");
+    assert_eq!(d.controls[2].items, ["/docs", "/desk"]);
+    assert_eq!(d.controls[2].text(), "/docs");
+    let labels: Vec<&str> = d.buttons.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(labels, ["Save", "Don't Save", "Cancel", "More options..."]);
+    let mut stack = crate::dialog::DialogStack::default();
+    stack.push(d);
+    assert_eq!(stack.key_button("enter", true).as_deref(), Some("Save"));
+    assert_eq!(stack.key_button("escape", true).as_deref(), Some("Cancel"));
+    // Typing goes to the File name.
+    stack.top_dialog_mut().unwrap().type_char('!').unwrap();
+    assert_eq!(
+        stack.top().unwrap().controls[0].text(),
+        "Quarterly report for the north region!"
+    );
+}
+
+#[test]
+fn a_workbook_or_project_prompt_names_the_tab() {
+    for kind in [Kind::Xlsx, Kind::Project] {
+        let t = tab(kind);
+        let d = close_prompt(&t, true, &known());
+        assert_eq!(
+            d.text.as_deref(),
+            Some(format!("Save changes to {} before closing?", t.title).as_str())
+        );
+        assert_eq!(d.owner, DialogOwner::SaveOnClose { quit: true });
+        let labels: Vec<&str> = d.buttons.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["Save", "Don't Save", "Cancel"]);
+        assert!(d.buttons[0].default);
+    }
+}
+
+/// A file-backed document tab on a private copy of basic.docx, with `text`
+/// typed into it (unsaved).
+fn edited_copy(root: &Root, name: &str, text: &str) -> DocTab {
+    let path = root.0.join(name);
+    std::fs::copy(fixtures().join("basic.docx"), &path).unwrap();
+    let mut t = tab_from_path(&path);
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!("{}", t.status)
+    };
+    ed.insert_str(text);
+    t.dirty = true;
+    t
+}
+
+#[test]
+fn quitting_asks_each_unsaved_tab_once_in_order() {
+    let mut tabs = vec![
+        tab(Kind::Docx),
+        tab(Kind::Xlsx),
+        tab(Kind::Docx),
+        tab(Kind::Project),
+    ];
+    tabs[1].dirty = true;
+    tabs[3].dirty = true;
+    assert_eq!(next_to_ask(&tabs, &[]), Some(1));
+    // Answered Don't Save: the next one; a clean tab is never asked.
+    assert_eq!(next_to_ask(&tabs, &[1]), Some(3));
+    assert_eq!(next_to_ask(&tabs, &[1, 3]), None);
+    // Answered Save: it is clean now.
+    tabs[1].dirty = false;
+    assert_eq!(next_to_ask(&tabs, &[]), Some(3));
+}
+
+#[test]
+fn dont_save_on_quit_drops_a_never_saved_tab_and_forgets_a_files_edits() {
+    let root = Root::new("quit-forget");
+    let mut tabs = vec![
+        untitled("Document1", "never saved\n"),
+        edited_copy(&root, "kept.docx", "QuitKeptMarker"),
+        edited_copy(&root, "forgotten.docx", "QuitForgottenMarker"),
+        untitled("Document2", "also never saved\n"),
+    ];
+    let before = std::fs::read(root.0.join("forgotten.docx")).unwrap();
+    let mut active = 2;
+    let forget = forget_on_quit(&mut tabs, &mut active, vec![0, 2, 3]);
+    let titles: Vec<&str> = tabs.iter().map(|t| t.title.as_ref()).collect();
+    assert_eq!(titles, ["kept.docx", "forgotten.docx"]);
+    assert_eq!(forget, [1]);
+    assert_eq!(active, 1);
+
+    write_session_forgetting(&root.0, &tabs, active, prefs(), &forget);
+    let session = root.session();
+    assert!(session.tabs[0].dirty);
+    assert!(
+        session.tabs[0].hot.is_some(),
+        "an unanswered tab keeps its work"
+    );
+    assert!(!session.tabs[1].dirty);
+    assert!(session.tabs[1].hot.is_none());
+    assert!(tabs[1].last_hot.borrow().is_none());
+
+    // The next launch reopens the file as it is on disk, and the file was
+    // never written.
+    let restored = restore_session(
+        &session,
+        false,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    );
+    assert!(doc_text(&restored[0]).contains("QuitKeptMarker"));
+    assert!(!restored[1].dirty);
+    assert!(!doc_text(&restored[1]).contains("QuitForgottenMarker"));
+    assert_eq!(
+        std::fs::read(root.0.join("forgotten.docx")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn a_quit_is_live_only_while_its_question_is_open() {
+    let mut tabs = vec![tab(Kind::Docx), tab(Kind::Project)];
+    assert!(!quit_prompt_live(&tabs));
+    // A tab's own close prompt is not a quit.
+    let p = close_prompt(&tabs[1], false, &known());
+    tabs[1].dialogs.push(p);
+    assert!(!quit_prompt_live(&tabs));
+    tabs[1].dialogs.clear();
+    let p = close_prompt(&tabs[1], true, &known());
+    tabs[1].dialogs.push(p);
+    assert!(quit_prompt_live(&tabs));
+    // Cleared behind the app's back (a control verb, say): a later window
+    // close starts a new quit instead of waiting forever.
+    tabs[1].dialogs.clear();
+    assert!(!quit_prompt_live(&tabs));
+}
+
+#[test]
+fn a_quit_notices_its_tabs_changing() {
+    let mut tabs = vec![tab(Kind::Docx), tab(Kind::Xlsx)];
+    let at_start = tab_ids(&tabs);
+    assert_eq!(tab_ids(&tabs), at_start);
+    tabs.swap(0, 1);
+    assert_ne!(tab_ids(&tabs), at_start, "a reorder");
+    tabs.swap(0, 1);
+    tabs.remove(1);
+    assert_ne!(tab_ids(&tabs), at_start, "a close");
+}
+
+#[test]
+fn project_verbs_that_would_drop_a_close_prompt_are_refused() {
+    let mut tabs = vec![tab(Kind::Docx), tab(Kind::Project)];
+    for verb in [
+        "proj.open",
+        "proj.save",
+        "proj.reload",
+        projctl::MUTATING[0],
+        "proj.path",
+    ] {
+        assert_eq!(close_prompt_refusal(&tabs, verb), Ok(()), "{verb}");
+    }
+    let p = close_prompt(&tabs[1], true, &known());
+    tabs[1].dialogs.push(p);
+    for verb in [
+        "proj.open",
+        "proj.save",
+        "proj.reload",
+        projctl::MUTATING[0],
+    ] {
+        assert_eq!(
+            close_prompt_refusal(&tabs, verb),
+            Err("a dialog is open: docxy".into()),
+            "{verb}"
+        );
+    }
+    // Reads still answer.
+    assert_eq!(close_prompt_refusal(&tabs, "proj.path"), Ok(()));
+}
+
+#[test]
+fn a_quits_own_save_under_a_new_name_is_not_a_change_of_tabs() {
+    let mut tabs = vec![untitled("Document1", "Quarterly report\n"), tab(Kind::Docx)];
+    let mut ids = tab_ids(&tabs);
+    // Save named the never-saved document, and saved the other as a copy.
+    tabs[0].title = "Quarterly report.docx".into();
+    tabs[0].path = Some(PathBuf::from("/docs/Quarterly report.docx"));
+    refresh_tab_id(&mut ids, &tabs, 0);
+    assert_eq!(tab_ids(&tabs), ids);
+    tabs[1].title = "renamed.docx".into();
+    tabs[1].path = Some(PathBuf::from("/docs/renamed.docx"));
+    refresh_tab_id(&mut ids, &tabs, 1);
+    assert_eq!(tab_ids(&tabs), ids);
+    // Anything else still is.
+    tabs.swap(0, 1);
+    assert_ne!(tab_ids(&tabs), ids);
+    // Out of range: nothing to refresh, nothing panics.
+    refresh_tab_id(&mut ids, &tabs, 9);
+}
+
+#[test]
+fn an_in_place_tab_keeps_whatever_extension_it_has() {
+    let dir = crate::open_mode_tests::Scratch::new();
+    for (name, stem, ext) in [("Letter.dotx", "Letter", ".dotx"), ("Letter", "Letter", "")] {
+        let path = dir.path(name);
+        std::fs::copy(fixtures().join("basic.docx"), &path).unwrap();
+        let t = tab_from_path(&path);
+        assert!(matches!(t.surface, Surface::Doc(_)), "{name}: {}", t.status);
+        assert!(saves_in_place(&t), "{name}");
+        let prompt = prompt_name(&t, &known());
+        assert_eq!(
+            (prompt.stem.as_str(), prompt.ext.as_str()),
+            (stem, ext),
+            "{name}"
+        );
+        assert_eq!(
+            prompt_target(
+                &prompt.stem,
+                &prompt.ext,
+                &prompt.locations[0],
+                t.path.as_deref(),
+                true
+            ),
+            Ok(PromptSave::InPlace),
+            "{name}"
+        );
+    }
 }

@@ -1866,32 +1866,50 @@ fn file_tab_json(kind: crate::Kind) -> Json {
     ])
 }
 
-/// A ribbon reply: the tabs, their count and the Quick Access Toolbar.
+/// A ribbon reply: the tabs, their count and the Quick Access Toolbar as a
+/// tab without live state shows it ([`set_live_qat`] gives the live one).
 fn ribbon_reply(tabs: Vec<Json>) -> Json {
     let tab_count = tabs.len();
-    let qat = crate::QAT_ITEMS
-        .iter()
-        .map(|item| {
-            Json::obj(vec![
-                ("id", Json::Str(item.id.into())),
-                ("label", Json::Str(item.label.into())),
-                (
-                    "tip",
-                    Json::obj(vec![
-                        ("title", Json::Str(item.tip.into())),
-                        ("body", Json::Str(String::new())),
-                    ]),
-                ),
-                ("key_tip", Json::Str(String::new())),
-                ("checked", Json::Bool(false)),
-            ])
-        })
-        .collect();
     Json::obj(vec![
         ("tabs", Json::Arr(tabs)),
         ("tab_count", Json::Num(tab_count as f64)),
-        ("qat", Json::Arr(qat)),
+        ("qat", qat_json(crate::QatState::Plain)),
     ])
+}
+
+/// The Quick Access Toolbar as drawn in `state`: a document's redo button
+/// reads Redo or Repeat (#618), and its Undo reports its drop-down (#619).
+fn qat_json(state: crate::QatState) -> Json {
+    Json::Arr(
+        crate::qat_entries(state)
+            .into_iter()
+            .map(|entry| {
+                Json::obj(vec![
+                    ("id", Json::Str(entry.id.into())),
+                    ("label", Json::Str(entry.label.into())),
+                    (
+                        "tip",
+                        Json::obj(vec![
+                            ("title", Json::Str(entry.tip.into())),
+                            ("body", Json::Str(String::new())),
+                        ]),
+                    ),
+                    ("key_tip", Json::Str(String::new())),
+                    ("checked", Json::Bool(false)),
+                    ("enabled", Json::Bool(entry.enabled)),
+                    ("menu", Json::Bool(entry.menu)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// Replace a ribbon reply's Quick Access Toolbar with the one `state` draws.
+fn set_live_qat(json: &mut Json, state: crate::QatState) {
+    let Json::Obj(fields) = json else { return };
+    if let Some((_, qat)) = fields.iter_mut().find(|(k, _)| k == "qat") {
+        *qat = qat_json(state);
+    }
 }
 
 /// Ribbon snapshot using the active tab and live checked states.
@@ -1912,6 +1930,7 @@ fn ribbon_json(app: &crate::Docxy) -> Json {
         |act| app.act_enabled_now(act),
     );
     add_combo_values(&mut json, app);
+    set_live_qat(&mut json, app.qat_state());
     json
 }
 
@@ -2224,8 +2243,20 @@ fn menu_open(
                 let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
                 app.open_split_menu(id, at, cx)
             }
+            // The Quick Access Toolbar Undo arrow (#619).
+            "qat" => {
+                if fields[0].1.as_str() != Some(crate::menu::QAT_UNDO_ID) {
+                    return Err(format!(
+                        "'qat' names a Quick Access Toolbar split button; only \"{}\" has a menu",
+                        crate::menu::QAT_UNDO_ID
+                    ));
+                }
+                let anchor = crate::qat_undo_anchor(&app.probes.borrow());
+                let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
+                app.open_undo_menu(at, cx)
+            }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, row and ribbon are)"
+                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, row, ribbon and qat are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
@@ -2296,6 +2327,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "ribbon-click"
             | "title-tab"
             | "close-tab"
+            | "close-window"
             | "selection-set"
             | "open"
             | "backstage-close"
@@ -2311,6 +2343,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "dialog-tab"
             | "dialog-click"
             | "enable-editing"
+            | "edit-anyway"
     )
 }
 
@@ -2327,7 +2360,7 @@ fn menu_path(args: &Json) -> Result<Vec<&str>, String> {
                     .ok_or_else(|| "'path' must be an array of labels".to_string())
             })
             .collect(),
-        _ => Err("menu-click takes 'label' or 'path'".into()),
+        _ => Err("menu-click takes 'label', 'path' or 'index'".into()),
     }
 }
 
@@ -2528,6 +2561,15 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             "protected",
             Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.access.protected)),
         ),
+        // A document Word marked as final, until Edit Anyway (#617).
+        (
+            "final",
+            Json::Bool(
+                app.tabs
+                    .get(app.active)
+                    .is_some_and(|t| t.access.marked_final),
+            ),
+        ),
         (
             "repaired",
             Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.access.repaired)),
@@ -2701,6 +2743,7 @@ fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
                 ("caption", Json::Str(t.caption())),
                 ("read_only", Json::Bool(t.access.read_only)),
                 ("protected", Json::Bool(t.access.protected)),
+                ("final", Json::Bool(t.access.marked_final)),
                 ("repaired", Json::Bool(t.access.repaired)),
             ])
         })
@@ -2738,6 +2781,23 @@ fn open_dialogs(app: &mut crate::Docxy) -> Result<&mut crate::dialog::DialogStac
 /// the handler under test was broken — the one way this harness could be worse
 /// than nothing.
 pub fn dispatch(
+    app: &mut crate::Docxy,
+    verb: &str,
+    args: &Json,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) -> Result<Done, String> {
+    let mut done = dispatch_verb(app, verb, args, window, cx)?;
+    // The window's close went ahead (#630): its last question was answered
+    // by this verb, or `close-window` found nothing to ask. The process ends
+    // once this reply is out, as after `quit`.
+    if app.quit_ready {
+        done.quit = true;
+    }
+    Ok(done)
+}
+
+fn dispatch_verb(
     app: &mut crate::Docxy,
     verb: &str,
     args: &Json,
@@ -2946,12 +3006,16 @@ pub fn dispatch(
         "dialog-click" => {
             let button = arg_str(args, "button")?.to_string();
             open_dialogs(app)?;
-            app.dialog_press(&button)?;
+            app.dialog_press(&button, window, cx)?;
             app.refocus(window, cx);
             let Json::Obj(mut out) = state(app, window) else {
                 unreachable!("state is an object")
             };
-            let dialog = app.tabs[app.active].dialogs.to_json();
+            // A close prompt's Save or Don't Save may have closed the last tab.
+            let dialog = app.tabs.get(app.active).map_or_else(
+                || crate::dialog::DialogStack::default().to_json(),
+                |t| t.dialogs.to_json(),
+            );
             match out.iter_mut().find(|(k, _)| k == "dialog") {
                 Some((_, v)) => *v = dialog,
                 None => out.push(("dialog".into(), dialog)),
@@ -3093,9 +3157,15 @@ pub fn dispatch(
         "menu-click" => {
             app.refuse_under_dialog()?;
             refuse_under_cover(app)?;
-            let labels = menu_path(args)?;
             let menu = app.menu.as_ref().ok_or("no menu is open")?;
-            let path = crate::menu::resolve(&menu.items, &labels)?;
+            // `index` picks among items whose labels repeat (#619).
+            let path = match args.get("index") {
+                Some(_) if args.get("label").is_some() || args.get("path").is_some() => {
+                    return Err("menu-click takes 'label', 'path' or 'index'".into());
+                }
+                Some(_) => crate::menu::resolve_index(&menu.items, arg_usize(args, "index")?)?,
+                None => crate::menu::resolve(&menu.items, &menu_path(args)?)?,
+            };
             app.menu_activate(&path, window, cx)?;
             Done::ok(state(app, window))
         }
@@ -3137,6 +3207,18 @@ pub fn dispatch(
         "backstage-close" => {
             app.refuse_under_dialog()?;
             app.backstage_close(window, cx);
+            Done::ok(state(app, window))
+        }
+        // The window's close button, as `on_window_should_close` runs it
+        // outside the harness (#630): with "ask before closing" on and work
+        // unsaved, Word's question for each unsaved tab, driven with
+        // `dialog-click`; otherwise, or once the last one is answered, a clean
+        // exit, and the process ends after the reply.
+        "close-window" => {
+            app.refuse_under_dialog()?;
+            if app.window_should_close(true, window, cx) {
+                app.quit_ready = true;
+            }
             Done::ok(state(app, window))
         }
         "ask-on-close" => {
@@ -3305,6 +3387,18 @@ pub fn dispatch(
             app.enable_editing(cx);
             Done::ok(state(app, window))
         }
+        // The MARKED AS FINAL bar's Edit Anyway (#617).
+        "edit-anyway" => {
+            app.refuse_under_dialog()?;
+            let Some(t) = app.tabs.get(app.active).filter(|t| t.access.marked_final) else {
+                return Err("the active document is not marked as final".into());
+            };
+            if t.access.protected {
+                return Err(crate::open_mode::PROTECTED_STATUS.into());
+            }
+            app.edit_anyway(cx);
+            Done::ok(state(app, window))
+        }
 
         // A click on a cell: press, click, release — the three events the
         // pointer delivers, in that order.
@@ -3420,8 +3514,8 @@ pub fn dispatch(
             };
             let tab = app.tabs.get_mut(app.active).ok_or("no tab is open")?;
             // Attaching a data source changes what the document saves (#633).
-            if tab.access.protected {
-                return Err(crate::open_mode::PROTECTED_STATUS.into());
+            if tab.access.locked() {
+                return Err(tab.access.locked_status().into());
             }
             if tab.kind != crate::Kind::Docx {
                 return Err("mail-attach needs a Word document".into());
@@ -3533,11 +3627,13 @@ pub fn dispatch(
             let src = sheet(app)?.range();
             app.sheet_fill_start(cx);
             if app.sheet_fill.is_none() {
-                return Err(if app.protected_view() {
-                    format!(
-                        "the fill did not arm: {}",
-                        crate::open_mode::PROTECTED_STATUS
-                    )
+                let locked = app
+                    .tabs
+                    .get(app.active)
+                    .map(|t| t.access)
+                    .filter(|a| a.locked());
+                return Err(if let Some(access) = locked {
+                    format!("the fill did not arm: {}", access.locked_status())
                 } else if app.sheet_protected() {
                     "the fill did not arm: the sheet is protected".into()
                 } else {
@@ -4090,7 +4186,7 @@ mod tests {
         };
         let mut word = doc(crate::Kind::Docx, "a.docx");
         word.path = Some("C:/work/a.docx".into());
-        word.dirty = true;
+        word.set_dirty();
         let book = doc(crate::Kind::Xlsx, "Untitled.xlsx");
         let blank = crate::new_project_tab();
         let mut mpp = doc(crate::Kind::Project, "plan.mpp");
@@ -4483,6 +4579,57 @@ mod tests {
         );
     }
 
+    /// #618, #619: `ribbon-read`'s Quick Access Toolbar is the one drawn: a
+    /// document's live state replaces the plain Undo and Redo.
+    #[test]
+    fn ribbon_read_reports_the_live_qat_618_619() {
+        let item = |json: &Json, id: &str| {
+            json.get("qat")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q.get_str("id") == Some(id))
+                .cloned()
+                .unwrap()
+        };
+        let mut json = ribbon_json_for(crate::Kind::Docx, false, false, false, |_| false);
+        let redo = item(&json, "qat-redo");
+        assert_eq!(redo.get_str("label"), Some("Redo"));
+        assert_eq!(redo.get("enabled"), Some(&Json::Bool(true)));
+        assert_eq!(
+            item(&json, "qat-undo").get("menu"),
+            Some(&Json::Bool(false))
+        );
+        set_live_qat(
+            &mut json,
+            crate::QatState::Doc {
+                can_redo: false,
+                can_repeat: false,
+            },
+        );
+        let redo = item(&json, "qat-redo");
+        assert_eq!(redo.get_str("label"), Some("Repeat"));
+        assert_eq!(
+            redo.get("tip").unwrap().get_str("title"),
+            Some("Can't Repeat")
+        );
+        assert_eq!(redo.get("enabled"), Some(&Json::Bool(false)));
+        assert_eq!(item(&json, "qat-undo").get("menu"), Some(&Json::Bool(true)));
+        set_live_qat(
+            &mut json,
+            crate::QatState::Doc {
+                can_redo: false,
+                can_repeat: true,
+            },
+        );
+        let redo = item(&json, "qat-redo");
+        assert_eq!(
+            redo.get("tip").unwrap().get_str("title"),
+            Some("Repeat (Ctrl+Y)")
+        );
+        assert_eq!(redo.get("enabled"), Some(&Json::Bool(true)));
+    }
     #[test]
     fn ribbon_lists_gantt_chart_format_only_with_a_project_gantt() {
         let names = |ribbon: &Json| {
@@ -4793,6 +4940,7 @@ mod tests {
             "ribbon-click",
             "title-tab",
             "close-tab",
+            "close-window",
             "selection-set",
             "open",
             "select-chart",

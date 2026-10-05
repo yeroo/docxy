@@ -125,7 +125,7 @@ pub(crate) fn create_for(
     ed.edit_sections(&[root], |raw| {
         set_hf_reference(raw, is_header, variant.as_ooxml(), Some(&rid))
     });
-    tab.dirty = true;
+    tab.set_dirty();
     Some(part_name)
 }
 

@@ -29,7 +29,17 @@ pub(crate) enum MenuTarget {
         group: String,
         label: String,
     },
+    /// The Quick Access Toolbar Undo button's drop-down (#619): the undo
+    /// history, newest first.
+    QatUndo,
 }
+
+/// The Quick Access Toolbar's Undo split button, whose arrow opens
+/// [`MenuTarget::QatUndo`].
+pub(crate) const QAT_UNDO_ID: &str = "qat-undo";
+
+/// The most undo steps the Undo drop-down lists.
+pub(crate) const UNDO_LIST_CAP: usize = 100;
 
 impl MenuTarget {
     pub fn to_json(&self) -> Json {
@@ -53,6 +63,7 @@ impl MenuTarget {
                     Json::Str(label.clone()),
                 ]),
             )]),
+            Self::QatUndo => Json::obj(vec![("qat", Json::Str(QAT_UNDO_ID.into()))]),
         }
     }
 }
@@ -246,12 +257,14 @@ pub(crate) fn target_stands(
         (MenuTarget::Cell | MenuTarget::PickList | MenuTarget::FlashFill, Some(_)) => {
             Err("this menu runs on a sheet tab".into())
         }
+        (MenuTarget::QatUndo, Some(_)) => Err("the undo list does not run on a Project tab".into()),
         (
             MenuTarget::Document
             | MenuTarget::Cell
             | MenuTarget::PickList
             | MenuTarget::FlashFill
-            | MenuTarget::Ribbon { .. },
+            | MenuTarget::Ribbon { .. }
+            | MenuTarget::QatUndo,
             _,
         ) => Ok(()),
     }
@@ -267,8 +280,11 @@ pub(crate) fn split_arrow_opens(
     open: Option<&MenuTarget>,
     closed_by_this_press: Option<&MenuTarget>,
 ) -> bool {
-    let mine =
-        |t: Option<&MenuTarget>| matches!(t, Some(MenuTarget::Ribbon { id: i, .. }) if i == id);
+    let mine = |t: Option<&MenuTarget>| match t {
+        Some(MenuTarget::Ribbon { id: i, .. }) => i == id,
+        Some(MenuTarget::QatUndo) => id == QAT_UNDO_ID,
+        _ => false,
+    };
     !(mine(open) || mine(closed_by_this_press))
 }
 
@@ -309,6 +325,37 @@ pub(crate) fn resolve(items: &[MenuItem], path: &[&str]) -> Result<Vec<usize>, S
     }
     out.push(i);
     Ok(out)
+}
+
+/// The item a `menu-click {"index": k}` names: the `k`th clickable item
+/// (0-based, separators and headings not counted) among the top-level
+/// items. Labels can repeat (two `Typing "a"` steps in the undo list, #619);
+/// an index cannot.
+pub(crate) fn resolve_index(items: &[MenuItem], k: usize) -> Result<Vec<usize>, String> {
+    let entries: Vec<(usize, &Entry)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| match item {
+            MenuItem::Item(e) => Some((i, e)),
+            _ => None,
+        })
+        .collect();
+    let Some((i, e)) = entries.get(k) else {
+        return Err(format!(
+            "no menu item at index {k}; the menu has {} items",
+            entries.len()
+        ));
+    };
+    if !e.submenu.is_empty() {
+        return Err(format!(
+            "menu item '{}' opens a submenu; name an item in it with a path",
+            e.label
+        ));
+    }
+    if !e.enabled {
+        return Err(format!("menu item '{}' is disabled", e.label));
+    }
+    Ok(vec![*i])
 }
 
 /// The entry at an index path, if the path still names one.
@@ -533,6 +580,32 @@ pub(crate) fn split_menu(
                     .checked(checked(c.act))
                     .key(c.key_tip),
             )
+        })
+        .collect()
+}
+
+/// The Undo drop-down (#619): the undo steps' names, newest first (at most
+/// [`UNDO_LIST_CAP`]); the `k`th undoes `k + 1` steps, back to and
+/// including it. With nothing to undo, one disabled `Can't Undo`.
+pub(crate) fn undo_menu(names: &[String]) -> Vec<MenuItem> {
+    if names.is_empty() {
+        return vec![MenuItem::Item(Entry::unavailable(
+            "undo-none",
+            "Can't Undo",
+        ))];
+    }
+    names
+        .iter()
+        .take(UNDO_LIST_CAP)
+        .enumerate()
+        .map(|(k, name)| {
+            MenuItem::Item(Entry::new(
+                &format!("undo-{}", k + 1),
+                name,
+                "",
+                Act::UndoTo(k + 1),
+                true,
+            ))
         })
         .collect()
 }
@@ -791,6 +864,83 @@ mod tests {
             None,
             Some(&MenuTarget::Row(Some(1)))
         ));
+    }
+
+    #[test]
+    fn the_qat_undo_arrow_toggles_its_own_menu_619() {
+        let undo = MenuTarget::QatUndo;
+        assert!(split_arrow_opens(QAT_UNDO_ID, None, None));
+        assert!(!split_arrow_opens(QAT_UNDO_ID, Some(&undo), None));
+        assert!(!split_arrow_opens(QAT_UNDO_ID, None, Some(&undo)));
+        assert!(split_arrow_opens(
+            QAT_UNDO_ID,
+            Some(&MenuTarget::Document),
+            None
+        ));
+        // A ribbon arrow is not the Undo arrow.
+        assert!(split_arrow_opens("pr-baseline", Some(&undo), None));
+        assert_eq!(undo.to_json().to_string(), r#"{"qat":"qat-undo"}"#);
+        assert!(
+            target_stands(&undo, Some(None)).is_err(),
+            "never on a Project"
+        );
+        assert!(target_stands(&undo, None).is_ok());
+    }
+
+    #[test]
+    fn the_undo_menu_lists_names_newest_first_and_undoes_back_to_the_pick_619() {
+        let names: Vec<String> = ["Bold", "Typing \"two\"", "Enter", "Typing \"one\""]
+            .map(String::from)
+            .into();
+        let items = undo_menu(&names);
+        assert_eq!(labels(&items), names);
+        let acts: Vec<usize> = items
+            .iter()
+            .map(|item| match item {
+                MenuItem::Item(Entry {
+                    act: Some(Act::UndoTo(n)),
+                    enabled: true,
+                    ..
+                }) => *n,
+                _ => panic!("every entry undoes"),
+            })
+            .collect();
+        assert_eq!(acts, [1, 2, 3, 4]);
+        let none = undo_menu(&[]);
+        assert_eq!(labels(&none), ["Can't Undo"]);
+        assert!(resolve_index(&none, 0).is_err(), "disabled");
+        let many: Vec<String> = (0..150).map(|i| format!("Step {i}")).collect();
+        assert_eq!(undo_menu(&many).len(), UNDO_LIST_CAP);
+    }
+
+    #[test]
+    fn a_menu_item_resolves_by_index_when_labels_repeat_619() {
+        let names: Vec<String> = ["Typing \"a\"", "Enter", "Typing \"a\""]
+            .map(String::from)
+            .into();
+        let items = undo_menu(&names);
+        assert!(
+            resolve(&items, &["Typing \"a\""])
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+        assert_eq!(resolve_index(&items, 2), Ok(vec![2]));
+        assert_eq!(
+            entry_at(&items, &[2])
+                .unwrap()
+                .act
+                .map(|a| matches!(a, Act::UndoTo(3))),
+            Some(true)
+        );
+        assert!(
+            resolve_index(&items, 3)
+                .unwrap_err()
+                .contains("no menu item at index 3")
+        );
+        // Separators are not counted.
+        let doc = document_menu();
+        let path = resolve_index(&doc, 3).unwrap();
+        assert_eq!(entry_at(&doc, &path).unwrap().label, "Bold");
     }
 
     #[test]

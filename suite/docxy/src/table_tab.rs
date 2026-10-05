@@ -744,7 +744,7 @@ impl Docxy {
             match result {
                 Some(Ok(status)) => {
                     if edits(act) {
-                        tab.dirty = true;
+                        tab.set_dirty();
                     }
                     tab.status = status.into();
                 }

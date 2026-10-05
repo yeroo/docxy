@@ -296,7 +296,7 @@ mod tests {
     fn a_refused_save_as_leaves_the_tab_where_it_was() {
         let dir = temp("refused");
         let mut tab = docx_tab(&dir);
-        tab.dirty = true;
+        tab.set_dirty();
         let (path, title, markdown) = (tab.path.clone(), tab.title.clone(), tab.markdown);
         let index = dir.join("index.html");
         std::fs::write(&index, "<html>mine</html>").unwrap();
@@ -332,7 +332,7 @@ mod tests {
         let mut tab = docx_tab(&dir);
         tab.path = None;
         tab.title = "never-saved-164.docx".into();
-        tab.dirty = true;
+        tab.set_dirty();
         assert!(!crate::save_doc_tab(&mut tab, None));
         assert!(tab.dirty);
         assert!(tab.status.contains("never been saved"), "{}", tab.status);

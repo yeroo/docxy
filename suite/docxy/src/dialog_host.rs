@@ -111,6 +111,9 @@ fn apply_dialog(
         DialogOwner::AutoCorrect
         | DialogOwner::AutoCorrectExceptions
         | DialogOwner::AutoCorrectRedefine => Err("AutoCorrect is an app setting".into()),
+        // Handled in `close::close_prompt_click`, before this: it closes
+        // the tab, or goes on with the window's close.
+        DialogOwner::SaveOnClose { .. } => Err("closing a tab applies through the app".into()),
         // Handled in `user_name::click`, before this: it is the app's.
         DialogOwner::UserName => Err("the user name is an app setting".into()),
         #[cfg(test)]
@@ -198,7 +201,7 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
         Ok(())
     })?;
     if changed {
-        tab.dirty = true;
+        tab.set_dirty();
     }
     complete_project(tab, true);
     Ok(())
@@ -280,13 +283,23 @@ impl Docxy {
     }
 
     /// Press a button on the active tab's top dialog.
-    pub(crate) fn dialog_press(&mut self, button: &str) -> Result<(), String> {
+    pub(crate) fn dialog_press(
+        &mut self,
+        button: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         // The user name is the app's setting, not the tab's (#620).
         if let Some(done) = self.user_name_click(button) {
             return done;
         }
         // So is AutoCorrect (#667).
         if let Some(done) = self.autocorrect_click(button) {
+            return done;
+        }
+        // The close prompt closes the tab, or goes on with the window's
+        // close (#629, #630).
+        if let Some(done) = self.close_prompt_click(button, window, cx) {
             return done;
         }
         let reopen = reopen_on_top(self.tabs.get(self.active));
@@ -313,26 +326,26 @@ impl Docxy {
         key: &str,
         typed: Option<&str>,
         m: Modifiers,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        // Enter or Escape on an app-setting dialog (User name, AutoCorrect)
-        // presses through the app.
+        // Enter or Escape on a dialog the app owns (the user name, AutoCorrect, the
+        // close prompt) presses through the app, as its drawn buttons do.
         let plain = !m.control && !m.alt && !m.platform;
-        let app_dialog_button = self
+        let app_button = self
             .tabs
             .get(self.active)
             .filter(|t| {
                 t.dialogs.top().is_some_and(|d| {
-                    d.owner == DialogOwner::UserName
-                        || crate::sheet_autocorrect::is_autocorrect(d.owner)
+                    matches!(
+                        d.owner,
+                        DialogOwner::UserName | DialogOwner::SaveOnClose { .. }
+                    ) || crate::sheet_autocorrect::is_autocorrect(d.owner)
                 })
             })
             .and_then(|t| t.dialogs.key_button(key, plain));
-        if let Some(label) = app_dialog_button {
-            let done = self
-                .user_name_click(&label)
-                .or_else(|| self.autocorrect_click(&label));
-            if let Some(Err(e)) = done {
+        if let Some(label) = app_button {
+            if let Err(e) = self.dialog_press(&label, window, cx) {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.status = e.into();
                 }
@@ -356,7 +369,7 @@ impl Docxy {
     }
 
     fn dialog_button_click(&mut self, button: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(e) = self.dialog_press(button) {
+        if let Err(e) = self.dialog_press(button, window, cx) {
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 tab.status = e.into();
             }

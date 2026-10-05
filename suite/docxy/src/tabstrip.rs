@@ -179,7 +179,7 @@ pub fn move_index<T>(v: &mut Vec<T>, active: &mut usize, from: usize, to: usize)
 /// closed or another reorder landing mid-drag invalidates the snapshot, and
 /// the drop must not guess at what moved. `title_at_ix` is the title the
 /// stored index names now — `None` when it names nothing. Documented
-/// limitation: titles are not unique (new documents are all `Untitled.*`),
+/// limitation: titles are not unique (new workbooks are all `Untitled.*`),
 /// so a shift that lands the stored index on a same-title tab (at the same
 /// length) passes the guard.
 pub fn drag_applies(

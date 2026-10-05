@@ -404,8 +404,10 @@ pub(super) fn indent_project(tab: &mut DocTab, delta: i32) {
     }
     if let Err(e) = v.ed.indent(uid, delta) {
         tab.status = e.into();
+        return;
     }
     tab.dirty = v.ed.dirty();
+    crate::bump_edit_generation();
 }
 
 impl Docxy {

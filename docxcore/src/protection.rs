@@ -25,6 +25,10 @@ pub enum ProtectionDenial {
     FormsUnsupported,
     TrackedChangesUnsupported,
     UnsupportedMode(String),
+    /// Word's Mark as Final (#617). Not `w:documentProtection`, so
+    /// [`authorize`] never returns it: a host that knows the document is
+    /// final refuses with it before asking `authorize`, until Edit Anyway.
+    MarkedFinal,
 }
 
 impl ProtectionDenial {
@@ -37,6 +41,7 @@ impl ProtectionDenial {
             Self::FormsUnsupported => "forms_unsupported",
             Self::TrackedChangesUnsupported => "tracked_changes_unsupported",
             Self::UnsupportedMode(_) => "unsupported_mode",
+            Self::MarkedFinal => "marked_final",
         }
     }
 
@@ -55,6 +60,9 @@ impl ProtectionDenial {
             }
             Self::UnsupportedMode(mode) => {
                 format!("the document uses unsupported protection mode '{mode}'")
+            }
+            Self::MarkedFinal => {
+                "the document is marked as final; use Edit Anyway to edit it".to_string()
             }
         }
     }

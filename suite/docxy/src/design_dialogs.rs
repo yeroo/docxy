@@ -774,7 +774,9 @@ fn apply(tab: &mut DocTab, d: &Dialog) -> Result<(), String> {
         }
         _ => return Err("not a Design dialog".into()),
     };
-    tab.dirty |= changed;
+    if changed {
+        tab.set_dirty();
+    }
     tab.status = status.into();
     Ok(())
 }

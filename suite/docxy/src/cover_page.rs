@@ -179,7 +179,7 @@ pub(crate) fn cover_apply(tab: &mut DocTab, act: CoverAct) -> Result<(), String>
             tab.status = "Cover page removed".into();
         }
     }
-    tab.dirty = true;
+    tab.set_dirty();
     Ok(())
 }
 
@@ -190,7 +190,7 @@ pub(crate) fn blank_page_apply(tab: &mut DocTab) -> Result<(), String> {
     }
     if let Surface::Doc(ed) = &mut tab.surface {
         ed.insert_blank_page();
-        tab.dirty = true;
+        tab.set_dirty();
     }
     Ok(())
 }
