@@ -2,6 +2,7 @@
 //! rectangles of a multi-area selection.
 
 use super::Area;
+use super::areas::{RectIndex, entries_in};
 use super::paste_special::cells_to_rects;
 use crate::formula::{collect_refs, parse, translate_formula};
 use crate::sheet::{Cell, CellValue, Sheet, Workbook};
@@ -132,18 +133,10 @@ fn clip(a: Area, b: Area) -> Option<Area> {
     (r.0 <= r.2 && r.1 <= r.3).then_some(r)
 }
 
-/// The existing cells of `scope`, each once.
-fn cells_in<'a>(sheet: &'a Sheet, scope: &'a [Area]) -> Vec<((u32, u32), &'a Cell)> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    for &(r0, c0, r1, c1) in scope {
-        for (&(r, c), cell) in sheet.cells.range((r0, c0)..=(r1, c1)) {
-            if (c0..=c1).contains(&c) && seen.insert((r, c)) {
-                out.push(((r, c), cell));
-            }
-        }
-    }
-    out
+/// The existing cells of `scope`, each once, in sheet order (#707 r6:
+/// through an index of the areas, not a walk per area).
+fn cells_in<'a>(sheet: &'a Sheet, scope: &[Area]) -> Vec<((u32, u32), &'a Cell)> {
+    entries_in(&sheet.cells, scope, &RectIndex::new(scope))
 }
 
 /// The references a formula on `sheet` makes to cells of that same sheet,
@@ -272,68 +265,170 @@ pub(crate) fn union_rects(rects: &[Area]) -> Vec<Area> {
     out
 }
 
+/// Intervals `[lo, hi]` along one line of cells (a column's rows, or a
+/// row's columns), each naming a formula, found by the point they contain
+/// and taken out as they are found: every interval is returned at most once
+/// over all queries, and a query costs O((k + 1) log n) for k returned
+/// (#707 r6 M1). A max-tree of `hi` over the intervals sorted by `lo`.
+struct Stabber {
+    lo: Vec<u32>,
+    ids: Vec<usize>,
+    /// The tree of `hi + 1` (0 once taken), leaves from `size`.
+    max: Vec<u64>,
+    size: usize,
+}
+
+impl Stabber {
+    fn new(mut items: Vec<(u32, u32, usize)>) -> Stabber {
+        items.sort_unstable();
+        let size = items.len().next_power_of_two().max(1);
+        let mut max = vec![0u64; 2 * size];
+        for (k, &(_, hi, _)) in items.iter().enumerate() {
+            max[size + k] = u64::from(hi) + 1;
+        }
+        for k in (1..size).rev() {
+            max[k] = max[2 * k].max(max[2 * k + 1]);
+        }
+        Stabber {
+            lo: items.iter().map(|e| e.0).collect(),
+            ids: items.iter().map(|e| e.2).collect(),
+            max,
+            size,
+        }
+    }
+
+    /// Take out every interval that contains `x`, adding its formula to `out`.
+    fn take(&mut self, x: u32, out: &mut Vec<usize>) {
+        let upto = self.lo.partition_point(|&lo| lo <= x);
+        if upto > 0 {
+            self.descend(1, 0, self.size, upto, u64::from(x) + 1, out);
+        }
+    }
+
+    fn descend(
+        &mut self,
+        node: usize,
+        from: usize,
+        to: usize,
+        upto: usize,
+        need: u64,
+        out: &mut Vec<usize>,
+    ) {
+        if from >= upto || self.max[node] < need {
+            return;
+        }
+        if to - from == 1 {
+            out.push(self.ids[from]);
+            self.max[node] = 0;
+        } else {
+            let mid = (from + to) / 2;
+            self.descend(2 * node, from, mid, upto, need, out);
+            self.descend(2 * node + 1, mid, to, upto, need, out);
+            self.max[node] = self.max[2 * node].max(self.max[2 * node + 1]);
+        }
+    }
+}
+
 /// Where each formula on a sheet reads, indexed by what it reads, so "which
-/// formulas read cell (r, c)" is answered without scanning them all (#707
-/// r5 M2): single cells by cell, ranges up to 256 columns wide by column
-/// (sorted by first row), and wider ones in a short list.
+/// formulas read cell (r, c)" is answered without scanning them all, and
+/// each reference is examined once over a whole walk (#707 r5 M2, r6 M1):
+/// single cells by cell, a range along its shorter side (per column for a
+/// tall one, per row for a wide one), and a range huge both ways per block
+/// of [`BAND`] columns it covers whole, its ragged edge columns per column.
 struct ReadIndex {
     cells: Vec<(u32, u32)>,
     refs: Vec<Vec<Area>>,
     single: std::collections::HashMap<(u32, u32), Vec<usize>>,
-    by_col: std::collections::HashMap<u32, Vec<(u32, u32, usize)>>,
-    wide: Vec<(Area, usize)>,
+    by_col: std::collections::HashMap<u32, Stabber>,
+    by_row: std::collections::HashMap<u32, Stabber>,
+    by_band: std::collections::HashMap<u32, Stabber>,
 }
+
+/// The columns a [`ReadIndex`] band spans.
+const BAND: u32 = 256;
 
 impl ReadIndex {
     fn new(wb: &Workbook, sheet: usize, s: &Sheet) -> ReadIndex {
-        let mut ix = ReadIndex {
-            cells: Vec::new(),
-            refs: Vec::new(),
-            single: Default::default(),
-            by_col: Default::default(),
-            wide: Vec::new(),
-        };
+        use std::collections::HashMap;
+        let mut cells = Vec::new();
+        let mut refs_all = Vec::new();
+        let mut single: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        let mut cols: HashMap<u32, Vec<(u32, u32, usize)>> = HashMap::new();
+        let mut rows: HashMap<u32, Vec<(u32, u32, usize)>> = HashMap::new();
+        let mut bands: HashMap<u32, Vec<(u32, u32, usize)>> = HashMap::new();
         for (&rc, cell) in &s.cells {
             let Some(f) = cell.formula.as_deref() else {
                 continue;
             };
             let refs = same_sheet_refs(wb, sheet, f);
-            let i = ix.cells.len();
+            let i = cells.len();
             for &a in &refs {
-                if a.0 == a.2 && a.1 == a.3 {
-                    ix.single.entry((a.0, a.1)).or_default().push(i);
-                } else if a.3 - a.1 < 256 {
+                let (h, w) = (a.2 - a.0, a.3 - a.1);
+                if h == 0 && w == 0 {
+                    single.entry((a.0, a.1)).or_default().push(i);
+                } else if w <= h && w < 256 {
                     for c in a.1..=a.3 {
-                        ix.by_col.entry(c).or_default().push((a.0, a.2, i));
+                        cols.entry(c).or_default().push((a.0, a.2, i));
+                    }
+                } else if h < 256 {
+                    for r in a.0..=a.2 {
+                        rows.entry(r).or_default().push((a.1, a.3, i));
                     }
                 } else {
-                    ix.wide.push((a, i));
+                    // Whole bands, then the edge columns either side.
+                    let first = a.1.div_ceil(BAND);
+                    let last = (a.3 + 1) / BAND;
+                    for band in first..last {
+                        bands.entry(band).or_default().push((a.0, a.2, i));
+                    }
+                    let edges: Vec<u32> = if first >= last {
+                        (a.1..=a.3).collect()
+                    } else {
+                        (a.1..first * BAND).chain(last * BAND..=a.3).collect()
+                    };
+                    for c in edges {
+                        cols.entry(c).or_default().push((a.0, a.2, i));
+                    }
                 }
             }
-            ix.cells.push(rc);
-            ix.refs.push(refs);
+            cells.push(rc);
+            refs_all.push(refs);
         }
-        for list in ix.by_col.values_mut() {
-            list.sort_unstable();
+        ReadIndex {
+            cells,
+            refs: refs_all,
+            single,
+            by_col: cols
+                .into_iter()
+                .map(|(k, v)| (k, Stabber::new(v)))
+                .collect(),
+            by_row: rows
+                .into_iter()
+                .map(|(k, v)| (k, Stabber::new(v)))
+                .collect(),
+            by_band: bands
+                .into_iter()
+                .map(|(k, v)| (k, Stabber::new(v)))
+                .collect(),
         }
-        ix
     }
 
-    /// The formulas that read cell (r, c).
-    fn readers(&self, (r, c): (u32, u32), out: &mut Vec<usize>) {
-        if let Some(v) = self.single.get(&(r, c)) {
+    /// Take out the references to cell (r, c), adding the formulas that make
+    /// them to `out` (a formula may come more than once; the caller keeps
+    /// the ones it has found).
+    fn take_readers(&mut self, (r, c): (u32, u32), out: &mut Vec<usize>) {
+        if let Some(v) = self.single.remove(&(r, c)) {
             out.extend(v);
         }
-        if let Some(list) = self.by_col.get(&c) {
-            let upto = list.partition_point(|&(r0, _, _)| r0 <= r);
-            out.extend(list[..upto].iter().filter(|e| e.1 >= r).map(|e| e.2));
+        if let Some(t) = self.by_col.get_mut(&c) {
+            t.take(r, out);
         }
-        out.extend(
-            self.wide
-                .iter()
-                .filter(|(a, _)| inside(r, c, *a))
-                .map(|e| e.1),
-        );
+        if let Some(t) = self.by_row.get_mut(&r) {
+            t.take(c, out);
+        }
+        if let Some(t) = self.by_band.get_mut(&(c / BAND)) {
+            t.take(r, out);
+        }
     }
 }
 
@@ -363,7 +458,8 @@ pub fn go_to_special(
     let used = used_rect(s);
     let clip_used = |a: Area| used.and_then(|u| clip(a, u));
     let scope_used: Vec<Area> = scope.iter().filter_map(|&a| clip_used(a)).collect();
-    let in_scope = |r: u32, c: u32| scope.iter().any(|&a| inside(r, c, a));
+    let scope_ix = RectIndex::new(scope);
+    let in_scope = |r: u32, c: u32| scope_ix.holds(r, c);
     let rects: Vec<Area> = match kind {
         GoSpecial::Notes => cells_to_rects(
             &note_cells
@@ -500,15 +596,12 @@ pub fn go_to_special(
             // The formulas that read the selection, then (All levels) those
             // that read them, each found once through an index of what every
             // formula reads (#707 r5 M2).
-            let ix = ReadIndex::new(wb, sheet, s);
+            let mut ix = ReadIndex::new(wb, sheet, s);
             let mut found = vec![false; ix.cells.len()];
             let mut queue: Vec<usize> = Vec::new();
+            let areas_ix = RectIndex::new(areas);
             for (i, refs) in ix.refs.iter().enumerate() {
-                let hits = refs.iter().any(|&a| {
-                    areas
-                        .iter()
-                        .any(|&t| a.0 <= t.2 && t.0 <= a.2 && a.1 <= t.3 && t.1 <= a.3)
-                });
+                let hits = refs.iter().any(|&a| areas_ix.meets(a));
                 if hits {
                     found[i] = true;
                     queue.push(i);
@@ -518,7 +611,8 @@ pub fn go_to_special(
                 let mut readers = Vec::new();
                 while let Some(i) = queue.pop() {
                     readers.clear();
-                    ix.readers(ix.cells[i], &mut readers);
+                    let cell = ix.cells[i];
+                    ix.take_readers(cell, &mut readers);
                     for &j in &readers {
                         if !found[j] {
                             found[j] = true;
@@ -542,32 +636,21 @@ pub fn go_to_special(
             .collect(),
         GoSpecial::VisibleCells => {
             // By rows and columns, never cells: cheap over any scope, so
-            // the selection's own extent is kept (#707 r4 M2).
+            // the selection's own extent is kept (#707 r4 M2). The hidden
+            // rows and columns are gathered once, and each area cut by the
+            // runs of them it holds, not walked row by row (#707 r6).
+            let hidden_rows = runs(s.row_attrs.keys().copied().filter(|&r| s.row_hidden(r)));
+            let hidden_cols = runs((0..crate::sheet::MAX_COLS).filter(|&c| s.col_hidden(c)));
             let mut rects = Vec::new();
             for &a in scope {
-                let mut row_runs: Vec<(u32, u32)> = Vec::new();
-                for r in a.0..=a.2 {
-                    if s.row_hidden(r) {
-                        continue;
-                    }
-                    match row_runs.last_mut() {
-                        Some(run) if run.1 + 1 == r => run.1 = r,
-                        _ => row_runs.push((r, r)),
-                    }
-                }
-                let mut col_runs: Vec<(u32, u32)> = Vec::new();
-                for c in a.1..=a.3 {
-                    if s.col_hidden(c) {
-                        continue;
-                    }
-                    match col_runs.last_mut() {
-                        Some(run) if run.1 + 1 == c => run.1 = c,
-                        _ => col_runs.push((c, c)),
-                    }
-                }
+                let row_runs = visible_runs(a.0, a.2, &hidden_rows);
+                let col_runs = visible_runs(a.1, a.3, &hidden_cols);
                 for &(r0, r1) in &row_runs {
                     for &(c0, c1) in &col_runs {
                         rects.push((r0, c0, r1, c1));
+                    }
+                    if rects.len() > MAX_AREAS {
+                        return Err(TOO_MANY_AREAS);
                     }
                 }
             }
@@ -596,6 +679,38 @@ pub fn go_to_special(
     Ok(rects)
 }
 
+/// Sorted numbers as runs of consecutive ones.
+fn runs(sorted: impl Iterator<Item = u32>) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for x in sorted {
+        match out.last_mut() {
+            Some(run) if u64::from(run.1) + 1 == u64::from(x) => run.1 = x,
+            _ => out.push((x, x)),
+        }
+    }
+    out
+}
+
+/// The runs of `lo..=hi` outside the sorted, disjoint `hidden` runs.
+fn visible_runs(lo: u32, hi: u32, hidden: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut at = u64::from(lo);
+    let first = hidden.partition_point(|h| h.1 < lo);
+    for &(h0, h1) in &hidden[first..] {
+        if h0 > hi {
+            break;
+        }
+        if u64::from(h0) > at {
+            out.push((at as u32, h0 - 1));
+        }
+        at = at.max(u64::from(h1) + 1);
+    }
+    if at <= u64::from(hi) {
+        out.push((at as u32, hi));
+    }
+    out
+}
+
 /// The ranges of every rule (or, `same`, of the rules covering `active`),
 /// within the selection `areas` when it is more than one cell (the whole
 /// sheet otherwise), as rectangles: a rule's ranges are never walked cell
@@ -614,13 +729,17 @@ fn rule_ranges<'a>(
     } else {
         areas.to_vec()
     };
+    let scope_ix = RectIndex::new(&scope);
     let mut parts = Vec::new();
+    let mut met = Vec::new();
     for ranges in rules {
         if same && !ranges.iter().any(|&a| inside(active.0, active.1, a)) {
             continue;
         }
         for &a in ranges {
-            parts.extend(scope.iter().filter_map(|&s| clip(a, s)));
+            met.clear();
+            scope_ix.meeting(a, &mut met);
+            parts.extend(met.iter().filter_map(|&s| clip(a, s)));
         }
     }
     union_rects(&parts)

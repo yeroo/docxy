@@ -197,14 +197,21 @@ impl SheetView {
         if let Some(rect) = extras.clear_rules {
             gridcore::edit::clear_validation(sheet, rect);
         }
-        for (rect, rule) in &extras.rules {
-            let f2 = (!rule.formula2.is_empty()).then_some(rule.formula2.as_str());
-            self.pkg
-                .add_data_validation(s, *rect, &rule.kind, &rule.operator, &rule.formula1, f2);
-        }
-        for (r, c, author, text) in &extras.notes {
-            self.pkg.set_comment(s, *r, *c, author, text);
-        }
+        // Rules and notes each go in with one rewrite of their parts, not
+        // one per rule or note (#707 r6).
+        let rules: Vec<gridcore::xlsx::NewValidation> = extras
+            .rules
+            .iter()
+            .map(|(rect, rule)| gridcore::xlsx::NewValidation {
+                range: *rect,
+                kind: &rule.kind,
+                operator: &rule.operator,
+                formula1: &rule.formula1,
+                formula2: (!rule.formula2.is_empty()).then_some(rule.formula2.as_str()),
+            })
+            .collect();
+        self.pkg.add_data_validations(s, &rules);
+        self.pkg.set_comments(s, &extras.notes);
         let rect = block.pasted_rect(at, spec.transpose);
         self.sel = (rect.0, rect.1);
         self.anchor = (rect.2, rect.3);

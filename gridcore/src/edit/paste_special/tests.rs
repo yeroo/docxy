@@ -661,3 +661,119 @@ fn a_spill_with_an_operation_or_transposed() {
     paste(&mut wb, 0, "E1", &clip, tv);
     assert_eq!(value(&wb, 0, "G1"), CellValue::Number(3.0));
 }
+
+/// #707 r6 M3: 50,000 spilling anchors (each over two cells to its right)
+/// paste with Formulas fast, members blank.
+#[test]
+fn fifty_thousand_spilling_anchors_paste_fast() {
+    let mut wb = book(&[("Sheet1", &[])]);
+    let s = &mut wb.sheets[0];
+    for r in 0..50_000u32 {
+        s.set_cell(
+            r,
+            1,
+            Cell {
+                value: CellValue::Text("a".into()),
+                formula: Some("TEXTSPLIT(\"a,b,c\",\",\")".into()),
+                spill: Some((1, 3)),
+                ..Cell::default()
+            },
+        );
+        s.set_cell(r, 2, Cell::text("b"));
+        s.set_cell(r, 3, Cell::text("c"));
+    }
+    let clip = copy(&wb, 0, "B1:D50000");
+    let t = std::time::Instant::now();
+    let ch = paste_special_changes(
+        &mut wb,
+        0,
+        at("F1"),
+        &clip,
+        &PasteSpec::of(PasteWhat::Formulas),
+    )
+    .unwrap();
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(ch.len(), 150_000);
+    let g1 = ch.iter().find(|(r, c, _)| (*r, *c) == (0, 6)).unwrap();
+    assert!(g1.2.is_blank(), "a member pastes blank");
+}
+
+/// #707 r6: a 50,000-row copy with a validation rule and a note per row,
+/// formulas reading the copy transposed, and styles mixed per cell, is
+/// captured and pasted without a scan per cell.
+#[test]
+fn a_50k_row_copy_with_rules_notes_and_styles_is_fast() {
+    let mut wb = book(&[("Sheet1", &[])]);
+    let styles: Vec<u32> = (0..2_000)
+        .map(|k| {
+            wb.styles.intern(Xf {
+                code: Some(format!("0.00\" {k}\"")),
+                border: true,
+                ..Xf::default()
+            })
+        })
+        .collect();
+    let s = &mut wb.sheets[0];
+    for r in 0..50_000u32 {
+        let mut a = Cell::number(f64::from(r));
+        a.style = styles[r as usize % styles.len()];
+        s.set_cell(r, 0, a);
+        let mut b = Cell::formula(&format!("A{}*2", r + 1));
+        b.style = a_style(r, &styles);
+        s.set_cell(r, 1, b);
+        s.validations.push(DataValidation {
+            ranges: vec![(r, 0, r, 0)],
+            kind: "whole".into(),
+            operator: "greaterThan".into(),
+            formula1: "0".into(),
+            ..DataValidation::default()
+        });
+    }
+    let t = std::time::Instant::now();
+    let mut clip = copy(&wb, 0, "A1:B50000");
+    clip.set_notes((0..50_000u32).map(|r| (r, 0, "me".into(), format!("n{r}"))));
+    let ch = paste_special_changes(
+        &mut wb,
+        0,
+        at("D1"),
+        &clip,
+        &PasteSpec::of(PasteWhat::AllExceptBorders),
+    )
+    .unwrap();
+    let ex = paste_special_extras(&clip, at("D1"), &PasteSpec::of(PasteWhat::All));
+    // Transposed across the grid's width: each formula finds the copied
+    // cell it reads by binary search.
+    let wide = copy(&wb, 0, "A1:B16000");
+    let tr = paste_special_changes(
+        &mut wb,
+        0,
+        at("D1"),
+        &wide,
+        &PasteSpec {
+            transpose: true,
+            ..PasteSpec::of(PasteWhat::Formulas)
+        },
+    )
+    .unwrap();
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!((clip.rules.len(), clip.notes.len()), (50_000, 50_000));
+    assert_eq!(ex.rules.len(), 50_000);
+    assert_eq!(ch.len(), 100_000);
+    assert!(!wb.styles.xf(ch[0].2.style).border);
+    assert_eq!(tr.len(), 32_000);
+    // B1 (`A1*2`) lands at D2, reading A1's copy at D1.
+    let d2 = tr.iter().find(|(r, c, _)| (*r, *c) == (1, 3)).unwrap();
+    assert_eq!(d2.2.formula.as_deref(), Some("D1*2"));
+}
+
+fn a_style(r: u32, styles: &[u32]) -> u32 {
+    styles[(r as usize * 7) % styles.len()]
+}

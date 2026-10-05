@@ -350,3 +350,60 @@ fn a_tiled_paste_is_not_pasted_once() {
         "tiled three times"
     );
 }
+
+/// #707 r6: a copy of 50,000 rows each with a note and a validation rule
+/// pastes its notes and its rules with one rewrite of the note and
+/// worksheet parts each, not one per note or rule. (Comments and
+/// Validation write no cells: 50,000 cell writes go through the engine,
+/// whose per-cell cost is its own.)
+#[test]
+fn fifty_thousand_notes_and_rules_paste_fast() {
+    let mut v = view();
+    let n: u32 = std::env::var("PROBE_N")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(50_000);
+    for r in 0..n {
+        v.pkg.workbook.sheets[0].set_cell(r, 0, Cell::number(f64::from(r)));
+    }
+    let notes: Vec<(u32, u32, String, String)> = (0..n)
+        .map(|r| (r, 0, "Ann".into(), format!("n{r}")))
+        .collect();
+    let rules: Vec<gridcore::xlsx::NewValidation> = (0..n)
+        .map(|r| gridcore::xlsx::NewValidation {
+            range: (r, 0, r, 0),
+            kind: "whole",
+            operator: "greaterThan",
+            formula1: "-1",
+            formula2: None,
+        })
+        .collect();
+    let t = std::time::Instant::now();
+    assert!(v.pkg.set_comments(0, &notes));
+    assert!(v.pkg.add_data_validations(0, &rules));
+    let clip = copy(&mut v, "A1", &format!("A{n}"));
+    fast_enough(t);
+    assert_eq!(
+        (clip.block.notes.len(), clip.block.rules.len()),
+        (n as usize, n as usize)
+    );
+    // Each paste on its own: linear, 12,500 to 50,000 rows doubling its
+    // time at each step.
+    for what in [PasteWhat::Comments, PasteWhat::Validation] {
+        let t = std::time::Instant::now();
+        v.paste_special_at(&clip.block, &PasteSpec::of(what), at("C1"))
+            .unwrap();
+        fast_enough(t);
+    }
+    assert_eq!(v.note_cells().len(), 2 * n as usize);
+    assert_eq!(v.sheet().validations.len(), 2 * n as usize);
+    assert!(v.sheet().validations.iter().all(|dv| dv.ix.is_some()));
+}
+
+fn fast_enough(t: std::time::Instant) {
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        t.elapsed()
+    );
+}

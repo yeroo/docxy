@@ -343,7 +343,7 @@ fn the_series_dialog_and_an_unreachable_stop() {
     };
     assert_eq!(
         v.fill_series(&spec, &[]),
-        Err(gridcore::edit::STOP_UNREACHABLE.to_string())
+        Err("The stop value can never be reached with this step value.".to_string())
     );
 }
 

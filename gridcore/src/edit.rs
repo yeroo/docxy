@@ -16,25 +16,26 @@ use std::collections::BTreeMap;
 /// selection, a copy, a Subtotal region.
 pub type Area = (u32, u32, u32, u32);
 
+mod areas;
+pub use areas::{RectIndex, cells_in_areas};
 mod clear;
 mod clip;
 mod goto_special;
 #[cfg(test)]
 pub(crate) use clear::apply_clear;
-pub use clear::{ClearPlan, ClearWhat, MERGED_PART, apply_clear_sheet, clear_plan};
+pub use clear::{ClearPlan, ClearWhat, apply_clear_sheet, clear_plan};
 pub use goto_special::{GoSpecial, NO_CELLS, Types, go_to_special, resolve_reference};
 mod series;
 pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
 pub use series::{
-    FillDir, FillKind, FillTarget, JUSTIFY_OVERFLOW, STEP_OUT_OF_RANGE, STOP_UNREACHABLE,
-    SeriesSpec, SeriesType, builtin_lists, fill_down_to, fill_target, justify_lines,
-    series_rows_for,
+    FillDir, FillKind, FillTarget, JUSTIFY_OVERFLOW, SeriesSpec, SeriesType, builtin_lists,
+    fill_down_to, fill_target, justify_lines, series_rows_for,
 };
 mod consolidate;
 mod paste_special;
 pub use paste_special::{
     ClipBlock, ClipNote, ClipRule, MULTI_SELECTION, PasteExtras, PasteOp, PasteSpec, PasteWhat,
-    TRANSPOSE_ARRAY, clear_validation, multi_area_shape, paste_link_changes, paste_special_changes,
+    clear_validation, multi_area_shape, paste_link_changes, paste_special_changes,
     paste_special_extras,
 };
 mod subtotal;

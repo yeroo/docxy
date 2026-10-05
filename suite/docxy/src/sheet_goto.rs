@@ -55,9 +55,8 @@ impl SheetView {
         self.engine
             .set_cells_prechecked(&mut self.pkg.workbook, s, plan.cells.clone());
         apply_clear_sheet(&mut self.pkg.workbook.sheets[s], &plan);
-        for &(r, c) in &plan.notes {
-            self.pkg.remove_comment(s, r, c);
-        }
+        // In one rewrite of the note parts (#707 r6).
+        self.pkg.remove_comments(s, &plan.notes);
         Ok(true)
     }
 }
@@ -431,6 +430,30 @@ mod tests {
         assert_eq!(view(&mut t).sel, at("D9"));
     }
 
+    /// #707 r6 m2: Enter and Escape on Go To and Go To Special press
+    /// through the app, whose press drops the grid state of a sheet Go To
+    /// left; the buttons they name are what the dialogs' own clicks take.
+    #[test]
+    fn enter_and_escape_on_go_to_press_through_the_app() {
+        use crate::dialog_host::{dialog_click, presses_through_app};
+        let mut t = tab();
+        t.dialogs.push(goto_dialog(&t).unwrap());
+        let top = t.dialogs.top().unwrap();
+        assert!(presses_through_app(&top.owner));
+        assert!(presses_through_app(&DialogOwner::GoToSpecial));
+        assert!(!presses_through_app(&DialogOwner::Test));
+        set(&mut t, "reference", Value::Text("C7".into()));
+        let enter = t.dialogs.key_button("enter", true).unwrap();
+        assert_eq!(dialog_click(&mut t, &enter), Ok(()));
+        assert_eq!(view(&mut t).sel, at("C7"));
+        assert!(!t.dialogs.is_open());
+        t.dialogs.push(goto_dialog(&t).unwrap());
+        assert_eq!(click(&mut t, "Special..."), Some(Ok(())));
+        let escape = t.dialogs.key_button("escape", true).unwrap();
+        assert_eq!(dialog_click(&mut t, &escape), Ok(()));
+        assert!(!t.dialogs.is_open(), "Escape closes Go To Special");
+    }
+
     /// #671's QA case through the dialogs: Go To › Special… › Blanks over
     /// A1:A10 selects A2:A4 and A6:A9, with A2 active (R6); `=A1` and
     /// Ctrl+Enter then fill the grouping column from above.
@@ -513,6 +536,75 @@ mod tests {
         assert_eq!(v.undo.len(), 1, "no step for nothing");
         assert_eq!(v.clear_what(ClearWhat::All), Ok(true));
         assert!(v.sheet().cell(2, 2).is_none());
+    }
+
+    /// #707 r6: Delete, Clear All's plan and Clear Comments over 10,000
+    /// areas (5,000 whole-height column strips and 5,000 single cells) of a
+    /// sheet with 50,000 cells and notes: the areas are indexed, and the
+    /// notes go in one rewrite of their parts. (Writing 50,000 cells goes
+    /// through the engine, whose per-cell cost is its own.)
+    #[test]
+    fn clearing_10k_areas_with_50k_notes_is_fast() {
+        let n = 50_000u32;
+        let mut t = tab();
+        let v = view(&mut t);
+        for r in 0..n {
+            v.pkg.workbook.sheets[0].set_cell(r, 0, Cell::number(1.0));
+            v.pkg.workbook.sheets[0].set_cell(r, 1, Cell::number(2.0));
+        }
+        let notes: Vec<(u32, u32, String, String)> = (0..n)
+            .map(|r| (r, 0, "Ann".into(), format!("n{r}")))
+            .collect();
+        assert!(v.pkg.set_comments(0, &notes));
+        let mut areas: Vec<(u32, u32, u32, u32)> =
+            (0..5_000u32).map(|k| (0, 2 * k, n - 1, 2 * k)).collect();
+        areas.extend((0..5_000u32).map(|k| (k * 10, 1, k * 10, 1)));
+        v.set_areas(&areas);
+        let started = std::time::Instant::now();
+        assert_eq!(v.clear_changes().len(), 55_000);
+        let plan =
+            gridcore::edit::clear_plan(v.sheet(), &areas, ClearWhat::All, &v.note_cells()).unwrap();
+        assert_eq!((plan.cells.len(), plan.notes.len()), (55_000, 50_000));
+        assert_eq!(v.clear_what(ClearWhat::Comments), Ok(true));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(v.note_cells().is_empty());
+    }
+
+    /// #707 r6: a format over 50,000 cells in 2,000 styles interns each
+    /// new style once, not a scan of the style table per cell.
+    #[test]
+    fn formatting_50k_cells_of_2k_styles_is_fast() {
+        let mut t = tab();
+        let v = view(&mut t);
+        let styles: Vec<u32> = (0..2_000)
+            .map(|k| {
+                v.pkg.workbook.styles.intern(gridcore::sheet::Xf {
+                    code: Some(format!("0.00\" {k}\"")),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        for r in 0..50_000u32 {
+            let mut c = Cell::number(1.0);
+            c.style = styles[r as usize % styles.len()];
+            v.pkg.workbook.sheets[0].set_cell(r, 0, c);
+        }
+        v.anchor = (0, 0);
+        v.sel = (49_999, 0);
+        v.clear_areas();
+        let started = std::time::Instant::now();
+        v.format_selection(&|xf| xf.bold = true);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        let cell = v.sheet().cell(49_999, 0).unwrap();
+        assert!(v.pkg.workbook.styles.xf(cell.style).bold);
     }
 
     #[test]

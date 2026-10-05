@@ -650,21 +650,6 @@ struct SheetView {
     areas_dead: std::cell::Cell<bool>,
 }
 
-/// The column spans of `areas` on each row below `rows` (#670, R17): what
-/// the row renderer asks, one row at a time.
-fn area_row_index(
-    areas: &[(u32, u32, u32, u32)],
-    rows: u32,
-) -> std::collections::HashMap<u32, Vec<(u32, u32)>> {
-    let mut index: std::collections::HashMap<u32, Vec<(u32, u32)>> = Default::default();
-    for &(r0, c0, r1, c1) in areas {
-        for r in r0..=r1.min(rows.saturating_sub(1)) {
-            index.entry(r).or_default().push((c0, c1));
-        }
-    }
-    index
-}
-
 /// Whether a pointer event's modifiers hold Excel's Ctrl (Cmd on macOS).
 fn ctrl_held(m: &Modifiers) -> bool {
     m.control || (cfg!(target_os = "macos") && m.platform)
@@ -2202,17 +2187,12 @@ impl SheetView {
     /// The blanks clearing the selected range writes: each cell's content
     /// goes, its style stays.
     fn clear_changes(&self) -> Vec<(u32, u32, gridcore::sheet::Cell)> {
-        let mut changes = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
-        // Every area of a multi-area selection (#670).
-        for (r0, c0, r1, c1) in self.areas_all() {
-            for (&(r, c), cell) in self.sheet().cells.range((r0, 0)..=(r1, u32::MAX)) {
-                if (c0..=c1).contains(&c) && seen.insert((r, c)) {
-                    changes.push((r, c, cell.blank_like()));
-                }
-            }
-        }
-        changes
+        // Every area of a multi-area selection (#670), through an index of
+        // the areas rather than a walk per area (#707 r6).
+        gridcore::edit::cells_in_areas(self.sheet(), &self.areas_all())
+            .into_iter()
+            .map(|((r, c), cell)| (r, c, cell.blank_like()))
+            .collect()
     }
 
     /// Why `buf` cannot be committed into the cells `rect` of sheet `s` as a
@@ -2757,7 +2737,10 @@ impl SheetView {
     /// Values and formulas are untouched, so no recalc is needed.
     fn format_selection(&mut self, apply: &dyn Fn(&mut gridcore::sheet::Xf)) {
         let s = self.active;
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = std::collections::HashSet::new();
+        // Each old style's new one, interned once: interning scans the style
+        // table (#707 r6).
+        let mut restyled: std::collections::HashMap<u32, u32> = Default::default();
         // Every area of a multi-area selection (#670), each cell once.
         for (r0, c0, r1, c1) in self.areas_all() {
             for (r, c) in (r0..=r1).flat_map(|r| (c0..=c1).map(move |c| (r, c))) {
@@ -2765,13 +2748,13 @@ impl SheetView {
                     continue;
                 }
                 let cur = self.sheet().cell(r, c).cloned();
-                let mut xf = self
-                    .pkg
-                    .workbook
-                    .styles
-                    .xf(cur.as_ref().map(|cl| cl.style).unwrap_or(0));
-                apply(&mut xf);
-                let idx = self.pkg.workbook.styles.intern(xf);
+                let old = cur.as_ref().map(|cl| cl.style).unwrap_or(0);
+                let styles = &mut self.pkg.workbook.styles;
+                let idx = *restyled.entry(old).or_insert_with(|| {
+                    let mut xf = styles.xf(old);
+                    apply(&mut xf);
+                    styles.intern(xf)
+                });
                 let mut cell = cur.unwrap_or_default();
                 cell.style = idx;
                 self.pkg.workbook.sheets[s].set_cell(r, c, cell);
@@ -12010,7 +11993,7 @@ impl Docxy {
                     .map(SheetView::extra_areas)
                     .unwrap_or_default(),
             ),
-            area_rows: Default::default(),
+            area_ix: Default::default(),
             border_grips: self.edit_opts.fill_handle
                 && cell_selection_shown(self.chart_sel)
                 && !self.grid_gesture_in_flight()
@@ -28824,8 +28807,8 @@ struct GridOverlay {
     /// Ctrl+Shift+U: the formula bar is about four lines tall (#672).
     fx_expanded: bool,
     /// The selection's areas other than the active one (#670), shaded like
-    /// it. An INPUT to `area_rows`, which `sheet_el` builds for the rows it
-    /// draws; the row renderer reads that.
+    /// it. An INPUT to `area_ix`, which `sheet_el` builds; the row renderer
+    /// reads that.
     extra_areas: std::rc::Rc<Vec<(u32, u32, u32, u32)>>,
     /// The cell the Auto Fill Options button (#668) or the Paste Options
     /// button (#669) hangs off: the bottom-right of what was filled or
@@ -28835,9 +28818,10 @@ struct GridOverlay {
     /// one area, the fill handle and drag-and-drop on, nothing being edited
     /// or pointed at, and no gesture in flight.
     border_grips: bool,
-    /// `extra_areas` by row: each row's column spans, for the rows drawn
-    /// (R17), so a cell asks only its own row.
-    area_rows: std::rc::Rc<std::collections::HashMap<u32, Vec<(u32, u32)>>>,
+    /// `extra_areas` indexed (R17): a drawn cell asks the index, which costs
+    /// a log of the areas, not their rows; a per-row map built each frame
+    /// cost every area's rows (#707 r6).
+    area_ix: std::rc::Rc<gridcore::edit::RectIndex>,
     /// What the dashed brand border outlines this frame: the pointed range,
     /// else a selection spanning more than one cell (`border_range`), with its
     /// rows snapped onto the ones the grid draws (`snap_range_rows`).
@@ -28966,11 +28950,7 @@ fn sheet_row(
         // wash instead of the ring, so only the picked range reads as an outline.
         let ring = selected && !ov.picking && !ov.sel_hidden;
         let in_range = !ov.sel_hidden
-            && ((r >= r0 && r <= r1 && c >= c0 && c <= c1)
-                || ov
-                    .area_rows
-                    .get(&r)
-                    .is_some_and(|spans| spans.iter().any(|&(a, b)| c >= a && c <= b)));
+            && ((r >= r0 && r <= r1 && c >= c0 && c <= c1) || ov.area_ix.holds(r, c));
         // Cells the fill drag would reach: shaded while the button is down, so
         // the drag reads as a preview and nothing has actually moved yet.
         let in_preview = !in_range
@@ -31006,9 +30986,9 @@ fn sheet_el(
                 .collect(),
         )
     };
-    let area_rows = std::rc::Rc::new(area_row_index(&ov.extra_areas, total_rows as u32));
+    let area_ix = std::rc::Rc::new(gridcore::edit::RectIndex::new(&ov.extra_areas));
     let ov = GridOverlay {
-        area_rows,
+        area_ix,
         handle_hidden: ov.handle_hidden || corner_under_chart,
         border_rg,
         range_dashed,

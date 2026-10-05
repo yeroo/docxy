@@ -12,6 +12,7 @@
 use crate::sheet::{Cell, CellValue, NumFmt, Styles, classify_format_code, parts_to_serial};
 
 use super::Area;
+use std::collections::HashMap;
 
 /// How a fill writes its cells: what the Auto Fill Options button, the
 /// fill handle's right-drag menu and the Series dialog offer.
@@ -454,38 +455,85 @@ fn exact_step(ys: &[f64]) -> Option<f64> {
         .then_some(step)
 }
 
-/// The linear series through `ys` at index `n`: an exact run by its step
+/// A group of seeds and what each of its outputs reads, worked out once:
+/// the fits walk every seed, and a line has as many outputs (#707 r6).
+struct Group {
+    ys: Vec<f64>,
+    /// `exact_step` of the seeds.
+    exact: Option<f64>,
+    /// The least-squares line through the seeds.
+    fit: (f64, f64),
+    /// The least-squares line through their logs, when all are positive.
+    log_fit: Option<(f64, f64)>,
+    /// Date seeds: `month_step`, and the month step between every two
+    /// seeds when it is one and the same.
+    month: Option<i64>,
+    even_months: Option<i64>,
+}
+
+impl Group {
+    fn new(ys: Vec<f64>, dates: bool, date1904: bool) -> Group {
+        let positive = ys.iter().all(|&y| y > 0.0);
+        let log_fit = positive.then(|| {
+            let logs: Vec<f64> = ys.iter().map(|y| y.ln()).collect();
+            linear_fit(&logs)
+        });
+        let (month, even_months) = if dates && ys.len() > 1 {
+            let months: Option<Vec<i64>> = ys
+                .iter()
+                .map(|&y| ymd(y, date1904).map(|(yy, mm, ..)| yy * 12 + i64::from(mm)))
+                .collect();
+            let even = months.and_then(|ms| {
+                let d = ms[1] - ms[0];
+                ms.windows(2).all(|w| w[1] - w[0] == d).then_some(d)
+            });
+            (month_step(&ys, date1904), even)
+        } else {
+            (None, None)
+        };
+        Group {
+            exact: exact_step(&ys),
+            fit: linear_fit(&ys),
+            log_fit,
+            month,
+            even_months,
+            ys,
+        }
+    }
+}
+
+/// The linear series through `g` at index `n`: an exact run by its step
 /// from the last seed, anything else along the least-squares line. One seed
 /// steps by `lone`.
-fn linear_at(ys: &[f64], n: f64, lone: f64) -> f64 {
+fn linear_at(g: &Group, n: f64, lone: f64) -> f64 {
+    let ys = &g.ys;
     let m = ys.len();
     if m == 1 {
         return ys[0] + lone * n;
     }
-    if let Some(step) = exact_step(ys) {
+    if let Some(step) = g.exact {
         return ys[m - 1] + step * (n - (m - 1) as f64);
     }
-    let (a, b) = linear_fit(ys);
+    let (a, b) = g.fit;
     a + b * n
 }
 
-/// The growth series through `ys` at index `n`: two seeds by their ratio,
+/// The growth series through `g` at index `n`: two seeds by their ratio,
 /// three or more along the least-squares exponential. A non-positive seed
 /// has no exponential: those fall back to the linear series.
-fn growth_at(ys: &[f64], n: f64) -> f64 {
+fn growth_at(g: &Group, n: f64) -> f64 {
+    let ys = &g.ys;
     let m = ys.len();
     if m == 1 {
         return ys[0];
     }
-    if ys.iter().all(|&y| y > 0.0) {
+    if let Some((a, b)) = g.log_fit {
         if m == 2 {
             return ys[0] * (ys[1] / ys[0]).powf(n);
         }
-        let logs: Vec<f64> = ys.iter().map(|y| y.ln()).collect();
-        let (a, b) = linear_fit(&logs);
         return (a + b * n).exp();
     }
-    linear_at(ys, n, 1.0)
+    linear_at(g, n, 1.0)
 }
 
 /// Calendar parts of a date serial: (year, month, day, seconds into the day).
@@ -618,7 +666,8 @@ fn month_step(ys: &[f64], date1904: bool) -> Option<i64> {
 }
 
 /// A date group's value at index `n` for `kind`.
-fn date_at(ys: &[f64], n: f64, t: Temporal, kind: FillKind, date1904: bool, dir: f64) -> f64 {
+fn date_at(g: &Group, n: f64, t: Temporal, kind: FillKind, date1904: bool, dir: f64) -> f64 {
+    let ys = &g.ys;
     let m = ys.len();
     let last = ys[m - 1];
     let ahead = n - (m - 1) as f64;
@@ -665,28 +714,23 @@ fn date_at(ys: &[f64], n: f64, t: Temporal, kind: FillKind, date1904: bool, dir:
             // Seeds a whole step apart run on from the first, so a clamped
             // month end does not stick (31 Jan, 29 Feb, 31 Mar); uneven ones
             // continue from the last, as Days does (#707 r4 m1).
-            let months = |y: f64| ymd(y, date1904).map(|(yy, mm, ..)| yy * 12 + i64::from(mm));
-            let even = ys.windows(2).all(|w| match (months(w[0]), months(w[1])) {
-                (Some(a), Some(b)) => b - a == step,
-                _ => false,
-            });
-            if m == 1 || even {
+            if m == 1 || g.even_months == Some(step) {
                 add_months(ys[0], step * n.round() as i64, date1904)
             } else {
                 add_months(last, step * ahead.round() as i64, date1904)
             }
         }
-        FillKind::LinearTrend => linear_at(ys, n, dir),
-        FillKind::GrowthTrend => growth_at(ys, n),
+        FillKind::LinearTrend => linear_at(g, n, dir),
+        FillKind::GrowthTrend => growth_at(g, n),
         _ => {
             if m == 1 {
                 let lone = if t == Temporal::Time { dir / 24.0 } else { dir };
                 return ys[0] + lone * n;
             }
-            if let Some(step) = month_step(ys, date1904) {
+            if let Some(step) = g.month {
                 return add_months(ys[0], step * n.round() as i64, date1904);
             }
-            linear_at(ys, n, 1.0)
+            linear_at(g, n, 1.0)
         }
     }
 }
@@ -729,28 +773,48 @@ pub(crate) fn extend_line(
     if lone_plain && matches!(kind, FillKind::Auto | FillKind::WithoutFormatting) {
         return copy_all();
     }
-    // Each position's group: the positions sharing its key, in order.
-    let keys: Vec<Option<Key>> = seeds.iter().map(Seed::key).collect();
+    // Each position's group (the positions sharing its key, in order) and
+    // its place in it, found once for the whole line (#707 r6).
+    let mut group_of: HashMap<Key, usize> = HashMap::new();
+    let mut members: Vec<Vec<usize>> = Vec::new();
+    let place: Vec<Option<(usize, usize)>> = seeds
+        .iter()
+        .enumerate()
+        .map(|(k, seed)| {
+            let key = seed.key()?;
+            let g = *group_of.entry(key).or_insert_with(|| {
+                members.push(Vec::new());
+                members.len() - 1
+            });
+            members[g].push(k);
+            Some((g, members[g].len() - 1))
+        })
+        .collect();
+    let groups: Vec<Group> = members
+        .iter()
+        .map(|ms| {
+            let ys = ms.iter().map(|&j| seeds[j].value()).collect();
+            let dates = matches!(seeds[ms[0]], Seed::Date(..));
+            Group::new(ys, dates, ctx.date1904)
+        })
+        .collect();
     (0..count)
         .map(|t| {
             let k = t % len;
-            let Some(key) = &keys[k] else {
+            let Some((g, i)) = place[k] else {
                 return LineOut::Copy(k);
             };
-            let members: Vec<usize> = (0..len)
-                .filter(|&j| keys[j].as_ref() == Some(key))
-                .collect();
-            let m = members.len();
-            let i = members.iter().position(|&j| j == k).unwrap_or(0);
-            let ys: Vec<f64> = members.iter().map(|&j| seeds[j].value()).collect();
+            let group = &groups[g];
+            let ys = &group.ys;
+            let m = ys.len();
             // This output's index on the group's own number line.
             let n = ((t / len + 1) * m + i) as f64;
             let seed = &seeds[k];
             let v = match seed {
-                Seed::Date(_, tm) => date_at(&ys, n, *tm, kind, ctx.date1904, dir),
+                Seed::Date(_, tm) => date_at(group, n, *tm, kind, ctx.date1904, dir),
                 Seed::Num(_) => match kind {
-                    FillKind::GrowthTrend => growth_at(&ys, n),
-                    _ => linear_at(&ys, n, dir),
+                    FillKind::GrowthTrend => growth_at(group, n),
+                    _ => linear_at(group, n, dir),
                 },
                 _ => {
                     // Counted text steps by whole numbers: the last step.
@@ -1050,20 +1114,12 @@ pub(crate) fn series_changes(
         };
         let mut prev: Option<f64> = None;
         let start = if spec.trend { 0 } else { 1 };
+        // The trend's line, fitted once for the whole line (#707 r6).
+        let trend = spec.trend.then(|| trend_fit(&ys, spec));
         for i in start..len {
             let n = f64::from(i);
-            let v = if spec.trend {
-                match spec.kind {
-                    SeriesType::Growth => growth_trend(&ys, n),
-                    _ => {
-                        let (a, b) = if ys.len() == 1 {
-                            (ys[0], spec.step)
-                        } else {
-                            linear_fit(&ys)
-                        };
-                        a + b * n
-                    }
-                }
+            let v = if let Some((a, b, exp)) = trend {
+                if exp { (a + b * n).exp() } else { a + b * n }
             } else {
                 match spec.kind {
                     SeriesType::Linear => v0 + spec.step * n,
@@ -1102,10 +1158,11 @@ pub(crate) fn series_changes(
 const MAX_STEP: f64 = 1e12;
 
 /// Series' refusal of a step it cannot take.
-pub const STEP_OUT_OF_RANGE: &str = "The step value is out of range.";
+pub(crate) const STEP_OUT_OF_RANGE: &str = "The step value is out of range.";
 
 /// Series' refusal of a stop value its step never reaches.
-pub const STOP_UNREACHABLE: &str = "The stop value can never be reached with this step value.";
+pub(crate) const STOP_UNREACHABLE: &str =
+    "The stop value can never be reached with this step value.";
 
 /// Which way a series from `v0` runs: +1 up, -1 down, 0 when it does not
 /// move (or, for Growth with a step of 0 or below, does not run one way).
@@ -1148,19 +1205,22 @@ fn stop_reachable(spec: &SeriesSpec, v0: f64, stop: f64) -> bool {
     }
 }
 
-/// The growth trend's value at `n`: the least-squares exponential through
-/// the seeds, or the seed itself when there is only one.
-fn growth_trend(ys: &[f64], n: f64) -> f64 {
+/// Series' trend through the seeds as `(a, b, exponential)`: the value at
+/// `n` is `a + b·n`, or its exponential. Linear fits the least-squares line
+/// (one seed steps by the step); Growth the least-squares exponential (one
+/// seed stays put; a non-positive seed falls back to the line).
+fn trend_fit(ys: &[f64], spec: &SeriesSpec) -> (f64, f64, bool) {
+    let growth = spec.kind == SeriesType::Growth;
     if ys.len() == 1 {
-        return ys[0];
+        return (ys[0], if growth { 0.0 } else { spec.step }, false);
     }
-    if ys.iter().all(|&y| y > 0.0) {
+    if growth && ys.iter().all(|&y| y > 0.0) {
         let logs: Vec<f64> = ys.iter().map(|y| y.ln()).collect();
         let (a, b) = linear_fit(&logs);
-        return (a + b * n).exp();
+        return (a, b, true);
     }
     let (a, b) = linear_fit(ys);
-    a + b * n
+    (a, b, false)
 }
 
 /// Where a double-click on the fill handle of `src` fills down to: the last
@@ -1194,15 +1254,22 @@ pub fn justify_lines(texts: &[String], width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();
+    // The line's length in characters, kept as it grows: counting it per
+    // word would cost the line's width each time (#707 r6).
+    let mut len = 0;
     for word in texts.iter().flat_map(|t| t.split_whitespace()) {
+        let n = word.chars().count();
         if cur.is_empty() {
             cur.push_str(word);
-        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            len = n;
+        } else if len + 1 + n <= width {
             cur.push(' ');
             cur.push_str(word);
+            len += 1 + n;
         } else {
             lines.push(std::mem::take(&mut cur));
             cur.push_str(word);
+            len = n;
         }
     }
     if !cur.is_empty() {

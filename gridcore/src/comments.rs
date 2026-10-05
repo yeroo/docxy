@@ -300,6 +300,63 @@ impl SheetPackage {
         true
     }
 
+    /// [`SheetPackage::set_comment`] for each `(row, col, author, text)` of
+    /// `new`, a later one on a cell winning: the parts are read and written
+    /// once, not once per note, so a paste of many notes stays linear
+    /// (#707 r6).
+    pub fn set_comments(&mut self, sheet: usize, new: &[(u32, u32, String, String)]) -> bool {
+        if new.is_empty() {
+            return true;
+        }
+        let Some(ws_part) = self.sheet_parts.get(sheet).cloned() else {
+            return false;
+        };
+        if !self.sheet_takes(sheet, "legacyDrawing", true) {
+            return false;
+        }
+        let mut by_cell: std::collections::BTreeMap<(u32, u32), Note> = self
+            .sheet_notes(sheet)
+            .into_iter()
+            .map(|n| ((n.row, n.col), n))
+            .collect();
+        for (row, col, author, text) in new {
+            by_cell.insert(
+                (*row, *col),
+                Note {
+                    row: *row,
+                    col: *col,
+                    author: author.clone(),
+                    text: text.clone(),
+                },
+            );
+        }
+        let notes: Vec<Note> = by_cell.into_values().collect();
+        self.write_notes(sheet, &ws_part, &notes);
+        true
+    }
+
+    /// [`SheetPackage::remove_comment`] for every cell of `cells`, with one
+    /// read and write of the parts (#707 r6).
+    pub fn remove_comments(&mut self, sheet: usize, cells: &[(u32, u32)]) {
+        if cells.is_empty() {
+            return;
+        }
+        let Some(ws_part) = self.sheet_parts.get(sheet).cloned() else {
+            return;
+        };
+        let gone: std::collections::HashSet<(u32, u32)> = cells.iter().copied().collect();
+        let refs: std::collections::HashSet<String> =
+            cells.iter().map(|&(r, c)| cell_name(r, c)).collect();
+        let removed_thread = self.remove_thread_entries_in(&ws_part, &refs);
+        let mut notes = self.sheet_notes(sheet);
+        let before = notes.len();
+        notes.retain(|n| !gone.contains(&(n.row, n.col)));
+        if notes.len() == before && !removed_thread {
+            return;
+        }
+        self.write_notes(sheet, &ws_part, &notes);
+    }
+
     /// Remove the comment on `(row, col)` of `sheet` — the threaded
     /// conversation if present, otherwise the legacy note.
     pub fn remove_comment(&mut self, sheet: usize, row: u32, col: u32) {
@@ -333,17 +390,13 @@ impl SheetPackage {
                 text: c.text.clone(),
             })
             .collect();
-        // One shadow per threaded conversation (grouped by cell, in order).
-        let mut seen: Vec<(u32, u32)> = Vec::new();
+        // One shadow per threaded conversation (grouped by cell, in order),
+        // grouped in one pass rather than a scan per thread (#707 r6).
+        let mut threads: std::collections::BTreeMap<(u32, u32), Vec<&Comment>> = Default::default();
         for c in all.iter().filter(|c| c.sheet == sheet && c.threaded) {
-            if seen.contains(&(c.row, c.col)) {
-                continue;
-            }
-            seen.push((c.row, c.col));
-            let thread: Vec<&Comment> = all
-                .iter()
-                .filter(|t| t.sheet == sheet && t.threaded && t.row == c.row && t.col == c.col)
-                .collect();
+            threads.entry((c.row, c.col)).or_default().push(c);
+        }
+        for ((row, col), thread) in threads {
             let pid = guid_from(&[&thread[0].author]);
             let text = thread
                 .iter()
@@ -351,8 +404,8 @@ impl SheetPackage {
                 .collect::<Vec<_>>()
                 .join("\n");
             notes.push(Note {
-                row: c.row,
-                col: c.col,
+                row,
+                col,
                 author: format!("tc={pid}"),
                 text,
             });
@@ -548,6 +601,17 @@ impl SheetPackage {
     /// Remove every threaded comment on `(row, col)` from the sheet's thread
     /// part; returns whether anything was removed.
     fn remove_thread_entries(&mut self, ws_part: &str, row: u32, col: u32) -> bool {
+        let refs = std::iter::once(cell_name(row, col)).collect();
+        self.remove_thread_entries_in(ws_part, &refs)
+    }
+
+    /// Remove every threaded comment on a cell named in `refs` (`B2`), in
+    /// one pass over the thread part; returns whether anything was removed.
+    fn remove_thread_entries_in(
+        &mut self,
+        ws_part: &str,
+        refs: &std::collections::HashSet<String>,
+    ) -> bool {
         let (dir, file) = split_part(ws_part);
         let rels_name = format!("{dir}/_rels/{file}.rels");
         let Some(tc_part) = self.find_rel_target(&rels_name, "/threadedComment") else {
@@ -556,7 +620,6 @@ impl SheetPackage {
         let Some(xml) = self.part_str(&tc_part) else {
             return false;
         };
-        let cellref = cell_name(row, col);
         let mut out = String::new();
         let mut removed = false;
         let mut rest = xml.as_str();
@@ -571,7 +634,7 @@ impl SheetPackage {
                 }
             };
             let el = &after[..end];
-            if attr(el, "ref") == Some(cellref.as_str()) {
+            if attr(el, "ref").is_some_and(|r| refs.contains(r)) {
                 removed = true;
             } else {
                 out.push_str(el);
@@ -683,11 +746,14 @@ fn rel_target(ws_dir: &str, part: &str) -> String {
 
 fn serialize_comments(notes: &[Note], sml_ns: &str) -> String {
     use crate::xlsx::esc_text;
+    // Each author once, in order of first note, found by hash (#707 r6).
     let mut authors: Vec<&str> = Vec::new();
+    let mut author_id: std::collections::HashMap<&str, usize> = Default::default();
     for n in notes {
-        if !authors.contains(&n.author.as_str()) {
+        author_id.entry(n.author.as_str()).or_insert_with(|| {
             authors.push(&n.author);
-        }
+            authors.len() - 1
+        });
     }
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
     s.push_str(&format!("<comments xmlns=\"{sml_ns}\"><authors>"));
@@ -696,7 +762,7 @@ fn serialize_comments(notes: &[Note], sml_ns: &str) -> String {
     }
     s.push_str("</authors><commentList>");
     for n in notes {
-        let aid = authors.iter().position(|a| *a == n.author).unwrap_or(0);
+        let aid = author_id.get(n.author.as_str()).copied().unwrap_or(0);
         s.push_str(&format!(
             "<comment ref=\"{}\" authorId=\"{aid}\"><text><r><t xml:space=\"preserve\">{}</t></r></text></comment>",
             cell_name(n.row, n.col),
@@ -882,6 +948,32 @@ mod tests {
         // The worksheet gained a legacyDrawing hook.
         let ws = reloaded.part("xl/worksheets/sheet1.xml").unwrap();
         assert!(String::from_utf8_lossy(ws).contains("<legacyDrawing "));
+    }
+
+    /// #707 r6: the batch calls leave what one call per note leaves, with
+    /// one rewrite of the parts each.
+    #[test]
+    fn batches_match_one_call_per_note() {
+        let notes = [
+            (0, 0, "A".to_string(), "first".to_string()),
+            (5, 5, "C".to_string(), "elsewhere".to_string()),
+            (0, 0, "B".to_string(), "second".to_string()),
+            (2, 1, "A".to_string(), "third".to_string()),
+        ];
+        let mut one = blank();
+        for (r, c, a, t) in &notes {
+            one.set_comment(0, *r, *c, a, t);
+        }
+        let mut batch = blank();
+        assert!(batch.set_comments(0, &notes));
+        assert_eq!(batch.comments(), one.comments());
+        one.remove_comment(0, 0, 0);
+        one.remove_comment(0, 2, 1);
+        batch.remove_comments(0, &[(0, 0), (2, 1), (9, 9)]);
+        assert_eq!(batch.comments(), one.comments());
+        assert_eq!(batch.comments().len(), 1);
+        let reloaded = load_xlsx(&save_xlsx(&batch)).expect("reload");
+        assert_eq!(reloaded.comments(), one.comments());
     }
 
     #[test]

@@ -199,13 +199,20 @@ pub fn custom_lists_from_text(text: &str) -> Vec<Vec<String>> {
 }
 
 /// `lists` as `key=value` lines, each ending in `\n`; what
-/// [`custom_lists_from_text`] reads back.
+/// [`custom_lists_from_text`] reads back. A backslash, comma or line break
+/// in an item is escaped, so an item imported from a cell with a line break
+/// keeps its list on one line (#707 r6 m1).
 pub fn custom_lists_to_lines(lists: &[Vec<String>]) -> String {
     let mut out = String::new();
     for list in lists.iter().filter(|l| !l.is_empty()) {
         let items: Vec<String> = list
             .iter()
-            .map(|i| i.replace('\\', "\\\\").replace(',', "\\,"))
+            .map(|i| {
+                i.replace('\\', "\\\\")
+                    .replace(',', "\\,")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+            })
             .collect();
         out.push_str(&format!("{KEY_CUSTOM_LIST}={}\n", items.join(",")));
     }
@@ -218,7 +225,11 @@ fn split_list(v: &str) -> Vec<String> {
     let mut chars = v.chars();
     while let Some(ch) = chars.next() {
         match ch {
-            '\\' => cur.extend(chars.next()),
+            '\\' => match chars.next() {
+                Some('n') => cur.push('\n'),
+                Some('r') => cur.push('\r'),
+                next => cur.extend(next),
+            },
             ',' => items.push(std::mem::take(&mut cur)),
             _ => cur.push(ch),
         }
@@ -336,8 +347,15 @@ mod tests {
         let lists = vec![
             vec!["North".to_string(), "East".into(), "South".into()],
             vec!["a, b".to_string(), "c\\d".into()],
+            // Imported from cells with line breaks (#707 r6 m1).
+            vec![
+                "two\nlines".to_string(),
+                "cr\r\nlf".into(),
+                "back\\n".into(),
+            ],
         ];
         let text = custom_lists_to_lines(&lists);
+        assert_eq!(text.lines().count(), 3, "{text}");
         assert_eq!(custom_lists_from_text(&text), lists);
         // Alongside the other options, each reader takes its own keys.
         let both = format!("{}{text}", EditOptions::default().to_lines());

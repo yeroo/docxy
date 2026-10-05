@@ -1,6 +1,5 @@
 use super::*;
 use crate::edit::{FillReq, Filled, autofill, fill_series};
-use crate::edit::{STEP_OUT_OF_RANGE, STOP_UNREACHABLE};
 use crate::sheet::{Sheet, Workbook, Xf, cell_name, parse_cell_name};
 
 fn book(cells: &[(&str, Cell)]) -> Workbook {
@@ -968,4 +967,79 @@ fn uneven_month_seeds_continue_from_the_last() {
     }
     fill_with(&mut wb, "A1:A3", "A4", FillKind::Months, false, &[]);
     assert_eq!(nums(&wb, &["A4"]), [parts_to_serial(2024, 5, 15, 0, false)]);
+}
+
+fn fast(t: std::time::Instant, what: &str) {
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(3),
+        "{what}: {:?}",
+        t.elapsed()
+    );
+}
+
+/// #707 r6: a fill from 50,000 seeds fits each group once, not once per
+/// output: uneven numbers along their trend, month-end dates, and text
+/// with numbers in two interleaved groups.
+#[test]
+fn filling_from_50k_seeds_is_fast() {
+    let mut wb = book(&[]);
+    let ds = style(&mut wb, "yyyy-mm-dd");
+    for r in 0..50_000u32 {
+        let x = f64::from(r);
+        wb.sheets[0].set_cell(r, 0, Cell::number(2.0 * x + f64::from(r % 3)));
+        let mut d = Cell::number(parts_to_serial(
+            1900 + i64::from(r / 12) % 8000,
+            r % 12 + 1,
+            1,
+            0,
+            false,
+        ));
+        d.style = ds;
+        wb.sheets[0].set_cell(r, 1, d);
+        let t = if r % 2 == 0 { "Item" } else { "Lot" };
+        wb.sheets[0].set_cell(r, 2, Cell::text(&format!("{t} {r}")));
+    }
+    let t = std::time::Instant::now();
+    fill(&mut wb, "A1:C50000", "C100000").unwrap();
+    fast(t, "fill");
+    // The trend's slope is 2; the offsets 0,1,2 lift it by about 1.
+    let a = nums(&wb, &["A100000"])[0];
+    assert!((a - (2.0 * 99_999.0 + 1.0)).abs() < 1e-3, "{a}");
+    assert_eq!(
+        texts(&wb, &["C50001", "C50002"]),
+        ["Item 50000", "Lot 50001"]
+    );
+}
+
+/// #707 r6: Series' trend over 50,000 seeds fits them once.
+#[test]
+fn a_50k_seed_series_trend_is_fast() {
+    let mut wb = book(&[]);
+    for r in 0..50_000u32 {
+        wb.sheets[0].set_cell(r, 0, Cell::number(3.0 * f64::from(r) + f64::from(r % 2)));
+    }
+    let t = std::time::Instant::now();
+    for kind in [SeriesType::Linear, SeriesType::Growth] {
+        fill_series(
+            &mut wb,
+            0,
+            (0, 0, 99_999, 0),
+            &spec(false, kind, 1.0, None, true),
+            &[],
+        )
+        .unwrap();
+    }
+    fast(t, "trend");
+}
+
+/// #707 r6: justifying 50,000 words into a very wide line keeps the line's
+/// length as it grows instead of counting it per word.
+#[test]
+fn justifying_50k_words_is_fast() {
+    let texts: Vec<String> = (0..50_000).map(|k| format!("w{k}")).collect();
+    let t = std::time::Instant::now();
+    let lines = justify_lines(&texts, 130_000);
+    fast(t, "justify");
+    assert_eq!(lines.len(), 3);
+    assert!(lines.iter().all(|l| l.chars().count() <= 130_000));
 }

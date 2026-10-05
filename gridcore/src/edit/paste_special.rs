@@ -16,7 +16,8 @@ use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Workbook, cell_na
 use super::{Area, rects_overlap as overlaps};
 
 /// Why a transposed paste of a spilling array is refused (#707 r5 m1).
-pub const TRANSPOSE_ARRAY: &str = "You can't transpose part of an array: paste its values instead.";
+pub(crate) const TRANSPOSE_ARRAY: &str =
+    "You can't transpose part of an array: paste its values instead.";
 
 /// Excel's refusal of a multi-area copy whose areas share neither their rows
 /// nor their columns, of any multi-area cut, and of a paste or a drag over a
@@ -208,6 +209,11 @@ pub struct ClipRule {
     pub cells: Vec<(usize, usize)>,
 }
 
+/// The positions in sorted `v` of the values `lo..=hi`.
+fn span(v: &[u32], lo: u32, hi: u32) -> std::ops::Range<usize> {
+    v.partition_point(|&x| x < lo)..v.partition_point(|&x| x <= hi)
+}
+
 /// A copy, as Paste Special reads it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClipBlock {
@@ -231,7 +237,7 @@ pub struct ClipBlock {
 
 impl ClipBlock {
     /// The cells of `rows` × `cols` on `sheet`, with their column widths and
-    /// the validation over them.
+    /// the validation over them. `rows` and `cols` are in sheet order.
     pub fn capture(wb: &Workbook, sheet: usize, rows: Vec<u32>, cols: Vec<u32>) -> ClipBlock {
         let Some(s) = wb.sheets.get(sheet) else {
             return ClipBlock::default();
@@ -249,13 +255,20 @@ impl ClipBlock {
             .validations
             .iter()
             .filter_map(|dv| {
+                // Each range's cells in the copy, found by binary search in
+                // the sorted rows and columns: a rule off the copy costs
+                // nothing (#707 r6).
                 let mut cells = Vec::new();
-                for (i, &r) in rows.iter().enumerate() {
-                    for (j, &c) in cols.iter().enumerate() {
-                        if dv.covers(r, c) {
+                for &(ra, ca, rb, cb) in &dv.ranges {
+                    for i in span(&rows, ra, rb) {
+                        for j in span(&cols, ca, cb) {
                             cells.push((i, j));
                         }
                     }
+                }
+                if dv.ranges.len() > 1 {
+                    cells.sort_unstable();
+                    cells.dedup();
                 }
                 (!cells.is_empty()).then(|| ClipRule {
                     kind: dv.kind.clone(),
@@ -285,8 +298,8 @@ impl ClipBlock {
         self.notes = notes
             .into_iter()
             .filter_map(|(r, c, author, text)| {
-                let i = self.rows.iter().position(|&x| x == r)?;
-                let j = self.cols.iter().position(|&x| x == c)?;
+                let i = self.rows.binary_search(&r).ok()?;
+                let j = self.cols.binary_search(&c).ok()?;
                 Some(ClipNote {
                     at: (i, j),
                     author,
@@ -307,6 +320,14 @@ impl ClipBlock {
     /// The block positions an array formula of the copy spills into (its
     /// own cell aside): a dynamic array's spill, or a legacy CSE block.
     fn spill_members(&self) -> std::collections::HashSet<(usize, usize)> {
+        // The block's rows and columns are in sheet order, so each anchor's
+        // extent is found by binary search: only its own cells are visited
+        // (#707 r6 M3).
+        let span = |v: &[u32], from: u32, len: u32| {
+            let lo = v.partition_point(|&x| x < from);
+            let hi = v.partition_point(|&x| u64::from(x) < u64::from(from) + u64::from(len));
+            lo..hi
+        };
         let mut members = std::collections::HashSet::new();
         for (i, row) in self.cells.iter().enumerate() {
             for (j, cell) in row.iter().enumerate() {
@@ -318,10 +339,9 @@ impl ClipBlock {
                 ) else {
                     continue;
                 };
-                for (ii, &r) in self.rows.iter().enumerate() {
-                    for (jj, &c) in self.cols.iter().enumerate() {
-                        let inside = (r0..r0 + h).contains(&r) && (c0..c0 + w).contains(&c);
-                        if inside && (ii, jj) != (i, j) {
+                for ii in span(&self.rows, r0, h) {
+                    for jj in span(&self.cols, c0, w) {
+                        if (ii, jj) != (i, j) {
                             members.insert((ii, jj));
                         }
                     }
@@ -373,8 +393,8 @@ impl ClipBlock {
         let dc = i64::from(dest.1) - i64::from(*self.cols.get(j)?);
         if transpose {
             let inside = |row: i64, col: i64| -> Option<(i64, i64)> {
-                let i = self.rows.iter().position(|&x| i64::from(x) == row)?;
-                let j = self.cols.iter().position(|&x| i64::from(x) == col)?;
+                let i = self.rows.binary_search(&u32::try_from(row).ok()?).ok()?;
+                let j = self.cols.binary_search(&u32::try_from(col).ok()?).ok()?;
                 Some((i64::from(at.0) + j as i64, i64::from(at.1) + i as i64))
             };
             let t = Transposed {
@@ -512,6 +532,9 @@ pub fn paste_special_changes(
     if spec.transpose && !values_only && !members.is_empty() {
         return Err(TRANSPOSE_ARRAY);
     }
+    // The styles a paste mixes, each interned once per (source, destination)
+    // pair: interning scans the style table (#707 r6).
+    let mut mixed: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
     // Only the cells that know where they came from.
     for (i, row) in clip.cells.iter().enumerate().take(clip.rows.len()) {
         for (j, src) in row.iter().enumerate().take(clip.cols.len()) {
@@ -527,17 +550,19 @@ pub fn paste_special_changes(
                 | PasteWhat::AllAndColumnWidths
                 | PasteWhat::Formats
                 | PasteWhat::ValuesAndSourceFormatting => src.style,
-                PasteWhat::AllExceptBorders => {
+                PasteWhat::AllExceptBorders => *mixed.entry((src.style, 0)).or_insert_with(|| {
                     let mut xf = styles.xf(src.style);
                     xf.border = false;
                     styles.intern(xf)
-                }
+                }),
                 PasteWhat::FormulasAndNumberFormats | PasteWhat::ValuesAndNumberFormats => {
-                    let from = styles.xf(src.style);
-                    let mut xf = styles.xf(d.style);
-                    xf.numfmt = from.numfmt;
-                    xf.code = from.code;
-                    styles.intern(xf)
+                    *mixed.entry((src.style, d.style)).or_insert_with(|| {
+                        let from = styles.xf(src.style);
+                        let mut xf = styles.xf(d.style);
+                        xf.numfmt = from.numfmt;
+                        xf.code = from.code;
+                        styles.intern(xf)
+                    })
                 }
                 _ => d.style,
             };

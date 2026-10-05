@@ -130,3 +130,33 @@ fn labels_round_trip() {
     }
     assert_eq!(ClearWhat::from_label("formats"), Some(ClearWhat::Formats));
 }
+
+/// #707 r6: a clear over 10,000 areas (5,000 whole-height column strips and
+/// 5,000 single cells) of a sheet with 50,000 cells, links, notes and
+/// merges looks the areas up through an index.
+#[test]
+fn clearing_10k_areas_over_50k_cells_links_notes_and_merges_is_fast() {
+    let n = 50_000u32;
+    let mut wb = book();
+    let s = &mut wb.sheets[0];
+    for r in 0..n {
+        s.set_cell(r, 0, Cell::number(1.0));
+        s.set_cell(r, 1, Cell::number(2.0));
+        s.hyperlinks.insert((r, 0), "https://example.com".into());
+        s.merges.push((r, 12_000, r, 12_001));
+    }
+    let mut areas: Vec<Area> = (0..5_000u32).map(|k| (0, 2 * k, n - 1, 2 * k)).collect();
+    areas.extend((0..5_000u32).map(|k| (k * 10, 1, k * 10, 1)));
+    let notes: Vec<(u32, u32)> = (0..n).map(|r| (r, 0)).collect();
+    let t = std::time::Instant::now();
+    let plan = clear_plan(&wb.sheets[0], &areas, ClearWhat::All, &notes).unwrap();
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        t.elapsed()
+    );
+    // Column A whole and every tenth B (F6 is in no strip).
+    assert_eq!(plan.cells.len(), 50_000 + 5_000);
+    assert_eq!((plan.notes.len(), plan.unlink.len()), (50_000, 50_000));
+    assert!(plan.unmerge.is_empty());
+}

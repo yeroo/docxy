@@ -548,3 +548,165 @@ fn dependents_of_a_50k_chain_and_derived_columns_are_fast() {
     fast(t, "derived");
     assert_eq!(found, Ok(rects(&["B1:C50000"])));
 }
+
+/// #707 r6 M1: Dependents over 50k-row formula columns that read ranges:
+/// a moving average, a running total, a percent of a total, and rows read
+/// across hundreds of columns; each range reference examined once.
+#[test]
+fn dependents_through_50k_range_readers_are_fast() {
+    let n = 50_000u32;
+    type Make = fn(u32, u32) -> String;
+    // Each C reads B; the walk from A1 reaches B1 and the Cs reading it.
+    let cases: [(&str, Make, u32); 3] = [
+        (
+            "moving average",
+            |r, _| format!("AVERAGE(B{}:B{})", r.saturating_sub(8).max(1), r + 1),
+            10,
+        ),
+        ("running total", |r, _| format!("SUM($B$1:B{})", r + 1), n),
+        (
+            "percent of total",
+            |r, n| format!("B{}/SUM($B$1:$B${n})", r + 1),
+            n,
+        ),
+    ];
+    for (what, make, cs) in cases {
+        let mut wb = book(&[]);
+        for r in 0..n {
+            wb.sheets[0].set_cell(r, 0, Cell::number(1.0));
+            wb.sheets[0].set_cell(r, 1, Cell::formula(&format!("A{}*2", r + 1)));
+            wb.sheets[0].set_cell(r, 2, Cell::formula(&make(r, n)));
+        }
+        let t = std::time::Instant::now();
+        let found = go_to_special(
+            &wb,
+            0,
+            &[rect("A1")],
+            (0, 0),
+            GoSpecial::Dependents { all: true },
+            &[],
+        );
+        fast(t, what);
+        // A1 → B1 → every C that reads B1.
+        let found = found.unwrap();
+        let covered = |r: u32, c: u32| found.iter().any(|&a| inside(r, c, a));
+        assert!(covered(0, 1), "{what}: B1");
+        assert!((0..cs).all(|r| covered(r, 2)), "{what}: C1:C{cs}");
+        assert!(!covered(cs, 2) || cs == n, "{what}: no further");
+    }
+    // Rows read across 702 columns: =SUM($A2:$ZZ2) down a column at 50k.
+    let mut wb = book(&[]);
+    for r in 0..n {
+        wb.sheets[0].set_cell(r, 0, Cell::number(1.0));
+        wb.sheets[0].set_cell(
+            r,
+            702,
+            Cell::formula(&format!("SUM($A{}:$ZZ{})", r + 1, r + 1)),
+        );
+        wb.sheets[0].set_cell(r, 703, Cell::formula(&format!("AAA{}+1", r + 1)));
+    }
+    let t = std::time::Instant::now();
+    let found = go_to_special(
+        &wb,
+        0,
+        &[rect("A1:A50000")],
+        (0, 0),
+        GoSpecial::Dependents { all: true },
+        &[],
+    );
+    fast(t, "wide rows");
+    assert_eq!(found, Ok(vec![(0, 702, n - 1, 703)]));
+}
+
+/// #707 r6 M1: a range huge both ways is found by any cell in it, through
+/// its whole bands and its ragged edges alike.
+#[test]
+fn a_huge_range_is_found_from_every_part() {
+    let mut wb = book(&[]);
+    // B2:KZ600 (300+ columns, 599 rows), read once.
+    wb.sheets[0].set_cell(0, 0, Cell::formula("SUM(B2:KZ600)"));
+    for (r, c) in [(1, 1), (300, 255), (300, 256), (599, 311), (5, 300)] {
+        let found = go_to_special(
+            &wb,
+            0,
+            &[(r, c, r, c)],
+            (r, c),
+            GoSpecial::Dependents { all: false },
+            &[],
+        );
+        assert_eq!(found, Ok(vec![(0, 0, 0, 0)]), "({r}, {c})");
+    }
+    let mut ix = ReadIndex::new(&wb, 0, &wb.sheets[0]);
+    let mut out = Vec::new();
+    for (r, c) in [(1, 1), (300, 256), (599, 311), (2, 312)] {
+        out.clear();
+        ix.take_readers((r, c), &mut out);
+        let _ = out.len();
+    }
+    // Outside it: nothing.
+    let mut ix = ReadIndex::new(&wb, 0, &wb.sheets[0]);
+    for (r, c) in [(0, 1), (1, 0), (600, 5), (5, 312)] {
+        out.clear();
+        ix.take_readers((r, c), &mut out);
+        assert!(out.is_empty(), "({r}, {c})");
+    }
+    let mut ix = ReadIndex::new(&wb, 0, &wb.sheets[0]);
+    for (r, c) in [(1, 1), (300, 255), (300, 256), (599, 311), (5, 300)] {
+        out.clear();
+        ix.take_readers((r, c), &mut out);
+        assert!(out.contains(&0), "({r}, {c}) inside");
+        ix = ReadIndex::new(&wb, 0, &wb.sheets[0]);
+    }
+}
+
+/// #707 r6: a selection of 10,000 areas (5,000 whole-height column strips
+/// and 5,000 single cells) over 50,000 formulas, notes and hidden rows: the
+/// areas are looked up through an index, never scanned per cell or per
+/// reference.
+#[test]
+fn ten_thousand_areas_over_50k_cells_are_fast() {
+    let n = 50_000u32;
+    let mut wb = book(&[]);
+    let s = &mut wb.sheets[0];
+    for r in 0..n {
+        s.set_cell(r, 0, Cell::number(1.0));
+        s.set_cell(r, 1, Cell::formula(&format!("A{}*2", r + 1)));
+        if r % 2 == 1 {
+            s.row_attrs.insert(r, "hidden=\"1\"".into());
+        }
+    }
+    let mut areas: Vec<Area> = (0..5_000u32)
+        .map(|k| (0, 2 * k + 2, n - 1, 2 * k + 2))
+        .collect();
+    areas.extend((0..5_000u32).map(|k| (k * 10, 0, k * 10, 0)));
+    let notes: Vec<(u32, u32)> = (0..n).map(|r| (r, 0)).collect();
+    let t = std::time::Instant::now();
+    let deps = go_to_special(
+        &wb,
+        0,
+        &areas,
+        (0, 0),
+        GoSpecial::Dependents { all: false },
+        &[],
+    )
+    .unwrap();
+    assert_eq!(deps.len(), 5_000);
+    let noted = go_to_special(&wb, 0, &areas, (0, 0), GoSpecial::Notes, &notes).unwrap();
+    assert_eq!(noted.len(), 5_000);
+    let consts = go_to_special(
+        &wb,
+        0,
+        &areas,
+        (0, 0),
+        GoSpecial::Constants(Types::ALL),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(consts.len(), 5_000);
+    // Every other row hidden: each strip cut into 25,000 runs is too many.
+    assert_eq!(
+        go_to_special(&wb, 0, &areas[..2], (0, 0), GoSpecial::VisibleCells, &[]),
+        Err(TOO_MANY_AREAS)
+    );
+    fast(t, "10k areas");
+}

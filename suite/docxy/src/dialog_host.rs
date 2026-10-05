@@ -140,6 +140,23 @@ fn reopen_click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
     Some(crate::tab_from_path_mode(&path, mode, &trusted).map(|fresh| *tab = fresh))
 }
 
+/// Whether Enter and Escape on a dialog of `owner` press through
+/// `Docxy::dialog_press`, which the app's own dialogs need, as does Go To's
+/// move to another sheet (#707 r6 m2).
+pub(crate) fn presses_through_app(owner: &DialogOwner) -> bool {
+    matches!(
+        owner,
+        DialogOwner::UserName
+            | DialogOwner::Series
+            | DialogOwner::JustifyOverflow
+            | DialogOwner::CustomLists
+            | DialogOwner::PasteSpecial { .. }
+            | DialogOwner::DropReplace
+            | DialogOwner::GoTo
+            | DialogOwner::GoToSpecial
+    )
+}
+
 /// Whether the active tab's top dialog is the reopen question, whose Yes
 /// replaces the tab under any grid state the window keeps for it.
 fn reopen_on_top(tab: Option<&DocTab>) -> bool {
@@ -326,23 +343,17 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> bool {
         // Enter or Escape on a dialog the app applies (the user name, the
-        // fill, paste and drop dialogs) presses through the app.
+        // fill, paste and drop dialogs) presses through the app; so do Go To
+        // and Go To Special, whose OK may move to another sheet and must
+        // drop the grid state left behind, as a click does (#707 r6 m2).
         let plain = !m.control && !m.alt && !m.platform;
         let app_dialog_button = self
             .tabs
             .get(self.active)
             .filter(|t| {
-                t.dialogs.top().is_some_and(|d| {
-                    matches!(
-                        d.owner,
-                        DialogOwner::UserName
-                            | DialogOwner::Series
-                            | DialogOwner::JustifyOverflow
-                            | DialogOwner::CustomLists
-                            | DialogOwner::PasteSpecial { .. }
-                            | DialogOwner::DropReplace
-                    )
-                })
+                t.dialogs
+                    .top()
+                    .is_some_and(|d| presses_through_app(&d.owner))
             })
             .and_then(|t| t.dialogs.key_button(key, plain));
         if let Some(label) = app_dialog_button {
