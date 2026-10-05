@@ -114,22 +114,42 @@ pub(crate) fn click(dialogs: &mut DialogStack, button: &str) -> Option<Result<bo
     Some(dialogs.click(button, |_| Ok(())).map(|()| button == "Copy"))
 }
 
-/// `--version`: print the block and return, for `main` to exit. A release build
-/// on Windows has no console, so it attaches to the parent's first.
+/// Whether standard output already goes somewhere: a valid, non-null handle of a
+/// known file type (a redirect, a pipe, or the console). A release build on Windows
+/// is a GUI-subsystem app, so started from a shell it has none, and started with
+/// `> v.txt` or by `Command::output()` it has the redirect, which must be honoured.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn stdout_usable(handle: isize, file_type: u32) -> bool {
+    // INVALID_HANDLE_VALUE is -1; FILE_TYPE_UNKNOWN is 0.
+    handle != 0 && handle != -1 && file_type != 0
+}
+
+/// `--version`: print the block and return, for `main` to exit. On Windows, a
+/// release build has no console of its own: when stdout is not already a redirect or
+/// pipe it attaches to the parent's console and writes there, and falls back to
+/// stdout if that fails. (Windows-only code: not run in this change's CI on Linux.)
 pub(crate) fn print_version() {
     let text = version_text(info());
     #[cfg(windows)]
     {
         use std::io::Write;
         unsafe extern "system" {
+            fn GetStdHandle(which: u32) -> isize;
+            fn GetFileType(handle: isize) -> u32;
             fn AttachConsole(process_id: u32) -> i32;
         }
-        // ATTACH_PARENT_PROCESS
-        // SAFETY: a plain Win32 call with no pointers.
-        if unsafe { AttachConsole(u32::MAX) } != 0
+        // STD_OUTPUT_HANDLE is (DWORD)-11; ATTACH_PARENT_PROCESS is (DWORD)-1.
+        // SAFETY: plain Win32 calls with no pointers; an invalid handle is checked
+        // before it is passed to GetFileType.
+        let (handle, file_type) = unsafe {
+            let h = GetStdHandle(-11i32 as u32);
+            (h, if h != 0 && h != -1 { GetFileType(h) } else { 0 })
+        };
+        if !stdout_usable(handle, file_type)
+            && unsafe { AttachConsole(u32::MAX) } != 0
             && let Ok(mut out) = std::fs::OpenOptions::new().write(true).open("CONOUT$")
+            && out.write_all(text.as_bytes()).is_ok()
         {
-            let _ = out.write_all(text.as_bytes());
             return;
         }
     }
@@ -146,6 +166,14 @@ mod tests {
         assert!(
             version_text(info()).starts_with(&format!("{PRODUCT} {}\n", env!("CARGO_PKG_VERSION")))
         );
+    }
+
+    #[test]
+    fn stdout_is_usable_only_with_a_real_handle_of_a_known_type() {
+        assert!(stdout_usable(0x1c4, 3)); // a redirect to a file / pipe / console
+        assert!(!stdout_usable(0, 0)); // a GUI process started from Explorer: no handle
+        assert!(!stdout_usable(-1, 0)); // INVALID_HANDLE_VALUE
+        assert!(!stdout_usable(0x1c4, 0)); // FILE_TYPE_UNKNOWN
     }
 
     #[test]

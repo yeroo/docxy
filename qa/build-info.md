@@ -85,3 +85,21 @@ depth 1, so it says `kind: ci`, no badge when clean, `last PR: none` and no comm
 
 **Fails when:** `release.yml` stops setting `DOCXY_BUILD_KIND=release`, or `ci.yml`
 sets a kind on the `ui-sweep-linux` job (its `.uit` asserts `local`).
+
+## Windows: `--version` reaches a redirect, a pipe and the console
+
+**Guards:** #1023 requires `--version` on every binary; the release suite is a
+GUI-subsystem app with no console of its own, which is why it needs this case. Not run in
+CI, and written without a Windows machine: run it on the release build.
+
+**Steps:**
+1. In a Windows terminal, `suite.exe --version > v.txt`, then `type v.txt`.
+2. `suite.exe --version | more`.
+3. Bare: `suite.exe --version` in cmd.exe or PowerShell.
+4. Double-click `suite.exe` (no `--version`).
+
+**Expect:** steps 1 and 2 hold the whole block (first line `docxy suite <version>`, a `commit:`
+line, `kind: release`). Step 3 prints the block on the console. Step 4 opens the window, as before.
+
+**Fails when:** step 1 or 2 is empty (the console was attached ahead of the redirect), or step 3
+prints nothing (no fallback to the parent's console).

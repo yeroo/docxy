@@ -389,5 +389,24 @@ mod tests {
         let b = BuildInfo::new("9.9.9");
         assert_eq!(b.version, "9.9.9");
         assert!(["release", "ci", "local"].contains(&b.kind.as_str()));
+        // The stamp is a full SHA or `unknown` (a tarball), and a UTC timestamp.
+        assert!(
+            b.commit == "unknown"
+                || (b.commit.len() == 40 && b.commit.bytes().all(|c| c.is_ascii_hexdigit())),
+            "{}",
+            b.commit
+        );
+        let t = b.built_at.as_bytes();
+        assert_eq!(t.len(), 20, "{}", b.built_at);
+        for (i, c) in t.iter().enumerate() {
+            let ok = match i {
+                4 | 7 => *c == b'-',
+                10 => *c == b'T',
+                13 | 16 => *c == b':',
+                19 => *c == b'Z',
+                _ => c.is_ascii_digit(),
+            };
+            assert!(ok, "{} at {i}", b.built_at);
+        }
     }
 }

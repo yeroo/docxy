@@ -26391,19 +26391,6 @@ impl Docxy {
             return None;
         }
         let info = about::info();
-        let button = |id: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .px_3()
-                .py_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(dim)
-                .text_color(fg)
-                .cursor_pointer()
-                .hover(|d| d.border_color(rgb(BRAND)))
-                .child(label)
-        };
         let page = v_flex()
             .relative()
             .flex_1()
@@ -26446,7 +26433,17 @@ impl Docxy {
             .when(!self.tabs.is_empty(), |d| {
                 d.child(
                     h_flex().child(
-                        button("account-about", "About docxy suite")
+                        div()
+                            .id("account-about")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(dim)
+                            .text_color(fg)
+                            .cursor_pointer()
+                            .hover(|d| d.border_color(rgb(BRAND)))
+                            .child("About docxy suite")
                             .on_click(cx.listener(|this, _, _, cx| this.open_about_clicked(cx))),
                     ),
                 )
