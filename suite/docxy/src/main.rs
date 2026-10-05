@@ -133,6 +133,29 @@ fn icon_svg(name: &str, size: f32, color: Hsla) -> Svg {
         .flex_none()
 }
 
+/// The editor a tab's keystrokes and commands drive: its header/footer
+/// editor while one is open, else a document's body; none on other tabs.
+fn tab_edit_target(tab: &mut DocTab) -> Option<&mut Editor> {
+    if let Some(hf) = tab.hf_edit.as_mut() {
+        return Some(&mut hf.editor);
+    }
+    match &mut tab.surface {
+        Surface::Doc(ed) => Some(ed),
+        _ => None,
+    }
+}
+
+/// [`tab_edit_target`], to read.
+fn tab_edit_target_ref(tab: &DocTab) -> Option<&Editor> {
+    if let Some(hf) = tab.hf_edit.as_ref() {
+        return Some(&hf.editor);
+    }
+    match &tab.surface {
+        Surface::Doc(ed) => Some(ed),
+        _ => None,
+    }
+}
+
 /// A small Quick-Access-Toolbar icon button (Undo/Redo in the title bar).
 /// A disabled one (Can't Repeat, #618) is drawn dimmed and takes no click.
 fn qat_btn(
@@ -15145,28 +15168,14 @@ impl Docxy {
 
     /// [`Self::edit_target`] and the Repeat record (#618), borrowed apart.
     fn edit_target_and_repeat(&mut self) -> (Option<&mut Editor>, &mut Option<RepeatRecord>) {
-        let repeat = &mut self.repeat;
-        let ed = self.tabs.get_mut(self.active).and_then(|tab| {
-            if let Some(hf) = tab.hf_edit.as_mut() {
-                return Some(&mut hf.editor);
-            }
-            match &mut tab.surface {
-                Surface::Doc(ed) => Some(ed),
-                _ => None,
-            }
-        });
-        (ed, repeat)
+        let ed = self.tabs.get_mut(self.active).and_then(tab_edit_target);
+        (ed, &mut self.repeat)
     }
 
     /// What the Quick Access Toolbar shows for the active tab (#618, #619).
     fn qat_state(&self) -> QatState {
-        let Some(tab) = self.tabs.get(self.active) else {
+        let Some(ed) = self.tabs.get(self.active).and_then(tab_edit_target_ref) else {
             return QatState::Plain;
-        };
-        let ed = match (&tab.hf_edit, &tab.surface) {
-            (Some(hf), _) => &hf.editor,
-            (None, Surface::Doc(ed)) => ed,
-            _ => return QatState::Plain,
         };
         QatState::Doc {
             can_redo: ed.can_redo(),
@@ -15178,14 +15187,7 @@ impl Docxy {
     /// in HF edit mode, otherwise the document body. All editing routes through
     /// this so the same machinery serves both surfaces.
     fn edit_target(&mut self) -> Option<&mut Editor> {
-        let tab = self.tabs.get_mut(self.active)?;
-        if let Some(hf) = tab.hf_edit.as_mut() {
-            return Some(&mut hf.editor);
-        }
-        match &mut tab.surface {
-            Surface::Doc(ed) => Some(ed),
-            _ => None,
-        }
+        self.tabs.get_mut(self.active).and_then(tab_edit_target)
     }
 
     /// Whether the active tab is currently in header/footer edit mode.
@@ -16022,6 +16024,23 @@ impl Docxy {
         cx.notify();
     }
 
+    /// [`Self::with_editor`] for an edit a key makes outside `on_key` (Tab,
+    /// Shift+Tab are action-bound): its steps are named and, when it can be
+    /// repeated, recorded for Repeat (#618, #619), as `on_key` does.
+    fn with_editor_noted(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        what: Repeat,
+        f: impl FnOnce(&mut Editor),
+    ) {
+        let since = docxcore::editor::undo_serial_counter();
+        self.with_editor(window, cx, f);
+        if let (Some(ed), rec) = self.edit_target_and_repeat() {
+            note_edit(ed, rec, since, what);
+        }
+    }
+
     fn with_editor(
         &mut self,
         window: &mut Window,
@@ -16035,10 +16054,15 @@ impl Docxy {
         }
         if let Some(tab) = self.tabs.get_mut(self.active) {
             // Route to the header/footer editor while it's open, else the body.
+            // A host edit never grows the typing (or deleting) run before it:
+            // it is a step of its own, which also makes a Repeat record of
+            // that typing stale (#618).
             if let Some(hf) = tab.hf_edit.as_mut() {
+                hf.editor.break_undo_group();
                 f(&mut hf.editor);
                 tab.mark_dirty();
             } else if let Surface::Doc(ed) = &mut tab.surface {
+                ed.break_undo_group();
                 f(ed);
                 // A merge field the edit added shows the previewed record too.
                 ed.refresh_merge_preview();
@@ -16287,7 +16311,7 @@ impl Docxy {
     fn insert_symbol(&mut self, s: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = None;
         let s = s.to_string();
-        self.with_editor(window, cx, move |e| e.insert_str(&s));
+        self.with_editor(window, cx, move |e| insert_symbol_into(e, &s));
     }
 
     /// Insert an inline math equation from a LaTeX template (Insert ▸ Equation).
@@ -17663,7 +17687,7 @@ impl Docxy {
         if self.table_tab(false, window, cx) {
             return;
         }
-        self.with_editor(window, cx, |e| e.insert_tab());
+        self.with_editor_noted(window, cx, Repeat::Tab, |e| e.insert_tab());
         self.scroll_to_caret();
     }
 
@@ -17751,7 +17775,9 @@ impl Docxy {
         if self.table_tab(true, window, cx) {
             return;
         }
-        self.with_editor(window, cx, |e| e.change_indent(-720));
+        self.with_editor_noted(window, cx, Repeat::Act(Act::IndentDec), |e| {
+            apply_doc_act(e, Act::IndentDec)
+        });
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -17950,7 +17976,8 @@ impl Docxy {
                 "backspace" => yes(|| ed.backspace()),
                 "delete" => yes(|| ed.delete_forward()),
                 "enter" => yes(|| ed.insert_newline()),
-                "tab" => yes(|| ed.insert_tab()),
+                // Plain Tab and Shift+Tab are action-bound (`tab_key`,
+                // `shift_tab_key`) and never arrive here.
                 // Word's Repeat key; it redoes first, as Ctrl+Y does (#618).
                 "f4" => redo_or_repeat(ed, repeat),
                 "left" => no(|| ed.move_left()),
@@ -20139,6 +20166,9 @@ impl Repeat {
 /// only while that step is still its editor's newest: any edit the record
 /// did not see, through any path and in any editor, pushes a newer step
 /// (serials are unique across editors), so a stale record never replays.
+/// That holds because only typing coalesces into an existing step, and every
+/// host edit (`Docxy::with_editor`, and so the ribbon, pickers, dialogs,
+/// ruler, paste and menus) breaks the group first.
 #[derive(Clone, Copy, Debug)]
 struct RepeatRecord {
     what: Repeat,
@@ -20208,6 +20238,16 @@ fn note_edit(ed: &mut Editor, rec: &mut Option<RepeatRecord>, since: u64, what: 
     if !matches!(what, Repeat::Act(act) if !repeatable_act(act)) {
         *rec = Some(RepeatRecord { what, serial });
     }
+}
+
+/// Insert ▸ Symbol's insertion: a step of its own, named for the Undo
+/// drop-down (#619). Never part of the typing before it, so a Repeat record
+/// of that typing goes stale rather than replaying the symbol (#618).
+fn insert_symbol_into(e: &mut Editor, s: &str) {
+    let since = docxcore::editor::undo_serial_counter();
+    e.break_undo_group();
+    e.insert_str(s);
+    e.name_steps_since(since, "Insert Symbol");
 }
 
 /// What a document key does that Repeat can do again (#618): the formatting
@@ -20422,6 +20462,67 @@ mod repeat_tests {
         assert!(!repeat_ready(&ed, other_rec));
         assert!(!redo_or_repeat(&mut ed, &mut other_rec));
         assert_eq!(ed.doc, before);
+    }
+
+    /// A host edit after typing (Insert ▸ Symbol) is a step of its own: it
+    /// does not grow `Typing "abc"`, and it makes the record of that typing
+    /// stale, so F4 does nothing rather than type `abc©` again.
+    #[test]
+    fn a_symbol_after_typing_is_its_own_step_and_stales_the_record_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        assert!(repeat_ready(&ed, rec));
+        insert_symbol_into(&mut ed, "\u{00A9}");
+        assert_eq!(text(&ed, 2), "Third one.abc\u{00A9}");
+        assert_eq!(ed.undo_names()[..2], ["Insert Symbol", "Typing \"abc\""]);
+        assert!(!repeat_ready(&ed, rec));
+        assert!(!redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abc\u{00A9}");
+        // Typing after it starts its own step again.
+        type_text(&mut ed, &mut rec, "d");
+        assert_eq!(ed.undo_names()[0], "Typing \"d\"");
+    }
+
+    /// Tab and Shift+Tab (action-bound, `with_editor_noted`): named, and Tab
+    /// recorded for Repeat; Shift+Tab repeats as Decrease Indent.
+    #[test]
+    fn tab_and_shift_tab_are_named_and_repeat_618_619() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], 0));
+        let since = docxcore::editor::undo_serial_counter();
+        ed.break_undo_group();
+        ed.insert_tab();
+        note_edit(&mut ed, &mut rec, since, Repeat::Tab);
+        assert_eq!(ed.undo_names(), ["Tab"]);
+        assert!(matches!(
+            rec,
+            Some(RepeatRecord {
+                what: Repeat::Tab,
+                ..
+            })
+        ));
+        let one_tab = ed.doc.clone();
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_ne!(ed.doc, one_tab, "F4 typed a second tab");
+        assert_eq!(ed.undo_names(), ["Tab", "Tab"]);
+
+        let indented = ed.doc.clone();
+        let since = docxcore::editor::undo_serial_counter();
+        ed.break_undo_group();
+        apply_doc_act(&mut ed, Act::IndentInc);
+        apply_doc_act(&mut ed, Act::IndentInc);
+        note_edit(&mut ed, &mut rec, since, Repeat::Act(Act::IndentInc));
+        let since = docxcore::editor::undo_serial_counter();
+        ed.break_undo_group();
+        apply_doc_act(&mut ed, Act::IndentDec);
+        note_edit(&mut ed, &mut rec, since, Repeat::Act(Act::IndentDec));
+        assert_eq!(ed.undo_names()[0], "Decrease Indent");
+        assert!(redo_or_repeat(&mut ed, &mut rec), "F4 outdents again");
+        assert_eq!(ed.undo_names()[..2], ["Decrease Indent", "Decrease Indent"]);
+        assert_eq!(ed.doc.body[2].plain_text(), indented.body[2].plain_text());
     }
 
     #[test]
