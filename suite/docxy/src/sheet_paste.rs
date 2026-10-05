@@ -25,6 +25,8 @@ pub(crate) struct PasteOptions {
     /// The pasted cells; the button sits at their bottom-right.
     pub rect: Rect,
     pub item: PasteItem,
+    /// The copy came from another workbook: no Paste Link.
+    pub foreign: bool,
 }
 
 impl PasteOptions {
@@ -238,12 +240,26 @@ impl SheetView {
         if !opts.stands(self) {
             return Err("The paste has changed since; there is nothing to redo".into());
         }
-        let Some(snap) = self.undo.pop() else {
-            return Err("There is no paste to redo".into());
-        };
-        self.restore(snap);
-        self.paste_item_at(&opts.block, item, opts.at)
+        let (block, at) = (&opts.block, opts.at);
+        self.redo_last_step(|v| v.paste_item_at(block, item, at))
+            .ok_or_else(|| "There is no paste to redo".to_string())?
     }
+}
+
+/// Why `src` cannot paste as `item`: a cut takes plain Paste only (M5), text
+/// only Paste, Values and Transpose, and a copy from another workbook no
+/// Paste Link (M1).
+pub(crate) fn item_refusal(src: &PasteSource, item: PasteItem) -> Result<(), &'static str> {
+    if src.cut && item != PasteItem::Paste {
+        return Err(CUT_PASTE_ONLY);
+    }
+    if !src.clip && !item.takes_text() {
+        return Err("Only Paste, Values and Transpose paste text copied from another program");
+    }
+    if src.foreign && item == PasteItem::Link {
+        return Err(LINK_FOREIGN);
+    }
+    Ok(())
 }
 
 const WHATS: [PasteWhat; 10] = PasteWhat::DIALOG;
@@ -351,14 +367,40 @@ fn presses(d: &Dialog, button: &str, label: &str) -> bool {
         && d.buttons.iter().any(|b| b.label == label && b.enabled)
 }
 
+/// What a Paste Special, a gallery item or Paste Options pastes.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PasteSource {
+    pub block: ClipBlock,
+    /// A live copy (else the clipboard's text).
+    pub clip: bool,
+    /// The copy is a cut: only plain Paste takes it, as in Excel.
+    pub cut: bool,
+    /// The copy came from another workbook: Paste Link would name a sheet
+    /// of this one (#707 r1 M1).
+    pub foreign: bool,
+}
+
+/// Why Paste Link refuses a copy from another workbook.
+pub(crate) const LINK_FOREIGN: &str =
+    "Paste Link links within the workbook the cells were copied from";
+
+/// Why Paste Special and the gallery refuse a cut.
+pub(crate) const CUT_PASTE_ONLY: &str = "A cut pastes with Paste only (Ctrl+V)";
+
 impl Docxy {
     /// What a paste would take now, as a [`ClipBlock`]: the live copy, or
     /// the clipboard's text read at the selection. `None` when there is
     /// nothing to paste.
-    fn paste_source(&mut self, cx: &mut gpui::Context<Self>) -> Option<(ClipBlock, bool)> {
+    pub(crate) fn paste_source(&mut self, cx: &mut gpui::Context<Self>) -> Option<PasteSource> {
         let now = self.clipboard_read(cx);
+        let here = self.active_sheet().map(|v| v.id);
         if let Some(clip) = self.grid_clip_live(&now) {
-            return Some((clip.block.clone(), true));
+            return Some(PasteSource {
+                block: clip.block.clone(),
+                clip: true,
+                cut: clip.cut,
+                foreign: Some(clip.view) != here,
+            });
         }
         if self
             .grid_clip
@@ -372,7 +414,12 @@ impl Docxy {
         };
         let v = self.active_sheet_mut()?;
         let (r, c, _, _) = v.range();
-        Some((v.text_clip_block(&text, (r, c)), false))
+        Some(PasteSource {
+            block: v.text_clip_block(&text, (r, c)),
+            clip: false,
+            cut: false,
+            foreign: false,
+        })
     }
 
     /// A Paste gallery item over the selection (#669).
@@ -386,25 +433,22 @@ impl Docxy {
             return;
         }
         self.grid_clip_expire();
-        let Some((block, clip)) = self.paste_source(cx) else {
+        let Some(src) = self.paste_source(cx) else {
             self.set_status("There is nothing to paste");
             return cx.notify();
         };
-        if !clip && !item.takes_text() {
-            self.set_status(
-                "Only Paste, Values and Transpose paste text copied from another program",
-            );
+        if let Err(why) = item_refusal(&src, item) {
+            self.set_status(why);
             return cx.notify();
         }
-        self.sheet_paste_block(block, clip, item, cx);
+        self.sheet_paste_block(src, item, cx);
     }
 
     /// Paste `block` as `item` at the selection's top-left, leaving the Paste
     /// Options button after a copy's paste.
     fn sheet_paste_block(
         &mut self,
-        block: ClipBlock,
-        clip: bool,
+        src: PasteSource,
         item: PasteItem,
         cx: &mut gpui::Context<Self>,
     ) {
@@ -412,12 +456,13 @@ impl Docxy {
             return;
         };
         let (r, c, _, _) = v.range();
-        match v.paste_item_at(&block, item, (r, c)) {
+        match v.paste_item_at(&src.block, item, (r, c)) {
             Ok(rect) => {
-                let opts = clip.then_some(PasteOptions {
+                let opts = src.clip.then_some(PasteOptions {
                     view: v.id,
                     edit_gen: v.edit_gen,
-                    block,
+                    foreign: src.foreign,
+                    block: src.block,
                     at: (r, c),
                     rect,
                     item,
@@ -437,6 +482,10 @@ impl Docxy {
             self.set_status("There is no paste to change");
             return cx.notify();
         };
+        if item == PasteItem::Link && opts.foreign {
+            self.set_status(LINK_FOREIGN);
+            return cx.notify();
+        }
         let Some(v) = self.active_sheet_mut() else {
             return;
         };
@@ -470,11 +519,16 @@ impl Docxy {
     /// paste. What it pastes is taken now, as the clipboard holds it.
     pub(crate) fn open_paste_special(&mut self, cx: &mut gpui::Context<Self>) {
         self.grid_clip_expire();
-        let Some((block, clip)) = self.paste_source(cx) else {
+        let Some(src) = self.paste_source(cx) else {
             self.set_status("There is nothing to paste");
             return cx.notify();
         };
-        self.paste_special_source = Some((block, clip));
+        if src.cut {
+            self.set_status(CUT_PASTE_ONLY);
+            return cx.notify();
+        }
+        let clip = src.clip;
+        self.paste_special_source = Some(src);
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.dialogs.push(paste_special_dialog(clip));
         }
@@ -500,9 +554,15 @@ impl Docxy {
                 Err(e) => return Some(Err(e)),
             }
         };
-        let Some((block, clip)) = self.paste_special_source.clone() else {
+        let Some(src) = self.paste_special_source.clone() else {
             return Some(Err("There is nothing to paste".into()));
         };
+        if link {
+            if let Err(why) = item_refusal(&src, PasteItem::Link) {
+                return Some(Err(why.into()));
+            }
+        }
+        let (block, clip) = (src.block, src.clip);
         if self.protected_view() {
             return Some(Err(crate::open_mode::PROTECTED_STATUS.into()));
         }

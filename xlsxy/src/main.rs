@@ -6318,9 +6318,17 @@ impl App {
                 Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
             return;
         }
-        if self.clip.is_none() {
-            self.status = Some("Paste Special pastes a copy made here: copy first".into());
-            return;
+        match &self.clip {
+            None => {
+                self.status = Some("Paste Special pastes a copy made here: copy first".into());
+                return;
+            }
+            // Excel offers only Paste for a cut (#707 r1).
+            Some(clip) if clip.cut => {
+                self.status = Some("A cut pastes with Paste only (Ctrl+V)".into());
+                return;
+            }
+            _ => {}
         }
         self.outline_dialog = Some(outlinedlg::Dialog::PasteSpecial(
             outlinedlg::PasteSpecialDialog::default(),
@@ -6333,6 +6341,10 @@ impl App {
         let Some(clip) = self.clip.clone() else {
             return;
         };
+        if clip.sheet >= self.pkg.workbook.sheets.len() {
+            self.status = Some("The copy's sheet is gone: copy again".into());
+            return;
+        }
         let rows: Vec<u32> = (0..clip.cells.len() as u32)
             .map(|i| clip.from.0 + i)
             .collect();
@@ -7475,8 +7487,20 @@ impl App {
 
     fn delete_current_sheet(&mut self) {
         let name = self.pkg.workbook.sheets[self.sheet].name.clone();
-        if self.pkg.remove_sheet(self.sheet) {
+        let gone = self.sheet;
+        if self.pkg.remove_sheet(gone) {
             self.cancel_cut();
+            // The copy names its sheet by index: one deleted takes the copy
+            // with it, and one before it renumbers it (#707 r1).
+            match self.clip.as_ref().map(|c| c.sheet) {
+                Some(s) if s == gone => self.clip = None,
+                Some(s) if s > gone => {
+                    if let Some(clip) = self.clip.as_mut() {
+                        clip.sheet -= 1;
+                    }
+                }
+                _ => {}
+            }
             self.sheet = self.sheet.min(self.pkg.workbook.sheets.len() - 1);
             self.cur = (0, 0);
             self.top = 0;
@@ -12217,6 +12241,54 @@ mod tests {
         });
         assert_eq!(cell(&app, 5, 0).value, CellValue::Number(20.0));
         assert!(app.undo.len() >= 2, "each paste is an undo step");
+    }
+
+    /// #707 r1 C1: a copy whose sheet is deleted goes with it, so Paste
+    /// Special cannot read a sheet that is not there (it panicked); a copy
+    /// on a later sheet follows the renumbering. M5: a cut takes Paste only.
+    #[test]
+    fn paste_special_after_the_copys_sheet_is_deleted() {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Sheet2");
+        pkg.add_sheet("Sheet3");
+        let mut app = App::new(pkg, "del.xlsx");
+        app.os_clip = None;
+        app.sheet = 1;
+        app.pkg.workbook.sheets[1].set_cell(0, 0, Cell::number(2.0));
+        app.pkg.workbook.sheets[1].set_cell(1, 0, Cell::formula("A1*3"));
+        app.cur = (1, 0);
+        app.anchor = Some((0, 0));
+        app.copy(false);
+        app.delete_current_sheet();
+        assert!(app.clip.is_none(), "the copy went with its sheet");
+        app.anchor = None;
+        app.open_paste_special();
+        assert!(app.outline_dialog.is_none());
+        // Even a clip left pointing past the sheets is refused, not a panic.
+        app.clip = Some(ClipData {
+            cells: vec![vec![Some(Cell::number(1.0))]],
+            sheet: 9,
+            from: (0, 0),
+            cut: false,
+        });
+        app.paste_special(gridcore::edit::PasteSpec::default());
+        assert!(app.status.as_deref().unwrap_or("").contains("gone"));
+        // A copy on Sheet3 survives deleting Sheet1, renumbered.
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Sheet2");
+        let mut app = App::new(pkg, "renum.xlsx");
+        app.os_clip = None;
+        app.sheet = 1;
+        app.pkg.workbook.sheets[1].set_cell(0, 0, Cell::number(5.0));
+        app.copy(false);
+        app.sheet = 0;
+        app.delete_current_sheet();
+        assert_eq!(app.clip.as_ref().map(|c| c.sheet), Some(0));
+        // M5: a cut refuses Paste Special.
+        app.copy(true);
+        app.open_paste_special();
+        assert!(app.outline_dialog.is_none());
+        assert!(app.status.as_deref().unwrap_or("").contains("cut"));
     }
 
     /// #668: Fill Up and Fill Left.

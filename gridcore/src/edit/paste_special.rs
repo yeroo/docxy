@@ -294,6 +294,14 @@ impl ClipBlock {
             .collect();
     }
 
+    /// Whether every copied cell has its source row and column: a block
+    /// whose `cells` outgrew `rows`/`cols` (its sheet gone, say, so
+    /// [`ClipBlock::capture`] found nothing) is not pasted (#707 r1).
+    pub fn is_consistent(&self) -> bool {
+        self.cells.len() == self.rows.len()
+            && self.cells.iter().all(|row| row.len() <= self.cols.len())
+    }
+
     /// (rows, cols) of the copy.
     pub fn size(&self) -> (u32, u32) {
         (self.rows.len() as u32, self.cols.len() as u32)
@@ -331,8 +339,8 @@ impl ClipBlock {
         at: (u32, u32),
         transpose: bool,
     ) -> Option<String> {
-        let dr = i64::from(dest.0) - i64::from(self.rows[i]);
-        let dc = i64::from(dest.1) - i64::from(self.cols[j]);
+        let dr = i64::from(dest.0) - i64::from(*self.rows.get(i)?);
+        let dc = i64::from(dest.1) - i64::from(*self.cols.get(j)?);
         if transpose {
             let inside = |row: i64, col: i64| -> Option<(i64, i64)> {
                 let i = self.rows.iter().position(|&x| i64::from(x) == row)?;
@@ -464,8 +472,9 @@ pub fn paste_special_changes(
     let Some(s) = sheets.get(sheet) else {
         return out;
     };
-    for (i, row) in clip.cells.iter().enumerate() {
-        for (j, src) in row.iter().enumerate() {
+    // Only the cells that know where they came from.
+    for (i, row) in clip.cells.iter().enumerate().take(clip.rows.len()) {
+        for (j, src) in row.iter().enumerate().take(clip.cols.len()) {
             let Some(dest) = clip.dest(at, (i, j), spec.transpose) else {
                 continue;
             };
@@ -592,8 +601,11 @@ pub fn paste_special_extras(clip: &ClipBlock, at: (u32, u32), spec: &PasteSpec) 
             };
             // The rule's relative references move with its first cell.
             let (i0, j0) = rule.cells[0];
-            let dr = i64::from(first.0) - i64::from(clip.rows[i0]);
-            let dc = i64::from(first.1) - i64::from(clip.cols[j0]);
+            let (Some(&sr), Some(&sc)) = (clip.rows.get(i0), clip.cols.get(j0)) else {
+                continue;
+            };
+            let dr = i64::from(first.0) - i64::from(sr);
+            let dc = i64::from(first.1) - i64::from(sc);
             let mv = |f: &str| {
                 if f.is_empty() || (dr, dc) == (0, 0) {
                     f.to_string()
@@ -771,6 +783,9 @@ pub fn paste_special(
     }
     if clip.cells.is_empty() || at.0 >= MAX_ROWS || at.1 >= MAX_COLS {
         return Err("Nothing to paste".into());
+    }
+    if !clip.is_consistent() {
+        return Err("The copy no longer matches its cells: copy again".into());
     }
     let changes = paste_special_changes(wb, sheet, at, clip, spec);
     let ex = paste_special_extras(clip, at, spec);

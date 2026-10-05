@@ -644,6 +644,10 @@ struct SheetView {
     /// area is ever acted on.
     areas: Vec<(u32, u32, u32, u32)>,
     areas_at: (usize, (u32, u32), (u32, u32)),
+    /// Set the first time the stamp is seen stale: the earlier areas are
+    /// then gone for good, so a later return to the stamped cell cannot
+    /// bring them back (#707 r1 M3). Interior, since readers only look.
+    areas_dead: std::cell::Cell<bool>,
 }
 
 /// The column spans of `areas` on each row below `rows` (#670, R17): what
@@ -1011,7 +1015,8 @@ fn multi_area_ok(act: SheetAct) -> bool {
         | SheetAct::Fill(_)
         | SheetAct::FillSeries
         | SheetAct::FillJustify
-        | SheetAct::FillAs(_) => false,
+        | SheetAct::FillAs(_)
+        | SheetAct::FillDrop(_) => false,
     }
 }
 
@@ -1662,6 +1667,8 @@ enum SheetAct {
     /// Auto Fill Options (and the fill handle's right-drag menu): redo the
     /// last fill as this kind.
     FillAs(gridcore::edit::FillKind),
+    /// The fill handle's right-drag menu: fill the waiting drag as this kind.
+    FillDrop(gridcore::edit::FillKind),
     /// A Home › Clear item.
     Clear(gridcore::edit::ClearWhat),
     /// Home › Find & Select › Go To… and Go To Special….
@@ -1885,6 +1892,7 @@ impl SheetView {
         self.end_cell_edit();
         self.active = si;
         self.sel = (r1, c1);
+        self.clear_areas();
         self.anchor = (r2, c2);
         let near = self.row_list_index(r1);
         self.vlist.scroll_to_reveal_item(near);
@@ -2020,6 +2028,7 @@ impl SheetView {
         let idx = self.pkg.add_sheet(name);
         self.active = idx;
         self.sel = (0, 0);
+        self.clear_areas();
         self.anchor = (0, 0);
         self.end_cell_edit();
         self.engine = sheet_engine(&self.pkg.workbook);
@@ -2083,6 +2092,7 @@ impl SheetView {
             self.active = self.pkg.workbook.sheets.len() - 1;
         }
         self.sel = (0, 0);
+        self.clear_areas();
         self.anchor = (0, 0);
         self.end_cell_edit();
         self.engine = sheet_engine(&self.pkg.workbook);
@@ -2493,6 +2503,7 @@ impl SheetView {
     fn move_sel(&mut self, dr: i32, dc: i32) {
         let (r, c) = self.sel;
         self.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
+        self.clear_areas();
         self.anchor = self.sel;
         self.end_cell_edit();
     }
@@ -2999,9 +3010,17 @@ impl SheetView {
         sel_range(self.sel, self.anchor)
     }
 
-    /// Whether the earlier areas still belong to the selection (R5).
+    /// Whether the earlier areas still belong to the selection (R5): the
+    /// stamp still matches, and never stopped matching since they were set.
     fn areas_live(&self) -> bool {
-        !self.areas.is_empty() && self.areas_at == (self.active, self.sel, self.anchor)
+        if self.areas.is_empty() || self.areas_dead.get() {
+            return false;
+        }
+        let live = self.areas_at == (self.active, self.sel, self.anchor);
+        if !live {
+            self.areas_dead.set(true);
+        }
+        live
     }
 
     /// The selection's areas other than the active one; empty for a
@@ -3031,6 +3050,7 @@ impl SheetView {
     /// a Ctrl+drag's sweep).
     fn stamp_areas(&mut self) {
         self.areas_at = (self.active, self.sel, self.anchor);
+        self.areas_dead.set(false);
     }
 
     /// Ctrl+click (or the press of a Ctrl+drag): the selection so far stays,
@@ -3069,6 +3089,7 @@ impl SheetView {
     /// Back to one area.
     fn clear_areas(&mut self) {
         self.areas.clear();
+        self.areas_dead.set(false);
     }
 
     /// The selection as a grid clip (Ctrl+C, Ctrl+X): its cells, and as TSV
@@ -3148,6 +3169,7 @@ impl SheetView {
         let w = block.iter().map(Vec::len).max().unwrap_or(0) as u32;
         if h > 0 && w > 0 {
             self.sel = at;
+            self.clear_areas();
             self.anchor = (at.0 + h - 1, at.1 + w - 1);
         }
     }
@@ -3621,7 +3643,7 @@ struct Docxy {
     // The Paste Options button of the last paste of a copy (#669), what
     // the Paste Special dialog pastes, and the Office Clipboard.
     paste_options: Option<sheet_paste::PasteOptions>,
-    paste_special_source: Option<(gridcore::edit::ClipBlock, bool)>,
+    paste_special_source: Option<sheet_paste::PasteSource>,
     office_clip: sheet_paste::OfficeClipboard,
     // A drag of the selection by its border (#670), and a drop waiting on
     // its menu or on the replace question.
@@ -8374,6 +8396,7 @@ fn new_sheet_surface() -> Surface {
         edit_gen: 0,
         areas: Vec::new(),
         areas_at: (0, (0, 0), (0, 0)),
+        areas_dead: Default::default(),
     })
 }
 
@@ -8444,6 +8467,7 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     edit_gen: 0,
                     areas: Vec::new(),
                     areas_at: (0, (0, 0), (0, 0)),
+                    areas_dead: Default::default(),
                 };
                 let mut status = format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" });
                 if repair {
@@ -10035,6 +10059,9 @@ impl Docxy {
     /// verbs cannot see a handler added here. This guard can. See
     /// `docs/ui-test-harness.md`.
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
+        // A new gesture: a drop still waiting on its menu is over.
+        self.fill_drop = None;
+        self.border_pending = None;
         if self.protected_refused(cx) || self.multi_area_refused(cx) {
             return;
         }
@@ -12060,7 +12087,7 @@ impl Docxy {
             .active_sheet()
             .map_or((false, false), |v| v.seed_kinds(f.src));
         self.fill_drop = Some(f);
-        let items = sheet_menus::fill_options(&sheet_menus::fill_kinds(dates, numbers), None);
+        let items = sheet_menus::fill_drop_menu(&sheet_menus::fill_kinds(dates, numbers));
         let at = self.last_pointer;
         self.open_menu(
             menu::MenuTarget::Grid(menu::GridMenu::FillDrop),
@@ -12070,11 +12097,20 @@ impl Docxy {
         );
     }
 
-    /// A choice from the Auto Fill Options button or the right-drag menu.
-    fn sheet_fill_as(&mut self, kind: gridcore::edit::FillKind, cx: &mut Context<Self>) {
-        if let Some(f) = self.fill_drop.take() {
-            return self.sheet_fill_run(f, kind, false, cx);
+    /// A choice from the fill handle's right-drag menu: the drag it waits
+    /// on, filled as `kind`.
+    fn sheet_fill_drop_as(&mut self, kind: gridcore::edit::FillKind, cx: &mut Context<Self>) {
+        match self.fill_drop.take() {
+            Some(f) => self.sheet_fill_run(f, kind, false, cx),
+            None => {
+                self.set_status("There is no drag to fill");
+                cx.notify();
+            }
         }
+    }
+
+    /// A choice from the Auto Fill Options button.
+    fn sheet_fill_as(&mut self, kind: gridcore::edit::FillKind, cx: &mut Context<Self>) {
         let Some(opts) = self.fill_options.clone() else {
             self.set_status("There is no fill to change");
             return cx.notify();
@@ -12220,6 +12256,7 @@ impl Docxy {
         if let Some(Surface::Sheet(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
             v.active = idx.min(v.pkg.workbook.sheets.len().saturating_sub(1));
             v.sel = (0, 0);
+            v.clear_areas();
             v.anchor = (0, 0);
             v.end_cell_edit();
         } else {
@@ -12952,7 +12989,8 @@ impl Docxy {
             let res = v.paste_grid_clip(&clip);
             let landed = matches!(res, Ok(GridPasted::Done | GridPasted::KeptAsCopy(_)));
             // A copy's paste leaves the Paste Options button (#669); a
-            // move does not, as in Excel.
+            // move does not, as in Excel. Copy mode stays on after a Ctrl+V:
+            // the paste's own undo step does not end it.
             self.paste_options = None;
             if landed && !clip.cut {
                 if let Some(v) = self.active_sheet() {
@@ -12964,18 +13002,10 @@ impl Docxy {
                         at: (rect.0, rect.1),
                         rect,
                         item: sheet_menus::PasteItem::Paste,
+                        foreign: clip.view != v.id,
                     });
                 }
-            }
-            // Copy mode stays on after a Ctrl+V: the paste's own undo step
-            // does not end it.
-            if landed && !clip.cut {
-                if let Some(mut ours) = self.grid_clip.take() {
-                    if let Some(v) = self.active_sheet() {
-                        ours.restamp(v);
-                    }
-                    self.grid_clip = Some(ours);
-                }
+                self.grid_clip_restamp();
             }
             // A cut pastes once; a cancelled one is over too. A refused paste
             // keeps it, to paste somewhere else.
@@ -13531,6 +13561,7 @@ impl Docxy {
                     .unwrap_or(*cells.last().unwrap())
             };
             v.sel = next;
+            v.clear_areas();
             v.anchor = next;
             // Bring the target row into view (columns follow via reconcile).
             v.vlist.scroll_to_reveal_item(v.row_list_index(next.0));
@@ -13799,6 +13830,7 @@ impl Docxy {
                 if let Some((rr, cc)) = gridcore::sheet::parse_cell_name(&cellref.replace('$', ""))
                 {
                     v.sel = (rr, cc);
+                    v.clear_areas();
                     v.anchor = (rr, cc);
                     v.vlist.scroll_to_reveal_item(v.row_list_index(rr));
                 }
@@ -14066,6 +14098,7 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             if let Some((r, c)) = v.find_match(&q, back) {
                 v.sel = (r, c);
+                v.clear_areas();
                 v.anchor = (r, c);
                 v.vlist.scroll_to_reveal_item(v.row_list_index(r));
             }
@@ -15193,10 +15226,15 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         let items = match m {
-            sheet_menus::SheetMenu::Paste => {
-                let (clip, text) = self.paste_sources(cx);
-                sheet_menus::paste_gallery(clip, text)
-            }
+            sheet_menus::SheetMenu::Paste => match self.paste_source(cx) {
+                // Each item on when the source takes it: a cut only Paste,
+                // text only Paste, Values and Transpose (#707 r1 M5).
+                Some(src) => sheet_menus::paste_gallery(
+                    |item| sheet_paste::item_refusal(&src, item).is_ok(),
+                    !src.cut,
+                ),
+                None => sheet_menus::paste_gallery(|_| false, false),
+            },
             sheet_menus::SheetMenu::Fill => sheet_menus::fill_menu(),
             sheet_menus::SheetMenu::Clear => sheet_menus::clear_menu(),
             sheet_menus::SheetMenu::FindSelect => sheet_menus::find_select_menu(),
@@ -15257,13 +15295,6 @@ impl Docxy {
         self.set_status(gridcore::edit::MULTI_SELECTION);
         cx.notify();
         true
-    }
-
-    /// What a paste could take now: a live grid clip, and clipboard text.
-    fn paste_sources(&mut self, cx: &mut Context<Self>) -> (bool, bool) {
-        let now = self.clipboard_read(cx);
-        let clip = self.grid_clip_live(&now).is_some();
-        (clip, matches!(now, ClipRead::Text(_)))
     }
 
     fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
@@ -15444,6 +15475,7 @@ impl Docxy {
                 cx.notify();
             }
             SheetAct::FillAs(kind) => self.sheet_fill_as(kind, cx),
+            SheetAct::FillDrop(kind) => self.sheet_fill_drop_as(kind, cx),
             SheetAct::PasteAs(item) => self.sheet_paste_as(item, cx),
             SheetAct::PasteAgain(item) => self.sheet_paste_again(item, cx),
             SheetAct::PasteSpecial => self.open_paste_special(cx),
@@ -15673,6 +15705,7 @@ impl Docxy {
                     if let Some(v) = self.active_sheet_mut() {
                         let (mr, mc) = v.extent();
                         v.sel = (0, 0);
+                        v.clear_areas();
                         v.anchor = (mr, mc);
                         v.end_cell_edit();
                     }
@@ -20825,6 +20858,7 @@ mod sheet_save_tests {
         assert!(v.delete_sheet(2));
         v.active = 0;
         v.sel = (0, 0);
+        v.clear_areas();
         assert!(v.comment_cell("me", "check"));
         assert_eq!(comment_texts(v), note);
         assert!(v.undo_step());
@@ -20845,6 +20879,7 @@ mod sheet_save_tests {
         assert!(v.undo_step());
         v.active = 0;
         v.sel = (0, 0);
+        v.clear_areas();
         assert!(v.comment_cell("me", "check"));
         assert!(!v.redo_step());
         assert_eq!(comment_texts(v), note);

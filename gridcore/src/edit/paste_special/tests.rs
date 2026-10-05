@@ -500,3 +500,35 @@ fn cells_become_rectangles() {
     assert_eq!(subtract((0, 0, 4, 4), (1, 1, 2, 2)).len(), 4);
     assert_eq!(subtract((0, 0, 0, 0), (5, 5, 5, 5)), vec![(0, 0, 0, 0)]);
 }
+
+/// #707 r1 C1: a block whose rows and columns no longer cover its cells
+/// (its sheet gone) is refused, and the changes never index past them.
+#[test]
+fn a_malformed_block_is_refused_and_never_panics() {
+    let mut wb = book(&[("Sheet1", &[])]);
+    let mut clip = ClipBlock::capture(&wb, 7, vec![0, 1], vec![0]);
+    assert_eq!(clip, ClipBlock::default(), "no such sheet");
+    clip.cells = vec![vec![Cell::number(1.0)], vec![Cell::formula("A1*3")]];
+    assert!(!clip.is_consistent());
+    assert!(paste_special(&mut wb, 0, at("C1"), &clip, &PasteSpec::default()).is_err());
+    // The cell writes alone skip what they cannot place; transposed too.
+    clip.rows = vec![0];
+    clip.cols = vec![0];
+    for transpose in [false, true] {
+        let spec = PasteSpec {
+            transpose,
+            ..PasteSpec::default()
+        };
+        let ch = paste_special_changes(&mut wb, 0, at("C1"), &clip, &spec);
+        assert_eq!(ch.len(), 1);
+    }
+    clip.rules = vec![ClipRule {
+        kind: "list".into(),
+        operator: String::new(),
+        formula1: "\"a\"".into(),
+        formula2: String::new(),
+        prompt: None,
+        cells: vec![(5, 5)],
+    }];
+    let _ = paste_special_extras(&clip, at("C1"), &PasteSpec::of(PasteWhat::Validation));
+}

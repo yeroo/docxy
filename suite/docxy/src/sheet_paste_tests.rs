@@ -147,6 +147,7 @@ fn paste_options_repaste_in_place_as_one_step() {
         at: at("C1"),
         rect: v.range(),
         item: PasteItem::Paste,
+        foreign: false,
     };
     v.repaste(&opts, PasteItem::Values).unwrap();
     assert_eq!(formula(&v, "C1"), None);
@@ -167,6 +168,7 @@ fn paste_options_repaste_in_place_as_one_step() {
         at: at("B1"),
         rect: (0, 1, 0, 1),
         item: PasteItem::Paste,
+        foreign: false,
     };
     v.push_undo();
     assert!(v.repaste(&stale, PasteItem::Values).is_err());
@@ -228,4 +230,70 @@ fn the_office_clipboard_keeps_24_newest_first() {
     assert_eq!(OfficeClipboard::preview("a\tb\nc\n"), "a  b\u{2026}");
     oc.push("");
     assert_eq!(oc.items.len(), 2, "an empty copy adds nothing");
+}
+
+/// #707 r1 M2: a Paste Options choice that is refused (here a transposed
+/// paste over part of a legacy array) leaves the first paste and its undo
+/// step exactly as they were.
+#[test]
+fn a_refused_repaste_keeps_the_first_paste_and_its_step() {
+    let mut v = view();
+    for (n, x) in [("X1", 1.0), ("Y1", 2.0), ("Z1", 3.0)] {
+        put(&mut v, n, Cell::number(x));
+    }
+    // A CSE block over A3:B3: a transposed paste down B2:B4 would change
+    // B3, half of it (and not its anchor).
+    let s = v.active;
+    let mut a3 = Cell::formula("X1*2");
+    a3.f_attrs = Some(" t=\"array\" ref=\"A3:B3\"".into());
+    v.pkg.workbook.sheets[s].set_cell(2, 0, a3);
+    v.pkg.workbook.sheets[s].set_cell(2, 1, Cell::number(2.0));
+    v.engine = crate::sheet_engine(&v.pkg.workbook);
+    v.engine.recalc_all(&mut v.pkg.workbook);
+    let clip = copy(&mut v, "X1", "Z1");
+    select(&mut v, "B2");
+    assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    assert_eq!(value(&v, "D2"), CellValue::Number(3.0));
+    let opts = PasteOptions {
+        view: v.id,
+        edit_gen: v.edit_gen,
+        block: clip.block.clone(),
+        at: at("B2"),
+        rect: v.range(),
+        item: PasteItem::Paste,
+        foreign: false,
+    };
+    assert_eq!(v.undo.len(), 1);
+    assert!(v.repaste(&opts, PasteItem::Transpose).is_err());
+    assert_eq!(value(&v, "D2"), CellValue::Number(3.0), "the paste stays");
+    assert_eq!(v.undo.len(), 1, "and its step");
+    assert!(v.redo.is_empty());
+    assert!(v.undo_step());
+    assert_eq!(
+        value(&v, "D2"),
+        CellValue::Empty,
+        "one undo: before the paste"
+    );
+}
+
+/// #707 r1 M1 and M5: a cut takes plain Paste only, text Paste, Values and
+/// Transpose, and a copy from another workbook no Paste Link.
+#[test]
+fn the_paste_sources_refuse_what_they_cannot_take() {
+    let src = |clip, cut, foreign| PasteSource {
+        block: ClipBlock::default(),
+        clip,
+        cut,
+        foreign,
+    };
+    let cut = src(true, true, false);
+    assert_eq!(item_refusal(&cut, PasteItem::Paste), Ok(()));
+    assert_eq!(item_refusal(&cut, PasteItem::Values), Err(CUT_PASTE_ONLY));
+    assert_eq!(item_refusal(&cut, PasteItem::Link), Err(CUT_PASTE_ONLY));
+    let foreign = src(true, false, true);
+    assert_eq!(item_refusal(&foreign, PasteItem::Link), Err(LINK_FOREIGN));
+    assert_eq!(item_refusal(&foreign, PasteItem::Values), Ok(()));
+    let text = src(false, false, false);
+    assert!(item_refusal(&text, PasteItem::Formulas).is_err());
+    assert_eq!(item_refusal(&text, PasteItem::Transpose), Ok(()));
 }

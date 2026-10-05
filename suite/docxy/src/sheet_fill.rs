@@ -13,7 +13,7 @@ use gridcore::edit::{
 
 /// The Auto Fill Options button after a fill: what that fill was, so a
 /// choice from its menu runs it again as another kind. It stands only while
-/// the workbook is as the fill left it (`view` and `gen`).
+/// the workbook is as the fill left it (`view` and `edit_gen`).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FillOptions {
     pub view: u64,
@@ -21,6 +21,7 @@ pub(crate) struct FillOptions {
     pub src: (u32, u32, u32, u32),
     pub to: (u32, u32),
     pub kind: FillKind,
+    /// Ctrl was held: a choice runs again with it held.
     pub ctrl: bool,
     /// The filled cells; the button sits at their bottom-right.
     pub dest: (u32, u32, u32, u32),
@@ -100,17 +101,35 @@ impl SheetView {
         if !opts.stands(self) {
             return Err("The fill has changed since; there is nothing to redo".into());
         }
-        let Some(snap) = self.undo.pop() else {
-            return Err("There is no fill to redo".into());
-        };
-        self.restore(snap);
-        self.fill_drag(&FillReq {
+        let req = FillReq {
             src: opts.src,
             to: opts.to,
             kind,
-            ctrl: false,
+            ctrl: opts.ctrl,
             lists,
-        })
+        };
+        self.redo_last_step(|v| v.fill_drag(&req))
+            .ok_or_else(|| "There is no fill to redo".to_string())?
+    }
+
+    /// Take the last undo step back in place and run `again` instead, as its
+    /// replacement: one undo still returns to before either. When `again`
+    /// fails (an array in the way, say), the step and the state it undid are
+    /// put back as they were (#707 r1 M2). `None` when there is no step.
+    pub(crate) fn redo_last_step<T>(
+        &mut self,
+        again: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Option<Result<T, String>> {
+        let snap = self.undo.pop()?;
+        let now = self.snapshot_like(&snap);
+        self.restore(snap);
+        let before = self.snapshot_like(&now);
+        let done = again(self);
+        if done.is_err() {
+            self.restore(now);
+            self.undo.push(before);
+        }
+        Some(done)
     }
 
     /// Home › Fill › Series… over the selection, as one undo step. Refused

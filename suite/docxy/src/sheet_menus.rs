@@ -133,33 +133,26 @@ fn sep() -> MenuItem {
     MenuItem::Separator
 }
 
-/// The Paste gallery (Home › Paste's arrow): its sections, then Paste
-/// Special…. `clip` is whether a grid clip is live (without one, only the
-/// items that read plain text are on).
-pub(crate) fn paste_gallery(clip: bool, text: bool) -> Vec<MenuItem> {
-    let mut items = paste_options(clip, text);
-    items.push(sep());
-    items.push(item(
-        "paste-special",
-        "Paste Special\u{2026}",
-        SheetAct::PasteSpecial,
-        clip || text,
-    ));
-    items
-}
-
-/// The Paste Options menu: the gallery's items without Paste Special.
-pub(crate) fn paste_options(clip: bool, text: bool) -> Vec<MenuItem> {
+/// The Paste gallery (Home › Paste's arrow): its sections, each item on
+/// when `on` says the paste source takes it, then Paste Special…, on when
+/// `special` (there is something to paste, and it is not a cut).
+pub(crate) fn paste_gallery(on: impl Fn(PasteItem) -> bool, special: bool) -> Vec<MenuItem> {
     let mut items = Vec::new();
     for (k, section) in PasteItem::SECTIONS.iter().enumerate() {
         if k > 0 {
             items.push(sep());
         }
         for &p in *section {
-            let on = clip || (text && p.takes_text());
-            items.push(item(p.id(), p.label(), SheetAct::PasteAs(p), on));
+            items.push(item(p.id(), p.label(), SheetAct::PasteAs(p), on(p)));
         }
     }
+    items.push(sep());
+    items.push(item(
+        "paste-special",
+        "Paste Special\u{2026}",
+        SheetAct::PasteSpecial,
+        special,
+    ));
     items
 }
 
@@ -255,15 +248,30 @@ pub(crate) fn fill_kinds(dates: bool, numbers: bool) -> Vec<FillKind> {
     kinds
 }
 
-/// The Auto Fill Options menu (and the fill handle's right-drag menu, which
-/// offers the same kinds), `current` ticked.
+/// The Auto Fill Options menu, `current` ticked: each item runs the last
+/// fill again as its kind.
 pub(crate) fn fill_options(kinds: &[FillKind], current: Option<FillKind>) -> Vec<MenuItem> {
+    fill_kind_items(kinds, current, SheetAct::FillAs)
+}
+
+/// The fill handle's right-drag menu: the same kinds, each running the
+/// drag that opened it. Its own act, so a choice from it can only ever run
+/// that drag, and Auto Fill Options can never run it (#707 r1 M4).
+pub(crate) fn fill_drop_menu(kinds: &[FillKind]) -> Vec<MenuItem> {
+    fill_kind_items(kinds, None, SheetAct::FillDrop)
+}
+
+fn fill_kind_items(
+    kinds: &[FillKind],
+    current: Option<FillKind>,
+    act: fn(FillKind) -> SheetAct,
+) -> Vec<MenuItem> {
     kinds
         .iter()
         .map(|&k| {
             let id = format!("fill-{}", k.label().to_ascii_lowercase().replace(' ', "-"));
             MenuItem::Item(
-                Entry::new(&id, k.label(), "", Act::Sheet(SheetAct::FillAs(k)), true)
+                Entry::new(&id, k.label(), "", Act::Sheet(act(k)), true)
                     .checked(current == Some(k)),
             )
         })
@@ -343,18 +351,18 @@ mod tests {
 
     #[test]
     fn the_gallery_is_excels_with_paste_special_last() {
-        let g = paste_gallery(true, true);
+        let g = paste_gallery(|_| true, true);
         let l = labels(&g);
         assert_eq!(l.len(), 13);
         assert_eq!(l[0], "Paste");
         assert_eq!(l.last().unwrap(), "Paste Special\u{2026}");
-        assert_eq!(labels(&paste_options(true, true)).len(), 12);
+        assert_eq!(labels(&paste_again_menu(PasteItem::Paste)).len(), 12);
         assert!(resolve(&g, &["No Borders"]).is_ok());
     }
 
     #[test]
-    fn without_a_clip_only_the_text_items_are_on() {
-        let g = paste_options(false, true);
+    fn the_gallery_turns_off_what_the_source_cannot_take() {
+        let g = paste_gallery(PasteItem::takes_text, false);
         let on: Vec<String> = g
             .iter()
             .filter_map(|i| match i {
@@ -363,7 +371,37 @@ mod tests {
             })
             .collect();
         assert_eq!(on, ["Paste", "Transpose", "Values"]);
-        assert!(resolve(&paste_gallery(false, false), &["Paste Special\u{2026}"]).is_err());
+        assert!(resolve(&g, &["Paste Special\u{2026}"]).is_err());
+    }
+
+    /// #707 r1 M4: the right-drag menu runs its own drag and Auto Fill
+    /// Options its own fill: their items never share an act, so a dismissed
+    /// drop menu leaves nothing an Options choice could run.
+    #[test]
+    fn the_drop_menu_and_auto_fill_options_run_different_acts() {
+        let kinds = fill_kinds(false, true);
+        let acts = |items: Vec<MenuItem>| -> Vec<SheetAct> {
+            items
+                .into_iter()
+                .filter_map(|i| match i {
+                    MenuItem::Item(e) => match e.act {
+                        Some(Act::Sheet(a)) => Some(a),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(
+            acts(fill_drop_menu(&kinds))
+                .iter()
+                .all(|a| matches!(a, SheetAct::FillDrop(_)))
+        );
+        assert!(
+            acts(fill_options(&kinds, None))
+                .iter()
+                .all(|a| matches!(a, SheetAct::FillAs(_)))
+        );
     }
 
     #[test]

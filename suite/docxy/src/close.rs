@@ -138,6 +138,7 @@ fn commit_changed_cell(tab: &mut DocTab) -> Result<(), String> {
         tab.dirty |= changed;
         if changed {
             v.anchor = v.sel;
+            v.clear_areas();
         }
     }
     Ok(())

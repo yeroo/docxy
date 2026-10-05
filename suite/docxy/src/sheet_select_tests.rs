@@ -222,3 +222,29 @@ fn the_guard_sorts_every_command() {
         gridcore::edit::FillDir::Down
     )));
 }
+
+/// #707 r1 M3: Down then Up lands on the stamped cell again; the areas
+/// must not come back with it (Delete then cleared A1 too).
+#[test]
+fn areas_once_dropped_never_come_back() {
+    let mut v = view();
+    put(&mut v, "A1", Cell::number(1.0));
+    put(&mut v, "C3", Cell::number(3.0));
+    select(&mut v, "A1", "A1");
+    v.add_area(at("C3"));
+    v.move_sel(1, 0);
+    v.move_sel(-1, 0);
+    assert_eq!(areas(&v), vec![rect("C3")]);
+    let changes = v.clear_changes();
+    assert_eq!(changes.len(), 1, "only C3");
+    // A writer that never clears them: the first read of the stale stamp
+    // drops them for good, so a return to the stamped cell finds none.
+    select(&mut v, "A1", "A1");
+    v.add_area(at("C3"));
+    v.sel = at("A5");
+    v.anchor = at("A5");
+    assert_eq!(areas(&v), vec![rect("A5")]);
+    v.sel = at("C3");
+    v.anchor = at("C3");
+    assert_eq!(areas(&v), vec![rect("C3")]);
+}

@@ -152,6 +152,9 @@ impl Docxy {
         {
             return;
         }
+        // A new gesture: a drop still waiting on its menu or question is over.
+        self.border_pending = None;
+        self.fill_drop = None;
         if self.protected_refused(cx) || self.multi_area_refused(cx) {
             return;
         }
