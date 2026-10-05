@@ -1,5 +1,8 @@
 //! Pure parsers for the build info. No I/O: `build.rs` includes this file, so the
 //! unit tests here cover exactly the code the build script runs.
+// The library itself only reads what the build script stamped; the parsers are the
+// build script's (and the tests').
+#![allow(dead_code)]
 
 /// How a binary was built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

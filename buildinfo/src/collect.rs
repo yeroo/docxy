@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Newest merges to scan for the last merged PR.
+/// First-parent commits to scan for the last merged PR.
 const SCAN_LIMIT: usize = 500;
 
 pub const UNKNOWN: &str = "unknown";
@@ -38,11 +38,18 @@ impl Fields {
     }
 }
 
+/// An environment lookup (a parameter so tests need not touch the process env).
+pub type Env<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
 /// Run `git <args>` in `dir`; stdout (trimmed of the final newline) on success.
-fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
+fn git(dir: &Path, env: &Env, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(dir);
+    // Where git must stop looking for a repository (the tests' git-less directory).
+    if let Some(ceiling) = env("GIT_CEILING_DIRECTORIES") {
+        cmd.env("GIT_CEILING_DIRECTORIES", ceiling);
+    }
+    let out = cmd
         // An outer `git` invocation (a hook, a worktree script) must not redirect us.
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -57,14 +64,14 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// `env` reads an environment variable (a parameter so tests need not touch the process env).
-pub fn collect(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Fields {
+pub fn collect(dir: &Path, env: &Env) -> Fields {
     let mut f = Fields::unknown();
-    let Some(head) = git(dir, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty()) else {
+    let Some(head) = git(dir, env, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty()) else {
         return f;
     };
     f.commit = head;
 
-    f.branch = match git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).as_deref() {
+    f.branch = match git(dir, env, &["rev-parse", "--abbrev-ref", "HEAD"]).as_deref() {
         Some(b) if !b.is_empty() && b != "HEAD" => b.to_string(),
         // Detached HEAD (a CI checkout): the workflow knows the branch.
         _ => env("GITHUB_HEAD_REF")
@@ -73,17 +80,18 @@ pub fn collect(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Fields {
             .unwrap_or_else(|| UNKNOWN.into()),
     };
 
-    if let Some(d) = git(dir, &["log", "-1", "--format=%cI"]).filter(|s| !s.is_empty()) {
+    if let Some(d) = git(dir, env, &["log", "-1", "--format=%cI"]).filter(|s| !s.is_empty()) {
         f.commit_date = d;
     }
 
-    if let Some(s) = git(dir, &["status", "--porcelain", "--untracked-files=no"]) {
+    if let Some(s) = git(dir, env, &["status", "--porcelain", "--untracked-files=no"]) {
         f.dirty = !s.trim().is_empty();
     }
 
     let max = format!("--max-count={SCAN_LIMIT}");
     if let Some(log) = git(
         dir,
+        env,
         &["log", "--first-parent", &max, "--format=%s%x1f%b%x1e"],
     ) {
         let recs: Vec<(u32, String, bool)> = log
@@ -107,7 +115,7 @@ pub fn collect(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Fields {
 
     f.issue = crate::parse::issue_from_branch(&f.branch);
     if f.issue.is_some() {
-        f.ahead = git(dir, &["rev-list", "--count", "origin/main..HEAD"])
+        f.ahead = git(dir, env, &["rev-list", "--count", "origin/main..HEAD"])
             .and_then(|s| s.trim().parse().ok());
     }
     f
@@ -117,20 +125,21 @@ pub fn collect(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Fields {
 /// the index, packed refs, and every tracked file that is modified right now.
 /// Empty without a repository. Paths resolve against `dir` (cargo runs the build
 /// script in the package directory).
-pub fn watch_paths(dir: &Path) -> Vec<PathBuf> {
+pub fn watch_paths(dir: &Path, env: &Env) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if git(dir, &["rev-parse", "HEAD"]).is_none() {
+    if git(dir, env, &["rev-parse", "HEAD"]).is_none() {
         return out;
     }
-    let git_path = |name: &str| git(dir, &["rev-parse", "--git-path", name]).map(PathBuf::from);
+    let git_path =
+        |name: &str| git(dir, env, &["rev-parse", "--git-path", name]).map(PathBuf::from);
     out.extend(git_path("HEAD"));
-    if let Some(r) = git(dir, &["symbolic-ref", "-q", "HEAD"]) {
+    if let Some(r) = git(dir, env, &["symbolic-ref", "-q", "HEAD"]) {
         out.extend(git_path(&r));
     }
     out.extend(git_path("packed-refs"));
     out.extend(git_path("index"));
-    if let Some(top) = git(dir, &["rev-parse", "--show-toplevel"]) {
-        if let Some(list) = git(dir, &["diff", "--name-only", "--no-renames", "HEAD"]) {
+    if let Some(top) = git(dir, env, &["rev-parse", "--show-toplevel"]) {
+        if let Some(list) = git(dir, env, &["diff", "--name-only", "--no-renames", "HEAD"]) {
             out.extend(
                 list.lines()
                     .filter(|l| !l.is_empty())
@@ -158,15 +167,19 @@ mod tests {
 
     #[test]
     fn without_git_everything_is_unknown() {
-        let d = temp_dir("nogit");
-        // Stop git walking up from the temp dir into some enclosing repository.
-        // SAFETY: only this test sets the variable, before any thread it spawns reads it.
-        unsafe { std::env::set_var("GIT_CEILING_DIRECTORIES", &d) };
-        let f = collect(&d, &no_env);
+        let outer = temp_dir("nogit");
+        // git ignores a ceiling equal to the working directory, so the directory
+        // under test is a child of the ceiling: git may not look above it, and
+        // cannot find a repository enclosing the temp dir.
+        let d = outer.join("work");
+        std::fs::create_dir_all(&d).unwrap();
+        let ceiling = outer.display().to_string();
+        let env = move |k: &str| (k == "GIT_CEILING_DIRECTORIES").then(|| ceiling.clone());
+        let f = collect(&d, &env);
         assert_eq!(f, Fields::unknown());
         assert_eq!(f.commit, "unknown");
-        assert!(watch_paths(&d).is_empty());
-        let _ = std::fs::remove_dir_all(&d);
+        assert!(watch_paths(&d, &env).is_empty());
+        let _ = std::fs::remove_dir_all(&outer);
     }
 
     /// `git -C dir <args>` with a fixed identity; false when git is not installed.
@@ -231,11 +244,48 @@ mod tests {
         assert!(!collect(&d, &no_env).dirty);
         std::fs::write(d.join("a.txt"), "2").unwrap();
         assert!(collect(&d, &no_env).dirty);
-        assert!(watch_paths(&d).iter().any(|p| p.ends_with("a.txt")));
+        assert!(
+            watch_paths(&d, &no_env)
+                .iter()
+                .any(|p| p.ends_with("a.txt"))
+        );
         // The branch's own issue number is not a PR.
         assert!(run(&d, &["checkout", "-q", "-b", "issue-99-later"]));
         assert_eq!(collect(&d, &no_env).issue, Some(99));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_squash_subject_naming_the_branchs_own_issue_is_not_a_pr() {
+        let outer = temp_dir("own-issue");
+        let d = outer.join("work");
+        std::fs::create_dir_all(&d).unwrap();
+        if !run(&d, &["init", "-q", "-b", "issue-42-x"]) {
+            return; // no git on this machine
+        }
+        std::fs::write(d.join("a.txt"), "1").unwrap();
+        assert!(run(&d, &["add", "."]));
+        assert!(run(&d, &["commit", "-qm", "Older squash (#7)"]));
+        assert!(run(
+            &d,
+            &["commit", "-q", "--allow-empty", "-m", "Fix (#42)"]
+        ));
+        let ceiling = outer.display().to_string();
+        let env = move |k: &str| (k == "GIT_CEILING_DIRECTORIES").then(|| ceiling.clone());
+        // Newest first: "Fix (#42)" is the branch's own issue, so the older squash wins.
+        let f = collect(&d, &env);
+        assert_eq!(f.issue, Some(42));
+        assert_eq!(f.last_pr, Some((7, "Older squash".into())));
+        // With nothing else in range there is no PR at all.
+        assert!(run(&d, &["checkout", "-q", "--orphan", "issue-42-y"]));
+        assert!(run(
+            &d,
+            &["commit", "-q", "--allow-empty", "-m", "Fix (#42)"]
+        ));
+        let f = collect(&d, &env);
+        assert_eq!(f.issue, Some(42));
+        assert_eq!(f.last_pr, None);
+        let _ = std::fs::remove_dir_all(&outer);
     }
 
     #[test]

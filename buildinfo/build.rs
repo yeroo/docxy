@@ -37,7 +37,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     println!("cargo:rerun-if-env-changed=GITHUB_HEAD_REF");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
-    for p in collect::watch_paths(&dir) {
+    for p in collect::watch_paths(&dir, &env) {
         println!("cargo:rerun-if-changed={}", p.display());
     }
 

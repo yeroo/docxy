@@ -1,7 +1,7 @@
 //! Build info stamped at compile time: which commit, which merged PR, which kind
 //! of build, and whether it is a "manual build". Dependency-free so every host
-//! (the suite, docxy, xlsxy, yppxy, lookxy) can share it; hosts map [`Value`] to
-//! their own JSON type.
+//! (the suite, docxy, xlsxy, yppxy, lookxy) can share it. Hosts that need JSON
+//! (`app-info`) take [`BuildInfo::json`] and parse it with their own JSON type.
 //!
 //! The dirty bit and build time are as of the last time `build.rs` ran. Cargo
 //! reruns it when HEAD, the ref HEAD points to, or the index changes (and when a
@@ -14,12 +14,13 @@
 mod collect;
 mod parse;
 
-pub use parse::{Kind, is_manual, issue_from_branch, kind_from_env, last_merged_pr, utc_timestamp};
+pub use parse::Kind;
+use parse::{is_manual, kind_from_env};
 
 use std::sync::OnceLock;
 
 /// What `build.rs` recorded.
-pub struct Raw {
+pub(crate) struct Raw {
     pub commit: &'static str,
     pub branch: &'static str,
     pub commit_date: &'static str,
@@ -40,7 +41,7 @@ const RAW: Raw = include!(concat!(env!("OUT_DIR"), "/buildinfo.rs"));
 /// A JSON-shaped value, so hosts can build their own JSON without `buildinfo`
 /// depending on one.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Value {
+enum Value {
     Str(String),
     Bool(bool),
     Num(u64),
@@ -73,7 +74,7 @@ impl BuildInfo {
         BuildInfo::from_raw(&RAW, version)
     }
 
-    pub fn from_raw(raw: &Raw, version: &str) -> BuildInfo {
+    fn from_raw(raw: &Raw, version: &str) -> BuildInfo {
         BuildInfo {
             version: version.to_string(),
             commit: raw.commit.to_string(),
@@ -142,7 +143,7 @@ impl BuildInfo {
     }
 
     /// Every field, in display order.
-    pub fn fields(&self) -> Vec<(&'static str, Value)> {
+    fn fields(&self) -> Vec<(&'static str, Value)> {
         let s = |v: &str| Value::Str(v.to_string());
         let num = |v: Option<u32>| v.map_or(Value::Null, |n| Value::Num(u64::from(n)));
         vec![
@@ -196,35 +197,46 @@ impl BuildInfo {
         s
     }
 
+    /// The labelled rows of the build, in display order: what the About dialog
+    /// lists and what [`BuildInfo::version_block`] prints after its title line.
+    /// The "manual build" marker is not a row: see [`BuildInfo::manual`].
+    pub fn rows(&self) -> Vec<(&'static str, String)> {
+        let last_pr = match (self.last_pr, &self.last_pr_title) {
+            (Some(n), Some(t)) if !t.is_empty() => format!("#{n} {t}"),
+            (Some(n), _) => format!("#{n}"),
+            (None, _) => "none".to_string(),
+        };
+        let mut rows = vec![
+            ("commit", self.commit.clone()),
+            ("branch", self.branch.clone()),
+            ("commit date", self.commit_date.clone()),
+            ("last PR", last_pr),
+        ];
+        if let Some(issue) = self.issue {
+            rows.push((
+                "issue",
+                match self.ahead {
+                    Some(a) => format!("#{issue} ({a} ahead of origin/main)"),
+                    None => format!("#{issue}"),
+                },
+            ));
+        }
+        rows.push(("dirty", if self.dirty { "yes" } else { "no" }.to_string()));
+        rows.push(("built", self.built_at.clone()));
+        rows.push(("profile", self.profile.clone()));
+        rows.push(("target", self.target.clone()));
+        rows.push(("host", self.host.clone()));
+        rows.push(("kind", self.kind.as_str().to_string()));
+        rows
+    }
+
     /// The multi-line block `--version`, the About dialog's Copy and the crash log print.
     /// `name` is the program (`docxy`, `suite`).
     pub fn version_block(&self, name: &str) -> String {
         let mut s = format!("{name} {}\n", self.version);
-        s.push_str(&format!("commit:      {}\n", self.commit));
-        s.push_str(&format!("branch:      {}\n", self.branch));
-        s.push_str(&format!("commit date: {}\n", self.commit_date));
-        match (self.last_pr, &self.last_pr_title) {
-            (Some(n), Some(t)) if !t.is_empty() => s.push_str(&format!("last PR:     #{n} {t}\n")),
-            (Some(n), _) => s.push_str(&format!("last PR:     #{n}\n")),
-            (None, _) => s.push_str("last PR:     none\n"),
+        for (label, value) in self.rows() {
+            s.push_str(&format!("{:<12} {value}\n", format!("{label}:")));
         }
-        if let Some(issue) = self.issue {
-            match self.ahead {
-                Some(a) => s.push_str(&format!(
-                    "issue:       #{issue} ({a} ahead of origin/main)\n"
-                )),
-                None => s.push_str(&format!("issue:       #{issue}\n")),
-            }
-        }
-        s.push_str(&format!(
-            "dirty:       {}\n",
-            if self.dirty { "yes" } else { "no" }
-        ));
-        s.push_str(&format!("built:       {}\n", self.built_at));
-        s.push_str(&format!("profile:     {}\n", self.profile));
-        s.push_str(&format!("target:      {}\n", self.target));
-        s.push_str(&format!("host:        {}\n", self.host));
-        s.push_str(&format!("kind:        {}\n", self.kind.as_str()));
         if self.manual() {
             s.push_str("manual build\n");
         }
