@@ -2847,6 +2847,39 @@ pub fn eval_formula_at(wb: &Workbook, sheet: usize, row: u32, col: u32, src: &st
     }
 }
 
+/// Which records of the list `list` on `sheet` (its first row the headers)
+/// the criteria range `crit` on `crit_sheet` selects, with the D-functions'
+/// rules (see [`formula::Eval::db_matches`]): one entry per record. Advanced
+/// Filter's matcher.
+pub fn criteria_matches(
+    wb: &Workbook,
+    sheet: usize,
+    list: (u32, u32, u32, u32),
+    crit_sheet: usize,
+    crit: (u32, u32, u32, u32),
+) -> Vec<bool> {
+    let resolver = WbResolver {
+        wb,
+        clock: None,
+        rand_state: StdCell::new(0),
+        has_rand: false,
+    };
+    let grid = |s: usize, (r1, c1, r2, c2): (u32, u32, u32, u32)| -> Vec<Vec<Value>> {
+        (r1..=r2)
+            .map(|r| (c1..=c2).map(|c| resolver.value(s, r, c)).collect())
+            .collect()
+    };
+    let db = grid(sheet, list);
+    let cr = grid(crit_sheet, crit);
+    let mut ev = Eval::new(&resolver, sheet, (list.0, list.1));
+    ev.db_matches(
+        &db,
+        Some((sheet, list.0, list.1)),
+        &cr,
+        Some((crit_sheet, crit.0, crit.1)),
+    )
+}
+
 /// The (already recalculated) value of a cell as a [`Value`].
 pub fn cell_value_at(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Value {
     let resolver = WbResolver {

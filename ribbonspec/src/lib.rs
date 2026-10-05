@@ -111,7 +111,7 @@ pub struct Group<A> {
 pub enum Control<A> {
     /// A big icon-over-label button (the group's headline command).
     Large(Cmd<A>),
-    /// Up to three small icon+label buttons stacked in a column.
+    /// Up to three ([`MAX_COLUMN_ROWS`]) small icon+label buttons stacked in a column.
     Column(Vec<Cmd<A>>),
     /// A primary button plus a dropdown of related commands.
     Split { primary: Cmd<A>, menu: Vec<Cmd<A>> },
@@ -230,14 +230,84 @@ impl<A> Group<A> {
     }
 }
 
-/// A column of up to three small buttons.
+/// The most small-button rows a [`Control::Column`] or [`Control::Rows`] stack
+/// holds. The ribbon body fits three; a fourth row would be clipped, or, where
+/// the renderer wraps a column at three, hidden in a second column (#1018).
+pub const MAX_COLUMN_ROWS: usize = 3;
+
+/// A column of up to three small buttons ([`MAX_COLUMN_ROWS`]).
 pub fn column<A>(cmds: Vec<Cmd<A>>) -> Control<A> {
+    debug_assert!(
+        cmds.len() <= MAX_COLUMN_ROWS,
+        "a column holds at most {MAX_COLUMN_ROWS} rows, not {}",
+        cmds.len()
+    );
     Control::Column(cmds)
 }
 
-/// A grid of small controls in explicit rows (the Office two-row layout).
+/// A grid of small controls in explicit rows (the Office two-row layout), at
+/// most [`MAX_COLUMN_ROWS`] of them.
 pub fn rows<A>(rows: Vec<Vec<Cell<A>>>) -> Control<A> {
+    debug_assert!(
+        rows.len() <= MAX_COLUMN_ROWS,
+        "a rows stack holds at most {MAX_COLUMN_ROWS} rows, not {}",
+        rows.len()
+    );
     Control::Rows(rows)
+}
+
+impl<A> Control<A> {
+    /// The row count of a column or rows stack that holds more than
+    /// [`MAX_COLUMN_ROWS`], else `None`.
+    pub fn too_many_rows(&self) -> Option<usize> {
+        let n = match self {
+            Control::Column(cmds) => cmds.len(),
+            Control::Rows(rows) => rows.len(),
+            _ => return None,
+        };
+        (n > MAX_COLUMN_ROWS).then_some(n)
+    }
+}
+
+/// Every column or rows stack in `groups` that is over [`MAX_COLUMN_ROWS`], as
+/// `tab 'T', group 'G': N rows (max 3)`.
+fn row_violations<A>(tab: &str, groups: &[Group<A>]) -> Vec<String> {
+    groups
+        .iter()
+        .flat_map(|g| {
+            g.items.iter().filter_map(move |c| {
+                c.too_many_rows().map(|n| {
+                    format!(
+                        "tab '{tab}', group '{}': {n} rows (max {MAX_COLUMN_ROWS})",
+                        g.title
+                    )
+                })
+            })
+        })
+        .collect()
+}
+
+impl<A> Tab<A> {
+    /// The groups whose column or rows stack is taller than the ribbon fits.
+    pub fn row_violations(&self) -> Vec<String> {
+        row_violations(self.name, &self.groups)
+    }
+}
+
+impl<A> ContextTab<A> {
+    /// As [`Tab::row_violations`].
+    pub fn row_violations(&self) -> Vec<String> {
+        row_violations(self.name, &self.groups)
+    }
+}
+
+impl<A> Ribbon<A> {
+    /// Every over-tall column or rows stack on any persistent or contextual tab.
+    pub fn row_violations(&self) -> Vec<String> {
+        let tabs = self.tabs.iter().flat_map(Tab::row_violations);
+        let contextual = self.contextual.iter().flat_map(ContextTab::row_violations);
+        tabs.chain(contextual).collect()
+    }
 }
 
 /// A small icon button cell.
@@ -256,5 +326,34 @@ pub fn tab<A>(name: &'static str, key_tip: &'static str, groups: Vec<Group<A>>) 
         name,
         key_tip,
         groups,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn c(id: &'static str) -> Cmd<()> {
+        cmd(id, id, id, ())
+    }
+
+    #[test]
+    fn a_column_over_three_rows_is_named_with_tab_group_and_count() {
+        let four = Control::Column(vec![c("a"), c("b"), c("c"), c("d")]);
+        let three = Control::Column(vec![c("a"), c("b"), c("c")]);
+        assert_eq!(four.too_many_rows(), Some(4));
+        assert_eq!(three.too_many_rows(), None);
+        let t = tab("Home", "H", vec![group("Editing", 1, vec![three, four])]);
+        assert_eq!(
+            t.row_violations(),
+            vec!["tab 'Home', group 'Editing': 4 rows (max 3)".to_string()]
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "at most 3 rows")]
+    fn the_column_constructor_refuses_a_fourth_row() {
+        let _ = column(vec![c("a"), c("b"), c("c"), c("d")]);
     }
 }

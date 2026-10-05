@@ -22,7 +22,16 @@ pub struct Comment {
     pub text: String,
     /// The document text the comment is anchored to (may be empty).
     pub quoted: String,
+    /// Whether the comment is resolved: `w15:done` on its `commentEx` in
+    /// `word/commentsExtended.xml` (keyed by `para_id`).
+    pub resolved: bool,
+    /// The `w14:paraId` of the comment's last paragraph, the key
+    /// `commentsExtended.xml` and `commentsIds.xml` use for it.
+    pub para_id: Option<String>,
 }
+
+/// The part holding each comment's `w15:done` (resolved) state.
+pub const COMMENTS_EXTENDED_PART: &str = "word/commentsExtended.xml";
 
 /// A reviewer's initials as Word derives them from the user name: the first
 /// letter of each word, uppercased (`Jane doe` is `JD`).
@@ -42,6 +51,17 @@ pub fn parse_comments(pkg: &Package) -> Vec<Comment> {
     let mut comments = parse_comments_xml(xml);
     if comments.is_empty() {
         return comments;
+    }
+    if let Some(ext) = pkg.part_text(COMMENTS_EXTENDED_PART) {
+        let done = parse_comments_extended(&ext);
+        for c in &mut comments {
+            c.resolved = c
+                .para_id
+                .as_ref()
+                .and_then(|id| done.get(id))
+                .copied()
+                .unwrap_or(false);
+        }
     }
     if let Some(doc) = pkg
         .part("word/document.xml")
@@ -65,14 +85,14 @@ pub fn parse_comments_xml(xml: &str) -> Vec<Comment> {
     loop {
         match p.next() {
             Event::Start if p.name() == "w:comment" => {
-                let c = Comment {
+                let mut c = Comment {
                     id: p.attr("w:id").to_string(),
                     author: decode(p.attr("w:author")),
                     initials: decode(p.attr("w:initials")),
                     date: p.attr("w:date").to_string(),
-                    text: collect_text(&mut p),
-                    quoted: String::new(),
+                    ..Comment::default()
                 };
+                (c.text, c.para_id) = collect_text(&mut p);
                 out.push(c);
             }
             Event::Eof => break,
@@ -80,6 +100,19 @@ pub fn parse_comments_xml(xml: &str) -> Vec<Comment> {
         }
     }
     out
+}
+
+/// Each `w15:commentEx`'s `w15:paraId` with whether it is `w15:done`.
+pub fn parse_comments_extended(xml: &str) -> HashMap<String, bool> {
+    crate::load::start_tags(xml, "w15:commentEx")
+        .into_iter()
+        .filter_map(|(_, tag)| {
+            let id = crate::load::xml_attr_value(tag, "w15:paraId")?;
+            let done = crate::load::xml_attr_value(tag, "w15:done")
+                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "on"));
+            Some((id, done))
+        })
+        .collect()
 }
 
 fn decode(raw: &str) -> String {
@@ -90,8 +123,9 @@ fn decode(raw: &str) -> String {
 
 /// Consume the body of the just-started `w:comment`, returning its plain text
 /// with paragraph breaks as newlines. Stops at the matching end tag.
-fn collect_text(p: &mut XmlParser) -> String {
+fn collect_text(p: &mut XmlParser) -> (String, Option<String>) {
     let mut s = String::new();
+    let mut para_id = None;
     let mut depth = 1; // inside <w:comment>
     let mut in_t = false;
     loop {
@@ -101,6 +135,11 @@ fn collect_text(p: &mut XmlParser) -> String {
                     "w:t" => in_t = true,
                     "w:tab" => s.push('\t'),
                     "w:br" | "w:cr" => s.push('\n'),
+                    "w:p" => {
+                        // The last paragraph's id is the comment's.
+                        para_id =
+                            Some(p.attr("w14:paraId").to_string()).filter(|id| !id.is_empty());
+                    }
                     _ => {}
                 }
                 depth += 1;
@@ -125,7 +164,7 @@ fn collect_text(p: &mut XmlParser) -> String {
             Event::Eof => break,
         }
     }
-    s.trim_matches('\n').to_string()
+    (s.trim_matches('\n').to_string(), para_id)
 }
 
 /// Scan `document.xml` once, returning (anchor-order by comment id, quoted span

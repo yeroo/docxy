@@ -31,7 +31,8 @@ accepts the Project verbs. A harness instance ignores `AGWINTERM_SESSION_ID`
 and is always `suite-<pid>` (#697). Normal control does not expose harness operations
 such as `open`, `key`, `type`, or `quit`.
 
-Every verb except `proj.open` and `proj.new` accepts optional `tab`: an absolute zero-based
+Every verb except `proj.open`, `proj.new` and `app-info` (the build of the whole
+suite process, which ignores `tab`) accepts optional `tab`: an absolute zero-based
 index among **all** tabs, or a case-insensitive substring of a Project tab's
 title/path. Omit it to use the active tab. Ambiguous strings, empty strings,
 invalid indices, non-Project targets, and failed-load placeholders are errors.
@@ -42,7 +43,7 @@ Supported verbs are `proj.path`, `task.list`, `task.get`, `task.fields`, `task.s
 `task.add`, `task.del`, `link.add`, `link.del`, `find`, `assign.list`,
 `assign.get`, `assign.fields`, `assign.add`, `assign.set`, `assign.del`,
 `proj.save`, `proj.reload`, `proj.open` and `proj.new`, with the yppxy
-argument/result shapes. `proj.path` additionally
+argument/result shapes, plus `app-info` (the build: version, commit, last merged PR, kind, `manual`; #1023). `proj.path` additionally
 reports `tab`, `imported`, `cell` (active column name), `cell_row` (zero-based row),
 and `cell_edit` (pending cell buffer, or `null` when closed). Reads and rejected
 edits leave selection, prompts, pending cell edits, history and scroll unchanged.
@@ -79,7 +80,8 @@ Baseline and Baseline1–Baseline10 Start/Finish/Duration/Work/Cost, Start,
 Finish, Duration, Work and Cost Variance, Total, Free, Start and Finish Slack,
 Early and Late Start/Finish, Critical, Constraint Type and Date, Deadline,
 Active, Outline Number, Outline Level, WBS, Leveling Delay, Type, Effort Driven,
-Priority, Notes, Milestone, Summary, Estimated, Status and Unique ID. Status is
+Priority, Notes, Hyperlink, Hyperlink Address, Hyperlink SubAddress, Milestone,
+Summary, Estimated, Status and Unique ID. Status is
 measured at the plan's StatusDate, else its CurrentDate, and is empty when the
 plan has neither. Earned-value and custom fields are not readable yet.
 
@@ -93,8 +95,9 @@ plan has neither. Earned-value and custom fields are not readable yet.
   and slack signed minutes; money a number of currency units; percents
   integers; flags booleans; enums (Task Mode, Constraint Type, Type, Fixed
   Cost Accrual, Status) their display names; text strings. It is `null` only
-  for a date that shows `NA`, for a stored quantity the plan does not have
-  (unset % Complete reads `"0%"` and `null`; a stored 0 reads `"0%"` and `0`),
+  for a date that shows `NA`, for a stored value the plan does not have
+  (unset % Complete reads `"0%"` and `null`; a stored 0 reads `"0%"` and `0`;
+  unset hyperlink parts read `""` and `null`),
   and for Status when the plan has no StatusDate or CurrentDate (or the task
   no start), which then reads `""` and `null`. Fields
   with a Project default read the default: Active Yes, Priority 500, Type and
@@ -173,6 +176,11 @@ File handling differs from the TUI:
   with `proj.path` for the new tab. It takes neither `tab` nor `name`; save the
   plan with `proj.save {"path":"..."}` to give it a file. It is refused while a
   dialog is open on the active tab.
+- While the desktop suite's close prompt (`Save your changes to this file?`,
+  or a window close's per-document question) is open on any tab, `proj.open`,
+  `proj.save`, `proj.reload` and every editing verb are refused with
+  `a dialog is open: <title>`; reads still answer. Otherwise an edit, save or
+  reload dismisses the Project tab's dialogs unapplied.
 
 For example, the repository's CLI sends raw control requests (PowerShell;
 use your explicit config root in place of `$env:APPDATA` when overridden):
@@ -252,7 +260,9 @@ One JSON object per line; one reply line per request:
 
 | Verb | Args | Result |
 |---|---|---|
-| `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?}` |
+| `app-info` | — | the build: `{version, commit, short_commit, branch, commit_date, dirty, last_pr, issue, ahead, built_at, profile, target, host, kind, manual, summary, …}`: `kind` is `release`, `ci` or `local`; `manual` is `kind == local \|\| dirty` (#1023) |
+| `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?, final?}` — `final: true` only when Word marked the document as final |
+| `doc.edit-anyway` | — | `{path, …, was_final}` — Word's Edit Anyway: clears Mark as Final so edits are allowed and a save writes the document without the mark |
 | `doc.outline` | — | `{headings:[{index, level, text}]}` |
 | `doc.read` | `{start?, end?}` or `{range?:"a..b"}` (default: whole doc) | `{total, start, end, text, blocks:[{index, kind, text, heading?}]}` |
 | `doc.find` | `{query, case_sensitive?}` | `{query, count, matches:[{path, start, end, block?, text?}]}` — `start`/`end` are editor offsets (see notes) |
@@ -265,7 +275,9 @@ One JSON object per line; one reply line per request:
 | `doc.compare` | `{original, revised}` | `{path, insertions, deletions, skipped:[{kind, index?, revision?}]}` — Review ▸ Compare: opens a new, unsaved `Compare Result N.docx` (beside the revised file) whose tracked changes turn the original into the revised `.docx`; neither source is written. Refuses while the open document has unsaved changes. `skipped` kinds: `table`, `object`, `formatting` (original property markup whose namespace prefix the revised document binds differently; reported once), `note-ref`, `unsupported-revision`, `paragraph-mark` |
 | `doc.export` | `{format:"markdown"\|"text"}` | `{format, text}` — the **live buffer** |
 | `doc.export-pdf` | `{path}` | `{path}` (absolutized; refuses to overwrite — same `already exists:`/`bad path:`/`create failed:` error family as creating a new file) |
-| `doc.comments` | — | `{comments:[{id,author,initials,date,text,anchor}]}` |
+| `doc.comments` | — | `{comments:[{id,author,initials,date,text,anchor,resolved}]}` |
+| `doc.comment-resolve` | `{id, resolved?}` | `{id,resolved}` — Review ▸ Resolve / Reopen: `w15:done` in `commentsExtended.xml` on save (the part, its relationship and the comment's `w14:paraId` are created when absent; reply threads and unknown attributes are kept). Without `resolved` the comment toggles. Not an undo step; comments-only protection allows it |
+| `doc.comments-delete-all` | — | `{deleted}` — Review ▸ Delete All: every comment and its anchors (text stays), ONE undo step that brings markers and records back |
 | `doc.notes` | — | `{notes:[{id,kind:"footnote"\|"endnote",text}]}` |
 | `doc.header` / `doc.footer` | — | `{blocks:[{index,kind,text}]}` (empty list if the document has none) |
 | `doc.metadata` | — | present-if-set keys: `{title?,author?,subject?,keywords?,comments?,last_saved_by?,revision?,created?,modified?}` |
@@ -282,6 +294,9 @@ One JSON object per line; one reply line per request:
 | `doc.revision-next` / `doc.revision-previous` | — | `{count,revision}` after selecting the wrapping next/previous change |
 | `doc.revision-accept` / `doc.revision-reject` | `{revision}` | structured applied/stale/unsupported/malformed outcome |
 | `doc.revisions-accept-all` / `doc.revisions-reject-all` | — | `{total,applied,outcomes:[…]}` from one undoable transaction |
+| `doc.track-changes` | — | `{enabled, author}` — whether edits are recorded as tracked changes, and as whom |
+| `doc.track-changes-set` | `{enabled}` | `{enabled, author}` — Review ▸ Track Changes: typing, paste, Replace and deletions are then recorded (`w:ins` / `w:del`, stamped with the reviewer and the time) and the document saves with `w:trackRevisions`. Not an undo step (the setting is package metadata). Refuses Markdown documents; while on, `doc.insert` / `doc.append` / `doc.replace-range` with `markdown:true` are refused (plain text is recorded) |
+| `doc.display-mode` | `{mode?}` | `{mode, label, editable}` — Review ▸ Display for Review: `all`, `simple`, `none` (No Markup) or `original`. A view only: never a mutation, never saved. While `none` or `original` is shown every edit verb is refused with `protection_denied:display_mode` (comment verbs still work) |
 
 Notes:
 
@@ -355,11 +370,14 @@ same checks and do not maintain a second policy table:
 The current mutating control/MCP operations cover Structure
 (`doc.replace-range`, `doc.insert`, `doc.append`), Content (`doc.replace-all`,
 `doc.undo`, `doc.redo`, `doc.revision-accept`, `doc.revision-reject`,
-`doc.revisions-accept-all`, `doc.revisions-reject-all`), and Formatting
+`doc.revisions-accept-all`, `doc.revisions-reject-all`), Formatting
 (`doc.format`, `doc.set-style`, `doc.page-color`, `doc.watermark`,
-`doc.page-borders`). There
-is no comment-writing control verb yet, so comments-only protection denies all
-current automation edits even though comment mutations in the TUI are allowed.
+`doc.page-borders`), Comment (`doc.comment-resolve`,
+`doc.comments-delete-all`: the only automation edits comments-only protection
+allows) and Package metadata (`doc.track-changes-set`). Display for Review
+(`doc.display-mode`) is view state, not a mutation, but No Markup and Original
+show text that is not the document's, so while either is chosen every edit
+route except Comment is refused with `protection_denied:display_mode`.
 Markdown control/MCP inserts that carry styles, numbering, or direct run
 formatting additionally require Formatting authorization.
 Read, navigation, inspection, export, same-format save, open/reload, compare, and
@@ -371,16 +389,25 @@ document XML is preserved verbatim rather than regenerated.
 Denied control and MCP requests return
 `protection_denied:<stable_code>: <explanation>`, where `<stable_code>` is one
 of `read_only`, `comments_only`, `formatting_locked`, `forms_unsupported`,
-`tracked_changes_unsupported`, or `unsupported_mode`. The check runs before
+`tracked_changes_unsupported`, `unsupported_mode`, or `marked_final`. The check runs before
 argument parsing and before any mutation, so a rejected request does not alter
 the document, package parts, caret, undo/redo stacks, dirty state, or save
 state. Invalid arguments and unknown verbs retain their existing non-protection
 errors.
 
+A document Word marked as final (`_MarkAsFinal` = true in
+`docProps/custom.xml`) refuses every mutating verb with
+`protection_denied:marked_final` until `doc.edit-anyway`, which removes the mark
+from the package without modifying the document; a later save writes it as an
+ordinary document. The TUI asks "Edit anyway?" at the first refused edit. There
+is deliberately no MCP tool for Edit Anyway: unlocking a final document is a
+control-surface decision.
+
 Forms-only, tracked-changes-only, and unknown enforced modes deliberately fail
-closed. docxy cannot yet make conforming form-field-only edits or automatically
-record ordinary edits as tracked changes; use Word for those edits until those
-editing models exist. Recommendation-only `w:writeProtection` is different: the
+closed. docxy cannot yet make conforming form-field-only edits, and a
+tracked-changes-only document still refuses ordinary edits even though Track
+Changes can now record them (turn it on, or use Word, after removing the
+protection); use Word for those edits until those editing models exist. Recommendation-only `w:writeProtection` is different: the
 TUI shows a warning and `doc.path` reports `read-only (recommended)`, but all
 edits remain allowed. A password/hash-backed declaration is enforced read-only
 until docxy can verify the password.
@@ -559,7 +586,9 @@ Tools: `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`, `docxy_read`,
 `docxy_revision_next`, `docxy_revision_previous`, `docxy_revision_accept`,
 `docxy_revision_reject`, `docxy_revisions_accept_all`,
 `docxy_revisions_reject_all`, `docxy_compare`, `docxy_page_color`,
-`docxy_watermark`, and `docxy_page_borders` (35 total). Each edit
+`docxy_watermark`, `docxy_page_borders`, `docxy_comment_resolve`,
+`docxy_comments_delete_all`, `docxy_display_mode`, `docxy_track_changes` and
+`docxy_track_changes_set` (40 total). Each edit
 tool maps to the matching verb — except `docxy_new`, which composes a file
 create with a `doc.open` — and results come back as JSON text. When several
 docxy editors are open, pass `target` (a substring of the instance/pane id) to
@@ -598,10 +627,14 @@ windows that open a same-basename file, which would otherwise mint the same
 **exactly** the terminal verb
 surface, nothing more (except xlsxy's `wb.properties`/`wb.set-properties` and the
 page-layout and printing verbs (`page.*`, `print-area.*`, `print-titles.set`,
-`page-break.*`, `print.pages`, `wb.export-pdf`), which only a terminal xlsxy
-answers so far; and docxy's `doc.page-color`, `doc.watermark`,
-`doc.page-borders` and `doc.compare`, which only a terminal docxy answers so
-far — a tab answers `unknown verb`): a couple of internal-only verbs the extension host
+`page-break.*`, `print.pages`, `wb.export-pdf`) and the filter and sort verbs
+(`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`), which only a terminal
+xlsxy answers so far; and docxy's `doc.page-color`, `doc.watermark`,
+`doc.page-borders`, `doc.compare`, `doc.comment-resolve`,
+`doc.comments-delete-all`, `doc.display-mode`, `doc.track-changes` and
+`doc.track-changes-set`, which only a terminal docxy answers so
+far, and the `app-info` build verb (#1023), which only a terminal instance and
+the suite answer — a tab answers `unknown verb`): a couple of internal-only verbs the extension host
 uses to compose its own `doc.path`/`wb.path` replies (`doc.blocks`, `wb.info`)
 are deliberately not in the tab's exposed verb set, and are rejected as
 `"unknown verb"` — same as a terminal instance, which has no arm for them at
@@ -759,8 +792,9 @@ Differences from a terminal pane:
 
 **Excel tabs** (`xlsxy-jetbrains-<basename>-<pid>-<n>` in xlsxy's ctl dir)
 serve the full xlsxy verb surface through `grid_ctl` (except
-`wb.properties`/`wb.set-properties` and the page-layout and printing verbs,
-terminal xlsxy only for now: a tab answers `unknown verb`), with the same host-verb
+`wb.properties`/`wb.set-properties`, the page-layout and printing verbs and the
+filter and sort verbs (`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`) and
+`app-info`, terminal xlsxy only for now: a tab answers `unknown verb`), with the same host-verb
 split (`wb.path`/`wb.save`/`wb.reload`/`wb.open`; `wb.open` opens a new tab;
 `wb.info` internal). Every mutating agent verb lands as **one IDE undo step**
 driving the engine's own undo stack — the same mechanism the grid UI uses,
@@ -776,6 +810,7 @@ name and defaults to the active sheet):
 
 | Verb | Args | Result |
 |---|---|---|
+| `app-info` | — | the build: `{version, commit, short_commit, branch, commit_date, dirty, last_pr, issue, ahead, built_at, profile, target, host, kind, manual, summary, …}`: `kind` is `release`, `ci` or `local`; `manual` is `kind == local \|\| dirty` (#1023) |
 | `wb.path` | — | `{path, modified, read_only, sheets, active, active_name, circular}` — `read_only` is true while the workbook is bound to the file `xlsxy --read-only` opened (terminal xlsxy; see `wb.save`);  `circular` lists the cells on circular references (active sheet first, bare `E1`; other sheets as `Sheet2!A1`), empty when there are none. It lists them whether or not the workbook enables iterative calculation (the TUI's warning and footer note appear only when it does not, as in Excel). Without iterative calculation those cells are 0, as in Excel |
 | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
@@ -804,8 +839,10 @@ name and defaults to the active sheet):
 | `range.set` | `{start,rows:[[string]],sheet?}` | `{set:N}` — each string typed like `cell.set`; **atomic**: every formula and length validated first, any invalid (a bad formula, or an entry over 32,767 characters) → an error naming the cell and nothing applied; a group that would change part of a legacy CSE array (not its anchor) is refused with `range.set: You can't change part of an array.` and nothing applied; one undo group |
 | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a **new** sheet, never overwrites ; fields convert as opening a `.csv` does (a `sep=` first line, typed-entry dates/percentages/formulas, 15 digits, File › Options › Data) |
 | `sheet.import-text` | `{text\|path,options?,name?}` | `{sheet,name,rows,cols}` — the Text Import Wizard without the dialog, into a **new** sheet. `options`: `kind` (`delimited`/`fixed`), `delimiters` (`tab`, `semicolon`, `comma`, `space` or a character), `consecutive`, `qualifier` (`"`, `'`, `none`), `breaks`, `start_row`, `origin` (`auto`, `utf-8`, `utf-16le`, `windows-1252`), `columns` (`general`, `text`, `date:dmy`…, `skip`), `decimal`, `thousands`, `trailing_minus` |
-| `app.options` | `{convert_leading_zeros?,convert_long_numbers?,convert_e_notation?,convert_dates?,edit_fixed_decimal?,edit_fixed_decimal_places?,edit_move_after_enter?,edit_move_direction?,edit_in_cell?,edit_autocomplete?}` | every option — File › Options › Data › Automatic Data Conversion (four booleans, followed by the next `.csv`/text open and `sheet.import-csv`/`sheet.import-text`) and Advanced › Editing (booleans, places a whole number -300..=300, direction `down`/`right`/`up`/`left`); every given key is checked before any is set; saved with the app's preferences on exit. The fixed decimal point shifts only numbers typed into the grid, never `cell.set`/`range.set` |
+| `app.options` | `{convert_leading_zeros?,convert_long_numbers?,convert_e_notation?,convert_dates?,edit_fixed_decimal?,edit_fixed_decimal_places?,edit_move_after_enter?,edit_move_direction?,edit_in_cell?,edit_autocomplete?,edit_formula_autocomplete?}` | every option — File › Options › Data › Automatic Data Conversion (four booleans, followed by the next `.csv`/text open and `sheet.import-csv`/`sheet.import-text`) and Advanced › Editing (booleans, places a whole number -300..=300, direction `down`/`right`/`up`/`left`); every given key is checked before any is set; saved with the app's preferences on exit. The fixed decimal point shifts only numbers typed into the grid, never `cell.set`/`range.set` |
 | `range.text-to-columns` | `{range,options?,dest?,replace?,sheet?}` | `{rows}` — Data › Text to Columns on **one** column with the same `options`; refuses with "Do you want to replace the contents of the destination cells?" unless `replace:true`; one undo step |
+| `range.flash-fill` | `{ref,sheet?}` | `{changed:[ref], blank:[ref]}` — Data › Flash Fill (Ctrl+E) on the column of `ref`: the examples typed at the top of the data (or below a header row: the column's top cell empty, or the examples showing no pattern with it), the non-empty columns next to it as sources, down to their last row; cells holding values are kept; results are typed like entries: text when every example is text that would not stay text typed bare (`'007`), and never with an apostrophe in a Text-formatted cell; one undo step. No pattern errors with "Flash Fill didn't see a pattern…"; a protected sheet is refused |
+| `app.autocorrect` | `{options?:{ac_*:bool}, add?:{replace,with,overwrite?}, delete?, exception?:{kind:first_letter\|initial_caps, add?\|delete?}}` | `{options, entries:[{replace,with}], exceptions:{first_letter, initial_caps}}` — File › Options › Proofing › AutoCorrect: switches, the replace list (re-adding a word with another With needs `overwrite:true`, as the dialog asks) and the exceptions; everything given is checked before anything is set; saved with the app's preferences on exit |
 | `wb.consolidate` | `{refs,dest?,fn?,top?,left?,links?}` | Terminal xlsxy only for now. `{sheet,range}` — Data › Consolidate: `refs` are source references such as `East!A1:C4` or `'My sheet'!$A$1:$D$9` (a bare range is on the destination's sheet; other workbooks and defined names are not supported); `dest` is the output's top-left cell, `Sheet!B2` or `B2` (default: the cursor on the active sheet); `fn` is a dialog name or file token, case-insensitive (`Sum` by default, `Count`, `Average`, `Max`, `Min`, `Product`, `Count Numbers`/`countNums`, `StdDev`, `StdDevp`, `Var`, `Varp`); `top`/`left` match rows and columns by the labels in each source's top row / left column (case-insensitive, whole label, any order); `links` writes `=Sheet!$B$2` detail formulas in hidden outline rows under a summary formula, and is refused for a source on the destination sheet. A refusal (no or bad references, a source overlapping the output) changes nothing. The settings are kept on the destination sheet (`<dataConsolidate>`). One undo step |
 | `wb.replace-all` | `{query,text}` | `{replaced}` — spans **all sheets**, one undo group; the match runs on each cell's own input text (never on the `'` a quote prefix adds, which is kept on the result), and the replaced text is re-read with the entry rules of `cell.set`, except that a percent cell's number constant is not divided again; a result over the cell limit leaves that cell as it was |
 | `sheet.add` | `{name?}` | `{sheet,name}` — deduplicates a taken name, never errors |
@@ -826,6 +863,16 @@ name and defaults to the active sheet):
 | `page-break.reset` | `{sheet?}` | Terminal xlsxy only for now. `{rowBreaks, colBreaks, changed}` — Reset All Page Breaks: every manual break goes, automatic ones stay |
 | `print.pages` | `{what?, sheet?\|sheets?, range?, ignorePrintAreas?, from?, to?}` | Terminal xlsxy only for now. `{total, pages:[{sheet, name, range, number, titleRows, titleCols, scale}]}` — the pages printing lays out. `what`: `active` (default; `sheets`, `sheet` or the active sheet, each starting new pages), `workbook` (every visible sheet) or `selection` (`range` of `sheet`, comma-separated ranges each on pages of their own). A print area's ranges each start new pages; hidden rows and columns don't print, nor do hidden sheets with `workbook` (a hidden sheet named by `sheet`/`sheets`, or active, prints); title rows/columns repeat on pages that don't show them, except that titles that would fill a page by themselves, at the print scale, don't repeat; numbering continues across sheets and honours a first page number; `from`/`to` pick pages by position (1-based), `total` counts them all. A selected range prints only as far as its printed cells, and one with none prints nothing. A job over 100,000 pages is an error, `This would print more than 100000 pages; set a print area or select less.`, as for `wb.export-pdf` |
 | `wb.export-pdf` | `{path, …print.pages args}` | Terminal xlsxy only for now. `{path, pages}` — the job as PDF (the active sheet by default), the **live buffer**; `&D`/`&T` are the local date and time. Refuses to overwrite (`already exists: …`). Nothing to print errors with `We didn't find anything to print.` and writes no file, and so does a job over 100,000 pages (`print.pages`' error). Text outside Windows-1252 prints as `?` (standard PDF fonts). Doesn't mark the workbook modified |
+| `filter.set` | `{range?, col, criteria, sheet?}` | Terminal xlsxy only for now. `{shown, total, status, changed, range}` — AutoFilter: turns the filter on over `range` when the sheet has none (a `range` with the filter's header row and columns is that filter: a shorter one names it after it grew over rows typed below, a longer one extends it, its criteria kept; any other `range` replaces it and its criteria; `range` in the reply is the filter's), then sets column `col` (a header's text or a column letter) and applies the whole filter (columns combine with AND; values match the **displayed** text). `criteria`: `{values:[…], blanks?, dates?:[{year,month?,day?}]}`, `{custom:{and?, conds:[[op,val],…]}}` (one or two; `equal notEqual greaterThan greaterThanOrEqual lessThan lessThanOrEqual beginsWith endsWith contains notContains`, `*` `?` `~` wildcards), `{top:{n, percent?, bottom?}}`, `{dynamic:"aboveAverage"\|"thisWeek"\|"yearToDate"\|"M3"\|"Q1"\|…}`, `{cellColor:"FF00B050"\|null}`, `{fontColor:…}` (both read conditional formatting too; `null` is No Fill / automatic), `{icon:{set,id}}`, `{search:"7*1", add?}` (Select All Search Results: every item `filter.menu` lists for that search — a date by its year, month name or day; `add` joins the current checklist), or `null` (clear the column). `status` is `<n> of <m> records found`. Filters are not live: an edit changes nothing until `filter.reapply`. One undo step when it changes something (a no-op pushes none; `changed` says which) |
+| `filter.reapply` | `{sheet?}` | Terminal xlsxy only for now. `{shown, total, status, changed}` — works Top 10, the averages and the date periods out again from the current data and today, then applies the filter. One undo step when it changes something (a no-op pushes none; `changed` says which) |
+| `filter.clear` | `{col?, sheet?}` | Terminal xlsxy only for now. `{shown, total, status, changed}` — clears one column's criteria (the rest apply again), or all of them: every row of the list shows and the filter buttons stay. With no AutoFilter it shows the rows an in-place Advanced Filter hid. One undo step when it changes something (a no-op pushes none; `changed` says which) |
+| `filter.off` | `{sheet?}` | Terminal xlsxy only for now. `{off, range, changed}` — turns AutoFilter off: every row of its range shows (hand-hidden ones too, as in Excel) and its `_xlnm._FilterDatabase` goes. One undo step when it changes something (a no-op pushes none; `changed` says which) |
+| `filter.menu` | `{col, search?, sheet?}` | Terminal xlsxy only for now. `{col, header, submenu, items:[{label, depth, checked}], truncated, total, filtered, colors}` — a column's drop-down: `submenu` is `Text Filters`, `Number Filters` or `Date Filters` by the column's dominant type; `items` are the distinct values of the records the other columns keep (dates as a year › month › day tree, `depth` 0–2; `(Blanks)` last), at most 10,000 (`truncated` says so); `search` narrows them; `colors` lists Filter by Color's choices (`Cell Color 00B050`, `Cell Color No Fill`, `Font Color Automatic`, `Icon 3Arrows/2`; empty when no record shows a colour or an icon). Read only |
+| `filter.by-cell` | `{ref, by?:value\|cellColor\|fontColor\|icon, sheet?}` | Terminal xlsxy only for now. `{shown, total, status, changed}` — Filter by Selected Cell's Value / Color / Font Color / Icon (turns the filter on over the cell's list first). One undo step when it changes something (a no-op pushes none; `changed` says which) |
+| `filter.advanced` | `{list, criteria?, copyTo?, unique?, sheet?}` | Terminal xlsxy only for now. `{shown, total, status, changed}` — Advanced Filter: `criteria` a range (`E1:E2`, `Sheet2!A1:B3`) read with the D-functions' rules (AND across a row, OR down rows); in place it hides the other records (an AutoFilter goes first), with `copyTo` it writes the records there instead — one cell gets every column, a header row only those columns in that order; `unique` drops repeated records. Copying to another sheet is refused: "You can only copy filtered data to the active sheet." Defines `_xlnm._FilterDatabase`, `_xlnm.Criteria` (when `criteria` is given; otherwise the last one's stays) and, copying, `_xlnm.Extract`. One undo step when it changes something (a no-op pushes none; `changed` says which) |
+| `sheet.rows` | `{range, sheet?}` | Terminal xlsxy only for now. `{rows:[{row, hidden, hiddenBy}]}` — `row` is 1-based; `hiddenBy` is `filter`, `hand`, or `null` for a visible row. Read only |
+| `range.sort` | `{range, keys:[…], header?, caseSensitive?, orientation?:rows\|columns, expand?, sheet?}` | Terminal xlsxy only for now. `{sorted, range, count, changed}` — sorts the cells of `range` only (hidden rows stay put). A key is `{col, order?:asc\|desc\|"list:Jan,Feb,…"\|"list:months", direction?, on?:value\|cell-color\|font-color\|icon, color?, icon?:{set,id}, position?:top\|bottom}` (`row` instead of `col` with `orientation:"columns"`, which sorts left to right); keys may repeat a column. A selection inside a wider list answers `{sorted:false, warning, expanded}` and moves nothing until `expand` answers it (`true`: the whole list, its header guessed; `false`: the selection alone). Merged cells of different sizes are refused with "To do this, all the merged cells need to be the same size." One undo step when it changes something (a no-op pushes none; `changed` says which) |
+| `wb.clock` | `{date}` | Terminal xlsxy only for now. `{date}` — fixes today at `YYYY-MM-DD[THH:MM[:SS]]` for `TODAY`/`NOW`, the date filters and a typed `3/4`'s year; `null` returns to the local clock. Not an edit (no undo step) |
 
 Notes:
 
@@ -946,8 +993,8 @@ MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
 `xlsxy_page_header`, `xlsxy_print_area_set`, `xlsxy_print_area_add`,
 `xlsxy_print_area_clear`, `xlsxy_print_titles`, `xlsxy_page_break_insert`,
 `xlsxy_page_break_remove`, `xlsxy_page_break_reset`, `xlsxy_print_pages`,
-`xlsxy_export_pdf` (46 total; docxy's 31 + xlsxy's 46 = **77 tools** total
-across both apps).
+`xlsxy_export_pdf`, `xlsxy_flash_fill`, `xlsxy_autocorrect` (48 total;
+docxy's 40 + xlsxy's 48 = **88 tools** total across both apps).
 Skill: `xlsxy install skill`.
 
 **yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):
@@ -956,7 +1003,7 @@ Skill: `xlsxy install skill`.
 `fields: [...]` to read any listed field by Project's name), `link.add {uid, pred, type?, lag?}` / `link.del`,
 `find {query}`, `assign.list/get/add/set/del` and `assign.fields` (a task's
 resource assignments, by assignment UID), `proj.save {path?}`, `proj.reload`,
-`proj.open {path}`. Edits
+`proj.open {path}`, `app-info` (the build; #1023). Edits
 reschedule the plan (CPM) live. MCP: `claude mcp add yppxy -- yppxy --mcp` →
 `yppxy_list`, `yppxy_status`, `yppxy_tasks`, `yppxy_get`, `yppxy_set`,
 `yppxy_fields`, `yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`,

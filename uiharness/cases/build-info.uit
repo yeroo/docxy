@@ -1,0 +1,54 @@
+# Build info in the suite (#1023): app-info, File > Account and its About dialog.
+# The sweep builds the suite locally (not as a ci/release build), so kind is local
+# and the build is a manual one; a release or CI binary shows no badge.
+
+test About shows the build info and app-info matches it
+  open ../fixtures/basic.xlsx
+  call app-info {}
+  assert reply.commit_len is 40
+  assert reply.commit_hex is true
+  assert reply.kind is local
+  assert reply.manual is true
+  call backstage {"action":"open"}
+  assert reply.open is true
+  call account {"action":"open"}
+  assert reply.open is true
+  # `badge` is the drawn badge: read it once a settled frame has been captured.
+  shot window
+  call account {"action":"read"}
+  assert reply.badge is true
+  call account {"action":"about"}
+  call dialog-read {}
+  assert reply.open is true
+  assert reply.id is about
+  assert reply.controls.0.name is manual
+  assert reply.controls.0.text is Manual build
+  assert reply.controls.1.name is commit
+  assert reply.buttons.0.label is Copy
+  assert reply.buttons.1.label is Close
+  assert reply.buttons.1.default is true
+  shot window
+  call dialog-click {"button":"Copy"}
+  assert reply.dialog.open is true
+  call clipboard {"action":"read"}
+  assert reply.text is not nothing
+  call dialog-click {"button":"Close"}
+  assert reply.dialog.open is false
+  call account {"action":"about"}
+  key escape
+  call dialog-read {}
+  assert reply.open is false
+  call backstage {"action":"close"}
+
+test Account is on the backstage of a document too
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call account {"action":"open"}
+  assert reply.open is true
+  shot window
+  call account {"action":"read"}
+  assert reply.badge is true
+  call-error dialog-click {"button":"Copy"} => no dialog is open
+  call backstage {"action":"close"}
+  call account {"action":"read"}
+  assert reply.open is false

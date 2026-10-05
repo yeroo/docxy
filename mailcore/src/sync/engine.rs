@@ -1932,12 +1932,31 @@ mod tests {
         tokencache::save(path, &t).unwrap();
     }
 
-    /// Collects events until `pred` returns true, or panics after 5s.
+    /// Upper bound for every "wait until the engine thread has done X" in these tests. Generous on
+    /// purpose: a loaded windows-latest CI runner has taken more than 5s to emit the first event
+    /// (#1000). A passing test returns as soon as its condition holds, so this costs nothing there.
+    const ENGINE_WAIT: Duration = Duration::from_secs(30);
+
+    /// Polls `done` every 20ms until it returns true (-> true) or `budget` runs out (-> false).
+    fn wait_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            if done() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Collects events until `pred` returns true, or panics after `ENGINE_WAIT`.
     fn wait_for(
         rx: &Receiver<SyncEvent>,
         mut pred: impl FnMut(&SyncEvent) -> bool,
     ) -> Vec<SyncEvent> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + ENGINE_WAIT;
         let mut seen = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2075,19 +2094,12 @@ mod tests {
             .unwrap();
 
         // The optimistic local write + drain should PATCH the message on Graph.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if srv
-                .requests()
+        if !wait_until(ENGINE_WAIT, || {
+            srv.requests()
                 .iter()
                 .any(|r| r.method == "PATCH" && r.path.starts_with("/me/messages/M1"))
-            {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!("no PATCH observed; requests: {:?}", srv.requests());
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        }) {
+            panic!("no PATCH observed; requests: {:?}", srv.requests());
         }
 
         let patch = srv
@@ -2192,19 +2204,12 @@ mod tests {
         // The optimistic local re-file happens before the outbox drain POSTs
         // the move, so once the POST is observed the local row is already in
         // DEST.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if srv
-                .requests()
+        if !wait_until(ENGINE_WAIT, || {
+            srv.requests()
                 .iter()
                 .any(|r| r.method == "POST" && r.path.starts_with("/me/messages/M1/move"))
-            {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!("no move POST observed; requests: {:?}", srv.requests());
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        }) {
+            panic!("no move POST observed; requests: {:?}", srv.requests());
         }
 
         let store = Store::open(&store_path).unwrap();
@@ -2259,18 +2264,16 @@ mod tests {
     /// `move_command_optimistically_refiles_locally` uses to wait for the
     /// move POST to land.
     fn wait_for_contact(store_path: &std::path::Path, query: &str) -> Vec<crate::store::Contact> {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+        let mut hits = Vec::new();
+        let found = wait_until(ENGINE_WAIT, || {
             let store = Store::open(store_path).unwrap();
-            let hits = store.search_contacts(query, 1).unwrap();
-            if !hits.is_empty() {
-                return hits;
-            }
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for a contact matching {query:?}");
-            }
-            std::thread::sleep(Duration::from_millis(20));
+            hits = store.search_contacts(query, 1).unwrap();
+            !hits.is_empty()
+        });
+        if !found {
+            panic!("timed out waiting for a contact matching {query:?}");
         }
+        hits
     }
 
     #[test]
@@ -2516,21 +2519,15 @@ mod tests {
         );
 
         // The reconverge pass ignores the cutoff and re-adds the old M1.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let restored = Store::open(&store_path)
+        if !wait_until(ENGINE_WAIT, || {
+            Store::open(&store_path)
                 .unwrap()
                 .messages_in_folder("F1", 50, 0)
                 .unwrap()
                 .iter()
-                .any(|m| m.id == "M1");
-            if restored {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!("reconverge did not restore the aged-out message");
-            }
-            std::thread::sleep(Duration::from_millis(20));
+                .any(|m| m.id == "M1")
+        }) {
+            panic!("reconverge did not restore the aged-out message");
         }
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
@@ -2575,23 +2572,17 @@ mod tests {
         wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
 
         // At least one tick must re-request the folder list (>1 total).
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let n = srv
-                .requests()
+        if !wait_until(ENGINE_WAIT, || {
+            srv.requests()
                 .iter()
                 .filter(|r| r.method == "GET" && r.path.starts_with("/me/mailFolders"))
-                .count();
-            if n >= 2 {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "tick did not re-enumerate folders; requests: {:?}",
-                    srv.requests()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(20));
+                .count()
+                >= 2
+        }) {
+            panic!(
+                "tick did not re-enumerate folders; requests: {:?}",
+                srv.requests()
+            );
         }
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
@@ -2656,18 +2647,13 @@ mod tests {
 
         // Wait for 2 accepted connections: startup's sync_pass, then the
         // first tick's sync_pass (gated behind BACKOFF_MIN, ~5s).
-        let deadline = Instant::now() + Duration::from_secs(8);
-        loop {
-            if attempts.load(Ordering::SeqCst) >= 2 {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "did not observe 2 connection attempts in time (saw {})",
-                    attempts.load(Ordering::SeqCst)
-                );
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        if !wait_until(BACKOFF_MIN + ENGINE_WAIT, || {
+            attempts.load(Ordering::SeqCst) >= 2
+        }) {
+            panic!(
+                "did not observe 2 connection attempts in time (saw {})",
+                attempts.load(Ordering::SeqCst)
+            );
         }
 
         // Give a (buggy) extra `refresh_calendar` attempt in that same tick a
@@ -3273,23 +3259,16 @@ mod tests {
                 categories: vec!["Work".into()],
             })
             .unwrap();
-        // No completion event and no re-sync (tick is 3600s). Poll (paced by the
-        // event channel) for the drain's PATCH — the definitive "command fully
-        // processed" signal, since the optimistic local write happens earlier in
-        // the same `handle_command` call. Asserting the PATCH immediately would
+        // No completion event and no re-sync (tick is 3600s). Poll for the
+        // drain's PATCH — the definitive "command fully processed" signal,
+        // since the optimistic local write happens earlier in the same
+        // `handle_command` call. Asserting the PATCH immediately would
         // race the drain on a slow CI machine.
-        let mut patched = false;
-        for _ in 0..100 {
-            if srv
-                .requests()
+        let patched = wait_until(ENGINE_WAIT, || {
+            srv.requests()
                 .iter()
                 .any(|r| r.method == "PATCH" && r.path.contains("/me/messages/M1"))
-            {
-                patched = true;
-                break;
-            }
-            let _ = handle.evt_rx.recv_timeout(Duration::from_millis(50));
-        }
+        });
         assert!(patched, "SetCategories did not PATCH");
         // The PATCH ran, so the earlier optimistic local write is committed.
         let store = Store::open(&store_path).unwrap();
@@ -4202,19 +4181,12 @@ mod tests {
         assert_eq!(rows[0].response_status, "accepted");
 
         // The drain reaches Graph too.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if srv
-                .requests()
+        if !wait_until(ENGINE_WAIT, || {
+            srv.requests()
                 .iter()
                 .any(|r| r.method == "POST" && r.path.starts_with("/me/events/E1/accept"))
-            {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!("no accept POST observed; requests: {:?}", srv.requests());
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        }) {
+            panic!("no accept POST observed; requests: {:?}", srv.requests());
         }
         let accept = srv
             .requests()
@@ -4493,5 +4465,30 @@ mod tests {
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_for_tolerates_an_engine_slower_than_five_seconds() {
+        let (tx, rx) = std::sync::mpsc::channel::<SyncEvent>();
+        let slow = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(6));
+            let _ = tx.send(SyncEvent::FoldersUpdated);
+        });
+        let seen = wait_for(&rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert_eq!(seen.len(), 1);
+        slow.join().unwrap();
+    }
+
+    #[test]
+    fn wait_until_sees_a_side_effect_that_lands_after_five_seconds() {
+        let dir = unique_dir("slow-side-effect");
+        let target = dir.join("done");
+        let slow = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(6));
+            std::fs::write(target, b"done").unwrap();
+        });
+        assert!(wait_until(ENGINE_WAIT, || dir.join("done").exists()));
+        slow.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

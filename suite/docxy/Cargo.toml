@@ -20,6 +20,8 @@ workspace = true
 
 [dependencies]
 opccore = { version = "0.1.0", path = "../../opccore" }
+# Commit / last merged PR / build kind, for --version, File > Account, app-info and the crash log.
+buildinfo = { path = "../../buildinfo" }
 projctl = { path = "../../projctl" }
 gpui.workspace = true
 gpui_platform.workspace = true

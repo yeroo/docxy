@@ -22,6 +22,16 @@ pub enum VertAlign {
     Subscript,
 }
 
+/// A tracked insertion the editor recorded on live text (#624): the run it
+/// is on is ordinary editable text, so offsets, formatting and every editing
+/// command see it as such, and a save wraps adjacent runs with the same
+/// `metadata` in one `<w:ins>`. Text loaded from a file keeps its
+/// [`Inline::Revision`] wrapper instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedInsert {
+    pub metadata: RevisionMetadata,
+}
+
 /// Character-level formatting (a resolved `w:rPr`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RunProps {
@@ -57,6 +67,10 @@ pub struct RunProps {
     /// A tracked `w:rPrChange`, when present. The owning `RunProps` is the
     /// current state; `previous` on the change retains the prior snapshot.
     pub property_change: Option<PropertyChange>,
+    /// The tracked insertion this run was recorded as, when the editor typed
+    /// or pasted it with Track Changes on. Not part of `w:rPr`: a save
+    /// writes it as the `<w:ins>` around the run.
+    pub tracked_insert: Option<TrackedInsert>,
     /// Display-only formatting contributed by enclosing revision wrappers.
     ///
     /// The public formatting fields remain the effective render state. These
@@ -65,6 +79,35 @@ pub struct RunProps {
     /// formatting. They are not serialized as document properties.
     #[doc(hidden)]
     pub revision_cues: RevisionDisplayCues,
+}
+
+impl RunProps {
+    /// Whether the text is underlined as the user set it: the underline a
+    /// tracked insertion is drawn with is a display cue, not formatting.
+    pub fn user_underline(&self) -> bool {
+        self.underline && !self.revision_cues.underline_added
+    }
+
+    /// Whether the text is struck through as the user set it (not the cue of
+    /// a tracked deletion).
+    pub fn user_strike(&self) -> bool {
+        self.strike && !self.revision_cues.strike_added
+    }
+
+    /// Set the user's underline. Off leaves the insertion cue drawn when the
+    /// text is a tracked insertion; on makes the underline real (saved).
+    pub fn set_user_underline(&mut self, on: bool) {
+        let cue = self.revision_cues.insertions > 0;
+        self.underline = on || cue;
+        self.revision_cues.underline_added = !on && cue;
+    }
+
+    /// [`RunProps::set_user_underline`] for strike and a tracked deletion.
+    pub fn set_user_strike(&mut self, on: bool) {
+        let cue = self.revision_cues.deletions > 0;
+        self.strike = on || cue;
+        self.revision_cues.strike_added = !on && cue;
+    }
 }
 
 /// Provenance for the underline/strike cues used to render tracked changes.
@@ -1148,6 +1191,12 @@ impl Document {
             .unwrap_or(0)
             .saturating_add(1)
             .max(1);
+        // Recorded insertions first: every run of one (the same `w:id`) is
+        // one revision, however far apart the editor split them.
+        let mut by_id = std::collections::HashMap::new();
+        for block in &mut self.body {
+            assign_tracked_insert_block(block, &mut next, &mut by_id);
+        }
         let mut seen = std::collections::HashSet::new();
         for block in &mut self.body {
             assign_block_revision_targets(block, &mut next, &mut seen);
@@ -1157,11 +1206,11 @@ impl Document {
     /// Enumerate modeled and recognized-unsupported revisions in current source
     /// order. Addresses contain stable node identities, not structural paths.
     pub fn revisions(&self) -> Vec<RevisionAddress> {
-        let mut out = Vec::new();
+        let mut out = Collected::default();
         for block in &self.body {
             collect_block_revisions(block, None, 0, &mut out);
         }
-        out
+        out.list
     }
 
     /// Resolve a stable target against the current tree after intervening edits.
@@ -1169,6 +1218,67 @@ impl Document {
         self.revisions()
             .into_iter()
             .find(|address| address.target == target)
+    }
+}
+
+/// Give each recorded insertion ([`TrackedInsert`]) without a target one,
+/// the same for every run that has its `w:id`.
+fn assign_tracked_insert_block(
+    block: &mut Block,
+    next: &mut u64,
+    by_id: &mut std::collections::HashMap<Option<String>, RevisionTarget>,
+) {
+    fn props(
+        props: &mut RunProps,
+        next: &mut u64,
+        by_id: &mut std::collections::HashMap<Option<String>, RevisionTarget>,
+    ) {
+        let Some(insert) = &mut props.tracked_insert else {
+            return;
+        };
+        let target = &mut insert.metadata.target;
+        if target.is_assigned() {
+            by_id.insert(insert.metadata.id.clone(), *target);
+        } else {
+            *target = *by_id.entry(insert.metadata.id.clone()).or_insert_with(|| {
+                let t = RevisionTarget(*next);
+                *next = next.saturating_add(1);
+                t
+            });
+        }
+    }
+    fn inlines(
+        content: &mut [Inline],
+        next: &mut u64,
+        by_id: &mut std::collections::HashMap<Option<String>, RevisionTarget>,
+    ) {
+        for inline in content {
+            match inline {
+                Inline::Run(run) => props(&mut run.props, next, by_id),
+                Inline::Tab(p) | Inline::Break(_, p) => props(p, next, by_id),
+                Inline::Revision { content, .. } => inlines(content, next, by_id),
+                Inline::Hyperlink(h) => inlines(&mut h.content, next, by_id),
+                Inline::TextBox { blocks, .. } => {
+                    for block in blocks {
+                        assign_tracked_insert_block(block, next, by_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    match block {
+        Block::Paragraph(p) => inlines(&mut p.content, next, by_id),
+        Block::Table(t) => {
+            for row in &mut t.rows {
+                for cell in &mut row.cells {
+                    for block in &mut cell.blocks {
+                        assign_tracked_insert_block(block, next, by_id);
+                    }
+                }
+            }
+        }
+        Block::SectionProperties(_) | Block::Raw(_) => {}
     }
 }
 
@@ -1200,6 +1310,16 @@ fn assign_run_props_target(
     seen: &mut std::collections::HashSet<RevisionTarget>,
 ) {
     assign_property_target(&mut props.property_change, next, seen);
+    // The runs of one recorded insertion share its target on purpose (a
+    // format change splits a run in two), so a repeat is not a clone to
+    // renumber.
+    if let Some(insert) = &mut props.tracked_insert {
+        if !insert.metadata.target.is_assigned() {
+            insert.metadata.target = RevisionTarget(*next);
+            *next = next.saturating_add(1);
+        }
+        seen.insert(insert.metadata.target);
+    }
 }
 
 fn assign_inline_revision_targets(
@@ -1283,16 +1403,24 @@ fn assign_block_revision_targets(
     }
 }
 
+/// The addresses collected so far, and the recorded insertions already listed
+/// (one entry per [`TrackedInsert`] however many runs it is in).
+#[derive(Default)]
+struct Collected {
+    list: Vec<RevisionAddress>,
+    recorded: std::collections::HashSet<RevisionTarget>,
+}
+
 fn push_revision_address(
     metadata: &RevisionMetadata,
     category: RevisionCategory,
     parent: Option<RevisionTarget>,
     depth: usize,
-    out: &mut Vec<RevisionAddress>,
+    out: &mut Collected,
 ) {
-    out.push(RevisionAddress {
+    out.list.push(RevisionAddress {
         target: metadata.target,
-        ordinal: out.len(),
+        ordinal: out.list.len(),
         parent,
         depth,
         category,
@@ -1304,7 +1432,7 @@ fn collect_property_revision(
     change: &Option<PropertyChange>,
     parent: Option<RevisionTarget>,
     depth: usize,
-    out: &mut Vec<RevisionAddress>,
+    out: &mut Collected,
 ) {
     if let Some(change) = change {
         push_revision_address(
@@ -1321,16 +1449,31 @@ fn collect_run_props_revisions(
     props: &RunProps,
     parent: Option<RevisionTarget>,
     depth: usize,
-    out: &mut Vec<RevisionAddress>,
+    out: &mut Collected,
 ) {
     collect_property_revision(&props.property_change, parent, depth, out);
+    // One entry per recorded insertion, however many runs it is in.
+    if let Some(insert) = &props.tracked_insert {
+        // (A deletion of part of it can sit between two runs of it.)
+        let target = insert.metadata.target;
+        let listed = target.is_assigned() && !out.recorded.insert(target);
+        if !listed {
+            push_revision_address(
+                &insert.metadata,
+                RevisionCategory::Inline(RevisionKind::Insert),
+                parent,
+                depth,
+                out,
+            );
+        }
+    }
 }
 
 fn collect_inline_revisions(
     inline: &Inline,
     parent: Option<RevisionTarget>,
     depth: usize,
-    out: &mut Vec<RevisionAddress>,
+    out: &mut Collected,
 ) {
     match inline {
         Inline::Run(run) => collect_run_props_revisions(&run.props, parent, depth, out),
@@ -1388,7 +1531,7 @@ fn collect_block_revisions(
     block: &Block,
     parent: Option<RevisionTarget>,
     depth: usize,
-    out: &mut Vec<RevisionAddress>,
+    out: &mut Collected,
 ) {
     match block {
         Block::Paragraph(paragraph) => {

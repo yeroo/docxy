@@ -16,6 +16,8 @@ pub enum Act {
     Cut,
     Copy,
     Paste,
+    /// Home › Paste Special (Ctrl+Alt+V, #669).
+    PasteSpecial,
     Undo,
     Redo,
     Find,
@@ -24,6 +26,9 @@ pub enum Act {
     ClearContents,
     FillDown,
     FillRight,
+    /// Home › Fill › Up and Left (#668).
+    FillUp,
+    FillLeft,
     InsertRow,
     InsertCol,
     DeleteRow,
@@ -51,7 +56,12 @@ pub enum Act {
     MergeCenter,
     CondFormat,
     DataValidation,
+    /// Data › Sort & Filter.
     Filter,
+    ClearFilter,
+    ReapplyFilter,
+    AdvancedFilter,
+    FilterByCell,
     RemoveDuplicates,
     TextToColumns,
     FormatAsTable,
@@ -151,7 +161,11 @@ fn home_groups() -> Vec<Group> {
             title: "Clipboard",
             width: 13,
             rows: [
-                vec![btn("Paste", Paste, "Paste (Ctrl+V)")],
+                vec![
+                    btn("Paste", Paste, "Paste (Ctrl+V)"),
+                    Seg::Gap(" "),
+                    btn("Spec…", PasteSpecial, "Paste Special (Ctrl+Alt+V)"),
+                ],
                 vec![
                     btn("✂ Cut", Cut, "Cut (Ctrl+X)"),
                     Seg::Gap(" "),
@@ -161,7 +175,7 @@ fn home_groups() -> Vec<Group> {
         },
         Group {
             title: "Cells",
-            width: 26,
+            width: 28,
             rows: [
                 vec![
                     btn("+Row", InsertRow, "Insert rows above the selection"),
@@ -178,6 +192,10 @@ fn home_groups() -> Vec<Group> {
                     btn("−Col", DeleteCol, "Delete the selected columns"),
                     Seg::Gap(" "),
                     btn("Fill→", FillRight, "Fill right (Ctrl+R)"),
+                    Seg::Gap(" "),
+                    btn("Fill↑", FillUp, "Fill up"),
+                    Seg::Gap(" "),
+                    btn("Fill←", FillLeft, "Fill left"),
                 ],
             ],
         },
@@ -327,23 +345,60 @@ fn insert_groups() -> Vec<Group> {
     ]
 }
 
-/// Excel's Data tab: the data tools that were on Insert, and the outline.
+/// Excel's Data tab: Sort & Filter, the data tools that were on Insert, and
+/// the outline.
 fn data_groups() -> Vec<Group> {
     use Act::*;
     vec![
         Group {
+            title: "Sort & Filter",
+            width: 34,
+            rows: [
+                vec![
+                    btn("↑ A→Z", SortAsc, "Sort A to Z by the current column"),
+                    Seg::Gap(" "),
+                    btn("↓ Z→A", SortDesc, "Sort Z to A by the current column"),
+                    Seg::Gap(" "),
+                    btn(
+                        "⇅ Sort…",
+                        CustomSort,
+                        "Sort by levels, custom lists, colour or icon",
+                    ),
+                    Seg::Gap(" "),
+                    btn(
+                        "By Cell…",
+                        FilterByCell,
+                        "Filter by the selected cell's value, colour, font colour or icon",
+                    ),
+                ],
+                vec![
+                    btn(
+                        "Filter ▾",
+                        Filter,
+                        "Filter buttons on/off (Ctrl+Shift+L); Alt+Down on a header opens one",
+                    ),
+                    Seg::Gap(" "),
+                    btn("Clear", ClearFilter, "Clear the filter: show every row"),
+                    Seg::Gap(" "),
+                    btn("Reapply", ReapplyFilter, "Apply the filter again"),
+                    Seg::Gap(" "),
+                    btn(
+                        "Advanced…",
+                        AdvancedFilter,
+                        "Filter with a criteria range, in place or to a copy",
+                    ),
+                ],
+            ],
+        },
+        Group {
             title: "Data Tools",
             width: 30,
             rows: [
-                vec![
-                    btn(
-                        "Validation",
-                        DataValidation,
-                        "Data validation (dropdown list)",
-                    ),
-                    Seg::Gap(" "),
-                    btn("Filter ▾", Filter, "AutoFilter the current column"),
-                ],
+                vec![btn(
+                    "Validation",
+                    DataValidation,
+                    "Data validation (dropdown list)",
+                )],
                 vec![
                     btn(
                         "Remove Dup",

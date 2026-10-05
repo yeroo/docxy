@@ -102,6 +102,9 @@ pub(crate) enum DialogOwner {
     /// Settings' User name... (#620): the reviewer name and initials new
     /// comments carry. An app setting, applied by `user_name::click`.
     UserName,
+    /// File > Account's About docxy suite (#1023): the build's rows, Copy and
+    /// Close. Its presses are the app's (`Docxy::about_click`), before the tab's.
+    About,
     /// Excel's Subtotal dialog (#693) over the region `(r1, c1, r2, c2)` of
     /// `sheet`: its column choices start at `c1` (at most 64 of them), and
     /// `c2` ends the region, so total rows are found only in `c1..=c2`;
@@ -122,11 +125,84 @@ pub(crate) enum DialogOwner {
         row: u32,
         col: u32,
     },
+    /// A filter button's drop-down on absolute column `col` of `sheet`'s
+    /// AutoFilter (#690); its buttons apply in `sheet_filter::click`.
+    FilterMenu {
+        sheet: usize,
+        col: u32,
+    },
+    /// Custom AutoFilter and Top 10 AutoFilter for that column.
+    CustomFilter {
+        sheet: usize,
+        col: u32,
+        /// The column holds dates: a typed `YYYY-MM-DD` compares as a date.
+        date: bool,
+    },
+    Top10Filter {
+        sheet: usize,
+        col: u32,
+    },
+    /// Advanced Filter on `sheet`.
+    AdvancedFilter {
+        sheet: usize,
+    },
+    /// Excel's Sort dialog over `area` of `sheet` (#691), applied in
+    /// `sheet_sort::click`.
+    SortLevels {
+        sheet: usize,
+        area: (u32, u32, u32, u32),
+    },
+    /// The Sort Warning: the selection `sel` sits in the wider list
+    /// `region` (`header` when its first row is one); `then` is the sort
+    /// waiting on the answer.
+    SortWarning {
+        sheet: usize,
+        sel: (u32, u32, u32, u32),
+        region: (u32, u32, u32, u32),
+        header: bool,
+        then: crate::sheet_sort::SortThen,
+    },
     /// The outline Settings (#693): where summary rows and columns sit.
     OutlineSettings,
+    /// Home › Find & Select › Go To… and Go To Special… (#671), applied in
+    /// `sheet_goto::click`.
+    GoTo,
+    GoToSpecial,
+    /// Home › Fill › Series… (#668); its OK needs the app's custom lists,
+    /// so `Docxy::fill_dialog_click` applies it.
+    Series,
+    /// Justify's "Text will extend below selected range." (#668).
+    JustifyOverflow,
+    /// File › Options › Edit Custom Lists (#668): an app setting, applied by
+    /// `Docxy::fill_dialog_click`.
+    CustomLists,
+    /// Paste Special… (#669); `clip` when a copy is live (else only text
+    /// is on the clipboard). Applied by `Docxy::paste_dialog_click`.
+    PasteSpecial {
+        clip: bool,
+    },
+    /// "There's already data here. Do you want to replace it?" before a
+    /// drop by the selection's border (#670), applied by
+    /// `Docxy::drop_dialog_click`.
+    DropReplace,
     /// Group's (Ungroup's) "Rows or Columns?" over a block selection (#693).
     OutlineAxis {
         ungroup: bool,
+    },
+    /// A message whose only button is OK, which just closes it (Flash
+    /// Fill's "didn't see a pattern", #666).
+    Message,
+    /// The AutoCorrect dialog, its Exceptions and its "redefine it?"
+    /// question (#667): app settings, pressed in `sheet_autocorrect::click`.
+    AutoCorrect,
+    AutoCorrectExceptions,
+    AutoCorrectRedefine,
+    /// Word's "Save your changes to this file?" before a dirty tab closes
+    /// (#629), or for a workbook or a Project "Save changes to … before
+    /// closing?"; `quit` when it is one of the window close's questions
+    /// (#630). Every press is handled in `close::close_prompt_click`.
+    SaveOnClose {
+        quit: bool,
     },
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
@@ -237,6 +313,10 @@ pub(crate) enum ControlKind {
     List,
     Grid,
     Label,
+    /// Items each checked or not, a tree by `Control::depths`: checking an
+    /// item checks the items under it, and an item with items under it is
+    /// checked when they all are (the AutoFilter value list, #690).
+    CheckList,
 }
 
 impl ControlKind {
@@ -252,6 +332,7 @@ impl ControlKind {
             Self::List => "list",
             Self::Grid => "grid",
             Self::Label => "label",
+            Self::CheckList => "checklist",
         }
     }
     fn has_items(self) -> bool {
@@ -267,7 +348,11 @@ impl ControlKind {
     /// A control the keyboard and pointer can edit: a list and a grid are
     /// still read-only widgets, and a label is never edited.
     pub fn is_editable(self) -> bool {
-        self.is_text() || matches!(self, Self::Checkbox | Self::Radio | Self::Dropdown)
+        self.is_text()
+            || matches!(
+                self,
+                Self::Checkbox | Self::Radio | Self::Dropdown | Self::CheckList
+            )
     }
 }
 
@@ -291,6 +376,8 @@ pub(crate) enum Value {
     Choice(Option<usize>),
     /// A grid's rows, one string per column.
     Rows(Vec<Vec<String>>),
+    /// A check list's checks, one per item.
+    Checks(Vec<bool>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -308,6 +395,8 @@ pub(crate) struct Control {
     pub items: Vec<String>,
     /// A grid's column headings.
     pub columns: Vec<String>,
+    /// A check list's items' depths in its tree (0 at the top).
+    pub depths: Vec<u8>,
 }
 
 impl Control {
@@ -322,6 +411,7 @@ impl Control {
             page: None,
             items: Vec::new(),
             columns: Vec::new(),
+            depths: Vec::new(),
         }
     }
 
@@ -338,6 +428,11 @@ impl Control {
                 1 => "1 row".into(),
                 n => format!("{n} rows"),
             },
+            Value::Checks(c) => format!(
+                "{} of {} checked",
+                c.iter().filter(|x| **x).count(),
+                c.len()
+            ),
         }
     }
 
@@ -353,6 +448,7 @@ impl Control {
                 .and_then(|i| self.items.get(i))
                 .map_or(Json::Null, |s| Json::Str(s.clone())),
             Value::Rows(rows) => rows_json(rows),
+            Value::Checks(c) => Json::Arr(c.iter().map(|x| Json::Bool(*x)).collect()),
         };
         let mut out = vec![
             ("name", Json::Str(self.name.into())),
@@ -376,6 +472,18 @@ impl Control {
         if let Value::Rows(rows) = &self.value {
             out.push(("columns", strs(&self.columns)));
             out.push(("rows", rows_json(rows)));
+        }
+        if self.kind == ControlKind::CheckList {
+            out.push(("items", strs(&self.items)));
+            out.push((
+                "depths",
+                Json::Arr(
+                    self.depths
+                        .iter()
+                        .map(|d| Json::Num(f64::from(*d)))
+                        .collect(),
+                ),
+            ));
         }
         Json::obj(out)
     }
@@ -436,8 +544,61 @@ impl Control {
                 self.edit_grid(&mut rows, args)?;
                 Value::Rows(rows)
             }
+            ControlKind::CheckList => Value::Checks(self.set_checks(args)?),
         };
         Ok(())
+    }
+
+    /// A check list's `dialog-set`: `{value: true|false}` checks or clears
+    /// every item; `{value: [labels]}` checks exactly those; `{item, checked}`
+    /// checks or clears one (and the items under it).
+    fn set_checks(&self, args: &Json) -> Result<Vec<bool>, String> {
+        let label = shown(&self.label);
+        let mut checks = match &self.value {
+            Value::Checks(c) => c.clone(),
+            _ => vec![false; self.items.len()],
+        };
+        checks.resize(self.items.len(), false);
+        let find = |want: &str| {
+            self.items
+                .iter()
+                .position(|item| fold(item.trim()) == fold(want.trim()))
+                .ok_or_else(|| format!("'{label}' has no item '{want}'"))
+        };
+        // One item, by label or (for a label the tree repeats, a day under
+        // two months) by index.
+        let one = match (args.get_str("item"), args.get("index")) {
+            (Some(item), _) => Some(find(item)?),
+            (None, Some(i)) => Some(
+                i.as_usize()
+                    .filter(|&k| k < self.items.len())
+                    .ok_or_else(|| format!("'{label}' has no item {i:?}"))?,
+            ),
+            _ => None,
+        };
+        if let Some(k) = one {
+            let on = args
+                .get("checked")
+                .and_then(Json::as_bool)
+                .ok_or("'checked' must be true or false")?;
+            gridcore::filter::check_tree(&mut checks, &self.depths, k, on);
+            return Ok(checks);
+        }
+        match args.get("value").ok_or("missing argument 'value'")? {
+            Json::Bool(b) => checks.iter_mut().for_each(|c| *c = *b),
+            Json::Arr(want) => {
+                checks.iter_mut().for_each(|c| *c = false);
+                for w in want {
+                    let w = w
+                        .as_str()
+                        .ok_or_else(|| format!("'{label}' takes labels"))?;
+                    let k = find(w)?;
+                    gridcore::filter::check_tree(&mut checks, &self.depths, k, true);
+                }
+            }
+            _ => return Err(format!("'{label}' takes true, false or a list of labels")),
+        }
+        Ok(checks)
     }
 
     fn edit_grid(&self, rows: &mut Vec<Vec<String>>, args: &Json) -> Result<(), String> {
@@ -549,6 +710,15 @@ pub(crate) struct Dialog {
     pub owner: DialogOwner,
     /// The control typed keys go to (an index into `controls`).
     pub focus: Option<usize>,
+    /// The caret in the focused text field, as a character index; `None` is
+    /// the end of the text. Reset whenever the focus moves or a value is set.
+    caret: Option<usize>,
+    /// The other end of the selection the caret extends from, when one is
+    /// made (Shift+arrow, Ctrl+A); `None` is no selection.
+    anchor: Option<usize>,
+    /// The control `caret` and `anchor` belong to: they mean nothing once the
+    /// focus is on another (however it got there).
+    caret_for: Option<usize>,
     /// The values the dialog opened on, one per control (see
     /// [`Dialog::changed`]); empty for a dialog that does not track them.
     pub opened: Vec<Value>,
@@ -602,6 +772,9 @@ impl Dialog {
                 .collect(),
             owner,
             focus: None,
+            caret: None,
+            anchor: None,
+            caret_for: None,
             opened: Vec::new(),
             react: None,
         }
@@ -681,6 +854,8 @@ impl Dialog {
     fn set_at(&mut self, i: usize, args: &Json) -> Result<(), String> {
         let before = self.controls[i].value.clone();
         self.controls[i].set(args)?;
+        self.caret = None;
+        self.anchor = None;
         if let Some(Reaction(react)) = self.react {
             react(self, i, &before);
         }
@@ -735,33 +910,139 @@ impl Dialog {
             (Some(i), true) => (i + order.len() - 1) % order.len(),
         };
         self.focus = Some(order[next]);
+        self.caret = None;
+        self.anchor = None;
     }
 
-    /// Change the focused field's text through its input handler.
-    fn edit_focused(&mut self, edit: impl FnOnce(&mut String)) -> Result<(), String> {
-        let Some(c) = self.focused() else {
+    /// The focused text field's text, when the focus is on one.
+    fn focused_text(&self) -> Option<String> {
+        self.focused()
+            .filter(|c| c.kind.is_text())
+            .map(Control::text)
+    }
+
+    /// The caret, when it belongs to the focused control.
+    fn live_caret(&self) -> Option<usize> {
+        self.caret.filter(|_| self.caret_for == self.focus)
+    }
+
+    /// Put the caret at character `at` of the focused control, with no selection.
+    fn put_caret(&mut self, at: usize) {
+        self.caret = Some(at);
+        self.anchor = None;
+        self.caret_for = self.focus;
+    }
+
+    /// The caret in the focused field: a character index, at most the text's
+    /// length (the text may have been set shorter since).
+    pub fn caret_at(&self) -> usize {
+        let len = self.focused_text().map_or(0, |t| t.chars().count());
+        self.live_caret().unwrap_or(len).min(len)
+    }
+
+    /// The selected character range `(from, to)` in the focused field.
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let len = self.focused_text()?.chars().count();
+        let anchor = self.live_caret().and(self.anchor)?;
+        let (a, c) = (anchor.min(len), self.caret_at());
+        (a != c).then(|| (a.min(c), a.max(c)))
+    }
+
+    /// Replace `from..to` (characters) of the focused field with `with`,
+    /// through its input handler, and put the caret after it. A refusal (a
+    /// letter in a number) is the error and leaves the text and caret as they were.
+    fn replace_range(&mut self, from: usize, to: usize, with: &str) -> Result<(), String> {
+        let Some(text) = self.focused_text() else {
             return Ok(());
         };
-        if !c.kind.is_text() {
-            return Ok(());
-        }
-        let mut text = c.text();
-        edit(&mut text);
+        let chars: Vec<char> = text.chars().collect();
+        let (from, to) = (from.min(chars.len()), to.min(chars.len()));
+        let mut next: String = chars[..from].iter().collect();
+        next.push_str(with);
+        next.extend(&chars[to..]);
         let i = self.focus.unwrap_or_default();
-        self.set_at(i, &Json::obj(vec![("value", Json::Str(text))]))
+        self.set_at(i, &Json::obj(vec![("value", Json::Str(next))]))?;
+        self.put_caret(from + with.chars().count());
+        Ok(())
     }
 
-    /// A typed character: appended to the focused field. A character the
-    /// field refuses (a letter in a number) is the error, and changes nothing.
+    /// The range an edit replaces: the selection, else `fallback` around the
+    /// caret.
+    fn edit_range(&self, fallback: impl FnOnce(usize) -> (usize, usize)) -> (usize, usize) {
+        self.selection()
+            .unwrap_or_else(|| fallback(self.caret_at()))
+    }
+
+    /// Text typed or pasted at the caret, replacing the selection. A
+    /// character the field refuses (a letter in a number) is the error, and
+    /// changes nothing.
+    pub fn insert_text(&mut self, text: &str) -> Result<(), String> {
+        let (from, to) = self.edit_range(|c| (c, c));
+        self.replace_range(from, to, text)
+    }
+
+    /// A typed character at the caret.
     pub fn type_char(&mut self, ch: char) -> Result<(), String> {
-        self.edit_focused(|t| t.push(ch))
+        self.insert_text(ch.encode_utf8(&mut [0; 4]))
     }
 
-    /// Backspace in the focused field.
+    /// Backspace in the focused field: the selection, else the character
+    /// before the caret.
     pub fn backspace(&mut self) -> Result<(), String> {
-        self.edit_focused(|t| {
-            t.pop();
-        })
+        let (from, to) = self.edit_range(|c| (c.saturating_sub(1), c));
+        self.replace_range(from, to, "")
+    }
+
+    /// Delete in the focused field: the selection, else the character after
+    /// the caret.
+    pub fn delete(&mut self) -> Result<(), String> {
+        let (from, to) = self.edit_range(|c| (c, c + 1));
+        self.replace_range(from, to, "")
+    }
+
+    /// Move the caret in the focused field to character `to`; `extend` keeps
+    /// (or starts) a selection from where it was, else the selection is dropped.
+    pub fn move_caret_to(&mut self, to: usize, extend: bool) {
+        let Some(len) = self.focused_text().map(|t| t.chars().count()) else {
+            return;
+        };
+        let from = self.caret_at();
+        let anchor = self.live_caret().and(self.anchor).or(Some(from));
+        self.put_caret(to.min(len));
+        self.anchor = anchor.filter(|_| extend);
+    }
+
+    /// Left or Right: one character, or to the selection's edge when one is
+    /// made and `extend` is off.
+    pub fn move_caret(&mut self, right: bool, extend: bool) {
+        let at = self.caret_at();
+        let len = self.focused_text().map_or(0, |t| t.chars().count());
+        if !extend {
+            if let Some((from, to)) = self.selection() {
+                return self.move_caret_to(if right { to } else { from }, false);
+            }
+        }
+        let to = if right {
+            (at + 1).min(len)
+        } else {
+            at.saturating_sub(1)
+        };
+        self.move_caret_to(to, extend);
+    }
+
+    /// Home or End.
+    pub fn move_caret_edge(&mut self, end: bool, extend: bool) {
+        let len = self.focused_text().map_or(0, |t| t.chars().count());
+        self.move_caret_to(if end { len } else { 0 }, extend);
+    }
+
+    /// Ctrl+A: the whole text selected, the caret at its end.
+    pub fn select_all(&mut self) {
+        let Some(len) = self.focused_text().map(|t| t.chars().count()) else {
+            return;
+        };
+        self.put_caret(len);
+        self.anchor = Some(0);
     }
 
     /// A press on a control, as the pointer makes it: a field takes the
@@ -772,9 +1053,26 @@ impl Dialog {
         if !self.focusable().contains(&index) {
             return Err(format!("'{}' cannot be edited", shown(&c.label)));
         }
+        if self.focus != Some(index) {
+            self.caret = None;
+            self.anchor = None;
+        }
         self.focus = Some(index);
         let value = match (c.kind, &c.value) {
             (ControlKind::Checkbox, Value::Bool(b)) => Json::Bool(!b),
+            (ControlKind::CheckList, Value::Checks(c)) => {
+                let Some(k) = item else {
+                    return Ok(());
+                };
+                let on = !c.get(k).copied().ok_or("no such item")?;
+                return self.set_at(
+                    index,
+                    &Json::obj(vec![
+                        ("index", Json::Num(k as f64)),
+                        ("checked", Json::Bool(on)),
+                    ]),
+                );
+            }
             (ControlKind::Radio | ControlKind::Dropdown, Value::Choice(cur)) => {
                 let n = c.items.len().max(1);
                 let pick = match (item, c.kind) {
@@ -1055,6 +1353,9 @@ mod tests_support {
             ],
             owner: DialogOwner::Test,
             focus: None,
+            caret: None,
+            anchor: None,
+            caret_for: None,
             opened: Vec::new(),
             react: None,
         }

@@ -1,5 +1,6 @@
 //! Conditional-formatting evaluation. Given a cell, find the differential format
-//! ([`crate::sheet::Dxf`]) of the highest-priority matching rule.
+//! ([`crate::sheet::Dxf`]) its matching rules stack up to: each property from
+//! the highest-priority matching rule that sets it.
 //!
 //! Only `cellIs` and `expression` rules are evaluated (the common ones); other
 //! rule types (colorScale/dataBar/iconSet/top10/…) are ignored for now.
@@ -30,13 +31,52 @@ fn eval_cf(
 }
 
 /// The differential format conditional formatting applies to cell
-/// (sheet, row, col), if any. The lowest-`priority`-number matching rule wins.
+/// (sheet, row, col), if any rule matches. Excel stacks the matching rules'
+/// formats: the fill, the font colour, bold and italic each come from the
+/// highest-precedence (lowest `priority` number) matching rule that sets
+/// it, so a font-only rule above leaves the fill to a rule below. The
+/// unresolved flags travel with their colour. (`stopIfTrue`, which would
+/// end the stack early, isn't read.)
 pub fn cell_dxf(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<Dxf> {
-    let s = wb.sheets.get(sheet)?;
-    if s.cond_formats.is_empty() {
+    let rules = matching_rules(wb, sheet, row, col);
+    if rules.is_empty() {
         return None;
     }
-    let mut best: Option<(i32, usize)> = None; // (priority, dxf_id)
+    let first = |sets: &dyn Fn(&Dxf) -> bool| rules.iter().map(|r| r.1).find(|d| sets(d));
+    let mut out = Dxf::default();
+    if let Some(d) = first(&|d| dxf_sets_color(d, true)) {
+        (out.fill, out.fill_unresolved) = (d.fill, d.fill_unresolved);
+    }
+    if let Some(d) = first(&|d| dxf_sets_color(d, false)) {
+        (out.color, out.color_unresolved) = (d.color, d.color_unresolved);
+    }
+    out.bold = first(&|d| d.bold.is_some()).and_then(|d| d.bold);
+    out.italic = first(&|d| d.italic.is_some()).and_then(|d| d.italic);
+    Some(out)
+}
+
+/// The highest-precedence matching rule whose format `wants` takes (the
+/// one that sets a given property), with its `priority`.
+fn cell_dxf_rule_by(
+    wb: &Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    wants: impl Fn(&Dxf) -> bool,
+) -> Option<(i32, Dxf)> {
+    matching_rules(wb, sheet, row, col)
+        .into_iter()
+        .find(|(_, d)| wants(d))
+        .map(|(p, d)| (p, d.clone()))
+}
+
+/// The formats of the rules over the cell that match it, highest
+/// precedence (lowest `priority` number) first.
+fn matching_rules(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Vec<(i32, &Dxf)> {
+    let Some(s) = wb.sheets.get(sheet) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
     for cf in &s.cond_formats {
         let covers = cf
             .ranges
@@ -53,16 +93,16 @@ pub fn cell_dxf(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<Dxf> 
                 (r.min(r1), c.min(c1))
             });
         for rule in &cf.rules {
-            let Some(dxf_id) = rule.dxf_id else { continue };
-            if best.is_some_and(|(p, _)| rule.priority >= p) {
-                continue; // a higher-precedence rule already matched
-            }
+            let Some(d) = rule.dxf_id.and_then(|i| wb.styles.dxfs.get(i)) else {
+                continue;
+            };
             if rule_matches(wb, sheet, row, col, anchor, &rule.kind) {
-                best = Some((rule.priority, dxf_id));
+                found.push((rule.priority, d));
             }
         }
     }
-    best.and_then(|(_, id)| wb.styles.dxfs.get(id).cloned())
+    found.sort_by_key(|r| r.0);
+    found
 }
 
 fn truthy(v: &Value) -> bool {
@@ -138,7 +178,300 @@ fn rule_matches(
                 _ => false,
             }
         }
-        CfKind::Other { .. } => false,
+        CfKind::IconSet { .. } | CfKind::Other { .. } => false,
+    }
+}
+
+/// A cell's displayed fill or font colour, as filtering and sorting by
+/// colour compare it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shown {
+    /// No fill, or the automatic font colour.
+    None,
+    Rgb((u8, u8, u8)),
+    /// A colour we can't read: a theme or indexed colour we don't resolve,
+    /// or a conditional-formatting rule we don't evaluate (Duplicate Values,
+    /// a colour scale, …) that may be colouring the cell, perhaps not at all.
+    /// It matches neither No Fill nor any colour.
+    Unknown,
+}
+
+impl Shown {
+    /// Whether this is the colour a filter or sort level names (`None`: No
+    /// Fill, or the automatic font colour).
+    pub fn is(self, rgb: Option<(u8, u8, u8)>) -> bool {
+        match (self, rgb) {
+            (Shown::None, None) => true,
+            (Shown::Rgb(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// As a criterion's colour: `None` for no colour; an unknown one has none.
+    pub fn rgb(self) -> Option<Option<(u8, u8, u8)>> {
+        match self {
+            Shown::None => Some(None),
+            Shown::Rgb(c) => Some(Some(c)),
+            Shown::Unknown => None,
+        }
+    }
+}
+
+/// The fill a cell shows: conditional formatting's when a matching rule sets
+/// one, else its own; [`Shown::Unknown`] when we can't tell (a theme or
+/// indexed colour, or a rule we don't evaluate that may set it).
+pub fn cell_fill(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Shown {
+    shown_color(wb, sheet, row, col, true)
+}
+
+/// The font colour a cell shows, conditional formatting's first.
+pub fn cell_font_color(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Shown {
+    shown_color(wb, sheet, row, col, false)
+}
+
+fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> Shown {
+    // The colour comes from the highest-precedence matching rule that sets
+    // it, as [`cell_dxf`] stacks the formats the grid paints.
+    let winner = cell_dxf_rule_by(wb, sheet, row, col, |d| dxf_sets_color(d, fill));
+    // A rule we don't evaluate (Duplicate Values, a colour scale, …) that
+    // takes precedence over the one that sets the colour, or any such rule
+    // when none does, may be colouring the cell: then its colour is unknown.
+    let bound = winner.as_ref().map(|w| w.0);
+    if unevaluated_could_color(wb, sheet, row, col, fill, bound) {
+        return Shown::Unknown;
+    }
+    if let Some((_, d)) = winner {
+        let (rgb, unresolved) = if fill {
+            (d.fill, d.fill_unresolved)
+        } else {
+            (d.color, d.color_unresolved)
+        };
+        match rgb {
+            Some(c) => return Shown::Rgb(c),
+            // A theme or indexed colour the rule sets: some colour.
+            None if unresolved => return Shown::Unknown,
+            None => {}
+        }
+    }
+    let style = wb
+        .sheets
+        .get(sheet)
+        .and_then(|s| s.cell(row, col))
+        .map_or(0, |c| c.style);
+    let xf = wb.styles.xf(style);
+    let (rgb, unresolved) = if fill {
+        (xf.fill, xf.fill_unresolved)
+    } else {
+        (xf.color, xf.color_unresolved)
+    };
+    match rgb {
+        Some(c) => Shown::Rgb(c),
+        None if unresolved => Shown::Unknown,
+        None => Shown::None,
+    }
+}
+
+/// Does a conditional-formatting rule over the cell that we don't evaluate
+/// set the fill (`fill`) or the font colour? Its format does, or for a fill
+/// it is a colour scale. With `before`, only a rule that takes precedence
+/// over that priority counts.
+fn unevaluated_could_color(
+    wb: &Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    fill: bool,
+    before: Option<i32>,
+) -> bool {
+    let Some(s) = wb.sheets.get(sheet) else {
+        return false;
+    };
+    s.cond_formats
+        .iter()
+        .filter(|cf| {
+            cf.ranges
+                .iter()
+                .any(|&(r1, c1, r2, c2)| row >= r1 && row <= r2 && col >= c1 && col <= c2)
+        })
+        .flat_map(|cf| &cf.rules)
+        .any(|rule| {
+            let CfKind::Other { rule_type, .. } = &rule.kind else {
+                return false;
+            };
+            if before.is_some_and(|p| rule.priority >= p) {
+                return false;
+            }
+            if fill && rule_type == "colorScale" {
+                return true;
+            }
+            rule.dxf_id
+                .and_then(|i| wb.styles.dxfs.get(i))
+                .is_some_and(|d| dxf_sets_color(d, fill))
+        })
+}
+
+/// Does a conditional format set the fill (`fill`) or the font colour, read
+/// or not (a theme or indexed colour)?
+fn dxf_sets_color(d: &Dxf, fill: bool) -> bool {
+    if fill {
+        d.fill.is_some() || d.fill_unresolved
+    } else {
+        d.color.is_some() || d.color_unresolved
+    }
+}
+
+/// The conditional-formatting icon a cell shows, as (`iconSet`, `iconId`):
+/// from the highest-precedence icon-set rule over it. `iconId` 0 is the
+/// set's first icon (for `3Arrows`, the red down arrow), which goes to the
+/// lowest values unless the rule is `reverse`. Only a number gets an icon.
+/// For many cells, keep one [`Icons`] instead: it reads each rule's range
+/// once.
+pub fn cell_icon(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<(String, u32)> {
+    Icons::new(wb, sheet).icon(row, col)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`Icons`] has read a rule's numbers on this thread.
+    pub(crate) static ICON_RANGE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The icons of one sheet's cells, for a command that asks about many
+/// (filtering or sorting by icon): each icon-set rule's numbers, which
+/// percent and percentile thresholds need, are read and sorted once.
+pub struct Icons<'a> {
+    wb: &'a Workbook,
+    sheet: usize,
+    /// Each conditional-format block's numbers, sorted, by block index.
+    nums: std::cell::RefCell<std::collections::HashMap<usize, std::rc::Rc<Vec<f64>>>>,
+}
+
+impl<'a> Icons<'a> {
+    pub fn new(wb: &'a Workbook, sheet: usize) -> Self {
+        Icons {
+            wb,
+            sheet,
+            nums: Default::default(),
+        }
+    }
+
+    /// The numbers of block `i`'s ranges, sorted.
+    fn numbers(&self, i: usize) -> std::rc::Rc<Vec<f64>> {
+        if let Some(n) = self.nums.borrow().get(&i) {
+            return n.clone();
+        }
+        #[cfg(test)]
+        ICON_RANGE_READS.with(|n| n.set(n.get() + 1));
+        let (wb, sheet) = (self.wb, self.sheet);
+        let s = &wb.sheets[sheet];
+        let mut nums: Vec<f64> = Vec::new();
+        let last_row = s.used_size().0.saturating_sub(1);
+        for &(r1, c1, r2, c2) in &s.cond_formats[i].ranges {
+            for r in r1..=r2.min(last_row) {
+                for (&(_, c), _) in s.cells.range((r, c1)..=(r, c2)) {
+                    if let Value::Num(n) = cell_value_at(wb, sheet, r, c) {
+                        nums.push(n);
+                    }
+                }
+            }
+        }
+        nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        let nums = std::rc::Rc::new(nums);
+        self.nums.borrow_mut().insert(i, nums.clone());
+        nums
+    }
+
+    /// See [`cell_icon`].
+    pub fn icon(&self, row: u32, col: u32) -> Option<(String, u32)> {
+        let (wb, sheet) = (self.wb, self.sheet);
+        let s = wb.sheets.get(sheet)?;
+        let mut best: Option<(i32, usize, &CfKind)> = None;
+        for (i, cf) in s.cond_formats.iter().enumerate() {
+            let covers = cf
+                .ranges
+                .iter()
+                .any(|&(r1, c1, r2, c2)| row >= r1 && row <= r2 && col >= c1 && col <= c2);
+            if !covers {
+                continue;
+            }
+            for rule in &cf.rules {
+                if matches!(rule.kind, CfKind::IconSet { .. })
+                    && best.is_none_or(|(p, _, _)| rule.priority < p)
+                {
+                    best = Some((rule.priority, i, &rule.kind));
+                }
+            }
+        }
+        let (
+            _,
+            i,
+            CfKind::IconSet {
+                set,
+                reverse,
+                cfvos,
+                ..
+            },
+        ) = best?
+        else {
+            return None;
+        };
+        let Value::Num(v) = cell_value_at(wb, sheet, row, col) else {
+            return None;
+        };
+        let nums = self.numbers(i);
+        let (lo, hi) = (*nums.first()?, *nums.last()?);
+        let anchor = s.cond_formats[i]
+            .ranges
+            .iter()
+            .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, ..)| {
+                (r.min(r1), c.min(c1))
+            });
+        let threshold = |c: &crate::sheet::Cfvo| -> Option<f64> {
+            let num = || match c.val.trim().parse::<f64>() {
+                Ok(n) => Some(n),
+                Err(_) => match eval_cf(wb, sheet, row, col, anchor, &c.val) {
+                    Value::Num(n) => Some(n),
+                    _ => None,
+                },
+            };
+            match c.kind.as_str() {
+                "num" | "formula" => num(),
+                "percent" => Some(lo + (hi - lo) * num()? / 100.0),
+                "percentile" => Some(percentile(&nums, num()? / 100.0)),
+                "min" => Some(lo),
+                "max" => Some(hi),
+                _ => None,
+            }
+        };
+        let n = cfvos.len();
+        // The highest band whose threshold the value reaches; the first cfvo
+        // is the floor of band 0.
+        let mut band = 0;
+        for (k, c) in cfvos.iter().enumerate().skip(1) {
+            let Some(t) = threshold(c) else { continue };
+            if if c.gte { v >= t } else { v > t } {
+                band = k;
+            }
+        }
+        let id = if *reverse {
+            n.saturating_sub(1) - band
+        } else {
+            band
+        };
+        Some((set.clone(), id as u32))
+    }
+}
+
+/// Excel's `PERCENTILE.INC` of sorted `nums` at `p` (0..=1).
+fn percentile(nums: &[f64], p: f64) -> f64 {
+    if nums.is_empty() {
+        return 0.0;
+    }
+    let rank = p.clamp(0.0, 1.0) * (nums.len() - 1) as f64;
+    let (i, frac) = (rank.floor() as usize, rank.fract());
+    match nums.get(i + 1) {
+        Some(next) => nums[i] + (next - nums[i]) * frac,
+        None => nums[i],
     }
 }
 
@@ -421,7 +754,10 @@ mod tests {
             ix: None,
             ranges: vec![(0, 0, 9, 0)],
             rules: vec![CfRule {
-                kind: CfKind::Other { formulas: vec![] },
+                kind: CfKind::Other {
+                    rule_type: "dataBar".into(),
+                    formulas: vec![],
+                },
                 dxf_id: Some(0),
                 priority: 1,
             }],
@@ -469,6 +805,58 @@ mod tests {
     }
 
     #[test]
+    fn matching_rules_stack_each_property_from_the_top_rule_that_sets_it() {
+        // Priority 1 sets bold and a red font; priority 2 a green fill and
+        // italic off; priority 3 a blue fill. A1 shows red bold on green.
+        let gt0 = || CfKind::CellIs {
+            op: "greaterThan".into(),
+            formulas: vec!["0".into()],
+        };
+        let dxfs = vec![
+            Dxf {
+                bold: Some(true),
+                color: Some((255, 0, 0)),
+                ..Dxf::default()
+            },
+            Dxf {
+                fill: Some((0, 255, 0)),
+                italic: Some(false),
+                ..Dxf::default()
+            },
+            Dxf {
+                fill: Some((0, 0, 255)),
+                bold: Some(false),
+                ..Dxf::default()
+            },
+        ];
+        // Dxf i at priority i + 1, listed lowest precedence first: the
+        // order in the file doesn't decide, the priority does.
+        let cf = CondFormat {
+            ix: None,
+            ranges: vec![(0, 0, 9, 0)],
+            rules: (0..3)
+                .rev()
+                .map(|i| CfRule {
+                    kind: gt0(),
+                    dxf_id: Some(i),
+                    priority: i as i32 + 1,
+                })
+                .collect(),
+        };
+        let wb = wb_with_cells(&[("A1", Cell::number(5.0))], cf, dxfs);
+        let want = Dxf {
+            fill: Some((0, 255, 0)),
+            color: Some((255, 0, 0)),
+            bold: Some(true),
+            italic: Some(false),
+            ..Dxf::default()
+        };
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), Some(want));
+        assert_eq!(cell_fill(&wb, 0, 0, 0), Shown::Rgb((0, 255, 0)));
+        assert_eq!(cell_font_color(&wb, 0, 0, 0), Shown::Rgb((255, 0, 0)));
+    }
+
+    #[test]
     fn empty_expression_formula_does_not_match() {
         let d = Dxf {
             bold: Some(true),
@@ -487,5 +875,115 @@ mod tests {
         };
         let wb = wb_with_cells(&[("A1", Cell::number(3.0))], cf, vec![d]);
         assert_eq!(cell_dxf(&wb, 0, 0, 0), None);
+    }
+
+    fn icon_wb(vals: &[f64], set: &str, reverse: bool, cfvos: &[(&str, &str)]) -> Workbook {
+        let cells: Vec<(String, f64)> = vals
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (format!("A{}", i + 1), *v))
+            .collect();
+        let cells: Vec<(&str, f64)> = cells.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        let cf = CondFormat {
+            ix: None,
+            ranges: vec![(0, 0, 99, 0)],
+            rules: vec![CfRule {
+                kind: CfKind::IconSet {
+                    set: set.into(),
+                    reverse,
+                    cfvos: cfvos
+                        .iter()
+                        .map(|(k, v)| crate::sheet::Cfvo {
+                            kind: (*k).into(),
+                            val: (*v).into(),
+                            gte: true,
+                        })
+                        .collect(),
+                    formulas: Vec::new(),
+                },
+                dxf_id: None,
+                priority: 1,
+            }],
+        };
+        wb_with_cf(&cells, cf, Vec::new())
+    }
+
+    fn icons(wb: &Workbook, n: u32) -> Vec<u32> {
+        (0..n).map(|r| cell_icon(wb, 0, r, 0).unwrap().1).collect()
+    }
+
+    #[test]
+    fn icon_sets_by_percent_percentile_and_number() {
+        // Excel's default 3Arrows thresholds: 33% and 67% of the range.
+        let vals = [0.0, 10.0, 33.0, 34.0, 66.0, 67.0, 100.0];
+        let wb = icon_wb(
+            &vals,
+            "3Arrows",
+            false,
+            &[("percent", "0"), ("percent", "33"), ("percent", "67")],
+        );
+        assert_eq!(icons(&wb, 7), vec![0, 0, 1, 1, 1, 2, 2]);
+        // Reversed, the top values get the first icon.
+        let wb = icon_wb(
+            &vals,
+            "3Arrows",
+            true,
+            &[("percent", "0"), ("percent", "33"), ("percent", "67")],
+        );
+        assert_eq!(icons(&wb, 7), vec![2, 2, 1, 1, 1, 0, 0]);
+        // Percentile of 1..=5: the 50th is 3.
+        let wb = icon_wb(
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            "3TrafficLights1",
+            false,
+            &[("percent", "0"), ("percentile", "50"), ("num", "5")],
+        );
+        assert_eq!(icons(&wb, 5), vec![0, 0, 1, 1, 2]);
+        // Text and blanks get no icon.
+        let mut wb = icon_wb(&[1.0], "3Arrows", false, &[("percent", "0"), ("num", "1")]);
+        wb.sheets[0].set_cell(1, 0, Cell::text("x"));
+        assert_eq!(cell_icon(&wb, 0, 1, 0), None);
+        assert_eq!(cell_icon(&wb, 0, 5, 0), None);
+        assert_eq!(cell_icon(&wb, 0, 0, 1), None);
+    }
+
+    #[test]
+    fn displayed_colours_come_from_conditional_formatting_first() {
+        let red = Dxf {
+            fill: Some((255, 0, 0)),
+            color: Some((0, 0, 255)),
+            ..Dxf::default()
+        };
+        let mut wb = wb_with_cf(
+            &[("A1", 10.0), ("A2", 3.0)],
+            cell_is("greaterThan", &["5"]),
+            vec![red],
+        );
+        wb.styles.xfs.push(crate::sheet::Xf::default());
+        let green = wb.styles.intern(crate::sheet::Xf {
+            fill: Some((0, 176, 80)),
+            ..crate::sheet::Xf::default()
+        });
+        let themed = wb.styles.intern(crate::sheet::Xf {
+            fill_unresolved: true,
+            color_unresolved: true,
+            ..crate::sheet::Xf::default()
+        });
+        wb.sheets[0].cells.get_mut(&(1, 0)).unwrap().style = green;
+        wb.sheets[0].set_cell(
+            2,
+            0,
+            Cell {
+                style: themed,
+                ..Cell::number(1.0)
+            },
+        );
+        assert_eq!(cell_fill(&wb, 0, 0, 0), Shown::Rgb((255, 0, 0)));
+        assert_eq!(cell_font_color(&wb, 0, 0, 0), Shown::Rgb((0, 0, 255)));
+        assert_eq!(cell_fill(&wb, 0, 1, 0), Shown::Rgb((0, 176, 80)));
+        assert_eq!(cell_font_color(&wb, 0, 1, 0), Shown::None);
+        assert_eq!(cell_fill(&wb, 0, 2, 0), Shown::Unknown);
+        assert!(!cell_fill(&wb, 0, 2, 0).is(None));
+        assert!(cell_fill(&wb, 0, 9, 9).is(None));
     }
 }

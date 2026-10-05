@@ -3000,6 +3000,115 @@
                   }
                 }
               ]
+            },
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "resolvecomment",
+                  "label": "Resolve",
+                  "icon": "comment",
+                  "act": "ResolveComment",
+                  "keyTip": "V",
+                  "tip": {
+                    "title": "Resolve",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "deleteallcomments",
+                  "label": "Delete all",
+                  "icon": "table-dismiss",
+                  "act": "DeleteAllComments",
+                  "keyTip": "X",
+                  "tip": {
+                    "title": "Delete all",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "Tracking",
+          "priority": 35,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "tracktoggle",
+                "label": "Track Changes",
+                "icon": "paragraph",
+                "act": "ToggleTrack",
+                "keyTip": "T",
+                "tip": {
+                  "title": "Track Changes",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "markupall",
+                  "label": "All markup",
+                  "icon": "paragraph",
+                  "act": "Markup(All)",
+                  "keyTip": "KA",
+                  "tip": {
+                    "title": "All markup",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "markupsimple",
+                  "label": "Simple markup",
+                  "icon": "paragraph",
+                  "act": "Markup(Simple)",
+                  "keyTip": "KS",
+                  "tip": {
+                    "title": "Simple markup",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "markupnone",
+                  "label": "No markup",
+                  "icon": "paragraph",
+                  "act": "Markup(NoMarkup)",
+                  "keyTip": "KN",
+                  "tip": {
+                    "title": "No markup",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "markuporiginal",
+                  "label": "Original",
+                  "icon": "paragraph",
+                  "act": "Markup(Original)",
+                  "keyTip": "KO",
+                  "tip": {
+                    "title": "Original",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
             }
           ]
         },
@@ -3123,7 +3232,12 @@
                     "body": "",
                     "shortcut": ""
                   }
-                },
+                }
+              ]
+            },
+            {
+              "kind": "column",
+              "cmds": [
                 {
                   "id": "viewcomments",
                   "label": "Comments pane",

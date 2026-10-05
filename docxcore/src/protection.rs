@@ -25,6 +25,14 @@ pub enum ProtectionDenial {
     FormsUnsupported,
     TrackedChangesUnsupported,
     UnsupportedMode(String),
+    /// Word's Mark as Final (#617). Not `w:documentProtection`, so
+    /// [`authorize`] never returns it: a host that knows the document is
+    /// final refuses with it before asking `authorize`, until Edit Anyway.
+    MarkedFinal,
+    /// Display for Review shows No Markup or Original (#625): a view whose
+    /// text is not the document's, so it is not edited. Like `MarkedFinal`,
+    /// [`authorize`] never returns it: the host that picked the view does.
+    DisplayMode,
 }
 
 impl ProtectionDenial {
@@ -37,6 +45,8 @@ impl ProtectionDenial {
             Self::FormsUnsupported => "forms_unsupported",
             Self::TrackedChangesUnsupported => "tracked_changes_unsupported",
             Self::UnsupportedMode(_) => "unsupported_mode",
+            Self::MarkedFinal => "marked_final",
+            Self::DisplayMode => "display_mode",
         }
     }
 
@@ -55,6 +65,14 @@ impl ProtectionDenial {
             }
             Self::UnsupportedMode(mode) => {
                 format!("the document uses unsupported protection mode '{mode}'")
+            }
+            Self::MarkedFinal => {
+                "the document is marked as final; use Edit Anyway to edit it".to_string()
+            }
+            Self::DisplayMode => {
+                "Display for Review is No Markup or Original; switch to All Markup or \
+                 Simple Markup to edit"
+                    .to_string()
             }
         }
     }

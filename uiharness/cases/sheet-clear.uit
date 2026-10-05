@@ -1,0 +1,70 @@
+# #671: Home > Clear and Go To Special. Each case works in J:L, clear of the
+# fixture's data (A1:C5).
+
+test go to special blanks then ctrl+enter fills a grouping column (#671's QA)
+  open ../fixtures/basic.xlsx
+  click J1
+  type East
+  key enter
+  click J5
+  type West
+  key enter
+  click J10
+  type North
+  key enter
+  click J1
+  click J10 shift
+  key f5
+  assert dialog is goto
+  call dialog-click {"button":"Special…"}
+  assert dialog is goto-special
+  call dialog-set {"control":"select","value":"Blanks"}
+  call dialog-click {"button":"OK"}
+  assert sel is J2
+  assert areas.0 is J6:J9
+  assert areas.1 is J2:J4
+  type =J1
+  key ctrl+enter
+  assert cell J2 is East
+  assert cell J4 is East
+  assert cell J6 is West
+  assert cell J9 is West
+
+test go to special finds nothing and says so
+  open ../fixtures/basic.xlsx
+  click J20
+  type 1
+  key enter
+  click J20
+  call ribbon-click {"tab":"Home","command":"Find & Select"}
+  call menu-click {"label":"Go To Special…"}
+  call dialog-set {"control":"select","value":"Formulas"}
+  call dialog-click {"button":"OK"}
+  assert status is No cells were found.
+  assert sel is J20
+
+test go to selects a reference
+  open ../fixtures/basic.xlsx
+  key ctrl+g
+  call dialog-set {"control":"reference","value":"K3:L4"}
+  call dialog-click {"button":"OK"}
+  assert range is K3:L4
+
+test the clear menu clears one part of every area
+  open ../fixtures/basic.xlsx
+  click B2
+  click B4 ctrl
+  call ribbon-click {"tab":"Home","command":"Clear"}
+  call menu-click {"label":"Clear Contents"}
+  assert cell B2 is nothing
+  assert cell B4 is nothing
+  assert cell B3 is 20
+  key ctrl+z
+  assert cell B2 is 10
+  click A2
+  call menu-open {"target":{"ribbon":["Home","Editing","Clear"]}}
+  call menu-click {"label":"Clear Formats"}
+  assert cell A2 is North
+  call menu-open {"target":{"ribbon":["Home","Editing","Clear"]}}
+  call menu-click {"label":"Clear All"}
+  assert cell A2 is nothing

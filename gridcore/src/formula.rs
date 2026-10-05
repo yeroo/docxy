@@ -1117,7 +1117,7 @@ fn parse_ref_text(s: &str) -> Option<CellRef> {
 
 /// Unescape a structured-ref name: a single quote escapes the next char
 /// (`'[`, `']`, `'#`, `'@`, `''`).
-fn unescape_spec(s: &str) -> String {
+pub(crate) fn unescape_spec(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(ch) = chars.next() {
@@ -1281,7 +1281,7 @@ fn parse_spec(table: Option<String>, spec: &str) -> Result<Expr, String> {
 }
 
 /// Escape a column name for printing inside a structured reference.
-fn escape_spec(name: &str) -> String {
+pub(crate) fn escape_spec(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
         if matches!(ch, '[' | ']' | '\'' | '#' | '@') {
@@ -1725,6 +1725,415 @@ fn param_name(n: &str) -> String {
     format!("_xlpm.{}", bare_param(n))
 }
 
+/// The worksheet functions Formula AutoComplete offers (#686, FRM-151): what
+/// the evaluator computes, sorted. Not the 2007 names it does not evaluate
+/// (`UNEVALUATED_BUILTINS`), nor the few internal names `NOT_OFFERED` lists.
+/// `function_names_match_the_evaluator` keeps this in step with the
+/// evaluator.
+pub static FUNCTION_NAMES: &[&str] = &[
+    "ABS",
+    "ACOS",
+    "ACOSH",
+    "ACOT",
+    "ACOTH",
+    "ADDRESS",
+    "AGGREGATE",
+    "AND",
+    "ARABIC",
+    "ASIN",
+    "ASINH",
+    "ATAN",
+    "ATAN2",
+    "ATANH",
+    "AVEDEV",
+    "AVERAGE",
+    "AVERAGEA",
+    "AVERAGEIF",
+    "AVERAGEIFS",
+    "BASE",
+    "BETA.DIST",
+    "BETA.INV",
+    "BETADIST",
+    "BETAINV",
+    "BIN2DEC",
+    "BIN2HEX",
+    "BIN2OCT",
+    "BINOM.DIST",
+    "BINOM.INV",
+    "BINOMDIST",
+    "BITAND",
+    "BITLSHIFT",
+    "BITOR",
+    "BITRSHIFT",
+    "BITXOR",
+    "BYCOL",
+    "BYROW",
+    "CEILING",
+    "CEILING.MATH",
+    "CEILING.PRECISE",
+    "CELL",
+    "CHAR",
+    "CHIDIST",
+    "CHIINV",
+    "CHISQ.DIST",
+    "CHISQ.DIST.RT",
+    "CHISQ.INV",
+    "CHISQ.INV.RT",
+    "CHOOSE",
+    "CHOOSECOLS",
+    "CHOOSEROWS",
+    "CLEAN",
+    "CODE",
+    "COLUMN",
+    "COLUMNS",
+    "COMBIN",
+    "COMBINA",
+    "CONCAT",
+    "CONCATENATE",
+    "CONFIDENCE",
+    "CONFIDENCE.NORM",
+    "CONFIDENCE.T",
+    "CORREL",
+    "COS",
+    "COSH",
+    "COT",
+    "COTH",
+    "COUNT",
+    "COUNTA",
+    "COUNTBLANK",
+    "COUNTIF",
+    "COUNTIFS",
+    "COVAR",
+    "COVARIANCE.P",
+    "COVARIANCE.S",
+    "CRITBINOM",
+    "CSC",
+    "CSCH",
+    "CUMIPMT",
+    "CUMPRINC",
+    "DATE",
+    "DATEDIF",
+    "DATEVALUE",
+    "DAVERAGE",
+    "DAY",
+    "DAYS",
+    "DAYS360",
+    "DB",
+    "DCOUNT",
+    "DCOUNTA",
+    "DDB",
+    "DEC2BIN",
+    "DEC2HEX",
+    "DEC2OCT",
+    "DECIMAL",
+    "DEGREES",
+    "DELTA",
+    "DEVSQ",
+    "DGET",
+    "DMAX",
+    "DMIN",
+    "DOLLAR",
+    "DOLLARDE",
+    "DOLLARFR",
+    "DPRODUCT",
+    "DROP",
+    "DSTDEV",
+    "DSUM",
+    "DVAR",
+    "DVARP",
+    "EDATE",
+    "EFFECT",
+    "EOMONTH",
+    "ERROR.TYPE",
+    "EVEN",
+    "EXACT",
+    "EXP",
+    "EXPAND",
+    "EXPON.DIST",
+    "EXPONDIST",
+    "F.DIST",
+    "F.DIST.RT",
+    "F.INV",
+    "F.INV.RT",
+    "FACT",
+    "FACTDOUBLE",
+    "FALSE",
+    "FDIST",
+    "FILTER",
+    "FIND",
+    "FINV",
+    "FISHER",
+    "FISHERINV",
+    "FIXED",
+    "FLOOR",
+    "FLOOR.MATH",
+    "FLOOR.PRECISE",
+    "FORECAST",
+    "FORECAST.LINEAR",
+    "FORMULATEXT",
+    "FREQUENCY",
+    "FV",
+    "GAMMA",
+    "GAMMA.DIST",
+    "GAMMA.INV",
+    "GAMMADIST",
+    "GAMMAINV",
+    "GAMMALN",
+    "GAMMALN.PRECISE",
+    "GAUSS",
+    "GCD",
+    "GEOMEAN",
+    "GESTEP",
+    "HARMEAN",
+    "HEX2BIN",
+    "HEX2DEC",
+    "HEX2OCT",
+    "HLOOKUP",
+    "HOUR",
+    "HSTACK",
+    "HYPERLINK",
+    "HYPGEOM.DIST",
+    "HYPGEOMDIST",
+    "IF",
+    "IFERROR",
+    "IFNA",
+    "IFS",
+    "INDEX",
+    "INDIRECT",
+    "INT",
+    "INTERCEPT",
+    "IPMT",
+    "IRR",
+    "ISBLANK",
+    "ISERR",
+    "ISERROR",
+    "ISEVEN",
+    "ISFORMULA",
+    "ISLOGICAL",
+    "ISNA",
+    "ISNONTEXT",
+    "ISNUMBER",
+    "ISO.CEILING",
+    "ISODD",
+    "ISOMITTED",
+    "ISOWEEKNUM",
+    "ISPMT",
+    "ISTEXT",
+    "KURT",
+    "LAMBDA",
+    "LARGE",
+    "LCM",
+    "LEFT",
+    "LEN",
+    "LET",
+    "LN",
+    "LOG",
+    "LOG10",
+    "LOGINV",
+    "LOGNORM.DIST",
+    "LOGNORM.INV",
+    "LOGNORMDIST",
+    "LOOKUP",
+    "LOWER",
+    "MAKEARRAY",
+    "MAP",
+    "MATCH",
+    "MAX",
+    "MAXA",
+    "MAXIFS",
+    "MDETERM",
+    "MEDIAN",
+    "MID",
+    "MIN",
+    "MINA",
+    "MINIFS",
+    "MINUTE",
+    "MINVERSE",
+    "MIRR",
+    "MMULT",
+    "MOD",
+    "MODE",
+    "MODE.SNGL",
+    "MONTH",
+    "MROUND",
+    "MULTINOMIAL",
+    "MUNIT",
+    "N",
+    "NA",
+    "NEGBINOM.DIST",
+    "NEGBINOMDIST",
+    "NETWORKDAYS",
+    "NETWORKDAYS.INTL",
+    "NOMINAL",
+    "NORM.DIST",
+    "NORM.INV",
+    "NORM.S.DIST",
+    "NORM.S.INV",
+    "NORMDIST",
+    "NORMINV",
+    "NORMSDIST",
+    "NORMSINV",
+    "NOT",
+    "NOW",
+    "NPER",
+    "NPV",
+    "NUMBERVALUE",
+    "OCT2BIN",
+    "OCT2DEC",
+    "OCT2HEX",
+    "ODD",
+    "OFFSET",
+    "OR",
+    "PDURATION",
+    "PEARSON",
+    "PERCENTILE",
+    "PERCENTILE.EXC",
+    "PERCENTILE.INC",
+    "PERCENTRANK",
+    "PERCENTRANK.INC",
+    "PERMUT",
+    "PHI",
+    "PI",
+    "PMT",
+    "POISSON",
+    "POISSON.DIST",
+    "POWER",
+    "PPMT",
+    "PRODUCT",
+    "PROPER",
+    "PV",
+    "QUARTILE",
+    "QUARTILE.EXC",
+    "QUARTILE.INC",
+    "QUOTIENT",
+    "RADIANS",
+    "RAND",
+    "RANDARRAY",
+    "RANDBETWEEN",
+    "RANK",
+    "RANK.EQ",
+    "RATE",
+    "REDUCE",
+    "REPLACE",
+    "REPT",
+    "RIGHT",
+    "ROMAN",
+    "ROUND",
+    "ROUNDDOWN",
+    "ROUNDUP",
+    "ROW",
+    "ROWS",
+    "RRI",
+    "RSQ",
+    "SCAN",
+    "SEARCH",
+    "SEC",
+    "SECH",
+    "SECOND",
+    "SEQUENCE",
+    "SERIESSUM",
+    "SIGN",
+    "SIN",
+    "SINH",
+    "SKEW",
+    "SLN",
+    "SLOPE",
+    "SMALL",
+    "SORT",
+    "SORTBY",
+    "SQRT",
+    "SQRTPI",
+    "STANDARDIZE",
+    "STDEV",
+    "STDEV.P",
+    "STDEV.S",
+    "STDEVA",
+    "STDEVP",
+    "STDEVPA",
+    "SUBSTITUTE",
+    "SUBTOTAL",
+    "SUM",
+    "SUMIF",
+    "SUMIFS",
+    "SUMPRODUCT",
+    "SUMSQ",
+    "SUMX2MY2",
+    "SUMX2PY2",
+    "SUMXMY2",
+    "SWITCH",
+    "SYD",
+    "T",
+    "T.DIST",
+    "T.DIST.2T",
+    "T.DIST.RT",
+    "T.INV",
+    "T.INV.2T",
+    "TAKE",
+    "TAN",
+    "TANH",
+    "TDIST",
+    "TEXT",
+    "TEXTAFTER",
+    "TEXTBEFORE",
+    "TEXTJOIN",
+    "TEXTSPLIT",
+    "TIME",
+    "TIMEVALUE",
+    "TINV",
+    "TOCOL",
+    "TODAY",
+    "TOROW",
+    "TRANSPOSE",
+    "TRIM",
+    "TRIMMEAN",
+    "TRUE",
+    "TRUNC",
+    "TYPE",
+    "UNICHAR",
+    "UNICODE",
+    "UNIQUE",
+    "UPPER",
+    "VALUE",
+    "VAR",
+    "VAR.P",
+    "VAR.S",
+    "VARA",
+    "VARP",
+    "VARPA",
+    "VLOOKUP",
+    "VSTACK",
+    "WEEKDAY",
+    "WEEKNUM",
+    "WEIBULL",
+    "WEIBULL.DIST",
+    "WORKDAY",
+    "WORKDAY.INTL",
+    "WRAPCOLS",
+    "WRAPROWS",
+    "XIRR",
+    "XLOOKUP",
+    "XMATCH",
+    "XNPV",
+    "XOR",
+    "YEAR",
+    "YEARFRAC",
+];
+
+/// Names the evaluator dispatches that Excel's function list does not hold:
+/// the file spellings of `A1#` and `@x`, and the row-context iterators this
+/// engine adds (`SUMX(Table, expr)` and kin).
+#[cfg(test)]
+const NOT_OFFERED: &[&str] = &[
+    "ANCHORARRAY",
+    "AVERAGEX",
+    "COUNTAX",
+    "COUNTX",
+    "MAXX",
+    "MINX",
+    "SINGLE",
+    "SUMX",
+];
+
 /// Excel 2007 worksheet functions the evaluator doesn't dispatch (yet), so
 /// [`is_builtin`] can't learn them from it. Drop a name here once the
 /// evaluator handles it (`unevaluated_builtins_are_still_unevaluated`).
@@ -1990,6 +2399,101 @@ pub fn translate(e: &Expr, dr: i64, dc: i64) -> Expr {
 pub fn translate_formula(src: &str, dr: i64, dc: i64) -> Option<String> {
     let ast = parse(src).ok()?;
     Some(to_string(&translate(&ast, dr, dc)))
+}
+
+/// A transposed paste (Paste Special › Transpose), as seen by one pasted
+/// formula. `inside` maps a cell of the copy (read on the copy's own sheet)
+/// to where its transposed copy lands, `None` for a cell outside the copy;
+/// `(dr, dc)` is how far the formula's own cell moved.
+pub struct Transposed<'a> {
+    /// The copy's sheet: a reference qualified with another sheet is outside.
+    pub src_sheet: &'a str,
+    /// The sheet the paste lands on: a qualified reference into the copy
+    /// points at its transposed copy there.
+    pub dst_sheet: &'a str,
+    pub inside: &'a dyn Fn(i64, i64) -> Option<(i64, i64)>,
+    pub dr: i64,
+    pub dc: i64,
+}
+
+impl Transposed<'_> {
+    fn map(&self, r: &CellRef) -> Option<CellRef> {
+        let ours = r
+            .sheet
+            .as_deref()
+            .is_none_or(|s| s.eq_ignore_ascii_case(self.src_sheet));
+        if !ours || r.row < 0 {
+            return None;
+        }
+        let (row, col) = (self.inside)(r.row, r.col)?;
+        Some(CellRef {
+            // The transposed copy is on the paste's sheet (#707 r1 m12): an
+            // unqualified reference reads it there already.
+            sheet: r.sheet.as_ref().map(|_| self.dst_sheet.to_string()),
+            row,
+            col,
+            ..r.clone()
+        })
+    }
+}
+
+/// Rewrite `e`, a formula pasted transposed ([`Transposed`]): a reference to
+/// a copied cell points at that cell's transposed copy (a range whose both
+/// corners were copied, corner by corner, then put back in order), keeping
+/// its `$` flags; any other reference translates by the formula's own move,
+/// as a plain copy's does.
+pub fn transpose_ref_expr(e: &Expr, t: &Transposed) -> Expr {
+    let recur = |x: &Expr| transpose_ref_expr(x, t);
+    match e {
+        Expr::Ref(r) => Expr::Ref(t.map(r).unwrap_or_else(|| translate_ref(r, t.dr, t.dc))),
+        Expr::SpillRef(r) => {
+            Expr::SpillRef(t.map(r).unwrap_or_else(|| translate_ref(r, t.dr, t.dc)))
+        }
+        Expr::Range(p, q) => {
+            let q_in = CellRef {
+                sheet: q.sheet.clone().or_else(|| p.sheet.clone()),
+                ..q.clone()
+            };
+            match (t.map(p), t.map(&q_in)) {
+                (Some(a), Some(b)) => {
+                    let (r0, r1) = (a.row.min(b.row), a.row.max(b.row));
+                    let (c0, c1) = (a.col.min(b.col), a.col.max(b.col));
+                    Expr::Range(
+                        CellRef {
+                            row: r0,
+                            col: c0,
+                            ..a
+                        },
+                        CellRef {
+                            sheet: q.sheet.clone(),
+                            row: r1,
+                            col: c1,
+                            ..b
+                        },
+                    )
+                }
+                _ => translate(e, t.dr, t.dc),
+            }
+        }
+        Expr::ArrayLit(rows) => Expr::ArrayLit(
+            rows.iter()
+                .map(|row| row.iter().map(recur).collect())
+                .collect(),
+        ),
+        Expr::Func(n, args) => Expr::Func(n.clone(), args.iter().map(recur).collect()),
+        Expr::Call(callee, args) => {
+            Expr::Call(Box::new(recur(callee)), args.iter().map(recur).collect())
+        }
+        Expr::Un(op, x) => Expr::Un(*op, Box::new(recur(x))),
+        Expr::Bin(op, l, r) => Expr::Bin(*op, Box::new(recur(l)), Box::new(recur(r))),
+        other => translate(other, t.dr, t.dc),
+    }
+}
+
+/// [`transpose_ref_expr`] on formula text; `None` when it doesn't parse.
+pub fn transpose_formula(src: &str, t: &Transposed) -> Option<String> {
+    let ast = parse(src).ok()?;
+    Some(to_string(&transpose_ref_expr(&ast, t)))
 }
 
 // ---------------------------------------------------------------------------
@@ -11599,6 +12103,35 @@ impl<'a> Eval<'a> {
                 }
             }
         };
+        let matched = self.db_matches(&db, db_at, &crit, crit_at);
+        Ok(db[1..]
+            .iter()
+            .zip(matched)
+            .filter(|(_, m)| *m)
+            .map(|(row, _)| row.get(col).cloned().unwrap_or(Value::Empty))
+            .collect())
+    }
+
+    /// Which records of database `db` (its first row the headers) the
+    /// criteria range `crit` selects, as the D-functions and Advanced Filter
+    /// read it: criteria rows are OR'd, the cells of a row AND'd; a header
+    /// names a field, plain text means "begins with", and a formula under a
+    /// blank header (or one naming no field) is a computed criterion. `db_at`
+    /// / `crit_at` are where the grids sit (sheet, top row, left column),
+    /// which a computed criterion needs. One entry per record.
+    pub(crate) fn db_matches(
+        &mut self,
+        db: &[Vec<Value>],
+        db_at: Option<(usize, u32, u32)>,
+        crit: &[Vec<Value>],
+        crit_at: Option<(usize, u32, u32)>,
+    ) -> Vec<bool> {
+        let headers = &db[0];
+        let text_eq = |a: &Value, b: &str| {
+            to_text(a)
+                .map(|t| t.eq_ignore_ascii_case(b))
+                .unwrap_or(false)
+        };
         // Map each criteria column to a database column via its header text.
         let crit_headers = &crit[0];
         let crit_cols: Vec<Option<usize>> = crit_headers
@@ -11688,11 +12221,9 @@ impl<'a> Eval<'a> {
                     break;
                 }
             }
-            if matched {
-                out.push(row.get(col).cloned().unwrap_or(Value::Empty));
-            }
+            out.push(matched);
         }
-        Ok(out)
+        out
     }
 
     /// Two equal-shaped arrays reduced to the numeric pairs they share
@@ -14761,6 +15292,54 @@ mod tests {
             file("LET(_xlpm.x,1,_xlpm.x+x)"),
             "_xlfn.LET(_xlpm.x,1,_xlpm.x+_xlpm.x)"
         );
+    }
+
+    #[test]
+    fn function_names_match_the_evaluator() {
+        // Every offered name is a builtin the evaluator computes, listed once
+        // in order, and every name it dispatches (the `"NAME" =>` scan) or
+        // knows as a post-2007 function is offered, unless NOT_OFFERED.
+        for (i, n) in FUNCTION_NAMES.iter().enumerate() {
+            assert!(is_builtin(n), "{n}");
+            assert!(probe_known(n), "{n} is not evaluated");
+            assert!(!NOT_OFFERED.contains(n), "{n}");
+            if i > 0 {
+                assert!(FUNCTION_NAMES[i - 1] < *n, "{n} out of order or twice");
+            }
+        }
+        let src = include_str!("formula.rs");
+        for (i, _) in src.match_indices('"') {
+            let rest = &src[i + 1..];
+            let Some(end) = rest.find('"') else { break };
+            let lit = &rest[..end];
+            let after = rest[end + 1..].trim_start();
+            let is_name = !lit.is_empty()
+                && lit.starts_with(|c: char| c.is_ascii_uppercase())
+                && lit
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.');
+            if is_name
+                && (after.starts_with("=>") || after.starts_with('|'))
+                && probe_known(lit)
+                && !NOT_OFFERED.contains(&lit)
+            {
+                assert!(
+                    FUNCTION_NAMES.contains(&lit),
+                    "{lit} is evaluated but not offered"
+                );
+            }
+        }
+        for n in FUTURE_FUNCTIONS.iter().chain(&["SORT", "FILTER"]) {
+            if probe_known(n) && !NOT_OFFERED.contains(n) {
+                assert!(FUNCTION_NAMES.contains(n), "{n}");
+            }
+        }
+        for n in NOT_OFFERED {
+            assert!(
+                is_builtin(n),
+                "{n} is no builtin now: drop it from NOT_OFFERED"
+            );
+        }
     }
 
     #[test]

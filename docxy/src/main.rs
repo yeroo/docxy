@@ -7,6 +7,7 @@
 //!   docxy <in> --md <out.md>       headless: convert to Markdown and exit
 //!   docxy <in> --docx <out.docx>   headless: convert to .docx and exit
 //!   docxy <in> --html <out.docx.html>  headless: export editable HTML and exit
+//!   docxy --version (-V)           print the build (commit, last merged PR, kind) and exit
 //!
 //! The logic lives in the pure `docxcore` crate; this binary is the TUI shell:
 //! it maps `docxcore::render` lines onto ratatui, draws a caret via the render
@@ -37,7 +38,7 @@ use std::process::ExitCode;
 use backstage::BackstageHost as _;
 
 use docxcore::compare::{CompareOptions, CompareResult, CompareSkip, compare_packages};
-use docxcore::editor::{Caret, Clip, Editor, FoundMatch};
+use docxcore::editor::{Caret, Clip, Editor, FoundMatch, TrackAuthor};
 use docxcore::export::{PdfOptions, to_pdf};
 #[cfg(test)]
 use docxcore::load::parse_header_footer;
@@ -208,6 +209,15 @@ fn source_lines_to_doc(md: &str) -> Document {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--version` prints the build block (commit, last merged PR, build kind) and
+    // exits, before any file-oriented argument parsing or terminal setup.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        print!(
+            "{}",
+            buildinfo::get(env!("CARGO_PKG_VERSION")).version_block("docxy")
+        );
+        return ExitCode::SUCCESS;
+    }
     // `--mcp` runs the headless MCP stdio bridge (a client of a running docxy),
     // not the editor, so handle it before the file-oriented argument parsing.
     if args.iter().any(|a| a == "--mcp") {
@@ -657,6 +667,7 @@ fn print_usage() {
                                            write a tracked-changes comparison and exit\n  \
            docxy merge <main.docx> <data.csv> -o <out.docx>\n  \
                                            mail-merge every CSV recipient and exit\n  \
+           docxy --version (-V)            print the build (commit, last merged PR, kind)\n  \
            docxy --mcp                      run the MCP bridge to drive a live docxy\n  \
            docxy install skill              install the agent SKILL.md (self-onboarding)\n  \
            (Save As to a .md/.docx/.docx.html name converts between the formats;\n   \
@@ -823,6 +834,13 @@ struct TrackedComment {
     /// `comment`, which needs a numeric id (new comments always have one;
     /// any other is not written back).
     raw: Option<String>,
+    /// Its `commentsExtended` / `commentsIds` / `commentsExtensible` entries
+    /// when it was deleted (the reply link, the durable id, its UTC date),
+    /// put back with `raw` ([`Package::comment_extras`]).
+    extras: Vec<docxcore::package::CommentExtra>,
+    /// `comments.xml`'s root start tag then, so a part the delete dropped is
+    /// rebuilt under the namespaces `raw` may use ([`Package::comments_root_tag`]).
+    root: Option<String>,
     /// Where it sat in `comments`, so a restored one goes back there.
     index: usize,
 }
@@ -840,7 +858,13 @@ enum ConfirmAction {
         original: String,
         revised: String,
     },
+    /// Edit Anyway on a document marked as final (#617).
+    EditAnyway,
 }
+
+/// The question a refused edit asks on a document marked as final.
+const MARKED_FINAL_PROMPT: &str =
+    "An author has marked this document as final to discourage editing. Edit anyway?";
 
 // The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
 // across all apps); docxy only supplies the action carried on Yes.
@@ -1398,6 +1422,9 @@ struct App {
     /// Structured document-protection policy metadata. Display text is derived
     /// from its compatibility label; authorization never compares UI strings.
     doc_protection: Protection,
+    /// Word marked the document as final (#617): every mutation is refused
+    /// until Edit Anyway, which also removes the mark from `pkg`.
+    marked_final: bool,
     /// Structured page/header-scoped watermark state used by both the TUI
     /// overlay renderer and compatibility status labels.
     watermark_state: watermark::State,
@@ -1452,6 +1479,9 @@ struct App {
     /// one of them (#620). Reseeded wherever `tracked_comments` is cleared.
     used_comment_ids: std::collections::BTreeSet<String>,
     show_comments: bool,
+    /// Display for Review (#625): how tracked changes are shown. Not saved;
+    /// a view only, so the document and its save never depend on it.
+    markup: docxcore::markup::MarkupView,
     /// The comment highlighted by Prev/Next navigation (only once `comment_active`).
     comment_sel: usize,
     comment_active: bool,
@@ -1573,6 +1603,7 @@ impl App {
         let comments = docxcore::comments::parse_comments(&pkg);
         let notes = docxcore::notes::parse_notes(&pkg);
         let doc_protection = pkg.protection();
+        let marked_final = pkg.marked_final();
         // Recompute fields that depend on the clock / document properties (DATE,
         // TIME, AUTHOR, CREATEDATE, …) so they show a live value like Word does,
         // rather than the value last cached in the file. This is a content
@@ -1598,9 +1629,16 @@ impl App {
         let watermark_state = watermark::State::from_package(&pkg);
         let doc_page_borders = pkg.has_page_borders();
         let used_comment_ids = used_comment_ids(&comments, &doc);
+        let mut editor = Editor::new(doc);
+        if pkg.track_revisions() && format_for(path) != DocFormat::Markdown {
+            editor.set_track_changes(Some(TrackAuthor {
+                author: os_user_name().unwrap_or_else(|| DEFAULT_AUTHOR.to_string()),
+                clock: utc_now_iso,
+            }));
+        }
         App {
             pkg,
-            editor: Editor::new(doc),
+            editor,
             path: path.to_string(),
             format: format_for(path),
             bundle_html: None,
@@ -1632,6 +1670,7 @@ impl App {
             quit_requested: false,
             status: None,
             doc_protection,
+            marked_final,
             watermark_state,
             doc_page_borders,
             scroll: 0,
@@ -1655,6 +1694,7 @@ impl App {
             tracked_comments: Default::default(),
             used_comment_ids,
             show_comments: false,
+            markup: Default::default(),
             comment_sel: 0,
             comment_active: false,
             comment_input: None,
@@ -1723,13 +1763,17 @@ impl App {
 
     fn options(&self, width: u16) -> RenderOptions {
         // In find mode, highlight all matches; otherwise the live selection.
-        let selection = match &self.find {
-            Some(f) => f
-                .matches
-                .iter()
-                .map(|m| (m.path.clone(), m.start, m.end))
-                .collect(),
-            None => self.editor.selection_spans(),
+        let selection = if !self.markup.is_editable() {
+            Vec::new()
+        } else {
+            match &self.find {
+                Some(f) => f
+                    .matches
+                    .iter()
+                    .map(|m| (m.path.clone(), m.start, m.end))
+                    .collect(),
+                None => self.editor.selection_spans(),
+            }
         };
         RenderOptions {
             width: width.max(1) as usize,
@@ -1738,7 +1782,10 @@ impl App {
             borderless_tables: self.borderless,
             selection,
             styles: self.styles.clone(),
-            list_markers: Rc::new(compute_markers(&self.editor.doc, &self.numbering)),
+            list_markers: Rc::new(compute_markers(
+                &self.editor.doc.markup_view(self.markup),
+                &self.numbering,
+            )),
             page: self
                 .editor
                 .doc
@@ -1852,6 +1899,55 @@ impl App {
         } else {
             "Comments panel hidden.".to_string()
         });
+        self.dirty = true;
+    }
+
+    /// Track Changes on or off (Review ▸ Track): the settings flag the file
+    /// saves with, and recording in the editor. Not an undo step.
+    fn toggle_track(&mut self) {
+        let on = !self.body_editor().track_changes();
+        self.set_track(on);
+    }
+
+    fn set_track(&mut self, on: bool) {
+        if self.format != DocFormat::Markdown
+            && !self.mutation_allowed(protection::MutationKind::PackageMetadata)
+        {
+            return;
+        }
+        self.status = Some(match self.set_track_setting(on) {
+            Ok(()) => format!("Track Changes: {}", if on { "On" } else { "Off" }),
+            Err(e) => e,
+        });
+        self.dirty = true;
+    }
+
+    /// [`App::set_track`] without the protection check (callers authorize).
+    pub(crate) fn set_track_setting(&mut self, on: bool) -> Result<(), String> {
+        if self.format == DocFormat::Markdown {
+            return Err("Track Changes needs a Word document".to_string());
+        }
+        self.pkg.set_track_revisions(on);
+        self.apply_track(on);
+        self.modified = true;
+        Ok(())
+    }
+
+    /// Record edits in the body editor as this reviewer, or stop.
+    fn apply_track(&mut self, on: bool) {
+        let author = self.review_author();
+        self.body_editor_mut()
+            .set_track_changes(on.then_some(TrackAuthor {
+                author,
+                clock: utc_now_iso,
+            }));
+    }
+
+    /// Choose Display for Review. A view only: the document, its history and
+    /// what a save writes are untouched.
+    fn set_markup(&mut self, view: docxcore::markup::MarkupView) {
+        self.markup = view;
+        self.status = Some(format!("Display for Review: {}", view.label()));
         self.dirty = true;
     }
 
@@ -2197,6 +2293,10 @@ impl App {
             NextComment => self.nav_comment(1),
             NewComment => self.start_comment(),
             DeleteComment => self.delete_comment(),
+            ResolveComment => self.resolve_comment(),
+            DeleteAllComments => self.delete_all_comments(),
+            CycleMarkup => self.set_markup(self.markup.next()),
+            ToggleTrack => self.toggle_track(),
             PrevRevision => self.navigate_revision(true),
             NextRevision => self.navigate_revision(false),
             AcceptRevision => self.review_current_revision(RevisionAction::Accept),
@@ -2532,6 +2632,10 @@ impl App {
                         self.run_compare(&original, &revised, true);
                         false
                     }
+                    ConfirmAction::EditAnyway => {
+                        self.edit_anyway();
+                        false
+                    }
                 }
             }
         }
@@ -2691,6 +2795,7 @@ impl App {
         self.comment_sel = 0;
         self.comment_active = false;
         self.doc_protection = pkg.protection();
+        self.marked_final = pkg.marked_final();
         self.watermark_state = watermark::State::from_package(&pkg);
         self.doc_page_borders = pkg.has_page_borders();
         let mut doc = std::mem::take(&mut pkg.document);
@@ -2719,6 +2824,10 @@ impl App {
         self.hf_edit = None;
         self.path = path;
         self.modified = false;
+        // A file saved with Track Changes on opens with it on.
+        if self.format != DocFormat::Markdown && self.pkg.track_revisions() {
+            self.apply_track(true);
+        }
         self.scroll = 0;
         self.find = None;
         self.img_cache.clear();
@@ -2780,6 +2889,9 @@ impl App {
     /// watermark, page borders) — empty when the document has none.
     fn doc_notice(&self) -> String {
         let mut parts = Vec::new();
+        if self.marked_final {
+            parts.push("Marked as Final".to_string());
+        }
         if let Some(p) = self.doc_protection.label() {
             parts.push(format!("Protected: {p}"));
         }
@@ -2805,15 +2917,53 @@ impl App {
         &self,
         mutation: protection::MutationKind,
     ) -> Result<(), protection::ProtectionDenial> {
+        if self.marked_final {
+            return Err(protection::ProtectionDenial::MarkedFinal);
+        }
+        // A view whose text is not the document's is not edited; comments
+        // hold no text of it.
+        if !self.markup.is_editable() && mutation != protection::MutationKind::Comment {
+            return Err(protection::ProtectionDenial::DisplayMode);
+        }
         protection::authorize(&self.doc_protection, mutation)
     }
 
+    /// Word's Edit Anyway on a document marked as final (#617): editing is
+    /// allowed again, and the mark leaves the package so a later save writes
+    /// an ordinary document. Not an edit: the document stays unmodified.
+    /// Returns whether the document was final.
+    pub(crate) fn edit_anyway(&mut self) -> bool {
+        if !self.marked_final {
+            return false;
+        }
+        self.marked_final = false;
+        self.pkg.clear_marked_final();
+        self.status = Some("Editing enabled: the document is no longer marked as final".into());
+        self.dirty = true;
+        true
+    }
+
     /// Check a requested interactive mutation before it reaches the editor,
-    /// history, package, comments, or save-state implementation. A denial only
-    /// replaces the transient status message; document state stays untouched.
+    /// history, package, comments, or save-state implementation. A denial
+    /// replaces the transient status message, and a document marked as final
+    /// also asks Edit Anyway (#617); document state stays untouched.
     fn mutation_allowed(&mut self, mutation: protection::MutationKind) -> bool {
         match self.authorize_mutation(mutation) {
             Ok(()) => true,
+            Err(protection::ProtectionDenial::MarkedFinal) => {
+                // Word's question, asked where the edit was refused; the
+                // refused key stays dropped either way.
+                if self.confirm.is_none() {
+                    self.confirm = Some(backstage::Confirm::new(
+                        MARKED_FINAL_PROMPT,
+                        ConfirmAction::EditAnyway,
+                        Color::LightBlue,
+                    ));
+                }
+                self.status = Some(protection::ProtectionDenial::MarkedFinal.tui_status());
+                self.dirty = true;
+                false
+            }
             Err(denial) => {
                 self.status = Some(denial.tui_status());
                 false
@@ -2930,12 +3080,15 @@ impl App {
             date: utc_now_iso(),
             text,
             quoted,
+            ..Default::default()
         };
         self.tracked_comments.insert(
             comment.id.clone(),
             TrackedComment {
                 comment: comment.clone(),
                 raw: None,
+                extras: Vec::new(),
+                root: None,
                 index: self.comments.len(),
             },
         );
@@ -3010,6 +3163,29 @@ impl App {
     /// original XML), drop each one with no marker left that it holds.
     /// `pkg` is reloaded from every save, so it may hold one already.
     fn reconcile_tracked_comments(&mut self) {
+        self.reconcile_tracked_records();
+        self.sync_resolved_to_pkg();
+    }
+
+    /// Write each comment's resolved state into `pkg`'s `commentsExtended`
+    /// where it differs, and drop the comment parts when none is left.
+    fn sync_resolved_to_pkg(&mut self) {
+        let stored: std::collections::HashMap<String, bool> =
+            docxcore::comments::parse_comments(&self.pkg)
+                .into_iter()
+                .map(|c| (c.id, c.resolved))
+                .collect();
+        for c in &self.comments {
+            if stored.get(&c.id).is_some_and(|&r| r != c.resolved) {
+                self.pkg.set_comment_resolved(&c.id, c.resolved);
+            }
+        }
+        if !self.tracked_comments.is_empty() {
+            self.pkg.drop_empty_comment_parts();
+        }
+    }
+
+    fn reconcile_tracked_records(&mut self) {
         if self.tracked_comments.is_empty() {
             return;
         }
@@ -3020,7 +3196,10 @@ impl App {
         for (id, t) in &self.tracked_comments {
             let c = &t.comment;
             match (live.contains(id), saved.contains(id), &t.raw) {
-                (true, false, Some(raw)) => self.pkg.insert_comment_xml(raw),
+                (true, false, Some(raw)) => {
+                    self.pkg.insert_comment_xml_rooted(raw, t.root.as_deref());
+                    self.pkg.restore_comment_extras(&t.extras);
+                }
                 (true, false, None) => {
                     if let Ok(n) = id.parse::<i32>() {
                         self.pkg
@@ -3030,6 +3209,48 @@ impl App {
                 (false, true, _) => self.pkg.remove_comment_id(id),
                 _ => {}
             }
+        }
+    }
+
+    /// What follows a comment whose markers were just taken: with markers left
+    /// in a header or footer not being edited (`still_marked`) nothing could
+    /// take them, so it goes from `pkg` now; otherwise its record stays,
+    /// tracked, so the save leaves it out and an undo brings it back whole
+    /// (#971). `index` is where it sat in `comments`.
+    fn keep_deleted_comment(
+        &mut self,
+        c: &docxcore::comments::Comment,
+        index: usize,
+        still_marked: bool,
+    ) {
+        if still_marked {
+            self.tracked_comments.remove(&c.id);
+            self.pkg.remove_comment_id(&c.id);
+        } else if let Some(t) = self.tracked_comments.get_mut(&c.id) {
+            t.index = index;
+            // The record as it is now (its resolved state included).
+            t.comment = c.clone();
+            // A comment added this session and saved since is in `pkg` now:
+            // keep that XML too.
+            if t.raw.is_none() {
+                t.raw = self.pkg.comment_xml(&c.id);
+                t.extras = self.pkg.comment_extras(&c.id);
+                t.root = self.pkg.comments_root_tag();
+            }
+        } else {
+            let raw = self.pkg.comment_xml(&c.id);
+            let extras = self.pkg.comment_extras(&c.id);
+            let root = self.pkg.comments_root_tag();
+            self.tracked_comments.insert(
+                c.id.clone(),
+                TrackedComment {
+                    comment: c.clone(),
+                    raw,
+                    extras,
+                    root,
+                    index,
+                },
+            );
         }
     }
 
@@ -3056,31 +3277,85 @@ impl App {
         if self.hf_edit.is_some() {
             self.editor.remove_comment_markers(&c.id);
         }
-        if self.comment_marker_ids_everywhere().contains(&c.id) {
-            self.tracked_comments.remove(&c.id);
-            self.pkg.remove_comment_id(&c.id);
-        } else if let Some(t) = self.tracked_comments.get_mut(&c.id) {
-            t.index = idx;
-            // A comment added this session and saved since is in `pkg`
-            // now: keep that XML too.
-            if t.raw.is_none() {
-                t.raw = self.pkg.comment_xml(&c.id);
-            }
-        } else {
-            let raw = self.pkg.comment_xml(&c.id);
-            self.tracked_comments.insert(
-                c.id.clone(),
-                TrackedComment {
-                    comment: c.clone(),
-                    raw,
-                    index: idx,
-                },
-            );
-        }
+        let marked = self.comment_marker_ids_everywhere().contains(&c.id);
+        self.keep_deleted_comment(&c, idx, marked);
         self.comment_sel = idx.min(self.comments.len().saturating_sub(1));
         self.comment_active = !self.comments.is_empty();
         self.after_edit();
         self.status = Some(format!("Deleted comment by {}", c.author));
+    }
+
+    /// Resolve the navigation-selected comment, or reopen it when it is
+    /// resolved. The state is the comment's own (it follows the record of a
+    /// deleted one), and each save writes it to `commentsExtended.xml`.
+    fn resolve_comment(&mut self) {
+        if self.comments.is_empty() {
+            self.status = Some("No comments to resolve".to_string());
+            self.dirty = true;
+            return;
+        }
+        if !self.mutation_allowed(protection::MutationKind::Comment) {
+            return;
+        }
+        let id = self.comments[self.comment_sel.min(self.comments.len() - 1)]
+            .id
+            .clone();
+        if let Some(resolved) = self.set_comment_resolved(&id, None) {
+            self.status = Some(if resolved {
+                "Comment resolved".to_string()
+            } else {
+                "Comment reopened".to_string()
+            });
+        }
+    }
+
+    /// Set comment `id` resolved (`Some(true)`), reopened (`Some(false)`), or
+    /// the other of the two (`None`). The new state, or `None` when no
+    /// listed comment has that id. No protection check: callers authorize.
+    fn set_comment_resolved(&mut self, id: &str, resolved: Option<bool>) -> Option<bool> {
+        let c = self.comments.iter_mut().find(|c| c.id == id)?;
+        c.resolved = resolved.unwrap_or(!c.resolved);
+        let now = c.resolved;
+        if let Some(t) = self.tracked_comments.get_mut(id) {
+            t.comment.resolved = now;
+        }
+        self.modified = true;
+        self.dirty = true;
+        Some(now)
+    }
+
+    /// Delete every comment: all markers (one undo step per editor that
+    /// held some), and each comment's record kept, tracked, so an undo brings
+    /// back markers and record whole (#971), like [`App::delete_comment`].
+    fn delete_all_comments(&mut self) {
+        if self.comments.is_empty() && self.comment_marker_ids_everywhere().is_empty() {
+            self.status = Some("No comments to delete".to_string());
+            self.dirty = true;
+            return;
+        }
+        if !self.mutation_allowed(protection::MutationKind::Comment) {
+            return;
+        }
+        let n = self.remove_all_comments();
+        self.status = Some(format!("Deleted all comments ({n})"));
+    }
+
+    /// [`App::delete_all_comments`] without the checks: how many listed
+    /// comments went. No protection check: callers authorize.
+    fn remove_all_comments(&mut self) -> usize {
+        self.body_editor_mut().remove_all_comment_markers();
+        if self.hf_edit.is_some() {
+            self.editor.remove_all_comment_markers();
+        }
+        let still_marked = self.comment_marker_ids_everywhere();
+        let comments = std::mem::take(&mut self.comments);
+        for (idx, c) in comments.iter().enumerate() {
+            self.keep_deleted_comment(c, idx, still_marked.contains(&c.id));
+        }
+        self.comment_sel = 0;
+        self.comment_active = false;
+        self.after_edit();
+        comments.len()
     }
 
     fn comment_input_key(&mut self, key: KeyEvent) -> bool {
@@ -3178,7 +3453,12 @@ impl App {
             } else {
                 head
             };
-            lines.push(RLine::styled(format!("▣ {who}  {date}"), hstyle));
+            let mark = if c.resolved { "✓" } else { "▣" };
+            let state = if c.resolved { "  (resolved)" } else { "" };
+            lines.push(RLine::styled(
+                format!("{mark} {who}  {date}{state}"),
+                hstyle,
+            ));
             if !c.quoted.is_empty() {
                 for w in wrap_str(&format!("“{}”", c.quoted), inner_w) {
                     lines.push(RLine::styled(w, quote));
@@ -3355,9 +3635,15 @@ impl App {
     fn ensure_rendered(&mut self, width: u16) {
         if self.dirty || width != self.rendered_width {
             let opts = self.options(width);
-            let rendered = render_with_page_layout(&self.editor.doc, &opts);
+            let shown = self.editor.doc.markup_view(self.markup);
+            let rendered = render_with_page_layout(&shown, &opts);
             let mut lines = rendered.lines;
             let mut maps = rendered.maps;
+            if !self.markup.is_editable() {
+                // The caret stops of a text that is not the document's: none,
+                // so a click or a vertical move cannot take an offset from it.
+                maps.iter_mut().for_each(|m| *m = LineMap::default());
+            }
             let mut images = rendered.images;
             let pages = rendered.pages;
             // While editing a header/footer, show the rest of the page (the parked
@@ -6359,8 +6645,8 @@ impl App {
         for (on, act) in [
             (rp.bold, ribbon::Act::Bold),
             (rp.italic, ribbon::Act::Italic),
-            (rp.underline, ribbon::Act::Underline),
-            (rp.strike, ribbon::Act::Strike),
+            (rp.user_underline(), ribbon::Act::Underline),
+            (rp.user_strike(), ribbon::Act::Strike),
         ] {
             if on {
                 toggles.push(act);
@@ -6370,6 +6656,12 @@ impl App {
             docxcore::model::VertAlign::Subscript => toggles.push(ribbon::Act::Subscript),
             docxcore::model::VertAlign::Superscript => toggles.push(ribbon::Act::Superscript),
             docxcore::model::VertAlign::Baseline => {}
+        }
+        if self.markup != docxcore::markup::MarkupView::All {
+            toggles.push(ribbon::Act::CycleMarkup);
+        }
+        if self.body_editor().track_changes() {
+            toggles.push(ribbon::Act::ToggleTrack);
         }
         // Markdown files get a contextual View ▸ Markdown group; highlight whichever
         // of Rendered/Source is active.
@@ -6612,8 +6904,13 @@ impl App {
             Some(_) => "[FOOTER] ",
             None => "",
         };
+        let tracking = if self.body_editor().track_changes() {
+            "  │  Track Changes: On"
+        } else {
+            ""
+        };
         let left = format!(
-            " {}{}{}  │  ln {cr} col {cc}  │  {} lines  │  pg:{} marks:{} brd:{} ",
+            " {}{}{}  │  ln {cr} col {cc}  │  {} lines  │  pg:{} marks:{} brd:{}{tracking} ",
             surface,
             dirty_mark,
             self.path,
@@ -7313,6 +7610,10 @@ impl backstage::BackstageHost for App {
             RLine::raw(format!(
                 "  Modified    {}",
                 if self.modified { "yes" } else { "no" }
+            )),
+            RLine::raw(format!(
+                "  Build       {}",
+                buildinfo::get(env!("CARGO_PKG_VERSION")).short_line()
             )),
             RLine::raw(String::new()),
             RLine::raw(format!("  Paragraphs  {paras}")),
@@ -9594,6 +9895,18 @@ mod tests {
         let parsed = parse_header_footer(&out, &Relationships::default());
         assert_eq!(parsed.len(), 1);
         assert!(matches!(&parsed[0], Block::Paragraph(p) if p.plain_text() == "new text"));
+    }
+
+    #[test]
+    fn backstage_info_shows_the_build_line() {
+        let app = app_with(&["A"]);
+        let info: Vec<String> = app.info_lines().iter().map(|l| l.to_string()).collect();
+        let line = buildinfo::get(env!("CARGO_PKG_VERSION")).short_line();
+        assert!(
+            info.iter()
+                .any(|l| l.contains("Build") && l.contains(&line)),
+            "{info:?}"
+        );
     }
 
     fn app_with(paras: &[&str]) -> App {
@@ -11983,6 +12296,218 @@ mod tests {
         assert!(comments.contains(RICH_COMMENT), "{comments}");
     }
 
+    fn saved_pkg(path: &std::path::Path) -> docxcore::package::Package {
+        load_package(&std::fs::read(path).expect("saved")).unwrap()
+    }
+
+    fn saved_resolved(path: &std::path::Path) -> Vec<(String, bool)> {
+        docxcore::comments::parse_comments(&saved_pkg(path))
+            .into_iter()
+            .map(|c| (c.id, c.resolved))
+            .collect()
+    }
+
+    /// #621: Resolve toggles the selected comment and saves `w15:done`.
+    #[test]
+    fn resolve_and_reopen_comment_saves_done_state() {
+        let mut app = app_with_rich_comments(2);
+        app.comment_sel = 1;
+        app.run_act(ribbon::Act::ResolveComment);
+        assert!(app.comments[1].resolved && !app.comments[0].resolved);
+        let path = save_to_temp(&mut app, "cmt-resolve");
+        let pkg = saved_pkg(&path);
+        let ext = pkg.part_text("word/commentsExtended.xml").expect("part");
+        assert!(ext.contains("w15:done=\"1\""), "{ext}");
+        assert_eq!(
+            saved_resolved(&path),
+            [("1".to_string(), false), ("2".to_string(), true)]
+        );
+        // The save reloaded `pkg`: Reopen writes done=0 over the entry.
+        app.run_act(ribbon::Act::ResolveComment);
+        assert!(!app.comments[1].resolved);
+        app.save();
+        assert_eq!(
+            saved_resolved(&path),
+            [("1".to_string(), false), ("2".to_string(), false)]
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #621: a resolved comment loaded from a file shows resolved; and the
+    /// state follows the comment through a delete and its undo.
+    #[test]
+    fn resolved_state_survives_delete_and_undo() {
+        let mut app = app_with_rich_comments(1);
+        app.run_act(ribbon::Act::ResolveComment);
+        let path = save_to_temp(&mut app, "cmt-resolve-undo");
+        let mut app = App::new(saved_pkg(&path), "test.docx", false);
+        app.os_clip = None;
+        app.path = path.to_string_lossy().into_owned();
+        assert!(app.comments[0].resolved, "loaded as resolved");
+        app.run_act(ribbon::Act::DeleteComment);
+        app.save();
+        assert!(saved_pkg(&path).part("word/commentsExtended.xml").is_none());
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert!(app.comments[0].resolved);
+        app.save();
+        assert_eq!(saved_resolved(&path), [("1".to_string(), true)]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A Word-authored comment: its `w14:paraId`, a `commentsExtended` entry
+    /// that links it to a parent, and a `commentsIds` durable id. Delete All,
+    /// save, undo, save writes it back well-formed, with those entries.
+    #[test]
+    fn delete_all_then_undo_restores_word_authored_comment_extras() {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(MPara {
+                props: ParProps::default(),
+                content: vec![Inline::Run(Run {
+                    text: "The quick brown fox.".into(),
+                    props: RunProps::default(),
+                })],
+            })],
+        });
+        ed.select_all();
+        assert!(ed.add_comment("1"));
+        let word_comment = "<w:comment w:id=\"1\" w:author=\"Ann\" w:initials=\"A\" \
+            w:date=\"2020-01-02T03:04:05Z\"><w:p w14:paraId=\"1A2B\"><w:r><w:t>reply</w:t></w:r></w:p></w:comment>";
+        let mut pkg = new_package(ed.doc);
+        pkg.insert_comment_xml(word_comment);
+        let extensible = "<w16cex:commentExtensible w16cex:durableId=\"7C7C7C7C\" \
+            w16cex:dateUtc=\"2020-01-02T03:04:05Z\"><w16cex:extLst><w16cex:ext uri=\"{1}\">\
+            <w16cr:reactions/></w16cex:ext></w16cex:extLst>\
+            </w16cex:commentExtensible>";
+        let extensible_root = "<w16cex:commentsExtensible \
+            xmlns:w16cex=\"http://schemas.microsoft.com/office/word/2018/wordml/cex\" \
+            xmlns:w16cr=\"urn:cr\">";
+        let extra = |part: &str, element: &str, root: &str| docxcore::package::CommentExtra {
+            part: part.to_string(),
+            element: element.to_string(),
+            root: root.to_string(),
+        };
+        pkg.restore_comment_extras(&[
+            extra(
+                "word/commentsExtended.xml",
+                "<w15:commentEx w15:paraId=\"1A2B\" w15:paraIdParent=\"0F0F\" w15:done=\"0\"/>",
+                "",
+            ),
+            extra(
+                "word/commentsIds.xml",
+                "<w16cid:commentId w16cid:paraId=\"1A2B\" w16cid:durableId=\"7C7C7C7C\"/>",
+                "",
+            ),
+            extra("word/commentsExtensible.xml", extensible, extensible_root),
+        ]);
+        assert!(!pkg.comment_extras("1").is_empty(), "the fixture has them");
+        let mut app = App::new(pkg, "test.docx", false);
+        app.os_clip = None;
+        app.run_act(ribbon::Act::DeleteAllComments);
+        let path = save_to_temp(&mut app, "cmt-extras");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        app.save();
+        let pkg = saved_pkg(&path);
+        let comments = pkg.part_text("word/comments.xml").unwrap();
+        assert!(comments.contains(word_comment), "{comments}");
+        assert!(comments.contains("xmlns:w14="), "w14 declared: {comments}");
+        let ext = pkg
+            .part_text("word/commentsExtended.xml")
+            .expect("part back");
+        assert!(ext.contains("w15:paraIdParent=\"0F0F\""), "{ext}");
+        let ids = pkg.part_text("word/commentsIds.xml").expect("part back");
+        assert!(ids.contains("w16cid:durableId=\"7C7C7C7C\""), "{ids}");
+        let cex = pkg
+            .part_text("word/commentsExtensible.xml")
+            .expect("part back");
+        assert!(
+            cex.contains(extensible),
+            "the whole entry, children and close tag: {cex}"
+        );
+        assert!(cex.contains(extensible_root), "the original root: {cex}");
+        let ct = pkg.part_text("[Content_Types].xml").unwrap();
+        assert!(
+            ct.contains("/word/commentsExtended.xml") && ct.contains("/word/commentsIds.xml"),
+            "{ct}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A comment that uses a prefix of its own (`r:` in a hyperlink): the
+    /// part rebuilt on undo keeps the original root, so it stays well-formed.
+    #[test]
+    fn delete_all_then_undo_rebuilds_comments_xml_under_the_original_root() {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(MPara {
+                props: ParProps::default(),
+                content: vec![Inline::Run(Run {
+                    text: "The quick brown fox.".into(),
+                    props: RunProps::default(),
+                })],
+            })],
+        });
+        ed.select_all();
+        assert!(ed.add_comment("1"));
+        let root = "<w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+            xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
+            xmlns:w16du=\"http://schemas.microsoft.com/office/word/2023/wordml/word16du\">";
+        let comment = "<w:comment w:id=\"1\" w:author=\"Ann\"><w:p><w:hyperlink r:id=\"rId9\" \
+            w16du:dateUtc=\"2020-01-02T03:04:05Z\"><w:r><w:t>link</w:t></w:r></w:hyperlink></w:p></w:comment>";
+        let mut pkg = new_package(ed.doc);
+        pkg.insert_comment_xml_rooted(comment, Some(root));
+        let mut app = App::new(pkg, "test.docx", false);
+        app.os_clip = None;
+        app.run_act(ribbon::Act::DeleteAllComments);
+        let path = save_to_temp(&mut app, "cmt-root");
+        assert!(saved_pkg(&path).part("word/comments.xml").is_none());
+        app.on_key(ctrl(KeyCode::Char('z')));
+        app.save();
+        let comments = saved_pkg(&path).part_text("word/comments.xml").unwrap();
+        assert!(comments.contains(comment), "{comments}");
+        for prefix in ["xmlns:r=", "xmlns:w16du="] {
+            assert!(comments.contains(prefix), "{prefix} declared: {comments}");
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #621 A2: Delete All Comments removes records and markers, keeps the
+    /// anchored text, and one undo step restores both.
+    #[test]
+    fn delete_all_comments_is_one_undo_and_removes_every_part() {
+        let mut app = app_with_rich_comments(3);
+        app.comment_sel = 2;
+        app.run_act(ribbon::Act::ResolveComment);
+        app.run_act(ribbon::Act::DeleteAllComments);
+        assert!(app.comments.is_empty());
+        let path = save_to_temp(&mut app, "cmt-delete-all");
+        let pkg = saved_pkg(&path);
+        for part in ["word/comments.xml", "word/commentsExtended.xml"] {
+            assert!(pkg.part(part).is_none(), "{part}");
+        }
+        let doc = pkg.part_text("word/document.xml").unwrap();
+        assert!(!doc.contains("comment"), "{doc}");
+        assert!(doc.contains("The quick brown fox."), "{doc}");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(comment_ids(&app), ["1", "2", "3"]);
+        app.save();
+        let pkg = saved_pkg(&path);
+        let doc = pkg.part_text("word/document.xml").unwrap();
+        assert_eq!(doc.matches("w:commentRangeStart").count(), 3, "{doc}");
+        assert!(
+            pkg.part_text("word/comments.xml")
+                .unwrap()
+                .contains(RICH_COMMENT)
+        );
+        assert_eq!(
+            saved_resolved(&path),
+            [
+                ("1".to_string(), false),
+                ("2".to_string(), false),
+                ("3".to_string(), true)
+            ]
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     /// #971 A7: every save reloads `pkg`, so the deleted comment's XML must
     /// outlive the save between the delete and its undo.
     #[test]
@@ -13043,6 +13568,44 @@ mod tests {
         assert!(app.quit_requested);
     }
 
+    fn final_tui_app() -> App {
+        let mut app = App::new(
+            crate::test_fixtures::marked_final_package(),
+            "final.docx",
+            false,
+        );
+        app.os_clip = None;
+        app
+    }
+
+    #[test]
+    fn a_final_document_asks_edit_anyway_and_refuses_until_yes() {
+        let mut app = final_tui_app();
+        assert!(app.doc_notice().contains("Marked as Final"));
+        let before = app.editor.doc.clone();
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.editor.doc, before, "a final document took a key");
+        assert!(!app.modified);
+        let confirm = app.confirm.as_ref().expect("Edit Anyway question");
+        assert!(confirm.prompt().contains("marked this document as final"));
+        // No keeps it final, and the next refused key asks again.
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.confirm.is_none());
+        assert!(app.marked_final);
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.confirm.is_some());
+        // Yes: Edit Anyway. The refused key stays dropped.
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.confirm.is_none());
+        assert!(!app.marked_final);
+        assert!(!app.pkg.marked_final(), "the mark is still in the package");
+        assert_eq!(app.editor.doc, before);
+        assert!(!app.modified, "Edit Anyway is not an edit");
+        assert!(!app.doc_notice().contains("Marked as Final"));
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.modified);
+    }
+
     #[test]
     fn ctrl_q_confirmation_can_be_cancelled() {
         let mut app = app_with(&["a"]);
@@ -13148,6 +13711,194 @@ mod tests {
         app.on_key(key(KeyCode::Char('Z'))); // replacement
         app.on_key(ctrl(KeyCode::Char('a'))); // replace all
         assert_eq!(first_line(&app), "Z y Z");
+    }
+
+    /// `Alpha beta gamma delta.` with `new ` inserted and `beta ` deleted.
+    fn app_with_ins_and_del() -> App {
+        let doc = docxcore::load::parse_document_xml(
+            "<w:document><w:body><w:p>\
+             <w:r><w:t xml:space=\"preserve\">Alpha </w:t></w:r>\
+             <w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t xml:space=\"preserve\">new </w:t></w:r></w:ins>\
+             <w:del w:id=\"2\" w:author=\"A\"><w:r><w:delText xml:space=\"preserve\">beta </w:delText></w:r></w:del>\
+             <w:r><w:t>gamma delta.</w:t></w:r>\
+             </w:p></w:body></w:document>",
+            &docxcore::load::Relationships::default(),
+        );
+        let mut app = App::new(new_package(doc), "test.docx", false);
+        app.os_clip = None;
+        app
+    }
+
+    /// The rendered text of the body, one row per line, trimmed.
+    fn shown_text(app: &mut App) -> String {
+        app.dirty = true;
+        app.ensure_rendered(80);
+        app.lines
+            .iter()
+            .map(|l| l.plain().trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #625 C1: the four views show the fixture as Word does, change nothing
+    /// in the document, and the save is the same bytes under each.
+    #[test]
+    fn display_for_review_modes_render_without_changing_the_document() {
+        use docxcore::markup::MarkupView;
+        let mut app = app_with_ins_and_del();
+        let doc = app.editor.doc.clone();
+        let revisions = app.editor.doc.revisions().len();
+        let mut saved = Vec::new();
+        for (view, text) in [
+            (MarkupView::All, "Alpha new beta gamma delta."),
+            (MarkupView::Simple, "Alpha new gamma delta."),
+            (MarkupView::NoMarkup, "Alpha new gamma delta."),
+            (MarkupView::Original, "Alpha beta gamma delta."),
+        ] {
+            app.run_act(ribbon::Act::CycleMarkup);
+            // The first step leaves All: walk to `view` by cycling.
+            while app.markup != view {
+                app.run_act(ribbon::Act::CycleMarkup);
+            }
+            assert_eq!(shown_text(&mut app), text, "{view:?}");
+            assert_eq!(app.editor.doc, doc, "{view:?}");
+            assert_eq!(app.editor.doc.revisions().len(), revisions);
+            assert!(!app.modified, "{view:?}");
+            // What the app's own Save writes under this view.
+            let path = save_to_temp(&mut app, &format!("markup-{}", view.name()));
+            saved.push(saved_pkg(&path).part_text("word/document.xml").unwrap());
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+        assert!(
+            saved.windows(2).all(|w| w[0] == w[1]),
+            "document.xml differs"
+        );
+    }
+
+    /// #625 C2: in No Markup and Original a key that would edit is refused
+    /// with a status; All and Simple Markup edit as always.
+    #[test]
+    fn view_only_markup_modes_refuse_typing_and_say_why() {
+        use docxcore::markup::MarkupView;
+        for (view, refused) in [
+            (MarkupView::All, false),
+            (MarkupView::Simple, false),
+            (MarkupView::NoMarkup, true),
+            (MarkupView::Original, true),
+        ] {
+            let mut app = app_with_ins_and_del();
+            app.set_markup(view);
+            let before = app.editor.doc.clone();
+            app.on_key(key(KeyCode::Char('z')));
+            if refused {
+                assert_eq!(app.editor.doc, before, "{view:?}");
+                let status = app.status.clone().unwrap_or_default();
+                assert!(status.contains("Display for Review"), "{status}");
+                assert!(!app.modified);
+            } else {
+                assert_ne!(app.editor.doc, before, "{view:?}");
+            }
+        }
+    }
+
+    /// The bottom row of the screen as text.
+    fn status_row(app: &mut App) -> String {
+        let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let y = buf.area.height - 1;
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// #624 B1/B3: Track on, type before `three` and delete `two `: the save
+    /// has `w:ins`, `w:del`/`w:delText`, the author and a date, and
+    /// `<w:trackRevisions/>`; the status bar says so; a reload starts with
+    /// tracking on; toggling off removes the setting.
+    #[test]
+    fn track_changes_records_typing_and_deleting_and_round_trips() {
+        let mut app = app_with(&["One two three."]);
+        assert!(!status_row(&mut app).contains("Track Changes: On"));
+        app.run_act(ribbon::Act::ToggleTrack);
+        assert!(app.body_editor().track_changes());
+        assert!(status_row(&mut app).contains("Track Changes: On"));
+        app.editor.caret.offset = 8;
+        type_text(&mut app, "and a half ");
+        app.editor.anchor = Some(Caret {
+            path: vec![0],
+            offset: 4,
+        });
+        app.editor.caret.offset = 8;
+        app.on_key(key(KeyCode::Backspace));
+        let path = save_to_temp(&mut app, "track-record");
+        let pkg = saved_pkg(&path);
+        let doc = pkg.part_text("word/document.xml").unwrap();
+        assert!(doc.contains("<w:ins "), "{doc}");
+        assert!(
+            doc.contains("<w:del ")
+                && doc.contains("<w:delText xml:space=\"preserve\">two </w:delText>"),
+            "{doc}"
+        );
+        assert!(
+            doc.contains(&format!("w:author=\"{}\"", app.review_author())),
+            "{doc}"
+        );
+        let date = doc
+            .split("w:date=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap();
+        assert!(is_utc_date_time(date), "{date}");
+        let settings = pkg.part_text("word/settings.xml").unwrap();
+        assert!(settings.contains("<w:trackRevisions/>"), "{settings}");
+        // The revisions are listed, and Accept All takes them.
+        assert_eq!(app.editor.doc.revisions().len(), 2);
+
+        let mut reopened = App::new(saved_pkg(&path), "test.docx", false);
+        reopened.os_clip = None;
+        assert!(
+            reopened.body_editor().track_changes(),
+            "starts with tracking on"
+        );
+
+        reopened.path = path.to_string_lossy().into_owned();
+        reopened.run_act(ribbon::Act::ToggleTrack);
+        assert!(!status_row(&mut reopened).contains("Track Changes: On"));
+        reopened.save();
+        let settings = saved_pkg(&path)
+            .part_text("word/settings.xml")
+            .unwrap_or_default();
+        assert!(!settings.contains("trackRevisions"), "{settings}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #624 B2: one undo takes a recorded edit back to the exact prior text.
+    #[test]
+    fn undo_of_a_recorded_edit_restores_the_document() {
+        let mut app = app_with(&["One two three."]);
+        let before = app.editor.doc.clone();
+        app.run_act(ribbon::Act::ToggleTrack);
+        app.editor.caret.offset = 8;
+        type_text(&mut app, "xy");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(app.editor.doc, before);
+    }
+
+    /// Track Changes is for Word documents: a Markdown file says so.
+    #[test]
+    fn markdown_refuses_track_changes() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_markdown_package(Document { body }), "a.md", false);
+        app.run_act(ribbon::Act::ToggleTrack);
+        assert!(!app.body_editor().track_changes());
+        assert!(
+            app.status
+                .clone()
+                .unwrap_or_default()
+                .contains("Word document")
+        );
     }
 
     /// `x ` + a tracked insertion `x` + ` x`: Find shows all three (#211).

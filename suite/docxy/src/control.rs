@@ -260,6 +260,7 @@ pub(crate) fn project_verb(
                 let mut effect = Effect::default();
                 if projctl::MUTATING.contains(&verb) {
                     tab.dirty = v.ed.dirty();
+                    crate::bump_edit_generation();
                     v.cancel_prompt();
                     tab.dialogs.clear();
                     v.cell = None;
@@ -286,10 +287,11 @@ pub(crate) struct Done {
     pub quit: bool,
     /// Draw one frame before replying. **macOS only** — see [`Done::ok_drawn`].
     pub draw: bool,
-    /// Mouse events the verb asked the pump to dispatch through gpui's own
-    /// hit testing after the entity borrow above it has ended (#545). A
-    /// dispatch inside `update_in` would double-borrow the app.
-    pub pointer: Vec<gpui::PlatformInput>,
+    /// Input events (mouse #545, key-downs #1027) the verb asked the pump to
+    /// dispatch through gpui's own hit testing and focus after the entity
+    /// borrow above it has ended. A dispatch inside `update_in` would
+    /// double-borrow the app.
+    pub input: Vec<gpui::PlatformInput>,
 }
 
 impl Done {
@@ -298,7 +300,7 @@ impl Done {
             result,
             quit: false,
             draw: false,
-            pointer: Vec::new(),
+            input: Vec::new(),
         })
     }
 
@@ -331,7 +333,7 @@ impl Done {
             result,
             quit: false,
             draw: cfg!(target_os = "macos"),
-            pointer: Vec::new(),
+            input: Vec::new(),
         })
     }
 }
@@ -368,11 +370,12 @@ pub(crate) fn attach_with_dispatch(
                 dispatch(this, &req.verb, &req.args, window, cx)
             }) {
                 Ok(Ok(mut done)) => {
-                    // Pointer verbs queue real input: dispatch it through
-                    // gpui's own hit testing now, outside the entity borrow,
-                    // so the listeners it triggers may update the app.
-                    if !done.pointer.is_empty() {
-                        let events = std::mem::take(&mut done.pointer);
+                    // Pointer and key verbs queue real input: dispatch it
+                    // through gpui's own hit testing and focus now, outside
+                    // the entity borrow, so the listeners it triggers may
+                    // update the app.
+                    if !done.input.is_empty() {
+                        let events = std::mem::take(&mut done.input);
                         let _ = cx.update(|window, cx| {
                             for event in events {
                                 window.dispatch_event(event, cx);
@@ -415,6 +418,11 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Result<Json, String>> {
+        // The build this binary is (#1023): the same JSON in a harness and in
+        // normal Project control, whatever tab is open.
+        if verb == "app-info" {
+            return Some(Json::parse(&crate::about::info().json()));
+        }
         if verb == "proj.new" {
             return Some((|| {
                 check_new_project_args(args)?;
@@ -426,6 +434,9 @@ impl Docxy {
         }
         // A control client reads and saves the plan: never half-leveled.
         self.flush_project_passes(cx);
+        if let Err(e) = crate::close::close_prompt_refusal(&self.tabs, verb) {
+            return Some(Err(e));
+        }
         let outcome = project_verb(&mut self.tabs, self.active, verb, args)?;
         Some(outcome.map(|(result, effect)| {
             // What drops the tab's dialogs (an edit, a reload, a save) or

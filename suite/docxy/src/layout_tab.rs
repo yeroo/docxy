@@ -515,7 +515,9 @@ pub(crate) fn layout_apply(tab: &mut DocTab, act: LayoutAct) -> Result<(), Strin
         | LayoutAct::MoreColumns
         | LayoutAct::Unavailable => return Ok(()),
     };
-    tab.dirty |= changed;
+    if changed {
+        tab.set_dirty();
+    }
     tab.status = status.into();
     Ok(())
 }

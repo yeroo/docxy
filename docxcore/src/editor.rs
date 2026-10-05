@@ -18,11 +18,13 @@ mod sections;
 mod table_design;
 mod table_layout;
 mod tables;
+mod track;
 mod visible;
 pub use flat::{FlatDocument, FlatStory, StoryOffset};
 pub use table_design::BorderCmd;
 pub use table_layout::{AutoFitKind, CellSep, DeleteShift, SortKey, SortKind, SortSpec};
 pub use tables::{CellRange, TablePos};
+pub use track::TrackAuthor;
 pub use visible::{FoundMatch, step_found};
 
 /// A path into the document tree (to a paragraph) plus a character offset.
@@ -145,6 +147,61 @@ struct Snapshot {
     caret: Caret,
     anchor: Option<Caret>,
     review_target: Option<RevisionTarget>,
+    /// What the step is called in an undo list (#619); travels with the step
+    /// between the undo and redo stacks.
+    name: StepName,
+    /// The step's identity, unique across every editor in the process
+    /// (0 until the step is pushed); travels with the step too.
+    serial: u64,
+}
+
+/// An undo step's name. Typing is named by its text as it coalesces; a host
+/// names a command's steps with [`Editor::name_command`]; anything else
+/// falls back to what kind of edit pushed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StepName {
+    Typing(String),
+    Named(String),
+    Unnamed(EditKind),
+}
+
+/// The longest typed text an undo-list label shows before it is shortened.
+const TYPING_LABEL_CHARS: usize = 30;
+
+impl StepName {
+    fn label(&self) -> String {
+        match self {
+            StepName::Typing(text) if text.is_empty() => "Typing".into(),
+            StepName::Typing(text) if text.chars().count() > TYPING_LABEL_CHARS => {
+                let short: String = text.chars().take(TYPING_LABEL_CHARS).collect();
+                format!("Typing \"{short}\u{2026}\"")
+            }
+            StepName::Typing(text) => format!("Typing \"{text}\""),
+            StepName::Named(name) => name.clone(),
+            StepName::Unnamed(EditKind::Insert) => "Typing".into(),
+            StepName::Unnamed(EditKind::Delete) => "Delete".into(),
+            StepName::Unnamed(_) => "Edit".into(),
+        }
+    }
+}
+
+/// The last undo-step serial handed out, shared by every editor so that a
+/// serial names one step in the whole process (a host's Repeat record can
+/// then never match another document's step by coincidence).
+static UNDO_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// The last serial issued on this thread.
+    static LAST_SERIAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The most recent undo-step serial issued on this thread, by any editor.
+/// Every step pushed after this call has a larger serial (see
+/// [`Editor::name_command`]), and it changes exactly when a step is pushed
+/// on this thread, so a host can tell that no edit pushed one since. Per
+/// thread, so editors on other threads never disturb it.
+pub fn undo_serial_counter() -> u64 {
+    LAST_SERIAL.with(|c| c.get())
 }
 
 const UNDO_CAP: usize = 500;
@@ -166,6 +223,10 @@ pub struct Editor {
     /// A preview has been shown since this editor opened, so merge fields'
     /// text may need putting back.
     merge_previewed: bool,
+    /// Track Changes (#624): edits are recorded as tracked changes by this
+    /// reviewer while `Some`. Not saved with the document: the host sets it
+    /// from the settings and its own identity.
+    track: Option<TrackAuthor>,
 }
 
 impl Editor {
@@ -182,6 +243,7 @@ impl Editor {
             review_target: None,
             merge_preview: None,
             merge_previewed: false,
+            track: None,
         }
     }
 
@@ -232,10 +294,14 @@ impl Editor {
             caret: self.caret.clone(),
             anchor: self.anchor.clone(),
             review_target: self.review_target,
+            name: StepName::Unnamed(EditKind::Structural),
+            serial: 0,
         }
     }
 
-    fn push_undo(&mut self, snapshot: Snapshot) {
+    fn push_undo(&mut self, mut snapshot: Snapshot) {
+        snapshot.serial = UNDO_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        LAST_SERIAL.with(|c| c.set(snapshot.serial));
         self.undo.push(snapshot);
         if self.undo.len() > UNDO_CAP {
             self.undo.remove(0);
@@ -251,14 +317,94 @@ impl Editor {
 
     fn checkpoint(&mut self, kind: EditKind) {
         if self.last != kind || kind == EditKind::Structural {
-            self.push_undo(self.snapshot());
+            let mut snapshot = self.snapshot();
+            snapshot.name = match kind {
+                EditKind::Insert => StepName::Typing(String::new()),
+                kind => StepName::Unnamed(kind),
+            };
+            self.push_undo(snapshot);
         }
         self.last = kind;
     }
 
+    /// The current state as the entry that undoing or redoing `step` leaves
+    /// on the other stack: the same step, so it keeps its name and serial.
+    fn snapshot_as(&self, step: &Snapshot) -> Snapshot {
+        Snapshot {
+            name: step.name.clone(),
+            serial: step.serial,
+            ..self.snapshot()
+        }
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// The undo steps' names, newest first (Word's Undo drop-down, #619).
+    pub fn undo_names(&self) -> Vec<String> {
+        self.undo.iter().rev().map(|s| s.name.label()).collect()
+    }
+
+    /// The newest undo step's serial, or `None` with nothing to undo. Redo
+    /// brings a step back with its serial, so a host can tell whether the
+    /// step it recorded is still the newest one.
+    pub fn undo_serial(&self) -> Option<u64> {
+        self.undo.last().map(|s| s.serial)
+    }
+
+    /// The undo steps pushed after `since` (a value of
+    /// [`undo_serial_counter`] taken before a command ran) are one command's:
+    /// collapse them into one step, the oldest (its snapshot is the state
+    /// before the command, and it keeps its serial), named `name`. One Undo
+    /// then undoes the whole command. Steps from before, such as a typing
+    /// step the command did not start, are left alone. Typing after a named
+    /// step starts a step of its own rather than growing it.
+    pub fn name_command(&mut self, since: u64, name: &str) {
+        let first = self
+            .undo
+            .iter()
+            .rposition(|step| step.serial <= since)
+            .map_or(0, |i| i + 1);
+        if first == self.undo.len() {
+            return;
+        }
+        self.undo.truncate(first + 1);
+        self.undo[first].name = StepName::Named(name.into());
+        self.last = EditKind::None;
+    }
+
+    /// The text of the newest undo step when it is typing.
+    pub fn last_typed(&self) -> Option<&str> {
+        match self.undo.last().map(|s| &s.name) {
+            Some(StepName::Typing(text)) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// End the current typing (or deleting) run, so the next edit starts a
+    /// new undo step instead of coalescing into the newest one.
+    pub fn break_undo_group(&mut self) {
+        self.last = EditKind::None;
+    }
+
+    /// Undo the `n` newest steps in one call (choosing an entry in the Undo
+    /// drop-down, #619). They go onto the redo stack in order, so Redo then
+    /// brings them back one at a time. False, and no change, for `n == 0`
+    /// or more steps than there are.
+    pub fn undo_to(&mut self, n: usize) -> bool {
+        if n == 0 || n > self.undo.len() {
+            return false;
+        }
+        for _ in 0..n {
+            self.undo();
+        }
+        true
+    }
+
     pub fn undo(&mut self) -> bool {
         if let Some(prev) = self.undo.pop() {
-            self.redo.push(self.snapshot());
+            self.redo.push(self.snapshot_as(&prev));
             self.doc = prev.doc;
             self.caret = prev.caret;
             self.anchor = prev.anchor;
@@ -273,7 +419,7 @@ impl Editor {
 
     pub fn redo(&mut self) -> bool {
         if let Some(next) = self.redo.pop() {
-            self.undo.push(self.snapshot());
+            self.undo.push(self.snapshot_as(&next));
             self.doc = next.doc;
             self.caret = next.caret;
             self.anchor = next.anchor;
@@ -502,6 +648,7 @@ impl Editor {
             return;
         }
         self.drop_collapsed_anchor();
+        let pushed_before = undo_serial_counter();
         if self.has_selection() {
             self.delete_selection();
         }
@@ -509,11 +656,25 @@ impl Editor {
             self.insert_newline();
             return;
         }
+        // Typing over a selection is one step, as in Word: the step the
+        // deletion pushed (its snapshot is the state before it) becomes the
+        // typing step, and the characters coalesce into it.
+        if undo_serial_counter() > pushed_before {
+            if let Some(step) = self.undo.last_mut() {
+                step.name = StepName::Typing(String::new());
+                self.last = EditKind::Insert;
+            }
+        }
         self.checkpoint(EditKind::Insert);
         let off = self.caret.offset;
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
             content_insert(&mut p.content, off, ch);
             self.caret.offset += 1;
+            let path = self.caret.path.clone();
+            self.settle_inserted(&path, off, 1);
+            if let Some(StepName::Typing(text)) = self.undo.last_mut().map(|s| &mut s.name) {
+                text.push(ch);
+            }
         }
     }
 
@@ -583,7 +744,7 @@ impl Editor {
             *last = new_idx;
         }
         self.caret.offset = 0;
-        self.doc.initialize_revision_targets();
+        self.settle_revisions();
     }
 
     /// Word-style autoformat: if the current paragraph's whole text is three or
@@ -683,9 +844,8 @@ impl Editor {
                 return;
             }
             self.checkpoint(EditKind::Delete);
-            if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
-                content_delete(&mut p.content, off - 1);
-            }
+            let path = self.caret.path.clone();
+            self.delete_char_at(&path, off - 1);
             self.caret.offset -= 1;
             return;
         }
@@ -734,9 +894,8 @@ impl Editor {
                 return;
             }
             self.checkpoint(EditKind::Delete);
-            if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
-                content_delete(&mut p.content, off);
-            }
+            let path = self.caret.path.clone();
+            self.delete_char_at(&path, off);
             return;
         }
         // At the end: pull up the next sibling paragraph.
@@ -1045,10 +1204,8 @@ impl Editor {
 
         if lo.path == hi.path {
             self.checkpoint(EditKind::Structural);
-            if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
-                for _ in lo.offset..hi.offset {
-                    content_delete(&mut p.content, lo.offset);
-                }
+            for _ in lo.offset..hi.offset {
+                self.delete_char_at(&lo.path, lo.offset);
             }
             self.caret = lo;
             return true;
@@ -1063,6 +1220,12 @@ impl Editor {
         }
 
         self.checkpoint(EditKind::Structural);
+        // Tracked: the text of each paragraph is recorded as deleted and the
+        // paragraph marks stay (see the `track` module).
+        if self.delete_text_across_paragraphs(&lo, &hi) {
+            self.caret = lo;
+            return true;
+        }
         let li = *lo.path.last().unwrap();
         let hii = *hi.path.last().unwrap();
         if let Some((cont, _)) = container_mut(&mut self.doc.body, &lo.path) {
@@ -1153,7 +1316,13 @@ impl Editor {
         let mut paras = Vec::new();
         for (path, s, e) in spans {
             if let Some(p) = resolve_para(&self.doc.body, &path) {
-                paras.push(extract_range(&p.content, s, e));
+                let mut inlines = extract_range(&p.content, s, e);
+                // A copy of a recorded insertion is plain text, not a second
+                // record of it.
+                for inline in &mut inlines {
+                    track::with_props(inline, track::clear_insert_record);
+                }
+                paras.push(inlines);
             }
         }
         // A previewed record is display only: copied merge fields carry
@@ -1186,6 +1355,7 @@ impl Editor {
         }
         self.checkpoint(EditKind::Structural);
         self.paste_at_caret(clip);
+        self.settle_revisions();
     }
 
     /// [`Editor::paste`]'s insertion at the caret, with no undo step of its
@@ -1194,6 +1364,10 @@ impl Editor {
         if clip.paras.is_empty() {
             return;
         }
+        // Recorded as one tracked insertion when tracking; a copy of recorded
+        // text is not itself a record when not.
+        let recorded = self.clip_for_insertion(clip);
+        let clip = &recorded;
         let off = self.caret.offset;
         let n = clip.paras.len();
         let in_cover = self.caret_in_cover();
@@ -1276,11 +1450,16 @@ impl Editor {
     pub fn toggle_italic(&mut self) {
         self.toggle_run_prop(|p| p.italic, |p, v| p.italic = v);
     }
+    /// Underline over the selection. The underline a tracked insertion is drawn
+    /// with is a display cue, not the user's: it does not count as "already
+    /// underlined", and an explicit underline replaces it (so it is saved).
     pub fn toggle_underline(&mut self) {
-        self.toggle_run_prop(|p| p.underline, |p, v| p.underline = v);
+        self.toggle_run_prop(RunProps::user_underline, RunProps::set_user_underline);
     }
+    /// Strike over the selection, as [`Editor::toggle_underline`] treats the
+    /// cue of a tracked deletion.
     pub fn toggle_strike(&mut self) {
-        self.toggle_run_prop(|p| p.strike, |p, v| p.strike = v);
+        self.toggle_run_prop(RunProps::user_strike, RunProps::set_user_strike);
     }
 
     /// Run properties at the caret (used for toggles and the ribbon's on-states).
@@ -1579,6 +1758,8 @@ impl Editor {
                 "<w:commentRangeStart w:id=\"{id}\"/>"
             ))]],
         });
+        // Markers inside a recorded insertion interrupt it.
+        self.settle_revisions();
         true
     }
 
@@ -1776,9 +1957,7 @@ impl Editor {
         let text = &without_field_chars(text);
         if lo.path == hi.path && !text.contains('\n') {
             self.checkpoint(EditKind::Structural);
-            if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
-                replace_range_in_content(&mut p.content, lo.offset, hi.offset, text);
-            }
+            self.replace_text_range(&lo.path, lo.offset, hi.offset, text);
             self.anchor = None;
             self.caret = Caret {
                 offset: lo.offset + text.chars().count(),
@@ -4513,6 +4692,197 @@ mod tests {
         assert_eq!(ed.anchor, None);
         ed.insert_char('z');
         assert_eq!(top_text(&ed), vec!["", "z"]);
+    }
+
+    /// #619: coalesced typing is one step named by its text, and other
+    /// edits fall back to their kind's name.
+    #[test]
+    fn undo_steps_are_named_newest_first() {
+        let mut ed = Editor::new(doc(&[""]));
+        ed.insert_str("one");
+        ed.insert_newline();
+        ed.insert_str("two");
+        ed.backspace();
+        assert_eq!(
+            ed.undo_names(),
+            vec!["Delete", "Typing \"two\"", "Edit", "Typing \"one\""]
+        );
+        assert_eq!(ed.last_typed(), None, "the newest step is the delete");
+        ed.insert_str("o");
+        assert_eq!(ed.last_typed(), Some("o"));
+    }
+
+    #[test]
+    fn long_typing_label_is_shortened_but_the_text_is_kept() {
+        let mut ed = Editor::new(doc(&[""]));
+        let text = "abcdefghijklmnopqrstuvwxyz0123456789";
+        ed.insert_str(text);
+        assert_eq!(
+            ed.undo_names(),
+            vec!["Typing \"abcdefghijklmnopqrstuvwxyz0123\u{2026}\""]
+        );
+        assert_eq!(ed.last_typed(), Some(text));
+    }
+
+    #[test]
+    fn step_names_and_serials_travel_through_undo_and_redo() {
+        let mut ed = Editor::new(doc(&[""]));
+        ed.insert_str("ab");
+        let typed = ed.undo_serial();
+        ed.select_all();
+        ed.toggle_bold();
+        let bold = ed.undo_serial();
+        assert_ne!(typed, bold);
+        ed.name_command(typed.unwrap(), "Bold");
+        assert_eq!(ed.undo_names(), vec!["Bold", "Typing \"ab\""]);
+        assert!(ed.undo());
+        assert_eq!(ed.undo_serial(), typed);
+        assert_eq!(ed.undo_names(), vec!["Typing \"ab\""]);
+        assert!(ed.can_redo());
+        assert!(ed.redo());
+        assert_eq!(
+            ed.undo_serial(),
+            bold,
+            "redo brings the step back as it was"
+        );
+        assert_eq!(ed.undo_names(), vec!["Bold", "Typing \"ab\""]);
+        assert!(!ed.can_redo());
+    }
+
+    #[test]
+    fn undo_serials_are_unique_across_editors() {
+        let mut a = Editor::new(doc(&[""]));
+        let mut b = Editor::new(doc(&[""]));
+        a.insert_str("x");
+        b.insert_str("x");
+        assert!(a.undo_serial().is_some() && b.undo_serial().is_some());
+        assert_ne!(a.undo_serial(), b.undo_serial());
+        let before = undo_serial_counter();
+        a.insert_newline();
+        assert!(a.undo_serial().unwrap() > before);
+    }
+
+    #[test]
+    fn name_command_merges_only_newer_steps() {
+        let mut ed = Editor::new(doc(&[""]));
+        ed.insert_str("ab");
+        let since = undo_serial_counter();
+        // Coalesces into the typing step from before: no new step to name.
+        ed.insert_str("c");
+        ed.name_command(since, "Symbol");
+        assert_eq!(ed.undo_names(), vec!["Typing \"abc\""]);
+        ed.break_undo_group();
+        ed.insert_str("d");
+        ed.insert_newline();
+        ed.name_command(since, "Insert Stuff");
+        assert_eq!(ed.undo_names(), vec!["Insert Stuff", "Typing \"abc\""]);
+        assert!(ed.undo());
+        assert_eq!(
+            top_text(&ed),
+            vec!["abc"],
+            "one undo takes the whole command"
+        );
+        assert!(ed.redo());
+        // Typing after a named command starts its own step.
+        let since = undo_serial_counter();
+        ed.insert_str("e");
+        ed.name_command(since, "Named");
+        ed.insert_str("f");
+        assert_eq!(ed.undo_names()[..2], ["Typing \"f\"", "Named"]);
+    }
+
+    /// A command that edits through several calls (No Spacing: style, two
+    /// spacings, line spacing) is one step once named.
+    #[test]
+    fn name_command_makes_a_multi_call_command_one_step() {
+        let mut ed = Editor::new(doc(&["a", "b"]));
+        ed.insert_str("x");
+        let typed = ed.undo_serial();
+        let before = ed.doc.clone();
+        let since = undo_serial_counter();
+        ed.break_undo_group();
+        ed.set_space_before(Some(0));
+        ed.set_space_after(Some(0));
+        ed.set_line_spacing(240, "auto");
+        assert_eq!(ed.undo_names().len(), 4);
+        let last = undo_serial_counter();
+        ed.name_command(since, "Style");
+        assert_eq!(ed.undo_names(), vec!["Style", "Typing \"x\""]);
+        let kept = ed.undo_serial().unwrap();
+        assert!(kept > since && kept < last, "the oldest new step's serial");
+        let after = ed.doc.clone();
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert_eq!(ed.undo_serial(), typed);
+        assert!(ed.redo());
+        assert_eq!(ed.doc, after);
+        // Nothing new since: nothing changes.
+        ed.name_command(undo_serial_counter(), "Other");
+        assert_eq!(ed.undo_names(), vec!["Style", "Typing \"x\""]);
+    }
+
+    /// Typing over a selection is one `Typing` step: one undo puts the
+    /// selected text back and removes what was typed.
+    #[test]
+    fn typing_over_a_selection_is_one_typing_step() {
+        let mut ed = Editor::new(doc(&["hello world"]));
+        let before = ed.doc.clone();
+        ed.anchor = Some(Caret::at(vec![0], 6));
+        ed.caret = Caret::at(vec![0], 11);
+        ed.insert_str("rust");
+        assert_eq!(top_text(&ed), vec!["hello rust"]);
+        assert_eq!(ed.undo_names(), vec!["Typing \"rust\""]);
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert!(!ed.undo());
+    }
+
+    #[test]
+    fn break_undo_group_starts_a_new_typing_step() {
+        let mut ed = Editor::new(doc(&[""]));
+        ed.insert_str("abc");
+        ed.break_undo_group();
+        ed.insert_str("abc");
+        assert_eq!(top_text(&ed), vec!["abcabc"]);
+        assert_eq!(ed.undo_names(), vec!["Typing \"abc\""; 2]);
+        assert!(ed.undo());
+        assert_eq!(top_text(&ed), vec!["abc"]);
+    }
+
+    #[test]
+    fn undo_to_undoes_n_steps_and_redo_walks_them_back() {
+        let mut ed = Editor::new(doc(&[""]));
+        ed.insert_str("one");
+        ed.insert_newline();
+        ed.insert_str("two");
+        ed.select_all();
+        ed.toggle_bold();
+        assert_eq!(ed.undo_names().len(), 4);
+        let full = ed.doc.clone();
+        assert!(!ed.undo_to(0));
+        assert!(!ed.undo_to(5), "more steps than there are");
+        assert_eq!(ed.doc, full, "a refused undo_to changes nothing");
+        assert!(!ed.can_redo());
+        assert!(ed.undo_to(3));
+        assert_eq!(top_text(&ed), vec!["one"]);
+        assert_eq!(ed.undo_names(), vec!["Typing \"one\""]);
+        assert!(ed.redo());
+        assert_eq!(top_text(&ed), vec!["one", ""], "redo restores Enter only");
+        assert!(ed.redo() && ed.redo());
+        assert_eq!(ed.doc, full);
+        assert!(!ed.redo());
+    }
+
+    #[test]
+    fn undo_cap_drops_the_oldest_name_with_its_step() {
+        let mut ed = Editor::new(doc(&[""]));
+        ed.insert_str("first");
+        for _ in 0..UNDO_CAP {
+            ed.insert_newline();
+        }
+        let names = ed.undo_names();
+        assert_eq!(names.len(), UNDO_CAP);
+        assert!(names.iter().all(|n| n == "Edit"), "the typing step is gone");
     }
 
     #[test]

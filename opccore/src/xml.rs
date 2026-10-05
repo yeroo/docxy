@@ -41,6 +41,8 @@ pub struct XmlParser<'a> {
     m_start: usize,
     /// Sticky: set once any token so far was malformed.
     malformed: bool,
+    /// Whether the most recent `Event::Text` came from a CDATA section.
+    m_cdata: bool,
 }
 
 fn is_ws(c: u8) -> bool {
@@ -72,6 +74,7 @@ impl<'a> XmlParser<'a> {
             pending_end: false,
             m_start: 0,
             malformed: false,
+            m_cdata: false,
         }
     }
 
@@ -116,6 +119,14 @@ impl<'a> XmlParser<'a> {
     }
     pub fn text(&self) -> &'a str {
         self.m_text
+    }
+    /// Whether the most recent [`Event::Text`] came from a `<![CDATA[...]]>`
+    /// section rather than ordinary character data. Defined only right after
+    /// an `Event::Text`; after any other event the value is stale. CDATA
+    /// content is raw text, so callers that entity-decode [`text`] can use
+    /// this to leave it verbatim.
+    pub fn is_cdata(&self) -> bool {
+        self.m_cdata
     }
     pub fn attr(&self, name: &str) -> &'a str {
         self.m_attrs
@@ -257,6 +268,7 @@ impl<'a> XmlParser<'a> {
                 let lt = self.find_from(self.pos, b'<').unwrap_or(size);
                 self.pos = lt;
                 self.m_text = self.slice(start, lt);
+                self.m_cdata = false;
                 return Event::Text;
             }
             self.pos += 1; // consume '<'
@@ -331,6 +343,7 @@ impl<'a> XmlParser<'a> {
                             self.pos = size;
                         }
                     }
+                    self.m_cdata = true;
                     return Event::Text;
                 }
                 self.pos = match self.find_from(self.pos, b'>') {
@@ -683,6 +696,29 @@ mod tests {
         assert_eq!(p.next(), Event::Text);
         assert_eq!(p.text(), "<b>&raw");
         assert_eq!(p.next(), Event::End);
+    }
+
+    #[test]
+    fn cdata_text_is_flagged() {
+        let mut p = XmlParser::new("<a>pre<![CDATA[x]]>tail</a>");
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.next(), Event::Text);
+        assert_eq!(p.text(), "pre");
+        assert!(!p.is_cdata());
+        assert_eq!(p.next(), Event::Text);
+        assert_eq!(p.text(), "x");
+        assert!(p.is_cdata());
+        // The flag resets with the next ordinary character data.
+        assert_eq!(p.next(), Event::Text);
+        assert_eq!(p.text(), "tail");
+        assert!(!p.is_cdata());
+        // An unterminated section still reports its content as CDATA text.
+        let mut p = XmlParser::new("<a><![CDATA[unterminated");
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.next(), Event::Text);
+        assert_eq!(p.text(), "unterminated");
+        assert!(p.is_malformed());
+        assert!(p.is_cdata());
     }
 
     #[test]

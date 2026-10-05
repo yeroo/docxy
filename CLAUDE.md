@@ -14,3 +14,11 @@
 - The editable-HTML page (`htmlbundle/web/`) renders DOCX as DOM from
   `docx_doc`, not as projected grid lines, so the browser does bidi itself;
   its selection maps to logical editor offsets through `data-o` segments.
+
+## Build info
+
+- `buildinfo` is the one place that stamps binaries (commit, last merged PR, kind,
+  manual build). Keep it dependency-free; hosts parse its `json()` text into their own
+  JSON type and pass their own `CARGO_PKG_VERSION` (the suite, xlsxy, yppxy and lookxy are 0.1.0, docxy 0.5.0).
+- `ci.yml` sets `DOCXY_BUILD_KIND: ci` per job and `release.yml` sets `release`, but
+  never on `ui-sweep-linux`: `uiharness/cases/build-info.uit` asserts `local`.

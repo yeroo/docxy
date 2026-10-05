@@ -236,7 +236,7 @@ pub(crate) fn inspect_remove(
         }
     };
     if changed {
-        tab.dirty = true;
+        tab.set_dirty();
     }
     tab.status = status.clone().into();
     Ok(status)
@@ -474,11 +474,15 @@ mod tests {
                 "bs-open",
                 "bs-save",
                 "bs-saveas",
+                "bs-account",
                 "bs-close"
             ]
         );
-        // A workbook, a placeholder: no Info.
+        // A workbook, a placeholder: no Info, but every tab kind has Account (#1023).
         assert!(!ids(false, false).contains(&"bs-info"));
+        for (project, doc) in [(false, false), (true, false), (false, true)] {
+            assert!(ids(project, doc).contains(&"bs-account"), "{project} {doc}");
+        }
         // A project: Export, no Info.
         let project = ids(true, false);
         assert!(!project.contains(&"bs-info"));

@@ -54,7 +54,7 @@ test the document's Bold menu never opens on a Project, and Esc closes the row m
   call-error menu-open {"target":"document"} => does not open on a Project tab
   call-error menu-open {"target":{"bar":2}} => menu target 'bar' is not supported yet
   call-error menu-open {"target":{"column":"Duration"}} => menu target 'column' is not supported yet
-  call-error menu-open {"target":{"cell":"C3"}} => menu target 'cell' is not supported yet
+  call-error menu-open {"target":{"cell":"C3"}} => the cell menu opens on a sheet tab
   call-error menu-open {"target":{"row":99}} => no task with uid 99
   call menu-open {"target":{"row":1}}
   call-error menu-click {"label":"Bold"} => no menu item 'Bold'

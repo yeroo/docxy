@@ -18,7 +18,7 @@ use ctlcore::mcp::{McpServer, prop, prop_obj, tool};
 pub fn run() -> std::io::Result<()> {
     McpServer {
         name: "docxy",
-        version: env!("CARGO_PKG_VERSION"),
+        version: buildinfo::long_version(env!("CARGO_PKG_VERSION")),
         tools: tool_defs(),
         handler: &do_tool,
     }
@@ -66,6 +66,11 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "docxy_page_color" => "doc.page-color",
         "docxy_watermark" => "doc.watermark",
         "docxy_page_borders" => "doc.page-borders",
+        "docxy_comment_resolve" => "doc.comment-resolve",
+        "docxy_comments_delete_all" => "doc.comments-delete-all",
+        "docxy_display_mode" => "doc.display-mode",
+        "docxy_track_changes" => "doc.track-changes",
+        "docxy_track_changes_set" => "doc.track-changes-set",
         _ => return None,
     })
 }
@@ -563,6 +568,74 @@ fn tool_defs() -> Json {
             ],
             &["border"],
         ),
+        tool(
+            "docxy_comment_resolve",
+            "Resolve a review comment, or reopen it (Review > Comments > Resolve): writes \
+             w15:done to commentsExtended.xml on save. Pass resolved to set the state; \
+             without it the comment toggles. Returns {id, resolved}.",
+            vec![
+                (
+                    "id",
+                    prop("string", "Comment id returned by docxy_comments."),
+                ),
+                (
+                    "resolved",
+                    prop(
+                        "boolean",
+                        "Optional: true to resolve, false to reopen (default: toggle).",
+                    ),
+                ),
+                target(),
+            ],
+            &["id"],
+        ),
+        tool(
+            "docxy_comments_delete_all",
+            "Delete every comment in the document (Review > Comments > Delete All): the \
+             comment records and their anchors, keeping the anchored text, as one undo step. \
+             Returns {deleted}.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_display_mode",
+            "Get or set Display for Review (Review > Tracking): how tracked changes are shown. \
+             A view only: the document, its revisions and its save are unchanged. No Markup and \
+             Original are view-only: edits are refused (protection_denied:display_mode) until \
+             All Markup or Simple Markup is chosen. Returns {mode, label, editable}.",
+            vec![
+                (
+                    "mode",
+                    prop(
+                        "string",
+                        "Optional: \"all\", \"simple\", \"none\" or \"original\" (default: report only).",
+                    ),
+                ),
+                target(),
+            ],
+            &[],
+        ),
+        tool(
+            "docxy_track_changes",
+            "Report whether Track Changes is on (edits are recorded as tracked changes) and the \
+             reviewer they are recorded as. Returns {enabled, author}.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_track_changes_set",
+            "Turn Track Changes on or off (Review > Track Changes): typing and deletions are \
+             then recorded as tracked insertions and deletions (w:ins / w:del, stamped with the \
+             reviewer and the time), and the document saves with w:trackRevisions. Paragraph \
+             marks, text in hyperlinks and formatting are not recorded, and a Markdown splice \
+             (markdown: true on insert, append or replace_range) is refused while it is on. \
+             Not an undo step. Returns {enabled, author}.",
+            vec![
+                ("enabled", prop("boolean", "true to record, false to stop.")),
+                target(),
+            ],
+            &["enabled"],
+        ),
     ])
 }
 
@@ -673,6 +746,14 @@ mod tests {
             "docxy_page_color",
             "docxy_watermark",
             "docxy_page_borders",
+            // #621: resolve / delete-all comments.
+            "docxy_comment_resolve",
+            "docxy_comments_delete_all",
+            // #625: Display for Review.
+            "docxy_display_mode",
+            // #624: Track Changes.
+            "docxy_track_changes",
+            "docxy_track_changes_set",
         ];
         let save_pos = names.iter().position(|n| *n == "docxy_save").unwrap();
         assert_eq!(
@@ -728,6 +809,11 @@ mod tests {
         assert_eq!(required_of("docxy_page_color"), "[\"color\"]");
         assert_eq!(required_of("docxy_watermark"), "[]");
         assert_eq!(required_of("docxy_page_borders"), "[\"border\"]");
+        assert_eq!(required_of("docxy_comment_resolve"), "[\"id\"]");
+        assert_eq!(required_of("docxy_comments_delete_all"), "[]");
+        assert_eq!(required_of("docxy_display_mode"), "[]");
+        assert_eq!(required_of("docxy_track_changes"), "[]");
+        assert_eq!(required_of("docxy_track_changes_set"), "[\"enabled\"]");
     }
 
     /// Wave-2: `docxy_insert`/`docxy_replace_range`/`docxy_append` gain an
@@ -897,6 +983,11 @@ mod tests {
         ("docxy_page_color", "doc.page-color"),
         ("docxy_watermark", "doc.watermark"),
         ("docxy_page_borders", "doc.page-borders"),
+        ("docxy_comment_resolve", "doc.comment-resolve"),
+        ("docxy_comments_delete_all", "doc.comments-delete-all"),
+        ("docxy_display_mode", "doc.display-mode"),
+        ("docxy_track_changes", "doc.track-changes"),
+        ("docxy_track_changes_set", "doc.track-changes-set"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.
@@ -944,9 +1035,14 @@ mod tests {
 
     #[test]
     fn mutating_mcp_tools_forward_to_control_authorized_verbs() {
-        use crate::protection::MutationKind::{Content, Formatting, Structure};
+        use crate::protection::MutationKind::{
+            Comment, Content, Formatting, PackageMetadata, Structure,
+        };
 
         let expected = [
+            ("docxy_track_changes_set", PackageMetadata),
+            ("docxy_comment_resolve", Comment),
+            ("docxy_comments_delete_all", Comment),
             ("docxy_replace_range", Structure),
             ("docxy_insert", Structure),
             ("docxy_append", Structure),

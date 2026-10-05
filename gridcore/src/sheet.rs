@@ -546,6 +546,13 @@ pub struct Sheet {
     /// or an in-workbook location as `#Sheet!A1`. Rendered underlined; a click
     /// opens the URL (external) or jumps (internal).
     pub hyperlinks: std::collections::BTreeMap<(u32, u32), String>,
+    /// The `ref` each loaded `<hyperlink>` covers, keyed by its top-left
+    /// cell: a link over a range spreads over its cells in `hyperlinks`, and
+    /// removing it from one cell removes it from all of them (#671).
+    pub hyperlink_refs: std::collections::BTreeMap<(u32, u32), (u32, u32, u32, u32)>,
+    /// The `ref`s of loaded `<hyperlink>` elements whose link was removed: the
+    /// worksheet part still holds them, so a save strikes them.
+    pub hyperlinks_removed: Vec<(u32, u32, u32, u32)>,
     /// Data-validation rules (`<dataValidation>`): the constraint on a cell's
     /// value (a dropdown list, a number range, …). Surfaced in the UI, not
     /// enforced on edit.
@@ -559,10 +566,12 @@ pub struct Sheet {
     /// [`Drawing::anchor_ix`] of drawings deleted since the file was loaded —
     /// the same round-trip means a save has to strike them from the part too.
     pub drawings_removed: Vec<usize>,
-    /// [`CondFormat::ix`] of blocks a structural edit deleted (every range
-    /// gone): the worksheet part still holds them, so a save strikes them.
+    /// [`CondFormat::ix`] of blocks an edit deleted (every range gone: a
+    /// row or column delete, Clear All or Clear Formats): the worksheet
+    /// part still holds them, so a save strikes them.
     pub cf_removed: Vec<usize>,
-    /// [`DataValidation::ix`] of rules a structural edit deleted, likewise.
+    /// [`DataValidation::ix`] of rules an edit deleted (a row or column
+    /// delete, a paste of validation over them), likewise.
     pub dv_removed: Vec<usize>,
     /// Sheet protection: `Some(attrs)` holds the raw attribute string of the
     /// worksheet's `<sheetProtection>` element (e.g. `sheet="1" objects="1"`),
@@ -596,12 +605,19 @@ pub struct Sheet {
     /// filter. In memory only. `SUBTOTAL(1..11)` skips these rows but counts
     /// hand-hidden ones. See [`Sheet::row_filtered`].
     pub filtered_rows: std::collections::BTreeSet<u32>,
-    /// Where the sheet's own top-level `<autoFilter>` sits (not a custom
-    /// view's or a table's), so structural edits can move it. `None` when the
-    /// part has none, or once a delete took all of its rows or columns. A save
-    /// rewrites the element only when this differs from what the part holds,
-    /// and never adds one the file didn't have.
+    /// The sheet's own top-level `<autoFilter>` (not a custom view's or a
+    /// table's): where it sits, so structural edits can move it, and its
+    /// criteria. `None` when there is none, or once a delete took all of its
+    /// rows or columns. A save leaves the element alone while this matches
+    /// what the part holds, moves it when only its position changed, and
+    /// otherwise writes it from the model (adding one the filter commands
+    /// created).
     pub auto_filter: Option<SheetAutoFilter>,
+    /// `<sheetPr filterMode>` (some rows are filtered): what the part said at
+    /// load, then what a filter command last left. A save writes it when it
+    /// differs from the part. `None` for a sheet built in memory that no
+    /// filter command has touched, which means no filtering.
+    pub filter_mode: Option<bool>,
     /// `<sheetPr><outlinePr>`: where a group's summary row and column sit.
     /// Edit this; a save writes it only when it differs from
     /// [`Sheet::outline_loaded`].
@@ -656,9 +672,9 @@ impl Default for SheetFormat {
     }
 }
 
-/// The position of a sheet's `<autoFilter>`: its range and the column each
-/// `<filterColumn>` filters.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A sheet's `<autoFilter>`: its range, the column each `<filterColumn>`
+/// the part holds filters, and the live criteria.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SheetAutoFilter {
     /// (r1, c1, r2, c2), 0-based, header row included.
     pub range: (u32, u32, u32, u32),
@@ -666,6 +682,11 @@ pub struct SheetAutoFilter {
     /// range's left column plus its `colId`); `None` once a delete removed
     /// that column.
     pub columns: Vec<Option<u32>>,
+    /// The criteria by absolute column, in column order. Loaded from the
+    /// part (one per `<filterColumn>`), moved by structural edits, and set
+    /// by the filter commands ([`crate::filter`]). A save writes the element
+    /// from these once they differ from what the part holds.
+    pub criteria: Vec<(u32, crate::filter::ColumnFilter)>,
 }
 
 /// One `<brk>`: `id` is the 0-based first row (column) of the page that starts
@@ -1908,6 +1929,14 @@ pub struct Xf {
     pub color: Option<(u8, u8, u8)>,
     /// Solid fill (background) color as (r, g, b), when set.
     pub fill: Option<(u8, u8, u8)>,
+    /// The file gives the fill colour as a theme or indexed colour, which we
+    /// don't resolve: with `fill` `None`, the cell has *some* fill, just not
+    /// one we know. Filtering and sorting by colour treat it as unknown
+    /// (neither No Fill nor any colour); rendering ignores it.
+    pub fill_unresolved: bool,
+    /// Likewise for the font colour (`color` `None`): a theme or indexed
+    /// colour other than the default text colour.
+    pub color_unresolved: bool,
     pub align: Align,
     /// Font size in points (`None` = the default 11).
     pub font_size: Option<f64>,
@@ -1954,6 +1983,13 @@ pub struct Dxf {
     pub color: Option<(u8, u8, u8)>,
     pub bold: Option<bool>,
     pub italic: Option<bool>,
+    /// The fill is a theme or indexed colour we don't resolve (`fill`
+    /// `None`): the format sets *some* fill, so filtering and sorting by
+    /// colour treat a cell it formats as an unknown colour, as for
+    /// [`Xf::fill_unresolved`].
+    pub fill_unresolved: bool,
+    /// Likewise the font colour.
+    pub color_unresolved: bool,
 }
 
 /// One conditional-formatting rule (`<cfRule>`).
@@ -1973,18 +2009,43 @@ pub enum CfKind {
     CellIs { op: String, formulas: Vec<String> },
     /// `expression`: a formula truthy when the rule applies.
     Expression { formula: String },
-    /// Anything else (colorScale/dataBar/iconSet/top10/…) — not evaluated.
-    /// Its `<formula>` children are kept so structural edits can move them.
-    Other { formulas: Vec<String> },
+    /// `iconSet`: the icon of a cell is picked by its value against the
+    /// `<cfvo>` thresholds (see [`crate::cf::cell_icon`]). It sets no format,
+    /// and the rule saves as the file had it; `formulas` are its `<formula>`
+    /// children (it normally has none), moved like any rule's. A `cfvo`'s
+    /// `val` is read only.
+    IconSet {
+        set: String,
+        reverse: bool,
+        cfvos: Vec<Cfvo>,
+        formulas: Vec<String>,
+    },
+    /// Anything else (colorScale/dataBar/top10/duplicateValues/…) — not
+    /// evaluated. `rule_type` is its `type`; its `<formula>` children are
+    /// kept so structural edits can move them.
+    Other {
+        rule_type: String,
+        formulas: Vec<String>,
+    },
+}
+
+/// One `<cfvo>` of an icon set: a threshold of type `num`, `percent`,
+/// `percentile` or `formula` (`min`/`max` for the first), compared with `>=`
+/// unless `gte` is off.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Cfvo {
+    pub kind: String,
+    pub val: String,
+    pub gte: bool,
 }
 
 impl CfRule {
     /// The rule's formulas in document order, whatever its kind.
     pub fn formulas(&self) -> Vec<&String> {
         match &self.kind {
-            CfKind::CellIs { formulas, .. } | CfKind::Other { formulas } => {
-                formulas.iter().collect()
-            }
+            CfKind::CellIs { formulas, .. }
+            | CfKind::IconSet { formulas, .. }
+            | CfKind::Other { formulas, .. } => formulas.iter().collect(),
             CfKind::Expression { formula } => vec![formula],
         }
     }
@@ -1992,9 +2053,9 @@ impl CfRule {
     /// [`Self::formulas`], mutably.
     pub fn formulas_mut(&mut self) -> Vec<&mut String> {
         match &mut self.kind {
-            CfKind::CellIs { formulas, .. } | CfKind::Other { formulas } => {
-                formulas.iter_mut().collect()
-            }
+            CfKind::CellIs { formulas, .. }
+            | CfKind::IconSet { formulas, .. }
+            | CfKind::Other { formulas, .. } => formulas.iter_mut().collect(),
             CfKind::Expression { formula } => vec![formula],
         }
     }

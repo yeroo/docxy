@@ -224,7 +224,8 @@ fn a_downloaded_workbook_opens_protected_until_enable_editing() {
     );
     // #610 r2: a bar that acts on Enter, left open on another tab, does not
     // follow into the protected one. Open an ordinary workbook, open its
-    // AutoFilter bar and type a criterion, then come back and press Enter.
+    // Conditional Formatting bar and type a rule, then come back and press
+    // Enter. (The AutoFilter bar this drove is gone, #690.)
     let local = files.join("local.xlsx");
     std::fs::copy(root.join("fixtures/basic.xlsx"), &local).unwrap();
     ok(
@@ -236,19 +237,19 @@ fn a_downloaded_workbook_opens_protected_until_enable_editing() {
     ok(
         &driver,
         "ribbon-click",
-        vec![("tab", s("Home")), ("command", s("Filter"))],
+        vec![("tab", s("Home")), ("command", s("Conditional Formatting"))],
     );
-    ok(&driver, "type", vec![("text", s("North"))]);
+    ok(&driver, "type", vec![("text", s(">20"))]);
     let back = ok(&driver, "tab-select", vec![("tab", s("book.xlsx"))]);
     assert_eq!(back.get("protected"), Some(&Json::Bool(true)), "{back}");
     let st = ok(&driver, "key", vec![("keys", Json::Arr(vec![s("enter")]))]);
     assert_eq!(st.get("dirty"), Some(&Json::Bool(false)), "{st}");
-    // Enter moved the selection, as on any sheet: no filter bar was there to
-    // take it (a carried one swallows Enter and the selection stays put).
+    // Enter moved the selection, as on any sheet: no bar was there to take
+    // it (a carried one swallows Enter and the selection stays put).
     assert_ne!(
         st.get("sel"),
         back.get("sel"),
-        "the other tab's filter bar followed: {st}"
+        "the other tab's rule bar followed: {st}"
     );
     let after: Vec<String> = ["B2", "B3", "B4", "C2"]
         .iter()

@@ -90,7 +90,7 @@ pub fn new_record_changes(
         .map(|(c, cell)| (at, c, cell))
         .collect();
     for c in (c1..=c2).filter(|&c| formula_col(c)) {
-        changes.extend(fill_changes(s, (at, c, at, c), true));
+        changes.extend(fill_changes(s, (at, c, at, c), super::FillDir::Down));
     }
     Ok(changes)
 }
@@ -177,7 +177,7 @@ pub fn delete_record(wb: &mut Workbook, sheet: usize, (_, c1, bottom, c2): Area,
                     cell.formula = Some(moved);
                 }
             }
-            move_own_array_ref(&mut cell, (r, c), r - 1);
+            move_own_array_ref(&mut cell, (r, c), (r - 1, c));
             s.cells.insert((r - 1, c), cell);
         }
     }

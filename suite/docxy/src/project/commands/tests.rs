@@ -1376,6 +1376,7 @@ fn task_commands_do_nothing_on_the_entry_row() {
         AddLink,
         Constraint,
         Assign,
+        Hyperlink,
         UnlinkTasks,
         MoveTask,
         ScrollToTask,
@@ -2521,6 +2522,296 @@ fn an_open_prompt_swallows_f11() {
     assert!(v(&t).prompt.is_some());
 }
 
+#[test]
+fn ctrl_k_opens_the_hyperlink_prompt_prefilled() {
+    use ProjectAct::*;
+    assert_eq!(key_act("k", ctrl()), Some(Hyperlink));
+    for gated in [
+        Modifiers {
+            alt: true,
+            ..ctrl()
+        },
+        Modifiers {
+            platform: true,
+            ..ctrl()
+        },
+        Modifiers::default(),
+    ] {
+        assert_eq!(key_act("k", gated), None, "{gated:?}");
+    }
+    let mut t = tab();
+    vm(&mut t)
+        .ed
+        .set_hyperlink(
+            2,
+            "Pour instructions",
+            "https://example.com/a?x=1&y=2",
+            "Gantt Chart!4",
+        )
+        .unwrap();
+    chord(&mut t, "k", ctrl());
+    let p = v(&t).prompt.as_ref().unwrap();
+    assert_eq!(p.kind, PromptKind::Hyperlink);
+    assert_eq!(p.uid, Some(2));
+    assert_eq!(
+        p.buf,
+        "https://example.com/a?x=1&y=2#Gantt Chart!4 | Pour instructions"
+    );
+}
+
+/// The three hyperlink parts a commit left on the selected task (uid 2).
+fn hyperlink_parts(t: &DocTab) -> (Option<String>, Option<String>, Option<String>) {
+    let task = v(t).ed.project().task(2).unwrap();
+    (
+        task.hyperlink.clone(),
+        task.hyperlink_address.clone(),
+        task.hyperlink_sub_address.clone(),
+    )
+}
+
+#[test]
+fn hyperlink_prompt_commit_sets_the_task_and_undo_restores() {
+    let mut t = tab();
+    // An address alone: the display text defaults to it, as Project's
+    // Text to display does.
+    commit(&mut t, ProjectAct::Hyperlink, "https://example.com");
+    assert_eq!(
+        hyperlink_parts(&t),
+        (
+            Some("https://example.com".into()),
+            Some("https://example.com".into()),
+            None
+        )
+    );
+    assert_eq!(t.status.as_ref(), "Hyperlink set: https://example.com");
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    // All three parts in the buffer's grammar, still one undo step.
+    commit(
+        &mut t,
+        ProjectAct::Hyperlink,
+        "https://x#Gantt Chart!4 | Runbook",
+    );
+    assert_eq!(
+        hyperlink_parts(&t),
+        (
+            Some("Runbook".into()),
+            Some("https://x".into()),
+            Some("Gantt Chart!4".into())
+        )
+    );
+    assert_eq!(t.status.as_ref(), "Hyperlink set: Runbook");
+    assert_eq!(v(&t).ed.undo_depth(), 2);
+    // Undo walks back through both steps, redo replays them.
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(
+        hyperlink_parts(&t),
+        (
+            Some("https://example.com".into()),
+            Some("https://example.com".into()),
+            None
+        )
+    );
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(hyperlink_parts(&t), (None, None, None));
+    apply_project_act(&mut t, ProjectAct::Redo);
+    assert_eq!(
+        hyperlink_parts(&t),
+        (
+            Some("https://example.com".into()),
+            Some("https://example.com".into()),
+            None
+        )
+    );
+}
+
+#[test]
+fn hyperlink_prompt_empty_buffer_removes_and_reports() {
+    let mut t = tab();
+    // Nothing to remove: no status, no history.
+    let status = t.status.clone();
+    commit(&mut t, ProjectAct::Hyperlink, "");
+    assert_eq!(hyperlink_parts(&t), (None, None, None));
+    assert_eq!(t.status, status);
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    // A removed link says so, as one undo step holding the previous link.
+    vm(&mut t)
+        .ed
+        .set_hyperlink(2, "docs", "https://x", "Gantt Chart!4")
+        .unwrap();
+    commit(&mut t, ProjectAct::Hyperlink, "");
+    assert_eq!(hyperlink_parts(&t), (None, None, None));
+    assert_eq!(t.status.as_ref(), "Hyperlink removed");
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(
+        hyperlink_parts(&t),
+        (
+            Some("docs".into()),
+            Some("https://x".into()),
+            Some("Gantt Chart!4".into())
+        )
+    );
+}
+
+#[test]
+fn hyperlink_prompt_parse_cases() {
+    let opt = |s: Option<&str>| s.map(str::to_string);
+    for (buf, address, location, text) in [
+        (
+            "https://example.com",
+            Some("https://example.com"),
+            None,
+            None,
+        ),
+        (
+            "https://x#Gantt Chart!4",
+            Some("https://x"),
+            Some("Gantt Chart!4"),
+            None,
+        ),
+        // An address-less `#Gantt Chart!4` is a location-only link.
+        ("#Gantt Chart!4", None, Some("Gantt Chart!4"), None),
+        (
+            "https://x | Runbook",
+            Some("https://x"),
+            None,
+            Some("Runbook"),
+        ),
+        (
+            "https://x#loc | Runbook",
+            Some("https://x"),
+            Some("loc"),
+            Some("Runbook"),
+        ),
+        (" | text only", None, None, Some("text only")),
+        // The first ` | ` splits; a later one stays in the text.
+        (
+            "https://x | one | two",
+            Some("https://x"),
+            None,
+            Some("one | two"),
+        ),
+        // Ends are trimmed, inner whitespace kept.
+        (
+            "  https://x  |  Run book  ",
+            Some("https://x"),
+            None,
+            Some("Run book"),
+        ),
+        // `| TEXT` without the leading space is text-only, like ` | TEXT`.
+        ("| Runbook", None, None, Some("Runbook")),
+        ("|Runbook", None, None, Some("Runbook")),
+        ("", None, None, None),
+    ] {
+        assert_eq!(
+            parse_hyperlink(buf),
+            (opt(address), opt(location), opt(text)),
+            "{buf}"
+        );
+    }
+}
+
+/// #418 r1: the prefill must parse back to the stored parts for every shape
+/// a file can hold — including a text containing the grammar's own `|` and
+/// `#` — so looking at a link never recasts it.
+#[test]
+fn hyperlink_prefill_round_trips_through_parse() {
+    let opt = |s: Option<&str>| s.map(str::to_string);
+    for (text, address, location) in [
+        (Some("Runbook"), None, None),
+        (Some("a | b"), None, None),
+        (Some("a#b"), None, None),
+        (None, None, Some("Gantt Chart!4")),
+        (None, Some("https://x"), None),
+        (Some("docs"), Some("https://x"), None),
+        (Some("docs"), None, Some("loc")),
+        (Some("docs"), Some("https://x"), Some("loc")),
+    ] {
+        let task = projcore::model::Task {
+            hyperlink: text.map(str::to_string),
+            hyperlink_address: address.map(str::to_string),
+            hyperlink_sub_address: location.map(str::to_string),
+            ..projcore::model::Task::default()
+        };
+        assert_eq!(
+            parse_hyperlink(&hyperlink_hint(&task)),
+            (opt(address), opt(location), opt(text)),
+            "{text:?} {address:?} {location:?}"
+        );
+    }
+}
+
+/// #418 r1: Enter on the prefill the prompt opened with — an address-only
+/// link, the empty elements #408 keeps, an address holding `#` — changes
+/// nothing: no fabricated text, no dropped elements, no re-split, no undo
+/// step, no dirty flag.
+#[test]
+fn hyperlink_prompt_enter_on_unchanged_prefill_changes_nothing() {
+    for (text, address, location) in [
+        (None, Some("https://example.com"), None),
+        (Some(""), Some(""), Some("")),
+        (Some("docs"), Some("https://x/#/route"), Some("Sheet!1")),
+    ] {
+        let mut t = tab();
+        let mut p = v(&t).ed.project().clone();
+        p.tasks[1].hyperlink = text.map(str::to_string);
+        p.tasks[1].hyperlink_address = address.map(str::to_string);
+        p.tasks[1].hyperlink_sub_address = location.map(str::to_string);
+        vm(&mut t).ed = ProjectEditor::new(p);
+        vm(&mut t).ed.select(1);
+        let before = v(&t).ed.project().clone();
+        let status = t.status.clone();
+        let depth = v(&t).ed.undo_depth();
+        chord(&mut t, "k", ctrl());
+        press(&mut t, "enter");
+        assert_eq!(
+            hyperlink_parts(&t),
+            (
+                before.task(2).unwrap().hyperlink.clone(),
+                before.task(2).unwrap().hyperlink_address.clone(),
+                before.task(2).unwrap().hyperlink_sub_address.clone()
+            ),
+            "{text:?} {address:?} {location:?}"
+        );
+        assert_eq!(v(&t).ed.project(), &before);
+        assert_eq!(v(&t).ed.undo_depth(), depth);
+        assert_eq!(t.status, status);
+        assert!(!t.dirty);
+    }
+}
+
+/// #418 r2: an empty buffer still removes a link whose stored parts are
+/// empty strings (a lone empty <HyperlinkAddress/> loads that way): the
+/// unchanged-prefill no-op must not swallow "empty to remove".
+#[test]
+fn hyperlink_prompt_empty_buffer_removes_empty_stored_parts() {
+    let mut t = tab();
+    let mut p = v(&t).ed.project().clone();
+    p.tasks[1].hyperlink_address = Some(String::new());
+    vm(&mut t).ed = ProjectEditor::new(p);
+    vm(&mut t).ed.select(1);
+    let depth = v(&t).ed.undo_depth();
+    chord(&mut t, "k", ctrl());
+    assert_eq!(v(&t).prompt.as_ref().unwrap().buf, "");
+    press(&mut t, "enter");
+    assert_eq!(hyperlink_parts(&t), (None, None, None));
+    assert_eq!(t.status.as_ref(), "Hyperlink removed");
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(hyperlink_parts(&t), (None, Some(String::new()), None));
+}
+
+#[test]
+fn hyperlink_prompt_does_not_open_on_the_entry_row() {
+    let mut t = tab();
+    vm(&mut t).enter_entry_row();
+    let status = t.status.clone();
+    chord(&mut t, "k", ctrl());
+    assert!(v(&t).prompt.is_none());
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    assert_eq!(t.status, status);
+    assert!(!t.dirty);
+}
+
 /// The Duration cell as the table shows it.
 fn duration_text(t: &DocTab, i: usize) -> String {
     let ed = &v(t).ed;
@@ -2975,6 +3266,7 @@ fn the_row_menu_enables_by_the_row_under_the_cursor() {
         "Auto Schedule",
         "Assign Resources...",
         "Information...",
+        "Hyperlink...",
     ];
     assert_eq!(enabled_items(&t), all_task);
     // A blank row can be inserted above and deleted, not scheduled.
@@ -2992,6 +3284,21 @@ fn the_row_menu_enables_by_the_row_under_the_cursor() {
     assert_eq!(enabled_items(&t), ["Cut", "Copy", "Paste", "Insert Task"]);
     // No tick without a task.
     assert!(row_menu(&t).iter().all(|(_, _, checked)| !checked));
+}
+
+/// #418: the row menu's Hyperlink... opens the prompt on a task row only,
+/// like Information....
+#[test]
+fn row_menu_hyperlink_is_enabled_on_a_task_row() {
+    let mut t = tab();
+    let enabled = |t: &DocTab| enabled_items(t).contains(&"Hyperlink...".to_string());
+    assert!(enabled(&t), "a task row links");
+    // A blank row in the middle of the plan has no task to link.
+    let i = vm(&mut t).ed.insert_blank_row(Some(2)).unwrap();
+    vm(&mut t).ed.select(i);
+    assert!(!enabled(&t), "a blank row does not");
+    vm(&mut t).enter_entry_row();
+    assert!(!enabled(&t), "the entry row does not");
 }
 
 /// #397: the ticks are the ribbon's (`project_act_active`).

@@ -6,6 +6,7 @@
 //!   xlsxy <in.xlsx> --recalc <out>      headless: recalculate and save
 //!   xlsxy <in.xlsx> --csv <out.csv>     headless: export the active sheet as CSV UTF-8
 //!   xlsxy <in.xlsx> --pdf <out.pdf>     headless: print the active sheet to PDF
+//!   xlsxy --version (-V)                print the build (commit, last merged PR, kind)
 //!
 //! The engine lives in the pure `gridcore` crate; this binary is the TUI
 //! shell: a cell grid with Excel muscle memory (formula bar, A1 navigation,
@@ -21,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 mod backstage;
 mod control;
+mod datacmd;
 mod dataform;
 mod mcp;
 mod outlinedlg;
@@ -32,11 +34,13 @@ mod textdlg;
 // for the `impl backstage::BackstageHost for App` call sites below.
 use backstage::BackstageHost as _;
 
+use gridcore::autocorrect::{AutoCorrect, Correction};
 use gridcore::comments::Comment;
 use gridcore::docprops::{CustomProperty, CustomValue, DocProperties};
-use gridcore::edit::{fill_changes, replace_all_in_sheet};
+use gridcore::edit::{FillDir, fill_changes, replace_all_in_sheet};
 use gridcore::engine::{Engine, PART_OF_ARRAY};
 use gridcore::entry::{EntryCtx, entry_cell, entry_cell_ctx, entry_ctx, seed_text};
+use gridcore::fcomplete::Completions;
 use gridcore::formula::{qualify_sheet_in_formula, translate_formula};
 use gridcore::frame::Agg;
 use gridcore::legacy::{SourceFormat, open_workbook as open_any};
@@ -474,6 +478,15 @@ fn is_text_import(path: &str) -> bool {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--version` prints the build block (commit, last merged PR, build kind) and
+    // exits, before any file-oriented argument parsing or terminal setup.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        print!(
+            "{}",
+            buildinfo::get(env!("CARGO_PKG_VERSION")).version_block("xlsxy")
+        );
+        return ExitCode::SUCCESS;
+    }
     // `--mcp` runs the headless MCP stdio bridge (a client of a running xlsxy),
     // not the editor, so handle it before the file-oriented argument parsing.
     if args.iter().any(|a| a == "--mcp") {
@@ -1068,6 +1081,7 @@ fn print_usage() {
                                             and diff against Excel's cached values\n  \
            xlsxy <file> --vim               modal (vim) navigation: hjkl, v, dd, :w :q\n  \
            xlsxy <file> --read-only (-r)    open read-only: Save asks for a new name\n  \
+           xlsxy --version (-V)             print the build (commit, last merged PR, kind)\n  \
            xlsxy --mcp                      run the MCP bridge to drive a live xlsxy\n  \
            xlsxy install skill              install the agent SKILL.md (self-onboarding)\n\n\
          EDITOR KEYS:\n  \
@@ -1083,14 +1097,33 @@ fn print_usage() {
            F5 insert rows  Shift-F5 delete rows  F6/Shift-F6 same for columns\n  \
            Ctrl-T add sheet  Shift-F2 rename sheet  Shift-Del delete sheet\n  \
            F12 Save As   F7 / F8 shrink / widen the current column\n  \
+           Ctrl-Shift-L filter buttons on/off   Alt-↓ on a header: its filter\n  \
+           Alt-↓ elsewhere: pick from the column's entries (or a formula's names)\n  \
+           Ctrl-E Flash Fill · Ctrl-Z while typing takes back an AutoCorrect\n  \
+           a formula's name list: ↑/↓ choose, Tab insert, Esc close\n  \
            mouse: click to move · drag to select · double-click to edit · wheel to scroll"
     );
 }
 
-/// Current local time as an Excel serial: Excel's `TODAY()`/`NOW()`, and
-/// the year a typed `3/4` takes, follow the local clock.
+thread_local! {
+    /// `wb.clock`'s fixed date (a serial), standing in for the local clock
+    /// until it is cleared. Thread-local: the app runs on one thread, and
+    /// tests running side by side don't see each other's.
+    static CLOCK_OVERRIDE: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fix the clock at `serial` (`None`: the local clock again) — `wb.clock`.
+fn set_clock_override(serial: Option<f64>) {
+    CLOCK_OVERRIDE.with(|c| c.set(serial));
+}
+
+/// Current local time as an Excel serial: Excel's `TODAY()`/`NOW()`, the
+/// year a typed `3/4` takes, and a date filter's "today" follow the local
+/// clock, or the date `wb.clock` fixed.
 fn now_serial() -> Option<f64> {
-    gridcore::clock::local_now_serial()
+    CLOCK_OVERRIDE
+        .with(|c| c.get())
+        .or_else(gridcore::clock::local_now_serial)
 }
 
 fn entropy_seed() -> Option<u64> {
@@ -1455,6 +1488,7 @@ fn values_agree(a: &CellValue, b: &CellValue) -> bool {
 
 /// In-cell editing state. `replace` distinguishes Excel's two modes: typing
 /// over a cell (arrows commit + move) vs F2 (arrows move inside the text).
+#[derive(Default)]
 struct EditState {
     text: String,
     cursor: usize, // char index
@@ -1468,6 +1502,20 @@ struct EditState {
     /// commit takes the value; Backspace or Delete drops the suffix; a caret
     /// move keeps the text as typed-plus-suffix and drops the marker.
     proposal: Option<(usize, String)>,
+    /// The AutoCorrect change the last typed character made (#667), while it
+    /// is the latest edit: Ctrl+Z takes back just it (ENT-119).
+    correction: Option<Correction>,
+    /// Where a correction was taken back: the word starting there is not
+    /// corrected again, as typed or at the commit.
+    kept: Option<usize>,
+    /// The last edit was a character typed at the end of the text: the
+    /// commit's AutoCorrect then sees the word just typed. Any caret move or
+    /// other edit clears it, so an F2 fix elsewhere in a cell never corrects
+    /// a last word nobody typed (FIX r2 m3).
+    typed_tail: bool,
+    /// Formula AutoComplete's list at the caret (#686) and its highlighted
+    /// item. Esc closes it until the formula is edited again.
+    complete: Option<(Completions, usize)>,
 }
 
 /// How soon a second press on the same cell makes a double-click.
@@ -1533,6 +1581,23 @@ struct WbSnapshot {
     model_rename: Option<(String, String)>,
 }
 
+/// Whether `wb` differs from the snapshot `before` in what a filter or sort
+/// command can change: cells, rows' hidden state and attributes, columns,
+/// merges, the AutoFilter, and the defined names.
+fn wb_changed(before: &WbSnapshot, wb: &gridcore::sheet::Workbook) -> bool {
+    before.names != wb.defined_names
+        || before.sheets.len() != wb.sheets.len()
+        || before.sheets.iter().zip(&wb.sheets).any(|(a, b)| {
+            a.cells != b.cells
+                || a.row_attrs != b.row_attrs
+                || a.col_defs != b.col_defs
+                || a.merges != b.merges
+                || a.filtered_rows != b.filtered_rows
+                || a.auto_filter != b.auto_filter
+                || a.filter_mode.unwrap_or(false) != b.filter_mode.unwrap_or(false)
+        })
+}
+
 enum UndoAction {
     /// One undo step; more than one group when it touched several sheets
     /// (a cut pasted on another sheet). The view follows the last group.
@@ -1573,10 +1638,18 @@ enum PromptKind {
     CondFormat,
     /// Data validation: comma-separated allowed values → a dropdown list.
     DataValidation,
-    /// AutoFilter: a criteria on the current column ("=Laptop", ">500", "clear").
-    Filter,
-    /// Multi-level sort: a spec like "B asc, C desc" over the current region.
+    /// Custom AutoFilter, Top 10 or a date period for a filter column
+    /// (`>10 and <=30`, `begins a`, `top 3`, `above average`, `this week`).
+    CustomFilter,
+    /// Filter by Selected Cell's value, colour, font colour or icon.
+    FilterByCell,
+    /// Advanced Filter: `list=A1:C9 criteria=E1:E2 copy=H1:I1 unique`.
+    AdvancedFilter,
+    /// Multi-level sort: a spec like "B asc, C desc" over the selection or
+    /// the current region (see [`datacmd::parse_sort_text`]).
     SortKeys,
+    /// The Sort Warning: expand the selection, or continue with it.
+    SortWarning,
     /// Row height in points for the selected rows ("auto" clears it).
     RowHeight,
     /// File › Info: a new value for editable property `n` ([`INFO_FIELDS`]),
@@ -1745,6 +1818,9 @@ struct PivotEdit {
     sel: usize,
 }
 
+/// [`ClipData::sheet`] of a copy whose sheet was deleted.
+const SHEET_GONE: usize = usize::MAX;
+
 /// An internal clipboard: a rect of cells plus its source sheet and corner so
 /// pasted formulas can shift their relative references (Excel semantics) and
 /// a cut clears the sheet it came from.
@@ -1756,10 +1832,28 @@ struct ClipData {
     cut: bool,
 }
 
-/// The list-validation dropdown: the allowed values and the highlighted row.
+/// The AutoCorrect switches File › Options shows (#667): the ones xlsxy
+/// acts on.
+const AC_OPTION_KEYS: [&str; 8] = [
+    "ac_two_initial_caps",
+    "ac_first_letter",
+    "ac_names_of_days",
+    "ac_caps_lock",
+    "ac_replace_text",
+    "ac_hyperlinks",
+    "ac_math_outside",
+    "ac_math_replace",
+];
+
+/// A drop-down list over the cursor cell: a `list` validation's allowed
+/// values, or Pick From Drop-down List's column entries (Alt+Down, #665).
 struct DvPicker {
     values: Vec<String>,
-    sel: usize,
+    /// The highlighted row. A validation list opens on the cell's value (or
+    /// the first); the pick list opens on none, so Down lands on the first.
+    sel: Option<usize>,
+    /// Pick From Drop-down List rather than a validation list.
+    pick: bool,
 }
 
 /// What a confirmed (Yes) modal should do.
@@ -1835,6 +1929,9 @@ struct App {
     auto_convert: AutoConvert,
     /// File › Options › Editing (persisted, #672).
     edit_opts: EditOptions,
+    /// AutoCorrect's switches, list and exceptions (#667), saved with the
+    /// preferences.
+    autocorrect: AutoCorrect,
     /// Ctrl+Shift+U: the formula bar is four rows of wrapped text. View
     /// state for this session, not persisted.
     fx_expanded: bool,
@@ -1880,6 +1977,12 @@ struct App {
     sheet_picker: Option<usize>,
     /// The list-validation dropdown, open on a `list`-validated cell.
     dv_picker: Option<DvPicker>,
+    /// A filter button's drop-down (Alt+Down on the filter's header row).
+    filter_picker: Option<datacmd::FilterPicker>,
+    /// A sort waiting on the Sort Warning's answer.
+    pending_sort: Option<datacmd::PendingSort>,
+    /// The column the Custom AutoFilter prompt filters.
+    custom_filter_col: Option<u32>,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
@@ -1977,6 +2080,7 @@ impl App {
             show_comments: false,
             auto_convert: AutoConvert::default(),
             edit_opts: EditOptions::default(),
+            autocorrect: AutoCorrect::default(),
             fx_expanded: false,
             last_click: None,
             comment_sel: 0,
@@ -2022,6 +2126,9 @@ impl App {
             startup_import: false,
             sheet_picker: None,
             dv_picker: None,
+            filter_picker: None,
+            pending_sort: None,
+            custom_filter_col: None,
             grid_area: Rect::default(),
             gutter_w: 4,
             outline_w: 0,
@@ -2105,7 +2212,8 @@ impl App {
             text,
             cursor,
             replace: initial.is_some(),
-            proposal: None,
+            typed_tail: initial.is_some(),
+            ..EditState::default()
         });
         self.anchor = None;
     }
@@ -2263,16 +2371,28 @@ impl App {
         let Some(mut edit) = self.edit.take() else {
             return true;
         };
+        let took = edit.proposal.is_some();
         if let Some((_, value)) = edit.proposal.take() {
             edit.text = value;
         }
-        let (text, seed) = (edit.text, edit.seed);
+        let (text, seed, kept, tail) = (edit.text, edit.seed, edit.kept, edit.typed_tail);
         // A seeded editor left unchanged must not re-read the cell: `007` in
         // a quote-prefixed cell is fine either way, but a stored
         // 0.30000000000000004 would come back as 0.3.
         if seed.as_deref() == Some(text.as_str()) {
             return true;
         }
+        // AutoCorrect's last word (#667) when it was just typed, unless a
+        // taken AutoComplete proposal or pick spelled the entry, or Ctrl+Z
+        // took the word back.
+        let fix = (!took && tail)
+            .then(|| self.autocorrect.correct_at_commit(&text))
+            .flatten()
+            .filter(|c| kept != Some(c.start));
+        let text = match fix {
+            Some(c) => c.apply(&text),
+            None => text,
+        };
         let (r, c) = self.cur;
         let formula = gridcore::entry::typed_formula(&self.pkg.workbook, self.sheet, r, c, &text);
         if let Some(Err(e)) = formula.map(Engine::validate) {
@@ -2282,7 +2402,7 @@ impl App {
                 text,
                 replace: false,
                 seed,
-                proposal: None,
+                ..EditState::default()
             });
             return false;
         }
@@ -2297,19 +2417,29 @@ impl App {
                     text,
                     replace: false,
                     seed,
-                    proposal: None,
+                    ..EditState::default()
                 });
                 return false;
             }
         };
-        if !self.apply(vec![(r, c, cell)]) {
+        // A typed URL, e-mail address or network path becomes a hyperlink
+        // (ENT-120) when it commits as text.
+        let link = (!took)
+            .then(|| self.autocorrect.hyperlink(&text))
+            .flatten()
+            .filter(|_| cell.formula.is_none() && matches!(cell.value, CellValue::Text(_)));
+        let applied = match link {
+            Some(url) => self.apply_with_link(r, c, cell, url),
+            None => self.apply(vec![(r, c, cell)]),
+        };
+        if !applied {
             // Refused (part of an array): keep the editor open, as Excel does.
             self.edit = Some(EditState {
                 cursor: text.chars().count(),
                 text,
                 replace: false,
                 seed,
-                proposal: None,
+                ..EditState::default()
             });
             return false;
         }
@@ -2318,6 +2448,24 @@ impl App {
 
     fn cancel_edit(&mut self) {
         self.edit = None;
+    }
+
+    /// Commit `cell` at (r, c) of the active sheet with a hyperlink to `url`,
+    /// as one undo step that takes both back. Refused like [`Self::apply`].
+    fn apply_with_link(&mut self, r: u32, c: u32, cell: Cell, url: String) -> bool {
+        let s = self.sheet;
+        let change = vec![(r, c, cell)];
+        if self.engine.refuses(&self.pkg.workbook, s, &change) {
+            self.status = Some(PART_OF_ARRAY.to_string());
+            return false;
+        }
+        self.structural_writing_cells(|wb| {
+            for (r, c, cell) in change {
+                wb.sheets[s].set_cell(r, c, cell);
+            }
+            wb.sheets[s].hyperlinks.insert((r, c), url);
+        });
+        true
     }
 
     /// Undo/redo snapshots of `keys` on sheet `sheet_idx` as it is now
@@ -2639,7 +2787,8 @@ impl App {
         model_rename: Option<(&str, &str)>,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.structural_step(model_rename, false, op)
+        self.structural_step(model_rename, false, false, op)
+            .map(|_| ())
     }
 
     /// [`Self::structural`] for an edit that writes cell content in place
@@ -2648,22 +2797,35 @@ impl App {
     /// ([`Self::sync_written_headers`]). An edit that moves cells (rows,
     /// columns, a sort) must not use it: its moved headers aren't written.
     fn structural_writing_cells(&mut self, op: impl FnOnce(&mut gridcore::sheet::Workbook)) {
-        let infallible = self.structural_step(None, true, |wb| {
+        let infallible = self.structural_step(None, true, false, |wb| {
             op(wb);
             Ok(())
         });
         debug_assert!(infallible.is_ok());
     }
 
-    /// The one structural step behind [`Self::try_structural`] and
-    /// [`Self::structural_writing_cells`]; `sync_headers` says whether the
-    /// edit wrote cells in place, whose header cells then rename columns.
+    /// [`Self::try_structural`] for an edit that may change nothing (a
+    /// filter command, a sort, #690/#691): then it pushes no undo step and
+    /// leaves the workbook unmodified. Whether it changed anything.
+    fn try_structural_if_changed(
+        &mut self,
+        op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        self.structural_step(None, false, true, op)
+    }
+
+    /// The one structural step behind [`Self::try_structural`],
+    /// [`Self::structural_writing_cells`] and
+    /// [`Self::try_structural_if_changed`]; `sync_headers` says whether the
+    /// edit wrote cells in place, whose header cells then rename columns, and
+    /// `skip_unchanged` that an edit that changed nothing is not one.
     fn structural_step(
         &mut self,
         model_rename: Option<(&str, &str)>,
         sync_headers: bool,
+        skip_unchanged: bool,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let mut before = self.wb_snapshot();
         // A structural edit moves cells, so compare how many cells sit on
         // circles rather than where: a circle that merely moved is not new.
@@ -2671,6 +2833,9 @@ impl App {
         if let Err(e) = op(&mut self.pkg.workbook) {
             self.put_back(&before);
             return Err(e);
+        }
+        if skip_unchanged && !wb_changed(&before, &self.pkg.workbook) {
+            return Ok(false);
         }
         if sync_headers {
             self.sync_written_headers(&before);
@@ -2690,7 +2855,7 @@ impl App {
         self.modified = true;
         self.clamp_cursor();
         self.cancel_cut();
-        Ok(())
+        Ok(true)
     }
 
     /// A structural edit that wrote cells in place (Replace All, Text to
@@ -4693,23 +4858,285 @@ impl App {
         }
         let current = self.current_input_text();
         let sel = values.iter().position(|v| *v == current).unwrap_or(0);
-        self.dv_picker = Some(DvPicker { values, sel });
+        self.dv_picker = Some(DvPicker {
+            values,
+            sel: Some(sel),
+            pick: false,
+        });
+    }
+
+    /// Pick From Drop-down List (Alt+Down, #665, ENT-072): the column
+    /// block's distinct text entries over the cursor cell, nothing
+    /// highlighted. False, with the status saying why, when there is no list.
+    fn open_pick_list(&mut self) -> bool {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return false;
+        }
+        let (r, c) = self.cur;
+        let values = gridcore::entry::pick_list(self.sheet(), r, c);
+        if values.is_empty() {
+            self.status = Some("No entries above or below this cell to pick from".into());
+            return false;
+        }
+        self.dv_picker = Some(DvPicker {
+            values,
+            sel: None,
+            pick: true,
+        });
+        true
+    }
+
+    /// Alt+Down on the grid: a filter button's drop-down, else a `list`
+    /// validation's, else Pick From Drop-down List (Excel's order).
+    fn alt_down(&mut self) {
+        if self.open_filter_picker() {
+            return;
+        }
+        if self.current_validation().is_some_and(|d| d.kind == "list") {
+            self.open_dv_dropdown();
+        } else {
+            self.open_pick_list();
+        }
+    }
+
+    /// Enter a value chosen from the pick list into the cursor cell, as a
+    /// typed commit would (an open editor's text is replaced): through
+    /// [`Self::commit_edit`], as a taken proposal, so AutoCorrect leaves the
+    /// column's own spelling alone.
+    fn pick_value(&mut self, value: String) {
+        let seed = self.edit.take().and_then(|e| e.seed);
+        self.edit = Some(EditState {
+            cursor: value.chars().count(),
+            text: value.clone(),
+            replace: true,
+            seed,
+            proposal: Some((0, value)),
+            ..EditState::default()
+        });
+        self.commit_edit();
+    }
+
+    /// Ctrl+E (#666): Flash Fill the cursor's column; the status says what
+    /// it did, or why it did nothing (ENT-110).
+    fn flash_fill(&mut self) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
+        let (r, c) = self.cur;
+        self.status = Some(match self.flash_fill_on(self.sheet, r, c) {
+            Ok(f) => format!(
+                "Flash Fill: {} changed cells, {} blank cells",
+                f.fills.len(),
+                f.blank.len()
+            ),
+            Err(e) => e,
+        });
+    }
+
+    /// Flash Fill the column of (row, col) on sheet `si` as one undo step,
+    /// each result committed as a typed entry (ENT-108).
+    fn flash_fill_on(
+        &mut self,
+        si: usize,
+        row: u32,
+        col: u32,
+    ) -> Result<gridcore::flashfill::FlashFill, String> {
+        let fill = gridcore::flashfill::flash_fill(&self.pkg.workbook, si, row, col)
+            .map_err(|e| e.message().to_string())?;
+        let mut changes = Vec::new();
+        for (r, text) in &fill.fills {
+            let cell = entry_cell(&mut self.pkg.workbook, si, *r, fill.col, text, now_serial())
+                .map_err(|e| e.to_string())?;
+            changes.push((*r, fill.col, cell));
+        }
+        if !self.apply_on(si, changes) {
+            return Err(PART_OF_ARRAY.to_string());
+        }
+        Ok(fill)
+    }
+
+    /// The keys an open editor gives the typing assistance before its own
+    /// (#665, #666, #667, #686): an open formula list's Up/Down/Tab/Esc, then
+    /// Alt+Down, Ctrl+E and Ctrl+Z — ahead of the type-over arrows that
+    /// commit and the Ctrl chords the editor ignores. True when taken.
+    fn edit_assist_key(&mut self, code: KeyCode, ctrl: bool, alt: bool) -> bool {
+        if let Some(e) = self.edit.as_mut() {
+            if let Some((list, sel)) = &mut e.complete {
+                let last = list.items.len().saturating_sub(1);
+                match code {
+                    KeyCode::Up if !alt => *sel = sel.saturating_sub(1),
+                    KeyCode::Down if !alt => *sel = (*sel + 1).min(last),
+                    KeyCode::Tab => {
+                        if let Some((text, cursor)) = list.insert(&e.text, e.cursor, *sel) {
+                            e.text = text;
+                            e.cursor = cursor;
+                        }
+                        e.complete = None;
+                    }
+                    KeyCode::Esc => e.complete = None,
+                    _ => return self.edit_chord(code, ctrl, alt),
+                }
+                return true;
+            }
+        }
+        self.edit_chord(code, ctrl, alt)
+    }
+
+    fn edit_chord(&mut self, code: KeyCode, ctrl: bool, alt: bool) -> bool {
+        match code {
+            KeyCode::Down if alt => self.edit_alt_down(),
+            KeyCode::Char('e') | KeyCode::Char('E') if ctrl => {
+                if self.commit_edit() {
+                    self.flash_fill();
+                }
+            }
+            KeyCode::Char('z') | KeyCode::Char('Z') if ctrl => self.edit_undo(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Alt+Down while editing: a formula's AutoComplete list on demand
+    /// (FRM-153), or a text entry's pick list.
+    fn edit_alt_down(&mut self) {
+        let Some(e) = self.edit.as_ref() else {
+            return;
+        };
+        if !e.text.starts_with('=') {
+            self.open_pick_list();
+            return;
+        }
+        let list = gridcore::fcomplete::completions(
+            &e.text,
+            e.cursor,
+            &self.pkg.workbook,
+            self.sheet,
+            true,
+        );
+        match list {
+            Some(list) => {
+                if let Some(e) = self.edit.as_mut() {
+                    e.complete = Some((list, 0));
+                }
+            }
+            None => self.status = Some("No functions or names to offer here".into()),
+        }
+    }
+
+    /// Ctrl+Z in the editor: right after an AutoCorrect change, take back
+    /// only it (ENT-119) — and the AutoComplete proposal the corrected word
+    /// may have started; otherwise undo the typing, back to the text the
+    /// editor opened with (or nothing, when typing replaced the cell).
+    fn edit_undo(&mut self) {
+        // An AutoComplete proposal the corrected word started goes first:
+        // its suffix is not part of what was typed.
+        self.drop_proposal();
+        let Some(e) = self.edit.as_mut() else {
+            return;
+        };
+        e.complete = None;
+        if let Some(c) = e.correction.take() {
+            if let Some(text) = c.undo(&e.text) {
+                e.cursor = e.cursor.saturating_add_signed(-c.shift());
+                e.text = text;
+                e.kept = Some(c.start);
+                return;
+            }
+        }
+        e.text = e.seed.clone().unwrap_or_default();
+        e.cursor = e.text.chars().count();
+        e.kept = None;
+        e.typed_tail = false;
+    }
+
+    /// After `ch` was typed into the editor: when it ends a word, AutoCorrect
+    /// that word (#667), remembering the change for Ctrl+Z.
+    fn autocorrect_typed(&mut self, ch: char) {
+        if !gridcore::autocorrect::ends_word(ch) {
+            return;
+        }
+        let Some(e) = self.edit.as_mut() else {
+            return;
+        };
+        let Some(c) = self
+            .autocorrect
+            .correct(&e.text, e.cursor.saturating_sub(1))
+        else {
+            return;
+        };
+        if e.kept == Some(c.start) {
+            return;
+        }
+        e.text = c.apply(&e.text);
+        e.cursor = e.cursor.saturating_add_signed(c.shift());
+        e.correction = Some(c);
+    }
+
+    /// Formula AutoComplete (#686): the list at the caret of a formula being
+    /// edited, with the option on; closed otherwise. The highlight stays on
+    /// the item it was on while that is still listed.
+    fn refresh_completions(&mut self) {
+        let Some(e) = self.edit.as_ref() else {
+            return;
+        };
+        let list = if self.edit_opts.formula_autocomplete {
+            gridcore::fcomplete::completions(
+                &e.text,
+                e.cursor,
+                &self.pkg.workbook,
+                self.sheet,
+                false,
+            )
+        } else {
+            None
+        };
+        let was = e
+            .complete
+            .as_ref()
+            .and_then(|(l, i)| l.items.get(*i))
+            .map(|i| i.label.clone());
+        let list = list.map(|l| {
+            let at = was
+                .and_then(|w| l.items.iter().position(|i| i.label == w))
+                .unwrap_or(0);
+            (l, at)
+        });
+        if let Some(e) = self.edit.as_mut() {
+            e.complete = list;
+        }
     }
 
     fn dv_picker_key(&mut self, code: KeyCode) {
         let Some(p) = self.dv_picker.as_mut() else {
             return;
         };
-        let n = p.values.len();
+        let last = p.values.len().saturating_sub(1);
         match code {
             KeyCode::Esc => self.dv_picker = None,
-            KeyCode::Up | KeyCode::Char('k') => p.sel = p.sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => p.sel = (p.sel + 1).min(n - 1),
-            KeyCode::Home => p.sel = 0,
-            KeyCode::End => p.sel = n - 1,
+            KeyCode::Up | KeyCode::Char('k') => {
+                p.sel = Some(p.sel.map_or(0, |s| s.saturating_sub(1)));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                p.sel = Some(p.sel.map_or(0, |s| (s + 1).min(last)));
+            }
+            KeyCode::Home => p.sel = Some(0),
+            KeyCode::End => p.sel = Some(last),
             KeyCode::Enter | KeyCode::Tab => {
-                let value = p.values[p.sel].clone();
+                // Nothing highlighted (a pick list just opened): close.
+                let Some(value) = p.sel.and_then(|i| p.values.get(i)).cloned() else {
+                    self.dv_picker = None;
+                    return;
+                };
+                let pick = p.pick;
                 self.dv_picker = None;
+                if pick {
+                    self.pick_value(value);
+                    return;
+                }
                 let (r, c) = self.cur;
                 match entry_cell(
                     &mut self.pkg.workbook,
@@ -4756,6 +5183,7 @@ impl App {
     fn apply_view_prefs(&mut self, text: &str) {
         self.auto_convert = auto_convert_from_prefs(text);
         self.edit_opts = EditOptions::from_text(text);
+        self.autocorrect = AutoCorrect::from_text(text);
         for line in text.lines() {
             if let Some((k, v)) = line.split_once('=') {
                 let on = v.trim() == "1";
@@ -4802,6 +5230,7 @@ impl App {
             text.push_str(&format!("{key}={}\n", u8::from(on)));
         }
         text.push_str(&self.edit_opts.to_lines());
+        text.push_str(&self.autocorrect.to_lines());
         if let Some(dir) = &self.alt_startup {
             text.push_str(&format!("alt_startup_path={dir}\n"));
         }
@@ -4821,14 +5250,17 @@ impl App {
             Replace => self.open_prompt(PromptKind::ReplaceFind),
             GoTo => self.open_prompt(PromptKind::GoTo),
             ClearContents => self.clear_selection(),
-            FillDown => self.fill(true),
-            FillRight => self.fill(false),
+            FillDown => self.fill(FillDir::Down),
+            FillRight => self.fill(FillDir::Right),
+            FillUp => self.fill(FillDir::Up),
+            FillLeft => self.fill(FillDir::Left),
+            PasteSpecial => self.open_paste_special(),
             InsertRow => self.row_op(true),
             InsertCol => self.col_op(true),
             DeleteRow => self.row_op(false),
             DeleteCol => self.col_op(false),
-            SortAsc => self.sort_region(true),
-            SortDesc => self.sort_region(false),
+            SortAsc => self.quick_sort(true),
+            SortDesc => self.quick_sort(false),
             CustomSort => self.open_prompt(PromptKind::SortKeys),
             AutoSum => self.autosum(),
             InsertChart(kind) => self.insert_chart(kind),
@@ -4849,7 +5281,20 @@ impl App {
             RowHeight => self.open_prompt(PromptKind::RowHeight),
             CondFormat => self.open_prompt(PromptKind::CondFormat),
             DataValidation => self.open_prompt(PromptKind::DataValidation),
-            Filter => self.open_prompt(PromptKind::Filter),
+            Filter => {
+                let sel = self.selection();
+                let range = ((sel.0, sel.1) != (sel.2, sel.3)).then_some(sel);
+                let _ = self.toggle_filter(range);
+            }
+            ClearFilter => {
+                let _ = self
+                    .filter_command(|wb, si, today| gridcore::filter::clear(wb, si, None, today));
+            }
+            ReapplyFilter => {
+                let _ = self.filter_command(gridcore::filter::reapply);
+            }
+            AdvancedFilter => self.open_prompt(PromptKind::AdvancedFilter),
+            FilterByCell => self.open_prompt(PromptKind::FilterByCell),
             RemoveDuplicates => self.remove_duplicates(),
             TextToColumns => self.open_text_to_columns(),
             FormatAsTable => self.format_as_table(),
@@ -4990,9 +5435,13 @@ impl App {
         self.ribbon_focus = ribbon::Focus::None;
     }
 
-    /// File › Options' rows: Data's Automatic Data Conversion switches and
-    /// Advanced › Editing's options (#672), each keyed by its preference key.
-    /// Fill handle and drag-and-drop is left out: xlsxy has neither.
+    /// File › Options' rows: Data's Automatic Data Conversion switches,
+    /// Advanced › Editing's options (#672), Formula AutoComplete and the
+    /// AutoCorrect switches (#667, #686), each keyed by its preference key.
+    /// Rows for what xlsxy does not have are left out: fill handle and
+    /// drag-and-drop, Automatically Flash Fill (the TUI shows no preview),
+    /// the AutoCorrect Options buttons, the right-click actions and the
+    /// table AutoFormat switches.
     fn option_rows(&self) -> Vec<backstage::OptRow> {
         use backstage::OptRow;
         use gridcore::options as o;
@@ -5065,7 +5514,22 @@ impl App {
                 "Enable AutoComplete for cell values",
                 e.autocomplete,
             ),
+            OptRow::check(
+                o::KEY_FORMULA_AUTOCOMPLETE,
+                "Formulas › Working with formulas",
+                "Formula AutoComplete",
+                e.formula_autocomplete,
+            ),
         ]
+        .into_iter()
+        .chain(AC_OPTION_KEYS.iter().filter_map(|&key| {
+            let (_, label, _) = gridcore::autocorrect::SWITCHES
+                .iter()
+                .find(|(k, _, _)| *k == key)?;
+            let on = self.autocorrect.opts.get(key)?;
+            Some(OptRow::check(key, "Proofing › AutoCorrect", label, on))
+        }))
+        .collect()
     }
 
     /// Take File › Options' rows into the app, by key (they are saved with
@@ -5101,7 +5565,14 @@ impl App {
             edit_in_cell: check(o::KEY_EDIT_IN_CELL, e.edit_in_cell),
             autocomplete: check(o::KEY_AUTOCOMPLETE, e.autocomplete),
             fill_handle: e.fill_handle,
+            flash_fill_auto: e.flash_fill_auto,
+            formula_autocomplete: check(o::KEY_FORMULA_AUTOCOMPLETE, e.formula_autocomplete),
         };
+        for key in AC_OPTION_KEYS {
+            if let (Some(on), Some(slot)) = (b.option_check(key), self.autocorrect.opts.slot(key)) {
+                *slot = on;
+            }
+        }
     }
 
     /// Leave the File backstage via a click on the ribbon tab strip. Clicking
@@ -5792,95 +6263,6 @@ impl App {
         ));
     }
 
-    /// Sort the contiguous region around the cursor by the cursor's column
-    /// (header-aware; rows move as whole units; blanks last). Value-table sort —
-    /// like the suite; formula refs in moved rows are not re-based.
-    /// The contiguous region around the cursor to sort, as `(start, bottom)`
-    /// data-row bounds (header excluded). A header is inferred when the top row
-    /// has a text label over numeric data in *any* column. `None` when there's
-    /// nothing to sort.
-    fn sort_bounds(&self) -> Option<(u32, u32)> {
-        use gridcore::sheet::CellValue;
-        let (rc, cc) = self.sheet().used_size();
-        if rc == 0 || cc == 0 {
-            return None;
-        }
-        let (max_r, max_c) = (rc - 1, cc - 1);
-        let cur_r = self.cur.0;
-        let sh = self.sheet();
-        let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-        if !used(cur_r) {
-            return None;
-        }
-        let mut top = cur_r;
-        while top > 0 && used(top - 1) {
-            top -= 1;
-        }
-        let mut bottom = cur_r;
-        while bottom < max_r && used(bottom + 1) {
-            bottom += 1;
-        }
-        let header = (0..=max_c).any(|c| {
-            matches!(
-                sh.cell(top, c).map(|cl| &cl.value),
-                Some(CellValue::Text(_))
-            ) && (top + 1..=bottom).any(|r| {
-                matches!(
-                    sh.cell(r, c).map(|cl| &cl.value),
-                    Some(CellValue::Number(_))
-                )
-            })
-        });
-        let start = if header { top + 1 } else { top };
-        (bottom > start).then_some((start, bottom))
-    }
-
-    fn sort_region(&mut self, ascending: bool) {
-        let sc = self.cur.1;
-        let Some((start, bottom)) = self.sort_bounds() else {
-            return;
-        };
-        let s = self.sheet;
-        if gridcore::edit::sort_cuts_spill(&self.pkg.workbook, s, start, bottom) {
-            self.status = Some(gridcore::edit::SORT_CUTS_SPILL.into());
-            return;
-        }
-        self.structural(move |wb| {
-            gridcore::edit::sort_rows(wb, s, start, bottom, &[(sc, ascending)]);
-        });
-        self.status = Some(format!(
-            "Sorted {}",
-            if ascending { "A->Z" } else { "Z->A" }
-        ));
-    }
-
-    /// Multi-level sort from a typed spec like "B asc, C desc" (column letters,
-    /// optional asc/desc, default ascending). The first key is primary.
-    fn commit_sort(&mut self, text: &str) {
-        let Some(keys) = gridcore::edit::parse_sort_spec(text) else {
-            self.status = Some("Sort: enter columns, e.g. \"B asc, C desc\"".into());
-            return;
-        };
-        let Some((start, bottom)) = self.sort_bounds() else {
-            self.status = Some("Sort: put the cursor in the data".into());
-            return;
-        };
-        let s = self.sheet;
-        if gridcore::edit::sort_cuts_spill(&self.pkg.workbook, s, start, bottom) {
-            self.status = Some(gridcore::edit::SORT_CUTS_SPILL.into());
-            return;
-        }
-        let keys2 = keys.clone();
-        self.structural(move |wb| {
-            gridcore::edit::sort_rows(wb, s, start, bottom, &keys2);
-        });
-        self.status = Some(format!(
-            "Sorted by {} key{}",
-            keys.len(),
-            if keys.len() == 1 { "" } else { "s" }
-        ));
-    }
-
     /// AutoSum: put =SUM(range) in the current cell, summing the run of numbers
     /// directly above (else to the left).
     fn autosum(&mut self) {
@@ -6317,6 +6699,80 @@ impl App {
         }
     }
 
+    /// Home › Paste Special (Ctrl+Alt+V): the dialog, over xlsxy's own copy
+    /// (a paste special needs its formulas and formats; text from another
+    /// program has neither).
+    fn open_paste_special(&mut self) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
+        match &self.clip {
+            None => {
+                self.status = Some("Paste Special pastes a copy made here: copy first".into());
+                return;
+            }
+            // Excel offers only Paste for a cut (#707 r1).
+            Some(clip) if clip.cut => {
+                self.status = Some("A cut pastes with Paste only (Ctrl+V)".into());
+                return;
+            }
+            _ => {}
+        }
+        self.outline_dialog = Some(outlinedlg::Dialog::PasteSpecial(
+            outlinedlg::PasteSpecialDialog::default(),
+        ));
+    }
+
+    /// Paste Special `spec` of the copy at the cursor, through gridcore's
+    /// [`gridcore::edit::paste_special_changes`], as one undo step.
+    fn paste_special(&mut self, spec: gridcore::edit::PasteSpec) {
+        let Some(clip) = self.clip.clone() else {
+            return;
+        };
+        if clip.sheet >= self.pkg.workbook.sheets.len() {
+            self.status = Some("The copy's sheet is gone: copy again".into());
+            return;
+        }
+        let rows: Vec<u32> = (0..clip.cells.len() as u32)
+            .map(|i| clip.from.0 + i)
+            .collect();
+        let w = clip.cells.iter().map(Vec::len).max().unwrap_or(0) as u32;
+        let cols: Vec<u32> = (0..w).map(|j| clip.from.1 + j).collect();
+        let mut block =
+            gridcore::edit::ClipBlock::capture(&self.pkg.workbook, clip.sheet, rows, cols);
+        // The cells as they were copied.
+        block.cells = clip
+            .cells
+            .iter()
+            .map(|row| {
+                let mut row: Vec<Cell> =
+                    row.iter().map(|c| c.clone().unwrap_or_default()).collect();
+                row.resize(w as usize, Cell::default());
+                row
+            })
+            .collect();
+        let s = self.sheet;
+        let changes = match gridcore::edit::paste_special_changes(
+            &mut self.pkg.workbook,
+            s,
+            self.cur,
+            &block,
+            &spec,
+        ) {
+            Ok(changes) => changes,
+            Err(why) => {
+                self.status = Some(why.into());
+                return;
+            }
+        };
+        let n = changes.len();
+        if self.apply(changes) {
+            self.status = Some(format!("Pasted {} into {n} cell(s)", spec.what.label()));
+        }
+    }
+
     /// A key for the open outline dialog.
     fn outline_dialog_key(&mut self, code: KeyCode) {
         let Some(d) = self.outline_dialog.as_mut() else {
@@ -6326,6 +6782,10 @@ impl App {
         match outcome {
             outlinedlg::Outcome::Pending => {}
             outlinedlg::Outcome::Cancel => self.outline_dialog = None,
+            outlinedlg::Outcome::PasteSpecial(spec) => {
+                self.outline_dialog = None;
+                self.paste_special(spec);
+            }
             outlinedlg::Outcome::Subtotal(opts) => {
                 let Some(outlinedlg::Dialog::Subtotal(d)) = self.outline_dialog.clone() else {
                     return;
@@ -6945,72 +7405,6 @@ impl App {
         });
     }
 
-    /// AutoFilter: hide the rows of the current region whose cursor-column value
-    /// fails the typed criteria (header row kept). "clear" unhides them all.
-    fn commit_filter(&mut self, text: &str) {
-        use gridcore::sheet::CellValue;
-        let s = self.sheet;
-        let sc = self.cur.1;
-        let cur_r = self.cur.0;
-        let (rc, cc) = self.sheet().used_size();
-        if rc == 0 || cc == 0 {
-            return;
-        }
-        let (max_r, max_c) = (rc - 1, cc - 1);
-        // Contiguous region around the cursor.
-        let (top, bottom, header) = {
-            let sh = self.sheet();
-            let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-            if !used(cur_r) {
-                return;
-            }
-            let mut top = cur_r;
-            while top > 0 && used(top - 1) {
-                top -= 1;
-            }
-            let mut bottom = cur_r;
-            while bottom < max_r && used(bottom + 1) {
-                bottom += 1;
-            }
-            let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
-            (top, bottom, header)
-        };
-        if text.trim().eq_ignore_ascii_case("clear") {
-            for r in top..=bottom {
-                self.pkg.workbook.sheets[s].set_row_filtered(r, false);
-            }
-            // SUBTOTAL(1..11) counts rows by whether a filter hid them.
-            self.engine.recalc_all(&mut self.pkg.workbook);
-            self.clamp_cursor();
-            self.modified = true;
-            self.status = Some("Filter cleared".into());
-            return;
-        }
-        let Some((op, operand)) = gridcore::filter::parse(text) else {
-            self.status = Some("Filter: enter a value or comparison".into());
-            return;
-        };
-        let start = if header { top + 1 } else { top };
-        let keep: Vec<bool> = (start..=bottom)
-            .map(|r| {
-                let v = self.sheet().cell(r, sc).map(|c| c.value.clone());
-                gridcore::filter::matches(v.as_ref(), op, &operand)
-            })
-            .collect();
-        let mut hidden = 0;
-        for (i, r) in (start..=bottom).enumerate() {
-            let hide = !keep[i];
-            if hide {
-                hidden += 1;
-            }
-            self.pkg.workbook.sheets[s].set_row_filtered(r, hide);
-        }
-        self.engine.recalc_all(&mut self.pkg.workbook);
-        self.clamp_cursor();
-        self.modified = true;
-        self.status = Some(format!("Filtered by column: {hidden} rows hidden"));
-    }
-
     /// Create a list data-validation (dropdown) over the selection from a
     /// comma-separated list of allowed values.
     fn commit_data_validation(&mut self, text: &str) {
@@ -7065,8 +7459,7 @@ impl App {
         let dxf = gridcore::sheet::Dxf {
             fill: Some((0xFF, 0xC7, 0xCE)),
             color: Some((0x9C, 0x00, 0x06)),
-            bold: None,
-            italic: None,
+            ..Default::default()
         };
         if !self
             .pkg
@@ -7144,12 +7537,18 @@ impl App {
         self.status = Some(format!("Inserted {kind} chart"));
     }
 
-    /// Ctrl-D / Ctrl-R: fill the selection from its first row/column,
-    /// translating relative refs — or, when the selection is one row high
-    /// (Ctrl-D) or one column wide (Ctrl-R), a single cell included, pull
-    /// each cell from the row above / the column to the left.
-    fn fill(&mut self, down: bool) {
-        let changes = fill_changes(self.sheet(), self.selection(), down);
+    /// Ctrl-D / Ctrl-R and Fill Up / Left: fill the selection from its first
+    /// row/column (last, for Up and Left), translating relative refs — or,
+    /// when the selection is one cell deep along the fill, pull each cell
+    /// from its neighbour before it.
+    fn fill(&mut self, dir: FillDir) {
+        // A protected sheet refuses, as Delete does (#707 r3 m5).
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
+        let changes = fill_changes(self.sheet(), self.selection(), dir);
         if changes.is_empty() {
             return;
         }
@@ -7160,7 +7559,7 @@ impl App {
         self.status = Some(format!(
             "Filled {n} cell{} {}",
             if n == 1 { "" } else { "s" },
-            if down { "down" } else { "right" }
+            dir.label().to_ascii_lowercase()
         ));
     }
 
@@ -7557,11 +7956,26 @@ impl App {
             PromptKind::DataValidation => {
                 ("Dropdown list (comma-separated values): ", String::new())
             }
-            PromptKind::Filter => (
-                "Filter this column (=Laptop, >500, <>0, 'clear'): ",
+            PromptKind::CustomFilter => (
+                "Filter (>10 and <=30, begins a, top 3, top 25%, above average, this week): ",
                 String::new(),
             ),
-            PromptKind::SortKeys => ("Sort by (e.g. B asc, C desc): ", String::new()),
+            PromptKind::FilterByCell => (
+                "Filter by selected cell's (v)alue, (c)olor, (f)ont color, (i)con: ",
+                String::new(),
+            ),
+            PromptKind::AdvancedFilter => (
+                "Advanced Filter (list=A1:C9 criteria=E1:E2 copy=H1:I1 unique): ",
+                String::new(),
+            ),
+            PromptKind::SortKeys => (
+                "Sort by (B asc, C desc, A list:Jan/Feb, A fill:FF00B050 top; /case /ltr /noheader): ",
+                String::new(),
+            ),
+            PromptKind::SortWarning => (
+                "Data next to your selection won't be sorted: (e)xpand the selection / (c)ontinue: ",
+                String::new(),
+            ),
             PromptKind::RowHeight => ("Row height in points (or 'auto'): ", String::new()),
             PromptKind::DocProperty(i) => {
                 let mut p = self.pkg.doc_properties();
@@ -7607,8 +8021,11 @@ impl App {
             PromptKind::GoTo => self.goto(&text),
             PromptKind::CondFormat => self.commit_cond_format(&text),
             PromptKind::DataValidation => self.commit_data_validation(&text),
-            PromptKind::Filter => self.commit_filter(&text),
-            PromptKind::SortKeys => self.commit_sort(&text),
+            PromptKind::CustomFilter => self.commit_custom_filter(&text),
+            PromptKind::FilterByCell => self.commit_filter_by_cell(&text),
+            PromptKind::AdvancedFilter => self.commit_advanced_filter(&text),
+            PromptKind::SortKeys => self.commit_sort_text(&text),
+            PromptKind::SortWarning => self.answer_sort_warning(&text),
             PromptKind::RowHeight => self.commit_row_height(&text),
             PromptKind::DocProperty(i) => {
                 let message = self.commit_doc_property(i as usize, &text);
@@ -7757,8 +8174,19 @@ impl App {
 
     fn delete_current_sheet(&mut self) {
         let name = self.pkg.workbook.sheets[self.sheet].name.clone();
-        if self.pkg.remove_sheet(self.sheet) {
+        let gone = self.sheet;
+        if self.pkg.remove_sheet(gone) {
             self.cancel_cut();
+            // The copy names its sheet by index: one deleted leaves it no
+            // sheet (it still pastes its cells as a copy, but Paste Special
+            // has nothing to read), and one before it renumbers it (#707 r1).
+            if let Some(clip) = self.clip.as_mut() {
+                if clip.sheet == gone {
+                    clip.sheet = SHEET_GONE;
+                } else if clip.sheet > gone && clip.sheet != SHEET_GONE {
+                    clip.sheet -= 1;
+                }
+            }
             self.sheet = self.sheet.min(self.pkg.workbook.sheets.len() - 1);
             self.cur = (0, 0);
             self.top = 0;
@@ -7853,6 +8281,10 @@ impl backstage::BackstageHost for App {
             RLine::raw(format!(
                 "  Modified    {}",
                 if self.modified { "yes" } else { "no" }
+            )),
+            RLine::raw(format!(
+                "  Build       {}",
+                buildinfo::get(env!("CARGO_PKG_VERSION")).short_line()
             )),
             RLine::raw(String::new()),
             RLine::raw(format!(
@@ -8302,6 +8734,14 @@ fn draw(app: &mut App, f: &mut Frame) {
                     Align::General => fit(&line_text, w as usize, numeric),
                 }
             };
+            // A filter button sits at the right edge of each header cell.
+            let display = match datacmd::filter_button(&app.pkg.workbook, app.sheet, row, col) {
+                Some(mark) if sub == 0 && w > 1 => {
+                    let (head, _) = truncate_width(&display, w as usize - 1);
+                    format!("{}{mark}", fit(&head, w as usize - 1, false))
+                }
+                _ => display,
+            };
             let mut style = base;
             if xf.bold {
                 style = style.add_modifier(Modifier::BOLD);
@@ -8396,6 +8836,11 @@ fn draw(app: &mut App, f: &mut Frame) {
     // --- data-validation dropdown ----------------------------------------------
     if let Some(p) = &app.dv_picker {
         draw_dv_picker(app, p, f, grid);
+    } else if let Some((list, sel)) = app.edit.as_ref().and_then(|e| e.complete.as_ref()) {
+        draw_completions(app, list, *sel, f, grid);
+    }
+    if let Some(p) = &app.filter_picker {
+        datacmd::draw_filter_picker(app, p, f, grid);
     }
 
     // --- sheet tabs + stats ---------------------------------------------------
@@ -8506,6 +8951,9 @@ fn draw(app: &mut App, f: &mut Frame) {
         s.clone()
     } else if app.edit.is_some() {
         "Enter commit ↓ · Tab commit → · Esc cancel".to_string()
+    } else if app.filter_picker.is_some() {
+        "Filter: ↑/↓ move · Space check · type to search · Tab add to filter · Enter apply · Esc close"
+            .to_string()
     } else if let Some(dv) = app.current_validation() {
         if dv.kind == "list" {
             format!("✔ {}   ·   Alt-↓ dropdown", dv.describe())
@@ -8893,22 +9341,59 @@ fn num_short(v: f64) -> String {
 }
 
 fn draw_dv_picker(app: &App, p: &DvPicker, f: &mut Frame, grid: Rect) {
-    if p.values.is_empty() {
+    let title = if p.pick {
+        " Pick from list"
+    } else {
+        " Choose value"
+    };
+    draw_list_popup(app, title, &p.values, p.sel, f, grid);
+}
+
+/// Formula AutoComplete's list (#686) under the cell being edited.
+fn draw_completions(app: &App, list: &Completions, sel: usize, f: &mut Frame, grid: Rect) {
+    let rows: Vec<String> = list
+        .items
+        .iter()
+        .map(|i| {
+            let mark = match i.kind {
+                gridcore::fcomplete::Kind::Function => "fx",
+                gridcore::fcomplete::Kind::Name => "nm",
+                gridcore::fcomplete::Kind::Table => "tb",
+                gridcore::fcomplete::Kind::Column => "co",
+                gridcore::fcomplete::Kind::Specifier => "  ",
+            };
+            format!("{mark} {}", i.label)
+        })
+        .collect();
+    draw_list_popup(app, " Formula AutoComplete", &rows, Some(sel), f, grid);
+}
+
+/// A list under the cursor cell (above it when there is no room below),
+/// with `sel` highlighted and scrolled into view.
+fn draw_list_popup(
+    app: &App,
+    title: &str,
+    values: &[String],
+    sel: Option<usize>,
+    f: &mut Frame,
+    grid: Rect,
+) {
+    if values.is_empty() {
         return;
     }
-    let widest = p
-        .values
+    let widest = values
         .iter()
         .map(|v| v.chars().count())
         .max()
         .unwrap_or(6)
+        .max(title.chars().count())
         .max(8);
     // See `draw_sheet_picker`: `clamp` asserts `min <= max`, and a narrow
     // terminal leaves the available width below the 10 asked for here.
     let w = ((widest + 4) as u16)
         .max(10)
         .min(grid.width.saturating_sub(2));
-    let h = (p.values.len() as u16 + 2).min(grid.height.max(3));
+    let h = (values.len() as u16 + 2).min(grid.height.max(3));
     // Anchor under the cursor cell when it's on screen, else the grid's corner.
     let cell_x = app
         .vis_cols
@@ -8931,13 +9416,13 @@ fn draw_dv_picker(app: &App, p: &DvPicker, f: &mut Frame, grid: Rect) {
     let area = Rect::new(x, y, w, h);
     f.render_widget(Clear, area);
     let mut lines: Vec<RLine> = vec![RLine::from(RSpan::styled(
-        fit(" Choose value", w as usize, false),
+        fit(title, w as usize, false),
         Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
     ))];
     let vis = h.saturating_sub(2) as usize;
-    let top = p.sel.saturating_sub(vis.saturating_sub(1));
-    for (i, v) in p.values.iter().enumerate().skip(top).take(vis) {
-        let style = if i == p.sel {
+    let top = sel.unwrap_or(0).saturating_sub(vis.saturating_sub(1));
+    for (i, v) in values.iter().enumerate().skip(top).take(vis) {
+        let style = if Some(i) == sel {
             Style::new().fg(Color::Black).bg(Color::Cyan)
         } else {
             Style::new()
@@ -9361,7 +9846,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         || app.outline_dialog.is_some()
         || app.data_form.is_some()
         || app.sheet_picker.is_some()
-        || app.dv_picker.is_some();
+        || app.dv_picker.is_some()
+        || app.filter_picker.is_some();
     // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
     if key.code == KeyCode::F(9) && !overlay_open && !shift && !ctrl {
         app.ribbon_focus = if app.ribbon_focus == ribbon::Focus::None {
@@ -9407,6 +9893,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // --- data-validation dropdown ---------------------------------------------
     if app.dv_picker.is_some() {
         app.dv_picker_key(key.code);
+        return false;
+    }
+
+    // --- filter drop-down ------------------------------------------------------
+    if app.filter_picker.is_some() {
+        app.filter_picker_key(key.code);
         return false;
     }
 
@@ -9494,6 +9986,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 
     // --- edit mode -----------------------------------------------------------
     if app.edit.is_some() {
+        if app.edit_assist_key(key.code, ctrl, alt) {
+            return false;
+        }
+        let was = app.edit.as_ref().map(|e| (e.text.clone(), e.cursor));
         let replace = app.edit.as_ref().is_some_and(|e| e.replace);
         // A caret move keeps an AutoComplete proposal's text and drops its
         // marker; the keys that commit take the proposal in `commit_edit`.
@@ -9581,17 +10077,33 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 }
             }
             KeyCode::Char(ch) if !ctrl => {
-                // A typed character replaces a proposal's suffix, then the
-                // match runs again on the longer text.
+                // A typed character replaces a proposal's suffix, then
+                // AutoCorrect sees the word it may end, then the match runs
+                // again on the longer text.
                 app.drop_proposal();
                 if let Some(e) = &mut app.edit {
                     let idx = char_index(&e.text, e.cursor);
+                    e.typed_tail = e.cursor == e.text.chars().count();
                     e.text.insert(idx, ch);
                     e.cursor += 1;
+                    e.correction = None;
                 }
+                app.autocorrect_typed(ch);
                 app.propose();
             }
             _ => {}
+        }
+        // Any other change to the text or caret ends a correction's Ctrl+Z
+        // (the typed character set its own), and moves the formula list.
+        let now = app.edit.as_ref().map(|e| (e.text.clone(), e.cursor));
+        if now.is_some() && now != was {
+            if !matches!(key.code, KeyCode::Char(_)) {
+                if let Some(e) = &mut app.edit {
+                    e.correction = None;
+                    e.typed_tail = false;
+                }
+            }
+            app.refresh_completions();
         }
         return false;
     }
@@ -9613,9 +10125,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('y') | KeyCode::Char('Y') if ctrl => app.redo(),
         KeyCode::Char('c') | KeyCode::Char('C') if ctrl => app.copy(false),
         KeyCode::Char('x') | KeyCode::Char('X') if ctrl => app.copy(true),
+        // Ctrl+Alt+V, when the terminal reports it: Paste Special (#669).
+        KeyCode::Char('v') | KeyCode::Char('V') if ctrl && alt => app.open_paste_special(),
         KeyCode::Char('v') | KeyCode::Char('V') if ctrl => app.paste(),
-        KeyCode::Char('d') | KeyCode::Char('D') if ctrl => app.fill(true),
-        KeyCode::Char('r') | KeyCode::Char('R') if ctrl => app.fill(false),
+        KeyCode::Char('d') | KeyCode::Char('D') if ctrl => app.fill(FillDir::Down),
+        KeyCode::Char('r') | KeyCode::Char('R') if ctrl => app.fill(FillDir::Right),
         KeyCode::Char('f') | KeyCode::Char('F') if alt => app.open_backstage(),
         KeyCode::Char('o') | KeyCode::Char('O') if ctrl => {
             app.open_backstage();
@@ -9660,8 +10174,17 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.cur = (rows - 1, cols.max(1) - 1);
             }
         }
-        // Alt-↓ on a validated cell opens its dropdown (Excel parity).
-        KeyCode::Down if alt => app.open_dv_dropdown(),
+        // Alt-↓ on a filter button opens its drop-down, on a list-validated
+        // cell its list, elsewhere Pick From Drop-down List (Excel parity).
+        KeyCode::Down if alt => app.alt_down(),
+        // Ctrl+E: Flash Fill (#666).
+        KeyCode::Char('e') | KeyCode::Char('E') if ctrl => app.flash_fill(),
+        // Ctrl+Shift+L: Data › Filter.
+        KeyCode::Char('l') | KeyCode::Char('L') if ctrl && shift => {
+            let sel = app.selection();
+            let range = ((sel.0, sel.1) != (sel.2, sel.3)).then_some(sel);
+            let _ = app.toggle_filter(range);
+        }
         // Excel's Group / Ungroup.
         KeyCode::Right if alt && shift => app.group_outline(false),
         KeyCode::Left if alt && shift => app.group_outline(true),
@@ -10138,6 +10661,18 @@ mod tests {
     use super::*;
     use gridcore::edit::parse_input;
     use gridcore::xlsx::{load_xlsx, save_xlsx};
+
+    #[test]
+    fn backstage_info_shows_the_build_line() {
+        let app = App::new(new_xlsx(), "untitled.xlsx");
+        let info: Vec<String> = app.info_lines().iter().map(|l| l.to_string()).collect();
+        let line = buildinfo::get(env!("CARGO_PKG_VERSION")).short_line();
+        assert!(
+            info.iter()
+                .any(|l| l.contains("Build") && l.contains(&line)),
+            "{info:?}"
+        );
+    }
 
     /// `Backup of <stem>.xlk` lives beside the file; the stem keeps any
     /// dots in the name.
@@ -12468,6 +13003,179 @@ mod tests {
         assert_eq!(f_attrs_at(&app, 0, 0, 3), None);
     }
 
+    /// #669: Paste Special over xlsxy's own copy, through gridcore's rules.
+    #[test]
+    fn paste_special_values_transpose_and_an_operation() {
+        let mut app = App::new(new_xlsx(), "ps.xlsx");
+        app.os_clip = None;
+        let s = &mut app.pkg.workbook.sheets[0];
+        s.set_cell(0, 0, Cell::number(2.0));
+        s.set_cell(1, 0, Cell::formula("A1*3"));
+        app.engine = Engine::new(&app.pkg.workbook);
+        app.engine.recalc_all(&mut app.pkg.workbook);
+        app.cur = (1, 0);
+        app.anchor = Some((0, 0));
+        app.copy(false);
+        app.anchor = None;
+        app.cur = (0, 2);
+        app.open_paste_special();
+        assert!(matches!(
+            app.outline_dialog,
+            Some(outlinedlg::Dialog::PasteSpecial(_))
+        ));
+        // Values, transposed: C1 2, D1 6 (no formula).
+        app.outline_dialog_key(KeyCode::Right);
+        app.outline_dialog_key(KeyCode::Right);
+        for _ in 0..3 {
+            app.outline_dialog_key(KeyCode::Down);
+        }
+        app.outline_dialog_key(KeyCode::Char(' '));
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        let cell = |app: &App, r, c| app.sheet().cell(r, c).cloned().unwrap_or_default();
+        assert_eq!(cell(&app, 0, 3).value, CellValue::Number(6.0));
+        assert!(cell(&app, 0, 3).formula.is_none());
+        // Multiply onto a constant.
+        app.pkg.workbook.sheets[0].set_cell(5, 0, Cell::number(10.0));
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.copy(false);
+        app.cur = (5, 0);
+        app.paste_special(gridcore::edit::PasteSpec {
+            op: gridcore::edit::PasteOp::Multiply,
+            ..Default::default()
+        });
+        assert_eq!(cell(&app, 5, 0).value, CellValue::Number(20.0));
+        assert!(app.undo.len() >= 2, "each paste is an undo step");
+    }
+
+    /// #707 r1 C1: a copy whose sheet is deleted keeps its cells but marks
+    /// its sheet gone (`SHEET_GONE`), so Paste Special refuses it rather
+    /// than read a sheet that is not there (it panicked); a copy on a later
+    /// sheet follows the renumbering. M5: a cut takes Paste only.
+    #[test]
+    fn paste_special_after_the_copys_sheet_is_deleted() {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Sheet2");
+        pkg.add_sheet("Sheet3");
+        let mut app = App::new(pkg, "del.xlsx");
+        app.os_clip = None;
+        app.sheet = 1;
+        app.pkg.workbook.sheets[1].set_cell(0, 0, Cell::number(2.0));
+        app.pkg.workbook.sheets[1].set_cell(1, 0, Cell::formula("A1*3"));
+        app.cur = (1, 0);
+        app.anchor = Some((0, 0));
+        app.copy(false);
+        app.delete_current_sheet();
+        assert_eq!(app.clip.as_ref().map(|c| c.sheet), Some(SHEET_GONE));
+        app.anchor = None;
+        app.open_paste_special();
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        assert!(app.status.as_deref().unwrap_or("").contains("gone"));
+        // Even a clip left pointing past the sheets is refused, not a panic.
+        app.clip = Some(ClipData {
+            cells: vec![vec![Some(Cell::number(1.0))]],
+            sheet: 9,
+            from: (0, 0),
+            cut: false,
+        });
+        app.paste_special(gridcore::edit::PasteSpec::default());
+        assert!(app.status.as_deref().unwrap_or("").contains("gone"));
+        // A copy on Sheet3 survives deleting Sheet1, renumbered.
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Sheet2");
+        let mut app = App::new(pkg, "renum.xlsx");
+        app.os_clip = None;
+        app.sheet = 1;
+        app.pkg.workbook.sheets[1].set_cell(0, 0, Cell::number(5.0));
+        app.copy(false);
+        app.sheet = 0;
+        app.delete_current_sheet();
+        assert_eq!(app.clip.as_ref().map(|c| c.sheet), Some(0));
+        // M5: a cut refuses Paste Special.
+        app.copy(true);
+        app.open_paste_special();
+        assert!(app.outline_dialog.is_none());
+        assert!(app.status.as_deref().unwrap_or("").contains("cut"));
+    }
+
+    /// #707 r4 M1: Paste Special › All of a spilling array pastes its
+    /// members blank, so the pasted formula spills again; Values writes
+    /// what they show.
+    #[test]
+    fn paste_special_of_a_spill_spills_again() {
+        for (what, formula_kept) in [
+            (gridcore::edit::PasteWhat::All, true),
+            (gridcore::edit::PasteWhat::Formulas, true),
+            (gridcore::edit::PasteWhat::Values, false),
+        ] {
+            let mut app = App::new(new_xlsx(), "spill.xlsx");
+            app.os_clip = None;
+            app.engine.set_cell(
+                &mut app.pkg.workbook,
+                (0, 0, 0),
+                Cell::formula("SEQUENCE(3)"),
+            );
+            app.cur = (2, 0);
+            app.anchor = Some((0, 0));
+            app.copy(false);
+            app.anchor = None;
+            app.cur = (0, 2);
+            app.paste_special(gridcore::edit::PasteSpec::of(what));
+            let v = |r| app.sheet().cell(r, 2).map(|c| c.value.clone());
+            let n = |x: f64| Some(CellValue::Number(x));
+            assert_eq!([v(0), v(1), v(2)], [n(1.0), n(2.0), n(3.0)], "{what:?}");
+            assert_eq!(
+                app.sheet().cell(0, 2).is_some_and(|c| c.formula.is_some()),
+                formula_kept
+            );
+        }
+    }
+
+    /// #707 r3 m5: Fill (Ctrl+D/R, Up, Left) refuses a protected sheet.
+    #[test]
+    fn fill_refuses_a_protected_sheet() {
+        let mut app = App::new(new_xlsx(), "prot.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(7.0));
+        app.pkg.workbook.sheets[0].set_protected(true);
+        for dir in [FillDir::Down, FillDir::Right, FillDir::Up, FillDir::Left] {
+            app.cur = (2, 2);
+            app.anchor = Some((0, 0));
+            app.fill(dir);
+            assert_eq!(app.sheet().cells.len(), 1, "{dir:?}");
+            assert!(app.status.as_deref().unwrap_or("").contains("protected"));
+        }
+        assert!(app.undo.is_empty());
+    }
+
+    /// #668: Fill Up and Fill Left.
+    #[test]
+    fn fill_up_and_left() {
+        let mut app = App::new(new_xlsx(), "fill.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_cell(2, 0, Cell::number(7.0));
+        app.pkg.workbook.sheets[0].set_cell(0, 3, Cell::formula("E1+1"));
+        app.cur = (0, 0);
+        app.anchor = Some((2, 0));
+        app.fill(FillDir::Up);
+        assert_eq!(
+            app.sheet().cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(7.0))
+        );
+        app.cur = (0, 1);
+        app.anchor = Some((0, 3));
+        app.fill(FillDir::Left);
+        assert_eq!(
+            app.sheet()
+                .cell(0, 1)
+                .and_then(|c| c.formula.clone())
+                .as_deref(),
+            Some("C1+1")
+        );
+    }
+
     /// A1:A3 = 1, 2, 3 and a legacy CSE block `{=A1:A3*2}` over D1:D3, as
     /// load_xlsx reads it, spilling 2, 4, 6.
     fn app_with_spilling_cse() -> App {
@@ -12586,7 +13294,7 @@ mod tests {
         let before = app.sheet().cells.clone();
         app.cur = (3, 3);
         app.anchor = Some((1, 2));
-        app.fill(true);
+        app.fill(FillDir::Down);
         assert_refused(&app, &before);
         app.cur = (2, 3);
         app.anchor = Some((1, 2));
@@ -12815,7 +13523,7 @@ mod tests {
         app.rebuild_engine();
         app.cur = (1, 1); // a data cell in the Qty column
         app.anchor = None;
-        app.sort_region(true); // ascending by Qty
+        app.quick_sort(true); // ascending by Qty
 
         let v = |r, c| app.sheet().cell(r, c).unwrap().value.clone();
         assert_eq!(v(0, 0), CellValue::Text("Item".into())); // header stays put
@@ -12825,7 +13533,7 @@ mod tests {
         assert_eq!(v(2, 0), CellValue::Text("C".into()));
         assert_eq!(v(3, 0), CellValue::Text("B".into()));
 
-        app.sort_region(false); // descending => B, C, A
+        app.quick_sort(false); // descending => B, C, A
         let v = |r, c| app.sheet().cell(r, c).unwrap().value.clone();
         assert_eq!(v(1, 0), CellValue::Text("B".into()));
         assert_eq!(v(3, 0), CellValue::Text("A".into()));
@@ -12834,27 +13542,29 @@ mod tests {
     #[test]
     fn a_sort_across_a_spill_is_refused() {
         // #840: rows that cut a spilled array don't sort; the status says
-        // why and no undo step is pushed. A1:A3 = 3, 1, 2 beside C1
-        // `=SEQUENCE(3)`.
+        // why and no undo step is pushed. B1:B3 = 3, 1, 2 beside C1
+        // `=SEQUENCE(3)`, so the list B1:C3 holds the spill. (#691: a sort
+        // moves only its list's cells, so a list off to the side, past a
+        // blank column, would sort.)
         use gridcore::sheet::{Cell, CellValue};
         let mut app = app_with_sequence_in_c1();
         for (r, n) in [3.0, 1.0, 2.0].iter().enumerate() {
-            app.pkg.workbook.sheets[0].set_cell(r as u32, 0, Cell::number(*n));
+            app.pkg.workbook.sheets[0].set_cell(r as u32, 1, Cell::number(*n));
         }
         app.rebuild_engine();
         let before = app.sheet().cells.clone();
         let undo = app.undo.len();
-        app.cur = (0, 0);
+        app.cur = (0, 1);
         app.anchor = None;
-        app.sort_region(true);
+        app.quick_sort(true);
         assert_eq!(app.status.as_deref(), Some(gridcore::edit::SORT_CUTS_SPILL));
         app.status = None;
-        app.commit_sort("A desc");
+        app.commit_sort_text("B desc");
         assert_eq!(app.status.as_deref(), Some(gridcore::edit::SORT_CUTS_SPILL));
         assert_eq!(app.sheet().cells, before);
         assert_eq!(app.undo.len(), undo);
         assert_eq!(
-            app.sheet().cell(0, 0).unwrap().value,
+            app.sheet().cell(0, 1).unwrap().value,
             CellValue::Number(3.0)
         );
     }
@@ -12886,7 +13596,7 @@ mod tests {
         app.rebuild_engine();
         app.cur = (1, 0);
         app.anchor = None;
-        app.commit_sort("A asc, B desc"); // Grp asc, then Score desc
+        app.commit_sort_text("A asc, B desc"); // Grp asc, then Score desc
         let v = |r, c| app.sheet().cell(r, c).unwrap().value.clone();
         assert_eq!(v(0, 0), CellValue::Text("Grp".into())); // header kept
         assert_eq!(
@@ -13766,8 +14476,8 @@ mod tests {
         assert!(!app.sheet().col_hidden(1));
     }
     #[test]
-    fn commit_filter_hides_nonmatching_rows() {
-        use gridcore::sheet::Cell;
+    fn filter_commands_hide_rows_as_filtered() {
+        use gridcore::sheet::{Cell, CellValue};
         let mut app = App::new(new_xlsx(), "t.xlsx");
         app.os_clip = None;
         {
@@ -13782,7 +14492,28 @@ mod tests {
         app.rebuild_engine();
         app.cur = (1, 1); // Qty column, a data cell
         app.anchor = None;
-        app.commit_filter(">100");
+        // Data › Filter puts buttons on A1:B4; nothing hides yet.
+        app.ribbon_act(ribbon::Act::Filter);
+        let af = app.sheet().auto_filter.as_ref().unwrap();
+        assert_eq!(af.range, (0, 0, 3, 1));
+        assert_eq!(app.status.as_deref(), Some("Filter on"));
+        // Alt+Down on B1 opens its drop-down; its Number Filters item asks for
+        // the condition.
+        app.cur = (0, 1);
+        assert!(app.open_filter_picker());
+        assert_eq!(
+            app.filter_picker.as_ref().unwrap().menu.submenu,
+            gridcore::filter::Submenu::Number
+        );
+        app.filter_picker.as_mut().unwrap().sel = 3;
+        app.filter_picker_key(KeyCode::Enter);
+        assert!(matches!(
+            app.prompt.as_ref().map(|p| &p.kind),
+            Some(PromptKind::CustomFilter)
+        ));
+        app.prompt = None;
+        app.commit_custom_filter(">100");
+        assert_eq!(app.status.as_deref(), Some("2 of 3 records found"));
         // header visible; A(300),C(900) kept; B(50) hidden.
         let sh = app.sheet();
         assert!(!sh.row_hidden(0)); // header
@@ -13797,23 +14528,36 @@ mod tests {
         app.pkg.workbook.sheets[0].set_cell(6, 1, Cell::formula("SUBTOTAL(109,B2:B4)"));
         app.rebuild_engine();
         let v = |app: &App, r: u32| app.sheet().cell(r, 1).unwrap().value.clone();
-        use gridcore::sheet::CellValue;
         assert_eq!(v(&app, 5), CellValue::Number(1200.0));
         assert_eq!(v(&app, 6), CellValue::Number(300.0));
         app.pkg.workbook.sheets[0].set_row_hidden(3, false);
 
-        // Clear unhides everything, and the rows are no longer filtered.
-        app.commit_filter("clear");
+        // Clear shows everything; the buttons stay.
+        app.ribbon_act(ribbon::Act::ClearFilter);
         let sh = app.sheet();
         assert!(!sh.row_hidden(2));
         assert!(sh.filtered_rows.is_empty());
+        assert!(sh.auto_filter.is_some());
         assert_eq!(v(&app, 5), CellValue::Number(1250.0));
 
-        // Text equals filter on the Item column.
-        app.cur = (1, 0);
-        app.commit_filter("=C");
+        // The checklist on Item with only C checked.
+        app.cur = (0, 0);
+        assert!(app.open_filter_picker());
+        let p = app.filter_picker.as_mut().unwrap();
+        let labels: Vec<&str> = p.menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["A", "B", "C"]);
+        p.sel = 4; // (Select All) off
+        app.filter_picker_key(KeyCode::Char(' '));
+        app.filter_picker.as_mut().unwrap().sel = 7; // C on
+        app.filter_picker_key(KeyCode::Char(' '));
+        app.filter_picker_key(KeyCode::Enter);
         let sh = app.sheet();
         assert!(sh.row_hidden(1) && sh.row_hidden(2) && !sh.row_hidden(3));
+        // One undo step brings A and B back; Ctrl+Shift+L turns it all off.
+        app.undo();
+        assert!(!app.sheet().row_hidden(1));
+        app.ribbon_act(ribbon::Act::Filter);
+        assert!(app.sheet().auto_filter.is_none());
     }
 
     #[test]
@@ -14385,7 +15129,7 @@ mod tests {
         };
         let before = header(&app);
         app.cur = (1, 0);
-        app.sort_region(true);
+        app.quick_sort(true);
         assert_ne!(header(&app), before, "the sort moved the header row");
         assert_eq!(app.pkg.workbook.tables[0].columns, ["Name", "City"]);
         let f10 = app.pkg.workbook.sheets[0].cell(9, 5).unwrap();
@@ -14512,7 +15256,7 @@ mod tests {
         ]);
         clip_range(&mut app, (0, 0), (1, 1), true);
         app.cur = (0, 0);
-        app.sort_region(true);
+        app.quick_sort(true);
         app.cur = (0, 5);
         app.paste();
         let some = |v: [f64; 4]| v.map(Some).to_vec();
@@ -15902,7 +16646,7 @@ mod tests {
         app.pkg.workbook.sheets[0].set_cell(2, 3, Cell::number(5.0));
         app.anchor = Some((1, 3));
         app.cur = (2, 4);
-        app.fill(false);
+        app.fill(FillDir::Right);
         let filled = vec![n(7.0), CellValue::Empty, n(5.0)];
         assert_eq!(col_values(&app, 4, 0, 2), filled, "fill");
         app.undo();
@@ -16020,7 +16764,7 @@ mod tests {
         // Select B1:B4 and fill down.
         app.cur = (3, 1);
         app.anchor = Some((0, 1));
-        app.fill(true);
+        app.fill(FillDir::Down);
         let s = &app.pkg.workbook.sheets[0];
         assert_eq!(s.cell(2, 1).unwrap().formula.as_deref(), Some("A3*2"));
         assert_eq!(s.cell(3, 1).unwrap().value, CellValue::Number(8.0));
@@ -18465,6 +19209,33 @@ mod tests {
     }
 
     #[test]
+    fn data_form_closes_when_an_agent_sorts_or_filters_its_list() {
+        // A sort moves the records and a filter hides them: the form's
+        // record may be another one now (#690, #691).
+        for (verb, args) in [
+            (
+                "range.sort",
+                r#"{"range":"A1:C4","header":true,"keys":[{"col":"A","order":"desc"}]}"#,
+            ),
+            (
+                "filter.set",
+                r#"{"range":"A1:C4","col":"Name","criteria":{"values":["Bob"]}}"#,
+            ),
+        ] {
+            let mut app = data_form_app();
+            app.ribbon_act(ribbon::Act::DataForm);
+            let args = ctlcore::json::Json::parse(args).unwrap();
+            run_control(&mut app, verb, &args).unwrap();
+            assert!(app.data_form.is_none(), "{verb}");
+            assert_eq!(
+                app.status.as_deref(),
+                Some("Data Form closed: the workbook changed"),
+                "{verb}"
+            );
+        }
+    }
+
+    #[test]
     fn data_form_stays_open_over_an_agents_cell_edit() {
         use ctlcore::json::Json;
         let set = |app: &mut App, r: &str, t: &str| {
@@ -18542,6 +19313,456 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
         assert!(app.data_form.is_none());
+    }
+
+    // ---- #712: Pick From Drop-down List, Flash Fill, AutoCorrect, Formula
+    // AutoComplete ----
+
+    fn alt(app: &mut App, code: KeyCode) {
+        press_mod(app, code, KeyModifiers::ALT);
+    }
+
+    fn chord(app: &mut App, ch: char) {
+        press_mod(app, KeyCode::Char(ch), KeyModifiers::CONTROL);
+    }
+
+    fn text_at(app: &App, r: u32, c: u32) -> String {
+        match value_at(app, r, c) {
+            CellValue::Text(t) => t,
+            v => panic!("{} holds {v:?}", cell_name(r, c)),
+        }
+    }
+
+    /// ENT-CASE-029's column with A6 `Widgets`: A1:A7 one block.
+    fn pick_app() -> App {
+        let mut app = opts_app();
+        for (r, t) in [
+            "Widgets",
+            "Gadgets",
+            "Gizmos",
+            "100",
+            "Grommets",
+            "Widgets",
+            "Sprockets",
+        ]
+        .iter()
+        .enumerate()
+        {
+            put(&mut app, r as u32, 0, t);
+        }
+        app
+    }
+
+    #[test]
+    fn ent_case_030_alt_down_picks_from_the_column() {
+        let mut app = pick_app();
+        app.cur = (7, 0);
+        alt(&mut app, KeyCode::Down);
+        let p = app.dv_picker.as_ref().expect("the pick list");
+        assert!(p.pick);
+        assert_eq!(
+            p.values,
+            ["Gadgets", "Gizmos", "Grommets", "Sprockets", "Widgets"]
+        );
+        assert_eq!(p.sel, None, "nothing highlighted until Down");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_picker.is_none());
+        assert_eq!(text_at(&app, 7, 0), "Gadgets");
+        app.cur = (8, 0);
+        alt(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 8, 0), "Gizmos");
+        // Enter with nothing highlighted closes without entering.
+        app.cur = (9, 0);
+        alt(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_picker.is_none());
+        assert_eq!(value_at(&app, 9, 0), CellValue::Empty);
+        // A cell with no block around it has nothing to pick.
+        app.cur = (0, 5);
+        alt(&mut app, KeyCode::Down);
+        assert!(app.dv_picker.is_none());
+        assert!(app.status.as_deref().unwrap_or("").contains("No entries"));
+    }
+
+    #[test]
+    fn alt_down_while_typing_text_picks_and_commits() {
+        let mut app = pick_app();
+        app.cur = (7, 0);
+        type_text(&mut app, "x");
+        alt(&mut app, KeyCode::Down);
+        assert!(app.edit.is_some(), "the editor stays open under the list");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.edit.is_none());
+        assert_eq!(text_at(&app, 7, 0), "Gizmos");
+        assert_eq!(app.cur, (7, 0), "choosing commits in place");
+    }
+
+    #[test]
+    fn alt_down_prefers_a_validation_list_to_the_pick_list() {
+        let mut app = pick_app();
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(7, 0, 7, 0)],
+                kind: "list".into(),
+                formula1: "\"Yes,No\"".into(),
+                ..Default::default()
+            });
+        app.cur = (7, 0);
+        alt(&mut app, KeyCode::Down);
+        let p = app.dv_picker.as_ref().unwrap();
+        assert!(!p.pick);
+        assert_eq!(p.values, ["Yes", "No"]);
+        assert_eq!(p.sel, Some(0));
+        press(&mut app, KeyCode::Esc);
+        // A protected sheet opens no pick list.
+        app.cur = (8, 0);
+        app.pkg.workbook.sheets[0].set_protected(true);
+        alt(&mut app, KeyCode::Down);
+        assert!(app.dv_picker.is_none());
+    }
+
+    const NAMES: [&str; 6] = [
+        "Ada Lovelace",
+        "Alan Turing",
+        "Grace Hopper",
+        "Edsger Dijkstra",
+        "Barbara Liskov",
+        "Donald Knuth",
+    ];
+
+    fn flash_app() -> App {
+        let mut app = opts_app();
+        for (r, t) in NAMES.iter().enumerate() {
+            put(&mut app, r as u32, 0, t);
+        }
+        for (r, t) in ["x-007", "y-042", "z-100"].iter().enumerate() {
+            put(&mut app, r as u32, 2, t);
+        }
+        app
+    }
+
+    #[test]
+    fn ent_case_038_ctrl_e_flash_fills_one_undo_step() {
+        let mut app = flash_app();
+        put(&mut app, 4, 1, "Babs");
+        app.cur = (0, 1);
+        type_text(&mut app, "Ada");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.cur, (1, 1));
+        chord(&mut app, 'e');
+        let col: Vec<String> = (0..6).map(|r| text_at(&app, r, 1)).collect();
+        assert_eq!(col, ["Ada", "Alan", "Grace", "Edsger", "Babs", "Donald"]);
+        assert!(app.sheet().cell(1, 1).unwrap().formula.is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .starts_with("Flash Fill: 4 changed")
+        );
+        // Constants: a changed source leaves them.
+        app.cur = (0, 0);
+        type_text(&mut app, "Augusta Lovelace");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 1, 1), "Alan");
+        app.undo();
+        app.undo();
+        assert_eq!(value_at(&app, 1, 1), CellValue::Empty, "one undo step");
+        assert_eq!(text_at(&app, 0, 1), "Ada");
+        // A text example gives text results.
+        app.cur = (0, 3);
+        type_text(&mut app, "'007");
+        press(&mut app, KeyCode::Enter);
+        app.cur = (0, 3);
+        chord(&mut app, 'e');
+        assert_eq!(text_at(&app, 1, 3), "042");
+        assert_eq!(text_at(&app, 2, 3), "100");
+    }
+
+    #[test]
+    fn ctrl_e_while_typing_commits_first_and_no_pattern_says_so() {
+        let mut app = flash_app();
+        app.cur = (0, 1);
+        type_text(&mut app, "Ada");
+        chord(&mut app, 'e');
+        assert!(app.edit.is_none());
+        assert_eq!(text_at(&app, 5, 1), "Donald");
+        // E1 `zzz` next to D1:D3: no pattern, nothing filled (ENT-CASE-039).
+        for (r, t) in ["'007", "'042", "'100"].iter().enumerate() {
+            put(&mut app, r as u32, 3, t);
+        }
+        app.cur = (0, 4);
+        type_text(&mut app, "zzz");
+        chord(&mut app, 'e');
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .starts_with("Flash Fill didn't see a pattern"),
+            "{:?}",
+            app.status
+        );
+        assert_eq!(value_at(&app, 1, 4), CellValue::Empty);
+    }
+
+    fn type_enter(app: &mut App, r: u32, c: u32, text: &str) {
+        app.cur = (r, c);
+        type_text(app, text);
+        press(app, KeyCode::Enter);
+    }
+
+    #[test]
+    fn ent_case_040_autocorrect_while_typing() {
+        let mut app = opts_app();
+        type_enter(&mut app, 0, 0, "(c) 2024");
+        type_enter(&mut app, 1, 0, "teh cat");
+        type_enter(&mut app, 2, 0, "=\"(c)\"");
+        type_enter(&mut app, 3, 0, "monday meeting");
+        type_enter(&mut app, 4, 0, "THursday");
+        type_enter(&mut app, 5, 0, "teh");
+        assert_eq!(text_at(&app, 0, 0), "\u{a9} 2024");
+        assert_eq!(text_at(&app, 1, 0), "the cat");
+        assert_eq!(text_at(&app, 2, 0), "(c)");
+        assert_eq!(
+            app.sheet().cell(2, 0).unwrap().formula.as_deref(),
+            Some("\"(c)\"")
+        );
+        assert_eq!(text_at(&app, 3, 0), "Monday meeting");
+        assert_eq!(text_at(&app, 4, 0), "Thursday");
+        assert_eq!(text_at(&app, 5, 0), "the");
+        // A7: Ctrl+Z right after the correction takes back only it.
+        app.cur = (6, 0);
+        type_text(&mut app, "teh ");
+        // Corrected to `the `, which then proposes A2's `the cat`.
+        let e = app.edit.as_ref().unwrap();
+        assert_eq!((e.text.as_str(), e.cursor), ("the cat", 4));
+        assert_eq!(e.proposal, Some((4, "the cat".to_string())));
+        chord(&mut app, 'z');
+        let e = app.edit.as_ref().expect("the editor stays open");
+        assert_eq!((e.text.as_str(), e.cursor), ("teh ", 4));
+        type_text(&mut app, "x");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 6, 0), "teh x");
+        assert_eq!(app.cur, (7, 0), "the earlier entry was not undone");
+    }
+
+    #[test]
+    fn autocorrect_leaves_proposals_numbers_and_taken_back_words() {
+        let mut app = opts_app();
+        put(&mut app, 0, 0, "Teh Corp");
+        type_enter(&mut app, 1, 0, "teh");
+        assert_eq!(text_at(&app, 1, 0), "Teh Corp", "a taken proposal");
+        type_enter(&mut app, 0, 3, "1/2");
+        assert!(matches!(value_at(&app, 0, 3), CellValue::Number(_)));
+        // `teh,` taken back with Ctrl+Z is not corrected again at Enter.
+        app.cur = (1, 3);
+        type_text(&mut app, "teh,");
+        assert_eq!(app.edit.as_ref().unwrap().text, "the,");
+        chord(&mut app, 'z');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 1, 3), "teh,");
+        // Ctrl+Z with no correction pending undoes the typing.
+        app.cur = (2, 3);
+        type_text(&mut app, "abc");
+        chord(&mut app, 'z');
+        assert_eq!(app.edit.as_ref().unwrap().text, "");
+        press(&mut app, KeyCode::Esc);
+        // Off, nothing is replaced.
+        app.autocorrect.opts.replace_text = false;
+        type_enter(&mut app, 3, 3, "teh cat");
+        assert_eq!(text_at(&app, 3, 3), "teh cat");
+    }
+
+    /// FIX r2 m3: the commit corrects only a last word just typed.
+    #[test]
+    fn an_edit_elsewhere_leaves_an_untyped_last_word() {
+        let mut app = opts_app();
+        app.autocorrect.opts.names_of_days = true;
+        put(&mut app, 0, 0, "Meting on monday");
+        app.cur = (0, 0);
+        press(&mut app, KeyCode::F(2));
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        type_text(&mut app, "e");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 0, 0), "Meeting on monday");
+        // Typed at the end, the last word is corrected at the commit.
+        put(&mut app, 2, 0, "Note:");
+        app.cur = (2, 0);
+        press(&mut app, KeyCode::F(2));
+        type_text(&mut app, " teh");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 2, 0), "Note: the");
+        // A caret move after the typing clears it.
+        app.cur = (1, 0);
+        type_text(&mut app, "x teh");
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 1, 0), "x teh");
+    }
+
+    #[test]
+    fn ent_case_056_typed_urls_become_hyperlinks() {
+        let mut app = opts_app();
+        type_enter(&mut app, 2, 0, "https://example.com");
+        assert_eq!(
+            app.sheet().hyperlinks.get(&(2, 0)).map(String::as_str),
+            Some("https://example.com")
+        );
+        assert_eq!(text_at(&app, 2, 0), "https://example.com");
+        app.undo();
+        assert_eq!(value_at(&app, 2, 0), CellValue::Empty);
+        assert!(
+            !app.sheet().hyperlinks.contains_key(&(2, 0)),
+            "one undo takes both"
+        );
+        app.autocorrect.opts.hyperlinks = false;
+        type_enter(&mut app, 3, 0, "https://example.org");
+        assert!(!app.sheet().hyperlinks.contains_key(&(3, 0)));
+        assert_eq!(text_at(&app, 3, 0), "https://example.org");
+    }
+
+    #[test]
+    fn autocorrect_and_formula_autocomplete_persist_with_the_preferences() {
+        let mut app = opts_app();
+        app.autocorrect
+            .add("cdp", "Consolidated Data Processing")
+            .unwrap();
+        app.autocorrect.opts.hyperlinks = false;
+        app.edit_opts.formula_autocomplete = false;
+        let text = app.view_prefs_text();
+        let mut again = opts_app();
+        again.apply_view_prefs(&text);
+        assert_eq!(again.autocorrect, app.autocorrect);
+        assert!(!again.edit_opts.formula_autocomplete);
+        type_enter(&mut again, 0, 0, "cdp report");
+        assert_eq!(text_at(&again, 0, 0), "Consolidated Data Processing report");
+    }
+
+    fn sales_app() -> App {
+        let mut app = opts_app();
+        for (c, h) in ["Item", "Qty", "Price", "Region"].iter().enumerate() {
+            put(&mut app, 0, c as u32, h);
+        }
+        app.pkg.workbook.tables.push(gridcore::sheet::Table {
+            name: "Sales".into(),
+            sheet: 0,
+            range: (0, 0, 3, 3),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: ["Item", "Qty", "Price", "Region"]
+                .map(String::from)
+                .to_vec(),
+            column_ids: Vec::new(),
+            part: String::new(),
+        });
+        app.rebuild_engine();
+        app
+    }
+
+    fn listed(app: &App) -> Vec<String> {
+        app.edit
+            .as_ref()
+            .and_then(|e| e.complete.as_ref())
+            .map(|(l, _)| l.items.iter().map(|i| i.label.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn tbl_case_021_formula_autocomplete_lists_and_inserts() {
+        let mut app = sales_app();
+        app.cur = (0, 7);
+        type_text(&mut app, "=SUM(Sal");
+        assert_eq!(listed(&app), ["Sales"]);
+        type_text(&mut app, "es[");
+        assert_eq!(
+            listed(&app),
+            [
+                "Item",
+                "Qty",
+                "Price",
+                "Region",
+                "#All",
+                "#Data",
+                "#Headers",
+                "#Totals",
+                "@ - This Row"
+            ]
+        );
+        // Down moves the highlight (no commit in type-over mode); Tab inserts.
+        press(&mut app, KeyCode::Down);
+        assert!(app.edit.is_some());
+        press(&mut app, KeyCode::Tab);
+        let e = app.edit.as_ref().unwrap();
+        assert_eq!((e.text.as_str(), e.cursor), ("=SUM(Sales[Qty", 14));
+        assert!(e.complete.is_none());
+        type_text(&mut app, "])");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.sheet().cell(0, 7).unwrap().formula.as_deref(),
+            Some("SUM(Sales[Qty])")
+        );
+    }
+
+    #[test]
+    fn formula_autocomplete_keys_and_option() {
+        let mut app = sales_app();
+        app.cur = (1, 7);
+        type_text(&mut app, "=su");
+        assert_eq!(listed(&app)[..3], ["SUBSTITUTE", "SUBTOTAL", "SUM"]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.edit.as_ref().unwrap().text, "=SUBTOTAL(");
+        // Esc closes the list, not the editor; Enter commits as typed.
+        type_text(&mut app, "9,A");
+        assert!(!listed(&app).is_empty());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.edit.is_some() && listed(&app).is_empty());
+        type_text(&mut app, "2:A3)");
+        assert!(listed(&app).is_empty());
+        app.edit.as_mut().unwrap().text = "=a".into();
+        app.edit.as_mut().unwrap().cursor = 2;
+        app.refresh_completions();
+        assert!(!listed(&app).is_empty());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.sheet().cell(1, 7).unwrap().formula.as_deref(),
+            Some("a"),
+            "Enter commits as typed"
+        );
+        // Not in text or in a string; off with the option; Alt+Down on demand.
+        app.cur = (2, 7);
+        type_text(&mut app, "su");
+        assert!(listed(&app).is_empty());
+        press(&mut app, KeyCode::Esc);
+        app.edit_opts.formula_autocomplete = false;
+        app.cur = (3, 7);
+        type_text(&mut app, "=su");
+        assert!(listed(&app).is_empty());
+        alt(&mut app, KeyCode::Down);
+        assert_eq!(listed(&app)[2], "SUM");
+    }
+
+    #[test]
+    fn options_page_has_the_new_rows() {
+        let app = opts_app();
+        let rows = app.option_rows();
+        let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+        assert!(keys.contains(&gridcore::options::KEY_FORMULA_AUTOCOMPLETE));
+        for k in AC_OPTION_KEYS {
+            assert!(keys.contains(&k), "{k}");
+        }
+        assert!(!keys.contains(&gridcore::options::KEY_FLASH_FILL_AUTO));
     }
 }
 

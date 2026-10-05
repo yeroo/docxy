@@ -22,6 +22,7 @@ compile_error!(
      whose draw-without-present would make Windows captures read stale pixels"
 );
 
+mod about;
 mod close;
 #[cfg(test)]
 mod comment_tests;
@@ -35,9 +36,12 @@ mod design_dialogs;
 mod design_tab;
 mod dialog;
 mod dialog_host;
+#[cfg(test)]
+mod doc_final_tests;
 mod doc_import;
 #[cfg(test)]
 mod doc_import_tests;
+mod doc_name;
 #[cfg(test)]
 mod doc_protected_tests;
 mod harness;
@@ -58,20 +62,42 @@ mod project;
 mod recover;
 #[cfg(test)]
 mod ribbon_export;
+mod ribbon_layout;
 #[cfg(test)]
 mod sect_pr_tests;
+mod sheet_autocorrect;
 #[cfg(test)]
 mod sheet_clip_tests;
+mod sheet_complete;
 mod sheet_consolidate;
+mod sheet_drag;
+/// The wall-clock bound of the tests that guard against a quadratic cost
+/// (#707): generous, since they run as debug builds on shared CI runners,
+/// and still far below what the quadratic version they guard took (minutes).
+#[cfg(test)]
+pub(crate) const PERF_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
 #[cfg(test)]
 mod sheet_entry_tests;
+mod sheet_fill;
+#[cfg(test)]
+mod sheet_fill_tests;
+mod sheet_filter;
+mod sheet_flashfill;
+mod sheet_goto;
+mod sheet_menus;
 mod sheet_outline;
+mod sheet_paste;
 mod sheet_ribbon;
+#[cfg(test)]
+mod sheet_select_tests;
+mod sheet_sort;
 mod style_gallery;
 mod table_dialogs;
 mod table_tab;
 mod table_view;
 mod tabstrip;
+#[cfg(test)]
+mod track_tests;
 mod trusted;
 mod ttc_dialog;
 mod user_name;
@@ -82,6 +108,7 @@ use std::path::PathBuf;
 
 use docxcore::comments::Comment;
 use docxcore::editor::{Caret, Clip, Editor, FoundMatch, step_found};
+use docxcore::markup::MarkupView;
 use docxcore::model::{
     Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign,
 };
@@ -131,27 +158,61 @@ fn icon_svg(name: &str, size: f32, color: Hsla) -> Svg {
         .flex_none()
 }
 
+/// The editor a tab's keystrokes and commands drive: its header/footer
+/// editor while one is open, else a document's body; none on other tabs.
+fn tab_edit_target(tab: &mut DocTab) -> Option<&mut Editor> {
+    if let Some(hf) = tab.hf_edit.as_mut() {
+        return Some(&mut hf.editor);
+    }
+    match &mut tab.surface {
+        Surface::Doc(ed) => Some(ed),
+        _ => None,
+    }
+}
+
+/// [`tab_edit_target`], to read.
+fn tab_edit_target_ref(tab: &DocTab) -> Option<&Editor> {
+    if let Some(hf) = tab.hf_edit.as_ref() {
+        return Some(&hf.editor);
+    }
+    match &tab.surface {
+        Surface::Doc(ed) => Some(ed),
+        _ => None,
+    }
+}
+
 /// A small Quick-Access-Toolbar icon button (Undo/Redo in the title bar).
+/// A disabled one (Can't Repeat, #618) is drawn dimmed and takes no click.
 fn qat_btn(
     id: &'static str,
     icon: &'static str,
     tip: &'static str,
+    enabled: bool,
     pal: Pal,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
+) -> Stateful<Div> {
+    let btn = div()
         .id(id)
         .flex()
         .items_center()
         .justify_center()
         .size(px(20.))
         .rounded(px(3.))
-        .cursor_pointer()
+        .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx));
+    if !enabled {
+        return btn.child(icon_svg(icon, 14., pal.dim));
+    }
+    btn.cursor_pointer()
         .hover(|d| d.bg(pal.hover))
         .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
         .child(icon_svg(icon, 14., pal.fg))
-        .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx))
         .on_click(on_click)
+}
+
+/// Where the Undo drop-down opens: below the arrow, when the last frame drew
+/// it.
+fn qat_undo_anchor(probes: &Probes) -> Option<Point<Pixels>> {
+    probes.current("qat-undo-arrow").map(|b| b.bottom_left())
 }
 
 // ---- session model ---------------------------------------------------------
@@ -331,6 +392,13 @@ struct Prefs {
     autorecover_minutes: u32,
     keep_drafts: bool,
     edit_opts: EditOptions,
+    /// File › Options › Advanced › Edit Custom Lists (#668), saved with the
+    /// editing options in `sheet_editing`.
+    custom_lists: Vec<Vec<String>>,
+    /// AutoCorrect's changes from its defaults (#667), as
+    /// [`gridcore::autocorrect::AutoCorrect::to_lines`] writes them; saved
+    /// in `sheet_editing` with the Editing options.
+    autocorrect: String,
     user_name: String,
     user_initials: String,
 }
@@ -415,6 +483,8 @@ enum BackstageRailAction {
     Save,
     SaveAs,
     Export,
+    /// Build info and the About dialog (#1023); on every tab kind.
+    Account,
     Close,
 }
 
@@ -478,6 +548,13 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         doc_only: false,
     },
     BackstageRailItem {
+        id: "bs-account",
+        display: "Account",
+        action: BackstageRailAction::Account,
+        project_only: false,
+        doc_only: false,
+    },
+    BackstageRailItem {
         id: "bs-close",
         display: "Close",
         action: BackstageRailAction::Close,
@@ -497,7 +574,7 @@ fn backstage_rail_items(
         .filter(move |item| (!item.project_only || project) && (!item.doc_only || doc))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum QatAction {
     Undo,
     Redo,
@@ -619,12 +696,59 @@ struct SheetView {
     /// commit takes the value; Backspace or Delete drops the suffix; a caret
     /// move keeps the text and drops the marker.
     edit_proposal: Option<(usize, String)>,
+    /// Formula AutoComplete's list for the open editor (#686), kept with the
+    /// buffer it was made for ([`sheet_complete::CompleteList`]).
+    edit_complete: Option<sheet_complete::CompleteList>,
+    /// That list's scroll. A list rebuilt for new typing starts at the top and
+    /// scrolls once to the highlight it carries ([`SheetView::complete_now`]);
+    /// nothing scrolls it per frame, so the mouse wheel is free.
+    fx_scroll: ScrollHandle,
+    /// Flash Fill's greyed preview after a typed commit, and the last fill
+    /// for its Options button (#666); each stands only while nothing has
+    /// moved on from it ([`SheetView::live_preview`],
+    /// [`SheetView::live_flash`]).
+    flash_preview: Option<sheet_flashfill::FlashPreview>,
+    last_flash: Option<sheet_flashfill::LastFlash>,
+    /// The app's AutoCorrect (#667), stamped like `edit_opts`.
+    autocorrect: std::rc::Rc<gridcore::autocorrect::AutoCorrect>,
+    /// The last correction while typing, with the buffer and caret it left
+    /// (before AutoComplete proposed): Ctrl+Z takes back just it while they
+    /// stand.
+    edit_correction: Option<(gridcore::autocorrect::Correction, String, usize)>,
+    /// Where Ctrl+Z took a correction back: that word is not corrected again.
+    edit_kept: Option<usize>,
+    /// The buffer and caret the last character typed at the end left: the
+    /// commit corrects the last word only while they stand.
+    edit_typed_tail: Option<(String, usize)>,
     /// Which workbook tab this is, for the grid clip: a cut moves cells only
     /// within the workbook it came from ([`next_sheet_view_id`]).
     id: u64,
     /// Bumped by every undo step pushed and every undo or redo: a pending
     /// cut is cancelled once its workbook changes, as Excel's is (#664).
     edit_gen: u64,
+    /// The earlier areas of a multi-area selection (#670); `anchor`/`sel`
+    /// are the active (last) one. Live only while `areas_at` still matches
+    /// the sheet, `sel` and `anchor` (R5): any write to the selection that
+    /// does not go through the area methods leaves one area, so no stale
+    /// area is ever acted on.
+    areas: Vec<(u32, u32, u32, u32)>,
+    areas_at: (usize, (u32, u32), (u32, u32)),
+    /// Set the first time the stamp is seen stale: the earlier areas are
+    /// then gone for good, so a later return to the stamped cell cannot
+    /// bring them back (#707 r1 M3). Interior, since readers only look.
+    areas_dead: std::cell::Cell<bool>,
+}
+
+/// Whether a pointer event's modifiers hold Excel's Ctrl (Cmd on macOS).
+fn ctrl_held(m: &Modifiers) -> bool {
+    m.control || (cfg!(target_os = "macos") && m.platform)
+}
+
+/// Whether a grid gesture started in sheet view `started` may end in the
+/// active one: only where it started, never in another tab or on a
+/// non-sheet tab (#707 r2 M4).
+fn gesture_stands(started: u64, active: Option<u64>) -> bool {
+    active == Some(started)
 }
 
 /// A fresh [`SheetView::id`].
@@ -740,6 +864,8 @@ struct SheetSnapshot {
     active: usize,
     sel: (u32, u32),
     anchor: (u32, u32),
+    /// The selection's other areas (#670), so undo restores them too.
+    areas: Vec<(u32, u32, u32, u32)>,
 }
 
 /// What an undo step puts back of the package.
@@ -755,8 +881,8 @@ enum SnapshotBody {
 }
 
 impl SheetSnapshot {
-    /// The workbook this step restores.
-    #[cfg(test)]
+    /// The workbook this step restores: what a command compares against to
+    /// tell whether it changed anything, without a second copy.
     fn workbook(&self) -> &gridcore::sheet::Workbook {
         match &self.body {
             SnapshotBody::Workbook(wb) => wb,
@@ -776,10 +902,16 @@ struct ColDrag {
 
 /// An in-progress auto-fill drag from the selection's fill handle: the source
 /// range and the cell the handle has reached.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct FillDrag {
     src: (u32, u32, u32, u32),
     to: (u32, u32),
+    /// Ctrl held as it moved: copy and series swap (#668).
+    ctrl: bool,
+    /// Dragged with the right button: its release opens the fill menu.
+    right: bool,
+    /// The sheet view it started in: a release anywhere else does nothing.
+    view: u64,
 }
 
 /// An in-progress chart drag: which chart on the active sheet, where the press
@@ -820,8 +952,6 @@ enum RefTarget {
     CondFormat,
     /// The cells a data-validation list applies to.
     Validation,
-    /// The rows a sort runs over.
-    Sort,
 }
 
 impl RefTarget {
@@ -835,10 +965,7 @@ impl RefTarget {
     /// the keyboard while they are open, so their range field has to be asked
     /// first — otherwise what you type lands in the bar's own buffer.
     fn is_bar(self) -> bool {
-        matches!(
-            self,
-            RefTarget::CondFormat | RefTarget::Validation | RefTarget::Sort
-        )
+        matches!(self, RefTarget::CondFormat | RefTarget::Validation)
     }
 }
 
@@ -847,7 +974,6 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
     match act {
         SheetAct::CondFormat => Some(RefTarget::CondFormat),
         SheetAct::DataValidation => Some(RefTarget::Validation),
-        SheetAct::CustomSort => Some(RefTarget::Sort),
         _ => None,
     }
 }
@@ -866,8 +992,12 @@ fn protected_view_allows_act(act: SheetAct) -> bool {
 
 /// The document commands Protected View lets through (#633): copying,
 /// selecting, finding and what only changes the view. Everything else edits,
-/// or opens a picker, menu or dialog that would.
+/// or opens a picker, menu or dialog that would. A sheet command (the cell
+/// menu's) passes when [`protected_view_allows_act`] does.
 fn protected_view_allows_doc_act(act: Act) -> bool {
+    if let Act::Sheet(a) = act {
+        return protected_view_allows_act(a);
+    }
     matches!(
         act,
         Act::Copy
@@ -877,12 +1007,116 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
             | Act::ToggleComments
             | Act::ToggleNav
             | Act::ToggleNotes
+            | Act::Markup(_)
             | Act::DarkMode
             | Act::AutoHideRibbon
             | Act::PrintLayout
             | Act::ToggleRuler
             | Act::Project(_)
+            // `run_sheet_act` asks Protected View itself.
+            | Act::Sheet(_)
     )
+}
+
+/// Whether a sheet command runs on a multi-area selection (#670, R4).
+/// Exhaustive, with no catch-all, so a new command cannot be added without
+/// being sorted. Those that act on every area, or never on the selection's
+/// cells, run; the rest would act on the active area alone, so they are
+/// refused with Excel's [`gridcore::edit::MULTI_SELECTION`].
+fn multi_area_ok(act: SheetAct) -> bool {
+    match act {
+        // Every area: formats, Delete-like clears, and Copy, which checks
+        // the areas' shape itself.
+        SheetAct::Copy
+        | SheetAct::Bold
+        | SheetAct::Italic
+        | SheetAct::AlignL
+        | SheetAct::AlignC
+        | SheetAct::AlignR
+        | SheetAct::WrapText
+        | SheetAct::GrowFont
+        | SheetAct::ShrinkFont
+        | SheetAct::Percent
+        | SheetAct::Currency
+        | SheetAct::Comma
+        | SheetAct::FillColor
+        | SheetAct::FontColor
+        | SheetAct::ToggleBorder
+        | SheetAct::FormatCells
+        | SheetAct::NumberFormatMenu
+        | SheetAct::Clear(_)
+        // Not the cells: menus, the sheet, navigation, panes and dialogs
+        // that pick a new selection.
+        | SheetAct::Menu(_)
+        | SheetAct::FreezePanes
+        | SheetAct::PrevComment
+        | SheetAct::NextComment
+        | SheetAct::ProtectSheet
+        | SheetAct::ShowLevel(_)
+        | SheetAct::ClearOutline
+        | SheetAct::OutlineSettings
+        | SheetAct::GoTo
+        | SheetAct::GoToSpecial
+        | SheetAct::OfficeClipboard
+        | SheetAct::CustomLists
+        | SheetAct::Todo
+        // The sheet's filter as a whole, wherever the selection is (#690).
+        | SheetAct::ClearFilter
+        | SheetAct::ReapplyFilter
+        // The Flash Fill Options menu works on the fill that stands (undo
+        // it, accept it, select its cells), not on the selection (#666).
+        | SheetAct::FlashUndo
+        | SheetAct::FlashAccept
+        | SheetAct::FlashSelectBlank
+        | SheetAct::FlashSelectChanged => true,
+        // One rectangle only.
+        SheetAct::Cut
+        | SheetAct::Paste
+        | SheetAct::PasteAs(_)
+        | SheetAct::PasteAgain(_)
+        | SheetAct::PasteSpecial
+        | SheetAct::Drop(_)
+        | SheetAct::RowHeight
+        | SheetAct::InsertPivot
+        | SheetAct::InsertChart(_)
+        | SheetAct::NewComment
+        | SheetAct::DeleteComment
+        | SheetAct::InsertRow
+        | SheetAct::DeleteRow
+        | SheetAct::InsertCol
+        | SheetAct::DeleteCol
+        | SheetAct::SortAsc
+        | SheetAct::SortDesc
+        | SheetAct::CustomSort
+        | SheetAct::AutoSum
+        | SheetAct::Merge
+        | SheetAct::CondFormat
+        | SheetAct::DataValidation
+        | SheetAct::Filter
+        | SheetAct::AdvancedFilter
+        // Pick From Drop-down List and Flash Fill read the one column
+        // block around the active cell: refused over several areas.
+        | SheetAct::PickList
+        | SheetAct::PickItem(_)
+        | SheetAct::FlashFill
+        | SheetAct::FilterBy(_)
+        | SheetAct::PutOnTop(_)
+        | SheetAct::RemoveDuplicates
+        | SheetAct::TextToColumns
+        | SheetAct::FormatAsTable
+        | SheetAct::Consolidate
+        | SheetAct::Subtotal
+        | SheetAct::Group
+        | SheetAct::Ungroup
+        | SheetAct::ShowDetail
+        | SheetAct::HideDetail
+        | SheetAct::AutoOutline
+        | SheetAct::Fill(_)
+        | SheetAct::FillSeries
+        | SheetAct::FillJustify
+        | SheetAct::FillAs(_)
+        | SheetAct::FillDrop(_) => false,
+    }
 }
 
 /// Whether a ribbon command reads or writes the cell selection.
@@ -900,7 +1134,9 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
 /// ones that never touch it — protection, the outline level buttons, Clear
 /// Outline and the outline Settings are properties of the whole sheet, the
 /// Number format combo only opens or closes its strip (a format picked there
-/// is what acts on cells), and `Todo` does nothing at all. Group, Ungroup,
+/// is what acts on cells), a `Menu` only opens a dropdown (its items are what
+/// act), the Office Clipboard pane and Edit Custom Lists are the app's own
+/// state rather than the cells', and `Todo` does nothing at all. Group, Ungroup,
 /// Show/Hide Detail, Auto Outline and Subtotal read the selection, and
 /// Consolidate writes at the selected cell.
 fn act_targets_cells(act: SheetAct) -> bool {
@@ -911,6 +1147,9 @@ fn act_targets_cells(act: SheetAct) -> bool {
             | SheetAct::ClearOutline
             | SheetAct::OutlineSettings
             | SheetAct::NumberFormatMenu
+            | SheetAct::Menu(_)
+            | SheetAct::OfficeClipboard
+            | SheetAct::CustomLists
             | SheetAct::Todo
     )
 }
@@ -1165,6 +1404,9 @@ fn arm_fill(
     *fill = Some(FillDrag {
         src,
         to: (src.2, src.3),
+        ctrl: false,
+        right: false,
+        view: 0,
     });
     true
 }
@@ -1186,6 +1428,8 @@ enum HandleHidden {
     ChartSelected,
     /// File › Options turned the fill handle off (#672).
     Disabled,
+    /// The selection has more than one area (#670): Excel draws no handle.
+    MultiArea,
 }
 
 impl HandleHidden {
@@ -1195,6 +1439,7 @@ impl HandleHidden {
             HandleHidden::Pointing => "a reference is being pointed at",
             HandleHidden::ChartSelected => "a chart is selected",
             HandleHidden::Disabled => "the fill handle is turned off in Settings",
+            HandleHidden::MultiArea => "the selection has more than one area",
         }
     }
 
@@ -1231,40 +1476,30 @@ fn fill_handle_hidden(
     }
 }
 
-/// The dominant-axis fill box for `src` dragged to `to`: extend rows (down) or
-/// columns (right), whichever the handle was pulled furthest along. Returns the
-/// full box (source + filled cells), 0-based inclusive.
+/// The box a fill-handle drag from `src` to `to` leaves selected
+/// ([`gridcore::edit::fill_target`]): the source and the cells it fills, along
+/// the axis pulled furthest (down or up, right or left), or, dragged back
+/// inside, the source without the cells it clears.
 fn fill_box(src: (u32, u32, u32, u32), to: (u32, u32)) -> (u32, u32, u32, u32) {
-    let (sr0, sc0, sr1, sc1) = src;
-    let (tr, tc) = to;
-    let dr = tr.saturating_sub(sr1);
-    let dc = tc.saturating_sub(sc1);
-    if dr >= dc {
-        (sr0, sc0, sr1.max(tr), sc1)
-    } else {
-        (sr0, sc0, sr1, sc1.max(tc))
-    }
+    gridcore::edit::fill_target(src, to).selection(src)
 }
 
-/// The cells a drag fill from `src` over `bx` ([`fill_box`]) writes: the rows
-/// below the source, or the columns right of it (`gridcore::edit::autofill`).
-fn fill_dest(src: (u32, u32, u32, u32), bx: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
-    let (_, sc0, sr1, sc1) = src;
-    let (br0, _, br1, bc1) = bx;
-    if br1 > sr1 {
-        (sr1 + 1, sc0, br1, sc1)
-    } else {
-        (br0, sc1 + 1, br1, bc1)
-    }
+/// Whether a paste of `clip` that left `pasted` selected wrote one copy of
+/// it, not several tiled over a bigger area.
+fn pasted_once(pasted: (u32, u32, u32, u32), clip: &GridClip) -> bool {
+    let (r0, c0, r1, c1) = pasted;
+    (r1 - r0 + 1, c1 - c0 + 1) == (clip.block.rows.len() as u32, clip.block.cols.len() as u32)
 }
+
+/// Why a copy took nothing: a filter hides every selected row.
+const NOTHING_TO_COPY: &str = "Nothing to copy: a filter hides every selected row";
 
 /// The grid clipboard: a rectangular block of cells copied from a sheet.
 #[derive(Clone)]
 #[cfg_attr(test, derive(Default))]
 struct GridClip {
-    cells: Vec<Vec<gridcore::sheet::Cell>>,
     /// The TSV this copy put on the clipboard. While the clipboard still holds
-    /// it, a paste uses `cells` (formats and formulas intact); once something
+    /// it, a paste uses `block` (formats and formulas intact); once something
     /// else has been copied, the clipboard's text wins.
     text: String,
     /// The [`SheetView::id`] of the workbook it came from.
@@ -1274,9 +1509,12 @@ struct GridClip {
     sheet_name: String,
     /// The selection it was taken from, (r0, c0, r1, c1).
     rect: (u32, u32, u32, u32),
-    /// The sheet row each row of `cells` came from: a copy leaves out the
-    /// rows a filter hides (#664), so rows may be missing.
-    rows: Vec<u32>,
+    /// The copied cells, and for each row and column of them the sheet row
+    /// and column it came from: a copy leaves out the rows a filter hides
+    /// (#664) and a multi-area copy joins areas (#670), so rows and columns
+    /// may be missing. With the source's column widths, validation and notes
+    /// for Paste Special (#669); the only copy of the cells (#707 r5 i1).
+    block: gridcore::edit::ClipBlock,
     /// A cut: its paste moves the cells, once (#664).
     cut: bool,
     /// The source's [`SheetView::edit_gen`] when it was taken (or last
@@ -1319,8 +1557,7 @@ impl GridClip {
     /// End copy mode; only the text is kept, to recognise the clipboard.
     fn spend(&mut self) {
         self.spent = true;
-        self.cells = Vec::new();
-        self.rows = Vec::new();
+        self.block = Default::default();
     }
 }
 
@@ -1501,11 +1738,21 @@ enum SheetAct {
     Merge,
     CondFormat,
     DataValidation,
+    /// Data › Sort & Filter › Filter (Ctrl+Shift+L): AutoFilter buttons on
+    /// over the selection or the list around the cursor, or off (#690).
     Filter,
-    /// Data › Sort & Filter › Clear: unhide every hidden row of the region
-    /// around the cursor (hand-hidden ones too) and drop its filter marks,
-    /// as `clear` typed in the Filter bar does (#696).
+    /// Data › Sort & Filter › Clear: every row of the filtered list shows
+    /// again (hand-hidden ones too, as in Excel); the buttons stay (#690).
     ClearFilter,
+    /// Data › Sort & Filter › Reapply and Advanced (#690).
+    ReapplyFilter,
+    AdvancedFilter,
+    /// The cell menu's Filter by Selected Cell's Value / Color / Font Color /
+    /// Icon (#690).
+    FilterBy(gridcore::filter::ByCell),
+    /// The cell menu's Put Selected Cell Color / Font Color / Icon On Top
+    /// (#691).
+    PutOnTop(sheet_sort::OnTop),
     RemoveDuplicates,
     TextToColumns,
     FormatAsTable,
@@ -1526,6 +1773,46 @@ enum SheetAct {
     OutlineSettings,
     /// The Number group's format combo: opens or closes the format strip.
     NumberFormatMenu,
+    /// A ribbon command that opens a menu (#707): the Paste gallery, Fill,
+    /// Clear, Find & Select.
+    Menu(sheet_menus::SheetMenu),
+    /// Home › Fill › Down, Right, Up, Left.
+    Fill(gridcore::edit::FillDir),
+    /// Home › Fill › Series… (the Series dialog) and Justify.
+    FillSeries,
+    FillJustify,
+    /// Auto Fill Options: redo the last fill as this kind.
+    FillAs(gridcore::edit::FillKind),
+    /// The fill handle's right-drag menu: fill the waiting drag as this kind.
+    FillDrop(gridcore::edit::FillKind),
+    /// A Home › Clear item.
+    Clear(gridcore::edit::ClearWhat),
+    /// Home › Find & Select › Go To… and Go To Special….
+    GoTo,
+    GoToSpecial,
+    /// A Paste gallery item.
+    PasteAs(sheet_menus::PasteItem),
+    /// A Paste Options choice: the last paste again, that way.
+    PasteAgain(sheet_menus::PasteItem),
+    /// Paste Special… (Ctrl+Alt+V).
+    PasteSpecial,
+    /// The Clipboard group's launcher: the Office Clipboard pane.
+    OfficeClipboard,
+    /// File › Options › Advanced › Edit Custom Lists….
+    CustomLists,
+    /// A border right-drag's drop menu item.
+    Drop(sheet_menus::DropChoice),
+    /// Pick From Drop-down List... (the cell menu, Alt+Down; #665): its menu
+    /// over the selected cell, and entry `n` of it chosen.
+    PickList,
+    PickItem(u32),
+    /// Data › Flash Fill and Ctrl+E (#666), and the Flash Fill Options
+    /// menu's items.
+    FlashFill,
+    FlashUndo,
+    FlashAccept,
+    FlashSelectBlank,
+    FlashSelectChanged,
     Todo,
 }
 
@@ -1568,8 +1855,7 @@ fn cf_preset_dxf() -> gridcore::sheet::Dxf {
     gridcore::sheet::Dxf {
         fill: Some((0xFF, 0xC7, 0xCE)),
         color: Some((0x9C, 0x00, 0x06)),
-        bold: None,
-        italic: None,
+        ..Default::default()
     }
 }
 
@@ -1597,6 +1883,10 @@ impl SheetView {
         self.edit_overtype = false;
         self.edit_point = None;
         self.edit_proposal = None;
+        self.edit_complete = None;
+        self.edit_correction = None;
+        self.edit_kept = None;
+        self.edit_typed_tail = None;
     }
 
     /// The context a typed commit reads its entry under: the workbook's, with
@@ -1620,11 +1910,17 @@ impl SheetView {
     fn type_char(&mut self, c: &str) {
         if self.editing.is_some() {
             self.drop_proposal();
+            let at_end = self
+                .editing
+                .as_deref()
+                .is_some_and(|b| self.edit_caret == b.chars().count());
             self.edit_type(c);
+            self.autocorrect_typed(c, at_end);
         } else {
             self.begin_cell_edit(Some(String::new()));
             self.edit_caret = 0;
             self.edit_insert(c);
+            self.autocorrect_typed(c, true);
         }
         self.propose();
     }
@@ -1682,17 +1978,23 @@ impl SheetView {
     /// feed, the Ctrl+; / Ctrl+' entry chords — drops the suffix first, as
     /// typing does, so it lands after the typed text. A key that moves the
     /// caret or rewrites the buffer (Home/End, F2/F4/F9, Insert, Edit-mode
-    /// Left/Right, Ctrl+Left/Right/Delete/Z) keeps the text and drops only
-    /// the marker. Every other key leaves it live: the keys that commit
+    /// Left/Right, Ctrl+Left/Right/Delete) keeps the text and drops only
+    /// the marker. Ctrl+Z drops the suffix too, as a typed character does:
+    /// it may take back the AutoCorrect change the proposal was made from,
+    /// and the suffix is not part of what was typed. Every other key leaves
+    /// it live: the keys that commit
     /// (Enter, Tab, Ctrl+Enter, Ctrl+S's save) take it in `commit_edit`, and
     /// Backspace, Delete and typing handle it themselves.
     fn proposal_before_key(&mut self, key: &str, ctrl: bool, alt: bool) {
         if self.edit_proposal.is_none() {
             return;
         }
-        let inserts = (alt && key == "enter") || (ctrl && matches!(key, "'" | "\"" | ";" | ":"));
+        // Ctrl+Z drops the suffix too: it may take back the AutoCorrect
+        // change the proposal was made from, which the suffix is not part of.
+        let inserts =
+            (alt && key == "enter") || (ctrl && matches!(key, "'" | "\"" | ";" | ":" | "z"));
         let caret_move = if ctrl {
-            matches!(key, "left" | "right" | "delete" | "z")
+            matches!(key, "left" | "right" | "delete")
         } else {
             matches!(key, "home" | "end" | "f2" | "f4" | "f9" | "insert")
                 || (self.edit_arrows_move_caret() && matches!(key, "left" | "right"))
@@ -1706,13 +2008,15 @@ impl SheetView {
 
     /// A commit takes a live AutoComplete proposal: the buffer becomes the
     /// value it completes to, in that value's case.
-    fn take_proposal(&mut self) {
-        if let Some((_, value)) = self.edit_proposal.take() {
-            if self.editing.is_some() {
-                self.editing = Some(value);
-                self.edit_caret_to_end();
-            }
+    fn take_proposal(&mut self) -> bool {
+        let Some((_, value)) = self.edit_proposal.take() else {
+            return false;
+        };
+        if self.editing.is_some() {
+            self.editing = Some(value);
+            self.edit_caret_to_end();
         }
+        true
     }
 
     /// Where a double-click on (r, c) goes with editing directly in cells
@@ -1732,6 +2036,7 @@ impl SheetView {
         self.end_cell_edit();
         self.active = si;
         self.sel = (r1, c1);
+        self.clear_areas();
         self.anchor = (r2, c2);
         let near = self.row_list_index(r1);
         self.vlist.scroll_to_reveal_item(near);
@@ -1770,6 +2075,16 @@ impl SheetView {
         self.edit_overtype = false;
         self.edit_point = None;
         self.edit_proposal = None;
+        self.edit_complete = None;
+        self.edit_correction = None;
+        self.edit_kept = None;
+        self.edit_typed_tail = None;
+    }
+
+    /// A caret move or a deletion: the last word is no longer the one just
+    /// typed, so the commit's AutoCorrect leaves it (#667).
+    fn edit_tail_left(&mut self) {
+        self.edit_typed_tail = None;
     }
 
     fn edit_untouched(&self) -> bool {
@@ -1867,6 +2182,7 @@ impl SheetView {
         let idx = self.pkg.add_sheet(name);
         self.active = idx;
         self.sel = (0, 0);
+        self.clear_areas();
         self.anchor = (0, 0);
         self.end_cell_edit();
         self.engine = sheet_engine(&self.pkg.workbook);
@@ -1930,6 +2246,7 @@ impl SheetView {
             self.active = self.pkg.workbook.sheets.len() - 1;
         }
         self.sel = (0, 0);
+        self.clear_areas();
         self.anchor = (0, 0);
         self.end_cell_edit();
         self.engine = sheet_engine(&self.pkg.workbook);
@@ -1970,7 +2287,15 @@ impl SheetView {
     /// text and [`SheetView::entry_error`] says why.
     fn commit_edit(&mut self) -> bool {
         self.entry_error = None;
-        self.take_proposal();
+        let took = self.take_proposal();
+        self.autocorrect_commit(took);
+        self.commit_edit_taken(took)
+    }
+
+    /// [`SheetView::commit_edit`] after the proposal was taken (`took`) and
+    /// AutoCorrect ran: the rest of the commit, which Ctrl+Enter on one cell
+    /// shares so neither takes a proposal twice.
+    fn commit_edit_taken(&mut self, took: bool) -> bool {
         let untouched = self.edit_untouched();
         debug_assert!(self.editing.is_none() || self.edit_origin.is_some());
         let Some(buf) = self.editing.as_deref() else {
@@ -2005,11 +2330,16 @@ impl SheetView {
                 return false;
             }
         }
+        let link = self.typed_link(&buf, took, cell.as_ref());
         self.editing = None;
         self.end_cell_edit();
         self.push_undo();
         if let Some(cell) = cell {
             self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
+        }
+        // A typed URL is a hyperlink (ENT-120), in the same undo step.
+        if let (Some(url), Some(sh)) = (link, self.pkg.workbook.sheets.get_mut(s)) {
+            sh.hyperlinks.insert((r, c), url);
         }
         true
     }
@@ -2029,14 +2359,12 @@ impl SheetView {
     /// The blanks clearing the selected range writes: each cell's content
     /// goes, its style stays.
     fn clear_changes(&self) -> Vec<(u32, u32, gridcore::sheet::Cell)> {
-        let (r0, c0, r1, c1) = self.range();
-        let mut changes = Vec::new();
-        for (&(r, c), cell) in self.sheet().cells.range((r0, 0)..=(r1, u32::MAX)) {
-            if (c0..=c1).contains(&c) {
-                changes.push((r, c, cell.blank_like()));
-            }
-        }
-        changes
+        // Every area of a multi-area selection (#670), through an index of
+        // the areas rather than a walk per area (#707 r6).
+        gridcore::edit::cells_in_areas(self.sheet(), &self.areas_all())
+            .into_iter()
+            .map(|((r, c), cell)| (r, c, cell.blank_like()))
+            .collect()
     }
 
     /// Why `buf` cannot be committed into the cells `rect` of sheet `s` as a
@@ -2200,6 +2528,7 @@ impl SheetView {
 
     /// Ctrl+Left / Ctrl+Right: to the start of the previous / next word.
     fn edit_word_move(&mut self, forward: bool) {
+        self.edit_tail_left();
         let chars: Vec<char> = self.editing.as_deref().unwrap_or("").chars().collect();
         let word = |c: char| c.is_alphanumeric() || c == '_';
         let mut i = self.edit_caret.min(chars.len());
@@ -2223,6 +2552,7 @@ impl SheetView {
 
     /// Ctrl+Delete: delete from the caret to the end of the text.
     fn edit_delete_to_end(&mut self) {
+        self.edit_tail_left();
         let caret = self.edit_caret;
         if let Some(buf) = self.editing.as_mut() {
             let at = char_to_byte(buf, caret);
@@ -2234,6 +2564,10 @@ impl SheetView {
     /// opened with; the editor stays open and the workbook's undo is untouched.
     fn edit_revert(&mut self) {
         if self.editing.is_some() {
+            // Right after an AutoCorrect change, only it goes (ENT-119).
+            if self.undo_correction() {
+                return;
+            }
             self.edit_proposal = None;
             self.editing = Some(self.edit_start.clone());
             self.edit_caret_to_end();
@@ -2337,6 +2671,7 @@ impl SheetView {
     fn move_sel(&mut self, dr: i32, dc: i32) {
         let (r, c) = self.sel;
         self.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
+        self.clear_areas();
         self.anchor = self.sel;
         self.end_cell_edit();
     }
@@ -2505,17 +2840,22 @@ impl SheetView {
     /// selection kept. False when nothing was entered (no editor, or refused).
     fn commit_edit_to_selection(&mut self) -> bool {
         self.entry_error = None;
-        self.take_proposal();
+        let took = self.take_proposal();
+        self.autocorrect_commit(took);
         let Some(buf) = self.editing.clone() else {
             return false;
         };
         let (s, r, c) = self
             .edit_origin
             .unwrap_or((self.active, self.sel.0, self.sel.1));
-        let range = self.range();
-        let inside = (range.0..=range.2).contains(&r) && (range.1..=range.3).contains(&c);
-        if !self.has_range() || s != self.active || !inside {
-            return self.commit_edit();
+        // Every area of a multi-area selection (#670), each relative to the
+        // active cell: Go To Special › Blanks, `=A1`, Ctrl+Enter.
+        let areas = self.areas_all();
+        let inside = areas
+            .iter()
+            .any(|a| (a.0..=a.2).contains(&r) && (a.1..=a.3).contains(&c));
+        if (!self.has_range() && areas.len() == 1) || s != self.active || !inside {
+            return self.commit_edit_taken(took);
         }
         if let Err(e) = gridcore::entry::check_len(&buf) {
             self.entry_error = Some(e.to_string());
@@ -2523,30 +2863,55 @@ impl SheetView {
         }
         // Every cell of the range, not just the active one: a Text-formatted
         // active cell takes `=SUM(B1` as text while the others would not.
-        if let Some(e) = self.formula_error(s, range, &buf) {
+        if let Some(e) = areas
+            .iter()
+            .find_map(|&range| self.formula_error(s, range, &buf))
+        {
             self.entry_error = Some(e);
             return false;
         }
         let ctx = self.typed_ctx();
         let wb = &mut self.pkg.workbook;
-        let cells = gridcore::entry::entry_range_ctx(wb, s, range, (r, c), &buf, &ctx).ok();
+        let mut cells = Some(Vec::new());
+        for &range in &areas {
+            match gridcore::entry::entry_range_ctx(wb, s, range, (r, c), &buf, &ctx) {
+                Ok(more) => {
+                    if let Some(all) = cells.as_mut() {
+                        all.extend(more);
+                    }
+                }
+                Err(_) => cells = None,
+            }
+        }
         if cells.as_ref().is_some_and(|cells| self.refuses(s, cells)) {
             return false;
         }
+        // A typed URL is a link in each cell it fills (ENT-120).
+        let link = cells
+            .as_ref()
+            .and_then(|cells| cells.first())
+            .and_then(|(_, _, cell)| self.typed_link(&buf, took, Some(cell)));
+        let filled: Vec<(u32, u32)> = cells.iter().flatten().map(|(r, c, _)| (*r, *c)).collect();
         self.end_cell_edit();
         self.push_undo();
         if let Some(cells) = cells {
             self.engine
                 .set_cells_prechecked(&mut self.pkg.workbook, s, cells);
         }
+        if let (Some(url), Some(sh)) = (link, self.pkg.workbook.sheets.get_mut(s)) {
+            for at in filled {
+                sh.hyperlinks.insert(at, url.clone());
+            }
+        }
         true
     }
 
-    /// Ctrl+D / Ctrl+R over the selection (one undo step). False when there
-    /// was nothing to fill, or the fill was refused as part of an array
-    /// ([`SheetView::entry_error`] says so).
-    fn fill_selection(&mut self, down: bool) -> bool {
-        let changes = gridcore::edit::fill_changes(self.sheet(), self.range(), down);
+    /// Ctrl+D / Ctrl+R and Home › Fill › Down, Right, Up, Left over the
+    /// selection (one undo step). False when there was nothing to fill, or
+    /// the fill was refused as part of an array ([`SheetView::entry_error`]
+    /// says so).
+    fn fill_selection(&mut self, dir: gridcore::edit::FillDir) -> bool {
+        let changes = gridcore::edit::fill_changes(self.sheet(), self.range(), dir);
         if changes.is_empty() || self.refuses(self.active, &changes) {
             return false;
         }
@@ -2561,18 +2926,25 @@ impl SheetView {
     /// of each cell's `Xf`, intern it (dedup), and re-point the cell's style.
     /// Values and formulas are untouched, so no recalc is needed.
     fn format_selection(&mut self, apply: &dyn Fn(&mut gridcore::sheet::Xf)) {
-        let (r0, c0, r1, c1) = self.range();
         let s = self.active;
-        for r in r0..=r1 {
-            for c in c0..=c1 {
+        let mut seen = std::collections::HashSet::new();
+        // Each old style's new one, interned once: interning scans the style
+        // table (#707 r6).
+        let mut restyled: std::collections::HashMap<u32, u32> = Default::default();
+        // Every area of a multi-area selection (#670), each cell once.
+        for (r0, c0, r1, c1) in self.areas_all() {
+            for (r, c) in (r0..=r1).flat_map(|r| (c0..=c1).map(move |c| (r, c))) {
+                if !seen.insert((r, c)) {
+                    continue;
+                }
                 let cur = self.sheet().cell(r, c).cloned();
-                let mut xf = self
-                    .pkg
-                    .workbook
-                    .styles
-                    .xf(cur.as_ref().map(|cl| cl.style).unwrap_or(0));
-                apply(&mut xf);
-                let idx = self.pkg.workbook.styles.intern(xf);
+                let old = cur.as_ref().map(|cl| cl.style).unwrap_or(0);
+                let styles = &mut self.pkg.workbook.styles;
+                let idx = *restyled.entry(old).or_insert_with(|| {
+                    let mut xf = styles.xf(old);
+                    apply(&mut xf);
+                    styles.intern(xf)
+                });
                 let mut cell = cur.unwrap_or_default();
                 cell.style = idx;
                 self.pkg.workbook.sheets[s].set_cell(r, c, cell);
@@ -2643,106 +3015,6 @@ impl SheetView {
         true
     }
 
-    /// The contiguous region around the selection to sort, as `(start, bottom)`
-    /// data-row bounds (header excluded). A header is inferred when the top row
-    /// carries a text label over numeric data in *any* column. `None` when
-    /// there's nothing to sort.
-    fn sort_bounds(&self) -> Option<(u32, u32)> {
-        use gridcore::sheet::CellValue;
-        let s = self.active;
-        let (max_r, max_c) = self.extent();
-        let sh = &self.pkg.workbook.sheets[s];
-        let row_used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-        let sr = self.sel.0;
-        if !row_used(sr) {
-            return None;
-        }
-        let mut top = sr;
-        while top > 0 && row_used(top - 1) {
-            top -= 1;
-        }
-        let mut bottom = sr;
-        while bottom < max_r && row_used(bottom + 1) {
-            bottom += 1;
-        }
-        let header = (0..=max_c).any(|c| {
-            matches!(
-                sh.cell(top, c).map(|cl| &cl.value),
-                Some(CellValue::Text(_))
-            ) && (top + 1..=bottom).any(|r| {
-                matches!(
-                    sh.cell(r, c).map(|cl| &cl.value),
-                    Some(CellValue::Number(_))
-                )
-            })
-        });
-        let start = if header { top + 1 } else { top };
-        (bottom > start).then_some((start, bottom))
-    }
-
-    /// The contiguous rows around the cursor a filter acts on, as
-    /// `(top, bottom)`; `None` when the cursor's row is empty.
-    fn filter_region(&self) -> Option<(u32, u32)> {
-        let (max_r, max_c) = self.extent();
-        let sh = self.sheet();
-        let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-        let cur_r = self.sel.0;
-        if !used(cur_r) {
-            return None;
-        }
-        let mut top = cur_r;
-        while top > 0 && used(top - 1) {
-            top -= 1;
-        }
-        let mut bottom = cur_r;
-        while bottom < max_r && used(bottom + 1) {
-            bottom += 1;
-        }
-        Some((top, bottom))
-    }
-
-    /// Data › Sort & Filter › Clear, and `clear` typed in the Filter bar:
-    /// unhide every row of the region around the cursor and drop its filter
-    /// marks. Whether any row changed.
-    fn clear_filter(&mut self) -> bool {
-        let Some((top, bottom)) = self.filter_region() else {
-            return false;
-        };
-        let s = self.active;
-        let sh = &mut self.pkg.workbook.sheets[s];
-        let rows: Vec<u32> = (top..=bottom)
-            .filter(|&r| sh.row_hidden(r) || sh.filtered_rows.contains(&r))
-            .collect();
-        for &r in &rows {
-            sh.set_row_filtered(r, false);
-        }
-        !rows.is_empty()
-    }
-
-    /// Commit the editor before computing bounds or sorting its row. Rows
-    /// that cut a spilled array are not sorted: `entry_error` says why.
-    fn sort_with_pending_edit(
-        &mut self,
-        field: Option<(u32, u32, u32, u32)>,
-        keys: &[(u32, bool)],
-    ) -> (bool, bool) {
-        let committed = self.commit_edit();
-        if self.editing.is_some() {
-            return (false, false); // refused: sorting would move its origin
-        }
-        let Some((start, bottom)) = sort_rows_from(field, self.sort_bounds()) else {
-            return (committed, false);
-        };
-        if gridcore::edit::sort_cuts_spill(&self.pkg.workbook, self.active, start, bottom) {
-            self.entry_error = Some(gridcore::edit::SORT_CUTS_SPILL.into());
-            return (committed, false);
-        }
-        self.push_undo();
-        gridcore::edit::sort_rows(&mut self.pkg.workbook, self.active, start, bottom, keys);
-        self.engine = sheet_engine(&self.pkg.workbook);
-        (committed, true)
-    }
-
     fn sheet(&self) -> &gridcore::sheet::Sheet {
         &self.pkg.workbook.sheets[self
             .active
@@ -2783,12 +3055,14 @@ impl SheetView {
     }
     /// Delete the char before the caret (Backspace).
     fn edit_backspace(&mut self) {
+        self.edit_tail_left();
         if let Some(buf) = self.editing.as_mut() {
             buf_backspace(buf, &mut self.edit_caret);
         }
     }
     /// Delete the char at the caret (Delete).
     fn edit_delete(&mut self) {
+        self.edit_tail_left();
         let caret = self.edit_caret;
         if let Some(buf) = self.editing.as_mut() {
             buf_delete(buf, caret);
@@ -2796,6 +3070,7 @@ impl SheetView {
     }
     /// Move the caret by `delta` chars, clamped to the buffer.
     fn edit_move(&mut self, delta: i32) {
+        self.edit_tail_left();
         let n = self.edit_len() as i32;
         self.edit_caret = (self.edit_caret as i32 + delta).clamp(0, n) as usize;
     }
@@ -2831,6 +3106,7 @@ impl SheetView {
             active: self.active,
             sel: self.sel,
             anchor: self.anchor,
+            areas: self.extra_areas(),
         }
     }
 
@@ -2849,34 +3125,149 @@ impl SheetView {
             .min(self.pkg.workbook.sheets.len().saturating_sub(1));
         self.sel = snap.sel;
         self.anchor = snap.anchor;
+        self.areas = snap.areas;
+        self.stamp_areas();
         self.end_cell_edit();
     }
-    /// The selection rectangle as (r0, c0, r1, c1), top-left to bottom-right.
+    /// The selection rectangle as (r0, c0, r1, c1), top-left to bottom-right:
+    /// the active area of a multi-area selection.
     fn range(&self) -> (u32, u32, u32, u32) {
         sel_range(self.sel, self.anchor)
+    }
+
+    /// Whether the earlier areas still belong to the selection (R5): the
+    /// stamp still matches, and never stopped matching since they were set.
+    fn areas_live(&self) -> bool {
+        if self.areas.is_empty() || self.areas_dead.get() {
+            return false;
+        }
+        let live = self.areas_at == (self.active, self.sel, self.anchor);
+        if !live {
+            self.areas_dead.set(true);
+        }
+        live
+    }
+
+    /// The selection's areas other than the active one; empty for a
+    /// one-area selection.
+    fn extra_areas(&self) -> Vec<(u32, u32, u32, u32)> {
+        if self.areas_live() {
+            self.areas.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Every area of the selection, the active one last.
+    fn areas_all(&self) -> Vec<(u32, u32, u32, u32)> {
+        let mut all = self.extra_areas();
+        all.push(self.range());
+        all
+    }
+
+    /// Whether the selection has more than one area.
+    fn multi_area(&self) -> bool {
+        self.areas_live()
+    }
+
+    /// Take the selection as it is now as the one the areas belong to:
+    /// after an edit of the active area that keeps the others (Shift+click,
+    /// a Ctrl+drag's sweep).
+    fn stamp_areas(&mut self) {
+        self.areas_at = (self.active, self.sel, self.anchor);
+        self.areas_dead.set(false);
+    }
+
+    /// Ctrl+click (or the press of a Ctrl+drag): the selection so far stays,
+    /// and `cell` starts a new active area.
+    fn add_area(&mut self, cell: (u32, u32)) {
+        self.areas = self.areas_all();
+        self.sel = cell;
+        self.anchor = cell;
+        self.stamp_areas();
+        self.end_cell_edit();
+    }
+
+    /// Move the active area's moving corner to `cell`, keeping the other
+    /// areas (Shift+click, a sweep, Shift+arrow).
+    fn extend_active(&mut self, cell: (u32, u32)) {
+        let live = self.areas_live();
+        self.sel = cell;
+        if live {
+            self.stamp_areas();
+        }
+    }
+
+    /// Select `rects` as one multi-area selection (Go To Special): the first
+    /// is active, with the active cell at its top-left (R6).
+    fn set_areas(&mut self, rects: &[(u32, u32, u32, u32)]) {
+        let Some((&(r0, c0, r1, c1), rest)) = rects.split_first() else {
+            return;
+        };
+        self.sel = (r0, c0);
+        self.anchor = (r1, c1);
+        self.areas = rest.to_vec();
+        self.stamp_areas();
+        self.end_cell_edit();
+        // The active area scrolled into view (#707 r5 M3).
+        self.reveal((r0, c0, r1, c1));
+    }
+
+    /// Scroll `rect` into view: its far end first, then its near one, so a
+    /// range that fits is wholly shown and one that doesn't shows its start;
+    /// a column to the right waits for the render pass, which knows the
+    /// grid's width (`reveal_col`).
+    fn reveal(&mut self, (r0, c0, r1, c1): (u32, u32, u32, u32)) {
+        let (near, far) = (self.row_list_index(r0), self.row_list_index(r1));
+        self.vlist.scroll_to_reveal_item(far);
+        self.vlist.scroll_to_reveal_item(near);
+        self.col0 = self.col0.min(c0);
+        self.reveal_col = Some(c1);
+    }
+
+    /// Back to one area.
+    fn clear_areas(&mut self) {
+        self.areas.clear();
+        self.areas_dead.set(false);
     }
 
     /// The selection as a grid clip (Ctrl+C, Ctrl+X): its cells, and as TSV
     /// the text it puts on the clipboard. A copy leaves out the rows a filter
     /// hides, as Excel does (rows hidden by Hide are copied); a cut keeps
-    /// every row, since it moves the whole range (#664). `None` when a
-    /// filter hides every selected row: there is nothing to copy.
-    fn grid_clip(&self, cut: bool) -> Option<GridClip> {
-        let rect = self.range();
-        let (r0, c0, r1, c1) = rect;
+    /// every row, since it moves the whole range (#664). A multi-area copy
+    /// joins areas that share their rows (or their columns) into one block,
+    /// and refuses any other, as a cut of more than one area is refused
+    /// ([`gridcore::edit::MULTI_SELECTION`], #670). Refused too when a filter
+    /// hides every selected row: there is nothing to copy.
+    fn grid_clip(&self, cut: bool) -> Result<GridClip, &'static str> {
+        let (all_rows, cols) = if self.multi_area() {
+            if cut {
+                return Err(gridcore::edit::MULTI_SELECTION);
+            }
+            gridcore::edit::multi_area_shape(&self.areas_all())?
+        } else {
+            let (r0, c0, r1, c1) = self.range();
+            ((r0..=r1).collect(), (c0..=c1).collect())
+        };
+        let rect = (
+            all_rows[0],
+            cols[0],
+            *all_rows.last().unwrap_or(&all_rows[0]),
+            *cols.last().unwrap_or(&cols[0]),
+        );
         let sheet = self.sheet();
-        let rows: Vec<u32> = (r0..=r1)
+        let rows: Vec<u32> = all_rows
+            .into_iter()
             .filter(|&r| cut || !sheet.row_filtered(r))
             .collect();
         if rows.is_empty() {
-            return None;
+            return Err(NOTHING_TO_COPY);
         }
-        let mut cells = Vec::with_capacity(rows.len());
+        let block = self.clip_block(rows, cols);
         let mut tsv = String::new();
-        for &r in &rows {
-            let mut row = Vec::new();
-            for c in c0..=c1 {
-                if c > c0 {
+        for &r in &block.rows {
+            for (j, &c) in block.cols.iter().enumerate() {
+                if j > 0 {
                     tsv.push('\t');
                 }
                 // With the `'` a paste needs to read the text back.
@@ -2888,19 +3279,16 @@ impl SheetView {
                         self.cell_text(r, c),
                     ));
                 }
-                row.push(sheet.cell(r, c).cloned().unwrap_or_default());
             }
-            cells.push(row);
             tsv.push('\n');
         }
-        Some(GridClip {
-            cells,
+        Ok(GridClip {
             text: tsv,
             view: self.id,
             sheet: self.active,
             sheet_name: sheet.name.clone(),
             rect,
-            rows,
+            block,
             cut,
             view_gen: self.edit_gen,
             spent: false,
@@ -2914,6 +3302,7 @@ impl SheetView {
         let w = block.iter().map(Vec::len).max().unwrap_or(0) as u32;
         if h > 0 && w > 0 {
             self.sel = at;
+            self.clear_areas();
             self.anchor = (at.0 + h - 1, at.1 + w - 1);
         }
     }
@@ -2980,8 +3369,8 @@ impl SheetView {
     /// written whatever its size, as before #664).
     fn paste_copy(&mut self, clip: &GridClip) -> Result<GridPasted, GridPasteError> {
         use gridcore::edit::{MAX_PASTE_CELLS, PASTE_SHAPE, paste_tiles, tiled_block};
-        let h = clip.cells.len() as u32;
-        let w = clip.cells.iter().map(Vec::len).max().unwrap_or(0) as u32;
+        let h = clip.block.cells.len() as u32;
+        let w = clip.block.cells.iter().map(Vec::len).max().unwrap_or(0) as u32;
         let sel = self.range();
         let used = self.sheet().used_size();
         let tiles = paste_tiles((h, w), sel, used)
@@ -2993,7 +3382,13 @@ impl SheetView {
             )));
         }
         let at = (sel.0, sel.1);
-        let block = tiled_block(&clip.cells, &clip.rows, clip.rect.1, at, tiles);
+        let block = tiled_block(
+            &clip.block.cells,
+            &clip.block.rows,
+            &clip.block.cols,
+            at,
+            tiles,
+        );
         self.write_block(at, &block).map(|()| GridPasted::Done)
     }
 
@@ -3010,7 +3405,7 @@ impl SheetView {
             return false;
         };
         let (r0, c0, r1, c1) = clip.rect;
-        if sheet.name != clip.sheet_name || clip.cells.len() as u32 != r1 - r0 + 1 {
+        if sheet.name != clip.sheet_name || clip.block.cells.len() as u32 != r1 - r0 + 1 {
             return false;
         }
         let same = |a: &gridcore::sheet::Cell, b: &gridcore::sheet::Cell| {
@@ -3019,7 +3414,7 @@ impl SheetView {
                 && a.style == b.style
                 && (a.formula.is_some() || a.value == b.value)
         };
-        (r0..=r1).zip(&clip.cells).all(|(r, row)| {
+        (r0..=r1).zip(&clip.block.cells).all(|(r, row)| {
             (c0..=c1)
                 .zip(row)
                 .all(|(c, was)| same(was, &sheet.cell(r, c).cloned().unwrap_or_default()))
@@ -3248,15 +3643,24 @@ impl DocTab {
         caption
     }
 
-    /// A document edit landed. In Protected View (#633) a gate before it
-    /// leaked, so the edit is rolled back instead ([`protected_rollback`])
-    /// and the tab never turns dirty.
+    /// A document edit landed. In Protected View (#633), or in a document
+    /// marked as final (#617), a gate before it leaked, so the edit is
+    /// rolled back instead ([`protected_rollback`]) and the tab never turns
+    /// dirty.
     fn mark_dirty(&mut self) {
-        if self.access.protected {
+        if self.access.locked() {
             protected_rollback(self);
         } else {
-            self.dirty = true;
+            self.set_dirty();
         }
+    }
+
+    /// A document tab's changes go through here; sheet commits and Project
+    /// edits sync `dirty` themselves and call `bump_edit_generation`
+    /// directly. Either way a Repeat record taken before goes stale (#618).
+    fn set_dirty(&mut self) {
+        self.dirty = true;
+        bump_edit_generation();
     }
 }
 
@@ -3287,10 +3691,21 @@ struct Docxy {
     ribbon_tab: RibbonTab,
     ribbon_min: bool,
     backstage: bool,
+    /// Dialogs the app owns: the Settings' User name opened with no document
+    /// open, where there is no tab's stack to hold it (#1027). While one is
+    /// open it is the one shown and keyed, even if a tab arrives under it.
+    app_dialogs: dialog::DialogStack,
     bs_new: bool,
+    /// Vertical scroll of the backstage's content pane and of its rail
+    /// (#1028). The content one is reset when the page changes.
+    bs_scroll: ScrollHandle,
+    bs_rail_scroll: ScrollHandle,
     /// The backstage shows the Info page (Inspect Document, #627). Cleared
     /// wherever `bs_new` is; New and Info clear each other.
     bs_info: bool,
+    /// The backstage shows the Account page: the build line and About (#1023).
+    /// New, Info and Account clear one another.
+    bs_account: bool,
     /// The last Remove All on the Info page and the tab index it ran on:
     /// the backstage draws no status bar, so the page shows it under the
     /// rows. Cleared with `bs_info`, on a tab switch, and when a tab is
@@ -3298,10 +3713,26 @@ struct Docxy {
     bs_info_status: Option<(usize, Result<String, String>)>,
     clip: Option<DocClip>,
     theme_pref: ThemePref,
-    /// When set, closing the window with unsaved tabs shows a confirm dialog.
-    /// Off by default: work is hot-persisted and restored regardless, so closing
-    /// is normally silent.
+    /// When set, closing the window with unsaved tabs asks about each unsaved
+    /// tab in turn (#630). Off by default: work is hot-persisted and restored
+    /// regardless, so closing is normally silent.
     ask_on_close: bool,
+    /// The number the next new document's `Document<n>` title takes (#631):
+    /// it only goes up, so a number is never reused in a session.
+    next_document: u32,
+    /// The window is closing through its per-document questions (#630):
+    /// a close prompt with `quit` is on the tab being asked about.
+    quitting: bool,
+    /// The tabs answered Don't Save while quitting, by index: their unsaved
+    /// work is forgotten, but only once the quit goes ahead.
+    quit_discards: Vec<usize>,
+    /// The tabs as they were when the quit began ([`close::tab_ids`]): a quit
+    /// whose tabs changed under it is cancelled rather than answering for
+    /// tabs by stale indexes.
+    quit_tabs: Vec<close::TabId>,
+    /// A harness quit that went ahead (#630): the harness ends the process
+    /// after the reply, rather than the window removing itself under it.
+    quit_ready: bool,
     /// Minutes between AutoRecover writes while a tab is unsaved (#632); 0 is off.
     autorecover_minutes: u32,
     /// Keep a workbook's last AutoRecover copy as a draft when it is closed
@@ -3312,6 +3743,9 @@ struct Docxy {
     /// keeps a copy that [`stamp_edit_opts`] refreshes on restore, on a
     /// change and every frame (and `active_sheet_mut` on each use).
     edit_opts: EditOptions,
+    /// AutoCorrect (#667): the app's, stamped into every sheet tab, saved
+    /// with the Editing options. Its dialogs change it.
+    autocorrect: std::rc::Rc<gridcore::autocorrect::AutoCorrect>,
     /// The reviewer's name and initials for new comments (#620), as set in
     /// Settings › User name; empty falls back ([`review_identity`]).
     user_name: String,
@@ -3347,8 +3781,19 @@ struct Docxy {
     picker: Option<PickKind>,
     // Scroll handle for the document body, so the caret can be kept in view.
     doc_scroll: ScrollHandle,
+    /// The open menu's scroll: Up/Down scroll the highlighted row into view,
+    /// and each menu (or submenu) starts at the top.
+    menu_scroll: ScrollHandle,
     // New-comment entry bar (Review ▸ New comment); routes keys while open.
     comment_open: bool,
+    /// The comment the Review tab's Resolve acts on: the one last clicked in
+    /// the Comments pane, with the tab it is in (ids are per document). The tab
+    /// is named by its title and file ([`close::TabId`]), not its index, so
+    /// closing or moving tabs never points it at another document.
+    selected_comment: Option<(close::TabId, String)>,
+    /// Display for Review (#625): how tracked changes are shown. A view only,
+    /// not saved; No Markup and Original refuse edits.
+    markup: docxcore::markup::MarkupView,
     comment_text: String,
     // Show formatting marks (¶, tab arrows) — View ▸ Show/Hide.
     show_marks: bool,
@@ -3380,6 +3825,23 @@ struct Docxy {
     sheet_dragging: bool,
     // An in-progress auto-fill drag from the selection's fill handle.
     sheet_fill: Option<FillDrag>,
+    // The Auto Fill Options button of the last fill (#668).
+    fill_options: Option<sheet_fill::FillOptions>,
+    // The pending drops of the grid's drags (#670, #668): a border drag
+    // in flight, a drop waiting on its menu or question, a fill-handle
+    // right-drag waiting on its menu.
+    drops: sheet_drag::GridDrops,
+    // The Paste Options button of the last paste of a copy (#669), what
+    // the Paste Special dialog pastes, and the Office Clipboard.
+    paste_options: Option<sheet_paste::PasteOptions>,
+    paste_special_source: Option<sheet_paste::PasteSource>,
+    office_clip: sheet_paste::OfficeClipboard,
+    // Where the pointer last was over the grid, window coordinates: where a
+    // menu a release opens is drawn.
+    last_pointer: Point<Pixels>,
+    // File › Options › Advanced › Edit Custom Lists: AutoFill continues them
+    // in every workbook (#668).
+    custom_lists: Vec<Vec<String>>,
     // The selected chart on the active sheet, as an index into that sheet's
     // chart list (UI-authored charts first, then the ones loaded from the file).
     chart_sel: Option<usize>,
@@ -3399,6 +3861,8 @@ struct Docxy {
     ref_msg: Option<(RefTarget, bool, String)>,
     // The cell a left press landed on, so a drag-select starts there.
     drag_anchor: Option<(u32, u32)>,
+    // Ctrl was held at that press: the sweep adds an area (#670).
+    drag_ctrl: bool,
     // A reference being pointed at while a formula is being typed: the buffer
     // and caret as they were when the press landed, plus the anchor cell. Each
     // move re-splices from those, so a drag rewrites one reference rather than
@@ -3418,6 +3882,9 @@ struct Docxy {
     // The menu the backdrop last closed and where that press was, so a press
     // on a split button's arrow can tell it just shut the arrow's own menu.
     menu_closed_at: Option<(menu::MenuTarget, Point<Pixels>)>,
+    // What Ctrl+Y / F4 repeat when there is nothing to redo (#618); see
+    // `RepeatRecord` for when it is still valid.
+    repeat: Option<RepeatRecord>,
     // Floating mini formatting toolbar shown after a drag-selection (window coords).
     mini_bar: Option<Point<Pixels>>,
     // Document zoom factor (1.0 = 100%), controlled from the status bar.
@@ -3440,6 +3907,12 @@ struct Docxy {
     // In-progress cell-comment entry for the selected cell (the input buffer);
     // None = the comment bar is closed.
     sheet_comment_edit: Option<String>,
+    // The raw text a comment bar opened with (its seed): the selection moves
+    // freely while the bar is open, and an exit commit uses the seed only to
+    // tell an untouched buffer from an edit — so a bar merely open never
+    // deletes or copies onto a clicked cell. Set where the buffer opens,
+    // cleared with it.
+    sheet_comment_seed: Option<String>,
     // Whether the data-validation list dropdown is open on the selected cell.
     sheet_dv_open: bool,
     // Whether the Number-group format picker strip is open.
@@ -3450,14 +3923,10 @@ struct Docxy {
     sheet_cf_edit: Option<String>,
     // In-progress data-validation list entry (comma-separated allowed values).
     sheet_dv_edit: Option<String>,
-    // In-progress AutoFilter criteria entry for the selected column.
-    sheet_filter_edit: Option<String>,
-    // In-progress multi-level sort spec entry ("B asc, C desc").
-    sheet_sort_edit: Option<String>,
     // In-progress row-height entry (points, or "auto").
     sheet_rowh_edit: Option<String>,
-    // Which entry bar's range field is on screen, if any. Its seed depends on
-    // the bar (a sort's is the region it would find, not the selection).
+    // Which entry bar's range field is on screen, if any; it starts on the
+    // selection.
     bar_field: Option<RefTarget>,
     // A range the user PINNED into that field, by typing it or pointing at it.
     // While this is None the bar keeps following the selection, which is what
@@ -3494,6 +3963,8 @@ struct Probes {
     next: Vec<(String, Bounds<Pixels>)>,
     /// The last frame that finished — what `rect` answers from.
     last: Vec<(String, Bounds<Pixels>)>,
+    /// Ribbon groups already warned about as clipped (debug builds).
+    warned: std::collections::HashSet<String>,
 }
 
 impl Probes {
@@ -3540,11 +4011,121 @@ impl Probes {
     }
 }
 
+/// Where PageUp/PageDown/Home/End leave the backstage pane's scroll offset
+/// (gpui offsets run from 0 down to `-max_y`), or `None` for any other key.
+/// A page is the viewport less a 40px overlap, as a browser scrolls it.
+fn backstage_scroll_target(key: &str, cur_y: f32, view_h: f32, max_y: f32) -> Option<f32> {
+    let page = (view_h - 40.0).max(40.0);
+    let y = match key {
+        "pageup" => cur_y + page,
+        "pagedown" => cur_y - page,
+        "home" => 0.0,
+        "end" => -max_y,
+        _ => return None,
+    };
+    Some(y.clamp(-max_y.max(0.0), 0.0))
+}
+
+/// The backstage content pane's layout, as `backstage-layout` reports it.
+struct BackstageLayout {
+    viewport_h: f32,
+    content_h: f32,
+    scroll_y: f32,
+}
+
+impl BackstageLayout {
+    fn read(scroll: &ScrollHandle) -> Self {
+        let viewport_h = f32::from(scroll.bounds().size.height);
+        BackstageLayout {
+            viewport_h,
+            content_h: viewport_h + f32::from(scroll.max_offset().y).max(0.0),
+            scroll_y: -f32::from(scroll.offset().y),
+        }
+    }
+
+    fn scrollable(&self) -> bool {
+        self.content_h > self.viewport_h + 0.5
+    }
+
+    /// The page's last row is inside the viewport: it fits, or the scroll has
+    /// reached the end.
+    fn last_item_visible(&self) -> bool {
+        !self.scrollable() || self.scroll_y >= self.content_h - self.viewport_h - 1.0
+    }
+}
+
+#[cfg(test)]
+mod backstage_scroll_tests {
+    use super::{BackstageLayout, backstage_scroll_target};
+
+    /// #1028: offsets run 0 → -max; PageDown moves a viewport less 40px.
+    #[test]
+    fn keys_move_the_pane_within_its_range() {
+        // viewport 440, content 1000 → max 560, page 400.
+        assert_eq!(
+            backstage_scroll_target("pagedown", 0.0, 440.0, 560.0),
+            Some(-400.0)
+        );
+        assert_eq!(
+            backstage_scroll_target("pagedown", -400.0, 440.0, 560.0),
+            Some(-560.0)
+        );
+        assert_eq!(
+            backstage_scroll_target("pageup", -560.0, 440.0, 560.0),
+            Some(-160.0)
+        );
+        assert_eq!(
+            backstage_scroll_target("pageup", -100.0, 440.0, 560.0),
+            Some(0.0)
+        );
+        assert_eq!(
+            backstage_scroll_target("home", -300.0, 440.0, 560.0),
+            Some(0.0)
+        );
+        assert_eq!(
+            backstage_scroll_target("end", 0.0, 440.0, 560.0),
+            Some(-560.0)
+        );
+        assert_eq!(backstage_scroll_target("a", 0.0, 440.0, 560.0), None);
+        // A page that fits has nowhere to go.
+        assert_eq!(backstage_scroll_target("end", 0.0, 440.0, 0.0), Some(0.0));
+        assert_eq!(
+            backstage_scroll_target("pagedown", 0.0, 440.0, 0.0),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn layout_reports_fit_scrollable_and_reached_the_end() {
+        let fits = BackstageLayout {
+            viewport_h: 400.0,
+            content_h: 400.0,
+            scroll_y: 0.0,
+        };
+        assert!(!fits.scrollable() && fits.last_item_visible());
+        let top = BackstageLayout {
+            viewport_h: 400.0,
+            content_h: 900.0,
+            scroll_y: 0.0,
+        };
+        assert!(top.scrollable() && !top.last_item_visible());
+        let end = BackstageLayout {
+            viewport_h: 400.0,
+            content_h: 900.0,
+            scroll_y: 500.0,
+        };
+        assert!(end.scrollable() && end.last_item_visible());
+    }
+}
+
 /// Where a split button's drop-down opens: under the whole button, at its
 /// lower left, as Office drops it, so the list never covers the arrow that
 /// toggles it. The pointer and `menu-open` both anchor here; `None` when the
 /// button has not been laid out.
 fn split_menu_anchor(probes: &Probes, primary_id: &str) -> Option<Point<Pixels>> {
+    if primary_id == menu::QAT_UNDO_ID {
+        return qat_undo_anchor(probes);
+    }
     probes
         .current(&format!("ribbon-split:{primary_id}"))
         .map(|b| b.bottom_left())
@@ -5016,8 +5597,11 @@ mod click_caret_tests {
     }
 }
 
+/// A new blank document, as Word starts one: one empty paragraph (#631).
 fn empty_doc() -> Document {
-    docxcore::markdown::from_markdown("# Untitled\n\n")
+    Document {
+        body: vec![Block::Paragraph(Default::default())],
+    }
 }
 
 /// A loaded document with everything a tab needs to hold and re-save it losslessly.
@@ -5064,11 +5648,14 @@ impl Loaded {
         path: Option<PathBuf>,
         dirty: bool,
     ) -> DocTab {
+        // Word's Mark as Final (#617), from whatever the tab loaded: its
+        // file, or its hot-exit copy.
+        let marked_final = self.pkg.as_ref().is_some_and(Package::marked_final);
         let mut tab = DocTab {
             kind,
             title,
             path,
-            surface: Surface::Doc(Editor::new(self.doc)),
+            surface: Surface::Doc(new_doc_editor(self.doc, self.pkg.as_ref())),
             dirty,
             status: self.status,
             comments: self.comments,
@@ -5085,6 +5672,7 @@ impl Loaded {
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access {
                 converted: self.converted,
+                marked_final,
                 ..Default::default()
             },
             last_hot: Default::default(),
@@ -5100,6 +5688,70 @@ impl Loaded {
 fn is_markdown_path(path: &std::path::Path) -> bool {
     let l = path.to_string_lossy().to_lowercase();
     l.ends_with(".md") || l.ends_with(".markdown") || l.ends_with(".mdown")
+}
+
+/// The reviewer name and initials the user configured (#620), for the
+/// editors built where no [`Docxy`] is at hand (a load, a restore). Set when
+/// the session is read and whenever the user changes it, so a file that opens
+/// with Track Changes on records as the same reviewer as its comments and
+/// the Track Changes toggle do.
+static CONFIGURED_IDENTITY: std::sync::Mutex<(String, String)> =
+    std::sync::Mutex::new((String::new(), String::new()));
+
+/// The raw configured name and initials (empty when none), to put back.
+#[cfg(test)]
+fn configured_identity_raw() -> (String, String) {
+    CONFIGURED_IDENTITY
+        .lock()
+        .map(|id| id.clone())
+        .unwrap_or_default()
+}
+
+fn set_configured_identity(name: &str, initials: &str) {
+    if let Ok(mut id) = CONFIGURED_IDENTITY.lock() {
+        *id = (name.to_string(), initials.to_string());
+    }
+}
+
+fn configured_identity() -> (String, String) {
+    let (name, initials) = CONFIGURED_IDENTITY
+        .lock()
+        .map(|id| id.clone())
+        .unwrap_or_default();
+    review_identity(&name, &initials)
+}
+
+/// Tabs already recording tracked changes keep recording, as the reviewer
+/// now configured (the user-name dialog changed it).
+fn reauthor_tracking(tabs: &mut [DocTab], user_name: &str, user_initials: &str) {
+    let author = track_author(&review_identity(user_name, user_initials));
+    for tab in tabs {
+        if let Surface::Doc(ed) = &mut tab.surface {
+            if ed.track_changes() {
+                ed.set_track_changes(Some(author.clone()));
+            }
+        }
+    }
+}
+
+/// A document editor over `doc`, recording tracked changes when the file's
+/// settings ask for it (`w:trackRevisions`, #624), as the configured reviewer
+/// ([`configured_identity`]). The Review tab's Track Changes turns it on or
+/// off after that.
+fn new_doc_editor(doc: Document, pkg: Option<&Package>) -> Editor {
+    let mut editor = Editor::new(doc);
+    if pkg.is_some_and(Package::track_revisions) {
+        editor.set_track_changes(Some(track_author(&configured_identity())));
+    }
+    editor
+}
+
+/// Who Track Changes records as: the reviewer identity (#620).
+fn track_author(identity: &(String, String)) -> docxcore::editor::TrackAuthor {
+    docxcore::editor::TrackAuthor {
+        author: identity.0.clone(),
+        clock: utc_now_iso,
+    }
 }
 
 /// Load a `.docx` from bytes, keeping the whole package so save stays lossless.
@@ -5213,7 +5865,7 @@ fn finish_pending_conversion(tab: &mut DocTab) {
     // The whole document is replaced: nothing of the placeholder is kept.
     tab.dirty = false;
     tab.hf_edit = None;
-    tab.surface = Surface::Doc(Editor::new(l.doc));
+    tab.surface = Surface::Doc(new_doc_editor(l.doc, l.pkg.as_ref()));
     tab.comments = l.comments;
     tab.tracked_comment_ids.clear();
     tab.comments_removed_all = false;
@@ -5780,6 +6432,7 @@ fn fx_segment(
                 if let Some(v) = this.active_sheet_mut() {
                     v.edit_caret = idx;
                     v.edit_proposal = None;
+                    v.edit_tail_left();
                 }
                 cx.notify();
             });
@@ -7894,11 +8547,9 @@ fn bar_range_text(text: &str, sheet: &str) -> Result<String, String> {
 ///   validated are, and those are commonly on a different sheet from the one
 ///   the rule is built on (a lookup sheet holding the list, an entry sheet
 ///   holding the boxes).
-/// - `CondFormat` and `Sort` refuse. Each acts on the rows in front of you: a
-///   rule paints these cells, a sort reorders these rows. A qualifier naming
-///   elsewhere is a mistake,
-///   and the existing message says so rather than acting on the same-named
-///   cells here.
+/// - `CondFormat` refuses: a rule paints the cells in front of you. A
+///   qualifier naming elsewhere is a mistake, and the existing message says
+///   so rather than acting on the same-named cells here.
 /// - `ChartTitle` isn't a range at all, so nothing resolves; it answers `false`
 ///   only because the question doesn't apply to it.
 fn target_takes_foreign_sheet(target: RefTarget) -> bool {
@@ -7908,7 +8559,7 @@ fn target_takes_foreign_sheet(target: RefTarget) -> bool {
         | RefTarget::SeriesValues(_)
         | RefTarget::Categories
         | RefTarget::Validation => true,
-        RefTarget::CondFormat | RefTarget::Sort | RefTarget::ChartTitle => false,
+        RefTarget::CondFormat | RefTarget::ChartTitle => false,
     }
 }
 
@@ -7938,18 +8589,6 @@ fn bar_ref_text(
     };
     let i = sheet_index_of(names, r.sheet.as_deref(), active)?;
     Ok((i, ref_a1(names.get(i).map(String::as_str), r.range)))
-}
-
-/// The rows a sort runs over: a field naming more than one row sorts exactly
-/// those, anything else falls back to the region found around the cursor.
-fn sort_rows_from(
-    field: Option<(u32, u32, u32, u32)>,
-    region: Option<(u32, u32)>,
-) -> Option<(u32, u32)> {
-    match field {
-        Some((r0, _, r1, _)) if r1 > r0 => Some((r0, r1)),
-        _ => region,
-    }
 }
 
 /// The cells a range field's text points at ON THE SHEET IN FRONT OF YOU, or
@@ -8114,8 +8753,19 @@ fn new_sheet_surface() -> Surface {
         reveal_col: None,
         edit_opts: EditOptions::default(),
         edit_proposal: None,
+        edit_complete: None,
+        fx_scroll: ScrollHandle::new(),
+        flash_preview: None,
+        last_flash: None,
+        autocorrect: Default::default(),
+        edit_correction: None,
+        edit_kept: None,
+        edit_typed_tail: None,
         id: next_sheet_view_id(),
         edit_gen: 0,
+        areas: Vec::new(),
+        areas_at: (0, (0, 0), (0, 0)),
+        areas_dead: Default::default(),
     })
 }
 
@@ -8182,8 +8832,19 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     reveal_col: None,
                     edit_opts: EditOptions::default(),
                     edit_proposal: None,
+                    edit_complete: None,
+                    fx_scroll: ScrollHandle::new(),
+                    flash_preview: None,
+                    last_flash: None,
+                    autocorrect: Default::default(),
+                    edit_correction: None,
+                    edit_kept: None,
+                    edit_typed_tail: None,
                     id: next_sheet_view_id(),
                     edit_gen: 0,
+                    areas: Vec::new(),
+                    areas_at: (0, (0, 0), (0, 0)),
+                    areas_dead: Default::default(),
                 };
                 let mut status = format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" });
                 if repair {
@@ -8204,8 +8865,8 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
     }
 }
 
-/// The backstop behind Protected View's gates (#610). An edit reached a
-/// protected workbook, so a gate leaked. Not every edit takes an undo
+/// The backstop behind the gates of Protected View (#610), or of a document
+/// marked as final (#617). An edit reached a locked tab, so a gate leaked. Not every edit takes an undo
 /// snapshot first (a sheet rename, an AutoFilter), so the workbook is loaded
 /// again from the tab's file, the way it was opened; the hot-exit sidecar
 /// then holds that too. Only a tab with no file to read (a template opened
@@ -8227,13 +8888,14 @@ fn protected_rollback(tab: &mut DocTab) {
             (Some(_), None) | (None, _) => tab.path.clone().map(|p| reload_without_converting(&p)),
         };
         if let Some(l) = reloaded {
-            tab.surface = Surface::Doc(Editor::new(l.doc));
+            tab.surface = Surface::Doc(new_doc_editor(l.doc, l.pkg.as_ref()));
             tab.comments = l.comments;
             tab.tracked_comment_ids.clear();
             tab.comments_removed_all = false;
             seed_used_comment_ids(tab);
             tab.notes = l.notes;
             tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
+            tab.access.marked_final = l.pkg.as_ref().is_some_and(Package::marked_final);
             tab.pkg = l.pkg;
             tab.markdown = l.markdown;
             tab.bundle_html = l.bundle_html;
@@ -8241,7 +8903,7 @@ fn protected_rollback(tab: &mut DocTab) {
         }
         tab.hf_edit = None;
         tab.dirty = false;
-        tab.status = open_mode::PROTECTED_STATUS.into();
+        tab.status = tab.access.locked_status().into();
         return;
     }
     let reloaded = tab
@@ -8267,6 +8929,20 @@ fn protected_rollback(tab: &mut DocTab) {
     }
     tab.dirty = false;
     tab.status = open_mode::PROTECTED_STATUS.into();
+}
+
+/// Edit Anyway on `tab` (#617): see [`Docxy::edit_anyway`]. `false` when it
+/// is not marked as final, or still in Protected View.
+fn edit_anyway_tab(tab: &mut DocTab) -> bool {
+    if !tab.access.marked_final || tab.access.protected {
+        return false;
+    }
+    tab.access.marked_final = false;
+    if let Some(pkg) = tab.pkg.as_mut() {
+        pkg.clear_marked_final();
+    }
+    tab.status = "editing enabled: the document is no longer marked as final".into();
+    true
 }
 
 /// Excel's question before reopening `path` over a tab with unsaved changes
@@ -8318,7 +8994,7 @@ fn build_surface(
             Some(p) => {
                 let l = doc_from_path(p);
                 (
-                    Surface::Doc(Editor::new(l.doc)),
+                    Surface::Doc(new_doc_editor(l.doc, l.pkg.as_ref())),
                     l.comments,
                     l.notes,
                     l.pkg,
@@ -8354,7 +9030,7 @@ fn build_surface(
 fn file_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Untitled.docx".into())
+        .unwrap_or_else(|| "Document.docx".into())
 }
 
 /// Directory holding hot-exit sidecars (`.docx`, `.xlsx`, or `.yppx` by tab kind),
@@ -8372,12 +9048,29 @@ fn hot_dir_in(root: &std::path::Path) -> PathBuf {
 /// after a tab close or reorder, the old session can pair `tab-N` with another
 /// tab's `path`. The AutoRecover tick never reorders, so it does not widen this.
 fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: Prefs) {
+    write_session_forgetting(root, tabs, active, prefs, &[]);
+}
+
+/// [`write_session`], with the unsaved work of the tabs at `forget` left out
+/// (#630): Don't Save on quit. Such a tab is kept as its file alone, so it
+/// reopens clean from disk.
+fn write_session_forgetting(
+    root: &std::path::Path,
+    tabs: &[DocTab],
+    active: usize,
+    prefs: Prefs,
+    forget: &[usize],
+) {
     let hd = hot_dir_in(root);
     let _ = std::fs::create_dir_all(&hd);
     let tabs = tabs
         .iter()
         .enumerate()
         .map(|(i, t)| {
+            if forget.contains(&i) {
+                *t.last_hot.borrow_mut() = None;
+                return forgotten(persist_tab_meta(t));
+            }
             let persisted = persist_tab(&hd, i, t);
             // Every tab is rewritten in this one call, so the path names this
             // tab's content even after a later close shifts the indices.
@@ -8396,7 +9089,12 @@ fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: 
         ask_on_close: prefs.ask_on_close,
         autorecover_minutes: prefs.autorecover_minutes,
         keep_drafts: prefs.keep_drafts,
-        sheet_editing: prefs.edit_opts.to_lines(),
+        sheet_editing: format!(
+            "{}{}{}",
+            prefs.edit_opts.to_lines(),
+            gridcore::options::custom_lists_to_lines(&prefs.custom_lists),
+            prefs.autocorrect
+        ),
         user_name: prefs.user_name,
         user_initials: prefs.user_initials,
     };
@@ -8465,25 +9163,51 @@ fn save_base<'a>(
     doc: &Document,
     live: &[Comment],
 ) -> Option<std::borrow::Cow<'a, Package>> {
-    let pkg = tab.pkg.as_ref()?;
+    use std::borrow::Cow;
+    // Track Changes is the editor's state; the package carries it as
+    // `w:trackRevisions` (#624). A new document has no package yet: one
+    // is made for it, as the save would make.
+    let track = matches!(&tab.surface, Surface::Doc(ed) if ed.track_changes());
+    let mut base: Cow<'a, Package> = match (tab.pkg.as_ref(), track) {
+        (Some(pkg), _) => Cow::Borrowed(pkg),
+        (None, true) => Cow::Owned(blank_base(doc)),
+        (None, false) => return None,
+    };
+    if base.track_revisions() != track {
+        base.to_mut().set_track_revisions(track);
+    }
     if !tab.comments_removed_all {
-        return Some(std::borrow::Cow::Borrowed(pkg));
+        return Some(base);
     }
     let mut keep = docxcore::inspect::comment_marker_ids(doc);
     keep.extend(live.iter().map(|c| c.id.clone()));
-    let stale: Vec<String> = pkg
+    let stale: Vec<String> = base
         .comment_ids()
         .into_iter()
         .filter(|id| !keep.contains(id))
         .collect();
     if stale.is_empty() {
-        return Some(std::borrow::Cow::Borrowed(pkg));
+        return Some(base);
     }
-    let mut pruned = pkg.clone();
+    let pruned = base.to_mut();
     for id in &stale {
         pruned.remove_comment_id(id);
     }
-    Some(std::borrow::Cow::Owned(pruned))
+    Some(base)
+}
+
+/// The package a new document is saved into (what [`doc_to_docx_styled`]
+/// builds without a base).
+fn blank_base(doc: &Document) -> Package {
+    let has_list = doc
+        .body
+        .iter()
+        .any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
+    if has_list {
+        docxcore::package::new_markdown_package(doc.clone())
+    } else {
+        docxcore::package::new_package(doc.clone())
+    }
 }
 
 /// Add a comment on `tab`'s selection: its markers go around the selection
@@ -8534,6 +9258,7 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
         date: utc_now_iso(),
         text,
         quoted,
+        ..Comment::default()
     });
     tab.tracked_comment_ids.insert(id.to_string());
     tab.used_comment_ids.insert(id.to_string());
@@ -8549,6 +9274,30 @@ fn delete_doc_comment(tab: &mut DocTab, id: &str) {
     }
     tab.tracked_comment_ids.insert(id.to_string());
     tab.mark_dirty();
+}
+
+/// The id of the selected comment when it belongs to the active tab (the tab
+/// the selection was made in, by title and file), else `None`.
+fn selected_comment_id(
+    tabs: &[DocTab],
+    active: usize,
+    selected: &Option<(close::TabId, String)>,
+) -> Option<String> {
+    let (tab, id) = selected.as_ref()?;
+    let here = tabs.get(active)?;
+    (here.title == tab.0 && here.path == tab.1).then(|| id.clone())
+}
+
+/// Set comment `id` of `tab` resolved (`Some(true)`), reopened (`Some(false)`)
+/// or the other of the two (`None`). The new state, `None` when `tab` lists
+/// no such comment. The state lives on the comment, so it follows the record
+/// through a delete and its undo, and a save writes it ([`doc_to_docx`]).
+fn set_doc_comment_resolved(tab: &mut DocTab, id: &str, resolved: Option<bool>) -> Option<bool> {
+    let c = tab.comments.iter_mut().find(|c| c.id == id)?;
+    c.resolved = resolved.unwrap_or(!c.resolved);
+    let now = c.resolved;
+    tab.mark_dirty();
+    Some(now)
 }
 
 /// The name and initials new comments are stamped with (#620), as Word's
@@ -8608,14 +9357,10 @@ fn doc_to_docx_styled(
             p
         }
         None => {
-            let has_list = doc
-                .body
-                .iter()
-                .any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
-            if has_list || converted {
+            if converted {
                 docxcore::package::new_markdown_package(doc.clone())
             } else {
-                docxcore::package::new_package(doc.clone())
+                blank_base(doc)
             }
         }
     };
@@ -8645,6 +9390,19 @@ fn doc_to_docx_styled(
                 pkg.add_comment(id, &c.author, &c.initials, &c.date, &c.text);
             }
         }
+    }
+    // Resolved state: `w15:done`, written where it differs from the part.
+    let stored: std::collections::HashMap<String, bool> = docxcore::comments::parse_comments(&pkg)
+        .into_iter()
+        .map(|c| (c.id, c.resolved))
+        .collect();
+    for c in comments {
+        if stored.get(&c.id).is_some_and(|&r| r != c.resolved) {
+            pkg.set_comment_resolved(&c.id, c.resolved);
+        }
+    }
+    if comments.is_empty() {
+        pkg.drop_empty_comment_parts();
     }
     docxcore::package::save_package(&pkg)
 }
@@ -8886,7 +9644,20 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
             // A sidecar loads as a plain .docx; the session says what it was
             // converted from, and a fresh load of the file says so too.
             converted: t.converted.or(tab.access.converted),
+            // The loaded package's own mark (#617): a sidecar written after
+            // Edit Anyway no longer carries it.
+            marked_final: tab.access.marked_final,
         };
+        // Unsaved edits recovered from the sidecar of a document still marked
+        // as final (a build before #617 let them through) are kept, not
+        // rolled back as a leaked edit: the user already edited it, so it
+        // opens as after Edit Anyway, mark gone from what a save writes.
+        if from_hot && tab.dirty && tab.access.marked_final {
+            tab.access.marked_final = false;
+            if let Some(pkg) = tab.pkg.as_mut() {
+                pkg.clear_marked_final();
+            }
+        }
     }
     (tab, from_hot)
 }
@@ -8957,11 +9728,30 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         Surface::Placeholder => None,
     };
     PersistTab {
+        hot,
+        ..persist_tab_meta(t)
+    }
+}
+
+/// A tab answered Don't Save on quit (#630): its file alone, clean, so the
+/// next launch reopens what is on disk.
+fn forgotten(p: PersistTab) -> PersistTab {
+    PersistTab {
+        hot: None,
+        dirty: false,
+        ..p
+    }
+}
+
+/// What the session keeps of tab `t` besides its live content: everything
+/// [`persist_tab`] writes but the sidecar.
+fn persist_tab_meta(t: &DocTab) -> PersistTab {
+    PersistTab {
         kind: t.kind,
         title: t.title.to_string(),
         path: t.path.as_ref().map(|p| p.display().to_string()),
         dirty: t.dirty,
-        hot,
+        hot: None,
         unreadable: match &t.surface {
             Surface::Project(v) => v.ed.project().package.unreadable.clone(),
             _ => Vec::new(),
@@ -9066,6 +9856,7 @@ impl Docxy {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        set_configured_identity(&session.user_name, &session.user_initials);
         // Asked before this run writes its own marker.
         let crashed = recover::was_unclean(&root);
         recover::mark_running(&root);
@@ -9081,10 +9872,22 @@ impl Docxy {
         }
         let active = session.active.min(tabs.len().saturating_sub(1));
         let mut this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
+        // New documents continue past the restored ones (#631).
+        this.next_document = doc_name::next_after(
+            this.tabs
+                .iter()
+                .filter(|t| t.kind == Kind::Docx && t.path.is_none())
+                .map(|t| t.title.as_ref()),
+        );
         this.autorecover_minutes = session.autorecover_minutes;
         this.keep_drafts = session.keep_drafts;
         this.edit_opts = EditOptions::from_text(&session.sheet_editing);
+        this.custom_lists = gridcore::options::custom_lists_from_text(&session.sheet_editing);
         stamp_edit_opts(&mut this.tabs, this.edit_opts);
+        this.autocorrect = std::rc::Rc::new(gridcore::autocorrect::AutoCorrect::from_text(
+            &session.sheet_editing,
+        ));
+        sheet_autocorrect::stamp_autocorrect(&mut this.tabs, &this.autocorrect);
         this.user_name = session.user_name;
         this.user_initials = session.user_initials;
         this.persist_to(&root);
@@ -9112,15 +9915,25 @@ impl Docxy {
             ribbon_tab: RibbonTab::Home,
             ribbon_min: false,
             backstage: false,
+            app_dialogs: dialog::DialogStack::default(),
             bs_new: false,
+            bs_scroll: ScrollHandle::new(),
+            bs_rail_scroll: ScrollHandle::new(),
             bs_info: false,
+            bs_account: false,
             bs_info_status: None,
             clip: None,
             theme_pref,
             ask_on_close,
+            next_document: 1,
+            quitting: false,
+            quit_discards: Vec::new(),
+            quit_tabs: Vec::new(),
+            quit_ready: false,
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
             edit_opts: EditOptions::default(),
+            autocorrect: Default::default(),
             user_name: String::new(),
             user_initials: String::new(),
             fx_expanded: false,
@@ -9137,7 +9950,10 @@ impl Docxy {
             find_cur: None,
             picker: None,
             doc_scroll: ScrollHandle::new(),
+            menu_scroll: ScrollHandle::new(),
             comment_open: false,
+            selected_comment: None,
+            markup: Default::default(),
             comment_text: String::new(),
             show_marks: false,
             show_comments: false,
@@ -9153,6 +9969,13 @@ impl Docxy {
             selecting: false,
             sheet_dragging: false,
             sheet_fill: None,
+            fill_options: None,
+            drops: Default::default(),
+            paste_options: None,
+            paste_special_source: None,
+            office_clip: Default::default(),
+            last_pointer: point(px(0.), px(0.)),
+            custom_lists: Vec::new(),
             chart_sel: None,
             panel_chart: None,
             chart_drag: None,
@@ -9160,11 +9983,13 @@ impl Docxy {
             ref_msg: None,
             formula_pick: None,
             drag_anchor: None,
+            drag_ctrl: false,
             range_pick: None,
             keytips: KeyTip::Off,
             keytip_prefix: String::new(),
             menu: None,
             menu_closed_at: None,
+            repeat: None,
             mini_bar: None,
             zoom: 1.0,
             ruler_guide: None,
@@ -9174,13 +9999,12 @@ impl Docxy {
             sheet_rename: None,
             sheet_grid_w: 1000.0,
             sheet_comment_edit: None,
+            sheet_comment_seed: None,
             sheet_dv_open: false,
             sheet_numfmt_open: false,
             sheet_fmt_open: false,
             sheet_cf_edit: None,
             sheet_dv_edit: None,
-            sheet_filter_edit: None,
-            sheet_sort_edit: None,
             sheet_rowh_edit: None,
             bar_field: None,
             bar_range: None,
@@ -9208,6 +10032,8 @@ impl Docxy {
             autorecover_minutes: self.autorecover_minutes,
             keep_drafts: self.keep_drafts,
             edit_opts: self.edit_opts,
+            custom_lists: self.custom_lists.clone(),
+            autocorrect: self.autocorrect.to_lines(),
             user_name: self.user_name.clone(),
             user_initials: self.user_initials.clone(),
         }
@@ -9266,20 +10092,79 @@ impl Docxy {
         self.project_prompt_cancel();
         self.close_menu();
         self.backstage = true;
-        self.bs_new = false;
-        self.bs_info = false;
-        self.bs_info_status = None;
+        self.show_backstage_open_page();
         self.refresh_drafts();
         self.trusted_count = trusted::count(&config_root());
         self.trusted_error = None;
         cx.notify();
     }
 
-    fn backstage_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.backstage = false;
+    /// A dialog or the more-tabs list owns the key before any surface sees
+    /// it (#393): true when one took it. (An open menu is `on_key`'s next
+    /// check, `menu_key`.)
+    fn modal_takes_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // An open dialog takes every key first (#393): nothing under it, not
+        // the tab list, KeyTips or a Project shortcut, may see one.
+        if self.dialog_takes_key(
+            &ev.keystroke.key,
+            ev.keystroke.key_char.as_deref(),
+            ev.keystroke.modifiers,
+            window,
+            cx,
+        ) {
+            return true;
+        }
+        if self.tab_more_open {
+            if ev.keystroke.key == "escape" {
+                self.tab_more_close(cx);
+            }
+            return true; // the modal list owns keys; do not edit the surface below
+        }
+        false
+    }
+
+    /// PageUp/PageDown/Home/End scroll the backstage's content pane.
+    /// True when the key was one of those and moved (or held) the pane.
+    fn backstage_scroll_key(&self, stroke: &Keystroke) -> bool {
+        let m = stroke.modifiers;
+        if m.control || m.alt || m.shift || m.platform {
+            return false;
+        }
+        let key = stroke.key.as_str();
+        let max_y = f32::from(self.bs_scroll.max_offset().y);
+        let view_h = f32::from(self.bs_scroll.bounds().size.height);
+        let cur = f32::from(self.bs_scroll.offset().y);
+        match backstage_scroll_target(key, cur, view_h, max_y) {
+            Some(y) => {
+                self.bs_scroll.set_offset(point(px(0.), px(y)));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The default (Open) page, as `open_backstage` leaves it.
+    fn show_backstage_open_page(&mut self) {
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_account = false;
         self.bs_info_status = None;
+        self.reset_backstage_scroll();
+    }
+
+    /// Every backstage page starts at the top (#1028).
+    fn reset_backstage_scroll(&self) {
+        self.bs_scroll.set_offset(point(px(0.), px(0.)));
+    }
+
+    fn backstage_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.backstage = false;
+        self.show_backstage_open_page();
         self.refocus(window, cx);
     }
 
@@ -9304,6 +10189,17 @@ impl Docxy {
         }
     }
 
+    /// File > Account (#1023): the build line and the About button. The rail
+    /// item and the harness's `account` verb both come here.
+    fn open_account(&mut self, cx: &mut Context<Self>) {
+        self.bs_account = true;
+        self.bs_info = false;
+        self.bs_info_status = None;
+        self.bs_new = false;
+        self.reset_backstage_scroll();
+        cx.notify();
+    }
+
     fn backstage_rail_action(
         &mut self,
         action: BackstageRailAction,
@@ -9316,12 +10212,17 @@ impl Docxy {
                 self.bs_info = true;
                 self.bs_info_status = None;
                 self.bs_new = false;
+                self.reset_backstage_scroll();
+                self.bs_account = false;
                 cx.notify();
             }
+            BackstageRailAction::Account => self.open_account(cx),
             BackstageRailAction::New => {
                 self.bs_new = true;
+                self.bs_account = false;
                 self.bs_info = false;
                 self.bs_info_status = None;
+                self.reset_backstage_scroll();
                 cx.notify();
             }
             BackstageRailAction::Open => self.open_file(window, cx),
@@ -9343,14 +10244,46 @@ impl Docxy {
                 cx,
             );
         }
-        self.with_editor(window, cx, |ed| match action {
+        let untouched = repeat_untouched(&self.repeat);
+        match action {
             QatAction::Undo => {
-                ed.undo();
+                self.with_editor(window, cx, |ed| {
+                    ed.undo();
+                });
+                self.keep_repeat_current(untouched);
             }
+            // Redo, or Repeat with nothing to redo (#618). With neither,
+            // nothing happens and the tab stays clean.
             QatAction::Redo => {
-                ed.redo();
+                let ready = match self.edit_target_and_repeat() {
+                    (Some(ed), rec) => ed.can_redo() || repeat_ready(ed, rec),
+                    (None, _) => false,
+                };
+                if !ready {
+                    return self.refocus(window, cx);
+                }
+                // Protected View refuses it as any edit; the tab turns dirty
+                // only when something changed.
+                if self.protected_refused(cx) {
+                    return self.refocus(window, cx);
+                }
+                let changed = match self.edit_target_and_repeat() {
+                    (Some(ed), rec) => {
+                        let changed = redo_or_repeat(ed, rec);
+                        ed.refresh_merge_preview();
+                        changed
+                    }
+                    (None, _) => false,
+                };
+                if changed {
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.mark_dirty();
+                    }
+                }
+                self.keep_repeat_current(untouched);
+                self.refocus(window, cx);
             }
-        });
+        }
     }
 
     fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -9520,6 +10453,47 @@ impl Docxy {
                 |o| o.fill_handle = !o.fill_handle,
                 cx,
             ))
+            .child(check_row(
+                "bs-flash-fill-auto",
+                o.flash_fill_auto,
+                "Automatically Flash Fill",
+                |o| o.flash_fill_auto = !o.flash_fill_auto,
+                cx,
+            ))
+            .child(check_row(
+                "bs-formula-autocomplete",
+                o.formula_autocomplete,
+                "Formula AutoComplete",
+                |o| o.formula_autocomplete = !o.formula_autocomplete,
+                cx,
+            ))
+            // Proofing › AutoCorrect Options... (#667).
+            .child(
+                row("bs-autocorrect")
+                    .child(div().text_color(fg).child("AutoCorrect Options..."))
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        if let Err(e) = this.open_autocorrect_dialog() {
+                            this.set_status(e);
+                        }
+                        cx.notify();
+                    })),
+            )
+            // Advanced › General › Edit Custom Lists… (#668): the lists
+            // AutoFill continues in every workbook.
+            .when(!self.tabs.is_empty(), |d| {
+                d.child(
+                    row("bs-custom-lists")
+                        .child(div().text_color(fg).child("Edit Custom Lists\u{2026}"))
+                        .child(div().text_color(dim).child(SharedString::from(format!(
+                            "{} of your own",
+                            self.custom_lists.len()
+                        ))))
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            this.fill_menu_act(SheetAct::CustomLists);
+                            cx.notify();
+                        })),
+                )
+            })
             .into_any_element()
     }
 
@@ -9586,6 +10560,41 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Ctrl+N (#631): a new blank document on a document tab, a new workbook
+    /// on a workbook tab; on any other tab it does nothing. Ctrl+W (#629):
+    /// close the active tab, as File > Close and its X do. `None` for a key
+    /// that is not one of these.
+    fn document_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<()> {
+        let m = &ev.keystroke.modifiers;
+        if !(m.control || m.platform) || m.alt || m.shift {
+            return None;
+        }
+        match ev.keystroke.key.as_str() {
+            "n" => {
+                self.keytips = KeyTip::Off;
+                let kind = self.tabs.get(self.active).map_or(Kind::Docx, |t| t.kind);
+                if matches!(kind, Kind::Docx | Kind::Xlsx) {
+                    self.add_tab(kind, window, cx);
+                }
+                Some(())
+            }
+            "w" => {
+                self.keytips = KeyTip::Off;
+                if self.active < self.tabs.len() {
+                    self.backstage = false;
+                    self.close_tab(self.active, window, cx);
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
         self.project_prompt_cancel();
         let new_tab = |title: &str, surface| DocTab {
@@ -9615,7 +10624,10 @@ impl Docxy {
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
-            Kind::Docx => new_tab("Untitled.docx", Surface::Doc(Editor::new(empty_doc()))),
+            Kind::Docx => new_tab(
+                &doc_name::next_document_title(&mut self.next_document),
+                Surface::Doc(Editor::new(empty_doc())),
+            ),
             Kind::Xlsx => new_tab("Untitled.xlsx", new_sheet_surface()),
             Kind::Look => new_tab("Inbox", Surface::Placeholder),
         });
@@ -9675,7 +10687,26 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             v.sel = (row, col);
             v.anchor = (row, col);
+            v.clear_areas();
             v.end_cell_edit();
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+click on `(row, col)`, or the first move of a Ctrl+drag: the
+    /// selection so far stays and the cell starts a new area (#670), as a
+    /// plain click's [`Self::select_cell`] would start the only one.
+    fn add_area_at(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        if self.chart_sel.is_some() {
+            // A chart holds the selection: the grid's is not shown, so
+            // there is nothing to add to.
+            return self.select_cell(row, col, cx);
+        }
+        if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
+            self.sheet_commit(0, 0, cx);
+        }
+        if let Some(v) = self.active_sheet_mut() {
+            v.add_area((row, col));
         }
         cx.notify();
     }
@@ -9698,6 +10729,31 @@ impl Docxy {
         )
     }
 
+    /// A right-button press on the fill handle: the fill arms, and its
+    /// release opens the fill menu (#668). The handle's own handler and the
+    /// harness's `fill-drag` both press through here.
+    fn sheet_fill_start_right(&mut self, cx: &mut Context<Self>) {
+        self.sheet_fill_start(cx);
+        if let Some(f) = self.sheet_fill.as_mut() {
+            f.right = true;
+        }
+    }
+
+    /// The pointer over (r, c) with the left button held, Ctrl as `ctrl`: a
+    /// block dragged by its border goes there (#670), a fill swaps copy and
+    /// series with Ctrl (#668), and anything else sweeps the selection. The
+    /// cells' left-button move handler and the harness's `fill-drag` moves
+    /// go through here.
+    fn grid_left_drag_over(&mut self, r: u32, c: u32, ctrl: bool, cx: &mut Context<Self>) {
+        if self.drops.border_drag.is_some() {
+            return self.border_drag_over((r, c), ctrl, cx);
+        }
+        if let Some(f) = self.sheet_fill.as_mut() {
+            f.ctrl = ctrl;
+        }
+        self.grid_drag_over(r, c, cx)
+    }
+
     /// Begin an auto-fill drag from the selection's fill handle (the small
     /// square at the range's bottom-right). Captures the source range.
     ///
@@ -9716,14 +10772,18 @@ impl Docxy {
     /// mouse-down (gpui runs bubble-phase listeners in reverse paint order) and
     /// stops propagation — `grid_press` never runs, and nothing is in flight.
     ///
-    /// The UI test harness's handler-calling verbs (`drag`, `fill-drag`)
-    /// drive `grid_press_cell`/`grid_drag_over` directly and so never go
-    /// through the element tree's hitboxes — `pointer-click`/`pointer-drag`
+    /// The UI test harness's handler-calling verbs (`drag`, which drives
+    /// `grid_press_cell`/`grid_drag_over`; `fill-drag`, which presses
+    /// through here or [`Self::sheet_fill_start_right`] and moves through
+    /// [`Self::grid_left_drag_over`]) call the app's methods directly and so
+    /// never go through the element tree's hitboxes — `pointer-click`/`pointer-drag`
     /// (#545) do hit-test through gpui, but a case built on the handler
     /// verbs cannot see a handler added here. This guard can. See
     /// `docs/ui-test-harness.md`.
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
-        if self.protected_refused(cx) {
+        // A new gesture: a drop still waiting on its menu is over.
+        self.drops.new_gesture();
+        if self.protected_refused(cx) || self.multi_area_refused(cx) {
             return;
         }
         let gesture_in_flight = self.grid_gesture_in_flight();
@@ -9737,6 +10797,10 @@ impl Docxy {
             protected,
             self.edit_opts.fill_handle,
         ) {
+            let id = self.active_sheet().map_or(0, |v| v.id);
+            if let Some(f) = self.sheet_fill.as_mut() {
+                f.view = id;
+            }
             cx.notify();
         }
     }
@@ -9752,6 +10816,11 @@ impl Docxy {
             self.formula_pick_active(),
             self.chart_sel,
         )
+        .or_else(|| {
+            self.active_sheet()
+                .is_some_and(SheetView::multi_area)
+                .then_some(HandleHidden::MultiArea)
+        })
     }
 
     /// Update the auto-fill target as the handle is dragged. Nothing is
@@ -9831,7 +10900,7 @@ impl Docxy {
         // The panel swaps to it, opening if it was shut.
         self.chart_panel_event(PanelEvent::Select(idx));
         // Selecting a chart only looks; moving or resizing it would edit.
-        if self.protected_view() {
+        if self.active_locked() {
             cx.notify();
             return;
         }
@@ -9862,7 +10931,9 @@ impl Docxy {
         self.col_resize_end(cx);
         self.sheet_dragging = false; // end any drag-select
         self.drag_anchor = None;
+        self.drag_ctrl = false;
         self.sheet_fill_end(cx); // commit an auto-fill drag, if any
+        self.border_drag_end(cx); // drop a block dragged by its border
         self.chart_drag_end(cx); // commit a chart move, if any
         self.range_pick_end(cx); // replot a range picked off the grid
         self.formula_pick = None; // the reference stays; the drag is over
@@ -9978,15 +11049,31 @@ impl Docxy {
         self.chart_drop_selection();
         self.bar_close();
         // The bars that act on Enter point into the grid too: a rename names
-        // a sheet by index, and the filter, row-height and comment bars act
-        // on the selection. Carried into another tab, Enter would apply them
+        // a sheet by index, and the row-height and comment bars act on the
+        // selection. Carried into another tab, Enter would apply them
         // there, a Protected View tab included (#610).
         self.sheet_rename = None;
-        self.sheet_filter_edit = None;
         self.sheet_rowh_edit = None;
-        self.sheet_comment_edit = None;
+        self.sheet_comment_bar_close();
         self.sheet_fill = None;
         self.formula_pick = None;
+        // A drag by the selection's border, or a drop waiting on its menu or
+        // question, belongs to the grid it started on (#707 r2 M4).
+        self.drops.clear();
+    }
+
+    /// A right-button release anywhere in the window. Over the grid its own
+    /// handler has already ended a right-drag (with its menu); one let go
+    /// off the grid is cancelled, as Excel drops it (#707 r2 M4).
+    fn right_release_off_grid(&mut self, cx: &mut Context<Self>) {
+        if self.drops.cancel_right(&mut self.sheet_fill) {
+            cx.notify();
+        }
+    }
+
+    /// Whether the active tab is the sheet view `id` a gesture started in.
+    fn gesture_view_is_active(&self, id: u64) -> bool {
+        gesture_stands(id, self.active_sheet().map(|v| v.id))
     }
 
     /// Where the idx-th chart of the active sheet lives. The overlay lays the
@@ -10386,9 +11473,7 @@ impl Docxy {
             RefTarget::SeriesValues(i) => self.series_apply_values(i, text, cx),
             RefTarget::SeriesName(i) => self.series_apply_name(i, text, cx),
             RefTarget::Categories => self.categories_apply(text, cx),
-            RefTarget::CondFormat | RefTarget::Validation | RefTarget::Sort => {
-                self.bar_range_apply(target, text, cx)
-            }
+            RefTarget::CondFormat | RefTarget::Validation => self.bar_range_apply(target, text, cx),
         }
     }
 
@@ -10439,27 +11524,19 @@ impl Docxy {
             .or_else(|| self.bar_seed())
     }
 
-    /// What an untouched range field shows: the live selection, or for a sort
-    /// the region it would find (header already dropped).
+    /// What an untouched range field shows: the live selection.
     fn bar_seed(&self) -> Option<(u32, u32, u32, u32)> {
-        if self.bar_field == Some(RefTarget::Sort) {
-            if let Some((top, bottom)) = self.sheet_sort_bounds() {
-                if let Some(max_c) = self.active_sheet().map(|v| v.extent().1) {
-                    return Some((top, 0, bottom, max_c));
-                }
-            }
-        }
         self.active_sheet().map(|v| v.range())
     }
 
     /// Open a bar's range field. It starts unpinned, so until the user types a
     /// range or points at one the bar still acts on the selection.
     fn bar_open(&mut self, target: RefTarget) {
-        // The three bars share ONE `bar_field`/`bar_range`, and `sheet_key`
-        // routes to whichever is open first. Leaving a second one on screen
+        // The two bars share ONE `bar_field`/`bar_range`, and `sheet_key`
+        // routes to whichever is open first. Leaving the other on screen
         // therefore aims the first at cells pinned for the other — a
-        // conditional format painting the Sort bar's whole region, say. Only one at a
-        // time, which is also what the keyboard already assumed.
+        // conditional format painting the validation bar's range, say. Only
+        // one at a time, which is also what the keyboard already assumed.
         self.bar_close();
         // `bar_close` only drops a field belonging to a bar. A Chart panel field
         // left focused would keep `range_field_active` true, so the very first
@@ -10565,13 +11642,11 @@ impl Docxy {
     }
 
     /// A bar closed: drop the bar itself along with its range field. Closing the
-    /// field alone would leave a bar on screen whose seeding (`bar_seed` keys
-    /// off `bar_field`) had gone with it — a Sort bar still showing, now acting
-    /// on the selection rather than the region it found.
+    /// field alone would leave a bar on screen with no field to say which
+    /// cells it acts on.
     fn bar_close(&mut self) {
         self.sheet_cf_edit = None;
         self.sheet_dv_edit = None;
-        self.sheet_sort_edit = None;
         self.bar_field = None;
         self.bar_range = None;
         if matches!(&self.range_edit, Some(f) if f.target.is_bar()) {
@@ -10592,8 +11667,7 @@ impl Docxy {
     fn typing_bars_close(&mut self) {
         self.project_prompt_cancel();
         self.bar_close();
-        self.sheet_comment_edit = None;
-        self.sheet_filter_edit = None;
+        self.sheet_comment_bar_close();
         self.sheet_rowh_edit = None;
         self.find_open = false;
     }
@@ -10827,11 +11901,11 @@ impl Docxy {
     /// A press landed on the grid: remember which cell, so the drag that may
     /// follow extends from there rather than from wherever the pointer first
     /// crossed a boundary.
-    fn grid_press(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+    fn grid_press(&mut self, pos: Point<Pixels>, ctrl: bool, cx: &mut Context<Self>) {
         let Some(cell) = self.cell_at(pos) else {
             return;
         };
-        self.grid_press_cell(cell, cx);
+        self.grid_press_cell(cell, ctrl, cx);
     }
 
     /// The press, once it has been located. Split out of [`grid_press`] so the
@@ -10839,7 +11913,8 @@ impl Docxy {
     /// pixel hit-test is not what a test asserts on, and a harness that
     /// reproduced this body instead of calling it would keep passing after this
     /// one changed.
-    fn grid_press_cell(&mut self, cell: (u32, u32), _cx: &mut Context<Self>) {
+    fn grid_press_cell(&mut self, cell: (u32, u32), ctrl: bool, _cx: &mut Context<Self>) {
+        self.drag_ctrl = ctrl;
         if self.formula_pick_active() {
             // Anchor the reference on the pressed cell, with the buffer as it
             // stands, so the drag rewrites from there.
@@ -10860,17 +11935,25 @@ impl Docxy {
     /// it. The body of the cell's own `on_click`, lifted to a method so the UI
     /// test harness's `click-cell` verb drives the same code the pointer does
     /// rather than a second copy of these rules.
+    #[allow(clippy::too_many_arguments)]
     fn cell_click(
         &mut self,
         r: u32,
         c: u32,
         shift: bool,
+        ctrl: bool,
         dbl: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if shift {
             self.extend_to(r, c, cx)
+        } else if ctrl && !self.formula_pick_active() && !self.range_field_active() {
+            // Ctrl+click adds a one-cell area (#670). A Ctrl+drag that ends
+            // where it began already added its area at its first move.
+            if !self.sheet_dragging {
+                self.add_area_at(r, c, cx);
+            }
         } else {
             // While a formula is being typed — or a range field has the
             // keyboard — a click POINTS at this cell: the selection never
@@ -10896,6 +11979,33 @@ impl Docxy {
         // Keep keyboard focus on the grid after a click inside the virtualized
         // list (which would otherwise capture it).
         self.focus.focus(window, cx);
+    }
+
+    /// A right-click on cell `(r, c)`: outside the selection it selects the
+    /// cell first (an open editor commits), so the cell menu's "Selected
+    /// Cell" commands act on the cell clicked; inside it the selection stays.
+    /// None of a left click's extras: a link isn't followed, and while a
+    /// formula or a range field is pointing the selection and the buffer stay
+    /// as they are — no reference is written. Then the cell menu opens at
+    /// `at`.
+    pub(crate) fn cell_right_click(
+        &mut self,
+        r: u32,
+        c: u32,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inside = self.active_sheet().is_some_and(|v| {
+            let (r1, c1, r2, c2) = sel_range(v.sel, v.anchor);
+            (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
+        });
+        let pointing = self.formula_pick_active() || self.range_field_active();
+        if !inside && !pointing {
+            self.select_cell(r, c, cx);
+            self.focus.focus(window, cx);
+        }
+        self.open_cell_menu(at, cx);
     }
 
     /// The pointer moved over cell `(r, c)` with the left button down: the
@@ -11002,6 +12112,11 @@ impl Docxy {
             | Region::ProjectTimeline
             | Region::ProjectSplit => self.project_region_bounds(region, lookup),
             Region::Grid => self.grid_bounds(),
+            Region::BackstageContent | Region::BackstageRail => lookup(
+                &self.probes.borrow(),
+                &harness::region_name(region),
+            )
+            .ok_or_else(|| "the File screen is not open".to_string()),
             Region::Gallery => lookup(&self.probes.borrow(), "gallery").ok_or_else(|| {
                 "the Styles gallery is not shown (it is on a document's Home tab, with the ribbon expanded)"
                     .to_string()
@@ -11012,6 +12127,16 @@ impl Docxy {
             Region::Cells(r0, c0, r1, c1) => self.cells_bounds((r0, c0), (r1, c1)),
             Region::ChartPanel => lookup(&self.probes.borrow(), "chart-panel")
                 .ok_or_else(|| "the Chart panel is not open".to_string()),
+            Region::FilterButton(c) => lookup(
+                &self.probes.borrow(),
+                &format!("filter-button:{}", gridcore::sheet::col_name(c)),
+            )
+            .ok_or_else(|| {
+                format!(
+                    "column {} has no filter button in view (Data › Filter puts them on)",
+                    gridcore::sheet::col_name(c)
+                )
+            }),
             Region::Chart(i) => {
                 let n = self.chart_count();
                 if i >= n {
@@ -11273,19 +12398,11 @@ impl Docxy {
         if after == before {
             return;
         }
-        let Some((r0, c0, r1, c1)) = after else {
+        let Some(rect) = after else {
             return;
         };
         if let Some(v) = self.active_sheet_mut() {
-            // Reveal the far end first, then the near one: a range that fits
-            // ends up wholly in view, and one that doesn't shows its start.
-            let (near, far) = (v.row_list_index(r0), v.row_list_index(r1));
-            v.vlist.scroll_to_reveal_item(far);
-            v.vlist.scroll_to_reveal_item(near);
-            // A range to the LEFT can be scrolled to here; one to the right
-            // needs the grid width, which only the render pass knows.
-            v.col0 = v.col0.min(c0);
-            v.reveal_col = Some(c1);
+            v.reveal(rect);
         }
     }
 
@@ -11608,9 +12725,32 @@ impl Docxy {
             // in-cell edit, so without this a drag that starts on those few
             // pixels writes cells instead of picking them.
             handle_hidden: !self.edit_opts.fill_handle
-                || fill_handle_pointing(self.range_field_active(), self.formula_pick_active()),
+                || fill_handle_pointing(self.range_field_active(), self.formula_pick_active())
+                || self.active_sheet().is_some_and(SheetView::multi_area),
             edit_in_cell: self.edit_opts.edit_in_cell,
             fx_expanded: self.fx_expanded,
+            extra_areas: std::rc::Rc::new(
+                self.active_sheet()
+                    .map(SheetView::extra_areas)
+                    .unwrap_or_default(),
+            ),
+            area_ix: Default::default(),
+            border_grips: self.edit_opts.fill_handle
+                && cell_selection_shown(self.chart_sel)
+                && !self.grid_gesture_in_flight()
+                && self.sheet_fill.is_none()
+                && self.drops.border_drag.is_none()
+                && !fill_handle_pointing(self.range_field_active(), self.formula_pick_active())
+                && self
+                    .active_sheet()
+                    .is_some_and(|v| v.editing.is_none() && !v.multi_area()),
+            options_button: self
+                .fill_options_live()
+                .map(|o| ((o.dest.2, o.dest.3), menu::GridMenu::FillOptions))
+                .or_else(|| {
+                    self.paste_options_live()
+                        .map(|o| ((o.rect.2, o.rect.3), menu::GridMenu::PasteOptions))
+                }),
             // The border's range and the cap on its dashes both need the
             // visible-row list and the column window, which only `sheet_el`
             // has.
@@ -11624,6 +12764,10 @@ impl Docxy {
 
     /// The box the in-progress fill drag would cover, for the preview outline.
     fn sheet_fill_preview(&self) -> Option<(u32, u32, u32, u32)> {
+        // A block dragged by its border outlines where it would land (#670).
+        if let Some(d) = self.drops.border_drag {
+            return (d.dest_at() != (d.src.0, d.src.1)).then(|| d.dest());
+        }
         let f = self.sheet_fill?;
         if f.to == (f.src.2, f.src.3) {
             return None; // still on the source — nothing to outline
@@ -11637,42 +12781,158 @@ impl Docxy {
         let Some(f) = self.sheet_fill.take() else {
             return;
         };
-        let (br0, bc0, br1, bc1) = fill_box(f.src, f.to);
-        // Dragged back onto the source, or up/left off it — either way the box
-        // is the source and `autofill` would write nothing. Bail before the
-        // snapshot, or an idle flick of the handle costs an undo step and marks
-        // a clean workbook dirty.
-        if (br0, bc0, br1, bc1) == f.src {
+        if !self.gesture_view_is_active(f.view) {
             return;
         }
-        // A fill over part of an array is refused whole. `autofill` writes
-        // the destination's cells itself, so that area is asked; an anchor in
-        // the source is not rewritten, so it is not replaced.
-        let dest = fill_dest(f.src, (br0, bc0, br1, bc1));
-        if self.active_sheet_mut().is_some_and(|v| {
-            let refused = v.engine.refuses_area(&v.pkg.workbook, v.active, dest);
-            if refused {
-                v.entry_error = Some(gridcore::engine::PART_OF_ARRAY.to_string());
+        if f.right {
+            // A right-drag's release opens the fill menu; its choice fills.
+            return self.sheet_fill_drop(f, cx);
+        }
+        self.sheet_fill_run(f, gridcore::edit::FillKind::Auto, f.ctrl, cx);
+    }
+
+    /// Fill as the handle's drag `f` asks, as `kind`, leaving the Auto Fill
+    /// Options button on the cells it filled (#668). An idle flick of the
+    /// handle costs no undo step; a fill over part of an array is refused
+    /// whole.
+    fn sheet_fill_run(
+        &mut self,
+        f: FillDrag,
+        kind: gridcore::edit::FillKind,
+        ctrl: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let lists = self.custom_lists.clone();
+        let req = gridcore::edit::FillReq {
+            src: f.src,
+            to: f.to,
+            kind,
+            ctrl,
+            lists: &lists,
+        };
+        let Some(v) = self.active_sheet_mut() else {
+            return;
+        };
+        let (dates, numbers) = v.seed_kinds(f.src);
+        match v.fill_drag(&req) {
+            Ok(Some(gridcore::edit::Filled::Extended(dest))) => {
+                self.fill_options = Some(sheet_fill::FillOptions {
+                    view: v.id,
+                    edit_gen: v.edit_gen,
+                    src: f.src,
+                    to: f.to,
+                    kind,
+                    ctrl,
+                    dest,
+                    sel: v.range(),
+                    dates,
+                    numbers,
+                    gone: Default::default(),
+                });
+                self.mark_sheet_dirty();
             }
-            refused
-        }) {
-            self.sheet_entry_refused(cx);
+            Ok(Some(gridcore::edit::Filled::Cleared(_))) => {
+                self.fill_options = None;
+                self.mark_sheet_dirty();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                v.entry_error = Some(e);
+                self.sheet_entry_refused(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// A right-drag of the fill handle let go: the fill menu, whose choice
+    /// fills ([`SheetAct::FillDrop`]).
+    fn sheet_fill_drop(&mut self, f: FillDrag, cx: &mut Context<Self>) {
+        if gridcore::edit::fill_target(f.src, f.to) == gridcore::edit::FillTarget::None {
             return;
         }
-        self.sheet_snapshot();
-        if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            // Only now does anything move: the cells fill and the selection grows
-            // to cover them (during the drag it was just an outline).
-            v.anchor = (br0, bc0);
-            v.sel = (br1, bc1);
-            gridcore::edit::autofill(&mut v.pkg.workbook, s, f.src, f.to);
-            // Filled formulas were re-based, so their copied results are stale.
-            v.engine = sheet_engine(&v.pkg.workbook);
-            v.engine.recalc_all(&mut v.pkg.workbook);
+        let (dates, numbers) = self
+            .active_sheet()
+            .map_or((false, false), |v| v.seed_kinds(f.src));
+        self.drops.fill_drop = Some(f);
+        let items = sheet_menus::fill_drop_menu(&sheet_menus::fill_kinds(dates, numbers));
+        let at = self.last_pointer;
+        self.open_menu(
+            menu::MenuTarget::Grid(menu::GridMenu::FillDrop),
+            at,
+            items,
+            cx,
+        );
+    }
+
+    /// A choice from the fill handle's right-drag menu: the drag it waits
+    /// on, filled as `kind`.
+    fn sheet_fill_drop_as(&mut self, kind: gridcore::edit::FillKind, cx: &mut Context<Self>) {
+        match self.drops.fill_drop.take() {
+            Some(f) => self.sheet_fill_run(f, kind, false, cx),
+            None => {
+                self.set_status("There is no drag to fill");
+                cx.notify();
+            }
         }
-        self.mark_sheet_dirty();
+    }
+
+    /// A choice from the Auto Fill Options button.
+    fn sheet_fill_as(&mut self, kind: gridcore::edit::FillKind, cx: &mut Context<Self>) {
+        let Some(opts) = self.fill_options.clone() else {
+            self.set_status("There is no fill to change");
+            return cx.notify();
+        };
+        let lists = self.custom_lists.clone();
+        let Some(v) = self.active_sheet_mut() else {
+            return;
+        };
+        match v.refill(&opts, kind, &lists) {
+            Ok(_) => {
+                self.fill_options = Some(sheet_fill::FillOptions {
+                    edit_gen: v.edit_gen,
+                    sel: v.range(),
+                    kind,
+                    ..opts
+                });
+                self.mark_sheet_dirty();
+            }
+            Err(e) => {
+                self.fill_options = None;
+                self.set_status(e);
+            }
+        }
         cx.notify();
+    }
+
+    /// The Auto Fill Options button, while the fill it stands for is what
+    /// the workbook still holds.
+    fn fill_options_live(&self) -> Option<&sheet_fill::FillOptions> {
+        let v = self.active_sheet()?;
+        self.fill_options.as_ref().filter(|o| o.stands(v))
+    }
+
+    /// A double-click on the fill handle: fill down to the end of the block
+    /// in the neighbouring column (#668).
+    fn sheet_fill_double(&mut self, cx: &mut Context<Self>) {
+        self.sheet_fill = None;
+        if self.sheet_protected() || self.protected_refused(cx) || self.multi_area_refused(cx) {
+            return;
+        }
+        let Some(v) = self.active_sheet() else {
+            return;
+        };
+        let src = v.range();
+        let Some(end) = gridcore::edit::fill_down_to(v.sheet(), src) else {
+            return;
+        };
+        let f = FillDrag {
+            src,
+            to: (end, src.3),
+            ctrl: false,
+            right: false,
+            view: v.id,
+        };
+        self.sheet_fill_run(f, gridcore::edit::FillKind::Auto, false, cx);
     }
 
     /// Left-drag over a cell: the first cell of the drag plants the anchor (and
@@ -11710,7 +12970,12 @@ impl Docxy {
             // The press located the origin; fall back to this cell when it
             // couldn't (frozen rows, or a press outside the grid).
             let (ar, ac) = self.drag_anchor.unwrap_or((row, col));
-            self.select_cell(ar, ac, cx);
+            if self.drag_ctrl {
+                // Ctrl+drag sweeps a new area (#670).
+                self.add_area_at(ar, ac, cx);
+            } else {
+                self.select_cell(ar, ac, cx);
+            }
             if (ar, ac) != (row, col) {
                 self.extend_to(row, col, cx);
             }
@@ -11748,7 +13013,8 @@ impl Docxy {
             self.ref_msg = None;
         }
         if let Some(v) = self.active_sheet_mut() {
-            v.sel = (row, col);
+            // Only the active area moves; the others stay (#670).
+            v.extend_active((row, col));
             v.end_cell_edit();
         }
         cx.notify();
@@ -11759,6 +13025,7 @@ impl Docxy {
         if let Some(Surface::Sheet(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
             v.active = idx.min(v.pkg.workbook.sheets.len().saturating_sub(1));
             v.sel = (0, 0);
+            v.clear_areas();
             v.anchor = (0, 0);
             v.end_cell_edit();
         } else {
@@ -11887,20 +13154,12 @@ impl Docxy {
                     self.sheet_rename = None;
                     return;
                 }
-                if let Some(v) = self.active_sheet_mut() {
-                    let old = v.pkg.workbook.sheets.get(idx).map(|s| s.name.clone());
-                    // `rename_sheet` follows the refs inside the workbook (and
-                    // declines a name already taken); a chart this session
-                    // authored isn't in there yet, and would save pointing at a
-                    // sheet name that no longer exists.
-                    if let (true, Some(old)) = (v.pkg.rename_sheet(idx, &buf), old) {
-                        let new = buf.trim().to_string();
-                        for c in &mut v.charts {
-                            gridcore::edit::rename_sheet_in_chart(&mut c.data, &old, &new);
-                        }
-                    }
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    crate::close::commit_rename_buffer(t, idx, &buf);
                 }
                 self.sheet_rename = None;
+                // Enter marks the tab dirty even when the name was declined;
+                // that quirk predates the extraction and stays.
                 self.mark_sheet_dirty();
             }
             "backspace" => {
@@ -11977,7 +13236,11 @@ impl Docxy {
     }
     fn active_sheet_mut(&mut self) -> Option<&mut SheetView> {
         let opts = self.edit_opts;
-        sheet_with_opts(self.tabs.get_mut(self.active), opts)
+        let ac = self.autocorrect.clone();
+        let v = sheet_with_opts(self.tabs.get_mut(self.active), opts)?;
+        v.autocorrect = ac;
+        v.retire_stale_preview();
+        Some(v)
     }
     /// Whether the active sheet is protected (cells read-only until unprotected).
     fn sheet_protected(&self) -> bool {
@@ -12065,35 +13328,114 @@ impl Docxy {
                 protected_rollback(t);
                 return;
             }
-            t.dirty = true;
+            t.set_dirty();
         }
     }
 
-    /// Whether the active tab is in Protected View (#610).
-    fn protected_view(&self) -> bool {
+    /// Whether Protected View (#610, #633) or a final document (#617) hides the
+    /// active document or workbook's ribbon commands.
+    fn ribbon_locked(&self) -> bool {
+        (self.active_is_sheet() || self.active_is_doc()) && self.active_locked()
+    }
+
+    /// Whether the window draws no ribbon body now: collapsed, locked, or a tab
+    /// with no ribbon. Render and `ribbon-layout` both ask this.
+    pub(crate) fn ribbon_body_hidden(&self) -> bool {
+        self.ribbon_min
+            || self.ribbon_locked()
+            || !(self.active_is_doc() || self.active_is_sheet() || self.active_is_project())
+    }
+
+    /// Whether the active tab takes no edits: Protected View (#610), or a
+    /// document marked as final (#617).
+    fn active_locked(&self) -> bool {
         self.tabs
             .get(self.active)
-            .is_some_and(|t| t.access.protected)
+            .is_some_and(|t| t.access.locked())
     }
 
-    /// Refuse an edit in Protected View, saying how to edit; `true` when it
-    /// was refused. Every gate that would change the workbook asks this first.
+    /// Refuse an edit in Protected View, in a document marked as final, or
+    /// while Display for Review shows No Markup or Original (text that is not
+    /// the document's), saying how to edit; `true` when it was refused. Every
+    /// gate that would change the workbook or document asks this first.
     fn protected_refused(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.protected_view() {
-            return false;
+        if self.view_only_active() {
+            self.set_status(VIEW_ONLY_STATUS);
+            cx.notify();
+            return true;
         }
-        self.set_status(open_mode::PROTECTED_STATUS);
+        self.access_refused(cx)
+    }
+
+    /// The active tab is a document shown as No Markup or Original: text that
+    /// is not the document's, so it is looked at and not edited (#625).
+    fn view_only_active(&self) -> bool {
+        !self.markup.is_editable()
+            && matches!(
+                self.tabs.get(self.active).map(|t| &t.surface),
+                Some(Surface::Doc(_))
+            )
+    }
+
+    /// [`Self::protected_refused`] for what holds no text of the view (a
+    /// comment's Resolve and Delete all): only Protected View or Mark as
+    /// Final refuse it.
+    fn access_refused(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(access) = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.access)
+            .filter(|a| a.locked())
+        else {
+            return false;
+        };
+        self.set_status(access.locked_status());
         cx.notify();
         true
     }
 
     /// Excel's PROTECTED VIEW message bar (#610), under the ribbon while the
     /// active workbook came from the Internet: what it is, why, and the one
-    /// way out. Its colours are Excel's, in either theme.
+    /// way out.
     fn protected_view_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        self.message_bar(
+            pal,
+            ("pv-bar", "pv-enable"),
+            (open_mode::PROTECTED_LABEL, open_mode::PROTECTED_TEXT),
+            "Enable Editing",
+            Self::enable_editing,
+            cx,
+        )
+    }
+
+    /// Word's MARKED AS FINAL message bar (#617), under the ribbon while the
+    /// active document is marked as final: what it is, and Edit Anyway.
+    fn marked_final_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        self.message_bar(
+            pal,
+            ("final-bar", "final-edit-anyway"),
+            (open_mode::MARKED_FINAL_LABEL, open_mode::MARKED_FINAL_TEXT),
+            "Edit Anyway",
+            Self::edit_anyway,
+            cx,
+        )
+    }
+
+    /// Office's yellow message bar: a bold `label`, its `text`, and one
+    /// `button` that runs `press`. `ids` are the bar's and the button's.
+    /// Its colours are Office's, in either theme.
+    fn message_bar(
+        &self,
+        pal: Pal,
+        ids: (&'static str, &'static str),
+        (label, text): (&'static str, &'static str),
+        button: &'static str,
+        press: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let ink = hsla_u(0x3B3B3B);
         h_flex()
-            .id("pv-bar")
+            .id(ids.0)
             .w_full()
             .h(px(36.))
             .flex_none()
@@ -12105,23 +13447,18 @@ impl Docxy {
             .border_color(pal.border)
             .text_size(px(12.))
             .text_color(ink)
-            .child(
-                div()
-                    .flex_none()
-                    .font_weight(FontWeight::BOLD)
-                    .child(open_mode::PROTECTED_LABEL),
-            )
+            .child(div().flex_none().font_weight(FontWeight::BOLD).child(label))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .child(open_mode::PROTECTED_TEXT),
+                    .child(text),
             )
             .child(
                 div()
-                    .id("pv-enable")
+                    .id(ids.1)
                     .flex_none()
                     .px_3()
                     .py_1()
@@ -12131,13 +13468,24 @@ impl Docxy {
                     .bg(hsla_u(0xFFFFFF))
                     .cursor_pointer()
                     .hover(|d| d.bg(hsla_u(0xF3F2F1)))
-                    .child("Enable Editing")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.enable_editing(cx);
+                    .child(button)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        press(this, cx);
                         this.refocus(window, cx);
                     })),
             )
             .into_any_element()
+    }
+
+    /// The final bar's Edit Anyway (#617): the document takes edits, and the
+    /// mark leaves its package, so a later save writes an ordinary document
+    /// as Word's does. Not an edit: the tab stays clean. In Protected View
+    /// it waits for Enable Editing, whose bar shows first.
+    pub(crate) fn edit_anyway(&mut self, cx: &mut Context<Self>) {
+        if self.tabs.get_mut(self.active).is_some_and(edit_anyway_tab) {
+            self.persist();
+            cx.notify();
+        }
     }
 
     /// The message bar's Enable Editing (#610): the tab leaves Protected View
@@ -12271,12 +13619,19 @@ impl Docxy {
     /// Commit and move; false (the editor left open, the status saying why)
     /// when the entry was refused.
     fn sheet_commit_move(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) -> bool {
+        let origin = self
+            .active_sheet()
+            .and_then(|v| v.editing.as_ref().and(v.edit_origin));
         let res = self.active_sheet_mut().map(|v| v.commit_and_move(dr, dc));
         cx.notify();
         match res {
             Some(Some(committed)) => {
                 if committed {
                     self.mark_sheet_dirty();
+                    // A typed entry may be Flash Fill's second example.
+                    if let (Some(origin), Some(v)) = (origin, self.active_sheet_mut()) {
+                        v.flash_preview_after(origin);
+                    }
                 }
                 true
             }
@@ -12330,7 +13685,8 @@ impl Docxy {
         }
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
-            v.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
+            // Only the active area grows; the others stay (#670).
+            v.extend_active(((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32));
             v.end_cell_edit();
         }
         cx.notify();
@@ -12409,12 +13765,17 @@ impl Docxy {
         };
         // A filter hiding every selected row leaves nothing to copy; the
         // clipboard and copy mode stay as they were.
-        let Some(mut clip) = v.grid_clip(cut) else {
-            self.set_status("Nothing to copy: a filter hides every selected row");
-            cx.notify();
-            return;
+        let mut clip = match v.grid_clip(cut) {
+            Ok(clip) => clip,
+            Err(why) => {
+                self.set_status(why);
+                cx.notify();
+                return;
+            }
         };
         clip.text = self.clipboard_write_recorded(std::mem::take(&mut clip.text), cx);
+        // Every copy and cut goes on the Office Clipboard too (#669).
+        self.office_clip.push(&clip.text);
         self.grid_clip = Some(clip);
         cx.notify();
     }
@@ -12449,6 +13810,17 @@ impl Docxy {
         cut
     }
 
+    /// After a paste of the live copy into its own workbook: the paste's own
+    /// undo step does not end copy mode.
+    fn grid_clip_restamp(&mut self) {
+        if let Some(mut ours) = self.grid_clip.take() {
+            if let Some(v) = self.active_sheet() {
+                ours.restamp(v);
+            }
+            self.grid_clip = Some(ours);
+        }
+    }
+
     /// End copy mode (Esc, an Enter paste, a pasted cut).
     fn grid_clip_spend(&mut self) {
         if let Some(clip) = self.grid_clip.as_mut() {
@@ -12473,15 +13845,30 @@ impl Docxy {
             };
             let res = v.paste_grid_clip(&clip);
             let landed = matches!(res, Ok(GridPasted::Done | GridPasted::KeptAsCopy(_)));
-            // Copy mode stays on after a Ctrl+V: the paste's own undo step
-            // does not end it.
+            // A copy's paste leaves the Paste Options button (#669); a
+            // move does not, as in Excel. Copy mode stays on after a Ctrl+V:
+            // the paste's own undo step does not end it.
+            self.paste_options = None;
             if landed && !clip.cut {
-                if let Some(mut ours) = self.grid_clip.take() {
-                    if let Some(v) = self.active_sheet() {
-                        ours.restamp(v);
-                    }
-                    self.grid_clip = Some(ours);
+                // A paste tiled over a bigger area gets no button: its
+                // choices re-paste one copy (#707 r2 m3).
+                let untiled = self
+                    .active_sheet()
+                    .is_some_and(|v| pasted_once(v.range(), &clip));
+                if let Some(v) = self.active_sheet().filter(|_| untiled) {
+                    let rect = v.range();
+                    self.paste_options = Some(sheet_paste::PasteOptions {
+                        view: v.id,
+                        edit_gen: v.edit_gen,
+                        block: clip.block.clone(),
+                        at: (rect.0, rect.1),
+                        rect,
+                        item: sheet_menus::PasteItem::Paste,
+                        foreign: clip.view != v.id,
+                        gone: Default::default(),
+                    });
                 }
+                self.grid_clip_restamp();
             }
             // A cut pastes once; a cancelled one is over too. A refused paste
             // keeps it, to paste somewhere else.
@@ -12515,33 +13902,19 @@ impl Docxy {
         let ClipRead::Text(text) = now else {
             return false;
         };
+        self.paste_text(&text, cx)
+    }
+
+    /// Paste `text` at the selection's top-left as TSV, each field read as
+    /// typed into its target cell (paste_cell: a leading `'` is
+    /// quote-prefixed text, a date brings its format), as xlsxy's and
+    /// gridwasm's pastes do. Whether it landed.
+    fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         let Some(v) = self.active_sheet_mut() else {
             return false;
         };
-        // Each field is read as typed into its target cell (paste_cell:
-        // a leading `'` is quote-prefixed text, a date brings its
-        // format), as xlsxy's and gridwasm's pastes do. The block goes at the
-        // selection's top-left.
         let (br, bc, _, _) = v.range();
-        let s = v.active;
-        let ctx = gridcore::entry::entry_ctx(&v.pkg.workbook, v.engine.clock);
-        let wb = &mut v.pkg.workbook;
-        let mut block = Vec::new();
-        for (dr, line) in text
-            .replace("\r\n", "\n")
-            .trim_end_matches('\n')
-            .split('\n')
-            .enumerate()
-        {
-            let mut row = Vec::new();
-            for (dc, f) in line.split('\t').enumerate() {
-                let style = wb.sheets[s]
-                    .cell(br + dr as u32, bc + dc as u32)
-                    .map_or(0, |cl| cl.style);
-                row.push(gridcore::entry::paste_cell(&mut wb.styles, style, f, &ctx));
-            }
-            block.push(row);
-        }
+        let block = v.text_block(text, (br, bc));
         if block.is_empty() {
             return false;
         }
@@ -12570,8 +13943,12 @@ impl Docxy {
             self.set_status(CUT_CANCELLED_STATUS);
         }
         let now = self.clipboard_read(cx);
-        if self.sheet_protected() || self.protected_view() || self.grid_clip_live(&now).is_none() {
+        if self.sheet_protected() || self.active_locked() || self.grid_clip_live(&now).is_none() {
             return false;
+        }
+        // A paste lands in one rectangle (#670).
+        if self.multi_area_refused(cx) {
+            return true;
         }
         if self.sheet_paste(cx) {
             self.grid_clip_spend();
@@ -12688,13 +14065,25 @@ impl Docxy {
             .map(|cm| cm.text)
     }
 
-    /// Open the comment entry bar for the selected cell, seeded with its existing
-    /// comment text (so New Comment doubles as Edit).
+    /// Open the comment entry bar for the selected cell, seeded with its
+    /// existing comment text (so New Comment doubles as Edit). The seed — the
+    /// raw text — is remembered with the buffer: the selection moves freely
+    /// while the bar is open, and an exit commit uses it only to skip a
+    /// buffer that is the seed, untouched, after a click moved on.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
         if self.active_sheet().is_some() {
-            self.sheet_comment_edit = Some(self.selected_comment().unwrap_or_default());
+            let text = self.selected_comment().unwrap_or_default();
+            self.sheet_comment_seed = Some(text.clone());
+            self.sheet_comment_edit = Some(text);
             cx.notify();
         }
+    }
+
+    /// Drop the comment bar: its buffer and, with it, the seed that says
+    /// what text it opened with.
+    fn sheet_comment_bar_close(&mut self) {
+        self.sheet_comment_edit = None;
+        self.sheet_comment_seed = None;
     }
 
     /// Route a keystroke into the conditional-format entry bar; Enter applies the
@@ -12749,126 +14138,6 @@ impl Docxy {
             }
         }
         cx.notify();
-    }
-
-    /// Apply an AutoFilter criteria to the selected column: hide the rows of the
-    /// contiguous region whose value fails it (header kept). "clear" unhides.
-    fn sheet_apply_filter(&mut self, text: &str, cx: &mut Context<Self>) {
-        use gridcore::sheet::CellValue;
-        if text.trim().eq_ignore_ascii_case("clear") {
-            return self.sheet_clear_filter(cx);
-        }
-        if self.protected_refused(cx) {
-            return;
-        }
-        // An empty or unreadable criteria changes nothing, so it leaves the
-        // tab clean; the bar has already closed.
-        let Some((op, operand)) = gridcore::filter::parse(text) else {
-            return cx.notify();
-        };
-        let Some(v) = self.active_sheet_mut() else {
-            return;
-        };
-        let Some((top, bottom)) = v.filter_region() else {
-            return;
-        };
-        let s = v.active;
-        let sc = v.sel.1;
-        let sh = &v.pkg.workbook.sheets[s];
-        let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
-        let start = if header { top + 1 } else { top };
-        // Rows are marked filter-hidden (not hidden by hand) so SUBTOTAL
-        // 1-11 skips them and still counts hand-hidden rows.
-        let keep: Vec<bool> = (start..=bottom)
-            .map(|r| {
-                let val = v.pkg.workbook.sheets[s]
-                    .cell(r, sc)
-                    .map(|c| c.value.clone());
-                gridcore::filter::matches(val.as_ref(), op, &operand)
-            })
-            .collect();
-        for (i, r) in (start..=bottom).enumerate() {
-            v.pkg.workbook.sheets[s].set_row_filtered(r, !keep[i]);
-        }
-        self.mark_sheet_dirty();
-        cx.notify();
-    }
-
-    /// Data › Sort & Filter › Clear (and `clear` in the Filter bar): unhide
-    /// every hidden row of the region around the cursor (hand-hidden ones
-    /// too) and drop its filter marks; dirty only when a row changed.
-    fn sheet_clear_filter(&mut self, cx: &mut Context<Self>) {
-        if self.protected_refused(cx) {
-            return;
-        }
-        if self.active_sheet_mut().is_some_and(SheetView::clear_filter) {
-            self.mark_sheet_dirty();
-        }
-        cx.notify();
-    }
-
-    /// Route a keystroke into the AutoFilter criteria bar (Enter applies, Esc cancels).
-    fn sheet_filter_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
-        let Some(mut buf) = self.sheet_filter_edit.clone() else {
-            return;
-        };
-        match key {
-            "escape" => {
-                self.sheet_filter_edit = None;
-                cx.notify();
-            }
-            "enter" => {
-                self.sheet_filter_edit = None;
-                self.sheet_apply_filter(&buf, cx);
-            }
-            "backspace" => {
-                buf.pop();
-                self.sheet_filter_edit = Some(buf);
-                cx.notify();
-            }
-            _ => {
-                if let Some(c) = ev.keystroke.key_char.as_deref() {
-                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
-                        buf.push_str(c);
-                    }
-                }
-                self.sheet_filter_edit = Some(buf);
-                cx.notify();
-            }
-        }
-    }
-
-    /// Route a keystroke into the multi-level sort entry bar; Enter runs the sort.
-    fn sheet_sort_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
-        let Some(mut buf) = self.sheet_sort_edit.clone() else {
-            return;
-        };
-        match key {
-            "escape" => {
-                self.sheet_sort_edit = None;
-                self.bar_close();
-                cx.notify();
-            }
-            "enter" => {
-                self.sheet_sort_edit = None;
-                self.sheet_commit_sort(&buf, cx);
-                self.bar_close();
-            }
-            "backspace" => {
-                buf.pop();
-                self.sheet_sort_edit = Some(buf);
-                cx.notify();
-            }
-            _ => {
-                if let Some(c) = ev.keystroke.key_char.as_deref() {
-                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
-                        buf.push_str(c);
-                    }
-                }
-                self.sheet_sort_edit = Some(buf);
-                cx.notify();
-            }
-        }
     }
 
     /// Route a keystroke into the row-height entry bar; Enter applies it.
@@ -12977,7 +14246,7 @@ impl Docxy {
         };
         match key {
             "escape" => {
-                self.sheet_comment_edit = None;
+                self.sheet_comment_bar_close();
                 cx.notify();
             }
             "enter" => self.sheet_commit_comment(cx),
@@ -13006,9 +14275,11 @@ impl Docxy {
         let Some(text) = self.sheet_comment_edit.take() else {
             return;
         };
+        self.sheet_comment_bar_close();
         let author = self.comment_author();
-        // The view takes the undo step itself: the whole package.
-        self.sheet_try_edit(false, |v| v.comment_cell(&author, &text));
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            crate::close::commit_comment_buffer(t, &author, &text);
+        }
         cx.notify();
     }
 
@@ -13051,6 +14322,7 @@ impl Docxy {
                     .unwrap_or(*cells.last().unwrap())
             };
             v.sel = next;
+            v.clear_areas();
             v.anchor = next;
             // Bring the target row into view (columns follow via reconcile).
             v.vlist.scroll_to_reveal_item(v.row_list_index(next.0));
@@ -13231,50 +14503,6 @@ impl Docxy {
         cx.notify();
     }
 
-    fn sheet_sort_bounds(&self) -> Option<(u32, u32)> {
-        self.active_sheet()?.sort_bounds()
-    }
-
-    /// Sort the current region by the selected column (header-aware). Rows move
-    /// as whole units (all columns + styles); blanks sort last. Formula refs are
-    /// not re-based, so this targets value tables (the common case).
-    fn sheet_sort(&mut self, ascending: bool, cx: &mut Context<Self>) {
-        let Some(v) = self.active_sheet_mut() else {
-            return;
-        };
-        let keys = [(v.sel.1, ascending)];
-        let (committed, sorted) = v.sort_with_pending_edit(None, &keys);
-        if committed || sorted {
-            self.mark_sheet_dirty();
-        }
-        self.sheet_entry_refused(cx);
-        cx.notify();
-    }
-
-    /// Multi-level sort of the current region from a typed spec like
-    /// "B asc, C desc" (column letters, optional asc/desc, default ascending).
-    fn sheet_commit_sort(&mut self, text: &str, cx: &mut Context<Self>) {
-        let Some(keys) = gridcore::edit::parse_sort_spec(text) else {
-            return;
-        };
-        // Only a PINNED range overrides the region the sort would find on its
-        // own; the field showing that region is not the user choosing it.
-        let field = self
-            .bar_range
-            .as_deref()
-            .and_then(parse_ref_text)
-            .map(|r| r.range);
-        let Some(v) = self.active_sheet_mut() else {
-            return;
-        };
-        let (committed, sorted) = v.sort_with_pending_edit(field, &keys);
-        if committed || sorted {
-            self.mark_sheet_dirty();
-        }
-        self.sheet_entry_refused(cx);
-        cx.notify();
-    }
-
     /// Insert/delete a whole row or column at the selection (Home ▸ Cells), then
     /// rebuild the recalc engine so shifted formulas re-evaluate.
     fn sheet_structural(&mut self, op: StructOp, cx: &mut Context<Self>) {
@@ -13319,6 +14547,7 @@ impl Docxy {
                 if let Some((rr, cc)) = gridcore::sheet::parse_cell_name(&cellref.replace('$', ""))
                 {
                     v.sel = (rr, cc);
+                    v.clear_areas();
                     v.anchor = (rr, cc);
                     v.vlist.scroll_to_reveal_item(v.row_list_index(rr));
                 }
@@ -13381,6 +14610,24 @@ impl Docxy {
             }
         }
         Some(out)
+    }
+
+    /// A press on column `col`'s filter button: its drop-down (#690).
+    fn sheet_filter_button(&mut self, col: u32, cx: &mut Context<Self>) {
+        // Protected View (#610) keeps the workbook as it opened.
+        if self.protected_refused(cx) {
+            return;
+        }
+        self.sheet_data_cmd(
+            |t| {
+                // A value being typed belongs in the list the drop-down shows.
+                sheet_sort::commit_first(t)?;
+                let d = sheet_filter::menu_dialog(t, col)?;
+                t.dialogs.push(d);
+                Ok(())
+            },
+            cx,
+        );
     }
 
     fn sheet_dv_toggle(&mut self, cx: &mut Context<Self>) {
@@ -13586,6 +14833,7 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             if let Some((r, c)) = v.find_match(&q, back) {
                 v.sel = (r, c);
+                v.clear_areas();
                 v.anchor = (r, c);
                 v.vlist.scroll_to_reveal_item(v.row_list_index(r));
             }
@@ -14673,12 +15921,141 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// Home › Fill › Down, Right, Up, Left (and Ctrl+D, Ctrl+R).
+    fn sheet_fill_dir(&mut self, dir: gridcore::edit::FillDir, cx: &mut Context<Self>) {
+        if self.sheet_protected() {
+            return;
+        }
+        if self
+            .active_sheet_mut()
+            .is_some_and(|v| v.fill_selection(dir))
+        {
+            self.mark_sheet_dirty();
+        }
+        self.sheet_entry_refused(cx);
+        cx.notify();
+    }
+
+    /// The sheet ribbon command `id`'s menu, with what it is drawn in.
+    fn sheet_menu_target(m: sheet_menus::SheetMenu) -> menu::MenuTarget {
+        let (id, group, label) = match m {
+            sheet_menus::SheetMenu::Paste => ("paste", "Clipboard", "Paste"),
+            sheet_menus::SheetMenu::Fill => ("fill", "Editing", "Fill"),
+            sheet_menus::SheetMenu::Clear => ("clear", "Editing", "Clear"),
+            sheet_menus::SheetMenu::FindSelect => ("find-select", "Editing", "Find & Select"),
+        };
+        menu::MenuTarget::Ribbon {
+            id: id.into(),
+            tab: "Home".into(),
+            group: group.into(),
+            label: label.into(),
+        }
+    }
+
+    /// Open a sheet ribbon menu at `at` (#707).
+    pub(crate) fn open_sheet_menu(
+        &mut self,
+        m: sheet_menus::SheetMenu,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let items = match m {
+            sheet_menus::SheetMenu::Paste => match self.paste_source(cx) {
+                // Each item on when the source takes it: a cut only Paste,
+                // text only Paste, Values and Transpose (#707 r1 M5).
+                Some(src) => sheet_menus::paste_gallery(
+                    |item| sheet_paste::item_refusal(&src, item).is_ok(),
+                    !src.cut,
+                ),
+                None => sheet_menus::paste_gallery(|_| false, false),
+            },
+            sheet_menus::SheetMenu::Fill => sheet_menus::fill_menu(),
+            sheet_menus::SheetMenu::Clear => sheet_menus::clear_menu(),
+            sheet_menus::SheetMenu::FindSelect => sheet_menus::find_select_menu(),
+        };
+        self.open_menu(Self::sheet_menu_target(m), at, items, cx);
+    }
+
+    /// Open the grid menu `kind` where its button is (#707): the Auto Fill
+    /// Options or Paste Options button, or a right-drag's drop menu. Refused
+    /// when nothing shows it.
+    pub(crate) fn open_grid_menu(
+        &mut self,
+        kind: menu::GridMenu,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let items = match kind {
+            menu::GridMenu::FillOptions => {
+                let opts = self
+                    .fill_options_live()
+                    .ok_or("no Auto Fill Options button is showing")?;
+                sheet_menus::fill_options(&opts.kinds(), Some(opts.kind))
+            }
+            menu::GridMenu::PasteOptions => {
+                let opts = self
+                    .paste_options_live()
+                    .ok_or("no Paste Options button is showing")?;
+                sheet_menus::paste_again_menu(opts.item)
+            }
+            menu::GridMenu::FillDrop | menu::GridMenu::BorderDrop => {
+                return Err("a drop menu opens only when a right-drag ends".into());
+            }
+        };
+        self.open_menu(menu::MenuTarget::Grid(kind), at, items, cx);
+        Ok(())
+    }
+
+    /// A Home › Clear item other than Clear Contents (which is Delete): one
+    /// undo step over every area, or the status says why not.
+    fn sheet_clear_what(&mut self, what: gridcore::edit::ClearWhat, cx: &mut Context<Self>) {
+        let Some(v) = self.active_sheet_mut() else {
+            return;
+        };
+        match v.clear_what(what) {
+            Ok(true) => self.mark_sheet_dirty(),
+            Ok(false) => self.set_status("Nothing to clear"),
+            Err(e) => self.set_status(e),
+        }
+        cx.notify();
+    }
+
+    /// Run a Sort & Filter command on the active tab (#690, #691); a refusal
+    /// lands in the status line.
+    fn sheet_data_cmd(
+        &mut self,
+        op: impl FnOnce(&mut DocTab) -> Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if let Err(e) = op(tab) {
+                tab.status = e.into();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Refuse what would act on one area of a multi-area selection, with
+    /// Excel's message; false when the selection has one area.
+    fn multi_area_refused(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.active_sheet().is_some_and(SheetView::multi_area) {
+            return false;
+        }
+        self.set_status(gridcore::edit::MULTI_SELECTION);
+        cx.notify();
+        true
+    }
+
     /// Dispatch a spreadsheet ribbon command.
     fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
         // Protected View (#610): the ribbon is hidden, but shortcuts, KeyTips
         // and the harness's `ribbon-click` still come here.
         if !protected_view_allows_act(act) && self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        // A multi-area selection runs only what acts on every area (#670).
+        if !multi_area_ok(act) && self.multi_area_refused(cx) {
             return self.refocus(window, cx);
         }
         // Before anything reads the selection — including the bar seeding below
@@ -14694,6 +16071,15 @@ impl Docxy {
             self.bar_open(target);
         }
         match act {
+            SheetAct::PickList => {
+                let _ = self.open_pick_menu(cx);
+            }
+            SheetAct::FlashFill => self.sheet_flash_fill(cx),
+            SheetAct::FlashUndo
+            | SheetAct::FlashAccept
+            | SheetAct::FlashSelectBlank
+            | SheetAct::FlashSelectChanged => self.flash_option(act, cx),
+            SheetAct::PickItem(i) => self.sheet_pick_item(i as usize, cx),
             SheetAct::Cut => self.sheet_copy(true, cx),
             SheetAct::Copy => self.sheet_copy(false, cx),
             SheetAct::Paste => {
@@ -14729,12 +16115,10 @@ impl Docxy {
             SheetAct::DeleteRow => self.sheet_structural(StructOp::DeleteRow, cx),
             SheetAct::InsertCol => self.sheet_structural(StructOp::InsertCol, cx),
             SheetAct::DeleteCol => self.sheet_structural(StructOp::DeleteCol, cx),
-            SheetAct::SortAsc => self.sheet_sort(true, cx),
-            SheetAct::SortDesc => self.sheet_sort(false, cx),
-            SheetAct::CustomSort => {
-                self.sheet_sort_edit = Some(String::new());
-                cx.notify();
-            }
+            SheetAct::SortAsc => self.sheet_data_cmd(|t| sheet_sort::quick(t, true), cx),
+            SheetAct::SortDesc => self.sheet_data_cmd(|t| sheet_sort::quick(t, false), cx),
+            SheetAct::CustomSort => self.sheet_data_cmd(sheet_sort::open_dialog, cx),
+            SheetAct::PutOnTop(by) => self.sheet_data_cmd(|t| sheet_sort::on_top(t, by), cx),
             SheetAct::AutoSum => self.sheet_autosum(cx),
             SheetAct::FormatCells => {
                 self.sheet_fmt_open = true;
@@ -14754,11 +16138,29 @@ impl Docxy {
                 self.sheet_dv_edit = Some(String::new());
                 cx.notify();
             }
-            SheetAct::Filter => {
-                self.sheet_filter_edit = Some(String::new());
-                cx.notify();
-            }
-            SheetAct::ClearFilter => self.sheet_clear_filter(cx),
+            SheetAct::Filter => self.sheet_data_cmd(sheet_filter::toggle, cx),
+            SheetAct::ClearFilter => self.sheet_data_cmd(
+                |t| {
+                    sheet_filter::run(t, |wb, s, today| {
+                        gridcore::filter::clear(wb, s, None, today)
+                    })
+                    .map(|_| ())
+                },
+                cx,
+            ),
+            SheetAct::ReapplyFilter => self.sheet_data_cmd(
+                |t| sheet_filter::run(t, gridcore::filter::reapply).map(|_| ()),
+                cx,
+            ),
+            SheetAct::AdvancedFilter => self.sheet_data_cmd(
+                |t| {
+                    let d = sheet_filter::advanced_dialog(t)?;
+                    t.dialogs.push(d);
+                    Ok(())
+                },
+                cx,
+            ),
+            SheetAct::FilterBy(by) => self.sheet_data_cmd(|t| sheet_filter::by_cell(t, by), cx),
             SheetAct::RemoveDuplicates => self.sheet_remove_duplicates(cx),
             SheetAct::FormatAsTable => self.sheet_format_as_table(cx),
             SheetAct::ProtectSheet => self.sheet_toggle_protection(cx),
@@ -14821,6 +16223,43 @@ impl Docxy {
                 self.sheet_numfmt_open = !self.sheet_numfmt_open;
                 cx.notify();
             }
+            SheetAct::Menu(m) => {
+                let at = window.mouse_position();
+                self.open_sheet_menu(m, at, cx);
+                // The menu has the pointer now; refocusing would close it.
+                return;
+            }
+            SheetAct::Fill(dir) => self.sheet_fill_dir(dir, cx),
+            SheetAct::Clear(gridcore::edit::ClearWhat::Contents) => self.sheet_clear(cx),
+            SheetAct::Clear(what) => self.sheet_clear_what(what, cx),
+            SheetAct::GoTo | SheetAct::GoToSpecial => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    let d = if act == SheetAct::GoTo {
+                        sheet_goto::goto_dialog(tab)
+                    } else {
+                        sheet_goto::special_dialog(tab)
+                    };
+                    match d {
+                        Ok(d) => tab.dialogs.push(d),
+                        Err(e) => tab.status = e.into(),
+                    }
+                }
+                cx.notify();
+            }
+            SheetAct::FillSeries | SheetAct::FillJustify | SheetAct::CustomLists => {
+                self.fill_menu_act(act);
+                cx.notify();
+            }
+            SheetAct::FillAs(kind) => self.sheet_fill_as(kind, cx),
+            SheetAct::FillDrop(kind) => self.sheet_fill_drop_as(kind, cx),
+            SheetAct::PasteAs(item) => self.sheet_paste_as(item, cx),
+            SheetAct::PasteAgain(item) => self.sheet_paste_again(item, cx),
+            SheetAct::PasteSpecial => self.open_paste_special(cx),
+            SheetAct::OfficeClipboard => {
+                self.office_clip.open = !self.office_clip.open;
+                cx.notify();
+            }
+            SheetAct::Drop(choice) => self.border_drop_choice(choice, cx),
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -14850,7 +16289,7 @@ impl Docxy {
         // Protected View (#610): only keys that look, move or copy reach the
         // workbook. The find bar still takes typing; its Replace is refused
         // where it would write.
-        if self.protected_view()
+        if self.active_locked()
             && !self.find_open
             && !open_mode::protected_allows_key(key, ctrl, alt)
         {
@@ -14886,14 +16325,6 @@ impl Docxy {
         if to_bar(self.sheet_dv_edit.is_some()) {
             return self.sheet_dv_edit_key(ev, key, cx);
         }
-        // The AutoFilter criteria bar swallows typing too.
-        if self.sheet_filter_edit.is_some() {
-            return self.sheet_filter_key(ev, key, cx);
-        }
-        // The multi-level sort spec bar swallows typing too.
-        if to_bar(self.sheet_sort_edit.is_some()) {
-            return self.sheet_sort_key(ev, key, cx);
-        }
         // The row-height entry bar swallows typing too.
         if self.sheet_rowh_edit.is_some() {
             return self.sheet_rowh_key(ev, key, cx);
@@ -14908,6 +16339,39 @@ impl Docxy {
             return self.sheet_find_key(ev, shift, key, cx);
         }
         let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
+        // Flash Fill's preview stands for one key: Enter takes it, any
+        // other key (but a lone modifier) leaves it behind (ENT-105).
+        if key != "enter" && !matches!(key, "shift" | "control" | "alt" | "platform" | "function") {
+            if let Some(v) = self.active_sheet_mut() {
+                v.flash_preview = None;
+            }
+        }
+        // Alt+Down opens a drop-down list (#665), before point mode or the
+        // type-over arrows can take the Down.
+        if alt && !ctrl && !shift && key == "down" {
+            return self.sheet_alt_down(cx);
+        }
+        // Formula AutoComplete's list (#686) takes Up, Down and Esc while it
+        // shows: they move its highlight or close it, and neither commit,
+        // point nor cancel the entry.
+        if editing
+            && !ctrl
+            && !alt
+            && matches!(key, "up" | "down" | "escape")
+            && self
+                .active_sheet_mut()
+                .is_some_and(SheetView::complete_open)
+        {
+            if let Some(v) = self.active_sheet_mut() {
+                match key {
+                    "up" => v.complete_step(false),
+                    "down" => v.complete_step(true),
+                    _ => v.complete_close(),
+                }
+            }
+            cx.notify();
+            return;
+        }
         let caret_keys = editing
             && self
                 .active_sheet()
@@ -14961,6 +16425,10 @@ impl Docxy {
                     return;
                 }
             }
+            // Ctrl+Alt+V: Paste Special… (#669).
+            if alt && key == "v" && !editing {
+                return self.run_sheet_act(SheetAct::PasteSpecial, window, cx);
+            }
             // Excel's entry shortcuts (#663). The harness spells Ctrl+Shift+"
             // and Ctrl+Shift+; by the shifted character, the platform by the
             // key with Shift held: take both.
@@ -14987,19 +16455,19 @@ impl Docxy {
                     cx.notify();
                     return;
                 }
+                // Flash Fill (#666): an open entry is committed first. The
+                // ribbon command's own act, so a multi-area selection and
+                // Protected View are refused as there (#707).
+                "e" => return self.run_sheet_act(SheetAct::FlashFill, window, cx),
                 "d" | "r" if !editing => {
-                    if !protected {
-                        self.chart_hand_back(cx);
-                        if self
-                            .active_sheet_mut()
-                            .is_some_and(|v| v.fill_selection(key == "d"))
-                        {
-                            self.mark_sheet_dirty();
-                        }
-                        self.sheet_entry_refused(cx);
-                    }
-                    cx.notify();
-                    return;
+                    use gridcore::edit::FillDir;
+                    let dir = if key == "d" {
+                        FillDir::Down
+                    } else {
+                        FillDir::Right
+                    };
+                    // Home › Fill's own act, so the same checks run.
+                    return self.run_sheet_act(SheetAct::Fill(dir), window, cx);
                 }
                 _ => {}
             }
@@ -15020,24 +16488,31 @@ impl Docxy {
                     self.find_field = FindField::Query;
                     cx.notify();
                 }
-                "c" => self.sheet_copy(false, cx),
-                "x" => self.sheet_copy(true, cx),
-                "v" => {
-                    self.sheet_paste(cx);
-                }
+                // The shortcuts of ribbon commands run the commands' own
+                // acts, so they share their checks (a multi-area selection,
+                // #670).
+                "c" => return self.run_sheet_act(SheetAct::Copy, window, cx),
+                "g" => return self.run_sheet_act(SheetAct::GoTo, window, cx),
+                "x" => return self.run_sheet_act(SheetAct::Cut, window, cx),
+                "v" => return self.run_sheet_act(SheetAct::Paste, window, cx),
                 "z" => self.sheet_undo(cx),
                 "y" => self.sheet_redo(cx),
-                "b" => self.sheet_toggle_bold(cx),
-                "i" => self.sheet_toggle_italic(cx),
+                "b" => return self.run_sheet_act(SheetAct::Bold, window, cx),
+                "i" => return self.run_sheet_act(SheetAct::Italic, window, cx),
                 // Insert a PivotTable for the selection (also on the Insert ribbon).
-                "p" if shift => self.sheet_insert_pivot(cx),
+                "p" if shift => return self.run_sheet_act(SheetAct::InsertPivot, window, cx),
                 // Insert a chart of the selection (also on the Insert ribbon).
-                "k" if shift => self.sheet_insert_chart("column", cx),
+                "k" if shift => {
+                    return self.run_sheet_act(SheetAct::InsertChart("column"), window, cx);
+                }
+                // Data › Filter (#690).
+                "l" if shift => return self.run_sheet_act(SheetAct::Filter, window, cx),
                 "a" => {
                     // Select the whole used range.
                     if let Some(v) = self.active_sheet_mut() {
                         let (mr, mc) = v.extent();
                         v.sel = (0, 0);
+                        v.clear_areas();
                         v.anchor = (mr, mc);
                         v.end_cell_edit();
                     }
@@ -15129,6 +16604,9 @@ impl Docxy {
                 // (#664); while editing it only cancels the entry, as Excel's.
                 if !editing {
                     self.grid_clip_spend();
+                    // And the Auto Fill and Paste Options buttons (R3).
+                    self.fill_options = None;
+                    self.paste_options = None;
                 }
                 if let Some(v) = self.active_sheet_mut() {
                     v.end_cell_edit();
@@ -15143,6 +16621,8 @@ impl Docxy {
                 }
                 cx.notify();
             }
+            // Enter on Flash Fill's preview accepts it (#666, ENT-105).
+            "enter" if !editing && self.sheet_accept_preview(cx) => {}
             // Enter in copy mode pastes and ends it (#664).
             "enter" if !editing && self.sheet_enter_paste(cx) => {}
             "enter" => {
@@ -15159,6 +16639,8 @@ impl Docxy {
                 cx.notify();
             }
             "f2" => self.sheet_begin_edit(None, cx),
+            // Go To (#671), as Ctrl+G is.
+            "f5" if !editing => self.run_sheet_act(SheetAct::GoTo, window, cx),
             // F9 while editing a formula: its value replaces the text.
             "f9" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
@@ -15237,12 +16719,14 @@ impl Docxy {
             "home" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_caret = 0;
+                    v.edit_tail_left();
                 }
                 cx.notify();
             }
             "end" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_caret_to_end();
+                    v.edit_tail_left();
                 }
                 cx.notify();
             }
@@ -15301,18 +16785,35 @@ impl Docxy {
         }
     }
 
+    /// After a handler that recorded for Repeat, or that only undid, redid
+    /// or repeated (`keep`): the tab it marked dirty does not make the record
+    /// stale. Anything else that changed a tab since still does.
+    fn keep_repeat_current(&mut self, keep: bool) {
+        keep_current(&mut self.repeat, keep);
+    }
+
+    /// [`Self::edit_target`] and the Repeat record (#618), borrowed apart.
+    fn edit_target_and_repeat(&mut self) -> (Option<&mut Editor>, &mut Option<RepeatRecord>) {
+        let ed = self.tabs.get_mut(self.active).and_then(tab_edit_target);
+        (ed, &mut self.repeat)
+    }
+
+    /// What the Quick Access Toolbar shows for the active tab (#618, #619).
+    fn qat_state(&self) -> QatState {
+        let Some(ed) = self.tabs.get(self.active).and_then(tab_edit_target_ref) else {
+            return QatState::Plain;
+        };
+        QatState::Doc {
+            can_redo: ed.can_redo(),
+            can_repeat: repeat_ready(ed, &self.repeat),
+        }
+    }
+
     /// The editor keystrokes/clicks currently drive: the header/footer editor when
     /// in HF edit mode, otherwise the document body. All editing routes through
     /// this so the same machinery serves both surfaces.
     fn edit_target(&mut self) -> Option<&mut Editor> {
-        let tab = self.tabs.get_mut(self.active)?;
-        if let Some(hf) = tab.hf_edit.as_mut() {
-            return Some(&mut hf.editor);
-        }
-        match &mut tab.surface {
-            Surface::Doc(ed) => Some(ed),
-            _ => None,
-        }
+        self.tabs.get_mut(self.active).and_then(tab_edit_target)
     }
 
     /// Whether the active tab is currently in header/footer edit mode.
@@ -15460,8 +16961,16 @@ fn canonical(path: &std::path::Path) -> PathBuf {
 
 /// The name Save As suggests for a document tab: [`doc_import::save_name`]
 /// (its title, or an imported Word 97-2003 document's `.docx`), or for a tab
-/// converted from another format (#633) the same name as a Word document.
+/// converted from another format (#633) the same name as a Word document. A
+/// never-saved document proposes its first words, as Word does (#631).
 fn doc_save_as_name(tab: &DocTab) -> String {
+    if tab.path.is_none()
+        && tab.access.converted.is_none()
+        && !tab.import.binary_source
+        && let Surface::Doc(ed) = &tab.surface
+    {
+        return format!("{}.docx", doc_name::untitled_stem(&ed.doc, &tab.title));
+    }
     if tab.access.converted.is_none() {
         return doc_import::save_name(tab);
     }
@@ -15537,8 +17046,8 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
         tab.status = "this document has not been converted yet: open its tab first".into();
         return false;
     }
-    if tab.access.protected {
-        tab.status = open_mode::PROTECTED_STATUS.into();
+    if tab.access.locked() {
+        tab.status = tab.access.locked_status().into();
         return false;
     }
     if tab.access.converted.is_some() && writes_own_file(tab.path.as_deref(), target.as_deref()) {
@@ -15883,7 +17392,7 @@ impl Docxy {
             .tabs
             .get(self.active)
             .map(doc_save_as_name)
-            .unwrap_or_else(|| "Untitled.docx".into());
+            .unwrap_or_else(|| "Document1.docx".into());
         let mut dialog = rfd::FileDialog::new()
             .add_filter("Word document", &["docx"])
             .add_filter("Markdown", &["md", "markdown"]);
@@ -16149,6 +17658,23 @@ impl Docxy {
         cx.notify();
     }
 
+    /// [`Self::with_editor`] for an edit a key makes outside `on_key` (Tab,
+    /// Shift+Tab are action-bound): its steps are named and, when it can be
+    /// repeated, recorded for Repeat (#618, #619), as `on_key` does.
+    fn with_editor_noted(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        what: Repeat,
+        f: impl FnOnce(&mut Editor),
+    ) {
+        let since = docxcore::editor::undo_serial_counter();
+        self.with_editor(window, cx, f);
+        if let (Some(ed), rec) = self.edit_target_and_repeat() {
+            note_edit(ed, rec, since, what);
+        }
+    }
+
     fn with_editor(
         &mut self,
         window: &mut Window,
@@ -16162,10 +17688,15 @@ impl Docxy {
         }
         if let Some(tab) = self.tabs.get_mut(self.active) {
             // Route to the header/footer editor while it's open, else the body.
+            // A host edit never grows the typing (or deleting) run before it:
+            // it is a step of its own, which also makes a Repeat record of
+            // that typing stale (#618).
             if let Some(hf) = tab.hf_edit.as_mut() {
+                hf.editor.break_undo_group();
                 f(&mut hf.editor);
                 tab.mark_dirty();
             } else if let Surface::Doc(ed) = &mut tab.surface {
+                ed.break_undo_group();
                 f(ed);
                 // A merge field the edit added shows the previewed record too.
                 ed.refresh_merge_preview();
@@ -16182,9 +17713,16 @@ impl Docxy {
         if cut && self.protected_refused(cx) {
             return self.refocus(window, cx);
         }
-        let clip = self
-            .edit_target()
-            .and_then(|ed| if cut { ed.cut() } else { ed.copy() });
+        let clip = self.edit_target().and_then(|ed| {
+            if !cut {
+                return ed.copy();
+            }
+            let since = docxcore::editor::undo_serial_counter();
+            ed.break_undo_group();
+            let clip = ed.cut();
+            ed.name_command(since, "Cut");
+            clip
+        });
         if let Some(clip) = clip {
             let text = self.clipboard_write_recorded(clip.to_text(), cx);
             self.clip = Some(DocClip { clip, text });
@@ -16209,7 +17747,12 @@ impl Docxy {
             _ => now.text().map(Clip::from_text),
         };
         if let Some(clip) = clip {
-            self.with_editor(window, cx, |e| e.paste(&clip));
+            self.with_editor(window, cx, |e| {
+                let since = docxcore::editor::undo_serial_counter();
+                e.break_undo_group();
+                e.paste(&clip);
+                e.name_command(since, "Paste");
+            });
         } else {
             self.refocus(window, cx);
         }
@@ -16402,7 +17945,7 @@ impl Docxy {
     fn insert_symbol(&mut self, s: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = None;
         let s = s.to_string();
-        self.with_editor(window, cx, move |e| e.insert_str(&s));
+        self.with_editor(window, cx, move |e| insert_symbol_into(e, &s));
     }
 
     /// Insert an inline math equation from a LaTeX template (Insert ▸ Equation).
@@ -17239,6 +18782,83 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Resolve the selected comment, or reopen it when it is resolved. The
+    /// state is written to `commentsExtended.xml` on save.
+    fn resolve_selected_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.access_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        let active = self.active;
+        let id = selected_comment_id(&self.tabs, active, &self.selected_comment);
+        if let Some(t) = self.tabs.get_mut(active) {
+            t.status = match id.and_then(|id| set_doc_comment_resolved(t, &id, None)) {
+                Some(true) => "Comment resolved".into(),
+                Some(false) => "Comment reopened".into(),
+                None => "Select a comment in the Comments pane first".into(),
+            };
+        }
+        self.refocus(window, cx);
+    }
+
+    /// The Resolve button of one comment card: select it and toggle it.
+    fn resolve_comment(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_comment = close::tab_ids(&self.tabs)
+            .into_iter()
+            .nth(self.active)
+            .map(|tab| (tab, id));
+        self.resolve_selected_comment(window, cx);
+    }
+
+    /// Track Changes on or off for the active document (#624): the editor
+    /// records typing and deletions as tracked changes, and a save writes
+    /// `w:trackRevisions` ([`save_base`]).
+    fn toggle_track(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        let identity = review_identity(&self.user_name, &self.user_initials);
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            if t.markdown {
+                t.status = "Track Changes needs a Word document".into();
+            } else if let Surface::Doc(ed) = &mut t.surface {
+                let on = !ed.track_changes();
+                ed.set_track_changes(on.then(|| track_author(&identity)));
+                t.mark_dirty();
+                t.status = format!("Track Changes: {}", if on { "On" } else { "Off" }).into();
+            }
+        }
+        self.refocus(window, cx);
+    }
+
+    /// Whether the active document records its edits as tracked changes.
+    fn active_track_changes(&self) -> bool {
+        matches!(
+            self.tabs.get(self.active).map(|t| &t.surface),
+            Some(Surface::Doc(ed)) if ed.track_changes()
+        )
+    }
+
+    /// Whether the selected comment is resolved (Resolve shows pressed).
+    fn selected_comment_resolved(&self) -> bool {
+        let Some(id) = selected_comment_id(&self.tabs, self.active, &self.selected_comment) else {
+            return false;
+        };
+        self.tabs
+            .get(self.active)
+            .is_some_and(|t| t.comments.iter().any(|c| c.id == id && c.resolved))
+    }
+
+    /// Delete every comment (Review ▸ Comments ▸ Delete all): the Document
+    /// Inspector's Remove All for comments, one undo step.
+    fn delete_all_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.access_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        let _ = self.inspect_remove_active(inspector::InspectCategory::Comments);
+        self.selected_comment = None;
+        self.refocus(window, cx);
+    }
+
     /// Select the text a comment is anchored to (find its quoted run).
     fn goto_comment(&mut self, quoted: String, window: &mut Window, cx: &mut Context<Self>) {
         if !quoted.is_empty() {
@@ -17250,6 +18870,162 @@ impl Docxy {
         }
         self.scroll_to_caret();
         self.refocus(window, cx);
+    }
+
+    /// The Office Clipboard task pane (#669): Paste All and Clear All, then
+    /// the copies, newest first; a click pastes one as values, its ✕
+    /// deletes it.
+    fn office_clip_panel(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let btn = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px_2()
+                .py_0p5()
+                .rounded(px(3.))
+                .border_1()
+                .border_color(pal.border)
+                .cursor_pointer()
+                .hover(|d| d.bg(pal.hover))
+                .text_size(px(11.))
+                .text_color(pal.fg)
+                .child(label)
+        };
+        let n = self.office_clip.items.len();
+        let mut list = v_flex().gap_1().px_2();
+        for (i, text) in self.office_clip.items.iter().enumerate() {
+            list = list.child(
+                h_flex()
+                    .id(SharedString::from(format!("office-clip-{i}")))
+                    .gap_1()
+                    .p_1()
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(pal.border)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(pal.hover))
+                    .child(div().flex_1().text_size(px(11.)).text_color(pal.fg).child(
+                        SharedString::from(sheet_paste::OfficeClipboard::preview(text)),
+                    ))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("office-clip-del-{i}")))
+                            .px_1()
+                            .text_color(pal.dim)
+                            .hover(|d| d.text_color(pal.fg))
+                            .child("\u{2715}")
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                cx.stop_propagation();
+                                this.office_clip_act("delete", Some(i), cx).ok();
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Err(e) = this.office_clip_act("paste", Some(i), cx) {
+                            this.set_status(e);
+                        }
+                        this.refocus(window, cx);
+                    })),
+            );
+        }
+        v_flex()
+            .w(px(SIDE_PANEL_W))
+            .h_full()
+            .flex_none()
+            .bg(pal.panel)
+            .border_r_1()
+            .border_color(pal.border)
+            .gap_2()
+            .py_2()
+            .child(
+                h_flex()
+                    .px_2()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(pal.fg)
+                            .child(SharedString::from(format!(
+                                "Clipboard  {n} of {}",
+                                sheet_paste::OFFICE_CLIPBOARD_CAP
+                            ))),
+                    )
+                    .child(btn("office-clip-close", "\u{2715}").on_click(cx.listener(
+                        |this, _, _w, cx| {
+                            this.office_clip.open = false;
+                            cx.notify();
+                        },
+                    ))),
+            )
+            .child(
+                h_flex()
+                    .px_2()
+                    .gap_2()
+                    .child(
+                        btn("office-clip-paste-all", "Paste All").on_click(cx.listener(
+                            |this, _, window, cx| {
+                                if let Err(e) = this.office_clip_act("paste-all", None, cx) {
+                                    this.set_status(e);
+                                }
+                                this.refocus(window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        btn("office-clip-clear-all", "Clear All").on_click(cx.listener(
+                            |this, _, _w, cx| {
+                                this.office_clip_act("clear-all", None, cx).ok();
+                            },
+                        )),
+                    ),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .text_size(px(11.))
+                    .text_color(pal.dim)
+                    .child(if n == 0 {
+                        "Copy or cut on a sheet to collect items here (a copy in a document is not collected). A click pastes one as values."
+                    } else {
+                        "Click an item to paste it as values:"
+                    }),
+            )
+            .child(list)
+            .into_any_element()
+    }
+
+    /// The Office Clipboard's actions, for the pane and the harness's
+    /// `office-clipboard` verb: `open`, `close`, `paste` item `index`,
+    /// `paste-all`, `clear-all`, `delete` item `index`.
+    pub(crate) fn office_clip_act(
+        &mut self,
+        action: &str,
+        index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let n = self.office_clip.items.len();
+        let item = |i: Option<usize>| -> Result<usize, String> {
+            let i = i.ok_or("this action names an item 'index'")?;
+            (i < n)
+                .then_some(i)
+                .ok_or_else(|| format!("the Office Clipboard has {n} item(s); there is no {i}"))
+        };
+        match action {
+            "open" => self.office_clip.open = true,
+            "close" => self.office_clip.open = false,
+            "paste" => self.office_paste(Some(item(index)?), cx)?,
+            "paste-all" => self.office_paste(None, cx)?,
+            "clear-all" => self.office_clip.items.clear(),
+            "delete" => {
+                let i = item(index)?;
+                self.office_clip.items.remove(i);
+            }
+            other => {
+                return Err(format!(
+                    "no Office Clipboard action '{other}' (open, close, paste, paste-all, clear-all, delete)"
+                ));
+            }
+        }
+        cx.notify();
+        Ok(())
     }
 
     /// The comments review side panel (toggled from Review/View ▸ Comments pane).
@@ -17280,63 +19056,88 @@ impl Docxy {
         for c in &comments {
             let id = c.id.clone();
             let quoted = c.quoted.clone();
-            list =
-                list.child(
-                    v_flex()
-                        .id(("cmt", id.parse::<usize>().unwrap_or(0)))
-                        .gap_1()
-                        .p_2()
-                        .rounded(px(4.))
-                        .border_1()
-                        .border_color(pal.border)
-                        .bg(pal.panel)
-                        .cursor_pointer()
-                        .hover(|d| d.border_color(hsla_u(BRAND)))
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(hsla_u(BRAND))
-                                        .child(SharedString::from(c.author.clone())),
-                                )
-                                .child(
-                                    div()
-                                        .id(("cmtx", id.parse::<usize>().unwrap_or(0)))
-                                        .px_1()
-                                        .rounded_sm()
-                                        .text_color(pal.dim)
-                                        .hover(|d| d.bg(pal.hover))
-                                        .child("\u{00d7}")
-                                        .on_click(cx.listener({
-                                            let id = id.clone();
-                                            move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.delete_comment(id.clone(), window, cx);
-                                            }
-                                        })),
-                                ),
-                        )
-                        .when(!c.quoted.is_empty(), |d| {
-                            d.child(
-                                div().text_size(px(11.)).italic().text_color(pal.dim).child(
-                                    SharedString::from(format!("\u{201C}{}\u{201D}", c.quoted)),
-                                ),
+            list = list.child(
+                v_flex()
+                    .id(("cmt", id.parse::<usize>().unwrap_or(0)))
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(pal.border)
+                    .bg(pal.panel)
+                    .cursor_pointer()
+                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(hsla_u(BRAND))
+                                    .child(SharedString::from(c.author.clone())),
                             )
-                        })
-                        .child(
+                            .child(
+                                div()
+                                    .id(("cmtr", id.parse::<usize>().unwrap_or(0)))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_size(px(11.))
+                                    .text_color(if c.resolved { hsla_u(BRAND) } else { pal.dim })
+                                    .hover(|d| d.bg(pal.hover))
+                                    .child(if c.resolved { "Reopen" } else { "Resolve" })
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.resolve_comment(id.clone(), window, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("cmtx", id.parse::<usize>().unwrap_or(0)))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_color(pal.dim)
+                                    .hover(|d| d.bg(pal.hover))
+                                    .child("\u{00d7}")
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.delete_comment(id.clone(), window, cx);
+                                        }
+                                    })),
+                            ),
+                    )
+                    .when(!c.quoted.is_empty(), |d| {
+                        d.child(
                             div()
-                                .text_size(px(13.))
-                                .text_color(pal.fg)
-                                .child(SharedString::from(c.text.clone())),
+                                .text_size(px(11.))
+                                .italic()
+                                .text_color(pal.dim)
+                                .child(SharedString::from(format!("\u{201C}{}\u{201D}", c.quoted))),
                         )
-                        .on_click(cx.listener(move |this, _, window, cx| {
+                    })
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(pal.fg)
+                            .child(SharedString::from(c.text.clone())),
+                    )
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, window, cx| {
+                            this.selected_comment = close::tab_ids(&this.tabs)
+                                .into_iter()
+                                .nth(this.active)
+                                .map(|tab| (tab, id.clone()));
                             this.goto_comment(quoted.clone(), window, cx)
-                        })),
-                );
+                        }
+                    })),
+            );
         }
         v_flex()
             .w(px(280.))
@@ -17714,11 +19515,15 @@ impl Docxy {
     /// Insert a tab at the caret (bound to the Tab key via an action, since gpui
     /// swallows Tab for focus traversal before on_key_down sees it).
     fn tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // An open dialog takes Tab too; see `on_key`.
-        if self.dialog_takes_key("tab", None, Modifiers::default(), cx) {
+        // An open dialog takes Tab too; see `modal_takes_key`.
+        if self.dialog_takes_key("tab", None, Modifiers::default(), window, cx) {
             return;
         }
         if self.tab_more_open {
+            return;
+        }
+        // File (backstage) covers the window; Tab there edits nothing under it.
+        if self.backstage {
             return;
         }
         // An open menu takes Tab as it takes every key; see `on_key`.
@@ -17731,7 +19536,7 @@ impl Docxy {
         }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
-            if self.keytips == KeyTip::Off && !self.backstage {
+            if self.keytips == KeyTip::Off {
                 self.mini_bar = None;
                 self.project_tab_key(false, window, cx);
             }
@@ -17747,7 +19552,7 @@ impl Docxy {
             cx.notify();
             return;
         }
-        if self.keytips != KeyTip::Off || self.comment_open || self.backstage {
+        if self.keytips != KeyTip::Off || self.comment_open {
             return;
         }
         self.mini_bar = None;
@@ -17768,6 +19573,15 @@ impl Docxy {
                 cx.notify();
                 return;
             }
+            // Formula AutoComplete's list takes Tab: the highlighted name
+            // goes in, the editor stays (#686, FRM-151).
+            if self
+                .active_sheet_mut()
+                .is_some_and(|v| v.complete_open() && v.complete_insert())
+            {
+                cx.notify();
+                return;
+            }
             // Tab is action-bound, so it never reaches `sheet_key`'s hand-back
             // arm — the rule has to be stated again here. It moves the cell
             // selection exactly as the arrows do, and a selection the chart is
@@ -17778,7 +19592,7 @@ impl Docxy {
         if self.table_tab(false, window, cx) {
             return;
         }
-        self.with_editor(window, cx, |e| e.insert_tab());
+        self.with_editor_noted(window, cx, Repeat::Tab, |e| e.insert_tab());
         self.scroll_to_caret();
     }
 
@@ -17825,10 +19639,14 @@ impl Docxy {
             shift: true,
             ..Modifiers::default()
         };
-        if self.dialog_takes_key("tab", None, shift, cx) {
+        if self.dialog_takes_key("tab", None, shift, window, cx) {
             return;
         }
         if self.tab_more_open {
+            return;
+        }
+        // File (backstage) covers the window; Tab there edits nothing under it.
+        if self.backstage {
             return;
         }
         // An open menu takes Tab as it takes every key; see `on_key`.
@@ -17841,13 +19659,13 @@ impl Docxy {
         }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
-            if self.keytips == KeyTip::Off && !self.backstage {
+            if self.keytips == KeyTip::Off {
                 self.mini_bar = None;
                 self.project_tab_key(true, window, cx);
             }
             return;
         }
-        if self.keytips != KeyTip::Off || self.find_open || self.comment_open || self.backstage {
+        if self.keytips != KeyTip::Off || self.find_open || self.comment_open {
             return;
         }
         self.mini_bar = None;
@@ -17866,34 +19684,38 @@ impl Docxy {
         if self.table_tab(true, window, cx) {
             return;
         }
-        self.with_editor(window, cx, |e| e.change_indent(-720));
+        self.with_editor_noted(window, cx, Repeat::Act(Act::IndentDec), |e| {
+            apply_doc_act(e, Act::IndentDec)
+        });
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // An open dialog takes every key first (#393): nothing under it, not
-        // the tab list, KeyTips or a Project shortcut, may see one.
-        if self.dialog_takes_key(
-            &ev.keystroke.key,
-            ev.keystroke.key_char.as_deref(),
-            ev.keystroke.modifiers,
-            cx,
-        ) {
+        if self.modal_takes_key(ev, window, cx) {
             return;
         }
-        if self.tab_more_open {
-            if ev.keystroke.key == "escape" {
-                self.tab_more_close(cx);
+        // File (backstage) covers the window: with no dialog up, a key there
+        // edits nothing under it (#1027; its root takes keys for the dialogs).
+        // PageUp/PageDown/Home/End scroll its page (#1028).
+        if self.backstage {
+            if self.backstage_scroll_key(&ev.keystroke) {
+                cx.notify();
             }
-            return; // the modal list owns keys; do not edit the surface below
-        }
-        // An open menu takes the key: Esc closes it, and so, until menus
-        // take arrows and Enter, does any other key; none reaches the
-        // document or cell under it (#397).
-        if self.close_menu() {
-            cx.notify();
             return;
         }
-        if self.project_edit_open() && !self.backstage {
+        // An open menu takes the key (#397): Up and Down move its highlight,
+        // Enter runs the highlighted item (or opens its submenu), and any
+        // other key — Esc among them — closes it. None reaches the document
+        // or cell under it.
+        if self.menu.is_some() {
+            return self.menu_key(&ev.keystroke.key, window, cx);
+        }
+        // Word's and Excel's document keys come before every surface's own,
+        // so they work on any tab, in Protected View and in a document
+        // marked as final too.
+        if let Some(done) = self.document_key(ev, window, cx) {
+            return done;
+        }
+        if self.project_edit_open() {
             return self.project_key(ev, window, cx);
         }
         let m = &ev.keystroke.modifiers;
@@ -17907,6 +19729,11 @@ impl Docxy {
         // Alt+Shift+Right/Left group and ungroup (#693). Alt has raised the
         // KeyTips by the time the arrow comes, so they go down unasked.
         if self.active_is_sheet() && sheet_outline::group_key(&key, ctrl, shift, m.alt).is_some() {
+            self.keytips = KeyTip::Off;
+            return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
+        }
+        // Alt+Down: the drop-down lists (#665), for the same reason.
+        if self.active_is_sheet() && sheet_complete::alt_down_key(&key, *m) {
             self.keytips = KeyTip::Off;
             return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
         }
@@ -17956,10 +19783,10 @@ impl Docxy {
         if key == "escape" && self.hf_active() {
             return self.exit_hf(window, cx);
         }
-        // Protected View (#633): only keys that look, move or copy reach the
-        // document. The find bar still takes typing; its Replace is refused
-        // where it would write.
-        if self.protected_view()
+        // Protected View (#633), or a document marked as final (#617): only
+        // keys that look, move or copy reach the document. The find bar still
+        // takes typing; its Replace is refused where it would write.
+        if (self.active_locked() || self.view_only_active())
             && !self.find_open
             && !open_mode::protected_allows_doc_key(key.as_str(), ctrl, m.alt)
         {
@@ -18006,7 +19833,13 @@ impl Docxy {
                 _ => {}
             }
         }
-        let Some(ed) = self.edit_target() else { return };
+        // Undo, Redo and Repeat change the document but keep a current Repeat
+        // record current (#618).
+        let untouched = repeat_untouched(&self.repeat);
+        let history = (ctrl && matches!(key.as_str(), "z" | "y")) || (!ctrl && key == "f4");
+        let (Some(ed), repeat) = self.edit_target_and_repeat() else {
+            return;
+        };
         if key == "escape" {
             ed.clear_selection();
             cx.notify();
@@ -18021,6 +19854,12 @@ impl Docxy {
         ) {
             ed.extend_selection(shift);
         }
+        // What this key's undo steps are named and Repeat records (#618, #619).
+        let since = docxcore::editor::undo_serial_counter();
+        let mut noted = key_repeat(&key, ctrl, shift);
+        if noted.is_some() {
+            ed.break_undo_group();
+        }
         let changed = if ctrl {
             match key.as_str() {
                 "b" => yes(|| ed.toggle_bold()),
@@ -18030,10 +19869,8 @@ impl Docxy {
                     ed.undo();
                     true
                 }
-                "y" => {
-                    ed.redo();
-                    true
-                }
+                // Redo, or Repeat with nothing to redo (#618).
+                "y" => redo_or_repeat(ed, repeat),
                 "a" => no(|| ed.select_all()),
                 // Ctrl+Tab types a tab inside a table cell, where Tab moves to
                 // the next cell (Word). gpui binds no action to it, so it
@@ -18043,7 +19880,11 @@ impl Docxy {
                 "m" if shift => yes(|| ed.change_indent(-720)),
                 "m" => yes(|| ed.change_indent(720)),
                 // Non-breaking space (Ctrl+Shift+Space), a typesetting staple.
-                "space" if shift => yes(|| ed.insert_str("\u{00A0}")),
+                "space" if shift => {
+                    noted = Some(Repeat::Typing);
+                    break_typing_unless_continuing(ed, repeat);
+                    yes(|| ed.insert_str("\u{00A0}"))
+                }
                 // Word- and document-wise motion (Ctrl+←/→, Ctrl+Home/End).
                 "left" => no(|| ed.move_word_left()),
                 "right" => no(|| ed.move_word_right()),
@@ -18056,7 +19897,10 @@ impl Docxy {
                 "backspace" => yes(|| ed.backspace()),
                 "delete" => yes(|| ed.delete_forward()),
                 "enter" => yes(|| ed.insert_newline()),
-                "tab" => yes(|| ed.insert_tab()),
+                // Plain Tab and Shift+Tab are action-bound (`tab_key`,
+                // `shift_tab_key`) and never arrive here.
+                // Word's Repeat key; it redoes first, as Ctrl+Y does (#618).
+                "f4" => redo_or_repeat(ed, repeat),
                 "left" => no(|| ed.move_left()),
                 "right" => no(|| ed.move_right()),
                 "home" => no(|| ed.move_home()),
@@ -18065,22 +19909,29 @@ impl Docxy {
                 "down" => no(|| move_vert(ed, true)),
                 _ => match ev.keystroke.key_char.as_deref() {
                     Some(c) if !c.is_empty() && !c.chars().next().unwrap().is_control() => {
+                        break_typing_unless_continuing(ed, repeat);
                         ed.insert_str(c);
+                        noted = Some(Repeat::Typing);
                         true
                     }
                     _ => false,
                 },
             }
         };
+        let recorded = noted.is_some_and(|what| note_edit(ed, repeat, since, what));
         if changed {
             if let Some(t) = self.tabs.get_mut(self.active) {
                 t.mark_dirty();
             }
         }
+        self.keep_repeat_current(recorded || (history && untouched));
         self.scroll_to_caret();
         cx.notify();
     }
 }
+
+/// What a refused edit says while Display for Review is No Markup or Original.
+const VIEW_ONLY_STATUS: &str = "Edit blocked: Display for Review is No Markup or Original; switch to All Markup or Simple Markup to edit.";
 
 /// What a harness instance says when asked to Save As a document.
 const DOC_SAVE_AS_HARNESS: &str = "This document needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
@@ -18905,7 +20756,7 @@ mod load_failed_save_tests {
         let before = std::fs::read(path).ok();
         let mut tab = tab_from_path(&path.to_path_buf());
         assert!(tab.load_failed, "{}", tab.status);
-        tab.dirty = true;
+        tab.set_dirty();
         assert!(!save_doc_tab(&mut tab, None));
         assert_eq!(tab.status.as_ref(), DOC_LOAD_FAILED_SAVE);
         assert!(tab.dirty, "a refused save leaves the tab dirty");
@@ -18931,7 +20782,7 @@ mod load_failed_save_tests {
         assert!(save_doc_tab(&mut tab, Some(md.clone())));
         assert!(tab.markdown);
         assert_eq!(tab.path.as_deref(), Some(md.as_path()));
-        tab.dirty = true;
+        tab.set_dirty();
         std::fs::write(&md, b"stale").unwrap();
         assert!(save_doc_tab(&mut tab, None));
         let written = std::fs::read(&md).unwrap();
@@ -19117,7 +20968,7 @@ mod load_failed_save_tests {
         assert!(save_doc_tab(&mut tab, Some(copy.clone())), "{}", tab.status);
         assert!(!tab.load_failed && !tab.dirty);
         assert_eq!(tab.path.as_deref(), Some(copy.as_path()));
-        tab.dirty = true;
+        tab.set_dirty();
         assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
         assert!(!tab_from_path(&copy).load_failed);
         assert_eq!(std::fs::read(&path).unwrap(), b"not a zip");
@@ -19145,7 +20996,7 @@ mod load_failed_save_tests {
         let mut tab = tab_from_path(&path);
         assert!(!tab.load_failed, "{}", tab.status);
         assert_eq!(tab.access.converted, Some(open_mode::Converted::Html));
-        tab.dirty = true;
+        tab.set_dirty();
         for target in [None, Some(path.clone())] {
             assert!(!save_doc_tab(&mut tab, target));
             assert_eq!(
@@ -19180,7 +21031,7 @@ mod load_failed_save_tests {
         let mut tab = tab_from_path(&path);
         assert!(!tab.load_failed, "{}", tab.status);
         assert!(tab.status.starts_with("loaded"), "{}", tab.status);
-        tab.dirty = true;
+        tab.set_dirty();
         assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
         let reopened = tab_from_path(&path);
         assert!(reopened.pkg.is_some(), "{}", reopened.status);
@@ -19204,7 +21055,7 @@ mod load_failed_save_tests {
             if path.extension().is_some_and(|ext| ext == "md") {
                 assert_eq!(tab.status.as_ref(), "loaded (markdown)");
             }
-            tab.dirty = true;
+            tab.set_dirty();
             assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -19686,7 +21537,7 @@ mod sheet_save_tests {
         let dir = Scratch::new();
         let input = dir.path("in.xlsm");
         let mut tab = loaded_sheet_tab(&dir, "in.xlsm", &xlm_book(SpreadsheetKind::MacroWorkbook));
-        tab.dirty = true;
+        tab.set_dirty();
         // Save As .xlsx, .xltx, or a name with no extension (an .xlsx).
         for name in ["out.xlsx", "out.xltx", "out"] {
             let mut asked = Vec::new();
@@ -20032,6 +21883,7 @@ mod sheet_save_tests {
         assert!(v.delete_sheet(2));
         v.active = 0;
         v.sel = (0, 0);
+        v.clear_areas();
         assert!(v.comment_cell("me", "check"));
         assert_eq!(comment_texts(v), note);
         assert!(v.undo_step());
@@ -20052,6 +21904,7 @@ mod sheet_save_tests {
         assert!(v.undo_step());
         v.active = 0;
         v.sel = (0, 0);
+        v.clear_areas();
         assert!(v.comment_cell("me", "check"));
         assert!(!v.redo_step());
         assert_eq!(comment_texts(v), note);
@@ -20107,11 +21960,997 @@ fn no(mut f: impl FnMut()) -> bool {
     false
 }
 
+/// The commands that are plain edits of the document editor (formatting,
+/// alignment, styles, lists, indent): what `dispatch` runs for them, and what
+/// Repeat (#618) replays. Every other command does nothing here.
+fn apply_doc_act(e: &mut Editor, act: Act) {
+    use Act::*;
+    match act {
+        Bold => e.toggle_bold(),
+        Italic => e.toggle_italic(),
+        Underline => e.toggle_underline(),
+        Strike => e.toggle_strike(),
+        Super => e.toggle_vert_align(VertAlign::Superscript),
+        Sub => e.toggle_vert_align(VertAlign::Subscript),
+        Grow => e.resize_font(2),
+        Shrink => e.resize_font(-2),
+        AlignL => e.set_align(Align::Left),
+        AlignC => e.set_align(Align::Center),
+        AlignR => e.set_align(Align::Right),
+        AlignJ => e.set_align(Align::Justify),
+        Normal => e.set_para_style(None),
+        // No Spacing: Word's body style with single spacing and no space
+        // before/after. Modelled as Normal + explicit zeroed spacing.
+        NoSpacing => {
+            e.set_para_style(None);
+            e.set_space_before(Some(0));
+            e.set_space_after(Some(0));
+            e.set_line_spacing(240, "auto");
+        }
+        H1 => e.set_para_style(Some("Heading1")),
+        H2 => e.set_para_style(Some("Heading2")),
+        H3 => e.set_para_style(Some("Heading3")),
+        HRule => e.insert_hrule(),
+        SelectAll => e.select_all(),
+        Case => e.cycle_case(),
+        // Toggle: if every selected paragraph is already in this list, drop
+        // it; otherwise apply it.
+        Bullets => e.set_list((!e.all_in_list(NUM_BULLET)).then_some(NUM_BULLET)),
+        Numbers => e.set_list((!e.all_in_list(NUM_DECIMAL)).then_some(NUM_DECIMAL)),
+        IndentInc => e.change_indent(720),
+        IndentDec => e.change_indent(-720),
+        Sort => e.sort_paragraphs(),
+        ParaBorders => {
+            let has = e.caret_para_props().borders.bottom.is_some();
+            let b = if has {
+                ParBorders::default()
+            } else {
+                ParBorders {
+                    top: None,
+                    bottom: Some(BorderKind::Single),
+                }
+            };
+            e.set_para_border(b);
+        }
+        Title => e.set_para_style(Some("Title")),
+        Subtitle => e.set_para_style(Some("Subtitle")),
+        ClearFmt => e.clear_run_formatting(),
+        Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
+        | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments
+        | ResolveComment | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | DarkMode
+        | AutoHideRibbon | InsertField | PageBreak | BlankPage | Cover(_) | ToggleNotes
+        | InsertTable | InsertSymbol | InsertEquation | LineSpacing | Hf(_) | Design(_)
+        | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler | UndoTo(_) => {}
+    }
+}
+
+/// What a command's undo steps are called in the Undo drop-down (#619), for
+/// the commands that edit the document; `None` for the rest (they move,
+/// look, open something, or name their own steps).
+fn act_undo_name(act: Act) -> Option<&'static str> {
+    use Act::*;
+    Some(match act {
+        Bold => "Bold",
+        Italic => "Italic",
+        Underline => "Underline",
+        Strike => "Strikethrough",
+        Super => "Superscript",
+        Sub => "Subscript",
+        Grow => "Grow Font",
+        Shrink => "Shrink Font",
+        AlignL => "Align Left",
+        AlignC => "Center",
+        AlignR => "Align Right",
+        AlignJ => "Justify",
+        Normal | NoSpacing | H1 | H2 | H3 | Title | Subtitle => "Style",
+        HRule => "Horizontal Line",
+        Case => "Change Case",
+        Bullets => "Bullets",
+        Numbers => "Numbering",
+        IndentInc => "Increase Indent",
+        IndentDec => "Decrease Indent",
+        Sort => "Sort",
+        ParaBorders => "Borders",
+        ClearFmt => "Clear Formatting",
+        PageBreak => "Page Break",
+        BlankPage => "Blank Page",
+        _ => return None,
+    })
+}
+
+/// Whether Repeat (#618) replays `act`: the edits [`apply_doc_act`] runs,
+/// on whatever is selected now, except Sort. Select All is no edit, and Page
+/// Break and Blank Page do more than edit the editor.
+fn repeatable_act(act: Act) -> bool {
+    act_undo_name(act).is_some() && !matches!(act, Act::Sort | Act::PageBreak | Act::BlankPage)
+}
+
+/// An action Repeat (#618) can do again.
+#[derive(Clone, Copy, Debug)]
+enum Repeat {
+    /// The newest step's typed text, typed again at the caret.
+    Typing,
+    Enter,
+    Tab,
+    /// A command [`repeatable_act`] allows.
+    Act(Act),
+}
+
+impl Repeat {
+    /// The name its step takes; typing is named by docxcore.
+    fn step_name(self) -> Option<&'static str> {
+        match self {
+            Repeat::Typing => None,
+            Repeat::Enter => Some("Enter"),
+            Repeat::Tab => Some("Tab"),
+            Repeat::Act(act) => act_undo_name(act),
+        }
+    }
+}
+
+/// The last repeatable action and the undo step it made. Repeat replays it
+/// only while nothing else has happened since:
+/// - its step is still its editor's newest (`serial`);
+/// - no undo step was pushed anywhere since (`counter`, the thread's
+///   [`docxcore::editor::undo_serial_counter`]): an edit in another tab or
+///   the header/footer editor pushes one there;
+/// - no edit that pushes no step at all (Page Color, a watermark, a dialog's
+///   package change) marked any tab dirty since (`generation`, the
+///   [`edit_generation`]).
+///
+/// Only typing coalesces into an existing step, and every host edit
+/// (`Docxy::with_editor`: the ribbon, pickers, dialogs, ruler, paste and
+/// menus) breaks the group first, so no edit can hide inside the record's
+/// step. Undo and Redo push no step; the app keeps a current record current
+/// across them (`Docxy::keep_repeat_current`).
+#[derive(Clone, Debug)]
+struct RepeatRecord {
+    what: Repeat,
+    serial: u64,
+    counter: u64,
+    generation: u64,
+    /// Where the editor's caret was when it was taken, with no selection:
+    /// typing continues the run only from there, so a caret move by any
+    /// path ends it whether or not that path breaks the undo group.
+    caret: Caret,
+    selecting: bool,
+}
+
+impl RepeatRecord {
+    /// A record of `what`, whose step is `ed`'s newest, taken now.
+    fn now(what: Repeat, ed: &Editor) -> Option<Self> {
+        Some(Self {
+            what,
+            serial: ed.undo_serial()?,
+            counter: docxcore::editor::undo_serial_counter(),
+            generation: edit_generation(),
+            caret: ed.caret.clone(),
+            selecting: ed.has_selection(),
+        })
+    }
+}
+
+thread_local! {
+    /// Bumped by every change that marks a tab dirty
+    /// ([`DocTab::set_dirty`]), whether or not it pushed an undo step: what
+    /// makes a Repeat record stale after an edit outside the undo history
+    /// (#618). A Project tab bumps it on every interaction that syncs its
+    /// dirty state, navigation included: the Project editor has no change
+    /// counter, and a stale record fails safe (Can't Repeat). Per thread,
+    /// like docxcore's serial counter: the app edits on one thread.
+    static EDIT_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn edit_generation() -> u64 {
+    EDIT_GENERATION.with(|g| g.get())
+}
+
+fn bump_edit_generation() {
+    EDIT_GENERATION.with(|g| g.set(g.get() + 1));
+}
+
+/// Whether no undo step was pushed and no tab changed since `rec` was taken:
+/// the record is current, though its step may be undone for now.
+fn repeat_untouched(rec: &Option<RepeatRecord>) -> bool {
+    rec.as_ref().is_some_and(|r| {
+        docxcore::editor::undo_serial_counter() == r.counter && edit_generation() == r.generation
+    })
+}
+
+/// [`Docxy::keep_repeat_current`]'s rule: when `keep`, the tab changes
+/// made since `rec` was taken were the handler's own.
+fn keep_current(rec: &mut Option<RepeatRecord>, keep: bool) {
+    if let (true, Some(r)) = (keep, rec.as_mut()) {
+        r.generation = edit_generation();
+    }
+}
+
+/// Before a typed character: typing grows the newest typing step only while
+/// nothing happened since the last character (the Repeat record of that
+/// typing is still ready). After an edit that pushed no step (Page Color, an
+/// edit in another tab) the open run is over, so the character starts a step
+/// and a record of its own instead of reviving a stale one (#618).
+fn break_typing_unless_continuing(ed: &mut Editor, rec: &Option<RepeatRecord>) {
+    // The caret must be exactly where the last character left it: a move by
+    // any path (arrows, Up/Down, clicks, a future one) ends the run.
+    let continuing = rec.as_ref().is_some_and(|r| {
+        matches!(r.what, Repeat::Typing)
+            && !r.selecting
+            && !ed.has_selection()
+            && ed.caret == r.caret
+    }) && repeat_ready(ed, rec);
+    if !continuing {
+        ed.break_undo_group();
+    }
+}
+
+/// Whether Ctrl+Y / F4 would repeat on `ed` now (nothing to redo).
+fn repeat_ready(ed: &Editor, rec: &Option<RepeatRecord>) -> bool {
+    rec.as_ref().is_some_and(|r| {
+        ed.undo_serial() == Some(r.serial)
+            && docxcore::editor::undo_serial_counter() == r.counter
+            && edit_generation() == r.generation
+    })
+}
+
+/// Ctrl+Y, F4 and the Quick Access Toolbar's Redo/Repeat (#618): redo when
+/// there is something to redo, else repeat the recorded action as its own
+/// undo step, named as the original. True when either changed the document.
+fn redo_or_repeat(ed: &mut Editor, rec: &mut Option<RepeatRecord>) -> bool {
+    if ed.can_redo() {
+        return ed.redo();
+    }
+    let Some(r) = rec.clone().filter(|_| repeat_ready(ed, rec)) else {
+        return false;
+    };
+    let since = docxcore::editor::undo_serial_counter();
+    ed.break_undo_group();
+    match r.what {
+        Repeat::Typing => {
+            let Some(text) = ed.last_typed().filter(|t| !t.is_empty()).map(str::to_owned) else {
+                return false;
+            };
+            ed.insert_str(&text);
+        }
+        Repeat::Enter => ed.insert_newline(),
+        Repeat::Tab => ed.insert_tab(),
+        Repeat::Act(act) => apply_doc_act(ed, act),
+    }
+    if !ed.undo_serial().is_some_and(|s| s > since) {
+        return false;
+    }
+    if let Some(name) = r.what.step_name() {
+        ed.name_command(since, name);
+    }
+    // A repeat is a closed step: typing after it starts a step of its own.
+    ed.break_undo_group();
+    *rec = RepeatRecord::now(r.what, ed);
+    true
+}
+
+/// After an edit the host ran (a command or a key): make the undo steps it
+/// pushed after `since` one step, named, and, when it can be repeated,
+/// record it for Repeat. An edit that pushed no step changes neither. True
+/// when it recorded.
+fn note_edit(ed: &mut Editor, rec: &mut Option<RepeatRecord>, since: u64, what: Repeat) -> bool {
+    if matches!(what, Repeat::Typing) {
+        // Typing grows its step as it coalesces; the record follows it.
+        if ed.last_typed().is_none() {
+            return false;
+        }
+        *rec = RepeatRecord::now(what, ed);
+        return rec.is_some();
+    }
+    if !ed.undo_serial().is_some_and(|s| s > since) {
+        return false;
+    }
+    if let Some(name) = what.step_name() {
+        ed.name_command(since, name);
+    }
+    if matches!(what, Repeat::Act(act) if !repeatable_act(act)) {
+        return false;
+    }
+    *rec = RepeatRecord::now(what, ed);
+    rec.is_some()
+}
+
+/// Insert ▸ Symbol's insertion: a step of its own, named for the Undo
+/// drop-down (#619). Never part of the typing before it, so a Repeat record
+/// of that typing goes stale rather than replaying the symbol (#618).
+fn insert_symbol_into(e: &mut Editor, s: &str) {
+    let since = docxcore::editor::undo_serial_counter();
+    e.break_undo_group();
+    e.insert_str(s);
+    e.name_command(since, "Insert Symbol");
+}
+
+/// What a document key does that Repeat can do again (#618): the formatting
+/// shortcuts and Enter/Tab. Typing is told apart by the key handler.
+fn key_repeat(key: &str, ctrl: bool, shift: bool) -> Option<Repeat> {
+    Some(match (ctrl, key) {
+        (true, "b") => Repeat::Act(Act::Bold),
+        (true, "i") => Repeat::Act(Act::Italic),
+        (true, "u") => Repeat::Act(Act::Underline),
+        (true, "m") if shift => Repeat::Act(Act::IndentDec),
+        (true, "m") => Repeat::Act(Act::IndentInc),
+        (_, "tab") if !shift => Repeat::Tab,
+        (false, "enter") => Repeat::Enter,
+        _ => return None,
+    })
+}
+
+/// What the Quick Access Toolbar shows for the active tab: a document's
+/// redo button reads Redo or Repeat (#618), and its Undo has a drop-down
+/// (#619); Project and sheet tabs keep plain Undo and Redo.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum QatState {
+    Plain,
+    Doc { can_redo: bool, can_repeat: bool },
+}
+
+/// One Quick Access Toolbar button as drawn and as `ribbon-read` reports it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct QatEntry {
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    tip: &'static str,
+    enabled: bool,
+    /// A split button whose arrow opens a menu.
+    menu: bool,
+    action: QatAction,
+}
+
+fn qat_entries(state: QatState) -> Vec<QatEntry> {
+    QAT_ITEMS
+        .iter()
+        .map(|item| {
+            let plain = QatEntry {
+                id: item.id,
+                icon: item.icon,
+                label: item.label,
+                tip: item.tip,
+                enabled: true,
+                menu: false,
+                action: item.action,
+            };
+            match (state, item.action) {
+                (QatState::Plain, _) => plain,
+                (QatState::Doc { .. }, QatAction::Undo) => QatEntry {
+                    menu: true,
+                    ..plain
+                },
+                (QatState::Doc { can_redo: true, .. }, QatAction::Redo) => plain,
+                // The redo icon stays: the suite ships no Repeat icon.
+                (QatState::Doc { can_repeat, .. }, QatAction::Redo) => QatEntry {
+                    label: "Repeat",
+                    tip: if can_repeat {
+                        "Repeat (Ctrl+Y)"
+                    } else {
+                        "Can't Repeat"
+                    },
+                    enabled: can_repeat,
+                    ..plain
+                },
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    /// The #618 reproduction's `three.docx`.
+    fn three() -> Editor {
+        Editor::new(docxcore::markdown::from_markdown(
+            "The quick brown fox. It jumps over the dog.\n\nSecond paragraph here.\n\nThird one.\n",
+        ))
+    }
+
+    fn text(ed: &Editor, i: usize) -> String {
+        ed.doc.body[i].plain_text()
+    }
+
+    fn select(ed: &mut Editor, para: usize, from: usize, to: usize) {
+        ed.set_caret(Caret::at(vec![para], to));
+        ed.anchor = Some(Caret::at(vec![para], from));
+    }
+
+    /// A document key as the key handler runs it: an edit, then
+    /// `note_edit` with what the key records.
+    fn key(ed: &mut Editor, rec: &mut Option<RepeatRecord>, key: &str, ctrl: bool, shift: bool) {
+        let since = docxcore::editor::undo_serial_counter();
+        let noted = key_repeat(key, ctrl, shift);
+        if noted.is_some() {
+            ed.break_undo_group();
+        }
+        match (ctrl, key) {
+            (true, "b") => ed.toggle_bold(),
+            (true, "a") => ed.select_all(),
+            (false, "enter") => ed.insert_newline(),
+            other => panic!("no key {other:?} in this test"),
+        }
+        if let Some(what) = noted {
+            note_edit(ed, rec, since, what);
+        }
+    }
+
+    /// Typed text, one character per key event as the harness's `type` sends.
+    fn type_text(ed: &mut Editor, rec: &mut Option<RepeatRecord>, s: &str) {
+        for ch in s.chars() {
+            let since = docxcore::editor::undo_serial_counter();
+            ed.insert_str(&ch.to_string());
+            note_edit(ed, rec, since, Repeat::Typing);
+        }
+    }
+
+    /// The saved `w:r` that holds `word`, up to the word.
+    fn saved_run_of(ed: &Editor, word: &str) -> String {
+        let xml = docxcore::serialize::document_to_xml(&ed.doc);
+        let at = xml
+            .find(word)
+            .unwrap_or_else(|| panic!("{word} not in {xml}"));
+        let start = xml[..at].rfind("<w:r>").expect("a run");
+        xml[start..at].to_string()
+    }
+
+    /// #618 step 2: Bold on `quick`, then Ctrl+Y on `brown` with nothing
+    /// to redo repeats it.
+    #[test]
+    fn ctrl_y_repeats_bold_on_the_new_selection_618() {
+        let mut ed = three();
+        let mut rec = None;
+        select(&mut ed, 0, 4, 9);
+        key(&mut ed, &mut rec, "b", true, false);
+        assert!(saved_run_of(&ed, "quick").contains("<w:b/>"));
+        assert!(!saved_run_of(&ed, "brown").contains("<w:b/>"));
+        select(&mut ed, 0, 10, 15);
+        assert!(redo_or_repeat(&mut ed, &mut rec), "Ctrl+Y repeats");
+        assert!(saved_run_of(&ed, "quick").contains("<w:b/>"));
+        assert!(saved_run_of(&ed, "brown").contains("<w:b/>"));
+        assert_eq!(ed.undo_names(), ["Bold", "Bold"], "the repeat is a step");
+    }
+
+    /// #618 step 3: `abc` then F4 types it again, as its own undo step;
+    /// F4 again repeats again.
+    #[test]
+    fn f4_repeats_typing_as_its_own_step_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abcabc");
+        assert_eq!(ed.undo_names()[..2], ["Typing \"abc\"", "Typing \"abc\""]);
+        assert!(ed.undo());
+        assert_eq!(text(&ed, 2), "Third one.abc", "one undo removes one abc");
+        // Now there is something to redo: F4 redoes, it does not repeat.
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abcabc");
+        assert!(!ed.can_redo());
+        assert!(redo_or_repeat(&mut ed, &mut rec), "redo, then repeat again");
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abcabcabcabc");
+    }
+
+    #[test]
+    fn ctrl_y_redoes_when_there_is_something_to_redo_618() {
+        let mut ed = three();
+        let mut rec = None;
+        select(&mut ed, 0, 4, 9);
+        key(&mut ed, &mut rec, "b", true, false);
+        let bold = ed.doc.clone();
+        assert!(ed.undo());
+        let plain = ed.doc.clone();
+        // A different selection: a repeat would bold `brown`; a redo puts
+        // back exactly what was undone.
+        select(&mut ed, 0, 10, 15);
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(ed.doc, bold);
+        assert_ne!(ed.doc, plain);
+        assert_eq!(ed.undo_names(), ["Bold"]);
+    }
+
+    /// An edit the record never saw (a picker, a dialog, an API call) makes
+    /// it stale: Ctrl+Y / F4 then do nothing at all.
+    #[test]
+    fn a_stale_record_never_replays_618() {
+        let mut ed = three();
+        let mut rec = None;
+        select(&mut ed, 0, 4, 9);
+        key(&mut ed, &mut rec, "b", true, false);
+        assert!(repeat_ready(&ed, &rec));
+        ed.set_space_after(Some(240));
+        assert!(!repeat_ready(&ed, &rec));
+        select(&mut ed, 0, 10, 15);
+        let before = ed.doc.clone();
+        assert!(!redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(ed.doc, before);
+        // Nor does a record from another editor.
+        let mut other = three();
+        let mut other_rec = None;
+        select(&mut other, 0, 4, 9);
+        key(&mut other, &mut other_rec, "b", true, false);
+        assert!(!repeat_ready(&ed, &other_rec));
+        assert!(!redo_or_repeat(&mut ed, &mut other_rec));
+        assert_eq!(ed.doc, before);
+    }
+
+    /// A host edit after typing (Insert ▸ Symbol) is a step of its own: it
+    /// does not grow `Typing "abc"`, and it makes the record of that typing
+    /// stale, so F4 does nothing rather than type `abc©` again.
+    #[test]
+    fn a_symbol_after_typing_is_its_own_step_and_stales_the_record_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        assert!(repeat_ready(&ed, &rec));
+        insert_symbol_into(&mut ed, "\u{00A9}");
+        assert_eq!(text(&ed, 2), "Third one.abc\u{00A9}");
+        assert_eq!(ed.undo_names()[..2], ["Insert Symbol", "Typing \"abc\""]);
+        assert!(!repeat_ready(&ed, &rec));
+        assert!(!redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abc\u{00A9}");
+        // Typing after it starts its own step again.
+        type_text(&mut ed, &mut rec, "d");
+        assert_eq!(ed.undo_names()[0], "Typing \"d\"");
+    }
+
+    /// Tab and Shift+Tab (action-bound, `with_editor_noted`): named, and Tab
+    /// recorded for Repeat; Shift+Tab repeats as Decrease Indent.
+    #[test]
+    fn tab_and_shift_tab_are_named_and_repeat_618_619() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], 0));
+        let since = docxcore::editor::undo_serial_counter();
+        ed.break_undo_group();
+        ed.insert_tab();
+        note_edit(&mut ed, &mut rec, since, Repeat::Tab);
+        assert_eq!(ed.undo_names(), ["Tab"]);
+        assert!(matches!(
+            rec,
+            Some(RepeatRecord {
+                what: Repeat::Tab,
+                ..
+            })
+        ));
+        let one_tab = ed.doc.clone();
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_ne!(ed.doc, one_tab, "F4 typed a second tab");
+        assert_eq!(ed.undo_names(), ["Tab", "Tab"]);
+
+        let tabbed = ed.doc.clone();
+        let since = docxcore::editor::undo_serial_counter();
+        ed.break_undo_group();
+        apply_doc_act(&mut ed, Act::IndentInc);
+        apply_doc_act(&mut ed, Act::IndentInc);
+        note_edit(&mut ed, &mut rec, since, Repeat::Act(Act::IndentInc));
+        let since = docxcore::editor::undo_serial_counter();
+        ed.break_undo_group();
+        apply_doc_act(&mut ed, Act::IndentDec);
+        note_edit(&mut ed, &mut rec, since, Repeat::Act(Act::IndentDec));
+        assert_eq!(ed.undo_names()[0], "Decrease Indent");
+        assert!(redo_or_repeat(&mut ed, &mut rec), "F4 outdents again");
+        assert_eq!(ed.undo_names()[..2], ["Decrease Indent", "Decrease Indent"]);
+        // Two indents in, two out: the paragraph's indent is back as it was.
+        assert_eq!(ed.doc, tabbed);
+        assert!(ed.undo());
+        assert_ne!(ed.doc, tabbed, "the repeat outdented");
+    }
+
+    /// An undo step pushed in another editor (another tab, the
+    /// header/footer editor) makes the record stale, though this editor's
+    /// newest step is still the recorded one.
+    #[test]
+    fn a_step_in_another_editor_stales_the_record_618() {
+        let mut ed = three();
+        let mut rec = None;
+        select(&mut ed, 0, 4, 9);
+        key(&mut ed, &mut rec, "b", true, false);
+        assert!(repeat_ready(&ed, &rec));
+        let mut header = Editor::new(docxcore::markdown::from_markdown("Header\n"));
+        insert_symbol_into(&mut header, "\u{00A9}");
+        assert_eq!(
+            ed.undo_serial(),
+            rec.as_ref().map(|r| r.serial),
+            "body untouched"
+        );
+        assert!(!repeat_ready(&ed, &rec));
+        select(&mut ed, 0, 10, 15);
+        let before = ed.doc.clone();
+        assert!(!redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(ed.doc, before);
+    }
+
+    /// Design > Page Color edits the package, pushes no undo step, and
+    /// marks the tab dirty: the record is stale after it.
+    #[test]
+    fn a_package_edit_without_an_undo_step_stales_the_record_618() {
+        let mut tab = tab_from_path(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
+        );
+        let mut rec = None;
+        {
+            let Surface::Doc(ed) = &mut tab.surface else {
+                panic!("basic.docx is a document")
+            };
+            type_text(ed, &mut rec, "fox");
+            key(ed, &mut rec, "a", true, false);
+            key(ed, &mut rec, "b", true, false);
+            assert_eq!(ed.undo_names()[0], "Bold");
+            assert!(repeat_ready(ed, &rec));
+        }
+        design_tab::design_apply(&mut tab, design_tab::DesignAct::PageColor(Some(0xFFEEDD)))
+            .unwrap();
+        assert!(tab.dirty);
+        let Surface::Doc(ed) = &mut tab.surface else {
+            unreachable!()
+        };
+        assert!(!repeat_ready(ed, &rec));
+        assert!(!redo_or_repeat(ed, &mut rec));
+    }
+
+    /// Bold, Undo, Ctrl+Y (redo), Ctrl+Y (repeat): the app's own
+    /// dirty-marking after each keeps the record current.
+    #[test]
+    fn undo_then_redo_then_repeat_618() {
+        let mut ed = three();
+        let mut rec = None;
+        select(&mut ed, 0, 4, 9);
+        key(&mut ed, &mut rec, "b", true, false);
+        // Each of these marks the tab dirty after it, as `on_key` does.
+        let history =
+            |ed: &mut Editor,
+             rec: &mut Option<RepeatRecord>,
+             f: &dyn Fn(&mut Editor, &mut Option<RepeatRecord>) -> bool| {
+                let untouched = repeat_untouched(rec);
+                assert!(f(ed, rec));
+                bump_edit_generation();
+                keep_current(rec, untouched);
+            };
+        history(&mut ed, &mut rec, &|ed, _| ed.undo());
+        assert!(!repeat_ready(&ed, &rec), "its step is undone");
+        history(&mut ed, &mut rec, &redo_or_repeat);
+        assert_eq!(ed.undo_names(), ["Bold"], "that was the redo");
+        select(&mut ed, 0, 10, 15);
+        history(&mut ed, &mut rec, &redo_or_repeat);
+        assert_eq!(ed.undo_names(), ["Bold", "Bold"], "and this the repeat");
+        assert!(saved_run_of(&ed, "brown").contains("<w:b/>"));
+        // An edit the handler did not make is not kept current.
+        bump_edit_generation();
+        keep_current(&mut rec, false);
+        assert!(!repeat_ready(&ed, &rec));
+    }
+
+    /// No Spacing edits through four editor calls: one `Style` step, one
+    /// undo restores the paragraph, and a repeat is one step too.
+    #[test]
+    fn no_spacing_is_one_step_and_repeats_as_one_619() {
+        let mut ed = three();
+        let mut rec = None;
+        let original = ed.doc.clone();
+        ed.set_caret(Caret::at(vec![1], 0));
+        let since = docxcore::editor::undo_serial_counter();
+        ed.break_undo_group();
+        apply_doc_act(&mut ed, Act::NoSpacing);
+        assert!(note_edit(
+            &mut ed,
+            &mut rec,
+            since,
+            Repeat::Act(Act::NoSpacing)
+        ));
+        assert_eq!(ed.undo_names(), ["Style"]);
+        let spaced = ed.doc.clone();
+        assert!(ed.undo());
+        assert_eq!(ed.doc, original, "one undo restores it exactly");
+        assert!(!ed.can_redo() || ed.redo());
+        assert_eq!(ed.doc, spaced);
+        ed.set_caret(Caret::at(vec![2], 0));
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(
+            ed.undo_names(),
+            ["Style", "Style"],
+            "the repeat is one step"
+        );
+        assert!(ed.undo());
+        assert_eq!(ed.doc, spaced);
+    }
+
+    /// Typing after an edit that pushed no step starts its own step and
+    /// record: it does not coalesce into the old run and revive a stale
+    /// record, so F4 repeats only the new characters.
+    #[test]
+    fn typing_after_a_non_step_edit_starts_a_new_run_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        // `on_key`'s typing path: break unless continuing, insert, record.
+        let press = |ed: &mut Editor, rec: &mut Option<RepeatRecord>, c: &str| {
+            let since = docxcore::editor::undo_serial_counter();
+            break_typing_unless_continuing(ed, rec);
+            ed.insert_str(c);
+            note_edit(ed, rec, since, Repeat::Typing);
+            bump_edit_generation(); // mark_dirty
+            keep_current(rec, true);
+        };
+        for c in ["a", "b", "c"] {
+            press(&mut ed, &mut rec, c);
+        }
+        assert_eq!(ed.undo_names(), ["Typing \"abc\""], "one run");
+        bump_edit_generation(); // e.g. Page Color
+        assert!(!repeat_ready(&ed, &rec));
+        press(&mut ed, &mut rec, "d");
+        assert_eq!(ed.undo_names(), ["Typing \"d\"", "Typing \"abc\""]);
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abcdd", "F4 repeats only d");
+    }
+
+    /// Typing over a selection is one step, and so is a repeat of it.
+    #[test]
+    fn typing_over_a_selection_is_one_step_and_repeats_as_one_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        select(&mut ed, 0, 10, 15);
+        let before = ed.doc.clone();
+        // Typing "xy" over `brown`.
+        ed.break_undo_group();
+        let since = docxcore::editor::undo_serial_counter();
+        ed.insert_str("x");
+        note_edit(&mut ed, &mut rec, since, Repeat::Typing);
+        ed.insert_str("y");
+        note_edit(&mut ed, &mut rec, since, Repeat::Typing);
+        assert_eq!(ed.undo_names()[0], "Typing \"xy\"");
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before, "one undo restores brown");
+        assert!(ed.redo());
+        // Repeat over another selection: one step again.
+        select(&mut ed, 1, 0, 6);
+        let before = ed.doc.clone();
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(ed.undo_names()[0], "Typing \"xy\"");
+        assert_eq!(text(&ed, 1), "xy paragraph here.");
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before, "one undo removes the repeat whole");
+    }
+
+    /// Typing after a typing repeat starts a step of its own: the repeat is
+    /// closed, so the next F4 repeats `d`, not `abcd`.
+    #[test]
+    fn typing_after_a_typing_repeat_is_its_own_step_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        let press = |ed: &mut Editor, rec: &mut Option<RepeatRecord>, c: &str| {
+            let since = docxcore::editor::undo_serial_counter();
+            break_typing_unless_continuing(ed, rec);
+            ed.insert_str(c);
+            note_edit(ed, rec, since, Repeat::Typing);
+            bump_edit_generation();
+            keep_current(rec, true);
+        };
+        type_text(&mut ed, &mut rec, "abc");
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        press(&mut ed, &mut rec, "d");
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abcabcdd");
+        assert_eq!(
+            ed.undo_names(),
+            [
+                "Typing \"d\"",
+                "Typing \"d\"",
+                "Typing \"abc\"",
+                "Typing \"abc\""
+            ]
+        );
+    }
+
+    /// Any caret move ends the typing run, by whatever path: a direct caret
+    /// assignment, as `move_vert` makes, does not reset docxcore's `last`,
+    /// so the record's caret is what ends it.
+    #[test]
+    fn a_caret_move_ends_the_typing_run_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        let press = |ed: &mut Editor, rec: &mut Option<RepeatRecord>, c: &str| {
+            let since = docxcore::editor::undo_serial_counter();
+            break_typing_unless_continuing(ed, rec);
+            ed.insert_str(c);
+            note_edit(ed, rec, since, Repeat::Typing);
+            bump_edit_generation();
+            keep_current(rec, true);
+        };
+        for c in ["a", "b", "c"] {
+            press(&mut ed, &mut rec, c);
+        }
+        assert_eq!(
+            ed.undo_names(),
+            ["Typing \"abc\""],
+            "normal typing coalesces"
+        );
+        ed.caret = Caret::at(vec![1], 3); // a direct move, `last` untouched
+        press(&mut ed, &mut rec, "d");
+        assert_eq!(ed.undo_names(), ["Typing \"d\"", "Typing \"abc\""]);
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 1), "Secddond paragraph here.");
+        assert_eq!(text(&ed, 2), "Third one.abc");
+    }
+
+    /// An active selection ends the typing run, though the caret is where
+    /// the last character left it and the record is ready.
+    #[test]
+    fn a_selection_ends_the_typing_run_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        assert!(repeat_ready(&ed, &rec));
+        // Same caret, same record: only a selection (anchor) differs.
+        ed.anchor = Some(Caret::at(vec![2], 0));
+        break_typing_unless_continuing(&mut ed, &rec);
+        ed.anchor = None;
+        ed.insert_str("d");
+        assert_eq!(
+            ed.undo_names(),
+            ["Typing \"d\"", "Typing \"abc\""],
+            "the selection broke the group"
+        );
+        // Without a selection the same call continues the run.
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        type_text(&mut ed, &mut rec, "abc");
+        break_typing_unless_continuing(&mut ed, &rec);
+        ed.insert_str("d");
+        assert_eq!(ed.undo_names(), ["Typing \"abcd\""]);
+    }
+
+    #[test]
+    fn move_vert_ends_the_typing_run_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![0], 0));
+        type_text(&mut ed, &mut rec, "abc");
+        move_vert(&mut ed, true);
+        ed.insert_str("d");
+        assert_eq!(ed.undo_names(), ["Typing \"d\"", "Typing \"abc\""]);
+    }
+
+    #[test]
+    fn nothing_to_repeat_does_nothing_618() {
+        let mut ed = three();
+        let mut rec = None;
+        assert!(!redo_or_repeat(&mut ed, &mut rec));
+        // Selecting is no edit, and Sort is named but not repeated.
+        key(&mut ed, &mut rec, "a", true, false);
+        let since = docxcore::editor::undo_serial_counter();
+        apply_doc_act(&mut ed, Act::Sort);
+        note_edit(&mut ed, &mut rec, since, Repeat::Act(Act::Sort));
+        assert_eq!(ed.undo_names(), ["Sort"]);
+        assert!(rec.is_none());
+        assert!(!redo_or_repeat(&mut ed, &mut rec));
+    }
+
+    #[test]
+    fn repeat_keys_and_acts_618() {
+        assert!(matches!(
+            key_repeat("b", true, false),
+            Some(Repeat::Act(Act::Bold))
+        ));
+        assert!(matches!(
+            key_repeat("m", true, true),
+            Some(Repeat::Act(Act::IndentDec))
+        ));
+        assert!(matches!(
+            key_repeat("enter", false, false),
+            Some(Repeat::Enter)
+        ));
+        assert!(key_repeat("y", true, false).is_none());
+        assert!(key_repeat("f4", false, false).is_none());
+        assert!(key_repeat("left", false, false).is_none());
+        for act in [Act::Bold, Act::AlignC, Act::H1, Act::Bullets, Act::ClearFmt] {
+            assert!(repeatable_act(act), "{act:?}");
+        }
+        for act in [
+            Act::SelectAll,
+            Act::Sort,
+            Act::PageBreak,
+            Act::Paste,
+            Act::UndoTo(1),
+        ] {
+            assert!(!repeatable_act(act), "{act:?}");
+        }
+        // Protected View still refuses both (#633).
+        assert!(!open_mode::protected_allows_doc_key("f4", false, false));
+        assert!(!open_mode::protected_allows_doc_key("y", true, false));
+    }
+
+    /// #619's reproduction: `one`, Enter, `two`, Ctrl+A, Ctrl+B.
+    #[test]
+    fn the_undo_list_names_the_reproduction_619() {
+        let mut ed = Editor::new(docxcore::markdown::from_markdown("x\n"));
+        ed.set_caret(Caret::at(vec![0], 0));
+        ed.delete_forward();
+        let mut rec = None;
+        let fresh = ed.undo_names().len();
+        type_text(&mut ed, &mut rec, "one");
+        key(&mut ed, &mut rec, "enter", false, false);
+        type_text(&mut ed, &mut rec, "two");
+        key(&mut ed, &mut rec, "a", true, false);
+        key(&mut ed, &mut rec, "b", true, false);
+        let names = ed.undo_names();
+        assert_eq!(
+            names[..names.len() - fresh],
+            ["Bold", "Typing \"two\"", "Enter", "Typing \"one\""]
+        );
+        let items = menu::undo_menu(&names);
+        // Choosing `Typing "two"` (index 1) undoes it and Bold: `one` and
+        // an empty paragraph are left.
+        let path = menu::resolve_index(&items, 1).unwrap();
+        let Some(Act::UndoTo(n)) = menu::entry_at(&items, &path).unwrap().act else {
+            panic!("an undo entry");
+        };
+        assert!(ed.undo_to(n));
+        assert_eq!(text(&ed, 0), "one");
+        assert_eq!(text(&ed, 1), "");
+        assert_eq!(ed.undo_names()[0], "Enter");
+    }
+
+    #[test]
+    fn the_qat_reads_redo_or_repeat_618_619() {
+        let read = |state| {
+            qat_entries(state)
+                .into_iter()
+                .map(|e| (e.id, e.label, e.tip, e.enabled, e.menu))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            read(QatState::Plain),
+            [
+                ("qat-undo", "Undo", "Undo (Ctrl+Z)", true, false),
+                ("qat-redo", "Redo", "Redo (Ctrl+Y)", true, false),
+            ]
+        );
+        let doc = |can_redo, can_repeat| QatState::Doc {
+            can_redo,
+            can_repeat,
+        };
+        for can_repeat in [false, true] {
+            assert_eq!(
+                read(doc(true, can_repeat))[1],
+                ("qat-redo", "Redo", "Redo (Ctrl+Y)", true, false)
+            );
+        }
+        assert_eq!(
+            read(doc(false, true))[1],
+            ("qat-redo", "Repeat", "Repeat (Ctrl+Y)", true, false)
+        );
+        assert_eq!(
+            read(doc(false, false))[1],
+            ("qat-redo", "Repeat", "Can't Repeat", false, false)
+        );
+        assert_eq!(
+            read(doc(false, false))[0],
+            ("qat-undo", "Undo", "Undo (Ctrl+Z)", true, true)
+        );
+    }
+}
+
 // ---- the ribbon, defined once via ribbonspec (shared model) ----------------
 
 #[derive(Clone, Copy, Debug)]
 enum Act {
     Project(ProjectAct),
+    /// A sheet command from a menu: the sheet ribbon's menus (#707) and the
+    /// cell menu (#690, #691), drawn and clicked through the shared menu
+    /// model, whose items run `Act`s.
+    Sheet(SheetAct),
     Bold,
     Italic,
     Underline,
@@ -20145,6 +22984,14 @@ enum Act {
     Super,
     Sub,
     NewComment,
+    /// Resolve the selected comment, or reopen it.
+    ResolveComment,
+    /// Delete every comment in the document.
+    DeleteAllComments,
+    /// Display for Review: how tracked changes are shown.
+    Markup(docxcore::markup::MarkupView),
+    /// Track Changes on or off.
+    ToggleTrack,
     Sort,
     LineSpacing,
     ParaBorders,
@@ -20184,6 +23031,9 @@ enum Act {
     // dialog system).
     LaunchFont,
     LaunchParagraph,
+    /// Undo the `n` newest steps in one go: an entry in the Quick Access
+    /// Toolbar Undo drop-down (#619).
+    UndoTo(usize),
 }
 
 /// The gallery's selected item follows the paragraph formatting its actions set.
@@ -20491,6 +23341,64 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                             .key("P"),
                             cmdt("togglenotes", "comment", "Notes pane", ToggleNotes, "").key("O"),
                         ]),
+                        rs::column(vec![
+                            cmdt("resolvecomment", "comment", "Resolve", ResolveComment, "")
+                                .key("V"),
+                            cmdt(
+                                "deleteallcomments",
+                                "table-dismiss",
+                                "Delete all",
+                                DeleteAllComments,
+                                "",
+                            )
+                            .key("X"),
+                        ]),
+                    ],
+                ),
+                rs::group(
+                    "Tracking",
+                    35,
+                    vec![
+                        Control::Large(
+                            cmdt("tracktoggle", "paragraph", "Track Changes", ToggleTrack, "")
+                                .key("T"),
+                        ),
+                        rs::column(vec![
+                            cmdt(
+                                "markupall",
+                                "paragraph",
+                                "All markup",
+                                Markup(MarkupView::All),
+                                "",
+                            )
+                            .key("KA"),
+                            cmdt(
+                                "markupsimple",
+                                "paragraph",
+                                "Simple markup",
+                                Markup(MarkupView::Simple),
+                                "",
+                            )
+                            .key("KS"),
+                            cmdt(
+                                "markupnone",
+                                "paragraph",
+                                "No markup",
+                                Markup(MarkupView::NoMarkup),
+                                "",
+                            )
+                            .key("KN"),
+                        ]),
+                        rs::column(vec![
+                            cmdt(
+                                "markuporiginal",
+                                "paragraph",
+                                "Original",
+                                Markup(MarkupView::Original),
+                                "",
+                            )
+                            .key("KO"),
+                        ]),
                     ],
                 ),
                 rs::group(
@@ -20526,19 +23434,26 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 rs::group(
                     "Show",
                     30,
-                    vec![rs::column(vec![
-                        cmdt("ruler", "rule", "Ruler", ToggleRuler, "").key("R"),
-                        cmdt("showhide", "paragraph", "Formatting marks", ShowHide, "").key("M"),
-                        cmdt("nav", "select-all", "Navigation", ToggleNav, "").key("N"),
-                        cmdt(
-                            "viewcomments",
-                            "comment",
-                            "Comments pane",
-                            ToggleComments,
-                            "",
-                        )
-                        .key("C"),
-                    ])],
+                    // Three rows to a column (#1018): the fourth button sits in the
+                    // next column (the renderer wraps a longer column at three).
+                    vec![
+                        rs::column(vec![
+                            cmdt("ruler", "rule", "Ruler", ToggleRuler, "").key("R"),
+                            cmdt("showhide", "paragraph", "Formatting marks", ShowHide, "")
+                                .key("M"),
+                            cmdt("nav", "select-all", "Navigation", ToggleNav, "").key("N"),
+                        ]),
+                        rs::column(vec![
+                            cmdt(
+                                "viewcomments",
+                                "comment",
+                                "Comments pane",
+                                ToggleComments,
+                                "",
+                            )
+                            .key("C"),
+                        ]),
+                    ],
                 ),
                 rs::group(
                     "Appearance",
@@ -20892,6 +23807,7 @@ fn move_vert(ed: &mut Editor, down: bool) {
             let len = docxcore::editor::para_text_len(p);
             ed.caret = Caret::at(vec![j], col.min(len));
             ed.clear_selection();
+            ed.break_undo_group();
             return;
         }
     }
@@ -21966,6 +24882,31 @@ fn flat_inlines(content: &[Inline]) -> Vec<(Cow<'_, Inline>, bool)> {
     out
 }
 
+/// The runs under a tracked change, drawn as plain text with no caret mapping.
+fn emit_revision_text(out: &mut Vec<AnyElement>, content: &[Inline], base: f32, pal: Pal) {
+    for inline in content {
+        match inline {
+            Inline::Run(r) => {
+                let (mut idx, mut caret) = (0, None);
+                emit_run(
+                    out, &r.text, &r.props, base, false, &mut idx, &mut caret, None, None, pal,
+                );
+            }
+            Inline::Hyperlink(h) => {
+                for r in &h.runs {
+                    let (mut idx, mut caret) = (0, None);
+                    emit_run(
+                        out, &r.text, &r.props, base, true, &mut idx, &mut caret, None, None, pal,
+                    );
+                }
+                emit_revision_text(out, &h.content, base, pal);
+            }
+            Inline::Revision { content, .. } => emit_revision_text(out, content, base, pal),
+            _ => {}
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paragraph_el(
     p: &Paragraph,
@@ -22132,6 +25073,12 @@ fn paragraph_el(
             Inline::Break(..) => {
                 emit_break(&mut spans, &mut idx, &mut caret);
                 x = 0.0; // a hard break restarts the line
+            }
+            Inline::Revision { content, .. } => {
+                // A tracked change is shown, not edited here: its text takes no
+                // caret offsets (the engine counts it as none), and carries the
+                // underline / strike cue the loader gave its runs.
+                emit_revision_text(&mut spans, content, base, pal);
             }
             Inline::Raw(xml) => {
                 // Comment reference → a small badge; other raw XML (range markers,
@@ -22812,11 +25759,12 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         self.mini_bar = None;
-        self.menu = Some(menu::Menu {
+        self.menu_scroll = ScrollHandle::new();
+        self.menu = Some(menu::Menu::new(
             target,
-            at: (f32::from(at.x), f32::from(at.y)),
+            (f32::from(at.x), f32::from(at.y)),
             items,
-        });
+        ));
         cx.notify();
     }
 
@@ -22839,9 +25787,34 @@ impl Docxy {
         }
     }
 
+    /// The Quick Access Toolbar Undo arrow, and `menu-open {"qat":
+    /// "qat-undo"}`: the active document's undo steps, newest first (#619).
+    /// Project and sheet tabs have no list.
+    pub(crate) fn open_undo_menu(
+        &mut self,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if !matches!(self.qat_state(), QatState::Doc { .. }) {
+            return Err("the Undo drop-down opens on a document tab".into());
+        }
+        let names = self
+            .edit_target()
+            .map(|ed| ed.undo_names())
+            .unwrap_or_default();
+        self.open_menu(menu::MenuTarget::QatUndo, at, menu::undo_menu(&names), cx);
+        Ok(())
+    }
+
     /// The document body's right-click, and `menu-open "document"`.
     pub(crate) fn open_document_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
         self.open_menu(menu::MenuTarget::Document, at, menu::document_menu(), cx);
+    }
+
+    /// A right-click on a sheet, and `menu-open "cell"`: the cell menu
+    /// (#690, #691) for the selected cell.
+    pub(crate) fn open_cell_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.open_menu(menu::MenuTarget::Cell, at, menu::cell_menu(), cx);
     }
 
     /// A right-click on a Project row's table (row `row` in task order; past
@@ -22891,6 +25864,10 @@ impl Docxy {
         at: Point<Pixels>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        // The Quick Access Toolbar's Undo arrow opens the undo list (#619).
+        if primary_id == menu::QAT_UNDO_ID {
+            return self.open_undo_menu(at, cx);
+        }
         let (target, items) = self
             .split_menu_for(primary_id)
             .ok_or_else(|| format!("no split button '{primary_id}' on the ribbon"))?;
@@ -22901,6 +25878,9 @@ impl Docxy {
     /// The split button whose primary is `primary_id`: where it is, and its
     /// menu with the live enabled and checked states.
     fn split_menu_for(&self, primary_id: &str) -> Option<(menu::MenuTarget, Vec<menu::MenuItem>)> {
+        if self.active_is_sheet() {
+            return self.sheet_menu_for(primary_id);
+        }
         // The arrow is drawn on the active tab only, and `menu-open`
         // selects the named tab first.
         let tab = self.active_ribbon_tab_def();
@@ -22977,6 +25957,30 @@ impl Docxy {
         })
     }
 
+    /// The sheet ribbon drop-down whose button is `primary_id` on the tab
+    /// shown now: where it is, and its menu from the `sheet_ribbon` table.
+    fn sheet_menu_for(&self, primary_id: &str) -> Option<(menu::MenuTarget, Vec<menu::MenuItem>)> {
+        let def = sheet_ribbon::tab_def(self.ribbon_tab);
+        let tab = ribbon_tab_name(def.tab);
+        def.groups.iter().find_map(|group| {
+            let dd = group.dropdown(primary_id)?;
+            Some((
+                menu::MenuTarget::Ribbon {
+                    id: primary_id.into(),
+                    tab: tab.into(),
+                    group: group.title.into(),
+                    label: dd.button.label.into(),
+                },
+                menu::sheet_dropdown(dd.items, |act| {
+                    matches!(act, SheetAct::Filter)
+                        && self
+                            .active_sheet()
+                            .is_some_and(|v| v.sheet().auto_filter.is_some())
+                }),
+            ))
+        })
+    }
+
     /// Open the submenu of the open menu's item `i` in the menu's place (the
     /// Page Number menu's galleries): the pointer's way into a submenu.
     fn menu_enter_submenu(&mut self, i: usize, cx: &mut Context<Self>) {
@@ -22984,10 +25988,54 @@ impl Docxy {
             if let Some(menu::MenuItem::Item(e)) = menu.items.get(i) {
                 if e.enabled && !e.submenu.is_empty() {
                     menu.items = e.submenu.clone();
+                    menu.hi = None;
+                    self.menu_scroll = ScrollHandle::new();
                 }
             }
         }
         cx.notify();
+    }
+
+    /// A key while a menu is open: Up and Down move the highlight, Enter
+    /// runs the highlighted item (an item with a submenu opens it in the
+    /// menu's place; Enter with nothing highlighted closes the menu), and
+    /// every other key closes the menu and is spent.
+    fn menu_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        match key {
+            "down" | "up" => {
+                menu.step(key == "down");
+                if let Some(i) = menu.hi {
+                    self.menu_scroll.scroll_to_item(i);
+                }
+                cx.notify();
+            }
+            "enter" => {
+                let hi = menu.hi;
+                let submenu = hi.is_some_and(|i| {
+                    matches!(menu.items.get(i), Some(menu::MenuItem::Item(e)) if !e.submenu.is_empty())
+                });
+                match hi {
+                    Some(i) if submenu => self.menu_enter_submenu(i, cx),
+                    Some(i) => {
+                        if let Err(e) = self.menu_activate(&[i], window, cx) {
+                            self.set_status(e);
+                        }
+                        cx.notify();
+                    }
+                    None => {
+                        self.close_menu();
+                        cx.notify();
+                    }
+                }
+            }
+            _ => {
+                self.close_menu();
+                cx.notify();
+            }
+        }
     }
 
     /// Click the open menu's item at `path` (indices through submenus): the
@@ -23022,8 +26070,14 @@ impl Docxy {
     /// click; a ticked item shows its tick where the icon goes.
     fn menu_el(&self, menu: &menu::Menu, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         use menu::MenuItem;
+        // Bounded and scrollable: a menu holding data (the pick list) can
+        // outgrow the window. Up/Down scroll the highlight into view.
         let mut list = v_flex()
+            .id("menu-list")
             .min_w(px(200.))
+            .max_h(px(320.))
+            .overflow_y_scroll()
+            .track_scroll(&self.menu_scroll)
             .py_1()
             .rounded_md()
             .bg(pal.panel)
@@ -23061,6 +26115,7 @@ impl Docxy {
                     };
                     let clickable = e.enabled;
                     let opens = !e.submenu.is_empty();
+                    let lit = menu.hi == Some(i);
                     div()
                         .id(SharedString::from(e.id.clone()))
                         .flex()
@@ -23069,6 +26124,7 @@ impl Docxy {
                         .px_3()
                         .py_1()
                         .rounded_sm()
+                        .when(lit, |d| d.bg(pal.hover))
                         .text_size(px(12.))
                         .text_color(color)
                         .child(lead)
@@ -23236,16 +26292,48 @@ impl Docxy {
     }
 
     fn dispatch(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
-        use Act::*;
         // A command run from anywhere ends an open menu's moment (#397).
         self.close_menu();
         // Protected View (#633): the ribbon is hidden, but shortcuts, KeyTips,
         // context menus and the harness's `ribbon-click` still come here.
-        if !protected_view_allows_doc_act(act) && self.protected_refused(cx) {
+        // Resolve and Delete all hold no text of the view: only Protected View
+        // and Mark as Final refuse them.
+        let refused = if matches!(act, Act::ResolveComment | Act::DeleteAllComments) {
+            self.access_refused(cx)
+        } else {
+            !protected_view_allows_doc_act(act) && self.protected_refused(cx)
+        };
+        if refused {
             return self.refocus(window, cx);
         }
+        // A document edit is its own undo step, named for the Undo drop-down
+        // (#619) and kept for Repeat (#618) when it can be repeated.
+        let since = docxcore::editor::undo_serial_counter();
+        let untouched = repeat_untouched(&self.repeat);
+        if act_undo_name(act).is_some() {
+            if let Some(ed) = self.edit_target() {
+                ed.break_undo_group();
+            }
+        }
+        self.run_act(act, window, cx);
+        if act_undo_name(act).is_some() {
+            if let (Some(ed), rec) = self.edit_target_and_repeat() {
+                note_edit(ed, rec, since, Repeat::Act(act));
+            }
+        }
+        // The Undo drop-down only undoes (#619).
+        if matches!(act, Act::UndoTo(_)) {
+            self.keep_repeat_current(untouched);
+        }
+    }
+
+    /// Run `act` (`dispatch` has already closed the menu and checked
+    /// Protected View).
+    fn run_act(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
+        use Act::*;
         match act {
             Project(p) => self.project_act(p, window, cx),
+            Sheet(a) => self.run_sheet_act(a, window, cx),
             Cut => self.do_copy(true, window, cx),
             Copy => self.do_copy(false, window, cx),
             Paste => self.do_paste(window, cx),
@@ -23259,6 +26347,14 @@ impl Docxy {
             FontName => self.toggle_picker(PickKind::FontName, window, cx),
             FontSize => self.toggle_picker(PickKind::FontSize, window, cx),
             NewComment => self.start_comment(window, cx),
+            ResolveComment => self.resolve_selected_comment(window, cx),
+            ToggleTrack => self.toggle_track(window, cx),
+            Markup(view) => {
+                self.markup = view;
+                self.set_status(format!("Display for Review: {}", view.label()));
+                self.refocus(window, cx);
+            }
+            DeleteAllComments => self.delete_all_comments(window, cx),
             ShowHide => {
                 self.show_marks = !self.show_marks;
                 self.refocus(window, cx);
@@ -23310,63 +26406,10 @@ impl Docxy {
                 self.show_notes = !self.show_notes;
                 self.refocus(window, cx);
             }
-            _ => self.with_editor(window, cx, |e| match act {
-                Bold => e.toggle_bold(),
-                Italic => e.toggle_italic(),
-                Underline => e.toggle_underline(),
-                Strike => e.toggle_strike(),
-                Super => e.toggle_vert_align(VertAlign::Superscript),
-                Sub => e.toggle_vert_align(VertAlign::Subscript),
-                Grow => e.resize_font(2),
-                Shrink => e.resize_font(-2),
-                AlignL => e.set_align(Align::Left),
-                AlignC => e.set_align(Align::Center),
-                AlignR => e.set_align(Align::Right),
-                AlignJ => e.set_align(Align::Justify),
-                Normal => e.set_para_style(None),
-                // No Spacing: Word's body style with single spacing and no space
-                // before/after. Modelled as Normal + explicit zeroed spacing.
-                NoSpacing => {
-                    e.set_para_style(None);
-                    e.set_space_before(Some(0));
-                    e.set_space_after(Some(0));
-                    e.set_line_spacing(240, "auto");
-                }
-                H1 => e.set_para_style(Some("Heading1")),
-                H2 => e.set_para_style(Some("Heading2")),
-                H3 => e.set_para_style(Some("Heading3")),
-                HRule => e.insert_hrule(),
-                SelectAll => e.select_all(),
-                Case => e.cycle_case(),
-                // Toggle: if every selected paragraph is already in this list, drop
-                // it; otherwise apply it.
-                Bullets => e.set_list((!e.all_in_list(NUM_BULLET)).then_some(NUM_BULLET)),
-                Numbers => e.set_list((!e.all_in_list(NUM_DECIMAL)).then_some(NUM_DECIMAL)),
-                IndentInc => e.change_indent(720),
-                IndentDec => e.change_indent(-720),
-                Sort => e.sort_paragraphs(),
-                ParaBorders => {
-                    let has = e.caret_para_props().borders.bottom.is_some();
-                    let b = if has {
-                        ParBorders::default()
-                    } else {
-                        ParBorders {
-                            top: None,
-                            bottom: Some(BorderKind::Single),
-                        }
-                    };
-                    e.set_para_border(b);
-                }
-                Title => e.set_para_style(Some("Title")),
-                Subtitle => e.set_para_style(Some("Subtitle")),
-                ClearFmt => e.clear_run_formatting(),
-                Project(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
-                | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
-                | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField
-                | PageBreak | BlankPage | Cover(_) | ToggleNotes | InsertTable | InsertSymbol
-                | InsertEquation | LineSpacing | Hf(_) | Design(_) | Layout(_) | Mail(_)
-                | Table(_) | PrintLayout | ToggleRuler => {}
+            UndoTo(n) => self.with_editor(window, cx, |e| {
+                e.undo_to(n);
             }),
+            _ => self.with_editor(window, cx, |e| apply_doc_act(e, act)),
         }
     }
 
@@ -23409,7 +26452,9 @@ impl Docxy {
             .bg(pal.panel)
             .border_b_1()
             .border_color(pal.border)
+            .relative()
             .children(groups)
+            .child(probe(&self.probes, format!("ribbon-tab:{}", tab.name)))
             .into_any_element()
     }
 
@@ -24125,138 +27170,6 @@ impl Docxy {
         self.ref_field(id, target, value, hint, "", cx)
     }
 
-    /// The AutoFilter criteria bar: type a comparison on the current column.
-    fn sheet_filter_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        use gridcore::sheet::col_name;
-        let col = self
-            .active_sheet()
-            .map(|v| col_name(v.sel.1))
-            .unwrap_or_default();
-        let ent = cx.entity();
-        let ent_cancel = ent.clone();
-        h_flex()
-            .w_full()
-            .h(px(30.))
-            .items_center()
-            .gap_2()
-            .px_2()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(pal.dim)
-                    .child(format!("Filter column {col} where value")),
-            )
-            .child(
-                div()
-                    .w(px(180.))
-                    .h(px(22.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .rounded_sm()
-                    .bg(hsla_u(0xffffff))
-                    .border_1()
-                    .border_color(hsla_u(BRAND))
-                    .text_size(px(12.))
-                    .text_color(hsla_u(0x1a1a1a))
-                    .child(div().child(SharedString::from(if buf.is_empty() {
-                        "=Laptop  (or >500, clear)".to_string()
-                    } else {
-                        buf.to_string()
-                    })))
-                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
-            )
-            .child(
-                div()
-                    .id("filter-cancel")
-                    .px_2()
-                    .py(px(2.))
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .bg(pal.panel)
-                    .text_color(pal.fg)
-                    .border_1()
-                    .border_color(pal.border)
-                    .child("Cancel")
-                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                        ent_cancel.update(cx, |this, cx| {
-                            this.sheet_filter_edit = None;
-                            cx.notify();
-                        });
-                    }),
-            )
-            .into_any_element()
-    }
-
-    /// The multi-level sort bar: type a spec like "B asc, C desc".
-    fn sheet_sort_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let ent = cx.entity();
-        let ent_cancel = ent.clone();
-        h_flex()
-            .w_full()
-            .min_h(px(30.))
-            .py(px(3.))
-            .items_center()
-            .gap_2()
-            .px_2()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .child(div().text_size(px(12.)).text_color(pal.dim).child("Sort"))
-            .child(
-                div()
-                    .w(px(160.))
-                    .child(self.bar_range_field("sort-range", RefTarget::Sort, cx)),
-            )
-            .child(div().text_size(px(12.)).text_color(pal.dim).child("by"))
-            .child(
-                div()
-                    .w(px(220.))
-                    .h(px(22.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .rounded_sm()
-                    .bg(hsla_u(0xffffff))
-                    .border_1()
-                    .border_color(hsla_u(BRAND))
-                    .text_size(px(12.))
-                    .text_color(hsla_u(0x1a1a1a))
-                    .child(div().child(SharedString::from(if buf.is_empty() {
-                        "B asc, C desc".to_string()
-                    } else {
-                        buf.to_string()
-                    })))
-                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
-            )
-            .child(
-                div()
-                    .id("sort-cancel")
-                    .px_2()
-                    .py(px(2.))
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .bg(pal.panel)
-                    .text_color(pal.fg)
-                    .border_1()
-                    .border_color(pal.border)
-                    .child("Cancel")
-                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                        ent_cancel.update(cx, |this, cx| {
-                            this.sheet_sort_edit = None;
-                            this.bar_close();
-                            cx.notify();
-                        });
-                    }),
-            )
-            .into_any_element()
-    }
-
     /// The row-height entry bar: type a height in points (or "auto").
     fn sheet_rowh_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let ent = cx.entity();
@@ -24504,7 +27417,7 @@ impl Docxy {
             .child(
                 btn("Cancel", false).on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
                     ent_cancel.update(cx, |this, cx| {
-                        this.sheet_comment_edit = None;
+                        this.sheet_comment_bar_close();
                         cx.notify();
                     });
                 }),
@@ -24642,11 +27555,16 @@ impl Docxy {
             .border_b_1()
             .border_color(pal.border)
             .overflow_x_scroll()
+            .relative()
             .children(
                 tab.groups
                     .iter()
                     .map(|g| self.sheet_group(g, tab.titles, &xf, pal, cx)),
             )
+            .child(probe(
+                &self.probes,
+                format!("ribbon-tab:{}", ribbon_tab_name(tab.tab)),
+            ))
             .into_any_element()
     }
 
@@ -24678,64 +27596,122 @@ impl Docxy {
             sheet_ribbon::Gap::Px(v) => d.gap(px(v)),
             sheet_ribbon::Gap::Rem(v) => d.gap(rems(v)),
         };
+        let probes = &self.probes;
+        let content = |i: usize| probe(probes, format!("ribbon-content:{}:{i}", g.title));
         let body = match &g.body {
             Body::Strip {
                 gap: strip_gap,
                 items,
             } => {
                 let mut strip = gap(h_flex().h_full().items_center(), *strip_gap);
-                for item in *items {
+                for (i, item) in items.iter().enumerate() {
                     strip = strip.child(match item {
                         Item::One(c) => self.sheet_cmd_el(c, xf, pal, cx),
-                        Item::Col { gap: col_gap, cmds } => gap(v_flex(), *col_gap)
-                            .children(cmds.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
+                        Item::Col(c) => gap(v_flex(), c.gap)
+                            .relative()
+                            .children(c.cmds.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
+                            .child(content(i))
                             .into_any_element(),
+                        Item::Menu(m) => self.sheet_dropdown_btn(&m.button, pal, cx),
                     });
                 }
                 strip.into_any_element()
             }
-            Body::Rows(rows) => v_flex()
+            Body::Rows(r) => v_flex()
+                .relative()
                 .gap(px(1.))
-                .children(rows.iter().map(|r| {
+                .children(r.rows.iter().map(|r| {
                     h_flex()
                         .items_center()
                         .gap(px(2.))
                         .children(r.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
                 }))
+                .child(content(0))
                 .into_any_element(),
         };
         v_flex()
+            .relative()
             .h(px(94.))
             .px_1p5()
             .py(px(3.))
             .justify_between()
             .border_r_1()
             .border_color(pal.border)
+            .child(probe(&self.probes, format!("ribbon-group:{}", g.title)))
             .child(div().flex_1().flex().items_center().child(body))
             .child(match titles {
                 sheet_ribbon::Titles::WithLaunchers => h_flex()
+                    .relative()
                     .w_full()
                     .items_center()
                     .justify_center()
                     .gap_1()
+                    .child(probe(&self.probes, format!("ribbon-title:{}", g.title)))
                     .child(div().text_size(px(10.)).text_color(pal.dim).child(g.title))
                     .when(g.launcher, |d| {
+                        let launch = g.launch;
                         d.child(
                             div()
+                                .id(SharedString::from(format!("sheet-launch-{}", g.title)))
                                 .text_size(px(9.))
                                 .text_color(pal.dim)
-                                .child("\u{2921}"),
+                                .when(launch.is_some(), |d| {
+                                    d.cursor_pointer().hover(|d| d.text_color(pal.fg))
+                                })
+                                .child("\u{2921}")
+                                .when_some(launch, |d, act| {
+                                    d.on_click(cx.listener(move |this, _, window, cx| {
+                                        this.run_sheet_act(act, window, cx)
+                                    }))
+                                }),
                         )
                     })
                     .into_any_element(),
                 sheet_ribbon::Titles::Plain => div()
+                    .relative()
                     .w_full()
                     .text_size(px(10.))
                     .text_color(pal.dim)
                     .text_center()
+                    .child(probe(&self.probes, format!("ribbon-title:{}", g.title)))
                     .child(g.title)
                     .into_any_element(),
             })
+            .into_any_element()
+    }
+
+    /// A Large sheet ribbon button that opens a drop-down (Sort & Filter): a
+    /// press anywhere on it opens its menu, or shuts it when it is the one
+    /// open, as the document ribbon's drop-downs do.
+    fn sheet_dropdown_btn(
+        &self,
+        c: &sheet_ribbon::SheetCmd,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let sheet_ribbon::Shape::Menu(icon) = c.shape else {
+            unreachable!("only a Shape::Menu command is drawn as a drop-down")
+        };
+        let id = c.id;
+        div()
+            .id(SharedString::from(format!("{id}-dropdown")))
+            .relative()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_0p5()
+            .min_w(px(40.))
+            .h_full()
+            .px_1p5()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|d| d.bg(pal.hover))
+            .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
+            .child(probe(&self.probes, format!("ribbon-split:{id}")))
+            .when_some(icon, |d, ic| d.child(icon_svg(ic, 22., pal.fg)))
+            .child(menu_button_label(c.label, pal.fg))
+            .on_mouse_down(MouseButton::Left, menu_toggle(id, cx))
             .into_any_element()
     }
 
@@ -24750,6 +27726,7 @@ impl Docxy {
         use sheet_ribbon::Shape;
         let text = c.text(self.sheet_act_toggled(c.act));
         match c.shape {
+            Shape::Menu(_) => self.sheet_dropdown_btn(c, pal, cx),
             Shape::Large(icon) => self.sheet_lb(icon, text, c.act, pal, cx),
             Shape::Row(icon) => self.sheet_rb(icon, text, c.act, pal, cx),
             Shape::Icon(icon) => {
@@ -24758,6 +27735,29 @@ impl Docxy {
             Shape::Glyph(glyph) => self.sheet_gb(glyph, c.act, pal, cx),
             Shape::Combo { value, wide } => self.sheet_combo(value, wide, c.act, pal, cx),
             Shape::NumFmt => self.sheet_numfmt_combo(pal, cx),
+            Shape::Split { icon, menu } => v_flex()
+                .h_full()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .child(self.sheet_lb(icon, text, c.act, pal, cx)),
+                )
+                .child(
+                    div()
+                        .id(ElementId::Name(format!("slb-arrow-{}", c.id).into()))
+                        .px_2()
+                        .rounded(px(3.))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(pal.hover))
+                        .text_size(px(10.))
+                        .text_color(pal.fg)
+                        .child("\u{25BE}")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.run_sheet_act(SheetAct::Menu(menu), window, cx)
+                        })),
+                )
+                .into_any_element(),
         }
     }
 
@@ -24771,12 +27771,18 @@ impl Docxy {
         let controls: Vec<AnyElement> = g
             .items
             .iter()
-            .map(|c| self.render_control(c, icon_only, pal, cx))
+            .enumerate()
+            .map(|(i, c)| {
+                let slot = format!("ribbon-content:{}:{i}", g.title);
+                self.render_control(c, icon_only, slot, pal, cx)
+            })
             .collect();
         // group title row + optional dialog-box launcher (⤢)
         let title_row = h_flex()
+            .relative()
             .items_center()
             .gap_1()
+            .child(probe(&self.probes, format!("ribbon-title:{}", g.title)))
             .child(div().text_size(px(9.)).text_color(pal.dim).child(g.title))
             .when_some(g.launcher, |d, act| {
                 d.child(
@@ -24792,6 +27798,7 @@ impl Docxy {
                 )
             });
         v_flex()
+            .relative()
             .items_center()
             .justify_between()
             .h_full()
@@ -24800,15 +27807,19 @@ impl Docxy {
             .gap_0p5()
             .border_r_1()
             .border_color(pal.border)
+            .child(probe(&self.probes, format!("ribbon-group:{}", g.title)))
             .child(h_flex().flex_1().items_center().gap_1().children(controls))
             .child(title_row)
             .into_any_element()
     }
 
+    /// `slot` names the probe that measures a column or a rows stack, the two
+    /// controls whose height grows with their rows (`ribbon-layout`).
     fn render_control(
         &self,
         c: &Control<Act>,
         icon_only: bool,
+        slot: String,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -24821,7 +27832,7 @@ impl Docxy {
                 // Office caps a button column at 3 rows; extra buttons wrap into
                 // the next column so nothing overflows the ribbon body height.
                 let cols: Vec<AnyElement> = cmds
-                    .chunks(3)
+                    .chunks(rs::MAX_COLUMN_ROWS)
                     .map(|chunk| {
                         v_flex()
                             .gap(px(1.))
@@ -24834,9 +27845,11 @@ impl Docxy {
                     })
                     .collect();
                 h_flex()
+                    .relative()
                     .items_start()
                     .gap_1()
                     .children(cols)
+                    .child(probe(&self.probes, slot))
                     .into_any_element()
             }
             // The Office two-row layout: each inner Vec is one left-to-right row.
@@ -24852,9 +27865,11 @@ impl Docxy {
                     })
                     .collect();
                 v_flex()
+                    .relative()
                     .items_start()
                     .gap(px(2.))
                     .children(rendered)
+                    .child(probe(&self.probes, slot))
                     .into_any_element()
             }
             Control::Gallery(gal) if gal.id == "tablestyles" => {
@@ -25242,8 +28257,8 @@ impl Docxy {
             ),
             Bold => rp.is_some_and(|p| p.bold),
             Italic => rp.is_some_and(|p| p.italic),
-            Underline => rp.is_some_and(|p| p.underline),
-            Strike => rp.is_some_and(|p| p.strike),
+            Underline => rp.is_some_and(|p| p.user_underline()),
+            Strike => rp.is_some_and(|p| p.user_strike()),
             Super => rp.is_some_and(|p| p.vert_align == VertAlign::Superscript),
             Sub => rp.is_some_and(|p| p.vert_align == VertAlign::Subscript),
             AlignL => pp.is_some_and(|p| p.align == Align::Left),
@@ -25255,6 +28270,9 @@ impl Docxy {
             ParaBorders => pp.is_some_and(|p| p.borders.bottom.is_some()),
             ShowHide => self.show_marks,
             ToggleComments => self.show_comments,
+            ResolveComment => self.selected_comment_resolved(),
+            Markup(view) => self.markup == view,
+            ToggleTrack => self.active_track_changes(),
             ToggleNav => self.show_nav,
             ToggleNotes => self.show_notes,
             PrintLayout => self.page_view,
@@ -25340,6 +28358,80 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// File > Account (#1023), for every tab kind: the build's one-line summary, a
+    /// "Manual build" badge when it is one, and the About docxy suite button,
+    /// whose dialog lists every field with a Copy button. `None` unless the
+    /// Account page is selected.
+    fn account_page(
+        &self,
+        bg: Hsla,
+        fg: Hsla,
+        dim: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.bs_account {
+            return None;
+        }
+        let info = about::info();
+        let page = v_flex()
+            .relative()
+            .w_full()
+            .p_8()
+            .gap_4()
+            .bg(bg)
+            .child(
+                div()
+                    .text_size(px(20.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(fg)
+                    .child("Account"),
+            )
+            .child(
+                div()
+                    .id("account-line")
+                    .text_color(fg)
+                    .child(info.short_line()),
+            )
+            .when(info.manual(), |d| {
+                d.child(
+                    h_flex().child(
+                        div()
+                            .id("account-manual-badge")
+                            .relative()
+                            .child(probe(&self.probes, "account-manual-badge"))
+                            .px_2()
+                            .py_0p5()
+                            .rounded_sm()
+                            .bg(rgb(0xB45309))
+                            .text_color(rgb(FILE_FG))
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::BOLD)
+                            .child("Manual build"),
+                    ),
+                )
+            })
+            // The dialog lives on a tab's stack, so with no tab there is nothing to open it on.
+            .when(!self.tabs.is_empty(), |d| {
+                d.child(
+                    h_flex().child(
+                        div()
+                            .id("account-about")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(dim)
+                            .text_color(fg)
+                            .cursor_pointer()
+                            .hover(|d| d.border_color(rgb(BRAND)))
+                            .child("About docxy suite")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_about_clicked(cx))),
+                    ),
+                )
+            });
+        Some(page.into_any_element())
+    }
+
     /// File > Info for a document tab (#627): its name and path, then Word's
     /// Inspect Document with a Remove All per category found. `None` unless
     /// the Info page is selected and the active tab is a document.
@@ -25406,8 +28498,7 @@ impl Docxy {
         }
         Some(
             v_flex()
-                .flex_1()
-                .h_full()
+                .w_full()
                 .p_8()
                 .gap_4()
                 .bg(bg)
@@ -25537,7 +28628,7 @@ impl Docxy {
         sidebar: Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut rail = v_flex().w(px(220.)).h_full().py_3().gap_1().bg(sidebar);
+        let mut rail = v_flex().w_full().py_3().gap_1();
         for item in backstage_rail_items(self.active_is_project(), self.active_is_doc()) {
             let action = item.action;
             rail = rail.child(
@@ -25594,8 +28685,7 @@ impl Docxy {
                     )
             };
             v_flex()
-                .flex_1()
-                .h_full()
+                .w_full()
                 .p_8()
                 .gap_4()
                 .bg(bg)
@@ -25643,6 +28733,8 @@ impl Docxy {
                         )),
                 )
                 .into_any_element()
+        } else if let Some(page) = self.account_page(bg, fg, dim, cx) {
+            page
         } else if let Some(page) = self.info_page(bg, fg, dim, cx) {
             page
         } else {
@@ -25737,8 +28829,7 @@ impl Docxy {
                     })
             };
             v_flex()
-                .flex_1()
-                .h_full()
+                .w_full()
                 .p_8()
                 .gap_4()
                 .bg(bg)
@@ -25851,7 +28942,7 @@ impl Docxy {
                         })),
                 )
                 .child(div().text_size(px(11.)).text_color(dim).child(
-                    "Off: closing the window is silent — your work is kept and reopened next launch. Closing a single tab with unsaved changes always asks.",
+                    "On: closing the window asks \u{201C}Save your changes to this file?\u{201D} for each unsaved document in turn; Don't Save leaves its file as it is. Off: closing the window is silent — your work is kept and reopened next launch. Closing a single tab with unsaved changes always asks.",
                 ))
                 // One button that cycles the interval, as simple as the
                 // toggle above; Word's File › Options › Save equivalent.
@@ -25917,13 +29008,14 @@ impl Docxy {
                 )
                 // Word's File › Options › General › User name and Initials
                 // (#620), stamped on new comments. Its dialog sits on a tab's
-                // stack, so the row needs a tab.
-                .when(!self.tabs.is_empty(), |d| {
+                // stack, or the app's when none is open (#1027).
+                .map(|d| {
                     let (name, initials) =
                         review_identity(&self.user_name, &self.user_initials);
                     d.child(
                         div()
                             .id("bs-user-name")
+                            .relative()
                             .flex()
                             .items_center()
                             .gap_2()
@@ -25932,6 +29024,7 @@ impl Docxy {
                             .cursor_pointer()
                             .rounded_sm()
                             .hover(|d| d.bg(sidebar))
+                            .child(probe(&self.probes, "bs-user-name"))
                             .child(div().text_color(fg).child("User name..."))
                             .child(
                                 div()
@@ -25997,11 +29090,76 @@ impl Docxy {
                 .into_any_element()
         };
 
+        // One scroll container per column, built here so no page can skip
+        // it (#1028): a page taller than the window scrolls instead of being
+        // clipped. The pane takes its natural height inside, so the
+        // container's `max_offset` is the overflow the harness reports.
+        let rail_col = div()
+            .id("backstage-rail")
+            .relative()
+            .w(px(220.))
+            .h_full()
+            .min_h(px(0.))
+            .flex_shrink_0()
+            .bg(sidebar)
+            .child(probe(&self.probes, "backstage-rail"))
+            .child(
+                div()
+                    .id("backstage-rail-scroll")
+                    .size_full()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.bs_rail_scroll)
+                    .child(rail),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(12.))
+                    .child(
+                        gpui_component::scroll::Scrollbar::vertical(&self.bs_rail_scroll)
+                            .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
+                    ),
+            );
+        let content_col = div()
+            .id("backstage-content")
+            .relative()
+            .flex_1()
+            .h_full()
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .bg(bg)
+            .child(probe(&self.probes, "backstage-content"))
+            .child(
+                div()
+                    .id("backstage-content-scroll")
+                    .size_full()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.bs_scroll)
+                    .child(pane),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(12.))
+                    .child(
+                        gpui_component::scroll::Scrollbar::vertical(&self.bs_scroll)
+                            .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
+                    ),
+            );
         h_flex()
             .size_full()
+            .min_h(px(0.))
             .bg(bg)
-            .child(rail)
-            .child(pane)
+            .child(rail_col)
+            .child(content_col)
             .into_any_element()
     }
 }
@@ -26009,7 +29167,7 @@ impl Docxy {
 /// The drag payload for a title-chip drag: the source tab's absolute index,
 /// plus the strip length and the tab's title at drag start — a tab closed or
 /// another reorder landing mid-drag invalidates the snapshot, and the drop
-/// must not guess at what moved. Titles are not unique (new documents are
+/// must not guess at what moved. Titles are not unique (new workbooks are
 /// all `Untitled.*`), so the guard passes if the shifted index happens to
 /// land on a same-title tab; a per-tab id would close that and is out of
 /// scope here. Cloned into the view gpui draws under the cursor — the same
@@ -26188,20 +29346,23 @@ impl Docxy {
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A tab created since the last frame holds the app's Editing options
-        // before anything can reach it (#672).
+        // before anything can reach it (#672), and its AutoCorrect (#667).
         stamp_edit_opts(&mut self.tabs, self.edit_opts);
+        sheet_autocorrect::stamp_autocorrect(&mut self.tabs, &self.autocorrect);
+        sheet_flashfill::retire_stale_previews(&mut self.tabs);
+        sheet_complete::sync_lists(&mut self.tabs);
         // A new frame: what the probes recorded during the last one is now the
         // complete answer, and they start collecting this one afresh. Stale
         // entries cannot survive — a chart that was deleted simply does not
         // record itself again.
         self.frame = self.frame.wrapping_add(1);
         self.schedule_project_passes(window, cx);
-        // Protected View's last backstop (#633): an edit that reached a
-        // protected document by a way no gate or `mark_dirty` covers (one of
+        // The last backstop of Protected View (#633), or of a document marked
+        // as final (#617): an edit that reached a locked document by a way no gate or `mark_dirty` covers (one of
         // the tab's other modules) is rolled back before it is ever drawn,
         // saved or written to the hot-exit sidecar as unsaved work.
         for t in self.tabs.iter_mut() {
-            if t.access.protected && t.dirty {
+            if t.access.locked() && t.dirty {
                 protected_rollback(t);
             }
         }
@@ -26213,6 +29374,15 @@ impl Render for Docxy {
         {
             let mut p = self.probes.borrow_mut();
             p.last = std::mem::take(&mut p.next);
+            // A debug build says so, once per group, when a ribbon group's
+            // content is taller than its body (#1018).
+            if cfg!(debug_assertions) {
+                for title in ribbon_layout::warn_clipped(&p) {
+                    if p.warned.insert(title.clone()) {
+                        eprintln!("docxy: ribbon group {title:?} content is taller than its body");
+                    }
+                }
+            }
         }
         // Apply the theme choice (Auto follows the OS appearance).
         let desired = self.theme_pref.resolve(window.appearance());
@@ -26238,6 +29408,9 @@ impl Render for Docxy {
                 panel += SIDE_PANEL_W;
             }
             if self.panel_chart_shown().is_some() {
+                panel += SIDE_PANEL_W;
+            }
+            if self.office_clip.open {
                 panel += SIDE_PANEL_W;
             }
             let w = f32::from(window.viewport_size().width) - panel;
@@ -26268,6 +29441,7 @@ impl Render for Docxy {
 
         // --- title bar: wordmark + document tab chips + theme toggle ---
         let theme_pref = self.theme_pref;
+        let qat_state = self.qat_state();
         // The pinned TitleBar gives #bar flex-shrink:0. A definite width,
         // accounting for Root's client decoration insets, keeps the caption
         // controls inside the viewport.
@@ -26483,17 +29657,48 @@ impl Render for Docxy {
                                 .items_center()
                                 .gap_0p5()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .children(QAT_ITEMS.iter().map(|item| {
-                                    let action = item.action;
-                                    qat_btn(
-                                        item.id,
-                                        item.icon,
-                                        item.tip,
+                                .children(qat_entries(qat_state).into_iter().map(|entry| {
+                                    let action = entry.action;
+                                    let btn = qat_btn(
+                                        entry.id,
+                                        entry.icon,
+                                        entry.tip,
+                                        entry.enabled,
                                         pal,
                                         cx.listener(move |this, _, window, cx| {
                                             this.qat_action(action, window, cx)
                                         }),
-                                    )
+                                    );
+                                    if !entry.menu {
+                                        return btn.into_any_element();
+                                    }
+                                    // A split button: its arrow opens the
+                                    // Undo drop-down (#619).
+                                    h_flex()
+                                        .items_center()
+                                        .child(btn)
+                                        .child(
+                                            div()
+                                                .id("qat-undo-arrow")
+                                                .relative()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .w(px(10.))
+                                                .h(px(20.))
+                                                .rounded(px(3.))
+                                                .cursor_pointer()
+                                                .hover(|d| d.bg(pal.hover))
+                                                .text_size(px(8.))
+                                                .text_color(pal.fg)
+                                                .child(probe(&self.probes, "qat-undo-arrow"))
+                                                .child("\u{25BE}")
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    menu_toggle(menu::QAT_UNDO_ID, cx),
+                                                ),
+                                        )
+                                        .into_any_element()
                                 })),
                         ),
                 )
@@ -26548,6 +29753,7 @@ impl Render for Docxy {
                 .relative()
                 .bg(bg)
                 .track_focus(&self.focus)
+                .key_routing(cx)
                 .child(probe_tracked(
                     &self.probes,
                     "suite-root",
@@ -26575,13 +29781,11 @@ impl Render for Docxy {
         );
         let vw = f32::from(window.viewport_size().width);
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
-        // Protected View (#610, documents #633) hides the ribbon's commands,
-        // as Excel and Word grey them out; its message bar takes their place.
-        let protected = (self.active_is_sheet() || is_doc) && self.protected_view();
-        let ribbon_body = (!self.ribbon_min
-            && !protected
-            && (is_doc || self.active_is_sheet() || self.active_is_project()))
-        .then(|| {
+        // Protected View (#610, documents #633), or a document marked as
+        // final (#617), hides the ribbon's commands, as Excel and Word grey
+        // them out; its message bar takes their place.
+        let protected = self.ribbon_locked();
+        let ribbon_body = (!self.ribbon_body_hidden()).then(|| {
             if is_doc || self.active_is_project() {
                 self.ribbon_body(vw, pal, cx)
             } else {
@@ -26589,7 +29793,19 @@ impl Render for Docxy {
             }
         });
         let project_prompt = self.project_prompt_bar(pal, cx);
-        let protected_bar = protected.then(|| self.protected_view_bar(pal, cx));
+        // Protected View's bar comes first; once editing is enabled, a
+        // document marked as final shows Word's bar (#617).
+        let protected_bar = protected.then(|| {
+            if self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| t.access.protected)
+            {
+                self.protected_view_bar(pal, cx)
+            } else {
+                self.marked_final_bar(pal, cx)
+            }
+        });
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
         let picker_bar = (is_doc)
             .then_some(self.picker)
@@ -26618,14 +29834,6 @@ impl Render for Docxy {
             .sheet_dv_edit
             .clone()
             .map(|buf| self.sheet_dv_edit_bar(&buf, pal, cx));
-        let sheet_filter = self
-            .sheet_filter_edit
-            .clone()
-            .map(|buf| self.sheet_filter_bar(&buf, pal, cx));
-        let sheet_sort = self
-            .sheet_sort_edit
-            .clone()
-            .map(|buf| self.sheet_sort_bar(&buf, pal, cx));
         let sheet_rowh = self
             .sheet_rowh_edit
             .clone()
@@ -26638,8 +29846,15 @@ impl Render for Docxy {
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
                 Surface::Doc(editor) => {
-                    let spans = editor.selection_spans();
-                    let markers = list_markers(&editor.doc.body);
+                    // Display for Review: the document, or a clone shown as No
+                    // Markup / Original / Simple; never saved.
+                    let shown = editor.doc.markup_view(self.markup);
+                    let spans = if self.markup.is_editable() {
+                        editor.selection_spans()
+                    } else {
+                        Vec::new()
+                    };
+                    let markers = list_markers(&shown.body);
                     let ent = cx.entity();
                     // In Print Layout the sheet is white, or the document's page
                     // colour (#651), whatever the app theme, like Word's document
@@ -26674,14 +29889,14 @@ impl Render for Docxy {
                         pal: doc_pal,
                         marks: self.show_marks,
                         zoom: self.zoom,
-                        active: hf.is_none(),
+                        active: hf.is_none() && self.markup.is_editable(),
                         meas: &measurer,
                         hf_width: None,
                         tbl: &tbl,
                         cell_range: body_range.as_ref(),
                         merge_hl: tab.mail.highlight,
                     };
-                    let body = &editor.doc.body;
+                    let body = &shown.body;
                     if self.page_view {
                         // Print Layout: split the body into discrete page sheets
                         // (section margins), stacked on a grey canvas. A sheet is
@@ -27102,6 +30317,16 @@ impl Render for Docxy {
                 }
                 _ => None,
             });
+        // Track Changes and Display for Review, when they are not the default.
+        let mut review_chips: Vec<String> = Vec::new();
+        if is_doc {
+            if self.active_track_changes() {
+                review_chips.push("Track Changes: On".to_string());
+            }
+            if self.markup != MarkupView::All {
+                review_chips.push(self.markup.label().to_string());
+            }
+        }
         let stats_text = doc_stats.map(|(w, p)| {
             SharedString::from(format!(
                 "{} page{} \u{00b7} {} word{}",
@@ -27181,6 +30406,19 @@ impl Render for Docxy {
                 d.child(div().text_color(dim).child("·"))
                     .child(div().text_color(dim).child(s))
             })
+            .children(review_chips.into_iter().flat_map(|chip| {
+                [
+                    div().text_color(dim).child("·").into_any_element(),
+                    div()
+                        .id(SharedString::from(format!(
+                            "status-{}",
+                            chip.to_lowercase().replace([' ', ':'], "-")
+                        )))
+                        .text_color(fg)
+                        .child(SharedString::from(chip))
+                        .into_any_element(),
+                ]
+            }))
             // Excel's status-bar words for the Editing options (#672).
             .when(self.active_is_sheet(), |d| {
                 d.children(sheet_status_words(&self.edit_opts).into_iter().map(|w| {
@@ -27230,23 +30468,28 @@ impl Render for Docxy {
         // `PanelEvent`), so a click on the grid can no longer close it mid-edit.
         let chart_panel =
             (!is_doc && self.panel_chart_shown().is_some()).then(|| self.chart_panel(pal, cx));
+        // The Office Clipboard (#669), docked left of the grid as Excel's is.
+        let office_panel = (self.active_is_sheet() && self.office_clip.open)
+            .then(|| self.office_clip_panel(pal, cx));
         let body = h_flex()
             .flex_1()
             .min_h(px(0.))
             .overflow_hidden()
-            // Right-click in a document or sheet body opens the document's
-            // context menu. A Project's task rows open their own (the table
-            // pane's handler); nothing else on a Project has a menu yet, so
-            // the document's never opens there (#397).
+            // Right-click in a document body opens the document's context
+            // menu. A sheet's cells open the cell menu (each cell's own
+            // handler, which selects it first); a Project's task rows open
+            // their own (the table pane's handler); nothing else there has a
+            // menu yet (#397).
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                    if !this.active_is_project() {
+                    if !this.active_is_project() && !this.active_is_sheet() {
                         this.open_document_menu(ev.position, cx);
                     }
                 }),
             )
             .when_some(nav_panel, |d, n| d.child(n))
+            .when_some(office_panel, |d, p| d.child(p))
             .child(content)
             .when_some(comments_panel, |d, p| d.child(p))
             .when_some(notes_panel, |d, p| d.child(p))
@@ -27266,9 +30509,7 @@ impl Render for Docxy {
             .size_full()
             .relative()
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(Self::on_key))
-            .on_action(cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)))
-            .on_action(cx.listener(|this, _: &OutdentAction, window, cx| this.shift_tab_key(window, cx)))
+            .key_routing(cx)
             // Ruler drags are tracked at the window level so they keep working when
             // the pointer leaves the thin ruler strip (gpui move events are
             // hitbox-scoped, so a ruler-only handler would stop the moment the
@@ -27287,6 +30528,10 @@ impl Render for Docxy {
                     drop(probe);
                     if old_page != new_page { cx.notify(); }
                 }
+            }))
+            // A right-drag of the grid released off it is cancelled (#707 r2).
+            .on_mouse_up(MouseButton::Right, cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                this.right_release_off_grid(cx);
             }))
             // End a text drag-selection or a ruler drag wherever the button is
             // released; a non-empty text selection pops the mini formatting toolbar.
@@ -27319,8 +30564,6 @@ impl Render for Docxy {
             .when_some(sheet_comment, |d, c| d.child(c))
             .when_some(sheet_cf, |d, c| d.child(c))
             .when_some(sheet_dv_bar, |d, c| d.child(c))
-            .when_some(sheet_filter, |d, c| d.child(c))
-            .when_some(sheet_sort, |d, c| d.child(c))
             .when_some(sheet_rowh, |d, c| d.child(c))
             .when_some(project_prompt, |d, c| d.child(c))
             .when_some(comment_bar, |d, c| d.child(c))
@@ -27343,6 +30586,27 @@ impl Render for Docxy {
 /// Excel column width (character units) → pixels, clamped to a sane range.
 fn col_px(units: f64) -> f32 {
     ((units * 7.0 + 6.0) as f32).clamp(28.0, 320.0)
+}
+
+/// The window root's keyboard: every key to [`Docxy::on_key`] and the two
+/// bound actions (Tab, Shift+Tab), which gpui matches before it delivers a
+/// key-down. Both of `render`'s roots, the Backstage one too, take it from
+/// here: Backstage without it dropped every key a dialog opened from it
+/// should have had (#1027).
+trait KeyRouting: Sized {
+    fn key_routing(self, cx: &mut Context<Docxy>) -> Self;
+}
+
+impl KeyRouting for Div {
+    fn key_routing(self, cx: &mut Context<Docxy>) -> Self {
+        self.on_key_down(cx.listener(Docxy::on_key))
+            .on_action(
+                cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &OutdentAction, window, cx| this.shift_tab_key(window, cx)),
+            )
+    }
 }
 
 // ---- grid geometry (pure; unit-tested in `grid_geom_tests`) --------------
@@ -27892,6 +31156,22 @@ struct GridOverlay {
     edit_in_cell: bool,
     /// Ctrl+Shift+U: the formula bar is about four lines tall (#672).
     fx_expanded: bool,
+    /// The selection's areas other than the active one (#670), shaded like
+    /// it. An INPUT to `area_ix`, which `sheet_el` builds; the row renderer
+    /// reads that.
+    extra_areas: std::rc::Rc<Vec<(u32, u32, u32, u32)>>,
+    /// The cell the Auto Fill Options button (#668) or the Paste Options
+    /// button (#669) hangs off: the bottom-right of what was filled or
+    /// pasted, and which menu it opens.
+    options_button: Option<((u32, u32), menu::GridMenu)>,
+    /// The selection's edges take a press that drags the block (#670):
+    /// one area, the fill handle and drag-and-drop on, nothing being edited
+    /// or pointed at, and no gesture in flight.
+    border_grips: bool,
+    /// `extra_areas` indexed (R17): a drawn cell asks the index, which costs
+    /// a log of the areas, not their rows; a per-row map built each frame
+    /// cost every area's rows (#707 r6).
+    area_ix: std::rc::Rc<gridcore::edit::RectIndex>,
     /// What the dashed brand border outlines this frame: the pointed range,
     /// else a selection spanning more than one cell (`border_range`), with its
     /// rows snapped onto the ones the grid draws (`snap_range_rows`).
@@ -28019,7 +31299,8 @@ fn sheet_row(
         // While a range is being picked the active cell keeps its place with a
         // wash instead of the ring, so only the picked range reads as an outline.
         let ring = selected && !ov.picking && !ov.sel_hidden;
-        let in_range = !ov.sel_hidden && r >= r0 && r <= r1 && c >= c0 && c <= c1;
+        let in_range = !ov.sel_hidden
+            && ((r >= r0 && r <= r1 && c >= c0 && c <= c1) || ov.area_ix.holds(r, c));
         // Cells the fill drag would reach: shaded while the button is down, so
         // the drag reads as a preview and nothing has actually moved yet.
         let in_preview = !in_range
@@ -28220,16 +31501,38 @@ fn sheet_row(
         let ent2 = ent.clone();
         cell = cell.on_click(move |ev, window, cx| {
             let shift = ev.modifiers().shift;
+            let ctrl = ctrl_held(&ev.modifiers());
             let dbl = ev.click_count() >= 2;
-            ent2.update(cx, |this, cx| this.cell_click(r, c, shift, dbl, window, cx));
+            ent2.update(cx, |this, cx| {
+                this.cell_click(r, c, shift, ctrl, dbl, window, cx)
+            });
+        });
+        // A right-click opens the cell menu over this cell (#690, #691).
+        let ent_menu = ent.clone();
+        cell = cell.on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+            cx.stop_propagation();
+            let at = ev.position;
+            ent_menu.update(cx, |this, cx| this.cell_right_click(r, c, at, window, cx));
         });
         // Drag-select: while the left button is held, extend the selection to
         // whatever cell the pointer is over (on_mouse_move is hitbox-scoped, so
         // one fires per cell crossed).
         let ent_drag = ent.clone();
         cell = cell.on_mouse_move(move |ev, _window, cx| {
-            if ev.pressed_button == Some(MouseButton::Left) {
-                ent_drag.update(cx, |this, cx| this.grid_drag_over(r, c, cx));
+            let ctrl = ctrl_held(&ev.modifiers);
+            match ev.pressed_button {
+                Some(MouseButton::Left) => {
+                    ent_drag.update(cx, |this, cx| this.grid_left_drag_over(r, c, ctrl, cx))
+                }
+                Some(MouseButton::Right) => ent_drag.update(cx, |this, cx| {
+                    if this.drops.border_drag.is_some_and(|d| d.right) {
+                        return this.border_drag_over((r, c), ctrl, cx);
+                    }
+                    if this.sheet_fill.is_some_and(|f| f.right) {
+                        this.sheet_fill_over(r, c, cx)
+                    }
+                }),
+                _ => {}
             }
         });
         // A formula's references, each in its own colour — drawn per edge cell
@@ -28344,9 +31647,25 @@ fn sheet_row(
                     // its hitboxes; `pointer-click`/`pointer-drag` do
                     // hit-test, see docs/ui-test-harness.md #545), so the app
                     // has to.
-                    .on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
+                    .on_mouse_down(MouseButton::Left, {
+                        let ent_fill_dn = ent_fill_dn.clone();
+                        move |ev, _w, cx2| {
+                            cx2.stop_propagation();
+                            // A double-click fills down to the neighbour's end.
+                            let dbl = ev.click_count >= 2;
+                            ent_fill_dn.update(cx2, |this, cx2| {
+                                if dbl {
+                                    this.sheet_fill_double(cx2)
+                                } else {
+                                    this.sheet_fill_start(cx2)
+                                }
+                            });
+                        }
+                    })
+                    // A right-drag opens the fill menu where it is let go.
+                    .on_mouse_down(MouseButton::Right, move |_ev, _w, cx2| {
                         cx2.stop_propagation();
-                        ent_fill_dn.update(cx2, |this, cx2| this.sheet_fill_start(cx2));
+                        ent_fill_dn.update(cx2, |this, cx2| this.sheet_fill_start_right(cx2));
                     })
                     .child(
                         // A 6px square in a 1px white surround, so it reads against
@@ -28366,6 +31685,83 @@ fn sheet_row(
                                     .hover(|d| d.bg(hsla_u(BRAND))),
                             ),
                     ),
+            ));
+        }
+        // The selection's edges: a press there drags the block (#670). Thin
+        // strips over each edge cell's outer side, deferred so they see the
+        // press the list would swallow, arming on the press only (as the
+        // fill handle does: they follow the selection, so a sweep passes
+        // under them, and `border_grips` is off while one is in flight).
+        if ov.border_grips && in_range && !ov.sel_hidden {
+            let sides = [
+                (r == r0, "top"),
+                (r == r1, "bottom"),
+                (c == c0, "left"),
+                (c == c1, "right"),
+            ];
+            for (on, side) in sides {
+                if !on {
+                    continue;
+                }
+                let ent_l = ent.clone();
+                let ent_r = ent.clone();
+                let strip = div()
+                    .id(SharedString::from(format!("border-grip-{side}")))
+                    .absolute()
+                    .cursor(CursorStyle::OpenHand)
+                    .map(|d| match side {
+                        "top" => d.top(px(-2.)).left_0().right_0().h(px(4.)),
+                        "bottom" => d.bottom(px(-2.)).left_0().right_0().h(px(4.)),
+                        "left" => d.left(px(-2.)).top_0().bottom_0().w(px(4.)),
+                        _ => d.right(px(-2.)).top_0().bottom_0().w(px(4.)),
+                    })
+                    .on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
+                        cx2.stop_propagation();
+                        ent_l.update(cx2, |this, cx2| this.border_drag_start((r, c), false, cx2));
+                    })
+                    .on_mouse_down(MouseButton::Right, move |_ev, _w, cx2| {
+                        cx2.stop_propagation();
+                        ent_r.update(cx2, |this, cx2| this.border_drag_start((r, c), true, cx2));
+                    });
+                cell = cell.relative().child(deferred(strip));
+            }
+        }
+        // The Auto Fill / Paste Options button, just past the corner of what
+        // was filled or pasted (#668, #669). A press opens its menu.
+        if let Some((_, kind)) = ov.options_button.filter(|&(at, _)| at == (r, c)) {
+            let ent_opts = ent.clone();
+            cell = cell.relative().child(deferred(
+                div()
+                    .id("options-button")
+                    .absolute()
+                    .right(px(-22.))
+                    .bottom(px(-18.))
+                    .w(px(20.))
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(2.))
+                    .border_1()
+                    .border_color(hsla_u(0x7a7a7a))
+                    .bg(hsla_u(0xffffff))
+                    .text_size(px(10.))
+                    .text_color(hsla_u(0x1a1a1a))
+                    .cursor_pointer()
+                    .child(if kind == menu::GridMenu::FillOptions {
+                        "\u{229E}\u{25BE}"
+                    } else {
+                        "\u{1F4CB}\u{25BE}"
+                    })
+                    .on_mouse_down(MouseButton::Left, move |ev, _w, cx2| {
+                        cx2.stop_propagation();
+                        let at = ev.position;
+                        ent_opts.update(cx2, |this, cx2| {
+                            if let Err(e) = this.open_grid_menu(kind, at, cx2) {
+                                this.set_status(e);
+                            }
+                        });
+                    }),
             ));
         }
         // Red corner marker for a commented cell (Excel's note indicator).
@@ -29934,7 +33330,9 @@ fn sheet_el(
                 .collect(),
         )
     };
+    let area_ix = std::rc::Rc::new(gridcore::edit::RectIndex::new(&ov.extra_areas));
     let ov = GridOverlay {
+        area_ix,
         handle_hidden: ov.handle_hidden || corner_under_chart,
         border_rg,
         range_dashed,
@@ -30338,6 +33736,7 @@ fn sheet_el(
                     .text_color(hsla_u(0x333333))
                     .child("\u{25bc}")
                     .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
                         ent_arrow.update(cx, |this, cx| this.sheet_dv_toggle(cx));
                     })
                     .into_any_element(),
@@ -30369,12 +33768,182 @@ fn sheet_el(
                             .hover(|d| d.bg(hsla_u(0xe8f0fe)))
                             .child(SharedString::from(val.clone()))
                             .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                                cx.stop_propagation();
                                 ent_pick.update(cx, |this, cx| this.sheet_dv_pick(v2.clone(), cx));
                             }),
                     );
                 }
                 dv_overlay.push(list.into_any_element());
             }
+        }
+    }
+    // Flash Fill's preview (#666, ENT-105): the values Enter would write,
+    // greyed in their empty cells.
+    if let Some(p) = view.live_preview() {
+        if let Some(cx0) = col_x(p.fill.col) {
+            let cw = col_px(sh.col_width(p.fill.col));
+            for (r, text) in &p.fill.fills {
+                let shown = text.strip_prefix('\'').unwrap_or(text);
+                dv_overlay.push(
+                    div()
+                        .absolute()
+                        .left(px(cx0 + 3.0))
+                        .top(px(row_y(*r)))
+                        .w(px((cw - 6.0).max(0.0)))
+                        .h(px(SHEET_ROW_H))
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .text_size(px(12.))
+                        .text_color(hsla_u(0xa0a0a0))
+                        .child(SharedString::from(shown.to_string()))
+                        .into_any_element(),
+                );
+            }
+        }
+    }
+    // The Flash Fill Options button (#666, ENT-109) by the last cell filled,
+    // while the fill stands; a press opens its menu.
+    if let Some((br, bc)) = view.live_flash().and_then(|f| f.button_cell()) {
+        if let Some(cx0) = col_x(bc) {
+            let cw = col_px(sh.col_width(bc));
+            let ent_btn = ent.clone();
+            dv_overlay.push(
+                div()
+                    .id("flash-fill-options")
+                    .absolute()
+                    .left(px(cx0 + cw + 2.0))
+                    .top(px(row_y(br) + 1.0))
+                    .w(px(18.))
+                    .h(px(SHEET_ROW_H - 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .bg(hsla_u(0xf1f1f1))
+                    .border_1()
+                    .border_color(hsla_u(0x9a9a9a))
+                    .rounded_sm()
+                    .text_size(px(10.))
+                    .text_color(hsla_u(0x333333))
+                    .child("\u{26a1}")
+                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        ent_btn.update(cx, |this, cx| {
+                            // The button is drawn only while a fill stands, so
+                            // the only refusal (no fill) cannot happen here.
+                            let _ = this.open_flash_menu(cx);
+                        });
+                    })
+                    .into_any_element(),
+            );
+        }
+    }
+    // Formula AutoComplete's list (#686) under the cell being edited: each
+    // name with its kind, the highlighted one marked. Keys drive it (Up/Down
+    // move, Tab inserts, Esc closes); a press inserts that item.
+    if let Some(c) = view.complete_view() {
+        let (er, ec) = view
+            .edit_origin
+            .filter(|o| o.0 == view.active)
+            .map_or(view.sel, |(_, r, c)| (r, c));
+        if let Some(cx0) = col_x(ec) {
+            let y = row_y(er);
+            let mut list = v_flex()
+                .id("fx-complete")
+                .absolute()
+                .left(px(cx0))
+                .top(px(y + SHEET_ROW_H))
+                .min_w(px(200.))
+                .max_h(px(220.))
+                .overflow_y_scroll()
+                .track_scroll(&view.fx_scroll)
+                .bg(hsla_u(0xffffff))
+                .border_1()
+                .border_color(hsla_u(0x9a9a9a))
+                .rounded_sm();
+            for (i, item) in c.list.items.iter().enumerate() {
+                let mark = match item.kind {
+                    gridcore::fcomplete::Kind::Function => "fx",
+                    gridcore::fcomplete::Kind::Name => "nm",
+                    gridcore::fcomplete::Kind::Table => "tb",
+                    gridcore::fcomplete::Kind::Column => "co",
+                    gridcore::fcomplete::Kind::Specifier => "",
+                };
+                let ent_pick = ent.clone();
+                list = list.child(
+                    div()
+                        .id(("fx-complete-item", i))
+                        .flex()
+                        .gap_2()
+                        .px_2()
+                        .py(px(2.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(hsla_u(0x1a1a1a))
+                        .when(i == c.sel, |d| d.bg(hsla_u(0xd2e3fc)))
+                        .hover(|d| d.bg(hsla_u(0xe8f0fe)))
+                        .child(div().w(px(16.)).text_color(hsla_u(0x777777)).child(mark))
+                        .child(SharedString::from(item.label.clone()))
+                        .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                            cx.stop_propagation();
+                            ent_pick.update(cx, |this, cx| this.sheet_complete_pick(i, cx));
+                        }),
+                );
+            }
+            dv_overlay.push(list.into_any_element());
+        }
+    }
+    // AutoFilter buttons (#690): an arrow at the right of each header cell of
+    // the sheet's filter, a funnel once its column filters; a press opens the
+    // column's drop-down.
+    let mut filter_buttons: Vec<AnyElement> = Vec::new();
+    if let Some(af) = sh
+        .auto_filter
+        .as_ref()
+        .filter(|af| !sh.row_hidden(af.range.0))
+    {
+        let (r1, c1, _, c2) = af.range;
+        let y = row_y(r1);
+        for c in c1..=c2 {
+            let Some(x0) = col_x(c).filter(|_| !sh.col_hidden(c)) else {
+                continue;
+            };
+            let cw = col_px(sh.col_width(c));
+            // A column that only hides its button is not filtering.
+            let filtered = af.criteria.iter().any(|(k, f)| {
+                *k == c && (!matches!(f, gridcore::filter::ColumnFilter::Raw(_)) || f.is_opaque())
+            });
+            let ent_btn = ent.clone();
+            filter_buttons.push(
+                div()
+                    .id(("filter-button", c as usize))
+                    .absolute()
+                    .left(px(x0 + cw - 17.0))
+                    .top(px(y + 1.0))
+                    .w(px(16.))
+                    .h(px(SHEET_ROW_H - 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .bg(hsla_u(0xf1f1f1))
+                    .border_1()
+                    .border_color(hsla_u(if filtered { 0x217346 } else { 0x9a9a9a }))
+                    .rounded_sm()
+                    .text_size(px(8.))
+                    .text_color(hsla_u(if filtered { 0x217346 } else { 0x333333 }))
+                    .child(probe(
+                        probes,
+                        format!("filter-button:{}", gridcore::sheet::col_name(c)),
+                    ))
+                    .child(if filtered { "\u{29e9}" } else { "\u{25bc}" })
+                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        ent_btn.update(cx, |this, cx| this.sheet_filter_button(c, cx));
+                    })
+                    .into_any_element(),
+            );
         }
     }
     // (The auto-fill handle is drawn inside its own cell — see sheet_row — where
@@ -30391,7 +33960,8 @@ fn sheet_el(
         .overflow_hidden()
         .children(cards)
         .children(note)
-        .children(dv_overlay);
+        .children(dv_overlay)
+        .children(filter_buttons);
 
     let ent_move = ent.clone();
     let ent_up = ent.clone();
@@ -30412,13 +33982,16 @@ fn sheet_el(
         .on_mouse_down(MouseButton::Left, {
             let ent_dn = ent.clone();
             move |ev, _w, cx| {
-                ent_dn.update(cx, |this, cx| this.grid_press(ev.position, cx));
+                let ctrl = ctrl_held(&ev.modifiers);
+                ent_dn.update(cx, |this, cx| this.grid_press(ev.position, ctrl, cx));
             }
         })
         // Column-resize drag: track the pointer and release anywhere in the grid.
         .on_mouse_move(move |ev, _w, cx| {
             let at = (f32::from(ev.position.x), f32::from(ev.position.y));
+            let pos = ev.position;
             ent_move.update(cx, |this, cx| {
+                this.last_pointer = pos;
                 this.col_resize_move(at.0, cx);
                 // A chart move is tracked here rather than on the card, so the
                 // pointer can outrun it without dropping the drag.
@@ -30427,8 +34000,28 @@ fn sheet_el(
                 }
             });
         })
-        .on_mouse_up(MouseButton::Left, move |_ev, _w, cx| {
-            ent_up.update(cx, |this, cx| this.grid_release(cx));
+        .on_mouse_up(MouseButton::Left, {
+            let ent_up = ent_up.clone();
+            move |ev, _w, cx| {
+                let pos = ev.position;
+                ent_up.update(cx, |this, cx| {
+                    this.last_pointer = pos;
+                    this.grid_release(cx)
+                });
+            }
+        })
+        // A right-drag of the fill handle (#668) ends here too.
+        .on_mouse_up(MouseButton::Right, move |ev, _w, cx| {
+            let pos = ev.position;
+            ent_up.update(cx, |this, cx| {
+                this.last_pointer = pos;
+                if this.sheet_fill.is_some_and(|f| f.right) {
+                    this.sheet_fill_end(cx);
+                }
+                if this.drops.border_drag.is_some_and(|d| d.right) {
+                    this.border_drag_end(cx);
+                }
+            });
         })
         .child(bar)
         .child(grid_area)
@@ -30610,6 +34203,12 @@ fn main() {
     if let Some(code) = convert_child::child_main(&std::env::args_os().collect::<Vec<_>>()) {
         std::process::exit(code);
     }
+    // `--version`: the build block, before the crash hook, the control server or
+    // any window (#1023).
+    if harness::parse_args(std::env::args_os().skip(1)).version {
+        about::print_version();
+        return;
+    }
     // First, before anything can panic: the release build has no console, so
     // a panic's only trace is the crash log (#733).
     crashlog::install(config_root());
@@ -30690,44 +34289,21 @@ fn main() {
             }
             // Open any command-line files on top of the restored session.
             if !startup_files.is_empty() {
-                view.update(cx, move |this, cx| this.open_args(startup_files, cli_read_only, cx));
+                view.update(cx, move |this, cx| {
+                    this.open_args(startup_files, cli_read_only, cx)
+                });
             }
             // Hot-exit: capture the latest (possibly unsaved) content when the
             // window is closed, so a restart restores exactly what was open. By
-            // default closing is silent; with "ask before closing" on, confirm
-            // when there are unsaved tabs.
+            // default closing is silent; with "ask before closing" on, each
+            // unsaved document is asked about in turn (#630).
             let on_close = view.clone();
-            window.on_window_should_close(cx, move |_window, cx| {
+            window.on_window_should_close(cx, move |window, cx| {
                 on_close.update(cx, |this, cx| {
-                    close::commit_pending_for_exit(&mut this.tabs);
-                    // A cancelled close keeps the window: repaint the committed cell.
-                    cx.notify();
-                    this.persist();
-                    // ⚠️ Not in a harness instance — the same modal-loop trap as
-                    // `save_sheet_tab` describes, and here it would wedge the
-                    // shutdown the runner waits on after the `quit` verb.
-                    let close = if this.harness.is_none()
-                        && this.ask_on_close
-                        && this.tabs.iter().any(|t| t.dirty)
-                    {
-                        matches!(
-                            rfd::MessageDialog::new()
-                                .set_title("docxy")
-                                .set_description("You have unsaved changes.\n\nClose anyway? Your work is kept and reopened next launch.")
-                                .set_buttons(rfd::MessageButtons::YesNo)
-                                .show(),
-                            rfd::MessageDialogResult::Yes
-                        )
-                    } else {
-                        true
-                    };
-                    // Only an accepted close is a clean exit; a cancelled one
-                    // keeps running, marker and all. The persist above is the
-                    // final one, so only the marker is left.
-                    if close {
-                        this.mark_clean_exit();
-                    }
-                    close
+                    // Not asked in a harness instance: its `quit` must end the
+                    // run it waits on. Its `close-window` verb asks instead.
+                    let ask = this.harness.is_none();
+                    this.window_should_close(ask, window, cx)
                 })
             });
             // AutoRecover (#632): wake when the interval is up (and at least
@@ -30739,7 +34315,7 @@ fn main() {
             //
             // ⚠️ Only `update_in`, never `read_with` / `update`. On Windows a
             // foreground task runs from a window message, and rfd's dialogs
-            // (Open, Save As, the ask-on-close prompt) pump those messages in
+            // (Open, Save As) pump those messages in
             // a modal loop while a gpui listener holds the App borrowed. The
             // plain entity calls `borrow()` the App and panic there, aborting
             // the process with the unsaved work this exists to keep;
@@ -33195,11 +36771,14 @@ mod grid_geom_tests {
         assert_eq!(fill_box(src, (6, 4)), (1, 1, 6, 2));
         assert_eq!(fill_box(src, (4, 6)), (1, 1, 2, 6));
         assert_eq!(fill_box(src, (4, 4)), (1, 1, 4, 2));
-        // Back onto the source, or up/left off it, is the source itself — which
-        // is how `sheet_fill_end` knows there is nothing to fill.
+        // Back onto the handle's own cell is the source itself — which is
+        // how `sheet_fill_end` knows there is nothing to fill.
         assert_eq!(fill_box(src, (2, 2)), src);
-        assert_eq!(fill_box(src, (0, 0)), src);
-        assert_eq!(fill_box(src, (1, 0)), src);
+        // Up and left fill backwards (#668).
+        assert_eq!(fill_box(src, (0, 1)), (0, 1, 2, 2));
+        assert_eq!(fill_box(src, (1, 0)), (1, 0, 2, 2));
+        // Back inside: the cells it leaves are cleared.
+        assert_eq!(fill_box(src, (1, 2)), (1, 1, 1, 2));
     }
 
     #[test]
@@ -34463,7 +38042,8 @@ mod grid_geom_tests {
             bar_target(SheetAct::DataValidation),
             Some(RefTarget::Validation)
         );
-        assert_eq!(bar_target(SheetAct::CustomSort), Some(RefTarget::Sort));
+        // The Sort dialog replaced the sort bar (#691).
+        assert_eq!(bar_target(SheetAct::CustomSort), None);
         // Text to Columns opens a wizard dialog, not a bar (#692).
         assert_eq!(bar_target(SheetAct::TextToColumns), None);
         // The bars without a range field — and everything else — get none.
@@ -34509,12 +38089,20 @@ mod grid_geom_tests {
         }
         // Every command that opens a bar seeded from the selection is one, or
         // the bar would open on cells nothing on screen marked.
-        for act in [
-            SheetAct::CondFormat,
-            SheetAct::DataValidation,
-            SheetAct::CustomSort,
-        ] {
+        for act in [SheetAct::CondFormat, SheetAct::DataValidation] {
             assert!(super::bar_target(act).is_some() && act_targets_cells(act));
+        }
+        // So does every Sort & Filter command: the Sort dialog and A to Z
+        // sort the selection, Filter puts buttons over it (#690, #691).
+        for act in [
+            SheetAct::CustomSort,
+            SheetAct::SortAsc,
+            SheetAct::Filter,
+            SheetAct::AdvancedFilter,
+            SheetAct::FilterBy(gridcore::filter::ByCell::Value),
+            SheetAct::PutOnTop(crate::sheet_sort::OnTop::Icon),
+        ] {
+            assert!(act_targets_cells(act));
         }
         // The Text to Columns wizard converts the selected column.
         assert!(act_targets_cells(SheetAct::TextToColumns));
@@ -34540,38 +38128,6 @@ mod grid_geom_tests {
     }
 
     #[test]
-    fn clear_filter_unhides_the_filtered_rows_of_the_region_around_the_cursor() {
-        use super::{Surface, new_sheet_surface};
-        use gridcore::sheet::Cell;
-        let Surface::Sheet(mut v) = new_sheet_surface() else {
-            unreachable!()
-        };
-        // Two regions, A1:A4 and A6:A7, split by the blank row 5.
-        for r in [0, 1, 2, 3, 5, 6] {
-            let s = v.active;
-            v.engine
-                .set_cell(&mut v.pkg.workbook, (s, r, 0), Cell::number(f64::from(r)));
-        }
-        let sh = &mut v.pkg.workbook.sheets[0];
-        sh.set_row_filtered(1, true);
-        sh.set_row_filtered(3, true);
-        sh.set_row_filtered(6, true);
-        v.sel = (2, 0);
-        assert!(v.clear_filter());
-        let sh = &v.pkg.workbook.sheets[0];
-        for r in 0..=3 {
-            assert!(!sh.row_hidden(r) && !sh.row_filtered(r), "row {r}");
-        }
-        assert!(sh.row_filtered(6), "the other region keeps its filter");
-        // Nothing left to clear: no change, so the tab is not dirtied.
-        assert!(!v.clear_filter());
-        // An empty cursor row has no region.
-        v.sel = (4, 0);
-        assert!(!v.clear_filter());
-        assert!(v.pkg.workbook.sheets[0].row_filtered(6));
-    }
-
-    #[test]
     fn protected_view_refuses_every_outline_command() {
         use super::SheetAct;
         // Each writes the outline, `hidden` or `collapsed` into the file.
@@ -34589,6 +38145,15 @@ mod grid_geom_tests {
             SheetAct::Consolidate,
             // Clear writes `hidden` too (#696).
             SheetAct::ClearFilter,
+            // Every Sort & Filter command writes rows or cells (#690, #691).
+            SheetAct::Filter,
+            SheetAct::ReapplyFilter,
+            SheetAct::AdvancedFilter,
+            SheetAct::FilterBy(gridcore::filter::ByCell::Value),
+            SheetAct::PutOnTop(crate::sheet_sort::OnTop::CellColor),
+            SheetAct::SortAsc,
+            SheetAct::SortDesc,
+            SheetAct::CustomSort,
         ] {
             assert!(!super::protected_view_allows_act(act), "{act:?}");
         }
@@ -34596,13 +38161,25 @@ mod grid_geom_tests {
     }
 
     #[test]
+    fn protected_view_lets_the_cell_menus_copy_through_and_nothing_else() {
+        // The cell menu's items are `Act::Sheet`, gated by the menu click.
+        use crate::{Act, SheetAct, protected_view_allows_doc_act as allows};
+        assert!(allows(Act::Sheet(SheetAct::Copy)));
+        for act in [
+            SheetAct::Cut,
+            SheetAct::Paste,
+            SheetAct::NewComment,
+            SheetAct::SortAsc,
+            SheetAct::FilterBy(gridcore::filter::ByCell::Value),
+        ] {
+            assert!(!allows(Act::Sheet(act)), "{act:?}");
+        }
+    }
+
+    #[test]
     fn bar_fields_are_ranges_and_take_the_keyboard_first() {
         use super::RefTarget;
-        for t in [
-            RefTarget::CondFormat,
-            RefTarget::Validation,
-            RefTarget::Sort,
-        ] {
+        for t in [RefTarget::CondFormat, RefTarget::Validation] {
             assert!(
                 t.is_bar(),
                 "{t:?} sits inside a bar, so it is asked before the bar's own buffer"
@@ -34733,9 +38310,8 @@ mod grid_geom_tests {
         // A dropdown is read where the boxes are, which is commonly not the
         // sheet the list was typed on.
         assert!(takes(Validation));
-        // A rule and a sort act on the rows in front of you.
+        // A rule acts on the rows in front of you.
         assert!(!takes(CondFormat));
-        assert!(!takes(Sort));
         // Not a range at all — the question doesn't apply.
         assert!(!takes(ChartTitle));
     }
@@ -34795,28 +38371,26 @@ mod grid_geom_tests {
     }
 
     #[test]
-    fn a_rule_a_sort_and_a_split_still_refuse_another_sheet() {
+    fn a_rule_still_refuses_another_sheet() {
         use super::{RefTarget, bar_ref_text};
         let wb: Vec<String> = ["Sheet1", "Lookup"].iter().map(|s| s.to_string()).collect();
-        for target in [RefTarget::CondFormat, RefTarget::Sort] {
-            // Refused even though the sheet EXISTS — the objection is that
-            // these act on the rows in view, not that the name is unknown.
-            assert_eq!(
-                bar_ref_text("Lookup!A1:A9", target, &wb, 0),
-                Err("\"Lookup\" is another sheet; this acts on Sheet1".to_string()),
-                "{target:?} took a foreign sheet"
-            );
-            // A range on the sheet in front of you is what they want, and the
-            // index they answer with is always that sheet.
-            assert_eq!(
-                bar_ref_text("B2:D5", target, &wb, 0),
-                Ok((0, "=Sheet1!$B$2:$D$5".to_string()))
-            );
-            assert_eq!(
-                bar_ref_text("A1:A9", target, &wb, 1),
-                Ok((1, "=Lookup!$A$1:$A$9".to_string()))
-            );
-        }
+        let target = RefTarget::CondFormat;
+        // Refused even though the sheet EXISTS — the objection is that a
+        // rule acts on the rows in view, not that the name is unknown.
+        assert_eq!(
+            bar_ref_text("Lookup!A1:A9", target, &wb, 0),
+            Err("\"Lookup\" is another sheet; this acts on Sheet1".to_string()),
+        );
+        // A range on the sheet in front of you is what it wants, and the
+        // index it answers with is always that sheet.
+        assert_eq!(
+            bar_ref_text("B2:D5", target, &wb, 0),
+            Ok((0, "=Sheet1!$B$2:$D$5".to_string()))
+        );
+        assert_eq!(
+            bar_ref_text("A1:A9", target, &wb, 1),
+            Ok((1, "=Lookup!$A$1:$A$9".to_string()))
+        );
     }
 
     #[test]
@@ -34829,11 +38403,7 @@ mod grid_geom_tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        for target in [
-            RefTarget::CondFormat,
-            RefTarget::Validation,
-            RefTarget::Sort,
-        ] {
+        for target in [RefTarget::CondFormat, RefTarget::Validation] {
             for active in 0..wb.len() {
                 let seed = ref_a1(Some(wb[active].as_str()), (1, 1, 4, 3));
                 assert_eq!(
@@ -34843,22 +38413,6 @@ mod grid_geom_tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn sort_uses_the_field_only_when_it_names_rows() {
-        use super::sort_rows_from;
-        let region = Some((1, 8));
-        // An explicit multi-row range sorts exactly those rows.
-        assert_eq!(sort_rows_from(Some((3, 0, 6, 2)), region), Some((3, 6)));
-        // One row, or one cell, says nothing useful — keep the found region.
-        assert_eq!(sort_rows_from(Some((3, 0, 3, 2)), region), region);
-        assert_eq!(sort_rows_from(None, region), region);
-        // With no region either, there is nothing to sort.
-        assert_eq!(sort_rows_from(Some((3, 0, 3, 2)), None), None);
-        assert_eq!(sort_rows_from(None, None), None);
-        // A field range still wins when no region was found.
-        assert_eq!(sort_rows_from(Some((0, 0, 4, 1)), None), Some((0, 4)));
     }
 
     #[test]
@@ -35313,11 +38867,7 @@ mod grid_geom_tests {
         assert!(keeps_panel_field(Some(3), 3, None));
 
         // A sheet bar pointing at the grid over an open panel: dropped.
-        for f in [
-            RefTarget::CondFormat,
-            RefTarget::Validation,
-            RefTarget::Sort,
-        ] {
+        for f in [RefTarget::CondFormat, RefTarget::Validation] {
             assert!(
                 !keeps_panel_field(Some(3), 3, Some(f)),
                 "{f:?} is the sheet's"
