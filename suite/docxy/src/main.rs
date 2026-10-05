@@ -3369,6 +3369,11 @@ struct Docxy {
     // In-progress cell-comment entry for the selected cell (the input buffer);
     // None = the comment bar is closed.
     sheet_comment_edit: Option<String>,
+    // The cell a comment bar opened on and the text it opened with (its
+    // seed): the selection moves freely while the bar is open, and an exit
+    // commit must land on the bar's cell and tell an untouched buffer from
+    // an edit. Set where the buffer opens, cleared with it.
+    sheet_comment_seed: Option<((u32, u32), String)>,
     // Whether the data-validation list dropdown is open on the selected cell.
     sheet_dv_open: bool,
     // Whether the Number-group format picker strip is open.
@@ -9168,6 +9173,7 @@ impl Docxy {
             sheet_rename: None,
             sheet_grid_w: 1000.0,
             sheet_comment_edit: None,
+            sheet_comment_seed: None,
             sheet_dv_open: false,
             sheet_numfmt_open: false,
             sheet_fmt_open: false,
@@ -10013,7 +10019,7 @@ impl Docxy {
         // there, a Protected View tab included (#610).
         self.sheet_rename = None;
         self.sheet_rowh_edit = None;
-        self.sheet_comment_edit = None;
+        self.sheet_comment_bar_close();
         self.sheet_fill = None;
         self.formula_pick = None;
     }
@@ -10609,7 +10615,7 @@ impl Docxy {
     fn typing_bars_close(&mut self) {
         self.project_prompt_cancel();
         self.bar_close();
-        self.sheet_comment_edit = None;
+        self.sheet_comment_bar_close();
         self.sheet_rowh_edit = None;
         self.find_open = false;
     }
@@ -12781,13 +12787,25 @@ impl Docxy {
             .map(|cm| cm.text)
     }
 
-    /// Open the comment entry bar for the selected cell, seeded with its existing
-    /// comment text (so New Comment doubles as Edit).
+    /// Open the comment entry bar for the selected cell, seeded with its
+    /// existing comment text (so New Comment doubles as Edit). The seed — the
+    /// cell and the raw text — is remembered with the buffer: the selection
+    /// moves freely while the bar is open, and an exit commit must land on
+    /// the bar's cell and skip a buffer that is the seed, untouched.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
-        if self.active_sheet().is_some() {
-            self.sheet_comment_edit = Some(self.selected_comment().unwrap_or_default());
+        if let Some(cell) = self.active_sheet().map(|v| v.sel) {
+            let text = self.selected_comment().unwrap_or_default();
+            self.sheet_comment_seed = Some((cell, text.clone()));
+            self.sheet_comment_edit = Some(text);
             cx.notify();
         }
+    }
+
+    /// Drop the comment bar: its buffer and, with it, the seed that says
+    /// which note and text it opened on.
+    fn sheet_comment_bar_close(&mut self) {
+        self.sheet_comment_edit = None;
+        self.sheet_comment_seed = None;
     }
 
     /// Route a keystroke into the conditional-format entry bar; Enter applies the
@@ -12950,7 +12968,7 @@ impl Docxy {
         };
         match key {
             "escape" => {
-                self.sheet_comment_edit = None;
+                self.sheet_comment_bar_close();
                 cx.notify();
             }
             "enter" => self.sheet_commit_comment(cx),
@@ -12979,6 +12997,7 @@ impl Docxy {
         let Some(text) = self.sheet_comment_edit.take() else {
             return;
         };
+        self.sheet_comment_bar_close();
         let author = self.comment_author();
         if let Some(t) = self.tabs.get_mut(self.active) {
             crate::close::commit_comment_buffer(t, &author, &text);
@@ -24369,7 +24388,7 @@ impl Docxy {
             .child(
                 btn("Cancel", false).on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
                     ent_cancel.update(cx, |this, cx| {
-                        this.sheet_comment_edit = None;
+                        this.sheet_comment_bar_close();
                         cx.notify();
                     });
                 }),

@@ -157,11 +157,11 @@ pub(crate) fn commit_rename_buffer(tab: &mut DocTab, idx: usize, buf: &str) -> b
 /// The exit path's rename commit ([`commit_rename_buffer`] minus one quirk).
 /// The rename bar seeds its buffer with the sheet's current name, so a merely
 /// OPEN bar holds an unchanged buffer — and `rename_sheet` takes a same-name
-/// rename (its taken-name check looks at the OTHER sheets), which would dirty
-/// the tab and ask about a change that never happened. So a buffer that
-/// equals the current name is skipped; the compare is on the trimmed buffer,
-/// exact, so a case-only rename still commits. Enter's path keeps the quirk,
-/// Must-not-change.
+/// rename (its taken-name check looks at the OTHER sheets, and it trims), so
+/// a sheet loaded as "Data " would be renamed to "Data", rewriting formulas
+/// and dirtying the tab for nothing. The skip therefore compares both sides
+/// trimmed — `rename_sheet`'s own semantics; a case-only rename still
+/// commits, its trims differ. Enter's path keeps the quirk, Must-not-change.
 pub(crate) fn commit_rename_buffer_for_exit(tab: &mut DocTab, idx: usize, buf: &str) -> bool {
     let unchanged = match &tab.surface {
         Surface::Sheet(v) => v
@@ -169,7 +169,7 @@ pub(crate) fn commit_rename_buffer_for_exit(tab: &mut DocTab, idx: usize, buf: &
             .workbook
             .sheets
             .get(idx)
-            .is_some_and(|s| s.name == buf.trim()),
+            .is_some_and(|s| s.name.trim() == buf.trim()),
         _ => true,
     };
     if unchanged {
@@ -198,37 +198,61 @@ pub(crate) fn commit_comment_buffer(tab: &mut DocTab, author: &str, text: &str) 
     true
 }
 
-/// The exit path's comment commit ([`commit_comment_buffer`] minus two
-/// quirks). Enter marks the tab dirty whenever its commit returns `true`, and
-/// its commit returns `true` even when nothing changes — an empty buffer
-/// deletes a comment that isn't there, and a re-set comment restamps its
-/// author — harmless for a keypress, but at exit the bar may merely have been
-/// OPEN (to read a colleague's note, say), and a dirty tab then asks about
-/// changes that never happened. So the commit is skipped in the two cases
-/// where it cannot change anything (`commit_changed_cell`'s seeded-and-
-/// unchanged rule): an empty buffer on a cell with no comment, and a buffer
-/// that equals the comment already there. A cell WITH a comment and an empty
-/// buffer still commits — that deletes, as Enter would.
-pub(crate) fn commit_comment_buffer_for_exit(tab: &mut DocTab, author: &str, text: &str) -> bool {
-    let noop = match &tab.surface {
-        Surface::Sheet(v) => {
-            let trimmed = text.trim();
-            match v
-                .pkg
-                .comments()
-                .iter()
-                .find(|cm| cm.sheet == v.active && cm.row == v.sel.0 && cm.col == v.sel.1)
-            {
-                Some(cm) => cm.text == trimmed,
-                None => trimmed.is_empty(),
-            }
-        }
-        _ => true,
+/// The exit path's comment commit. The bar edits the note on the cell it was
+/// OPENED on — `cell`, with `seed` the raw text it opened with — and the
+/// commit lands there: a click moves the selection without closing the bar
+/// (only range fields point), so committing to the selected cell would delete
+/// or copy notes onto whatever cell was clicked last. The commit is skipped
+/// when it cannot change anything (Enter would dirty the tab, restamp the
+/// author and spend a whole-package undo step for these): the buffer equals
+/// the seed (raw compare — a file-loaded note keeps its whitespace, so a note
+/// "note\n" seeds "note\n" and a bar opened to read it must not rewrite it
+/// as "note"), or the note on `cell` already trims to the buffer (retyped or
+/// unchanged text; committing would only restamp its author). Enter's own
+/// path is [`commit_comment_buffer`], unchanged.
+pub(crate) fn commit_comment_buffer_for_exit(
+    tab: &mut DocTab,
+    cell: (u32, u32),
+    seed: &str,
+    author: &str,
+    text: &str,
+) -> bool {
+    if tab.access.locked() {
+        return false;
+    }
+    let Surface::Sheet(v) = &mut tab.surface else {
+        return false;
     };
+    let trimmed = text.trim();
+    let noop = text == seed
+        || match v
+            .pkg
+            .comments()
+            .iter()
+            .find(|cm| cm.sheet == v.active && cm.row == cell.0 && cm.col == cell.1)
+        {
+            Some(cm) => cm.text.trim() == trimmed,
+            // No note there: an empty buffer's delete is the only no-op; the
+            // seed compare above covers the empty-on-empty case, this covers
+            // a note deleted under the bar while it was open.
+            None => trimmed.is_empty(),
+        };
     if noop {
         return false;
     }
-    commit_comment_buffer(tab, author, text)
+    // `comment_cell` acts on the selection; aim it at the bar's cell for the
+    // commit, then put the selection back.
+    let saved = v.sel;
+    v.sel = cell;
+    // The view takes the undo step itself: the whole package.
+    let ok = v.comment_cell(author, text);
+    v.sel = saved;
+    if !ok {
+        tab.status = DAMAGED_SHEET_STATUS.into();
+        return false;
+    }
+    tab.dirty = true;
+    true
 }
 
 /// Commit a sheet's open cell editor unless it was seeded from a cell and left
@@ -596,8 +620,16 @@ impl Docxy {
     pub(crate) fn commit_dialog_buffers_for_exit(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = self.sheet_comment_edit.take() {
             let author = self.comment_author();
+            // The bar edits the note on the cell it opened on, wherever the
+            // selection went while it was open; the seed is the text it
+            // opened with. The fallback is unreachable while the seed is set
+            // wherever the buffer is.
+            let (cell, seed) = self.sheet_comment_seed.take().unwrap_or_else(|| {
+                let cell = self.active_sheet().map(|v| v.sel).unwrap_or_default();
+                (cell, self.selected_comment().unwrap_or_default())
+            });
             if let Some(t) = self.tabs.get_mut(self.active) {
-                commit_comment_buffer_for_exit(t, &author, &text);
+                commit_comment_buffer_for_exit(t, cell, &seed, &author, &text);
             }
         }
         if let Some((idx, buf)) = self.sheet_rename.take() {

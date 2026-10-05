@@ -2301,8 +2301,11 @@ fn exit_commits_typed_comment_and_marks_tab_dirty() {
         v.sel = (0, 0);
     }
     assert!(!tabs[0].dirty);
+    // The bar opened on A1, empty; the user typed and closed the window.
     assert!(commit_comment_buffer_for_exit(
         &mut tabs[0],
+        (0, 0),
+        "",
         "Jane Doe",
         "Check this"
     ));
@@ -2382,6 +2385,8 @@ fn tab_level_exit_commits_leave_cf_dv_and_rowh_alone() {
     // of it, even while they commit what they do own.
     assert!(commit_comment_buffer_for_exit(
         &mut t,
+        (0, 0),
+        "",
         "Jane Doe",
         "Check this"
     ));
@@ -2411,11 +2416,15 @@ fn exit_with_empty_comment_buffer_does_not_dirty_clean_tab() {
     assert!(cell_comment(&tabs[0]).is_none());
     assert!(!commit_comment_buffer_for_exit(
         &mut tabs[0],
+        (1, 1),
+        "",
         "Jane Doe",
         ""
     ));
     assert!(!commit_comment_buffer_for_exit(
         &mut tabs[0],
+        (1, 1),
+        "",
         "Jane Doe",
         "   "
     ));
@@ -2434,12 +2443,21 @@ fn exit_with_empty_comment_buffer_does_not_dirty_clean_tab() {
     }
     assert!(commit_comment_buffer_for_exit(
         &mut t,
+        (2, 2),
+        "",
         "Jane Doe",
         "Check this"
     ));
-    // The delete must be what dirties: reset, then commit the empty buffer.
+    // The delete must be what dirties: reset, then a fresh bar on the
+    // commented cell, its buffer cleared, commits the delete at exit.
     t.dirty = false;
-    assert!(commit_comment_buffer_for_exit(&mut t, "Jane Doe", ""));
+    assert!(commit_comment_buffer_for_exit(
+        &mut t,
+        (2, 2),
+        "Check this",
+        "Jane Doe",
+        ""
+    ));
     assert!(t.dirty);
     assert!(cell_comment(&t).is_none());
 
@@ -2478,6 +2496,8 @@ fn exit_does_not_edit_a_protected_sheet() {
         }
         assert!(!commit_comment_buffer_for_exit(
             &mut t,
+            (0, 0),
+            "",
             "Jane Doe",
             "Check this"
         ));
@@ -2545,11 +2565,15 @@ fn exit_with_unchanged_prefilled_comment_keeps_author_undo_and_clean_tab() {
     t.dirty = false;
     assert!(!commit_comment_buffer_for_exit(
         &mut t,
+        (0, 0),
+        "Original note",
         "John Smith",
         "Original note"
     ));
     assert!(!commit_comment_buffer_for_exit(
         &mut t,
+        (0, 0),
+        "Original note",
         "John Smith",
         "  Original note  "
     ));
@@ -2575,4 +2599,154 @@ fn exit_with_unchanged_prefilled_comment_keeps_author_undo_and_clean_tab() {
     assert!(v.undo_step());
     assert!(!v.undo_step());
     assert!(cell_comment(&t).is_none());
+}
+
+#[test]
+fn exit_with_unchanged_rename_buffer_leaves_trailing_space_sheet_clean() {
+    let mut t = tab(Kind::Xlsx);
+    // A sheet name as a file can hold it — `rename_sheet` would trim it, so
+    // the name is set on the model directly.
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.pkg.workbook.sheets[0].name = "Data ".into();
+    }
+    // The rename bar seeds the buffer with the raw name; a bar merely OPEN
+    // must not rename "Data " to "Data" (rewriting formulas, dirtying the
+    // tab). The skip compares both sides trimmed, so padding skips too.
+    assert!(!commit_rename_buffer_for_exit(&mut t, 0, "Data "));
+    assert!(!commit_rename_buffer_for_exit(&mut t, 0, "  Data  "));
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.pkg.workbook.sheets[0].name, "Data ");
+
+    // A case-only rename is not "unchanged" — the trims differ — so it still
+    // commits and is taken (only names the OTHER sheets hold decline).
+    assert!(commit_rename_buffer_for_exit(&mut t, 0, "data"));
+    assert!(t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.pkg.workbook.sheets[0].name, "data");
+}
+
+#[test]
+fn exit_with_untouched_buffer_keeps_a_whitespace_note_intact() {
+    // A file-loaded note keeps its whitespace; the bar seeds with the raw
+    // text (written here straight into the model, the way a load leaves it).
+    // An untouched buffer must not rewrite the note (trim it, restamp the
+    // author) — and a whitespace-only note must not be deleted by the
+    // empty-looking buffer.
+    let mut t = tab(Kind::Xlsx);
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        assert!(v.pkg.set_comment(v.active, 0, 0, "Jane Doe", "note\n"));
+        assert!(v.pkg.set_comment(v.active, 1, 1, "Jane Doe", "\n"));
+    }
+    assert!(!commit_comment_buffer_for_exit(
+        &mut t,
+        (0, 0),
+        "note\n",
+        "John Smith",
+        "note\n"
+    ));
+    assert!(!commit_comment_buffer_for_exit(
+        &mut t,
+        (1, 1),
+        "\n",
+        "John Smith",
+        ""
+    ));
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    let at = |r: u32, c: u32| {
+        v.pkg
+            .comments()
+            .into_iter()
+            .find(|cm| cm.sheet == v.active && cm.row == r && cm.col == c)
+    };
+    let note = at(0, 0).expect("the note");
+    assert_eq!(note.text, "note\n");
+    assert_eq!(note.author, "Jane Doe");
+    assert!(at(1, 1).is_some(), "the whitespace-only note survives");
+}
+
+#[test]
+fn exit_comment_commit_targets_the_bar_cell_not_the_selection() {
+    // The bar opened on empty A1; the user typed, then clicked C5 — the
+    // selection moved, the bar stayed open (only range fields point). The
+    // commit lands on A1, the bar's cell, and the selection is left where
+    // the click put it.
+    let mut t = tab(Kind::Xlsx);
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.sel = (4, 4);
+    }
+    assert!(commit_comment_buffer_for_exit(
+        &mut t,
+        (0, 0),
+        "",
+        "Jane Doe",
+        "Typed note"
+    ));
+    assert!(t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    let at = |r: u32, c: u32| {
+        v.pkg
+            .comments()
+            .iter()
+            .any(|cm| cm.sheet == v.active && cm.row == r && cm.col == c)
+    };
+    assert!(at(0, 0), "on the bar's cell");
+    assert!(!at(4, 4), "not on the selected cell");
+    assert_eq!(
+        v.sel,
+        (4, 4),
+        "the selection is back where the click left it"
+    );
+}
+
+#[test]
+fn exit_comment_bar_untouched_survives_a_moved_selection() {
+    // A colleague's note on B2, opened in the bar to read; a click moved the
+    // selection to C5. Exiting must neither delete B2's note nor copy it to
+    // C5 — the buffer is the seed, and the bar's cell is where it would land.
+    let mut t = tab(Kind::Xlsx);
+    {
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        assert!(v.pkg.set_comment(v.active, 1, 1, "Jane Doe", "B2 note"));
+        v.sel = (2, 2);
+    }
+    assert!(!commit_comment_buffer_for_exit(
+        &mut t,
+        (1, 1),
+        "B2 note",
+        "John Smith",
+        "B2 note"
+    ));
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    let at = |r: u32, c: u32| {
+        v.pkg
+            .comments()
+            .iter()
+            .any(|cm| cm.sheet == v.active && cm.row == r && cm.col == c)
+    };
+    assert!(at(1, 1), "B2 keeps its note, author unstamped");
+    assert!(!at(2, 2), "C5 gets no copy");
 }
