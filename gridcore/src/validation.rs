@@ -329,6 +329,122 @@ fn outside(dv: &DataValidation, n: f64, b1: Option<f64>, b2: Option<f64>) -> boo
     !ok
 }
 
+// --- what a Data Validation dialog offers ------------------------------
+
+/// Excel's limit on an input or error title.
+pub const TITLE_MAX: usize = 32;
+/// Excel's limit on an input or error message.
+pub const MESSAGE_MAX: usize = 255;
+
+/// "Allow:" choices, in Excel's order: the rule's `type` (empty is Any value)
+/// and its name.
+pub const KINDS: [(&str, &str); 8] = [
+    ("", "Any value"),
+    ("whole", "Whole number"),
+    ("decimal", "Decimal"),
+    ("list", "List"),
+    ("date", "Date"),
+    ("time", "Time"),
+    ("textLength", "Text length"),
+    ("custom", "Custom"),
+];
+
+/// "Data:" choices, in Excel's order: the `operator` and its name.
+pub const OPERATORS: [(&str, &str); 8] = [
+    ("between", "between"),
+    ("notBetween", "not between"),
+    ("equal", "equal to"),
+    ("notEqual", "not equal to"),
+    ("greaterThan", "greater than"),
+    ("lessThan", "less than"),
+    ("greaterThanOrEqual", "greater than or equal to"),
+    ("lessThanOrEqual", "less than or equal to"),
+];
+
+/// Does a rule of this `type` compare against bounds (so offers a "Data:"
+/// operator)?
+pub fn takes_operator(kind: &str) -> bool {
+    matches!(kind, "whole" | "decimal" | "date" | "time" | "textLength")
+}
+
+/// Does `kind` with `operator` need two bounds?
+pub fn takes_two(kind: &str, operator: &str) -> bool {
+    takes_operator(kind) && matches!(operator, "between" | "notBetween")
+}
+
+/// The caption of the first bound's box.
+pub fn first_label(kind: &str, operator: &str) -> &'static str {
+    match kind {
+        "list" => "Source:",
+        "custom" => "Formula:",
+        _ if takes_two(kind, operator) => "Minimum:",
+        "date" => "Date:",
+        "time" => "Time:",
+        "textLength" => "Length:",
+        _ => "Value:",
+    }
+}
+
+/// What the box for a rule's first formula shows: an inline list as its
+/// items, a reference or any formula behind `=` (a list) or as it is.
+pub fn first_box(dv: &DataValidation) -> String {
+    if dv.kind == "list" {
+        return match dv.list_values() {
+            Some(items) => items.join(","),
+            None => format!("={}", dv.formula1),
+        };
+    }
+    dv.formula1.clone()
+}
+
+/// The `(formula1, formula2)` of a rule from the dialog's boxes: a list's
+/// text is its items (`Yes, No`) or, behind `=`, a reference or name; any
+/// other `=` is the formula bar's and is dropped. The reason a box is
+/// missing otherwise.
+pub fn formulas_from_boxes(
+    kind: &str,
+    operator: &str,
+    first: &str,
+    second: &str,
+) -> Result<(String, String), String> {
+    let first = first.trim();
+    if first.is_empty() {
+        return Err(match kind {
+            "list" => "Data validation: enter the list's source".to_string(),
+            "custom" => "Data validation: enter a formula".to_string(),
+            _ if takes_two(kind, operator) => "Data validation: enter a minimum".to_string(),
+            _ => "Data validation: enter a value".to_string(),
+        });
+    }
+    let bare = |t: &str| t.strip_prefix('=').unwrap_or(t).trim().to_string();
+    let f1 = if kind == "list" {
+        match first.strip_prefix('=') {
+            Some(f) => f.trim().to_string(),
+            None => {
+                let items: Vec<&str> = first
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if items.is_empty() {
+                    return Err("Data validation: enter the list's source".to_string());
+                }
+                format!("\"{}\"", items.join(","))
+            }
+        }
+    } else {
+        bare(first)
+    };
+    if !takes_two(kind, operator) {
+        return Ok((f1, String::new()));
+    }
+    let second = second.trim();
+    if second.is_empty() {
+        return Err("Data validation: enter a maximum".to_string());
+    }
+    Ok((f1, bare(second)))
+}
+
 // --- editing the rules -------------------------------------------------
 
 type Rect = (u32, u32, u32, u32);

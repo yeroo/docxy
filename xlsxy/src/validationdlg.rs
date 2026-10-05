@@ -13,33 +13,8 @@ use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 
-/// Excel's limits on an input or error title and message.
-pub const TITLE_MAX: usize = 32;
-pub const MESSAGE_MAX: usize = 255;
-
-/// "Allow:" choices, in Excel's order: the rule's `type` ("" is Any value).
-const KINDS: [(&str, &str); 8] = [
-    ("", "Any value"),
-    ("whole", "Whole number"),
-    ("decimal", "Decimal"),
-    ("list", "List"),
-    ("date", "Date"),
-    ("time", "Time"),
-    ("textLength", "Text length"),
-    ("custom", "Custom"),
-];
-
-/// "Data:" choices, in Excel's order.
-const OPERATORS: [(&str, &str); 8] = [
-    ("between", "between"),
-    ("notBetween", "not between"),
-    ("equal", "equal to"),
-    ("notEqual", "not equal to"),
-    ("greaterThan", "greater than"),
-    ("lessThan", "less than"),
-    ("greaterThanOrEqual", "greater than or equal to"),
-    ("lessThanOrEqual", "less than or equal to"),
-];
+use gridcore::validation::{KINDS, OPERATORS};
+pub use gridcore::validation::{MESSAGE_MAX, TITLE_MAX};
 
 const STYLES: [(AlertStyle, &str); 3] = [
     (AlertStyle::Stop, "Stop"),
@@ -104,18 +79,6 @@ pub struct ValidationDialog {
     focus: usize,
 }
 
-/// A rule's formula as the box shows it: an inline list as its items, a
-/// reference or any formula behind `=`.
-fn shown(dv: &DataValidation, f: &str) -> String {
-    if dv.kind == "list" {
-        if let Some(items) = dv.list_values() {
-            return items.join(",");
-        }
-        return format!("={f}");
-    }
-    f.to_string()
-}
-
 impl ValidationDialog {
     /// The dialog showing `current`, the rule on the selection's first cell
     /// (or Excel's defaults when it has none).
@@ -140,7 +103,7 @@ impl ValidationDialog {
                 .iter()
                 .position(|o| o.0 == dv.operator)
                 .unwrap_or(0),
-            first: shown(dv, &dv.formula1),
+            first: gridcore::validation::first_box(dv),
             second: dv.formula2.clone(),
             ignore_blank: dv.allow_blank,
             dropdown: dv.show_dropdown,
@@ -164,14 +127,11 @@ impl ValidationDialog {
     }
 
     fn takes_operator(&self) -> bool {
-        matches!(
-            self.kind_name(),
-            "whole" | "decimal" | "date" | "time" | "textLength"
-        )
+        gridcore::validation::takes_operator(self.kind_name())
     }
 
     fn takes_two(&self) -> bool {
-        self.takes_operator() && matches!(OPERATORS[self.op].0, "between" | "notBetween")
+        gridcore::validation::takes_two(self.kind_name(), OPERATORS[self.op].0)
     }
 
     fn fields(&self) -> Vec<Field> {
@@ -305,62 +265,18 @@ impl ValidationDialog {
             dv.allow_blank = true;
             return Ok(dv);
         }
-        let first = self.first.trim();
-        if first.is_empty() {
-            return Err(match kind {
-                "list" => "Data validation: enter the list's source".to_string(),
-                "custom" => "Data validation: enter a formula".to_string(),
-                _ if self.takes_two() => "Data validation: enter a minimum".to_string(),
-                _ => "Data validation: enter a value".to_string(),
-            });
-        }
+        let operator = OPERATORS[self.op].0;
         if self.takes_operator() {
-            dv.operator = OPERATORS[self.op].0.to_string();
+            dv.operator = operator.to_string();
         }
-        match kind {
-            "list" => {
-                dv.formula1 = match first.strip_prefix('=') {
-                    Some(f) => f.trim().to_string(),
-                    None => {
-                        let items: Vec<&str> = first
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        if items.is_empty() {
-                            return Err("Data validation: enter the list's source".to_string());
-                        }
-                        format!("\"{}\"", items.join(","))
-                    }
-                };
-            }
-            _ => dv.formula1 = first.strip_prefix('=').unwrap_or(first).trim().to_string(),
-        }
-        if self.takes_two() {
-            let second = self.second.trim();
-            if second.is_empty() {
-                return Err("Data validation: enter a maximum".to_string());
-            }
-            dv.formula2 = second
-                .strip_prefix('=')
-                .unwrap_or(second)
-                .trim()
-                .to_string();
-        }
+        (dv.formula1, dv.formula2) =
+            gridcore::validation::formulas_from_boxes(kind, operator, &self.first, &self.second)?;
         Ok(dv)
     }
 
     fn line(&self, field: Field) -> String {
         let check = |on: bool| if on { "[x]" } else { "[ ]" };
-        let first_label = match self.kind_name() {
-            "list" => "Source:",
-            "custom" => "Formula:",
-            _ if self.takes_two() => "Minimum:",
-            "date" => "Date:",
-            "time" => "Time:",
-            "textLength" => "Length:",
-            _ => "Value:",
-        };
+        let first_label = gridcore::validation::first_label(self.kind_name(), OPERATORS[self.op].0);
         let second_label = "Maximum:";
         match field {
             Field::Tab => {
