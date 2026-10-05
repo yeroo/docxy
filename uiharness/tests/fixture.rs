@@ -486,3 +486,131 @@ fn fixture_drift_detects_a_complexity_only_change() {
         "a grouping-only change must fail fixture parity"
     );
 }
+
+// ---- #712: the typing-assistance cases' workbooks ---------------------------
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(name)
+}
+
+/// A workbook whose first sheet holds `cells` (row, col, typed text).
+fn typed_workbook(cells: &[(u32, u32, &str)]) -> SheetPackage {
+    let mut pkg = new_xlsx();
+    for &(r, c, t) in cells {
+        let cell = gridcore::entry::entry_cell(&mut pkg.workbook, 0, r, c, t, None)
+            .expect("a fixture entry");
+        pkg.workbook.sheets[0].set_cell(r, c, cell);
+    }
+    pkg
+}
+
+fn text_at(pkg: &SheetPackage, r: u32, c: u32) -> String {
+    pkg.workbook.sheets[0]
+        .cells
+        .get(&(r, c))
+        .map(|cell| shown(&cell.value))
+        .unwrap_or_default()
+}
+
+/// ENT-CASE-029/030's column: A1:A5 `Widgets`, `Gadgets`, `Gizmos`, `100`,
+/// `Grommets`; A6 empty; A7 `Sprockets`.
+const AUTOCOMPLETE: [(u32, u32, &str); 6] = [
+    (0, 0, "Widgets"),
+    (1, 0, "Gadgets"),
+    (2, 0, "Gizmos"),
+    (3, 0, "100"),
+    (4, 0, "Grommets"),
+    (6, 0, "Sprockets"),
+];
+
+fn build_autocomplete() -> Vec<u8> {
+    save_xlsx(&typed_workbook(&AUTOCOMPLETE))
+}
+
+fn check_autocomplete(bytes: &[u8]) {
+    let pkg = load_xlsx(bytes).expect("autocomplete.xlsx reads");
+    for (r, c, t) in AUTOCOMPLETE {
+        assert_eq!(text_at(&pkg, r, c), t);
+    }
+    assert_eq!(text_at(&pkg, 5, 0), "", "A6 is empty");
+}
+
+/// ENT-CASE-038/039's sheet: A1:A6 names, B5 `Babs`, C1:C3 `x-007`, `y-042`,
+/// `z-100`.
+const FLASH_FILL: [(u32, u32, &str); 10] = [
+    (0, 0, "Ada Lovelace"),
+    (1, 0, "Alan Turing"),
+    (2, 0, "Grace Hopper"),
+    (3, 0, "Edsger Dijkstra"),
+    (4, 0, "Barbara Liskov"),
+    (5, 0, "Donald Knuth"),
+    (4, 1, "Babs"),
+    (0, 2, "x-007"),
+    (1, 2, "y-042"),
+    (2, 2, "z-100"),
+];
+
+fn build_flash_fill() -> Vec<u8> {
+    save_xlsx(&typed_workbook(&FLASH_FILL))
+}
+
+fn check_flash_fill(bytes: &[u8]) {
+    let pkg = load_xlsx(bytes).expect("flash-fill.xlsx reads");
+    for (r, c, t) in FLASH_FILL {
+        assert_eq!(text_at(&pkg, r, c), t);
+    }
+}
+
+/// TBL-CASE-021's table `Sales` (Item, Qty, Price, Region) over A1:D4.
+const SALES: [(u32, u32, &str); 16] = [
+    (0, 0, "Item"),
+    (0, 1, "Qty"),
+    (0, 2, "Price"),
+    (0, 3, "Region"),
+    (1, 0, "Pens"),
+    (1, 1, "3"),
+    (1, 2, "2"),
+    (1, 3, "North"),
+    (2, 0, "Ink"),
+    (2, 1, "5"),
+    (2, 2, "7"),
+    (2, 3, "South"),
+    (3, 0, "Pads"),
+    (3, 1, "2"),
+    (3, 2, "4"),
+    (3, 3, "East"),
+];
+
+fn build_sales() -> Vec<u8> {
+    let mut pkg = typed_workbook(&SALES);
+    let i = pkg
+        .add_table(0, (0, 0, 3, 3), true, "TableStyleMedium2")
+        .expect("a table over A1:D4");
+    let old = pkg.workbook.tables[i].name.clone();
+    gridcore::edit::rename_table(&mut pkg.workbook, &old, "Sales").expect("renamed Sales");
+    save_xlsx(&pkg)
+}
+
+fn check_sales(bytes: &[u8]) {
+    let pkg = load_xlsx(bytes).expect("sales.xlsx reads");
+    let t = pkg.workbook.table("Sales").expect("the table Sales");
+    assert_eq!(t.columns, ["Item", "Qty", "Price", "Region"]);
+    assert_eq!(t.range, (0, 0, 3, 3));
+}
+
+#[test]
+fn the_typing_assistance_fixtures_are_what_their_cases_assume() {
+    let regen = std::env::var_os("UIHARNESS_REGEN_FIXTURE").is_some();
+    let fixtures: [(&str, fn() -> Vec<u8>, fn(&[u8])); 3] = [
+        ("autocomplete.xlsx", build_autocomplete, check_autocomplete),
+        ("flash-fill.xlsx", build_flash_fill, check_flash_fill),
+        ("sales.xlsx", build_sales, check_sales),
+    ];
+    for (name, build_fixture, check_fixture) in fixtures {
+        let bytes = read_generated_fixture(&fixture(name), regen, build_fixture, check_fixture)
+            .unwrap_or_else(|e| panic!("{e}"));
+        check_fixture(&bytes);
+    }
+}

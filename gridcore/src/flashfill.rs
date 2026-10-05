@@ -78,16 +78,12 @@ pub enum NoFill {
 }
 
 impl NoFill {
+    /// What the hosts show. Excel has one message for both: there is no
+    /// pattern to fill with, whether the examples show none or there are no
+    /// examples or data to read one from.
     pub fn message(&self) -> &'static str {
-        match self {
-            NoFill::NoPattern => {
-                "Flash Fill didn't see a pattern. If you've entered a few examples, \
-                 make sure they follow a consistent pattern, then try again."
-            }
-            NoFill::Nothing => {
-                "Flash Fill needs an example typed at the top of a column next to your data."
-            }
-        }
+        "Flash Fill didn't see a pattern. If you've entered a few examples, \
+         make sure they follow a consistent pattern, then try again."
     }
 }
 
@@ -889,6 +885,7 @@ mod tests {
                 .message()
                 .starts_with("Flash Fill didn't see a pattern")
         );
+        assert_eq!(NoFill::Nothing.message(), NoFill::NoPattern.message());
         // Nothing to fill: no data next to the column, or no example.
         let wb = wb_with(&[&["a"], &[], &["x"]]);
         assert_eq!(flash_fill(&wb, 0, 0, 2), Err(NoFill::Nothing));

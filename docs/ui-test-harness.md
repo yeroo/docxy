@@ -648,6 +648,11 @@ case). `cell` reads a task a collapsed summary hides (its reply's `cell` and
 `row` are then `null`); `click-cell` refuses one, since nothing is drawn to
 click. Giving both `cell` and `uid` is an error. The Project `cell` reply adds
 the task's `id` and `uid`, and `entry: true` on the entry row, which reads empty.
+On a sheet, `call cell {"cell":"B2"}` replies `{cell, row, col, text, value,
+empty, hyperlink}`: `text` is what the cell shows, `value` its input text (a
+formula with its `=`, a text a typed entry would read otherwise with its `'`,
+so a Flash Filled `'042` reads as text), and `hyperlink` its link target or
+null (#667).
 
 `call rows {}` lists the rows the entry table draws, top to bottom, without the
 entry row; an optional `tab` picks a Project tab as the control verbs do, without

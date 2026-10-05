@@ -3730,6 +3730,11 @@ pub fn dispatch(
                 ("text", Json::Str(v.cell_text(r, c))),
                 ("value", Json::Str(raw.clone())),
                 ("empty", Json::Bool(raw.is_empty())),
+                // The cell's hyperlink target, or null (#667: a typed URL).
+                (
+                    "hyperlink",
+                    str_or_null(v.sheet().hyperlinks.get(&(r, c)).cloned()),
+                ),
             ]))
         }
 

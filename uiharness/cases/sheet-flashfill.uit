@@ -1,0 +1,97 @@
+# Flash Fill (#666): ENT-CASE-038 and ENT-CASE-039 on fixtures/flash-fill.xlsx
+# (A1:A6 Ada Lovelace … Donald Knuth, B5 Babs, C1:C3 x-007, y-042, z-100).
+
+# ENT-CASE-038: Ctrl+E writes constants, keeps a value already typed lower
+# down, and keeps a text example's text-ness.
+test ENT-CASE-038 ctrl e fills constants and keeps typed values
+  open copy:../fixtures/flash-fill.xlsx
+  click B1
+  type Ada
+  key enter
+  key ctrl+e
+  assert cell B2 is Alan
+  assert cell B3 is Grace
+  assert cell B4 is Edsger
+  assert cell B5 is Babs
+  assert cell B6 is Donald
+  call cell {"cell":"B2"}
+  assert reply.value is Alan
+  click D1
+  type '007
+  key enter
+  click D1
+  key ctrl+e
+  call cell {"cell":"D2"}
+  assert reply.text is 042
+  assert reply.value is '042
+  call cell {"cell":"D3"}
+  assert reply.value is '100
+  click A1
+  type Augusta Lovelace
+  key enter
+  assert cell B1 is Ada
+  assert cell B2 is Alan
+
+# ENT-CASE-039: the greyed preview after the second example, accepted with
+# Enter; the Flash Fill Options menu; the no-pattern message.
+test ENT-CASE-039 preview options and no pattern
+  open copy:../fixtures/flash-fill.xlsx
+  click B5
+  key delete
+  click B1
+  type Ada
+  key enter
+  assert flash_preview is nothing
+  type Alan
+  key enter
+  assert flash_preview.range is B3:B6
+  assert flash_preview.values.0 is Grace
+  assert flash_preview.values.1 is Edsger
+  assert flash_preview.values.2 is Barbara
+  assert flash_preview.values.3 is Donald
+  assert cell B3 is nothing
+  key enter
+  assert flash_preview is nothing
+  assert cell B3 is Grace
+  assert cell B6 is Donald
+  call menu-open {"target":"flash-fill"}
+  assert reply.items.0.label is Undo Flash Fill
+  assert reply.items.1.label is Accept suggestions
+  assert reply.items.2.label is Select all 0 blank cells
+  assert reply.items.3.label is Select all 4 changed cells
+  call menu-click {"label":"Select all 4 changed cells"}
+  assert range is B3:B6
+  click E1
+  type zzz
+  key enter
+  snapshot E2:E6
+  click E1
+  key ctrl+e
+  assert dialog is flash-fill
+  call dialog-read {}
+  assert reply.text is Flash Fill didn't see a pattern. If you've entered a few examples, make sure they follow a consistent pattern, then try again.
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert cells unchanged
+
+test another key drops the preview and data flash fill runs it
+  open copy:../fixtures/flash-fill.xlsx
+  click B5
+  key delete
+  click B1
+  type Ada
+  key enter
+  type Alan
+  key enter
+  assert flash_preview.range is B3:B6
+  key escape
+  assert flash_preview is nothing
+  key enter
+  assert cell B3 is nothing
+  click B3
+  call ribbon-click {"tab":"Data","command":"Flash Fill"}
+  assert cell B3 is Grace
+  call menu-open {"target":"flash-fill"}
+  call menu-click {"label":"Undo Flash Fill"}
+  assert cell B3 is nothing
+  call-error menu-open {"target":"flash-fill"} => no Flash Fill
