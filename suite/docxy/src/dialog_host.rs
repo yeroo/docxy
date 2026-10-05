@@ -111,7 +111,7 @@ fn apply_dialog(
         DialogOwner::SaveOnClose { .. } => Err("closing a tab applies through the app".into()),
         // Handled in `user_name::click`, before this: it is the app's.
         DialogOwner::UserName => Err("the user name is an app setting".into()),
-        // Handled in `about::click`, before this: it only copies or closes.
+        // Handled in `Docxy::about_click`, before this: it only copies or closes.
         DialogOwner::About => Err("the About dialog only copies or closes".into()),
         #[cfg(test)]
         DialogOwner::Test | DialogOwner::TestChild => Ok(false),
@@ -291,7 +291,7 @@ impl Docxy {
             return done;
         }
         // About's Copy and Close are the app's too (#1023).
-        if let Some(done) = self.about_click(button, window, cx) {
+        if let Some(done) = self.about_click(button, cx) {
             return done;
         }
         // The close prompt closes the tab, or goes on with the window's
@@ -326,7 +326,7 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        // Enter or Escape on a dialog the app owns (the user name, the close
+        // Enter or Escape on a dialog the app owns (the user name, About, the close
         // prompt) presses through the app, as its drawn buttons do.
         let plain = !m.control && !m.alt && !m.platform;
         let app_button = self

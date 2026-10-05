@@ -984,7 +984,7 @@ Skill: `xlsxy install skill`.
 `fields: [...]` to read any listed field by Project's name), `link.add {uid, pred, type?, lag?}` / `link.del`,
 `find {query}`, `assign.list/get/add/set/del` and `assign.fields` (a task's
 resource assignments, by assignment UID), `proj.save {path?}`, `proj.reload`,
-`proj.open {path}`. Edits
+`proj.open {path}`, `app-info` (the build; #1023). Edits
 reschedule the plan (CPM) live. MCP: `claude mcp add yppxy -- yppxy --mcp` →
 `yppxy_list`, `yppxy_status`, `yppxy_tasks`, `yppxy_get`, `yppxy_set`,
 `yppxy_fields`, `yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`,

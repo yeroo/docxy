@@ -33,7 +33,11 @@ jobs:
             ext: ""
     runs-on: ${{ matrix.os }}
     steps:
+      # The whole history: buildinfo finds the last merged PR by walking first-parent
+      # commits, and a depth-1 checkout of a plain commit has none (#1023).
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install Linux clipboard deps (arboard)
         if: runner.os == 'Linux'
@@ -236,8 +240,8 @@ jobs:
           # docxy depends on htmlbundle (editable HTML). Published crates keep
           # `html-export` off, so `cargo install docxy` needs no wasm target.
           publish htmlbundle
-          # docxy and xlsxy stamp their build info (#1023). A crates.io install has
-          # no .git, so buildinfo's build script reports `unknown` there.
+          # docxy and xlsxy stamp their build info (#1023). A crates.io install is not a
+          # checkout of this repository, so buildinfo's build script reports `unknown`.
           publish buildinfo
           publish docxy
           publish xlsxy
@@ -251,7 +255,11 @@ jobs:
       DOCXY_BUILD_KIND: release
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
+      # The whole history: buildinfo finds the last merged PR by walking first-parent
+      # commits, and a depth-1 checkout of a plain commit has none (#1023).
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -321,7 +329,11 @@ jobs:
       DOCXY_BUILD_KIND: release
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
+      # The whole history: buildinfo finds the last merged PR by walking first-parent
+      # commits, and a depth-1 checkout of a plain commit has none (#1023).
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -374,7 +386,11 @@ jobs:
       DOCXY_BUILD_KIND: release
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
+      # The whole history: buildinfo finds the last merged PR by walking first-parent
+      # commits, and a depth-1 checkout of a plain commit has none (#1023).
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown

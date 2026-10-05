@@ -4,9 +4,9 @@
 //! crate; this module names the product and shapes the text.
 
 use crate::dialog::{
-    ButtonRole, Control as Field, ControlKind, Dialog, DialogOwner, NONE_OPEN, Value,
+    ButtonRole, Control as Field, ControlKind, Dialog, DialogOwner, DialogStack, NONE_OPEN, Value,
 };
-use crate::{Context, Docxy, Window};
+use crate::{Context, Docxy};
 use buildinfo::BuildInfo;
 
 /// The product name `--version` and the About dialog print.
@@ -92,19 +92,26 @@ impl Docxy {
     pub(crate) fn about_click(
         &mut self,
         button: &str,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Result<(), String>> {
         let tab = self.tabs.get_mut(self.active)?;
-        if tab.dialogs.top()?.owner != DialogOwner::About {
-            return None;
-        }
-        let done = tab.dialogs.click(button, |_| Ok(()));
-        if done.is_ok() && button == "Copy" {
-            self.clipboard_write(copy_text(info()), cx);
-        }
-        Some(done)
+        let done = click(&mut tab.dialogs, button)?;
+        Some(done.map(|copy| {
+            if copy {
+                self.clipboard_write(copy_text(info()), cx);
+            }
+        }))
     }
+}
+
+/// A press of `button` when the dialog on top is About: `None` for any other
+/// dialog. `Ok(true)` when it was Copy (the dialog stays open, the app writes the
+/// clipboard), `Ok(false)` for Close (the dialog is closed).
+pub(crate) fn click(dialogs: &mut DialogStack, button: &str) -> Option<Result<bool, String>> {
+    if dialogs.top()?.owner != DialogOwner::About {
+        return None;
+    }
+    Some(dialogs.click(button, |_| Ok(())).map(|()| button == "Copy"))
 }
 
 /// `--version`: print the block and return, for `main` to exit. A release build
@@ -132,7 +139,6 @@ pub(crate) fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dialog::DialogStack;
 
     #[test]
     fn the_suite_reports_its_own_version() {
@@ -211,9 +217,14 @@ mod tests {
         // Enter and Escape both press Close; Copy leaves the dialog open.
         assert_eq!(stack.key_button("enter", true).as_deref(), Some("Close"));
         assert_eq!(stack.key_button("escape", true).as_deref(), Some("Close"));
-        stack.click("Copy", |_| Ok(())).unwrap();
-        assert!(stack.is_open());
-        stack.click("Close", |_| Ok(())).unwrap();
+        assert_eq!(click(&mut stack, "Copy"), Some(Ok(true)));
+        assert!(stack.is_open(), "Copy leaves the dialog open");
+        assert_eq!(click(&mut stack, "Close"), Some(Ok(false)));
         assert!(!stack.is_open());
+        // Not About on top: not ours.
+        assert_eq!(click(&mut stack, "Close"), None);
+        let mut other = DialogStack::default();
+        other.push(crate::user_name::dialog("a", "b"));
+        assert_eq!(click(&mut other, "Cancel"), None);
     }
 }

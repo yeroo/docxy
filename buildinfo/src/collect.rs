@@ -1,6 +1,16 @@
 //! Reads the build info from git. Every failure (no git binary, no repository, a
 //! shallow clone without `origin/main`) gives `unknown` / `None`; nothing here
 //! panics. `build.rs` includes this file, so the tests here cover the build script.
+//!
+//! The repository counts only when it tracks this crate (`build.rs` is a tracked
+//! file in `dir`): git walks up from wherever it runs, so a crate unpacked under
+//! `~/.cargo/registry` inside some enclosing repository (a dotfiles repo in `$HOME`)
+//! must not be stamped with that repository's commit.
+//!
+//! A shallow checkout sees only the commits it has: the last merged PR is found
+//! only if a merge commit is among them. `release.yml` fetches the whole history.
+//! A CI build of a pull request checks out a synthetic `Merge <sha> into <sha>`
+//! commit with depth 1, so it reports no PR and no commits ahead of `origin/main`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,10 +73,17 @@ fn git(dir: &Path, env: &Env, args: &[&str]) -> Option<String> {
     Some(s.trim_end_matches(['\n', '\r']).to_string())
 }
 
+/// HEAD's commit when `dir` is inside a repository that tracks this crate.
+fn head_of_our_repository(dir: &Path, env: &Env) -> Option<String> {
+    let head = git(dir, env, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty())?;
+    git(dir, env, &["ls-files", "--error-unmatch", "build.rs"])?;
+    Some(head)
+}
+
 /// `env` reads an environment variable (a parameter so tests need not touch the process env).
 pub fn collect(dir: &Path, env: &Env) -> Fields {
     let mut f = Fields::unknown();
-    let Some(head) = git(dir, env, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty()) else {
+    let Some(head) = head_of_our_repository(dir, env) else {
         return f;
     };
     f.commit = head;
@@ -121,20 +138,38 @@ pub fn collect(dir: &Path, env: &Env) -> Fields {
     f
 }
 
-/// Files whose change must rerun the build script: HEAD, the ref it points to,
-/// the index, packed refs, and every tracked file that is modified right now.
-/// Empty without a repository. Paths resolve against `dir` (cargo runs the build
-/// script in the package directory).
+/// Files whose change must rerun the build script: HEAD, the ref it points to
+/// (its directory when the ref is packed and the loose file is gone), packed refs
+/// and the index when they exist, and every tracked file that is modified right
+/// now. Only paths that exist: cargo reruns a build script on every build for a
+/// missing one. Empty outside a repository that tracks this crate. Paths resolve
+/// against `dir` (cargo runs the build script in the package directory).
 pub fn watch_paths(dir: &Path, env: &Env) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if git(dir, env, &["rev-parse", "HEAD"]).is_none() {
+    if head_of_our_repository(dir, env).is_none() {
         return out;
     }
-    let git_path =
-        |name: &str| git(dir, env, &["rev-parse", "--git-path", name]).map(PathBuf::from);
+    let git_path = |name: &str| {
+        git(dir, env, &["rev-parse", "--git-path", name])
+            .map(PathBuf::from)
+            .filter(|p| dir.join(p).exists())
+    };
     out.extend(git_path("HEAD"));
     if let Some(r) = git(dir, env, &["symbolic-ref", "-q", "HEAD"]) {
-        out.extend(git_path(&r));
+        match git_path(&r) {
+            Some(p) => out.push(p),
+            // `git pack-refs` / gc removed the loose file: its directory sees it come back.
+            None => {
+                let loose = git(dir, env, &["rev-parse", "--git-path", &r]).map(PathBuf::from);
+                out.extend(
+                    loose
+                        .as_deref()
+                        .and_then(Path::parent)
+                        .filter(|p| dir.join(p).is_dir())
+                        .map(Path::to_path_buf),
+                );
+            }
+        }
     }
     out.extend(git_path("packed-refs"));
     out.extend(git_path("index"));
@@ -143,7 +178,8 @@ pub fn watch_paths(dir: &Path, env: &Env) -> Vec<PathBuf> {
             out.extend(
                 list.lines()
                     .filter(|l| !l.is_empty())
-                    .map(|l| Path::new(&top).join(l)),
+                    .map(|l| Path::new(&top).join(l))
+                    .filter(|p| p.exists()),
             );
         }
     }
@@ -208,6 +244,7 @@ mod tests {
             return; // no git on this machine
         }
         std::fs::write(d.join("a.txt"), "1").unwrap();
+        std::fs::write(d.join("build.rs"), "fn main() {}").unwrap();
         assert!(run(&d, &["add", "."]));
         // A branch commit naming an issue must not read as a PR ...
         assert!(run(&d, &["commit", "-qm", "Fix the thing (#42)"]));
@@ -264,6 +301,7 @@ mod tests {
             return; // no git on this machine
         }
         std::fs::write(d.join("a.txt"), "1").unwrap();
+        std::fs::write(d.join("build.rs"), "fn main() {}").unwrap();
         assert!(run(&d, &["add", "."]));
         assert!(run(&d, &["commit", "-qm", "Older squash (#7)"]));
         assert!(run(
@@ -286,6 +324,79 @@ mod tests {
         assert_eq!(f.issue, Some(42));
         assert_eq!(f.last_pr, None);
         let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    #[test]
+    fn an_enclosing_repository_that_does_not_track_the_crate_is_not_ours() {
+        // A crate unpacked inside someone else's repository (`~/.cargo/registry`
+        // under a dotfiles repo): git finds HEAD, but build.rs is not tracked.
+        let repo = temp_dir("enclosing");
+        if !run(&repo, &["init", "-q", "-b", "main"]) {
+            return; // no git on this machine
+        }
+        std::fs::write(repo.join("notes.txt"), "x").unwrap();
+        assert!(run(&repo, &["add", "."]));
+        assert!(run(&repo, &["commit", "-qm", "Dotfiles (#3)"]));
+        let krate = repo.join("registry").join("buildinfo-0.5.0");
+        std::fs::create_dir_all(&krate).unwrap();
+        std::fs::write(krate.join("build.rs"), "fn main() {}").unwrap(); // untracked
+        assert_eq!(collect(&krate, &no_env), Fields::unknown());
+        assert!(watch_paths(&krate, &no_env).is_empty());
+        // Once the repository tracks it, it is ours.
+        assert!(run(
+            &repo,
+            &["add", "-f", "registry/buildinfo-0.5.0/build.rs"]
+        ));
+        assert_ne!(collect(&krate, &no_env).commit, UNKNOWN);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn watch_paths_names_only_paths_that_exist() {
+        let d = temp_dir("watch");
+        if !run(&d, &["init", "-q", "-b", "main"]) {
+            return; // no git on this machine
+        }
+        std::fs::write(d.join("build.rs"), "fn main() {}").unwrap();
+        assert!(run(&d, &["add", "."]));
+        assert!(run(&d, &["commit", "-qm", "one"]));
+        let all_exist = |watched: &[PathBuf]| {
+            assert!(!watched.is_empty());
+            for p in watched {
+                assert!(d.join(p).exists(), "{p:?} does not exist");
+            }
+        };
+        let loose = watch_paths(&d, &no_env);
+        all_exist(&loose);
+        assert!(
+            loose.iter().any(|p| p.ends_with("refs/heads/main")),
+            "{loose:?}"
+        );
+        // After `git pack-refs` the loose ref is gone: watch its directory, and
+        // packed-refs, instead of a path that does not exist.
+        assert!(run(&d, &["pack-refs", "--all", "--prune"]));
+        let packed = watch_paths(&d, &no_env);
+        all_exist(&packed);
+        assert!(
+            !packed.iter().any(|p| p.ends_with("refs/heads/main")),
+            "{packed:?}"
+        );
+        assert!(
+            packed.iter().any(|p| p.ends_with("packed-refs")),
+            "{packed:?}"
+        );
+        assert!(
+            packed.iter().any(|p| p.ends_with("refs/heads")),
+            "{packed:?}"
+        );
+        // A tracked file modified now is watched.
+        std::fs::write(d.join("build.rs"), "fn main() { }").unwrap();
+        assert!(
+            watch_paths(&d, &no_env)
+                .iter()
+                .any(|p| p.ends_with("build.rs"))
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

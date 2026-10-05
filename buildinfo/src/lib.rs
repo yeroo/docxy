@@ -3,12 +3,17 @@
 //! (the suite, docxy, xlsxy, yppxy, lookxy) can share it. Hosts that need JSON
 //! (`app-info`) take [`BuildInfo::json`] and parse it with their own JSON type.
 //!
-//! The dirty bit and build time are as of the last time `build.rs` ran. Cargo
-//! reruns it when HEAD, the ref HEAD points to, or the index changes (and when a
-//! file that was already modified changes), not on every source edit, so a first
-//! edit to a clean, unstaged tree is not noticed until `git add`, a commit, or
+//! The dirty bit and build time are as of the last time `build.rs` ran. It reruns
+//! when one of these changes, and only these: `.git/HEAD`, the ref HEAD points to
+//! (the ref's directory once `git pack-refs` has removed the loose file),
+//! `packed-refs` and the index (each only while it exists), every tracked file that
+//! was already modified when it last ran, `build.rs` itself, and the environment
+//! variables `DOCXY_BUILD_KIND`, `SOURCE_DATE_EPOCH`, `GITHUB_HEAD_REF` and
+//! `GITHUB_REF_NAME`. It does not rerun on every source edit, so a first edit to a
+//! clean, unstaged tree is not noticed until `git add`, a commit, or
 //! `touch buildinfo/build.rs`. The dirty bit counts tracked files only: untracked
-//! scratch files do not turn a release build into a manual one.
+//! scratch files do not turn a release build into a manual one. The repository
+//! counts only if it tracks this crate (see `collect.rs`).
 
 #[cfg(test)]
 mod collect;
@@ -38,8 +43,8 @@ pub(crate) struct Raw {
 
 const RAW: Raw = include!(concat!(env!("OUT_DIR"), "/buildinfo.rs"));
 
-/// A JSON-shaped value, so hosts can build their own JSON without `buildinfo`
-/// depending on one.
+/// A JSON-shaped value: what [`BuildInfo::json`] serializes. Private; hosts take
+/// the JSON text.
 #[derive(Clone, Debug, PartialEq)]
 enum Value {
     Str(String),
@@ -177,7 +182,8 @@ impl BuildInfo {
         ]
     }
 
-    /// [`BuildInfo::fields`] as one JSON object (`{"version":"0.5.0",...}`), for
+    /// Every field of the build (version, commit, branch, last PR, kind, `manual`,
+    /// `summary`, ...) as one JSON object (`{"version":"0.5.0",...}`), for
     /// hosts that parse it into their own JSON type.
     pub fn json(&self) -> String {
         let mut s = String::from("{");

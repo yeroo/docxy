@@ -77,8 +77,10 @@ still `local`, so it is still a manual build). After step 2 the branch line is
    committed tree). Run `docxy --version` and open File › Account in the suite.
 
 **Expect:** `kind: release`, `dirty: no`, no `manual build` line, no badge, and
-`last PR:` names the newest merged PR on that commit's first-parent history. A CI
-build of a PR branch says `kind: ci` and no badge when clean. `suite --version` and
+`last PR:` names the newest merged PR on that commit's first-parent history (release
+jobs check out the full history; a depth-1 checkout would only see the commit itself).
+A CI build of a pull request checks out a synthetic `Merge <sha> into <sha>` commit with
+depth 1, so it says `kind: ci`, no badge when clean, `last PR: none` and no commits ahead. `suite --version` and
 `app-info` agree.
 
 **Fails when:** `release.yml` stops setting `DOCXY_BUILD_KIND=release`, or `ci.yml`

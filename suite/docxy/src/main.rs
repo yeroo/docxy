@@ -26442,12 +26442,15 @@ impl Docxy {
                     ),
                 )
             })
-            .child(
-                h_flex().child(
-                    button("account-about", "About docxy suite")
-                        .on_click(cx.listener(|this, _, _, cx| this.open_about_clicked(cx))),
-                ),
-            );
+            // The dialog lives on a tab's stack, so with no tab there is nothing to open it on.
+            .when(!self.tabs.is_empty(), |d| {
+                d.child(
+                    h_flex().child(
+                        button("account-about", "About docxy suite")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_about_clicked(cx))),
+                    ),
+                )
+            });
         Some(page.into_any_element())
     }
 
