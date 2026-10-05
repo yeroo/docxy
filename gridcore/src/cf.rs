@@ -37,6 +37,18 @@ pub fn cell_dxf(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<Dxf> 
 
 /// [`cell_dxf`], with the winning rule's `priority`.
 fn cell_dxf_rule(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<(i32, Dxf)> {
+    cell_dxf_rule_by(wb, sheet, row, col, |_| true)
+}
+
+/// [`cell_dxf_rule`] among the rules whose format `wants` takes: the
+/// highest-precedence matching rule that sets a given property.
+fn cell_dxf_rule_by(
+    wb: &Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    wants: impl Fn(&Dxf) -> bool,
+) -> Option<(i32, Dxf)> {
     let s = wb.sheets.get(sheet)?;
     if s.cond_formats.is_empty() {
         return None;
@@ -61,6 +73,9 @@ fn cell_dxf_rule(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<(i32
             let Some(dxf_id) = rule.dxf_id else { continue };
             if best.is_some_and(|(p, _)| rule.priority >= p) {
                 continue; // a higher-precedence rule already matched
+            }
+            if !wb.styles.dxfs.get(dxf_id).is_some_and(&wants) {
+                continue;
             }
             if rule_matches(wb, sheet, row, col, anchor, &rule.kind) {
                 best = Some((rule.priority, dxf_id));
@@ -195,20 +210,15 @@ pub fn cell_font_color(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Shown
 }
 
 fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> Shown {
-    let winner = cell_dxf_rule(wb, sheet, row, col);
+    // Excel stacks the matching rules' formats: each property comes from the
+    // highest-precedence matching rule that sets it, so a font-only rule
+    // above leaves the fill to a rule below. (`stopIfTrue`, which would end
+    // the stack early, isn't read.)
+    let winner = cell_dxf_rule_by(wb, sheet, row, col, |d| dxf_sets_color(d, fill));
     // A rule we don't evaluate (Duplicate Values, a colour scale, …) that
-    // takes precedence over the one that matched, or any such rule when
-    // none did, may be colouring the cell: then its colour is unknown.
-    // The winner bounds them only when it sets that colour itself: a
-    // bold-only or font-only winner leaves the fill to the others.
-    let sets = |d: &Dxf| {
-        if fill {
-            d.fill.is_some() || d.fill_unresolved
-        } else {
-            d.color.is_some() || d.color_unresolved
-        }
-    };
-    let bound = winner.as_ref().filter(|(_, d)| sets(d)).map(|w| w.0);
+    // takes precedence over the one that sets the colour, or any such rule
+    // when none does, may be colouring the cell: then its colour is unknown.
+    let bound = winner.as_ref().map(|w| w.0);
     if unevaluated_could_color(wb, sheet, row, col, fill, bound) {
         return Shown::Unknown;
     }
@@ -278,14 +288,18 @@ fn unevaluated_could_color(
             }
             rule.dxf_id
                 .and_then(|i| wb.styles.dxfs.get(i))
-                .is_some_and(|d| {
-                    if fill {
-                        d.fill.is_some() || d.fill_unresolved
-                    } else {
-                        d.color.is_some() || d.color_unresolved
-                    }
-                })
+                .is_some_and(|d| dxf_sets_color(d, fill))
         })
+}
+
+/// Does a conditional format set the fill (`fill`) or the font colour, read
+/// or not (a theme or indexed colour)?
+fn dxf_sets_color(d: &Dxf, fill: bool) -> bool {
+    if fill {
+        d.fill.is_some() || d.fill_unresolved
+    } else {
+        d.color.is_some() || d.color_unresolved
+    }
 }
 
 /// The conditional-formatting icon a cell shows, as (`iconSet`, `iconId`):

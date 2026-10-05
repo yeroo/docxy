@@ -40,22 +40,24 @@ pub(crate) enum OnTop {
 
 const PROTECTED: &str = "The sheet is protected: unprotect it (Review › Protect Sheet) to sort it.";
 
-/// Sort `area` of the view's sheet by `levels` as one undo step, after
-/// committing an open cell editor. A refusal (the editor can't commit, a cut
-/// spill, merged cells of different sizes) changes nothing, and its reason
-/// is the error and the view's `entry_error`. `Ok` says whether the sort
-/// changed anything, and whether committing the editor did.
+/// Sort `area` of the view's sheet by `levels` as one undo step. [`run`]
+/// commits an open cell editor first; here the commit is a guard for a
+/// direct caller, and an editor that can't commit refuses the sort. A
+/// refusal (that editor, a cut spill, merged cells of different sizes)
+/// changes nothing, and its reason is the error and the view's
+/// `entry_error`. `Ok` gives the rows (or columns) sorted and whether the
+/// sort changed anything.
 pub(crate) fn sort_view(
     v: &mut crate::SheetView,
     area: Area,
     levels: &[SortLevel],
     opts: &SortOptions,
-) -> Result<(usize, bool, bool), String> {
+) -> Result<(usize, bool), String> {
     let s = v.active;
     if v.pkg.workbook.sheets[s].is_protected() {
         return Err(PROTECTED.into());
     }
-    let committed = v.commit_edit();
+    v.commit_edit();
     if v.editing.is_some() {
         // Sorting would move the cell being typed in.
         return Err(v
@@ -76,7 +78,7 @@ pub(crate) fn sort_view(
                 v.engine.clock = clock;
                 v.engine.recalc_all(&mut v.pkg.workbook);
             }
-            Ok((n, changed, committed))
+            Ok((n, changed))
         }
         Err(e) => {
             v.restore(snap);
@@ -100,7 +102,7 @@ pub(crate) fn run(
         return Err("Sort needs a spreadsheet".into());
     };
     match sort_view(v, area, levels, opts) {
-        Ok((n, changed, _)) => {
+        Ok((n, changed)) => {
             if changed {
                 tab.dirty = true;
             }
@@ -628,12 +630,6 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
                 (region, header)
             } else {
                 (sel, false)
-            };
-            let header = header && {
-                let Surface::Sheet(v) = &tab.surface else {
-                    return Some(Err("Sort needs a spreadsheet".into()));
-                };
-                gridcore::edit::guess_header(&v.pkg.workbook, v.active, area)
             };
             tab.dialogs.pop();
             Some(match then {

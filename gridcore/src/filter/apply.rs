@@ -348,9 +348,9 @@ pub fn clear(
     })
 }
 
-/// The filter drop-down's search: check the column's values whose displayed
-/// text contains `pattern` (`*` and `?` wildcards, `~` escapes) — Select All
-/// Search Results. With `add` ("Add current selection to filter"), they join
+/// The filter drop-down's search: check every result the drop-down lists
+/// for `pattern` (`*` and `?` wildcards, `~` escapes) — Select All Search
+/// Results. With `add` ("Add current selection to filter"), they join
 /// the column's checked values; a criterion other than a checklist is
 /// replaced, as Excel does.
 pub fn search(
@@ -361,42 +361,22 @@ pub fn search(
     add: bool,
     today: f64,
 ) -> Result<FilterOutcome, FilterError> {
-    let af = wb
-        .sheets
-        .get(sheet)
-        .and_then(|s| s.auto_filter.as_ref())
-        .ok_or(FilterError::NoFilter)?;
-    let (r1, _, r2, _) = grown_range(wb, sheet, af.range);
-    let pat = format!("*{pattern}*");
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut hits: Vec<String> = Vec::new();
-    for r in r1 + 1..=r2 {
-        let t = shown_text(wb, sheet, r, col);
-        if !t.is_empty()
-            && crate::formula::wildcard_match(&pat, &t)
-            && seen.insert(t.to_lowercase())
-        {
-            hits.push(t);
-        }
-    }
-    let current = af.criteria.iter().find(|(c, _)| *c == col).map(|x| &x.1);
-    let f = match (add, current) {
-        (true, Some(ColumnFilter::Values { vals, blank, dates })) => {
-            let mut vals = vals.clone();
-            let have: HashSet<String> = vals.iter().map(|v| v.to_lowercase()).collect();
-            vals.extend(
-                hits.into_iter()
-                    .filter(|h| !have.contains(&h.to_lowercase())),
-            );
-            ColumnFilter::Values {
-                vals,
-                blank: *blank,
-                dates: dates.clone(),
-            }
-        }
-        _ => ColumnFilter::values(hits),
-    };
-    set_criterion(wb, sheet, col, Some(f), today)
+    // The drop-down's own results, all checked: one matcher for the list
+    // the user sees and the filter it makes (a date matches by its year,
+    // month name or day, as the tree shows it).
+    let found = super::menu_all(wb, sheet, col, Some(pattern))?;
+    let checks = vec![true; found.items.len()];
+    let f = super::checklist_criteria(
+        wb,
+        sheet,
+        col,
+        Some(pattern),
+        &found.items,
+        &checks,
+        false,
+        add,
+    )?;
+    set_criterion(wb, sheet, col, f, today)
 }
 
 /// Right-click › Filter › Filter by Selected Cell's Value / Color / Font

@@ -1,7 +1,7 @@
 //! The model of a column's filter drop-down: which typed submenu it offers
 //! (Text, Number or Date Filters), and its value checklist.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::apply::{Area, FilterError, cell_date, grown_range, passes, shown_text, test_for};
 use super::{ColumnFilter, DateGroup, is_blank_value};
@@ -159,10 +159,10 @@ pub fn menu(
     menu_up_to(wb, sheet, col, search, Some(MENU_LIMIT))
 }
 
-/// [`menu`] with every value listed, however many: what a host needs to
-/// keep the values the drop-down didn't show as they are when a cut-short
-/// list is applied.
-pub fn menu_all(
+/// [`menu`] with every value listed, however many: it backs
+/// [`checklist_criteria`], which keeps the values a cut-short drop-down
+/// didn't show as they are, and the search.
+pub(crate) fn menu_all(
     wb: &Workbook,
     sheet: usize,
     col: u32,
@@ -263,25 +263,35 @@ fn menu_up_to(
         pat.as_deref()
             .is_none_or(|p| crate::formula::wildcard_match(p, label))
     };
+    // The column's checklist as sets, built once: a 12,000-value list is
+    // looked up, not scanned, per item.
+    let (vals_on, dates_on): (HashSet<String>, HashSet<DateGroup>) = match mine {
+        Some(ColumnFilter::Values { vals, dates, .. }) => (
+            vals.iter().map(|v| v.trim().to_lowercase()).collect(),
+            dates.iter().copied().collect(),
+        ),
+        _ => Default::default(),
+    };
     let checked = |text: Option<&str>, group: Option<DateGroup>, blank: bool| match mine {
         None => true,
-        Some(ColumnFilter::Values {
-            vals,
-            blank: b,
-            dates,
-        }) => {
+        Some(ColumnFilter::Values { blank: b, .. }) => {
             if blank {
                 return *b;
             }
-            // A node is checked when a checked group covers it.
+            // A node is checked when a checked group covers it: itself, its
+            // month or its year.
             if let Some(g) = group {
-                return dates.iter().any(|d| {
-                    d.year == g.year
-                        && d.month.is_none_or(|m| g.month == Some(m))
-                        && d.day.is_none_or(|x| g.day == Some(x))
-                });
+                let year = DateGroup {
+                    month: None,
+                    day: None,
+                    ..g
+                };
+                let month = DateGroup { day: None, ..g };
+                return dates_on.contains(&year)
+                    || (g.month.is_some() && dates_on.contains(&month))
+                    || (g.day.is_some() && dates_on.contains(&g));
             }
-            text.is_some_and(|t| vals.iter().any(|v| v.trim().eq_ignore_ascii_case(t.trim())))
+            text.is_some_and(|t| vals_on.contains(&t.trim().to_lowercase()))
         }
         Some(_) => false,
     };
@@ -405,10 +415,14 @@ fn menu_up_to(
 
 /// The criteria a drop-down's checklist makes on OK: `listed` are the
 /// lines it showed (a [`menu`]'s items, for `search`) and `checks` whether
-/// each is checked. Every line checked clears the column (`None`), cut-short
-/// list or not. Otherwise a value checklist of the checked values, dates and
-/// `(Blanks)`; on a cut-short list the values it didn't show keep their
-/// current state, read from [`menu_all`].
+/// each is checked. Without a search, every line checked clears the column
+/// (`None`), cut-short list or not. Otherwise a value checklist of the
+/// checked values, dates and `(Blanks)`; on a cut-short list the values it
+/// didn't show keep their current state (under a search, a result not shown
+/// is taken as checked, as Excel's results start), read from [`menu_all`].
+/// With a search and `add` ("Add current selection to filter"), the checked
+/// results join the column's current value checklist.
+#[allow(clippy::too_many_arguments)]
 pub fn checklist_criteria(
     wb: &Workbook,
     sheet: usize,
@@ -417,8 +431,10 @@ pub fn checklist_criteria(
     listed: &[MenuItem],
     checks: &[bool],
     truncated: bool,
+    add: bool,
 ) -> Result<Option<ColumnFilter>, FilterError> {
-    if checks.iter().all(|c| *c) && checks.len() >= listed.len() {
+    let search = search.filter(|s| !s.is_empty());
+    if search.is_none() && checks.iter().all(|c| *c) && checks.len() >= listed.len() {
         return Ok(None);
     }
     // Each line with its check: the listed ones as shown, the rest as the
@@ -434,7 +450,8 @@ pub fn checklist_criteria(
             .items
             .into_iter()
             .map(|i| {
-                let on = shown.get(&key(&i)).copied().unwrap_or(i.checked);
+                let unshown = search.is_some() || i.checked;
+                let on = shown.get(&key(&i)).copied().unwrap_or(unshown);
                 (i, on)
             })
             .collect()
@@ -453,6 +470,35 @@ pub fn checklist_criteria(
             Some(_) => {}
             None if item.blank => blank = true,
             None => vals.push(item.label),
+        }
+    }
+    if let (Some(_), true) = (search, add) {
+        let current = wb.sheets[sheet]
+            .auto_filter
+            .as_ref()
+            .and_then(|af| af.criteria.iter().find(|(c, _)| *c == col));
+        if let Some((
+            _,
+            ColumnFilter::Values {
+                vals: v,
+                blank: b,
+                dates: d,
+            },
+        )) = current
+        {
+            let have: HashSet<String> = v.iter().map(|x| x.to_lowercase()).collect();
+            let mut merged = v.clone();
+            merged.extend(
+                vals.into_iter()
+                    .filter(|x| !have.contains(&x.to_lowercase())),
+            );
+            let mut all_dates = d.clone();
+            all_dates.extend(dates.into_iter().filter(|g| !d.contains(g)));
+            return Ok(Some(ColumnFilter::Values {
+                vals: merged,
+                blank: *b || blank,
+                dates: all_dates,
+            }));
         }
     }
     Ok(Some(ColumnFilter::Values { vals, blank, dates }))

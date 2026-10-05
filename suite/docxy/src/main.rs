@@ -7795,11 +7795,9 @@ fn bar_range_text(text: &str, sheet: &str) -> Result<String, String> {
 ///   validated are, and those are commonly on a different sheet from the one
 ///   the rule is built on (a lookup sheet holding the list, an entry sheet
 ///   holding the boxes).
-/// - `CondFormat` and `Sort` refuse. Each acts on the rows in front of you: a
-///   rule paints these cells, a sort reorders these rows. A qualifier naming
-///   elsewhere is a mistake,
-///   and the existing message says so rather than acting on the same-named
-///   cells here.
+/// - `CondFormat` refuses: a rule paints the cells in front of you. A
+///   qualifier naming elsewhere is a mistake, and the existing message says
+///   so rather than acting on the same-named cells here.
 /// - `ChartTitle` isn't a range at all, so nothing resolves; it answers `false`
 ///   only because the question doesn't apply to it.
 fn target_takes_foreign_sheet(target: RefTarget) -> bool {
@@ -10772,9 +10770,12 @@ impl Docxy {
     }
 
     /// A right-click on cell `(r, c)`: outside the selection it selects the
-    /// cell first, as a left click does (an open editor commits or closes),
-    /// so the cell menu's "Selected Cell" commands act on the cell clicked;
-    /// inside it the selection stays. Then the cell menu opens at `at`.
+    /// cell first (an open editor commits), so the cell menu's "Selected
+    /// Cell" commands act on the cell clicked; inside it the selection stays.
+    /// None of a left click's extras: a link isn't followed, and while a
+    /// formula or a range field is pointing the selection and the buffer stay
+    /// as they are — no reference is written. Then the cell menu opens at
+    /// `at`.
     pub(crate) fn cell_right_click(
         &mut self,
         r: u32,
@@ -10787,8 +10788,10 @@ impl Docxy {
             let (r1, c1, r2, c2) = sel_range(v.sel, v.anchor);
             (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
         });
-        if !inside {
-            self.cell_click(r, c, false, false, window, cx);
+        let pointing = self.formula_pick_active() || self.range_field_active();
+        if !inside && !pointing {
+            self.select_cell(r, c, cx);
+            self.focus.focus(window, cx);
         }
         self.open_cell_menu(at, cx);
     }

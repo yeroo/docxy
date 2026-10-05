@@ -86,6 +86,27 @@ test sheet filter cell menu right-clicked without a click first
   call menu-click {"path":["Filter","Filter by Selected Cell's Value"]}
   assert status is 1 of 4 records found
 
+# links.xlsx is colors.xlsx with A4 (East) linked to C5. A right-click
+# selects the cell without a left click's extras: the link isn't followed.
+test sheet filter cell menu right-click doesn't follow a link
+  open ../fixtures/links.xlsx
+  click A2
+  call menu-open {"target":{"cell":"A4"}}
+  assert sel is A4
+  call menu-click {"path":["Filter","Filter by Selected Cell's Value"]}
+  assert status is 1 of 4 records found
+
+# While a formula is pointing, a right-click writes no reference and moves
+# nothing.
+test sheet filter cell menu right-click leaves a half-typed formula alone
+  open ../fixtures/basic.xlsx
+  click E1
+  type =SUM(
+  call menu-open {"target":{"cell":"B3"}}
+  assert sel is E1
+  assert editing is true
+  assert edit is =SUM(
+
 test sheet filter advanced filter in place
   open ../fixtures/basic.xlsx
   click E1

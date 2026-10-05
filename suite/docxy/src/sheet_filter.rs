@@ -582,7 +582,6 @@ fn operand(text: &str, date1904: bool) -> String {
     t.to_string()
 }
 
-/// The Custom AutoFilter dialog's criteria.
 /// The Custom AutoFilter dialog's criteria. On a date column (`date`) a
 /// typed `YYYY-MM-DD` compares as that date; a wildcard pattern (begins
 /// with, contains, …) and any other column keep the text as typed.
@@ -852,20 +851,17 @@ fn menu_click(
             Ok(())
         }
         _ => {
-            // OK: a search applies its results (added to the current
-            // checklist with "Add current selection"); an untouched list
-            // leaves the column's criterion as it is (a Top 10 or a colour
-            // filter shows there as nothing checked); else the checklist.
+            // OK: the checklist as shown makes the criteria, a search's
+            // results with their checks (added to the column's checklist
+            // with "Add current selection"); an untouched list leaves the
+            // column's criterion as it is (a Top 10 or a colour filter shows
+            // there as nothing checked).
             let checks = match control(top, "values").map(|c| &c.value) {
                 Some(Value::Checks(c)) => c.clone(),
                 _ => Vec::new(),
             };
             let add = checked(top, "add");
-            if !search.is_empty() && checks.first() == Some(&true) {
-                apply_and_close(tab, move |wb, s, today| {
-                    gridcore::filter::search(wb, s, col, &search, add, today)
-                })
-            } else if search.is_empty() && !top.changed("values") {
+            if search.is_empty() && !top.changed("values") {
                 tab.dialogs.pop();
                 Ok(())
             } else {
@@ -877,6 +873,7 @@ fn menu_click(
                     &m.items,
                     checks.get(1..).unwrap_or_default(),
                     m.truncated,
+                    add,
                 );
                 match f {
                     Ok(f) => apply_and_close(tab, move |wb, s, today| {

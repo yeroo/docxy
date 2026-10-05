@@ -444,12 +444,10 @@ impl App {
             return;
         };
         let mut opts = p.opts;
-        let si = self.sheet;
         let area = match text.trim().to_lowercase().chars().next() {
             Some('e') => {
                 if !p.header_given {
-                    opts.header = p.region_header
-                        && gridcore::edit::guess_header(&self.pkg.workbook, si, p.region);
+                    opts.header = p.region_header;
                 }
                 p.region
             }
@@ -598,25 +596,22 @@ impl App {
                 self.custom_filter_col = Some(col);
                 self.open_prompt(crate::PromptKind::CustomFilter);
             }
-            _ if !p.search.is_empty() => {
-                let (pattern, add) = (p.search.clone(), p.add);
-                let _ = self.filter_command(|wb, si, today| {
-                    gridcore::filter::search(wb, si, col, &pattern, add, today)
-                });
-            }
             // An untouched list keeps the column's criterion (a Top 10 or a
             // colour filter shows here as nothing checked).
-            _ if !p.touched => {}
+            _ if p.search.is_empty() && !p.touched => {}
+            // The checklist as shown: a search's results with their checks,
+            // added to the column's checklist with "Add current selection".
             _ => {
                 let si = self.sheet;
                 let f = gridcore::filter::checklist_criteria(
                     &self.pkg.workbook,
                     si,
                     col,
-                    None,
+                    (!p.search.is_empty()).then_some(p.search.as_str()),
                     &p.menu.items,
                     &p.checks[1..],
                     p.menu.truncated,
+                    p.add,
                 );
                 match f {
                     Ok(f) => {
@@ -1083,5 +1078,24 @@ mod tests {
         assert_eq!(a.status.as_deref(), Some("2 of 5 records found"));
         let af = a.sheet().auto_filter.as_ref().unwrap();
         assert!(matches!(af.criteria[0].1, ColumnFilter::Top10 { .. }));
+    }
+
+    #[test]
+    fn enter_under_a_search_takes_its_unchecks() {
+        let mut a = regions();
+        a.ribbon_act(crate::ribbon::Act::Filter);
+        a.cur = (0, 1); // Rep's button
+        assert!(a.open_filter_picker());
+        a.filter_picker_key(KeyCode::Char('a'));
+        let p = a.filter_picker.as_ref().unwrap();
+        let labels: Vec<&str> = p.menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Ann", "Cara", "Dan"]);
+        // Uncheck Cara: the actions, (Select All Search Results), Ann.
+        a.filter_picker.as_mut().unwrap().sel = PICKER_ACTIONS + 2;
+        a.filter_picker_key(KeyCode::Char(' '));
+        a.filter_picker_key(KeyCode::Enter);
+        assert_eq!(a.status.as_deref(), Some("2 of 5 records found"));
+        assert!(a.sheet().row_hidden(4), "Cara's row");
+        assert!(!a.sheet().row_hidden(2) && !a.sheet().row_hidden(3));
     }
 }

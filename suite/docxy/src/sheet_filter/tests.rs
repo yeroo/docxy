@@ -434,3 +434,50 @@ fn a_typed_date_compares_as_a_date_only_on_a_date_column() {
     press(&mut t, "OK").unwrap();
     assert_eq!(shown(&mut t), vec![3]);
 }
+
+#[test]
+fn a_search_for_a_month_name_keeps_that_month() {
+    // When shows yyyy-mm-dd, but the tree lists March: OK keeps the March
+    // records, as the list showed them.
+    let mut t = list();
+    let v = view(&mut t);
+    let april = Cell {
+        style: v.sheet().cell(6, 2).unwrap().style,
+        ..Cell::number(45400.0) // 2024-04-18
+    };
+    v.pkg.workbook.sheets[0].set_cell(6, 2, april);
+    toggle(&mut t).unwrap();
+    t.dialogs.push(menu_dialog(&t, 2).unwrap());
+    set(&mut t, "search", Json::Str("March".into()));
+    press(&mut t, "Search").unwrap();
+    assert!(checklist(&t).iter().any(|(l, _)| l == "March"));
+    press(&mut t, "OK").unwrap();
+    assert_eq!(shown(&mut t), vec![2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn add_to_filter_takes_the_searched_checks_and_keeps_the_old_values() {
+    let mut t = list();
+    toggle(&mut t).unwrap();
+    run(&mut t, |wb, s, today| {
+        let ann = ColumnFilter::values(vec!["Ann".into()]);
+        gridcore::filter::set_criterion(wb, s, 0, Some(ann), today)
+    })
+    .unwrap();
+    // Search "o": Bo and Noor; Bo unchecked, added to the filter.
+    t.dialogs.push(menu_dialog(&t, 0).unwrap());
+    set(&mut t, "search", Json::Str("o".into()));
+    press(&mut t, "Search").unwrap();
+    t.dialogs
+        .set(
+            "values",
+            &Json::obj(vec![
+                ("item", Json::Str("Bo".into())),
+                ("checked", Json::Bool(false)),
+            ]),
+        )
+        .unwrap();
+    set(&mut t, "add", Json::Bool(true));
+    press(&mut t, "OK").unwrap();
+    assert_eq!(shown(&mut t), vec![2, 5, 6], "Noor, Noor and Ann");
+}

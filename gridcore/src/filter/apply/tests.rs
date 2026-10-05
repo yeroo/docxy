@@ -1014,12 +1014,14 @@ fn a_cut_short_checklist_keeps_what_it_did_not_show() {
     assert!(m.truncated);
     // Everything checked: the column is cleared, not cut to 10,000 values.
     let all = vec![true; m.items.len()];
-    let f = crate::filter::checklist_criteria(&wb, 0, 0, None, &m.items, &all, true).unwrap();
+    let f =
+        crate::filter::checklist_criteria(&wb, 0, 0, None, &m.items, &all, true, false).unwrap();
     assert_eq!(f, None);
     // One listed value unchecked: the 2,000 unlisted ones stay shown.
     let mut some = all.clone();
     some[0] = false;
-    let f = crate::filter::checklist_criteria(&wb, 0, 0, None, &m.items, &some, true).unwrap();
+    let f =
+        crate::filter::checklist_criteria(&wb, 0, 0, None, &m.items, &some, true, false).unwrap();
     let out = set_criterion(&mut wb, 0, 0, f, today()).unwrap();
     assert_eq!(
         out,
@@ -1028,4 +1030,60 @@ fn a_cut_short_checklist_keeps_what_it_did_not_show() {
             total: 12_000
         }
     );
+}
+
+#[test]
+fn a_search_matches_dates_as_the_tree_lists_them() {
+    // The dates show as yyyy-mm-dd, but the tree lists March: a search for
+    // it keeps the March days, the list and the filter matching alike.
+    let (mut wb, dates) = datelist();
+    let m = menu(&wb, 0, 0, Some("March")).unwrap();
+    assert!(m.items.iter().any(|i| i.label == "March"), "{:?}", m.items);
+    search(&mut wb, 0, 0, "March", false, today()).unwrap();
+    // `visible` counts rows from 1: the header is row 1, the dates 2..=25.
+    let want: Vec<u32> = (2..=25u32)
+        .filter(|r| dates[*r as usize - 2].1 == 3)
+        .collect();
+    assert_eq!(visible(&wb, 2, 25), want);
+}
+
+#[test]
+fn a_searched_checklist_takes_its_unchecks_and_add() {
+    let rows: Vec<Vec<Cell>> = ["Name", "Ann", "Anna", "Bob", "Dan"]
+        .iter()
+        .map(|s| vec![t(s)])
+        .collect();
+    let mut wb = book(&rows);
+    auto_filter_on(&mut wb, 0, (0, 0)).unwrap();
+    set_criterion(
+        &mut wb,
+        0,
+        0,
+        Some(ColumnFilter::values(vec!["Bob".into()])),
+        today(),
+    )
+    .unwrap();
+    // Search "an": Ann, Anna, Dan; Anna unchecked.
+    let m = menu(&wb, 0, 0, Some("an")).unwrap();
+    let labels: Vec<&str> = m.items.iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(labels, ["Ann", "Anna", "Dan"]);
+    let checks = [true, false, true];
+    let replace =
+        crate::filter::checklist_criteria(&wb, 0, 0, Some("an"), &m.items, &checks, false, false)
+            .unwrap();
+    assert_eq!(
+        replace,
+        Some(ColumnFilter::values(vec!["Ann".into(), "Dan".into()]))
+    );
+    // With "Add current selection to filter", Bob stays, Anna stays out.
+    let add =
+        crate::filter::checklist_criteria(&wb, 0, 0, Some("an"), &m.items, &checks, false, true)
+            .unwrap();
+    set_criterion(&mut wb, 0, 0, add, today()).unwrap();
+    assert_eq!(visible(&wb, 2, 5), vec![2, 4, 5], "Ann, Bob, Dan");
+    // Every result checked under a search is still a filter, not a clear.
+    let all = [true; 3];
+    let f = crate::filter::checklist_criteria(&wb, 0, 0, Some("an"), &m.items, &all, false, false)
+        .unwrap();
+    assert!(f.is_some());
 }

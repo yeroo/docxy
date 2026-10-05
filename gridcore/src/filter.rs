@@ -23,9 +23,8 @@ pub use apply::{
     status_text,
 };
 pub use dates::DYNAMIC_KINDS;
-pub use menu::{
-    ColorChoice, FilterMenu, MENU_LIMIT, MenuItem, Submenu, checklist_criteria, menu, menu_all,
-};
+pub(crate) use menu::menu_all;
+pub use menu::{ColorChoice, FilterMenu, MENU_LIMIT, MenuItem, Submenu, checklist_criteria, menu};
 
 /// Parse a filter criteria into `(operator, operand)`: ">500", "<=100", "<>X",
 /// "=Laptop", or a plain value. Unlike the CF parser, the default operator is

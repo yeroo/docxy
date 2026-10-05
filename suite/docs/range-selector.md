@@ -146,17 +146,16 @@ One `RefTarget` variant per input, one `ref_commit` arm per variant:
 | `Categories` | Chart panel | the category-axis labels, from **one line** of cells — one column on a column-oriented chart (`A2:A5`), one row on a row-oriented one (`B1:D1`), exactly as `SeriesValues(i)` follows the orientation (`categories_shape_err`). Labels name a series' *points*, and a series' points run down rows one way round and along columns the other, so the labels run the same way each derivation writes them. A **single cell** is one row and one column at once and goes through either way, which is what a row chart two columns wide has. A rectangle is refused by the same check on both orientations, for the reason that first motivated it: `range_labels` flattens row-major while Excel derives its own list from the ref itself, so the cache written beside the ref would contradict it the moment Excel refreshes. Taking either line on either orientation would also put the field at odds with `infer_by_row`, which reads a chart's orientation back *out* of the shape of its `<c:cat>` — see [`chart-orientation.md`](chart-orientation.md). `parse_chart` shuts the same door on import — a multi-level `<c:cat>` makes the chart `complex` rather than arriving in a state the field would not accept |
 | `CondFormat` | Conditional Formatting bar | the cells the rule applies to |
 | `Validation` | Data Validation bar | the cells the list applies to |
-| `Sort` | Sort bar | the rows to sort |
 
-Data › Text to Columns used to be a fourth bar with a field here; it is now
-Excel's Convert Text to Columns Wizard, a form dialog (`ttc_dialog.rs`, #692)
-that converts the selected column, so it has no reference field.
+Data › Text to Columns and Custom Sort used to be bars with a field here; they
+are now Excel's Convert Text to Columns Wizard (`ttc_dialog.rs`, #692) and Sort
+dialog (`sheet_sort.rs`, #691), form dialogs that act on the selection or the
+list around it, so they have no reference field.
 
-The three bars *display* the current selection in their field until you pin a
+The two bars *display* the current selection in their field until you pin a
 range into it (`bar_target` → `bar_open` → `bar_seed`; see "The entry bars follow
 the selection until you pin them" below), so leaving the field alone does exactly
-what the bar did before it had one. Sort shows the *region it would find* —
-header already dropped — for the same reason. At apply time `bar_cells()` is the
+what the bar did before it had one. At apply time `bar_cells()` is the
 field's range when it names one, else the selection.
 
 A bar owns the keyboard while it is open, so `sheet_key` asks its range field
@@ -304,7 +303,7 @@ field:
 |--------|---------------|-----|
 | `ChartRange`, `SeriesName`, `SeriesValues`, `Categories` | resolved | a chart plots numbers that needn't live on the sheet it floats over |
 | `Validation` | resolved | the rule is built while looking at the lookup sheet holding the list, and applies to the entry sheet holding the boxes |
-| `CondFormat`, `Sort` | refused | each acts on the rows in front of you — a rule paints *these* cells, a sort reorders *these* rows |
+| `CondFormat` | refused | a rule paints the cells in front of you — *these* cells |
 | `ChartTitle` | n/a | not a range at all |
 
 The refusal is the pre-existing message, unchanged:
@@ -385,13 +384,10 @@ alone, wrapped as `Docxy::ref_sheet_index` for the view and reached from
 
 `bar_range` is `None` until you type a range into the field or point at one. Up
 to that moment the field *displays* the live selection (`bar_seed`) and the bar
-acts on it, which is exactly what Conditional Formatting, Data Validation and
-Custom Sort did before they had a field at all. Seeding the
+acts on it, which is exactly what Conditional Formatting and Data Validation
+did before they had a field at all. Seeding the
 field on open instead would freeze it: you would open the bar, drag out the
 cells you meant, and Apply would still use whatever was selected beforehand.
-
-A sort's seed is not the selection but the region it would find on its own
-(`sheet_sort_bounds`), and only a *pinned* range overrides that.
 
 The Apply button flushes the focused field first (`bar_flush`), so a range typed
 but not yet Entered still counts. After a pick with the mouse the field keeps
@@ -835,7 +831,7 @@ Covered that way: `parse_ref_text`, `range_a1`, `ref_a1`, `source_ref_text`,
 `preview_range`, `sel_range`, `col_at_x`, `row_at_index`/`row_index_of`,
 `series_remove`/`series_move`, `ref_token_at`, `replace_ref`,
 `formula_ref_tokens`, `edit_runs`, `ref_color`, `ref_index_at`,
-`sort_rows_from`, `bar_range_text`, `series_values_shape_err`,
+`bar_range_text`, `series_values_shape_err`,
 `categories_shape_err`, `chart_field_examples`, `chart_plotted_series`,
 `series_is_plotted`, `chart_unplotted_note`, `smallest_ref_at`,
 `range_edges_at`, `snap_range_rows`, `range_border_plan`,

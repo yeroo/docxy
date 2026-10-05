@@ -458,3 +458,29 @@ fn a_winning_rule_that_sets_no_fill_does_not_hide_an_unevaluated_fill() {
         crate::cf::Shown::Rgb((255, 0, 0))
     );
 }
+
+#[test]
+fn a_fill_comes_from_the_highest_rule_that_sets_one() {
+    // B2:B3 holds 5 and 9 (`list`): `> 5` sets only a red font at priority
+    // 1, `> 0` a green fill at priority 2. Excel stacks them: 9 shows the
+    // red font on the green fill, 5 the fill alone.
+    let rules = r#"<conditionalFormatting sqref="B2:B3"><cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>5</formula></cfRule><cfRule type="cellIs" dxfId="1" priority="2" operator="greaterThan"><formula>0</formula></cfRule></conditionalFormatting>"#;
+    let dxfs = r#"<dxfs count="2"><dxf><font><color rgb="FFFF0000"/></font></dxf><dxf><fill><patternFill><bgColor rgb="FF00B050"/></patternFill></fill></dxf></dxfs>"#;
+    let pkg = list(rules, dxfs);
+    let wb = &pkg.workbook;
+    for r in 1..=2 {
+        assert_eq!(
+            crate::cf::cell_fill(wb, 0, r, 1),
+            crate::cf::Shown::Rgb((0, 0xB0, 0x50)),
+            "row {r}"
+        );
+    }
+    assert_eq!(
+        crate::cf::cell_font_color(wb, 0, 2, 1),
+        crate::cf::Shown::Rgb((255, 0, 0))
+    );
+    assert_eq!(
+        crate::cf::cell_font_color(wb, 0, 1, 1),
+        crate::cf::Shown::None
+    );
+}
