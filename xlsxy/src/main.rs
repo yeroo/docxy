@@ -1798,6 +1798,62 @@ struct ClipData {
     cut: bool,
 }
 
+/// What a commit that raised a data-validation alert goes on to do once the
+/// entry is let in: the move the key or click would have made.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cont {
+    Nothing,
+    /// Enter (Shift+Enter moves up).
+    Enter(bool),
+    Move(i64, i64),
+    Click(u32, u32),
+}
+
+/// A button of a data-validation alert.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DvChoice {
+    Retry,
+    Yes,
+    No,
+    Ok,
+    Cancel,
+}
+
+impl DvChoice {
+    fn label(self) -> &'static str {
+        match self {
+            DvChoice::Retry => "Retry",
+            DvChoice::Yes => "Yes",
+            DvChoice::No => "No",
+            DvChoice::Ok => "OK",
+            DvChoice::Cancel => "Cancel",
+        }
+    }
+}
+
+/// The buttons of an alert style, Excel's: Stop Retry/Cancel, Warning
+/// Yes/No/Cancel, Information OK/Cancel. The first selected is the default
+/// (Warning's is No).
+fn dv_buttons(style: gridcore::sheet::AlertStyle) -> &'static [DvChoice] {
+    use gridcore::sheet::AlertStyle;
+    match style {
+        AlertStyle::Stop => &[DvChoice::Retry, DvChoice::Cancel],
+        AlertStyle::Warning => &[DvChoice::Yes, DvChoice::No, DvChoice::Cancel],
+        AlertStyle::Information => &[DvChoice::Ok, DvChoice::Cancel],
+    }
+}
+
+/// A typed entry that broke its cell's data-validation rule, waiting for the
+/// user's answer. The editor stays open behind it with the typed text.
+struct DvAlert {
+    /// The cell and what the entry would put there.
+    cell: (u32, u32),
+    entry: Cell,
+    violation: gridcore::validation::Violation,
+    sel: usize,
+    cont: Cont,
+}
+
 /// The list-validation dropdown: the allowed values and the highlighted row.
 struct DvPicker {
     values: Vec<String>,
@@ -1922,6 +1978,10 @@ struct App {
     sheet_picker: Option<usize>,
     /// The list-validation dropdown, open on a `list`-validated cell.
     dv_picker: Option<DvPicker>,
+    /// The data-validation alert a typed entry raised, until answered.
+    dv_alert: Option<DvAlert>,
+    /// What the commit now running goes on to do, for an alert it raises.
+    commit_cont: Cont,
     /// A filter button's drop-down (Alt+Down on the filter's header row).
     filter_picker: Option<datacmd::FilterPicker>,
     /// A sort waiting on the Sort Warning's answer.
@@ -2070,6 +2130,8 @@ impl App {
             startup_import: false,
             sheet_picker: None,
             dv_picker: None,
+            dv_alert: None,
+            commit_cont: Cont::Nothing,
             filter_picker: None,
             pending_sort: None,
             custom_filter_col: None,
@@ -2353,6 +2415,32 @@ impl App {
                 return false;
             }
         };
+        // The cell's data-validation rule: a breaking entry raises its alert
+        // and waits, the editor kept with the text.
+        if let Some(v) =
+            gridcore::validation::check_entry(&mut self.pkg.workbook, self.sheet, r, c, &cell)
+        {
+            let sel = if v.style == gridcore::sheet::AlertStyle::Warning {
+                1
+            } else {
+                0
+            };
+            self.dv_alert = Some(DvAlert {
+                cell: (r, c),
+                entry: cell,
+                violation: v,
+                sel,
+                cont: std::mem::replace(&mut self.commit_cont, Cont::Nothing),
+            });
+            self.edit = Some(EditState {
+                cursor: text.chars().count(),
+                text,
+                replace: false,
+                seed,
+                proposal: None,
+            });
+            return false;
+        }
         if !self.apply(vec![(r, c, cell)]) {
             // Refused (part of an array): keep the editor open, as Excel does.
             self.edit = Some(EditState {
@@ -2369,6 +2457,73 @@ impl App {
 
     fn cancel_edit(&mut self) {
         self.edit = None;
+    }
+
+    /// Commit the editor, then do `cont` once the entry is in. A data-validation
+    /// alert holds `cont` until it is answered Yes or OK.
+    fn commit_edit_then(&mut self, cont: Cont) -> bool {
+        self.commit_cont = cont;
+        let ok = self.commit_edit();
+        self.commit_cont = Cont::Nothing;
+        if ok {
+            self.run_cont(cont);
+        }
+        ok
+    }
+
+    fn run_cont(&mut self, cont: Cont) {
+        match cont {
+            Cont::Nothing => {}
+            Cont::Enter(shift) => self.enter_move(shift),
+            Cont::Move(dr, dc) => self.move_cur(dr, dc, false),
+            Cont::Click(r, c) => self.click_cell(r, c, Instant::now()),
+        }
+    }
+
+    /// The user's answer to the data-validation alert. Retry and No leave the
+    /// editor open with its text, Cancel drops the entry, Yes and OK let it in.
+    fn dv_alert_choose(&mut self, choice: DvChoice) {
+        let Some(alert) = self.dv_alert.take() else {
+            return;
+        };
+        match choice {
+            DvChoice::Retry | DvChoice::No => {}
+            DvChoice::Cancel => self.edit = None,
+            DvChoice::Yes | DvChoice::Ok => {
+                let (r, c) = alert.cell;
+                if self.apply(vec![(r, c, alert.entry)]) {
+                    self.edit = None;
+                    self.run_cont(alert.cont);
+                }
+            }
+        }
+    }
+
+    fn dv_alert_key(&mut self, code: KeyCode) {
+        let Some(alert) = self.dv_alert.as_mut() else {
+            return;
+        };
+        let buttons = dv_buttons(alert.violation.style);
+        let n = buttons.len();
+        match code {
+            KeyCode::Left | KeyCode::Up | KeyCode::BackTab => alert.sel = (alert.sel + n - 1) % n,
+            KeyCode::Right | KeyCode::Down | KeyCode::Tab => alert.sel = (alert.sel + 1) % n,
+            KeyCode::Enter => {
+                let choice = buttons[alert.sel];
+                self.dv_alert_choose(choice);
+            }
+            KeyCode::Esc => self.dv_alert_choose(DvChoice::Cancel),
+            KeyCode::Char(ch) => {
+                let ch = ch.to_ascii_lowercase();
+                if let Some(&choice) = buttons
+                    .iter()
+                    .find(|b| b.label().to_ascii_lowercase().starts_with(ch))
+                {
+                    self.dv_alert_choose(choice);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Undo/redo snapshots of `keys` on sheet `sheet_idx` as it is now
@@ -8348,6 +8503,9 @@ fn draw(app: &mut App, f: &mut Frame) {
     if let Some(p) = &app.dv_picker {
         draw_dv_picker(app, p, f, grid);
     }
+    if let Some(a) = &app.dv_alert {
+        draw_dv_alert(a, f, grid);
+    }
     if let Some(p) = &app.filter_picker {
         datacmd::draw_filter_picker(app, p, f, grid);
     }
@@ -8849,6 +9007,48 @@ fn num_short(v: f64) -> String {
     }
 }
 
+/// The data-validation alert, centred on the grid: the rule's title, its
+/// message and the style's buttons.
+fn draw_dv_alert(a: &DvAlert, f: &mut Frame, grid: Rect) {
+    let msg = &a.violation.message;
+    let w = ((msg.chars().count().max(a.violation.title.chars().count()) + 4) as u16)
+        .clamp(30, grid.width.max(30))
+        .min(grid.width);
+    let h = 5.min(grid.height);
+    let area = Rect::new(
+        grid.x + grid.width.saturating_sub(w) / 2,
+        grid.y + grid.height.saturating_sub(h) / 2,
+        w,
+        h,
+    );
+    f.render_widget(Clear, area);
+    let buttons: Vec<RSpan> = dv_buttons(a.violation.style)
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| {
+            let style = if i == a.sel {
+                Style::new().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::new()
+            };
+            [
+                RSpan::styled(format!(" {} ", b.label()), style),
+                RSpan::raw(" "),
+            ]
+        })
+        .collect();
+    let lines = vec![
+        RLine::from(RSpan::styled(
+            fit(&format!(" {}", a.violation.title), w as usize, false),
+            Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )),
+        RLine::from(RSpan::raw(fit(&format!(" {msg}"), w as usize, false))),
+        RLine::from(RSpan::raw("")),
+        RLine::from(buttons),
+    ];
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 fn draw_dv_picker(app: &App, p: &DvPicker, f: &mut Frame, grid: Rect) {
     if p.values.is_empty() {
         return;
@@ -9319,6 +9519,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         || app.data_form.is_some()
         || app.sheet_picker.is_some()
         || app.dv_picker.is_some()
+        || app.dv_alert.is_some()
         || app.filter_picker.is_some();
     // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
     if key.code == KeyCode::F(9) && !overlay_open && !shift && !ctrl {
@@ -9359,6 +9560,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // --- sheet picker ---------------------------------------------------------
     if app.sheet_picker.is_some() {
         app.sheet_picker_key(key.code);
+        return false;
+    }
+
+    // --- data-validation alert -------------------------------------------------
+    if app.dv_alert.is_some() {
+        app.dv_alert_key(key.code);
         return false;
     }
 
@@ -9476,30 +9683,23 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => app.cancel_edit(),
             KeyCode::Enter => {
-                if app.commit_edit() {
-                    app.enter_move(shift);
-                }
+                app.commit_edit_then(Cont::Enter(shift));
             }
             KeyCode::Tab => {
-                if app.commit_edit() {
-                    app.move_cur(0, if shift { -1 } else { 1 }, false);
-                }
+                app.commit_edit_then(Cont::Move(0, if shift { -1 } else { 1 }));
             }
             KeyCode::BackTab => {
-                if app.commit_edit() {
-                    app.move_cur(0, -1, false);
-                }
+                app.commit_edit_then(Cont::Move(0, -1));
             }
             // In type-over mode, arrows commit and move (Excel behavior).
             KeyCode::Up | KeyCode::Down if replace => {
-                if app.commit_edit() {
-                    app.move_cur(if key.code == KeyCode::Up { -1 } else { 1 }, 0, false);
-                }
+                app.commit_edit_then(Cont::Move(if key.code == KeyCode::Up { -1 } else { 1 }, 0));
             }
             KeyCode::Left | KeyCode::Right if replace => {
-                if app.commit_edit() {
-                    app.move_cur(0, if key.code == KeyCode::Left { -1 } else { 1 }, false);
-                }
+                app.commit_edit_then(Cont::Move(
+                    0,
+                    if key.code == KeyCode::Left { -1 } else { 1 },
+                ));
             }
             KeyCode::Left => {
                 if let Some(e) = &mut app.edit {
@@ -9734,6 +9934,10 @@ fn char_index(s: &str, char_pos: usize) -> usize {
 }
 
 fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
+    // A data-validation alert is answered from the keyboard.
+    if app.dv_alert.is_some() {
+        return false;
+    }
     // A modal confirmation owns the mouse while open — even over the welcome
     // screen or the backstage.
     if app.confirm.is_some() {
@@ -9848,8 +10052,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
             }
             let Some(col) = col else { return false };
             if app.edit.is_some() {
-                // Clicking outside while editing commits first.
-                if !app.commit_edit() {
+                // Clicking outside while editing commits first; a
+                // data-validation alert keeps the editor and the click waits.
+                if drag {
+                    if !app.commit_edit_then(Cont::Nothing) {
+                        return false;
+                    }
+                } else {
+                    app.commit_edit_then(Cont::Click(row, col));
                     return false;
                 }
             }
@@ -18580,6 +18790,104 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
         assert!(app.data_form.is_none());
+    }
+    // ---- #687: data-validation alerts on typed entry ----
+
+    fn dv_app(style: gridcore::sheet::AlertStyle) -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.apply(vec![(1, 1, Cell::number(50.0))]);
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(1, 1, 9, 1)], // B2:B10
+                kind: "whole".into(),
+                operator: "between".into(),
+                formula1: "10".into(),
+                formula2: "90".into(),
+                allow_blank: true,
+                show_error: true,
+                error_style: style,
+                error_title: "Score".into(),
+                error: "10 to 90 only".into(),
+                ..Default::default()
+            });
+        app.cur = (1, 1);
+        app
+    }
+
+    #[test]
+    fn stop_alert_refuses_the_issue_entries() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        type_text(&mut app, "250");
+        press(&mut app, KeyCode::Enter);
+        let a = app.dv_alert.as_ref().expect("Stop alert raised");
+        assert_eq!(a.violation.title, "Score");
+        assert_eq!(a.violation.message, "10 to 90 only");
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(50.0));
+        // Enter on Retry: back to the editor with the text, no move.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_none());
+        assert_eq!(app.edit.as_ref().map(|e| e.text.as_str()), Some("250"));
+        assert_eq!(app.cur, (1, 1));
+        // Commit again, then Cancel: the edit is dropped, the old content kept.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_some());
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.edit.is_none() && app.dv_alert.is_none());
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(50.0));
+
+        // 45.5 into B3 is refused too.
+        app.cur = (2, 1);
+        type_text(&mut app, "45.5");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_some());
+        assert_eq!(value_at(&app, 2, 1), CellValue::Empty);
+        // A good entry goes in and moves.
+        press(&mut app, KeyCode::Esc);
+        app.cur = (2, 1);
+        type_text(&mut app, "45");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_none());
+        assert_eq!(value_at(&app, 2, 1), CellValue::Number(45.0));
+        assert_eq!(app.cur, (3, 1));
+    }
+
+    #[test]
+    fn warning_asks_yes_no_and_information_lets_the_entry_in() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Warning);
+        type_text(&mut app, "250");
+        press(&mut app, KeyCode::Enter);
+        // No is the default: the editor stays.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_none() && app.edit.is_some());
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(50.0));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(250.0));
+        assert_eq!(app.cur, (2, 1), "Yes enters the value and makes the move");
+
+        let mut app = dv_app(AlertStyle::Information);
+        type_text(&mut app, "250");
+        press(&mut app, KeyCode::Tab);
+        assert!(app.dv_alert.is_some());
+        assert_eq!(app.cur, (1, 1));
+        press(&mut app, KeyCode::Enter); // OK
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(250.0));
+        assert_eq!(app.cur, (1, 2), "OK makes the Tab move");
+    }
+
+    #[test]
+    fn show_error_off_lets_anything_in() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.pkg.workbook.sheets[0].validations[0].show_error = false;
+        type_text(&mut app, "250");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_none());
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(250.0));
     }
 }
 
