@@ -136,3 +136,34 @@ fn the_session_keeps_the_packages_answer() {
     assert!(!back.access.locked());
     assert!(saved_is_final(&src));
 }
+
+#[test]
+fn recovered_edits_of_a_final_document_are_kept() {
+    // A sidecar written by a build before #617, which let edits through: the
+    // mark is still in it, and so is unsaved work.
+    let dir = Scratch::new();
+    let src = final_docx(&dir, "final.docx");
+    let hot = dir.path("hot");
+    std::fs::create_dir_all(&hot).unwrap();
+    let mut tab = tab_from_path(&src);
+    leak_edit(&mut tab, "Recovered ");
+    tab.dirty = true;
+    let persisted = persist_tab(&hot, 0, &tab);
+    assert!(persisted.dirty && persisted.hot.is_some());
+
+    let mut back = restore_tab(&persisted);
+    assert!(back.dirty);
+    assert!(
+        !back.access.locked(),
+        "the render backstop would roll it back"
+    );
+    assert!(text(&back).starts_with("Recovered "));
+    assert!(!back.pkg.as_ref().unwrap().marked_final());
+    // An edit lands as an edit, and the work survives the next persist.
+    back.mark_dirty();
+    assert!(text(&back).starts_with("Recovered "));
+    let again = restore_tab(&persist_tab(&hot, 1, &back));
+    assert!(again.dirty && text(&again).starts_with("Recovered "));
+    // The file itself is untouched and still final.
+    assert!(saved_is_final(&src));
+}

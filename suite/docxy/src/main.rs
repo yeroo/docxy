@@ -8945,6 +8945,16 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
             // Edit Anyway no longer carries it.
             marked_final: tab.access.marked_final,
         };
+        // Unsaved edits recovered from the sidecar of a document still marked
+        // as final (a build before #617 let them through) are kept, not
+        // rolled back as a leaked edit: the user already edited it, so it
+        // opens as after Edit Anyway, mark gone from what a save writes.
+        if from_hot && tab.dirty && tab.access.marked_final {
+            tab.access.marked_final = false;
+            if let Some(pkg) = tab.pkg.as_mut() {
+                pkg.clear_marked_final();
+            }
+        }
     }
     (tab, from_hot)
 }
