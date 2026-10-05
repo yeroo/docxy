@@ -15,12 +15,17 @@ use std::collections::BTreeMap;
 mod clip;
 pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
 mod consolidate;
+mod sort;
 mod subtotal;
 pub(crate) use consolidate::split_ref_text;
 pub use consolidate::{
     ConsolidateError, ConsolidateFunc, ConsolidateOptions, ConsolidateRef, ConsolidateSettings,
     canonical_consolidate_ref, consolidate, consolidate_fn_name, consolidate_token,
     format_consolidate_ref, parse_consolidate_func, parse_consolidate_ref,
+};
+pub use sort::{
+    BUILTIN_SORT_LISTS, SORT_MERGED, SORT_WARNING, SortError, SortLevel, SortOn, SortOptions,
+    sort_range, sort_region, sort_warning,
 };
 pub use subtotal::{
     Area, SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,

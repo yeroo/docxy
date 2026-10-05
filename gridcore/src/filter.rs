@@ -16,6 +16,7 @@ mod dates;
 mod menu;
 
 pub use advanced::{ADVANCED_OTHER_SHEET, AdvancedFilter, advanced};
+pub(crate) use apply::shown_text;
 pub use apply::{
     ByCell, FilterError, FilterOutcome, auto_filter_off, auto_filter_on, auto_filter_on_range,
     clear, filter_by_cell, reapply, search, set_criterion, status_text,
