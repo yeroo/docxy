@@ -105,6 +105,113 @@ fn cross_project_fields_survive_xml_yppx_and_cell_edit() {
 }
 
 #[test]
+fn predecessors_cell_shows_the_cross_project_name() {
+    let proj = read_mspdi(&fixture(r"C:\plans\other.mpp", "")).unwrap();
+    let task = proj.task(2).unwrap();
+    assert_eq!(format_predecessors(task, &proj), r"1, C:\plans\other.mpp\7");
+
+    let mut not_cross = proj.clone();
+    not_cross
+        .tasks
+        .iter_mut()
+        .find(|t| t.uid == 2)
+        .unwrap()
+        .predecessors[1]
+        .cross_project = Some(false);
+    assert_eq!(
+        format_predecessors(not_cross.task(2).unwrap(), &not_cross),
+        "1, 3"
+    );
+
+    let mut blank = proj.clone();
+    blank
+        .tasks
+        .iter_mut()
+        .find(|t| t.uid == 2)
+        .unwrap()
+        .predecessors[1]
+        .cross_project_name = Some("   ".into());
+    assert_eq!(
+        format_predecessors(blank.task(2).unwrap(), &blank),
+        "1, 3"
+    );
+
+    let mut unnamed = proj.clone();
+    unnamed
+        .tasks
+        .iter_mut()
+        .find(|t| t.uid == 2)
+        .unwrap()
+        .predecessors[1]
+        .cross_project_name = None;
+    assert_eq!(
+        format_predecessors(unnamed.task(2).unwrap(), &unnamed),
+        "1, 3"
+    );
+}
+
+#[test]
+fn cross_project_name_round_trips_in_the_cell() {
+    let mut proj = read_mspdi(&fixture(r"C:\plans\other.mpp", "")).unwrap();
+    proj.tasks
+        .iter_mut()
+        .find(|t| t.uid == 2)
+        .unwrap()
+        .predecessors[1]
+        .cross_project_name = Some(r"C:\a,b\other&more.mpp\7".into());
+    let task = proj.task(2).unwrap();
+    let shown = format_predecessors(task, &proj);
+    assert_eq!(shown, r"1, C:\a,b\other&more.mpp\7");
+    let parsed = parse_task_predecessors(&shown, task, &proj).unwrap();
+    assert_eq!(parsed, task.predecessors);
+
+    // The name typed in another case with a new type and lag edits the link
+    // and keeps the stored name byte-exact.
+    let edited = parse_task_predecessors(r"1, c:\a,b\other&more.mpp\7ss+1d", task, &proj).unwrap();
+    let by_id = parse_task_predecessors("1, 3SS+1d", task, &proj).unwrap();
+    assert_eq!(edited[0], task.predecessors[0]);
+    assert_eq!(edited[1].link, by_id[1].link);
+    assert_eq!(edited[1].lag, by_id[1].lag);
+    assert_eq!(edited[1].lag_format, by_id[1].lag_format);
+    assert_eq!(edited[1].cross_project, Some(true));
+    assert_eq!(
+        edited[1].cross_project_name.as_deref(),
+        Some(r"C:\a,b\other&more.mpp\7")
+    );
+
+    // The edited links survive a save.
+    let mut edited_proj = proj.clone();
+    edited_proj
+        .tasks
+        .iter_mut()
+        .find(|t| t.uid == 2)
+        .unwrap()
+        .predecessors = edited;
+    let saved = write_mspdi(&edited_proj);
+    assert!(saved.contains(r"<CrossProjectName>C:\a,b\other&amp;more.mpp\7</CrossProjectName>"));
+    let back = read_mspdi(&saved).unwrap();
+    assert_eq!(
+        back.task(2).unwrap().predecessors[1]
+            .cross_project_name
+            .as_deref(),
+        Some(r"C:\a,b\other&more.mpp\7")
+    );
+}
+
+#[test]
+fn cross_project_cell_rejects_duplicates_and_unknown_names() {
+    let proj = read_mspdi(&fixture(r"C:\plans\other.mpp", "")).unwrap();
+    let task = proj.task(2).unwrap();
+    let name = r"C:\plans\other.mpp\7";
+    let err = parse_task_predecessors(&format!("{name}, 3SS"), task, &proj).unwrap_err();
+    assert_eq!(err, "Duplicate predecessor");
+    let err = parse_task_predecessors(&format!("{name}, {name}"), task, &proj).unwrap_err();
+    assert_eq!(err, "Duplicate predecessor");
+    let err = parse_task_predecessors(r"C:\other.mpp\9", task, &proj).unwrap_err();
+    assert_eq!(err, "Expected predecessor task ID");
+}
+
+#[test]
 fn external_leaf_is_not_local_work_or_a_project_bound() {
     let proj = read_mspdi(&fixture(r"C:\plans\other.mpp", "")).unwrap();
     let sched = schedule(&proj);
