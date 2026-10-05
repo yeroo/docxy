@@ -20,3 +20,14 @@ test the user name dialog opened from the Backstage row takes typed text with no
   assert dialog is none
   assert user_name is Jane Doe
   assert user_initials is JD
+
+test a tab arriving under the open dialog does not strand it
+  call backstage {"action":"open"}
+  call user-name {}
+  assert dialog is user-name
+  open copy:../fixtures/basic.docx
+  assert dialog is user-name
+  call dialog-set {"control":"user-name","value":"Pat Lee"}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert user_name is Pat Lee

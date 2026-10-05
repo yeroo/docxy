@@ -418,8 +418,9 @@ impl Docxy {
             })
             .flatten();
         if self.app_dialogs.is_open() {
-            // The app's own dialog (the User name with no document open). A
-            // refusal has no status line to go to without a document.
+            // The app's own dialog (the User name opened with no document). It
+            // stays on top if a tab arrives under it. A refusal goes to the
+            // active tab's status line, if there is a tab.
             if let Err(e) = edit_key(&mut self.app_dialogs, key, typed, m, clip.as_deref()) {
                 self.set_status(e);
             }
@@ -487,7 +488,7 @@ impl Docxy {
         else {
             return;
         };
-        // The text starts a padding (and the border) in from the box's edge.
+        // The probe is already inside the border: the text starts a padding in.
         let x = f32::from(at.x - bounds.left()) - FIELD_INSET;
         let measurer = Measurer::new(window);
         if let Some(d) = self
@@ -526,15 +527,16 @@ impl Docxy {
             .text_size(px(12.))
             .text_color(fg)
             .child(probe(&self.probes, format!("dialog-control:{}", c.name)));
-        let boxed = |text: String| {
+        let boxed_with = |content: AnyElement| {
             div()
                 .min_w(px(96.))
                 .px_1()
                 .border_1()
                 .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
                 .bg(pal.panel)
-                .child(SharedString::from(text))
+                .child(content)
         };
+        let boxed = |text: String| boxed_with(SharedString::from(text).into_any_element());
         match c.kind {
             k if k.is_text() => {
                 let name = c.name;
@@ -562,15 +564,9 @@ impl Docxy {
                 };
                 row.child(label)
                     .child(
-                        div()
+                        boxed_with(shown)
                             .relative()
-                            .min_w(px(96.))
-                            .px_1()
-                            .border_1()
-                            .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
-                            .bg(pal.panel)
-                            .child(probe(&self.probes, format!("dialog-field:{name}")))
-                            .child(shown),
+                            .child(probe(&self.probes, format!("dialog-field:{name}"))),
                     )
                     .when(editable, |r| {
                         r.cursor_text().on_click(cx.listener(

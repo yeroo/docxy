@@ -680,10 +680,10 @@ pub(crate) struct Dialog {
     pub focus: Option<usize>,
     /// The caret in the focused text field, as a character index; `None` is
     /// the end of the text. Reset whenever the focus moves or a value is set.
-    pub caret: Option<usize>,
+    caret: Option<usize>,
     /// The other end of the selection the caret extends from, when one is
     /// made (Shift+arrow, Ctrl+A); `None` is no selection.
-    pub anchor: Option<usize>,
+    anchor: Option<usize>,
     /// The control `caret` and `anchor` belong to: they mean nothing once the
     /// focus is on another (however it got there).
     caret_for: Option<usize>,

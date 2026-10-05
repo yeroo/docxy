@@ -3413,7 +3413,7 @@ fn dispatch_verb(
                     ("x", Json::Num(f64::from(p.x))),
                     ("y", Json::Num(f64::from(p.y))),
                 ]))?;
-                done.pointer = click_events(p);
+                done.input = click_events(p);
                 return Ok(done);
             }
             app.refuse_under_dialog()?;
@@ -3451,7 +3451,7 @@ fn dispatch_verb(
                     Json::Num(item_at_point(&app.probes.borrow(), p) as f64),
                 ),
             ]))?;
-            done.pointer = click_events(p);
+            done.input = click_events(p);
             Ok(done)
         }
         "pointer-drag" => {
@@ -3478,7 +3478,7 @@ fn dispatch_verb(
                     Json::Arr(vec![Json::Num(f64::from(to.x)), Json::Num(f64::from(to.y))]),
                 ),
             ]))?;
-            done.pointer = drag_events(&path);
+            done.input = drag_events(&path);
             Ok(done)
         }
 
@@ -3698,7 +3698,7 @@ fn dispatch_verb(
                     .collect::<Result<Vec<_>, _>>()?
             };
             let mut done = Done::ok(Json::obj(vec![("keys", Json::Num(strokes.len() as f64))]))?;
-            done.pointer = strokes
+            done.input = strokes
                 .into_iter()
                 .map(|keystroke| PlatformInput::KeyDown(key_event(keystroke)))
                 .collect();
@@ -3911,7 +3911,7 @@ fn dispatch_verb(
                 result: Json::obj(vec![("quitting", Json::Bool(true))]),
                 quit: true,
                 draw: false,
-                pointer: Vec::new(),
+                input: Vec::new(),
             })
         }
 

@@ -3242,8 +3242,9 @@ struct Docxy {
     ribbon_tab: RibbonTab,
     ribbon_min: bool,
     backstage: bool,
-    /// Dialogs the app owns while no document is open, where there is no
-    /// tab's stack to hold them: the Settings' User name (#1027).
+    /// Dialogs the app owns: the Settings' User name opened with no document
+    /// open, where there is no tab's stack to hold it (#1027). While one is
+    /// open it is the one shown and keyed, even if a tab arrives under it.
     app_dialogs: dialog::DialogStack,
     bs_new: bool,
     /// The backstage shows the Info page (Inspect Document, #627). Cleared
@@ -17845,6 +17846,10 @@ impl Docxy {
         if self.tab_more_open {
             return;
         }
+        // File (backstage) covers the window; Tab there edits nothing under it.
+        if self.backstage {
+            return;
+        }
         // An open menu takes Tab as it takes every key; see `on_key`.
         if self.close_menu() {
             cx.notify();
@@ -17955,6 +17960,10 @@ impl Docxy {
         if self.tab_more_open {
             return;
         }
+        // File (backstage) covers the window; Tab there edits nothing under it.
+        if self.backstage {
+            return;
+        }
         // An open menu takes Tab as it takes every key; see `on_key`.
         if self.close_menu() {
             cx.notify();
@@ -18031,7 +18040,7 @@ impl Docxy {
         if let Some(done) = self.document_key(ev, window, cx) {
             return done;
         }
-        if self.project_edit_open() && !self.backstage {
+        if self.project_edit_open() {
             return self.project_key(ev, window, cx);
         }
         let m = &ev.keystroke.modifiers;
