@@ -1138,4 +1138,81 @@ mod tests {
         let reloaded = gridcore::validation::validation_at(&re.workbook.sheets[0], r, c).unwrap();
         assert_eq!(reloaded.error_style, AlertStyle::Warning);
     }
+
+    // ---- review r12 ----
+
+    /// A1 empty; A2 = 1 and B2 a custom Stop rule reading `formula`.
+    fn cut_book(formula: &str) -> DocTab {
+        let mut t = tab();
+        put(&mut t, "A2", Cell::number(1.0));
+        view(&mut t).pkg.workbook.sheets[0]
+            .validations
+            .push(DataValidation {
+                ranges: vec![(1, 1, 1, 1)],
+                kind: "custom".into(),
+                formula1: formula.into(),
+                allow_blank: true,
+                show_error: true,
+                ..Default::default()
+            });
+        t
+    }
+
+    fn cut_paste(t: &mut DocTab, to: &str) {
+        let v = view(t);
+        v.anchor = at("A2");
+        v.sel = at("B2");
+        std::mem::swap(&mut v.anchor, &mut v.sel);
+        let clip = v.grid_clip(true).unwrap();
+        v.anchor = at(to);
+        v.sel = at(to);
+        assert_eq!(v.paste_grid_clip(&clip), Ok(crate::GridPasted::Done));
+    }
+
+    #[test]
+    fn a_cut_keeps_a_rule_reading_the_cells_it_moved() {
+        let mut t = cut_book("$A$2>0");
+        cut_paste(&mut t, "A3");
+        let (r, c) = at("B3");
+        let dv =
+            gridcore::validation::validation_at(view(&mut t).sheet(), r, c).expect("B3 has it");
+        assert_eq!(dv.formula1, "$A$3>0", "the reference followed the cut cell");
+        // Typing in B3 is checked against A3 (which holds 1), not the empty A2.
+        select(&mut t, "B3");
+        assert_eq!(enter(&mut t, "5"), Some(true));
+        assert!(view(&mut t).dv_pending.is_none());
+    }
+
+    #[test]
+    fn a_cut_keeps_a_relative_rule_and_moves_to_another_sheet() {
+        // Relative: B2>A2 reads cells that moved with the cut, so it follows.
+        let mut t = cut_book("B2>A2");
+        cut_paste(&mut t, "A3");
+        let (r, c) = at("B3");
+        let dv = gridcore::validation::validation_at(view(&mut t).sheet(), r, c).unwrap();
+        assert_eq!(dv.formula1, "B3>A3");
+        // Onto another sheet of the workbook.
+        let mut t = cut_book("$A$2>0");
+        {
+            let v = view(&mut t);
+            v.pkg.workbook.sheets.push(gridcore::sheet::Sheet {
+                name: "Other".into(),
+                ..Default::default()
+            });
+            v.engine = crate::sheet_engine(&v.pkg.workbook);
+        }
+        let v = view(&mut t);
+        v.anchor = at("A2");
+        v.sel = at("B2");
+        std::mem::swap(&mut v.anchor, &mut v.sel);
+        let clip = v.grid_clip(true).unwrap();
+        v.active = 1;
+        v.anchor = at("A3");
+        v.sel = at("A3");
+        assert_eq!(v.paste_grid_clip(&clip), Ok(crate::GridPasted::Done));
+        let (r, c) = at("B3");
+        assert!(gridcore::validation::validation_at(&v.pkg.workbook.sheets[1], r, c).is_some());
+        let (r, c) = at("B2");
+        assert!(gridcore::validation::validation_at(&v.pkg.workbook.sheets[0], r, c).is_none());
+    }
 }

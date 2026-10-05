@@ -3723,13 +3723,17 @@ impl SheetView {
         // target, whose own are replaced.
         let can_hold = self.pkg.takes_validations(dst) && self.pkg.takes_validations(src);
         if can_hold {
+            // The rules as they are now, after the references to the moved
+            // cells were rewritten (not the copy-time snapshot, which would
+            // reinstall the old references), put where the cells went with
+            // their formulas as they are: a cut moves, it does not copy.
+            let live = gridcore::validation::copy_rules(&self.pkg.workbook.sheets[src], clip.rect);
             gridcore::validation::clear_validation(&mut self.pkg.workbook.sheets[src], clip.rect);
-            gridcore::validation::paste_rules(
+            gridcore::validation::move_rules(
                 &mut self.pkg.workbook.sheets[dst],
-                &clip.rules,
+                &live,
                 clip.rect,
                 at,
-                (1, 1),
             );
         }
         self.prune_circles();

@@ -3918,18 +3918,42 @@ impl App {
                     app.record_groups(keys, cut_from, |app| {
                         if can_hold {
                             if cut {
+                                // A cut moves: the formulas keep their text
+                                // (as the cut cells' own do).
                                 gridcore::validation::clear_validation(
                                     &mut app.pkg.workbook.sheets[src],
                                     rules_from,
                                 );
+                                let mut followed = rules.clone();
+                                let (src_name, dst_name) = (
+                                    app.pkg.workbook.sheets[src].name.clone(),
+                                    app.pkg.workbook.sheets[here].name.clone(),
+                                );
+                                gridcore::validation::follow_cut(
+                                    &mut followed,
+                                    &gridcore::formula::CellMove {
+                                        src: &src_name,
+                                        dst: &dst_name,
+                                        rect: rules_from,
+                                        dr: i64::from(r0) - i64::from(rules_from.0),
+                                        dc: i64::from(c0) - i64::from(rules_from.1),
+                                    },
+                                );
+                                gridcore::validation::move_rules(
+                                    &mut app.pkg.workbook.sheets[here],
+                                    &followed,
+                                    rules_from,
+                                    (r0, c0),
+                                );
+                            } else {
+                                gridcore::validation::paste_rules(
+                                    &mut app.pkg.workbook.sheets[here],
+                                    &rules,
+                                    rules_from,
+                                    (r0, c0),
+                                    (1, 1),
+                                );
                             }
-                            gridcore::validation::paste_rules(
-                                &mut app.pkg.workbook.sheets[here],
-                                &rules,
-                                rules_from,
-                                (r0, c0),
-                                (1, 1),
-                            );
                         }
                         let (clears, late) = if same_sheet {
                             app.engine
@@ -20711,6 +20735,37 @@ mod tests {
         app.anchor = None;
         app.row_op(true);
         assert!(app.circles.is_empty());
+    }
+    #[test]
+    fn a_cut_keeps_a_rule_reading_the_cells_it_moved() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.pkg.workbook.sheets[0].validations.clear();
+        app.apply(vec![(1, 0, Cell::number(1.0))]); // A2 = 1
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(1, 1, 1, 1)], // B2
+                kind: "custom".into(),
+                formula1: "$A$2>0".into(),
+                allow_blank: true,
+                show_error: true,
+                ..Default::default()
+            });
+        app.cur = (1, 0);
+        app.anchor = Some((1, 1)); // A2:B2
+        app.copy(true);
+        app.anchor = None;
+        app.cur = (2, 0); // A3
+        app.paste_from(None);
+        let dv = gridcore::validation::validation_at(app.sheet(), 2, 1).expect("B3 has the rule");
+        assert_eq!(dv.formula1, "$A$3>0", "the reference followed the cut cell");
+        // Typing in B3 is checked against A3 (1), not the empty A2.
+        app.cur = (2, 1);
+        type_text(&mut app, "5");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_none());
+        assert_eq!(value_at(&app, 2, 1), CellValue::Number(5.0));
     }
 }
 
