@@ -273,7 +273,8 @@ that call GPUI window APIs. `title-tab` calls the same handler methods as the
 title-bar arrows and dropdown items, and `tab-select` calls `select_tab`, the
 tab chip's click handler. `pointer-click`/`pointer-drag` are the hit-testing
 exception (#545): real `PlatformInput` events dispatched through gpui, for
-overlap order a handler call cannot see. `proj.new` calls `add_tab(Kind::Project)`, the
+overlap order a handler call cannot see; `real-key`/`real-type` (#1027) are the
+same for the keyboard, for which root handles a key (`key`/`type` call `on_key`). `proj.new` calls `add_tab(Kind::Project)`, the
 Backstage › New › Project card's handler; F11 also commits the active plan's
 pending cell edit first, and `proj.new` does not.
 
@@ -285,8 +286,8 @@ and cannot see **which elements carry handlers at all**. `drag A1 -> C5` runs
 deferred fill-handle hitbox that sits over the cells, so a case's `assert cells
 unchanged` would stay green if someone put a second handler back on that handle.
 
-The exception is `pointer-click`/`pointer-drag` (#545): they queue real
-`PlatformInput` mouse events on the control reply, and the pump dispatches them
+The exception is `pointer-click`/`pointer-drag` (#545) and `real-key`/`real-type`
+(#1027): they queue real `PlatformInput` mouse and key-down events on the control reply, and the pump dispatches them
 through `Window::dispatch_event` once the entity borrow ends — so hit testing
 runs against the last rendered frame exactly as an OS click would. They exist
 precisely for what handler-calling verbs cannot express: hit order between
@@ -325,7 +326,7 @@ State keys, as the app reports them after every driving verb:
 | `tab`, `title`, `dirty`, `status`, `sheet_tab` | the active tab |
 | `caption`, `read_only`, `protected`, `repaired`, `final` | `final` is a document Word marked as final (#617), locked like Protected View until Edit Anyway and captioned `[Read-Only]`; the active tab's caption as the strip draws it (`book.xlsx [Read-Only]`, or `Report.doc [Compatibility Mode]` for a document imported from Word 97-2003 until Convert, #634) and its open mode; see [Open modes](#open-modes-and-protected-view) |
 | `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor, prompt or dialog is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
-| `dialog` | the active tab's top dialog's id, or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
+| `dialog` | the top dialog's id (the app's own, #1027, else the active tab's), or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
 | `autorecover_minutes` | minutes between AutoRecover writes while a tab is unsaved; `0` is off |
 | `keep_drafts` | whether Don't Save keeps a workbook's last AutoRecover copy as a draft |
@@ -444,7 +445,7 @@ footer editor; `selection-set` refuses while it is open.
 | `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
 | `tab-list {}` | read every open tab in strip order: `{active, tabs:[{index, title, kind, path, dirty, imported, caption, read_only, protected, final, repaired}]}`. `kind` is `docx`, `xlsx`, `project` or `mail`; `path` is `null` for a tab never saved; `imported` is true for a Project read from `.mpp` and for a document whose file is a Word 97-2003 binary it was imported from (#634; a `.doc`, or one renamed), until a save rebinds the tab to the file it wrote |
 | `tab-select {"tab":"schedule"}` | make a tab active as clicking its chip does, and reply with the state. `tab` is an index or a case-insensitive title/path substring over **all** tabs, the rule the `proj.*` verbs use; a miss (`no tab matches 'x'`), an ambiguous match (`several tabs match 'x' (2, 3)`) and an index past the end (`no tab at index 9`) are refused. The Backstage stays as it was, as it does for a chip click |
-| `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog; a press reaches an open menu's own item or backdrop, so it does not pre-close menus |
+| `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point; or `{"at":"user-name-row"}`: Backstage's User name... row, #1027); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog, except the `{"dialog-field":"user-name","x":N}` form (#1027), which clicks the open dialog's text field `N` pixels in from its left edge (its middle without `x`) and replies `{x, y}`; a press reaches an open menu's own item or backdrop, so it does not pre-close menus |
 | `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 8 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The drag arms once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of about 2.25px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
 | `proj.new {}` | make a blank Project and activate it, as Backstage › New › Project does; replies with `proj.path` for it (`tab`, `path: null`, `name: Project1`, 0 `tasks`, `imported`, the cell state). It takes no `tab` and no `name`: the plan is the app's, so name it by saving it (`proj.save {"path":…}`). The Project control server accepts it too |
 | `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
@@ -546,10 +547,25 @@ Recover Unsaved Workbooks does. The ignored desktop test in
 `uiharness/tests/autorecover.rs` walks the issue's scenario.
 
 `call user-name {}` opens Settings' User name... dialog (#620) on the active
-tab, as the backstage row does: `dialog-set` its `user-name` and `initials`
+tab (or the app's own stack when no document is open, #1027), as the backstage
+row does: `dialog-set` its `user-name` and `initials`
 fields and `dialog-click` OK to store and persist them. New Word comments are
 stamped with that name and those initials (else the OS account name, else
 `docxy`, with initials derived from the name) and the UTC time.
+
+`key` and `type` call the key handler directly, so they pass when a window root
+has no key handler. `call real-key {"key":"ctrl+a"}` (or `"keys":[...]`) and
+`call real-type {"text":"…"}` queue the same strokes as real `KeyDown` input,
+which gpui dispatches through the focused window root and its bound actions
+(Tab, Shift+Tab) as the OS's keys go. `call pointer-click {"dialog-field":"user-name"}`
+clicks the open dialog's text field (`"x":N` pixels in from its left edge, else
+its middle), which focuses it and puts the caret under the click; it needs a
+drawn frame, so `shot window` first. `call pointer-click {"at":"user-name-row"}`
+clicks Backstage's User name... row (open File first). Keys pressed in
+Backstage with no dialog up edit nothing under it. `call comments {}` reads the
+active document's comments `{comments:[{id,author,initials,text}]}`. The cases are in
+`uiharness/cases/user-name.uit`; `user-name-no-document.uit` closes every tab,
+so it has its own file (cases in one file share one instance).
 
 `call autocorrect {}` opens Settings' AutoCorrect Options... dialog (#667,
 id `autocorrect`) on the active tab, as the backstage row does. Its tabs are

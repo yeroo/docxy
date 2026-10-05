@@ -3356,6 +3356,10 @@ struct Docxy {
     ribbon_tab: RibbonTab,
     ribbon_min: bool,
     backstage: bool,
+    /// Dialogs the app owns: the Settings' User name opened with no document
+    /// open, where there is no tab's stack to hold it (#1027). While one is
+    /// open it is the one shown and keyed, even if a tab arrives under it.
+    app_dialogs: dialog::DialogStack,
     bs_new: bool,
     /// The backstage shows the Info page (Inspect Document, #627). Cleared
     /// wherever `bs_new` is; New and Info clear each other.
@@ -9293,6 +9297,7 @@ impl Docxy {
             ribbon_tab: RibbonTab::Home,
             ribbon_min: false,
             backstage: false,
+            app_dialogs: dialog::DialogStack::default(),
             bs_new: false,
             bs_info: false,
             bs_account: false,
@@ -18091,6 +18096,10 @@ impl Docxy {
         if self.tab_more_open {
             return;
         }
+        // File (backstage) covers the window; Tab there edits nothing under it.
+        if self.backstage {
+            return;
+        }
         // An open menu takes Tab as it takes every key; see `on_key`.
         if self.close_menu() {
             cx.notify();
@@ -18101,7 +18110,7 @@ impl Docxy {
         }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
-            if self.keytips == KeyTip::Off && !self.backstage {
+            if self.keytips == KeyTip::Off {
                 self.mini_bar = None;
                 self.project_tab_key(false, window, cx);
             }
@@ -18117,7 +18126,7 @@ impl Docxy {
             cx.notify();
             return;
         }
-        if self.keytips != KeyTip::Off || self.comment_open || self.backstage {
+        if self.keytips != KeyTip::Off || self.comment_open {
             return;
         }
         self.mini_bar = None;
@@ -18210,6 +18219,10 @@ impl Docxy {
         if self.tab_more_open {
             return;
         }
+        // File (backstage) covers the window; Tab there edits nothing under it.
+        if self.backstage {
+            return;
+        }
         // An open menu takes Tab as it takes every key; see `on_key`.
         if self.close_menu() {
             cx.notify();
@@ -18220,13 +18233,13 @@ impl Docxy {
         }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
-            if self.keytips == KeyTip::Off && !self.backstage {
+            if self.keytips == KeyTip::Off {
                 self.mini_bar = None;
                 self.project_tab_key(true, window, cx);
             }
             return;
         }
-        if self.keytips != KeyTip::Off || self.find_open || self.comment_open || self.backstage {
+        if self.keytips != KeyTip::Off || self.find_open || self.comment_open {
             return;
         }
         self.mini_bar = None;
@@ -18268,6 +18281,11 @@ impl Docxy {
             }
             return; // the modal list owns keys; do not edit the surface below
         }
+        // File (backstage) covers the window: with no dialog up, a key there
+        // edits nothing under it (#1027; its root takes keys for the dialogs).
+        if self.backstage {
+            return;
+        }
         // An open menu takes the key (#397): Up and Down move its highlight,
         // Enter runs the highlighted item (or opens its submenu), and any
         // other key — Esc among them — closes it. None reaches the document
@@ -18281,7 +18299,7 @@ impl Docxy {
         if let Some(done) = self.document_key(ev, window, cx) {
             return done;
         }
-        if self.project_edit_open() && !self.backstage {
+        if self.project_edit_open() {
             return self.project_key(ev, window, cx);
         }
         let m = &ev.keystroke.modifiers;
@@ -27318,13 +27336,14 @@ impl Docxy {
                 )
                 // Word's File › Options › General › User name and Initials
                 // (#620), stamped on new comments. Its dialog sits on a tab's
-                // stack, so the row needs a tab.
-                .when(!self.tabs.is_empty(), |d| {
+                // stack, or the app's when none is open (#1027).
+                .map(|d| {
                     let (name, initials) =
                         review_identity(&self.user_name, &self.user_initials);
                     d.child(
                         div()
                             .id("bs-user-name")
+                            .relative()
                             .flex()
                             .items_center()
                             .gap_2()
@@ -27333,6 +27352,7 @@ impl Docxy {
                             .cursor_pointer()
                             .rounded_sm()
                             .hover(|d| d.bg(sidebar))
+                            .child(probe(&self.probes, "bs-user-name"))
                             .child(div().text_color(fg).child("User name..."))
                             .child(
                                 div()
@@ -27984,6 +28004,7 @@ impl Render for Docxy {
                 .relative()
                 .bg(bg)
                 .track_focus(&self.focus)
+                .key_routing(cx)
                 .child(probe_tracked(
                     &self.probes,
                     "suite-root",
@@ -28708,9 +28729,7 @@ impl Render for Docxy {
             .size_full()
             .relative()
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(Self::on_key))
-            .on_action(cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)))
-            .on_action(cx.listener(|this, _: &OutdentAction, window, cx| this.shift_tab_key(window, cx)))
+            .key_routing(cx)
             // Ruler drags are tracked at the window level so they keep working when
             // the pointer leaves the thin ruler strip (gpui move events are
             // hitbox-scoped, so a ruler-only handler would stop the moment the
@@ -28783,6 +28802,27 @@ impl Render for Docxy {
 /// Excel column width (character units) → pixels, clamped to a sane range.
 fn col_px(units: f64) -> f32 {
     ((units * 7.0 + 6.0) as f32).clamp(28.0, 320.0)
+}
+
+/// The window root's keyboard: every key to [`Docxy::on_key`] and the two
+/// bound actions (Tab, Shift+Tab), which gpui matches before it delivers a
+/// key-down. Both of `render`'s roots, the Backstage one too, take it from
+/// here: Backstage without it dropped every key a dialog opened from it
+/// should have had (#1027).
+trait KeyRouting: Sized {
+    fn key_routing(self, cx: &mut Context<Docxy>) -> Self;
+}
+
+impl KeyRouting for Div {
+    fn key_routing(self, cx: &mut Context<Docxy>) -> Self {
+        self.on_key_down(cx.listener(Docxy::on_key))
+            .on_action(
+                cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &OutdentAction, window, cx| this.shift_tab_key(window, cx)),
+            )
+    }
 }
 
 // ---- grid geometry (pure; unit-tested in `grid_geom_tests`) --------------

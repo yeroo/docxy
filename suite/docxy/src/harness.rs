@@ -1019,6 +1019,25 @@ fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
     events
 }
 
+/// Where to click the open dialog's text field `name`: `x` pixels in from its
+/// left edge, or its middle, at the box's middle height.
+fn dialog_field_point(
+    app: &crate::Docxy,
+    name: &str,
+    x: Option<f64>,
+) -> Result<Point<Pixels>, String> {
+    if app.active_dialogs().is_none() {
+        return Err(crate::dialog::NONE_OPEN.into());
+    }
+    let b = app
+        .probes
+        .borrow()
+        .on_screen(&format!("dialog-field:{name}"))
+        .ok_or_else(|| format!("no field '{name}' is drawn in the open dialog"))?;
+    let at = x.map_or_else(|| b.center().x, |x| b.left() + px(x as f32));
+    Ok(point(at, b.center().y))
+}
+
 /// The centre of a named region's recorded bounds — where a pointer verb
 /// presses or releases. Errors name the region. Probe-backed regions read
 /// the frame that is on screen now (see `Docxy::region_bounds_live`), the
@@ -1039,6 +1058,35 @@ fn fill_handle_point(app: &crate::Docxy) -> Result<Point<Pixels>, String> {
         .ok_or_else(|| "the active tab is not a spreadsheet".to_string())?;
     let br = (v.sel.0.max(v.anchor.0), v.sel.1.max(v.anchor.1));
     Ok(app.cells_bounds(br, br)?.bottom_right())
+}
+
+/// The keystrokes of `key`'s and `real-key`'s arguments: `"key"`, or `"keys"`
+/// as a list. All are parsed before any is pressed, so a typo in the third
+/// does not leave the app half way through the sequence.
+fn key_args(args: &Json) -> Result<Vec<Keystroke>, String> {
+    let specs: Vec<String> = match args.get("keys") {
+        Some(Json::Arr(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "'keys' must be an array of strings".to_string())
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("'keys' must be an array of strings".to_string()),
+        None => vec![arg_str(args, "key")?.to_string()],
+    };
+    if specs.is_empty() {
+        return Err("'keys' is empty; there is nothing to press".to_string());
+    }
+    specs.iter().map(|s| parse_key(s)).collect()
+}
+
+/// `pointer-click`'s optional `"x"`: pixels in from a dialog field's left edge.
+fn field_x(args: &Json) -> Result<Option<f64>, String> {
+    args.get("x")
+        .map(|v| v.as_f64().ok_or_else(|| "'x' must be a number".to_string()))
+        .transpose()
 }
 
 /// The optional `"offset":[dx,dy]` on `pointer-drag`: logical pixels added to
@@ -2631,15 +2679,11 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
                 Json::obj(vec![("target", m.target.to_json())])
             }),
         ),
-        // The active tab's top dialog's id, or `none`; `dialog-read` has the rest.
+        // The top dialog's id (the app's own, else the active tab's), or `none`;
+        // `dialog-read` has the rest.
         (
             "dialog",
-            Json::Str(
-                app.tabs
-                    .get(app.active)
-                    .map_or("none", |t| t.dialogs.top_id())
-                    .into(),
-            ),
+            Json::Str(app.active_dialogs().map_or("none", |d| d.top_id()).into()),
         ),
     ];
     if let Some(v) = app.active_sheet() {
@@ -2781,11 +2825,10 @@ fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
     ])
 }
 
-/// The active tab's dialogs, for a verb that drives one.
+/// The open dialogs (the app's own, else the active tab's), for a verb that
+/// drives one.
 fn open_dialogs(app: &mut crate::Docxy) -> Result<&mut crate::dialog::DialogStack, String> {
-    app.tabs
-        .get_mut(app.active)
-        .map(|t| &mut t.dialogs)
+    Some(app.active_dialogs_mut())
         .filter(|d| d.is_open())
         .ok_or_else(|| crate::dialog::NONE_OPEN.into())
 }
@@ -2972,6 +3015,27 @@ fn dispatch_verb(
             Done::ok(state(app, window))
         }
         "doc" => Done::ok(live_doc_state(app, window)?),
+        // The active document's comments, as a save would write them (#1027):
+        // `{comments:[{id, author, initials, text}]}`, in the order the comments
+        // part lists them (new ones last).
+        "comments" => {
+            let tab = app.tabs.get(app.active).ok_or(crate::dialog::NONE_OPEN)?;
+            let crate::Surface::Doc(ed) = &tab.surface else {
+                return Err("the active tab is not a document".into());
+            };
+            let items = crate::live_comments(tab, &ed.doc)
+                .iter()
+                .map(|c| {
+                    Json::obj(vec![
+                        ("id", Json::Str(c.id.clone())),
+                        ("author", Json::Str(c.author.clone())),
+                        ("initials", Json::Str(c.initials.clone())),
+                        ("text", Json::Str(c.text.clone())),
+                    ])
+                })
+                .collect();
+            Done::ok(Json::obj(vec![("comments", Json::Arr(items))]))
+        }
         // Header/footer editing state (#641): which area of which section and
         // variant, its labels, and the contextual tab's Options and Position.
         "hf-state" => Done::ok(crate::hf_tab::hf_state(app.tabs.get(app.active))),
@@ -3005,10 +3069,7 @@ fn dispatch_verb(
         }
         // Dialogs (#393). There is no `dialog-open`: a dialog opens through
         // the verb a person would use (`key`, `ribbon-click`, `click-cell`).
-        "dialog-read" => Done::ok(app.tabs.get(app.active).map_or_else(
-            || crate::dialog::DialogStack::default().to_json(),
-            |t| t.dialogs.to_json(),
-        )),
+        "dialog-read" => Done::ok(app.active_dialogs_mut().to_json()),
         // The control's input handler, the one the overlay's editable widgets
         // call too (#649).
         "dialog-set" => {
@@ -3039,10 +3100,7 @@ fn dispatch_verb(
                 unreachable!("state is an object")
             };
             // A close prompt's Save or Don't Save may have closed the last tab.
-            let dialog = app.tabs.get(app.active).map_or_else(
-                || crate::dialog::DialogStack::default().to_json(),
-                |t| t.dialogs.to_json(),
-            );
+            let dialog = app.active_dialogs_mut().to_json();
             match out.iter_mut().find(|(k, _)| k == "dialog") {
                 Some((_, v)) => *v = dialog,
                 None => out.push(("dialog".into(), dialog)),
@@ -3295,7 +3353,8 @@ fn dispatch_verb(
             Done::ok(state(app, window))
         }
         // Settings' User name... row (#620): opens its dialog on the active
-        // tab, which `dialog-set` and `dialog-click` then drive.
+        // tab's stack, or the app's own with no document open (#1027), which
+        // `dialog-set` and `dialog-click` then drive.
         "user-name" => {
             app.open_user_name_dialog()?;
             cx.notify();
@@ -3494,6 +3553,20 @@ fn dispatch_verb(
         // exactly like an OS click. `item` is the drift guard for the
         // fill-handle case: which more-tabs item the point landed on.
         "pointer-click" => {
+            // A field of the open dialog: where a person clicks it, a number
+            // of pixels `x` in from its left edge (its middle without one).
+            if let Some(field) = args.get("dialog-field") {
+                let name = field
+                    .as_str()
+                    .ok_or("'dialog-field' must be a field name")?;
+                let p = dialog_field_point(app, name, field_x(args)?)?;
+                let mut done = Done::ok(Json::obj(vec![
+                    ("x", Json::Num(f64::from(p.x))),
+                    ("y", Json::Num(f64::from(p.y))),
+                ]))?;
+                done.input = click_events(p);
+                return Ok(done);
+            }
             app.refuse_under_dialog()?;
             let p = match (args.get("region"), args.get("at")) {
                 (Some(region), None) => {
@@ -3502,8 +3575,17 @@ fn dispatch_verb(
                 }
                 (None, Some(at)) => match at.as_str() {
                     Some("fill-handle") => fill_handle_point(app)?,
+                    // Backstage's Settings row for the User name dialog.
+                    Some("user-name-row") => app
+                        .probes
+                        .borrow()
+                        .on_screen("bs-user-name")
+                        .ok_or("the User name row is not drawn: open File (backstage) first")?
+                        .center(),
                     Some(other) => {
-                        return Err(format!("unknown pointer target '{other}' (fill-handle)"));
+                        return Err(format!(
+                            "unknown pointer target '{other}' (fill-handle, user-name-row)"
+                        ));
                     }
                     None => return Err("'at' must be a string".into()),
                 },
@@ -3520,7 +3602,7 @@ fn dispatch_verb(
                     Json::Num(item_at_point(&app.probes.borrow(), p) as f64),
                 ),
             ]))?;
-            done.pointer = click_events(p);
+            done.input = click_events(p);
             Ok(done)
         }
         "pointer-drag" => {
@@ -3547,7 +3629,7 @@ fn dispatch_verb(
                     Json::Arr(vec![Json::Num(f64::from(to.x)), Json::Num(f64::from(to.y))]),
                 ),
             ]))?;
-            done.pointer = drag_events(&path);
+            done.input = drag_events(&path);
             Ok(done)
         }
 
@@ -3745,6 +3827,24 @@ fn dispatch_verb(
             Done::ok(state(app, window))
         }
 
+        // `key` and `type` through the window's own input path, as the OS
+        // delivers them (#1027): the events queue on the reply and the pump
+        // dispatches them through gpui, so a root that lacks its key handler
+        // (Backstage's once did) never sees them, where `key` calls `on_key`.
+        "real-key" | "real-type" => {
+            let strokes = if verb == "real-type" {
+                typed_keys(arg_str(args, "text")?)?
+            } else {
+                key_args(args)?
+            };
+            let mut done = Done::ok(Json::obj(vec![("keys", Json::Num(strokes.len() as f64))]))?;
+            done.input = strokes
+                .into_iter()
+                .map(|keystroke| PlatformInput::KeyDown(key_event(keystroke)))
+                .collect();
+            Ok(done)
+        }
+
         // Type text, one key event per character.
         "type" => {
             for stroke in typed_keys(arg_str(args, "text")?)? {
@@ -3755,27 +3855,7 @@ fn dispatch_verb(
 
         // One key, or a list of them ("keys": ["ctrl+c", "down", "ctrl+v"]).
         "key" => {
-            let specs: Vec<String> = match args.get("keys") {
-                Some(Json::Arr(items)) => items
-                    .iter()
-                    .map(|v| {
-                        v.as_str()
-                            .map(str::to_string)
-                            .ok_or_else(|| "'keys' must be an array of strings".to_string())
-                    })
-                    .collect::<Result<_, _>>()?,
-                Some(_) => return Err("'keys' must be an array of strings".to_string()),
-                None => vec![arg_str(args, "key")?.to_string()],
-            };
-            if specs.is_empty() {
-                return Err("'keys' is empty; there is nothing to press".to_string());
-            }
-            // Parse them all before pressing any, so a typo in the third key
-            // does not leave the app half way through the sequence.
-            let strokes = specs
-                .iter()
-                .map(|s| parse_key(s))
-                .collect::<Result<Vec<_>, _>>()?;
+            let strokes = key_args(args)?;
             for stroke in strokes {
                 press(app, stroke, window, cx);
             }
@@ -3956,7 +4036,7 @@ fn dispatch_verb(
                 result: Json::obj(vec![("quitting", Json::Bool(true))]),
                 quit: true,
                 draw: false,
-                pointer: Vec::new(),
+                input: Vec::new(),
             })
         }
 
@@ -6167,6 +6247,40 @@ mod tests {
     /// #545 (FIX r1 M1): `offset` is optional, is a two-number array, and is
     /// added to the resolved `to` point — the shape a drop-back-on-own-chip
     /// drag is built from.
+    /// `real-key` and `key` read their keys the same way; an empty list, a
+    /// non-string entry and a non-list are refused, and a bad key refuses all.
+    #[test]
+    fn key_args_reads_one_key_or_a_list_and_refuses_the_rest() {
+        let one = Json::obj(vec![("key", Json::Str("ctrl+a".into()))]);
+        assert_eq!(key_args(&one).unwrap().len(), 1);
+        let list = |items: Vec<Json>| Json::obj(vec![("keys", Json::Arr(items))]);
+        let two = list(vec![Json::Str("tab".into()), Json::Str("enter".into())]);
+        assert_eq!(key_args(&two).unwrap().len(), 2);
+        assert!(key_args(&list(vec![])).unwrap_err().contains("empty"));
+        assert!(key_args(&list(vec![Json::Num(1.)])).is_err());
+        assert!(key_args(&Json::obj(vec![("keys", Json::Str("tab".into()))])).is_err());
+        assert!(
+            key_args(&list(vec![
+                Json::Str("tab".into()),
+                Json::Str("hyper+a".into())
+            ]))
+            .is_err()
+        );
+        assert!(key_args(&Json::obj(vec![])).is_err());
+    }
+
+    /// `pointer-click`'s `x` is optional, and a present one must be a number.
+    #[test]
+    fn field_x_is_an_optional_number() {
+        assert_eq!(field_x(&Json::obj(vec![])), Ok(None));
+        assert_eq!(
+            field_x(&Json::obj(vec![("x", Json::Num(5.))])),
+            Ok(Some(5.0))
+        );
+        let bad = Json::obj(vec![("x", Json::Str("5".into()))]);
+        assert_eq!(field_x(&bad), Err("'x' must be a number".into()));
+    }
+
     #[test]
     fn drag_offset_is_an_optional_two_number_pair() {
         let no_offset = Json::obj(vec![]);
