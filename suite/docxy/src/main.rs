@@ -21667,7 +21667,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                     "Show",
                     30,
                     // Three rows to a column (#1018): the fourth button sits in the
-                    // next column, where the renderer used to wrap it.
+                    // next column (the renderer wraps a longer column at three).
                     vec![
                         rs::column(vec![
                             cmdt("ruler", "rule", "Ruler", ToggleRuler, "").key("R"),
@@ -24161,10 +24161,7 @@ impl Docxy {
     /// shown now: where it is, and its menu from the `sheet_ribbon` table.
     fn sheet_menu_for(&self, primary_id: &str) -> Option<(menu::MenuTarget, Vec<menu::MenuItem>)> {
         let def = sheet_ribbon::tab_def(self.ribbon_tab);
-        let tab = ribbon_tab_set(Kind::Xlsx)
-            .iter()
-            .find(|(t, _, _)| *t == Some(def.tab))
-            .map_or("Home", |(_, name, _)| *name);
+        let tab = ribbon_tab_name(def.tab);
         def.groups.iter().find_map(|group| {
             let dd = group.dropdown(primary_id)?;
             Some((
@@ -25923,7 +25920,7 @@ impl Docxy {
                 // Office caps a button column at 3 rows; extra buttons wrap into
                 // the next column so nothing overflows the ribbon body height.
                 let cols: Vec<AnyElement> = cmds
-                    .chunks(3)
+                    .chunks(rs::MAX_COLUMN_ROWS)
                     .map(|chunk| {
                         v_flex()
                             .gap(px(1.))

@@ -140,6 +140,8 @@ test sheet Home Editing group matches Excel
   assert reply.tabs.1.groups.6.commands.3.label is Sort & Filter
   assert reply.tabs.1.groups.6.commands.3.enabled is true
   assert reply.tabs.1.groups.6.commands.4.id is sort-a-z
+  assert reply.tabs.1.groups.6.commands.4.menu is sort-filter
+  assert reply.tabs.1.groups.6.commands.9.menu is sort-filter
   assert reply.tabs.1.groups.6.commands.5.id is sort-z-a
   assert reply.tabs.1.groups.6.commands.6.id is custom-sort
   assert reply.tabs.1.groups.6.commands.7.id is filter

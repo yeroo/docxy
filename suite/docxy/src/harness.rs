@@ -1550,9 +1550,16 @@ fn ribbon_surface(app: &crate::Docxy) -> Result<RibbonSurface, String> {
 
 /// One sheet ribbon command, in the document ribbon's reply shape. A sheet
 /// button has no screentip or KeyTip, so the tip title is the label.
-fn sheet_command_json(app: &crate::Docxy, cmd: &crate::sheet_ribbon::SheetCmd) -> Json {
+///
+/// `menu` is the id of the drop-down button whose menu lists the command, as
+/// a document ribbon split's items carry it.
+fn sheet_command_json(
+    app: &crate::Docxy,
+    cmd: &crate::sheet_ribbon::SheetCmd,
+    menu: Option<&str>,
+) -> Json {
     let label = cmd.label(app.sheet_act_toggled(cmd.act));
-    Json::obj(vec![
+    let mut fields = vec![
         ("id", Json::Str(cmd.id.into())),
         ("label", Json::Str(label.into())),
         (
@@ -1568,7 +1575,11 @@ fn sheet_command_json(app: &crate::Docxy, cmd: &crate::sheet_ribbon::SheetCmd) -
             Json::Bool(crate::sheet_ribbon::act_on(cmd.act, &app.active_xf())),
         ),
         ("enabled", Json::Bool(cmd.enabled())),
-    ])
+    ];
+    if let Some(menu) = menu {
+        fields.push(("menu", Json::Str(menu.into())));
+    }
+    Json::obj(fields)
 }
 
 /// The spreadsheet ribbon as `ribbon-read` reports it: File, then every tab
@@ -1591,7 +1602,7 @@ fn sheet_ribbon_json(app: &crate::Docxy) -> Json {
                         Json::Arr(
                             g.commands()
                                 .into_iter()
-                                .map(|c| sheet_command_json(app, c))
+                                .map(|c| sheet_command_json(app, c, g.menu_owner(c).map(|m| m.button.id)))
                                 .collect(),
                         ),
                     ),
@@ -2370,6 +2381,10 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
     if verb == "inspect" {
         return args.get_str("remove").is_some();
     }
+    // Showing another ribbon tab is a press on its tab; reading is not.
+    if verb == "ribbon-layout" {
+        return args.get("tab").is_some();
+    }
     matches!(
         verb,
         "click-cell"
@@ -3113,6 +3128,7 @@ fn dispatch_verb(
         // Where each group of the shown ribbon tab drew its content, from the
         // last frame (settle with a `shot` first, as for `title-bar`).
         "ribbon-layout" => {
+            app.refuse_under_dialog()?;
             let surface = ribbon_surface(app)?;
             // `tab` shows that tab first, as `ribbon-click` does. Its groups
             // are drawn a frame later, so that call answers `settled: false`
@@ -3124,25 +3140,20 @@ fn dispatch_verb(
                     RibbonSurface::Model => app.ribbon_kind(),
                 };
                 let tab = ribbon_tab_by_name(kind, want)?;
+                // The model ribbon's contextual tabs exist only in context.
+                if surface == RibbonSurface::Model {
+                    ribbon_tab_def(app, want)?;
+                }
                 if tab != app.ribbon_tab {
                     app.select_ribbon_tab(tab, window, cx);
                     cx.notify();
-                    return Done::ok(Json::obj(vec![
-                        ("tab", Json::Str(want.into())),
-                        ("settled", Json::Bool(false)),
-                        ("any_clipped_v", Json::Bool(false)),
-                        ("any_clipped_h", Json::Bool(false)),
-                        ("groups", Json::Arr(Vec::new())),
-                    ]));
+                    return Done::ok(crate::ribbon_layout::unsettled_json(want));
                 }
             }
             let (name, titles): (String, Vec<&str>) = match surface {
                 RibbonSurface::Sheet => {
                     let def = crate::sheet_ribbon::tab_def(app.ribbon_tab);
-                    let name = crate::ribbon_tab_set(crate::Kind::Xlsx)
-                        .iter()
-                        .find(|(t, _, _)| *t == Some(def.tab))
-                        .map_or("Home", |(_, n, _)| *n);
+                    let name = crate::ribbon_tab_name(def.tab);
                     (name.into(), def.groups.iter().map(|g| g.title).collect())
                 }
                 RibbonSurface::Model => {
@@ -3153,15 +3164,14 @@ fn dispatch_verb(
                     )
                 }
             };
+            // The last frame may predate the tab shown now (a verb only marks
+            // the view dirty): then it is not this tab's layout.
             let probes = app.probes.borrow();
-            if !probes
-                .last
-                .iter()
-                .any(|(n, _)| n.starts_with("ribbon-group:"))
-            {
-                return Err("the ribbon has not been laid out yet".into());
-            }
             let measured = crate::ribbon_layout::measure(&probes.last);
+            if !crate::ribbon_layout::is_frame_of(&measured, &titles) {
+                cx.notify();
+                return Done::ok(crate::ribbon_layout::unsettled_json(&name));
+            }
             Done::ok(crate::ribbon_layout::layout_json(&name, &titles, &measured))
         }
         "ribbon-click" => {
@@ -3170,7 +3180,9 @@ fn dispatch_verb(
             let tab = arg_str(args, "tab")?.to_string();
             let command = arg_str(args, "command")?.to_string();
             if surface == RibbonSurface::Sheet {
-                // The button's own click: select its tab, then run its act.
+                // The button's own click: select its tab, then run its act. A
+                // drop-down button opens its menu; a menu item is clicked
+                // through the menu.
                 let (ribbon_tab, cmd) = resolve_sheet_command(app, &tab, &command)?;
                 app.select_ribbon_tab(ribbon_tab, window, cx);
                 click_sheet_command(app, ribbon_tab, cmd, window, cx)?;
@@ -5027,6 +5039,10 @@ mod tests {
         assert!(!closes_menu("inspect", &Json::obj(vec![])), "a read");
         let remove = Json::obj(vec![("remove", Json::Str("comments".into()))]);
         assert!(closes_menu("inspect", &remove));
+        // #1018: reading the layout is a read; showing a tab first is a press.
+        assert!(!closes_menu("ribbon-layout", &Json::obj(vec![])), "a read");
+        let tab = Json::obj(vec![("tab", Json::Str("Data".into()))]);
+        assert!(closes_menu("ribbon-layout", &tab));
     }
 
     /// #627: `inspect` reports every category, a count for all but properties.

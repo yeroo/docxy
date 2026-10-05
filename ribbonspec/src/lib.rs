@@ -231,7 +231,8 @@ impl<A> Group<A> {
 }
 
 /// The most small-button rows a [`Control::Column`] or [`Control::Rows`] stack
-/// holds. The ribbon body fits three; a fourth row is clipped (#1018).
+/// holds. The ribbon body fits three; a fourth row would be clipped, or, where
+/// the renderer wraps a column at three, hidden in a second column (#1018).
 pub const MAX_COLUMN_ROWS: usize = 3;
 
 /// A column of up to three small buttons ([`MAX_COLUMN_ROWS`]).

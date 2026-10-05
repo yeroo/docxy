@@ -1,6 +1,6 @@
 # No ribbon group draws its content taller than its body (#1018). Each tab
-# is shown (ribbon-layout selects it, answers `settled: false`), a frame is
-# drawn, and the second call reads where every group's content landed.
+# is shown (ribbon-layout selects it; when that switched tabs it answers
+# `settled: false`), a frame is drawn, and the second call reads where every group's content landed.
 
 test sheet ribbon: no tab is clipped vertically
   open ../fixtures/basic.xlsx
@@ -109,3 +109,7 @@ test Project ribbon: no tab is clipped vertically
   assert reply.tab is View
   assert reply.settled is true
   assert reply.any_clipped_v is false
+
+test document ribbon: a contextual tab out of context is refused
+  open ../fixtures/basic.docx
+  call-error ribbon-layout {"tab":"Table Design"} => Table Design tab is not active outside a table

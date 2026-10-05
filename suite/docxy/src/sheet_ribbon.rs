@@ -83,7 +83,9 @@ impl SheetCmd {
     }
 
     /// Whether the command does anything yet. `Todo` buttons are drawn, but
-    /// clicking one is a no-op, so the harness lists them disabled.
+    /// clicking one is a no-op, so the harness lists them disabled. A
+    /// `Shape::Menu` button is enabled although its act is `Todo`: pressing it
+    /// opens its menu, and the items carry the acts.
     pub fn enabled(&self) -> bool {
         !matches!(self.act, SheetAct::Todo) || matches!(self.shape, Shape::Menu(_))
     }
@@ -1177,10 +1179,7 @@ mod tests {
         const LIMIT: usize = ribbonspec::MAX_COLUMN_ROWS;
         let mut bad: Vec<String> = Vec::new();
         for tab in SHEET_RIBBON {
-            let name = ribbon_tab_set(Kind::Xlsx)
-                .iter()
-                .find(|(t, _, _)| *t == Some(tab.tab))
-                .map_or("Home", |(_, n, _)| *n);
+            let name = crate::ribbon_tab_name(tab.tab);
             for g in tab.groups {
                 if let Body::Rows(r) = &g.body {
                     if r.rows.len() > LIMIT {
@@ -1256,6 +1255,22 @@ mod tests {
         );
         let data = tab_def(RibbonTab::Data).commands();
         assert!(data.iter().any(|c| c.id == "data-remove-duplicates"));
+    }
+
+    #[test]
+    fn only_the_sort_filter_items_belong_to_a_menu() {
+        let home = tab_def(RibbonTab::Home);
+        let editing = home.groups.iter().find(|g| g.title == "Editing").unwrap();
+        let owner = |id: &str| {
+            let c = editing.commands().into_iter().find(|c| c.id == id).unwrap();
+            editing.menu_owner(c).map(|m| m.button.id)
+        };
+        for id in ["sort-a-z", "sort-z-a", "custom-sort", "filter", "home-clear-filter", "home-reapply-filter"] {
+            assert_eq!(owner(id), Some("sort-filter"), "{id}");
+        }
+        for id in ["autosum", "fill", "clear", "sort-filter", "find-select"] {
+            assert_eq!(owner(id), None, "{id}");
+        }
     }
 
     #[test]

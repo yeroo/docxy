@@ -25,6 +25,9 @@ most three small-button rows to a column.
 AutoSum / Fill / Clear column, a large Sort & Filter drop-down and Find & Select.
 
 **Fails when:** a column or stack in any ribbon definition holds a fourth row.
+The sheet ribbon and a Rows stack clip it, which `ribbon-layout` measures. The
+document ribbon wraps a fourth Column button into a second column instead, so
+only `no_ribbon_column_has_more_than_three_rows` guards that.
 
 ## Sort & Filter is a drop-down with six items
 

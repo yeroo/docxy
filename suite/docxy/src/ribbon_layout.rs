@@ -89,6 +89,24 @@ fn rect_json(b: Bounds<Pixels>) -> Json {
     ])
 }
 
+/// Whether `measured` is a finished frame of the tab whose groups are `titles`:
+/// something was measured, and nothing from another tab's groups.
+pub(crate) fn is_frame_of(measured: &[GroupLayout], titles: &[&str]) -> bool {
+    !measured.is_empty() && measured.iter().all(|g| titles.contains(&g.title.as_str()))
+}
+
+/// The `ribbon-layout` reply while the frame on record is not the shown tab's:
+/// no groups yet, ask again after a frame.
+pub(crate) fn unsettled_json(tab: &str) -> Json {
+    Json::obj(vec![
+        ("tab", Json::Str(tab.into())),
+        ("settled", Json::Bool(false)),
+        ("any_clipped_v", Json::Bool(false)),
+        ("any_clipped_h", Json::Bool(false)),
+        ("groups", Json::Arr(Vec::new())),
+    ])
+}
+
 /// The `ribbon-layout` reply for the groups of the tab shown. A group the
 /// ribbon dropped (responsive collapse) is listed `hidden`.
 pub(crate) fn layout_json(tab: &str, titles: &[&str], measured: &[GroupLayout]) -> Json {
@@ -189,6 +207,21 @@ mod tests {
         let f = frame(62.)[..2].to_vec();
         let m = measure(&f);
         assert!(m[0].content.is_none() && !m[0].clipped_v);
+    }
+
+    #[test]
+    fn a_frame_of_another_tab_or_none_is_not_settled() {
+        let m = measure(&frame(62.));
+        assert!(is_frame_of(&m, &["Editing", "Cells"]));
+        assert!(!is_frame_of(&m, &["Cells"]), "another tab's group is on record");
+        assert!(!is_frame_of(&[], &["Editing"]), "nothing measured yet");
+        let json = unsettled_json("Data");
+        assert_eq!(json.get("settled"), Some(&Json::Bool(false)));
+        assert_eq!(json.get("groups"), Some(&Json::Arr(Vec::new())));
+        assert_eq!(
+            layout_json("Home", &["Editing"], &m).get("settled"),
+            Some(&Json::Bool(true))
+        );
     }
 
     #[test]
