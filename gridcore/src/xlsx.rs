@@ -7490,6 +7490,14 @@ impl SheetPackage {
         true
     }
 
+    /// Whether the worksheet part of `sheet` can hold a `<dataValidations>`
+    /// block, so a rule added to the model will be written by a save. A
+    /// host refuses to add one when it can't, as it does for other edits it
+    /// cannot write.
+    pub fn takes_validations(&self, sheet: usize) -> bool {
+        sheet < self.workbook.sheets.len() && self.sheet_takes(sheet, "dataValidations", true)
+    }
+
     /// Add a data-validation rule to `sheet` over `range`. For a list, pass
     /// kind="list" and formula1 as an inline `"a,b,c"` list or a range ref;
     /// numeric/date kinds use an operator (between/greaterThan/…) + operand(s).
@@ -17681,6 +17689,33 @@ mod ct_worksheet_order_tests {
         assert!(!pkg.can_add_chart(0));
         assert!(!pkg.add_chart(0, (0, 3), (10, 8), &chart()));
         assert_eq!(pkg.parts, parts);
+    }
+
+    #[test]
+    fn a_sheet_with_no_place_for_data_validations_says_so() {
+        // The walk stops before dataValidations' rank: a rule added to the
+        // model would vanish on save, so hosts ask first (#689 review).
+        let early = loaded(&format!(
+            r#"{ROWS}<autoFilter ref="A1:B2"><filterColumn colId="0">{MARGINS}"#
+        ));
+        assert!(!early.takes_validations(0));
+        assert!(!early.takes_validations(9), "no such sheet");
+        assert!(loaded(&format!("{ROWS}{MARGINS}")).takes_validations(0));
+    }
+
+    #[test]
+    fn clearing_the_anchor_cell_keeps_relative_formulas_right_through_a_save() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<dataValidations count="1"><dataValidation type="custom" showErrorMessage="1" sqref="B2:B10"><formula1>B2&gt;A2</formula1></dataValidation></dataValidations>{MARGINS}"#
+        ));
+        crate::validation::clear_validation(&mut pkg.workbook.sheets[0], (1, 1, 1, 1));
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let dv = &re.workbook.sheets[0].validations[0];
+        assert_eq!(dv.ranges, vec![(2, 1, 9, 1)]);
+        assert_eq!(dv.formula1, "B3>A3");
+        // B3 is checked as B3>A3, as it was before the clear.
+        let part = String::from_utf8(re.part(SHEET).unwrap().to_vec()).unwrap();
+        assert!(part.contains(r#"sqref="B3:B10""#), "{part}");
     }
 
     #[test]

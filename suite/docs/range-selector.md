@@ -370,7 +370,7 @@ Parsing is likewise one function. `parse_ref_text` returns the sheet and the
 cells **separately** (`RefText`) instead of a bare rectangle, so no caller can
 quietly drop half the answer; resolving the sheet half is then `sheet_index_of`
 alone, wrapped as `Docxy::ref_sheet_index` for the view and reached from
-`chart_ref_of`, `bar_ref_text` and `bar_sheet_index`.
+`chart_ref_of` and `bar_ref_text`.
 
 ### The entry bars follow the selection until you pin them
 

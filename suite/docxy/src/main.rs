@@ -1387,6 +1387,9 @@ impl GridClip {
     }
 }
 
+/// The status of a paste whose cells' data validation could not be kept.
+const NO_RULES_KEPT: &str = "Pasted without its data validation: this sheet's part can't hold it";
+
 /// How a grid paste landed ([`SheetView::paste_grid_clip`]).
 #[derive(Debug, PartialEq)]
 enum GridPasted {
@@ -1394,6 +1397,10 @@ enum GridPasted {
     Done,
     /// A cut pasted as a copy, its source kept; the status says why.
     KeptAsCopy(&'static str),
+    /// Pasted, but the data validation of the cells did not come along: the
+    /// target sheet's part can't hold a `<dataValidations>` block, so a rule
+    /// would be lost on save (#688); the status says so.
+    WithoutRules(&'static str),
 }
 
 /// Why a grid paste wrote nothing.
@@ -2044,7 +2051,9 @@ impl SheetView {
     /// that does not parse (`=SUM(A1`, [`SheetView::formula_error`]) is
     /// refused, and so is one that would change part of an array
     /// ([`gridcore::engine::PART_OF_ARRAY`]): the editor stays open with its
-    /// text and [`SheetView::entry_error`] says why.
+    /// text and [`SheetView::entry_error`] says why. An entry that breaks its
+    /// cell's data-validation rule is refused the same way, and held in
+    /// [`SheetView::dv_pending`] for the alert the caller shows.
     fn commit_edit(&mut self) -> bool {
         self.entry_error = None;
         self.dv_pending = None;
@@ -3052,7 +3061,7 @@ impl SheetView {
                 "The cut was pasted as a copy: its sheet is protected",
             ));
         }
-        self.paste_move(clip).map(|()| GridPasted::Done)
+        self.paste_move(clip)
     }
 
     /// A copy pasted over the selection: tiled over a paste area that is a
@@ -3085,6 +3094,9 @@ impl SheetView {
         // longer lines up with its rules: the target's stay.
         if h == clip.rect.2 - clip.rect.0 + 1 {
             let dst = self.active;
+            if !clip.rules.is_empty() && !self.pkg.takes_validations(dst) {
+                return Ok(GridPasted::WithoutRules(NO_RULES_KEPT));
+            }
             gridcore::validation::paste_rules(
                 &mut self.pkg.workbook.sheets[dst],
                 &clip.rules,
@@ -3134,7 +3146,7 @@ impl SheetView {
     /// ([`gridcore::formula::move_block_formula`]). One undo step; refused
     /// whole, before anything changes, when it would change part of an array
     /// or run past the sheet's edge.
-    fn paste_move(&mut self, clip: &GridClip) -> Result<(), GridPasteError> {
+    fn paste_move(&mut self, clip: &GridClip) -> Result<GridPasted, GridPasteError> {
         use gridcore::sheet::{Cell, MAX_COLS, MAX_ROWS, is_array_f};
         let (fr0, fc0, fr1, fc1) = clip.rect;
         let (h, w) = (fr1 - fr0 + 1, fc1 - fc0 + 1);
@@ -3221,17 +3233,24 @@ impl SheetView {
         self.engine.set_cells_prechecked(wb, src, late);
         // The rules move with the cells (#688): off the source, onto the
         // target, whose own are replaced.
-        gridcore::validation::clear_validation(&mut self.pkg.workbook.sheets[src], clip.rect);
-        gridcore::validation::paste_rules(
-            &mut self.pkg.workbook.sheets[dst],
-            &clip.rules,
-            clip.rect,
-            at,
-            (1, 1),
-        );
+        let can_hold = self.pkg.takes_validations(dst) && self.pkg.takes_validations(src);
+        if can_hold {
+            gridcore::validation::clear_validation(&mut self.pkg.workbook.sheets[src], clip.rect);
+            gridcore::validation::paste_rules(
+                &mut self.pkg.workbook.sheets[dst],
+                &clip.rules,
+                clip.rect,
+                at,
+                (1, 1),
+            );
+        }
         self.prune_circles();
         self.select_block(at, &block);
-        Ok(())
+        Ok(if can_hold || clip.rules.is_empty() {
+            GridPasted::Done
+        } else {
+            GridPasted::WithoutRules(NO_RULES_KEPT)
+        })
     }
     /// Whether more than one cell is selected.
     fn has_range(&self) -> bool {
@@ -12831,7 +12850,10 @@ impl Docxy {
                 return false;
             };
             let res = v.paste_grid_clip(&clip);
-            let landed = matches!(res, Ok(GridPasted::Done | GridPasted::KeptAsCopy(_)));
+            let landed = matches!(
+                res,
+                Ok(GridPasted::Done | GridPasted::KeptAsCopy(_) | GridPasted::WithoutRules(_))
+            );
             // Copy mode stays on after a Ctrl+V: the paste's own undo step
             // does not end it.
             if landed && !clip.cut {
@@ -12847,7 +12869,9 @@ impl Docxy {
             let over = clip.cut && !matches!(res, Err(GridPasteError::Refused(_)));
             match res {
                 Ok(GridPasted::Done) => {}
-                Ok(GridPasted::KeptAsCopy(why)) => self.set_status(why),
+                Ok(GridPasted::KeptAsCopy(why) | GridPasted::WithoutRules(why)) => {
+                    self.set_status(why)
+                }
                 Err(GridPasteError::Refused(why)) => self.set_status(why),
                 Err(GridPasteError::CutCancelled) => self.set_status(CUT_CANCELLED_STATUS),
             }
@@ -14832,8 +14856,6 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// Run a Sort & Filter command on the active tab (#690, #691); a refusal
-    /// lands in the status line.
     /// Data › Data Validation: the dialog over the selection (#689).
     fn sheet_data_validation(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -14873,6 +14895,8 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Run a Sort & Filter command on the active tab (#690, #691); a refusal
+    /// lands in the status line.
     fn sheet_data_cmd(
         &mut self,
         op: impl FnOnce(&mut DocTab) -> Result<(), String>,

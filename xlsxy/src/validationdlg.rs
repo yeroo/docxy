@@ -8,19 +8,13 @@
 //! the app applies it ([`gridcore::validation::set_validation`]).
 
 use crate::outlinedlg::{heading, hint, item, modal};
-use gridcore::sheet::{AlertStyle, DataValidation};
+use gridcore::sheet::DataValidation;
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 
-use gridcore::validation::{KINDS, OPERATORS};
+use gridcore::validation::{ALERT_STYLES as STYLES, DialogBoxes, KINDS, OPERATORS};
 pub use gridcore::validation::{MESSAGE_MAX, TITLE_MAX};
-
-const STYLES: [(AlertStyle, &str); 3] = [
-    (AlertStyle::Stop, "Stop"),
-    (AlertStyle::Warning, "Warning"),
-    (AlertStyle::Information, "Information"),
-];
 
 const TABS: [&str; 3] = ["Settings", "Input Message", "Error Alert"];
 
@@ -86,38 +80,27 @@ impl ValidationDialog {
         sheet: usize,
         range: (u32, u32, u32, u32),
         current: Option<&DataValidation>,
+        date1904: bool,
     ) -> ValidationDialog {
-        let blank = DataValidation {
-            allow_blank: true,
-            show_input: true,
-            show_error: true,
-            ..DataValidation::default()
-        };
-        let dv = current.unwrap_or(&blank);
+        let b = DialogBoxes::of(current, (range.0, range.1), date1904);
         ValidationDialog {
             sheet,
             range,
             tab: 0,
-            kind: KINDS.iter().position(|k| k.0 == dv.kind).unwrap_or(0),
-            op: OPERATORS
-                .iter()
-                .position(|o| o.0 == dv.operator)
-                .unwrap_or(0),
-            first: gridcore::validation::first_box(dv),
-            second: dv.formula2.clone(),
-            ignore_blank: dv.allow_blank,
-            dropdown: dv.show_dropdown,
+            kind: b.kind,
+            op: b.operator,
+            first: b.first,
+            second: b.second,
+            ignore_blank: b.ignore_blank,
+            dropdown: b.dropdown,
             apply_all: false,
-            show_input: dv.show_input,
-            prompt_title: dv.prompt_title.clone(),
-            prompt: dv.prompt.clone().unwrap_or_default(),
-            show_error: dv.show_error,
-            style: STYLES
-                .iter()
-                .position(|s| s.0 == dv.error_style)
-                .unwrap_or(0),
-            error_title: dv.error_title.clone(),
-            error: dv.error.clone(),
+            show_input: b.show_input,
+            prompt_title: b.prompt_title,
+            prompt: b.prompt,
+            show_error: b.show_error,
+            style: b.style,
+            error_title: b.error_title,
+            error: b.error,
             focus: 0,
         }
     }
@@ -244,34 +227,24 @@ impl ValidationDialog {
     }
 
     /// The rule OK applies, its ranges left empty; the reason it can't be
-    /// applied when a bound is missing.
-    pub fn rule(&self) -> Result<DataValidation, String> {
-        let kind = self.kind_name();
-        let mut dv = DataValidation {
-            kind: kind.to_string(),
-            allow_blank: self.ignore_blank,
-            show_dropdown: self.dropdown,
+    /// applied when a bound is missing or isn't a date or time.
+    pub fn rule(&self, ctx: &gridcore::entry::EntryCtx) -> Result<DataValidation, String> {
+        DialogBoxes {
+            kind: self.kind,
+            operator: self.op,
+            first: self.first.clone(),
+            second: self.second.clone(),
+            ignore_blank: self.ignore_blank,
+            dropdown: self.dropdown,
             show_input: self.show_input,
             prompt_title: self.prompt_title.clone(),
-            prompt: (!self.prompt.is_empty()).then(|| self.prompt.clone()),
+            prompt: self.prompt.clone(),
             show_error: self.show_error,
-            error_style: STYLES[self.style].0,
+            style: self.style,
             error_title: self.error_title.clone(),
             error: self.error.clone(),
-            ..DataValidation::default()
-        };
-        if kind.is_empty() {
-            // Any value: only the messages remain.
-            dv.allow_blank = true;
-            return Ok(dv);
         }
-        let operator = OPERATORS[self.op].0;
-        if self.takes_operator() {
-            dv.operator = operator.to_string();
-        }
-        (dv.formula1, dv.formula2) =
-            gridcore::validation::formulas_from_boxes(kind, operator, &self.first, &self.second)?;
-        Ok(dv)
+        .rule(ctx)
     }
 
     fn line(&self, field: Field) -> String {
@@ -358,6 +331,10 @@ impl ValidationDialog {
 mod tests {
     use super::*;
 
+    fn ctx() -> gridcore::entry::EntryCtx {
+        gridcore::entry::EntryCtx::default()
+    }
+
     fn type_into(d: &mut ValidationDialog, text: &str) {
         for ch in text.chars() {
             d.key(KeyCode::Char(ch));
@@ -366,8 +343,8 @@ mod tests {
 
     #[test]
     fn whole_between_with_an_error_alert() {
-        let mut d = ValidationDialog::new(0, (1, 1, 9, 1), None);
-        assert!(d.rule().unwrap().kind.is_empty());
+        let mut d = ValidationDialog::new(0, (1, 1, 9, 1), None, false);
+        assert!(d.rule(&ctx()).unwrap().kind.is_empty());
         d.key(KeyCode::Down); // Allow
         d.key(KeyCode::Right); // Whole number
         d.key(KeyCode::Down); // Data
@@ -375,7 +352,7 @@ mod tests {
         type_into(&mut d, "10");
         d.key(KeyCode::Down); // Maximum
         type_into(&mut d, "=90");
-        let dv = d.rule().unwrap();
+        let dv = d.rule(&ctx()).unwrap();
         assert_eq!(
             (dv.kind.as_str(), dv.operator.as_str()),
             ("whole", "between")
@@ -386,25 +363,25 @@ mod tests {
 
     #[test]
     fn a_missing_bound_is_refused_and_a_list_source_reads_both_ways() {
-        let mut d = ValidationDialog::new(0, (1, 1, 9, 1), None);
+        let mut d = ValidationDialog::new(0, (1, 1, 9, 1), None, false);
         d.key(KeyCode::Down);
         d.key(KeyCode::Right);
-        assert!(d.rule().is_err());
+        assert!(d.rule(&ctx()).is_err());
         // Allow: List.
         d.key(KeyCode::Right);
         d.key(KeyCode::Right);
         d.key(KeyCode::Down);
         type_into(&mut d, "Yes, No ,Maybe");
-        assert_eq!(d.rule().unwrap().formula1, "\"Yes,No,Maybe\"");
-        let mut d2 = ValidationDialog::new(0, (1, 1, 9, 1), Some(&d.rule().unwrap()));
+        assert_eq!(d.rule(&ctx()).unwrap().formula1, "\"Yes,No,Maybe\"");
+        let mut d2 = ValidationDialog::new(0, (1, 1, 9, 1), Some(&d.rule(&ctx()).unwrap()), false);
         assert_eq!(d2.first, "Yes,No,Maybe");
         d2.first = "=$A$1:$A$5".into();
-        assert_eq!(d2.rule().unwrap().formula1, "$A$1:$A$5");
+        assert_eq!(d2.rule(&ctx()).unwrap().formula1, "$A$1:$A$5");
     }
 
     #[test]
     fn message_and_title_limits_hold() {
-        let mut d = ValidationDialog::new(0, (1, 1, 9, 1), None);
+        let mut d = ValidationDialog::new(0, (1, 1, 9, 1), None, false);
         d.key(KeyCode::Left); // tab strip: Error Alert
         d.key(KeyCode::Down); // Show error
         d.key(KeyCode::Down); // Style
@@ -412,14 +389,14 @@ mod tests {
         type_into(&mut d, &"t".repeat(40));
         d.key(KeyCode::Down); // Message
         type_into(&mut d, &"m".repeat(300));
-        let dv = d.rule().unwrap();
+        let dv = d.rule(&ctx()).unwrap();
         assert_eq!(dv.error_title.chars().count(), TITLE_MAX);
         assert_eq!(dv.error.chars().count(), MESSAGE_MAX);
     }
 
     #[test]
     fn clear_all_and_apply_all() {
-        let mut d = ValidationDialog::new(0, (1, 1, 9, 1), None);
+        let mut d = ValidationDialog::new(0, (1, 1, 9, 1), None, false);
         d.key(KeyCode::Down);
         d.key(KeyCode::Down); // Apply-all is the last Settings box for "Any value"
         d.key(KeyCode::Char(' '));
@@ -427,5 +404,34 @@ mod tests {
         d.key(KeyCode::Down);
         d.key(KeyCode::Down); // Clear All
         assert_eq!(d.key(KeyCode::Enter), Outcome::ClearAll);
+    }
+
+    #[test]
+    fn a_date_bound_is_typed_as_a_date_and_a_relative_formula_is_seen_from_the_cell() {
+        let mut d = ValidationDialog::new(0, (1, 1, 9, 1), None, false);
+        d.key(KeyCode::Down); // Allow
+        for _ in 0..4 {
+            d.key(KeyCode::Right); // Date
+        }
+        d.key(KeyCode::Down); // Data
+        d.key(KeyCode::Right);
+        d.key(KeyCode::Right);
+        d.key(KeyCode::Right);
+        d.key(KeyCode::Right); // greater than
+        d.key(KeyCode::Down); // Value
+        type_into(&mut d, "1/1/2020");
+        let dv = d.rule(&ctx()).unwrap();
+        assert_eq!((dv.kind.as_str(), dv.formula1.as_str()), ("date", "43831"));
+        let d2 = ValidationDialog::new(0, (1, 1, 9, 1), Some(&dv), false);
+        assert_eq!(d2.first, "1/1/2020");
+        // A relative formula is shown from the selected cell.
+        let custom = DataValidation {
+            ranges: vec![(1, 1, 9, 1)],
+            kind: "custom".into(),
+            formula1: "B2>A2".into(),
+            ..DataValidation::default()
+        };
+        let d3 = ValidationDialog::new(0, (4, 1, 5, 1), Some(&custom), false);
+        assert_eq!(d3.first, "B5>A5");
     }
 }

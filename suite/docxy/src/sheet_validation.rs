@@ -13,18 +13,14 @@ use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwne
 use crate::{DocTab, Surface};
 use gridcore::sheet::{AlertStyle, DataValidation};
 use gridcore::validation::{
-    KINDS, MESSAGE_MAX, OPERATORS, TITLE_MAX, Violation, first_box, first_label,
-    formulas_from_boxes, takes_operator, takes_two,
+    ALERT_STYLES, DialogBoxes, KINDS, MESSAGE_MAX, OPERATORS, TITLE_MAX, Violation, first_label,
+    takes_operator, takes_two,
 };
 
 const PROTECTED: &str =
     "The sheet is protected: unprotect it (Review › Protect Sheet) to change its data validation.";
 
-const STYLES: [(AlertStyle, &str); 3] = [
-    (AlertStyle::Stop, "Stop"),
-    (AlertStyle::Warning, "Warning"),
-    (AlertStyle::Information, "Information"),
-];
+const NOT_WRITABLE: &str = "This sheet's part can't hold data validation, so the rule could not be saved: nothing was changed.";
 
 // ---- the alert -------------------------------------------------------------
 
@@ -171,13 +167,7 @@ pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
     }
     let range = v.range();
     let current = gridcore::validation::validation_at(v.sheet(), range.0, range.1);
-    let blank = DataValidation {
-        allow_blank: true,
-        show_input: true,
-        show_error: true,
-        ..DataValidation::default()
-    };
-    let dv = current.unwrap_or(&blank);
+    let b = DialogBoxes::of(current, (range.0, range.1), v.pkg.workbook.date1904);
     let mut d = Dialog::message(
         "data-validation",
         "Data Validation",
@@ -213,18 +203,13 @@ pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
     let check = |name, label: &str, on: bool| {
         Control::new(name, label, ControlKind::Checkbox, Value::Bool(on))
     };
-    let kind = KINDS.iter().position(|k| k.0 == dv.kind).unwrap_or(0);
-    let op = OPERATORS
-        .iter()
-        .position(|o| o.0 == dv.operator)
-        .unwrap_or(0);
     d.controls = vec![
         page(
             dropdown(
                 "allow",
                 "Allow:",
                 KINDS.iter().map(|k| k.1.to_string()).collect(),
-                kind,
+                b.kind,
             ),
             0,
         ),
@@ -233,14 +218,14 @@ pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
                 "operator",
                 "Data:",
                 OPERATORS.iter().map(|o| o.1.to_string()).collect(),
-                op,
+                b.operator,
             ),
             0,
         ),
-        page(text("first", "Minimum:", &first_box(dv)), 0),
-        page(text("second", "Maximum:", &dv.formula2), 0),
-        page(check("ignore-blank", "Ignore blank", dv.allow_blank), 0),
-        page(check("dropdown", "In-cell dropdown", dv.show_dropdown), 0),
+        page(text("first", "Minimum:", &b.first), 0),
+        page(text("second", "Maximum:", &b.second), 0),
+        page(check("ignore-blank", "Ignore blank", b.ignore_blank), 0),
+        page(check("dropdown", "In-cell dropdown", b.dropdown), 0),
         page(
             check(
                 "apply-all",
@@ -253,24 +238,17 @@ pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
             check(
                 "show-input",
                 "Show input message when cell is selected",
-                dv.show_input,
+                b.show_input,
             ),
             1,
         ),
-        page(text("input-title", "Title:", &dv.prompt_title), 1),
-        page(
-            text(
-                "input-message",
-                "Input message:",
-                dv.prompt.as_deref().unwrap_or_default(),
-            ),
-            1,
-        ),
+        page(text("input-title", "Title:", &b.prompt_title), 1),
+        page(text("input-message", "Input message:", &b.prompt), 1),
         page(
             check(
                 "show-error",
                 "Show error alert after invalid data is entered",
-                dv.show_error,
+                b.show_error,
             ),
             2,
         ),
@@ -278,16 +256,13 @@ pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
             dropdown(
                 "error-style",
                 "Style:",
-                STYLES.iter().map(|s| s.1.to_string()).collect(),
-                STYLES
-                    .iter()
-                    .position(|s| s.0 == dv.error_style)
-                    .unwrap_or(0),
+                ALERT_STYLES.iter().map(|s| s.1.to_string()).collect(),
+                b.style,
             ),
             2,
         ),
-        page(text("error-title", "Title:", &dv.error_title), 2),
-        page(text("error-message", "Error message:", &dv.error), 2),
+        page(text("error-title", "Title:", &b.error_title), 2),
+        page(text("error-message", "Error message:", &b.error), 2),
     ];
     d.react = Some(crate::dialog::Reaction(react));
     react(&mut d, usize::MAX, &Value::Bool(false));
@@ -295,39 +270,29 @@ pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
     Ok(d)
 }
 
-/// The rule OK applies (its ranges left empty), or why the boxes can't make one.
-pub(crate) fn rule(d: &Dialog) -> Result<DataValidation, String> {
-    let kind = KINDS[kind_ix(d).min(KINDS.len() - 1)].0;
-    let op = OPERATORS[operator_ix(d).min(OPERATORS.len() - 1)].0;
-    let style = match d.value("error-style") {
-        Some(Value::Choice(Some(i))) => STYLES.get(*i).map_or(AlertStyle::Stop, |s| s.0),
-        _ => AlertStyle::Stop,
+/// The rule OK applies (its ranges left empty, its formulas written for the
+/// cell the dialog opened on), or why the boxes can't make one.
+pub(crate) fn rule(d: &Dialog, ctx: &gridcore::entry::EntryCtx) -> Result<DataValidation, String> {
+    let ix = |name: &str| match d.value(name) {
+        Some(Value::Choice(Some(i))) => *i,
+        _ => 0,
     };
-    let prompt = text(d, "input-message");
-    let mut dv = DataValidation {
-        kind: kind.to_string(),
-        allow_blank: checked(d, "ignore-blank"),
-        show_dropdown: checked(d, "dropdown"),
+    DialogBoxes {
+        kind: kind_ix(d),
+        operator: operator_ix(d),
+        first: text(d, "first"),
+        second: text(d, "second"),
+        ignore_blank: checked(d, "ignore-blank"),
+        dropdown: checked(d, "dropdown"),
         show_input: checked(d, "show-input"),
         prompt_title: text(d, "input-title"),
-        prompt: (!prompt.is_empty()).then_some(prompt),
+        prompt: text(d, "input-message"),
         show_error: checked(d, "show-error"),
-        error_style: style,
+        style: ix("error-style"),
         error_title: text(d, "error-title"),
         error: text(d, "error-message"),
-        ..DataValidation::default()
-    };
-    if kind.is_empty() {
-        // Any value: only the messages remain.
-        dv.allow_blank = true;
-        return Ok(dv);
     }
-    if takes_operator(kind) {
-        dv.operator = op.to_string();
-    }
-    (dv.formula1, dv.formula2) =
-        formulas_from_boxes(kind, op, &text(d, "first"), &text(d, "second"))?;
-    Ok(dv)
+    .rule(ctx)
 }
 
 /// A press the Data Validation dialog handles itself: OK and Clear All.
@@ -347,7 +312,10 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
     let rule = if clear {
         None
     } else {
-        match rule(top) {
+        let Surface::Sheet(v) = &tab.surface else {
+            return Some(Err("Data Validation needs a spreadsheet".into()));
+        };
+        match rule(top, &v.typed_ctx()) {
             Ok(r) => Some(r),
             Err(e) => return Some(Err(e)),
         }
@@ -355,6 +323,10 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
     let Surface::Sheet(v) = &mut tab.surface else {
         return Some(Err("Data Validation needs a spreadsheet".into()));
     };
+    // A part that can't hold `<dataValidations>` would lose the rule on save.
+    if rule.is_some() && !v.pkg.takes_validations(sheet) {
+        return Some(Err(NOT_WRITABLE.into()));
+    }
     if v.pkg
         .workbook
         .sheets
@@ -762,7 +734,7 @@ mod tests {
         set(&mut t, "input-message", Json::Str("m".repeat(300)));
         let top = t.dialogs.top().unwrap();
         assert_eq!(
-            rule(top).map(|r| (r.prompt_title.len(), r.prompt.unwrap().len())),
+            rule(top, &Default::default()).map(|r| (r.prompt_title.len(), r.prompt.unwrap().len())),
             Ok((32, 255))
         );
         // A bound missing keeps the dialog open and says why.
@@ -826,5 +798,63 @@ mod tests {
         let mut t = book(AlertStyle::Stop);
         view(&mut t).pkg.workbook.sheets[0].protection = Some("sheet=\"1\"".into());
         assert!(dialog(&t).is_err());
+    }
+
+    #[test]
+    fn the_dialog_shows_and_keeps_a_relative_formula_from_the_selected_cell() {
+        let mut t = tab();
+        view(&mut t).pkg.workbook.sheets[0]
+            .validations
+            .push(DataValidation {
+                ranges: vec![(1, 1, 9, 1)], // B2:B10
+                kind: "custom".into(),
+                formula1: "B2>A2".into(),
+                allow_blank: true,
+                show_error: true,
+                ..Default::default()
+            });
+        let v = view(&mut t);
+        v.anchor = at("B5");
+        v.sel = at("B6");
+        open(&mut t);
+        // Seen from B5, the formula is B5>A5.
+        assert_eq!(
+            t.dialogs.top().unwrap().value("first"),
+            Some(&Value::Text("B5>A5".into()))
+        );
+        t.dialogs.select_tab("Error Alert").unwrap();
+        set(&mut t, "error-message", Json::Str("new".into()));
+        press(&mut t, "OK").unwrap();
+        let rules = &view(&mut t).sheet().validations;
+        let b5 = rules.iter().find(|d| d.covers(4, 1)).unwrap();
+        assert_eq!(b5.formula1, "B5>A5");
+        let b3 = rules.iter().find(|d| d.covers(2, 1)).unwrap();
+        assert_eq!(b3.formula1, "B2>A2");
+    }
+
+    #[test]
+    fn date_bounds_are_typed_as_dates_and_shown_as_dates() {
+        let mut t = tab();
+        select(&mut t, "B2");
+        open(&mut t);
+        set(&mut t, "allow", Json::Str("Date".into()));
+        set(
+            &mut t,
+            "operator",
+            Json::Str("greater than or equal to".into()),
+        );
+        set(&mut t, "first", Json::Str("1/1/2020".into()));
+        press(&mut t, "OK").unwrap();
+        assert_eq!(view(&mut t).sheet().validations[0].formula1, "43831");
+        // Reopened, the box shows the date again.
+        open(&mut t);
+        assert_eq!(
+            t.dialogs.top().unwrap().value("first"),
+            Some(&Value::Text("1/1/2020".into()))
+        );
+        press(&mut t, "Cancel").unwrap();
+        // And the rule checks entries against it.
+        select(&mut t, "B2");
+        assert_eq!(enter(&mut t, "2019-12-31"), None);
     }
 }

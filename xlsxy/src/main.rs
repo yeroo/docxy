@@ -2388,6 +2388,8 @@ impl App {
     /// limit, or it would change part of an array ([`PART_OF_ARRAY`]).
     /// A live AutoComplete proposal commits as the value it completes to,
     /// in that value's case; a fixed decimal point shifts a typed number.
+    /// Also false, the editor kept, while the entry breaks its cell's
+    /// data-validation rule: [`App::dv_alert`] holds it until it is answered.
     fn commit_edit(&mut self) -> bool {
         let Some(mut edit) = self.edit.take() else {
             return true;
@@ -3781,6 +3783,11 @@ impl App {
                     (fr, fc, fr + h - 1, fc + w - 1)
                 };
                 let rules = clip.rules.clone();
+                // A part that can't hold `<dataValidations>` would lose them
+                // on save: leave the rules where they are and say so.
+                let can_hold =
+                    self.pkg.takes_validations(here) && (!cut || self.pkg.takes_validations(src));
+                let lost = !can_hold && !rules.is_empty();
                 let rule_sheets = if same_sheet || src >= self.pkg.workbook.sheets.len() {
                     vec![here]
                 } else {
@@ -3788,19 +3795,21 @@ impl App {
                 };
                 self.with_rules(&rule_sheets, |app| {
                     app.record_groups(keys, cut_from, |app| {
-                        if cut {
-                            gridcore::validation::clear_validation(
-                                &mut app.pkg.workbook.sheets[src],
+                        if can_hold {
+                            if cut {
+                                gridcore::validation::clear_validation(
+                                    &mut app.pkg.workbook.sheets[src],
+                                    rules_from,
+                                );
+                            }
+                            gridcore::validation::paste_rules(
+                                &mut app.pkg.workbook.sheets[here],
+                                &rules,
                                 rules_from,
+                                (r0, c0),
+                                (1, 1),
                             );
                         }
-                        gridcore::validation::paste_rules(
-                            &mut app.pkg.workbook.sheets[here],
-                            &rules,
-                            rules_from,
-                            (r0, c0),
-                            (1, 1),
-                        );
                         let (clears, late) = if same_sheet {
                             app.engine
                                 .split_frozen_blanks(&app.pkg.workbook, src, clears)
@@ -3818,6 +3827,9 @@ impl App {
                 });
                 self.status = Some(if source_locked {
                     "Pasted (source sheet is protected; cut kept as copy)".to_string()
+                } else if lost {
+                    "Pasted (its data validation was not kept: this sheet can't hold it)"
+                        .to_string()
                 } else {
                     "Pasted".to_string()
                 });
@@ -5027,6 +5039,7 @@ impl App {
             self.sheet,
             range,
             current.as_ref(),
+            self.pkg.workbook.date1904,
         ));
     }
 
@@ -5042,8 +5055,14 @@ impl App {
                 let Some(d) = self.validation_dialog.clone() else {
                     return;
                 };
-                match d.rule() {
+                let ctx = entry_ctx(&self.pkg.workbook, now_serial());
+                match d.rule(&ctx) {
                     Err(why) => self.status = Some(why),
+                    // The part can't hold a rule: refused whole, as any edit
+                    // a save couldn't write is.
+                    Ok(_) if !self.pkg.takes_validations(d.sheet) => {
+                        self.status = Some(WRITE_REFUSED.into());
+                    }
                     Ok(rule) => {
                         self.validation_dialog = None;
                         let (sheet, range) = (d.sheet, d.range);
