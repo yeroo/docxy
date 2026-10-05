@@ -1069,6 +1069,7 @@ fn parse_styles(xml: &str) -> Styles {
                     } else if dxf_in_font {
                         if let Some(d) = &mut cur_dxf {
                             d.color = parse_rgb(p.attr("rgb"));
+                            d.color_unresolved = d.color.is_none() && unresolved(&p, true);
                         }
                     }
                 }
@@ -1102,6 +1103,10 @@ fn parse_styles(xml: &str) -> Styles {
                             if let Some(c) = parse_rgb(rgb) {
                                 if let Some(d) = &mut cur_dxf {
                                     d.fill = Some(c);
+                                }
+                            } else if unresolved(&p, false) {
+                                if let Some(d) = &mut cur_dxf {
+                                    d.fill_unresolved = d.fill.is_none();
                                 }
                             }
                         }
@@ -3787,7 +3792,8 @@ fn splice_worksheet(
         sheet.consolidate.as_ref(),
         sheet.consolidate_loaded.as_ref(),
     );
-    // The sheet's autoFilter: rewritten only where a structural edit moved it.
+    // The sheet's autoFilter: kept while it matches the model, else moved,
+    // rewritten from the model, added or dropped (see set_auto_filter).
     let out = set_auto_filter(out, sheet.auto_filter.as_ref(), dxfs, dxf_for);
     let out = set_filter_mode(out, sheet.filter_mode);
     // Conditional formatting and data validation: likewise.
@@ -8745,9 +8751,8 @@ mod tests {
         // Highlight D-col > 500 with a red fill over A1:A2.
         let dxf = Dxf {
             fill: Some((255, 0, 0)),
-            color: None,
             bold: Some(true),
-            italic: None,
+            ..Dxf::default()
         };
         pkg.add_conditional_format(0, (0, 0, 1, 0), "greaterThan", "500", None, dxf);
 
@@ -11954,9 +11959,8 @@ b",
         let mut pkg = new_xlsx();
         let dxf = Dxf {
             fill: Some((255, 0, 0)),
-            color: None,
             bold: None,
-            italic: None,
+            ..Dxf::default()
         };
         pkg.add_conditional_format(
             0,
@@ -16699,7 +16703,7 @@ mod print_setup_tests {
     }
 
     #[test]
-    fn filter_database_is_never_appended() {
+    fn filter_database_is_not_appended_for_an_unfiltered_sheet() {
         let mut pkg = report(PRINT_NAMES, "");
         pkg.workbook
             .defined_names

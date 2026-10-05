@@ -188,8 +188,16 @@ pub fn cell_font_color(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Shown
 
 fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> Shown {
     if let Some(d) = cell_dxf(wb, sheet, row, col) {
-        if let Some(c) = if fill { d.fill } else { d.color } {
-            return Shown::Rgb(c);
+        let (rgb, unresolved) = if fill {
+            (d.fill, d.fill_unresolved)
+        } else {
+            (d.color, d.color_unresolved)
+        };
+        match rgb {
+            Some(c) => return Shown::Rgb(c),
+            // A theme or indexed colour the rule sets: some colour.
+            None if unresolved => return Shown::Unknown,
+            None => {}
         }
     }
     let style = wb
@@ -214,94 +222,134 @@ fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> S
 /// from the highest-precedence icon-set rule over it. `iconId` 0 is the
 /// set's first icon (for `3Arrows`, the red down arrow), which goes to the
 /// lowest values unless the rule is `reverse`. Only a number gets an icon.
+/// For many cells, keep one [`Icons`] instead: it reads each rule's range
+/// once.
 pub fn cell_icon(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<(String, u32)> {
-    let s = wb.sheets.get(sheet)?;
-    let mut best: Option<(i32, &crate::sheet::CondFormat, &CfKind)> = None;
-    for cf in &s.cond_formats {
-        let covers = cf
-            .ranges
-            .iter()
-            .any(|&(r1, c1, r2, c2)| row >= r1 && row <= r2 && col >= c1 && col <= c2);
-        if !covers {
-            continue;
-        }
-        for rule in &cf.rules {
-            if matches!(rule.kind, CfKind::IconSet { .. })
-                && best.is_none_or(|(p, _, _)| rule.priority < p)
-            {
-                best = Some((rule.priority, cf, &rule.kind));
-            }
+    Icons::new(wb, sheet).icon(row, col)
+}
+
+/// The icons of one sheet's cells, for a command that asks about many
+/// (filtering or sorting by icon): each icon-set rule's numbers, which
+/// percent and percentile thresholds need, are read and sorted once.
+pub struct Icons<'a> {
+    wb: &'a Workbook,
+    sheet: usize,
+    /// Each conditional-format block's numbers, sorted, by block index.
+    nums: std::cell::RefCell<std::collections::HashMap<usize, std::rc::Rc<Vec<f64>>>>,
+}
+
+impl<'a> Icons<'a> {
+    pub fn new(wb: &'a Workbook, sheet: usize) -> Self {
+        Icons {
+            wb,
+            sheet,
+            nums: Default::default(),
         }
     }
-    let (
-        _,
-        cf,
-        CfKind::IconSet {
-            set,
-            reverse,
-            cfvos,
-            ..
-        },
-    ) = best?
-    else {
-        return None;
-    };
-    let Value::Num(v) = cell_value_at(wb, sheet, row, col) else {
-        return None;
-    };
-    // The numbers of the rule's whole range, for percent and percentile.
-    let mut nums: Vec<f64> = Vec::new();
-    let last_row = s.used_size().0.saturating_sub(1);
-    for &(r1, c1, r2, c2) in &cf.ranges {
-        for r in r1..=r2.min(last_row) {
-            for (&(_, c), _) in s.cells.range((r, c1)..=(r, c2)) {
-                if let Value::Num(n) = cell_value_at(wb, sheet, r, c) {
-                    nums.push(n);
+
+    /// The numbers of block `i`'s ranges, sorted.
+    fn numbers(&self, i: usize) -> std::rc::Rc<Vec<f64>> {
+        if let Some(n) = self.nums.borrow().get(&i) {
+            return n.clone();
+        }
+        let (wb, sheet) = (self.wb, self.sheet);
+        let s = &wb.sheets[sheet];
+        let mut nums: Vec<f64> = Vec::new();
+        let last_row = s.used_size().0.saturating_sub(1);
+        for &(r1, c1, r2, c2) in &s.cond_formats[i].ranges {
+            for r in r1..=r2.min(last_row) {
+                for (&(_, c), _) in s.cells.range((r, c1)..=(r, c2)) {
+                    if let Value::Num(n) = cell_value_at(wb, sheet, r, c) {
+                        nums.push(n);
+                    }
                 }
             }
         }
+        nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        let nums = std::rc::Rc::new(nums);
+        self.nums.borrow_mut().insert(i, nums.clone());
+        nums
     }
-    nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let (lo, hi) = (*nums.first()?, *nums.last()?);
-    let anchor = cf
-        .ranges
-        .iter()
-        .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, ..)| {
-            (r.min(r1), c.min(c1))
-        });
-    let threshold = |c: &crate::sheet::Cfvo| -> Option<f64> {
-        let num = || match c.val.trim().parse::<f64>() {
-            Ok(n) => Some(n),
-            Err(_) => match eval_cf(wb, sheet, row, col, anchor, &c.val) {
-                Value::Num(n) => Some(n),
-                _ => None,
+
+    /// See [`cell_icon`].
+    pub fn icon(&self, row: u32, col: u32) -> Option<(String, u32)> {
+        let (wb, sheet) = (self.wb, self.sheet);
+        let s = wb.sheets.get(sheet)?;
+        let mut best: Option<(i32, usize, &CfKind)> = None;
+        for (i, cf) in s.cond_formats.iter().enumerate() {
+            let covers = cf
+                .ranges
+                .iter()
+                .any(|&(r1, c1, r2, c2)| row >= r1 && row <= r2 && col >= c1 && col <= c2);
+            if !covers {
+                continue;
+            }
+            for rule in &cf.rules {
+                if matches!(rule.kind, CfKind::IconSet { .. })
+                    && best.is_none_or(|(p, _, _)| rule.priority < p)
+                {
+                    best = Some((rule.priority, i, &rule.kind));
+                }
+            }
+        }
+        let (
+            _,
+            i,
+            CfKind::IconSet {
+                set,
+                reverse,
+                cfvos,
+                ..
             },
+        ) = best?
+        else {
+            return None;
         };
-        match c.kind.as_str() {
-            "num" | "formula" => num(),
-            "percent" => Some(lo + (hi - lo) * num()? / 100.0),
-            "percentile" => Some(percentile(&nums, num()? / 100.0)),
-            "min" => Some(lo),
-            "max" => Some(hi),
-            _ => None,
+        let Value::Num(v) = cell_value_at(wb, sheet, row, col) else {
+            return None;
+        };
+        let nums = self.numbers(i);
+        let (lo, hi) = (*nums.first()?, *nums.last()?);
+        let anchor = s.cond_formats[i]
+            .ranges
+            .iter()
+            .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, ..)| {
+                (r.min(r1), c.min(c1))
+            });
+        let threshold = |c: &crate::sheet::Cfvo| -> Option<f64> {
+            let num = || match c.val.trim().parse::<f64>() {
+                Ok(n) => Some(n),
+                Err(_) => match eval_cf(wb, sheet, row, col, anchor, &c.val) {
+                    Value::Num(n) => Some(n),
+                    _ => None,
+                },
+            };
+            match c.kind.as_str() {
+                "num" | "formula" => num(),
+                "percent" => Some(lo + (hi - lo) * num()? / 100.0),
+                "percentile" => Some(percentile(&nums, num()? / 100.0)),
+                "min" => Some(lo),
+                "max" => Some(hi),
+                _ => None,
+            }
+        };
+        let n = cfvos.len();
+        // The highest band whose threshold the value reaches; the first cfvo
+        // is the floor of band 0.
+        let mut band = 0;
+        for (k, c) in cfvos.iter().enumerate().skip(1) {
+            let Some(t) = threshold(c) else { continue };
+            if if c.gte { v >= t } else { v > t } {
+                band = k;
+            }
         }
-    };
-    let n = cfvos.len();
-    // The highest band whose threshold the value reaches; the first cfvo is
-    // the floor of band 0.
-    let mut band = 0;
-    for (i, c) in cfvos.iter().enumerate().skip(1) {
-        let Some(t) = threshold(c) else { continue };
-        if if c.gte { v >= t } else { v > t } {
-            band = i;
-        }
+        let id = if *reverse {
+            n.saturating_sub(1) - band
+        } else {
+            band
+        };
+        Some((set.clone(), id as u32))
     }
-    let id = if *reverse {
-        n.saturating_sub(1) - band
-    } else {
-        band
-    };
-    Some((set.clone(), id as u32))
 }
 
 /// Excel's `PERCENTILE.INC` of sorted `nums` at `p` (0..=1).

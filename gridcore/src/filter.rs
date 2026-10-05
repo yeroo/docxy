@@ -114,6 +114,15 @@ pub struct DateGroup {
     pub day: Option<u32>,
 }
 
+impl DateGroup {
+    /// Whether the date `d` falls in this group.
+    pub fn covers(&self, d: &crate::sheet::DateParts) -> bool {
+        self.year == d.year
+            && self.month.is_none_or(|m| m == d.month)
+            && self.day.is_none_or(|x| x == d.day)
+    }
+}
+
 /// One `<filterColumn>`'s criteria.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ColumnFilter {
@@ -180,7 +189,7 @@ impl ColumnFilter {
         }
     }
 
-    /// An empty checklist: the column shows no value until one is checked.
+    /// A checklist of `vals` (no blanks, no date groups).
     pub fn values(vals: Vec<String>) -> ColumnFilter {
         ColumnFilter::Values {
             vals,
@@ -381,6 +390,16 @@ fn parse_modelled(element: &str, dxfs: &[Dxf]) -> Option<ColumnFilter> {
                         let id: u32 = p.attr("dxfId").parse().ok()?;
                         let dxf = dxfs.get(id as usize)?;
                         let cell = p.attr("cellColor").is_empty() || flag(p.attr("cellColor"));
+                        // A theme or indexed colour isn't one we can match:
+                        // the column stays as the file has it.
+                        let unresolved = if cell {
+                            dxf.fill.is_none() && dxf.fill_unresolved
+                        } else {
+                            dxf.color.is_none() && dxf.color_unresolved
+                        };
+                        if unresolved {
+                            return None;
+                        }
                         out = Some(ColumnFilter::Color {
                             cell,
                             rgb: if cell { dxf.fill } else { dxf.color },
@@ -560,8 +579,9 @@ pub fn color_dxf_xml(cell: bool, rgb: Option<(u8, u8, u8)>) -> String {
 /// The rows an applied auto-filter hides, as the file left them: rows below
 /// its header that are hidden *and* fail its criteria. A hidden row that
 /// passes them was hidden by hand. When a column's criteria can't be checked
-/// against the cells alone (anything but a value checklist or custom
-/// conditions), every hidden row in the range counts as filtered.
+/// against the cells alone (a checklist with date groups, Top 10, a dynamic,
+/// colour or icon filter, or an opaque [`ColumnFilter::Raw`]), every hidden
+/// row in the range counts as filtered.
 pub fn filtered_rows(sheet: &Sheet, styles: &Styles, date1904: bool, af: &AutoFilter) -> Vec<u32> {
     let (r1, c1, r2, _) = af.range;
     let unchecked = af.columns.iter().any(|(_, f)| match f {
@@ -585,7 +605,7 @@ pub fn filtered_rows(sheet: &Sheet, styles: &Styles, date1904: bool, af: &AutoFi
                     };
                     match f {
                         ColumnFilter::Values { vals, blank, .. } => {
-                            values_pass(vals, *blank, value, &shown, None)
+                            values_pass(vals, *blank, value, &shown)
                         }
                         ColumnFilter::Custom { and, conds } => {
                             custom_pass(*and, conds, value, &shown)
@@ -603,27 +623,16 @@ pub(crate) fn is_blank_value(value: Option<&CellValue>) -> bool {
         || matches!(value, Some(CellValue::Text(t)) if t.is_empty())
 }
 
-/// A value checklist: a blank passes when blanks are checked; anything else
-/// when its displayed text is checked, or (for a date) its date's group.
-pub(crate) fn values_pass(
+/// A value checklist without date groups: a blank passes when blanks are
+/// checked, anything else when its displayed text is.
+fn values_pass(
     vals: &[String],
     blank: bool,
     value: Option<&CellValue>,
     shown: &dyn Fn() -> String,
-    date: Option<(&[DateGroup], Option<crate::sheet::DateParts>)>,
 ) -> bool {
     if is_blank_value(value) {
         return blank;
-    }
-    if let Some((groups, Some(d))) = date {
-        let hit = groups.iter().any(|g| {
-            g.year == d.year
-                && g.month.is_none_or(|m| m == d.month)
-                && g.day.is_none_or(|x| x == d.day)
-        });
-        if hit {
-            return true;
-        }
     }
     let text = shown();
     let text = text.trim();

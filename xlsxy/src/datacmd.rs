@@ -24,9 +24,10 @@ pub fn today() -> f64 {
 
 impl App {
     /// Run filter command `op` (given "today") as one undo step; the status
-    /// line says `<n> of <m> records found`. A refused command changes
-    /// nothing and puts nothing on the undo stack; its reason is the error
-    /// and the status.
+    /// line says `<n> of <m> records found`. A command that changed nothing
+    /// (Clear with nothing filtered) puts nothing on the undo stack and
+    /// leaves the workbook unmodified; so does a refused one, whose reason is
+    /// the error and the status. [`Self::last_changed`] says which.
     pub(crate) fn filter_command(
         &mut self,
         op: impl FnOnce(&mut Workbook, usize, f64) -> Result<FilterOutcome, FilterError>,
@@ -43,12 +44,13 @@ impl App {
     ) -> Result<FilterOutcome, String> {
         let today = today();
         let mut got = None;
-        let res = self.try_structural(None, |wb| {
+        let res = self.try_structural_if_changed(|wb| {
             let o = op(wb, si, today).map_err(|e| e.to_string())?;
             got = Some(o);
             Ok(())
         });
-        match res.and_then(|()| got.ok_or_else(String::new)) {
+        self.last_changed = *res.as_ref().unwrap_or(&false);
+        match res.and_then(|_| got.ok_or_else(String::new)) {
             Ok(o) => {
                 self.status = Some(gridcore::filter::status_text(&o));
                 Ok(o)
@@ -66,7 +68,7 @@ impl App {
         let si = self.sheet;
         let at = self.cur;
         let on = self.pkg.workbook.sheets[si].auto_filter.is_some();
-        self.try_structural(None, |wb| {
+        self.try_structural_if_changed(|wb| {
             if on {
                 gridcore::filter::auto_filter_off(wb, si);
                 return Ok(());
@@ -94,12 +96,13 @@ impl App {
         opts: &SortOptions,
     ) -> Result<usize, String> {
         let mut n = 0;
-        self.try_structural(None, |wb| {
-            n = gridcore::edit::sort_range(wb, si, area, levels, opts)
-                .map_err(|e| e.message().to_string())?;
-            Ok(())
-        })
-        .inspect_err(|e| self.status = Some(e.clone()))?;
+        self.last_changed = self
+            .try_structural_if_changed(|wb| {
+                n = gridcore::edit::sort_range(wb, si, area, levels, opts)
+                    .map_err(|e| e.message().to_string())?;
+                Ok(())
+            })
+            .inspect_err(|e| self.status = Some(e.clone()))?;
         Ok(n)
     }
 }
@@ -169,7 +172,12 @@ pub(crate) fn parse_filter_text(text: &str) -> Result<ColumnFilter, String> {
         });
     }
     for (word, top) in [("top", true), ("bottom", false)] {
-        if let Some(rest) = lower.strip_prefix(word) {
+        // `top 3`, `top3`, `bottom 25%`; not a value such as `topaz` or
+        // `top shelf`.
+        let rest = lower
+            .strip_prefix(word)
+            .filter(|r| r.trim_start().starts_with(|c: char| c.is_ascii_digit()));
+        if let Some(rest) = rest {
             let rest = rest.trim().trim_end_matches("items").trim();
             let (num, percent) = match rest.strip_suffix('%') {
                 Some(n) => (n.trim(), true),
@@ -674,11 +682,11 @@ impl App {
         let on = |s: &str| -> Option<(usize, Area)> {
             match s.rsplit_once('!') {
                 Some((sh, r)) => {
-                    let name = sh.trim_matches('\'');
+                    let name = sh.trim().trim_matches('\'').replace("''", "'");
                     let i = wb
                         .sheets
                         .iter()
-                        .position(|x| x.name.eq_ignore_ascii_case(name))?;
+                        .position(|x| x.name.eq_ignore_ascii_case(&name))?;
                     Some((i, area(r)?))
                 }
                 None => Some((si, area(s)?)),
@@ -885,6 +893,14 @@ mod tests {
             );
         }
         assert!(parse_filter_text("").is_err());
+        // A value that starts like `top` is a value.
+        for v in ["topaz", "top shelf", "bottomline"] {
+            assert_eq!(
+                parse_filter_text(v),
+                Ok(custom(false, &[("equal", v)])),
+                "{v}"
+            );
+        }
     }
 
     #[test]
@@ -1027,6 +1043,13 @@ mod tests {
         );
         a.ribbon_act(crate::ribbon::Act::ClearFilter);
         assert_eq!(a.status.as_deref(), Some("5 of 5 records found"));
+        // A quoted sheet name, its quote doubled.
+        let its = a.pkg.add_sheet("It's");
+        a.pkg.workbook.sheets[its].set_cell(0, 0, Cell::text("Region"));
+        a.pkg.workbook.sheets[its].set_cell(1, 0, Cell::text("Nowhere"));
+        a.commit_advanced_filter("list=A1:C6 criteria='It''s'!A1:A2");
+        assert_eq!(a.status.as_deref(), Some("0 of 5 records found"));
+        a.ribbon_act(crate::ribbon::Act::ClearFilter);
         a.cur = (1, 0); // West
         a.commit_filter_by_cell("v");
         assert_eq!(a.status.as_deref(), Some("1 of 5 records found"));

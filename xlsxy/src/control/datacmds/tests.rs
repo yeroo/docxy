@@ -669,3 +669,76 @@ fn dat_case_010_colour_sort() {
     let got: Vec<String> = (2..=5).map(|r| text(&a, &format!("A{r}"))).collect();
     assert_eq!(got, ["i2", "i0", "i1", "i3"]);
 }
+
+#[test]
+fn a_command_that_changes_nothing_leaves_the_workbook_clean() {
+    let mut a = filterlist();
+    ok(
+        &mut a,
+        "filter.set",
+        r#"{"range":"A1:D21","col":"Rep","criteria":null}"#,
+    );
+    assert!(a.modified, "turning the filter on is an edit");
+    a.modified = false;
+    let undo = a.undo.len();
+    // Nothing is filtered: Clear and Reapply change no row.
+    let r = ok(&mut a, "filter.clear", "{}");
+    assert_eq!(r.get_str("status"), Some("20 of 20 records found"));
+    assert!(!a.last_changed);
+    ok(&mut a, "filter.reapply", "{}");
+    assert!(!a.last_changed);
+    assert!(!a.modified);
+    assert_eq!(a.undo.len(), undo);
+    // A sort moves rows once; the same sort again moves nothing.
+    let sort = r#"{"range":"A1:D21","header":true,"keys":[{"col":"Rep","order":"asc"}]}"#;
+    ok(&mut a, "range.sort", sort);
+    assert!(a.last_changed && a.modified);
+    a.modified = false;
+    let undo = a.undo.len();
+    ok(&mut a, "range.sort", sort);
+    assert!(!a.last_changed && !a.modified);
+    assert_eq!(a.undo.len(), undo);
+}
+
+#[test]
+fn bad_keys_columns_and_clocks_are_refused() {
+    let mut a = filterlist();
+    let e = call(
+        &mut a,
+        "filter.set",
+        r#"{"range":"A1:D21","col":"Pirce","criteria":null}"#,
+    );
+    assert_eq!(e.unwrap_err(), "no column 'Pirce'");
+    let e = call(
+        &mut a,
+        "filter.set",
+        r#"{"range":"A1:D21","col":"F","criteria":null}"#,
+    );
+    assert_eq!(e.unwrap_err(), "column 'F' is outside A1:D21");
+    let e = call(
+        &mut a,
+        "range.sort",
+        r#"{"range":"A1:D21","keys":[{"col":"E"}]}"#,
+    );
+    assert_eq!(e.unwrap_err(), "column 'E' is outside A1:D21");
+    let e = call(
+        &mut a,
+        "range.sort",
+        r#"{"range":"A1:C2","orientation":"columns","keys":[{"row":5}]}"#,
+    );
+    assert_eq!(e.unwrap_err(), "row 5 is outside A1:C2");
+    for bad in [
+        "2024-02-31",
+        "2023-02-29",
+        "2024-03-13T25:00",
+        "2024-03-13T10:60",
+        "2024-13-01",
+    ] {
+        assert!(
+            call(&mut a, "wb.clock", &format!(r#"{{"date":"{bad}"}}"#)).is_err(),
+            "{bad}"
+        );
+    }
+    ok(&mut a, "wb.clock", r#"{"date":"2024-02-29T23:59:59"}"#);
+    ok(&mut a, "wb.clock", r#"{"date":null}"#);
+}

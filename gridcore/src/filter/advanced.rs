@@ -32,7 +32,8 @@ pub struct AdvancedFilter {
 /// turned off first, as in Excel); copied, the matching records are written
 /// below the copy-to headers (values and styles), after the old extract rows
 /// in those columns are cleared. Defines the sheet's `_FilterDatabase`,
-/// `Criteria` and (copying) `Extract` names. Copying to another sheet is
+/// `Criteria` (when a criteria range is given; otherwise the last one's
+/// stays) and (copying) `Extract` names. Copying to another sheet is
 /// refused ([`ADVANCED_OTHER_SHEET`]) with nothing changed.
 pub fn advanced(
     wb: &mut Workbook,

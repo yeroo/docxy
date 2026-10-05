@@ -878,3 +878,42 @@ fn advanced_filter_turns_an_auto_filter_off_first() {
     assert_eq!(visible(&wb, 2, 9), vec![2, 4, 6, 9]);
     assert_eq!(wb.defined_name(FILTER_DB, 0), Some("Sheet1!$A$1:$C$9"));
 }
+
+#[test]
+fn an_icon_filter_over_ten_thousand_rows_reads_the_rule_once() {
+    // Not a timing test: without the per-rule cache this is quadratic.
+    let mut rows = vec![vec![t("Score")]];
+    for r in 0..10_000u32 {
+        rows.push(vec![n(f64::from(r % 97))]);
+    }
+    let mut wb = book(&rows);
+    wb.sheets[0].cond_formats.push(crate::sheet::CondFormat {
+        ranges: vec![(1, 0, 10_000, 0)],
+        rules: vec![crate::sheet::CfRule {
+            kind: crate::sheet::CfKind::IconSet {
+                set: "3Arrows".into(),
+                reverse: false,
+                cfvos: ["0", "33", "67"]
+                    .iter()
+                    .map(|v| crate::sheet::Cfvo {
+                        kind: "percentile".into(),
+                        val: (*v).into(),
+                        gte: true,
+                    })
+                    .collect(),
+                formulas: Vec::new(),
+            },
+            dxf_id: None,
+            priority: 1,
+        }],
+        ix: None,
+    });
+    auto_filter_on(&mut wb, 0, (0, 0)).unwrap();
+    let up = ColumnFilter::Icon {
+        set: "3Arrows".into(),
+        id: 2,
+    };
+    let out = set_criterion(&mut wb, 0, 0, Some(up), today()).unwrap();
+    assert!(out.shown > 0 && out.shown < 10_000);
+    menu(&wb, 0, 0, None).unwrap();
+}

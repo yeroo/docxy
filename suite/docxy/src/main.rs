@@ -1568,8 +1568,7 @@ fn cf_preset_dxf() -> gridcore::sheet::Dxf {
     gridcore::sheet::Dxf {
         fill: Some((0xFF, 0xC7, 0xCE)),
         color: Some((0x9C, 0x00, 0x06)),
-        bold: None,
-        italic: None,
+        ..Default::default()
     }
 }
 

@@ -1549,6 +1549,23 @@ struct WbSnapshot {
     model_rename: Option<(String, String)>,
 }
 
+/// Whether `wb` differs from the snapshot `before` in what a filter or sort
+/// command can change: cells, rows' hidden state and attributes, columns,
+/// merges, the AutoFilter, and the defined names.
+fn wb_changed(before: &WbSnapshot, wb: &gridcore::sheet::Workbook) -> bool {
+    before.names != wb.defined_names
+        || before.sheets.len() != wb.sheets.len()
+        || before.sheets.iter().zip(&wb.sheets).any(|(a, b)| {
+            a.cells != b.cells
+                || a.row_attrs != b.row_attrs
+                || a.col_defs != b.col_defs
+                || a.merges != b.merges
+                || a.filtered_rows != b.filtered_rows
+                || a.auto_filter != b.auto_filter
+                || a.filter_mode != b.filter_mode
+        })
+}
+
 enum UndoAction {
     /// One undo step; more than one group when it touched several sheets
     /// (a cut pasted on another sheet). The view follows the last group.
@@ -1906,6 +1923,9 @@ struct App {
     pending_sort: Option<datacmd::PendingSort>,
     /// The column the Custom AutoFilter prompt filters.
     custom_filter_col: Option<u32>,
+    /// Whether the last filter or sort command changed the workbook, so the
+    /// control verbs flash the activity dot only then.
+    last_changed: bool,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
@@ -2050,6 +2070,7 @@ impl App {
             filter_picker: None,
             pending_sort: None,
             custom_filter_col: None,
+            last_changed: false,
             grid_area: Rect::default(),
             gutter_w: 4,
             outline_w: 0,
@@ -2667,7 +2688,8 @@ impl App {
         model_rename: Option<(&str, &str)>,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.structural_step(model_rename, false, op)
+        self.structural_step(model_rename, false, false, op)
+            .map(|_| ())
     }
 
     /// [`Self::structural`] for an edit that writes cell content in place
@@ -2676,22 +2698,35 @@ impl App {
     /// ([`Self::sync_written_headers`]). An edit that moves cells (rows,
     /// columns, a sort) must not use it: its moved headers aren't written.
     fn structural_writing_cells(&mut self, op: impl FnOnce(&mut gridcore::sheet::Workbook)) {
-        let infallible = self.structural_step(None, true, |wb| {
+        let infallible = self.structural_step(None, true, false, |wb| {
             op(wb);
             Ok(())
         });
         debug_assert!(infallible.is_ok());
     }
 
-    /// The one structural step behind [`Self::try_structural`] and
-    /// [`Self::structural_writing_cells`]; `sync_headers` says whether the
-    /// edit wrote cells in place, whose header cells then rename columns.
+    /// [`Self::try_structural`] for an edit that may change nothing (a
+    /// filter command, a sort, #690/#691): then it pushes no undo step and
+    /// leaves the workbook unmodified. Whether it changed anything.
+    fn try_structural_if_changed(
+        &mut self,
+        op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        self.structural_step(None, false, true, op)
+    }
+
+    /// The one structural step behind [`Self::try_structural`],
+    /// [`Self::structural_writing_cells`] and
+    /// [`Self::try_structural_if_changed`]; `sync_headers` says whether the
+    /// edit wrote cells in place, whose header cells then rename columns, and
+    /// `skip_unchanged` that an edit that changed nothing is not one.
     fn structural_step(
         &mut self,
         model_rename: Option<(&str, &str)>,
         sync_headers: bool,
+        skip_unchanged: bool,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let mut before = self.wb_snapshot();
         // A structural edit moves cells, so compare how many cells sit on
         // circles rather than where: a circle that merely moved is not new.
@@ -2699,6 +2734,9 @@ impl App {
         if let Err(e) = op(&mut self.pkg.workbook) {
             self.put_back(&before);
             return Err(e);
+        }
+        if skip_unchanged && !wb_changed(&before, &self.pkg.workbook) {
+            return Ok(false);
         }
         if sync_headers {
             self.sync_written_headers(&before);
@@ -2718,7 +2756,7 @@ impl App {
         self.modified = true;
         self.clamp_cursor();
         self.cancel_cut();
-        Ok(())
+        Ok(true)
     }
 
     /// A structural edit that wrote cells in place (Replace All, Text to
@@ -6612,8 +6650,7 @@ impl App {
         let dxf = gridcore::sheet::Dxf {
             fill: Some((0xFF, 0xC7, 0xCE)),
             color: Some((0x9C, 0x00, 0x06)),
-            bold: None,
-            italic: None,
+            ..Default::default()
         };
         if !self
             .pkg

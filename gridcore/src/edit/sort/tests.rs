@@ -465,3 +465,104 @@ fn several_levels_on_one_column_and_a_refused_spill() {
         Err(SortError::CutsSpill)
     );
 }
+
+#[test]
+fn a_block_reaching_past_the_ranges_side_is_cut_too() {
+    // A1:B4 sorted top to bottom while a one-row block sits in B3:C3: B3
+    // would move without C3.
+    let rows = || {
+        book(&[
+            ("A1", n(4.0)),
+            ("A2", n(3.0)),
+            ("A3", n(2.0)),
+            ("A4", n(1.0)),
+            ("B3", Cell::formula("SEQUENCE(1,2)")),
+        ])
+    };
+    let mut wb = rows();
+    wb.sheets[0].cells.get_mut(&(2, 1)).unwrap().spill = Some((1, 2));
+    let by_a = [SortLevel { key: 0, on: asc() }];
+    let none = SortOptions::default();
+    assert_eq!(
+        sort_range(&mut wb, 0, area("A1:B4"), &by_a, &none),
+        Err(SortError::CutsSpill)
+    );
+    // The same block wholly inside the range moves with its row.
+    let mut wb = rows();
+    wb.sheets[0].cells.get_mut(&(2, 1)).unwrap().spill = Some((1, 2));
+    assert_eq!(sort_range(&mut wb, 0, area("A1:C4"), &by_a, &none), Ok(4));
+    // A legacy CSE block is cut the same way.
+    let mut wb = rows();
+    let cse = wb.sheets[0].cells.get_mut(&(2, 1)).unwrap();
+    cse.f_attrs = Some(r#" t="array" ref="B3:C3""#.into());
+    assert_eq!(
+        sort_range(&mut wb, 0, area("A1:B4"), &by_a, &none),
+        Err(SortError::CutsSpill)
+    );
+    // Left to right: a two-row block in row 1 reaching below the range.
+    let mut wb = book(&[
+        ("A1", n(2.0)),
+        ("B1", n(1.0)),
+        ("B2", n(0.0)),
+        ("A1", Cell::formula("SEQUENCE(2)")),
+    ]);
+    wb.sheets[0].cells.get_mut(&(0, 0)).unwrap().spill = Some((2, 1));
+    let ltr = SortOptions {
+        left_to_right: true,
+        ..SortOptions::default()
+    };
+    assert_eq!(
+        sort_range(
+            &mut wb,
+            0,
+            area("A1:B1"),
+            &[SortLevel { key: 0, on: asc() }],
+            &ltr
+        ),
+        Err(SortError::CutsSpill)
+    );
+}
+
+#[test]
+fn an_icon_level_over_ten_thousand_rows_reads_the_rule_once() {
+    // Not a timing test: without the per-rule cache this is quadratic and
+    // takes minutes.
+    let mut wb = book(&[("A1", t("Score"))]);
+    for r in 1..=10_000u32 {
+        wb.sheets[0].set_cell(r, 0, n(f64::from(r % 97)));
+    }
+    wb.sheets[0].cond_formats.push(CondFormat {
+        ranges: vec![area("A2:A10001")],
+        rules: vec![CfRule {
+            kind: CfKind::IconSet {
+                set: "3Arrows".into(),
+                reverse: false,
+                cfvos: ["0", "33", "67"]
+                    .iter()
+                    .map(|v| Cfvo {
+                        kind: "percentile".into(),
+                        val: (*v).into(),
+                        gte: true,
+                    })
+                    .collect(),
+                formulas: Vec::new(),
+            },
+            dxf_id: None,
+            priority: 1,
+        }],
+        ix: None,
+    });
+    let up = SortLevel {
+        key: 0,
+        on: SortOn::Icon {
+            set: "3Arrows".into(),
+            id: 2,
+            top: true,
+        },
+    };
+    sort_range(&mut wb, 0, area("A1:A10001"), &[up], &HEADER).unwrap();
+    let first = crate::cf::cell_icon(&wb, 0, 1, 0);
+    assert_eq!(first, Some(("3Arrows".to_string(), 2)));
+    let last = crate::cf::cell_icon(&wb, 0, 10_000, 0);
+    assert_ne!(last, first);
+}

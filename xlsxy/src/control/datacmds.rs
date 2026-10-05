@@ -218,27 +218,26 @@ fn criteria_arg(j: &Json) -> Result<Criteria, String> {
 pub(super) fn filter_set(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
     let range = args.get_str("range").map(area).transpose()?;
-    let col = args
-        .get_str("col")
-        .ok_or("filter.set needs a 'col'")?
-        .to_string();
+    let col = args.get_str("col").ok_or("filter.set needs a 'col'")?;
     let crit = criteria_arg(args.get("criteria").unwrap_or(&Json::Null))?;
+    // The column, in the range the filter has (or will have once `range`
+    // turns it on there).
+    let wb = &app.pkg.workbook;
+    let have = wb.sheets[si].auto_filter.as_ref().map(|a| a.range);
+    let target = range.or(have).ok_or_else(|| {
+        format!(
+            "{} Pass a 'range' to turn it on.",
+            gridcore::filter::FilterError::NoFilter
+        )
+    })?;
+    let c = column_in(wb, si, target, col)?;
+    if c < target.1 || c > target.3 {
+        return Err(format!("column '{col}' is outside {}", area_name(target)));
+    }
     let o = app.filter_command_on(si, |wb, si, today| {
-        use gridcore::filter::FilterError;
-        let have = wb.sheets[si].auto_filter.as_ref().map(|a| a.range);
-        match range {
-            Some(r) if have != Some(r) => {
-                gridcore::filter::auto_filter_on_range(wb, si, r)?;
-            }
-            None if have.is_none() => return Err(FilterError::NoFilter),
-            _ => {}
+        if have != Some(target) {
+            gridcore::filter::auto_filter_on_range(wb, si, target)?;
         }
-        let r = wb.sheets[si]
-            .auto_filter
-            .as_ref()
-            .map(|a| a.range)
-            .ok_or(FilterError::NoFilter)?;
-        let c = column_in(wb, si, r, &col).map_err(|_| FilterError::NotInFilter)?;
         match crit {
             Criteria::Set(f) => gridcore::filter::set_criterion(wb, si, c, f, today),
             Criteria::Search { pattern, add } => {
@@ -409,15 +408,23 @@ fn level_arg(
 ) -> Result<SortLevel, String> {
     let key = if ltr {
         let row = k.get("row").ok_or("a left-to-right key needs a 'row'")?;
-        match row {
+        let r = match row {
             Json::Num(_) => (row.as_usize().ok_or("bad 'row'")? as u32)
                 .checked_sub(1)
                 .ok_or("rows count from 1")?,
             _ => return Err("'row' is a row number".into()),
+        };
+        if r < range.0 || r > range.2 {
+            return Err(format!("row {} is outside {}", r + 1, area_name(range)));
         }
+        r
     } else {
         let col = k.get_str("col").ok_or("a key needs a 'col'")?;
-        column_in(wb, si, range, col)?
+        let c = column_in(wb, si, range, col)?;
+        if c < range.1 || c > range.3 {
+            return Err(format!("column '{col}' is outside {}", area_name(range)));
+        }
+        c
     };
     let top = k.get_str("position").unwrap_or("top") != "bottom";
     let on = match k.get_str("on").unwrap_or("value") {
@@ -540,14 +547,15 @@ pub(super) fn wb_clock(app: &mut App, args: &Json) -> Result<Json, String> {
     )]))
 }
 
-/// `YYYY-MM-DD[THH:MM[:SS]]` as a serial in the 1900 date system.
+/// `YYYY-MM-DD[THH:MM[:SS]]` as a serial in the 1900 date system; `None`
+/// for a date or time that doesn't exist (`2024-02-31`, `T25:00`).
 fn parse_date(s: &str) -> Option<f64> {
     let (d, t) = s.trim().split_once('T').unwrap_or((s.trim(), ""));
     let mut p = d.split('-');
     let y: i64 = p.next()?.parse().ok()?;
     let m: u32 = p.next()?.parse().ok()?;
     let day: u32 = p.next()?.parse().ok()?;
-    if p.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+    if p.next().is_some() {
         return None;
     }
     let mut secs = 0u32;
@@ -556,9 +564,15 @@ fn parse_date(s: &str) -> Option<f64> {
         let h: u32 = q.next()?.parse().ok()?;
         let mi: u32 = q.next()?.parse().ok()?;
         let se: u32 = q.next().map_or(Some(0), |x| x.parse().ok())?;
+        if q.next().is_some() || h > 23 || mi > 59 || se > 59 {
+            return None;
+        }
         secs = h * 3600 + mi * 60 + se;
     }
-    Some(gridcore::sheet::parts_to_serial(y, m, day, secs, false))
+    let serial = gridcore::sheet::parts_to_serial(y, m, day, secs, false);
+    // A day past the month's end would roll into the next month: refuse it.
+    let back = gridcore::sheet::serial_to_parts(serial, false)?;
+    ((back.year, back.month, back.day) == (y, m, day)).then_some(serial)
 }
 
 #[cfg(test)]

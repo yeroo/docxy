@@ -113,6 +113,7 @@ mod datacmds;
 /// Route one control verb against the live workbook, returning the JSON result
 /// or an error message.
 pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> {
+    app.last_changed = false;
     let out = match verb {
         "wb.path" => Ok(path_info(app)),
         "sheet.list" => Ok(sheet_list(app)),
@@ -223,22 +224,13 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
                 | "col.delete"
                 | "cell.format"
                 | "col.width"
-                | "filter.set"
-                | "filter.reapply"
-                | "filter.clear"
-                | "filter.off"
-                | "filter.by-cell"
-                | "filter.advanced"
         ) {
             ctlcore::signal_activity();
         }
-        // `range.sort` signals only when it sorted (a Sort Warning reply moved
-        // nothing).
-        if verb == "range.sort"
-            && out
-                .as_ref()
-                .is_ok_and(|j| j.get("sorted") == Some(&Json::Bool(true)))
-        {
+        // The filter verbs and `range.sort` signal only when they changed
+        // something: Clear with nothing filtered, a Sort Warning reply, or a
+        // sort that left every row in place moved nothing.
+        if (verb.starts_with("filter.") || verb == "range.sort") && app.last_changed {
             ctlcore::signal_activity();
         }
         // `comment.remove` can legitimately no-op (nothing on the cell), so it

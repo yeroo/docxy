@@ -330,3 +330,59 @@ fn a_filter_the_commands_set_survives_a_save_with_its_hidden_rows() {
     assert_eq!(a.filtered_rows, b.filtered_rows);
     assert!(b.row_filtered(1) && !b.row_hidden(2));
 }
+
+/// A list whose B2 a conditional format fills with theme colour 5, and
+/// `filter` after its data; dxf 0 is that theme fill.
+fn theme_cf_list(filter: &str) -> SheetPackage {
+    let cf = r#"<conditionalFormatting sqref="B2"><cfRule type="expression" dxfId="0" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting>"#;
+    let mut pkg = list(
+        &format!("{filter}{cf}"),
+        r#"<dxfs count="1"><dxf><fill><patternFill><bgColor theme="5"/></patternFill></fill></dxf></dxfs>"#,
+    );
+    // The data rows as `list` builds them, and B3's hidden row as a file
+    // filtered on that colour would leave it.
+    pkg.workbook.sheets[0].set_row_hidden(2, true);
+    pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+    pkg
+}
+
+#[test]
+fn a_conditional_theme_fill_is_an_unknown_colour() {
+    let mut pkg = theme_cf_list("");
+    let d = &pkg.workbook.styles.dxfs[0];
+    assert!(d.fill.is_none() && d.fill_unresolved);
+    let wb = &mut pkg.workbook;
+    assert_eq!(crate::cf::cell_fill(wb, 0, 1, 1), crate::cf::Shown::Unknown);
+    crate::filter::auto_filter_on(wb, 0, (0, 0)).unwrap();
+    // No Fill keeps only B3, whose fill is really none.
+    let none = ColumnFilter::Color {
+        cell: true,
+        rgb: None,
+        dxf_id: None,
+    };
+    crate::filter::set_criterion(wb, 0, 1, Some(none), 45000.0).unwrap();
+    assert!(wb.sheets[0].row_hidden(1) && !wb.sheets[0].row_hidden(2));
+    // Filter by Selected Cell's Color refuses a colour it can't read.
+    assert_eq!(
+        crate::filter::filter_by_cell(wb, 0, (1, 1), crate::filter::ByCell::CellColor, 45000.0),
+        Err(crate::filter::FilterError::NoColor)
+    );
+}
+
+#[test]
+fn a_loaded_filter_on_a_theme_colour_is_kept_as_it_was() {
+    let filter = r#"<autoFilter ref="A1:B3"><filterColumn colId="1"><colorFilter dxfId="0"/></filterColumn></autoFilter>"#;
+    let mut pkg = theme_cf_list(filter);
+    let af = pkg.workbook.sheets[0].auto_filter.as_ref().unwrap();
+    assert!(
+        matches!(af.criteria[0].1, ColumnFilter::Raw(_)),
+        "{:?}",
+        af.criteria
+    );
+    assert!(pkg.workbook.sheets[0].row_filtered(2));
+    // Reapply leaves the row it hid hidden, and the element as it was.
+    crate::filter::reapply(&mut pkg.workbook, 0, 45000.0).unwrap();
+    assert!(pkg.workbook.sheets[0].row_filtered(2));
+    let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+    assert!(ws.contains(filter), "{ws}");
+}

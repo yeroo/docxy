@@ -1973,6 +1973,13 @@ pub struct Dxf {
     pub color: Option<(u8, u8, u8)>,
     pub bold: Option<bool>,
     pub italic: Option<bool>,
+    /// The fill is a theme or indexed colour we don't resolve (`fill`
+    /// `None`): the format sets *some* fill, so filtering and sorting by
+    /// colour treat a cell it formats as an unknown colour, as for
+    /// [`Xf::fill_unresolved`].
+    pub fill_unresolved: bool,
+    /// Likewise the font colour.
+    pub color_unresolved: bool,
 }
 
 /// One conditional-formatting rule (`<cfRule>`).

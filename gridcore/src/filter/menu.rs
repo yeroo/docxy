@@ -101,6 +101,7 @@ pub fn menu(
         .map(|(c, f)| (*c, test_for(f)))
         .collect();
     let mine = af.criteria.iter().find(|(c, _)| *c == col).map(|x| &x.1);
+    let icons = crate::cf::Icons::new(wb, sheet);
     let (mut n_date, mut n_num, mut n_text) = (0usize, 0usize, 0usize);
     let mut blanks = false;
     let mut days: BTreeSet<(i64, u32, u32)> = BTreeSet::new();
@@ -115,7 +116,10 @@ pub fn menu(
             Some(CellValue::Number(_)) => n_num += 1,
             _ => n_text += 1,
         }
-        if !others.iter().all(|(c, t)| passes(wb, sheet, r, *c, t)) {
+        if !others
+            .iter()
+            .all(|(c, t)| passes(wb, sheet, r, *c, t, &icons))
+        {
             continue;
         }
         if is_blank_value(value) {

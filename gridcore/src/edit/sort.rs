@@ -159,11 +159,20 @@ pub fn sort_range(
     if levels.is_empty() || used_r == 0 {
         return Err(SortError::Empty);
     }
+    // What a spill shows counts as used: its cells hold no value, but a
+    // block reaching them must still be seen to be cut.
+    let (mut last_r, mut last_c) = (used_r - 1, used_c.saturating_sub(1));
+    for (&(r, c), cell) in &s.cells {
+        if let Some((h, w)) = array_rect(cell, (r, c)) {
+            last_r = last_r.max(r.saturating_add(h - 1));
+            last_c = last_c.max(c.saturating_add(w - 1));
+        }
+    }
     let (r1, c1, mut r2, mut c2) = area;
     // `A:A` and `1:1` are the "whole column / row" idiom: what lies past the
     // used cells is empty.
-    r2 = r2.min(used_r - 1);
-    c2 = c2.min(used_c.saturating_sub(1));
+    r2 = r2.min(last_r);
+    c2 = c2.min(last_c);
     if r2 < r1 || c2 < c1 {
         return Err(SortError::Empty);
     }
@@ -196,20 +205,31 @@ pub fn sort_range(
     // where they are whichever unit lands in each slot.
     check_merges(wb, sheet, sorted_area, &units, ltr)?;
 
+    // Each unit's key for each level, worked out once (a colour or an icon
+    // costs a conditional-format evaluation), then compared.
+    let icons = crate::cf::Icons::new(wb, sheet);
+    let keys: Vec<Vec<Key>> = units
+        .iter()
+        .map(|&u| {
+            levels
+                .iter()
+                .filter(|lv| across.contains(&lv.key))
+                .map(|lv| level_key(wb, sheet, at(u, lv.key), lv, &icons))
+                .collect()
+        })
+        .collect();
+    let used: Vec<&SortLevel> = levels
+        .iter()
+        .filter(|lv| across.contains(&lv.key))
+        .collect();
+    // A level must read a row (column) of the range.
+    if used.is_empty() {
+        return Err(SortError::Empty);
+    }
     let mut order: Vec<usize> = (0..units.len()).collect();
     order.sort_by(|&a, &b| {
-        for lv in levels {
-            if !across.contains(&lv.key) {
-                continue;
-            }
-            let o = level_cmp(
-                wb,
-                sheet,
-                at(units[a], lv.key),
-                at(units[b], lv.key),
-                lv,
-                opts,
-            );
+        for (i, lv) in used.iter().enumerate() {
+            let o = key_cmp(&keys[a][i], &keys[b][i], lv, opts);
             if o != Ordering::Equal {
                 return o;
             }
@@ -249,9 +269,11 @@ pub fn sort_range(
     Ok(units.len())
 }
 
-/// Does `area` cut an array formula's block? Sorting rows, a block that
-/// spans more than one row and meets them; left to right, more than one
-/// column.
+/// Does `area` cut an array formula's block? A sort moves only the range's
+/// cells, so a block meeting it is cut when it spans more than one unit
+/// (rows; columns, left to right) or reaches past the range's sides (its
+/// columns; its rows, left to right). Excel refuses both: "You can't change
+/// part of an array."
 fn cuts_array(wb: &Workbook, sheet: usize, (r1, c1, r2, c2): Area, ltr: bool) -> bool {
     let Some(s) = wb.sheets.get(sheet) else {
         return false;
@@ -260,7 +282,13 @@ fn cuts_array(wb: &Workbook, sheet: usize, (r1, c1, r2, c2): Area, ltr: bool) ->
         array_rect(cell, (ar, ac)).is_some_and(|(h, w)| {
             let (br, bc) = (ar.saturating_add(h - 1), ac.saturating_add(w - 1));
             let meets = ar <= r2 && br >= r1 && ac <= c2 && bc >= c1;
-            meets && if ltr { w > 1 } else { h > 1 }
+            let across = if ltr { h > 1 } else { w > 1 };
+            let past_sides = if ltr {
+                ar < r1 || br > r2
+            } else {
+                ac < c1 || bc > c2
+            };
+            meets && (if ltr { w > 1 } else { h > 1 } || (across && past_sides))
         })
     })
 }
@@ -308,67 +336,79 @@ fn check_merges(
     Ok(())
 }
 
-/// One level's order of two units' key cells.
-fn level_cmp(
+/// A unit's key on one level.
+enum Key {
+    /// A blank on a value level: last, whichever the direction.
+    Blank,
+    /// A value, and its place in the level's custom list.
+    Value(CellValue, Option<usize>),
+    /// Whether the cell shows the level's colour or icon.
+    Hit(bool),
+}
+
+/// The key cell `at`'s key on level `lv`.
+fn level_key(
     wb: &Workbook,
     sheet: usize,
-    a: (u32, u32),
-    b: (u32, u32),
+    at: (u32, u32),
     lv: &SortLevel,
-    opts: &SortOptions,
-) -> Ordering {
-    let s = &wb.sheets[sheet];
-    let placed = |hit_a: bool, hit_b: bool, top: bool| {
-        // Matching cells first (on top) or last; the rest keep their order.
-        let o = hit_b.cmp(&hit_a);
-        if top { o } else { o.reverse() }
-    };
+    icons: &crate::cf::Icons,
+) -> Key {
+    let (r, c) = at;
     match &lv.on {
-        SortOn::Value { asc, list } => {
-            let (ca, cb) = (s.cell(a.0, a.1), s.cell(b.0, b.1));
-            let blank = |c: Option<&Cell>| c.is_none_or(|c| c.is_blank());
-            match (blank(ca), blank(cb)) {
-                (true, true) => return Ordering::Equal,
-                (true, false) => return Ordering::Greater,
-                (false, true) => return Ordering::Less,
-                _ => {}
+        SortOn::Value { list, .. } => match wb.sheets[sheet].cell(r, c) {
+            Some(cell) if !cell.is_blank() => {
+                let pos = list.as_ref().and_then(|list| {
+                    let t = crate::filter::shown_text(wb, sheet, r, c);
+                    list.iter()
+                        .position(|x| x.trim().eq_ignore_ascii_case(t.trim()))
+                });
+                Key::Value(cell.value.clone(), pos)
             }
-            let (va, vb) = (&ca.unwrap().value, &cb.unwrap().value);
-            let o = match list {
-                Some(list) => {
-                    let pos = |c: (u32, u32)| {
-                        let t = crate::filter::shown_text(wb, sheet, c.0, c.1);
-                        list.iter()
-                            .position(|x| x.trim().eq_ignore_ascii_case(t.trim()))
-                    };
-                    match (pos(a), pos(b)) {
-                        (Some(x), Some(y)) => x.cmp(&y),
-                        (Some(_), None) => return Ordering::Less,
-                        (None, Some(_)) => return Ordering::Greater,
-                        (None, None) => value_cmp(va, vb, opts.case_sensitive),
-                    }
-                }
-                None => value_cmp(va, vb, opts.case_sensitive),
-            };
-            if *asc { o } else { o.reverse() }
+            _ => Key::Blank,
+        },
+        SortOn::CellColor { rgb, .. } => Key::Hit(crate::cf::cell_fill(wb, sheet, r, c).is(*rgb)),
+        SortOn::FontColor { rgb, .. } => {
+            Key::Hit(crate::cf::cell_font_color(wb, sheet, r, c).is(*rgb))
         }
-        SortOn::CellColor { rgb, top } => placed(
-            crate::cf::cell_fill(wb, sheet, a.0, a.1).is(*rgb),
-            crate::cf::cell_fill(wb, sheet, b.0, b.1).is(*rgb),
-            *top,
+        SortOn::Icon { set, id, .. } => Key::Hit(
+            icons
+                .icon(r, c)
+                .is_some_and(|(s, i)| s.eq_ignore_ascii_case(set) && i == *id),
         ),
-        SortOn::FontColor { rgb, top } => placed(
-            crate::cf::cell_font_color(wb, sheet, a.0, a.1).is(*rgb),
-            crate::cf::cell_font_color(wb, sheet, b.0, b.1).is(*rgb),
-            *top,
-        ),
-        SortOn::Icon { set, id, top } => {
-            let hit = |c: (u32, u32)| {
-                crate::cf::cell_icon(wb, sheet, c.0, c.1)
-                    .is_some_and(|(s, i)| s.eq_ignore_ascii_case(set) && i == *id)
+    }
+}
+
+/// One level's order of two units' keys.
+fn key_cmp(a: &Key, b: &Key, lv: &SortLevel, opts: &SortOptions) -> Ordering {
+    match (a, b) {
+        (Key::Blank, Key::Blank) => Ordering::Equal,
+        (Key::Blank, _) => Ordering::Greater,
+        (_, Key::Blank) => Ordering::Less,
+        (Key::Hit(x), Key::Hit(y)) => {
+            // Matching cells first (on top) or last; the rest keep their
+            // order.
+            let top = match &lv.on {
+                SortOn::CellColor { top, .. }
+                | SortOn::FontColor { top, .. }
+                | SortOn::Icon { top, .. } => *top,
+                SortOn::Value { .. } => true,
             };
-            placed(hit(a), hit(b), *top)
+            let o = y.cmp(x);
+            if top { o } else { o.reverse() }
         }
+        (Key::Value(va, pa), Key::Value(vb, pb)) => {
+            let asc = matches!(lv.on, SortOn::Value { asc: true, .. });
+            let o = match (pa, pb) {
+                (Some(x), Some(y)) => x.cmp(y),
+                // Unlisted values after the listed ones, either direction.
+                (Some(_), None) => return Ordering::Less,
+                (None, Some(_)) => return Ordering::Greater,
+                (None, None) => value_cmp(va, vb, opts.case_sensitive),
+            };
+            if asc { o } else { o.reverse() }
+        }
+        _ => Ordering::Equal,
     }
 }
 

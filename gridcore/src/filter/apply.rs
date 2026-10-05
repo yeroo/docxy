@@ -521,8 +521,16 @@ pub(crate) fn test_for(f: &ColumnFilter) -> Test {
     }
 }
 
-/// Whether the cell at (`r`, `c`) passes `t`.
-pub(crate) fn passes(wb: &Workbook, sheet: usize, r: u32, c: u32, t: &Test) -> bool {
+/// Whether the cell at (`r`, `c`) passes `t`. `icons` reads the sheet's
+/// icon sets once for all the cells a command checks.
+pub(crate) fn passes(
+    wb: &Workbook,
+    sheet: usize,
+    r: u32,
+    c: u32,
+    t: &Test,
+    icons: &crate::cf::Icons,
+) -> bool {
     let value = wb
         .sheets
         .get(sheet)
@@ -537,12 +545,7 @@ pub(crate) fn passes(wb: &Workbook, sheet: usize, r: u32, c: u32, t: &Test) -> b
             }
             if !dates.is_empty() {
                 if let Some(d) = cell_date(wb, sheet, r, c) {
-                    let hit = dates.iter().any(|g| {
-                        g.year == d.year
-                            && g.month.is_none_or(|m| m == d.month)
-                            && g.day.is_none_or(|x| x == d.day)
-                    });
-                    if hit {
+                    if dates.iter().any(|g| g.covers(&d)) {
                         return true;
                     }
                 }
@@ -568,7 +571,8 @@ pub(crate) fn passes(wb: &Workbook, sheet: usize, r: u32, c: u32, t: &Test) -> b
             };
             shown.is(*rgb)
         }
-        Test::Icon(set, id) => crate::cf::cell_icon(wb, sheet, r, c)
+        Test::Icon(set, id) => icons
+            .icon(r, c)
             .is_some_and(|(s, i)| s.eq_ignore_ascii_case(set) && i == *id),
     }
 }
@@ -661,8 +665,13 @@ fn run(wb: &mut Workbook, sheet: usize, today: f64) -> FilterOutcome {
     let tests: Vec<(u32, Test)> = af.criteria.iter().map(|(c, f)| (*c, test_for(f))).collect();
     let opaque = af.criteria.iter().any(|(_, f)| f.is_opaque());
     let (r1, _, r2, _) = af.range;
+    let icons = crate::cf::Icons::new(wb, sheet);
     let pass: Vec<bool> = (r1 + 1..=r2)
-        .map(|r| tests.iter().all(|(c, t)| passes(wb, sheet, r, *c, t)))
+        .map(|r| {
+            tests
+                .iter()
+                .all(|(c, t)| passes(wb, sheet, r, *c, t, &icons))
+        })
         .collect();
     let s = &mut wb.sheets[sheet];
     for (r, ok) in (r1 + 1..=r2).zip(&pass) {

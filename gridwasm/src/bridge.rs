@@ -2441,10 +2441,10 @@ impl Session {
     /// re-pointed at the restored sheet's NEW index (their old index may no
     /// longer even exist). They also survive a `save`: gridcore writes a
     /// model name that has no `<definedName>` element (the restored ones lost
-    /// theirs to `remove_sheet`). The restored sheet's autoFilter and its
-    /// `_xlnm._FilterDatabase` are not recreated, though: the sheet gets a
-    /// fresh part with no `<autoFilter>`, and a save never adds one or the
-    /// name that backs it. The stash is single-slot — a second
+    /// theirs to `remove_sheet`). The restored sheet's autoFilter is written
+    /// into its fresh part on save, with a hidden `_xlnm._FilterDatabase`
+    /// (#690: a save writes a filter the model holds). The stash is
+    /// single-slot — a second
     /// `sheet.remove` overwrites it, and a successful restore takes
     /// (clears) it via `Option::take` — so calling this with nothing
     /// stashed errors (`"nothing to restore"`).
