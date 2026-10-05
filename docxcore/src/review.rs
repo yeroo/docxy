@@ -168,20 +168,34 @@ impl Document {
         self.initialize_revision_targets();
         let addresses = self.revisions();
         let targets = revision_postorder(&addresses, action);
+        // Rejecting a recorded insertion takes with it a deletion that was
+        // left with nothing (text deleted from it), which the batch then
+        // finds gone: that deletion was acted on, not stale. Only that case.
+        let mut rejected_an_insertion = false;
         let mut outcomes = targets
             .into_iter()
             .map(|(ordinal, target)| {
                 let mut outcome = self.apply_revision_action(target, action);
-                // A deletion left with nothing by rejecting the insertion it
-                // was in goes with it: it was acted on, not stale.
-                if matches!(outcome, RevisionOutcome::Stale { .. }) {
-                    if let Some(a) = addresses.iter().find(|a| a.target == target) {
+                let category = addresses
+                    .iter()
+                    .find(|a| a.target == target)
+                    .map(|a| a.category.clone());
+                match (&outcome, category) {
+                    (
+                        RevisionOutcome::Applied { .. },
+                        Some(RevisionCategory::Inline(RevisionKind::Insert)),
+                    ) if action == RevisionAction::Reject => rejected_an_insertion = true,
+                    (
+                        RevisionOutcome::Stale { .. },
+                        Some(category @ RevisionCategory::Inline(RevisionKind::Delete)),
+                    ) if action == RevisionAction::Reject && rejected_an_insertion => {
                         outcome = RevisionOutcome::Applied {
                             target,
                             action,
-                            category: a.category.clone(),
+                            category,
                         };
                     }
+                    _ => {}
                 }
                 (ordinal, outcome)
             })

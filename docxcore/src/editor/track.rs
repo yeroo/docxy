@@ -140,7 +140,7 @@ impl Editor {
     /// of its runs (untracked typing, another reviewer's text). Each later
     /// stretch with an id already used gets a fresh one, above every id in the
     /// document.
-    pub(super) fn unshare_insert_ids(&mut self) {
+    fn unshare_insert_ids(&mut self) {
         let has_record = |i: &Inline| match i {
             Inline::Run(r) => r.props.tracked_insert.is_some(),
             Inline::Tab(p) | Inline::Break(_, p) => p.tracked_insert.is_some(),
@@ -180,7 +180,6 @@ impl Editor {
                 }
             }
         }
-        self.doc.initialize_revision_targets();
     }
 
     /// Delete the character at editor offset `idx` of the paragraph at `path`:
@@ -212,16 +211,21 @@ impl Editor {
                     record_deletion(&mut p.content, idx, &author, meta);
                 }
                 if !merges {
-                    // A deletion inside another insertion splits it.
+                    // A new revision: ids and targets (a deletion inside
+                    // another insertion also splits it, which unsharing sees).
                     self.settle_revisions();
                 }
             }
         }
     }
 
-    /// Delete the text of the selection `lo..hi` over several sibling
-    /// paragraphs as tracked deletions, keeping the paragraph marks. Whether
-    /// it applied (it does whenever tracking).
+    /// Delete the text of the selection `lo..hi` as tracked deletions in every
+    /// body or table-cell paragraph from `lo` to `hi` in document order (a
+    /// table between them stays, its cells' text recorded), keeping the
+    /// paragraph marks. A text box's paragraphs are not part of the text
+    /// between two points, so they are skipped. `false`, and nothing done,
+    /// when not tracking or an endpoint is not a paragraph the walk reaches
+    /// (the untracked delete then applies).
     pub(super) fn delete_text_across_paragraphs(
         &mut self,
         lo: &super::Caret,
@@ -232,7 +236,10 @@ impl Editor {
         }
         // Every paragraph from `lo` to `hi` in document order, the ones in a
         // table between them included: the table itself stays.
-        let paths = super::all_paragraph_paths(&self.doc.body);
+        let paths: Vec<Vec<usize>> = super::all_paragraph_paths(&self.doc.body)
+            .into_iter()
+            .filter(|p| !in_text_box(&self.doc.body, p))
+            .collect();
         let (Some(first), Some(last)) = (
             paths.iter().position(|p| *p == lo.path),
             paths.iter().position(|p| *p == hi.path),
@@ -642,4 +649,10 @@ impl Stretches {
             }
         }
     }
+}
+
+/// Whether `path` reaches its paragraph through an inline (a text box) rather
+/// than through blocks and table cells.
+fn in_text_box(body: &[crate::model::Block], path: &[usize]) -> bool {
+    (1..path.len()).any(|n| resolve_para(body, &path[..n]).is_some())
 }

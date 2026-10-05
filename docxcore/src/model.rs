@@ -81,6 +81,35 @@ pub struct RunProps {
     pub revision_cues: RevisionDisplayCues,
 }
 
+impl RunProps {
+    /// Whether the text is underlined as the user set it: the underline a
+    /// tracked insertion is drawn with is a display cue, not formatting.
+    pub fn user_underline(&self) -> bool {
+        self.underline && !self.revision_cues.underline_added
+    }
+
+    /// Whether the text is struck through as the user set it (not the cue of
+    /// a tracked deletion).
+    pub fn user_strike(&self) -> bool {
+        self.strike && !self.revision_cues.strike_added
+    }
+
+    /// Set the user's underline. Off leaves the insertion cue drawn when the
+    /// text is a tracked insertion; on makes the underline real (saved).
+    pub fn set_user_underline(&mut self, on: bool) {
+        let cue = self.revision_cues.insertions > 0;
+        self.underline = on || cue;
+        self.revision_cues.underline_added = !on && cue;
+    }
+
+    /// [`RunProps::set_user_underline`] for strike and a tracked deletion.
+    pub fn set_user_strike(&mut self, on: bool) {
+        let cue = self.revision_cues.deletions > 0;
+        self.strike = on || cue;
+        self.revision_cues.strike_added = !on && cue;
+    }
+}
+
 /// Provenance for the underline/strike cues used to render tracked changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[doc(hidden)]
@@ -1177,11 +1206,11 @@ impl Document {
     /// Enumerate modeled and recognized-unsupported revisions in current source
     /// order. Addresses contain stable node identities, not structural paths.
     pub fn revisions(&self) -> Vec<RevisionAddress> {
-        let mut out = Vec::new();
+        let mut out = Collected::default();
         for block in &self.body {
             collect_block_revisions(block, None, 0, &mut out);
         }
-        out
+        out.list
     }
 
     /// Resolve a stable target against the current tree after intervening edits.
@@ -1374,16 +1403,24 @@ fn assign_block_revision_targets(
     }
 }
 
+/// The addresses collected so far, and the recorded insertions already listed
+/// (one entry per [`TrackedInsert`] however many runs it is in).
+#[derive(Default)]
+struct Collected {
+    list: Vec<RevisionAddress>,
+    recorded: std::collections::HashSet<RevisionTarget>,
+}
+
 fn push_revision_address(
     metadata: &RevisionMetadata,
     category: RevisionCategory,
     parent: Option<RevisionTarget>,
     depth: usize,
-    out: &mut Vec<RevisionAddress>,
+    out: &mut Collected,
 ) {
-    out.push(RevisionAddress {
+    out.list.push(RevisionAddress {
         target: metadata.target,
-        ordinal: out.len(),
+        ordinal: out.list.len(),
         parent,
         depth,
         category,
@@ -1395,7 +1432,7 @@ fn collect_property_revision(
     change: &Option<PropertyChange>,
     parent: Option<RevisionTarget>,
     depth: usize,
-    out: &mut Vec<RevisionAddress>,
+    out: &mut Collected,
 ) {
     if let Some(change) = change {
         push_revision_address(
@@ -1412,16 +1449,14 @@ fn collect_run_props_revisions(
     props: &RunProps,
     parent: Option<RevisionTarget>,
     depth: usize,
-    out: &mut Vec<RevisionAddress>,
+    out: &mut Collected,
 ) {
     collect_property_revision(&props.property_change, parent, depth, out);
     // One entry per recorded insertion, however many runs it is in.
     if let Some(insert) = &props.tracked_insert {
         // (A deletion of part of it can sit between two runs of it.)
-        let listed = out.iter().rev().take(16).any(|a| {
-            a.target == insert.metadata.target
-                && matches!(a.category, RevisionCategory::Inline(RevisionKind::Insert))
-        });
+        let target = insert.metadata.target;
+        let listed = target.is_assigned() && !out.recorded.insert(target);
         if !listed {
             push_revision_address(
                 &insert.metadata,
@@ -1438,7 +1473,7 @@ fn collect_inline_revisions(
     inline: &Inline,
     parent: Option<RevisionTarget>,
     depth: usize,
-    out: &mut Vec<RevisionAddress>,
+    out: &mut Collected,
 ) {
     match inline {
         Inline::Run(run) => collect_run_props_revisions(&run.props, parent, depth, out),
@@ -1496,7 +1531,7 @@ fn collect_block_revisions(
     block: &Block,
     parent: Option<RevisionTarget>,
     depth: usize,
-    out: &mut Vec<RevisionAddress>,
+    out: &mut Collected,
 ) {
     match block {
         Block::Paragraph(paragraph) => {

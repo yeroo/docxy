@@ -794,10 +794,10 @@ fn apply_run_patch_props(props: &mut RunProps, patch: &RunPatch) {
         props.italic = v;
     }
     if let Some(v) = patch.underline {
-        props.underline = v;
+        props.set_user_underline(v);
     }
     if let Some(v) = patch.strike {
-        props.strike = v;
+        props.set_user_strike(v);
     }
     if let Some((r, g, b)) = patch.color {
         props.color = Some(format!("{r:02X}{g:02X}{b:02X}"));

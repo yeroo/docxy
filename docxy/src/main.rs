@@ -823,9 +823,13 @@ struct TrackedComment {
     /// `comment`, which needs a numeric id (new comments always have one;
     /// any other is not written back).
     raw: Option<String>,
-    /// Its `commentsExtended` / `commentsIds` entries when it was deleted (the
-    /// reply link, the durable id), put back with `raw` ([`Package::comment_extras`]).
+    /// Its `commentsExtended` / `commentsIds` / `commentsExtensible` entries
+    /// when it was deleted (the reply link, the durable id, its UTC date),
+    /// put back with `raw` ([`Package::comment_extras`]).
     extras: Vec<(String, String)>,
+    /// `comments.xml`'s root start tag then, so a part the delete dropped is
+    /// rebuilt under the namespaces `raw` may use ([`Package::comments_root_tag`]).
+    root: Option<String>,
     /// Where it sat in `comments`, so a restored one goes back there.
     index: usize,
 }
@@ -3073,6 +3077,7 @@ impl App {
                 comment: comment.clone(),
                 raw: None,
                 extras: Vec::new(),
+                root: None,
                 index: self.comments.len(),
             },
         );
@@ -3181,7 +3186,7 @@ impl App {
             let c = &t.comment;
             match (live.contains(id), saved.contains(id), &t.raw) {
                 (true, false, Some(raw)) => {
-                    self.pkg.insert_comment_xml(raw);
+                    self.pkg.insert_comment_xml_rooted(raw, t.root.as_deref());
                     self.pkg.restore_comment_extras(&t.extras);
                 }
                 (true, false, None) => {
@@ -3219,16 +3224,19 @@ impl App {
             if t.raw.is_none() {
                 t.raw = self.pkg.comment_xml(&c.id);
                 t.extras = self.pkg.comment_extras(&c.id);
+                t.root = self.pkg.comments_root_tag();
             }
         } else {
             let raw = self.pkg.comment_xml(&c.id);
             let extras = self.pkg.comment_extras(&c.id);
+            let root = self.pkg.comments_root_tag();
             self.tracked_comments.insert(
                 c.id.clone(),
                 TrackedComment {
                     comment: c.clone(),
                     raw,
                     extras,
+                    root,
                     index,
                 },
             );
@@ -6626,8 +6634,8 @@ impl App {
         for (on, act) in [
             (rp.bold, ribbon::Act::Bold),
             (rp.italic, ribbon::Act::Italic),
-            (rp.underline, ribbon::Act::Underline),
-            (rp.strike, ribbon::Act::Strike),
+            (rp.user_underline(), ribbon::Act::Underline),
+            (rp.user_strike(), ribbon::Act::Strike),
         ] {
             if on {
                 toggles.push(act);
@@ -12350,6 +12358,11 @@ mod tests {
                 "<w16cid:commentId w16cid:paraId=\"1A2B\" w16cid:durableId=\"7C7C7C7C\"/>"
                     .to_string(),
             ),
+            (
+                "word/commentsExtensible.xml".to_string(),
+                "<w16cex:commentExtensible w16cex:durableId=\"7C7C7C7C\" w16cex:dateUtc=\"2020-01-02T03:04:05Z\"/>"
+                    .to_string(),
+            ),
         ]);
         assert!(!pkg.comment_extras("1").is_empty(), "the fixture has them");
         let mut app = App::new(pkg, "test.docx", false);
@@ -12368,11 +12381,55 @@ mod tests {
         assert!(ext.contains("w15:paraIdParent=\"0F0F\""), "{ext}");
         let ids = pkg.part_text("word/commentsIds.xml").expect("part back");
         assert!(ids.contains("w16cid:durableId=\"7C7C7C7C\""), "{ids}");
+        let cex = pkg
+            .part_text("word/commentsExtensible.xml")
+            .expect("part back");
+        assert!(
+            cex.contains("w16cex:dateUtc=\"2020-01-02T03:04:05Z\""),
+            "{cex}"
+        );
         let ct = pkg.part_text("[Content_Types].xml").unwrap();
         assert!(
             ct.contains("/word/commentsExtended.xml") && ct.contains("/word/commentsIds.xml"),
             "{ct}"
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A comment that uses a prefix of its own (`r:` in a hyperlink): the
+    /// part rebuilt on undo keeps the original root, so it stays well-formed.
+    #[test]
+    fn delete_all_then_undo_rebuilds_comments_xml_under_the_original_root() {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(MPara {
+                props: ParProps::default(),
+                content: vec![Inline::Run(Run {
+                    text: "The quick brown fox.".into(),
+                    props: RunProps::default(),
+                })],
+            })],
+        });
+        ed.select_all();
+        assert!(ed.add_comment("1"));
+        let root = "<w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+            xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
+            xmlns:w16du=\"http://schemas.microsoft.com/office/word/2023/wordml/word16du\">";
+        let comment = "<w:comment w:id=\"1\" w:author=\"Ann\"><w:p><w:hyperlink r:id=\"rId9\" \
+            w16du:dateUtc=\"2020-01-02T03:04:05Z\"><w:r><w:t>link</w:t></w:r></w:hyperlink></w:p></w:comment>";
+        let mut pkg = new_package(ed.doc);
+        pkg.insert_comment_xml_rooted(comment, Some(root));
+        let mut app = App::new(pkg, "test.docx", false);
+        app.os_clip = None;
+        app.run_act(ribbon::Act::DeleteAllComments);
+        let path = save_to_temp(&mut app, "cmt-root");
+        assert!(saved_pkg(&path).part("word/comments.xml").is_none());
+        app.on_key(ctrl(KeyCode::Char('z')));
+        app.save();
+        let comments = saved_pkg(&path).part_text("word/comments.xml").unwrap();
+        assert!(comments.contains(comment), "{comments}");
+        for prefix in ["xmlns:r=", "xmlns:w16du="] {
+            assert!(comments.contains(prefix), "{prefix} declared: {comments}");
+        }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

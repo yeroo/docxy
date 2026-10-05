@@ -1302,24 +1302,12 @@ impl Editor {
     /// with is a display cue, not the user's: it does not count as "already
     /// underlined", and an explicit underline replaces it (so it is saved).
     pub fn toggle_underline(&mut self) {
-        self.toggle_run_prop(
-            |p| p.underline && !p.revision_cues.underline_added,
-            |p, v| {
-                p.underline = v || p.revision_cues.insertions > 0;
-                p.revision_cues.underline_added = !v && p.revision_cues.insertions > 0;
-            },
-        );
+        self.toggle_run_prop(RunProps::user_underline, RunProps::set_user_underline);
     }
     /// Strike over the selection, as [`Editor::toggle_underline`] treats the
     /// cue of a tracked deletion.
     pub fn toggle_strike(&mut self) {
-        self.toggle_run_prop(
-            |p| p.strike && !p.revision_cues.strike_added,
-            |p, v| {
-                p.strike = v || p.revision_cues.deletions > 0;
-                p.revision_cues.strike_added = !v && p.revision_cues.deletions > 0;
-            },
-        );
+        self.toggle_run_prop(RunProps::user_strike, RunProps::set_user_strike);
     }
 
     /// Run properties at the caret (used for toggles and the ribbon's on-states).

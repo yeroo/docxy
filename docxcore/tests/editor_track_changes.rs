@@ -594,3 +594,141 @@ fn a_tracked_selection_across_a_table_records_its_text_and_keeps_the_table() {
     );
     assert!(xml(&ed).contains(">cell</w:delText>"), "{}", xml(&ed));
 }
+
+/// A text box anchored before the selection is not text between its ends.
+#[test]
+fn a_tracked_selection_leaves_text_boxes_alone() {
+    let mut doc = Document {
+        body: vec![
+            Block::Paragraph(docxcore::model::Paragraph {
+                props: Default::default(),
+                content: vec![
+                    Inline::TextBox {
+                        raw: "<w:r><w:txbxContent></w:txbxContent></w:r>".into(),
+                        blocks: vec![Block::Paragraph(docxcore::model::Paragraph {
+                            props: Default::default(),
+                            content: vec![Inline::Run(docxcore::model::Run {
+                                text: "note".into(),
+                                props: Default::default(),
+                            })],
+                        })],
+                    },
+                    Inline::Run(docxcore::model::Run {
+                        text: "hello world".into(),
+                        props: Default::default(),
+                    }),
+                ],
+            }),
+            Block::Paragraph(docxcore::model::Paragraph {
+                props: Default::default(),
+                content: vec![Inline::Run(docxcore::model::Run {
+                    text: "tail".into(),
+                    props: Default::default(),
+                })],
+            }),
+        ],
+    };
+    doc.initialize_revision_targets();
+    let mut ed = Editor::new(doc);
+    as_author(&mut ed, "Ada");
+    ed.anchor = Some(Caret {
+        path: vec![0],
+        offset: 5,
+    });
+    ed.caret = Caret {
+        path: vec![1],
+        offset: 2,
+    };
+    ed.delete_selection();
+    assert_eq!(
+        kinds(&ed.doc).len(),
+        2,
+        "the tail of the first, the head of the second"
+    );
+    let Block::Paragraph(p) = &ed.doc.body[0] else {
+        panic!("paragraph")
+    };
+    let Some(Inline::TextBox { blocks, .. }) = p.content.first() else {
+        panic!("the text box is still first")
+    };
+    assert_eq!(blocks[0].plain_text(), "note");
+    assert!(!xml(&ed).contains(">note</w:delText>"));
+}
+
+/// An insertion with many deletions inside it is still one revision.
+#[test]
+fn many_deletions_inside_an_insertion_leave_it_one_revision() {
+    let mut ed = editor();
+    at(&mut ed, 8);
+    ed.insert_str("abcdefghijklmnopqrstuvwxyz0123456789");
+    as_author(&mut ed, "Bob");
+    for k in 0..17 {
+        at(&mut ed, 9 + k);
+        ed.delete_forward();
+    }
+    let inserts = kinds(&ed.doc)
+        .into_iter()
+        .filter(|k| *k == RevisionKind::Insert)
+        .count();
+    assert_eq!(inserts, 1, "{}", xml(&ed));
+}
+
+/// The nested deletion is one `w:ins` around one `w:del`, and it survives a
+/// save and reload: Reject All brings the original back.
+#[test]
+fn a_deletion_in_another_reviewers_insertion_saves_nested_and_reloads() {
+    let mut ed = editor();
+    at(&mut ed, 8);
+    ed.insert_str("abc");
+    as_author(&mut ed, "Bob");
+    at(&mut ed, 9);
+    ed.delete_forward();
+    let saved = xml(&ed);
+    assert_eq!(saved.matches("<w:ins ").count(), 1, "{saved}");
+    assert_eq!(saved.matches("<w:del ").count(), 1, "{saved}");
+    let (ins, close) = (
+        saved.find("<w:ins ").unwrap(),
+        saved.find("</w:ins>").unwrap(),
+    );
+    let del = saved.find("<w:del ").unwrap();
+    assert!(ins < del && del < close, "{saved}");
+    let inner = saved
+        .split("<w:body>")
+        .nth(1)
+        .unwrap()
+        .replace("</w:body></w:document>", "");
+    let mut back = parse(&inner);
+    let inserts = kinds(&back)
+        .into_iter()
+        .filter(|k| *k == RevisionKind::Insert)
+        .count();
+    assert_eq!(inserts, 1);
+    assert!(back.reject_all_revisions().iter().all(|o| o.is_applied()));
+    assert_eq!(back.plain_text().trim_end(), "One two three.");
+}
+
+/// Format patches and the ribbon's pressed state see the user's underline,
+/// not the insertion cue.
+#[test]
+fn format_and_pressed_state_ignore_the_insertion_cue() {
+    let mut ed = editor();
+    at(&mut ed, 8);
+    ed.insert_str("xyz");
+    ed.caret.offset = 9;
+    assert!(
+        !ed.caret_props().user_underline(),
+        "the cue is not underline"
+    );
+    let patch = docxcore::agent::RunPatch {
+        underline: Some(true),
+        ..Default::default()
+    };
+    docxcore::agent::format_range(&mut ed, 0, 0, &patch).unwrap();
+    assert!(xml(&ed).contains("<w:u w:val=\"single\"/>"), "{}", xml(&ed));
+    let off = docxcore::agent::RunPatch {
+        underline: Some(false),
+        ..Default::default()
+    };
+    docxcore::agent::format_range(&mut ed, 0, 0, &off).unwrap();
+    assert!(!xml(&ed).contains("<w:u "), "{}", xml(&ed));
+}

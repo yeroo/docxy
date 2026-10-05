@@ -2310,6 +2310,24 @@ impl Package {
     /// [`Package::comment_xml`] returns it), to `comments.xml`, creating the
     /// part + relationship + content-type if absent.
     pub fn insert_comment_xml(&mut self, comment: &str) {
+        self.insert_comment_xml_rooted(comment, None);
+    }
+
+    /// The start tag of `comments.xml`'s root, with every namespace it
+    /// declares: what a comment written under it may rely on, kept to rebuild
+    /// the part under it ([`Package::insert_comment_xml_rooted`]).
+    pub fn comments_root_tag(&self) -> Option<String> {
+        let xml = self.part_text("word/comments.xml")?;
+        crate::load::start_tags(&xml, "w:comments")
+            .into_iter()
+            .next()
+            .map(|(_, tag)| tag.to_string())
+    }
+
+    /// [`Package::insert_comment_xml`], creating a missing part under `root`
+    /// (the start tag [`Package::comments_root_tag`] returned) when given, so
+    /// the comment's own prefixes (`r:`, `w16du:`, a drawing's…) stay declared.
+    pub fn insert_comment_xml_rooted(&mut self, comment: &str, root: Option<&str>) {
         const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         let name = "word/comments.xml";
@@ -2324,14 +2342,20 @@ impl Package {
         }
         // The namespaces a comment written by Word uses (`w14:paraId` in its
         // paragraphs), declared and ignorable for readers that do not know them.
-        let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-             <w:comments xmlns:w=\"{W_NS}\" \
-             xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" \
-             xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" \
-             xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\" \
-             mc:Ignorable=\"w14 w15\">{comment}</w:comments>"
-        );
+        let body = match root.filter(|r| r.starts_with("<w:comments") && !r.ends_with("/>")) {
+            Some(root) => format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                 {root}{comment}</w:comments>"
+            ),
+            None => format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                 <w:comments xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" \
+                 xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" \
+                 xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" \
+                 xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\" \
+                 mc:Ignorable=\"w14 w15\">{comment}</w:comments>"
+            ),
+        };
         self.parts.push((name.to_string(), body.into_bytes()));
         if let Some(b) = self.part("[Content_Types].xml") {
             let ct = String::from_utf8_lossy(b).into_owned();
@@ -2414,6 +2438,19 @@ impl Package {
                 }
             }
         }
+        // `commentsExtensible` is keyed by the durable id `commentsIds` gave it.
+        let durable: Vec<String> = out
+            .iter()
+            .filter_map(|(_, el)| crate::load::xml_attr_value(el, "w16cid:durableId"))
+            .collect();
+        if let Some(xml) = self.part_text(COMMENTS_EXTENSIBLE.0) {
+            for (_, el) in crate::load::start_tags(&xml, COMMENTS_EXTENSIBLE.1) {
+                let key = crate::load::xml_attr_value(el, COMMENTS_EXTENSIBLE.2);
+                if key.is_some_and(|k| durable.contains(&k)) {
+                    out.push((COMMENTS_EXTENSIBLE.0.to_string(), el.to_string()));
+                }
+            }
+        }
         out
     }
 
@@ -2421,12 +2458,17 @@ impl Package {
     /// (with its content-type override and relationship) the removal dropped.
     pub fn restore_comment_extras(&mut self, extras: &[(String, String)]) {
         for (part, el) in extras {
-            let Some((_, tag, attr)) = COMMENT_EXTRAS.iter().find(|(p, ..)| p == part) else {
+            let Some((_, tag, attr)) = COMMENT_EXTRAS
+                .iter()
+                .chain([&COMMENTS_EXTENSIBLE])
+                .find(|(p, ..)| p == part)
+            else {
                 continue;
             };
             let para = crate::load::xml_attr_value(el, attr);
             let root = match *tag {
                 "w15:commentEx" => "w15:commentsEx",
+                "w16cex:commentExtensible" => "w16cex:commentsExtensible",
                 _ => "w16cid:commentsIds",
             };
             match self.part_text(part) {
@@ -2448,6 +2490,12 @@ impl Package {
                             "xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\"",
                             "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml",
                             "http://schemas.microsoft.com/office/2011/relationships/commentsExtended",
+                        )
+                    } else if root == "w16cex:commentsExtensible" {
+                        (
+                            "xmlns:w16cex=\"http://schemas.microsoft.com/office/word/2018/wordml/cex\"",
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtensible+xml",
+                            "http://schemas.microsoft.com/office/2018/08/relationships/commentsExtensible",
                         )
                     } else {
                         (
@@ -3859,6 +3907,14 @@ const COMMENT_EXTRAS: [(&str, &str, &str); 2] = [
     ("word/commentsExtended.xml", "w15:commentEx", "w15:paraId"),
     ("word/commentsIds.xml", "w16cid:commentId", "w16cid:paraId"),
 ];
+
+/// The part of per-comment entries keyed by the durable id (`commentsIds`)
+/// rather than the paragraph id: (part, entry element, its durableId attribute).
+const COMMENTS_EXTENSIBLE: (&str, &str, &str) = (
+    "word/commentsExtensible.xml",
+    "w16cex:commentExtensible",
+    "w16cex:durableId",
+);
 
 /// `xml` without each self-closing `<name …/>` element `drop` accepts.
 fn remove_tags_matching(xml: &str, name: &str, drop: impl Fn(&str) -> bool) -> String {
