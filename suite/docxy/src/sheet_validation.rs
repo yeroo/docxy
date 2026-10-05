@@ -1215,4 +1215,28 @@ mod tests {
         let (r, c) = at("B2");
         assert!(gridcore::validation::validation_at(&v.pkg.workbook.sheets[0], r, c).is_none());
     }
+
+    #[test]
+    fn a_sort_that_moves_rows_clears_the_circles() {
+        let mut t = book(AlertStyle::Stop);
+        put(&mut t, "B3", Cell::number(250.0));
+        put(&mut t, "B4", Cell::number(20.0));
+        assert_eq!(view(&mut t).circle_invalid(), 1);
+        let levels = [gridcore::edit::SortLevel {
+            key: 1,
+            on: gridcore::edit::SortOn::Value {
+                asc: true,
+                list: None,
+            },
+        }];
+        let (_, changed) = crate::sheet_sort::sort_view(
+            view(&mut t),
+            (1, 1, 3, 1),
+            &levels,
+            &gridcore::edit::SortOptions::default(),
+        )
+        .unwrap();
+        assert!(changed);
+        assert!(view(&mut t).circles.is_empty());
+    }
 }

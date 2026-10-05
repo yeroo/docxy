@@ -6236,6 +6236,17 @@ impl App {
     /// Close the data-validation dialog, alert and dropdown, which hold a
     /// sheet, a cell and choices read from a workbook that has changed under
     /// them; an alert takes its editor with it.
+    /// Sheet `gone` was removed: its circles go and those of the sheets after
+    /// it follow their renumbering.
+    fn sheet_removed_circles(&mut self, gone: usize) {
+        self.circles.retain(|&(s, ..)| s != gone);
+        for c in &mut self.circles {
+            if c.0 > gone {
+                c.0 -= 1;
+            }
+        }
+    }
+
     fn close_validation_ui(&mut self) {
         self.validation_dialog = None;
         self.dv_picker = None;
@@ -8569,6 +8580,7 @@ impl App {
         let name = self.pkg.workbook.sheets[self.sheet].name.clone();
         let gone = self.sheet;
         if self.pkg.remove_sheet(gone) {
+            self.sheet_removed_circles(gone);
             self.cancel_cut();
             // The copy names its sheet by index: one deleted leaves it no
             // sheet (it still pastes its cells as a copy, but Paste Special
@@ -20766,6 +20778,23 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(app.dv_alert.is_none());
         assert_eq!(value_at(&app, 2, 1), CellValue::Number(5.0));
+    }
+    #[test]
+    fn removing_a_sheet_takes_its_circles_and_renumbers_the_rest() {
+        use ctlcore::json::Json;
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Second");
+        pkg.add_sheet("Third");
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.circles = vec![(0, 1, 1), (1, 2, 2), (2, 3, 3)];
+        let args = Json::obj(vec![("sheet", Json::Num(1.0))]);
+        run_control(&mut app, "sheet.remove", &args).unwrap();
+        assert_eq!(app.circles, vec![(0, 1, 1), (1, 3, 3)]);
+        // The TUI's own delete (the active sheet) does the same.
+        app.sheet = 0;
+        app.delete_current_sheet();
+        assert_eq!(app.circles, vec![(0, 3, 3)]);
     }
 }
 

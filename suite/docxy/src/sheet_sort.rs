@@ -71,6 +71,8 @@ pub(crate) fn sort_view(
             let changed = snap.workbook().sheets[s].cells != v.pkg.workbook.sheets[s].cells;
             if changed {
                 v.push_undo_snapshot(snap);
+                // Validation circles name cells, and the rows just moved.
+                v.circles.clear();
                 // The rebuilt engine keeps the clock the old one had.
                 let clock = v.engine.clock;
                 v.engine = crate::sheet_engine(&v.pkg.workbook);

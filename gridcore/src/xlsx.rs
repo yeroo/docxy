@@ -4193,19 +4193,23 @@ fn set_validations(xml: String, sheet: &Sheet) -> String {
         .iter()
         .filter(|dv| dv.ix.is_none() && dv.orig.is_none() && !dv.ranges.is_empty())
         .collect();
-    let mut xml = xml;
-    for dv in new {
-        let item = dv_element(dv);
-        xml = match append_to_worksheet_child(&xml, "dataValidations", &item, None) {
-            Some(xml) => xml,
-            None if worksheet_takes(&xml, "dataValidations", true) => {
-                let block = format!("<dataValidations count=\"1\">{item}</dataValidations>");
-                put_worksheet_child(&xml, "dataValidations", &block, None, false)
-            }
-            None => xml,
-        };
+    if new.is_empty() {
+        return xml;
     }
-    xml
+    // All the new rules in one pass over the part, not one per rule.
+    let items: Vec<String> = new.iter().map(|dv| dv_element(dv)).collect();
+    match append_all_to_worksheet_child(&xml, "dataValidations", &items) {
+        Some(out) => out,
+        None if worksheet_takes(&xml, "dataValidations", true) => {
+            let block = format!(
+                "<dataValidations count=\"{}\">{}</dataValidations>",
+                items.len(),
+                items.concat()
+            );
+            put_worksheet_child(&xml, "dataValidations", &block, None, false)
+        }
+        None => xml,
+    }
 }
 
 /// A new `<dataValidation>` element for `dv`, attributes at their defaults
@@ -19488,6 +19492,57 @@ mod rule_shift_tests {
             ("20", "80"),
             "{ws}"
         );
+    }
+
+    #[test]
+    fn dv_many_new_rules_round_trip_in_order_with_a_right_count() {
+        let mut pkg = one("S", DV_RULE);
+        let n = 300;
+        for r in 0..n {
+            pkg.workbook.sheets[0]
+                .validations
+                .push(crate::sheet::DataValidation {
+                    ranges: vec![(20 + r, 0, 20 + r, 0)],
+                    kind: "whole".into(),
+                    operator: "equal".into(),
+                    formula1: r.to_string(),
+                    show_error: true,
+                    ..Default::default()
+                });
+        }
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(&format!(r#"<dataValidations count="{}">"#, n + 1)),
+            "count"
+        );
+        let rules = &re.workbook.sheets[0].validations;
+        assert_eq!(rules.len(), n as usize + 1);
+        let got: Vec<&str> = rules[1..].iter().map(|d| d.formula1.as_str()).collect();
+        let want: Vec<String> = (0..n).map(|r| r.to_string()).collect();
+        assert_eq!(got, want.iter().map(String::as_str).collect::<Vec<_>>());
+        // And onto a sheet with no block at all.
+        let mut pkg = one("S", "");
+        pkg.workbook.sheets[0]
+            .validations
+            .push(crate::sheet::DataValidation {
+                ranges: vec![(0, 0, 0, 0)],
+                kind: "whole".into(),
+                formula1: "1".into(),
+                show_error: true,
+                ..Default::default()
+            });
+        pkg.workbook.sheets[0]
+            .validations
+            .push(crate::sheet::DataValidation {
+                ranges: vec![(1, 0, 1, 0)],
+                kind: "whole".into(),
+                formula1: "2".into(),
+                show_error: true,
+                ..Default::default()
+            });
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"<dataValidations count="2">"#), "{ws}");
+        assert_eq!(re.workbook.sheets[0].validations.len(), 2);
     }
 
     #[test]

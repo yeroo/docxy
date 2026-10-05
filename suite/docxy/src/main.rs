@@ -33798,6 +33798,11 @@ fn sheet_el(
     // Circle Invalid Data's circles (#689): a red ellipse round each circled
     // cell of this sheet.
     for &(cs, cr, cc) in view.circles.iter().filter(|c| c.0 == view.active) {
+        // A hidden row or column has no cell to circle (the position would be
+        // the next visible one's).
+        if sh.row_hidden(cr) || sh.col_hidden(cc) {
+            continue;
+        }
         let Some(cx0) = col_x(cc) else {
             continue;
         };
