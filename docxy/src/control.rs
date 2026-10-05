@@ -39,6 +39,8 @@
 //! | `doc.undo` / `doc.redo` | — | `{done}` (false = nothing to undo/redo) |
 //! | `doc.revisions` / `doc.revision-current` | — | stable revision ids, kinds, metadata, and current selection |
 //! | `doc.revision-next` / `doc.revision-previous` | — | navigate and return the selected stable revision |
+//! | `doc.display-mode` | `{mode?}` | `{mode,label,editable}`; `mode` is `all`, `simple`, `none` or `original` (a view only) |
+//! | `doc.display-mode` | `{mode?}` | `{mode,label,editable}`; `mode` is `all`, `simple`, `none` or `original` (a view only, never saved) |
 //! | `doc.comment-resolve` | `{id, resolved?}` | `{id,resolved}`; no `resolved` toggles |
 //! | `doc.comments-delete-all` | — | `{deleted}`; markers and records, one undo step |
 //! | `doc.revision-accept` / `doc.revision-reject` | `{revision}` | structured applied/stale/unsupported/malformed outcome |
@@ -120,6 +122,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "doc.append" => append(app, args),
         "doc.export" => export(app, args),
         "doc.comments" => Ok(comments(app)),
+        "doc.display-mode" => display_mode(app, args),
         "doc.comment-resolve" => resolve_comment(app, args),
         "doc.comments-delete-all" => Ok(delete_all_comments(app)),
         "doc.notes" => Ok(notes(app)),
@@ -676,6 +679,23 @@ fn review_revision(app: &mut App, args: &Json, action: RevisionAction) -> Result
         ctlcore::signal_activity();
     }
     Ok(revision_outcome_json(&outcome))
+}
+
+/// `doc.display-mode`: Display for Review. With `mode` (`all`, `simple`,
+/// `none` or `original`) it chooses the view; either way it reports the
+/// current one and whether it can be edited. A view only: never a mutation.
+fn display_mode(app: &mut App, args: &Json) -> Result<Json, String> {
+    if let Some(name) = args.get_str("mode") {
+        let view = docxcore::markup::MarkupView::from_name(name)
+            .ok_or_else(|| format!("unknown mode '{name}' (all, simple, none or original)"))?;
+        app.set_markup(view);
+        ctlcore::signal_activity();
+    }
+    Ok(Json::obj(vec![
+        ("mode", Json::Str(app.markup.name().to_string())),
+        ("label", Json::Str(app.markup.label().to_string())),
+        ("editable", Json::Bool(app.markup.is_editable())),
+    ]))
 }
 
 /// `doc.comment-resolve`: resolve (`resolved` true), reopen (false) or, with
@@ -2423,6 +2443,7 @@ mod tests {
             "doc.find",
             "doc.export",
             "doc.comments",
+            "doc.display-mode",
             "doc.notes",
             "doc.header",
             "doc.footer",
@@ -3204,6 +3225,51 @@ mod tests {
             };
             assert!(dispatch(&mut app, verb, &a).is_ok(), "{verb}");
         }
+    }
+
+    /// #625: `doc.display-mode` sets and reports the view, and a view whose
+    /// text is not the document's refuses edits (but not comment verbs).
+    #[test]
+    fn doc_display_mode_sets_the_view_and_refuses_edits_in_view_only_modes() {
+        let mut app = app_with(&["hello"]);
+        let mode = |app: &mut App, m: Option<&str>| {
+            let a = m.map_or(Json::Null, |m| args(vec![("mode", Json::Str(m.into()))]));
+            dispatch(app, "doc.display-mode", &a)
+        };
+        let r = mode(&mut app, None).unwrap();
+        assert_eq!(r.get_str("mode"), Some("all"));
+        assert_eq!(r.get("editable").and_then(Json::as_bool), Some(true));
+        for (m, editable) in [("simple", true), ("none", false), ("original", false)] {
+            let r = mode(&mut app, Some(m)).unwrap();
+            assert_eq!(r.get_str("mode"), Some(m));
+            assert_eq!(r.get("editable").and_then(Json::as_bool), Some(editable));
+            let before = app.editor.doc.plain_text();
+            let inserted = dispatch(
+                &mut app,
+                "doc.insert",
+                &args(vec![
+                    ("at", Json::Num(0.0)),
+                    ("text", Json::Str("X".into())),
+                ]),
+            );
+            if editable {
+                inserted.unwrap();
+                assert!(app.editor.undo());
+            } else {
+                let err = inserted.unwrap_err();
+                assert!(err.starts_with("protection_denied:display_mode: "), "{err}");
+                assert_eq!(app.editor.doc.plain_text(), before);
+                // Comment verbs hold no text of the view.
+                dispatch(&mut app, "doc.comments-delete-all", &Json::Null).unwrap();
+            }
+        }
+        let err = mode(&mut app, Some("bogus")).unwrap_err();
+        assert!(err.contains("unknown mode"), "{err}");
+        // The view is not a mutation: the document is not modified by it.
+        let mut app = app_with(&["hello"]);
+        app.modified = false;
+        mode(&mut app, Some("none")).unwrap();
+        assert!(!app.modified);
     }
 
     #[test]

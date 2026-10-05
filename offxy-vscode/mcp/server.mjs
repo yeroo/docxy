@@ -696,6 +696,24 @@ function docxyToolDefs() {
       Object.fromEntries([target()]),
       [],
     ),
+    tool(
+      'docxy_display_mode',
+      'Get or set Display for Review (Review > Tracking): how tracked changes are shown. ' +
+        'A view only: the document, its revisions and its save are unchanged. No Markup and ' +
+        'Original are view-only: edits are refused (protection_denied:display_mode) until ' +
+        'All Markup or Simple Markup is chosen. Returns {mode, label, editable}.',
+      Object.fromEntries([
+        [
+          'mode',
+          prop(
+            'string',
+            'Optional: "all", "simple", "none" or "original" (default: report only).',
+          ),
+        ],
+        target(),
+      ]),
+      [],
+    ),
   ];
 }
 
@@ -1300,6 +1318,7 @@ const DOCXY_VERBS = {
   docxy_page_borders: 'doc.page-borders',
   docxy_comment_resolve: 'doc.comment-resolve',
   docxy_comments_delete_all: 'doc.comments-delete-all',
+  docxy_display_mode: 'doc.display-mode',
 };
 
 const XLSXY_VERBS = {

@@ -3033,6 +3033,71 @@
           ]
         },
         {
+          "title": "Tracking",
+          "priority": 35,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "markupall",
+                  "label": "All markup",
+                  "icon": "paragraph",
+                  "act": "Markup(All)",
+                  "keyTip": "KA",
+                  "tip": {
+                    "title": "All markup",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "markupsimple",
+                  "label": "Simple markup",
+                  "icon": "paragraph",
+                  "act": "Markup(Simple)",
+                  "keyTip": "KS",
+                  "tip": {
+                    "title": "Simple markup",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "markupnone",
+                  "label": "No markup",
+                  "icon": "paragraph",
+                  "act": "Markup(NoMarkup)",
+                  "keyTip": "KN",
+                  "tip": {
+                    "title": "No markup",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "markuporiginal",
+                  "label": "Original",
+                  "icon": "paragraph",
+                  "act": "Markup(Original)",
+                  "keyTip": "KO",
+                  "tip": {
+                    "title": "Original",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
           "title": "Editing",
           "priority": 30,
           "launcher": null,

@@ -745,6 +745,24 @@
     }
   },
   {
+    "name": "docxy_display_mode",
+    "description": "Get or set Display for Review (Review > Tracking): how tracked changes are shown. A view only: the document, its revisions and its save are unchanged. No Markup and Original are view-only: edits are refused (protection_denied:display_mode) until All Markup or Simple Markup is chosen. Returns {mode, label, editable}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "description": "Optional: \"all\", \"simple\", \"none\" or \"original\" (default: report only)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
     "name": "xlsxy_list",
     "description": "List the xlsxy editors currently running on this machine (instance/pane id, port, pid).",
     "inputSchema": {

@@ -72,6 +72,8 @@ pub enum Act {
     /// Resolve / reopen the selected comment; delete every comment.
     ResolveComment,
     DeleteAllComments,
+    /// Step Display for Review: All, Simple, No Markup, Original.
+    CycleMarkup,
     /// Navigate and act on imported tracked changes.
     PrevRevision,
     NextRevision,
@@ -592,8 +594,8 @@ fn review_groups() -> Vec<Group> {
                 vec![btn(
                     "Markup ▾",
                     8,
-                    Todo("Display for Review"),
-                    "Display for review",
+                    CycleMarkup,
+                    "Display for Review: step All Markup, Simple Markup, No Markup, Original",
                 )],
             ],
         },

@@ -1461,6 +1461,9 @@ struct App {
     /// one of them (#620). Reseeded wherever `tracked_comments` is cleared.
     used_comment_ids: std::collections::BTreeSet<String>,
     show_comments: bool,
+    /// Display for Review (#625): how tracked changes are shown. Not saved;
+    /// a view only, so the document and its save never depend on it.
+    markup: docxcore::markup::MarkupView,
     /// The comment highlighted by Prev/Next navigation (only once `comment_active`).
     comment_sel: usize,
     comment_active: bool,
@@ -1666,6 +1669,7 @@ impl App {
             tracked_comments: Default::default(),
             used_comment_ids,
             show_comments: false,
+            markup: Default::default(),
             comment_sel: 0,
             comment_active: false,
             comment_input: None,
@@ -1734,13 +1738,17 @@ impl App {
 
     fn options(&self, width: u16) -> RenderOptions {
         // In find mode, highlight all matches; otherwise the live selection.
-        let selection = match &self.find {
-            Some(f) => f
-                .matches
-                .iter()
-                .map(|m| (m.path.clone(), m.start, m.end))
-                .collect(),
-            None => self.editor.selection_spans(),
+        let selection = if !self.markup.is_editable() {
+            Vec::new()
+        } else {
+            match &self.find {
+                Some(f) => f
+                    .matches
+                    .iter()
+                    .map(|m| (m.path.clone(), m.start, m.end))
+                    .collect(),
+                None => self.editor.selection_spans(),
+            }
         };
         RenderOptions {
             width: width.max(1) as usize,
@@ -1749,7 +1757,10 @@ impl App {
             borderless_tables: self.borderless,
             selection,
             styles: self.styles.clone(),
-            list_markers: Rc::new(compute_markers(&self.editor.doc, &self.numbering)),
+            list_markers: Rc::new(compute_markers(
+                &self.editor.doc.markup_view(self.markup),
+                &self.numbering,
+            )),
             page: self
                 .editor
                 .doc
@@ -1867,6 +1878,14 @@ impl App {
     }
 
     /// Toggle the footnotes/endnotes side panel.
+    /// Choose Display for Review. A view only: the document, its history and
+    /// what a save writes are untouched.
+    fn set_markup(&mut self, view: docxcore::markup::MarkupView) {
+        self.markup = view;
+        self.status = Some(format!("Display for Review: {}", view.label()));
+        self.dirty = true;
+    }
+
     fn toggle_notes(&mut self) {
         self.show_notes = !self.show_notes;
         self.notes_scroll = 0;
@@ -2210,6 +2229,7 @@ impl App {
             DeleteComment => self.delete_comment(),
             ResolveComment => self.resolve_comment(),
             DeleteAllComments => self.delete_all_comments(),
+            CycleMarkup => self.set_markup(self.markup.next()),
             PrevRevision => self.navigate_revision(true),
             NextRevision => self.navigate_revision(false),
             AcceptRevision => self.review_current_revision(RevisionAction::Accept),
@@ -2828,6 +2848,11 @@ impl App {
     ) -> Result<(), protection::ProtectionDenial> {
         if self.marked_final {
             return Err(protection::ProtectionDenial::MarkedFinal);
+        }
+        // A view whose text is not the document's is not edited; comments
+        // hold no text of it.
+        if !self.markup.is_editable() && mutation != protection::MutationKind::Comment {
+            return Err(protection::ProtectionDenial::DisplayMode);
         }
         protection::authorize(&self.doc_protection, mutation)
     }
@@ -3532,9 +3557,15 @@ impl App {
     fn ensure_rendered(&mut self, width: u16) {
         if self.dirty || width != self.rendered_width {
             let opts = self.options(width);
-            let rendered = render_with_page_layout(&self.editor.doc, &opts);
+            let shown = self.editor.doc.markup_view(self.markup);
+            let rendered = render_with_page_layout(&shown, &opts);
             let mut lines = rendered.lines;
             let mut maps = rendered.maps;
+            if !self.markup.is_editable() {
+                // The caret stops of a text that is not the document's: none,
+                // so a click or a vertical move cannot take an offset from it.
+                maps.iter_mut().for_each(|m| *m = LineMap::default());
+            }
             let mut images = rendered.images;
             let pages = rendered.pages;
             // While editing a header/footer, show the rest of the page (the parked
@@ -6547,6 +6578,9 @@ impl App {
             docxcore::model::VertAlign::Subscript => toggles.push(ribbon::Act::Subscript),
             docxcore::model::VertAlign::Superscript => toggles.push(ribbon::Act::Superscript),
             docxcore::model::VertAlign::Baseline => {}
+        }
+        if self.markup != docxcore::markup::MarkupView::All {
+            toggles.push(ribbon::Act::CycleMarkup);
         }
         // Markdown files get a contextual View ▸ Markdown group; highlight whichever
         // of Rendered/Source is active.
@@ -13460,6 +13494,95 @@ mod tests {
         app.on_key(key(KeyCode::Char('Z'))); // replacement
         app.on_key(ctrl(KeyCode::Char('a'))); // replace all
         assert_eq!(first_line(&app), "Z y Z");
+    }
+
+    /// `Alpha beta gamma delta.` with `new ` inserted and `beta ` deleted.
+    fn app_with_ins_and_del() -> App {
+        let doc = docxcore::load::parse_document_xml(
+            "<w:document><w:body><w:p>\
+             <w:r><w:t xml:space=\"preserve\">Alpha </w:t></w:r>\
+             <w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t xml:space=\"preserve\">new </w:t></w:r></w:ins>\
+             <w:del w:id=\"2\" w:author=\"A\"><w:r><w:delText xml:space=\"preserve\">beta </w:delText></w:r></w:del>\
+             <w:r><w:t>gamma delta.</w:t></w:r>\
+             </w:p></w:body></w:document>",
+            &docxcore::load::Relationships::default(),
+        );
+        let mut app = App::new(new_package(doc), "test.docx", false);
+        app.os_clip = None;
+        app
+    }
+
+    /// The rendered text of the body, one row per line, trimmed.
+    fn shown_text(app: &mut App) -> String {
+        app.dirty = true;
+        app.ensure_rendered(80);
+        app.lines
+            .iter()
+            .map(|l| l.plain().trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #625 C1: the four views show the fixture as Word does, change nothing
+    /// in the document, and the save is the same bytes under each.
+    #[test]
+    fn display_for_review_modes_render_without_changing_the_document() {
+        use docxcore::markup::MarkupView;
+        let mut app = app_with_ins_and_del();
+        let doc = app.editor.doc.clone();
+        let revisions = app.editor.doc.revisions().len();
+        let mut saved = Vec::new();
+        for (view, text) in [
+            (MarkupView::All, "Alpha new beta gamma delta."),
+            (MarkupView::Simple, "Alpha new gamma delta."),
+            (MarkupView::NoMarkup, "Alpha new gamma delta."),
+            (MarkupView::Original, "Alpha beta gamma delta."),
+        ] {
+            app.run_act(ribbon::Act::CycleMarkup);
+            // The first step leaves All: walk to `view` by cycling.
+            while app.markup != view {
+                app.run_act(ribbon::Act::CycleMarkup);
+            }
+            assert_eq!(shown_text(&mut app), text, "{view:?}");
+            assert_eq!(app.editor.doc, doc, "{view:?}");
+            assert_eq!(app.editor.doc.revisions().len(), revisions);
+            assert!(!app.modified, "{view:?}");
+            app.pkg.document = app.editor.doc.clone();
+            let bytes = docxcore::package::save_package(&app.pkg);
+            let pkg = load_package(&bytes).unwrap();
+            saved.push(pkg.part_text("word/document.xml").unwrap());
+        }
+        assert!(
+            saved.windows(2).all(|w| w[0] == w[1]),
+            "document.xml differs"
+        );
+    }
+
+    /// #625 C2: in No Markup and Original a key that would edit is refused
+    /// with a status; All and Simple Markup edit as always.
+    #[test]
+    fn view_only_markup_modes_refuse_typing_and_say_why() {
+        use docxcore::markup::MarkupView;
+        for (view, refused) in [
+            (MarkupView::All, false),
+            (MarkupView::Simple, false),
+            (MarkupView::NoMarkup, true),
+            (MarkupView::Original, true),
+        ] {
+            let mut app = app_with_ins_and_del();
+            app.set_markup(view);
+            let before = app.editor.doc.clone();
+            app.on_key(key(KeyCode::Char('z')));
+            if refused {
+                assert_eq!(app.editor.doc, before, "{view:?}");
+                let status = app.status.clone().unwrap_or_default();
+                assert!(status.contains("Display for Review"), "{status}");
+                assert!(!app.modified);
+            } else {
+                assert_ne!(app.editor.doc, before, "{view:?}");
+            }
+        }
     }
 
     /// `x ` + a tracked insertion `x` + ` x`: Find shows all three (#211).

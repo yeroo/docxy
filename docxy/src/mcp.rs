@@ -68,6 +68,7 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "docxy_page_borders" => "doc.page-borders",
         "docxy_comment_resolve" => "doc.comment-resolve",
         "docxy_comments_delete_all" => "doc.comments-delete-all",
+        "docxy_display_mode" => "doc.display-mode",
         _ => return None,
     })
 }
@@ -594,6 +595,24 @@ fn tool_defs() -> Json {
             vec![target()],
             &[],
         ),
+        tool(
+            "docxy_display_mode",
+            "Get or set Display for Review (Review > Tracking): how tracked changes are shown. \
+             A view only: the document, its revisions and its save are unchanged. No Markup and \
+             Original are view-only: edits are refused (protection_denied:display_mode) until \
+             All Markup or Simple Markup is chosen. Returns {mode, label, editable}.",
+            vec![
+                (
+                    "mode",
+                    prop(
+                        "string",
+                        "Optional: \"all\", \"simple\", \"none\" or \"original\" (default: report only).",
+                    ),
+                ),
+                target(),
+            ],
+            &[],
+        ),
     ])
 }
 
@@ -707,6 +726,8 @@ mod tests {
             // #621: resolve / delete-all comments.
             "docxy_comment_resolve",
             "docxy_comments_delete_all",
+            // #625: Display for Review.
+            "docxy_display_mode",
         ];
         let save_pos = names.iter().position(|n| *n == "docxy_save").unwrap();
         assert_eq!(
@@ -764,6 +785,7 @@ mod tests {
         assert_eq!(required_of("docxy_page_borders"), "[\"border\"]");
         assert_eq!(required_of("docxy_comment_resolve"), "[\"id\"]");
         assert_eq!(required_of("docxy_comments_delete_all"), "[]");
+        assert_eq!(required_of("docxy_display_mode"), "[]");
     }
 
     /// Wave-2: `docxy_insert`/`docxy_replace_range`/`docxy_append` gain an
@@ -935,6 +957,7 @@ mod tests {
         ("docxy_page_borders", "doc.page-borders"),
         ("docxy_comment_resolve", "doc.comment-resolve"),
         ("docxy_comments_delete_all", "doc.comments-delete-all"),
+        ("docxy_display_mode", "doc.display-mode"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.

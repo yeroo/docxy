@@ -612,6 +612,10 @@
     DeleteAllComments: NOT_YET,
     ToggleComments: NOT_YET,
     ToggleNotes: NOT_YET,
+    'Markup(All)': NOT_YET,
+    'Markup(NoMarkup)': NOT_YET,
+    'Markup(Original)': NOT_YET,
+    'Markup(Simple)': NOT_YET,
     ToggleNav: NOT_YET,
     ToggleRuler: NOT_YET,
   };

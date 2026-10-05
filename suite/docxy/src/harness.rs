@@ -1193,6 +1193,8 @@ struct ViewFlags {
     zoom: f32,
     dark: bool,
     gridlines: bool,
+    /// Display for Review (#625), by its control name.
+    display_mode: &'static str,
 }
 
 impl ViewFlags {
@@ -1208,6 +1210,7 @@ impl ViewFlags {
             zoom: app.zoom,
             dark: app.theme_pref.resolve(window.appearance()) == gpui_component::ThemeMode::Dark,
             gridlines: app.view_gridlines,
+            display_mode: app.markup.name(),
         }
     }
 }
@@ -1318,6 +1321,7 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
             Json::Str(if flags.dark { "dark" } else { "light" }.into()),
         ),
         ("gridlines", Json::Bool(flags.gridlines)),
+        ("display_mode", Json::Str(flags.display_mode.into())),
     ]);
     Json::obj(vec![
         ("text", Json::Str(flat.main().text.clone())),
@@ -4212,6 +4216,7 @@ mod tests {
             zoom: 1.5,
             dark: true,
             gridlines: true,
+            display_mode: "all",
         };
         let state = doc_state(&editor(props, run), &flags);
         assert_eq!(state.get_str("text"), Some("abc\n"));
@@ -4289,6 +4294,7 @@ mod tests {
                 zoom: 1.0,
                 dark: false,
                 gridlines: true,
+                display_mode: "all",
             },
         );
         assert_ne!(state.get("para"), defaults.get("para"));
@@ -4386,6 +4392,7 @@ mod tests {
                 zoom: 1.0,
                 dark: false,
                 gridlines: true,
+                display_mode: "all",
             },
         );
         assert_eq!(state.get("cross_story"), Some(&Json::Bool(true)));

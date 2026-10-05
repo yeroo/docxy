@@ -87,6 +87,7 @@ use std::path::PathBuf;
 
 use docxcore::comments::Comment;
 use docxcore::editor::{Caret, Clip, Editor, FoundMatch, step_found};
+use docxcore::markup::MarkupView;
 use docxcore::model::{
     Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign,
 };
@@ -880,6 +881,7 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
             | Act::ToggleComments
             | Act::ToggleNav
             | Act::ToggleNotes
+            | Act::Markup(_)
             | Act::DarkMode
             | Act::AutoHideRibbon
             | Act::PrintLayout
@@ -3281,6 +3283,9 @@ struct Docxy {
     /// The comment the Review tab's Resolve acts on: the one last clicked in
     /// the Comments pane or added, with the tab it is in (ids are per document).
     selected_comment: Option<(usize, String)>,
+    /// Display for Review (#625): how tracked changes are shown. A view only,
+    /// not saved; No Markup and Original refuse edits.
+    markup: docxcore::markup::MarkupView,
     comment_text: String,
     // Show formatting marks (¶, tab arrows) — View ▸ Show/Hide.
     show_marks: bool,
@@ -9162,6 +9167,7 @@ impl Docxy {
             doc_scroll: ScrollHandle::new(),
             comment_open: false,
             selected_comment: None,
+            markup: Default::default(),
             comment_text: String::new(),
             show_marks: false,
             show_comments: false,
@@ -12164,6 +12170,28 @@ impl Docxy {
     /// saying how to edit; `true` when it was refused. Every gate that would
     /// change the workbook or document asks this first.
     fn protected_refused(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.view_only_active() {
+            self.set_status(VIEW_ONLY_STATUS);
+            cx.notify();
+            return true;
+        }
+        self.access_refused(cx)
+    }
+
+    /// The active tab is a document shown as No Markup or Original: text that
+    /// is not the document's, so it is looked at and not edited (#625).
+    fn view_only_active(&self) -> bool {
+        !self.markup.is_editable()
+            && matches!(
+                self.tabs.get(self.active).map(|t| &t.surface),
+                Some(Surface::Doc(_))
+            )
+    }
+
+    /// [`Self::protected_refused`] for what holds no text of the view (a
+    /// comment's Resolve and Delete all): only Protected View or Mark as
+    /// Final refuse it.
+    fn access_refused(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(access) = self
             .tabs
             .get(self.active)
@@ -17260,7 +17288,7 @@ impl Docxy {
     /// Resolve the selected comment, or reopen it when it is resolved. The
     /// state is written to `commentsExtended.xml` on save.
     fn resolve_selected_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.protected_refused(cx) {
+        if self.access_refused(cx) {
             return self.refocus(window, cx);
         }
         let active = self.active;
@@ -17298,7 +17326,7 @@ impl Docxy {
     /// Delete every comment (Review ▸ Comments ▸ Delete all): the Document
     /// Inspector's Remove All for comments, one undo step.
     fn delete_all_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.protected_refused(cx) {
+        if self.access_refused(cx) {
             return self.refocus(window, cx);
         }
         let _ = self.inspect_remove_active(inspector::InspectCategory::Comments);
@@ -18055,7 +18083,7 @@ impl Docxy {
         // Protected View (#633), or a document marked as final (#617): only
         // keys that look, move or copy reach the document. The find bar still
         // takes typing; its Replace is refused where it would write.
-        if self.active_locked()
+        if (self.active_locked() || self.view_only_active())
             && !self.find_open
             && !open_mode::protected_allows_doc_key(key.as_str(), ctrl, m.alt)
         {
@@ -18177,6 +18205,9 @@ impl Docxy {
         cx.notify();
     }
 }
+
+/// What a refused edit says while Display for Review is No Markup or Original.
+const VIEW_ONLY_STATUS: &str = "Edit blocked: Display for Review is No Markup or Original; switch to All Markup or Simple Markup to edit.";
 
 /// What a harness instance says when asked to Save As a document.
 const DOC_SAVE_AS_HARNESS: &str = "This document needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
@@ -20247,6 +20278,8 @@ enum Act {
     ResolveComment,
     /// Delete every comment in the document.
     DeleteAllComments,
+    /// Display for Review: how tracked changes are shown.
+    Markup(docxcore::markup::MarkupView),
     Sort,
     LineSpacing,
     ParaBorders,
@@ -20604,6 +20637,48 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                                 "",
                             )
                             .key("X"),
+                        ]),
+                    ],
+                ),
+                rs::group(
+                    "Tracking",
+                    35,
+                    vec![
+                        rs::column(vec![
+                            cmdt(
+                                "markupall",
+                                "paragraph",
+                                "All markup",
+                                Markup(MarkupView::All),
+                                "",
+                            )
+                            .key("KA"),
+                            cmdt(
+                                "markupsimple",
+                                "paragraph",
+                                "Simple markup",
+                                Markup(MarkupView::Simple),
+                                "",
+                            )
+                            .key("KS"),
+                            cmdt(
+                                "markupnone",
+                                "paragraph",
+                                "No markup",
+                                Markup(MarkupView::NoMarkup),
+                                "",
+                            )
+                            .key("KN"),
+                        ]),
+                        rs::column(vec![
+                            cmdt(
+                                "markuporiginal",
+                                "paragraph",
+                                "Original",
+                                Markup(MarkupView::Original),
+                                "",
+                            )
+                            .key("KO"),
                         ]),
                     ],
                 ),
@@ -22080,6 +22155,31 @@ fn flat_inlines(content: &[Inline]) -> Vec<(Cow<'_, Inline>, bool)> {
     out
 }
 
+/// The runs under a tracked change, drawn as plain text with no caret mapping.
+fn emit_revision_text(out: &mut Vec<AnyElement>, content: &[Inline], base: f32, pal: Pal) {
+    for inline in content {
+        match inline {
+            Inline::Run(r) => {
+                let (mut idx, mut caret) = (0, None);
+                emit_run(
+                    out, &r.text, &r.props, base, false, &mut idx, &mut caret, None, None, pal,
+                );
+            }
+            Inline::Hyperlink(h) => {
+                for r in &h.runs {
+                    let (mut idx, mut caret) = (0, None);
+                    emit_run(
+                        out, &r.text, &r.props, base, true, &mut idx, &mut caret, None, None, pal,
+                    );
+                }
+                emit_revision_text(out, &h.content, base, pal);
+            }
+            Inline::Revision { content, .. } => emit_revision_text(out, content, base, pal),
+            _ => {}
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paragraph_el(
     p: &Paragraph,
@@ -22246,6 +22346,12 @@ fn paragraph_el(
             Inline::Break(..) => {
                 emit_break(&mut spans, &mut idx, &mut caret);
                 x = 0.0; // a hard break restarts the line
+            }
+            Inline::Revision { content, .. } => {
+                // A tracked change is shown, not edited here: its text takes no
+                // caret offsets (the engine counts it as none), and carries the
+                // underline / strike cue the loader gave its runs.
+                emit_revision_text(&mut spans, content, base, pal);
             }
             Inline::Raw(xml) => {
                 // Comment reference → a small badge; other raw XML (range markers,
@@ -23361,7 +23467,14 @@ impl Docxy {
         self.close_menu();
         // Protected View (#633): the ribbon is hidden, but shortcuts, KeyTips,
         // context menus and the harness's `ribbon-click` still come here.
-        if !protected_view_allows_doc_act(act) && self.protected_refused(cx) {
+        // Resolve and Delete all hold no text of the view: only Protected View
+        // and Mark as Final refuse them.
+        let refused = if matches!(act, ResolveComment | DeleteAllComments) {
+            self.access_refused(cx)
+        } else {
+            !protected_view_allows_doc_act(act) && self.protected_refused(cx)
+        };
+        if refused {
             return self.refocus(window, cx);
         }
         match act {
@@ -23381,6 +23494,11 @@ impl Docxy {
             FontSize => self.toggle_picker(PickKind::FontSize, window, cx),
             NewComment => self.start_comment(window, cx),
             ResolveComment => self.resolve_selected_comment(window, cx),
+            Markup(view) => {
+                self.markup = view;
+                self.set_status(format!("Display for Review: {}", view.label()));
+                self.refocus(window, cx);
+            }
             DeleteAllComments => self.delete_all_comments(window, cx),
             ShowHide => {
                 self.show_marks = !self.show_marks;
@@ -23485,10 +23603,11 @@ impl Docxy {
                 ClearFmt => e.clear_run_formatting(),
                 Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph
                 | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
-                | ResolveComment | DeleteAllComments | ToggleComments | ToggleNav | DarkMode
-                | AutoHideRibbon | InsertField | PageBreak | BlankPage | Cover(_) | ToggleNotes
-                | InsertTable | InsertSymbol | InsertEquation | LineSpacing | Hf(_) | Design(_)
-                | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler => {}
+                | ResolveComment | DeleteAllComments | Markup(_) | ToggleComments | ToggleNav
+                | DarkMode | AutoHideRibbon | InsertField | PageBreak | BlankPage | Cover(_)
+                | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing
+                | Hf(_) | Design(_) | Layout(_) | Mail(_) | Table(_) | PrintLayout
+                | ToggleRuler => {}
             }),
         }
     }
@@ -25247,6 +25366,7 @@ impl Docxy {
             ShowHide => self.show_marks,
             ToggleComments => self.show_comments,
             ResolveComment => self.selected_comment_resolved(),
+            Markup(view) => self.markup == view,
             ToggleNav => self.show_nav,
             ToggleNotes => self.show_notes,
             PrintLayout => self.page_view,
@@ -26635,8 +26755,15 @@ impl Render for Docxy {
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
                 Surface::Doc(editor) => {
-                    let spans = editor.selection_spans();
-                    let markers = list_markers(&editor.doc.body);
+                    // Display for Review: the document, or a clone shown as No
+                    // Markup / Original / Simple; never saved.
+                    let shown = editor.doc.markup_view(self.markup);
+                    let spans = if self.markup.is_editable() {
+                        editor.selection_spans()
+                    } else {
+                        Vec::new()
+                    };
+                    let markers = list_markers(&shown.body);
                     let ent = cx.entity();
                     // In Print Layout the sheet is white, or the document's page
                     // colour (#651), whatever the app theme, like Word's document
@@ -26671,14 +26798,14 @@ impl Render for Docxy {
                         pal: doc_pal,
                         marks: self.show_marks,
                         zoom: self.zoom,
-                        active: hf.is_none(),
+                        active: hf.is_none() && self.markup.is_editable(),
                         meas: &measurer,
                         hf_width: None,
                         tbl: &tbl,
                         cell_range: body_range.as_ref(),
                         merge_hl: tab.mail.highlight,
                     };
-                    let body = &editor.doc.body;
+                    let body = &shown.body;
                     if self.page_view {
                         // Print Layout: split the body into discrete page sheets
                         // (section margins), stacked on a grey canvas. A sheet is

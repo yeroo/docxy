@@ -112,6 +112,7 @@ fn only_commands_that_look_pass_protected_view() {
         Act::Find,
         Act::ShowHide,
         Act::ToggleNav,
+        Act::Markup(docxcore::markup::MarkupView::NoMarkup),
     ] {
         assert!(protected_view_allows_doc_act(act), "{act:?}");
     }
@@ -126,6 +127,8 @@ fn only_commands_that_look_pass_protected_view() {
         Act::InsertTable,
         Act::PageBreak,
         Act::ClearFmt,
+        Act::ResolveComment,
+        Act::DeleteAllComments,
     ] {
         assert!(!protected_view_allows_doc_act(act), "{act:?}");
     }
