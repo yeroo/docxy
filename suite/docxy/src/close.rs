@@ -672,8 +672,12 @@ impl Docxy {
         // A cancelled close keeps the window: repaint the committed cell.
         cx.notify();
         if self.quitting {
-            // Already asking: the X again changes nothing.
-            return false;
+            if quit_prompt_live(&self.tabs) {
+                // Already asking: the X again changes nothing.
+                return false;
+            }
+            // Its question went away some other way: start again.
+            self.quit_cancelled();
         }
         commit_pending_for_exit(&mut self.tabs);
         self.persist();
@@ -684,12 +688,21 @@ impl Docxy {
         }
         self.quitting = true;
         self.quit_discards.clear();
+        self.quit_tabs = tab_ids(&self.tabs);
         self.next_quit_prompt(window, cx);
         false
     }
 
     /// Ask about the next unsaved tab, in tab order, or go when none is left.
     fn next_quit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if tab_ids(&self.tabs) != self.quit_tabs {
+            // A tab came or went (or moved) under the questions: the answers
+            // so far name tabs by index, so none of them is applied.
+            self.quit_cancelled();
+            self.set_status(QUIT_TABS_CHANGED);
+            self.refocus(window, cx);
+            return;
+        }
         let next = next_to_ask(&self.tabs, &self.quit_discards);
         match next {
             None => self.finish_quit(window),
@@ -718,6 +731,7 @@ impl Docxy {
     fn quit_cancelled(&mut self) {
         self.quitting = false;
         self.quit_discards.clear();
+        self.quit_tabs.clear();
     }
 
     /// Every unsaved tab is answered: keep the drafts of workbooks answered
@@ -753,6 +767,48 @@ impl Docxy {
         } else {
             window.remove_window();
         }
+    }
+}
+
+/// What a quit cancelled because its tabs changed says.
+const QUIT_TABS_CHANGED: &str =
+    "The open tabs changed: close the window again to be asked about each";
+
+/// A tab as the window's close knows it: its title and file.
+pub(crate) type TabId = (SharedString, Option<PathBuf>);
+
+/// The tabs, in order, as [`TabId`]s.
+pub(crate) fn tab_ids(tabs: &[DocTab]) -> Vec<TabId> {
+    tabs.iter()
+        .map(|t| (t.title.clone(), t.path.clone()))
+        .collect()
+}
+
+/// Whether a window close's question is open on some tab: the quit is live
+/// only while one is, whatever the app last recorded.
+fn quit_prompt_live(tabs: &[DocTab]) -> bool {
+    tabs.iter().any(|t| {
+        t.dialogs
+            .top()
+            .is_some_and(|d| d.owner == DialogOwner::SaveOnClose { quit: true })
+    })
+}
+
+/// A Project control verb that would drop a tab's dialogs (an edit, a save,
+/// a reload) or move the focus (an open) is refused while a close prompt is
+/// open: the prompt would vanish under the question it asks, or the tabs
+/// change under a window close's questions (#630).
+pub(crate) fn close_prompt_refusal(tabs: &[DocTab], verb: &str) -> Result<(), String> {
+    let drops = matches!(verb, "proj.open" | "proj.save" | "proj.reload")
+        || projctl::MUTATING.contains(&verb);
+    let open = tabs.iter().find_map(|t| {
+        t.dialogs
+            .top()
+            .filter(|d| matches!(d.owner, DialogOwner::SaveOnClose { .. }))
+    });
+    match open {
+        Some(d) if drops => Err(format!("a dialog is open: {}", d.title)),
+        _ => Ok(()),
     }
 }
 

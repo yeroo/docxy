@@ -2115,3 +2115,63 @@ fn dont_save_on_quit_drops_a_never_saved_tab_and_forgets_a_files_edits() {
         before
     );
 }
+
+#[test]
+fn a_quit_is_live_only_while_its_question_is_open() {
+    let mut tabs = vec![tab(Kind::Docx), tab(Kind::Project)];
+    assert!(!quit_prompt_live(&tabs));
+    // A tab's own close prompt is not a quit.
+    let p = close_prompt(&tabs[1], false, &known());
+    tabs[1].dialogs.push(p);
+    assert!(!quit_prompt_live(&tabs));
+    tabs[1].dialogs.clear();
+    let p = close_prompt(&tabs[1], true, &known());
+    tabs[1].dialogs.push(p);
+    assert!(quit_prompt_live(&tabs));
+    // Cleared behind the app's back (a control verb, say): a later window
+    // close starts a new quit instead of waiting forever.
+    tabs[1].dialogs.clear();
+    assert!(!quit_prompt_live(&tabs));
+}
+
+#[test]
+fn a_quit_notices_its_tabs_changing() {
+    let mut tabs = vec![tab(Kind::Docx), tab(Kind::Xlsx)];
+    let at_start = tab_ids(&tabs);
+    assert_eq!(tab_ids(&tabs), at_start);
+    tabs.swap(0, 1);
+    assert_ne!(tab_ids(&tabs), at_start, "a reorder");
+    tabs.swap(0, 1);
+    tabs.remove(1);
+    assert_ne!(tab_ids(&tabs), at_start, "a close");
+}
+
+#[test]
+fn project_verbs_that_would_drop_a_close_prompt_are_refused() {
+    let mut tabs = vec![tab(Kind::Docx), tab(Kind::Project)];
+    for verb in [
+        "proj.open",
+        "proj.save",
+        "proj.reload",
+        projctl::MUTATING[0],
+        "proj.path",
+    ] {
+        assert_eq!(close_prompt_refusal(&tabs, verb), Ok(()), "{verb}");
+    }
+    let p = close_prompt(&tabs[1], true, &known());
+    tabs[1].dialogs.push(p);
+    for verb in [
+        "proj.open",
+        "proj.save",
+        "proj.reload",
+        projctl::MUTATING[0],
+    ] {
+        assert_eq!(
+            close_prompt_refusal(&tabs, verb),
+            Err("a dialog is open: docxy".into()),
+            "{verb}"
+        );
+    }
+    // Reads still answer.
+    assert_eq!(close_prompt_refusal(&tabs, "proj.path"), Ok(()));
+}

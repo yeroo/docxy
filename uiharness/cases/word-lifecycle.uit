@@ -146,3 +146,21 @@ test Ctrl+W closes a document marked as final
   assert final is true
   key ctrl+w
   assert tabs is 0
+
+test a Project control verb cannot drop the window close question
+  call ask-on-close {"on":true}
+  open copy:../fixtures/gantt-summary.xml
+  click C2
+  type QuitProjectMarker
+  key enter
+  assert dirty is true
+  call close-window {}
+  assert dialog is save-on-close
+  call-error proj.reload {} => a dialog is open: docxy
+  call-error proj.save {} => a dialog is open: docxy
+  assert dialog is save-on-close
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  call ask-on-close {"on":false}
+  call close-tab {"answer":"discard"}
+  assert tabs is 0

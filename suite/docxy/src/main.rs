@@ -3315,6 +3315,10 @@ struct Docxy {
     /// The tabs answered Don't Save while quitting, by index: their unsaved
     /// work is forgotten, but only once the quit goes ahead.
     quit_discards: Vec<usize>,
+    /// The tabs as they were when the quit began ([`close::tab_ids`]): a quit
+    /// whose tabs changed under it is cancelled rather than answering for
+    /// tabs by stale indexes.
+    quit_tabs: Vec<close::TabId>,
     /// A harness quit that went ahead (#630): the harness ends the process
     /// after the reply, rather than the window removing itself under it.
     quit_ready: bool,
@@ -9215,6 +9219,7 @@ impl Docxy {
             next_document: 1,
             quitting: false,
             quit_discards: Vec::new(),
+            quit_tabs: Vec::new(),
             quit_ready: false,
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
