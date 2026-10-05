@@ -431,6 +431,7 @@ footer editor; `selection-set` refuses while it is open.
 | `selection-set {"start":5,"end":1}` | set main-story anchor and caret through `Editor`; backward selections keep the larger anchor; an empty range leaves a collapsed caret, the state a click leaves; both offsets are validated before either changes |
 | `ribbon-read {}` | list File, ribbon tabs and the contextual tabs — Header & Footer while a header or footer is being edited, Table while the caret is in a table, Gantt Chart Format while a Project's Gantt shows — with groups, commands, galleries and Quick Access Toolbar. The Header from Top and Footer from Bottom boxes carry the `value` they show (`0.5"`). Each `qat` item carries `enabled` and `menu` (a split button with a drop-down). On a document tab `qat-undo` has `menu: true`, and `qat-redo` reads `Redo` (tip `Redo (Ctrl+Y)`) while there is something to redo, else `Repeat` (#618): tip `Repeat (Ctrl+Y)` when Ctrl+Y / F4 would repeat the last action, or `Can't Repeat` with `enabled: false` |
 | `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command on a valid tab, contextual tabs included, by id, else by unique label, else by unique screentip title, and invoke the same action handler as its button |
+| `ribbon-layout {}` (or `{"tab":"Data"}`) | where each group of the shown ribbon tab drew its content, from the last frame (#1018): per group `title`, `bounds`, `content_bounds` (the union of its button columns and row stacks, `null` for a group of lone large buttons), `clipped_v` (content taller than the group body: it runs past the title row or out of the group) and `clipped_h`; `hidden: true` for a group the responsive ribbon dropped; plus `any_clipped_v` and `any_clipped_h`. Works on document, Project and sheet tabs. With `tab` it shows that tab first and answers `settled: false` with no groups, because the groups are drawn a frame later: take a `shot window`, then ask again. Like `title-bar` it reads probes, so settle with a `shot` after any verb that changes the ribbon. A debug build also prints a warning once per clipped group |
 | `status-read {}` | read the tab's status line as an ordered `items` array of `{id, text}`: on a Project tab `state` (Ready/Edit/Busy), `new-tasks` (`New Tasks: …`) and `message`; on other tabs only `message` (a document's word-count stats are not reported) |
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items (`Info` only while the active tab is a document); `close` returns to the tab |
 | `convert {}` | File > Info > Convert on the active tab (#634), the same handler as the page's button: an imported Word 97-2003 document leaves Compatibility Mode (`compatibilityMode` 15 on the next save), its caption drops ` [Compatibility Mode]` and it is dirty. Answers `{status, caption, dirty}`; refused, with the tab's status line saying why, on a tab that is not in Compatibility Mode or not a document |
@@ -477,8 +478,15 @@ implemented`) instead of replying green over a no-op. `ribbon-click` resolves
 by id, else label, else the drawn text (`Σ AutoSum`), selects the tab and runs
 the button's own `run_sheet_act`. Buttons that open a bar (Filter, Custom
 Sort, Data Validation, …) leave it open for `type` and `key enter`, as a click
-does. The sheet ribbon has no split buttons, so `menu-open {"ribbon": …}`
-refuses a sheet tab. `sheet-ribbon.uit` covers these.
+does. Home > Editing's Sort & Filter is a drop-down (#1018): `menu-open
+{"target":{"ribbon":["Home","Editing","Sort & Filter"]}}` opens it (any other
+sheet button is refused: `'Paste' is not a drop-down on the sheet ribbon`) and
+`menu-click` picks an item. Its items are listed after the button in
+`ribbon-read` and `ribbon-click` takes their ids (`sort-a-z`, `custom-sort`,
+`filter`, `home-clear-filter`, `home-reapply-filter`) or labels, opening the menu
+and clicking the item through `menu_activate`. A name that is both a ribbon
+button and a menu item (`Clear`) resolves to the button. `sheet-ribbon.uit`
+and `ribbon-fit.uit` cover these.
 
 Levelling (Level, Level All, Clear Leveling, Ctrl+Shift+L) is asked for, not
 run, so the Project status bar can draw `Busy`; render schedules the pass for

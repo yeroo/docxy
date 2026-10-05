@@ -493,6 +493,24 @@ pub(crate) fn cell_menu() -> Vec<MenuItem> {
     ]
 }
 
+/// A sheet ribbon drop-down's menu (Sort & Filter), from the items of its
+/// `sheet_ribbon` table entry. An item shows the text its entry gives it
+/// (`Custom Sort...`) and runs the act the ribbon button would.
+pub(crate) fn sheet_dropdown(items: &[crate::sheet_ribbon::SheetCmd]) -> Vec<MenuItem> {
+    items
+        .iter()
+        .map(|c| {
+            MenuItem::Item(Entry::new(
+                c.id,
+                c.text(false),
+                "",
+                Act::Sheet(c.act),
+                c.enabled(),
+            ))
+        })
+        .collect()
+}
+
 /// A split button's drop-down, from its menu commands on the ribbon.
 pub(crate) fn split_menu(
     menu: &[ribbonspec::Cmd<Act>],

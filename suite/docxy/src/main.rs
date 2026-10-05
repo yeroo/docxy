@@ -61,6 +61,7 @@ mod project;
 mod recover;
 #[cfg(test)]
 mod ribbon_export;
+mod ribbon_layout;
 #[cfg(test)]
 mod sect_pr_tests;
 #[cfg(test)]
@@ -3464,6 +3465,8 @@ struct Probes {
     next: Vec<(String, Bounds<Pixels>)>,
     /// The last frame that finished — what `rect` answers from.
     last: Vec<(String, Bounds<Pixels>)>,
+    /// Ribbon groups already warned about as clipped (debug builds).
+    warned: std::collections::HashSet<String>,
 }
 
 impl Probes {
@@ -21663,19 +21666,26 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 rs::group(
                     "Show",
                     30,
-                    vec![rs::column(vec![
-                        cmdt("ruler", "rule", "Ruler", ToggleRuler, "").key("R"),
-                        cmdt("showhide", "paragraph", "Formatting marks", ShowHide, "").key("M"),
-                        cmdt("nav", "select-all", "Navigation", ToggleNav, "").key("N"),
-                        cmdt(
-                            "viewcomments",
-                            "comment",
-                            "Comments pane",
-                            ToggleComments,
-                            "",
-                        )
-                        .key("C"),
-                    ])],
+                    // Three rows to a column (#1018): the fourth button sits in the
+                    // next column, where the renderer used to wrap it.
+                    vec![
+                        rs::column(vec![
+                            cmdt("ruler", "rule", "Ruler", ToggleRuler, "").key("R"),
+                            cmdt("showhide", "paragraph", "Formatting marks", ShowHide, "")
+                                .key("M"),
+                            cmdt("nav", "select-all", "Navigation", ToggleNav, "").key("N"),
+                        ]),
+                        rs::column(vec![
+                            cmdt(
+                                "viewcomments",
+                                "comment",
+                                "Comments pane",
+                                ToggleComments,
+                                "",
+                            )
+                            .key("C"),
+                        ]),
+                    ],
                 ),
                 rs::group(
                     "Appearance",
@@ -24068,6 +24078,9 @@ impl Docxy {
     /// The split button whose primary is `primary_id`: where it is, and its
     /// menu with the live enabled and checked states.
     fn split_menu_for(&self, primary_id: &str) -> Option<(menu::MenuTarget, Vec<menu::MenuItem>)> {
+        if self.active_is_sheet() {
+            return self.sheet_menu_for(primary_id);
+        }
         // The arrow is drawn on the active tab only, and `menu-open`
         // selects the named tab first.
         let tab = self.active_ribbon_tab_def();
@@ -24141,6 +24154,28 @@ impl Docxy {
                 }),
                 _ => None,
             })
+        })
+    }
+
+    /// The sheet ribbon drop-down whose button is `primary_id` on the tab
+    /// shown now: where it is, and its menu from the `sheet_ribbon` table.
+    fn sheet_menu_for(&self, primary_id: &str) -> Option<(menu::MenuTarget, Vec<menu::MenuItem>)> {
+        let def = sheet_ribbon::tab_def(self.ribbon_tab);
+        let tab = ribbon_tab_set(Kind::Xlsx)
+            .iter()
+            .find(|(t, _, _)| *t == Some(def.tab))
+            .map_or("Home", |(_, name, _)| *name);
+        def.groups.iter().find_map(|group| {
+            let dd = group.dropdown(primary_id)?;
+            Some((
+                menu::MenuTarget::Ribbon {
+                    id: primary_id.into(),
+                    tab: tab.into(),
+                    group: group.title.into(),
+                    label: dd.button.label.into(),
+                },
+                menu::sheet_dropdown(dd.items),
+            ))
         })
     }
 
@@ -25685,46 +25720,57 @@ impl Docxy {
             sheet_ribbon::Gap::Px(v) => d.gap(px(v)),
             sheet_ribbon::Gap::Rem(v) => d.gap(rems(v)),
         };
+        let probes = &self.probes;
+        let content = |i: usize| probe(probes, format!("ribbon-content:{}:{i}", g.title));
         let body = match &g.body {
             Body::Strip {
                 gap: strip_gap,
                 items,
             } => {
                 let mut strip = gap(h_flex().h_full().items_center(), *strip_gap);
-                for item in *items {
+                for (i, item) in items.iter().enumerate() {
                     strip = strip.child(match item {
                         Item::One(c) => self.sheet_cmd_el(c, xf, pal, cx),
-                        Item::Col { gap: col_gap, cmds } => gap(v_flex(), *col_gap)
-                            .children(cmds.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
+                        Item::Col(c) => gap(v_flex(), c.gap)
+                            .relative()
+                            .children(c.cmds.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
+                            .child(content(i))
                             .into_any_element(),
+                        Item::Menu(m) => self.sheet_dropdown_btn(&m.button, pal, cx),
                     });
                 }
                 strip.into_any_element()
             }
-            Body::Rows(rows) => v_flex()
+            Body::Rows(r) => v_flex()
+                .relative()
                 .gap(px(1.))
-                .children(rows.iter().map(|r| {
+                .children(r.rows.iter().map(|r| {
                     h_flex()
                         .items_center()
                         .gap(px(2.))
                         .children(r.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
                 }))
+                .child(content(0))
                 .into_any_element(),
         };
         v_flex()
+            .relative()
             .h(px(94.))
             .px_1p5()
             .py(px(3.))
             .justify_between()
             .border_r_1()
             .border_color(pal.border)
+            .child(probe(&self.probes, format!("ribbon-group:{}", g.title)))
             .child(div().flex_1().flex().items_center().child(body))
             .child(match titles {
                 sheet_ribbon::Titles::WithLaunchers => h_flex()
+                    .relative()
                     .w_full()
                     .items_center()
                     .justify_center()
                     .gap_1()
+                    .child(probe(&self.probes, format!("ribbon-title:{}", g.title)))
                     .child(div().text_size(px(10.)).text_color(pal.dim).child(g.title))
                     .when(g.launcher, |d| {
                         d.child(
@@ -25736,13 +25782,50 @@ impl Docxy {
                     })
                     .into_any_element(),
                 sheet_ribbon::Titles::Plain => div()
+                    .relative()
                     .w_full()
                     .text_size(px(10.))
                     .text_color(pal.dim)
                     .text_center()
+                    .child(probe(&self.probes, format!("ribbon-title:{}", g.title)))
                     .child(g.title)
                     .into_any_element(),
             })
+            .into_any_element()
+    }
+
+    /// A Large sheet ribbon button that opens a drop-down (Sort & Filter): a
+    /// press anywhere on it opens its menu, or shuts it when it is the one
+    /// open, as the document ribbon's drop-downs do.
+    fn sheet_dropdown_btn(
+        &self,
+        c: &sheet_ribbon::SheetCmd,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let sheet_ribbon::Shape::Menu(icon) = c.shape else {
+            unreachable!("only a Shape::Menu command is drawn as a drop-down")
+        };
+        let id = c.id;
+        div()
+            .id(SharedString::from(format!("{id}-dropdown")))
+            .relative()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_0p5()
+            .min_w(px(40.))
+            .h_full()
+            .px_1p5()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|d| d.bg(pal.hover))
+            .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
+            .child(probe(&self.probes, format!("ribbon-split:{id}")))
+            .when_some(icon, |d, ic| d.child(icon_svg(ic, 22., pal.fg)))
+            .child(menu_button_label(c.label, pal.fg))
+            .on_mouse_down(MouseButton::Left, menu_toggle(id, cx))
             .into_any_element()
     }
 
@@ -25757,6 +25840,7 @@ impl Docxy {
         use sheet_ribbon::Shape;
         let text = c.text(self.sheet_act_toggled(c.act));
         match c.shape {
+            Shape::Menu(_) => self.sheet_dropdown_btn(c, pal, cx),
             Shape::Large(icon) => self.sheet_lb(icon, text, c.act, pal, cx),
             Shape::Row(icon) => self.sheet_rb(icon, text, c.act, pal, cx),
             Shape::Icon(icon) => {
@@ -25778,12 +25862,18 @@ impl Docxy {
         let controls: Vec<AnyElement> = g
             .items
             .iter()
-            .map(|c| self.render_control(c, icon_only, pal, cx))
+            .enumerate()
+            .map(|(i, c)| {
+                let content = probe(&self.probes, format!("ribbon-content:{}:{i}", g.title));
+                self.render_control(c, icon_only, content, pal, cx)
+            })
             .collect();
         // group title row + optional dialog-box launcher (⤢)
         let title_row = h_flex()
+            .relative()
             .items_center()
             .gap_1()
+            .child(probe(&self.probes, format!("ribbon-title:{}", g.title)))
             .child(div().text_size(px(9.)).text_color(pal.dim).child(g.title))
             .when_some(g.launcher, |d, act| {
                 d.child(
@@ -25799,6 +25889,7 @@ impl Docxy {
                 )
             });
         v_flex()
+            .relative()
             .items_center()
             .justify_between()
             .h_full()
@@ -25807,15 +25898,19 @@ impl Docxy {
             .gap_0p5()
             .border_r_1()
             .border_color(pal.border)
+            .child(probe(&self.probes, format!("ribbon-group:{}", g.title)))
             .child(h_flex().flex_1().items_center().gap_1().children(controls))
             .child(title_row)
             .into_any_element()
     }
 
+    /// `content` is the probe that measures a column or a rows stack, the two
+    /// controls whose height grows with their rows (`ribbon-layout`).
     fn render_control(
         &self,
         c: &Control<Act>,
         icon_only: bool,
+        content: AnyElement,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -25841,9 +25936,11 @@ impl Docxy {
                     })
                     .collect();
                 h_flex()
+                    .relative()
                     .items_start()
                     .gap_1()
                     .children(cols)
+                    .child(content)
                     .into_any_element()
             }
             // The Office two-row layout: each inner Vec is one left-to-right row.
@@ -25859,9 +25956,11 @@ impl Docxy {
                     })
                     .collect();
                 v_flex()
+                    .relative()
                     .items_start()
                     .gap(px(2.))
                     .children(rendered)
+                    .child(content)
                     .into_any_element()
             }
             Control::Gallery(gal) if gal.id == "tablestyles" => {
@@ -27220,6 +27319,15 @@ impl Render for Docxy {
         {
             let mut p = self.probes.borrow_mut();
             p.last = std::mem::take(&mut p.next);
+            // A debug build says so, once per group, when a ribbon group's
+            // content is taller than its body (#1018).
+            if cfg!(debug_assertions) {
+                for title in ribbon_layout::warn_clipped(&p) {
+                    if p.warned.insert(title.clone()) {
+                        eprintln!("docxy: ribbon group {title:?} content is taller than its body");
+                    }
+                }
+            }
         }
         // Apply the theme choice (Auto follows the OS appearance).
         let desired = self.theme_pref.resolve(window.appearance());

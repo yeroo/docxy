@@ -1614,7 +1614,7 @@ fn resolve_sheet_command(
     app: &crate::Docxy,
     tab_name: &str,
     query: &str,
-) -> Result<(crate::RibbonTab, crate::SheetAct), String> {
+) -> Result<(crate::RibbonTab, &'static crate::sheet_ribbon::SheetCmd), String> {
     if tab_name == "File" {
         return Err("File is backstage; use the backstage verb".into());
     }
@@ -1622,7 +1622,74 @@ fn resolve_sheet_command(
     let commands = crate::sheet_ribbon::tab_def(tab).commands();
     let cmd =
         crate::sheet_ribbon::resolve(&commands, tab_name, query, |act| app.sheet_act_toggled(act))?;
-    Ok((tab, cmd.act))
+    Ok((tab, cmd))
+}
+
+/// Press sheet ribbon command `cmd` as a person would. A drop-down's button
+/// opens its menu; an item of a menu opens the menu and clicks the item, both
+/// through the entry points `menu-open` and `menu-click` use.
+fn click_sheet_command(
+    app: &mut crate::Docxy,
+    tab: crate::RibbonTab,
+    cmd: &'static crate::sheet_ribbon::SheetCmd,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) -> Result<(), String> {
+    let def = crate::sheet_ribbon::tab_def(tab);
+    let owner = def.groups.iter().find_map(|g| g.menu_owner(cmd));
+    let opens = owner
+        .map(|m| m.button.id)
+        .or_else(|| matches!(cmd.shape, crate::sheet_ribbon::Shape::Menu(_)).then_some(cmd.id));
+    let Some(id) = opens else {
+        app.run_sheet_act(cmd.act, window, cx);
+        return Ok(());
+    };
+    let anchor = crate::split_menu_anchor(&app.probes.borrow(), id);
+    let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
+    app.open_split_menu(id, at, cx)?;
+    if let Some(m) = owner {
+        let i = m
+            .items
+            .iter()
+            .position(|c| c.id == cmd.id)
+            .ok_or("the drop-down does not list its own item")?;
+        app.menu_activate(&[i], window, cx)?;
+    }
+    Ok(())
+}
+
+/// `menu-open {"ribbon":[tab, group, label]}` on the sheet ribbon: the
+/// drop-down button `label` in `group`.
+fn sheet_menu_open(
+    app: &mut crate::Docxy,
+    tab: &str,
+    group: &str,
+    label: &str,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) -> Result<(), String> {
+    let ribbon_tab = ribbon_tab_by_name(crate::Kind::Xlsx, tab)?;
+    let def = crate::sheet_ribbon::tab_def(ribbon_tab);
+    let g = def
+        .groups
+        .iter()
+        .find(|g| g.title == group)
+        .ok_or_else(|| format!("no group '{group}' on tab '{tab}'"))?;
+    let id = g
+        .commands()
+        .into_iter()
+        .find(|c| !c.in_menu && c.label == label)
+        .ok_or_else(|| format!("no command '{label}' in group '{group}'"))?
+        .id;
+    if g.dropdown(id).is_none() {
+        return Err(format!(
+            "'{label}' is not a drop-down on the sheet ribbon (Sort & Filter is)"
+        ));
+    }
+    app.select_ribbon_tab(ribbon_tab, window, cx);
+    let anchor = crate::split_menu_anchor(&app.probes.borrow(), id);
+    let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
+    app.open_split_menu(id, at, cx)
 }
 
 /// The live status-line items in the order the app draws them.
@@ -2222,7 +2289,7 @@ fn menu_open(
                     return Err("'ribbon' must be [tab, group, command]".into());
                 };
                 if ribbon_surface(app)? == RibbonSurface::Sheet {
-                    return Err("the sheet ribbon has no split buttons".into());
+                    return sheet_menu_open(app, tab, group, label, window, cx);
                 }
                 let def = ribbon_tab_def(app, tab)?;
                 let id = split_primary(&def, group, label)?;
@@ -3043,6 +3110,60 @@ fn dispatch_verb(
             RibbonSurface::Model => Done::ok(ribbon_json(app)),
             RibbonSurface::Sheet => Done::ok(sheet_ribbon_json(app)),
         },
+        // Where each group of the shown ribbon tab drew its content, from the
+        // last frame (settle with a `shot` first, as for `title-bar`).
+        "ribbon-layout" => {
+            let surface = ribbon_surface(app)?;
+            // `tab` shows that tab first, as `ribbon-click` does. Its groups
+            // are drawn a frame later, so that call answers `settled: false`
+            // and a `shot window` then a second call reads them.
+            if let Some(want) = args.get("tab") {
+                let want = want.as_str().ok_or("'tab' must be a tab name")?;
+                let kind = match surface {
+                    RibbonSurface::Sheet => crate::Kind::Xlsx,
+                    RibbonSurface::Model => app.ribbon_kind(),
+                };
+                let tab = ribbon_tab_by_name(kind, want)?;
+                if tab != app.ribbon_tab {
+                    app.select_ribbon_tab(tab, window, cx);
+                    cx.notify();
+                    return Done::ok(Json::obj(vec![
+                        ("tab", Json::Str(want.into())),
+                        ("settled", Json::Bool(false)),
+                        ("any_clipped_v", Json::Bool(false)),
+                        ("any_clipped_h", Json::Bool(false)),
+                        ("groups", Json::Arr(Vec::new())),
+                    ]));
+                }
+            }
+            let (name, titles): (String, Vec<&str>) = match surface {
+                RibbonSurface::Sheet => {
+                    let def = crate::sheet_ribbon::tab_def(app.ribbon_tab);
+                    let name = crate::ribbon_tab_set(crate::Kind::Xlsx)
+                        .iter()
+                        .find(|(t, _, _)| *t == Some(def.tab))
+                        .map_or("Home", |(_, n, _)| *n);
+                    (name.into(), def.groups.iter().map(|g| g.title).collect())
+                }
+                RibbonSurface::Model => {
+                    let def = app.active_ribbon_tab_def();
+                    (
+                        def.name.into(),
+                        def.groups.iter().map(|g| g.title).collect(),
+                    )
+                }
+            };
+            let probes = app.probes.borrow();
+            if !probes
+                .last
+                .iter()
+                .any(|(n, _)| n.starts_with("ribbon-group:"))
+            {
+                return Err("the ribbon has not been laid out yet".into());
+            }
+            let measured = crate::ribbon_layout::measure(&probes.last);
+            Done::ok(crate::ribbon_layout::layout_json(&name, &titles, &measured))
+        }
         "ribbon-click" => {
             app.refuse_under_dialog()?;
             let surface = ribbon_surface(app)?;
@@ -3050,9 +3171,9 @@ fn dispatch_verb(
             let command = arg_str(args, "command")?.to_string();
             if surface == RibbonSurface::Sheet {
                 // The button's own click: select its tab, then run its act.
-                let (ribbon_tab, act) = resolve_sheet_command(app, &tab, &command)?;
+                let (ribbon_tab, cmd) = resolve_sheet_command(app, &tab, &command)?;
                 app.select_ribbon_tab(ribbon_tab, window, cx);
-                app.run_sheet_act(act, window, cx);
+                click_sheet_command(app, ribbon_tab, cmd, window, cx)?;
                 return Done::ok(state(app, window));
             }
             let act = resolve_ribbon_command(app, &tab, &command)?;
@@ -4881,6 +5002,7 @@ mod tests {
             "key",
             "type",
             "ribbon-read",
+            "ribbon-layout",
             "clipboard",
             "dialog-read",
             "status-read",

@@ -46,7 +46,7 @@ test sheet ribbon refuses a placeholder, a missing command and a split menu
   call-error ribbon-click {"tab":"Review","command":"Spelling"} => 'Spelling' is not implemented
   call-error ribbon-click {"tab":"Home","command":"Spelling"} => command 'Spelling' is not on tab 'Home'
   call-error ribbon-click {"tab":"Table","command":"Bold"} => 'Table' is not a ribbon tab
-  call-error menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}} => the sheet ribbon has no split buttons
+  call-error menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}} => 'Paste' is not a drop-down on the sheet ribbon
 
 # Excel's Data tab (#696): Sort & Filter, Data Tools and Outline, in Excel's
 # order and under Excel's names.
@@ -126,3 +126,67 @@ test sheet ribbon data tab refuses its placeholders
   open ../fixtures/basic.xlsx
   call-error ribbon-click {"tab":"Data","command":"Flash Fill"} => 'Flash Fill' is not implemented
   call-error ribbon-click {"tab":"Data","command":"Circle Invalid Data"} => 'Circle Invalid Data' is not implemented
+
+# Home > Editing is Excel's (#1018): the AutoSum / Fill / Clear column, one
+# large Sort & Filter drop-down holding the sort and filter commands, and Find
+# & Select. Remove Duplicates is only on Data > Data Tools.
+test sheet Home Editing group matches Excel
+  open ../fixtures/basic.xlsx
+  call ribbon-read {}
+  assert reply.tabs.1.groups.6.title is Editing
+  assert reply.tabs.1.groups.6.commands.0.id is autosum
+  assert reply.tabs.1.groups.6.commands.1.id is fill
+  assert reply.tabs.1.groups.6.commands.2.id is clear
+  assert reply.tabs.1.groups.6.commands.3.label is Sort & Filter
+  assert reply.tabs.1.groups.6.commands.3.enabled is true
+  assert reply.tabs.1.groups.6.commands.4.id is sort-a-z
+  assert reply.tabs.1.groups.6.commands.5.id is sort-z-a
+  assert reply.tabs.1.groups.6.commands.6.id is custom-sort
+  assert reply.tabs.1.groups.6.commands.7.id is filter
+  assert reply.tabs.1.groups.6.commands.8.label is Clear
+  assert reply.tabs.1.groups.6.commands.9.label is Reapply
+  assert reply.tabs.1.groups.6.commands.10.label is Find & Select
+
+test sheet Home Sort & Filter drop-down opens and runs Sort A to Z
+  open ../fixtures/basic.xlsx
+  click A2
+  call menu-open {"target":{"ribbon":["Home","Editing","Sort & Filter"]}}
+  call menu-read {}
+  assert reply.open is true
+  assert reply.items.0.label is Sort A to Z
+  assert reply.items.2.label is Custom Sort...
+  assert reply.items.5.label is Reapply
+  call menu-click {"label":"Sort A to Z"}
+  assert dirty is true
+  assert cell A2 is East
+
+test sheet Home ribbon-click reaches a Sort & Filter menu item by id and by label
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Sort Z to A"}
+  assert cell B2 is 40
+  click A2
+  call ribbon-click {"tab":"Home","command":"sort-a-z"}
+  assert cell A2 is East
+
+test sheet Home Clear stays the AutoSum column's button
+  open ../fixtures/basic.xlsx
+  call-error ribbon-click {"tab":"Home","command":"Clear"} => 'Clear' is not implemented
+
+test sheet Home has no Remove Duplicates and Data keeps it
+  open ../fixtures/basic.xlsx
+  call-error ribbon-click {"tab":"Home","command":"Remove Duplicates"} => command 'Remove Duplicates' is not on tab 'Home'
+  call ribbon-read {}
+  assert reply.tabs.3.groups.1.commands.2.label is Remove Duplicates
+
+# The measured guard: each group records where its content landed, and
+# ribbon-layout says whether it fits. A fourth button in a column makes
+# clipped_v true.
+test sheet Home ribbon: no group is clipped vertically
+  open ../fixtures/basic.xlsx
+  call window-size {"w":1600,"h":900}
+  shot window
+  call ribbon-layout {}
+  assert reply.tab is Home
+  assert reply.groups.6.title is Editing
+  assert reply.any_clipped_v is false

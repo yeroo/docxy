@@ -12,6 +12,10 @@
 //! group is either a strip of buttons and button columns (`Body::Strip`) or a
 //! stack of small-button rows (`Body::Rows`), and each keeps the spacing it was
 //! drawn with before it became a table.
+//!
+//! The ribbon body fits three small rows. A column or a rows stack is built only
+//! through [`col`] and [`rows`], `const fn`s that assert `len <= 3`: a table
+//! with a fourth row does not compile (#1018).
 
 use crate::{RibbonTab, SheetAct};
 
@@ -38,6 +42,9 @@ pub(crate) enum Shape {
     Combo { value: &'static str, wide: bool },
     /// The Number group's format combo, showing the selection's format.
     NumFmt,
+    /// A Large button that opens a drop-down (Sort & Filter); its items are
+    /// the group's [`Dropdown`].
+    Menu(Option<&'static str>),
 }
 
 /// One sheet ribbon command.
@@ -54,6 +61,8 @@ pub(crate) struct SheetCmd {
     pub alt: Option<&'static str>,
     pub shape: Shape,
     pub act: SheetAct,
+    /// Listed in a drop-down's menu, not drawn on the ribbon itself.
+    pub in_menu: bool,
 }
 
 impl SheetCmd {
@@ -76,7 +85,7 @@ impl SheetCmd {
     /// Whether the command does anything yet. `Todo` buttons are drawn, but
     /// clicking one is a no-op, so the harness lists them disabled.
     pub fn enabled(&self) -> bool {
-        !matches!(self.act, SheetAct::Todo)
+        !matches!(self.act, SheetAct::Todo) || matches!(self.shape, Shape::Menu(_))
     }
 }
 
@@ -84,14 +93,76 @@ impl SheetCmd {
 pub(crate) enum Body {
     /// Buttons and button columns side by side.
     Strip { gap: Gap, items: &'static [Item] },
-    /// Rows of small buttons, stacked.
-    Rows(&'static [&'static [SheetCmd]]),
+    /// Rows of small buttons, stacked (built by [`rows`]).
+    Rows(RowStack),
 }
+
+/// The most small-button rows a column or a rows stack holds: what the 100 px
+/// ribbon body fits.
+pub(crate) const MAX_COL_ROWS: usize = ribbonspec::MAX_COLUMN_ROWS;
 
 /// One slot of a `Body::Strip`.
 pub(crate) enum Item {
     One(SheetCmd),
-    Col { gap: Gap, cmds: &'static [SheetCmd] },
+    /// A column of small buttons (built by [`col`]).
+    Col(Column),
+    /// A Large drop-down button and its menu (built by [`menu`]).
+    Menu(Dropdown),
+}
+
+/// A button column of at most [`MAX_COL_ROWS`] rows. The fields are readable;
+/// the only way to make one is [`col`].
+pub(crate) struct Column {
+    pub gap: Gap,
+    pub cmds: &'static [SheetCmd],
+    _built_by_col: (),
+}
+
+/// A stack of at most [`MAX_COL_ROWS`] rows of small buttons; made by [`rows`].
+pub(crate) struct RowStack {
+    pub rows: &'static [&'static [SheetCmd]],
+    _built_by_rows: (),
+}
+
+/// A Large drop-down button and the items of its menu; made by [`menu`].
+pub(crate) struct Dropdown {
+    pub button: SheetCmd,
+    pub items: &'static [SheetCmd],
+    _built_by_menu: (),
+}
+
+/// A button column. A fourth row fails the build where the table is a `const`.
+pub(crate) const fn col(gap: Gap, cmds: &'static [SheetCmd]) -> Item {
+    assert!(
+        cmds.len() <= MAX_COL_ROWS,
+        "a ribbon column holds at most 3 rows"
+    );
+    Item::Col(Column {
+        gap,
+        cmds,
+        _built_by_col: (),
+    })
+}
+
+/// A stack of small-button rows; as [`col`], at most three.
+pub(crate) const fn rows(rows: &'static [&'static [SheetCmd]]) -> Body {
+    assert!(
+        rows.len() <= MAX_COL_ROWS,
+        "a ribbon rows stack holds at most 3 rows"
+    );
+    Body::Rows(RowStack {
+        rows,
+        _built_by_rows: (),
+    })
+}
+
+/// A Large drop-down: `button` opens a menu of `items`.
+pub(crate) const fn menu(button: SheetCmd, items: &'static [SheetCmd]) -> Item {
+    Item::Menu(Dropdown {
+        button,
+        items,
+        _built_by_menu: (),
+    })
 }
 
 pub(crate) struct Group {
@@ -117,18 +188,48 @@ pub(crate) enum Titles {
 }
 
 impl Group {
-    /// The group's commands in drawn order.
+    /// The group's commands in drawn order; a drop-down's items follow its
+    /// button.
     pub fn commands(&self) -> Vec<&'static SheetCmd> {
         match &self.body {
-            Body::Strip { items, .. } => items
-                .iter()
-                .flat_map(|item| match item {
-                    Item::One(cmd) => std::slice::from_ref(cmd),
-                    Item::Col { cmds, .. } => cmds,
-                })
-                .collect(),
-            Body::Rows(rows) => rows.iter().flat_map(|r| r.iter()).collect(),
+            Body::Strip { items, .. } => {
+                let mut out = Vec::new();
+                for item in *items {
+                    match item {
+                        Item::One(cmd) => out.push(cmd),
+                        Item::Col(c) => out.extend(c.cmds),
+                        Item::Menu(m) => {
+                            out.push(&m.button);
+                            out.extend(m.items);
+                        }
+                    }
+                }
+                out
+            }
+            Body::Rows(r) => r.rows.iter().flat_map(|r| r.iter()).collect(),
         }
+    }
+
+    /// The drop-down whose button is `id`.
+    pub fn dropdown(&self, id: &str) -> Option<&'static Dropdown> {
+        let Body::Strip { items, .. } = &self.body else {
+            return None;
+        };
+        items.iter().find_map(|item| match item {
+            Item::Menu(m) if m.button.id == id => Some(m),
+            _ => None,
+        })
+    }
+
+    /// The drop-down that lists `item`.
+    pub fn menu_owner(&self, item: &SheetCmd) -> Option<&'static Dropdown> {
+        let Body::Strip { items, .. } = &self.body else {
+            return None;
+        };
+        items.iter().find_map(|i| match i {
+            Item::Menu(m) if m.items.iter().any(|c| c.id == item.id) => Some(m),
+            _ => None,
+        })
     }
 }
 
@@ -147,7 +248,34 @@ const fn cmd(id: &'static str, label: &'static str, shape: Shape, act: SheetAct)
         alt: None,
         shape,
         act,
+        in_menu: false,
     }
+}
+
+/// An item of a drop-down menu, named as its menu shows it.
+const fn menu_item(id: &'static str, label: &'static str, act: SheetAct) -> SheetCmd {
+    SheetCmd {
+        in_menu: true,
+        ..cmd(id, label, Shape::Row(None), act)
+    }
+}
+
+/// A menu item whose menu text differs from its name.
+const fn menu_item_as(
+    id: &'static str,
+    label: &'static str,
+    text: &'static str,
+    act: SheetAct,
+) -> SheetCmd {
+    SheetCmd {
+        text: Some(text),
+        ..menu_item(id, label, act)
+    }
+}
+
+/// A Large button that opens a menu.
+const fn drop_large(id: &'static str, label: &'static str, icon: Option<&'static str>) -> SheetCmd {
+    cmd(id, label, Shape::Menu(icon), SheetAct::Todo)
 }
 
 const fn large(
@@ -238,21 +366,21 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                     gap: GAP_1,
                     items: &[
                         Item::One(large("paste", "Paste", Some("paste"), SheetAct::Paste)),
-                        Item::Col {
-                            gap: COL,
-                            cmds: &[
+                        col(
+                            COL,
+                            &[
                                 row("cut", "Cut", Some("cut"), SheetAct::Cut),
                                 row("copy", "Copy", Some("copy"), SheetAct::Copy),
                                 row("format-painter", "Format Painter", None, SheetAct::Todo),
                             ],
-                        },
+                        ),
                     ],
                 },
             },
             Group {
                 title: "Font",
                 launcher: true,
-                body: Body::Rows(&[
+                body: rows(&[
                     &[
                         combo("font-name", "Font", "Calibri", true),
                         combo("font-size", "Font Size", "11", false),
@@ -292,7 +420,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Alignment",
                 launcher: true,
-                body: Body::Rows(&[
+                body: rows(&[
                     &[
                         glyph("top-align", "Top Align", "\u{2580}", SheetAct::Todo),
                         glyph("middle-align", "Middle Align", "\u{25AC}", SheetAct::Todo),
@@ -322,7 +450,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Number",
                 launcher: true,
-                body: Body::Rows(&[
+                body: rows(&[
                     &[cmd(
                         "number-format",
                         "Number Format",
@@ -381,20 +509,20 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                 body: Body::Strip {
                     gap: GAP_2,
                     items: &[
-                        Item::Col {
-                            gap: GAP_0P5,
-                            cmds: &[
+                        col(
+                            GAP_0P5,
+                            &[
                                 row("insert-row", "Insert Row", None, SheetAct::InsertRow),
                                 row("insert-col", "Insert Col", None, SheetAct::InsertCol),
                             ],
-                        },
-                        Item::Col {
-                            gap: GAP_0P5,
-                            cmds: &[
+                        ),
+                        col(
+                            GAP_0P5,
+                            &[
                                 row("delete-row", "Delete Row", None, SheetAct::DeleteRow),
                                 row("delete-col", "Delete Col", None, SheetAct::DeleteCol),
                             ],
-                        },
+                        ),
                         Item::One(large("format", "Format", None, SheetAct::FormatCells)),
                     ],
                 },
@@ -405,9 +533,9 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
-                        Item::Col {
-                            gap: COL,
-                            cmds: &[
+                        col(
+                            COL,
+                            &[
                                 row_as(
                                     "autosum",
                                     "AutoSum",
@@ -418,41 +546,27 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                 row("fill", "Fill", None, SheetAct::Todo),
                                 row("clear", "Clear", Some("clear-format"), SheetAct::Todo),
                             ],
-                        },
-                        Item::Col {
-                            gap: COL,
-                            cmds: &[
-                                row_as(
-                                    "sort-a-z",
-                                    "Sort A to Z",
-                                    "Sort A \u{2192} Z",
-                                    Some("sort"),
-                                    SheetAct::SortAsc,
-                                ),
-                                row_as(
-                                    "sort-z-a",
-                                    "Sort Z to A",
-                                    "Sort Z \u{2192} A",
-                                    Some("sort"),
-                                    SheetAct::SortDesc,
-                                ),
-                                row_as(
+                        ),
+                        menu(
+                            drop_large("sort-filter", "Sort & Filter", Some("sort")),
+                            &[
+                                menu_item("sort-a-z", "Sort A to Z", SheetAct::SortAsc),
+                                menu_item("sort-z-a", "Sort Z to A", SheetAct::SortDesc),
+                                menu_item_as(
                                     "custom-sort",
                                     "Custom Sort",
-                                    "Custom Sort\u{2026}",
-                                    Some("sort"),
+                                    "Custom Sort...",
                                     SheetAct::CustomSort,
                                 ),
-                                row("filter", "Filter", None, SheetAct::Filter),
-                                row_as(
-                                    "remove-duplicates",
-                                    "Remove Duplicates",
-                                    "Remove Dup",
-                                    None,
-                                    SheetAct::RemoveDuplicates,
+                                menu_item("filter", "Filter", SheetAct::Filter),
+                                menu_item("home-clear-filter", "Clear", SheetAct::ClearFilter),
+                                menu_item(
+                                    "home-reapply-filter",
+                                    "Reapply",
+                                    SheetAct::ReapplyFilter,
                                 ),
                             ],
-                        },
+                        ),
                         Item::One(large(
                             "find-select",
                             "Find & Select",
@@ -538,9 +652,9 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
-                        Item::Col {
-                            gap: COL,
-                            cmds: &[
+                        col(
+                            COL,
+                            &[
                                 row_as(
                                     "data-sort-a-z",
                                     "Sort A to Z",
@@ -556,7 +670,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                     SheetAct::SortDesc,
                                 ),
                             ],
-                        },
+                        ),
                         Item::One(large(
                             "data-sort",
                             "Sort",
@@ -564,9 +678,9 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             SheetAct::CustomSort,
                         )),
                         Item::One(large("data-filter", "Filter", None, SheetAct::Filter)),
-                        Item::Col {
-                            gap: COL,
-                            cmds: &[
+                        col(
+                            COL,
+                            &[
                                 row("clear-filter", "Clear", None, SheetAct::ClearFilter),
                                 row("reapply-filter", "Reapply", None, SheetAct::ReapplyFilter),
                                 row(
@@ -576,7 +690,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                     SheetAct::AdvancedFilter,
                                 ),
                             ],
-                        },
+                        ),
                     ],
                 },
             },
@@ -593,9 +707,9 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             SheetAct::TextToColumns,
                         )),
                         // Flash Fill is #666.
-                        Item::Col {
-                            gap: COL,
-                            cmds: &[
+                        col(
+                            COL,
+                            &[
                                 row("flash-fill", "Flash Fill", None, SheetAct::Todo),
                                 row(
                                     "data-remove-duplicates",
@@ -604,7 +718,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                     SheetAct::RemoveDuplicates,
                                 ),
                             ],
-                        },
+                        ),
                         Item::One(large(
                             "data-validation",
                             "Data Validation",
@@ -613,9 +727,9 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                         )),
                         // Excel keeps these under Data Validation's split
                         // button; this ribbon has none, so they follow it (#689).
-                        Item::Col {
-                            gap: COL,
-                            cmds: &[
+                        col(
+                            COL,
+                            &[
                                 row(
                                     "circle-invalid",
                                     "Circle Invalid Data",
@@ -629,7 +743,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                     SheetAct::Todo,
                                 ),
                             ],
-                        },
+                        ),
                         Item::One(large(
                             "consolidate",
                             "Consolidate",
@@ -648,16 +762,16 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                         Item::One(large("group", "Group", None, SheetAct::Group)),
                         Item::One(large("ungroup", "Ungroup", None, SheetAct::Ungroup)),
                         Item::One(large("subtotal", "Subtotal", None, SheetAct::Subtotal)),
-                        Item::Col {
-                            gap: COL,
-                            cmds: &[
+                        col(
+                            COL,
+                            &[
                                 row("show-detail", "Show Detail", None, SheetAct::ShowDetail),
                                 row("hide-detail", "Hide Detail", None, SheetAct::HideDetail),
                             ],
-                        },
-                        Item::Col {
-                            gap: COL,
-                            cmds: &[
+                        ),
+                        col(
+                            COL,
+                            &[
                                 row("auto-outline", "Auto Outline", None, SheetAct::AutoOutline),
                                 row(
                                     "clear-outline",
@@ -672,7 +786,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                     SheetAct::OutlineSettings,
                                 ),
                             ],
-                        },
+                        ),
                     ],
                 },
             },
@@ -681,7 +795,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Show Level",
                 launcher: false,
-                body: Body::Rows(&[
+                body: rows(&[
                     &[
                         glyph("level-1", "Show Level 1", "1", SheetAct::ShowLevel(1)),
                         glyph("level-2", "Show Level 2", "2", SheetAct::ShowLevel(2)),
@@ -834,6 +948,14 @@ pub(crate) fn resolve<'a>(
         })
         .find(|m| !m.is_empty())
         .unwrap_or_default();
+    // A menu item may repeat the name of a ribbon button (Home's AutoSum
+    // column has a Clear, so does Sort & Filter): the button wins.
+    let on_ribbon: Vec<&'a SheetCmd> = matches.iter().copied().filter(|c| !c.in_menu).collect();
+    let matches = if on_ribbon.len() == 1 {
+        on_ribbon
+    } else {
+        matches
+    };
     match matches.as_slice() {
         [only] if !only.enabled() => Err(format!(
             "'{}' is not implemented",
@@ -885,7 +1007,9 @@ mod tests {
         for tab in SHEET_RIBBON {
             for toggled in [false, true] {
                 let mut seen = HashSet::new();
-                for c in tab.commands() {
+                // A menu item may repeat a ribbon button's name (Home's Clear);
+                // `resolve` prefers the button.
+                for c in tab.commands().into_iter().filter(|c| !c.in_menu) {
                     assert!(
                         seen.insert(c.label(toggled)),
                         "label {} repeats on a tab",
@@ -1043,6 +1167,119 @@ mod tests {
             resolve(&[&A, &B], "Home", "Same", |_| false).unwrap_err(),
             "command 'Same' is ambiguous on tab 'Home': a, b"
         );
+    }
+
+    /// The most small-button rows a column or a rows stack holds: three fit the
+    /// ribbon body (#1018). Names the tab, the group and the count.
+    #[test]
+    fn no_ribbon_column_has_more_than_three_rows() {
+        let mut bad: Vec<String> = Vec::new();
+        for tab in SHEET_RIBBON {
+            let name = ribbon_tab_set(Kind::Xlsx)
+                .iter()
+                .find(|(t, _, _)| *t == Some(tab.tab))
+                .map_or("Home", |(_, n, _)| *n);
+            for g in tab.groups {
+                if let Body::Rows(r) = &g.body {
+                    if r.rows.len() > MAX_COL_ROWS {
+                        bad.push(format!(
+                            "sheet tab '{name}', group '{}': {} rows (max {MAX_COL_ROWS})",
+                            g.title,
+                            r.rows.len()
+                        ));
+                    }
+                }
+                if let Body::Strip { items, .. } = &g.body {
+                    for item in *items {
+                        if let Item::Col(c) = item {
+                            if c.cmds.len() > MAX_COL_ROWS {
+                                bad.push(format!(
+                                    "sheet tab '{name}', group '{}': {} rows (max {MAX_COL_ROWS})",
+                                    g.title,
+                                    c.cmds.len()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The document and Project ribbons, and the tabs that appear in context.
+        for kind in [Kind::Docx, Kind::Project] {
+            bad.extend(crate::ribbon_for(kind).row_violations());
+        }
+        for tab in [
+            crate::table_tab::table_design_tab(),
+            crate::table_tab::table_layout_tab(),
+            crate::hf_tab::hf_tab(),
+            crate::gantt_format_tab(),
+        ] {
+            bad.extend(tab.row_violations());
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn home_editing_matches_excel() {
+        let home = tab_def(RibbonTab::Home);
+        let g = home.groups.iter().find(|g| g.title == "Editing").unwrap();
+        let Body::Strip { items, .. } = &g.body else {
+            panic!("Editing is a strip");
+        };
+        let [Item::Col(col_), Item::Menu(sort), Item::One(find)] = items else {
+            panic!("Editing is a column, a drop-down and a button");
+        };
+        let ids = |c: &[SheetCmd]| c.iter().map(|c| c.label).collect::<Vec<_>>();
+        assert_eq!(ids(col_.cmds), ["AutoSum", "Fill", "Clear"]);
+        assert!(matches!(sort.button.shape, Shape::Menu(_)));
+        assert_eq!(sort.button.label, "Sort & Filter");
+        assert_eq!(
+            sort.items.iter().map(|c| c.text(false)).collect::<Vec<_>>(),
+            [
+                "Sort A to Z",
+                "Sort Z to A",
+                "Custom Sort...",
+                "Filter",
+                "Clear",
+                "Reapply"
+            ]
+        );
+        assert!(matches!(find.shape, Shape::Large(_)));
+        assert_eq!(find.label, "Find & Select");
+        assert!(
+            home.commands()
+                .iter()
+                .all(|c| c.act != SheetAct::RemoveDuplicates),
+            "Remove Duplicates lives on Data > Data Tools"
+        );
+        let data = tab_def(RibbonTab::Data).commands();
+        assert!(data.iter().any(|c| c.id == "data-remove-duplicates"));
+    }
+
+    #[test]
+    fn the_sort_filter_menu_keeps_the_ribbon_click_ids_and_runs_the_data_tabs_acts() {
+        let home = tab_def(RibbonTab::Home).commands();
+        let off = |_| false;
+        let act = |q| resolve(&home, "Home", q, off).map(|c| c.act);
+        assert_eq!(act("sort-a-z"), Ok(SheetAct::SortAsc));
+        assert_eq!(act("Sort Z to A"), Ok(SheetAct::SortDesc));
+        assert_eq!(act("custom-sort"), Ok(SheetAct::CustomSort));
+        assert_eq!(act("filter"), Ok(SheetAct::Filter));
+        assert_eq!(act("home-reapply-filter"), Ok(SheetAct::ReapplyFilter));
+        assert_eq!(act("home-clear-filter"), Ok(SheetAct::ClearFilter));
+        // The menu's Clear shares its name with the AutoSum column's: the
+        // ribbon button wins, and that one is not implemented yet.
+        assert_eq!(
+            resolve(&home, "Home", "Clear", off).unwrap_err(),
+            "'Clear' is not implemented"
+        );
+        assert_eq!(
+            resolve(&home, "Home", "clear", off).unwrap_err(),
+            "'Clear' is not implemented"
+        );
+        // The drop-down button itself resolves, enabled: it opens its menu.
+        let button = resolve(&home, "Home", "Sort & Filter", off).unwrap();
+        assert!(button.enabled() && matches!(button.shape, Shape::Menu(_)));
     }
 
     #[test]

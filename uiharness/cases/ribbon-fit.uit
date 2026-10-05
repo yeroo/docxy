@@ -1,0 +1,111 @@
+# No ribbon group draws its content taller than its body (#1018). Each tab
+# is shown (ribbon-layout selects it, answers `settled: false`), a frame is
+# drawn, and the second call reads where every group's content landed.
+
+test sheet ribbon: no tab is clipped vertically
+  open ../fixtures/basic.xlsx
+  call window-size {"w":1600,"h":900}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.tab is Home
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"Insert"}
+  shot window
+  call ribbon-layout {"tab":"Insert"}
+  assert reply.tab is Insert
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"Data"}
+  shot window
+  call ribbon-layout {"tab":"Data"}
+  assert reply.tab is Data
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"Review"}
+  shot window
+  call ribbon-layout {"tab":"Review"}
+  assert reply.tab is Review
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"View"}
+  shot window
+  call ribbon-layout {"tab":"View"}
+  assert reply.tab is View
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+
+test document ribbon: no tab is clipped vertically
+  open ../fixtures/basic.docx
+  call window-size {"w":1600,"h":900}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.tab is Home
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"Insert"}
+  shot window
+  call ribbon-layout {"tab":"Insert"}
+  assert reply.tab is Insert
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"Design"}
+  shot window
+  call ribbon-layout {"tab":"Design"}
+  assert reply.tab is Design
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"Layout"}
+  shot window
+  call ribbon-layout {"tab":"Layout"}
+  assert reply.tab is Layout
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"Mailings"}
+  shot window
+  call ribbon-layout {"tab":"Mailings"}
+  assert reply.tab is Mailings
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"Review"}
+  shot window
+  call ribbon-layout {"tab":"Review"}
+  assert reply.tab is Review
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"View"}
+  shot window
+  call ribbon-layout {"tab":"View"}
+  assert reply.tab is View
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+
+test Project ribbon: no tab is clipped vertically
+  open ../fixtures/gantt-summary.xml
+  call window-size {"w":1600,"h":900}
+  call ribbon-layout {"tab":"Task"}
+  shot window
+  call ribbon-layout {"tab":"Task"}
+  assert reply.tab is Task
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"Resource"}
+  shot window
+  call ribbon-layout {"tab":"Resource"}
+  assert reply.tab is Resource
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"Project"}
+  shot window
+  call ribbon-layout {"tab":"Project"}
+  assert reply.tab is Project
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"View"}
+  shot window
+  call ribbon-layout {"tab":"View"}
+  assert reply.tab is View
+  assert reply.settled is true
+  assert reply.any_clipped_v is false
