@@ -555,7 +555,7 @@ which gpui dispatches through the focused window root and its bound actions
 (Tab, Shift+Tab) as the OS's keys go. `call pointer-click {"dialog-field":"user-name"}`
 clicks the open dialog's text field (`"x":N` pixels in from its left edge, else
 its middle), which focuses it and puts the caret under the click; it needs a
-drawn frame, so `shot window` first. `call comments {}` reads the active
+drawn frame, so `shot window` first. `call pointer-click {"at":"user-name-row"}` clicks Backstage's User name... row (open File first). Keys pressed in Backstage with no dialog up edit nothing under it. `call comments {}` reads the active
 document's comments `{comments:[{id,author,initials,text}]}`. The cases are in
 `uiharness/cases/user-name.uit`.
 

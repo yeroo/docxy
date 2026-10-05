@@ -725,7 +725,6 @@ fn a_selection_is_replaced_by_typing_and_dropped_by_an_arrow() {
     let d = s.top_dialog_mut().unwrap();
     d.select_all();
     assert_eq!(d.selection(), Some((0, 6)));
-    assert_eq!(d.selected_text().as_deref(), Some("Design"));
     d.type_char('J').unwrap();
     assert_eq!(text(&s, "name"), "J");
     let d = s.top_dialog_mut().unwrap();

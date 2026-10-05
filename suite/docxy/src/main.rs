@@ -18013,6 +18013,11 @@ impl Docxy {
             }
             return; // the modal list owns keys; do not edit the surface below
         }
+        // File (backstage) covers the window: with no dialog up, a key there
+        // edits nothing under it (#1027; its root takes keys for the dialogs).
+        if self.backstage {
+            return;
+        }
         // An open menu takes the key: Esc closes it, and so, until menus
         // take arrows and Enter, does any other key; none reaches the
         // document or cell under it (#397).
@@ -26935,6 +26940,7 @@ impl Docxy {
                     d.child(
                         div()
                             .id("bs-user-name")
+                            .relative()
                             .flex()
                             .items_center()
                             .gap_2()
@@ -26943,6 +26949,7 @@ impl Docxy {
                             .cursor_pointer()
                             .rounded_sm()
                             .hover(|d| d.bg(sidebar))
+                            .child(probe(&self.probes, "bs-user-name"))
                             .child(div().text_color(fg).child("User name..."))
                             .child(
                                 div()

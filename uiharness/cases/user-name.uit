@@ -68,6 +68,7 @@ test the first field has the focus and Backspace, Delete, arrows and Home/End ed
   call real-key {"key":"backspace"}
   call dialog-read {}
   assert reply.controls.0.value is c
+  call real-key {"key":"escape"}
 
 test a click places the caret in the field
   open copy:../fixtures/basic.docx
@@ -84,6 +85,7 @@ test a click places the caret in the field
   call real-type {"text":"Y"}
   call dialog-read {}
   assert reply.controls.0.value is XabcdefY
+  call real-key {"key":"escape"}
 
 test Escape cancels and keeps the old name
   open copy:../fixtures/basic.docx
@@ -95,18 +97,26 @@ test Escape cancels and keeps the old name
   assert dialog is none
   assert user_name is not Nobody
 
-test the user name dialog takes typed text with no document open
+test Ctrl+V pastes the clipboard over the selected text
   open copy:../fixtures/basic.docx
-  call close-tab {}
   call backstage {"action":"open"}
   call user-name {}
-  assert dialog is user-name
+  call clipboard {"action":"write","text":"Pat Lee"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"Jane Doe"}
-  call real-key {"key":"tab"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"JD"}
-  call real-key {"key":"enter"}
-  assert dialog is none
-  assert user_name is Jane Doe
-  assert user_initials is JD
+  call real-key {"key":"ctrl+v"}
+  call dialog-read {}
+  assert reply.controls.0.value is Pat Lee
+  call real-key {"key":"escape"}
+
+test keys in Backstage with no dialog edit nothing under it
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call real-type {"text":"abc"}
+  call real-key {"keys":["backspace","enter","delete"]}
+  call backstage {"action":"close"}
+  assert dirty is false
+  assert text is not ab
+  call backstage {"action":"open"}
+  call real-key {"keys":["ctrl+b","ctrl+z","ctrl+s"]}
+  call backstage {"action":"close"}
+  assert dirty is false

@@ -1013,18 +1013,6 @@ impl Dialog {
         self.anchor = Some(0);
     }
 
-    /// The selected text, for Ctrl+C and Ctrl+X.
-    pub fn selected_text(&self) -> Option<String> {
-        let (from, to) = self.selection()?;
-        Some(
-            self.focused_text()?
-                .chars()
-                .skip(from)
-                .take(to - from)
-                .collect(),
-        )
-    }
-
     /// A press on a control, as the pointer makes it: a field takes the
     /// focus, a checkbox toggles, a radio picks `item`, a dropdown steps to its
     /// next item (or picks `item`). Each change goes through `Control::set`.

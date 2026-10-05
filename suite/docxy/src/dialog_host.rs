@@ -202,6 +202,12 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
     Ok(())
 }
 
+/// [`dialog_key_with`] with nothing on the clipboard, for the tests.
+#[cfg(test)]
+pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Modifiers) -> bool {
+    dialog_key_with(tab, key, typed, m, None)
+}
+
 /// A key while the tab has a dialog open: Enter presses the default button,
 /// Escape the cancel one, Tab and Shift+Tab move the focus, and the focused
 /// widget takes the rest: a field takes typed characters, Backspace, Delete,
@@ -210,12 +216,7 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
 /// Every key (chords and Alt too) is swallowed, so nothing under the dialog
 /// sees it. `typed` is the character the key types, when it types one.
 /// `false` when no dialog is open and the key should go on as usual.
-#[cfg(test)]
-pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Modifiers) -> bool {
-    dialog_key_with(tab, key, typed, m, None)
-}
-
-/// [`dialog_key`], with `clip` the text Ctrl+V pastes.
+/// `clip` is the text Ctrl+V pastes.
 pub(crate) fn dialog_key_with(
     tab: &mut DocTab,
     key: &str,
@@ -239,7 +240,7 @@ pub(crate) fn dialog_key_with(
     true
 }
 
-/// The part of [`dialog_key`] that edits the top dialog's focused widget.
+/// The part of [`dialog_key_with`] that edits the top dialog's focused widget.
 pub(crate) fn edit_key(
     stack: &mut DialogStack,
     key: &str,
@@ -304,27 +305,37 @@ pub(crate) fn edit_key(
     }
 }
 
+/// The dialogs a person sees: the app's own stack when it holds one (a tab
+/// that arrives while it is open does not hide it), else the active tab's.
+fn shown_stack<'a>(app: &'a DialogStack, tab: Option<&'a DialogStack>) -> Option<&'a DialogStack> {
+    if app.is_open() {
+        return Some(app);
+    }
+    tab.filter(|d| d.is_open())
+}
+
 impl Docxy {
-    /// The active tab's dialogs, when one is open.
+    /// The dialogs a person sees: the app's own stack when one is open (the
+    /// User name opened with no document, #1027; a tab that arrives later
+    /// does not hide it), else the active tab's. `None` when none is open.
     pub(crate) fn active_dialogs(&self) -> Option<&DialogStack> {
-        match self.tabs.get(self.active) {
-            Some(t) => Some(&t.dialogs),
-            // Nothing open: the app's own stack (the Start page's User name).
-            None => Some(&self.app_dialogs),
-        }
-        .filter(|d| d.is_open())
+        shown_stack(
+            &self.app_dialogs,
+            self.tabs.get(self.active).map(|t| &t.dialogs),
+        )
     }
 
-    /// The stack [`Docxy::active_dialogs`] reads, to change it.
+    /// The stack [`Docxy::active_dialogs`] reads, to change it: the app's
+    /// when it holds one or no document is open, else the active tab's.
     pub(crate) fn active_dialogs_mut(&mut self) -> &mut DialogStack {
         match self.tabs.get_mut(self.active) {
-            Some(t) => &mut t.dialogs,
-            None => &mut self.app_dialogs,
+            Some(t) if !self.app_dialogs.is_open() => &mut t.dialogs,
+            _ => &mut self.app_dialogs,
         }
     }
 
-    /// Refuse a verb a person could not reach while the active tab has a
-    /// dialog open: its backdrop covers the whole window, title bar and
+    /// Refuse a verb a person could not reach while a dialog is open (the
+    /// active tab's or the app's): its backdrop covers the whole window, title bar and
     /// ribbon included. Shared by the harness and the Project control server.
     pub(crate) fn refuse_under_dialog(&self) -> Result<(), String> {
         match self.active_dialogs().and_then(|d| d.top()) {
@@ -333,7 +344,8 @@ impl Docxy {
         }
     }
 
-    /// Press a button on the active tab's top dialog.
+    /// Press a button on the top dialog: the app's User name, else the
+    /// active tab's.
     pub(crate) fn dialog_press(
         &mut self,
         button: &str,
@@ -367,7 +379,8 @@ impl Docxy {
         self.persist();
     }
 
-    /// A key for the active tab's dialog; see [`dialog_key`].
+    /// A key for the open dialog, the app's or the active tab's; see
+    /// [`dialog_key_with`].
     pub(crate) fn dialog_takes_key(
         &mut self,
         key: &str,
@@ -392,9 +405,7 @@ impl Docxy {
             .and_then(|s| s.key_button(key, plain));
         if let Some(label) = app_button {
             if let Err(e) = self.dialog_press(&label, window, cx) {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.status = e.into();
-                }
+                self.set_status(e);
             }
             cx.notify();
             return true;
@@ -406,16 +417,18 @@ impl Docxy {
                 _ => None,
             })
             .flatten();
-        let reopen = reopen_on_top(self.tabs.get(self.active));
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            // No document: the app's own dialogs (the Start page's User name).
-            if !self.app_dialogs.is_open() {
-                return false;
+        if self.app_dialogs.is_open() {
+            // The app's own dialog (the User name with no document open). A
+            // refusal has no status line to go to without a document.
+            if let Err(e) = edit_key(&mut self.app_dialogs, key, typed, m, clip.as_deref()) {
+                self.set_status(e);
             }
-            // A refusal has no status line to go to without a document.
-            let _ = edit_key(&mut self.app_dialogs, key, typed, m, clip.as_deref());
             cx.notify();
             return true;
+        }
+        let reopen = reopen_on_top(self.tabs.get(self.active));
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return false;
         };
         let taken = dialog_key_with(tab, key, typed, m, clip.as_deref());
         if taken {
@@ -444,17 +457,9 @@ impl Docxy {
             .top_dialog_mut()
             .and_then(|d| d.click_control(index, item));
         if let Err(e) = done {
-            self.dialog_status(e);
+            self.set_status(e);
         }
         cx.notify();
-    }
-
-    /// Say why a dialog refused, on the tab's status line; with no document
-    /// open there is none.
-    fn dialog_status(&mut self, e: String) {
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.status = e.into();
-        }
     }
 
     /// A click on a text field: focus it and put the caret where the click
@@ -501,7 +506,7 @@ impl Docxy {
     /// A press on the top dialog's tab strip.
     fn dialog_tab_click(&mut self, label: &str, cx: &mut Context<Self>) {
         if let Err(e) = self.active_dialogs_mut().select_tab(label) {
-            self.dialog_status(e);
+            self.set_status(e);
         }
         cx.notify();
     }
@@ -782,10 +787,10 @@ impl Docxy {
     }
 }
 
-/// The click handler of a dialog widget: control `i`, and the radio item.
-/// How far in from a field box's edge its text starts: the box's one-pixel
-/// border and its `px_1` padding.
-const FIELD_INSET: f32 = 5.;
+/// How far in from the left of a field's `dialog-field` probe its text
+/// starts: the box's `px_1` padding. The probe is absolutely positioned inside
+/// the box's border, so the one-pixel border is already outside it.
+const FIELD_INSET: f32 = 4.;
 
 /// The character gap nearest to `x` pixels along `text`, whose prefixes
 /// measure as `width` says.
@@ -807,6 +812,7 @@ fn caret_bar(color: Hsla) -> Div {
     div().w(px(1.)).h(px(14.)).bg(color)
 }
 
+/// The click handler of a dialog widget: control `i`, and the radio item.
 fn on_widget(
     cx: &mut Context<Docxy>,
     i: usize,
@@ -997,6 +1003,34 @@ mod tests {
             char_at_x("a\u{1F600}", 19.0, w),
             2,
             "one character past a wide one"
+        );
+    }
+
+    /// An app-level dialog stays the one shown when a tab becomes active
+    /// under it, and the tab's own shows again once it closes (#1027).
+    #[test]
+    fn the_apps_dialog_is_not_stranded_by_a_tab_arriving() {
+        let tab = tab_with_form();
+        let mut app = DialogStack::default();
+        assert!(shown_stack(&app, None).is_none(), "nothing open");
+        assert_eq!(
+            shown_stack(&app, Some(&tab.dialogs)).map(|s| s.top_id()),
+            Some("form")
+        );
+        app.push(crate::user_name::dialog("", ""));
+        assert_eq!(
+            shown_stack(&app, None).map(|s| s.top_id()),
+            Some("user-name")
+        );
+        assert_eq!(
+            shown_stack(&app, Some(&tab.dialogs)).map(|s| s.top_id()),
+            Some("user-name"),
+            "a tab opened under it does not hide it"
+        );
+        app.clear();
+        assert_eq!(
+            shown_stack(&app, Some(&tab.dialogs)).map(|s| s.top_id()),
+            Some("form")
         );
     }
 }

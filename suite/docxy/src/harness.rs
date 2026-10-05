@@ -1026,7 +1026,7 @@ fn dialog_field_point(
     let b = app
         .probes
         .borrow()
-        .get(&format!("dialog-field:{name}"))
+        .on_screen(&format!("dialog-field:{name}"))
         .ok_or_else(|| format!("no field '{name}' is drawn in the open dialog"))?;
     let at = x.map_or_else(|| b.center().x, |x| b.left() + px(x as f32));
     Ok(point(at, b.center().y))
@@ -2606,7 +2606,8 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
                 Json::obj(vec![("target", m.target.to_json())])
             }),
         ),
-        // The active tab's top dialog's id, or `none`; `dialog-read` has the rest.
+        // The top dialog's id (the app's own, else the active tab's), or `none`;
+        // `dialog-read` has the rest.
         (
             "dialog",
             Json::Str(app.active_dialogs().map_or("none", |d| d.top_id()).into()),
@@ -2705,7 +2706,8 @@ fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
     ])
 }
 
-/// The active tab's dialogs, for a verb that drives one.
+/// The open dialogs (the app's own, else the active tab's), for a verb that
+/// drives one.
 fn open_dialogs(app: &mut crate::Docxy) -> Result<&mut crate::dialog::DialogStack, String> {
     Some(app.active_dialogs_mut())
         .filter(|d| d.is_open())
@@ -3422,8 +3424,17 @@ fn dispatch_verb(
                 }
                 (None, Some(at)) => match at.as_str() {
                     Some("fill-handle") => fill_handle_point(app)?,
+                    // Backstage's Settings row for the User name dialog.
+                    Some("user-name-row") => app
+                        .probes
+                        .borrow()
+                        .on_screen("bs-user-name")
+                        .ok_or("the User name row is not drawn: open File (backstage) first")?
+                        .center(),
                     Some(other) => {
-                        return Err(format!("unknown pointer target '{other}' (fill-handle)"));
+                        return Err(format!(
+                            "unknown pointer target '{other}' (fill-handle, user-name-row)"
+                        ));
                     }
                     None => return Err("'at' must be a string".into()),
                 },
