@@ -20,7 +20,7 @@ workspace = true
 
 [dependencies]
 # Commit / last merged PR / build kind, for --version, app-info and the MCP version.
-buildinfo = { path = "../buildinfo" }
+buildinfo = { version = "0.5.0", path = "../buildinfo" }
 opccore = { version = "0.1.0", path = "../opccore" }
 # Path + version so `docxy` can be published once `docxcore` is on crates.io.
 docxcore = { version = "0.5.0", path = "../docxcore" }

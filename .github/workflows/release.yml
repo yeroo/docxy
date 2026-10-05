@@ -15,6 +15,9 @@ jobs:
       contents: write # create release + upload assets
       id-token: write # keyless provenance + cosign signing
       attestations: write # build-provenance attestation
+    # What `--version` and File > Account report: a release build, no badge (#1023).
+    env:
+      DOCXY_BUILD_KIND: release
     strategy:
       fail-fast: false
       matrix:
@@ -233,6 +236,9 @@ jobs:
           # docxy depends on htmlbundle (editable HTML). Published crates keep
           # `html-export` off, so `cargo install docxy` needs no wasm target.
           publish htmlbundle
+          # docxy and xlsxy stamp their build info (#1023). A crates.io install has
+          # no .git, so buildinfo's build script reports `unknown` there.
+          publish buildinfo
           publish docxy
           publish xlsxy
 
@@ -242,6 +248,7 @@ jobs:
     permissions:
       contents: write # attach installers to the release
     env:
+      DOCXY_BUILD_KIND: release
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - uses: actions/checkout@v7
@@ -311,6 +318,7 @@ jobs:
     permissions:
       contents: write
     env:
+      DOCXY_BUILD_KIND: release
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - uses: actions/checkout@v7
@@ -363,6 +371,7 @@ jobs:
     permissions:
       contents: write
     env:
+      DOCXY_BUILD_KIND: release
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - uses: actions/checkout@v7

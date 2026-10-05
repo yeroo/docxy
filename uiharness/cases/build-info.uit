@@ -1,0 +1,39 @@
+# Build info in the suite (#1023): app-info, File > Account and its About dialog.
+# The sweep builds the suite locally (not as a ci/release build), so kind is local
+# and the build is a manual one; a release or CI binary shows no badge.
+
+test About shows the build info and app-info matches it
+  open ../fixtures/basic.xlsx
+  call app-info {}
+  assert reply.commit_len is 40
+  assert reply.commit_hex is true
+  assert reply.kind is local
+  assert reply.manual is true
+  call backstage {"action":"open"}
+  assert reply.open is true
+  call account {"action":"open"}
+  assert reply.open is true
+  assert reply.about is false
+  assert reply.badge is true
+  assert reply.rows.0.field is commit
+  call account {"action":"about"}
+  assert reply.about is true
+  shot window
+  call account {"action":"copy"}
+  assert reply.about is true
+  call clipboard {"action":"read"}
+  assert reply.text is not nothing
+  call account {"action":"close"}
+  assert reply.about is false
+  call backstage {"action":"close"}
+
+test Account is on the backstage of a document too
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call account {"action":"open"}
+  assert reply.open is true
+  assert reply.badge is true
+  call-error account {"action":"copy"} => the About dialog is not open
+  call backstage {"action":"close"}
+  call account {"action":"read"}
+  assert reply.open is false

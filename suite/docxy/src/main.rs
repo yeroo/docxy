@@ -26455,7 +26455,7 @@ impl Docxy {
             )
             .when(info.manual(), |d| {
                 d.child(
-                    div().child(
+                    h_flex().child(
                         div()
                             .id("account-manual-badge")
                             .px_2()
@@ -26470,7 +26470,7 @@ impl Docxy {
                 )
             })
             .child(
-                div().child(
+                h_flex().child(
                     button("account-about", "About docxy suite")
                         .on_click(cx.listener(|this, _, _, cx| this.open_about(cx))),
                 ),
