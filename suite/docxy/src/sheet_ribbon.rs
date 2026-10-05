@@ -564,13 +564,17 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             SheetAct::CustomSort,
                         )),
                         Item::One(large("data-filter", "Filter", None, SheetAct::Filter)),
-                        // Reapply and Advanced need stored criteria (#690).
                         Item::Col {
                             gap: COL,
                             cmds: &[
                                 row("clear-filter", "Clear", None, SheetAct::ClearFilter),
-                                row("reapply-filter", "Reapply", None, SheetAct::Todo),
-                                row("advanced-filter", "Advanced", None, SheetAct::Todo),
+                                row("reapply-filter", "Reapply", None, SheetAct::ReapplyFilter),
+                                row(
+                                    "advanced-filter",
+                                    "Advanced",
+                                    None,
+                                    SheetAct::AdvancedFilter,
+                                ),
                             ],
                         },
                     ],
@@ -916,8 +920,6 @@ mod tests {
                 "fill",
                 "clear",
                 "find-select",
-                "reapply-filter",
-                "advanced-filter",
                 "flash-fill",
                 "circle-invalid",
                 "clear-validation-circles",
@@ -1007,13 +1009,13 @@ mod tests {
         assert_eq!(act("Sort"), Ok(SheetAct::CustomSort));
         assert_eq!(act("Filter"), Ok(SheetAct::Filter));
         assert_eq!(act("Clear"), Ok(SheetAct::ClearFilter));
+        assert_eq!(act("Reapply"), Ok(SheetAct::ReapplyFilter));
+        assert_eq!(act("Advanced"), Ok(SheetAct::AdvancedFilter));
         assert_eq!(act("Remove Duplicates"), Ok(SheetAct::RemoveDuplicates));
         assert_eq!(act("Text to Columns"), Ok(SheetAct::TextToColumns));
         assert_eq!(act("Data Validation"), Ok(SheetAct::DataValidation));
         assert_eq!(act("Consolidate"), Ok(SheetAct::Consolidate));
         for todo in [
-            "Reapply",
-            "Advanced",
             "Flash Fill",
             "Circle Invalid Data",
             "Clear Validation Circles",

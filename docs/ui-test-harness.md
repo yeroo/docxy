@@ -856,7 +856,7 @@ point. Four verbs read and drive it:
 | Verb | Args | Reply |
 |---|---|---|
 | `dialog-read` | `{}` | the top dialog, or `{open: false}` |
-| `dialog-set` | `{control, value}`; a grid takes `{control, row, column, value}`, `{control, insert_row: n}` or `{control, delete_row: n}` | the dialog after the edit |
+| `dialog-set` | `{control, value}`; a grid takes `{control, row, column, value}`, `{control, insert_row: n}` or `{control, delete_row: n}`; a check list `{control, value: true\|false\|[labels]}`, `{control, item, checked}` or `{control, index, checked}` | the dialog after the edit |
 | `dialog-tab` | `{tab}` | the dialog on that tab |
 | `dialog-click` | `{button}` | `state` after the button's handler, with `dialog` set to the dialog now on top (the child it opened, the parent, or `{open: false}`) |
 
@@ -867,12 +867,21 @@ a message box's message (null otherwise), and `tab` is the current tab's label
 Each control is `{name, label, kind, value, text, enabled, visible}`:
 
 - `kind` is one of `text`, `number`, `date`, `duration`, `checkbox`, `radio`,
-  `dropdown`, `list`, `grid` and `label`.
+  `dropdown`, `list`, `grid`, `checklist` and `label`.
 - `value` is typed: a checkbox's is a bool, a number's a number, an item
   control's the selected item's label (or null), and a grid's its rows.
   `text` is what the control shows.
 - `radio`, `dropdown` and `list` add `items` (in order) and `selected` (an
   index, or null). A `grid` adds `columns` and `rows`.
+- A `checklist` (the AutoFilter drop-down's values, #690) has a bool per item
+  as its `value`, and adds `items` and `depths`: the items form a tree by
+  depth (`(Select All)` at 0 over the values; a year › month › day date
+  tree under it), and checking an item checks the items under it, while an
+  item with items under it is checked exactly when they all are. `value:
+  true`/`false` checks or clears all, `value: [labels]` checks exactly those,
+  and `{item, checked}` one item (or `{index, checked}` for a label the tree
+  repeats, a day under two months). The overlay draws it virtualised (up to
+  10,000 values) and a click toggles an item.
 
 `controls` lists **only the current tab's controls**, because that is what a
 person sees. To read a staged value on another tab, `dialog-tab` to it first. A
@@ -972,7 +981,7 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task) or `{"ribbon": [tab, group, command]}` | the menu, as `menu-read` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu: Cut, Copy, Paste, the Filter and Sort submenus, New Comment; #690, #691), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task) or `{"ribbon": [tab, group, command]}` | the menu, as `menu-read` |
 | `menu-read` | `{}` | `{open: true, target, items}`, or `{open: false}` |
 | `menu-click` | `{label}` among the top-level items, or `{path: [labels]}` through submenus | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
@@ -1011,8 +1020,8 @@ way it keeps itself inside the window.
 Refusals change nothing, and each names what it refuses: `menu-open` under a
 dialog, a `row` off a Project tab, an unknown uid, a task hidden under a
 collapsed summary (there is no row to right-click), a ribbon command that has
-no menu, `"document"` on a Project, and the targets without a menu yet
-(`cell`, `bar`, `column`, the ribbon's own right-click); `menu-click` with no
+no menu, `"document"` on a Project, `"cell"` off a sheet, and the targets
+without a menu yet (`bar`, `column`, the ribbon's own right-click); `menu-click` with no
 menu open, on a disabled item, an unknown or ambiguous label, a heading, or an
 item that opens a submenu; `menu-click` and `menu-close` under a dialog;
 `menu-open` and `menu-click` while File (the backstage) or the more-tabs list
@@ -1075,7 +1084,11 @@ View > Split View > Timeline has it hidden. `project-split` is the draggable bar
 between the entry table and the chart; its drags show in the `table_w` and `gantt_w`
 state entries. `gallery` is the Home ribbon's Styles gallery well on a
 document tab, and is an error while another ribbon tab, the Backstage or a
-collapsed ribbon hides it. Inside a
+collapsed ribbon hides it. `filter-button:<column>` (for example
+`filter-button:B`) is the AutoFilter button on that column's header cell
+(#690), an error while the sheet has no filter there or the button is
+scrolled out of view; `shot` it before a `pointer-click` so the click lands
+on the frame that drew it. Inside a
 border assertion the `cell:` may be dropped — `border A1:C5 solid` — because an
 assertion about a selection should read like the selection.
 

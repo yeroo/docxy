@@ -9,8 +9,10 @@ use ctlcore::json::Json;
 /// What a menu was opened on, as the harness names it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum MenuTarget {
-    /// The document body's context menu (document and sheet tabs).
+    /// The document body's context menu (document tabs).
     Document,
+    /// A sheet cell's context menu (#690, #691): clipboard, Sort and Filter.
+    Cell,
     /// A Project task row's context menu; `None` is the entry row.
     Row(Option<i32>),
     /// A ribbon split button's drop-down: tab, group and the primary's label
@@ -27,6 +29,7 @@ impl MenuTarget {
     pub fn to_json(&self) -> Json {
         match self {
             Self::Document => Json::Str("document".into()),
+            Self::Cell => Json::Str("cell".into()),
             Self::Row(uid) => Json::obj(vec![(
                 "row",
                 uid.map_or(Json::Null, |u| Json::Num(u as f64)),
@@ -195,7 +198,8 @@ pub(crate) fn target_stands(
         (MenuTarget::Document, Some(_)) => {
             Err("the document menu does not run on a Project tab".into())
         }
-        (MenuTarget::Document | MenuTarget::Ribbon { .. }, _) => Ok(()),
+        (MenuTarget::Cell, Some(_)) => Err("the cell menu runs on a sheet tab".into()),
+        (MenuTarget::Document | MenuTarget::Cell | MenuTarget::Ribbon { .. }, _) => Ok(()),
     }
 }
 
@@ -324,6 +328,94 @@ pub(crate) fn document_menu() -> Vec<MenuItem> {
             Act::Underline,
             true,
         )),
+        Separator,
+        Item(Entry::new(
+            "cm-comment",
+            "New Comment",
+            "comment-add",
+            Act::NewComment,
+            true,
+        )),
+    ]
+}
+
+/// A sheet cell's context menu: the clipboard, then Excel's Sort and Filter
+/// submenus over the selected cell.
+pub(crate) fn cell_menu() -> Vec<MenuItem> {
+    use crate::SheetAct as S;
+    use crate::sheet_sort::OnTop;
+    use MenuItem::{Item, Separator};
+    use gridcore::filter::ByCell;
+    let sheet = |id: &str, label: &str, act: S| Entry::new(id, label, "", Act::Sheet(act), true);
+    let sub = |id: &str, label: &str, items: Vec<MenuItem>| Entry {
+        submenu: items,
+        ..Entry::unavailable(id, label)
+    };
+    vec![
+        Item(Entry::new("cm-cut", "Cut", "cut", Act::Cut, true)),
+        Item(Entry::new("cm-copy", "Copy", "copy", Act::Copy, true)),
+        Item(Entry::new("cm-paste", "Paste", "paste", Act::Paste, true)),
+        Separator,
+        Item(Entry {
+            enabled: true,
+            ..sub(
+                "cm-filter",
+                "Filter",
+                vec![
+                    Item(sheet("cm-reapply", "Reapply", S::ReapplyFilter)),
+                    Separator,
+                    Item(sheet(
+                        "cm-filter-value",
+                        "Filter by Selected Cell's Value",
+                        S::FilterBy(ByCell::Value),
+                    )),
+                    Item(sheet(
+                        "cm-filter-color",
+                        "Filter by Selected Cell's Color",
+                        S::FilterBy(ByCell::CellColor),
+                    )),
+                    Item(sheet(
+                        "cm-filter-font",
+                        "Filter by Selected Cell's Font Color",
+                        S::FilterBy(ByCell::FontColor),
+                    )),
+                    Item(sheet(
+                        "cm-filter-icon",
+                        "Filter by Selected Cell's Icon",
+                        S::FilterBy(ByCell::Icon),
+                    )),
+                ],
+            )
+        }),
+        Item(Entry {
+            enabled: true,
+            ..sub(
+                "cm-sort",
+                "Sort",
+                vec![
+                    Item(sheet("cm-sort-a-z", "Sort A to Z", S::SortAsc)),
+                    Item(sheet("cm-sort-z-a", "Sort Z to A", S::SortDesc)),
+                    Separator,
+                    Item(sheet(
+                        "cm-top-color",
+                        "Put Selected Cell Color On Top",
+                        S::PutOnTop(OnTop::CellColor),
+                    )),
+                    Item(sheet(
+                        "cm-top-font",
+                        "Put Selected Font Color On Top",
+                        S::PutOnTop(OnTop::FontColor),
+                    )),
+                    Item(sheet(
+                        "cm-top-icon",
+                        "Put Selected Cell Icon On Top",
+                        S::PutOnTop(OnTop::Icon),
+                    )),
+                    Separator,
+                    Item(sheet("cm-custom-sort", "Custom Sort...", S::CustomSort)),
+                ],
+            )
+        }),
         Separator,
         Item(Entry::new(
             "cm-comment",

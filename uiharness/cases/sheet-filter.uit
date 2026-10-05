@@ -1,0 +1,94 @@
+# AutoFilter and Advanced Filter in the suite (#690): Data › Filter and
+# Ctrl+Shift+L put buttons on the header row, a button opens the column's
+# drop-down (the `filter-menu` dialog), and its typed submenu opens Custom
+# AutoFilter. basic.xlsx is A1:C5: Region, Q1, Q2 over North 10, South 20,
+# East 30, West 40. A copy of A1:C5 leaves out the rows a filter hides, so its
+# row count shows what the filter keeps.
+
+test sheet filter button opens the drop-down and its checklist filters
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  assert status is Filter on
+  assert dirty is true
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-read {}
+  assert reply.controls.0.label is Text Filters:
+  assert reply.controls.3.items.0 is (Select All)
+  assert reply.controls.3.items.1 is East
+  call dialog-set {"control":"values","value":["North","East"]}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert status is 2 of 4 records found
+  click A1
+  click C5 shift
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.app.rows is 3
+
+test sheet filter custom autofilter from the typed submenu
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Filter"}
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-read {}
+  assert reply.controls.0.label is Number Filters:
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-set {"control":"val1","value":"20"}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert status is 2 of 4 records found
+
+test sheet filter clear reapply and off
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Filter"}
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-set {"control":"n","value":"1"}
+  call dialog-click {"button":"OK"}
+  assert status is 1 of 4 records found
+  call ribbon-click {"tab":"Data","command":"Clear"}
+  assert status is 4 of 4 records found
+  click A1
+  click C5 shift
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.app.rows is 5
+  call ribbon-click {"tab":"Data","command":"Reapply"}
+  assert status is 4 of 4 records found
+  key ctrl+shift+l
+  assert status is Filter off
+
+test sheet filter cell menu filters by the selected cell's value
+  open ../fixtures/basic.xlsx
+  click A3
+  call menu-open {"target":"cell"}
+  call menu-click {"path":["Filter","Filter by Selected Cell's Value"]}
+  assert status is 1 of 4 records found
+  assert dirty is true
+
+test sheet filter advanced filter in place
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-set {"control":"criteria","value":"E1:E2"}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert status is 1 of 4 records found
+  call ribbon-click {"tab":"Data","command":"Clear"}
+  assert status is 4 of 4 records found

@@ -122,6 +122,41 @@ pub(crate) enum DialogOwner {
         row: u32,
         col: u32,
     },
+    /// A filter button's drop-down on absolute column `col` of `sheet`'s
+    /// AutoFilter (#690); its buttons apply in `sheet_filter::click`.
+    FilterMenu {
+        sheet: usize,
+        col: u32,
+    },
+    /// Custom AutoFilter and Top 10 AutoFilter for that column.
+    CustomFilter {
+        sheet: usize,
+        col: u32,
+    },
+    Top10Filter {
+        sheet: usize,
+        col: u32,
+    },
+    /// Advanced Filter on `sheet`.
+    AdvancedFilter {
+        sheet: usize,
+    },
+    /// Excel's Sort dialog over `area` of `sheet` (#691), applied in
+    /// `sheet_sort::click`.
+    SortLevels {
+        sheet: usize,
+        area: (u32, u32, u32, u32),
+    },
+    /// The Sort Warning: the selection `sel` sits in the wider list
+    /// `region` (`header` when its first row is one); `then` is the sort
+    /// waiting on the answer.
+    SortWarning {
+        sheet: usize,
+        sel: (u32, u32, u32, u32),
+        region: (u32, u32, u32, u32),
+        header: bool,
+        then: crate::sheet_sort::SortThen,
+    },
     /// The outline Settings (#693): where summary rows and columns sit.
     OutlineSettings,
     /// Group's (Ungroup's) "Rows or Columns?" over a block selection (#693).
@@ -237,6 +272,10 @@ pub(crate) enum ControlKind {
     List,
     Grid,
     Label,
+    /// Items each checked or not, a tree by `Control::depths`: checking an
+    /// item checks the items under it, and an item with items under it is
+    /// checked when they all are (the AutoFilter value list, #690).
+    CheckList,
 }
 
 impl ControlKind {
@@ -252,6 +291,7 @@ impl ControlKind {
             Self::List => "list",
             Self::Grid => "grid",
             Self::Label => "label",
+            Self::CheckList => "checklist",
         }
     }
     fn has_items(self) -> bool {
@@ -267,7 +307,11 @@ impl ControlKind {
     /// A control the keyboard and pointer can edit: a list and a grid are
     /// still read-only widgets, and a label is never edited.
     pub fn is_editable(self) -> bool {
-        self.is_text() || matches!(self, Self::Checkbox | Self::Radio | Self::Dropdown)
+        self.is_text()
+            || matches!(
+                self,
+                Self::Checkbox | Self::Radio | Self::Dropdown | Self::CheckList
+            )
     }
 }
 
@@ -291,6 +335,8 @@ pub(crate) enum Value {
     Choice(Option<usize>),
     /// A grid's rows, one string per column.
     Rows(Vec<Vec<String>>),
+    /// A check list's checks, one per item.
+    Checks(Vec<bool>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -308,6 +354,8 @@ pub(crate) struct Control {
     pub items: Vec<String>,
     /// A grid's column headings.
     pub columns: Vec<String>,
+    /// A check list's items' depths in its tree (0 at the top).
+    pub depths: Vec<u8>,
 }
 
 impl Control {
@@ -322,6 +370,7 @@ impl Control {
             page: None,
             items: Vec::new(),
             columns: Vec::new(),
+            depths: Vec::new(),
         }
     }
 
@@ -338,6 +387,11 @@ impl Control {
                 1 => "1 row".into(),
                 n => format!("{n} rows"),
             },
+            Value::Checks(c) => format!(
+                "{} of {} checked",
+                c.iter().filter(|x| **x).count(),
+                c.len()
+            ),
         }
     }
 
@@ -353,6 +407,7 @@ impl Control {
                 .and_then(|i| self.items.get(i))
                 .map_or(Json::Null, |s| Json::Str(s.clone())),
             Value::Rows(rows) => rows_json(rows),
+            Value::Checks(c) => Json::Arr(c.iter().map(|x| Json::Bool(*x)).collect()),
         };
         let mut out = vec![
             ("name", Json::Str(self.name.into())),
@@ -376,6 +431,18 @@ impl Control {
         if let Value::Rows(rows) = &self.value {
             out.push(("columns", strs(&self.columns)));
             out.push(("rows", rows_json(rows)));
+        }
+        if self.kind == ControlKind::CheckList {
+            out.push(("items", strs(&self.items)));
+            out.push((
+                "depths",
+                Json::Arr(
+                    self.depths
+                        .iter()
+                        .map(|d| Json::Num(f64::from(*d)))
+                        .collect(),
+                ),
+            ));
         }
         Json::obj(out)
     }
@@ -436,8 +503,61 @@ impl Control {
                 self.edit_grid(&mut rows, args)?;
                 Value::Rows(rows)
             }
+            ControlKind::CheckList => Value::Checks(self.set_checks(args)?),
         };
         Ok(())
+    }
+
+    /// A check list's `dialog-set`: `{value: true|false}` checks or clears
+    /// every item; `{value: [labels]}` checks exactly those; `{item, checked}`
+    /// checks or clears one (and the items under it).
+    fn set_checks(&self, args: &Json) -> Result<Vec<bool>, String> {
+        let label = shown(&self.label);
+        let mut checks = match &self.value {
+            Value::Checks(c) => c.clone(),
+            _ => vec![false; self.items.len()],
+        };
+        checks.resize(self.items.len(), false);
+        let find = |want: &str| {
+            self.items
+                .iter()
+                .position(|item| fold(item.trim()) == fold(want.trim()))
+                .ok_or_else(|| format!("'{label}' has no item '{want}'"))
+        };
+        // One item, by label or (for a label the tree repeats, a day under
+        // two months) by index.
+        let one = match (args.get_str("item"), args.get("index")) {
+            (Some(item), _) => Some(find(item)?),
+            (None, Some(i)) => Some(
+                i.as_usize()
+                    .filter(|&k| k < self.items.len())
+                    .ok_or_else(|| format!("'{label}' has no item {i:?}"))?,
+            ),
+            _ => None,
+        };
+        if let Some(k) = one {
+            let on = args
+                .get("checked")
+                .and_then(Json::as_bool)
+                .ok_or("'checked' must be true or false")?;
+            check_tree(&mut checks, &self.depths, k, on);
+            return Ok(checks);
+        }
+        match args.get("value").ok_or("missing argument 'value'")? {
+            Json::Bool(b) => checks.iter_mut().for_each(|c| *c = *b),
+            Json::Arr(want) => {
+                checks.iter_mut().for_each(|c| *c = false);
+                for w in want {
+                    let w = w
+                        .as_str()
+                        .ok_or_else(|| format!("'{label}' takes labels"))?;
+                    let k = find(w)?;
+                    check_tree(&mut checks, &self.depths, k, true);
+                }
+            }
+            _ => return Err(format!("'{label}' takes true, false or a list of labels")),
+        }
+        Ok(checks)
     }
 
     fn edit_grid(&self, rows: &mut Vec<Vec<String>>, args: &Json) -> Result<(), String> {
@@ -525,6 +645,36 @@ fn shown(label: &str) -> String {
 
 /// How a label is matched: case-insensitive, without `&` accelerator marks or
 /// a trailing colon, so `"&Name:"` answers to `name`.
+/// Check (or clear) item `k` of a check list and the items under it, then
+/// mark each item that has items under it checked exactly when they all are.
+pub(crate) fn check_tree(checks: &mut [bool], depths: &[u8], k: usize, on: bool) {
+    let depth = |i: usize| depths.get(i).copied().unwrap_or(0);
+    if k >= checks.len() {
+        return;
+    }
+    checks[k] = on;
+    let mut j = k + 1;
+    while j < checks.len() && depth(j) > depth(k) {
+        checks[j] = on;
+        j += 1;
+    }
+    // Parents, deepest first: a node's children follow it until the depth
+    // falls back to its own.
+    for i in (0..checks.len()).rev() {
+        let mut j = i + 1;
+        let mut any = false;
+        let mut all = true;
+        while j < checks.len() && depth(j) > depth(i) {
+            any = true;
+            all &= checks[j];
+            j += 1;
+        }
+        if any {
+            checks[i] = all;
+        }
+    }
+}
+
 fn fold(label: &str) -> String {
     label
         .replace('&', "")
@@ -775,6 +925,19 @@ impl Dialog {
         self.focus = Some(index);
         let value = match (c.kind, &c.value) {
             (ControlKind::Checkbox, Value::Bool(b)) => Json::Bool(!b),
+            (ControlKind::CheckList, Value::Checks(c)) => {
+                let Some(k) = item else {
+                    return Ok(());
+                };
+                let on = !c.get(k).copied().ok_or("no such item")?;
+                return self.set_at(
+                    index,
+                    &Json::obj(vec![
+                        ("index", Json::Num(k as f64)),
+                        ("checked", Json::Bool(on)),
+                    ]),
+                );
+            }
             (ControlKind::Radio | ControlKind::Dropdown, Value::Choice(cur)) => {
                 let n = c.items.len().max(1);
                 let pick = match (item, c.kind) {
