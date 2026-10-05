@@ -102,14 +102,6 @@ impl FillKind {
                     .find(|k| k.label().eq_ignore_ascii_case(s))
             })
     }
-
-    /// Whether the kind only applies to date seeds.
-    pub fn is_date_unit(self) -> bool {
-        matches!(
-            self,
-            FillKind::Days | FillKind::Weekdays | FillKind::Months | FillKind::Years
-        )
-    }
 }
 
 use crate::numfmt::{DAYS, MONTHS};
@@ -1246,6 +1238,10 @@ pub fn fill_down_to(sheet: &crate::sheet::Sheet, src: Area) -> Option<u32> {
 /// Excel's question when Home › Fill › Justify needs more rows than the
 /// selection has.
 pub const JUSTIFY_OVERFLOW: &str = "Text will extend below selected range.";
+
+/// Excel's refusal of a Justify over a number or a formula, which it would
+/// turn into text (#707 r9 M2).
+pub const JUSTIFY_NUMBERS: &str = "Cannot justify cells containing numbers or formulas.";
 
 /// Home › Fill › Justify's lines: the words of `texts`, joined, rewrapped to
 /// `width` characters a line (at least one word a line, so a word longer

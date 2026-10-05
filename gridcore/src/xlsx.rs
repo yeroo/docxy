@@ -8569,6 +8569,94 @@ mod tests {
     }
     use super::*;
 
+    /// #707 r9 M1: a rule whose anchor a cleared rectangle moves takes its
+    /// formulas along, in the model and through save and reload; an
+    /// absolute reference stays.
+    #[test]
+    fn a_trimmed_rule_keeps_reading_its_own_cells() {
+        let trimmed = |range, f: &str, cut| {
+            let mut pkg = new_xlsx();
+            assert!(pkg.add_data_validation(0, range, "custom", "", f, None));
+            crate::edit::clear_validation(&mut pkg.workbook.sheets[0], cut);
+            let dv = &pkg.workbook.sheets[0].validations[0];
+            let model = (dv.ranges.clone(), dv.formula1.clone());
+            let back = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+            let dv = &back.workbook.sheets[0].validations[0];
+            assert_eq!(
+                (dv.ranges.clone(), dv.formula1.clone()),
+                model,
+                "saved as held"
+            );
+            model
+        };
+        // The repro: A1>0 over A1:A10, A1:A3 cleared.
+        assert_eq!(
+            trimmed((0, 0, 9, 0), "A1>0", (0, 0, 2, 0)),
+            (vec![(3, 0, 9, 0)], "A4>0".to_string())
+        );
+        // A horizontal rule losing its left column.
+        assert_eq!(
+            trimmed((0, 0, 0, 9), "A1>0", (0, 0, 0, 0)),
+            (vec![(0, 1, 0, 9)], "B1>0".to_string())
+        );
+        // Absolute: unchanged.
+        assert_eq!(
+            trimmed((0, 0, 9, 0), "$A$1>0", (0, 0, 2, 0)),
+            (vec![(3, 0, 9, 0)], "$A$1>0".to_string())
+        );
+        // A cut that leaves the anchor where it was changes no formula.
+        assert_eq!(
+            trimmed((0, 0, 9, 0), "A1>0", (5, 0, 6, 0)),
+            (vec![(0, 0, 4, 0), (7, 0, 9, 0)], "A1>0".to_string())
+        );
+    }
+
+    /// #707 r9: Clear Formats and Clear All take the conditional formatting
+    /// off the cleared cells, a block whose anchor moved taking its formulas
+    /// along, and one left with nothing going; saved and reloaded as held.
+    /// Clear Contents leaves it.
+    #[test]
+    fn clearing_formats_trims_conditional_formatting() {
+        use crate::edit::{ClearWhat, apply_clear_sheet, clear_plan};
+        let cleared = |what, areas: &[(u32, u32, u32, u32)]| {
+            let mut pkg = new_xlsx();
+            assert!(pkg.add_conditional_format(
+                0,
+                (0, 0, 9, 0),
+                "greaterThan",
+                "B1",
+                None,
+                crate::sheet::Dxf::default()
+            ));
+            let plan = clear_plan(&pkg.workbook.sheets[0], areas, what, &[]).unwrap();
+            apply_clear_sheet(&mut pkg.workbook.sheets[0], &plan);
+            let held = |p: &SheetPackage| {
+                p.workbook.sheets[0]
+                    .cond_formats
+                    .iter()
+                    .map(|cf| (cf.ranges.clone(), cf.rules[0].formulas()[0].clone()))
+                    .collect::<Vec<_>>()
+            };
+            let model = held(&pkg);
+            let back = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+            assert_eq!(held(&back), model, "saved as held");
+            model
+        };
+        assert_eq!(
+            cleared(ClearWhat::Formats, &[(0, 0, 2, 0)]),
+            vec![(vec![(3, 0, 9, 0)], "B4".to_string())]
+        );
+        assert_eq!(
+            cleared(ClearWhat::All, &[(0, 0, 0, 0), (4, 0, 5, 0)]),
+            vec![(vec![(1, 0, 3, 0), (6, 0, 9, 0)], "B2".to_string())]
+        );
+        assert!(cleared(ClearWhat::All, &[(0, 0, 20, 3)]).is_empty());
+        assert_eq!(
+            cleared(ClearWhat::Contents, &[(0, 0, 2, 0)]),
+            vec![(vec![(0, 0, 9, 0)], "B1".to_string())]
+        );
+    }
+
     /// #707 r6: rules added in one batch read and save as one call each
     /// would, their ordinals claimed in order.
     #[test]

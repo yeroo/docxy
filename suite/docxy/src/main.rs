@@ -10037,6 +10037,31 @@ impl Docxy {
         )
     }
 
+    /// A right-button press on the fill handle: the fill arms, and its
+    /// release opens the fill menu (#668). The handle's own handler and the
+    /// harness's `fill-drag` both press through here.
+    fn sheet_fill_start_right(&mut self, cx: &mut Context<Self>) {
+        self.sheet_fill_start(cx);
+        if let Some(f) = self.sheet_fill.as_mut() {
+            f.right = true;
+        }
+    }
+
+    /// The pointer over (r, c) with the left button held, Ctrl as `ctrl`: a
+    /// block dragged by its border goes there (#670), a fill swaps copy and
+    /// series with Ctrl (#668), and anything else sweeps the selection. The
+    /// cells' left-button move handler and the harness's `fill-drag` moves
+    /// go through here.
+    fn grid_left_drag_over(&mut self, r: u32, c: u32, ctrl: bool, cx: &mut Context<Self>) {
+        if self.drops.border_drag.is_some() {
+            return self.border_drag_over((r, c), ctrl, cx);
+        }
+        if let Some(f) = self.sheet_fill.as_mut() {
+            f.ctrl = ctrl;
+        }
+        self.grid_drag_over(r, c, cx)
+    }
+
     /// Begin an auto-fill drag from the selection's fill handle (the small
     /// square at the range's bottom-right). Captures the source range.
     ///
@@ -10055,36 +10080,14 @@ impl Docxy {
     /// mouse-down (gpui runs bubble-phase listeners in reverse paint order) and
     /// stops propagation — `grid_press` never runs, and nothing is in flight.
     ///
-    /// The UI test harness's handler-calling verbs (`drag`, `fill-drag`)
-    /// drive `grid_press_cell`/`grid_drag_over` directly and so never go
-    /// through the element tree's hitboxes — `pointer-click`/`pointer-drag`
+    /// The UI test harness's handler-calling verbs (`drag`, which drives
+    /// `grid_press_cell`/`grid_drag_over`; `fill-drag`, which presses
+    /// through here or [`Self::sheet_fill_start_right`] and moves through
+    /// [`Self::grid_left_drag_over`]) call the app's methods directly and so
+    /// never go through the element tree's hitboxes — `pointer-click`/`pointer-drag`
     /// (#545) do hit-test through gpui, but a case built on the handler
     /// verbs cannot see a handler added here. This guard can. See
     /// `docs/ui-test-harness.md`.
-    /// A right-button press on the fill handle: the fill arms, and its
-    /// release opens the fill menu (#668). The handle's own handler and the
-    /// harness's `fill-drag` both press through here.
-    fn sheet_fill_start_right(&mut self, cx: &mut Context<Self>) {
-        self.sheet_fill_start(cx);
-        if let Some(f) = self.sheet_fill.as_mut() {
-            f.right = true;
-        }
-    }
-
-    /// The pointer over (r, c) with the left button held, Ctrl as `ctrl`: a
-    /// block dragged by its border goes there (#670), a fill swaps copy and
-    /// series with Ctrl (#668), and anything else sweeps the selection. The
-    /// cell's move handler and the harness's drags both go through here.
-    fn grid_left_drag_over(&mut self, r: u32, c: u32, ctrl: bool, cx: &mut Context<Self>) {
-        if self.drops.border_drag.is_some() {
-            return self.border_drag_over((r, c), ctrl, cx);
-        }
-        if let Some(f) = self.sheet_fill.as_mut() {
-            f.ctrl = ctrl;
-        }
-        self.grid_drag_over(r, c, cx)
-    }
-
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
         // A new gesture: a drop still waiting on its menu is over.
         self.drops.new_gesture();

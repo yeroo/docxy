@@ -182,8 +182,8 @@ cold start, and every accepted and rejected form is a unit test.
 | `open copy:"<path>" as <name>` | copy the same fixture under a distinct plain filename (no separators or `..`), so a case can open multiple tabs without the suite focusing an existing path; quotes keep a source path containing ` as ` unambiguous |
 | `call <verb> <json-object>` | send a raw control request, including Project verbs such as `call task.set {"uid":2,"duration":"3d"}`. JSON is parsed before launch and retained verbatim, including quoted `#`; trailing comments are not allowed. Non-object/invalid JSON is a script error; a refused request is an `ERROR` with the server message |
 | `call-error <verb> <json-object> => <message>` | require the app to refuse the request with a message containing the given text; a successful request or different refusal fails the step |
-| `click <cell> [shift] [double]` | the cell's click handler (press, click, release) |
-| `drag <from> -> <to>` | press, one move per cell crossed, release. `to` and a bare space read the same |
+| `click <cell> [shift] [double] [ctrl]` | the cell's click handler (press, click, release); `ctrl` adds an area |
+| `drag <from> -> <to> [ctrl]` | press, one move per cell crossed, release; `ctrl` adds an area. `to` and a bare space read the same |
 | `type <text>` | one key event per character. The text is taken verbatim between its ends; the whitespace on either side of it is trimmed, so `type   =SUM(` types `=SUM(` |
 | `key <k> [k…]` | those keys, in order: `escape`, `enter`, `tab`, `up`, `alt`, `f2`, `ctrl+c`, `shift+down`, … (`tab` and `shift+tab` go through the app's bound *action*, which is where gpui sends them — see below) |
 | `select chart <n>` | the press on a chart card, counting from 0 |
@@ -733,9 +733,11 @@ an item pastes as values.
 
 **`fill-drag`.** The `drag` verb presses the grid, so it only sweeps a
 selection; `fill-drag` does what a pointer on the fill handle does:
-`sheet_fill_start` (the handle's press), `grid_drag_over` for each cell of the
-straight path from the selection's bottom-right corner to `to`, and
-`grid_release`, which commits the fill as a series (`gridcore::edit::autofill`).
+`sheet_fill_start` (the handle's left press; `sheet_fill_start_right` with
+`right`), `grid_left_drag_over` (the cells' left-button move, which takes
+`ctrl`) for each cell of the straight path from the selection's bottom-right
+corner to `to` (`sheet_fill_over` with `right`), and `grid_release`, which
+commits the fill as a series (`gridcore::edit::autofill`).
 `from`, a cell or range, is selected first with `click-cell`'s own
 press/click/release (then the same with Shift for the far corner). The reply is
 the state plus `filled`, the filled box (`B4:B8`), or `null` when released on
@@ -759,7 +761,12 @@ the source. Refused:
   `… another gesture is in flight`;
 - an `option` that names no Auto Fill Options kind (`copy`, `series`,
   `formats`, `values`, `days`, `weekdays`, `months`, `years`, `linear`,
-  `growth`, or a menu label).
+  `growth`, or a menu label);
+- flags that don't go together: `right` with `double`, `right` with
+  `option` (a right drag ends in the fill menu: `menu-click` its kind), or
+  `ctrl` with `right` or `double` (Ctrl only swaps copy and series on a left
+  drag). `option` with `double` picks the kind after the double-click's
+  fill, as its Auto Fill Options button does.
 
 The fill runs gridcore's series rules (#668): counted text, ordinals,
 quarters, day/month and custom lists, the least-squares trend, dates by day,

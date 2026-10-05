@@ -3464,6 +3464,9 @@ pub fn dispatch(
                 arg_flag(args, "right")?,
                 arg_flag(args, "double")?,
             );
+            if let Some(why) = fill_flags_refusal(option.is_some(), ctrl, right, double) {
+                return Err(why.into());
+            }
             let to = if double {
                 (0, 0)
             } else {
@@ -3498,6 +3501,17 @@ pub fn dispatch(
             if double {
                 app.sheet_fill_double(cx);
                 let after = sheet(app)?.range();
+                // The Auto Fill Options button a double-click's fill leaves
+                // too; with nothing filled there is none to pick from.
+                if let Some(kind) = option {
+                    if after == src {
+                        return Err(
+                            "'option' has no fill to change: the double-click filled nothing"
+                                .into(),
+                        );
+                    }
+                    app.sheet_fill_as(kind, cx);
+                }
                 let mut reply = state(app, window);
                 if let Json::Obj(fields) = &mut reply {
                     let filled = (after != src).then(|| a1_range(after));
@@ -3944,6 +3958,25 @@ fn is_action_key(stroke: &Keystroke) -> bool {
         && ACTION_KEYS
             .iter()
             .any(|(key, shift)| *key == stroke.key && *shift == m.shift)
+}
+
+/// Why `fill-drag` refuses its flags together: a right drag ends in the
+/// fill menu, not the Auto Fill Options button `option` picks from, and a
+/// double-click or a right drag holds no Ctrl. `None` when they go together.
+fn fill_flags_refusal(option: bool, ctrl: bool, right: bool, double: bool) -> Option<&'static str> {
+    if right && double {
+        Some("'right' and 'double' don't go together: a double-click is a left press")
+    } else if right && option {
+        Some(
+            "'option' picks from the Auto Fill Options button; a right drag opens the fill menu instead (menu-click its kind)",
+        )
+    } else if ctrl && (right || double) {
+        Some(
+            "'ctrl' swaps copy and series on a left drag; it does nothing to a right drag or a double-click",
+        )
+    } else {
+        None
+    }
 }
 
 /// Why `fill-drag` cannot press the fill handle, or `Ok` when it can. The
@@ -5662,6 +5695,19 @@ mod tests {
             ok(Kind::Look, "x.docx", None),
             Err("this tab cannot be saved as a file".into())
         );
+    }
+
+    /// #707 r9 m4: `fill-drag`'s flags that cannot go together are refused
+    /// rather than dropped.
+    #[test]
+    fn fill_drag_refuses_flags_that_do_not_go_together() {
+        assert!(fill_flags_refusal(true, false, true, false).is_some());
+        assert!(fill_flags_refusal(false, true, true, false).is_some());
+        assert!(fill_flags_refusal(false, true, false, true).is_some());
+        assert!(fill_flags_refusal(false, false, true, true).is_some());
+        assert_eq!(fill_flags_refusal(true, false, false, true), None);
+        assert_eq!(fill_flags_refusal(true, true, false, false), None);
+        assert_eq!(fill_flags_refusal(false, false, true, false), None);
     }
 
     /// #699: `fill-drag` refuses before `from` is clicked when a click could

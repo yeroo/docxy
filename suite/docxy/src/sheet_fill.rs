@@ -187,10 +187,23 @@ impl SheetView {
             return Err(crate::sheet_goto::SHEET_PROTECTED.into());
         }
         let sheet = self.sheet();
+        // Only text is justified: a number or a formula refuses the whole
+        // command, as in Excel, rather than turn into text (#707 r9 M2).
+        let not_text = (r0..=r1).any(|r| {
+            sheet.cell(r, c0).is_some_and(|c| {
+                c.formula.is_some()
+                    || !matches!(
+                        c.value,
+                        gridcore::sheet::CellValue::Text(_) | gridcore::sheet::CellValue::Empty
+                    )
+            })
+        });
+        if not_text {
+            return Err(gridcore::edit::JUSTIFY_NUMBERS.to_string());
+        }
         let texts: Vec<String> = (r0..=r1)
             .filter_map(|r| match sheet.cell(r, c0).map(|c| &c.value) {
                 Some(gridcore::sheet::CellValue::Text(t)) => Some(t.clone()),
-                Some(v) if !v.is_empty() => Some(self.cell_text(r, c0)),
                 _ => None,
             })
             .collect();

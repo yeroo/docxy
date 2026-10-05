@@ -219,6 +219,28 @@ fn justify_rewraps_and_asks_before_writing_below() {
     assert_eq!(shown(view(&mut t), "A3"), CellValue::Text("jumps".into()));
 }
 
+/// #707 r9 M2: Justify refuses a formula or a number in its column, as
+/// Excel does, changing nothing and taking no undo step.
+#[test]
+fn justify_refuses_numbers_and_formulas() {
+    for (name, cell) in [("A2", Cell::formula("B1*2")), ("A2", Cell::number(42.0))] {
+        let mut t = tab();
+        let v = view(&mut t);
+        put(v, "A1", Cell::text("some words here"));
+        put(v, name, cell);
+        v.anchor = at("A1");
+        v.sel = at("A3");
+        let before = v.sheet().cells.clone();
+        let undo = v.undo.len();
+        assert_eq!(
+            v.justify(true),
+            Err(gridcore::edit::JUSTIFY_NUMBERS.to_string())
+        );
+        assert_eq!(v.sheet().cells, before);
+        assert_eq!(v.undo.len(), undo);
+    }
+}
+
 #[test]
 fn custom_lists_add_import_delete_and_ok() {
     let mut t = tab();

@@ -107,6 +107,16 @@ impl PasteWhat {
             .find(|w| w.label().eq_ignore_ascii_case(s))
     }
 
+    /// Whether it pastes what the cells show, never their formulas.
+    pub fn values_only(self) -> bool {
+        matches!(
+            self,
+            PasteWhat::Values
+                | PasteWhat::ValuesAndNumberFormats
+                | PasteWhat::ValuesAndSourceFormatting
+        )
+    }
+
     /// Whether it pastes cell contents (and so takes an operation).
     pub fn pastes_contents(self) -> bool {
         !matches!(
@@ -284,12 +294,7 @@ impl ClipBlock {
                     cells.sort_unstable();
                     cells.dedup();
                 }
-                let anchor = dv
-                    .ranges
-                    .iter()
-                    .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, _, _)| {
-                        (r.min(r1), c.min(c1))
-                    });
+                let anchor = rule_anchor(&dv.ranges);
                 (!cells.is_empty()).then(|| ClipRule {
                     anchor,
                     kind: dv.kind.clone(),
@@ -543,20 +548,14 @@ pub fn paste_special_changes(
     }
     // A typed formula pasted as a value: what it evaluates to where it
     // lands, as the sheet stands before the paste.
+    let values_only = spec.what.values_only();
     let mut typed_values: std::collections::HashMap<(usize, usize), CellValue> = Default::default();
-    if clip.typed && spec.what.pastes_contents() && sheet < wb.sheets.len() {
-        let values_only = matches!(
-            spec.what,
-            PasteWhat::Values
-                | PasteWhat::ValuesAndNumberFormats
-                | PasteWhat::ValuesAndSourceFormatting
-        );
+    if clip.typed && values_only && sheet < wb.sheets.len() {
         for (i, row) in clip.cells.iter().enumerate().take(clip.rows.len()) {
             for (j, src) in row.iter().enumerate().take(clip.cols.len()) {
-                let (Some(f), Some(dest), true) = (
+                let (Some(f), Some(dest)) = (
                     src.formula.as_deref(),
                     clip.dest(at, (i, j), spec.transpose),
-                    values_only,
                 ) else {
                     continue;
                 };
@@ -570,12 +569,6 @@ pub fn paste_special_changes(
         return Ok(out);
     };
     let members = clip.spill_members();
-    let values_only = matches!(
-        spec.what,
-        PasteWhat::Values
-            | PasteWhat::ValuesAndNumberFormats
-            | PasteWhat::ValuesAndSourceFormatting
-    );
     // A transposed array formula would spill along the wrong axis over cells
     // the paste never cleared: refused, as Excel refuses changing part of an
     // array (#707 r5 m1). Values transpose what the cells show.
@@ -780,13 +773,39 @@ pub fn clear_validation(sheet: &mut Sheet, rect: Area) {
         if !dv.ranges.iter().any(|&r| overlaps(r, rect)) {
             return true;
         }
+        let before = rule_anchor(&dv.ranges);
         dv.ranges = dv.ranges.iter().flat_map(|&r| subtract(r, rect)).collect();
         if dv.ranges.is_empty() {
             removed.extend(dv.ix);
             return false;
         }
+        // The formulas read relative to the anchor: one that moved takes
+        // them along, so every cell left still reads the cells it read
+        // (#707 r9 M1).
+        let after = rule_anchor(&dv.ranges);
+        let dr = i64::from(after.0) - i64::from(before.0);
+        let dc = i64::from(after.1) - i64::from(before.1);
+        if (dr, dc) != (0, 0) {
+            for f in [&mut dv.formula1, &mut dv.formula2] {
+                if !f.is_empty() {
+                    if let Some(moved) = translate_formula(f, dr, dc) {
+                        *f = moved;
+                    }
+                }
+            }
+        }
         true
     });
+}
+
+/// A rule's anchor: the top-left of its ranges, which its formulas are
+/// relative to (as `shift_rule_ranges` reads it).
+pub(crate) fn rule_anchor(ranges: &[Area]) -> (u32, u32) {
+    ranges
+        .iter()
+        .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, _, _)| {
+            (r.min(r1), c.min(c1))
+        })
 }
 
 /// `a` without `b`: up to four rectangles (above, below, left, right).

@@ -28,8 +28,8 @@ pub use goto_special::{GoSpecial, NO_CELLS, Types, go_to_special, resolve_refere
 mod series;
 pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
 pub use series::{
-    FillDir, FillKind, FillTarget, JUSTIFY_OVERFLOW, SeriesSpec, SeriesType, builtin_lists,
-    fill_down_to, fill_target, justify_lines, series_rows_for,
+    FillDir, FillKind, FillTarget, JUSTIFY_NUMBERS, JUSTIFY_OVERFLOW, SeriesSpec, SeriesType,
+    builtin_lists, fill_down_to, fill_target, justify_lines, series_rows_for,
 };
 mod consolidate;
 mod paste_special;

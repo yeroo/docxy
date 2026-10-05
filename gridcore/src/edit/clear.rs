@@ -3,6 +3,8 @@
 
 use super::Area;
 use super::areas::{RectIndex, entries_in};
+use super::paste_special::{rule_anchor, subtract};
+use crate::formula::translate_formula;
 use crate::sheet::{Cell, Sheet};
 
 /// Excel's refusal of a clear that would split a merged cell.
@@ -77,6 +79,9 @@ pub struct ClearPlan {
     pub unlinked_refs: Vec<Area>,
     /// Cells whose notes go (the host removes them from its package).
     pub notes: Vec<(u32, u32)>,
+    /// The areas whose conditional formatting goes (Clear All and Clear
+    /// Formats, as in Excel): those meeting a block's ranges.
+    pub uncond: Vec<Area>,
 }
 
 impl ClearPlan {
@@ -86,6 +91,7 @@ impl ClearPlan {
             && self.unmerge.is_empty()
             && self.unlink.is_empty()
             && self.notes.is_empty()
+            && self.uncond.is_empty()
     }
 }
 
@@ -114,6 +120,15 @@ pub fn clear_plan(
             }
             plan.unmerge.push(m);
         }
+        // The conditional formatting over the areas goes with their formats.
+        let cf_ix = RectIndex::new(
+            &sheet
+                .cond_formats
+                .iter()
+                .flat_map(|cf| cf.ranges.iter().copied())
+                .collect::<Vec<_>>(),
+        );
+        plan.uncond = areas.iter().copied().filter(|&a| cf_ix.meets(a)).collect();
     }
     // The cells whose link goes, as a set for the lookups below.
     let mut gone = std::collections::BTreeSet::new();
@@ -209,6 +224,7 @@ pub fn clear_plan(
 /// The sheet-level part of a clear: merges undone and links removed (the
 /// cells are the host's to write, through its engine).
 pub fn apply_clear_sheet(sheet: &mut Sheet, plan: &ClearPlan) {
+    clear_cond_formats(sheet, &plan.uncond);
     let unmerge: std::collections::HashSet<Area> = plan.unmerge.iter().copied().collect();
     sheet.merges.retain(|m| !unmerge.contains(m));
     for rc in &plan.unlink {
@@ -222,6 +238,53 @@ pub fn apply_clear_sheet(sheet: &mut Sheet, plan: &ClearPlan) {
             sheet.hyperlinks_removed.push(rect);
         }
     }
+}
+
+/// Take `areas` out of every conditional-format block's ranges. A block left
+/// with no range goes (its element named in `cf_removed` for the save); one
+/// whose anchor (the top-left of its ranges) moved takes its formulas along,
+/// so each cell left reads what it read (#707 r9).
+pub(crate) fn clear_cond_formats(sheet: &mut Sheet, areas: &[Area]) {
+    if areas.is_empty() {
+        return;
+    }
+    let ix = RectIndex::new(areas);
+    let removed = &mut sheet.cf_removed;
+    let mut met = Vec::new();
+    sheet.cond_formats.retain_mut(|cf| {
+        if !cf.ranges.iter().any(|&r| ix.meets(r)) {
+            return true;
+        }
+        let before = rule_anchor(&cf.ranges);
+        let mut ranges = Vec::new();
+        for &r in &cf.ranges {
+            met.clear();
+            ix.meeting(r, &mut met);
+            let mut parts = vec![r];
+            for &a in &met {
+                parts = parts.into_iter().flat_map(|p| subtract(p, a)).collect();
+            }
+            ranges.extend(parts);
+        }
+        cf.ranges = ranges;
+        if cf.ranges.is_empty() {
+            removed.extend(cf.ix);
+            return false;
+        }
+        let after = rule_anchor(&cf.ranges);
+        let dr = i64::from(after.0) - i64::from(before.0);
+        let dc = i64::from(after.1) - i64::from(before.1);
+        if (dr, dc) != (0, 0) {
+            for rule in &mut cf.rules {
+                for f in rule.formulas_mut() {
+                    if let Some(moved) = translate_formula(f, dr, dc) {
+                        *f = moved;
+                    }
+                }
+            }
+        }
+        true
+    });
 }
 
 /// Home › Clear `what` over `areas` of `wb`'s sheet `sheet`, cells and all.
