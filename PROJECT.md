@@ -392,9 +392,10 @@ Right-clicking a task row's table cells selects the row and opens Project's
 row menu, in Project's order (#397): Cut, Copy, Paste, Scroll to Task, Insert
 Task (a blank row above), Delete Task (the task whatever column the cursor is
 on; a summary asks first), Inactivate Task, Manually / Auto Schedule, Assign
-Resources... and Information... run their commands; Paste Special..., Text
-Styles..., Font..., Fill Down, Clear Contents, Notes..., Add to Timeline and
-Hyperlink... are drawn greyed until they exist. A bar, a column header and
+Resources... and Information... run their commands, and Hyperlink... opens the
+hyperlink prompt (below); Paste Special..., Text
+Styles..., Font..., Fill Down, Clear Contents, Notes... and Add to Timeline
+are drawn greyed until they exist. A bar, a column header and
 the ribbon have no menu yet, and the document's Bold / Italic menu never opens
 on a Project. docxy's extras have no ribbon
 button: rename and set durations in the cells (yppxy: Enter/F2 and `d`),
@@ -402,6 +403,26 @@ delete a task with Delete on its ID or the row menu's Delete Task (yppxy `x`), c
 on Resource Names (yppxy: Assign with an empty name), export with Ctrl+E or
 File › Export, and scroll the Gantt with Alt+Left/Right and Alt+Home (yppxy
 h/l and Alt+Home). The Report tab stays, with no groups yet.
+
+Ctrl+K (and a task row's menu › Hyperlink..., enabled like Information...)
+opens one prompt on the selected task: prefilled from its stored link as
+`address#location | text`, parts omitted when absent (a stored text keeps its
+` | `, so a text-only link prefills as ` | text`), committed with Enter,
+cancelled with Escape, never on the entry row. The buffer's grammar is
+`ADDRESS[#LOCATION] [| TEXT]`: the first ` | ` splits the display text (a
+later one stays in it), the first `#` splits the address from the location —
+Project's own address#subaddress convention, so an address cannot hold `#` —
+which makes an address-less `#Gantt Chart!4` a location-only link, as Project
+allows. Neither can an address hold ` | `; Enter on an unchanged prompt
+always leaves the stored link alone, however it is shaped. `| TEXT` typed
+without the leading space is text-only, like ` | TEXT`. Text omitted displays
+the address, else the location, as Project's
+Text to display defaults; an empty buffer removes the link (`Hyperlink
+removed`, or no status when there was none) and a set reports
+`Hyperlink set: <text>`. The three parts are one undo step, kept on save
+(#408). The registry fields `Hyperlink`, `Hyperlink Address` and
+`Hyperlink SubAddress` read them for every `FieldReader` consumer; the Entry
+table has no Hyperlink column or indicator yet (follow-ups).
 
 Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste cells through the system clipboard
 as tab-separated text (#369). Copy takes the cursor cell's edit text (a
