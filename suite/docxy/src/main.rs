@@ -35,9 +35,12 @@ mod design_dialogs;
 mod design_tab;
 mod dialog;
 mod dialog_host;
+#[cfg(test)]
+mod doc_final_tests;
 mod doc_import;
 #[cfg(test)]
 mod doc_import_tests;
+mod doc_name;
 #[cfg(test)]
 mod doc_protected_tests;
 mod harness;
@@ -3476,11 +3479,12 @@ impl DocTab {
         caption
     }
 
-    /// A document edit landed. In Protected View (#633) a gate before it
-    /// leaked, so the edit is rolled back instead ([`protected_rollback`])
-    /// and the tab never turns dirty.
+    /// A document edit landed. In Protected View (#633), or in a document
+    /// marked as final (#617), a gate before it leaked, so the edit is
+    /// rolled back instead ([`protected_rollback`]) and the tab never turns
+    /// dirty.
     fn mark_dirty(&mut self) {
-        if self.access.protected {
+        if self.access.locked() {
             protected_rollback(self);
         } else {
             self.dirty = true;
@@ -3526,10 +3530,26 @@ struct Docxy {
     bs_info_status: Option<(usize, Result<String, String>)>,
     clip: Option<DocClip>,
     theme_pref: ThemePref,
-    /// When set, closing the window with unsaved tabs shows a confirm dialog.
-    /// Off by default: work is hot-persisted and restored regardless, so closing
-    /// is normally silent.
+    /// When set, closing the window with unsaved tabs asks about each unsaved
+    /// tab in turn (#630). Off by default: work is hot-persisted and restored
+    /// regardless, so closing is normally silent.
     ask_on_close: bool,
+    /// The number the next new document's `Document<n>` title takes (#631):
+    /// it only goes up, so a number is never reused in a session.
+    next_document: u32,
+    /// The window is closing through its per-document questions (#630):
+    /// a close prompt with `quit` is on the tab being asked about.
+    quitting: bool,
+    /// The tabs answered Don't Save while quitting, by index: their unsaved
+    /// work is forgotten, but only once the quit goes ahead.
+    quit_discards: Vec<usize>,
+    /// The tabs as they were when the quit began ([`close::tab_ids`]): a quit
+    /// whose tabs changed under it is cancelled rather than answering for
+    /// tabs by stale indexes.
+    quit_tabs: Vec<close::TabId>,
+    /// A harness quit that went ahead (#630): the harness ends the process
+    /// after the reply, rather than the window removing itself under it.
+    quit_ready: bool,
     /// Minutes between AutoRecover writes while a tab is unsaved (#632); 0 is off.
     autorecover_minutes: u32,
     /// Keep a workbook's last AutoRecover copy as a draft when it is closed
@@ -5259,8 +5279,11 @@ mod click_caret_tests {
     }
 }
 
+/// A new blank document, as Word starts one: one empty paragraph (#631).
 fn empty_doc() -> Document {
-    docxcore::markdown::from_markdown("# Untitled\n\n")
+    Document {
+        body: vec![Block::Paragraph(Default::default())],
+    }
 }
 
 /// A loaded document with everything a tab needs to hold and re-save it losslessly.
@@ -5307,6 +5330,9 @@ impl Loaded {
         path: Option<PathBuf>,
         dirty: bool,
     ) -> DocTab {
+        // Word's Mark as Final (#617), from whatever the tab loaded: its
+        // file, or its hot-exit copy.
+        let marked_final = self.pkg.as_ref().is_some_and(Package::marked_final);
         let mut tab = DocTab {
             kind,
             title,
@@ -5328,6 +5354,7 @@ impl Loaded {
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access {
                 converted: self.converted,
+                marked_final,
                 ..Default::default()
             },
             last_hot: Default::default(),
@@ -8439,8 +8466,8 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
     }
 }
 
-/// The backstop behind Protected View's gates (#610). An edit reached a
-/// protected workbook, so a gate leaked. Not every edit takes an undo
+/// The backstop behind the gates of Protected View (#610), or of a document
+/// marked as final (#617). An edit reached a locked tab, so a gate leaked. Not every edit takes an undo
 /// snapshot first (a sheet rename, an AutoFilter), so the workbook is loaded
 /// again from the tab's file, the way it was opened; the hot-exit sidecar
 /// then holds that too. Only a tab with no file to read (a template opened
@@ -8469,6 +8496,7 @@ fn protected_rollback(tab: &mut DocTab) {
             seed_used_comment_ids(tab);
             tab.notes = l.notes;
             tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
+            tab.access.marked_final = l.pkg.as_ref().is_some_and(Package::marked_final);
             tab.pkg = l.pkg;
             tab.markdown = l.markdown;
             tab.bundle_html = l.bundle_html;
@@ -8476,7 +8504,7 @@ fn protected_rollback(tab: &mut DocTab) {
         }
         tab.hf_edit = None;
         tab.dirty = false;
-        tab.status = open_mode::PROTECTED_STATUS.into();
+        tab.status = tab.access.locked_status().into();
         return;
     }
     let reloaded = tab
@@ -8502,6 +8530,20 @@ fn protected_rollback(tab: &mut DocTab) {
     }
     tab.dirty = false;
     tab.status = open_mode::PROTECTED_STATUS.into();
+}
+
+/// Edit Anyway on `tab` (#617): see [`Docxy::edit_anyway`]. `false` when it
+/// is not marked as final, or still in Protected View.
+fn edit_anyway_tab(tab: &mut DocTab) -> bool {
+    if !tab.access.marked_final || tab.access.protected {
+        return false;
+    }
+    tab.access.marked_final = false;
+    if let Some(pkg) = tab.pkg.as_mut() {
+        pkg.clear_marked_final();
+    }
+    tab.status = "editing enabled: the document is no longer marked as final".into();
+    true
 }
 
 /// Excel's question before reopening `path` over a tab with unsaved changes
@@ -8589,7 +8631,7 @@ fn build_surface(
 fn file_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Untitled.docx".into())
+        .unwrap_or_else(|| "Document.docx".into())
 }
 
 /// Directory holding hot-exit sidecars (`.docx`, `.xlsx`, or `.yppx` by tab kind),
@@ -8607,12 +8649,29 @@ fn hot_dir_in(root: &std::path::Path) -> PathBuf {
 /// after a tab close or reorder, the old session can pair `tab-N` with another
 /// tab's `path`. The AutoRecover tick never reorders, so it does not widen this.
 fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: Prefs) {
+    write_session_forgetting(root, tabs, active, prefs, &[]);
+}
+
+/// [`write_session`], with the unsaved work of the tabs at `forget` left out
+/// (#630): Don't Save on quit. Such a tab is kept as its file alone, so it
+/// reopens clean from disk.
+fn write_session_forgetting(
+    root: &std::path::Path,
+    tabs: &[DocTab],
+    active: usize,
+    prefs: Prefs,
+    forget: &[usize],
+) {
     let hd = hot_dir_in(root);
     let _ = std::fs::create_dir_all(&hd);
     let tabs = tabs
         .iter()
         .enumerate()
         .map(|(i, t)| {
+            if forget.contains(&i) {
+                *t.last_hot.borrow_mut() = None;
+                return forgotten(persist_tab_meta(t));
+            }
             let persisted = persist_tab(&hd, i, t);
             // Every tab is rewritten in this one call, so the path names this
             // tab's content even after a later close shifts the indices.
@@ -9125,7 +9184,20 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
             // A sidecar loads as a plain .docx; the session says what it was
             // converted from, and a fresh load of the file says so too.
             converted: t.converted.or(tab.access.converted),
+            // The loaded package's own mark (#617): a sidecar written after
+            // Edit Anyway no longer carries it.
+            marked_final: tab.access.marked_final,
         };
+        // Unsaved edits recovered from the sidecar of a document still marked
+        // as final (a build before #617 let them through) are kept, not
+        // rolled back as a leaked edit: the user already edited it, so it
+        // opens as after Edit Anyway, mark gone from what a save writes.
+        if from_hot && tab.dirty && tab.access.marked_final {
+            tab.access.marked_final = false;
+            if let Some(pkg) = tab.pkg.as_mut() {
+                pkg.clear_marked_final();
+            }
+        }
     }
     (tab, from_hot)
 }
@@ -9196,11 +9268,30 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         Surface::Placeholder => None,
     };
     PersistTab {
+        hot,
+        ..persist_tab_meta(t)
+    }
+}
+
+/// A tab answered Don't Save on quit (#630): its file alone, clean, so the
+/// next launch reopens what is on disk.
+fn forgotten(p: PersistTab) -> PersistTab {
+    PersistTab {
+        hot: None,
+        dirty: false,
+        ..p
+    }
+}
+
+/// What the session keeps of tab `t` besides its live content: everything
+/// [`persist_tab`] writes but the sidecar.
+fn persist_tab_meta(t: &DocTab) -> PersistTab {
+    PersistTab {
         kind: t.kind,
         title: t.title.to_string(),
         path: t.path.as_ref().map(|p| p.display().to_string()),
         dirty: t.dirty,
-        hot,
+        hot: None,
         unreadable: match &t.surface {
             Surface::Project(v) => v.ed.project().package.unreadable.clone(),
             _ => Vec::new(),
@@ -9320,6 +9411,13 @@ impl Docxy {
         }
         let active = session.active.min(tabs.len().saturating_sub(1));
         let mut this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
+        // New documents continue past the restored ones (#631).
+        this.next_document = doc_name::next_after(
+            this.tabs
+                .iter()
+                .filter(|t| t.kind == Kind::Docx && t.path.is_none())
+                .map(|t| t.title.as_ref()),
+        );
         this.autorecover_minutes = session.autorecover_minutes;
         this.keep_drafts = session.keep_drafts;
         this.edit_opts = EditOptions::from_text(&session.sheet_editing);
@@ -9358,6 +9456,11 @@ impl Docxy {
             clip: None,
             theme_pref,
             ask_on_close,
+            next_document: 1,
+            quitting: false,
+            quit_discards: Vec::new(),
+            quit_tabs: Vec::new(),
+            quit_ready: false,
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
             edit_opts: EditOptions::default(),
@@ -9849,6 +9952,41 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Ctrl+N (#631): a new blank document on a document tab, a new workbook
+    /// on a workbook tab; on any other tab it does nothing. Ctrl+W (#629):
+    /// close the active tab, as File > Close and its X do. `None` for a key
+    /// that is not one of these.
+    fn document_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<()> {
+        let m = &ev.keystroke.modifiers;
+        if !(m.control || m.platform) || m.alt || m.shift {
+            return None;
+        }
+        match ev.keystroke.key.as_str() {
+            "n" => {
+                self.keytips = KeyTip::Off;
+                let kind = self.tabs.get(self.active).map_or(Kind::Docx, |t| t.kind);
+                if matches!(kind, Kind::Docx | Kind::Xlsx) {
+                    self.add_tab(kind, window, cx);
+                }
+                Some(())
+            }
+            "w" => {
+                self.keytips = KeyTip::Off;
+                if self.active < self.tabs.len() {
+                    self.backstage = false;
+                    self.close_tab(self.active, window, cx);
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
         self.project_prompt_cancel();
         let new_tab = |title: &str, surface| DocTab {
@@ -9878,7 +10016,10 @@ impl Docxy {
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
-            Kind::Docx => new_tab("Untitled.docx", Surface::Doc(Editor::new(empty_doc()))),
+            Kind::Docx => new_tab(
+                &doc_name::next_document_title(&mut self.next_document),
+                Surface::Doc(Editor::new(empty_doc())),
+            ),
             Kind::Xlsx => new_tab("Untitled.xlsx", new_sheet_surface()),
             Kind::Look => new_tab("Inbox", Surface::Placeholder),
         });
@@ -10151,7 +10292,7 @@ impl Docxy {
         // The panel swaps to it, opening if it was shut.
         self.chart_panel_event(PanelEvent::Select(idx));
         // Selecting a chart only looks; moving or resizing it would edit.
-        if self.protected_view() {
+        if self.active_locked() {
             cx.notify();
             return;
         }
@@ -12582,31 +12723,73 @@ impl Docxy {
         }
     }
 
-    /// Whether the active tab is in Protected View (#610).
-    fn protected_view(&self) -> bool {
+    /// Whether the active tab takes no edits: Protected View (#610), or a
+    /// document marked as final (#617).
+    fn active_locked(&self) -> bool {
         self.tabs
             .get(self.active)
-            .is_some_and(|t| t.access.protected)
+            .is_some_and(|t| t.access.locked())
     }
 
-    /// Refuse an edit in Protected View, saying how to edit; `true` when it
-    /// was refused. Every gate that would change the workbook asks this first.
+    /// Refuse an edit in Protected View or a document marked as final,
+    /// saying how to edit; `true` when it was refused. Every gate that would
+    /// change the workbook or document asks this first.
     fn protected_refused(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.protected_view() {
+        let Some(access) = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.access)
+            .filter(|a| a.locked())
+        else {
             return false;
-        }
-        self.set_status(open_mode::PROTECTED_STATUS);
+        };
+        self.set_status(access.locked_status());
         cx.notify();
         true
     }
 
     /// Excel's PROTECTED VIEW message bar (#610), under the ribbon while the
     /// active workbook came from the Internet: what it is, why, and the one
-    /// way out. Its colours are Excel's, in either theme.
+    /// way out.
     fn protected_view_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        self.message_bar(
+            pal,
+            ("pv-bar", "pv-enable"),
+            (open_mode::PROTECTED_LABEL, open_mode::PROTECTED_TEXT),
+            "Enable Editing",
+            Self::enable_editing,
+            cx,
+        )
+    }
+
+    /// Word's MARKED AS FINAL message bar (#617), under the ribbon while the
+    /// active document is marked as final: what it is, and Edit Anyway.
+    fn marked_final_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        self.message_bar(
+            pal,
+            ("final-bar", "final-edit-anyway"),
+            (open_mode::MARKED_FINAL_LABEL, open_mode::MARKED_FINAL_TEXT),
+            "Edit Anyway",
+            Self::edit_anyway,
+            cx,
+        )
+    }
+
+    /// Office's yellow message bar: a bold `label`, its `text`, and one
+    /// `button` that runs `press`. `ids` are the bar's and the button's.
+    /// Its colours are Office's, in either theme.
+    fn message_bar(
+        &self,
+        pal: Pal,
+        ids: (&'static str, &'static str),
+        (label, text): (&'static str, &'static str),
+        button: &'static str,
+        press: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let ink = hsla_u(0x3B3B3B);
         h_flex()
-            .id("pv-bar")
+            .id(ids.0)
             .w_full()
             .h(px(36.))
             .flex_none()
@@ -12618,23 +12801,18 @@ impl Docxy {
             .border_color(pal.border)
             .text_size(px(12.))
             .text_color(ink)
-            .child(
-                div()
-                    .flex_none()
-                    .font_weight(FontWeight::BOLD)
-                    .child(open_mode::PROTECTED_LABEL),
-            )
+            .child(div().flex_none().font_weight(FontWeight::BOLD).child(label))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .child(open_mode::PROTECTED_TEXT),
+                    .child(text),
             )
             .child(
                 div()
-                    .id("pv-enable")
+                    .id(ids.1)
                     .flex_none()
                     .px_3()
                     .py_1()
@@ -12644,13 +12822,24 @@ impl Docxy {
                     .bg(hsla_u(0xFFFFFF))
                     .cursor_pointer()
                     .hover(|d| d.bg(hsla_u(0xF3F2F1)))
-                    .child("Enable Editing")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.enable_editing(cx);
+                    .child(button)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        press(this, cx);
                         this.refocus(window, cx);
                     })),
             )
             .into_any_element()
+    }
+
+    /// The final bar's Edit Anyway (#617): the document takes edits, and the
+    /// mark leaves its package, so a later save writes an ordinary document
+    /// as Word's does. Not an edit: the tab stays clean. In Protected View
+    /// it waits for Enable Editing, whose bar shows first.
+    pub(crate) fn edit_anyway(&mut self, cx: &mut Context<Self>) {
+        if self.tabs.get_mut(self.active).is_some_and(edit_anyway_tab) {
+            self.persist();
+            cx.notify();
+        }
     }
 
     /// The message bar's Enable Editing (#610): the tab leaves Protected View
@@ -13101,7 +13290,7 @@ impl Docxy {
             self.set_status(CUT_CANCELLED_STATUS);
         }
         let now = self.clipboard_read(cx);
-        if self.sheet_protected() || self.protected_view() || self.grid_clip_live(&now).is_none() {
+        if self.sheet_protected() || self.active_locked() || self.grid_clip_live(&now).is_none() {
             return false;
         }
         // A paste lands in one rectangle (#670).
@@ -15424,7 +15613,7 @@ impl Docxy {
         // Protected View (#610): only keys that look, move or copy reach the
         // workbook. The find bar still takes typing; its Replace is refused
         // where it would write.
-        if self.protected_view()
+        if self.active_locked()
             && !self.find_open
             && !open_mode::protected_allows_key(key, ctrl, alt)
         {
@@ -16038,8 +16227,16 @@ fn canonical(path: &std::path::Path) -> PathBuf {
 
 /// The name Save As suggests for a document tab: [`doc_import::save_name`]
 /// (its title, or an imported Word 97-2003 document's `.docx`), or for a tab
-/// converted from another format (#633) the same name as a Word document.
+/// converted from another format (#633) the same name as a Word document. A
+/// never-saved document proposes its first words, as Word does (#631).
 fn doc_save_as_name(tab: &DocTab) -> String {
+    if tab.path.is_none()
+        && tab.access.converted.is_none()
+        && !tab.import.binary_source
+        && let Surface::Doc(ed) = &tab.surface
+    {
+        return format!("{}.docx", doc_name::untitled_stem(&ed.doc, &tab.title));
+    }
     if tab.access.converted.is_none() {
         return doc_import::save_name(tab);
     }
@@ -16115,8 +16312,8 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
         tab.status = "this document has not been converted yet: open its tab first".into();
         return false;
     }
-    if tab.access.protected {
-        tab.status = open_mode::PROTECTED_STATUS.into();
+    if tab.access.locked() {
+        tab.status = tab.access.locked_status().into();
         return false;
     }
     if tab.access.converted.is_some() && writes_own_file(tab.path.as_deref(), target.as_deref()) {
@@ -16461,7 +16658,7 @@ impl Docxy {
             .tabs
             .get(self.active)
             .map(doc_save_as_name)
-            .unwrap_or_else(|| "Untitled.docx".into());
+            .unwrap_or_else(|| "Document1.docx".into());
         let mut dialog = rfd::FileDialog::new()
             .add_filter("Word document", &["docx"])
             .add_filter("Markdown", &["md", "markdown"]);
@@ -18449,7 +18646,7 @@ impl Docxy {
     /// swallows Tab for focus traversal before on_key_down sees it).
     fn tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // An open dialog takes Tab too; see `on_key`.
-        if self.dialog_takes_key("tab", None, Modifiers::default(), cx) {
+        if self.dialog_takes_key("tab", None, Modifiers::default(), window, cx) {
             return;
         }
         if self.tab_more_open {
@@ -18559,7 +18756,7 @@ impl Docxy {
             shift: true,
             ..Modifiers::default()
         };
-        if self.dialog_takes_key("tab", None, shift, cx) {
+        if self.dialog_takes_key("tab", None, shift, window, cx) {
             return;
         }
         if self.tab_more_open {
@@ -18610,6 +18807,7 @@ impl Docxy {
             &ev.keystroke.key,
             ev.keystroke.key_char.as_deref(),
             ev.keystroke.modifiers,
+            window,
             cx,
         ) {
             return;
@@ -18626,6 +18824,12 @@ impl Docxy {
         if self.close_menu() {
             cx.notify();
             return;
+        }
+        // Word's and Excel's document keys come before every surface's own,
+        // so they work on any tab, in Protected View and in a document
+        // marked as final too.
+        if let Some(done) = self.document_key(ev, window, cx) {
+            return done;
         }
         if self.project_edit_open() && !self.backstage {
             return self.project_key(ev, window, cx);
@@ -18690,10 +18894,10 @@ impl Docxy {
         if key == "escape" && self.hf_active() {
             return self.exit_hf(window, cx);
         }
-        // Protected View (#633): only keys that look, move or copy reach the
-        // document. The find bar still takes typing; its Replace is refused
-        // where it would write.
-        if self.protected_view()
+        // Protected View (#633), or a document marked as final (#617): only
+        // keys that look, move or copy reach the document. The find bar still
+        // takes typing; its Replace is refused where it would write.
+        if self.active_locked()
             && !self.find_open
             && !open_mode::protected_allows_doc_key(key.as_str(), ctrl, m.alt)
         {
@@ -26499,7 +26703,7 @@ impl Docxy {
                         })),
                 )
                 .child(div().text_size(px(11.)).text_color(dim).child(
-                    "Off: closing the window is silent — your work is kept and reopened next launch. Closing a single tab with unsaved changes always asks.",
+                    "On: closing the window asks \u{201C}Save your changes to this file?\u{201D} for each unsaved document in turn; Don't Save leaves its file as it is. Off: closing the window is silent — your work is kept and reopened next launch. Closing a single tab with unsaved changes always asks.",
                 ))
                 // One button that cycles the interval, as simple as the
                 // toggle above; Word's File › Options › Save equivalent.
@@ -26657,7 +26861,7 @@ impl Docxy {
 /// The drag payload for a title-chip drag: the source tab's absolute index,
 /// plus the strip length and the tab's title at drag start — a tab closed or
 /// another reorder landing mid-drag invalidates the snapshot, and the drop
-/// must not guess at what moved. Titles are not unique (new documents are
+/// must not guess at what moved. Titles are not unique (new workbooks are
 /// all `Untitled.*`), so the guard passes if the shifted index happens to
 /// land on a same-title tab; a per-tab id would close that and is out of
 /// scope here. Cloned into the view gpui draws under the cursor — the same
@@ -26844,12 +27048,12 @@ impl Render for Docxy {
         // record itself again.
         self.frame = self.frame.wrapping_add(1);
         self.schedule_project_passes(window, cx);
-        // Protected View's last backstop (#633): an edit that reached a
-        // protected document by a way no gate or `mark_dirty` covers (one of
+        // The last backstop of Protected View (#633), or of a document marked
+        // as final (#617): an edit that reached a locked document by a way no gate or `mark_dirty` covers (one of
         // the tab's other modules) is rolled back before it is ever drawn,
         // saved or written to the hot-exit sidecar as unsaved work.
         for t in self.tabs.iter_mut() {
-            if t.access.protected && t.dirty {
+            if t.access.locked() && t.dirty {
                 protected_rollback(t);
             }
         }
@@ -27226,9 +27430,10 @@ impl Render for Docxy {
         );
         let vw = f32::from(window.viewport_size().width);
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
-        // Protected View (#610, documents #633) hides the ribbon's commands,
-        // as Excel and Word grey them out; its message bar takes their place.
-        let protected = (self.active_is_sheet() || is_doc) && self.protected_view();
+        // Protected View (#610, documents #633), or a document marked as
+        // final (#617), hides the ribbon's commands, as Excel and Word grey
+        // them out; its message bar takes their place.
+        let protected = (self.active_is_sheet() || is_doc) && self.active_locked();
         let ribbon_body = (!self.ribbon_min
             && !protected
             && (is_doc || self.active_is_sheet() || self.active_is_project()))
@@ -27240,7 +27445,19 @@ impl Render for Docxy {
             }
         });
         let project_prompt = self.project_prompt_bar(pal, cx);
-        let protected_bar = protected.then(|| self.protected_view_bar(pal, cx));
+        // Protected View's bar comes first; once editing is enabled, a
+        // document marked as final shows Word's bar (#617).
+        let protected_bar = protected.then(|| {
+            if self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| t.access.protected)
+            {
+                self.protected_view_bar(pal, cx)
+            } else {
+                self.marked_final_bar(pal, cx)
+            }
+        });
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
         let picker_bar = (is_doc)
             .then_some(self.picker)
@@ -31550,44 +31767,21 @@ fn main() {
             }
             // Open any command-line files on top of the restored session.
             if !startup_files.is_empty() {
-                view.update(cx, move |this, cx| this.open_args(startup_files, cli_read_only, cx));
+                view.update(cx, move |this, cx| {
+                    this.open_args(startup_files, cli_read_only, cx)
+                });
             }
             // Hot-exit: capture the latest (possibly unsaved) content when the
             // window is closed, so a restart restores exactly what was open. By
-            // default closing is silent; with "ask before closing" on, confirm
-            // when there are unsaved tabs.
+            // default closing is silent; with "ask before closing" on, each
+            // unsaved document is asked about in turn (#630).
             let on_close = view.clone();
-            window.on_window_should_close(cx, move |_window, cx| {
+            window.on_window_should_close(cx, move |window, cx| {
                 on_close.update(cx, |this, cx| {
-                    close::commit_pending_for_exit(&mut this.tabs);
-                    // A cancelled close keeps the window: repaint the committed cell.
-                    cx.notify();
-                    this.persist();
-                    // ⚠️ Not in a harness instance — the same modal-loop trap as
-                    // `save_sheet_tab` describes, and here it would wedge the
-                    // shutdown the runner waits on after the `quit` verb.
-                    let close = if this.harness.is_none()
-                        && this.ask_on_close
-                        && this.tabs.iter().any(|t| t.dirty)
-                    {
-                        matches!(
-                            rfd::MessageDialog::new()
-                                .set_title("docxy")
-                                .set_description("You have unsaved changes.\n\nClose anyway? Your work is kept and reopened next launch.")
-                                .set_buttons(rfd::MessageButtons::YesNo)
-                                .show(),
-                            rfd::MessageDialogResult::Yes
-                        )
-                    } else {
-                        true
-                    };
-                    // Only an accepted close is a clean exit; a cancelled one
-                    // keeps running, marker and all. The persist above is the
-                    // final one, so only the marker is left.
-                    if close {
-                        this.mark_clean_exit();
-                    }
-                    close
+                    // Not asked in a harness instance: its `quit` must end the
+                    // run it waits on. Its `close-window` verb asks instead.
+                    let ask = this.harness.is_none();
+                    this.window_should_close(ask, window, cx)
                 })
             });
             // AutoRecover (#632): wake when the interval is up (and at least
@@ -31599,7 +31793,7 @@ fn main() {
             //
             // ⚠️ Only `update_in`, never `read_with` / `update`. On Windows a
             // foreground task runs from a window message, and rfd's dialogs
-            // (Open, Save As, the ask-on-close prompt) pump those messages in
+            // (Open, Save As) pump those messages in
             // a modal loop while a gpui listener holds the App borrowed. The
             // plain entity calls `borrow()` the App and panic there, aborting
             // the process with the unsaved work this exists to keep;

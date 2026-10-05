@@ -595,8 +595,14 @@ impl Docxy {
             }
         }
         let block = src.block;
-        if self.protected_view() {
-            return Some(Err(crate::open_mode::PROTECTED_STATUS.into()));
+        // A locked workbook (Protected View, Read-Only) takes no paste.
+        if let Some(access) = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.access)
+            .filter(|a| a.locked())
+        {
+            return Some(Err(access.locked_status().to_string()));
         }
         if self.active_sheet().is_some_and(SheetView::multi_area) {
             return Some(Err(gridcore::edit::MULTI_SELECTION.into()));
