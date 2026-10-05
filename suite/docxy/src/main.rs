@@ -72,6 +72,7 @@ mod sheet_filter;
 mod sheet_outline;
 mod sheet_ribbon;
 mod sheet_sort;
+mod sheet_validation;
 mod style_gallery;
 mod table_dialogs;
 mod table_tab;
@@ -636,6 +637,16 @@ struct SheetView {
     /// rows cut a spilled array: `SORT_CUTS_SPILL`); the host shows it in
     /// the status bar.
     entry_error: Option<String>,
+    /// A typed entry that broke its cell's data-validation rule, waiting on
+    /// the alert the tab shows for it (#687). The editor stays open with its
+    /// text meanwhile.
+    dv_pending: Option<DvPending>,
+    /// The move the commit now running makes once its entry is in, which a
+    /// data-validation alert holds for Yes or OK; `None` keeps the selection.
+    dv_then: Option<(i32, i32)>,
+    /// Circle Invalid Data's circles: (sheet, row, col). View state, never
+    /// saved, and a circle goes when its cell is valid (#689).
+    circles: Vec<(usize, u32, u32)>,
     /// Leftmost visible column (horizontal scroll offset). Columns virtualize by
     /// offset — rendered `col0..=cend` — so columns past the viewport are
     /// reachable (raw gpui can't wrap the virtualized row list in an h-scroller).
@@ -857,8 +868,6 @@ enum RefTarget {
     Categories,
     /// The cells a conditional-formatting rule applies to.
     CondFormat,
-    /// The cells a data-validation list applies to.
-    Validation,
 }
 
 impl RefTarget {
@@ -872,7 +881,7 @@ impl RefTarget {
     /// the keyboard while they are open, so their range field has to be asked
     /// first — otherwise what you type lands in the bar's own buffer.
     fn is_bar(self) -> bool {
-        matches!(self, RefTarget::CondFormat | RefTarget::Validation)
+        matches!(self, RefTarget::CondFormat)
     }
 }
 
@@ -880,7 +889,6 @@ impl RefTarget {
 fn bar_target(act: SheetAct) -> Option<RefTarget> {
     match act {
         SheetAct::CondFormat => Some(RefTarget::CondFormat),
-        SheetAct::DataValidation => Some(RefTarget::Validation),
         _ => None,
     }
 }
@@ -948,8 +956,22 @@ fn act_targets_cells(act: SheetAct) -> bool {
             | SheetAct::ClearOutline
             | SheetAct::OutlineSettings
             | SheetAct::NumberFormatMenu
+            | SheetAct::CircleInvalid
+            | SheetAct::ClearValidationCircles
             | SheetAct::Todo
     )
+}
+
+/// A typed entry waiting on its data-validation alert: what it writes, the
+/// rule's violation, and the move to make once it is let in.
+#[derive(Clone, Debug)]
+struct DvPending {
+    origin: (usize, u32, u32),
+    /// What the entry writes: its cell, or the whole range of a Ctrl+Enter.
+    cells: Vec<(u32, u32, gridcore::sheet::Cell)>,
+    violation: gridcore::validation::Violation,
+    /// The move Yes or OK goes on to make; `None` keeps the selection.
+    then: Option<(i32, i32)>,
 }
 
 /// A live text field: which target it edits, its buffer, the caret and the
@@ -1311,6 +1333,10 @@ struct GridClip {
     sheet_name: String,
     /// The selection it was taken from, (r0, c0, r1, c1).
     rect: (u32, u32, u32, u32),
+    /// The data-validation rules of the cells it was taken from
+    /// ([`gridcore::validation::copy_rules`]), which a paste puts on its
+    /// target (#688).
+    rules: Vec<gridcore::sheet::DataValidation>,
     /// The sheet row each row of `cells` came from: a copy leaves out the
     /// rows a filter hides (#664), so rows may be missing.
     rows: Vec<u32>,
@@ -1538,6 +1564,11 @@ enum SheetAct {
     Merge,
     CondFormat,
     DataValidation,
+    /// Data › Data Tools › Data Validation › Circle Invalid Data: circles the
+    /// cells whose value breaks their rule; Clear Validation Circles takes them
+    /// off (#689). View state: a save knows nothing of them.
+    CircleInvalid,
+    ClearValidationCircles,
     /// Data › Sort & Filter › Filter (Ctrl+Shift+L): AutoFilter buttons on
     /// over the selection or the list around the cursor, or off (#690).
     Filter,
@@ -2016,6 +2047,7 @@ impl SheetView {
     /// text and [`SheetView::entry_error`] says why.
     fn commit_edit(&mut self) -> bool {
         self.entry_error = None;
+        self.dv_pending = None;
         self.take_proposal();
         let untouched = self.edit_untouched();
         debug_assert!(self.editing.is_none() || self.edit_origin.is_some());
@@ -2051,6 +2083,13 @@ impl SheetView {
                 return false;
             }
         }
+        // The cell's data-validation rule: a breaking entry waits for its
+        // alert, the editor kept with the text.
+        if let Some(cell) = &cell {
+            if self.dv_violation(origin, vec![(r, c, cell.clone())], self.dv_then) {
+                return false;
+            }
+        }
         self.editing = None;
         self.end_cell_edit();
         self.push_undo();
@@ -2058,6 +2097,92 @@ impl SheetView {
             self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
         }
         true
+    }
+
+    /// Check the entry `cells` (written for `origin`, the cell typed in)
+    /// against `origin`'s data-validation rule. When it breaks it, hold the
+    /// entry for its alert ([`SheetView::dv_pending`]), say why in
+    /// `entry_error` (for a caller that has no dialog to show) and answer
+    /// true.
+    fn dv_violation(
+        &mut self,
+        origin: (usize, u32, u32),
+        cells: Vec<(u32, u32, gridcore::sheet::Cell)>,
+        then: Option<(i32, i32)>,
+    ) -> bool {
+        let (s, r, c) = origin;
+        let Some(cell) = cells.iter().find(|(cr, cc, _)| (*cr, *cc) == (r, c)) else {
+            return false;
+        };
+        let Some(violation) =
+            gridcore::validation::check_entry(&mut self.pkg.workbook, s, r, c, &cell.2)
+        else {
+            return false;
+        };
+        self.entry_error = Some(violation.message.clone());
+        self.dv_pending = Some(DvPending {
+            origin,
+            cells,
+            violation,
+            then,
+        });
+        true
+    }
+
+    /// Yes or OK on a data-validation alert: the held entry goes in as one
+    /// undo step and the commit's move is made. False when nothing was held.
+    fn accept_pending(&mut self) -> bool {
+        let Some(p) = self.dv_pending.take() else {
+            return false;
+        };
+        let s = p.origin.0;
+        self.editing = None;
+        self.end_cell_edit();
+        self.push_undo();
+        match <[_; 1]>::try_from(p.cells) {
+            Ok([(cr, cc, cell)]) => {
+                self.engine
+                    .set_cell(&mut self.pkg.workbook, (s, cr, cc), cell);
+            }
+            Err(cells) => self
+                .engine
+                .set_cells_prechecked(&mut self.pkg.workbook, s, cells),
+        }
+        if let Some((dr, dc)) = p.then {
+            self.move_sel(dr, dc);
+        }
+        self.prune_circles();
+        true
+    }
+
+    /// Circle Invalid Data: circle every cell of the active sheet whose value
+    /// breaks its rule, in place of this sheet's circles. How many.
+    fn circle_invalid(&mut self) -> usize {
+        let sheet = self.active;
+        let cells = gridcore::validation::invalid_cells(&self.pkg.workbook, sheet);
+        self.circles.retain(|&(s, ..)| s != sheet);
+        let n = cells.len();
+        self.circles
+            .extend(cells.into_iter().map(|(r, c)| (sheet, r, c)));
+        n
+    }
+
+    /// Drop the circles round cells that are valid now.
+    fn prune_circles(&mut self) {
+        if self.circles.is_empty() {
+            return;
+        }
+        let sheets: std::collections::BTreeSet<usize> =
+            self.circles.iter().map(|&(s, ..)| s).collect();
+        let invalid: std::collections::BTreeSet<(usize, u32, u32)> = sheets
+            .into_iter()
+            .flat_map(|s| {
+                gridcore::validation::invalid_cells(&self.pkg.workbook, s)
+                    .into_iter()
+                    .map(move |(r, c)| (s, r, c))
+            })
+            .collect();
+        self.circles.retain(|c| invalid.contains(c));
     }
 
     /// Would `changes` to sheet `s` change part of an array
@@ -2391,11 +2516,14 @@ impl SheetView {
     /// refused: then the editor stays open, nothing moves, `entry_error` says
     /// why and this is `None`. `Some(committed)` otherwise.
     fn commit_and_move(&mut self, dr: i32, dc: i32) -> Option<bool> {
+        self.dv_then = Some((dr, dc));
         let committed = self.commit_edit();
+        self.dv_then = Some((0, 0));
         if self.entry_error.is_some() {
             return None;
         }
         self.move_sel(dr, dc);
+        self.prune_circles();
         Some(committed)
     }
 
@@ -2579,12 +2707,20 @@ impl SheetView {
         if cells.as_ref().is_some_and(|cells| self.refuses(s, cells)) {
             return false;
         }
+        // The typed entry is checked once, against the active cell's rule,
+        // and then fills the range.
+        if let Some(cells) = &cells {
+            if self.dv_violation((s, r, c), cells.clone(), None) {
+                return false;
+            }
+        }
         self.end_cell_edit();
         self.push_undo();
         if let Some(cells) = cells {
             self.engine
                 .set_cells_prechecked(&mut self.pkg.workbook, s, cells);
         }
+        self.prune_circles();
         true
     }
 
@@ -2796,6 +2932,7 @@ impl SheetView {
         self.sel = snap.sel;
         self.anchor = snap.anchor;
         self.end_cell_edit();
+        self.prune_circles();
     }
     /// The selection rectangle as (r0, c0, r1, c1), top-left to bottom-right.
     fn range(&self) -> (u32, u32, u32, u32) {
@@ -2846,6 +2983,7 @@ impl SheetView {
             sheet: self.active,
             sheet_name: sheet.name.clone(),
             rect,
+            rules: gridcore::validation::copy_rules(sheet, rect),
             rows,
             cut,
             view_gen: self.edit_gen,
@@ -2940,7 +3078,23 @@ impl SheetView {
         }
         let at = (sel.0, sel.1);
         let block = tiled_block(&clip.cells, &clip.rows, clip.rect.1, at, tiles);
-        self.write_block(at, &block).map(|()| GridPasted::Done)
+        self.write_block(at, &block)?;
+        // The source cells' rules replace the target's (#688) — an ordinary
+        // paste moves validation along with the cells, so a source with no
+        // rule clears the target's. A copy that left out filtered rows no
+        // longer lines up with its rules: the target's stay.
+        if h == clip.rect.2 - clip.rect.0 + 1 {
+            let dst = self.active;
+            gridcore::validation::paste_rules(
+                &mut self.pkg.workbook.sheets[dst],
+                &clip.rules,
+                clip.rect,
+                at,
+                tiles,
+            );
+            self.prune_circles();
+        }
+        Ok(GridPasted::Done)
     }
 
     /// Whether the cut `clip` still names the cells it was cut from: nothing
@@ -3065,6 +3219,17 @@ impl SheetView {
         self.engine.set_cells_prechecked(wb, src, clears);
         self.engine.paste_block_prechecked(wb, dst, at, &block);
         self.engine.set_cells_prechecked(wb, src, late);
+        // The rules move with the cells (#688): off the source, onto the
+        // target, whose own are replaced.
+        gridcore::validation::clear_validation(&mut self.pkg.workbook.sheets[src], clip.rect);
+        gridcore::validation::paste_rules(
+            &mut self.pkg.workbook.sheets[dst],
+            &clip.rules,
+            clip.rect,
+            at,
+            (1, 1),
+        );
+        self.prune_circles();
         self.select_block(at, &block);
         Ok(())
     }
@@ -3422,8 +3587,6 @@ struct Docxy {
     sheet_fmt_open: bool,
     // In-progress conditional-formatting rule entry (the value buffer, e.g. ">500").
     sheet_cf_edit: Option<String>,
-    // In-progress data-validation list entry (comma-separated allowed values).
-    sheet_dv_edit: Option<String>,
     // In-progress row-height entry (points, or "auto").
     sheet_rowh_edit: Option<String>,
     // Which entry bar's range field is on screen, if any; it starts on the
@@ -7884,8 +8047,7 @@ fn target_takes_foreign_sheet(target: RefTarget) -> bool {
         RefTarget::ChartRange
         | RefTarget::SeriesName(_)
         | RefTarget::SeriesValues(_)
-        | RefTarget::Categories
-        | RefTarget::Validation => true,
+        | RefTarget::Categories => true,
         RefTarget::CondFormat | RefTarget::ChartTitle => false,
     }
 }
@@ -8068,6 +8230,9 @@ fn new_sheet_surface() -> Surface {
         edit_start: String::new(),
         last_format: None,
         entry_error: None,
+        dv_pending: None,
+        dv_then: Some((0, 0)),
+        circles: Vec::new(),
         engine,
         undo: vec![],
         redo: vec![],
@@ -8136,6 +8301,9 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     edit_start: String::new(),
                     last_format: None,
                     entry_error: None,
+                    dv_pending: None,
+                    dv_then: Some((0, 0)),
+                    circles: Vec::new(),
                     engine,
                     undo: vec![],
                     redo: vec![],
@@ -9221,7 +9389,6 @@ impl Docxy {
             sheet_numfmt_open: false,
             sheet_fmt_open: false,
             sheet_cf_edit: None,
-            sheet_dv_edit: None,
             sheet_rowh_edit: None,
             bar_field: None,
             bar_range: None,
@@ -10496,7 +10663,7 @@ impl Docxy {
             RefTarget::SeriesValues(i) => self.series_apply_values(i, text, cx),
             RefTarget::SeriesName(i) => self.series_apply_name(i, text, cx),
             RefTarget::Categories => self.categories_apply(text, cx),
-            RefTarget::CondFormat | RefTarget::Validation => self.bar_range_apply(target, text, cx),
+            RefTarget::CondFormat => self.bar_range_apply(target, text, cx),
         }
     }
 
@@ -10519,21 +10686,6 @@ impl Docxy {
             Err(m) => self.ref_msg = Some((target, false, m)),
         }
         cx.notify();
-    }
-
-    /// The sheet the open bar acts on: the one its pinned range names, else the
-    /// one on screen. Only the bars that resolve a foreign qualifier can differ
-    /// from `active` — the others refuse one, so their pinned range always
-    /// names this sheet.
-    ///
-    /// Derived from `bar_range` rather than stored beside it, so the two cannot
-    /// drift into naming one sheet and acting on another.
-    fn bar_sheet_index(&self) -> Option<usize> {
-        let active = self.active_sheet()?.active;
-        match self.bar_range.as_deref().and_then(parse_ref_text) {
-            Some(r) => sheet_index_of(&self.sheet_names(), r.sheet.as_deref(), active).ok(),
-            None => Some(active),
-        }
     }
 
     /// The cells the open bar acts on: the range pinned into its field, else
@@ -10669,7 +10821,6 @@ impl Docxy {
     /// cells it acts on.
     fn bar_close(&mut self) {
         self.sheet_cf_edit = None;
-        self.sheet_dv_edit = None;
         self.bar_field = None;
         self.bar_range = None;
         if matches!(&self.range_edit, Some(f) if f.target.is_bar()) {
@@ -12462,9 +12613,33 @@ impl Docxy {
                 }
                 true
             }
-            Some(None) => !self.sheet_entry_refused(cx),
+            Some(None) => {
+                // A breaking entry waits on its data-validation alert.
+                if self.sheet_show_alert() {
+                    return false;
+                }
+                !self.sheet_entry_refused(cx)
+            }
             None => false,
         }
+    }
+
+    /// Show the data-validation alert the active sheet's last commit raised,
+    /// if it raised one (#687): its message is not an `entry_error` then, the
+    /// dialog says it. True when an alert is up.
+    fn sheet_show_alert(&mut self) -> bool {
+        let Some(v) = self.active_sheet_mut() else {
+            return false;
+        };
+        let Some(p) = &v.dv_pending else {
+            return false;
+        };
+        let d = sheet_validation::alert_dialog(&p.violation);
+        v.entry_error = None;
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.dialogs.push(d);
+        }
+        true
     }
 
     /// Ctrl+Enter: commit the entry into every selected cell and keep the
@@ -12476,7 +12651,9 @@ impl Docxy {
         {
             self.mark_sheet_dirty();
         }
-        self.sheet_entry_refused(cx);
+        if !self.sheet_show_alert() {
+            self.sheet_entry_refused(cx);
+        }
         cx.notify();
     }
 
@@ -12976,62 +13153,6 @@ impl Docxy {
         }
     }
 
-    /// Route a keystroke into the data-validation entry bar; Enter creates a list
-    /// validation from the comma-separated values over the selection.
-    fn sheet_dv_edit_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
-        let Some(mut buf) = self.sheet_dv_edit.clone() else {
-            return;
-        };
-        match key {
-            "escape" => {
-                self.sheet_dv_edit = None;
-                self.bar_close();
-            }
-            "enter" => {
-                let items: Vec<String> = buf
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                // The rule lands on the sheet the field NAMES, which for a
-                // validation may not be the one on screen: the list is built
-                // where it is read, and the boxes reading it commonly sit on
-                // another sheet from the one it was typed on.
-                let target = self.bar_cells().zip(self.bar_sheet_index());
-                match target {
-                    _ if items.is_empty() => {}
-                    Some((cells, s)) => {
-                        let f1 = format!("\"{}\"", items.join(","));
-                        self.sheet_try_edit(true, |v| {
-                            v.pkg.add_data_validation(s, cells, "list", "", &f1, None)
-                        });
-                    }
-                    // The pinned range no longer resolves — its sheet was
-                    // renamed or removed while this bar sat open. The bar closes
-                    // either way, and `bar_close` takes its `ref_msg` with it, so
-                    // the status line is what's left to say the rule never
-                    // landed rather than let the close look like it applied.
-                    None => self.set_status("That range names a sheet this workbook hasn't got"),
-                }
-                self.sheet_dv_edit = None;
-                self.bar_close();
-            }
-            "backspace" => {
-                buf.pop();
-                self.sheet_dv_edit = Some(buf);
-            }
-            _ => {
-                if let Some(c) = ev.keystroke.key_char.as_deref() {
-                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
-                        buf.push_str(c);
-                    }
-                }
-                self.sheet_dv_edit = Some(buf);
-            }
-        }
-        cx.notify();
-    }
-
     /// Route a keystroke into the open comment bar (char / backspace / enter / esc).
     fn sheet_comment_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
         let Some(mut buf) = self.sheet_comment_edit.clone() else {
@@ -13359,7 +13480,9 @@ impl Docxy {
         let dv = sh
             .validations
             .iter()
-            .find(|d| d.kind == "list" && d.covers(r, c))?;
+            .find(|d| d.kind == "list" && d.covers(r, c))
+            // `showDropDown="1"` hides the in-cell dropdown.
+            .filter(|d| d.show_dropdown)?;
         let f = dv.formula1.trim();
         // Inline list: "Yes,No,Maybe".
         if f.len() >= 2 && f.starts_with('"') && f.ends_with('"') {
@@ -14711,6 +14834,45 @@ impl Docxy {
 
     /// Run a Sort & Filter command on the active tab (#690, #691); a refusal
     /// lands in the status line.
+    /// Data › Data Validation: the dialog over the selection (#689).
+    fn sheet_data_validation(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            match sheet_validation::dialog(tab) {
+                Ok(d) => tab.dialogs.push(d),
+                Err(e) => tab.status = e.into(),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Data › Circle Invalid Data: circle every cell of the sheet whose value
+    /// breaks its rule (#689). View state: nothing changes in the workbook.
+    fn sheet_circle_invalid(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Surface::Sheet(v) = &mut tab.surface else {
+            return;
+        };
+        tab.status = match v.circle_invalid() {
+            0 => "No invalid data".to_string(),
+            n => format!("{n} invalid cell(s) circled"),
+        }
+        .into();
+        cx.notify();
+    }
+
+    /// Data › Clear Validation Circles (#689).
+    fn sheet_clear_circles(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if let Surface::Sheet(v) = &mut tab.surface {
+                v.circles.clear();
+                tab.status = "Validation circles cleared".into();
+            }
+        }
+        cx.notify();
+    }
+
     fn sheet_data_cmd(
         &mut self,
         op: impl FnOnce(&mut DocTab) -> Result<(), String>,
@@ -14799,10 +14961,9 @@ impl Docxy {
                 self.sheet_cf_edit = Some(String::new());
                 cx.notify();
             }
-            SheetAct::DataValidation => {
-                self.sheet_dv_edit = Some(String::new());
-                cx.notify();
-            }
+            SheetAct::DataValidation => self.sheet_data_validation(cx),
+            SheetAct::CircleInvalid => self.sheet_circle_invalid(cx),
+            SheetAct::ClearValidationCircles => self.sheet_clear_circles(cx),
             SheetAct::Filter => self.sheet_data_cmd(sheet_filter::toggle, cx),
             SheetAct::ClearFilter => self.sheet_data_cmd(
                 |t| {
@@ -14948,10 +15109,6 @@ impl Docxy {
         // The conditional-format entry bar likewise swallows typing.
         if to_bar(self.sheet_cf_edit.is_some()) {
             return self.sheet_cf_key(ev, key, cx);
-        }
-        // The data-validation entry bar swallows typing too.
-        if to_bar(self.sheet_dv_edit.is_some()) {
-            return self.sheet_dv_edit_key(ev, key, cx);
         }
         // The row-height entry bar swallows typing too.
         if self.sheet_rowh_edit.is_some() {
@@ -25326,82 +25483,6 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// The data-validation entry bar: type comma-separated allowed values to make
-    /// the selection a dropdown list.
-    fn sheet_dv_edit_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let ent = cx.entity();
-        let ent_cancel = ent.clone();
-        h_flex()
-            .w_full()
-            .min_h(px(30.))
-            .py(px(3.))
-            .items_center()
-            .gap_2()
-            .px_2()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(pal.dim)
-                    .child("Dropdown list for"),
-            )
-            .child(div().w(px(160.)).child(self.bar_range_field(
-                "dv-range",
-                RefTarget::Validation,
-                cx,
-            )))
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(pal.dim)
-                    .child("(comma-separated):"),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .h(px(22.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .rounded_sm()
-                    .bg(hsla_u(0xffffff))
-                    .border_1()
-                    .border_color(hsla_u(BRAND))
-                    .text_size(px(12.))
-                    .text_color(hsla_u(0x1a1a1a))
-                    .child(div().child(SharedString::from(if buf.is_empty() {
-                        "Yes, No, Maybe".to_string()
-                    } else {
-                        buf.to_string()
-                    })))
-                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
-            )
-            .child(
-                div()
-                    .id("dv-cancel")
-                    .px_2()
-                    .py(px(2.))
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .bg(pal.panel)
-                    .text_color(pal.fg)
-                    .border_1()
-                    .border_color(pal.border)
-                    .child("Cancel")
-                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                        ent_cancel.update(cx, |this, cx| {
-                            this.sheet_dv_edit = None;
-                            this.bar_close();
-                            cx.notify();
-                        });
-                    }),
-            )
-            .into_any_element()
-    }
-
     /// Apply the current CF buffer (used by the Apply button; Enter uses sheet_cf_key).
     fn sheet_cf_commit(&mut self, cx: &mut Context<Self>) {
         if self.protected_refused(cx) {
@@ -27666,10 +27747,6 @@ impl Render for Docxy {
             .sheet_cf_edit
             .clone()
             .map(|buf| self.sheet_cf_bar(&buf, pal, cx));
-        let sheet_dv_bar = self
-            .sheet_dv_edit
-            .clone()
-            .map(|buf| self.sheet_dv_edit_bar(&buf, pal, cx));
         let sheet_rowh = self
             .sheet_rowh_edit
             .clone()
@@ -28363,7 +28440,6 @@ impl Render for Docxy {
             .when_some(sheet_find, |d, f| d.child(f))
             .when_some(sheet_comment, |d, c| d.child(c))
             .when_some(sheet_cf, |d, c| d.child(c))
-            .when_some(sheet_dv_bar, |d, c| d.child(c))
             .when_some(sheet_rowh, |d, c| d.child(c))
             .when_some(project_prompt, |d, c| d.child(c))
             .when_some(comment_bar, |d, c| d.child(c))
@@ -31424,6 +31500,70 @@ fn sheet_el(
                     );
                 }
                 dv_overlay.push(list.into_any_element());
+            }
+        }
+    }
+    // Circle Invalid Data's circles (#689): a red ellipse round each circled
+    // cell of this sheet.
+    for &(cs, cr, cc) in view.circles.iter().filter(|c| c.0 == view.active) {
+        let Some(cx0) = col_x(cc) else {
+            continue;
+        };
+        let cw = col_px(sh.col_width(cc));
+        let y = row_y(cr);
+        dv_overlay.push(
+            div()
+                .id(ElementId::Name(format!("dv-circle-{cs}-{cr}-{cc}").into()))
+                .absolute()
+                .left(px(cx0 - 2.0))
+                .top(px(y - 2.0))
+                .w(px(cw + 4.0))
+                .h(px(SHEET_ROW_H + 4.0))
+                .rounded(px(SHEET_ROW_H))
+                .border_2()
+                .border_color(hsla_u(0xd13438))
+                .into_any_element(),
+        );
+    }
+    // The input message of the selected cell's rule (#689), under the cell.
+    if !sel_hidden && view.editing.is_none() {
+        let (tr, tc) = view.sel;
+        if let Some(dv) = gridcore::validation::validation_at(sh, tr, tc) {
+            let msg = dv.prompt.clone().unwrap_or_default();
+            if dv.show_input && !(msg.is_empty() && dv.prompt_title.is_empty()) {
+                if let Some(cx0) = col_x(tc) {
+                    let mut tip = v_flex()
+                        .id("dv-input-message")
+                        .absolute()
+                        .left(px(cx0))
+                        .top(px(row_y(tr) + SHEET_ROW_H + 2.0))
+                        .max_w(px(240.))
+                        .px_2()
+                        .py_1p5()
+                        .gap_1()
+                        .bg(hsla_u(0xffffe1))
+                        .border_1()
+                        .border_color(hsla_u(0xc9b458))
+                        .rounded_sm();
+                    if !dv.prompt_title.is_empty() {
+                        tip = tip.child(
+                            div()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(hsla_u(0x333333))
+                                .child(SharedString::from(dv.prompt_title.clone())),
+                        );
+                    }
+                    if !msg.is_empty() {
+                        tip = tip.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(hsla_u(0x1a1a1a))
+                                .child(SharedString::from(msg)),
+                        );
+                    }
+                    dv_overlay.push(tip.into_any_element());
+                }
             }
         }
     }
@@ -35539,10 +35679,8 @@ mod grid_geom_tests {
             bar_target(SheetAct::CondFormat),
             Some(RefTarget::CondFormat)
         );
-        assert_eq!(
-            bar_target(SheetAct::DataValidation),
-            Some(RefTarget::Validation)
-        );
+        // The Data Validation dialog replaced its bar (#689).
+        assert_eq!(bar_target(SheetAct::DataValidation), None);
         // The Sort dialog replaced the sort bar (#691).
         assert_eq!(bar_target(SheetAct::CustomSort), None);
         // Text to Columns opens a wizard dialog, not a bar (#692).
@@ -35590,9 +35728,10 @@ mod grid_geom_tests {
         }
         // Every command that opens a bar seeded from the selection is one, or
         // the bar would open on cells nothing on screen marked.
-        for act in [SheetAct::CondFormat, SheetAct::DataValidation] {
-            assert!(super::bar_target(act).is_some() && act_targets_cells(act));
-        }
+        assert!(super::bar_target(SheetAct::CondFormat).is_some());
+        assert!(act_targets_cells(SheetAct::CondFormat));
+        // Data Validation opens a dialog over the selection (#689).
+        assert!(act_targets_cells(SheetAct::DataValidation));
         // So does every Sort & Filter command: the Sort dialog and A to Z
         // sort the selection, Filter puts buttons over it (#690, #691).
         for act in [
@@ -35680,7 +35819,7 @@ mod grid_geom_tests {
     #[test]
     fn bar_fields_are_ranges_and_take_the_keyboard_first() {
         use super::RefTarget;
-        for t in [RefTarget::CondFormat, RefTarget::Validation] {
+        for t in [RefTarget::CondFormat] {
             assert!(
                 t.is_bar(),
                 "{t:?} sits inside a bar, so it is asked before the bar's own buffer"
@@ -35808,9 +35947,6 @@ mod grid_geom_tests {
         assert!(takes(SeriesValues(0)));
         assert!(takes(SeriesName(2)));
         assert!(takes(Categories));
-        // A dropdown is read where the boxes are, which is commonly not the
-        // sheet the list was typed on.
-        assert!(takes(Validation));
         // A rule acts on the rows in front of you.
         assert!(!takes(CondFormat));
         // Not a range at all — the question doesn't apply.
@@ -35818,13 +35954,13 @@ mod grid_geom_tests {
     }
 
     #[test]
-    fn validation_takes_another_sheets_cells() {
+    fn a_chart_range_takes_another_sheets_cells() {
         use super::{RefTarget, bar_ref_text};
         let wb: Vec<String> = ["Sheet1", "Lookup", "My Sheet"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let dv = |t: &str| bar_ref_text(t, RefTarget::Validation, &wb, 0);
+        let dv = |t: &str| bar_ref_text(t, RefTarget::ChartRange, &wb, 0);
         // The sheet named is the sheet acted on, and the field answers with the
         // index the rule will be written to.
         assert_eq!(dv("Lookup!A1:A9"), Ok((1, "=Lookup!$A$1:$A$9".to_string())));
@@ -35843,32 +35979,32 @@ mod grid_geom_tests {
         assert_eq!(dv("B2:D5"), Ok((0, "=Sheet1!$B$2:$D$5".to_string())));
         // And "in front of you" follows the active sheet, not the first one.
         assert_eq!(
-            bar_ref_text("B2:D5", RefTarget::Validation, &wb, 2),
+            bar_ref_text("B2:D5", RefTarget::ChartRange, &wb, 2),
             Ok((2, "='My Sheet'!$B$2:$D$5".to_string()))
         );
     }
 
     #[test]
-    fn validation_refuses_a_sheet_the_workbook_hasnt_got() {
+    fn a_chart_range_refuses_a_sheet_the_workbook_hasnt_got() {
         use super::{RefTarget, bar_ref_text};
         let wb: Vec<String> = ["Sheet1", "Lookup"].iter().map(|s| s.to_string()).collect();
         // Resolving is not the same as accepting anything: a name matching no
         // tab is refused by name rather than quietly applied to this sheet.
         assert_eq!(
-            bar_ref_text("Budget!A1:A9", RefTarget::Validation, &wb, 0),
+            bar_ref_text("Budget!A1:A9", RefTarget::ChartRange, &wb, 0),
             Err("there's no sheet called \"Budget\"".to_string())
         );
         // What isn't a range at all reads the same as it does on the other
         // bars, with the field's own `=` off the front of the complaint.
         assert_eq!(
-            bar_ref_text(" hello ", RefTarget::Validation, &wb, 0),
+            bar_ref_text(" hello ", RefTarget::ChartRange, &wb, 0),
             Err("\"hello\" isn't a range like =Sheet1!$A$1:$D$5".to_string())
         );
         assert_eq!(
-            bar_ref_text("=Lookup!", RefTarget::Validation, &wb, 0),
+            bar_ref_text("=Lookup!", RefTarget::ChartRange, &wb, 0),
             Err("\"Lookup!\" isn't a range like =Sheet1!$A$1:$D$5".to_string())
         );
-        assert!(bar_ref_text("", RefTarget::Validation, &wb, 0).is_err());
+        assert!(bar_ref_text("", RefTarget::ChartRange, &wb, 0).is_err());
     }
 
     #[test]
@@ -35904,7 +36040,7 @@ mod grid_geom_tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        for target in [RefTarget::CondFormat, RefTarget::Validation] {
+        for target in [RefTarget::CondFormat] {
             for active in 0..wb.len() {
                 let seed = ref_a1(Some(wb[active].as_str()), (1, 1, 4, 3));
                 assert_eq!(
@@ -36368,7 +36504,7 @@ mod grid_geom_tests {
         assert!(keeps_panel_field(Some(3), 3, None));
 
         // A sheet bar pointing at the grid over an open panel: dropped.
-        for f in [RefTarget::CondFormat, RefTarget::Validation] {
+        for f in [RefTarget::CondFormat] {
             assert!(
                 !keeps_panel_field(Some(3), 3, Some(f)),
                 "{f:?} is the sheet's"

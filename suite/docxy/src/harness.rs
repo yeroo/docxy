@@ -1134,10 +1134,9 @@ pub fn parse_field(name: &str) -> Result<RefTarget, String> {
         "series-name" => indexed(RefTarget::SeriesName),
         "series-values" => indexed(RefTarget::SeriesValues),
         "cond-format" => Ok(RefTarget::CondFormat),
-        "validation" => Ok(RefTarget::Validation),
         other => Err(format!(
             "unknown field '{other}' (chart-range, chart-title, categories, \
-             series-name:N, series-values:N, cond-format, validation)"
+             series-name:N, series-values:N, cond-format)"
         )),
     }
 }
@@ -1152,7 +1151,6 @@ pub fn field_name(target: RefTarget) -> String {
         RefTarget::SeriesName(i) => format!("series-name:{i}"),
         RefTarget::SeriesValues(i) => format!("series-values:{i}"),
         RefTarget::CondFormat => "cond-format".into(),
-        RefTarget::Validation => "validation".into(),
     }
 }
 
@@ -5973,7 +5971,6 @@ mod tests {
             RefTarget::SeriesName(0),
             RefTarget::SeriesValues(3),
             RefTarget::CondFormat,
-            RefTarget::Validation,
         ] {
             assert_eq!(parse_field(&field_name(t)), Ok(t));
         }

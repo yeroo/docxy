@@ -620,13 +620,13 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                     "circle-invalid",
                                     "Circle Invalid Data",
                                     None,
-                                    SheetAct::Todo,
+                                    SheetAct::CircleInvalid,
                                 ),
                                 row(
                                     "clear-validation-circles",
                                     "Clear Validation Circles",
                                     None,
-                                    SheetAct::Todo,
+                                    SheetAct::ClearValidationCircles,
                                 ),
                             ],
                         },
@@ -921,8 +921,6 @@ mod tests {
                 "clear",
                 "find-select",
                 "flash-fill",
-                "circle-invalid",
-                "clear-validation-circles",
                 "spelling",
                 "protect-workbook",
             ]
@@ -1015,11 +1013,12 @@ mod tests {
         assert_eq!(act("Text to Columns"), Ok(SheetAct::TextToColumns));
         assert_eq!(act("Data Validation"), Ok(SheetAct::DataValidation));
         assert_eq!(act("Consolidate"), Ok(SheetAct::Consolidate));
-        for todo in [
-            "Flash Fill",
-            "Circle Invalid Data",
-            "Clear Validation Circles",
-        ] {
+        assert_eq!(act("Circle Invalid Data"), Ok(SheetAct::CircleInvalid));
+        assert_eq!(
+            act("Clear Validation Circles"),
+            Ok(SheetAct::ClearValidationCircles)
+        );
+        for todo in ["Flash Fill"] {
             assert_eq!(act(todo), Err(format!("'{todo}' is not implemented")));
         }
     }
