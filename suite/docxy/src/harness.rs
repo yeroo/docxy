@@ -2557,6 +2557,8 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ("range", Json::Str(a1_range(v.range()))),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
+            // The sheet comment editor New Comment opens, and its text.
+            ("comment_edit", str_or_null(app.sheet_comment_edit.clone())),
         ]);
     }
     let ov = app.grid_overlay();

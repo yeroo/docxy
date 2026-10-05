@@ -107,6 +107,21 @@ test sheet filter cell menu right-click leaves a half-typed formula alone
   assert editing is true
   assert edit is =SUM(
 
+# The cell menu's clipboard and New Comment are the sheet's own commands.
+test sheet filter cell menu copies pastes and opens a comment
+  open ../fixtures/basic.xlsx
+  call menu-open {"target":{"cell":"A3"}}
+  call menu-click {"label":"Copy"}
+  call menu-open {"target":{"cell":"E3"}}
+  call menu-click {"label":"Paste"}
+  assert cell E3 is South
+  assert dirty is true
+  call menu-open {"target":{"cell":"B2"}}
+  call menu-click {"label":"New Comment"}
+  assert sel is B2
+  type Check this
+  assert comment_edit is Check this
+
 test sheet filter advanced filter in place
   open ../fixtures/basic.xlsx
   click E1

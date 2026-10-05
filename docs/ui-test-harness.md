@@ -335,6 +335,7 @@ State keys, as the app reports them after every driving verb:
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
+| `comment_edit` | the sheet comment editor's text (`null` when closed) |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
 | `field`, `field_text` | the focused reference field, and its buffer |
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
@@ -948,7 +949,12 @@ Menus open today:
 - **Set Baseline's split menu**: the lower half of Project › Schedule › Set
   Baseline (`Set Baseline...`, `Clear Baseline...`);
 - **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New
-  Comment): right-click a document or sheet body. It never opens on a Project;
+  Comment): right-click a document body. It never opens on a sheet or a
+  Project;
+- **the cell menu** on a sheet (#690, #691): right-click a cell. A cell outside
+  the selection is selected first (no link followed; while a formula or a range
+  field is pointing, nothing moves). It lists Cut, Copy, Paste, the Filter and
+  Sort submenus and New Comment, each a sheet command as the ribbon runs it;
 - **the Mailings tab's drop-downs** on a document (#628): Start Mail Merge,
   Select Recipients, Insert Merge Field (the attached list's columns), Rules,
   Finish & Merge, and the Preview Results record box (the attached rows).

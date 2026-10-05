@@ -340,7 +340,9 @@ pub(crate) fn document_menu() -> Vec<MenuItem> {
 }
 
 /// A sheet cell's context menu: the clipboard, then Excel's Sort and Filter
-/// submenus over the selected cell.
+/// submenus over the selected cell, and New Comment. Every item is a
+/// [`crate::SheetAct`], so it runs through `run_sheet_act` as the sheet
+/// ribbon's do, never the document's handlers.
 pub(crate) fn cell_menu() -> Vec<MenuItem> {
     use crate::SheetAct as S;
     use crate::sheet_sort::OnTop;
@@ -352,9 +354,21 @@ pub(crate) fn cell_menu() -> Vec<MenuItem> {
         ..Entry::unavailable(id, label)
     };
     vec![
-        Item(Entry::new("cm-cut", "Cut", "cut", Act::Cut, true)),
-        Item(Entry::new("cm-copy", "Copy", "copy", Act::Copy, true)),
-        Item(Entry::new("cm-paste", "Paste", "paste", Act::Paste, true)),
+        Item(Entry::new("cm-cut", "Cut", "cut", Act::Sheet(S::Cut), true)),
+        Item(Entry::new(
+            "cm-copy",
+            "Copy",
+            "copy",
+            Act::Sheet(S::Copy),
+            true,
+        )),
+        Item(Entry::new(
+            "cm-paste",
+            "Paste",
+            "paste",
+            Act::Sheet(S::Paste),
+            true,
+        )),
         Separator,
         Item(Entry {
             enabled: true,
@@ -421,7 +435,7 @@ pub(crate) fn cell_menu() -> Vec<MenuItem> {
             "cm-comment",
             "New Comment",
             "comment-add",
-            Act::NewComment,
+            Act::Sheet(S::NewComment),
             true,
         )),
     ]
@@ -477,6 +491,29 @@ mod tests {
             MenuItem::Item(Entry::new("d2", "Twice", "", Act::Paste, true)),
             MenuItem::Heading("Section".into()),
         ]
+    }
+
+    #[test]
+    fn every_cell_menu_command_is_a_sheet_act() {
+        fn walk(items: &[MenuItem], seen: &mut usize) {
+            for item in items {
+                if let MenuItem::Item(e) = item {
+                    if e.submenu.is_empty() {
+                        *seen += 1;
+                        assert!(
+                            matches!(e.act, Some(Act::Sheet(_))),
+                            "{} runs {:?}",
+                            e.label,
+                            e.act
+                        );
+                    }
+                    walk(&e.submenu, seen);
+                }
+            }
+        }
+        let mut seen = 0;
+        walk(&cell_menu(), &mut seen);
+        assert_eq!(seen, 15);
     }
 
     #[test]
