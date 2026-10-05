@@ -91,9 +91,11 @@ pub fn collect(dir: &Path, env: &Env) -> Fields {
     f.branch = match git(dir, env, &["rev-parse", "--abbrev-ref", "HEAD"]).as_deref() {
         Some(b) if !b.is_empty() && b != "HEAD" => b.to_string(),
         // Detached HEAD (a CI checkout): the workflow knows the branch.
+        // Each variable is filtered on its own: a push event exports
+        // GITHUB_HEAD_REF as an empty string, which must not hide GITHUB_REF_NAME.
         _ => env("GITHUB_HEAD_REF")
-            .or_else(|| env("GITHUB_REF_NAME"))
             .filter(|s| !s.is_empty())
+            .or_else(|| env("GITHUB_REF_NAME").filter(|s| !s.is_empty()))
             .unwrap_or_else(|| UNKNOWN.into()),
     };
 
@@ -396,6 +398,34 @@ mod tests {
                 .iter()
                 .any(|p| p.ends_with("build.rs"))
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_detached_head_takes_the_branch_from_the_first_non_empty_variable() {
+        let d = temp_dir("detached");
+        if !run(&d, &["init", "-q", "-b", "main"]) {
+            return; // no git on this machine
+        }
+        std::fs::write(d.join("build.rs"), "fn main() {}").unwrap();
+        assert!(run(&d, &["add", "."]));
+        assert!(run(&d, &["commit", "-qm", "one"]));
+        assert!(run(&d, &["checkout", "-q", "--detach"]));
+        // A push event: GITHUB_HEAD_REF is exported but empty.
+        let push = |k: &str| match k {
+            "GITHUB_HEAD_REF" => Some(String::new()),
+            "GITHUB_REF_NAME" => Some("v0.5.0".to_string()),
+            _ => None,
+        };
+        assert_eq!(collect(&d, &push).branch, "v0.5.0");
+        // A pull request: the head ref wins.
+        let pr = |k: &str| match k {
+            "GITHUB_HEAD_REF" => Some("issue-1-x".to_string()),
+            "GITHUB_REF_NAME" => Some("12/merge".to_string()),
+            _ => None,
+        };
+        assert_eq!(collect(&d, &pr).branch, "issue-1-x");
+        assert_eq!(collect(&d, &no_env).branch, "unknown");
         let _ = std::fs::remove_dir_all(&d);
     }
 

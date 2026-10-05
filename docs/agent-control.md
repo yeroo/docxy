@@ -31,7 +31,8 @@ accepts the Project verbs. A harness instance ignores `AGWINTERM_SESSION_ID`
 and is always `suite-<pid>` (#697). Normal control does not expose harness operations
 such as `open`, `key`, `type`, or `quit`.
 
-Every verb except `proj.open` and `proj.new` accepts optional `tab`: an absolute zero-based
+Every verb except `proj.open`, `proj.new` and `app-info` (the build of the whole
+suite process, which ignores `tab`) accepts optional `tab`: an absolute zero-based
 index among **all** tabs, or a case-insensitive substring of a Project tab's
 title/path. Omit it to use the active tab. Ambiguous strings, empty strings,
 invalid indices, non-Project targets, and failed-load placeholders are errors.
@@ -617,7 +618,8 @@ page-layout and printing verbs (`page.*`, `print-area.*`, `print-titles.set`,
 (`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`), which only a terminal
 xlsxy answers so far; and docxy's `doc.page-color`, `doc.watermark`,
 `doc.page-borders` and `doc.compare`, which only a terminal docxy answers so
-far — a tab answers `unknown verb`): a couple of internal-only verbs the extension host
+far, and the `app-info` build verb (#1023), which only a terminal instance and
+the suite answer — a tab answers `unknown verb`): a couple of internal-only verbs the extension host
 uses to compose its own `doc.path`/`wb.path` replies (`doc.blocks`, `wb.info`)
 are deliberately not in the tab's exposed verb set, and are rejected as
 `"unknown verb"` — same as a terminal instance, which has no arm for them at
@@ -776,8 +778,8 @@ Differences from a terminal pane:
 **Excel tabs** (`xlsxy-jetbrains-<basename>-<pid>-<n>` in xlsxy's ctl dir)
 serve the full xlsxy verb surface through `grid_ctl` (except
 `wb.properties`/`wb.set-properties`, the page-layout and printing verbs and the
-filter and sort verbs (`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`),
-terminal xlsxy only for now: a tab answers `unknown verb`), with the same host-verb
+filter and sort verbs (`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`) and
+`app-info`, terminal xlsxy only for now: a tab answers `unknown verb`), with the same host-verb
 split (`wb.path`/`wb.save`/`wb.reload`/`wb.open`; `wb.open` opens a new tab;
 `wb.info` internal). Every mutating agent verb lands as **one IDE undo step**
 driving the engine's own undo stack — the same mechanism the grid UI uses,
