@@ -1884,7 +1884,6 @@ impl App {
         self.dirty = true;
     }
 
-    /// Toggle the footnotes/endnotes side panel.
     /// Track Changes on or off (Review ▸ Track): the settings flag the file
     /// saves with, and recording in the editor. Not an undo step.
     fn toggle_track(&mut self) {
@@ -1934,6 +1933,7 @@ impl App {
         self.dirty = true;
     }
 
+    /// Toggle the footnotes/endnotes side panel.
     fn toggle_notes(&mut self) {
         self.show_notes = !self.show_notes;
         self.notes_scroll = 0;
@@ -3189,6 +3189,42 @@ impl App {
         }
     }
 
+    /// What follows a comment whose markers were just taken: with markers left
+    /// in a header or footer not being edited (`still_marked`) nothing could
+    /// take them, so it goes from `pkg` now; otherwise its record stays,
+    /// tracked, so the save leaves it out and an undo brings it back whole
+    /// (#971). `index` is where it sat in `comments`.
+    fn keep_deleted_comment(
+        &mut self,
+        c: &docxcore::comments::Comment,
+        index: usize,
+        still_marked: bool,
+    ) {
+        if still_marked {
+            self.tracked_comments.remove(&c.id);
+            self.pkg.remove_comment_id(&c.id);
+        } else if let Some(t) = self.tracked_comments.get_mut(&c.id) {
+            t.index = index;
+            // The record as it is now (its resolved state included).
+            t.comment = c.clone();
+            // A comment added this session and saved since is in `pkg` now:
+            // keep that XML too.
+            if t.raw.is_none() {
+                t.raw = self.pkg.comment_xml(&c.id);
+            }
+        } else {
+            let raw = self.pkg.comment_xml(&c.id);
+            self.tracked_comments.insert(
+                c.id.clone(),
+                TrackedComment {
+                    comment: c.clone(),
+                    raw,
+                    index,
+                },
+            );
+        }
+    }
+
     /// Delete the navigation-selected comment: its markers (one undo step)
     /// and its panel entry. Its record stays, tracked, so the save leaves it
     /// out and an undo brings it back whole (#971); one with markers left
@@ -3212,27 +3248,8 @@ impl App {
         if self.hf_edit.is_some() {
             self.editor.remove_comment_markers(&c.id);
         }
-        if self.comment_marker_ids_everywhere().contains(&c.id) {
-            self.tracked_comments.remove(&c.id);
-            self.pkg.remove_comment_id(&c.id);
-        } else if let Some(t) = self.tracked_comments.get_mut(&c.id) {
-            t.index = idx;
-            // A comment added this session and saved since is in `pkg`
-            // now: keep that XML too.
-            if t.raw.is_none() {
-                t.raw = self.pkg.comment_xml(&c.id);
-            }
-        } else {
-            let raw = self.pkg.comment_xml(&c.id);
-            self.tracked_comments.insert(
-                c.id.clone(),
-                TrackedComment {
-                    comment: c.clone(),
-                    raw,
-                    index: idx,
-                },
-            );
-        }
+        let marked = self.comment_marker_ids_everywhere().contains(&c.id);
+        self.keep_deleted_comment(&c, idx, marked);
         self.comment_sel = idx.min(self.comments.len().saturating_sub(1));
         self.comment_active = !self.comments.is_empty();
         self.after_edit();
@@ -3304,28 +3321,7 @@ impl App {
         let still_marked = self.comment_marker_ids_everywhere();
         let comments = std::mem::take(&mut self.comments);
         for (idx, c) in comments.iter().enumerate() {
-            if still_marked.contains(&c.id) {
-                // Markers in a header or footer not being edited: as in
-                // Delete Comment, nothing could take them, so it goes now.
-                self.tracked_comments.remove(&c.id);
-                self.pkg.remove_comment_id(&c.id);
-            } else if let Some(t) = self.tracked_comments.get_mut(&c.id) {
-                t.index = idx;
-                t.comment = c.clone();
-                if t.raw.is_none() {
-                    t.raw = self.pkg.comment_xml(&c.id);
-                }
-            } else {
-                let raw = self.pkg.comment_xml(&c.id);
-                self.tracked_comments.insert(
-                    c.id.clone(),
-                    TrackedComment {
-                        comment: c.clone(),
-                        raw,
-                        index: idx,
-                    },
-                );
-            }
+            self.keep_deleted_comment(c, idx, still_marked.contains(&c.id));
         }
         self.comment_sel = 0;
         self.comment_active = false;
@@ -13609,10 +13605,10 @@ mod tests {
             assert_eq!(app.editor.doc, doc, "{view:?}");
             assert_eq!(app.editor.doc.revisions().len(), revisions);
             assert!(!app.modified, "{view:?}");
-            app.pkg.document = app.editor.doc.clone();
-            let bytes = docxcore::package::save_package(&app.pkg);
-            let pkg = load_package(&bytes).unwrap();
-            saved.push(pkg.part_text("word/document.xml").unwrap());
+            // What the app's own Save writes under this view.
+            let path = save_to_temp(&mut app, &format!("markup-{}", view.name()));
+            saved.push(saved_pkg(&path).part_text("word/document.xml").unwrap());
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
         }
         assert!(
             saved.windows(2).all(|w| w[0] == w[1]),

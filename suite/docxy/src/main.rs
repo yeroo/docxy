@@ -5044,13 +5044,36 @@ fn is_markdown_path(path: &std::path::Path) -> bool {
     l.ends_with(".md") || l.ends_with(".markdown") || l.ends_with(".mdown")
 }
 
+/// The reviewer name and initials the user configured (#620), for the
+/// editors built where no [`Docxy`] is at hand (a load, a restore). Set when
+/// the session is read and whenever the user changes it, so a file that opens
+/// with Track Changes on records as the same reviewer as its comments and
+/// the Track Changes toggle do.
+static CONFIGURED_IDENTITY: std::sync::Mutex<(String, String)> =
+    std::sync::Mutex::new((String::new(), String::new()));
+
+fn set_configured_identity(name: &str, initials: &str) {
+    if let Ok(mut id) = CONFIGURED_IDENTITY.lock() {
+        *id = (name.to_string(), initials.to_string());
+    }
+}
+
+fn configured_identity() -> (String, String) {
+    let (name, initials) = CONFIGURED_IDENTITY
+        .lock()
+        .map(|id| id.clone())
+        .unwrap_or_default();
+    review_identity(&name, &initials)
+}
+
 /// A document editor over `doc`, recording tracked changes when the file's
-/// settings ask for it (`w:trackRevisions`, #624), as the OS user. The
-/// Review tab's Track Changes turns it on or off after that.
+/// settings ask for it (`w:trackRevisions`, #624), as the configured reviewer
+/// ([`configured_identity`]). The Review tab's Track Changes turns it on or
+/// off after that.
 fn new_doc_editor(doc: Document, pkg: Option<&Package>) -> Editor {
     let mut editor = Editor::new(doc);
     if pkg.is_some_and(Package::track_revisions) {
-        editor.set_track_changes(Some(track_author(&review_identity("", ""))));
+        editor.set_track_changes(Some(track_author(&configured_identity())));
     }
     editor
 }
@@ -9125,6 +9148,7 @@ impl Docxy {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        set_configured_identity(&session.user_name, &session.user_initials);
         // Asked before this run writes its own marker.
         let crashed = recover::was_unclean(&root);
         recover::mark_running(&root);

@@ -90,8 +90,10 @@ comment-marker id in the document.
 - **Typing, paste and Replace** record a tracked insertion: ordinary editable
   text whose runs carry `RunProps::tracked_insert`. Consecutive typing extends
   one insertion; a save writes it as one `<w:ins>`; it is listed as one
-  revision (all its runs, across paragraphs) and Accept / Reject act on all of
-  it. Text loaded from a file keeps its `Inline::Revision` wrapper instead, so
+  revision and Accept / Reject act on all its runs. An insertion that spans
+  paragraphs (Enter in the middle of it, a multi-paragraph paste) becomes one
+  insertion per paragraph, each with its own `w:id`, so a reload lists the same
+  revisions. Text loaded from a file keeps its `Inline::Revision` wrapper instead, so
   loaded `w:ins` text is still not addressable by the caret.
 - **Deletions** (Backspace, Delete, Cut, a selection) move the text into a
   `<w:del>` with `<w:delText>`; the editor counts it as zero-width, so the caret

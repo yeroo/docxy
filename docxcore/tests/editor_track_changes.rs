@@ -249,7 +249,7 @@ fn xml_has_del(ed: &Editor) -> bool {
 }
 
 #[test]
-fn paste_records_one_insertion_and_a_copy_of_it_is_plain() {
+fn paste_records_an_insertion_per_paragraph_and_a_copy_of_it_is_plain() {
     let mut ed = editor();
     at(&mut ed, 8);
     ed.paste(&Clip::from_text("a\nb"));
@@ -258,8 +258,12 @@ fn paste_records_one_insertion_and_a_copy_of_it_is_plain() {
         .revisions()
         .into_iter()
         .filter(|r| r.category == RevisionCategory::Inline(RevisionKind::Insert))
+        .map(|r| r.metadata.id)
         .collect();
-    assert_eq!(ids.len(), 1, "one insertion across both paragraphs");
+    assert_eq!(ids.len(), 2, "one insertion per paragraph");
+    assert_ne!(ids[0], ids[1], "each with its own w:id");
+    let xml = xml(&ed);
+    assert_eq!(xml.matches("<w:ins ").count(), 2, "{xml}");
     // Copy the recorded text: the clip carries no record.
     select(&mut ed, 8, 9);
     let clip = ed.copy().expect("a selection");
@@ -274,7 +278,7 @@ fn paste_records_one_insertion_and_a_copy_of_it_is_plain() {
     ed.paste(&clip);
     assert_eq!(
         kinds(&ed.doc),
-        [RevisionKind::Insert],
+        [RevisionKind::Insert, RevisionKind::Insert],
         "pasting with tracking off adds no record"
     );
 }
@@ -361,4 +365,30 @@ fn a_fresh_target_is_assigned_to_every_recorded_revision() {
     assert_eq!(targets.len(), 2);
     assert!(targets.iter().all(|t| t.is_assigned()));
     assert_ne!(targets[0], targets[1]);
+}
+
+#[test]
+fn enter_in_the_middle_of_a_recorded_insertion_gives_each_half_its_own_id() {
+    let mut ed = editor();
+    at(&mut ed, 8);
+    ed.insert_str("abcd");
+    ed.caret.offset = 10; // between "ab" and "cd"
+    ed.insert_newline();
+    let ids: Vec<_> = ed
+        .doc
+        .revisions()
+        .into_iter()
+        .filter(|r| r.category == RevisionCategory::Inline(RevisionKind::Insert))
+        .map(|r| r.metadata.id)
+        .collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_ne!(ids[0], ids[1]);
+    let xml = xml(&ed);
+    let ins_ids: Vec<&str> = xml
+        .split("<w:ins w:id=\"")
+        .skip(1)
+        .filter_map(|r| r.split('"').next())
+        .collect();
+    assert_eq!(ins_ids.len(), 2, "{xml}");
+    assert_ne!(ins_ids[0], ins_ids[1], "{xml}");
 }

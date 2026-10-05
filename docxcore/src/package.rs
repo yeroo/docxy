@@ -2499,44 +2499,29 @@ impl Package {
     /// the main document part.
     fn add_part_with_rel(&mut self, name: &str, content_type: &str, rel_type: &str, body: String) {
         self.parts.push((name.to_string(), body.into_bytes()));
-        if let Some(b) = self.part("[Content_Types].xml") {
-            let ct = String::from_utf8_lossy(b).into_owned();
+        // Read and written back the way each part is encoded (UTF-16 stays).
+        if let Some(ct) = self.part_text("[Content_Types].xml") {
             if !ct.contains(&format!("/{name}\"")) {
                 let ov = format!("<Override PartName=\"/{name}\" ContentType=\"{content_type}\"/>");
-                self.set_part(
+                self.set_part_text(
                     "[Content_Types].xml",
-                    ct.replacen("</Types>", &format!("{ov}</Types>"), 1)
-                        .into_bytes(),
+                    &ct.replacen("</Types>", &format!("{ov}</Types>"), 1),
                 );
             }
         }
         let rels_name = "word/_rels/document.xml.rels";
-        if let Some(b) = self.part(rels_name) {
-            let rels = String::from_utf8_lossy(b).into_owned();
+        if let Some(rels) = self.part_text(rels_name) {
             let target = name.strip_prefix("word/").unwrap_or(name);
             if !rels.contains(&format!("Target=\"{target}\"")) {
                 let rid = next_rid(&rels);
                 let rel =
                     format!("<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>");
-                self.set_part(
+                self.set_part_text(
                     rels_name,
-                    rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
-                        .into_bytes(),
+                    &rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1),
                 );
             }
         }
-    }
-
-    /// Remove every comment: each `<w:comment>`, then the comment parts
-    /// (`comments.xml` and its `commentsExtended`, `commentsIds` and
-    /// `commentsExtensible` companions) with their relationships and
-    /// content-type overrides. Body markers are the editor's
-    /// ([`crate::editor::Editor::remove_all_comment_markers`]).
-    pub fn remove_all_comments(&mut self) {
-        for id in self.comment_ids() {
-            self.remove_comment_id(&id);
-        }
-        self.drop_empty_comment_parts();
     }
 
     /// Drop the comment parts once `comments.xml` holds no comment.
@@ -6784,13 +6769,16 @@ mod tests {
     }
 
     #[test]
-    fn remove_all_comments_drops_every_comment_part() {
+    fn dropping_empty_comment_parts_removes_every_part_and_relationship() {
         let mut p = with_comment_plumbing(&format!(
             "{COMMENTS_OPEN}<w:comment w:id=\"1\"><w:p/></w:comment>\
              <w:comment w:id=\"2\"><w:p/></w:comment></w:comments>"
         ));
         assert!(p.set_comment_resolved("1", true));
-        p.remove_all_comments();
+        for id in p.comment_ids() {
+            p.remove_comment_id(&id);
+        }
+        p.drop_empty_comment_parts();
         for part in [
             "word/comments.xml",
             "word/commentsExtended.xml",

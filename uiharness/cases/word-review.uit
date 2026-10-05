@@ -30,6 +30,8 @@ test track changes records typing and Resolve / Delete all are on the Review tab
   assert reply.items.0.text is "Track Changes: On"
   type there
   assert text is hellothere
+  call inspect {}
+  assert reply.revisions.found is true
   call ribbon-click {"tab":"Review","command":"tracktoggle"}
   call status-read {}
   assert reply.items.0.text is "Track Changes: Off"
@@ -37,3 +39,5 @@ test track changes records typing and Resolve / Delete all are on the Review tab
   call status-read {}
   assert reply.items.0.text is "Select a comment in the Comments pane first"
   call ribbon-click {"tab":"Review","command":"deleteallcomments"}
+  call status-read {}
+  assert reply.items.0.text is "Comments: nothing to remove"

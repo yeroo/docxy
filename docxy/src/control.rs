@@ -41,7 +41,6 @@
 //! | `doc.revision-next` / `doc.revision-previous` | — | navigate and return the selected stable revision |
 //! | `doc.track-changes` | — | `{enabled,author}` |
 //! | `doc.track-changes-set` | `{enabled}` | `{enabled,author}`; records typing and deletions as tracked changes (`w:ins` / `w:del`) and sets `w:trackRevisions` |
-//! | `doc.display-mode` | `{mode?}` | `{mode,label,editable}`; `mode` is `all`, `simple`, `none` or `original` (a view only) |
 //! | `doc.display-mode` | `{mode?}` | `{mode,label,editable}`; `mode` is `all`, `simple`, `none` or `original` (a view only, never saved) |
 //! | `doc.comment-resolve` | `{id, resolved?}` | `{id,resolved}`; no `resolved` toggles |
 //! | `doc.comments-delete-all` | — | `{deleted}`; markers and records, one undo step |

@@ -48,7 +48,8 @@ fn para(content: Vec<Inline>) -> Block {
 }
 
 /// `One ` + recorded `two ` + `three` in one paragraph, and recorded `four`
-/// in a second.
+/// in a second, sharing one insertion's id (the model allows it; the editor
+/// gives each paragraph its own, see `editor_track_changes.rs`).
 fn doc() -> Document {
     let mut doc = Document {
         body: vec![
@@ -61,12 +62,19 @@ fn doc() -> Document {
 }
 
 #[test]
-fn recorded_runs_save_as_one_ins_and_reload_as_a_revision() {
-    let xml = document_to_xml(&doc());
+fn recorded_runs_save_as_one_ins_each_with_its_own_id_and_reload_as_revisions() {
+    let mut doc = Document {
+        body: vec![
+            para(vec![plain("One "), recorded("two ", "7"), plain("three")]),
+            para(vec![recorded("four", "8")]),
+        ],
+    };
+    doc.initialize_revision_targets();
+    let xml = document_to_xml(&doc);
     assert_eq!(
         xml.matches("<w:ins ").count(),
         2,
-        "one per paragraph: {xml}"
+        "one per insertion: {xml}"
     );
     assert!(
         xml.contains(
@@ -75,6 +83,7 @@ fn recorded_runs_save_as_one_ins_and_reload_as_a_revision() {
         ),
         "{xml}"
     );
+    assert!(xml.contains("<w:ins w:id=\"8\""), "{xml}");
     // The underline is the display cue, not formatting: it is not written.
     assert!(!xml.contains("<w:u "), "{xml}");
     let back = parse_document_xml(&xml, &Relationships::default());

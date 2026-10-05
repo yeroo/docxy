@@ -98,3 +98,20 @@ fn a_new_document_with_tracking_on_saves_the_setting_too() {
     assert!(settings.contains("<w:trackRevisions/>"), "{settings}");
     assert!(doc.contains("<w:ins "), "{doc}");
 }
+
+/// A file saved with Track Changes on records as the configured reviewer
+/// (the name comments and the toggle use), not the OS user.
+#[test]
+fn a_loaded_tracked_file_records_as_the_configured_reviewer() {
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir);
+    track_on(&mut tab, "Anyone");
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    crate::set_configured_identity("Jane Doe", "JD");
+    let mut again = tab_from_path(&path);
+    crate::set_configured_identity("", "");
+    type_at(&mut again, 8, "x");
+    assert!(save_doc_tab(&mut again, None), "{}", again.status);
+    let (doc, _) = saved(&path);
+    assert!(doc.contains("w:author=\"Jane Doe\""), "{doc}");
+}

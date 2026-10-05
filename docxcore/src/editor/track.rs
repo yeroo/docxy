@@ -51,10 +51,8 @@ impl Editor {
         self.track.as_ref().map(|t| t.author.as_str())
     }
 
-    /// The metadata of the next revision recorded: an id above every revision
-    /// and comment-marker id in the document, the author, and the clock's now.
-    fn fresh_revision_metadata(&self) -> Option<RevisionMetadata> {
-        let track = self.track.as_ref()?;
+    /// The highest numeric `w:id` of any revision or comment marker.
+    fn max_annotation_id(&self) -> u64 {
         let mut max = 0u64;
         let numeric = |id: &str| id.parse::<u64>().ok();
         for revision in self.doc.revisions() {
@@ -70,6 +68,14 @@ impl Editor {
         for id in crate::inspect::comment_marker_ids(&self.doc) {
             max = max.max(numeric(&id).unwrap_or(0));
         }
+        max
+    }
+
+    /// The metadata of the next revision recorded: an id above every revision
+    /// and comment-marker id in the document, the author, and the clock's now.
+    fn fresh_revision_metadata(&self) -> Option<RevisionMetadata> {
+        let track = self.track.as_ref()?;
+        let max = self.max_annotation_id();
         Some(RevisionMetadata {
             id: Some((max + 1).to_string()),
             author: Some(track.author.clone()),
@@ -113,6 +119,54 @@ impl Editor {
             }
             (None, _) => {}
         }
+    }
+
+    /// After an Enter or a multi-paragraph paste: a recorded insertion that
+    /// now spans paragraphs becomes one insertion per paragraph, each with its
+    /// own `w:id`, so a save writes distinct ids and a reload lists exactly
+    /// the revisions the editor does.
+    pub(super) fn unshare_insert_ids(&mut self) {
+        let has_records = |c: &[Inline]| {
+            c.iter().any(|i| {
+                matches!(i, Inline::Run(r) if r.props.tracked_insert.is_some())
+                    || matches!(i, Inline::Tab(p) | Inline::Break(_, p) if p.tracked_insert.is_some())
+            })
+        };
+        let paths = super::all_paragraph_paths(&self.doc.body);
+        let any = paths
+            .iter()
+            .any(|p| resolve_para(&self.doc.body, p).is_some_and(|p| has_records(&p.content)));
+        if !any {
+            return;
+        }
+        let mut next = self.max_annotation_id();
+        let mut seen: std::collections::HashSet<Option<String>> = Default::default();
+        for path in paths {
+            let Some(para) = para_mut(&mut self.doc.body, &path) else {
+                continue;
+            };
+            let mut renamed: std::collections::HashMap<Option<String>, String> = Default::default();
+            let mut here: Vec<Option<String>> = Vec::new();
+            for inline in &mut para.content {
+                with_props(inline, |props| {
+                    let Some(t) = &mut props.tracked_insert else {
+                        return;
+                    };
+                    let id = t.metadata.id.clone();
+                    if seen.contains(&id) {
+                        let new = renamed.entry(id.clone()).or_insert_with(|| {
+                            next += 1;
+                            next.to_string()
+                        });
+                        t.metadata.id = Some(new.clone());
+                        t.metadata.target = Default::default();
+                    }
+                    here.push(t.metadata.id.clone());
+                });
+            }
+            seen.extend(here);
+        }
+        self.doc.initialize_revision_targets();
     }
 
     /// Delete the character at editor offset `idx` of the paragraph at `path`:
