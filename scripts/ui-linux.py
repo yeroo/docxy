@@ -31,6 +31,17 @@ def stop(process):
     process.wait()
 
 
+def ignore_signals():
+    """Ignore SIGTERM/SIGINT, even if one arrives while the old handler is still armed."""
+    while True:
+        try:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                signal.signal(sig, signal.SIG_IGN)
+            return
+        except KeyboardInterrupt:
+            pass
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--xvfb', default='Xvfb')
@@ -108,6 +119,9 @@ def main():
         print(f'ui-linux: {exc}; see {logs}', file=sys.stderr)
         return 1
     finally:
+        # Teardown must finish: a second SIGTERM/SIGINT here would abort it
+        # and orphan Openbox and Xvfb.
+        ignore_signals()
         for process in (child, wm, xvfb):
             stop(process)
         os.close(read_fd)
