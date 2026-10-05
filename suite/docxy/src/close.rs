@@ -246,7 +246,7 @@ pub(crate) fn commit_comment_buffer_for_exit(
 /// its cell's data-validation rule, whatever the rule's alert style (no alert
 /// is shown here, so Save and close never let a rule-breaking entry in behind
 /// the user's back) — and the editor stays open with the text.
-pub(crate) fn commit_changed_cell(tab: &mut DocTab) -> Result<(), String> {
+fn commit_changed_cell(tab: &mut DocTab) -> Result<(), String> {
     if let Surface::Sheet(v) = &mut tab.surface
         && v.editing.is_some()
         && !v.edit_untouched()

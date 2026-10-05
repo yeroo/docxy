@@ -838,31 +838,6 @@ impl DialogBoxes {
 
 type Rect = (u32, u32, u32, u32);
 
-/// `a` without the cells of `cut`: the pieces above, below, left and right
-/// of it, in that order (`B2:B10` without `B6` is `B2:B5 B7:B10`).
-fn subtract(a: Rect, cut: Rect) -> Vec<Rect> {
-    let (r1, c1, r2, c2) = a;
-    let (x1, y1, x2, y2) = cut;
-    if x2 < r1 || x1 > r2 || y2 < c1 || y1 > c2 {
-        return vec![a];
-    }
-    let mut out = Vec::new();
-    if x1 > r1 {
-        out.push((r1, c1, x1 - 1, c2));
-    }
-    if x2 < r2 {
-        out.push((x2 + 1, c1, r2, c2));
-    }
-    let (mid1, mid2) = (r1.max(x1), r2.min(x2));
-    if y1 > c1 {
-        out.push((mid1, c1, mid2, y1 - 1));
-    }
-    if y2 < c2 {
-        out.push((mid1, y2 + 1, mid2, c2));
-    }
-    out
-}
-
 fn intersect(a: Rect, b: Rect) -> Option<Rect> {
     let (r1, c1, r2, c2) = (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3));
     (r1 <= r2 && c1 <= c2).then_some((r1, c1, r2, c2))
@@ -1041,22 +1016,10 @@ fn seen_losslessly(dv: &DataValidation, row: u32, col: u32) -> Option<DataValida
 /// Take every rule off the cells of `rect`: ranges are split around it and a
 /// rule left with none goes, its element named in `dv_removed` for the save.
 /// A rule whose top-left corner moves because of it keeps what its relative
-/// formulas mean.
+/// formulas mean. (One implementation, [`crate::edit::clear_validation`],
+/// which Paste Special shares.)
 pub fn clear_validation(sheet: &mut Sheet, rect: Rect) {
-    let removed = &mut sheet.dv_removed;
-    sheet.validations.retain_mut(|dv| {
-        if !dv.ranges.iter().any(|&r| intersect(r, rect).is_some()) {
-            return true;
-        }
-        let old = anchor(dv);
-        dv.ranges = dv.ranges.iter().flat_map(|&r| subtract(r, rect)).collect();
-        if dv.ranges.is_empty() {
-            removed.extend(dv.ix);
-            return false;
-        }
-        retarget(dv, old);
-        true
-    });
+    crate::edit::clear_validation(sheet, rect);
 }
 
 /// Give `rule`'s settings to `ranges`: onto an existing rule with the same

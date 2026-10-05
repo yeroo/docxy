@@ -981,7 +981,7 @@ mod tests {
         v.edit_type("5");
         v.edit_type("0");
         // Save's commit: refused, the editor kept, nothing held for an alert.
-        let saved = crate::close::commit_changed_cell(&mut t);
+        let saved = crate::close::prepare_sheet_save(&mut t);
         assert!(saved.is_err());
         assert!(view(&mut t).dv_pending.is_none());
         // Esc ends the editor; a later Ctrl+Enter over a range, refused for

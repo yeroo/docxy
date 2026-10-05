@@ -139,7 +139,7 @@ test sheet ribbon data tab clear with no filter leaves the workbook clean
   call ribbon-click {"tab":"Data","command":"Reapply"}
   assert dirty is false
 
-test sheet ribbon data tab refuses its placeholders
+test sheet ribbon home tab refuses its placeholders
   open ../fixtures/basic.xlsx
   call-error ribbon-click {"tab":"Home","command":"Format Painter"} => 'Format Painter' is not implemented
 
