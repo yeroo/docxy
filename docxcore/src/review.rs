@@ -133,6 +133,17 @@ impl Document {
             };
         }
 
+        // A tracked insertion recorded on live runs (TrackedInsert) may be on
+        // runs in several paragraphs: act on every one of them.
+        if sweep_tracked_inserts(&mut self.body, target, action) > 0 {
+            self.initialize_revision_targets();
+            return RevisionOutcome::Applied {
+                target,
+                action,
+                category: RevisionCategory::Inline(RevisionKind::Insert),
+            };
+        }
+
         match transform_blocks(&mut self.body, target, action) {
             Some(Ok(category)) => {
                 // A rejected property snapshot can expose previously nested
@@ -225,6 +236,74 @@ fn removes_mark(action: RevisionAction, kind: RevisionKind) -> bool {
         (RevisionAction::Accept, RevisionKind::Delete)
             | (RevisionAction::Reject, RevisionKind::Insert)
     )
+}
+
+/// Accept (keep the text, drop the record and its underline cue) or reject
+/// (remove the text) every run recorded as tracked insertion `target`,
+/// wherever it is. How many inlines it acted on.
+fn sweep_tracked_inserts(
+    blocks: &mut [Block],
+    target: RevisionTarget,
+    action: RevisionAction,
+) -> usize {
+    let mut n = 0;
+    for block in blocks {
+        match block {
+            Block::Paragraph(p) => n += sweep_inlines(&mut p.content, target, action),
+            Block::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        n += sweep_tracked_inserts(&mut cell.blocks, target, action);
+                    }
+                }
+            }
+            Block::SectionProperties(_) | Block::Raw(_) => {}
+        }
+    }
+    n
+}
+
+fn sweep_inlines(
+    content: &mut Vec<Inline>,
+    target: RevisionTarget,
+    action: RevisionAction,
+) -> usize {
+    let is_target = |inline: &Inline| {
+        let props = match inline {
+            Inline::Run(r) => &r.props,
+            Inline::Tab(props) | Inline::Break(_, props) => props,
+            _ => return false,
+        };
+        props
+            .tracked_insert
+            .as_ref()
+            .is_some_and(|t| t.metadata.target == target)
+    };
+    let mut n = 0;
+    if action == RevisionAction::Reject {
+        let before = content.len();
+        content.retain(|i| !is_target(i));
+        n += before - content.len();
+    } else {
+        for inline in content.iter_mut().filter(|i| is_target(i)) {
+            strip_revision_cue(inline, RevisionKind::Insert, false);
+            match inline {
+                Inline::Run(r) => r.props.tracked_insert = None,
+                Inline::Tab(props) | Inline::Break(_, props) => props.tracked_insert = None,
+                _ => {}
+            }
+            n += 1;
+        }
+    }
+    for inline in content.iter_mut() {
+        match inline {
+            Inline::Revision { content, .. } => n += sweep_inlines(content, target, action),
+            Inline::Hyperlink(h) => n += sweep_inlines(&mut h.content, target, action),
+            Inline::TextBox { blocks, .. } => n += sweep_tracked_inserts(blocks, target, action),
+            _ => {}
+        }
+    }
+    n
 }
 
 fn transform_blocks(

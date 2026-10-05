@@ -116,6 +116,17 @@ fn simplify_blocks(blocks: &mut [Block]) {
 }
 
 fn simplify_inlines(content: &mut Vec<Inline>) {
+    // Runs recorded as tracked insertions carry their cue on the run itself.
+    content.iter_mut().for_each(|i| {
+        let recorded = match i {
+            Inline::Run(r) => r.props.tracked_insert.is_some(),
+            Inline::Tab(p) | Inline::Break(_, p) => p.tracked_insert.is_some(),
+            _ => false,
+        };
+        if recorded {
+            clear_cues(i);
+        }
+    });
     content.retain(|i| {
         !matches!(
             i,

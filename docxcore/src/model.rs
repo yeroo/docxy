@@ -22,6 +22,16 @@ pub enum VertAlign {
     Subscript,
 }
 
+/// A tracked insertion the editor recorded on live text (#624): the run it
+/// is on is ordinary editable text, so offsets, formatting and every editing
+/// command see it as such, and a save wraps adjacent runs with the same
+/// `metadata` in one `<w:ins>`. Text loaded from a file keeps its
+/// [`Inline::Revision`] wrapper instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedInsert {
+    pub metadata: RevisionMetadata,
+}
+
 /// Character-level formatting (a resolved `w:rPr`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RunProps {
@@ -57,6 +67,10 @@ pub struct RunProps {
     /// A tracked `w:rPrChange`, when present. The owning `RunProps` is the
     /// current state; `previous` on the change retains the prior snapshot.
     pub property_change: Option<PropertyChange>,
+    /// The tracked insertion this run was recorded as, when the editor typed
+    /// or pasted it with Track Changes on. Not part of `w:rPr`: a save
+    /// writes it as the `<w:ins>` around the run.
+    pub tracked_insert: Option<TrackedInsert>,
     /// Display-only formatting contributed by enclosing revision wrappers.
     ///
     /// The public formatting fields remain the effective render state. These
@@ -1148,6 +1162,12 @@ impl Document {
             .unwrap_or(0)
             .saturating_add(1)
             .max(1);
+        // Recorded insertions first: every run of one (the same `w:id`) is
+        // one revision, however far apart the editor split them.
+        let mut by_id = std::collections::HashMap::new();
+        for block in &mut self.body {
+            assign_tracked_insert_block(block, &mut next, &mut by_id);
+        }
         let mut seen = std::collections::HashSet::new();
         for block in &mut self.body {
             assign_block_revision_targets(block, &mut next, &mut seen);
@@ -1169,6 +1189,67 @@ impl Document {
         self.revisions()
             .into_iter()
             .find(|address| address.target == target)
+    }
+}
+
+/// Give each recorded insertion ([`TrackedInsert`]) without a target one,
+/// the same for every run that has its `w:id`.
+fn assign_tracked_insert_block(
+    block: &mut Block,
+    next: &mut u64,
+    by_id: &mut std::collections::HashMap<Option<String>, RevisionTarget>,
+) {
+    fn props(
+        props: &mut RunProps,
+        next: &mut u64,
+        by_id: &mut std::collections::HashMap<Option<String>, RevisionTarget>,
+    ) {
+        let Some(insert) = &mut props.tracked_insert else {
+            return;
+        };
+        let target = &mut insert.metadata.target;
+        if target.is_assigned() {
+            by_id.insert(insert.metadata.id.clone(), *target);
+        } else {
+            *target = *by_id.entry(insert.metadata.id.clone()).or_insert_with(|| {
+                let t = RevisionTarget(*next);
+                *next = next.saturating_add(1);
+                t
+            });
+        }
+    }
+    fn inlines(
+        content: &mut [Inline],
+        next: &mut u64,
+        by_id: &mut std::collections::HashMap<Option<String>, RevisionTarget>,
+    ) {
+        for inline in content {
+            match inline {
+                Inline::Run(run) => props(&mut run.props, next, by_id),
+                Inline::Tab(p) | Inline::Break(_, p) => props(p, next, by_id),
+                Inline::Revision { content, .. } => inlines(content, next, by_id),
+                Inline::Hyperlink(h) => inlines(&mut h.content, next, by_id),
+                Inline::TextBox { blocks, .. } => {
+                    for block in blocks {
+                        assign_tracked_insert_block(block, next, by_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    match block {
+        Block::Paragraph(p) => inlines(&mut p.content, next, by_id),
+        Block::Table(t) => {
+            for row in &mut t.rows {
+                for cell in &mut row.cells {
+                    for block in &mut cell.blocks {
+                        assign_tracked_insert_block(block, next, by_id);
+                    }
+                }
+            }
+        }
+        Block::SectionProperties(_) | Block::Raw(_) => {}
     }
 }
 
@@ -1200,6 +1281,16 @@ fn assign_run_props_target(
     seen: &mut std::collections::HashSet<RevisionTarget>,
 ) {
     assign_property_target(&mut props.property_change, next, seen);
+    // The runs of one recorded insertion share its target on purpose (a split
+    // or an Enter in the middle keeps both halves), so a repeat is not a
+    // clone to renumber.
+    if let Some(insert) = &mut props.tracked_insert {
+        if !insert.metadata.target.is_assigned() {
+            insert.metadata.target = RevisionTarget(*next);
+            *next = next.saturating_add(1);
+        }
+        seen.insert(insert.metadata.target);
+    }
 }
 
 fn assign_inline_revision_targets(
@@ -1324,6 +1415,22 @@ fn collect_run_props_revisions(
     out: &mut Vec<RevisionAddress>,
 ) {
     collect_property_revision(&props.property_change, parent, depth, out);
+    // One entry per recorded insertion, however many runs it is in.
+    if let Some(insert) = &props.tracked_insert {
+        let listed = out.last().is_some_and(|a| {
+            a.target == insert.metadata.target
+                && matches!(a.category, RevisionCategory::Inline(RevisionKind::Insert))
+        });
+        if !listed {
+            push_revision_address(
+                &insert.metadata,
+                RevisionCategory::Inline(RevisionKind::Insert),
+                parent,
+                depth,
+                out,
+            );
+        }
+    }
 }
 
 fn collect_inline_revisions(
