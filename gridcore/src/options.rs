@@ -5,7 +5,9 @@
 //! The rules the options drive live with the code they change: the fixed
 //! decimal in [`crate::entry::EntryCtx::fixed_decimal`], AutoComplete in
 //! [`crate::entry::autocomplete`], the precedents a double-click jumps to in
-//! [`crate::formula::direct_precedents`]. The hosts read the switches here.
+//! [`crate::formula::direct_precedents`], the automatic Flash Fill preview in
+//! [`crate::flashfill::flash_preview`], Formula AutoComplete in
+//! [`crate::fcomplete::completions`]. The hosts read the switches here.
 
 /// The direction "After pressing Enter, move selection" moves in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -59,8 +61,8 @@ pub const PLACES_MIN: i16 = -300;
 pub const PLACES_MAX: i16 = 300;
 
 /// The Editing options. `Default` is Excel's: fixed decimal off with 2
-/// places, Enter moves down, editing directly in cells, AutoComplete and the
-/// fill handle on.
+/// places, Enter moves down, editing directly in cells, AutoComplete, the
+/// fill handle, Automatically Flash Fill and Formula AutoComplete on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EditOptions {
     /// Automatically insert a decimal point.
@@ -78,6 +80,11 @@ pub struct EditOptions {
     pub autocomplete: bool,
     /// Enable fill handle and cell drag-and-drop.
     pub fill_handle: bool,
+    /// Automatically Flash Fill (Advanced): the greyed preview after the
+    /// second example is typed.
+    pub flash_fill_auto: bool,
+    /// Formula AutoComplete (Formulas › Working with formulas).
+    pub formula_autocomplete: bool,
 }
 
 impl Default for EditOptions {
@@ -90,6 +97,8 @@ impl Default for EditOptions {
             edit_in_cell: true,
             autocomplete: true,
             fill_handle: true,
+            flash_fill_auto: true,
+            formula_autocomplete: true,
         }
     }
 }
@@ -103,6 +112,8 @@ pub const KEY_MOVE_DIRECTION: &str = "edit_move_direction";
 pub const KEY_EDIT_IN_CELL: &str = "edit_in_cell";
 pub const KEY_AUTOCOMPLETE: &str = "edit_autocomplete";
 pub const KEY_FILL_HANDLE: &str = "edit_fill_handle";
+pub const KEY_FLASH_FILL_AUTO: &str = "edit_flash_fill_auto";
+pub const KEY_FORMULA_AUTOCOMPLETE: &str = "edit_formula_autocomplete";
 
 impl EditOptions {
     /// The places a typed commit shifts by: `Some` only while the fixed
@@ -156,6 +167,8 @@ impl EditOptions {
                 KEY_EDIT_IN_CELL => flag(&mut o.edit_in_cell),
                 KEY_AUTOCOMPLETE => flag(&mut o.autocomplete),
                 KEY_FILL_HANDLE => flag(&mut o.fill_handle),
+                KEY_FLASH_FILL_AUTO => flag(&mut o.flash_fill_auto),
+                KEY_FORMULA_AUTOCOMPLETE => flag(&mut o.formula_autocomplete),
                 _ => {}
             }
         }
@@ -169,7 +182,7 @@ impl EditOptions {
         format!(
             "{KEY_FIXED_DECIMAL}={}\n{KEY_PLACES}={}\n{KEY_MOVE_AFTER_ENTER}={}\n\
              {KEY_MOVE_DIRECTION}={}\n{KEY_EDIT_IN_CELL}={}\n{KEY_AUTOCOMPLETE}={}\n\
-             {KEY_FILL_HANDLE}={}\n",
+             {KEY_FILL_HANDLE}={}\n{KEY_FLASH_FILL_AUTO}={}\n{KEY_FORMULA_AUTOCOMPLETE}={}\n",
             b(self.fixed_decimal),
             self.places,
             b(self.move_after_enter),
@@ -177,6 +190,8 @@ impl EditOptions {
             b(self.edit_in_cell),
             b(self.autocomplete),
             b(self.fill_handle),
+            b(self.flash_fill_auto),
+            b(self.formula_autocomplete),
         )
     }
 }
@@ -203,6 +218,7 @@ mod tests {
         assert!(o.move_after_enter);
         assert_eq!(o.enter_move, EnterMove::Down);
         assert!(o.edit_in_cell && o.autocomplete && o.fill_handle);
+        assert!(o.flash_fill_auto && o.formula_autocomplete);
         assert_eq!(o.fixed_places(), None);
     }
 
@@ -216,6 +232,8 @@ mod tests {
             edit_in_cell: false,
             autocomplete: false,
             fill_handle: false,
+            flash_fill_auto: false,
+            formula_autocomplete: false,
         };
         assert_eq!(EditOptions::from_text(&o.to_lines()), o);
         let d = EditOptions::default();
@@ -242,6 +260,18 @@ mod tests {
             EditOptions::from_text("edit_fixed_decimal_places=-300").places,
             -300
         );
+    }
+
+    #[test]
+    fn text_saved_before_the_flash_fill_and_formula_switches_reads_them_on() {
+        // A preferences text from before #712 has neither key.
+        let old = "edit_fixed_decimal=1\nedit_autocomplete=0\nedit_fill_handle=1\n";
+        let o = EditOptions::from_text(old);
+        assert!(o.fixed_decimal && !o.autocomplete);
+        assert!(o.flash_fill_auto && o.formula_autocomplete);
+        let off =
+            EditOptions::from_text("edit_flash_fill_auto=0\nedit_formula_autocomplete=false\n");
+        assert!(!off.flash_fill_auto && !off.formula_autocomplete);
     }
 
     #[test]

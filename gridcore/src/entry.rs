@@ -591,21 +591,8 @@ pub fn autocomplete(sheet: &Sheet, row: u32, col: u32, typed: &str) -> Option<St
         return None;
     }
     let want = typed.to_lowercase();
-    let filled = |r: u32| {
-        sheet
-            .cell(r, col)
-            .filter(|c| !c.value.is_empty() || c.formula.is_some())
-    };
-    let above = (0..row).rev().map_while(&filled);
-    let below = (row.saturating_add(1)..crate::sheet::MAX_ROWS).map_while(&filled);
     let mut found: Option<(String, String)> = None;
-    for cell in above.chain(below) {
-        let CellValue::Text(text) = &cell.value else {
-            continue;
-        };
-        if cell.formula.is_some() {
-            continue;
-        }
+    for text in block_texts(sheet, row, col) {
         let lower = text.to_lowercase();
         // Any text value counts for "already one of the values"; only a
         // matching one pays for the stays-text parse.
@@ -622,6 +609,45 @@ pub fn autocomplete(sheet: &Sheet, row: u32, col: u32, typed: &str) -> Option<St
         }
     }
     found.map(|(_, text)| text)
+}
+
+/// Pick From Drop-down List (Alt+Down, ENT-072): the distinct text entries
+/// of the column block [`autocomplete`] reads for (row, col), sorted
+/// case-insensitively. Values that differ only by case are one entry,
+/// spelled as the first one found (nearest above first), and the same
+/// entries are left out: numbers, booleans, errors, formulas and text that
+/// would not stay text when typed.
+pub fn pick_list(sheet: &Sheet, row: u32, col: u32) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for text in block_texts(sheet, row, col) {
+        let lower = text.to_lowercase();
+        if seen.contains(&lower) || !stays_text(text) {
+            continue;
+        }
+        seen.insert(lower.clone());
+        out.push((lower, text.clone()));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    out.into_iter().map(|(_, text)| text).collect()
+}
+
+/// The constant text values of the column's contiguous non-empty block
+/// around (row, col), the cell itself excluded: upward from the cell, then
+/// downward, each until the first empty cell. AutoComplete and the pick list
+/// both read this walk, so they cannot disagree on what the block is.
+fn block_texts(sheet: &Sheet, row: u32, col: u32) -> impl Iterator<Item = &String> {
+    let filled = move |r: u32| {
+        sheet
+            .cell(r, col)
+            .filter(|c| !c.value.is_empty() || c.formula.is_some())
+    };
+    let above = (0..row).rev().map_while(filled);
+    let below = (row.saturating_add(1)..crate::sheet::MAX_ROWS).map_while(filled);
+    above.chain(below).filter_map(|cell| match &cell.value {
+        CellValue::Text(text) if cell.formula.is_none() => Some(text),
+        _ => None,
+    })
 }
 
 /// Does `text`, typed into a General cell, stay that same text? With a
@@ -2104,5 +2130,63 @@ mod tests {
         let mut sh = column(&[Some("=\"x\"")]);
         sh.cells.get_mut(&(0, 0)).unwrap().value = CellValue::Text("xyz".into());
         assert_eq!(autocomplete(&sh, 1, 0, "x"), None);
+    }
+
+    /// ENT-CASE-029's column: A1:A5 `Widgets`, `Gadgets`, `Gizmos`, `100`,
+    /// `Grommets`, A7 `Sprockets`.
+    fn ent_case_029() -> Sheet {
+        column(&[
+            Some("Widgets"),
+            Some("Gadgets"),
+            Some("Gizmos"),
+            Some("100"),
+            Some("Grommets"),
+            None,
+            Some("Sprockets"),
+        ])
+    }
+
+    #[test]
+    fn ent_case_029_completes_across_the_block_it_sits_in() {
+        let mut sh = ent_case_029();
+        assert_eq!(autocomplete(&sh, 7, 0, "wid"), None, "Widgets is beyond A6");
+        assert_eq!(autocomplete(&sh, 7, 0, "spr").as_deref(), Some("Sprockets"));
+        sh.set_cell(7, 0, Cell::text("Sprockets"));
+        // A6 sits between two blocks and sees both.
+        assert_eq!(autocomplete(&sh, 5, 0, "gadg").as_deref(), Some("Gadgets"));
+        sh.set_cell(5, 0, Cell::text("Gadgets"));
+        assert_eq!(autocomplete(&sh, 8, 0, "g"), None, "ambiguous");
+        assert_eq!(autocomplete(&sh, 8, 0, "giz").as_deref(), Some("Gizmos"));
+        sh.set_cell(8, 0, Cell::text("Gizmos"));
+        assert_eq!(
+            autocomplete(&sh, 9, 0, "1"),
+            None,
+            "numbers are never completed"
+        );
+        // A6 now joins the blocks.
+        assert_eq!(autocomplete(&sh, 9, 0, "widg").as_deref(), Some("Widgets"));
+    }
+
+    #[test]
+    fn pick_list_is_the_blocks_distinct_text_sorted() {
+        // ENT-CASE-030: A6 `Widgets` makes A1:A7 one block.
+        let mut sh = ent_case_029();
+        sh.set_cell(5, 0, Cell::text("Widgets"));
+        assert_eq!(
+            pick_list(&sh, 7, 0),
+            ["Gadgets", "Gizmos", "Grommets", "Sprockets", "Widgets"]
+        );
+        // Without A6 the cell below A7 sees only A7's block.
+        assert_eq!(pick_list(&ent_case_029(), 7, 0), ["Sprockets"]);
+        // Case-insensitive order and identity; the nearest-above spelling.
+        let sh = column(&[Some("beta"), Some("Alpha"), Some("BETA"), None]);
+        assert_eq!(pick_list(&sh, 3, 0), ["Alpha", "BETA"]);
+        // The cell's own value, formulas and would-not-stay-text text are out.
+        let mut sh = column(&[Some("Own"), Some("=\"x\""), Some("007"), Some("Kept")]);
+        sh.cells.get_mut(&(1, 0)).unwrap().value = CellValue::Text("Formula".into());
+        sh.set_cell(2, 0, Cell::text("007"));
+        assert_eq!(pick_list(&sh, 0, 0), ["Kept"]);
+        // An isolated cell has nothing to pick.
+        assert!(pick_list(&Sheet::default(), 4, 2).is_empty());
     }
 }

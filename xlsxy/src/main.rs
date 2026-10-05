@@ -5182,6 +5182,8 @@ impl App {
             edit_in_cell: check(o::KEY_EDIT_IN_CELL, e.edit_in_cell),
             autocomplete: check(o::KEY_AUTOCOMPLETE, e.autocomplete),
             fill_handle: e.fill_handle,
+            flash_fill_auto: e.flash_fill_auto,
+            formula_autocomplete: e.formula_autocomplete,
         };
     }
 
