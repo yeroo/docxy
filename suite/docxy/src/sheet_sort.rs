@@ -66,10 +66,9 @@ pub(crate) fn sort_view(
             .unwrap_or_else(|| "Finish the cell you are typing in first".into()));
     }
     let snap = v.snapshot();
-    let before = v.pkg.workbook.sheets[s].cells.clone();
     match sort_range(&mut v.pkg.workbook, s, area, levels, opts) {
         Ok(n) => {
-            let changed = before != v.pkg.workbook.sheets[s].cells;
+            let changed = snap.workbook().sheets[s].cells != v.pkg.workbook.sheets[s].cells;
             if changed {
                 v.push_undo_snapshot(snap);
                 // The rebuilt engine keeps the clock the old one had.
@@ -124,8 +123,11 @@ pub(crate) fn run(
     }
 }
 
-/// Commit an open cell editor before a sort works out its range (its row
-/// may move); refused while the entry can't commit. Whether it committed.
+/// Commit an open cell editor before a sort or a filter command works out
+/// its range (the row may move or hide), marking the tab dirty when it did:
+/// the typed value is an edit whatever the command then does. Refused, with
+/// the entry's own reason (`entry_error`), while the entry can't commit.
+/// Whether it committed.
 pub(crate) fn commit_first(tab: &mut DocTab) -> Result<bool, String> {
     let Surface::Sheet(v) = &mut tab.surface else {
         return Err("Sort needs a spreadsheet".into());

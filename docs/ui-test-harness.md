@@ -950,7 +950,7 @@ Menus open today:
   Baseline (`Set Baseline...`, `Clear Baseline...`);
 - **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New
   Comment): right-click a document body. It never opens on a sheet or a
-  Project;
+  Project, and `menu-open {"target":"document"}` refuses on both;
 - **the cell menu** on a sheet (#690, #691): right-click a cell. A cell outside
   the selection is selected first (no link followed; while a formula or a range
   field is pointing, nothing moves). It lists Cut, Copy, Paste, the Filter and

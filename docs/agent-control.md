@@ -598,8 +598,9 @@ windows that open a same-basename file, which would otherwise mint the same
 **exactly** the terminal verb
 surface, nothing more (except xlsxy's `wb.properties`/`wb.set-properties` and the
 page-layout and printing verbs (`page.*`, `print-area.*`, `print-titles.set`,
-`page-break.*`, `print.pages`, `wb.export-pdf`), which only a terminal xlsxy
-answers so far; and docxy's `doc.page-color`, `doc.watermark`,
+`page-break.*`, `print.pages`, `wb.export-pdf`) and the filter and sort verbs
+(`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`), which only a terminal
+xlsxy answers so far; and docxy's `doc.page-color`, `doc.watermark`,
 `doc.page-borders` and `doc.compare`, which only a terminal docxy answers so
 far — a tab answers `unknown verb`): a couple of internal-only verbs the extension host
 uses to compose its own `doc.path`/`wb.path` replies (`doc.blocks`, `wb.info`)
@@ -759,7 +760,8 @@ Differences from a terminal pane:
 
 **Excel tabs** (`xlsxy-jetbrains-<basename>-<pid>-<n>` in xlsxy's ctl dir)
 serve the full xlsxy verb surface through `grid_ctl` (except
-`wb.properties`/`wb.set-properties` and the page-layout and printing verbs,
+`wb.properties`/`wb.set-properties`, the page-layout and printing verbs and the
+filter and sort verbs (`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`),
 terminal xlsxy only for now: a tab answers `unknown verb`), with the same host-verb
 split (`wb.path`/`wb.save`/`wb.reload`/`wb.open`; `wb.open` opens a new tab;
 `wb.info` internal). Every mutating agent verb lands as **one IDE undo step**
@@ -833,9 +835,9 @@ name and defaults to the active sheet):
 | `filter.menu` | `{col, search?, sheet?}` | Terminal xlsxy only for now. `{col, header, submenu, items:[{label, depth, checked}], truncated, total, filtered, colors}` — a column's drop-down: `submenu` is `Text Filters`, `Number Filters` or `Date Filters` by the column's dominant type; `items` are the distinct values of the records the other columns keep (dates as a year › month › day tree, `depth` 0–2; `(Blanks)` last), at most 10,000 (`truncated` says so); `search` narrows them; `colors` lists Filter by Color's choices (`Cell Color 00B050`, `Cell Color No Fill`, `Font Color Automatic`, `Icon 3Arrows/2`; empty when no record shows a colour or an icon). Read only |
 | `filter.by-cell` | `{ref, by?:value\|cellColor\|fontColor\|icon, sheet?}` | Terminal xlsxy only for now. `{shown, total, status, changed}` — Filter by Selected Cell's Value / Color / Font Color / Icon (turns the filter on over the cell's list first). One undo step when it changes something (a no-op pushes none; `changed` says which) |
 | `filter.advanced` | `{list, criteria?, copyTo?, unique?, sheet?}` | Terminal xlsxy only for now. `{shown, total, status, changed}` — Advanced Filter: `criteria` a range (`E1:E2`, `Sheet2!A1:B3`) read with the D-functions' rules (AND across a row, OR down rows); in place it hides the other records (an AutoFilter goes first), with `copyTo` it writes the records there instead — one cell gets every column, a header row only those columns in that order; `unique` drops repeated records. Copying to another sheet is refused: "You can only copy filtered data to the active sheet." Defines `_xlnm._FilterDatabase`, `_xlnm.Criteria` (when `criteria` is given; otherwise the last one's stays) and, copying, `_xlnm.Extract`. One undo step when it changes something (a no-op pushes none; `changed` says which) |
-| `sheet.rows` | `{range, sheet?}` | `{rows:[{row, hidden, hiddenBy}]}` — `row` is 1-based; `hiddenBy` is `filter`, `hand`, or `null` for a visible row. Read only |
+| `sheet.rows` | `{range, sheet?}` | Terminal xlsxy only for now. `{rows:[{row, hidden, hiddenBy}]}` — `row` is 1-based; `hiddenBy` is `filter`, `hand`, or `null` for a visible row. Read only |
 | `range.sort` | `{range, keys:[…], header?, caseSensitive?, orientation?:rows\|columns, expand?, sheet?}` | Terminal xlsxy only for now. `{sorted, range, count, changed}` — sorts the cells of `range` only (hidden rows stay put). A key is `{col, order?:asc\|desc\|"list:Jan,Feb,…"\|"list:months", direction?, on?:value\|cell-color\|font-color\|icon, color?, icon?:{set,id}, position?:top\|bottom}` (`row` instead of `col` with `orientation:"columns"`, which sorts left to right); keys may repeat a column. A selection inside a wider list answers `{sorted:false, warning, expanded}` and moves nothing until `expand` answers it (`true`: the whole list, its header guessed; `false`: the selection alone). Merged cells of different sizes are refused with "To do this, all the merged cells need to be the same size." One undo step when it changes something (a no-op pushes none; `changed` says which) |
-| `wb.clock` | `{date}` | `{date}` — fixes today at `YYYY-MM-DD[THH:MM[:SS]]` for `TODAY`/`NOW`, the date filters and a typed `3/4`'s year; `null` returns to the local clock. Not an edit (no undo step) |
+| `wb.clock` | `{date}` | Terminal xlsxy only for now. `{date}` — fixes today at `YYYY-MM-DD[THH:MM[:SS]]` for `TODAY`/`NOW`, the date filters and a typed `3/4`'s year; `null` returns to the local clock. Not an edit (no undo step) |
 
 Notes:
 

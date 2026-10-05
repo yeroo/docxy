@@ -509,3 +509,15 @@ fn ok_with_nothing_checked_is_refused_and_the_drop_down_stays() {
     assert_eq!(top_id(&t), "filter-menu");
     assert_eq!(shown(&mut t), vec![2, 3, 4, 5, 6, 7], "nothing hidden");
 }
+
+#[test]
+fn a_filter_command_under_an_entry_that_cannot_commit_says_why() {
+    let mut t = list();
+    toggle(&mut t).unwrap();
+    let v = view(&mut t);
+    v.sel = (3, 0);
+    v.begin_cell_edit(Some("y".repeat(32_768)));
+    let e = run(&mut t, gridcore::filter::reapply).unwrap_err();
+    assert!(e.contains("32767"), "the entry's own reason: {e}");
+    assert!(view(&mut t).editing.is_some(), "the editor stays open");
+}

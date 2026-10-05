@@ -757,8 +757,8 @@ enum SnapshotBody {
 }
 
 impl SheetSnapshot {
-    /// The workbook this step restores.
-    #[cfg(test)]
+    /// The workbook this step restores: what a command compares against to
+    /// tell whether it changed anything, without a second copy.
     fn workbook(&self) -> &gridcore::sheet::Workbook {
         match &self.body {
             SnapshotBody::Workbook(wb) => wb,
@@ -862,8 +862,12 @@ fn protected_view_allows_act(act: SheetAct) -> bool {
 
 /// The document commands Protected View lets through (#633): copying,
 /// selecting, finding and what only changes the view. Everything else edits,
-/// or opens a picker, menu or dialog that would.
+/// or opens a picker, menu or dialog that would. A sheet command (the cell
+/// menu's) passes when [`protected_view_allows_act`] does.
 fn protected_view_allows_doc_act(act: Act) -> bool {
+    if let Act::Sheet(a) = act {
+        return protected_view_allows_act(a);
+    }
     matches!(
         act,
         Act::Copy
@@ -9863,8 +9867,8 @@ impl Docxy {
         self.chart_drop_selection();
         self.bar_close();
         // The bars that act on Enter point into the grid too: a rename names
-        // a sheet by index, and the filter, row-height and comment bars act
-        // on the selection. Carried into another tab, Enter would apply them
+        // a sheet by index, and the row-height and comment bars act on the
+        // selection. Carried into another tab, Enter would apply them
         // there, a Protected View tab included (#610).
         self.sheet_rename = None;
         self.sheet_rowh_edit = None;
@@ -34294,6 +34298,22 @@ mod grid_geom_tests {
             assert!(!super::protected_view_allows_act(act), "{act:?}");
         }
         assert!(super::protected_view_allows_act(SheetAct::Copy));
+    }
+
+    #[test]
+    fn protected_view_lets_the_cell_menus_copy_through_and_nothing_else() {
+        // The cell menu's items are `Act::Sheet`, gated by the menu click.
+        use crate::{Act, SheetAct, protected_view_allows_doc_act as allows};
+        assert!(allows(Act::Sheet(SheetAct::Copy)));
+        for act in [
+            SheetAct::Cut,
+            SheetAct::Paste,
+            SheetAct::NewComment,
+            SheetAct::SortAsc,
+            SheetAct::FilterBy(gridcore::filter::ByCell::Value),
+        ] {
+            assert!(!allows(Act::Sheet(act)), "{act:?}");
+        }
     }
 
     #[test]

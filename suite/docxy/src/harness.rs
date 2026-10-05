@@ -2131,6 +2131,13 @@ fn menu_open(
                         .into(),
                 );
             }
+            // A right-click on a sheet's body opens the cell menu instead.
+            if app.active_is_sheet() {
+                return Err(
+                    r#"the document menu does not open on a sheet tab; a cell's is {"cell": "D7"}"#
+                        .into(),
+                );
+            }
             let at = menu_point(app, window, None, |b| b.center());
             app.open_document_menu(at, cx);
             Ok(())

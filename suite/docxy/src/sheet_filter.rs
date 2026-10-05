@@ -20,16 +20,17 @@ type Area = (u32, u32, u32, u32);
 const PROTECTED: &str =
     "The sheet is protected: unprotect it (Review › Protect Sheet) to filter it.";
 
-/// What a filter command can change, to tell whether it changed anything.
-fn state(wb: &Workbook, s: usize) -> impl PartialEq + use<> {
-    let sh = &wb.sheets[s];
-    (
-        sh.row_attrs.clone(),
-        sh.filtered_rows.clone(),
-        sh.auto_filter.clone(),
-        sh.cells.clone(),
-        wb.defined_names.clone(),
-    )
+/// Whether sheet `s` differs between `a` and `b` in what a filter command
+/// writes: the rows' attributes and hidden flags, the filter, the cells (a
+/// copy to another range) and the defined names (`_FilterDatabase`,
+/// `Criteria`, `Extract`).
+fn filter_changed(a: &Workbook, b: &Workbook, s: usize) -> bool {
+    let (x, y) = (&a.sheets[s], &b.sheets[s]);
+    x.row_attrs != y.row_attrs
+        || x.filtered_rows != y.filtered_rows
+        || x.auto_filter != y.auto_filter
+        || x.cells != y.cells
+        || a.defined_names != b.defined_names
 }
 
 /// Run filter command `op` on the tab's sheet as one undo step: commit an
@@ -47,19 +48,16 @@ pub(crate) fn run(
         return Err(PROTECTED.into());
     }
     // The typed value is an edit whatever the command then does.
-    if v.commit_edit() {
-        tab.dirty = true;
-    }
-    if v.editing.is_some() {
-        return Err("Finish the cell you are typing in first".into());
-    }
+    crate::sheet_sort::commit_first(tab)?;
+    let Surface::Sheet(v) = &mut tab.surface else {
+        return Err("Filter needs a spreadsheet".into());
+    };
     let today = v
         .engine
         .clock
         .or_else(gridcore::clock::local_now_serial)
         .unwrap_or(0.0);
     let snap = v.snapshot();
-    let before = state(&v.pkg.workbook, s);
     let outcome = match op(&mut v.pkg.workbook, s, today) {
         Ok(o) => o,
         Err(e) => {
@@ -68,7 +66,7 @@ pub(crate) fn run(
             return Err(e.to_string());
         }
     };
-    let changed = before != state(&v.pkg.workbook, s);
+    let changed = filter_changed(snap.workbook(), &v.pkg.workbook, s);
     if changed {
         v.push_undo_snapshot(snap);
         // The rebuilt engine keeps the clock the old one had.

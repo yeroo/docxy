@@ -110,6 +110,7 @@ test sheet filter cell menu right-click leaves a half-typed formula alone
 # The cell menu's clipboard and New Comment are the sheet's own commands.
 test sheet filter cell menu copies pastes and opens a comment
   open ../fixtures/basic.xlsx
+  call-error menu-open {"target":"document"} => does not open on a sheet tab
   call menu-open {"target":{"cell":"A3"}}
   call menu-click {"label":"Copy"}
   call menu-open {"target":{"cell":"E3"}}
