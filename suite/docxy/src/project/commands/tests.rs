@@ -2779,6 +2779,27 @@ fn hyperlink_prompt_enter_on_unchanged_prefill_changes_nothing() {
     }
 }
 
+/// #418 r2: an empty buffer still removes a link whose stored parts are
+/// empty strings (a lone empty <HyperlinkAddress/> loads that way): the
+/// unchanged-prefill no-op must not swallow "empty to remove".
+#[test]
+fn hyperlink_prompt_empty_buffer_removes_empty_stored_parts() {
+    let mut t = tab();
+    let mut p = v(&t).ed.project().clone();
+    p.tasks[1].hyperlink_address = Some(String::new());
+    vm(&mut t).ed = ProjectEditor::new(p);
+    vm(&mut t).ed.select(1);
+    let depth = v(&t).ed.undo_depth();
+    chord(&mut t, "k", ctrl());
+    assert_eq!(v(&t).prompt.as_ref().unwrap().buf, "");
+    press(&mut t, "enter");
+    assert_eq!(hyperlink_parts(&t), (None, None, None));
+    assert_eq!(t.status.as_ref(), "Hyperlink removed");
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(hyperlink_parts(&t), (None, Some(String::new()), None));
+}
+
 #[test]
 fn hyperlink_prompt_does_not_open_on_the_entry_row() {
     let mut t = tab();

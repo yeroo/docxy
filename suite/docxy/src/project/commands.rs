@@ -837,7 +837,7 @@ fn hyperlink_hint(task: &projcore::model::Task) -> String {
 /// Parse the prompt's `ADDRESS[#LOCATION] [| TEXT]`: the first ` | ` splits
 /// the display text, the first `#` splits the address from the location
 /// (Project's own address#subaddress convention, so an address cannot hold
-/// `#`), ends trimmed, an empty part absent. ` | TEXT` typed without the
+/// `#`), ends trimmed, an empty part absent. `| TEXT` typed without the
 /// leading space is text-only, like ` | TEXT`.
 fn parse_hyperlink(buf: &str) -> (Option<String>, Option<String>, Option<String>) {
     let (link, text) = match buf.trim_start().strip_prefix('|') {
@@ -909,7 +909,9 @@ fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, 
             // Enter on the prefill the prompt opened with changes nothing: a
             // stored address can hold `#` or ` | `, which the grammar would
             // re-split, and an address-only link would grow a display text.
-            if p.buf == hyperlink_hint(task) {
+            // An empty buffer never counts: "empty to remove" must still
+            // remove a link whose stored parts are empty strings.
+            if !p.buf.is_empty() && p.buf == hyperlink_hint(task) {
                 return Ok(None);
             }
             let had_link = task.hyperlink.is_some()
