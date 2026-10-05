@@ -211,7 +211,7 @@ fn in_brackets(before: &[char], open: usize, scan: &Scan, wb: &Workbook) -> Opti
         .filter(|c| matches(c))
         .map(|c| Item {
             label: c.clone(),
-            insert: escape_column(c),
+            insert: crate::formula::escape_spec(c),
             kind: Kind::Column,
         })
         .collect();
@@ -233,12 +233,6 @@ fn in_brackets(before: &[char], open: usize, scan: &Scan, wb: &Workbook) -> Opti
     })
 }
 
-/// A column name as a structured reference spells it: `[`, `]`, `#`, `'` and
-/// `@` take a `'` before them (the parser's own escaping).
-pub fn escape_column(name: &str) -> String {
-    crate::formula::escape_spec(name)
-}
-
 /// The functions, defined names (global, or scoped to `sheet`) and tables
 /// starting with `prefix`, sorted ignoring case.
 fn names(prefix: &str, wb: &Workbook, sheet: usize) -> Vec<Item> {
@@ -254,8 +248,9 @@ fn names(prefix: &str, wb: &Workbook, sheet: usize) -> Vec<Item> {
         })
         .collect();
     for d in &wb.defined_names {
-        let hidden = d.name.starts_with("_xl") || d.name.starts_with("_xlnm");
-        if hidden || !d.scope.is_none_or(|s| s == sheet) || !starts(&d.name) {
+        // Excel lists none of the `_xl…` names: the `_xlnm.` built-ins
+        // (Print_Area, _FilterDatabase) and the `_xlfn.`/`_xlpm.` spellings.
+        if d.name.starts_with("_xl") || !d.scope.is_none_or(|s| s == sheet) || !starts(&d.name) {
             continue;
         }
         if items.iter().any(|i| i.label.eq_ignore_ascii_case(&d.name)) {
@@ -434,8 +429,9 @@ mod tests {
 
     #[test]
     fn special_columns_are_escaped_and_parse_back() {
-        assert_eq!(escape_column("#Units"), "'#Units");
-        assert_eq!(escape_column("a[b]'c@"), "a'[b']''c'@");
+        use crate::formula::escape_spec;
+        assert_eq!(escape_spec("#Units"), "'#Units");
+        assert_eq!(escape_spec("a[b]'c@"), "a'[b']''c'@");
         let mut wb = sales();
         wb.tables[0].columns[1] = "#Units".into();
         let buf = "=SUM(Sales['#";

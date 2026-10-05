@@ -17,10 +17,17 @@
 //! word and the constant `, Ada`, which has fewer atoms. A program
 //! of constants alone, or none at all, is no pattern (ENT-110).
 //!
+//! The examples start at the top of the data, or at the row below it when
+//! that row is a header: the column's top cell is empty, or the examples
+//! show no pattern with it and do without it.
+//!
 //! What it returns is the text each empty cell below would be typed with, so
 //! a host commits it like a typed entry (ENT-108): digits become numbers,
-//! unless every example was entered as text with an apostrophe, in which case
-//! each result carries one too.
+//! unless every example is text that would not stay text typed bare (`'007`,
+//! entered with an apostrophe or into a Text cell), in which case each result
+//! carries an apostrophe too. A result that would type as a formula gets one
+//! as well, since Flash Fill writes constants. A Text-formatted target cell
+//! takes its result as it is, with no apostrophe.
 
 use std::collections::HashMap;
 

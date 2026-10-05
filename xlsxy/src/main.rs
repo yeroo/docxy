@@ -1497,6 +1497,11 @@ struct EditState {
     /// Where a correction was taken back: the word starting there is not
     /// corrected again, as typed or at the commit.
     kept: Option<usize>,
+    /// The last edit was a character typed at the end of the text: the
+    /// commit's AutoCorrect then sees the word just typed. Any caret move or
+    /// other edit clears it, so an F2 fix elsewhere in a cell never corrects
+    /// a last word nobody typed (FIX r2 m3).
+    typed_tail: bool,
     /// Formula AutoComplete's list at the caret (#686) and its highlighted
     /// item. Esc closes it until the formula is edited again.
     complete: Option<(Completions, usize)>,
@@ -2193,6 +2198,7 @@ impl App {
             text,
             cursor,
             replace: initial.is_some(),
+            typed_tail: initial.is_some(),
             ..EditState::default()
         });
         self.anchor = None;
@@ -2355,16 +2361,17 @@ impl App {
         if let Some((_, value)) = edit.proposal.take() {
             edit.text = value;
         }
-        let (text, seed, kept) = (edit.text, edit.seed, edit.kept);
+        let (text, seed, kept, tail) = (edit.text, edit.seed, edit.kept, edit.typed_tail);
         // A seeded editor left unchanged must not re-read the cell: `007` in
         // a quote-prefixed cell is fine either way, but a stored
         // 0.30000000000000004 would come back as 0.3.
         if seed.as_deref() == Some(text.as_str()) {
             return true;
         }
-        // AutoCorrect's last word (#667), unless a taken AutoComplete
-        // proposal or pick spelled the entry, or Ctrl+Z took the word back.
-        let fix = (!took)
+        // AutoCorrect's last word (#667) when it was just typed, unless a
+        // taken AutoComplete proposal or pick spelled the entry, or Ctrl+Z
+        // took the word back.
+        let fix = (!took && tail)
             .then(|| self.autocorrect.correct_at_commit(&text))
             .flatten()
             .filter(|c| kept != Some(c.start));
@@ -5029,6 +5036,7 @@ impl App {
         e.text = e.seed.clone().unwrap_or_default();
         e.cursor = e.text.chars().count();
         e.kept = None;
+        e.typed_tail = false;
     }
 
     /// After `ch` was typed into the editor: when it ends a word, AutoCorrect
@@ -9959,6 +9967,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.drop_proposal();
                 if let Some(e) = &mut app.edit {
                     let idx = char_index(&e.text, e.cursor);
+                    e.typed_tail = e.cursor == e.text.chars().count();
                     e.text.insert(idx, ch);
                     e.cursor += 1;
                     e.correction = None;
@@ -9975,6 +9984,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             if !matches!(key.code, KeyCode::Char(_)) {
                 if let Some(e) = &mut app.edit {
                     e.correction = None;
+                    e.typed_tail = false;
                 }
             }
             app.refresh_completions();
@@ -19264,6 +19274,36 @@ mod tests {
         app.autocorrect.opts.replace_text = false;
         type_enter(&mut app, 3, 3, "teh cat");
         assert_eq!(text_at(&app, 3, 3), "teh cat");
+    }
+
+    /// FIX r2 m3: the commit corrects only a last word just typed.
+    #[test]
+    fn an_edit_elsewhere_leaves_an_untyped_last_word() {
+        let mut app = opts_app();
+        app.autocorrect.opts.names_of_days = true;
+        put(&mut app, 0, 0, "Meting on monday");
+        app.cur = (0, 0);
+        press(&mut app, KeyCode::F(2));
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        type_text(&mut app, "e");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 0, 0), "Meeting on monday");
+        // Typed at the end, the last word is corrected at the commit.
+        put(&mut app, 2, 0, "Note:");
+        app.cur = (2, 0);
+        press(&mut app, KeyCode::F(2));
+        type_text(&mut app, " teh");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 2, 0), "Note: the");
+        // A caret move after the typing clears it.
+        app.cur = (1, 0);
+        type_text(&mut app, "x teh");
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 1, 0), "x teh");
     }
 
     #[test]
