@@ -12197,8 +12197,6 @@ mod tests {
         assert_eq!(f_attrs_at(&app, 0, 0, 3), None);
     }
 
-    /// A1:A3 = 1, 2, 3 and a legacy CSE block `{=A1:A3*2}` over D1:D3, as
-    /// load_xlsx reads it, spilling 2, 4, 6.
     /// #669: Paste Special over xlsxy's own copy, through gridcore's rules.
     #[test]
     fn paste_special_values_transpose_and_an_operation() {
@@ -12321,6 +12319,8 @@ mod tests {
         );
     }
 
+    /// A1:A3 = 1, 2, 3 and a legacy CSE block `{=A1:A3*2}` over D1:D3, as
+    /// load_xlsx reads it, spilling 2, 4, 6.
     fn app_with_spilling_cse() -> App {
         let mut pkg = new_xlsx();
         let sheet = &mut pkg.workbook.sheets[0];

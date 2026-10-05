@@ -479,8 +479,10 @@ implemented`) instead of replying green over a no-op. `ribbon-click` resolves
 by id, else label, else the drawn text (`Σ AutoSum`), selects the tab and runs
 the button's own `run_sheet_act`. Buttons that open a bar (Filter, Custom
 Sort, Data Validation, …) leave it open for `type` and `key enter`, as a click
-does. The sheet ribbon has no split buttons, so `menu-open {"ribbon": …}`
-refuses a sheet tab. `sheet-ribbon.uit` covers these.
+does. Home's Paste is a split button, and Fill, Clear and Find & Select open
+menus (#707): `menu-open {"ribbon": [tab, group, command]}` opens them, and a
+`ribbon-click` of Fill, Clear or Find & Select opens its menu as the click
+does. `sheet-ribbon.uit` covers these.
 
 Levelling (Level, Level All, Clear Leveling, Ctrl+Shift+L) is asked for, not
 run, so the Project status bar can draw `Busy`; render schedules the pass for
@@ -662,7 +664,7 @@ pointer on a few pixels, each driven through the app's own handlers (#699).
 | `clipboard {"action":"write","text":"a\tb\n"}` | put text on the clipboard, as another app's copy would |
 | `fill-drag {"from":"B4:B5","to":"B8"}` | press the fill handle, cross each cell to `to`, release. Optional `from`, `option`, `ctrl`, `right`, `double` (#668) |
 | `border-drag {"from":"B2:B3","to":"J2"}` | press the selection's edge, drop the block with its top-left on `to` (#670). Optional `from`, `ctrl`, `right`, `choice`, `replace` |
-| `office-clipboard {"action":"open"}` | the Office Clipboard pane's own handlers (#669): `read` (the default), `open`, `close`, `paste` item `index`, `paste-all`, `clear-all`, `delete` item `index`. Replies `{open, items, state}` |
+| `office-clipboard {"action":"open"}` | the Office Clipboard pane's own handlers (#669): `read` (the default), `open`, `close`, `paste` item `index`, `paste-all`, `clear-all`, `delete` item `index`. Replies `{open, items, state}`. It collects sheet copies and cuts only, not a document's |
 
 **`save-as`.** `path` is required; a relative one resolves against the folder
 of the tab's own file, where the dialog would open, so after `open copy:` it

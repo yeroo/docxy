@@ -62,7 +62,7 @@ pub fn paste_tiles(
 /// multi-area copy skips rows or columns, so each has its own offset). A
 /// formula that lands where it came from, or that doesn't parse, keeps its
 /// text as it was.
-pub fn translated_block(
+fn translated_block(
     cells: &[Vec<Cell>],
     src_rows: &[u32],
     src_cols: &[u32],

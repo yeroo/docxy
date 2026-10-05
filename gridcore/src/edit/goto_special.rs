@@ -1,7 +1,8 @@
 //! Home › Find & Select › Go To Special (#671): the cells of a kind, as the
 //! rectangles of a multi-area selection.
 
-use super::paste_special::{Rect, cells_to_rects};
+use super::Rect;
+use super::paste_special::cells_to_rects;
 use crate::formula::{collect_refs, parse, translate_formula};
 use crate::sheet::{Cell, CellValue, Sheet, Workbook};
 

@@ -25,15 +25,18 @@ pub(crate) struct FillOptions {
     pub ctrl: bool,
     /// The filled cells; the button sits at their bottom-right.
     pub dest: (u32, u32, u32, u32),
+    /// The selection the fill left: another selection dismisses the button.
+    pub sel: (u32, u32, u32, u32),
     /// Whether the source holds dates, numbers: which kinds the menu offers.
     pub dates: bool,
     pub numbers: bool,
 }
 
 impl FillOptions {
-    /// Whether the button still stands on `v`.
+    /// Whether the button still stands on `v`: the workbook and the
+    /// selection are as the fill left them.
     pub fn stands(&self, v: &SheetView) -> bool {
-        v.id == self.view && v.edit_gen == self.edit_gen
+        v.id == self.view && v.edit_gen == self.edit_gen && v.range() == self.sel && !v.multi_area()
     }
 
     /// The kinds its menu offers.

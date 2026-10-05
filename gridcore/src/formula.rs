@@ -1999,6 +1999,9 @@ pub fn translate_formula(src: &str, dr: i64, dc: i64) -> Option<String> {
 pub struct Transposed<'a> {
     /// The copy's sheet: a reference qualified with another sheet is outside.
     pub src_sheet: &'a str,
+    /// The sheet the paste lands on: a qualified reference into the copy
+    /// points at its transposed copy there.
+    pub dst_sheet: &'a str,
     pub inside: &'a dyn Fn(i64, i64) -> Option<(i64, i64)>,
     pub dr: i64,
     pub dc: i64,
@@ -2015,6 +2018,9 @@ impl Transposed<'_> {
         }
         let (row, col) = (self.inside)(r.row, r.col)?;
         Some(CellRef {
+            // The transposed copy is on the paste's sheet (#707 r1 m12): an
+            // unqualified reference reads it there already.
+            sheet: r.sheet.as_ref().map(|_| self.dst_sheet.to_string()),
             row,
             col,
             ..r.clone()

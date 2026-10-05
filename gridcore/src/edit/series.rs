@@ -11,8 +11,7 @@
 
 use crate::sheet::{Cell, CellValue, NumFmt, Styles, classify_format_code, parts_to_serial};
 
-/// A rectangle (r0, c0, r1, c1), inclusive.
-pub type Rect = (u32, u32, u32, u32);
+use super::Rect;
 
 /// How a fill writes its cells: what the Auto Fill Options button, the
 /// fill handle's right-drag menu and the Series dialog offer.
@@ -545,20 +544,23 @@ pub(crate) fn add_months(serial: f64, months: i64, date1904: bool) -> f64 {
     parts_to_serial(ny, nm, nd, secs, date1904)
 }
 
-/// Whether the serial falls on a Saturday or Sunday.
-fn weekend(serial: f64) -> bool {
-    let dow = (serial.floor() as i64 - 1).rem_euclid(7);
+/// Whether the serial falls on a Saturday or Sunday, in the 1900 date
+/// system (serial 1, 1900-01-01, a Sunday in Excel's reckoning) or the
+/// 1904 one (serial 0, 1904-01-01, a Friday).
+fn weekend(serial: f64, date1904: bool) -> bool {
+    let shift = if date1904 { 5 } else { -1 };
+    let dow = (serial.floor() as i64 + shift).rem_euclid(7);
     dow == 0 || dow == 6
 }
 
 /// `serial` moved by `k` weekdays (Monday to Friday).
-pub(crate) fn add_weekdays(serial: f64, k: i64) -> f64 {
+pub(crate) fn add_weekdays(serial: f64, k: i64, date1904: bool) -> f64 {
     let mut s = serial;
     let dir = if k < 0 { -1.0 } else { 1.0 };
     let mut left = k.abs();
     while left > 0 {
         s += dir;
-        if !weekend(s) {
+        if !weekend(s, date1904) {
             left -= 1;
         }
     }
@@ -609,13 +611,13 @@ fn date_at(ys: &[f64], n: f64, t: Temporal, kind: FillKind, date1904: bool, dir:
                 let dir = if b >= a { 1.0 } else { -1.0 };
                 while (dir > 0.0 && s < b) || (dir < 0.0 && s > b) {
                     s += dir;
-                    if !weekend(s) {
+                    if !weekend(s, date1904) {
                         k += dir as i64;
                     }
                 }
                 if k == 0 { 1 } else { k }
             };
-            add_weekdays(last, step * ahead.round() as i64)
+            add_weekdays(last, step * ahead.round() as i64, date1904)
         }
         FillKind::Months | FillKind::Years => {
             let unit = if kind == FillKind::Years { 12 } else { 1 };
@@ -851,7 +853,7 @@ pub struct SeriesSpec {
     pub step: f64,
     pub stop: Option<f64>,
     /// Trend: replace the line's values with their least-squares fit,
-    /// ignoring the step.
+    /// ignoring the step; a line with one seed steps by `step` from it.
     pub trend: bool,
 }
 
@@ -1006,7 +1008,7 @@ pub(crate) fn series_changes(
                     SeriesType::Date(unit) => {
                         let k = (spec.step * n).round() as i64;
                         match unit {
-                            FillKind::Weekdays => add_weekdays(v0, k),
+                            FillKind::Weekdays => add_weekdays(v0, k, ctx.date1904),
                             FillKind::Months => add_months(v0, k, ctx.date1904),
                             FillKind::Years => add_months(v0, 12 * k, ctx.date1904),
                             _ => v0 + spec.step * n,

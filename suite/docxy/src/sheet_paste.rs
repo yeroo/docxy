@@ -30,8 +30,13 @@ pub(crate) struct PasteOptions {
 }
 
 impl PasteOptions {
+    /// Whether the button still stands on `v`: the workbook as the paste
+    /// left it, and the pasted range still the selection (R3).
     pub fn stands(&self, v: &SheetView) -> bool {
-        v.id == self.view && v.edit_gen == self.edit_gen
+        v.id == self.view
+            && v.edit_gen == self.edit_gen
+            && v.range() == self.rect
+            && !v.multi_area()
     }
 }
 

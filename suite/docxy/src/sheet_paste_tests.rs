@@ -297,3 +297,28 @@ fn the_paste_sources_refuse_what_they_cannot_take() {
     assert!(item_refusal(&text, PasteItem::Formulas).is_err());
     assert_eq!(item_refusal(&text, PasteItem::Transpose), Ok(()));
 }
+
+/// #707 r1 m4 (R3): moving the selection off the pasted range dismisses
+/// the Paste Options button; coming back to it does not bring it back
+/// after another edit.
+#[test]
+fn a_selection_change_dismisses_paste_options() {
+    let mut v = view();
+    put(&mut v, "A1", Cell::number(1.0));
+    let clip = copy(&mut v, "A1", "A1");
+    select(&mut v, "C1");
+    v.paste_grid_clip(&clip).unwrap();
+    let opts = PasteOptions {
+        view: v.id,
+        edit_gen: v.edit_gen,
+        block: clip.block.clone(),
+        at: at("C1"),
+        rect: v.range(),
+        item: PasteItem::Paste,
+        foreign: false,
+    };
+    assert!(opts.stands(&v));
+    select(&mut v, "D4");
+    assert!(!opts.stands(&v));
+    assert!(v.repaste(&opts, PasteItem::Values).is_err());
+}

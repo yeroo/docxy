@@ -532,3 +532,24 @@ fn a_malformed_block_is_refused_and_never_panics() {
     }];
     let _ = paste_special_extras(&clip, at("C1"), &PasteSpec::of(PasteWhat::Validation));
 }
+
+/// #707 r1 m12: a transposed paste onto another sheet points a qualified
+/// reference into the copy at the transposed copy on the paste's sheet; an
+/// unqualified one reads it there already, and one outside keeps its sheet.
+#[test]
+fn transpose_onto_another_sheet_requalifies_references_into_the_copy() {
+    let mut wb = book(&[("Src", &[("A1", Cell::number(1.0))]), ("Dst", &[])]);
+    wb.sheets[0].set_cell(1, 0, Cell::formula("Src!A1+A1+Src!Z9"));
+    let clip = copy(&wb, 0, "A1:A2");
+    paste(
+        &mut wb,
+        1,
+        "C1",
+        &clip,
+        PasteSpec {
+            transpose: true,
+            ..PasteSpec::default()
+        },
+    );
+    assert_eq!(formula(&wb, 1, "D1").as_deref(), Some("Dst!C1+C1+Src!AC8"));
+}

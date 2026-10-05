@@ -13,8 +13,7 @@
 use crate::formula::{Expr, Transposed, to_string, translate_formula, transpose_formula};
 use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Workbook, cell_name};
 
-/// A rectangle (r0, c0, r1, c1), inclusive.
-pub type Rect = (u32, u32, u32, u32);
+use super::{Rect, rects_overlap as overlaps};
 
 /// Excel's refusal of a multi-area copy whose areas share neither their rows
 /// nor their columns, of any multi-area cut, and of a paste or a drag over a
@@ -338,6 +337,7 @@ impl ClipBlock {
         dest: (u32, u32),
         at: (u32, u32),
         transpose: bool,
+        dst_sheet: &str,
     ) -> Option<String> {
         let dr = i64::from(dest.0) - i64::from(*self.rows.get(i)?);
         let dc = i64::from(dest.1) - i64::from(*self.cols.get(j)?);
@@ -349,6 +349,7 @@ impl ClipBlock {
             };
             let t = Transposed {
                 src_sheet: &self.sheet_name,
+                dst_sheet,
                 inside: &inside,
                 dr,
                 dc,
@@ -517,7 +518,7 @@ pub fn paste_special_changes(
                 None
             } else {
                 src.formula.as_deref().map(|f| {
-                    clip.moved_formula(f, (i, j), dest, at, spec.transpose)
+                    clip.moved_formula(f, (i, j), dest, at, spec.transpose, &s.name)
                         .unwrap_or_else(|| f.to_string())
                 })
             };
@@ -655,10 +656,6 @@ pub fn clear_validation(sheet: &mut Sheet, rect: Rect) {
         }
         true
     });
-}
-
-pub(crate) fn overlaps(a: Rect, b: Rect) -> bool {
-    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
 }
 
 /// `a` without `b`: up to four rectangles (above, below, left, right).

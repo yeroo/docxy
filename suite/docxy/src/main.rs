@@ -12059,6 +12059,7 @@ impl Docxy {
                     kind,
                     ctrl,
                     dest,
+                    sel: v.range(),
                     dates,
                     numbers,
                 });
@@ -12123,6 +12124,7 @@ impl Docxy {
             Ok(_) => {
                 self.fill_options = Some(sheet_fill::FillOptions {
                     edit_gen: v.edit_gen,
+                    sel: v.range(),
                     kind,
                     ..opts
                 });
@@ -15186,7 +15188,6 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// Dispatch a spreadsheet ribbon command.
     /// Home › Fill › Down, Right, Up, Left (and Ctrl+D, Ctrl+R).
     fn sheet_fill_dir(&mut self, dir: gridcore::edit::FillDir, cx: &mut Context<Self>) {
         if self.sheet_protected() {
@@ -15297,6 +15298,7 @@ impl Docxy {
         true
     }
 
+    /// Dispatch a spreadsheet ribbon command.
     fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
         // Protected View (#610): the ribbon is hidden, but shortcuts, KeyTips
@@ -15797,6 +15799,9 @@ impl Docxy {
                 // (#664); while editing it only cancels the entry, as Excel's.
                 if !editing {
                     self.grid_clip_spend();
+                    // And the Auto Fill and Paste Options buttons (R3).
+                    self.fill_options = None;
+                    self.paste_options = None;
                 }
                 if let Some(v) = self.active_sheet_mut() {
                     v.end_cell_edit();
@@ -18033,7 +18038,7 @@ impl Docxy {
                     .text_size(px(11.))
                     .text_color(pal.dim)
                     .child(if n == 0 {
-                        "Copy or cut to collect items here. A click pastes one as values."
+                        "Copy or cut on a sheet to collect items here (a copy in a document is not collected). A click pastes one as values."
                     } else {
                         "Click an item to paste it as values:"
                     }),

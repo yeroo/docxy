@@ -1263,6 +1263,20 @@ fn a_drag_fill_from_a_source_holding_the_anchor_is_refused() {
     assert!(v.engine.refuses_area(&v.pkg.workbook, s, dest));
     // The whole box would count the anchor as replaced: the r7 bug.
     assert!(!v.engine.refuses_area(&v.pkg.workbook, s, bx));
+    // The drag itself: refused whole, nothing written, no undo step.
+    let before = v.sheet().cells.clone();
+    assert_eq!(
+        v.fill_drag(&gridcore::edit::FillReq {
+            src,
+            to: (5, 3),
+            kind: gridcore::edit::FillKind::Auto,
+            ctrl: false,
+            lists: &[],
+        }),
+        Err(gridcore::engine::PART_OF_ARRAY.to_string())
+    );
+    assert_eq!(v.sheet().cells, before);
+    assert!(v.undo.is_empty());
     // Right: the columns past the source.
     assert!(matches!(
         gridcore::edit::fill_target((0, 0, 1, 1), (1, 4)),

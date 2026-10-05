@@ -66,9 +66,11 @@ fn apply_dialog(
         DialogOwner::GoTo | DialogOwner::GoToSpecial => {
             Err("Go To applies through Find & Select".into())
         }
-        // Handled in `Docxy::fill_dialog_click`, before this.
+        // Handled in `Docxy::paste_dialog_click`, before this.
         DialogOwner::PasteSpecial { .. } => Err("Paste Special applies through Paste".into()),
+        // Handled in `Docxy::drop_dialog_click`, before this.
         DialogOwner::DropReplace => Err("the drop applies through the grid".into()),
+        // Handled in `Docxy::fill_dialog_click`, before this.
         DialogOwner::Series | DialogOwner::JustifyOverflow | DialogOwner::CustomLists => {
             Err("a Fill dialog applies through Home › Fill".into())
         }
@@ -317,9 +319,10 @@ impl Docxy {
         m: Modifiers,
         cx: &mut Context<Self>,
     ) -> bool {
-        // Enter or Escape on the user name dialog presses through the app.
+        // Enter or Escape on a dialog the app applies (the user name, the
+        // fill, paste and drop dialogs) presses through the app.
         let plain = !m.control && !m.alt && !m.platform;
-        let user_name_button = self
+        let app_dialog_button = self
             .tabs
             .get(self.active)
             .filter(|t| {
@@ -336,7 +339,7 @@ impl Docxy {
                 })
             })
             .and_then(|t| t.dialogs.key_button(key, plain));
-        if let Some(label) = user_name_button {
+        if let Some(label) = app_dialog_button {
             if let Err(e) = self.dialog_press(&label) {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.status = e.into();

@@ -133,6 +133,7 @@ fn auto_fill_options_redo_the_fill_as_one_step() {
         kind: FillKind::Auto,
         ctrl: false,
         dest: rect("A3:A4"),
+        sel: rect("A1:A4"),
         dates: false,
         numbers: true,
     };
@@ -156,6 +157,7 @@ fn auto_fill_options_redo_the_fill_as_one_step() {
         kind: FillKind::Auto,
         ctrl: false,
         dest: rect("A2"),
+        sel: rect("A1:A2"),
         dates: false,
         numbers: true,
     };
@@ -256,4 +258,28 @@ fn a_fill_continues_a_custom_list() {
         .unwrap();
     assert_eq!(shown(v, "A2"), CellValue::Text("High".into()));
     assert_eq!(shown(v, "A3"), CellValue::Text("Low".into()));
+}
+
+/// #707 r1 m4 (R3): another selection dismisses Auto Fill Options.
+#[test]
+fn a_selection_change_dismisses_auto_fill_options() {
+    let mut t = tab();
+    let v = view(&mut t);
+    put(v, "A1", Cell::number(1.0));
+    v.fill_drag(&req("A1", "A3", FillKind::Auto, &[])).unwrap();
+    let opts = FillOptions {
+        view: v.id,
+        edit_gen: v.edit_gen,
+        src: rect("A1"),
+        to: at("A3"),
+        kind: FillKind::Auto,
+        ctrl: false,
+        dest: rect("A2:A3"),
+        sel: v.range(),
+        dates: false,
+        numbers: true,
+    };
+    assert!(opts.stands(v));
+    v.move_sel(0, 1);
+    assert!(!opts.stands(v));
 }

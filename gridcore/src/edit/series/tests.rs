@@ -691,3 +691,24 @@ fn a_double_click_fills_to_the_neighbours_block() {
     let wb = book(&[("A1", Cell::number(1.0))]);
     assert_eq!(fill_down_to(&wb.sheets[0], (0, 0, 0, 0)), None);
 }
+
+/// #707 r1 m2: Fill Weekdays reads the 1904 date system's weekdays.
+#[test]
+fn weekdays_in_a_1904_workbook() {
+    // Friday 2024-10-04: Monday 7th, Tuesday 8th.
+    let mut wb = book(&[]);
+    wb.date1904 = true;
+    let s = style(&mut wb, "yyyy-mm-dd");
+    let fri = parts_to_serial(2024, 10, 4, 0, true);
+    let mut c = Cell::number(fri);
+    c.style = s;
+    wb.sheets[0].set_cell(0, 0, c);
+    fill_with(&mut wb, "A1", "A3", FillKind::Weekdays, false, &[]);
+    assert_eq!(
+        nums(&wb, &["A2", "A3"]),
+        [
+            parts_to_serial(2024, 10, 7, 0, true),
+            parts_to_serial(2024, 10, 8, 0, true)
+        ]
+    );
+}

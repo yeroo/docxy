@@ -9612,7 +9612,7 @@ mod tests {
     /// anywhere goes whole, and the others stay byte for byte.
     #[test]
     fn removed_hyperlinks_are_struck_on_save() {
-        use crate::edit::{ClearWhat, clear_areas};
+        use crate::edit::{ClearWhat, apply_clear};
         let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
         let rns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         let xml = format!(
@@ -9630,7 +9630,7 @@ mod tests {
         // A partial clear: B2 of A1:B2 takes the whole link.
         let mut wb = book(load(&xml));
         assert_eq!(wb.sheets[0].hyperlinks.len(), 5);
-        clear_areas(&mut wb, 0, &[(1, 1, 1, 1)], ClearWhat::Hyperlinks, &[]).unwrap();
+        apply_clear(&mut wb, 0, &[(1, 1, 1, 1)], ClearWhat::Hyperlinks, &[]).unwrap();
         assert_eq!(wb.sheets[0].hyperlinks.len(), 1, "A1:B2 went whole");
         let saved = splice_worksheet(&xml, &wb.sheets[0], "<sheetData/>");
         assert!(!saved.contains("A1:B2"), "{saved}");
@@ -9640,7 +9640,7 @@ mod tests {
         assert_eq!(back.hyperlinks.len(), 1);
         // A full clear drops the block.
         let mut wb = book(load(&xml));
-        clear_areas(
+        apply_clear(
             &mut wb,
             0,
             &[(0, 0, 9, 9)],

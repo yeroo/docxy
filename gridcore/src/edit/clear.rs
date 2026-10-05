@@ -1,7 +1,7 @@
 //! Home › Clear, as Excel has it (#671): each item removes exactly its part
 //! of the cells in the selected areas, and no cell moves.
 
-use super::paste_special::{Rect, overlaps};
+use super::{Rect, rects_overlap as overlaps};
 use crate::sheet::{Cell, Sheet};
 
 /// Excel's refusal of a clear that would split a merged cell.
@@ -220,7 +220,7 @@ pub fn apply_clear_sheet(sheet: &mut Sheet, plan: &ClearPlan) {
 
 /// Home › Clear `what` over `areas` of `wb`'s sheet `sheet`, cells and all.
 /// Notes are the host's (it removes [`ClearPlan::notes`] from its package).
-pub fn clear_areas(
+pub fn apply_clear(
     wb: &mut crate::sheet::Workbook,
     sheet: usize,
     areas: &[Rect],

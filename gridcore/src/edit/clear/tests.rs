@@ -34,7 +34,7 @@ const NOTES: &[(u32, u32)] = &[(0, 0), (5, 5)];
 #[test]
 fn clear_all_takes_everything_but_moves_nothing() {
     let mut wb = book();
-    let plan = clear_areas(&mut wb, 0, &[A1B2], ClearWhat::All, NOTES).unwrap();
+    let plan = apply_clear(&mut wb, 0, &[A1B2], ClearWhat::All, NOTES).unwrap();
     assert_eq!(cell(&wb, "A1"), Cell::default());
     assert_eq!(cell(&wb, "B1"), Cell::default());
     assert!(wb.sheets[0].hyperlinks.is_empty());
@@ -45,7 +45,7 @@ fn clear_all_takes_everything_but_moves_nothing() {
 #[test]
 fn clear_formats_keeps_contents_notes_and_links() {
     let mut wb = book();
-    let plan = clear_areas(&mut wb, 0, &[A1B2], ClearWhat::Formats, NOTES).unwrap();
+    let plan = apply_clear(&mut wb, 0, &[A1B2], ClearWhat::Formats, NOTES).unwrap();
     let a1 = cell(&wb, "A1");
     assert_eq!((a1.value, a1.style), (CellValue::Number(1.0), 0));
     assert_eq!(wb.sheets[0].hyperlinks.len(), 1);
@@ -56,7 +56,7 @@ fn clear_formats_keeps_contents_notes_and_links() {
 fn clear_contents_keeps_the_format() {
     let mut wb = book();
     let style = cell(&wb, "A1").style;
-    clear_areas(&mut wb, 0, &[A1B2], ClearWhat::Contents, NOTES).unwrap();
+    apply_clear(&mut wb, 0, &[A1B2], ClearWhat::Contents, NOTES).unwrap();
     let a1 = cell(&wb, "A1");
     assert_eq!((a1.value, a1.style), (CellValue::Empty, style));
     assert_eq!(cell(&wb, "B1").formula, None);
@@ -67,7 +67,7 @@ fn clear_contents_keeps_the_format() {
 fn clear_comments_only_names_the_notes() {
     let mut wb = book();
     let before = wb.sheets[0].cells.clone();
-    let plan = clear_areas(&mut wb, 0, &[A1B2], ClearWhat::Comments, NOTES).unwrap();
+    let plan = apply_clear(&mut wb, 0, &[A1B2], ClearWhat::Comments, NOTES).unwrap();
     assert_eq!(plan.notes, vec![(0, 0)]);
     assert_eq!(wb.sheets[0].cells, before);
 }
@@ -76,12 +76,12 @@ fn clear_comments_only_names_the_notes() {
 fn clear_hyperlinks_keeps_the_style_and_remove_resets_it() {
     let mut wb = book();
     let style = cell(&wb, "A1").style;
-    clear_areas(&mut wb, 0, &[A1B2], ClearWhat::Hyperlinks, NOTES).unwrap();
+    apply_clear(&mut wb, 0, &[A1B2], ClearWhat::Hyperlinks, NOTES).unwrap();
     assert!(wb.sheets[0].hyperlinks.is_empty());
     assert_eq!(cell(&wb, "A1").style, style);
     assert_eq!(wb.sheets[0].hyperlinks_removed, vec![(0, 0, 0, 0)]);
     let mut wb = book();
-    clear_areas(&mut wb, 0, &[A1B2], ClearWhat::RemoveHyperlinks, NOTES).unwrap();
+    apply_clear(&mut wb, 0, &[A1B2], ClearWhat::RemoveHyperlinks, NOTES).unwrap();
     assert!(wb.sheets[0].hyperlinks.is_empty());
     let a1 = cell(&wb, "A1");
     assert_eq!((a1.value, a1.style), (CellValue::Number(1.0), 0));
@@ -90,7 +90,7 @@ fn clear_hyperlinks_keeps_the_style_and_remove_resets_it() {
 #[test]
 fn every_area_is_cleared() {
     let mut wb = book();
-    clear_areas(
+    apply_clear(
         &mut wb,
         0,
         &[(0, 0, 0, 0), (5, 5, 5, 5)],
@@ -109,18 +109,18 @@ fn merges_inside_go_and_a_split_one_is_refused() {
     wb.sheets[0].merges.push((0, 0, 0, 1));
     wb.sheets[0].merges.push((4, 4, 6, 6));
     assert_eq!(
-        clear_areas(&mut wb, 0, &[A1B2], ClearWhat::All, &[]).map(|p| p.unmerge),
+        apply_clear(&mut wb, 0, &[A1B2], ClearWhat::All, &[]).map(|p| p.unmerge),
         Ok(vec![(0, 0, 0, 1)])
     );
     assert_eq!(wb.sheets[0].merges, vec![(4, 4, 6, 6)]);
     let before = wb.clone();
     assert_eq!(
-        clear_areas(&mut wb, 0, &[(5, 5, 5, 5)], ClearWhat::Formats, &[]),
+        apply_clear(&mut wb, 0, &[(5, 5, 5, 5)], ClearWhat::Formats, &[]),
         Err(MERGED_PART)
     );
     assert_eq!(wb.sheets[0].cells, before.sheets[0].cells);
     // Contents leave merges alone.
-    assert!(clear_areas(&mut wb, 0, &[(5, 5, 5, 5)], ClearWhat::Contents, &[]).is_ok());
+    assert!(apply_clear(&mut wb, 0, &[(5, 5, 5, 5)], ClearWhat::Contents, &[]).is_ok());
 }
 
 #[test]

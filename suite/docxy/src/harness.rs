@@ -3615,10 +3615,6 @@ pub fn dispatch(
             Done::ok(state(app, window))
         }
 
-        // The clipboard (#699). A harness instance has a private one (it starts
-        // empty and never touches the OS clipboard); `write` puts text on it
-        // as another app's copy would. Copy, cut and paste are the app's own
-        // keys and buttons (`key ctrl+c`, `ribbon-click`), not a second route.
         // The Office Clipboard pane (#669): `read` (the default), `open`,
         // `close`, `paste` item `index`, `paste-all`, `clear-all`, `delete`
         // item `index`. The same handler the pane's buttons call.
@@ -3648,6 +3644,10 @@ pub fn dispatch(
                 ("state", state(app, window)),
             ]))
         }
+        // The clipboard (#699). A harness instance has a private one (it starts
+        // empty and never touches the OS clipboard); `write` puts text on it
+        // as another app's copy would. Copy, cut and paste are the app's own
+        // keys and buttons (`key ctrl+c`, `ribbon-click`), not a second route.
         "clipboard" => {
             match arg_str(args, "action")? {
                 "read" => {}
