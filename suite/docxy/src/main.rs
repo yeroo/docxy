@@ -2124,7 +2124,14 @@ impl SheetView {
             return false;
         };
         let Some(violation) =
-            gridcore::validation::check_entry(&mut self.pkg.workbook, s, r, c, &cell.2)
+            gridcore::validation::check_entry(
+                &mut self.pkg.workbook,
+                s,
+                r,
+                c,
+                &cell.2,
+                self.engine.clock,
+            )
         else {
             return false;
         };
@@ -2168,7 +2175,7 @@ impl SheetView {
     /// breaks its rule, in place of this sheet's circles. How many.
     fn circle_invalid(&mut self) -> usize {
         let sheet = self.active;
-        let cells = gridcore::validation::invalid_cells(&self.pkg.workbook, sheet);
+        let cells = gridcore::validation::invalid_cells(&self.pkg.workbook, sheet, self.engine.clock);
         self.circles.retain(|&(s, ..)| s != sheet);
         let n = cells.len();
         self.circles
@@ -2186,7 +2193,7 @@ impl SheetView {
         let invalid: std::collections::BTreeSet<(usize, u32, u32)> = sheets
             .into_iter()
             .flat_map(|s| {
-                gridcore::validation::invalid_cells(&self.pkg.workbook, s)
+                gridcore::validation::invalid_cells(&self.pkg.workbook, s, self.engine.clock)
                     .into_iter()
                     .map(move |(r, c)| (s, r, c))
             })
@@ -13493,7 +13500,7 @@ impl Docxy {
         }
         // Read the way the entry check reads it, so a value picked here is one
         // the check accepts (a relative source shifted, a name followed).
-        gridcore::validation::list_choices(&v.pkg.workbook, v.active, r, c)
+        gridcore::validation::list_choices(&v.pkg.workbook, v.active, r, c, v.engine.clock)
     }
 
     /// A press on column `col`'s filter button: its drop-down (#690).

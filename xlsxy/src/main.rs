@@ -2437,9 +2437,14 @@ impl App {
         };
         // The cell's data-validation rule: a breaking entry raises its alert
         // and waits, the editor kept with the text.
-        if let Some(v) =
-            gridcore::validation::check_entry(&mut self.pkg.workbook, self.sheet, r, c, &cell)
-        {
+        if let Some(v) = gridcore::validation::check_entry(
+            &mut self.pkg.workbook,
+            self.sheet,
+            r,
+            c,
+            &cell,
+            now_serial(),
+        ) {
             let sel = if v.style == gridcore::sheet::AlertStyle::Warning {
                 1
             } else {
@@ -4974,7 +4979,8 @@ impl App {
     /// ([`gridcore::validation::list_choices`]).
     fn resolve_list_values(&self) -> Vec<gridcore::validation::ListChoice> {
         let (r, c) = self.cur;
-        gridcore::validation::list_choices(&self.pkg.workbook, self.sheet, r, c).unwrap_or_default()
+        gridcore::validation::list_choices(&self.pkg.workbook, self.sheet, r, c, now_serial())
+            .unwrap_or_default()
     }
 
     /// Data ▸ Data Validation: the dialog over the selection, showing the rule
@@ -5051,7 +5057,7 @@ impl App {
     /// breaks its rule.
     fn circle_invalid(&mut self) {
         let sheet = self.sheet;
-        let cells = gridcore::validation::invalid_cells(&self.pkg.workbook, sheet);
+        let cells = gridcore::validation::invalid_cells(&self.pkg.workbook, sheet, now_serial());
         self.circles.retain(|&(s, ..)| s != sheet);
         self.status = Some(match cells.len() {
             0 => "No invalid data".to_string(),
@@ -5076,7 +5082,7 @@ impl App {
         let invalid: std::collections::BTreeSet<(usize, u32, u32)> = sheets
             .into_iter()
             .flat_map(|s| {
-                gridcore::validation::invalid_cells(&self.pkg.workbook, s)
+                gridcore::validation::invalid_cells(&self.pkg.workbook, s, now_serial())
                     .into_iter()
                     .map(move |(r, c)| (s, r, c))
             })
