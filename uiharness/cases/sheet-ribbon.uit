@@ -162,6 +162,13 @@ test sheet Home Sort & Filter drop-down opens and runs Sort A to Z
   assert dirty is true
   assert cell A2 is East
 
+test sheet Home Sort & Filter button opens its menu instead of running a placeholder
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Home","command":"Sort & Filter"}
+  call menu-read {}
+  assert reply.open is true
+  assert reply.items.0.label is Sort A to Z
+
 test sheet Home ribbon-click reaches a Sort & Filter menu item by id and by label
   open ../fixtures/basic.xlsx
   click B2
@@ -191,4 +198,6 @@ test sheet Home ribbon: no group is clipped vertically
   call ribbon-layout {}
   assert reply.tab is Home
   assert reply.groups.6.title is Editing
+  # Not vacuous: Editing has a column, so its content was measured.
+  assert reply.groups.6.content_bounds is not null
   assert reply.any_clipped_v is false

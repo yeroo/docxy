@@ -983,6 +983,11 @@ Menus open today:
   edit, and lists Project's Gantt Chart row menu in Project's order;
 - **Set Baseline's split menu**: the lower half of Project › Schedule › Set
   Baseline (`Set Baseline...`, `Clear Baseline...`);
+- **the sheet ribbon's Sort & Filter drop-down** (#1018): Home › Editing. Six
+  items (Sort A to Z, Sort Z to A, Custom Sort..., Filter, Clear, Reapply),
+  each running the Data tab's act of the same name. `menu-open
+  {"target":{"ribbon":["Home","Editing","Sort & Filter"]}}` or `ribbon-click`
+  on the button opens it; `ribbon-click` on an item opens it and clicks it;
 - **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New
   Comment): right-click a document body. It never opens on a sheet or a
   Project, and `menu-open {"target":"document"}` refuses on both;

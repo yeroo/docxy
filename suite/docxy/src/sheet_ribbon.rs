@@ -1042,6 +1042,20 @@ mod tests {
                         c.label(toggled)
                     );
                 }
+                // Menu items need distinct names among themselves too, or a
+                // `menu-click` by label could not tell them apart.
+                let mut items = HashSet::new();
+                for c in tab
+                    .commands()
+                    .into_iter()
+                    .filter(|c| tab.groups.iter().any(|g| g.menu_owner(c).is_some()))
+                {
+                    assert!(
+                        items.insert(c.label(toggled)),
+                        "menu item label {} repeats on a tab",
+                        c.label(toggled)
+                    );
+                }
             }
         }
     }

@@ -11,6 +11,9 @@ test sheet ribbon: no tab is clipped vertically
   call ribbon-layout {"tab":"Home"}
   assert reply.tab is Home
   assert reply.settled is true
+  assert reply.groups.1.title is Font
+  # Not vacuous: Font is a Rows stack, so its content was measured.
+  assert reply.groups.1.content_bounds is not null
   assert reply.any_clipped_v is false
   call ribbon-layout {"tab":"Insert"}
   shot window

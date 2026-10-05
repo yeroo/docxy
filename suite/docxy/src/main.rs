@@ -12209,23 +12209,15 @@ impl Docxy {
     /// Whether Protected View (#610, #633) or a final document (#617) hides the
     /// active document or workbook's ribbon commands.
     fn ribbon_locked(&self) -> bool {
-        let is_doc = matches!(
-            self.tabs.get(self.active).map(|t| &t.surface),
-            Some(Surface::Doc(_))
-        );
-        (self.active_is_sheet() || is_doc) && self.active_locked()
+        (self.active_is_sheet() || self.active_is_doc()) && self.active_locked()
     }
 
     /// Whether the window draws no ribbon body now: collapsed, locked, or a tab
     /// with no ribbon. Render and `ribbon-layout` both ask this.
     pub(crate) fn ribbon_body_hidden(&self) -> bool {
-        let is_doc = matches!(
-            self.tabs.get(self.active).map(|t| &t.surface),
-            Some(Surface::Doc(_))
-        );
         self.ribbon_min
             || self.ribbon_locked()
-            || !(is_doc || self.active_is_sheet() || self.active_is_project())
+            || !(self.active_is_doc() || self.active_is_sheet() || self.active_is_project())
     }
 
     /// Whether the active tab takes no edits: Protected View (#610), or a
