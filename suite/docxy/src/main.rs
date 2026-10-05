@@ -10731,11 +10731,9 @@ impl Docxy {
     /// Open a bar's range field. It starts unpinned, so until the user types a
     /// range or points at one the bar still acts on the selection.
     fn bar_open(&mut self, target: RefTarget) {
-        // The two bars share ONE `bar_field`/`bar_range`, and `sheet_key`
-        // routes to whichever is open first. Leaving the other on screen
-        // therefore aims the first at cells pinned for the other — a
-        // conditional format painting the validation bar's range, say. Only
-        // one at a time, which is also what the keyboard already assumed.
+        // The bar shares its `bar_field`/`bar_range` with nothing else, but a
+        // stale one left on screen would aim at cells pinned for an earlier
+        // open: close any first, so the field starts on the selection.
         self.bar_close();
         // `bar_close` only drops a field belonging to a bar. A Chart panel field
         // left focused would keep `range_field_active` true, so the very first
@@ -13528,7 +13526,11 @@ impl Docxy {
             Some((sname, rest)) => {
                 let sname = sname.trim_matches('\'');
                 (
-                    v.pkg.workbook.sheets.iter().position(|s| s.name == sname)?,
+                    v.pkg
+                        .workbook
+                        .sheets
+                        .iter()
+                        .position(|s| s.name.eq_ignore_ascii_case(sname))?,
                     rest,
                 )
             }

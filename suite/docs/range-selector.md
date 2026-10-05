@@ -285,12 +285,11 @@ ASCII matches only at its own case: `бюджет!A1` does not find `Бюдже�
 same fold decides `preview_range` (which delegates to `sheet_index_of`), the
 sheet-name uniqueness check, and `bar_range_text` — the **preview** that spells
 a reference back out — so changing it here alone would let resolution and the
-preview disagree about one reference. It is not, however, universal: the
-in-workbook hyperlink jump (`sheet_follow_hyperlink`) and a validation list's
-range source (`dv_list_values`) still match a sheet name byte for byte, so
-`=Budget!A1:A9` as a DV source finds nothing if the sheet is spelt `budget`.
-That is a separate, older inconsistency this reference syntax didn't reach, not
-a counter-rule. Two sheets differing only in case — which Excel forbids but a
+preview disagree about one reference. It is not, however, universal: the in-workbook hyperlink jump
+(`sheet_follow_hyperlink`) still matches a sheet name byte for byte. A
+validation list's range source (`dv_list_values`) folds ASCII case like the
+entry check does, so the dropdown and the check agree. The hyperlink jump is a separate, older inconsistency this reference syntax
+didn't reach, not a counter-rule. Two sheets differing only in case — which Excel forbids but a
 hand-built file can carry — resolve to the first, in each of the folding
 lookups above.
 

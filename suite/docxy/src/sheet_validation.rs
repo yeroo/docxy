@@ -915,4 +915,47 @@ mod tests {
         assert_eq!((dv.formula1.as_str(), dv.formula2.as_str()), ("TODAY()", "43831.5"));
         assert_eq!(dv.error, "only the message");
     }
+
+    /// A sheet whose part has no place for `<dataValidations>`.
+    fn unwritable(t: &mut DocTab) {
+        let v = view(t);
+        v.pkg.set_part(
+            "xl/worksheets/sheet1.xml",
+            br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/><autoFilter ref="A1:B2"><filterColumn colId="0"><pageMargins left="0.7"/></worksheet>"#.to_vec(),
+        );
+        assert!(!v.pkg.takes_validations(0));
+    }
+
+    #[test]
+    fn a_paste_onto_a_sheet_that_cannot_hold_rules_says_so_and_prunes_circles() {
+        let mut t = book(AlertStyle::Stop);
+        put(&mut t, "B3", Cell::number(250.0));
+        assert_eq!(view(&mut t).circle_invalid(), 1);
+        unwritable(&mut t);
+        let v = view(&mut t);
+        v.anchor = at("B2");
+        v.sel = at("B2");
+        let clip = v.grid_clip(false).unwrap();
+        v.anchor = at("B3");
+        v.sel = at("B3");
+        let res = v.paste_grid_clip(&clip);
+        assert!(matches!(res, Ok(crate::GridPasted::WithoutRules(_))), "{res:?}");
+        assert_eq!(value(&mut t, "B3"), CellValue::Number(50.0));
+        assert!(view(&mut t).circles.is_empty(), "B3 is valid now");
+        // The rules stayed where they were.
+        assert_eq!(ranges(&mut t), vec![vec![(1, 1, 9, 1)]]);
+
+        // A cut that arrives as a copy says what it lost as well.
+        let v = view(&mut t);
+        v.anchor = at("B2");
+        v.sel = at("B2");
+        let mut clip = v.grid_clip(true).unwrap();
+        clip.view = v.id + 1;
+        v.anchor = at("B4");
+        v.sel = at("B4");
+        match v.paste_grid_clip(&clip) {
+            Ok(crate::GridPasted::KeptAsCopy(why)) => assert!(why.contains("data validation"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
 }

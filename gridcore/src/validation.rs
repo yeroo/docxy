@@ -603,19 +603,22 @@ impl DialogBoxes {
         if takes_operator(kind) {
             dv.operator = op.to_string();
         }
-        (dv.formula1, dv.formula2) = formulas_from_boxes(kind, op, &self.first, &self.second, ctx)?;
-        if let Some(cur) = current.filter(|c| c.kind == kind) {
-            let seen = as_seen_from(cur, at.0, at.1);
-            if self.first == first_box(&seen, ctx.date1904) && !seen.formula1.is_empty() {
-                dv.formula1.clone_from(&seen.formula1);
-            }
-            if takes_two(kind, op)
-                && self.second == second_box(&seen, ctx.date1904)
-                && !seen.formula2.is_empty()
-            {
-                dv.formula2.clone_from(&seen.formula2);
+        // A box still showing what it was opened with is not read again: its
+        // text can say less than its formula (a time of day, a serial of 0
+        // shown as 12/31/1899). Only a box the user changed is parsed.
+        let (mut first, mut second) = (self.first.clone(), self.second.clone());
+        if kind != "list" {
+            if let Some(cur) = current.filter(|c| c.kind == kind) {
+                let seen = as_seen_from(cur, at.0, at.1);
+                if first == first_box(&seen, ctx.date1904) && !seen.formula1.is_empty() {
+                    first = format!("={}", seen.formula1);
+                }
+                if second == second_box(&seen, ctx.date1904) && !seen.formula2.is_empty() {
+                    second = format!("={}", seen.formula2);
+                }
             }
         }
+        (dv.formula1, dv.formula2) = formulas_from_boxes(kind, op, &first, &second, ctx)?;
         Ok(dv)
     }
 }
@@ -654,8 +657,10 @@ fn intersect(a: Rect, b: Rect) -> Option<Rect> {
     (r1 <= r2 && c1 <= c2).then_some((r1, c1, r2, c2))
 }
 
-/// The ranges of `ranges` that no other one contains, in order.
+/// `ranges` with adjacent ones of the same width or height joined (a tiled
+/// paste names thousands), then those another contains left out.
 fn dedupe(ranges: Vec<Rect>) -> Vec<Rect> {
+    let ranges = coalesce(ranges);
     let inside = |a: &Rect, b: &Rect| a.0 >= b.0 && a.1 >= b.1 && a.2 <= b.2 && a.3 <= b.3;
     let mut out: Vec<Rect> = Vec::new();
     for (i, r) in ranges.iter().enumerate() {
@@ -667,6 +672,39 @@ fn dedupe(ranges: Vec<Rect>) -> Vec<Rect> {
             out.push(*r);
         }
     }
+    out
+}
+
+/// Join ranges that touch or overlap along one axis and span the same cells
+/// along the other: stacked first, then side by side. Linear after a sort.
+fn coalesce(mut ranges: Vec<Rect>) -> Vec<Rect> {
+    if ranges.len() < 2 {
+        return ranges;
+    }
+    // Same columns, rows touching: stack.
+    ranges.sort_by_key(|&(r1, c1, r2, c2)| (c1, c2, r1, r2));
+    let mut stacked: Vec<Rect> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match stacked.last_mut() {
+            Some(l) if (l.1, l.3) == (r.1, r.3) && r.0 <= l.2.saturating_add(1) => {
+                l.2 = l.2.max(r.2);
+            }
+            _ => stacked.push(r),
+        }
+    }
+    // Same rows, columns touching: join.
+    stacked.sort_by_key(|&(r1, c1, r2, c2)| (r1, r2, c1, c2));
+    let mut out: Vec<Rect> = Vec::with_capacity(stacked.len());
+    for r in stacked {
+        match out.last_mut() {
+            Some(l) if (l.0, l.2) == (r.0, r.2) && r.1 <= l.3.saturating_add(1) => {
+                l.3 = l.3.max(r.3);
+            }
+            _ => out.push(r),
+        }
+    }
+    // Back in reading order.
+    out.sort_by_key(|&(r1, c1, r2, c2)| (r1, c1, r2, c2));
     out
 }
 
@@ -872,11 +910,10 @@ pub fn set_validation(sheet: &mut Sheet, range: Rect, rule: &DataValidation, app
     let rule = &rule;
     // The rule being rewritten whole keeps its element (and any attribute
     // this code doesn't know): when everything it covers is covered again.
-    let keep = base_at.filter(|_| {
-        base.as_ref()
-            .is_some_and(|b| b.ranges.iter().all(|r| ranges.contains(r)))
-    });
-    let kept_ix = keep.map(|i| sheet.validations[i].ix);
+    let keep = base
+        .as_ref()
+        .filter(|b| b.ranges.iter().all(|r| ranges.contains(r)))
+        .and(base_at);
     let held = keep.map(|i| sheet.validations.remove(i));
     for &r in &ranges {
         clear_validation(sheet, r);
@@ -903,7 +940,6 @@ pub fn set_validation(sheet: &mut Sheet, range: Rect, rule: &DataValidation, app
             h.error_style = rule.error_style;
             h.error_title.clone_from(&rule.error_title);
             h.error.clone_from(&rule.error);
-            h.ix = kept_ix.flatten();
             sheet.validations.push(h);
         }
         None => add_ranges(sheet, rule, &ranges),
@@ -998,33 +1034,55 @@ pub fn paste_rules(
         dst_origin.1.saturating_add(w * tiles.1).saturating_sub(1),
     );
     clear_validation(dst, area);
-    for ti in 0..tiles.0 {
-        for tj in 0..tiles.1 {
-            let (dr, dc) = (
-                i64::from(dst_origin.0) + i64::from(ti * h) - i64::from(src_rect.0),
-                i64::from(dst_origin.1) + i64::from(tj * w) - i64::from(src_rect.1),
-            );
-            for rule in rules {
-                let mut moved = rule.clone();
-                shift_formulas(&mut moved, dr, dc);
-                let ranges: Vec<Rect> = rule
-                    .ranges
-                    .iter()
-                    .filter_map(|&(r1, c1, r2, c2)| {
-                        let shift = |v: u32, d: i64| u32::try_from(i64::from(v) + d).ok();
-                        let moved = (
-                            shift(r1, dr)?,
-                            shift(c1, dc)?,
-                            shift(r2, dr)?,
-                            shift(c2, dc)?,
-                        );
-                        // What the grid has room for: a paste cut short at
-                        // its edge doesn't name cells past it.
-                        intersect(moved, (0, 0, MAX_ROWS - 1, MAX_COLS - 1))
-                    })
-                    .collect();
-                add_ranges(dst, &moved, &ranges);
+    let shift_rect = |&(r1, c1, r2, c2): &Rect, dr: i64, dc: i64| {
+        let shift = |v: u32, d: i64| u32::try_from(i64::from(v) + d).ok();
+        let moved = (
+            shift(r1, dr)?,
+            shift(c1, dc)?,
+            shift(r2, dr)?,
+            shift(c2, dc)?,
+        );
+        // What the grid has room for: a paste cut short at its edge doesn't
+        // name cells past it.
+        intersect(moved, (0, 0, MAX_ROWS - 1, MAX_COLS - 1))
+    };
+    let first = (
+        i64::from(dst_origin.0) - i64::from(src_rect.0),
+        i64::from(dst_origin.1) - i64::from(src_rect.1),
+    );
+    for rule in rules {
+        // Each tile is the rule seen from its own cells: the same rule, so
+        // its ranges are collected and joined once, not tile by tile. A tile
+        // whose formulas don't move losslessly from the first (a reference
+        // that would leave the grid) is a rule of its own.
+        let mut base = rule.clone();
+        shift_formulas(&mut base, first.0, first.1);
+        let mut together: Vec<Rect> = Vec::new();
+        let mut apart: Vec<(i64, i64)> = Vec::new();
+        for ti in 0..tiles.0 {
+            for tj in 0..tiles.1 {
+                let (dr, dc) = (first.0 + i64::from(ti * h), first.1 + i64::from(tj * w));
+                let (ddr, ddc) = (i64::from(ti * h), i64::from(tj * w));
+                if (ti, tj) == (0, 0)
+                    || (lossless_shift(&base.formula1, ddr, ddc)
+                        && lossless_shift(&base.formula2, ddr, ddc))
+                {
+                    together.extend(rule.ranges.iter().filter_map(|r| shift_rect(r, dr, dc)));
+                } else {
+                    apart.push((dr, dc));
+                }
             }
+        }
+        add_ranges(dst, &base, &together);
+        for (dr, dc) in apart {
+            let mut moved = rule.clone();
+            shift_formulas(&mut moved, dr, dc);
+            let ranges: Vec<Rect> = rule
+                .ranges
+                .iter()
+                .filter_map(|r| shift_rect(r, dr, dc))
+                .collect();
+            add_ranges(dst, &moved, &ranges);
         }
     }
 }
@@ -1298,7 +1356,7 @@ mod tests {
         // Pasting beside an equal rule joins its sqref.
         paste_rules(&mut dst, &rules, (1, 1, 1, 1), (4, 5), (1, 1));
         assert_eq!(dst.validations.len(), 1);
-        assert_eq!(dst.validations[0].ranges, vec![(3, 5, 3, 5), (4, 5, 4, 5)]);
+        assert_eq!(dst.validations[0].ranges, vec![(3, 5, 4, 5)]);
     }
 
     #[test]
@@ -1314,7 +1372,7 @@ mod tests {
         // their own cells: one rule over both, anchored at D4.
         assert_eq!(dst.validations.len(), 1);
         assert_eq!(dst.validations[0].formula1, "D4>C4");
-        assert_eq!(dst.validations[0].ranges, vec![(3, 3, 3, 3), (4, 3, 4, 3)]);
+        assert_eq!(dst.validations[0].ranges, vec![(3, 3, 4, 3)]);
     }
 
     #[test]
@@ -1588,5 +1646,95 @@ mod tests {
             boxes.rule(&ctx, Some(&dv), (1, 1)).unwrap().formula2,
             "0.375"
         );
+    }
+
+    // ---- review r3 ----
+
+    #[test]
+    fn one_cell_pasted_over_twenty_thousand_rows_is_one_rule_and_one_range() {
+        let mut src = Sheet::default();
+        let mut dv = rule("list", "", "$F$1:$F$5", "");
+        dv.ranges = vec![(1, 1, 1, 1)];
+        src.validations.push(dv);
+        let rules = copy_rules(&src, (1, 1, 1, 1));
+        let mut dst = Sheet::default();
+        let t = std::time::Instant::now();
+        paste_rules(&mut dst, &rules, (1, 1, 1, 1), (1, 0), (20_000, 1)); // A2:A20001
+        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
+        assert_eq!(dst.validations.len(), 1);
+        assert_eq!(dst.validations[0].ranges, vec![(1, 0, 20_000, 0)]);
+        // A 2x2 block tiled over a large area is one rectangle.
+        let mut src = Sheet::default();
+        let mut dv = rule("list", "", "$F$1:$F$5", "");
+        dv.ranges = vec![(1, 1, 2, 2)];
+        src.validations.push(dv);
+        let rules = copy_rules(&src, (1, 1, 2, 2));
+        let mut dst = Sheet::default();
+        paste_rules(&mut dst, &rules, (1, 1, 2, 2), (0, 0), (5_000, 3));
+        assert_eq!(dst.validations.len(), 1);
+        assert_eq!(dst.validations[0].ranges, vec![(0, 0, 9_999, 5)]);
+    }
+
+    #[test]
+    fn a_relative_formula_tiled_over_many_rows_is_one_rule_that_checks_each_cell() {
+        let mut src = Sheet::default();
+        let mut dv = rule("custom", "", "B2>A2", "");
+        dv.ranges = vec![(1, 1, 1, 1)];
+        src.validations.push(dv);
+        let rules = copy_rules(&src, (1, 1, 1, 1));
+        let mut wb = book();
+        paste_rules(&mut wb.sheets[0], &rules, (1, 1, 1, 1), (4, 3), (1_000, 1)); // D5 down
+        assert_eq!(wb.sheets[0].validations.len(), 1);
+        assert_eq!(wb.sheets[0].validations[0].formula1, "D5>C5");
+        wb.sheets[0].set_cell(504, 2, Cell::number(10.0)); // C505
+        wb.sheets[0].validations[0].show_error = true;
+        // D505 is checked as D505>C505.
+        assert!(check(&mut wb, 504, 3, "11").is_none());
+        assert!(check(&mut wb, 504, 3, "9").is_some());
+    }
+
+    #[test]
+    fn a_bound_that_does_not_round_trip_in_text_keeps_its_exact_formula() {
+        let ctx = crate::entry::EntryCtx::default();
+        for (kind, f) in [("time", "0.354166666666667"), ("date", "43831.123456789")] {
+            let mut dv = rule(kind, "greaterThan", f, "");
+            dv.error = "old".into();
+            let mut boxes = DialogBoxes::of(Some(&dv), (1, 1), false);
+            boxes.error = "new".into();
+            assert_eq!(
+                boxes.rule(&ctx, Some(&dv), (1, 1)).unwrap().formula1,
+                f,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_date_bound_of_zero_can_be_okd_untouched() {
+        let ctx = crate::entry::EntryCtx::default();
+        let mut dv = rule("date", "greaterThan", "0", "");
+        dv.error = "old".into();
+        let mut boxes = DialogBoxes::of(Some(&dv), (1, 1), false);
+        boxes.error = "new".into();
+        assert_eq!(boxes.rule(&ctx, Some(&dv), (1, 1)).unwrap().formula1, "0");
+    }
+
+    #[test]
+    fn apply_to_all_and_clear_all_leave_a_rule_alone_that_says_something_else_from_here() {
+        let mut s = Sheet::default();
+        let mut dv = rule("custom", "", "B2>B1", "");
+        dv.ranges = vec![(1, 1, 9, 1)]; // B2:B10
+        s.validations.push(dv);
+        let rules = copy_rules(&s, (1, 1, 1, 1));
+        paste_rules(&mut s, &rules, (1, 1, 1, 1), (0, 1), (1, 1)); // B2 -> B1
+        let mut edited = rule("custom", "", "B1>B0", "");
+        edited.ranges.clear();
+        edited.error = "edited".into();
+        set_validation(&mut s, (0, 1, 0, 1), &edited, true);
+        assert_eq!(validation_at(&s, 1, 1).unwrap().formula1, "B2>B1");
+        assert_eq!(validation_at(&s, 1, 1).unwrap().error, "10 to 90 only");
+        clear_all_validation(&mut s, (0, 1, 0, 1), true);
+        assert!(validation_at(&s, 0, 1).is_none());
+        assert_eq!(validation_at(&s, 1, 1).unwrap().formula1, "B2>B1");
     }
 }
