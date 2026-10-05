@@ -19141,6 +19141,20 @@ mod rule_shift_tests {
     }
 
     #[test]
+    fn dv_paste_over_a_validated_cell_saves_the_split_sqref() {
+        let mut pkg = one("S", DV_RULE);
+        let s = &mut pkg.workbook.sheets[0];
+        // Copy H2 (no rule), paste at B6.
+        crate::validation::paste_rules(s, &[], (1, 7, 1, 7), (5, 1), (1, 1));
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"sqref="B2:B5 B7:B10""#), "{ws}");
+        assert_eq!(
+            re.workbook.sheets[0].validations[0].ranges,
+            vec![(1, 1, 4, 1), (6, 1, 9, 1)]
+        );
+    }
+
+    #[test]
     fn cf_and_dv_follow_inserts_and_rename_through_save() {
         // The issue's repro.
         let mut pkg = one(

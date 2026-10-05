@@ -327,6 +327,268 @@ fn outside(dv: &DataValidation, n: f64, b1: Option<f64>, b2: Option<f64>) -> boo
     !ok
 }
 
+// --- editing the rules -------------------------------------------------
+
+type Rect = (u32, u32, u32, u32);
+
+/// `a` without the cells of `cut`: the pieces above, below, left and right
+/// of it, in that order (`B2:B10` without `B6` is `B2:B5 B7:B10`).
+fn subtract(a: Rect, cut: Rect) -> Vec<Rect> {
+    let (r1, c1, r2, c2) = a;
+    let (x1, y1, x2, y2) = cut;
+    if x2 < r1 || x1 > r2 || y2 < c1 || y1 > c2 {
+        return vec![a];
+    }
+    let mut out = Vec::new();
+    if x1 > r1 {
+        out.push((r1, c1, x1 - 1, c2));
+    }
+    if x2 < r2 {
+        out.push((x2 + 1, c1, r2, c2));
+    }
+    let (mid1, mid2) = (r1.max(x1), r2.min(x2));
+    if y1 > c1 {
+        out.push((mid1, c1, mid2, y1 - 1));
+    }
+    if y2 < c2 {
+        out.push((mid1, y2 + 1, mid2, c2));
+    }
+    out
+}
+
+fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let (r1, c1, r2, c2) = (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3));
+    (r1 <= r2 && c1 <= c2).then_some((r1, c1, r2, c2))
+}
+
+/// The ranges of `ranges` that no other one contains, in order.
+fn dedupe(ranges: Vec<Rect>) -> Vec<Rect> {
+    let inside = |a: &Rect, b: &Rect| a.0 >= b.0 && a.1 >= b.1 && a.2 <= b.2 && a.3 <= b.3;
+    let mut out: Vec<Rect> = Vec::new();
+    for (i, r) in ranges.iter().enumerate() {
+        let dup = ranges
+            .iter()
+            .enumerate()
+            .any(|(j, o)| i != j && inside(r, o) && (r != o || j < i));
+        if !dup {
+            out.push(*r);
+        }
+    }
+    out
+}
+
+/// Take every rule off the cells of `rect`: ranges are split around it and a
+/// rule left with none goes, its element named in `dv_removed` for the save.
+pub fn clear_validation(sheet: &mut Sheet, rect: Rect) {
+    let removed = &mut sheet.dv_removed;
+    sheet.validations.retain_mut(|dv| {
+        if !dv.ranges.iter().any(|&r| intersect(r, rect).is_some()) {
+            return true;
+        }
+        dv.ranges = dv.ranges.iter().flat_map(|&r| subtract(r, rect)).collect();
+        if dv.ranges.is_empty() {
+            removed.extend(dv.ix);
+            return false;
+        }
+        true
+    });
+}
+
+/// Give `rule`'s settings to `ranges`: onto an existing rule with the same
+/// settings (one `sqref` list), else as a new rule. A rule that imposes
+/// nothing ([`DataValidation::is_meaningful`]) adds nothing. The ranges must
+/// already be free of other rules ([`clear_validation`]).
+pub fn add_ranges(sheet: &mut Sheet, rule: &DataValidation, ranges: &[Rect]) {
+    if ranges.is_empty() || !rule.is_meaningful() {
+        return;
+    }
+    match sheet
+        .validations
+        .iter_mut()
+        .find(|dv| dv.same_settings(rule))
+    {
+        Some(dv) => {
+            dv.ranges.extend_from_slice(ranges);
+            dv.ranges = dedupe(std::mem::take(&mut dv.ranges));
+        }
+        None => {
+            let mut dv = rule.clone();
+            dv.ranges = dedupe(ranges.to_vec());
+            dv.ix = None;
+            dv.orig = None;
+            sheet.validations.push(dv);
+        }
+    }
+}
+
+/// The Data Validation dialog's OK: `rule`'s settings on `range`. With
+/// `apply_to_all`, every cell range whose rule has the same settings as the
+/// one the range's top-left cell holds now takes them too. "Any value"
+/// without messages ([`DataValidation::is_meaningful`]) leaves the cells
+/// with no rule.
+pub fn set_validation(sheet: &mut Sheet, range: Rect, rule: &DataValidation, apply_to_all: bool) {
+    let base = validation_at(sheet, range.0, range.1).cloned();
+    let mut ranges = vec![range];
+    if let (true, Some(b)) = (apply_to_all, &base) {
+        for dv in sheet.validations.iter().filter(|dv| dv.same_settings(b)) {
+            ranges.extend(dv.ranges.iter().copied());
+        }
+    }
+    let ranges = dedupe(ranges);
+    // The rule being rewritten whole keeps its element (and any attribute
+    // this code doesn't know): when everything it covers is covered again.
+    let keep = base
+        .as_ref()
+        .filter(|b| b.ranges.iter().all(|r| ranges.contains(r)))
+        .and_then(|b| {
+            sheet
+                .validations
+                .iter()
+                .position(|dv| dv.ix == b.ix && dv.same_settings(b))
+        });
+    let kept_ix = keep.map(|i| sheet.validations[i].ix);
+    let held = keep.map(|i| sheet.validations.remove(i));
+    for &r in &ranges {
+        clear_validation(sheet, r);
+    }
+    if !rule.is_meaningful() {
+        if let Some(h) = held {
+            sheet.dv_removed.extend(h.ix);
+        }
+        return;
+    }
+    match held {
+        Some(mut h) => {
+            h.ranges = ranges;
+            h.kind.clone_from(&rule.kind);
+            h.operator.clone_from(&rule.operator);
+            h.formula1.clone_from(&rule.formula1);
+            h.formula2.clone_from(&rule.formula2);
+            h.prompt.clone_from(&rule.prompt);
+            h.prompt_title.clone_from(&rule.prompt_title);
+            h.allow_blank = rule.allow_blank;
+            h.show_input = rule.show_input;
+            h.show_error = rule.show_error;
+            h.show_dropdown = rule.show_dropdown;
+            h.error_style = rule.error_style;
+            h.error_title.clone_from(&rule.error_title);
+            h.error.clone_from(&rule.error);
+            h.ix = kept_ix.flatten();
+            sheet.validations.push(h);
+        }
+        None => add_ranges(sheet, rule, &ranges),
+    }
+}
+
+/// The dialog's Clear All: the cells of `range` lose their rule. With
+/// `apply_to_all`, so does every cell with the same settings as the one the
+/// range's top-left cell holds.
+pub fn clear_all_validation(sheet: &mut Sheet, range: Rect, apply_to_all: bool) {
+    let mut ranges = vec![range];
+    if let (true, Some(b)) = (
+        apply_to_all,
+        validation_at(sheet, range.0, range.1).cloned(),
+    ) {
+        for dv in sheet.validations.iter().filter(|dv| dv.same_settings(&b)) {
+            ranges.extend(dv.ranges.iter().copied());
+        }
+    }
+    for r in ranges {
+        clear_validation(sheet, r);
+    }
+}
+
+/// The rules that cover cells of `rect` on `sheet`, their ranges cut to it:
+/// what a copy or cut takes along for the paste.
+pub fn copy_rules(sheet: &Sheet, rect: Rect) -> Vec<DataValidation> {
+    sheet
+        .validations
+        .iter()
+        .filter_map(|dv| {
+            let ranges: Vec<Rect> = dv
+                .ranges
+                .iter()
+                .filter_map(|&r| intersect(r, rect))
+                .collect();
+            if ranges.is_empty() {
+                return None;
+            }
+            let mut piece = dv.clone();
+            // Formulas are written for the whole rule's anchor; the piece
+            // keeps that meaning by recording how far its own corner is.
+            let (ar, ac) = anchor(dv);
+            let (pr, pc) = ranges
+                .iter()
+                .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, ..)| {
+                    (r.min(r1), c.min(c1))
+                });
+            let (dr, dc) = (i64::from(pr) - i64::from(ar), i64::from(pc) - i64::from(ac));
+            if (dr, dc) != (0, 0) {
+                for f in [&mut piece.formula1, &mut piece.formula2] {
+                    if !f.is_empty() && !f.starts_with('"') {
+                        *f = translate_formula(f, dr, dc).unwrap_or_else(|| f.clone());
+                    }
+                }
+            }
+            piece.ranges = ranges;
+            piece.ix = None;
+            piece.orig = None;
+            Some(piece)
+        })
+        .collect()
+}
+
+/// Paste `rules` ([`copy_rules`] of `src_rect`) so that `src_rect`'s corner
+/// lands on `dst_origin`, tiled `tiles` times (rows, columns). The pasted
+/// area loses the rules it had, whether or not the source had any, and each
+/// rule's relative formulas move with it.
+pub fn paste_rules(
+    dst: &mut Sheet,
+    rules: &[DataValidation],
+    src_rect: Rect,
+    dst_origin: (u32, u32),
+    tiles: (u32, u32),
+) {
+    let (h, w) = (src_rect.2 - src_rect.0 + 1, src_rect.3 - src_rect.1 + 1);
+    let area = (
+        dst_origin.0,
+        dst_origin.1,
+        dst_origin.0.saturating_add(h * tiles.0).saturating_sub(1),
+        dst_origin.1.saturating_add(w * tiles.1).saturating_sub(1),
+    );
+    clear_validation(dst, area);
+    for ti in 0..tiles.0 {
+        for tj in 0..tiles.1 {
+            let (dr, dc) = (
+                i64::from(dst_origin.0) + i64::from(ti * h) - i64::from(src_rect.0),
+                i64::from(dst_origin.1) + i64::from(tj * w) - i64::from(src_rect.1),
+            );
+            for rule in rules {
+                let mut moved = rule.clone();
+                for f in [&mut moved.formula1, &mut moved.formula2] {
+                    if !f.is_empty() && !f.starts_with('"') {
+                        *f = translate_formula(f, dr, dc).unwrap_or_else(|| f.clone());
+                    }
+                }
+                let ranges: Vec<Rect> = rule
+                    .ranges
+                    .iter()
+                    .filter_map(|&(r1, c1, r2, c2)| {
+                        let shift = |v: u32, d: i64| u32::try_from(i64::from(v) + d).ok();
+                        Some((
+                            shift(r1, dr)?,
+                            shift(c1, dc)?,
+                            shift(r2, dr)?,
+                            shift(c2, dc)?,
+                        ))
+                    })
+                    .collect();
+                add_ranges(dst, &moved, &ranges);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,5 +819,115 @@ mod tests {
         // Circled whatever the rule's alert setting.
         wb.sheets[0].validations[0].show_error = false;
         assert_eq!(invalid_cells(&wb, 0).len(), 3);
+    }
+
+    fn sq(sheet: &Sheet) -> Vec<Vec<Rect>> {
+        sheet.validations.iter().map(|d| d.ranges.clone()).collect()
+    }
+
+    #[test]
+    fn clearing_a_cell_splits_the_rule_around_it() {
+        let mut s = Sheet::default();
+        s.validations.push(rule("whole", "between", "10", "90"));
+        clear_validation(&mut s, (5, 1, 5, 1)); // B6
+        assert_eq!(sq(&s), vec![vec![(1, 1, 4, 1), (6, 1, 9, 1)]]);
+        // A target covering a whole range removes it; none left removes the rule.
+        s.validations[0].ix = Some(3);
+        clear_validation(&mut s, (0, 0, 20, 5));
+        assert!(s.validations.is_empty());
+        assert_eq!(s.dv_removed, vec![3]);
+    }
+
+    #[test]
+    fn paste_without_a_source_rule_removes_the_targets() {
+        let mut dst = Sheet::default();
+        dst.validations.push(rule("whole", "between", "10", "90"));
+        paste_rules(&mut dst, &[], (1, 7, 1, 7), (5, 1), (1, 1)); // H2 onto B6
+        assert_eq!(sq(&dst), vec![vec![(1, 1, 4, 1), (6, 1, 9, 1)]]);
+    }
+
+    #[test]
+    fn paste_of_a_validated_cell_gives_the_target_an_equal_rule() {
+        let mut src = Sheet::default();
+        src.validations.push(rule("whole", "between", "10", "90"));
+        let rules = copy_rules(&src, (1, 1, 1, 1)); // B2
+        let mut dst = Sheet::default();
+        paste_rules(&mut dst, &rules, (1, 1, 1, 1), (3, 5), (1, 1)); // onto F4
+        assert_eq!(sq(&dst), vec![vec![(3, 5, 3, 5)]]);
+        assert!(dst.validations[0].same_settings(&src.validations[0]));
+        // Pasting beside an equal rule joins its sqref.
+        paste_rules(&mut dst, &rules, (1, 1, 1, 1), (4, 5), (1, 1));
+        assert_eq!(dst.validations.len(), 1);
+        assert_eq!(dst.validations[0].ranges, vec![(3, 5, 3, 5), (4, 5, 4, 5)]);
+    }
+
+    #[test]
+    fn tiled_paste_and_relative_formulas() {
+        let mut src = Sheet::default();
+        let mut dv = rule("custom", "", "B2>A2", "");
+        dv.ranges = vec![(1, 1, 1, 1)];
+        src.validations.push(dv);
+        let rules = copy_rules(&src, (1, 1, 1, 1));
+        let mut dst = Sheet::default();
+        paste_rules(&mut dst, &rules, (1, 1, 1, 1), (3, 3), (2, 1)); // D4, D5
+        assert_eq!(dst.validations.len(), 2);
+        assert_eq!(dst.validations[0].formula1, "D4>C4");
+        assert_eq!(dst.validations[1].formula1, "D5>C5");
+    }
+
+    #[test]
+    fn dialog_ok_apply_to_all_and_clear_all() {
+        let mut s = Sheet::default();
+        let mut a = rule("whole", "between", "10", "90");
+        a.ranges = vec![(1, 1, 3, 1), (1, 3, 3, 3)]; // B2:B4 D2:D4
+        s.validations.push(a);
+        let mut new = rule("whole", "between", "1", "5");
+        // Edit B2 only, applying to every cell with the same settings.
+        set_validation(&mut s, (1, 1, 1, 1), &new, true);
+        assert_eq!(s.validations.len(), 1);
+        assert_eq!(s.validations[0].formula1, "1");
+        assert_eq!(s.validations[0].ranges.len(), 2);
+        // Without apply-to-all only the selection changes.
+        new.formula1 = "2".into();
+        set_validation(&mut s, (1, 3, 1, 3), &new, false);
+        assert_eq!(s.validations.len(), 2);
+        assert!(validation_at(&s, 1, 3).unwrap().formula1 == "2");
+        assert!(validation_at(&s, 2, 3).unwrap().formula1 == "1");
+        // Clear All with apply-to-all clears the other cells with those settings.
+        clear_all_validation(&mut s, (2, 3, 2, 3), true);
+        assert!(validation_at(&s, 2, 3).is_none());
+        assert!(validation_at(&s, 1, 1).is_none());
+        assert!(validation_at(&s, 1, 3).is_some());
+    }
+
+    #[test]
+    fn any_value_without_messages_removes_the_rule() {
+        let mut s = Sheet::default();
+        s.validations.push(rule("whole", "between", "10", "90"));
+        let any = DataValidation::default();
+        set_validation(&mut s, (1, 1, 9, 1), &any, false);
+        assert!(s.validations.is_empty());
+        let mut msg = DataValidation::default();
+        msg.prompt = Some("hello".into());
+        msg.show_input = true;
+        set_validation(&mut s, (1, 1, 2, 1), &msg, false);
+        assert_eq!(s.validations[0].kind, "");
+        assert!(s.validations[0].is_meaningful());
+    }
+
+    #[test]
+    fn editing_a_whole_rule_keeps_its_element() {
+        let mut s = Sheet::default();
+        let mut a = rule("whole", "between", "10", "90");
+        a.ix = Some(2);
+        a.orig = Some(Box::new(a.clone()));
+        s.validations.push(a);
+        let mut new = rule("whole", "between", "1", "5");
+        new.ranges.clear();
+        set_validation(&mut s, (1, 1, 9, 1), &new, false);
+        assert_eq!(s.validations.len(), 1);
+        assert_eq!(s.validations[0].ix, Some(2));
+        assert!(s.dv_removed.is_empty());
+        assert_eq!(s.validations[0].formula1, "1");
     }
 }
