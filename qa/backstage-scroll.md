@@ -16,8 +16,10 @@ the File screen.
    check the last line (the Trusted Documents text) is fully visible.
 3. Press PageDown, PageUp, End and Home: the page scrolls by a screenful, to
    the bottom and back to the top.
-4. Click Info, then New, then Open in the rail: each page starts at the top,
-   even after you scrolled the previous one.
+4. Click Info, then New: each page starts at the top, even after you scrolled
+   the previous one. Scroll the Open page down, close File (Back or Esc) and
+   click File again: the default page is back at the top. (Open… in the rail
+   opens a file picker, not a page.)
 5. Make the window as short as it goes (it stops at 420 px): the rail's
    last item, Close, is still visible, or the rail scrolls to it.
 6. Switch the theme with the title bar's button and repeat step 2. No

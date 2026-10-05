@@ -1037,10 +1037,6 @@ fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
     events
 }
 
-/// The centre of a named region's recorded bounds — where a pointer verb
-/// presses or releases. Errors name the region. Probe-backed regions read
-/// the frame that is on screen now (see `Docxy::region_bounds_live`), the
-/// one dispatched input hit-tests against.
 /// `backstage-layout`'s reply: the open page, the content pane's viewport and
 /// content heights, its scroll offset, and the same for the rail.
 fn backstage_layout_json(app: &crate::Docxy) -> Json {
@@ -1072,6 +1068,10 @@ fn backstage_layout_json(app: &crate::Docxy) -> Json {
     ])
 }
 
+/// The centre of a named region's recorded bounds — where a pointer verb
+/// presses or releases. Errors name the region. Probe-backed regions read
+/// the frame that is on screen now (see `Docxy::region_bounds_live`), the
+/// one dispatched input hit-tests against.
 fn region_point(app: &crate::Docxy, name: &str, window: &Window) -> Result<Point<Pixels>, String> {
     let region = parse_region(name)?;
     let bounds = app
@@ -3475,10 +3475,10 @@ fn dispatch_verb(
             done.pointer = wheel_events(p, dy);
             Ok(done)
         }
-        // The File screen's scroll state, read from the pane's own scroll
-        // handle and recorded bounds (#1028).
-        // Switch the File screen's page as the rail does (#1028): `new`,
-        // `info` (a document tab only) or `open`, the default page.
+        // Switch the File screen's page (#1028): `new` and `info` (a document
+        // tab only) call the rail's handler; `open` is a setup shortcut for
+        // the default page, which the user reaches by closing and reopening
+        // File (the rail's Open… opens a file picker).
         "backstage-page" => {
             if !app.backstage {
                 return Err("the File screen is not open (backstage open)".into());
@@ -3496,6 +3496,9 @@ fn dispatch_verb(
             }
             Done::ok(backstage_layout_json(app))
         }
+        // The File screen's scroll state (#1028), read from the content and
+        // rail scroll handles: their bounds, max offset and offset, as of the
+        // last drawn frame.
         "backstage-layout" => {
             if !app.backstage {
                 return Err("the File screen is not open (backstage open)".into());
@@ -4037,7 +4040,11 @@ fn press(
         }
         return;
     }
-    app.on_key(&key_event(stroke), window, cx);
+    let ev = key_event(stroke);
+    if app.backstage && app.backstage_key(&ev, window, cx) {
+        return;
+    }
+    app.on_key(&ev, window, cx);
 }
 
 /// Render the last drawn frame to an offscreen texture and leave the RGBA in

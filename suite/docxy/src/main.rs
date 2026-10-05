@@ -9420,17 +9420,52 @@ impl Docxy {
         self.project_prompt_cancel();
         self.close_menu();
         self.backstage = true;
-        self.bs_new = false;
-        self.bs_info = false;
-        self.reset_backstage_scroll();
-        self.bs_info_status = None;
+        self.show_backstage_open_page();
         self.refresh_drafts();
         self.trusted_count = trusted::count(&config_root());
         self.trusted_error = None;
         cx.notify();
     }
 
-    /// PageUp/PageDown/Home/End scroll the backstage's content pane (#1028).
+    /// A key pressed while the File screen is open (#1028): the real root's
+    /// key listener and the harness's `key` verb both come here. The same
+    /// early-outs as `on_key` come first (a dialog, the more-tabs list or an
+    /// open menu owns the key); then PageUp/PageDown/Home/End scroll the
+    /// content pane. True when the key was taken; false leaves it to
+    /// `on_key` (the harness) or drops it (the real root).
+    fn backstage_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.dialog_takes_key(
+            &ev.keystroke.key,
+            ev.keystroke.key_char.as_deref(),
+            ev.keystroke.modifiers,
+            window,
+            cx,
+        ) {
+            return true;
+        }
+        if self.tab_more_open {
+            if ev.keystroke.key == "escape" {
+                self.tab_more_close(cx);
+            }
+            return true;
+        }
+        if self.close_menu() {
+            cx.notify();
+            return true;
+        }
+        if self.backstage_scroll_key(&ev.keystroke) {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// PageUp/PageDown/Home/End scroll the backstage's content pane.
     /// True when the key was one of those and moved (or held) the pane.
     fn backstage_scroll_key(&self, stroke: &Keystroke) -> bool {
         let m = stroke.modifiers;
@@ -18168,12 +18203,6 @@ impl Docxy {
         // take arrows and Enter, does any other key; none reaches the
         // document or cell under it (#397).
         if self.close_menu() {
-            cx.notify();
-            return;
-        }
-        // The File screen scrolls on PageUp/PageDown/Home/End (#1028); those
-        // keys must not reach the document hidden under it.
-        if self.backstage && self.backstage_scroll_key(&ev.keystroke) {
             cx.notify();
             return;
         }
@@ -27810,10 +27839,8 @@ impl Render for Docxy {
                 .relative()
                 .bg(bg)
                 .track_focus(&self.focus)
-                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
-                    if this.backstage_scroll_key(&ev.keystroke) {
-                        cx.notify();
-                    }
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                    this.backstage_key(ev, window, cx);
                 }))
                 .child(probe_tracked(
                     &self.probes,
