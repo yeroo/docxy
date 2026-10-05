@@ -1,0 +1,39 @@
+# Word's document lifecycle (#709): new-document names and Ctrl+N (#631).
+# Run against a fresh harness instance, whose one tab is the never-saved sample.
+
+test new blank documents are Document1 Document2 and never reuse a number
+  assert tabs is 1
+  key ctrl+n
+  assert tabs is 2
+  assert title is Document1
+  assert dirty is false
+  key ctrl+n
+  assert title is Document2
+  call close-tab {}
+  assert tabs is 2
+  assert title is Document1
+  key ctrl+n
+  assert title is Document3
+  call close-tab {}
+  call close-tab {}
+  call close-tab {}
+  assert tabs is 0
+
+test Ctrl+N on a workbook makes a workbook and on a Project nothing
+  open ../fixtures/basic.xlsx
+  assert tabs is 1
+  key ctrl+n
+  assert sheet_tab is true
+  assert title is Untitled.xlsx
+  open ../fixtures/gantt-summary.xml
+  assert tabs is 3
+  key ctrl+n
+  assert tabs is 3
+  assert title is gantt-summary.xml
+  call close-tab {}
+  call close-tab {}
+  call close-tab {}
+  assert tabs is 0
+  key ctrl+n
+  assert title is Document4
+  call close-tab {}

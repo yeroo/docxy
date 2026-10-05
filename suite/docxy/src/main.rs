@@ -38,6 +38,7 @@ mod dialog_host;
 mod doc_import;
 #[cfg(test)]
 mod doc_import_tests;
+mod doc_name;
 #[cfg(test)]
 mod doc_protected_tests;
 mod harness;
@@ -3302,6 +3303,9 @@ struct Docxy {
     /// Off by default: work is hot-persisted and restored regardless, so closing
     /// is normally silent.
     ask_on_close: bool,
+    /// The number the next new document's `Document<n>` title takes (#631):
+    /// it only goes up, so a number is never reused in a session.
+    next_document: u32,
     /// Minutes between AutoRecover writes while a tab is unsaved (#632); 0 is off.
     autorecover_minutes: u32,
     /// Keep a workbook's last AutoRecover copy as a draft when it is closed
@@ -5016,8 +5020,11 @@ mod click_caret_tests {
     }
 }
 
+/// A new blank document, as Word starts one: one empty paragraph (#631).
 fn empty_doc() -> Document {
-    docxcore::markdown::from_markdown("# Untitled\n\n")
+    Document {
+        body: vec![Block::Paragraph(Default::default())],
+    }
 }
 
 /// A loaded document with everything a tab needs to hold and re-save it losslessly.
@@ -8354,7 +8361,7 @@ fn build_surface(
 fn file_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Untitled.docx".into())
+        .unwrap_or_else(|| "Document.docx".into())
 }
 
 /// Directory holding hot-exit sidecars (`.docx`, `.xlsx`, or `.yppx` by tab kind),
@@ -9081,6 +9088,13 @@ impl Docxy {
         }
         let active = session.active.min(tabs.len().saturating_sub(1));
         let mut this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
+        // New documents continue past the restored ones (#631).
+        this.next_document = doc_name::next_after(
+            this.tabs
+                .iter()
+                .filter(|t| t.kind == Kind::Docx && t.path.is_none())
+                .map(|t| t.title.as_ref()),
+        );
         this.autorecover_minutes = session.autorecover_minutes;
         this.keep_drafts = session.keep_drafts;
         this.edit_opts = EditOptions::from_text(&session.sheet_editing);
@@ -9118,6 +9132,7 @@ impl Docxy {
             clip: None,
             theme_pref,
             ask_on_close,
+            next_document: 1,
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
             edit_opts: EditOptions::default(),
@@ -9586,6 +9601,32 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Ctrl+N (#631): a new blank document on a document tab, a new workbook
+    /// on a workbook tab; on any other tab it does nothing. `None` for a key
+    /// that is not one of these.
+    fn document_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<()> {
+        let m = &ev.keystroke.modifiers;
+        if !(m.control || m.platform) || m.alt || m.shift {
+            return None;
+        }
+        match ev.keystroke.key.as_str() {
+            "n" => {
+                self.keytips = KeyTip::Off;
+                let kind = self.tabs.get(self.active).map_or(Kind::Docx, |t| t.kind);
+                if matches!(kind, Kind::Docx | Kind::Xlsx) {
+                    self.add_tab(kind, window, cx);
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
         self.project_prompt_cancel();
         let new_tab = |title: &str, surface| DocTab {
@@ -9615,7 +9656,10 @@ impl Docxy {
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
-            Kind::Docx => new_tab("Untitled.docx", Surface::Doc(Editor::new(empty_doc()))),
+            Kind::Docx => new_tab(
+                &doc_name::next_document_title(&mut self.next_document),
+                Surface::Doc(Editor::new(empty_doc())),
+            ),
             Kind::Xlsx => new_tab("Untitled.xlsx", new_sheet_surface()),
             Kind::Look => new_tab("Inbox", Surface::Placeholder),
         });
@@ -15460,8 +15504,16 @@ fn canonical(path: &std::path::Path) -> PathBuf {
 
 /// The name Save As suggests for a document tab: [`doc_import::save_name`]
 /// (its title, or an imported Word 97-2003 document's `.docx`), or for a tab
-/// converted from another format (#633) the same name as a Word document.
+/// converted from another format (#633) the same name as a Word document. A
+/// never-saved document proposes its first words, as Word does (#631).
 fn doc_save_as_name(tab: &DocTab) -> String {
+    if tab.path.is_none()
+        && tab.access.converted.is_none()
+        && !tab.import.binary_source
+        && let Surface::Doc(ed) = &tab.surface
+    {
+        return format!("{}.docx", doc_name::untitled_stem(&ed.doc, &tab.title));
+    }
     if tab.access.converted.is_none() {
         return doc_import::save_name(tab);
     }
@@ -15883,7 +15935,7 @@ impl Docxy {
             .tabs
             .get(self.active)
             .map(doc_save_as_name)
-            .unwrap_or_else(|| "Untitled.docx".into());
+            .unwrap_or_else(|| "Document1.docx".into());
         let mut dialog = rfd::FileDialog::new()
             .add_filter("Word document", &["docx"])
             .add_filter("Markdown", &["md", "markdown"]);
@@ -17892,6 +17944,12 @@ impl Docxy {
         if self.close_menu() {
             cx.notify();
             return;
+        }
+        // Word's and Excel's document keys come before every surface's own,
+        // so they work on any tab, in Protected View and in a document
+        // marked as final too.
+        if let Some(done) = self.document_key(ev, window, cx) {
+            return done;
         }
         if self.project_edit_open() && !self.backstage {
             return self.project_key(ev, window, cx);
