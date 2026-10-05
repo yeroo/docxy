@@ -230,29 +230,45 @@ fn list_source(dv: &DataValidation, row: u32, col: u32) -> String {
     .unwrap_or_else(|| src.to_string())
 }
 
-/// One choice of the in-cell dropdown: what it shows, the value it stands
-/// for (a label can round: `3.14` for 3.14127) and the number format of the
-/// cell it came from.
+/// One choice of the in-cell dropdown: what it shows, and (for a choice read
+/// from a range) the value it stands for, since a label can round (`3.14` for
+/// 3.14127). An inline item has no value: picking it enters its label as
+/// typing it would.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ListChoice {
     pub label: String,
-    pub value: CellValue,
-    /// The source cell's number-format code, when it isn't General.
+    /// The value of the source cell; `None` for an inline item.
+    pub value: Option<CellValue>,
+    /// The number-format code of the source cell, when it isn't General
+    /// (range choices only).
     pub code: Option<String>,
 }
 
-/// The cell picking `choice` puts at (row, col): the choice's value itself
-/// (not text read back, which would round a long number and turn `007` into
-/// 7), the cell's own style, and the source's number format when the cell has
-/// none, so a picked date shows as a date. The entry check accepts it.
-pub fn pick_cell(wb: &mut Workbook, sheet: usize, row: u32, col: u32, choice: &ListChoice) -> Cell {
+/// The cell picking `choice` puts at (row, col). A range choice puts its value
+/// itself (text read back would round a long number and turn `007` into 7)
+/// with the cell's own style, and the source's number format when the cell has
+/// none, so a picked date shows as a date. An inline item is entered as typing
+/// its label would be: under the cell's own style (`@` keeps `001` text, `0%`
+/// reads `10` as 10%), today's date for a yearless one. Either way the entry
+/// check accepts it.
+pub fn pick_cell(
+    wb: &mut Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    choice: &ListChoice,
+    today: Option<f64>,
+) -> Result<Cell, crate::entry::EntryError> {
+    let Some(value) = &choice.value else {
+        return crate::entry::entry_cell(wb, sheet, row, col, &choice.label, today);
+    };
     let mut cell = wb
         .sheets
         .get(sheet)
         .and_then(|s| s.cell(row, col))
         .cloned()
         .unwrap_or_default();
-    cell.value = choice.value.clone();
+    cell.value = value.clone();
     cell.formula = None;
     cell.f_attrs = None;
     cell.spill = None;
@@ -263,44 +279,32 @@ pub fn pick_cell(wb: &mut Workbook, sheet: usize, row: u32, col: u32, choice: &L
             cell.style = wb.styles.intern(xf);
         }
     }
-    cell
+    Ok(cell)
 }
 
 /// The choices of the in-cell dropdown at (row, col): the rule's inline items,
 /// or the non-blank cells of its source, read from that cell the way the entry
 /// check reads them (a relative source shifted, a defined name followed) and
-/// shown as the cells show them. Picking puts the choice's value ([`pick_cell`]). `None` when the cell has no
-/// list rule or its source can't be read.
+/// shown as the cells show them. Picking enters the choice ([`pick_cell`]).
+/// `None` when the cell has no list rule or its source can't be read.
 pub fn list_choices(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<Vec<ListChoice>> {
     let dv = validation_at(wb.sheets.get(sheet)?, row, col)?;
     if dv.kind != "list" {
         return None;
     }
     if let Some(items) = dv.list_values() {
+        // Typed into the cell, an item that reads as an error would be
+        // refused by the check: it is not offered.
+        let xf = target_xf(wb, sheet, row, col);
         return Some(
             items
                 .into_iter()
                 .filter(|s| !s.is_empty())
-                .map(|s| {
-                    // An inline item is entered the way typing it would be
-                    // read: `1` a number, `TRUE` a boolean, `10%` a percent,
-                    // `1/1/2024` a date (with its format).
-                    let ctx = crate::entry::EntryCtx {
-                        date1904: wb.date1904,
-                        ..Default::default()
-                    };
-                    match crate::entry::parse_entry(&s, &crate::sheet::Xf::default(), &ctx) {
-                        Ok(e) if e.cell.formula.is_none() && !e.quote_prefix => ListChoice {
-                            label: s,
-                            value: e.cell.value,
-                            code: e.format.map(str::to_string),
-                        },
-                        _ => ListChoice {
-                            value: CellValue::Text(s.clone()),
-                            label: s,
-                            code: None,
-                        },
-                    }
+                .filter(|s| !matches!(inline_entry(wb, &xf, s), Some(CellValue::Error(_))))
+                .map(|s| ListChoice {
+                    label: s,
+                    value: None,
+                    code: None,
                 })
                 .collect(),
         );
@@ -323,7 +327,7 @@ pub fn list_choices(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<V
                 .filter(|c| !crate::entry::is_general(&xf) && !c.is_empty());
             out.push(ListChoice {
                 label,
-                value: v,
+                value: Some(v),
                 code,
             });
         }
@@ -407,7 +411,9 @@ fn breaks(
                 // typing it would give (`20%` is 0.2, `TRUE` a boolean).
                 _ if is_inline => {
                     text_of(item).trim() == text
-                        || inline_value(item, wb.date1904).as_ref() == Some(value)
+                        || inline_entry(wb, &target_xf(wb, sheet, row, col), &text_of(item))
+                            .as_ref()
+                            == Some(value)
                 }
                 _ => text_of(item).eq_ignore_ascii_case(&text),
             })
@@ -421,17 +427,23 @@ fn breaks(
     }
 }
 
-/// The value typing the inline list item `item` would give, when it is a
-/// number, boolean or date rather than text.
-fn inline_value(item: &CellValue, date1904: bool) -> Option<CellValue> {
-    let CellValue::Text(t) = item else {
-        return None;
-    };
-    let ctx = crate::entry::EntryCtx {
-        date1904,
-        ..Default::default()
-    };
-    let e = crate::entry::parse_entry(t.trim(), &crate::sheet::Xf::default(), &ctx).ok()?;
+/// The number format of the cell at (row, col) as typing into it reads it.
+fn target_xf(wb: &Workbook, sheet: usize, row: u32, col: u32) -> crate::sheet::Xf {
+    let style = wb
+        .sheets
+        .get(sheet)
+        .and_then(|s| s.cell(row, col))
+        .map_or(0, |c| c.style);
+    wb.styles.xf(style)
+}
+
+/// What typing the inline list item `item` into a cell formatted `xf` gives,
+/// when it is a number, boolean, date or error rather than text: the one
+/// reading the entry check and a dropdown pick (which enters the label as
+/// typed) share.
+fn inline_entry(wb: &Workbook, xf: &crate::sheet::Xf, item: &str) -> Option<CellValue> {
+    let ctx = crate::entry::entry_ctx(wb, None);
+    let e = crate::entry::parse_entry(item.trim(), xf, &ctx).ok()?;
     (e.cell.formula.is_none() && !e.quote_prefix && !matches!(e.cell.value, CellValue::Text(_)))
         .then_some(e.cell.value)
 }
@@ -2030,8 +2042,8 @@ mod tests {
         assert_eq!(choices[2].label, "3/15/2023");
         for (i, c) in choices.iter().enumerate() {
             // Picking puts the choice's own value; the check accepts it.
-            let cell = pick_cell(&mut wb, 0, 9, 3, c);
-            assert_eq!(cell.value, c.value);
+            let cell = pick_cell(&mut wb, 0, 9, 3, c, None).unwrap();
+            assert_eq!(Some(cell.value.clone()), c.value);
             assert!(
                 check_entry(&mut wb, 0, 9, 3, &cell).is_none(),
                 "choice {i}: {:?}",
@@ -2039,7 +2051,7 @@ mod tests {
             );
         }
         // A picked date shows as a date in a General cell.
-        let cell = pick_cell(&mut wb, 0, 9, 3, &choices[2]);
+        let cell = pick_cell(&mut wb, 0, 9, 3, &choices[2], None).unwrap();
         let xf = wb.styles.xf(cell.style);
         assert_eq!(xf.code.as_deref(), Some("m/d/yyyy"));
         // And a value near but not equal to an item still breaks the rule.
@@ -2048,8 +2060,39 @@ mod tests {
 
     // ---- review r6 ----
 
+    /// A book whose D10 (the target) is formatted `code` and whose D1:D10
+    /// carry an inline list.
+    fn inline_book(items: &str, code: Option<&str>) -> Workbook {
+        let mut wb = book();
+        wb.styles.intern(crate::sheet::Xf::default()); // style 0: General
+        let mut dv = rule("list", "", &format!("\"{items}\""), "");
+        dv.ranges = vec![(0, 3, 9, 3)];
+        wb.sheets[0].validations.push(dv);
+        if let Some(code) = code {
+            let style = wb.styles.intern(crate::sheet::Xf {
+                code: Some(code.to_string()),
+                ..Default::default()
+            });
+            wb.sheets[0].set_cell(
+                9,
+                3,
+                Cell {
+                    style,
+                    ..Cell::default()
+                },
+            );
+        }
+        wb
+    }
+
+    fn pick_inline(wb: &mut Workbook, i: usize) -> Cell {
+        let choices = list_choices(wb, 0, 9, 3).unwrap();
+        pick_cell(wb, 0, 9, 3, &choices[i], None).unwrap()
+    }
+
     #[test]
-    fn an_inline_item_is_entered_the_way_typing_it_reads() {
+    fn an_inline_item_is_entered_the_way_typing_it_reads_under_the_cells_own_format() {
+        // General: numbers, booleans, percents, dates and text as typed.
         for (items, pick, want) in [
             ("1,2,3", 0, CellValue::Number(1.0)),
             ("TRUE,FALSE", 0, CellValue::Bool(true)),
@@ -2057,27 +2100,38 @@ mod tests {
             ("1/1/2024,2/1/2024", 0, CellValue::Number(45292.0)),
             ("Yes,No", 0, CellValue::Text("Yes".into())),
         ] {
-            let mut wb = book();
-            wb.styles.intern(crate::sheet::Xf::default());
-            let mut dv = rule("list", "", &format!("\"{items}\""), "");
-            dv.ranges = vec![(0, 3, 9, 3)];
-            wb.sheets[0].validations.push(dv);
-            let choices = list_choices(&wb, 0, 0, 3).unwrap();
-            let cell = pick_cell(&mut wb, 0, 9, 3, &choices[pick]);
+            let mut wb = inline_book(items, None);
+            let cell = pick_inline(&mut wb, pick);
             assert_eq!(cell.value, want, "{items}");
             assert!(check_entry(&mut wb, 0, 9, 3, &cell).is_none(), "{items}");
         }
-        // A picked percent and date carry their format.
-        let mut wb = book();
-        wb.styles.intern(crate::sheet::Xf::default());
-        let mut dv = rule("list", "", "\"10%,1/1/2024\"", "");
-        dv.ranges = vec![(0, 3, 9, 3)];
-        wb.sheets[0].validations.push(dv);
-        let choices = list_choices(&wb, 0, 0, 3).unwrap();
-        let pct = pick_cell(&mut wb, 0, 9, 3, &choices[0]);
-        assert!(crate::entry::is_percent(&wb.styles.xf(pct.style)));
-        let date = pick_cell(&mut wb, 0, 9, 3, &choices[1]);
-        assert!(crate::entry::is_date(&wb.styles.xf(date.style)));
+        // A Text-formatted cell keeps `001` text, as typing does.
+        let mut wb = inline_book("001,002,003", Some("@"));
+        let cell = pick_inline(&mut wb, 0);
+        assert_eq!(cell.value, CellValue::Text("001".into()));
+        assert!(check_entry(&mut wb, 0, 9, 3, &cell).is_none());
+        // A percent cell reads `10` as 10%, picked or typed, and both pass.
+        let mut wb = inline_book("5,10,15", Some("0%"));
+        let cell = pick_inline(&mut wb, 1);
+        assert_eq!(cell.value, CellValue::Number(0.1));
+        assert!(check_entry(&mut wb, 0, 9, 3, &cell).is_none());
+        assert!(check(&mut wb, 9, 3, "10").is_none(), "typed 10 passes too");
+        assert!(check(&mut wb, 9, 3, "11").is_some());
+        // A picked percent shows as a percent in a General cell.
+        let mut wb = inline_book("10%,20%", None);
+        let cell = pick_inline(&mut wb, 0);
+        assert!(crate::entry::is_percent(&wb.styles.xf(cell.style)));
+    }
+
+    #[test]
+    fn an_inline_item_that_reads_as_an_error_is_not_offered() {
+        let wb = inline_book("#N/A,OK", None);
+        let labels: Vec<_> = list_choices(&wb, 0, 9, 3)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        assert_eq!(labels, ["OK"]);
     }
 
     #[test]

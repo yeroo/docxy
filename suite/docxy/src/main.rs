@@ -13522,10 +13522,10 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Pick a value from the in-cell dropdown. The cell takes the choice's own
-    /// value ([`gridcore::validation::pick_cell`]), not its label read back as
-    /// typed text, so what goes in is exactly an item of the list the entry
-    /// check reads and needs no second check.
+    /// Pick a value from the in-cell dropdown ([`gridcore::validation::pick_cell`]):
+    /// a range choice goes in as its own value, an inline item as typing it
+    /// would. What goes in is an item of the list the entry check reads, so it
+    /// needs no second check.
     fn sheet_dv_pick(&mut self, choice: gridcore::validation::ListChoice, cx: &mut Context<Self>) {
         if self.protected_refused(cx) {
             return;
@@ -13535,7 +13535,11 @@ impl Docxy {
             return;
         };
         let (s, (r, c)) = (v.active, v.sel);
-        let cell = gridcore::validation::pick_cell(&mut v.pkg.workbook, s, r, c, &choice);
+        let today = v.engine.clock;
+        let Ok(cell) = gridcore::validation::pick_cell(&mut v.pkg.workbook, s, r, c, &choice, today)
+        else {
+            return;
+        };
         if v.refuses(s, &[(r, c, cell.clone())]) {
             self.sheet_entry_refused(cx);
             return;

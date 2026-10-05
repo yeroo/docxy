@@ -5125,16 +5125,18 @@ impl App {
                 let choice = p.choices[p.sel].clone();
                 self.dv_picker = None;
                 let (r, c) = self.cur;
-                // The choice's own value, not its label read back as typed
-                // text (which would round a number and turn 007 into 7): what
-                // goes in is an item of the list the entry check reads.
-                let cell = gridcore::validation::pick_cell(
+                // A range choice goes in as its own value, an inline item as
+                // typing it would: an item of the list the entry check reads.
+                let Ok(cell) = gridcore::validation::pick_cell(
                     &mut self.pkg.workbook,
                     self.sheet,
                     r,
                     c,
                     &choice,
-                );
+                    now_serial(),
+                ) else {
+                    return;
+                };
                 if self.apply(vec![(r, c, cell)]) {
                     self.status = Some(format!("Set {} = {}", cell_name(r, c), choice.label));
                 }
@@ -12687,6 +12689,39 @@ mod tests {
         assert_eq!(
             app.sheet().cell(0, 0).map(|c| c.value.clone()),
             Some(CellValue::Number(2.0))
+        );
+    }
+
+    #[test]
+    fn picking_from_an_inline_list_reads_the_label_under_the_cells_format() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(0, 0, 4, 0)],
+                kind: "list".into(),
+                formula1: "\"001,002\"".into(),
+                ..Default::default()
+            });
+        let text = app.pkg.workbook.styles.intern(gridcore::sheet::Xf {
+            code: Some("@".into()),
+            ..Default::default()
+        });
+        app.pkg.workbook.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                style: text,
+                ..Cell::default()
+            },
+        );
+        app.cur = (0, 0);
+        app.open_dv_dropdown();
+        app.dv_picker_key(KeyCode::Enter);
+        assert_eq!(
+            app.sheet().cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Text("001".into()))
         );
     }
 
