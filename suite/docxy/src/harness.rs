@@ -3477,11 +3477,13 @@ fn dispatch_verb(
             let src = sheet(app)?.range();
             app.sheet_fill_start(cx);
             if app.sheet_fill.is_none() {
-                return Err(if app.protected_view() {
-                    format!(
-                        "the fill did not arm: {}",
-                        crate::open_mode::PROTECTED_STATUS
-                    )
+                let locked = app
+                    .tabs
+                    .get(app.active)
+                    .map(|t| t.access)
+                    .filter(|a| a.locked());
+                return Err(if let Some(access) = locked {
+                    format!("the fill did not arm: {}", access.locked_status())
                 } else if app.sheet_protected() {
                     "the fill did not arm: the sheet is protected".into()
                 } else {

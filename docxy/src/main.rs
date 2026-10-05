@@ -2846,8 +2846,9 @@ impl App {
     }
 
     /// Check a requested interactive mutation before it reaches the editor,
-    /// history, package, comments, or save-state implementation. A denial only
-    /// replaces the transient status message; document state stays untouched.
+    /// history, package, comments, or save-state implementation. A denial
+    /// replaces the transient status message, and a document marked as final
+    /// also asks Edit Anyway (#617); document state stays untouched.
     fn mutation_allowed(&mut self, mutation: protection::MutationKind) -> bool {
         match self.authorize_mutation(mutation) {
             Ok(()) => true,

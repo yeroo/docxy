@@ -305,38 +305,23 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        // Enter or Escape on the user name dialog presses through the app.
+        // Enter or Escape on a dialog the app owns (the user name, the close
+        // prompt) presses through the app, as its drawn buttons do.
         let plain = !m.control && !m.alt && !m.platform;
-        // So do they on the close prompt (#629): Save, or Cancel.
-        let close_button = self
+        let app_button = self
             .tabs
             .get(self.active)
             .filter(|t| {
-                t.dialogs
-                    .top()
-                    .is_some_and(|d| matches!(d.owner, DialogOwner::SaveOnClose { .. }))
+                t.dialogs.top().is_some_and(|d| {
+                    matches!(
+                        d.owner,
+                        DialogOwner::UserName | DialogOwner::SaveOnClose { .. }
+                    )
+                })
             })
             .and_then(|t| t.dialogs.key_button(key, plain));
-        if let Some(label) = close_button {
-            if let Some(Err(e)) = self.close_prompt_click(&label, window, cx) {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.status = e.into();
-                }
-            }
-            cx.notify();
-            return true;
-        }
-        let user_name_button = self
-            .tabs
-            .get(self.active)
-            .filter(|t| {
-                t.dialogs
-                    .top()
-                    .is_some_and(|d| d.owner == DialogOwner::UserName)
-            })
-            .and_then(|t| t.dialogs.key_button(key, plain));
-        if let Some(label) = user_name_button {
-            if let Some(Err(e)) = self.user_name_click(&label) {
+        if let Some(label) = app_button {
+            if let Err(e) = self.dialog_press(&label, window, cx) {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.status = e.into();
                 }

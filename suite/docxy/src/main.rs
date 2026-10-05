@@ -9972,7 +9972,7 @@ impl Docxy {
         // The panel swaps to it, opening if it was shut.
         self.chart_panel_event(PanelEvent::Select(idx));
         // Selecting a chart only looks; moving or resizing it would edit.
-        if self.protected_view() {
+        if self.active_locked() {
             cx.notify();
             return;
         }
@@ -12212,7 +12212,7 @@ impl Docxy {
 
     /// Whether the active tab takes no edits: Protected View (#610), or a
     /// document marked as final (#617).
-    fn protected_view(&self) -> bool {
+    fn active_locked(&self) -> bool {
         self.tabs
             .get(self.active)
             .is_some_and(|t| t.access.locked())
@@ -12781,7 +12781,7 @@ impl Docxy {
             self.set_status(CUT_CANCELLED_STATUS);
         }
         let now = self.clipboard_read(cx);
-        if self.sheet_protected() || self.protected_view() || self.grid_clip_live(&now).is_none() {
+        if self.sheet_protected() || self.active_locked() || self.grid_clip_live(&now).is_none() {
             return false;
         }
         if self.sheet_paste(cx) {
@@ -15061,7 +15061,7 @@ impl Docxy {
         // Protected View (#610): only keys that look, move or copy reach the
         // workbook. The find bar still takes typing; its Replace is refused
         // where it would write.
-        if self.protected_view()
+        if self.active_locked()
             && !self.find_open
             && !open_mode::protected_allows_key(key, ctrl, alt)
         {
@@ -18182,10 +18182,10 @@ impl Docxy {
         if key == "escape" && self.hf_active() {
             return self.exit_hf(window, cx);
         }
-        // Protected View (#633): only keys that look, move or copy reach the
-        // document. The find bar still takes typing; its Replace is refused
-        // where it would write.
-        if self.protected_view()
+        // Protected View (#633), or a document marked as final (#617): only
+        // keys that look, move or copy reach the document. The find bar still
+        // takes typing; its Replace is refused where it would write.
+        if self.active_locked()
             && !self.find_open
             && !open_mode::protected_allows_doc_key(key.as_str(), ctrl, m.alt)
         {
@@ -26803,7 +26803,7 @@ impl Render for Docxy {
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
         // Protected View (#610, documents #633) hides the ribbon's commands,
         // as Excel and Word grey them out; its message bar takes their place.
-        let protected = (self.active_is_sheet() || is_doc) && self.protected_view();
+        let protected = (self.active_is_sheet() || is_doc) && self.active_locked();
         let ribbon_body = (!self.ribbon_min
             && !protected
             && (is_doc || self.active_is_sheet() || self.active_is_project()))
