@@ -13500,59 +13500,16 @@ impl Docxy {
     /// If the selected cell has a `list` data validation, the allowed values —
     /// an inline `"a,b,c"` list or the contents of a referenced range.
     fn dv_list_values(&self) -> Option<Vec<String>> {
-        use gridcore::sheet::CellValue;
         let v = self.active_sheet()?;
         let (r, c) = v.sel;
-        let sh = v.sheet();
-        let dv = sh
-            .validations
-            .iter()
-            .find(|d| d.kind == "list" && d.covers(r, c))
-            // `showDropDown="1"` hides the in-cell dropdown.
-            .filter(|d| d.show_dropdown)?;
-        let f = dv.formula1.trim();
-        // Inline list: "Yes,No,Maybe".
-        if f.len() >= 2 && f.starts_with('"') && f.ends_with('"') {
-            return Some(
-                f[1..f.len() - 1]
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect(),
-            );
+        // `showDropDown="1"` hides the in-cell dropdown.
+        let dv = gridcore::validation::validation_at(v.sheet(), r, c)?;
+        if !dv.show_dropdown {
+            return None;
         }
-        // Range reference, optionally sheet-qualified.
-        let (sheet_idx, rref) = match f.split_once('!') {
-            Some((sname, rest)) => {
-                let sname = sname.trim_matches('\'');
-                (
-                    v.pkg
-                        .workbook
-                        .sheets
-                        .iter()
-                        .position(|s| s.name.eq_ignore_ascii_case(sname))?,
-                    rest,
-                )
-            }
-            None => (v.active, f),
-        };
-        let (r1, c1, r2, c2) = gridcore::sheet::parse_range_name(&rref.replace('$', ""))?;
-        let src = v.pkg.workbook.sheets.get(sheet_idx)?;
-        let mut out = Vec::new();
-        for rr in r1..=r2 {
-            for cc in c1..=c2 {
-                let t = match src.cell(rr, cc).map(|cl| &cl.value) {
-                    Some(CellValue::Text(s)) => s.clone(),
-                    Some(CellValue::Number(n)) => n.to_string(),
-                    Some(CellValue::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-                    _ => String::new(),
-                };
-                if !t.is_empty() {
-                    out.push(t);
-                }
-            }
-        }
-        Some(out)
+        // Read the way the entry check reads it, so a value picked here is one
+        // the check accepts (a relative source shifted, a name followed).
+        gridcore::validation::list_choices(&v.pkg.workbook, v.active, r, c)
     }
 
     /// A press on column `col`'s filter button: its drop-down (#690).

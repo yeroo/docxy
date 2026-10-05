@@ -181,8 +181,8 @@ fn list_items<'a>(
     cache.0.get(&key).map(|v| (v.as_slice(), false))
 }
 
-/// The non-blank values of the range `src` names (a defined name too).
-fn resolve_ref(wb: &Workbook, sheet: usize, src: &str) -> Option<Vec<CellValue>> {
+/// The sheet and the cells of the range `src` names (a defined name too).
+fn resolve_cells(wb: &Workbook, sheet: usize, src: &str) -> Option<(usize, Vec<(u32, u32)>)> {
     let named = wb
         .defined_names
         .iter()
@@ -204,14 +204,64 @@ fn resolve_ref(wb: &Workbook, sheet: usize, src: &str) -> Option<Vec<CellValue>>
     let (r1, c1, r2, c2) = crate::sheet::parse_range_name(&clean)
         .or_else(|| crate::sheet::parse_cell_name(&clean).map(|(r, c)| (r, c, r, c)))?;
     let s = wb.sheets.get(at)?;
+    let cells = s
+        .cells
+        .range((r1, 0)..=(r2, u32::MAX))
+        .map(|(&(r, c), _)| (r, c))
+        .filter(|&(_, c)| c >= c1 && c <= c2)
+        .collect();
+    Some((at, cells))
+}
+
+/// The non-blank values of the range `src` names (a defined name too).
+fn resolve_ref(wb: &Workbook, sheet: usize, src: &str) -> Option<Vec<CellValue>> {
+    let (at, cells) = resolve_cells(wb, sheet, src)?;
+    Some(
+        cells
+            .into_iter()
+            .map(|(r, c)| to_cell_value(cell_value_at(wb, at, r, c)))
+            .filter(|v| !v.is_empty())
+            .collect(),
+    )
+}
+
+/// The choices of the in-cell dropdown at (row, col): the rule's inline items,
+/// or the non-blank cells of its source, read from that cell the way the entry
+/// check reads them (a relative source shifted, a defined name followed) and
+/// shown as the cells show them. `None` when the cell has no list rule or its
+/// source can't be read.
+pub fn list_choices(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<Vec<String>> {
+    let dv = validation_at(wb.sheets.get(sheet)?, row, col)?;
+    if dv.kind != "list" {
+        return None;
+    }
+    if let Some(items) = dv.list_values() {
+        return Some(items.into_iter().filter(|s| !s.is_empty()).collect());
+    }
+    let (ar, ac) = anchor(dv);
+    let src = dv.formula1.trim().trim_start_matches('=');
+    let src = if ar == u32::MAX {
+        src.to_string()
+    } else {
+        translate_formula(
+            src,
+            i64::from(row) - i64::from(ar),
+            i64::from(col) - i64::from(ac),
+        )
+        .unwrap_or_else(|| src.to_string())
+    };
+    let (at, cells) = resolve_cells(wb, sheet, &src)?;
+    let sh = &wb.sheets[at];
     let mut out = Vec::new();
-    for (&(r, c), _) in s.cells.range((r1, 0)..=(r2, u32::MAX)) {
-        if c < c1 || c > c2 {
+    for (r, c) in cells {
+        let v = to_cell_value(cell_value_at(wb, at, r, c));
+        if v.is_empty() {
             continue;
         }
-        let v = to_cell_value(cell_value_at(wb, at, r, c));
-        if !v.is_empty() {
-            out.push(v);
+        let xf = wb.styles.xf(sh.cell(r, c).map_or(0, |cl| cl.style));
+        let text = crate::sheet::format_with(&xf, &v, wb.date1904);
+        if !text.is_empty() {
+            out.push(text);
         }
     }
     Some(out)
@@ -607,15 +657,13 @@ impl DialogBoxes {
         // text can say less than its formula (a time of day, a serial of 0
         // shown as 12/31/1899). Only a box the user changed is parsed.
         let (mut first, mut second) = (self.first.clone(), self.second.clone());
-        if kind != "list" {
-            if let Some(cur) = current.filter(|c| c.kind == kind) {
-                let seen = as_seen_from(cur, at.0, at.1);
-                if first == first_box(&seen, ctx.date1904) && !seen.formula1.is_empty() {
-                    first = format!("={}", seen.formula1);
-                }
-                if second == second_box(&seen, ctx.date1904) && !seen.formula2.is_empty() {
-                    second = format!("={}", seen.formula2);
-                }
+        if let Some(cur) = current.filter(|c| c.kind == kind) {
+            let seen = as_seen_from(cur, at.0, at.1);
+            if first == first_box(&seen, ctx.date1904) && !seen.formula1.is_empty() {
+                first = format!("={}", seen.formula1);
+            }
+            if second == second_box(&seen, ctx.date1904) && !seen.formula2.is_empty() {
+                second = format!("={}", seen.formula2);
             }
         }
         (dv.formula1, dv.formula2) = formulas_from_boxes(kind, op, &first, &second, ctx)?;
@@ -661,18 +709,36 @@ fn intersect(a: Rect, b: Rect) -> Option<Rect> {
 /// paste names thousands), then those another contains left out.
 fn dedupe(ranges: Vec<Rect>) -> Vec<Rect> {
     let ranges = coalesce(ranges);
-    let inside = |a: &Rect, b: &Rect| a.0 >= b.0 && a.1 >= b.1 && a.2 <= b.2 && a.3 <= b.3;
-    let mut out: Vec<Rect> = Vec::new();
-    for (i, r) in ranges.iter().enumerate() {
-        let dup = ranges
-            .iter()
-            .enumerate()
-            .any(|(j, o)| i != j && inside(r, o) && (r != o || j < i));
-        if !dup {
-            out.push(*r);
+    // Sweep by first row: a range that starts later can only be inside one
+    // that is still open (its last row not yet passed), so each is compared
+    // with the open ones, not with every other.
+    let mut order: Vec<usize> = (0..ranges.len()).collect();
+    order.sort_by_key(|&i| {
+        let (r1, c1, r2, c2) = ranges[i];
+        (r1, std::cmp::Reverse(r2), c1, std::cmp::Reverse(c2), i)
+    });
+    let mut dropped = vec![false; ranges.len()];
+    let mut open: Vec<usize> = Vec::new();
+    for &i in &order {
+        let r = ranges[i];
+        open.retain(|&k| ranges[k].2 >= r.0);
+        if open.iter().any(|&k| inside(&r, &ranges[k])) {
+            dropped[i] = true;
+        } else {
+            open.push(i);
         }
     }
-    out
+    ranges
+        .into_iter()
+        .zip(dropped)
+        .filter(|(_, d)| !d)
+        .map(|(r, _)| r)
+        .collect()
+}
+
+/// Is `a` entirely within `b`?
+fn inside(a: &Rect, b: &Rect) -> bool {
+    a.0 >= b.0 && a.1 >= b.1 && a.2 <= b.2 && a.3 <= b.3
 }
 
 /// Join ranges that touch or overlap along one axis and span the same cells
@@ -912,7 +978,7 @@ pub fn set_validation(sheet: &mut Sheet, range: Rect, rule: &DataValidation, app
     // this code doesn't know): when everything it covers is covered again.
     let keep = base
         .as_ref()
-        .filter(|b| b.ranges.iter().all(|r| ranges.contains(r)))
+        .filter(|b| b.ranges.iter().all(|r| ranges.iter().any(|o| inside(r, o))))
         .and(base_at);
     let held = keep.map(|i| sheet.validations.remove(i));
     for &r in &ranges {
@@ -1051,29 +1117,36 @@ pub fn paste_rules(
         i64::from(dst_origin.1) - i64::from(src_rect.1),
     );
     for rule in rules {
-        // Each tile is the rule seen from its own cells: the same rule, so
-        // its ranges are collected and joined once, not tile by tile. A tile
-        // whose formulas don't move losslessly from the first (a reference
-        // that would leave the grid) is a rule of its own.
-        let mut base = rule.clone();
-        shift_formulas(&mut base, first.0, first.1);
-        let mut together: Vec<Rect> = Vec::new();
+        // Each tile is the rule seen from its own cells. Tiles whose shift
+        // from the SOURCE loses nothing are the same rule, so their ranges
+        // are collected and joined once; one that would lose a reference
+        // (off the top of the grid) is a rule of its own.
+        let (sr, sc) = anchor_of(&rule.ranges);
+        let mut joined: Vec<Rect> = Vec::new();
+        let mut tiles_in: Vec<(i64, i64)> = Vec::new();
         let mut apart: Vec<(i64, i64)> = Vec::new();
         for ti in 0..tiles.0 {
             for tj in 0..tiles.1 {
                 let (dr, dc) = (first.0 + i64::from(ti * h), first.1 + i64::from(tj * w));
-                let (ddr, ddc) = (i64::from(ti * h), i64::from(tj * w));
-                if (ti, tj) == (0, 0)
-                    || (lossless_shift(&base.formula1, ddr, ddc)
-                        && lossless_shift(&base.formula2, ddr, ddc))
+                if lossless_shift(&rule.formula1, dr, dc) && lossless_shift(&rule.formula2, dr, dc)
                 {
-                    together.extend(rule.ranges.iter().filter_map(|r| shift_rect(r, dr, dc)));
+                    joined.extend(rule.ranges.iter().filter_map(|r| shift_rect(r, dr, dc)));
+                    tiles_in.push((dr, dc));
                 } else {
                     apart.push((dr, dc));
                 }
             }
         }
-        add_ranges(dst, &base, &together);
+        // The joined rule is anchored at the corner of its ranges.
+        let corner = anchor_of(&joined);
+        let (cdr, cdc) = (
+            i64::from(corner.0) - i64::from(sr),
+            i64::from(corner.1) - i64::from(sc),
+        );
+        match shifted(rule, cdr, cdc) {
+            Some(base) if !joined.is_empty() => add_ranges(dst, &base, &joined),
+            _ => apart.extend(tiles_in),
+        }
         for (dr, dc) in apart {
             let mut moved = rule.clone();
             shift_formulas(&mut moved, dr, dc);
@@ -1736,5 +1809,99 @@ mod tests {
         clear_all_validation(&mut s, (0, 1, 0, 1), true);
         assert!(validation_at(&s, 0, 1).is_none());
         assert_eq!(validation_at(&s, 1, 1).unwrap().formula1, "B2>B1");
+    }
+
+    // ---- review r4 ----
+
+    #[test]
+    fn a_paste_over_the_top_edge_in_several_tiles_keeps_the_healthy_formulas() {
+        let mut s = Sheet::default();
+        let mut dv = rule("custom", "", "B2>B1", "");
+        dv.ranges = vec![(1, 1, 9, 1)]; // B2:B10
+        s.validations.push(dv);
+        let rules = copy_rules(&s, (1, 1, 1, 1)); // B2
+        paste_rules(&mut s, &rules, (1, 1, 1, 1), (0, 1), (3, 1)); // over B1:B3
+        assert!(
+            !s.validations
+                .iter()
+                .any(|d| d.formula1.contains("#REF!") && d.covers(1, 1))
+        );
+        assert_eq!(validation_at(&s, 1, 1).unwrap().formula1, "B2>B1");
+        let b3 = validation_at(&s, 2, 1).unwrap();
+        assert!(
+            b3.covers(1, 1),
+            "B2 and B3 share the rule that says B2>B1: {b3:?}"
+        );
+        assert_eq!(b3.formula1, "B2>B1");
+    }
+
+    #[test]
+    fn a_touching_two_range_rule_keeps_its_element_under_apply_to_all() {
+        let mut s = Sheet::default();
+        let mut dv = rule("whole", "between", "10", "90");
+        dv.ranges = vec![(1, 1, 4, 1), (5, 1, 9, 1)]; // B2:B5 B6:B10
+        dv.ix = Some(2);
+        dv.orig = Some(Box::new(dv.clone()));
+        s.validations.push(dv);
+        let mut edited = rule("whole", "between", "1", "5");
+        edited.ranges.clear();
+        set_validation(&mut s, (1, 1, 1, 1), &edited, true);
+        assert_eq!(s.validations.len(), 1);
+        assert_eq!(s.validations[0].ix, Some(2));
+        assert!(s.dv_removed.is_empty());
+    }
+
+    #[test]
+    fn an_untouched_inline_list_box_keeps_its_stored_text() {
+        let ctx = crate::entry::EntryCtx::default();
+        for stored in ["\"Yes, No\"", "\"a,,b\""] {
+            let mut dv = rule("list", "", stored, "");
+            dv.error = "old".into();
+            let mut boxes = DialogBoxes::of(Some(&dv), (1, 1), false);
+            boxes.error = "new".into();
+            assert_eq!(
+                boxes.rule(&ctx, Some(&dv), (1, 1)).unwrap().formula1,
+                stored
+            );
+        }
+    }
+
+    #[test]
+    fn a_sparse_paste_over_a_hundred_thousand_rows_is_quick_and_right() {
+        let mut src = Sheet::default();
+        let mut dv = rule("list", "", "$F$1:$F$5", "");
+        dv.ranges = vec![(0, 0, 0, 0)]; // A1 only
+        src.validations.push(dv);
+        let rules = copy_rules(&src, (0, 0, 1, 0)); // A1:A2
+        let mut dst = Sheet::default();
+        let t = std::time::Instant::now();
+        paste_rules(&mut dst, &rules, (0, 0, 1, 0), (0, 0), (50_000, 1));
+        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
+        assert_eq!(dst.validations.len(), 1);
+        let r = &dst.validations[0].ranges;
+        assert_eq!(r.len(), 50_000);
+        assert_eq!((r[0], r[49_999]), ((0, 0, 0, 0), (99_998, 0, 99_998, 0)));
+    }
+
+    #[test]
+    fn the_dropdown_offers_what_the_check_accepts() {
+        let mut wb = book();
+        let s = &mut wb.sheets[0];
+        for (r, v) in [(0, 1.0), (1, 2.0), (2, 3.0), (4, 5.0), (5, 6.0), (6, 7.0)] {
+            s.set_cell(r, 0, Cell::number(v));
+        }
+        let mut dv = rule("list", "", "A1:A3", ""); // relative source
+        dv.ranges = vec![(0, 1, 9, 1)]; // B1:B10
+        s.validations.push(dv);
+        // At B5 the source is A5:A7.
+        assert_eq!(
+            list_choices(&wb, 0, 4, 1),
+            Some(vec!["5".into(), "6".into(), "7".into()])
+        );
+        assert_eq!(
+            list_choices(&wb, 0, 0, 1),
+            Some(vec!["1".into(), "2".into(), "3".into()])
+        );
+        assert!(list_choices(&wb, 0, 20, 1).is_none());
     }
 }

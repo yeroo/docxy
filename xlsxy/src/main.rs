@@ -4967,62 +4967,12 @@ impl App {
         self.sheet().validations.iter().find(|v| v.covers(r, c))
     }
 
-    /// The allowed values for a `list` validation: the inline CSV, or the cells
-    /// of the range / named range its `formula1` points at.
-    fn resolve_list_values(&self, dv: &gridcore::sheet::DataValidation) -> Vec<String> {
-        if let Some(v) = dv.list_values() {
-            return v;
-        }
-        let refstr = dv.formula1.trim();
-        if refstr.is_empty() {
-            return Vec::new();
-        }
-        // A named range resolves to its own reference formula first.
-        let resolved = self
-            .pkg
-            .workbook
-            .defined_names
-            .iter()
-            .find(|d| d.name.eq_ignore_ascii_case(refstr))
-            .map(|d| d.formula.clone());
-        let refstr = resolved.as_deref().unwrap_or(refstr);
-        // Optional Sheet! prefix; the range itself may carry `$` anchors.
-        let (sheet_name, rng) = match refstr.rsplit_once('!') {
-            Some((s, r)) => (Some(s.trim_matches(['\'', ' ', '='])), r),
-            None => (None, refstr),
-        };
-        let sidx = match sheet_name {
-            Some(n) => self
-                .pkg
-                .workbook
-                .sheets
-                .iter()
-                .position(|s| s.name.eq_ignore_ascii_case(n))
-                .unwrap_or(self.sheet),
-            None => self.sheet,
-        };
-        let clean = rng.replace('$', "");
-        let Some((r1, c1, r2, c2)) = gridcore::sheet::parse_range_name(&clean)
-            .or_else(|| gridcore::sheet::parse_cell_name(&clean).map(|(r, c)| (r, c, r, c)))
-        else {
-            return Vec::new();
-        };
-        let sheet = &self.pkg.workbook.sheets[sidx];
-        let styles = &self.pkg.workbook.styles;
-        let date1904 = self.pkg.workbook.date1904;
-        let mut out = Vec::new();
-        // Bound the scan: dropdowns are small, and a whole-column ref is huge.
-        for r in r1..=r2.min(r1.saturating_add(1024)) {
-            for c in c1..=c2 {
-                if let Some(cell) = sheet.cell(r, c) {
-                    let text = format_with(&styles.xf(cell.style), &cell.value, date1904);
-                    if !text.is_empty() {
-                        out.push(text);
-                    }
-                }
-            }
-        }
-        out
+    /// The allowed values for a `list` validation at the cursor: read the way
+    /// the entry check reads them, so a picked value is one it accepts
+    /// ([`gridcore::validation::list_choices`]).
+    fn resolve_list_values(&self) -> Vec<String> {
+        let (r, c) = self.cur;
+        gridcore::validation::list_choices(&self.pkg.workbook, self.sheet, r, c).unwrap_or_default()
     }
 
     /// Data ▸ Data Validation: the dialog over the selection, showing the rule
@@ -5148,7 +5098,7 @@ impl App {
             return;
         }
         let dv = dv.clone();
-        let values = self.resolve_list_values(&dv);
+        let values = self.resolve_list_values();
         if values.is_empty() {
             self.status = Some(format!("List: {} (no resolvable values)", dv.formula1));
             return;
