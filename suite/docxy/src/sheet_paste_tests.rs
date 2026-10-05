@@ -359,10 +359,7 @@ fn a_tiled_paste_is_not_pasted_once() {
 #[test]
 fn fifty_thousand_notes_and_rules_paste_fast() {
     let mut v = view();
-    let n: u32 = std::env::var("PROBE_N")
-        .ok()
-        .and_then(|x| x.parse().ok())
-        .unwrap_or(50_000);
+    let n = 50_000u32;
     for r in 0..n {
         v.pkg.workbook.sheets[0].set_cell(r, 0, Cell::number(f64::from(r)));
     }
@@ -387,8 +384,7 @@ fn fifty_thousand_notes_and_rules_paste_fast() {
         (clip.block.notes.len(), clip.block.rules.len()),
         (n as usize, n as usize)
     );
-    // Each paste on its own: linear, 12,500 to 50,000 rows doubling its
-    // time at each step.
+    // Each paste timed on its own.
     for what in [PasteWhat::Comments, PasteWhat::Validation] {
         let t = std::time::Instant::now();
         v.paste_special_at(&clip.block, &PasteSpec::of(what), at("C1"))
@@ -405,5 +401,35 @@ fn fast_enough(t: std::time::Instant) {
         t.elapsed() < std::time::Duration::from_secs(3),
         "{:?}",
         t.elapsed()
+    );
+}
+
+/// #707 r7 M1: a pasted note replaces the destination's threaded comment,
+/// as in Excel: B2 holds the pasted note alone, saved and reloaded too.
+#[test]
+fn a_pasted_note_replaces_a_thread_on_the_destination() {
+    let mut v = view();
+    put(&mut v, "A1", Cell::number(1.0));
+    assert!(v.pkg.set_comment(0, 0, 0, "Ann", "pasted"));
+    assert!(
+        v.pkg
+            .add_threaded_comment(0, 1, 1, "Bob", "a thread", "2024-01-02T03:04:05Z")
+    );
+    let clip = copy(&mut v, "A1", "A1");
+    v.paste_special_at(&clip.block, &PasteSpec::of(PasteWhat::Comments), at("B2"))
+        .unwrap();
+    let on_b2 = |cs: Vec<gridcore::comments::Comment>| -> Vec<(String, bool)> {
+        cs.into_iter()
+            .filter(|c| (c.row, c.col) == (1, 1))
+            .map(|c| (c.text, c.threaded))
+            .collect()
+    };
+    assert_eq!(on_b2(v.pkg.comments()), vec![("pasted".to_string(), false)]);
+    let back = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&v.pkg)).unwrap();
+    assert_eq!(on_b2(back.comments()), vec![("pasted".to_string(), false)]);
+    assert!(v.undo_step(), "one package step");
+    assert_eq!(
+        on_b2(v.pkg.comments()),
+        vec![("a thread".to_string(), true)]
     );
 }

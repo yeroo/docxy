@@ -211,6 +211,10 @@ impl SheetView {
             })
             .collect();
         self.pkg.add_data_validations(s, &rules);
+        // A pasted note replaces whatever comment its cell had, a thread
+        // included, as in Excel (#707 r7 M1).
+        let noted: Vec<(u32, u32)> = extras.notes.iter().map(|n| (n.0, n.1)).collect();
+        self.pkg.remove_comments(s, &noted);
         self.pkg.set_comments(s, &extras.notes);
         let rect = block.pasted_rect(at, spec.transpose);
         self.sel = (rect.0, rect.1);

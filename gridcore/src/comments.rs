@@ -314,13 +314,12 @@ impl SheetPackage {
         if !self.sheet_takes(sheet, "legacyDrawing", true) {
             return false;
         }
-        let mut by_cell: std::collections::BTreeMap<(u32, u32), Note> = self
-            .sheet_notes(sheet)
-            .into_iter()
-            .map(|n| ((n.row, n.col), n))
-            .collect();
+        // As `set_comment` does: the notes on the cells being set go (a
+        // legacy note and a thread's `tc=` shadow alike), every other one
+        // stays, and the new ones (the last per cell) join in cell order.
+        let mut last: std::collections::BTreeMap<(u32, u32), Note> = Default::default();
         for (row, col, author, text) in new {
-            by_cell.insert(
+            last.insert(
                 (*row, *col),
                 Note {
                     row: *row,
@@ -330,7 +329,10 @@ impl SheetPackage {
                 },
             );
         }
-        let notes: Vec<Note> = by_cell.into_values().collect();
+        let mut notes = self.sheet_notes(sheet);
+        notes.retain(|n| !last.contains_key(&(n.row, n.col)));
+        notes.extend(last.into_values());
+        notes.sort_by_key(|n| (n.row, n.col));
         self.write_notes(sheet, &ws_part, &notes);
         true
     }
@@ -974,6 +976,48 @@ mod tests {
         assert_eq!(batch.comments().len(), 1);
         let reloaded = load_xlsx(&save_xlsx(&batch)).expect("reload");
         assert_eq!(reloaded.comments(), one.comments());
+    }
+
+    /// #707 r7 M2: setting a note on another cell keeps both a cell's legacy
+    /// note and its thread's shadow, as one call does.
+    #[test]
+    fn a_batch_keeps_a_note_and_a_thread_on_another_cell() {
+        let build = || {
+            let mut pkg = blank();
+            pkg.set_comment(0, 1, 1, "Ann", "legacy");
+            pkg.add_threaded_comment(0, 1, 1, "Bob", "thread", "2024-01-02T03:04:05Z");
+            pkg
+        };
+        let notes_part = |p: &SheetPackage| {
+            p.part_names()
+                .into_iter()
+                .filter(|n| n.starts_with("xl/comments"))
+                .map(|n| String::from_utf8_lossy(p.part(n).unwrap()).into_owned())
+                .collect::<Vec<_>>()
+        };
+        let before = build();
+        let b2 = |p: &SheetPackage| {
+            p.comments()
+                .into_iter()
+                .filter(|c| (c.row, c.col) == (1, 1))
+                .count()
+        };
+        let mut one = build();
+        one.set_comment(0, 4, 3, "Cy", "new");
+        let mut batch = build();
+        assert!(batch.set_comments(0, &[(4, 3, "Cy".into(), "new".into())]));
+        assert_eq!(notes_part(&batch), notes_part(&one));
+        assert_eq!(batch.comments(), one.comments());
+        assert_eq!(b2(&batch), b2(&before), "B2 keeps what it had");
+        let reloaded = load_xlsx(&save_xlsx(&batch)).expect("reload");
+        assert_eq!(
+            reloaded.comments(),
+            load_xlsx(&save_xlsx(&one)).unwrap().comments()
+        );
+        assert_eq!(b2(&reloaded), b2(&before));
+        // The legacy note and the shadow both remain in the notes part.
+        let part = notes_part(&batch).concat();
+        assert_eq!(part.matches("ref=\"B2\"").count(), 2, "{part}");
     }
 
     #[test]

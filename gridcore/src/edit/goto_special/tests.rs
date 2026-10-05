@@ -636,12 +636,27 @@ fn a_huge_range_is_found_from_every_part() {
         );
         assert_eq!(found, Ok(vec![(0, 0, 0, 0)]), "({r}, {c})");
     }
-    let mut ix = ReadIndex::new(&wb, 0, &wb.sheets[0]);
+    // Taken once per line it is indexed on: a second stab in the same
+    // column, row or whole band finds nothing. (Each edge column of a range
+    // huge both ways is a line of its own.)
     let mut out = Vec::new();
-    for (r, c) in [(1, 1), (300, 256), (599, 311), (2, 312)] {
+    for (f, first, again) in [
+        // Edge column B of B2:KZ600 (narrower than a whole band).
+        ("SUM(B2:KZ600)", (1, 1), (500, 1)),
+        // Band 1 (IW:SR), whole in B2:AAA600.
+        ("SUM(B2:AAA600)", (300, 300), (5, 400)),
+        // Row 5 of a one-row range.
+        ("SUM(B5:ZZ5)", (4, 3), (4, 600)),
+    ] {
+        let mut one = book(&[]);
+        one.sheets[0].set_cell(0, 0, Cell::formula(f));
+        let mut ix = ReadIndex::new(&one, 0, &one.sheets[0]);
         out.clear();
-        ix.take_readers((r, c), &mut out);
-        let _ = out.len();
+        ix.take_readers(first, &mut out);
+        assert_eq!(out, vec![0], "{f} {first:?}");
+        out.clear();
+        ix.take_readers(again, &mut out);
+        assert!(out.is_empty(), "{f}: {again:?} after {first:?}");
     }
     // Outside it: nothing.
     let mut ix = ReadIndex::new(&wb, 0, &wb.sheets[0]);
