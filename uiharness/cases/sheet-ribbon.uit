@@ -125,4 +125,13 @@ test sheet ribbon data tab clear with no filter leaves the workbook clean
 test sheet ribbon data tab refuses its placeholders
   open ../fixtures/basic.xlsx
   call-error ribbon-click {"tab":"Data","command":"Flash Fill"} => 'Flash Fill' is not implemented
-  call-error ribbon-click {"tab":"Data","command":"Circle Invalid Data"} => 'Circle Invalid Data' is not implemented
+
+# Circle Invalid Data (#689) is view state: a workbook with no rules has none to
+# circle and stays clean.
+test sheet ribbon data tab circle invalid data changes nothing in a clean workbook
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Data","command":"Circle Invalid Data"}
+  assert status is No invalid data
+  assert dirty is false
+  call ribbon-click {"tab":"Data","command":"Clear Validation Circles"}
+  assert dirty is false

@@ -131,8 +131,14 @@ worksheet XML sources.
 **On save:**
 - Regenerate only `<sheetData>` (and `<cols>`/`<dimension>` when touched) and
   **splice** it into the original worksheet XML — sheet-level features we don't
-  model (conditional formatting, data validation, sheet views) ride
+  model (conditional formatting, sheet views) ride
   along untouched. This is the spreadsheet analogue of docxy's `sectPr` splice.
+- Data validation is modelled (`gridcore::validation`): typed entries are
+  checked against the cell's rule (Stop/Warning/Information alerts), a paste
+  carries the source's rules, and the Data Validation dialog edits them. A save
+  leaves an untouched `<dataValidation>` byte for byte and rewrites only the
+  attributes of an edited one (`DataValidation::orig`); new rules are appended.
+  x14 (`extLst`) validations are preserved, not edited.
 - Rewrite the drawing part's anchors in place (`drawing::rewrite_anchors`) so a
   moved or deleted drawing persists. Every other byte of that part survives —
   including whole anchors for shapes and text boxes we don't model, which is

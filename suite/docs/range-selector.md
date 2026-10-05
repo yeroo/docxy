@@ -145,9 +145,8 @@ One `RefTarget` variant per input, one `ref_commit` arm per variant:
 | `SeriesValues(i)` | series card | re-reads **only** that series' numbers, from **one line** — one column on a column-oriented chart, one row on a row-oriented one (`series_values_shape_err`; see [`chart-orientation.md`](chart-orientation.md)). Excel splits a two-dimensional pick into a series per line and reads such a ref the long way, while `range_numbers` flattens row-major, so a wider pick is refused rather than written out in the wrong order |
 | `Categories` | Chart panel | the category-axis labels, from **one line** of cells — one column on a column-oriented chart (`A2:A5`), one row on a row-oriented one (`B1:D1`), exactly as `SeriesValues(i)` follows the orientation (`categories_shape_err`). Labels name a series' *points*, and a series' points run down rows one way round and along columns the other, so the labels run the same way each derivation writes them. A **single cell** is one row and one column at once and goes through either way, which is what a row chart two columns wide has. A rectangle is refused by the same check on both orientations, for the reason that first motivated it: `range_labels` flattens row-major while Excel derives its own list from the ref itself, so the cache written beside the ref would contradict it the moment Excel refreshes. Taking either line on either orientation would also put the field at odds with `infer_by_row`, which reads a chart's orientation back *out* of the shape of its `<c:cat>` — see [`chart-orientation.md`](chart-orientation.md). `parse_chart` shuts the same door on import — a multi-level `<c:cat>` makes the chart `complex` rather than arriving in a state the field would not accept |
 | `CondFormat` | Conditional Formatting bar | the cells the rule applies to |
-| `Validation` | Data Validation bar | the cells the list applies to |
 
-Data › Text to Columns and Custom Sort used to be bars with a field here; they
+Data › Data Validation, Text to Columns and Custom Sort used to be bars with a field here (Data Validation's was `Validation`, the cells its list applied to); they
 are now Excel's Convert Text to Columns Wizard (`ttc_dialog.rs`, #692) and Sort
 dialog (`sheet_sort.rs`, #691), form dialogs that act on the selection or the
 list around it, so they have no reference field.
@@ -302,7 +301,6 @@ field:
 | Target | Foreign sheet | Why |
 |--------|---------------|-----|
 | `ChartRange`, `SeriesName`, `SeriesValues`, `Categories` | resolved | a chart plots numbers that needn't live on the sheet it floats over |
-| `Validation` | resolved | the rule is built while looking at the lookup sheet holding the list, and applies to the entry sheet holding the boxes |
 | `CondFormat` | refused | a rule paints the cells in front of you — *these* cells |
 | `ChartTitle` | n/a | not a range at all |
 
@@ -312,13 +310,7 @@ whether or not that sheet exists — the objection is *where the bar acts*, not 
 unknown name. A bar that resolves answers instead with the sheet actually found,
 spelled the way the workbook spells it, so `budget!a1:a9` comes back
 `=Budget!$A$1:$A$9` and the field stops disagreeing with the tab it names
-(`bar_ref_text`; the sheet a bar acts on is then derived from its pinned range by
-`bar_sheet_index`, never stored beside it, so the two cannot drift).
-
-⚠️ The Validation bar's range field is the **applies-to** range, not the list
-source — the bar's own text is a literal comma-separated list. What a qualifier
-buys there is building the rule where the boxes are while looking at the sheet
-holding the list. A range-valued list source is separate work.
+(`bar_ref_text`).
 
 Anything else is rejected with a message quoting what was typed. Multi-area,
 whole-column (`A:C`), whole-row, 3D and structured references still work **in
