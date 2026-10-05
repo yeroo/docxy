@@ -185,6 +185,20 @@ test sheet Home Sort & Filter button opens its menu instead of running a placeho
   assert reply.open is true
   assert reply.items.0.label is Sort A to Z
 
+test sheet Home Sort & Filter menu ticks Filter while the filter is on
+  open ../fixtures/basic.xlsx
+  click B2
+  call menu-open {"target":{"ribbon":["Home","Editing","Sort & Filter"]}}
+  call menu-read {}
+  assert reply.items.3.label is Filter
+  assert reply.items.3.checked is false
+  call menu-close {}
+  key ctrl+shift+l
+  call menu-open {"target":{"ribbon":["Home","Editing","Sort & Filter"]}}
+  call menu-read {}
+  assert reply.items.3.checked is true
+  assert reply.items.0.checked is false
+
 test sheet Home ribbon-click reaches a Sort & Filter menu item by id and by label
   open ../fixtures/basic.xlsx
   click B2

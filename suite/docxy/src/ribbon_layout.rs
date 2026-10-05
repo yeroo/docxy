@@ -89,6 +89,15 @@ fn rect_json(b: Bounds<Pixels>) -> Json {
     ])
 }
 
+/// The tab the finished frame drew, from its `ribbon-tab:` probe: two tabs can
+/// share group titles (Task's and Project's Schedule), so titles alone cannot
+/// say whose frame it is.
+pub(crate) fn shown_tab(probes: &[(String, Bounds<Pixels>)]) -> Option<&str> {
+    probes
+        .iter()
+        .find_map(|(n, _)| n.strip_prefix("ribbon-tab:"))
+}
+
 /// Whether `measured` is a finished frame of the tab whose groups are `titles`:
 /// something was measured, and nothing from another tab's groups.
 pub(crate) fn is_frame_of(measured: &[GroupLayout], titles: &[&str]) -> bool {
@@ -207,6 +216,14 @@ mod tests {
         let f = frame(62.)[..2].to_vec();
         let m = measure(&f);
         assert!(m[0].content.is_none() && !m[0].clipped_v);
+    }
+
+    #[test]
+    fn the_frame_names_the_tab_it_drew() {
+        let mut f = frame(62.);
+        assert_eq!(shown_tab(&f), None);
+        f.push(("ribbon-tab:Task".into(), b(0., 0., 400., 100.)));
+        assert_eq!(shown_tab(&f), Some("Task"));
     }
 
     #[test]

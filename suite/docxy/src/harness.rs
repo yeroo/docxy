@@ -3415,7 +3415,10 @@ fn dispatch_verb(
             let probes = app.probes.borrow();
             let measured = crate::ribbon_layout::measure(&probes.last);
             // A tab with no groups (Project's Report) has nothing to wait for.
-            if !titles.is_empty() && !crate::ribbon_layout::is_frame_of(&measured, &titles) {
+            let drawn = crate::ribbon_layout::shown_tab(&probes.last) == Some(name.as_str());
+            if !titles.is_empty()
+                && !(drawn && crate::ribbon_layout::is_frame_of(&measured, &titles))
+            {
                 cx.notify();
                 return Done::ok(crate::ribbon_layout::unsettled_json(&name));
             }

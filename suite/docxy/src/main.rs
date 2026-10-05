@@ -25803,7 +25803,12 @@ impl Docxy {
                     group: group.title.into(),
                     label: dd.button.label.into(),
                 },
-                menu::sheet_dropdown(dd.items),
+                menu::sheet_dropdown(dd.items, |act| {
+                    matches!(act, SheetAct::Filter)
+                        && self
+                            .active_sheet()
+                            .is_some_and(|v| v.sheet().auto_filter.is_some())
+                }),
             ))
         })
     }
@@ -26279,7 +26284,9 @@ impl Docxy {
             .bg(pal.panel)
             .border_b_1()
             .border_color(pal.border)
+            .relative()
             .children(groups)
+            .child(probe(&self.probes, format!("ribbon-tab:{}", tab.name)))
             .into_any_element()
     }
 
@@ -27380,11 +27387,16 @@ impl Docxy {
             .border_b_1()
             .border_color(pal.border)
             .overflow_x_scroll()
+            .relative()
             .children(
                 tab.groups
                     .iter()
                     .map(|g| self.sheet_group(g, tab.titles, &xf, pal, cx)),
             )
+            .child(probe(
+                &self.probes,
+                format!("ribbon-tab:{}", ribbon_tab_name(tab.tab)),
+            ))
             .into_any_element()
     }
 

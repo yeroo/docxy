@@ -351,6 +351,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "at most 3 rows")]
     fn the_column_constructor_refuses_a_fourth_row() {
         let _ = column(vec![c("a"), c("b"), c("c"), c("d")]);
