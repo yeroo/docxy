@@ -7,6 +7,7 @@
 //!   docxy <in> --md <out.md>       headless: convert to Markdown and exit
 //!   docxy <in> --docx <out.docx>   headless: convert to .docx and exit
 //!   docxy <in> --html <out.docx.html>  headless: export editable HTML and exit
+//!   docxy --version (-V)           print the build (commit, last merged PR, kind) and exit
 //!
 //! The logic lives in the pure `docxcore` crate; this binary is the TUI shell:
 //! it maps `docxcore::render` lines onto ratatui, draws a caret via the render
@@ -208,6 +209,15 @@ fn source_lines_to_doc(md: &str) -> Document {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--version` prints the build block (commit, last merged PR, build kind) and
+    // exits, before any file-oriented argument parsing or terminal setup.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        print!(
+            "{}",
+            buildinfo::get(env!("CARGO_PKG_VERSION")).version_block("docxy")
+        );
+        return ExitCode::SUCCESS;
+    }
     // `--mcp` runs the headless MCP stdio bridge (a client of a running docxy),
     // not the editor, so handle it before the file-oriented argument parsing.
     if args.iter().any(|a| a == "--mcp") {
@@ -657,6 +667,7 @@ fn print_usage() {
                                            write a tracked-changes comparison and exit\n  \
            docxy merge <main.docx> <data.csv> -o <out.docx>\n  \
                                            mail-merge every CSV recipient and exit\n  \
+           docxy --version (-V)            print the build (commit, last merged PR, kind)\n  \
            docxy --mcp                      run the MCP bridge to drive a live docxy\n  \
            docxy install skill              install the agent SKILL.md (self-onboarding)\n  \
            (Save As to a .md/.docx/.docx.html name converts between the formats;\n   \
@@ -7600,6 +7611,10 @@ impl backstage::BackstageHost for App {
                 "  Modified    {}",
                 if self.modified { "yes" } else { "no" }
             )),
+            RLine::raw(format!(
+                "  Build       {}",
+                buildinfo::get(env!("CARGO_PKG_VERSION")).short_line()
+            )),
             RLine::raw(String::new()),
             RLine::raw(format!("  Paragraphs  {paras}")),
             RLine::raw(format!("  Words       {words}")),
@@ -9880,6 +9895,18 @@ mod tests {
         let parsed = parse_header_footer(&out, &Relationships::default());
         assert_eq!(parsed.len(), 1);
         assert!(matches!(&parsed[0], Block::Paragraph(p) if p.plain_text() == "new text"));
+    }
+
+    #[test]
+    fn backstage_info_shows_the_build_line() {
+        let app = app_with(&["A"]);
+        let info: Vec<String> = app.info_lines().iter().map(|l| l.to_string()).collect();
+        let line = buildinfo::get(env!("CARGO_PKG_VERSION")).short_line();
+        assert!(
+            info.iter()
+                .any(|l| l.contains("Build") && l.contains(&line)),
+            "{info:?}"
+        );
     }
 
     fn app_with(paras: &[&str]) -> App {

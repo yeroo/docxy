@@ -31,7 +31,8 @@ accepts the Project verbs. A harness instance ignores `AGWINTERM_SESSION_ID`
 and is always `suite-<pid>` (#697). Normal control does not expose harness operations
 such as `open`, `key`, `type`, or `quit`.
 
-Every verb except `proj.open` and `proj.new` accepts optional `tab`: an absolute zero-based
+Every verb except `proj.open`, `proj.new` and `app-info` (the build of the whole
+suite process, which ignores `tab`) accepts optional `tab`: an absolute zero-based
 index among **all** tabs, or a case-insensitive substring of a Project tab's
 title/path. Omit it to use the active tab. Ambiguous strings, empty strings,
 invalid indices, non-Project targets, and failed-load placeholders are errors.
@@ -42,7 +43,7 @@ Supported verbs are `proj.path`, `task.list`, `task.get`, `task.fields`, `task.s
 `task.add`, `task.del`, `link.add`, `link.del`, `find`, `assign.list`,
 `assign.get`, `assign.fields`, `assign.add`, `assign.set`, `assign.del`,
 `proj.save`, `proj.reload`, `proj.open` and `proj.new`, with the yppxy
-argument/result shapes. `proj.path` additionally
+argument/result shapes, plus `app-info` (the build: version, commit, last merged PR, kind, `manual`; #1023). `proj.path` additionally
 reports `tab`, `imported`, `cell` (active column name), `cell_row` (zero-based row),
 and `cell_edit` (pending cell buffer, or `null` when closed). Reads and rejected
 edits leave selection, prompts, pending cell edits, history and scroll unchanged.
@@ -257,6 +258,7 @@ One JSON object per line; one reply line per request:
 
 | Verb | Args | Result |
 |---|---|---|
+| `app-info` | — | the build: `{version, commit, short_commit, branch, commit_date, dirty, last_pr, issue, ahead, built_at, profile, target, host, kind, manual, summary, …}`: `kind` is `release`, `ci` or `local`; `manual` is `kind == local \|\| dirty` (#1023) |
 | `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?, final?}` — `final: true` only when Word marked the document as final |
 | `doc.edit-anyway` | — | `{path, …, was_final}` — Word's Edit Anyway: clears Mark as Final so edits are allowed and a save writes the document without the mark |
 | `doc.outline` | — | `{headings:[{index, level, text}]}` |
@@ -629,7 +631,8 @@ xlsxy answers so far; and docxy's `doc.page-color`, `doc.watermark`,
 `doc.page-borders`, `doc.compare`, `doc.comment-resolve`,
 `doc.comments-delete-all`, `doc.display-mode`, `doc.track-changes` and
 `doc.track-changes-set`, which only a terminal docxy answers so
-far — a tab answers `unknown verb`): a couple of internal-only verbs the extension host
+far, and the `app-info` build verb (#1023), which only a terminal instance and
+the suite answer — a tab answers `unknown verb`): a couple of internal-only verbs the extension host
 uses to compose its own `doc.path`/`wb.path` replies (`doc.blocks`, `wb.info`)
 are deliberately not in the tab's exposed verb set, and are rejected as
 `"unknown verb"` — same as a terminal instance, which has no arm for them at
@@ -788,8 +791,8 @@ Differences from a terminal pane:
 **Excel tabs** (`xlsxy-jetbrains-<basename>-<pid>-<n>` in xlsxy's ctl dir)
 serve the full xlsxy verb surface through `grid_ctl` (except
 `wb.properties`/`wb.set-properties`, the page-layout and printing verbs and the
-filter and sort verbs (`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`),
-terminal xlsxy only for now: a tab answers `unknown verb`), with the same host-verb
+filter and sort verbs (`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`) and
+`app-info`, terminal xlsxy only for now: a tab answers `unknown verb`), with the same host-verb
 split (`wb.path`/`wb.save`/`wb.reload`/`wb.open`; `wb.open` opens a new tab;
 `wb.info` internal). Every mutating agent verb lands as **one IDE undo step**
 driving the engine's own undo stack — the same mechanism the grid UI uses,
@@ -805,6 +808,7 @@ name and defaults to the active sheet):
 
 | Verb | Args | Result |
 |---|---|---|
+| `app-info` | — | the build: `{version, commit, short_commit, branch, commit_date, dirty, last_pr, issue, ahead, built_at, profile, target, host, kind, manual, summary, …}`: `kind` is `release`, `ci` or `local`; `manual` is `kind == local \|\| dirty` (#1023) |
 | `wb.path` | — | `{path, modified, read_only, sheets, active, active_name, circular}` — `read_only` is true while the workbook is bound to the file `xlsxy --read-only` opened (terminal xlsxy; see `wb.save`);  `circular` lists the cells on circular references (active sheet first, bare `E1`; other sheets as `Sheet2!A1`), empty when there are none. It lists them whether or not the workbook enables iterative calculation (the TUI's warning and footer note appear only when it does not, as in Excel). Without iterative calculation those cells are 0, as in Excel |
 | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
@@ -997,7 +1001,7 @@ Skill: `xlsxy install skill`.
 `fields: [...]` to read any listed field by Project's name), `link.add {uid, pred, type?, lag?}` / `link.del`,
 `find {query}`, `assign.list/get/add/set/del` and `assign.fields` (a task's
 resource assignments, by assignment UID), `proj.save {path?}`, `proj.reload`,
-`proj.open {path}`. Edits
+`proj.open {path}`, `app-info` (the build; #1023). Edits
 reschedule the plan (CPM) live. MCP: `claude mcp add yppxy -- yppxy --mcp` →
 `yppxy_list`, `yppxy_status`, `yppxy_tasks`, `yppxy_get`, `yppxy_set`,
 `yppxy_fields`, `yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`,

@@ -777,6 +777,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "buildinfo"
+version = "0.5.0"
+
+[[package]]
 name = "built"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1570,6 +1574,7 @@ dependencies = [
 name = "docxy"
 version = "0.1.0"
 dependencies = [
+ "buildinfo",
  "ctlcore",
  "dirs 5.0.1",
  "docxcore",

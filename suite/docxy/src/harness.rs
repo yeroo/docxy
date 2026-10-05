@@ -69,6 +69,8 @@ pub struct Cli {
     /// `--read-only` (or `/r` on Windows) was passed: every workbook on the
     /// line opens read-only (#882). Documents and projects open as usual.
     pub read_only: bool,
+    /// `--version` (or `-V`) was passed: print the build info and exit (#1023).
+    pub version: bool,
     /// Positional arguments, in order.
     pub files: Vec<PathBuf>,
     /// `--`-prefixed arguments that are not ours. Kept rather than silently
@@ -92,6 +94,10 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Cli {
             }
             if arg == HARNESS_FLAG {
                 cli.harness = true;
+                continue;
+            }
+            if arg == "--version" || arg == "-V" {
+                cli.version = true;
                 continue;
             }
             if is_read_only_flag(&arg, cfg!(windows)) {
@@ -2305,6 +2311,23 @@ fn inspection_json(found: &crate::inspector::Inspection) -> Json {
     )
 }
 
+/// `account`'s reply: whether the Account page is open and what it shows.
+/// `badge` is whether the "Manual build" badge was drawn in the last frame (its
+/// own probe), not a copy of `manual`.
+fn account_json(app: &crate::Docxy) -> Json {
+    let info = crate::about::info();
+    let open = app.backstage && app.bs_account;
+    Json::obj(vec![
+        ("open", Json::Bool(open)),
+        ("line", Json::Str(info.short_line())),
+        ("manual", Json::Bool(info.manual())),
+        (
+            "badge",
+            Json::Bool(open && app.probes.borrow().get("account-manual-badge").is_some()),
+        ),
+    ])
+}
+
 /// Whether `verb` stands for a press outside an open menu, which closes it
 /// (#397). Reads leave it open, `key` and `type` reach the menu's own key
 /// gate, the `menu-*` verbs act on it, and a control-pipe verb closes it
@@ -2312,6 +2335,10 @@ fn inspection_json(found: &crate::inspector::Inspection) -> Json {
 fn closes_menu(verb: &str, args: &Json) -> bool {
     // Reading the backstage is a read; opening or closing it is a press.
     if verb == "backstage" {
+        return args.get_str("action") != Some("read");
+    }
+    // Reading the Account page is a read; the rest press it (#1023).
+    if verb == "account" {
         return args.get_str("action") != Some("read");
     }
     // Inspecting is a read; a Remove All is a press (#627).
@@ -3087,6 +3114,29 @@ fn dispatch_verb(
                     Json::Arr(items.map(|item| Json::Str(item.display.into())).collect()),
                 ),
             ]))
+        }
+        // File > Account and its About dialog (#1023). `open` is the rail item's
+        // handler and `about` the page's About button; the dialog it opens is an
+        // ordinary one, driven with `dialog-read` and `dialog-click` (Copy, Close).
+        "account" => {
+            let action = arg_str(args, "action")?;
+            match action {
+                "read" => {}
+                "open" | "about" => {
+                    app.refuse_under_dialog()?;
+                    if !app.backstage {
+                        return Err("File (backstage) is not open; use backstage open".into());
+                    }
+                    if action == "open" {
+                        app.open_account(cx);
+                    } else {
+                        app.open_about()?;
+                        cx.notify();
+                    }
+                }
+                _ => return Err("'action' must be open, about or read".into()),
+            }
+            Done::ok_drawn(account_json(app))
         }
         "theme-set" => {
             let pref = parse_theme_pref(arg_str(args, "theme")?)?;
@@ -5128,6 +5178,24 @@ mod tests {
             cli.files,
             vec![PathBuf::from("a.xlsx"), PathBuf::from("b.xlsx")]
         );
+    }
+
+    /// #1023: `--version` and `-V` are flags, not files or unknown options; after
+    /// `--` they are files.
+    #[test]
+    fn version_flag_is_parsed() {
+        for flag in ["--version", "-V"] {
+            let cli = parse_args(args(&[flag]));
+            assert!(cli.version, "{flag}");
+            assert!(
+                cli.files.is_empty() && cli.unknown_flags.is_empty(),
+                "{flag}"
+            );
+        }
+        assert!(!parse_args(args(&["a.xlsx"])).version);
+        let cli = parse_args(args(&["--", "--version"]));
+        assert!(!cli.version);
+        assert_eq!(cli.files, [PathBuf::from("--version")]);
     }
 
     /// No arguments at all is the double-click case: nothing on, nothing to open.
