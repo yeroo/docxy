@@ -28,6 +28,7 @@ mod outlinedlg;
 mod ribbon;
 mod skill;
 mod textdlg;
+mod validationdlg;
 
 // Bring the trait's methods (`extensions`, `default_save_name`, …) into scope
 // for the `impl backstage::BackstageHost for App` call sites below.
@@ -1613,8 +1614,6 @@ enum PromptKind {
     GoTo,
     /// Conditional formatting: a comparison like ">500" applied to the selection.
     CondFormat,
-    /// Data validation: comma-separated allowed values → a dropdown list.
-    DataValidation,
     /// Custom AutoFilter, Top 10 or a date period for a filter column
     /// (`>10 and <=30`, `begins a`, `top 3`, `above average`, `this week`).
     CustomFilter,
@@ -1991,6 +1990,10 @@ struct App {
     dv_picker: Option<DvPicker>,
     /// The data-validation alert a typed entry raised, until answered.
     dv_alert: Option<DvAlert>,
+    /// The Data Validation dialog.
+    validation_dialog: Option<validationdlg::ValidationDialog>,
+    /// Circle Invalid Data's circles: (sheet, row, col). View state, never saved.
+    circles: Vec<(usize, u32, u32)>,
     /// What the commit now running goes on to do, for an alert it raises.
     commit_cont: Cont,
     /// A filter button's drop-down (Alt+Down on the filter's header row).
@@ -2142,6 +2145,8 @@ impl App {
             sheet_picker: None,
             dv_picker: None,
             dv_alert: None,
+            validation_dialog: None,
+            circles: Vec::new(),
             commit_cont: Cont::Nothing,
             filter_picker: None,
             pending_sort: None,
@@ -2705,6 +2710,7 @@ impl App {
         self.undo.push(UndoAction::Cells(undo));
         self.redo.clear();
         self.modified = true;
+        self.prune_circles();
         self.warn_new_circles(&circles_before);
     }
 
@@ -3528,6 +3534,7 @@ impl App {
                 self.show_undo_group(groups.last());
                 self.redo.push(UndoAction::Cells(groups));
                 self.modified = true;
+                self.prune_circles();
                 self.status = Some("Undid".to_string());
             }
             Some(UndoAction::Structural { before, after }) => {
@@ -3569,6 +3576,7 @@ impl App {
                 self.show_undo_group(groups.last());
                 self.undo.push(UndoAction::Cells(groups));
                 self.modified = true;
+                self.prune_circles();
                 self.status = Some("Redid".to_string());
             }
             Some(UndoAction::Structural { before, after }) => {
@@ -5005,6 +5013,106 @@ impl App {
         out
     }
 
+    /// Data ▸ Data Validation: the dialog over the selection, showing the rule
+    /// on its first cell.
+    fn open_validation_dialog(&mut self) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
+        let range = self.selection();
+        let current = gridcore::validation::validation_at(self.sheet(), range.0, range.1).cloned();
+        self.validation_dialog = Some(validationdlg::ValidationDialog::new(
+            self.sheet,
+            range,
+            current.as_ref(),
+        ));
+    }
+
+    fn validation_dialog_key(&mut self, code: KeyCode) {
+        let Some(d) = self.validation_dialog.as_mut() else {
+            return;
+        };
+        let outcome = d.key(code);
+        match outcome {
+            validationdlg::Outcome::Pending => {}
+            validationdlg::Outcome::Cancel => self.validation_dialog = None,
+            validationdlg::Outcome::Ok => {
+                let Some(d) = self.validation_dialog.clone() else {
+                    return;
+                };
+                match d.rule() {
+                    Err(why) => self.status = Some(why),
+                    Ok(rule) => {
+                        self.validation_dialog = None;
+                        let (sheet, range) = (d.sheet, d.range);
+                        self.with_rules(&[sheet], |app| {
+                            gridcore::validation::set_validation(
+                                &mut app.pkg.workbook.sheets[sheet],
+                                range,
+                                &rule,
+                                d.apply_all,
+                            );
+                        });
+                        self.status = Some("Data validation applied".into());
+                    }
+                }
+            }
+            validationdlg::Outcome::ClearAll => {
+                let Some(d) = self.validation_dialog.take() else {
+                    return;
+                };
+                let (sheet, range) = (d.sheet, d.range);
+                self.with_rules(&[sheet], |app| {
+                    gridcore::validation::clear_all_validation(
+                        &mut app.pkg.workbook.sheets[sheet],
+                        range,
+                        d.apply_all,
+                    );
+                });
+                self.status = Some("Data validation cleared".into());
+            }
+        }
+    }
+
+    /// Data ▸ Circle Invalid Data: circle every cell of the sheet whose value
+    /// breaks its rule.
+    fn circle_invalid(&mut self) {
+        let sheet = self.sheet;
+        let cells = gridcore::validation::invalid_cells(&self.pkg.workbook, sheet);
+        self.circles.retain(|&(s, ..)| s != sheet);
+        self.status = Some(match cells.len() {
+            0 => "No invalid data".to_string(),
+            n => format!("{n} invalid cell(s) circled"),
+        });
+        self.circles
+            .extend(cells.into_iter().map(|(r, c)| (sheet, r, c)));
+    }
+
+    fn clear_circles(&mut self) {
+        self.circles.clear();
+        self.status = Some("Validation circles cleared".into());
+    }
+
+    /// Drop the circles round cells that are valid now.
+    fn prune_circles(&mut self) {
+        if self.circles.is_empty() {
+            return;
+        }
+        let sheets: std::collections::BTreeSet<usize> =
+            self.circles.iter().map(|&(s, ..)| s).collect();
+        let invalid: std::collections::BTreeSet<(usize, u32, u32)> = sheets
+            .into_iter()
+            .flat_map(|s| {
+                gridcore::validation::invalid_cells(&self.pkg.workbook, s)
+                    .into_iter()
+                    .map(move |(r, c)| (s, r, c))
+            })
+            .collect();
+        self.circles.retain(|c| invalid.contains(c));
+    }
+
     /// Open the dropdown for the `list` validation on the cursor cell, if there
     /// is one. Preselects the current cell value when it is among the choices.
     fn open_dv_dropdown(&mut self) {
@@ -5012,6 +5120,11 @@ impl App {
             return;
         };
         if dv.kind != "list" {
+            self.status = Some(format!("Data validation — {}", dv.describe()));
+            return;
+        }
+        // `showDropDown="1"` hides the in-cell dropdown.
+        if !dv.show_dropdown {
             self.status = Some(format!("Data validation — {}", dv.describe()));
             return;
         }
@@ -5178,7 +5291,9 @@ impl App {
             WrapText => self.toggle_wrap(),
             RowHeight => self.open_prompt(PromptKind::RowHeight),
             CondFormat => self.open_prompt(PromptKind::CondFormat),
-            DataValidation => self.open_prompt(PromptKind::DataValidation),
+            DataValidation => self.open_validation_dialog(),
+            CircleInvalid => self.circle_invalid(),
+            ClearCircles => self.clear_circles(),
             Filter => {
                 let sel = self.selection();
                 let range = ((sel.0, sel.1) != (sel.2, sel.3)).then_some(sel);
@@ -7199,34 +7314,6 @@ impl App {
         });
     }
 
-    /// Create a list data-validation (dropdown) over the selection from a
-    /// comma-separated list of allowed values.
-    fn commit_data_validation(&mut self, text: &str) {
-        let items: Vec<&str> = text
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if items.is_empty() {
-            self.status = Some("Data validation: enter comma-separated values".into());
-            return;
-        }
-        let f1 = format!("\"{}\"", items.join(","));
-        let (r1, c1, r2, c2) = self.selection();
-        let s = self.sheet;
-        if !self
-            .pkg
-            .add_data_validation(s, (r1, c1, r2, c2), "list", "", &f1, None)
-        {
-            self.status = Some(WRITE_REFUSED.into());
-            return;
-        }
-        self.undo.clear();
-        self.redo.clear();
-        self.modified = true;
-        self.status = Some(format!("Dropdown list: {} values", items.len()));
-    }
-
     /// Apply a "Highlight Cells" conditional-format rule to the selection from a
     /// typed comparison (">500", "<=100", "=42"; leading operator parsed, default
     /// greaterThan) using Excel's Light-Red-Fill / Dark-Red-Text preset.
@@ -7741,9 +7828,6 @@ impl App {
                 "Highlight (>500, =42, 100..500 between, 'clear'): ",
                 String::new(),
             ),
-            PromptKind::DataValidation => {
-                ("Dropdown list (comma-separated values): ", String::new())
-            }
             PromptKind::CustomFilter => (
                 "Filter (>10 and <=30, begins a, top 3, top 25%, above average, this week): ",
                 String::new(),
@@ -7808,7 +7892,6 @@ impl App {
             }
             PromptKind::GoTo => self.goto(&text),
             PromptKind::CondFormat => self.commit_cond_format(&text),
-            PromptKind::DataValidation => self.commit_data_validation(&text),
             PromptKind::CustomFilter => self.commit_custom_filter(&text),
             PromptKind::FilterByCell => self.commit_filter_by_cell(&text),
             PromptKind::AdvancedFilter => self.commit_advanced_filter(&text),
@@ -8597,6 +8680,9 @@ fn draw(app: &mut App, f: &mut Frame) {
     if let Some(d) = &app.outline_dialog {
         d.draw(f, grid);
     }
+    if let Some(d) = &app.validation_dialog {
+        d.draw(f, grid);
+    }
     if let Some(d) = &app.data_form {
         d.draw(f, grid);
     }
@@ -8610,6 +8696,7 @@ fn draw(app: &mut App, f: &mut Frame) {
     if let Some(p) = &app.dv_picker {
         draw_dv_picker(app, p, f, grid);
     }
+    draw_validation_marks(app, f, grid);
     if let Some(a) = &app.dv_alert {
         draw_dv_alert(a, f, grid);
     }
@@ -9112,6 +9199,82 @@ fn num_short(v: f64) -> String {
     } else {
         format!("{v:.2}")
     }
+}
+
+/// Circle Invalid Data's circles, drawn as red brackets round the cell, and
+/// the input message of the rule on the cursor cell as a tip under it.
+fn draw_validation_marks(app: &App, f: &mut Frame, grid: Rect) {
+    let on_screen = |r: u32, c: u32| -> Option<(u16, u16, u16)> {
+        let (x, w) = app
+            .vis_cols
+            .iter()
+            .find(|&&(col, ..)| col == c)
+            .map(|&(_, x, w)| (x, w))?;
+        let y = grid.y + app.vis_rows.iter().position(|&row| row == r)? as u16;
+        (y < grid.y + grid.height).then_some((x, y, w))
+    };
+    for &(s, r, c) in &app.circles {
+        if s != app.sheet {
+            continue;
+        }
+        let Some((x, y, w)) = on_screen(r, c) else {
+            continue;
+        };
+        if w < 2 {
+            continue;
+        }
+        let red = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
+        let buf = f.buffer_mut();
+        for (cx, ch) in [(x, "("), (x + w - 1, ")")] {
+            if let Some(cell) = buf.cell_mut((cx, y)) {
+                cell.set_symbol(ch).set_style(red);
+            }
+        }
+    }
+    if app.edit.is_some() || app.dv_alert.is_some() || app.dv_picker.is_some() {
+        return;
+    }
+    let Some(dv) = gridcore::validation::validation_at(app.sheet(), app.cur.0, app.cur.1) else {
+        return;
+    };
+    let msg = dv.prompt.as_deref().unwrap_or_default();
+    if !dv.show_input || (msg.is_empty() && dv.prompt_title.is_empty()) {
+        return;
+    }
+    let Some((x, y, _)) = on_screen(app.cur.0, app.cur.1) else {
+        return;
+    };
+    let w = (msg.chars().count().max(dv.prompt_title.chars().count()) as u16 + 2)
+        .clamp(12, grid.width.max(12))
+        .min(grid.width);
+    let h = if dv.prompt_title.is_empty() || msg.is_empty() {
+        1
+    } else {
+        2
+    };
+    if y + 1 + h > grid.y + grid.height {
+        return;
+    }
+    let area = Rect::new(x.min(grid.x + grid.width.saturating_sub(w)), y + 1, w, h);
+    f.render_widget(Clear, area);
+    let mut lines = Vec::new();
+    if !dv.prompt_title.is_empty() {
+        lines.push(RLine::from(RSpan::styled(
+            fit(&format!(" {}", dv.prompt_title), w as usize, false),
+            Style::new().add_modifier(Modifier::BOLD),
+        )));
+    }
+    if !msg.is_empty() {
+        lines.push(RLine::from(RSpan::raw(fit(
+            &format!(" {msg}"),
+            w as usize,
+            false,
+        ))));
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::new().fg(Color::Black).bg(Color::Yellow)),
+        area,
+    );
 }
 
 /// The data-validation alert, centred on the grid: the rule's title, its
@@ -9623,6 +9786,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         || app.format_dialog.is_some()
         || app.text_dialog.is_some()
         || app.outline_dialog.is_some()
+        || app.validation_dialog.is_some()
         || app.data_form.is_some()
         || app.sheet_picker.is_some()
         || app.dv_picker.is_some()
@@ -9657,6 +9821,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
     if app.outline_dialog.is_some() {
         app.outline_dialog_key(key.code);
+        return false;
+    }
+    if app.validation_dialog.is_some() {
+        app.validation_dialog_key(key.code);
         return false;
     }
     if app.data_form.is_some() {
@@ -10055,7 +10223,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
     }
     // An outline dialog is modal: a click under it (a sheet tab, a ribbon
     // command) must not change what its OK acts on.
-    if app.outline_dialog.is_some() || app.data_form.is_some() {
+    if app.outline_dialog.is_some() || app.validation_dialog.is_some() || app.data_form.is_some() {
         return false;
     }
     // The welcome screen owns the whole terminal; handle its clicks here so
@@ -14142,23 +14310,6 @@ mod tests {
         assert!(!app.sheet().row_hidden(1));
         app.ribbon_act(ribbon::Act::Filter);
         assert!(app.sheet().auto_filter.is_none());
-    }
-
-    #[test]
-    fn commit_data_validation_creates_list() {
-        let mut app = App::new(new_xlsx(), "t.xlsx");
-        app.os_clip = None;
-        app.cur = (0, 0);
-        app.anchor = Some((4, 0)); // A1:A5
-        app.commit_data_validation("Laptop, Monitor , Dock");
-        let dvs = &app.pkg.workbook.sheets[0].validations;
-        assert_eq!(dvs.len(), 1);
-        assert_eq!(dvs[0].kind, "list");
-        assert_eq!(dvs[0].formula1, "\"Laptop,Monitor,Dock\"");
-        assert!(dvs[0].covers(2, 0));
-        // Round-trips + the dropdown resolves the values.
-        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
-        assert_eq!(re.workbook.sheets[0].validations.len(), 1);
     }
 
     #[test]
@@ -19073,6 +19224,132 @@ mod tests {
         app.paste_from(Some("1000".into()));
         assert_eq!(value_at(&app, 5, 1), CellValue::Number(1000.0));
         assert_eq!(ranges_of(&app), vec![vec![(1, 1, 9, 1)]]);
+    }
+    // ---- #689: the Data Validation dialog and Circle Invalid Data ----
+
+    fn dialog_keys(app: &mut App, keys: &[KeyCode]) {
+        for &k in keys {
+            handle_key(app, KeyEvent::new(k, KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn dialog_creates_a_rule_in_one_undo_step_and_clear_all_removes_it() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.cur = (1, 1);
+        app.anchor = Some((9, 1)); // B2:B10
+        app.open_validation_dialog();
+        assert!(app.validation_dialog.is_some());
+        // Tab strip -> Allow: Whole number; Data: between; 10 .. 90.
+        dialog_keys(
+            &mut app,
+            &[KeyCode::Down, KeyCode::Right, KeyCode::Down, KeyCode::Down],
+        );
+        type_text(&mut app, "10");
+        press(&mut app, KeyCode::Down);
+        type_text(&mut app, "90");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.validation_dialog.is_none(), "{:?}", app.status);
+        let dv = &app.sheet().validations[0];
+        assert_eq!(dv.ranges, vec![(1, 1, 9, 1)]);
+        assert_eq!(
+            (dv.kind.as_str(), dv.formula1.as_str(), dv.formula2.as_str()),
+            ("whole", "10", "90")
+        );
+        // It round-trips through a save.
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].validations.len(), 1);
+        app.undo();
+        assert!(app.sheet().validations.is_empty());
+        app.redo();
+        assert_eq!(app.sheet().validations.len(), 1);
+
+        // Reopen on B3: the dialog shows the rule; Clear All removes it there.
+        app.cur = (2, 1);
+        app.anchor = None;
+        app.open_validation_dialog();
+        dialog_keys(
+            &mut app,
+            &[
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+            ],
+        );
+        // Focus walks Allow, Data, Min, Max, Ignore blank, Apply all, OK, Clear All.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.validation_dialog.is_none());
+        let ranges = ranges_of(&app);
+        assert_eq!(ranges, vec![vec![(1, 1, 1, 1), (3, 1, 9, 1)]]);
+        app.undo();
+        assert_eq!(ranges_of(&app), vec![vec![(1, 1, 9, 1)]]);
+    }
+
+    #[test]
+    fn dialog_apply_to_all_rewrites_every_range_with_the_same_settings() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        let mut other = app.sheet().validations[0].clone();
+        other.ranges = vec![(1, 5, 4, 5)]; // F2:F5, same settings
+        app.pkg.workbook.sheets[0].validations.push(other);
+        app.cur = (1, 1);
+        app.open_validation_dialog();
+        // Allow stays Whole number; Min 10 -> 11; tick Apply all; OK.
+        dialog_keys(&mut app, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        type_text(&mut app, "11");
+        dialog_keys(&mut app, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        let dvs = &app.sheet().validations;
+        assert!(dvs.iter().all(|d| d.formula1 == "11"), "{:?}", app.status);
+        assert!(dvs.iter().any(|d| d.covers(2, 5)) && dvs.iter().any(|d| d.covers(9, 1)));
+    }
+
+    #[test]
+    fn circle_invalid_data_and_clear_circles() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.apply(vec![(2, 1, Cell::number(250.0))]); // B3: a value that got in
+        app.circle_invalid();
+        assert_eq!(app.circles, vec![(0, 2, 1)]);
+        // Fixing the cell takes its circle away.
+        app.apply(vec![(2, 1, Cell::number(20.0))]);
+        assert!(app.circles.is_empty());
+        app.apply(vec![(3, 1, Cell::number(1.0))]);
+        app.circle_invalid();
+        assert_eq!(app.circles.len(), 1);
+        app.clear_circles();
+        assert!(app.circles.is_empty());
+        // Circles are view state: a save knows nothing of them.
+        app.circle_invalid();
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].validations.len(), 1);
+    }
+
+    #[test]
+    fn the_dropdown_honours_show_dropdown() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(0, 0, 4, 0)],
+                kind: "list".into(),
+                formula1: "\"a,b\"".into(),
+                show_dropdown: false,
+                ..Default::default()
+            });
+        app.cur = (0, 0);
+        app.open_dv_dropdown();
+        assert!(app.dv_picker.is_none());
     }
 }
 
