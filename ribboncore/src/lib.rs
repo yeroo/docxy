@@ -44,6 +44,10 @@ pub fn gap<A>(s: &'static str) -> Seg<A> {
 }
 
 /// A group of buttons (two rows) with a centred title, in the tab body.
+///
+/// The row count is the array length, so a terminal group cannot hold a third
+/// row the body would clip (#1018): the height rule is the type. Width is
+/// checked per ribbon (`every_group_is_wide_enough_for_its_content`).
 pub struct Group<A> {
     pub title: &'static str,
     pub width: usize,
