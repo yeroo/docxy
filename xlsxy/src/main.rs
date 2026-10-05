@@ -3885,8 +3885,11 @@ impl App {
                 // a cut also takes them off its source.
                 let rules_from = {
                     let (fr, fc) = clip.from;
-                    let h = clip.cells.len().max(1) as u32;
-                    let w = clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
+                    // Only the part that fits the grid at the target is pasted
+                    // (the rest stays where it was, as its cells do).
+                    let h = (clip.cells.len().max(1) as u32).min(MAX_ROWS - r0);
+                    let w = (clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32)
+                        .min(MAX_COLS - c0);
                     (fr, fc, fr + h - 1, fc + w - 1)
                 };
                 let rules = clip.rules.clone();
@@ -20641,6 +20644,29 @@ mod tests {
         run_control(&mut app, "wb.reload", &Json::Null).unwrap();
         assert!(app.dv_alert.is_none() && app.edit.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn a_cut_clipped_at_the_grid_edge_moves_only_the_rules_that_fit() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        // Rules on A1 and A2 (one rule each cell).
+        let mut a1 = app.sheet().validations[0].clone();
+        a1.ranges = vec![(0, 0, 0, 0)];
+        let mut a2 = a1.clone();
+        a2.ranges = vec![(1, 0, 1, 0)];
+        a2.formula1 = "20".into();
+        app.pkg.workbook.sheets[0].validations = vec![a1, a2];
+        app.cur = (0, 0);
+        app.anchor = Some((1, 0)); // A1:A2
+        app.copy(true);
+        app.anchor = None;
+        app.cur = (MAX_ROWS - 1, 3); // D1048576: only A1's cell fits
+        app.paste_from(None);
+        let sheet = app.sheet();
+        assert!(gridcore::validation::validation_at(sheet, MAX_ROWS - 1, 3).is_some());
+        // A2's cell was not moved, so its rule stays at A2.
+        assert!(gridcore::validation::validation_at(sheet, 1, 0).is_some());
+        assert!(gridcore::validation::validation_at(sheet, 0, 0).is_none());
     }
 }
 

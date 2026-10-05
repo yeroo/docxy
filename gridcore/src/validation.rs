@@ -186,11 +186,10 @@ fn list_items<'a>(
 
 /// The sheet and the cells of the range `src` names (a defined name too).
 fn resolve_cells(wb: &Workbook, sheet: usize, src: &str) -> Option<(usize, Vec<(u32, u32)>)> {
+    // A name scoped to the entry's sheet shadows a global one.
     let named = wb
-        .defined_names
-        .iter()
-        .find(|d| d.name.eq_ignore_ascii_case(src))
-        .map(|d| d.formula.trim_start_matches('=').to_string());
+        .defined_name(src, sheet)
+        .map(|f| f.trim_start_matches('=').to_string());
     let src = named.as_deref().unwrap_or(src);
     // The sheet unquoted (`'Bob''s data'` is `Bob's data`), as other
     // references read it.
@@ -2355,5 +2354,33 @@ mod tests {
         wb.sheets[0].set_cell(1, 1, Cell::number(44000.0)); // before today
         wb.sheets[0].set_cell(2, 1, Cell::number(46000.0));
         assert_eq!(invalid_cells(&wb, 0, Some(CLOCK)), vec![(1, 1)]);
+    }
+
+    #[test]
+    fn a_sheet_scoped_name_shadows_a_global_one_in_a_list_source() {
+        let mut wb = book();
+        let mut other = Sheet::default();
+        other.name = "Lists".into();
+        other.set_cell(0, 0, Cell::text("Red"));
+        other.set_cell(1, 0, Cell::text("Blue"));
+        wb.sheets.push(other);
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Choices".into(),
+            scope: None,
+            formula: "Lists!$A$1:$A$1".into(),
+        });
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Choices".into(),
+            scope: Some(0),
+            formula: "Lists!$A$2:$A$2".into(),
+        });
+        let mut dv = rule("list", "", "Choices", "");
+        dv.ranges = vec![(1, 1, 9, 1)];
+        wb.sheets[0].validations.push(dv);
+        assert!(
+            check(&mut wb, 1, 1, "Blue").is_none(),
+            "the sheet's own name wins"
+        );
+        assert!(check(&mut wb, 1, 1, "Red").is_some());
     }
 }
