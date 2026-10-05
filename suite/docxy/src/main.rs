@@ -9300,7 +9300,7 @@ impl Docxy {
                 cx,
             );
         }
-        let untouched = repeat_untouched(self.repeat);
+        let untouched = repeat_untouched(&self.repeat);
         match action {
             QatAction::Undo => {
                 self.with_editor(window, cx, |ed| {
@@ -9312,7 +9312,7 @@ impl Docxy {
             // nothing happens and the tab stays clean.
             QatAction::Redo => {
                 let ready = match self.edit_target_and_repeat() {
-                    (Some(ed), rec) => ed.can_redo() || repeat_ready(ed, *rec),
+                    (Some(ed), rec) => ed.can_redo() || repeat_ready(ed, &rec),
                     (None, _) => false,
                 };
                 if !ready {
@@ -15212,7 +15212,7 @@ impl Docxy {
         };
         QatState::Doc {
             can_redo: ed.can_redo(),
-            can_repeat: repeat_ready(ed, self.repeat),
+            can_repeat: repeat_ready(ed, &self.repeat),
         }
     }
 
@@ -17952,7 +17952,7 @@ impl Docxy {
         }
         // Undo, Redo and Repeat change the document but keep a current Repeat
         // record current (#618).
-        let untouched = repeat_untouched(self.repeat);
+        let untouched = repeat_untouched(&self.repeat);
         let history = (ctrl && matches!(key.as_str(), "z" | "y")) || (!ctrl && key == "f4");
         let (Some(ed), repeat) = self.edit_target_and_repeat() else {
             return;
@@ -17999,7 +17999,7 @@ impl Docxy {
                 // Non-breaking space (Ctrl+Shift+Space), a typesetting staple.
                 "space" if shift => {
                     noted = Some(Repeat::Typing);
-                    break_typing_unless_continuing(ed, *repeat);
+                    break_typing_unless_continuing(ed, repeat);
                     yes(|| ed.insert_str("\u{00A0}"))
                 }
                 // Word- and document-wise motion (Ctrl+←/→, Ctrl+Home/End).
@@ -18026,7 +18026,7 @@ impl Docxy {
                 "down" => no(|| move_vert(ed, true)),
                 _ => match ev.keystroke.key_char.as_deref() {
                     Some(c) if !c.is_empty() && !c.chars().next().unwrap().is_control() => {
-                        break_typing_unless_continuing(ed, *repeat);
+                        break_typing_unless_continuing(ed, repeat);
                         ed.insert_str(c);
                         noted = Some(Repeat::Typing);
                         true
@@ -20215,12 +20215,17 @@ impl Repeat {
 /// menus) breaks the group first, so no edit can hide inside the record's
 /// step. Undo and Redo push no step; the app keeps a current record current
 /// across them (`Docxy::keep_repeat_current`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct RepeatRecord {
     what: Repeat,
     serial: u64,
     counter: u64,
     generation: u64,
+    /// Where the editor's caret was when it was taken, with no selection:
+    /// typing continues the run only from there, so a caret move by any
+    /// path ends it whether or not that path breaks the undo group.
+    caret: Caret,
+    selecting: bool,
 }
 
 impl RepeatRecord {
@@ -20231,6 +20236,8 @@ impl RepeatRecord {
             serial: ed.undo_serial()?,
             counter: docxcore::editor::undo_serial_counter(),
             generation: edit_generation(),
+            caret: ed.caret.clone(),
+            selecting: ed.has_selection(),
         })
     }
 }
@@ -20239,8 +20246,10 @@ thread_local! {
     /// Bumped by every change that marks a tab dirty
     /// ([`DocTab::set_dirty`]), whether or not it pushed an undo step: what
     /// makes a Repeat record stale after an edit outside the undo history
-    /// (#618). Per thread, like docxcore's serial counter: the app edits on
-    /// one thread.
+    /// (#618). A Project tab bumps it on every interaction that syncs its
+    /// dirty state, navigation included: the Project editor has no change
+    /// counter, and a stale record fails safe (Can't Repeat). Per thread,
+    /// like docxcore's serial counter: the app edits on one thread.
     static EDIT_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -20254,8 +20263,8 @@ fn bump_edit_generation() {
 
 /// Whether no undo step was pushed and no tab changed since `rec` was taken:
 /// the record is current, though its step may be undone for now.
-fn repeat_untouched(rec: Option<RepeatRecord>) -> bool {
-    rec.is_some_and(|r| {
+fn repeat_untouched(rec: &Option<RepeatRecord>) -> bool {
+    rec.as_ref().is_some_and(|r| {
         docxcore::editor::undo_serial_counter() == r.counter && edit_generation() == r.generation
     })
 }
@@ -20273,16 +20282,23 @@ fn keep_current(rec: &mut Option<RepeatRecord>, keep: bool) {
 /// typing is still ready). After an edit that pushed no step (Page Color, an
 /// edit in another tab) the open run is over, so the character starts a step
 /// and a record of its own instead of reviving a stale one (#618).
-fn break_typing_unless_continuing(ed: &mut Editor, rec: Option<RepeatRecord>) {
-    let continuing = rec.is_some_and(|r| matches!(r.what, Repeat::Typing)) && repeat_ready(ed, rec);
+fn break_typing_unless_continuing(ed: &mut Editor, rec: &Option<RepeatRecord>) {
+    // The caret must be exactly where the last character left it: a move by
+    // any path (arrows, Up/Down, clicks, a future one) ends the run.
+    let continuing = rec.as_ref().is_some_and(|r| {
+        matches!(r.what, Repeat::Typing)
+            && !r.selecting
+            && !ed.has_selection()
+            && ed.caret == r.caret
+    }) && repeat_ready(ed, &rec);
     if !continuing {
         ed.break_undo_group();
     }
 }
 
 /// Whether Ctrl+Y / F4 would repeat on `ed` now (nothing to redo).
-fn repeat_ready(ed: &Editor, rec: Option<RepeatRecord>) -> bool {
-    rec.is_some_and(|r| {
+fn repeat_ready(ed: &Editor, rec: &Option<RepeatRecord>) -> bool {
+    rec.as_ref().is_some_and(|r| {
         ed.undo_serial() == Some(r.serial)
             && docxcore::editor::undo_serial_counter() == r.counter
             && edit_generation() == r.generation
@@ -20296,7 +20312,7 @@ fn redo_or_repeat(ed: &mut Editor, rec: &mut Option<RepeatRecord>) -> bool {
     if ed.can_redo() {
         return ed.redo();
     }
-    let Some(r) = rec.filter(|_| repeat_ready(ed, *rec)) else {
+    let Some(r) = rec.clone().filter(|_| repeat_ready(ed, &rec)) else {
         return false;
     };
     let since = docxcore::editor::undo_serial_counter();
@@ -20318,6 +20334,8 @@ fn redo_or_repeat(ed: &mut Editor, rec: &mut Option<RepeatRecord>) -> bool {
     if let Some(name) = r.what.step_name() {
         ed.name_command(since, name);
     }
+    // A repeat is a closed step: typing after it starts a step of its own.
+    ed.break_undo_group();
     *rec = RepeatRecord::now(r.what, ed);
     true
 }
@@ -20555,9 +20573,9 @@ mod repeat_tests {
         let mut rec = None;
         select(&mut ed, 0, 4, 9);
         key(&mut ed, &mut rec, "b", true, false);
-        assert!(repeat_ready(&ed, rec));
+        assert!(repeat_ready(&ed, &rec));
         ed.set_space_after(Some(240));
-        assert!(!repeat_ready(&ed, rec));
+        assert!(!repeat_ready(&ed, &rec));
         select(&mut ed, 0, 10, 15);
         let before = ed.doc.clone();
         assert!(!redo_or_repeat(&mut ed, &mut rec));
@@ -20567,7 +20585,7 @@ mod repeat_tests {
         let mut other_rec = None;
         select(&mut other, 0, 4, 9);
         key(&mut other, &mut other_rec, "b", true, false);
-        assert!(!repeat_ready(&ed, other_rec));
+        assert!(!repeat_ready(&ed, &other_rec));
         assert!(!redo_or_repeat(&mut ed, &mut other_rec));
         assert_eq!(ed.doc, before);
     }
@@ -20581,11 +20599,11 @@ mod repeat_tests {
         let mut rec = None;
         ed.set_caret(Caret::at(vec![2], "Third one.".len()));
         type_text(&mut ed, &mut rec, "abc");
-        assert!(repeat_ready(&ed, rec));
+        assert!(repeat_ready(&ed, &rec));
         insert_symbol_into(&mut ed, "\u{00A9}");
         assert_eq!(text(&ed, 2), "Third one.abc\u{00A9}");
         assert_eq!(ed.undo_names()[..2], ["Insert Symbol", "Typing \"abc\""]);
-        assert!(!repeat_ready(&ed, rec));
+        assert!(!repeat_ready(&ed, &rec));
         assert!(!redo_or_repeat(&mut ed, &mut rec));
         assert_eq!(text(&ed, 2), "Third one.abc\u{00A9}");
         // Typing after it starts its own step again.
@@ -20645,11 +20663,15 @@ mod repeat_tests {
         let mut rec = None;
         select(&mut ed, 0, 4, 9);
         key(&mut ed, &mut rec, "b", true, false);
-        assert!(repeat_ready(&ed, rec));
+        assert!(repeat_ready(&ed, &rec));
         let mut header = Editor::new(docxcore::markdown::from_markdown("Header\n"));
         insert_symbol_into(&mut header, "\u{00A9}");
-        assert_eq!(ed.undo_serial(), rec.map(|r| r.serial), "body untouched");
-        assert!(!repeat_ready(&ed, rec));
+        assert_eq!(
+            ed.undo_serial(),
+            rec.as_ref().map(|r| r.serial),
+            "body untouched"
+        );
+        assert!(!repeat_ready(&ed, &rec));
         select(&mut ed, 0, 10, 15);
         let before = ed.doc.clone();
         assert!(!redo_or_repeat(&mut ed, &mut rec));
@@ -20672,7 +20694,7 @@ mod repeat_tests {
             key(ed, &mut rec, "a", true, false);
             key(ed, &mut rec, "b", true, false);
             assert_eq!(ed.undo_names()[0], "Bold");
-            assert!(repeat_ready(ed, rec));
+            assert!(repeat_ready(ed, &rec));
         }
         design_tab::design_apply(&mut tab, design_tab::DesignAct::PageColor(Some(0xFFEEDD)))
             .unwrap();
@@ -20680,7 +20702,7 @@ mod repeat_tests {
         let Surface::Doc(ed) = &mut tab.surface else {
             unreachable!()
         };
-        assert!(!repeat_ready(ed, rec));
+        assert!(!repeat_ready(ed, &rec));
         assert!(!redo_or_repeat(ed, &mut rec));
     }
 
@@ -20697,13 +20719,13 @@ mod repeat_tests {
             |ed: &mut Editor,
              rec: &mut Option<RepeatRecord>,
              f: &dyn Fn(&mut Editor, &mut Option<RepeatRecord>) -> bool| {
-                let untouched = repeat_untouched(*rec);
+                let untouched = repeat_untouched(rec);
                 assert!(f(ed, rec));
                 bump_edit_generation();
                 keep_current(rec, untouched);
             };
         history(&mut ed, &mut rec, &|ed, _| ed.undo());
-        assert!(!repeat_ready(&ed, rec), "its step is undone");
+        assert!(!repeat_ready(&ed, &rec), "its step is undone");
         history(&mut ed, &mut rec, &redo_or_repeat);
         assert_eq!(ed.undo_names(), ["Bold"], "that was the redo");
         select(&mut ed, 0, 10, 15);
@@ -20713,7 +20735,7 @@ mod repeat_tests {
         // An edit the handler did not make is not kept current.
         bump_edit_generation();
         keep_current(&mut rec, false);
-        assert!(!repeat_ready(&ed, rec));
+        assert!(!repeat_ready(&ed, &rec));
     }
 
     /// No Spacing edits through four editor calls: one `Style` step, one
@@ -20761,7 +20783,7 @@ mod repeat_tests {
         // `on_key`'s typing path: break unless continuing, insert, record.
         let press = |ed: &mut Editor, rec: &mut Option<RepeatRecord>, c: &str| {
             let since = docxcore::editor::undo_serial_counter();
-            break_typing_unless_continuing(ed, *rec);
+            break_typing_unless_continuing(ed, rec);
             ed.insert_str(c);
             note_edit(ed, rec, since, Repeat::Typing);
             bump_edit_generation(); // mark_dirty
@@ -20772,7 +20794,7 @@ mod repeat_tests {
         }
         assert_eq!(ed.undo_names(), ["Typing \"abc\""], "one run");
         bump_edit_generation(); // e.g. Page Color
-        assert!(!repeat_ready(&ed, rec));
+        assert!(!repeat_ready(&ed, &rec));
         press(&mut ed, &mut rec, "d");
         assert_eq!(ed.undo_names(), ["Typing \"d\"", "Typing \"abc\""]);
         assert!(redo_or_repeat(&mut ed, &mut rec));
@@ -20807,6 +20829,84 @@ mod repeat_tests {
         assert_eq!(text(&ed, 1), "xy paragraph here.");
         assert!(ed.undo());
         assert_eq!(ed.doc, before, "one undo removes the repeat whole");
+    }
+
+    /// Typing after a typing repeat starts a step of its own: the repeat is
+    /// closed, so the next F4 repeats `d`, not `abcd`.
+    #[test]
+    fn typing_after_a_typing_repeat_is_its_own_step_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        let press = |ed: &mut Editor, rec: &mut Option<RepeatRecord>, c: &str| {
+            let since = docxcore::editor::undo_serial_counter();
+            break_typing_unless_continuing(ed, rec);
+            ed.insert_str(c);
+            note_edit(ed, rec, since, Repeat::Typing);
+            bump_edit_generation();
+            keep_current(rec, true);
+        };
+        type_text(&mut ed, &mut rec, "abc");
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        press(&mut ed, &mut rec, "d");
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 2), "Third one.abcabcdd");
+        assert_eq!(
+            ed.undo_names(),
+            [
+                "Typing \"d\"",
+                "Typing \"d\"",
+                "Typing \"abc\"",
+                "Typing \"abc\""
+            ]
+        );
+    }
+
+    /// Any caret move ends the typing run, by whatever path: a direct caret
+    /// assignment, as `move_vert` makes, does not reset docxcore's `last`,
+    /// so the record's caret is what ends it.
+    #[test]
+    fn a_caret_move_ends_the_typing_run_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], "Third one.".len()));
+        let press = |ed: &mut Editor, rec: &mut Option<RepeatRecord>, c: &str| {
+            let since = docxcore::editor::undo_serial_counter();
+            break_typing_unless_continuing(ed, rec);
+            ed.insert_str(c);
+            note_edit(ed, rec, since, Repeat::Typing);
+            bump_edit_generation();
+            keep_current(rec, true);
+        };
+        for c in ["a", "b", "c"] {
+            press(&mut ed, &mut rec, c);
+        }
+        assert_eq!(
+            ed.undo_names(),
+            ["Typing \"abc\""],
+            "normal typing coalesces"
+        );
+        ed.caret = Caret::at(vec![1], 3); // a direct move, `last` untouched
+        press(&mut ed, &mut rec, "d");
+        assert_eq!(ed.undo_names(), ["Typing \"d\"", "Typing \"abc\""]);
+        assert!(redo_or_repeat(&mut ed, &mut rec));
+        assert_eq!(text(&ed, 1), "Secddond paragraph here.");
+        assert_eq!(text(&ed, 2), "Third one.abc");
+        // A selection ends it too.
+        ed.anchor = Some(Caret::at(vec![1], 0));
+        press(&mut ed, &mut rec, "e");
+        assert_eq!(ed.undo_names()[0], "Typing \"e\"");
+    }
+
+    #[test]
+    fn move_vert_ends_the_typing_run_618() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![0], 0));
+        type_text(&mut ed, &mut rec, "abc");
+        move_vert(&mut ed, true);
+        ed.insert_str("d");
+        assert_eq!(ed.undo_names(), ["Typing \"d\"", "Typing \"abc\""]);
     }
 
     #[test]
@@ -21719,6 +21819,7 @@ fn move_vert(ed: &mut Editor, down: bool) {
             let len = docxcore::editor::para_text_len(p);
             ed.caret = Caret::at(vec![j], col.min(len));
             ed.clear_selection();
+            ed.break_undo_group();
             return;
         }
     }
@@ -24098,7 +24199,7 @@ impl Docxy {
         // A document edit is its own undo step, named for the Undo drop-down
         // (#619) and kept for Repeat (#618) when it can be repeated.
         let since = docxcore::editor::undo_serial_counter();
-        let untouched = repeat_untouched(self.repeat);
+        let untouched = repeat_untouched(&self.repeat);
         if act_undo_name(act).is_some() {
             if let Some(ed) = self.edit_target() {
                 ed.break_undo_group();

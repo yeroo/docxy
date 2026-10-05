@@ -1019,8 +1019,9 @@ first, in the `delete-summary` dialog.
 - **the Undo drop-down** (#619), on the Quick Access Toolbar of a document
   tab: the undo steps' names, newest first (`Bold`, `Typing "two"`, `Enter`,
   `Typing "one"`), at most 100. Typing is named by its text (shortened to 30
-  characters with `…`), a command by its name; Backspace and Delete read
-  `Delete`, and any other edit with no name of its own reads `Edit`. The
+  characters with `…`), a command by its name; Backspace and Delete of single
+  characters read `Delete`; deleting a selection, joining paragraphs and any
+  other edit with no name of its own read `Edit`. The
   item at index `k` undoes `k + 1` steps, back to and including it; Redo
   then brings them back one at a time. With nothing to undo it lists one
   disabled `Can't Undo`. Two steps can share a name, so pick those with
