@@ -167,7 +167,15 @@ class Teardown(unittest.TestCase):
         if self.wrapper is not None and self.wrapper.poll() is None:
             self.wrapper.kill()
             self.wrapper.wait(timeout=5)
-        for pid in self._pids:
+        pids = set(self._pids)
+        for path in self.fake.glob('*.pid'):
+            try:
+                pids.add(int(path.read_text().strip()))
+            except (ValueError, OSError):
+                pass
+        for pid in pids:
+            if self._gone(pid):
+                continue
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -175,9 +183,9 @@ class Teardown(unittest.TestCase):
 
     def test_second_signal_during_teardown_still_stops_everything(self):
         wrapper = self._start(self._write_child('child.py', CHILD_STUBBORN))
-        self._pid('child.pid')
         self._pid('xvfb.pid')
         self._pid('wm.pid')
+        self._pid('child.pid')
         os.kill(wrapper.pid, signal.SIGINT)
         # child.term proves the wrapper is inside stop(child)'s 3 s wait.
         self._wait_for(lambda: (self.fake / 'child.term').exists(), 'child.term')
@@ -187,18 +195,18 @@ class Teardown(unittest.TestCase):
 
     def test_single_sigterm_stops_everything(self):
         wrapper = self._start(self._write_child('child.py', CHILD_STUBBORN))
-        self._pid('child.pid')
         self._pid('xvfb.pid')
         self._pid('wm.pid')
+        self._pid('child.pid')
         os.kill(wrapper.pid, signal.SIGTERM)
         self.assertEqual(wrapper.wait(timeout=20), 130)
         self._assert_all_gone()
 
     def test_returns_child_exit_code(self):
         wrapper = self._start(self._write_child('child.py', CHILD_EXIT7))
-        self._pid('child.pid')
         self._pid('xvfb.pid')
         self._pid('wm.pid')
+        self._pid('child.pid')
         self.assertEqual(wrapper.wait(timeout=20), 7)
         self._assert_all_gone()
 
