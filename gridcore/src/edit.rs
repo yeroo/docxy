@@ -14,6 +14,11 @@ use std::collections::BTreeMap;
 
 mod clip;
 pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
+mod dataform;
+pub use dataform::{
+    CANNOT_EXTEND, criterion_matches, delete_record, delete_splits_array, find_record,
+    is_formula_field, new_record_changes, record_matches,
+};
 mod consolidate;
 mod sort;
 mod subtotal;
@@ -487,7 +492,7 @@ pub fn sort_cuts_spill(wb: &Workbook, sheet: usize, r1: u32, r2: u32) -> bool {
 /// the `ref` it owns (one that starts at `at`). A CSE formula evaluated to
 /// one value (`SUM` over its block) has no extent, but save keeps that
 /// `ref`, and Excel fills the block from it.
-fn array_rect(cell: &Cell, at: (u32, u32)) -> Option<(u32, u32)> {
+pub(super) fn array_rect(cell: &Cell, at: (u32, u32)) -> Option<(u32, u32)> {
     if cell.spill.is_some() {
         return cell.spill;
     }
@@ -513,13 +518,14 @@ fn sort_span(s: &Sheet, r1: u32, r2: u32) -> Option<(u32, u32)> {
     (r2 > r1).then_some((r2, cols - 1))
 }
 
-/// An array anchor moved from cell `from` to cell `to` (a sort's row, or a
-/// left-to-right sort's column) takes its block along: its `ref`, when the
+/// An array anchor moved from cell `from` to cell `to` (a sort's row, a
+/// left-to-right sort's column, or a data form Delete's row) takes its
+/// block along: its `ref`, when the
 /// anchor owns it (starts there), is rewritten to its block ([`array_rect`])
 /// at the new cell. Left behind, it would name the old cells:
 /// the cached block of an anchor the engine can't evaluate would no longer
 /// count as its own, and a CSE block would save as its anchor alone.
-fn move_own_array_ref(cell: &mut Cell, from: (u32, u32), to: (u32, u32)) {
+pub(super) fn move_own_array_ref(cell: &mut Cell, from: (u32, u32), to: (u32, u32)) {
     let Some((h, w)) = array_rect(cell, from) else {
         return;
     };
@@ -927,7 +933,7 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
     // too (a list on another sheet). Only one the rename touches is
     // reprinted, so the loaded spelling stays otherwise.
     for sheet in &mut wb.sheets {
-        for_each_rule_formula(sheet, |src| {
+        for_each_rule_formula(sheet, |_, src| {
             if let Some(updated) =
                 rewrite_if_changed(src, |e| rename_sheet_in_expr(e, &old, new_name))
             {
@@ -1422,9 +1428,11 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
             _ => false,
         };
         if deleted.iter().all(|&d| d) {
-            rewrite_workbook_formulas(wb, |e, site| {
-                crate::formula::delete_table_in_expr(e, &t.name, inside(site))
-            });
+            rewrite_workbook_formulas(
+                wb,
+                |_, _| true,
+                |e, site| crate::formula::delete_table_in_expr(e, &t.name, inside(site)),
+            );
             wb.tables.remove(i);
             wb.removed_tables.push(crate::sheet::RemovedTable {
                 table: t,
@@ -1432,15 +1440,19 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
             });
             continue;
         }
-        rewrite_workbook_formulas(wb, |e, site| {
-            crate::formula::delete_table_columns_in_expr(
-                e,
-                &t.name,
-                inside(site),
-                &t.columns,
-                &deleted,
-            )
-        });
+        rewrite_workbook_formulas(
+            wb,
+            |_, _| true,
+            |e, site| {
+                crate::formula::delete_table_columns_in_expr(
+                    e,
+                    &t.name,
+                    inside(site),
+                    &t.columns,
+                    &deleted,
+                )
+            },
+        );
         let kept = |j: usize| !deleted.get(j).copied().unwrap_or(false);
         let tm = &mut wb.tables[i];
         tm.columns = (t.columns.iter().enumerate())
@@ -1456,15 +1468,17 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
 }
 
 /// Every conditional-formatting and data-validation formula on `sheet`.
-fn for_each_rule_formula(sheet: &mut Sheet, mut f: impl FnMut(&mut String)) {
+fn for_each_rule_formula(sheet: &mut Sheet, mut f: impl FnMut(&[Area], &mut String)) {
     for cf in &mut sheet.cond_formats {
         for rule in &mut cf.rules {
-            rule.formulas_mut().into_iter().for_each(&mut f);
+            for src in rule.formulas_mut() {
+                f(&cf.ranges, src);
+            }
         }
     }
     for dv in &mut sheet.validations {
-        f(&mut dv.formula1);
-        f(&mut dv.formula2);
+        f(&dv.ranges, &mut dv.formula1);
+        f(&dv.ranges, &mut dv.formula2);
     }
 }
 
@@ -1778,13 +1792,17 @@ pub fn sync_table_headers(wb: &mut Workbook, sheet: usize, cells: &[(u32, u32)])
             }
             let t = wb.tables[ti].clone();
             let map = [(cur, name.clone())];
-            rewrite_workbook_formulas(wb, |e, (s, cell)| {
-                let inside = match (s, cell) {
-                    (Some(s), Some((r, c))) => t.contains(s, r, c),
-                    _ => false,
-                };
-                crate::formula::rename_table_columns_in_expr(e, &t.name, inside, &map)
-            });
+            rewrite_workbook_formulas(
+                wb,
+                |_, _| true,
+                |e, (s, cell)| {
+                    let inside = match (s, cell) {
+                        (Some(s), Some((r, c))) => t.contains(s, r, c),
+                        _ => false,
+                    };
+                    crate::formula::rename_table_columns_in_expr(e, &t.name, inside, &map)
+                },
+            );
             wb.tables[ti].columns[j] = name;
             renamed = true;
         }
@@ -1842,10 +1860,15 @@ type FormulaSite = (Option<usize>, Option<(u32, u32)>);
 
 /// Rewrite every formula a table edit can reach (a table or column rename, a
 /// conversion, a column delete through a table): cell
-/// formulas (array formulas included), defined names, and conditional-format
-/// and data-validation rules. A formula `f` leaves unchanged keeps its text
+/// formulas (array formulas included), defined names, and the
+/// conditional-format and data-validation rules `rules` takes (given the
+/// rule's sheet and ranges). A formula `f` leaves unchanged keeps its text
 /// exactly; one held verbatim (a shared or data-table formula) is left alone.
-fn rewrite_workbook_formulas(wb: &mut Workbook, f: impl Fn(&Expr, FormulaSite) -> Expr) {
+fn rewrite_workbook_formulas(
+    wb: &mut Workbook,
+    rules: impl Fn(usize, &[Area]) -> bool,
+    f: impl Fn(&Expr, FormulaSite) -> Expr,
+) {
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
         for (&(r, c), cell) in sheet.cells.iter_mut() {
             let Some(src) = &cell.formula else {
@@ -1858,7 +1881,10 @@ fn rewrite_workbook_formulas(wb: &mut Workbook, f: impl Fn(&Expr, FormulaSite) -
                 cell.formula = Some(updated);
             }
         }
-        for_each_rule_formula(sheet, |src| {
+        for_each_rule_formula(sheet, |ranges, src| {
+            if !rules(s, ranges) {
+                return;
+            }
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, (Some(s), None))) {
                 *src = updated;
             }
@@ -1909,7 +1935,11 @@ pub fn rename_table(wb: &mut Workbook, old: &str, new: &str) -> Result<(), Strin
         return Ok(());
     }
     let map = [(cur.clone(), new.to_string())];
-    rewrite_workbook_formulas(wb, |e, _| crate::formula::rename_tables_in_expr(e, &map));
+    rewrite_workbook_formulas(
+        wb,
+        |_, _| true,
+        |e, _| crate::formula::rename_tables_in_expr(e, &map),
+    );
     for piv in &mut wb.pivots {
         if let crate::pivot::PivotSource::Table(n) = &mut piv.source {
             if n.eq_ignore_ascii_case(&cur) {
@@ -2069,17 +2099,21 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
         sheet_name: &sheet_name,
         info: &info,
     };
-    rewrite_workbook_formulas(wb, |e, (s, cell)| {
-        let host = crate::formula::FormulaHost {
-            same_sheet: s == Some(t.sheet),
-            row: cell.map(|(r, _)| r),
-            inside: match (s, cell) {
-                (Some(s), Some((r, c))) => t.contains(s, r, c),
-                _ => false,
-            },
-        };
-        crate::formula::table_refs_to_cells_in_expr(e, &target, host)
-    });
+    rewrite_workbook_formulas(
+        wb,
+        |_, _| true,
+        |e, (s, cell)| {
+            let host = crate::formula::FormulaHost {
+                same_sheet: s == Some(t.sheet),
+                row: cell.map(|(r, _)| r),
+                inside: match (s, cell) {
+                    (Some(s), Some((r, c))) => t.contains(s, r, c),
+                    _ => false,
+                },
+            };
+            crate::formula::table_refs_to_cells_in_expr(e, &target, host)
+        },
+    );
     wb.tables.remove(idx);
     wb.removed_tables.push(crate::sheet::RemovedTable {
         table: t,

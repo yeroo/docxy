@@ -97,6 +97,20 @@ pub struct Engine {
     /// reused across edits; `None` whenever `formulas` changed since it was
     /// built — dropped together with `rev` by [`Engine::invalidate_rev`].
     covers: Option<HashMap<usize, CoverIndex>>,
+    /// The keys of the volatile formulas and of those with a spill reference,
+    /// a pure function of `formulas`. Built on first use, dropped together
+    /// with `rev` by [`Engine::invalidate_rev`].
+    flagged: Option<FlaggedKeys>,
+}
+
+/// The keys of the volatile formulas and of those with a spill reference
+/// ([`Engine::flagged`]), a pure function of `formulas`.
+#[derive(Default)]
+struct FlaggedKeys {
+    /// Formulas with `FormulaInfo::volatile`, sorted.
+    volatile: Vec<Key>,
+    /// Formulas with `FormulaInfo::spillref`, sorted.
+    spillref: Vec<Key>,
 }
 
 /// One sheet's spill anchors by the rows their extents cover
@@ -1041,12 +1055,12 @@ impl Engine {
     fn recalc_from_depth(&mut self, wb: &mut Workbook, changed: &[Key], depth: u32) {
         // Spill extents may have moved since indexing — refresh the dep
         // rects of every formula that reads one (`A1#`).
+        self.ensure_flagged();
         let with_spillrefs: Vec<Key> = self
-            .formulas
-            .iter()
-            .filter(|(_, i)| i.spillref)
-            .map(|(&k, _)| k)
-            .collect();
+            .flagged
+            .as_ref()
+            .map(|f| f.spillref.clone())
+            .unwrap_or_default();
         for k in with_spillrefs {
             let mut deps = Vec::new();
             if let Some(info) = self.formulas.get(&k) {
@@ -1055,7 +1069,7 @@ impl Engine {
             if let Some(info) = self.formulas.get_mut(&k) {
                 if info.deps != deps {
                     info.deps = deps;
-                    self.invalidate_rev();
+                    self.invalidate_edges();
                 }
             }
         }
@@ -1077,9 +1091,11 @@ impl Engine {
                 frontier.push_back(k);
             }
         }
-        for (&k, info) in &self.formulas {
-            if info.volatile && dirty.insert(k) {
-                frontier.push_back(k);
+        if let Some(f) = &self.flagged {
+            for &k in &f.volatile {
+                if dirty.insert(k) {
+                    frontier.push_back(k);
+                }
             }
         }
         for k in self.spill_blocked.iter().copied().collect::<Vec<_>>() {
@@ -1120,9 +1136,17 @@ impl Engine {
         self.evaluate(wb, dirty, depth);
     }
 
-    /// Drop the cached reverse edges and the cover index; call after any
-    /// change to `formulas`.
+    /// Drop the cached reverse edges, the cover index and the flag lists;
+    /// call after any change to `formulas`.
     fn invalidate_rev(&mut self) {
+        self.invalidate_edges();
+        self.flagged = None;
+    }
+
+    /// Drop the cached reverse edges and the cover index; call after a
+    /// change to a formula's `deps` only (the flag lists are a function of
+    /// `formulas`' membership, not of `deps`, so they stay valid).
+    fn invalidate_edges(&mut self) {
         self.rev = None;
         self.covers = None;
     }
@@ -1178,6 +1202,29 @@ impl Engine {
                 .map(|(s, rects)| (s, CoverIndex::new(rects)))
                 .collect(),
         );
+    }
+
+    /// The keys of the volatile formulas and of those with a spill reference,
+    /// a pure function of `formulas`; built on first use, dropped by
+    /// [`Engine::invalidate_rev`] together with `rev`.
+    fn ensure_flagged(&mut self) {
+        if self.flagged.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        tests::FLAG_BUILDS.with(|n| n.set(n.get() + 1));
+        let mut flagged = FlaggedKeys::default();
+        for (&k, info) in &self.formulas {
+            if info.volatile {
+                flagged.volatile.push(k);
+            }
+            if info.spillref {
+                flagged.spillref.push(k);
+            }
+        }
+        flagged.volatile.sort_unstable();
+        flagged.spillref.sort_unstable();
+        self.flagged = Some(flagged);
     }
 
     /// For each formula in `scope`, the deduped list of formulas *also in
@@ -2859,6 +2906,9 @@ mod tests {
         /// How many times [`Engine::ensure_covers`] has built the cover index
         /// on this thread.
         pub(super) static COVER_BUILDS: StdCell<usize> = const { StdCell::new(0) };
+        /// How many times [`Engine::ensure_flagged`] has built the flag lists
+        /// on this thread.
+        pub(super) static FLAG_BUILDS: StdCell<usize> = const { StdCell::new(0) };
         /// How many candidate rects [`CoverIndex::for_each_covering`] has
         /// visited on this thread — the walked axis' stab count.
         pub(super) static COVER_VISITS: StdCell<usize> = const { StdCell::new(0) };
@@ -4282,6 +4332,106 @@ mod tests {
         assert_eq!(REV_BUILDS.with(StdCell::get), 1);
         set(&mut eng, &mut wb, "H1", Cell::number(2.0));
         assert_eq!(REV_BUILDS.with(StdCell::get), 1);
+    }
+
+    #[test]
+    fn flag_cache_reused_across_data_edits() {
+        // #974: the volatile/spillref flag lists are cached like `rev` and the
+        // cover index, so plain data edits must not rebuild them — while the
+        // volatile still refreshes (the clock advance reaches TODAY()).
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::formula("TODAY()")),
+            ("B1", Cell::number(1.0)),
+            ("C1", Cell::formula("SUM(B1:B2)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.clock = Some(45_306.25);
+        eng.recalc_all(&mut wb);
+        set(&mut eng, &mut wb, "B1", Cell::number(2.0)); // warms the cache
+        FLAG_BUILDS.with(|n| n.set(0));
+        eng.clock = Some(45_400.5);
+        set(&mut eng, &mut wb, "B2", Cell::number(3.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(4.0));
+        assert_eq!(FLAG_BUILDS.with(StdCell::get), 0);
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(45_400.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(7.0));
+    }
+
+    #[test]
+    fn flag_cache_sees_volatile_added_by_edit() {
+        // A volatile typed after the cache was built must land in the lists:
+        // the next unrelated edit refreshes it on the advanced clock.
+        let mut wb = wb_one_sheet(&[("B1", Cell::number(1.0))]);
+        let mut eng = Engine::new(&wb);
+        eng.clock = Some(45_306.25);
+        eng.recalc_all(&mut wb);
+        set(&mut eng, &mut wb, "B1", Cell::number(2.0)); // warms the cache
+        set(&mut eng, &mut wb, "D1", Cell::formula("NOW()"));
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(45_306.25));
+        eng.clock = Some(45_400.5);
+        set(&mut eng, &mut wb, "B1", Cell::number(9.0));
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(45_400.5));
+    }
+
+    #[test]
+    fn flag_cache_drops_replaced_volatile() {
+        // Replacing a volatile with a non-volatile drops the cache, so the
+        // replacement's own recalc rebuilds it exactly once and the new
+        // formula is no longer seeded as volatile.
+        let mut wb = wb_one_sheet(&[("A1", Cell::formula("TODAY()")), ("B1", Cell::number(1.0))]);
+        let mut eng = Engine::new(&wb);
+        eng.clock = Some(45_306.25);
+        eng.recalc_all(&mut wb);
+        set(&mut eng, &mut wb, "B1", Cell::number(2.0)); // warms the cache
+        FLAG_BUILDS.with(|n| n.set(0));
+        set(&mut eng, &mut wb, "A1", Cell::formula("B1*2"));
+        // The removal dropped the cache, so this edit's walk rebuilt the lists.
+        assert_eq!(FLAG_BUILDS.with(StdCell::get), 1);
+        // The replacement is not seeded as volatile by the rebuilt lists.
+        assert!(!eng.flagged.as_ref().unwrap().volatile.contains(&(0, 0, 0)));
+        eng.clock = Some(45_400.5);
+        set(&mut eng, &mut wb, "B1", Cell::number(5.0));
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(10.0));
+        // A further data edit reuses the rebuilt lists: no second build.
+        set(&mut eng, &mut wb, "B1", Cell::number(6.0));
+        assert_eq!(FLAG_BUILDS.with(StdCell::get), 1);
+        FLAG_BUILDS.with(|n| n.set(0));
+        set(&mut eng, &mut wb, "B1", Cell::number(7.0));
+        assert_eq!(FLAG_BUILDS.with(StdCell::get), 0);
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(14.0));
+    }
+
+    #[test]
+    fn flag_cache_sees_spillref_added_by_edit() {
+        // An `A1#` reader typed after the cache was built must have its dep
+        // rects refreshed when the spill grows, like
+        // `spill_growth_updates_rows_of_spillref`.
+        let mut wb = wb_one_sheet(&[
+            ("A1", array_formula("SEQUENCE(B1)")),
+            ("B1", Cell::number(2.0)),
+            ("D1", Cell::number(1.0)),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        set(&mut eng, &mut wb, "D1", Cell::number(2.0)); // warms the cache
+        set(&mut eng, &mut wb, "C1", Cell::formula("ROWS(A1#)"));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(2.0));
+        // The inserted reader is in the cached list, and a plain data edit
+        // keeps it there: the value assertions below would still pass through
+        // rev[A1] if the list were stale, so this checks the list itself.
+        set(&mut eng, &mut wb, "D1", Cell::number(3.0));
+        assert!(eng.flagged.as_ref().unwrap().spillref.contains(&(0, 0, 2)));
+        // The growth edit moves the reader's dep rect, which drops rev/covers
+        // but not the flag lists.
+        FLAG_BUILDS.with(|n| n.set(0));
+        set(&mut eng, &mut wb, "B1", Cell::number(4.0)); // grows the spill
+        assert_eq!(FLAG_BUILDS.with(StdCell::get), 0);
+        assert_eq!(
+            eng.formulas[&(0, 0, 2)].deps,
+            vec![(0, 0, 0, 0, 0), (0, 0, 0, 3, 0)]
+        );
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(4.0));
+        assert_eq!(value_at(&wb, "A4"), CellValue::Number(4.0));
     }
 
     #[test]

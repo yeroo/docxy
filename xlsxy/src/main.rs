@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 mod backstage;
 mod control;
 mod datacmd;
+mod dataform;
 mod mcp;
 mod outlinedlg;
 mod ribbon;
@@ -1816,6 +1817,8 @@ enum ConfirmAction {
     TextToColumns(gridcore::edit::TtcSource, TextParse),
     /// Open or New over a modified workbook discards its changes (#882).
     Discard(Next),
+    /// The data form's Delete: the record it shows.
+    DataFormDelete,
 }
 
 /// What Yes to [`ConfirmAction::Discard`] goes on to do.
@@ -1892,6 +1895,8 @@ struct App {
     text_dialog: Option<textdlg::TextDialog>,
     /// Data ▸ Outline's open dialog: Subtotal, Settings, or Rows/Columns.
     outline_dialog: Option<outlinedlg::Dialog>,
+    /// Data ▸ Form…, while open: modal over everything.
+    data_form: Option<dataform::DataForm>,
     /// The text Save As type (index into [`SAVE_TYPES`]) the workbook was
     /// last saved as; Ctrl+S keeps writing it while the path has its extension.
     text_type: Option<usize>,
@@ -2047,6 +2052,7 @@ impl App {
             format_dialog: None,
             text_dialog: None,
             outline_dialog: None,
+            data_form: None,
             text_type: None,
             formula_view: false,
             light_theme: false,
@@ -4933,6 +4939,7 @@ impl App {
             ConvertToRange => self.convert_table_act(),
             Consolidate => self.open_consolidate(),
             Subtotal => self.subtotal(),
+            DataForm => self.data_form(),
             GroupOutline => self.group_outline(false),
             UngroupOutline => self.group_outline(true),
             ShowDetail => self.outline_detail(true),
@@ -5624,6 +5631,10 @@ impl App {
                     }
                     ConfirmAction::Discard(next) => {
                         self.discard_for(next);
+                        false
+                    }
+                    ConfirmAction::DataFormDelete => {
+                        self.data_form_delete();
                         false
                     }
                 }
@@ -6366,6 +6377,340 @@ impl App {
                 self.apply_group(axis, a, b, d.ungroup);
             }
         }
+    }
+
+    // --- Data ▸ Form ----------------------------------------------------------
+
+    /// Form…: Excel's data form over the list around the cursor, its first
+    /// row the fields' labels, on its first record (a blank new one when
+    /// the list has none yet).
+    fn data_form(&mut self) {
+        let (r, c) = self.cur;
+        let wb = &self.pkg.workbook;
+        let sh = &wb.sheets[self.sheet];
+        let Some((area, header)) = gridcore::edit::subtotal_region(sh, r, c) else {
+            self.status = Some("Data Form: put the cursor in a list".into());
+            return;
+        };
+        let labels = gridcore::edit::subtotal_columns(sh, area, true);
+        let mut d = dataform::DataForm::new(self.sheet, sh.name.clone(), area, labels);
+        let first = gridcore::edit::find_record(sh, area, area.0, true, &[]);
+        let rec = first.map_or(dataform::Rec::New, dataform::Rec::Row);
+        d.show(sh, &wb.styles, wb.date1904, rec);
+        if !header {
+            self.status = Some("Data Form: first row used as labels".into());
+        }
+        self.data_form = Some(d);
+        self.data_form_follow();
+    }
+
+    /// Close the data form because the workbook changed under it (an agent
+    /// edit, a sheet gone), with a Delete it was asking about.
+    fn close_data_form(&mut self) {
+        self.data_form = None;
+        if self
+            .confirm
+            .as_ref()
+            .is_some_and(|c| *c.action() == ConfirmAction::DataFormDelete)
+        {
+            self.confirm = None;
+        }
+        self.status = Some("Data Form closed: the workbook changed".into());
+    }
+
+    /// Whether the data form's sheet is still the one it opened on; when
+    /// not, the form is closed ([`Self::close_data_form`]).
+    fn data_form_sheet_ok(&mut self) -> bool {
+        let Some(d) = &self.data_form else {
+            return false;
+        };
+        let wb = &self.pkg.workbook;
+        if wb
+            .sheets
+            .get(d.sheet)
+            .is_some_and(|s| s.name == d.sheet_name)
+        {
+            return true;
+        }
+        self.close_data_form();
+        false
+    }
+
+    /// Read the shown record's fields again after the workbook changed in
+    /// place, keeping what the user has typed and not yet written.
+    fn data_form_refresh(&mut self) {
+        if !self.data_form_sheet_ok() {
+            return;
+        }
+        let Some(mut d) = self.data_form.take() else {
+            return;
+        };
+        let wb = &self.pkg.workbook;
+        d.refresh(&wb.sheets[d.sheet], &wb.styles, wb.date1904);
+        self.data_form = Some(d);
+    }
+
+    /// The form shows `rec`, read afresh from the sheet.
+    fn data_form_show(&mut self, rec: dataform::Rec) {
+        let Some(mut d) = self.data_form.take() else {
+            return;
+        };
+        let wb = &self.pkg.workbook;
+        d.show(&wb.sheets[d.sheet], &wb.styles, wb.date1904, rec);
+        self.data_form = Some(d);
+        self.data_form_follow();
+    }
+
+    /// The cursor follows the shown record, so the grid scrolls with it.
+    fn data_form_follow(&mut self) {
+        let Some(d) = &self.data_form else {
+            return;
+        };
+        if let dataform::Rec::Row(r) = d.rec {
+            let (_, c1, _, c2) = d.area;
+            self.cur = (r, self.cur.1.clamp(c1, c2));
+            self.anchor = None;
+            self.ensure_visible();
+        }
+    }
+
+    /// A key for the open data form. The form is modal over everything:
+    /// a Ctrl or Alt chord (Ctrl+Z, say) is neither typed into a field nor
+    /// passed to the grid; only AltGr, which arrives as Ctrl+Alt with the
+    /// character it makes (`@`, `€`), types.
+    fn data_form_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let altgr = ctrl && alt && matches!(key.code, KeyCode::Char(_));
+        if (ctrl || alt) && !altgr || !self.data_form_sheet_ok() {
+            return;
+        }
+        let Some(d) = self.data_form.as_mut() else {
+            return;
+        };
+        match d.key(key.code) {
+            dataform::Outcome::Pending => {}
+            dataform::Outcome::Close => {
+                if self.data_form_commit() {
+                    self.data_form = None;
+                }
+            }
+            dataform::Outcome::Step(forward) => self.data_form_step(forward),
+            dataform::Outcome::New => {
+                if self.data_form_commit() {
+                    self.data_form_show(dataform::Rec::New);
+                }
+            }
+            dataform::Outcome::Criteria => {
+                if self.data_form_commit() {
+                    if let Some(d) = self.data_form.as_mut() {
+                        d.show_criteria();
+                    }
+                }
+            }
+            dataform::Outcome::Form => {
+                let back = self.data_form.as_ref().map(|d| d.back);
+                if let Some(back) = back {
+                    self.data_form_show(back);
+                }
+            }
+            dataform::Outcome::Delete => self.data_form_ask_delete(),
+        }
+    }
+
+    /// Find Next (`forward`) or Find Prev: the shown record's changes are
+    /// written first, then the form moves to the next record meeting the
+    /// criteria (any record when there are none), stopping at the ends.
+    /// From the criteria the search starts at the record shown before them.
+    fn data_form_step(&mut self, forward: bool) {
+        use dataform::{Mode, Rec};
+        let Some(d) = &self.data_form else {
+            return;
+        };
+        let from_criteria = d.mode == Mode::Criteria;
+        if !from_criteria && !self.data_form_commit() {
+            return;
+        }
+        let Some(d) = &self.data_form else {
+            return;
+        };
+        let criteria = d.criteria();
+        let shown = if from_criteria { d.back } else { d.rec };
+        let (top, _, bottom, _) = d.area;
+        let from = match shown {
+            Rec::Row(r) => r,
+            // Searching from a new record starts at the top.
+            Rec::New if forward && from_criteria => top,
+            // Find Next from a new record stays on it.
+            Rec::New if forward => return,
+            // Find Prev from a new record goes to the last one.
+            Rec::New => bottom + 1,
+        };
+        let sh = &self.pkg.workbook.sheets[d.sheet];
+        match gridcore::edit::find_record(sh, d.area, from, forward, &criteria) {
+            Some(r) => self.data_form_show(Rec::Row(r)),
+            None => {
+                if from_criteria {
+                    self.data_form_show(shown);
+                }
+                if !criteria.is_empty() {
+                    self.status = Some("No matching record".into());
+                }
+            }
+        }
+    }
+
+    /// Write the shown record's changes: each changed field as typed entry
+    /// (a number stays a number, `=` starts a formula), all in one undo
+    /// step; a new record below the list, its computed fields filled down
+    /// ([`gridcore::edit::new_record_changes`]). False, with the status
+    /// saying why and nothing written, when refused: a protected sheet, a
+    /// formula that doesn't parse, an entry too long, part of an array, or
+    /// no room below the list.
+    fn data_form_commit(&mut self) -> bool {
+        use dataform::{Mode, Rec};
+        let Some(d) = self.data_form.clone() else {
+            return true;
+        };
+        let changes = d.changes();
+        if d.mode == Mode::Criteria || changes.is_empty() {
+            return true;
+        }
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return false;
+        }
+        let (top, _, bottom, _) = d.area;
+        // A field is read under its cell's format; a new record's, under the
+        // format of the field above it (its column's): a `0%` column takes
+        // `15` as 15%, a Text column keeps `007` as text.
+        let (row, style_row) = match d.rec {
+            Rec::Row(r) => (r, Some(r)),
+            Rec::New => (bottom + 1, (bottom > top).then_some(bottom)),
+        };
+        let ctx = self.typed_ctx();
+        let mut cells = Vec::new();
+        for (c, text) in changes {
+            let wb = &self.pkg.workbook;
+            let base = style_row
+                .and_then(|r| wb.sheets[d.sheet].cell(r, c))
+                .map_or(0, |cell| cell.style);
+            let formula = gridcore::entry::typed_formula_styled(wb, base, &text);
+            let built = match formula.map(Engine::validate) {
+                Some(Err(e)) => Err(format!("formula error: {e}")),
+                _ => gridcore::entry::entry_cell_styled(&mut self.pkg.workbook, base, &text, &ctx)
+                    .map_err(|e| e.to_string()),
+            };
+            match built {
+                Ok(cell) => cells.push((c, cell)),
+                Err(e) => {
+                    self.status = Some(e);
+                    if let Some(f) = self.data_form.as_mut() {
+                        f.focus_col(c);
+                    }
+                    return false;
+                }
+            }
+        }
+        match d.rec {
+            Rec::Row(r) => {
+                let cells = cells.into_iter().map(|(c, cell)| (r, c, cell)).collect();
+                if !self.apply_on(d.sheet, cells) {
+                    return false;
+                }
+                self.data_form_show(Rec::Row(r));
+            }
+            Rec::New => {
+                let sh = &self.pkg.workbook.sheets[d.sheet];
+                let cells = match gridcore::edit::new_record_changes(sh, d.area, cells) {
+                    Ok(cells) => cells,
+                    Err(e) => {
+                        self.status = Some(e.to_string());
+                        return false;
+                    }
+                };
+                if cells.is_empty() {
+                    return true;
+                }
+                if !self.apply_on(d.sheet, cells) {
+                    return false;
+                }
+                if let Some(f) = self.data_form.as_mut() {
+                    f.area.2 = row;
+                }
+                self.data_form_show(Rec::Row(row));
+            }
+        }
+        true
+    }
+
+    /// Delete: ask first (No is the default). A new record has nothing to
+    /// delete: its fields are cleared.
+    fn data_form_ask_delete(&mut self) {
+        let Some(d) = self.data_form.as_mut() else {
+            return;
+        };
+        match (d.mode, d.rec) {
+            (dataform::Mode::Criteria, _) => {}
+            (_, dataform::Rec::New) => d.restore(),
+            (_, dataform::Rec::Row(_)) if self.protected() => {
+                self.status =
+                    Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            }
+            (_, dataform::Rec::Row(_)) => {
+                self.confirm = Some(
+                    backstage::Confirm::new(
+                        "Displayed record will be permanently deleted",
+                        ConfirmAction::DataFormDelete,
+                        Color::Green,
+                    )
+                    .default_no(),
+                );
+            }
+        }
+    }
+
+    /// Yes to Delete: the shown record goes and the records below it move
+    /// up ([`gridcore::edit::delete_record`]), as one undo step. Refused,
+    /// changing nothing, when it would cut an array: one with cells in the
+    /// rows that move that doesn't go whole
+    /// ([`gridcore::edit::delete_splits_array`]).
+    /// The form then shows the record that took its place (the one before,
+    /// when it was the last) and closes when none is left.
+    fn data_form_delete(&mut self) {
+        if !self.data_form_sheet_ok() {
+            return;
+        }
+        let Some(d) = self.data_form.clone() else {
+            return;
+        };
+        let dataform::Rec::Row(row) = d.rec else {
+            return;
+        };
+        let (top, _, bottom, _) = d.area;
+        let sh = &self.pkg.workbook.sheets[d.sheet];
+        if gridcore::edit::delete_splits_array(sh, d.area, row) {
+            self.status = Some(PART_OF_ARRAY.to_string());
+            return;
+        }
+        let done = self.try_outline_edit(|wb| {
+            gridcore::edit::delete_record(wb, d.sheet, d.area, row);
+            Ok("Record deleted".into())
+        });
+        if done.is_err() {
+            return;
+        }
+        let bottom = bottom - 1;
+        if bottom == top {
+            self.data_form = None;
+            self.status = Some("Record deleted — the list has no records left".into());
+            return;
+        }
+        if let Some(f) = self.data_form.as_mut() {
+            f.area.2 = bottom;
+        }
+        self.data_form_show(dataform::Rec::Row(row.min(bottom)));
     }
 
     /// A click on an outline control: a level button (row levels left of the
@@ -7990,6 +8335,9 @@ fn draw(app: &mut App, f: &mut Frame) {
     if let Some(d) = &app.outline_dialog {
         d.draw(f, grid);
     }
+    if let Some(d) = &app.data_form {
+        d.draw(f, grid);
+    }
 
     // --- sheet picker -----------------------------------------------------------
     if let Some(sel) = app.sheet_picker {
@@ -8900,6 +9248,15 @@ fn run_control(
     if app.status.is_none() && !app.circle_warning_pending {
         app.status = before;
     }
+    // The data form's record, list or sheet may have moved under it: it
+    // closes. An edit that leaves the cells in place only refreshes it.
+    if result.is_ok() && control::mutates(verb) && app.data_form.is_some() {
+        if control::keeps_cells_in_place(verb) {
+            app.data_form_refresh();
+        } else {
+            app.close_data_form();
+        }
+    }
     app.flush_circle_warning();
     result
 }
@@ -8959,6 +9316,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         || app.format_dialog.is_some()
         || app.text_dialog.is_some()
         || app.outline_dialog.is_some()
+        || app.data_form.is_some()
         || app.sheet_picker.is_some()
         || app.dv_picker.is_some()
         || app.filter_picker.is_some();
@@ -8991,6 +9349,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
     if app.outline_dialog.is_some() {
         app.outline_dialog_key(key.code);
+        return false;
+    }
+    if app.data_form.is_some() {
+        app.data_form_key(key);
         return false;
     }
 
@@ -9382,7 +9744,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
     }
     // An outline dialog is modal: a click under it (a sheet tab, a ribbon
     // command) must not change what its OK acts on.
-    if app.outline_dialog.is_some() {
+    if app.outline_dialog.is_some() || app.data_form.is_some() {
         return false;
     }
     // The welcome screen owns the whole terminal; handle its clicks here so
@@ -17402,6 +17764,822 @@ mod tests {
         assert_eq!(bs.option_int("edit_fixed_decimal_places"), Some(3));
         assert_eq!(bs.option_choice("edit_move_direction"), Some(3));
         assert_eq!(bs.option_check("edit_in_cell"), Some(false));
+    }
+    // --- Data ▸ Form (#695) ---------------------------------------------------
+
+    /// Name/Qty/Total over A1:C4 (Total = Qty*2), cursor on A2.
+    fn data_form_app() -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        for (c, h) in ["Name", "Qty", "Total"].iter().enumerate() {
+            put(&mut app, 0, c as u32, h);
+        }
+        for (i, (n, q)) in [("Ann", "5"), ("Bob", "12"), ("Cara", "100")]
+            .iter()
+            .enumerate()
+        {
+            let r = i as u32 + 1;
+            put(&mut app, r, 0, n);
+            put(&mut app, r, 1, q);
+            put(&mut app, r, 2, &format!("=B{}*2", r + 1));
+        }
+        app.cur = (1, 0);
+        app.anchor = None;
+        app
+    }
+
+    fn form_key(app: &mut App, code: KeyCode) {
+        app.data_form_key(KeyEvent::from(code));
+    }
+
+    fn form_keys(app: &mut App, codes: &[KeyCode]) {
+        for &code in codes {
+            form_key(app, code);
+        }
+    }
+
+    fn form_type(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            form_key(app, KeyCode::Char(ch));
+        }
+    }
+
+    /// Clear the focused field (the caret sits at its end).
+    fn form_clear(app: &mut App) {
+        for _ in 0..20 {
+            form_key(app, KeyCode::Backspace);
+        }
+    }
+
+    fn form(app: &App) -> &dataform::DataForm {
+        app.data_form.as_ref().expect("the data form is open")
+    }
+
+    fn form_rec(app: &App) -> dataform::Rec {
+        form(app).rec
+    }
+
+    /// Tab to button `b`.
+    fn form_button(app: &mut App, b: dataform::Button) {
+        for _ in 0..20 {
+            if form(app).focused_button() == Some(b) {
+                return;
+            }
+            form_key(app, KeyCode::Tab);
+        }
+        panic!("no {b:?} button");
+    }
+
+    #[test]
+    fn data_form_opens_on_the_first_record() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = data_form_app();
+        app.cur = (2, 1);
+        app.ribbon_act(ribbon::Act::DataForm);
+        let d = form(&app);
+        assert_eq!(d.rec, dataform::Rec::Row(1));
+        assert_eq!(d.area, (0, 0, 3, 2));
+        let labels: Vec<&str> = d.fields.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(labels, ["Name", "Qty", "Total"]);
+        assert_eq!(d.fields[0].text, "Ann");
+        assert_eq!(d.position(), "1 of 3");
+        assert_eq!(app.cur, (1, 1), "the cursor follows the record");
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("Data Form — Sheet1"));
+        assert!(screen.contains("1 of 3"));
+        assert!(screen.contains("[ Find Next ]"));
+    }
+
+    #[test]
+    fn data_form_needs_a_list() {
+        let mut app = data_form_app();
+        app.cur = (20, 10);
+        app.ribbon_act(ribbon::Act::DataForm);
+        assert!(app.data_form.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Data Form: put the cursor in a list")
+        );
+    }
+
+    #[test]
+    fn data_form_steps_and_stops_at_the_ends() {
+        use dataform::Rec::Row;
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(
+            (form_rec(&app), form(&app).position()),
+            (Row(2), "2 of 3".into())
+        );
+        form_key(&mut app, KeyCode::PageDown);
+        assert_eq!(form_rec(&app), Row(3));
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(form_rec(&app), Row(3), "no wrap past the last record");
+        assert_eq!(form(&app).fields[0].text, "Cara");
+        form_key(&mut app, KeyCode::Up);
+        form_key(&mut app, KeyCode::PageUp);
+        assert_eq!(form_rec(&app), Row(1));
+        form_key(&mut app, KeyCode::Up);
+        assert_eq!(form_rec(&app), Row(1), "no wrap past the first record");
+        // The buttons step too.
+        form_button(&mut app, dataform::Button::FindNext);
+        form_key(&mut app, KeyCode::Enter);
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(form_rec(&app), Row(3));
+        form_key(&mut app, KeyCode::BackTab); // Find Prev
+        form_key(&mut app, KeyCode::Char(' '));
+        assert_eq!(form_rec(&app), Row(2));
+        assert_eq!(app.cur.0, 2);
+    }
+
+    #[test]
+    fn data_form_edit_writes_typed_entries_as_one_undo_step() {
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_clear(&mut app);
+        form_type(&mut app, "Zed");
+        form_key(&mut app, KeyCode::Tab);
+        form_clear(&mut app);
+        form_type(&mut app, "7");
+        let undo_len = app.undo.len();
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(form_rec(&app), dataform::Rec::Row(2));
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("Zed".into()));
+        assert_eq!(
+            value_at(&app, 1, 1),
+            CellValue::Number(7.0),
+            "a number stays a number"
+        );
+        assert_eq!(value_at(&app, 1, 2), CellValue::Number(14.0));
+        assert_eq!(app.undo.len(), undo_len + 1, "one undo step");
+        // A formula typed into a constant field is a formula.
+        form_key(&mut app, KeyCode::Up); // Qty keeps the focus
+        form_clear(&mut app);
+        form_type(&mut app, "=1+1");
+        form_key(&mut app, KeyCode::Enter); // commit and move on
+        assert_eq!(form_rec(&app), dataform::Rec::Row(2));
+        let b2 = app.sheet().cell(1, 1).unwrap();
+        assert_eq!(
+            (b2.formula.as_deref(), &b2.value),
+            (Some("1+1"), &CellValue::Number(2.0))
+        );
+        app.undo();
+        app.undo();
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("Ann".into()));
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(5.0));
+        // A formula that doesn't parse is refused and the form stays put.
+        app.data_form = None;
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_key(&mut app, KeyCode::Tab);
+        form_clear(&mut app);
+        form_type(&mut app, "=1+");
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(form_rec(&app), dataform::Rec::Row(1));
+        assert!(app.status.as_deref().unwrap().starts_with("formula error"));
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(5.0));
+    }
+
+    #[test]
+    fn data_form_restore_discards_the_records_changes() {
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_type(&mut app, "x");
+        assert!(form(&app).dirty());
+        form_button(&mut app, dataform::Button::Restore);
+        form_key(&mut app, KeyCode::Enter);
+        assert!(!form(&app).dirty());
+        assert_eq!(form(&app).fields[0].text, "Ann");
+        let undo_len = app.undo.len();
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(app.undo.len(), undo_len, "nothing written");
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("Ann".into()));
+    }
+
+    #[test]
+    fn data_form_formula_field_is_read_only() {
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        let total = &form(&app).fields[2];
+        assert!(total.formula);
+        assert_eq!(total.text, "10", "shown as its value");
+        // Name, Qty, then the buttons: Total is never focused.
+        form_keys(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        form_type(&mut app, "99");
+        assert!(form(&app).changes().is_empty());
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.sheet().cell(1, 2).unwrap().formula.as_deref(),
+            Some("B2*2")
+        );
+    }
+
+    #[test]
+    fn data_form_new_appends_and_fills_formula_columns() {
+        use dataform::Rec;
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        let undo_len = app.undo.len();
+        // New with nothing typed writes nothing.
+        form_button(&mut app, dataform::Button::New);
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(form_rec(&app), Rec::New);
+        assert_eq!(form(&app).position(), "New Record");
+        form_key(&mut app, KeyCode::Esc);
+        assert!(app.data_form.is_none());
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(app.sheet().cell(4, 0).is_none());
+
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_button(&mut app, dataform::Button::New);
+        form_key(&mut app, KeyCode::Enter);
+        form_type(&mut app, "Dan");
+        form_key(&mut app, KeyCode::Tab);
+        form_type(&mut app, "3");
+        form_key(&mut app, KeyCode::Enter); // adds it, then a blank new record
+        assert_eq!(value_at(&app, 4, 0), CellValue::Text("Dan".into()));
+        assert_eq!(value_at(&app, 4, 1), CellValue::Number(3.0));
+        let total = app.sheet().cell(4, 2).unwrap();
+        assert_eq!(total.formula.as_deref(), Some("B5*2"));
+        assert_eq!(total.value, CellValue::Number(6.0));
+        assert_eq!(form(&app).area, (0, 0, 4, 2));
+        assert_eq!(form_rec(&app), Rec::New);
+        assert_eq!(app.undo.len(), undo_len + 1, "one undo step");
+        // Find Prev from the new record: the last record, now 4 of 4.
+        form_key(&mut app, KeyCode::Up);
+        assert_eq!(
+            (form_rec(&app), form(&app).position()),
+            (Rec::Row(4), "4 of 4".into())
+        );
+        app.data_form = None;
+        app.undo();
+        assert!(app.sheet().cell(4, 0).is_none() && app.sheet().cell(4, 2).is_none());
+    }
+
+    #[test]
+    fn data_form_new_never_merges_the_block_below() {
+        let mut app = data_form_app();
+        put(&mut app, 5, 0, "below");
+        app.ribbon_act(ribbon::Act::DataForm);
+        assert_eq!(form(&app).area, (0, 0, 3, 2));
+        form_button(&mut app, dataform::Button::New);
+        form_key(&mut app, KeyCode::Enter);
+        form_type(&mut app, "Dan");
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(value_at(&app, 4, 0), CellValue::Text("Dan".into()));
+        assert_eq!(form(&app).area, (0, 0, 4, 2), "row 6 is not taken in");
+        let undo_len = app.undo.len();
+        form_type(&mut app, "Eve");
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some(gridcore::edit::CANNOT_EXTEND));
+        assert_eq!(app.undo.len(), undo_len, "nothing written");
+        assert_eq!(value_at(&app, 5, 0), CellValue::Text("below".into()));
+        assert!(app.sheet().cell(5, 2).is_none());
+        assert_eq!(
+            form_rec(&app),
+            dataform::Rec::New,
+            "the form keeps the typing"
+        );
+    }
+
+    #[test]
+    fn data_form_delete_asks_then_shifts_the_list_up() {
+        use dataform::Rec;
+        let mut app = data_form_app();
+        put(&mut app, 2, 4, "note");
+        put(&mut app, 9, 6, "=B4");
+        put(&mut app, 10, 6, "=B2");
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_button(&mut app, dataform::Button::Delete);
+        form_key(&mut app, KeyCode::Enter);
+        let c = app.confirm.as_ref().expect("Delete asks first");
+        assert_eq!(c.prompt(), "Displayed record will be permanently deleted");
+        assert!(!c.yes_selected(), "No is the default");
+        assert!(!app.confirm_key(KeyEvent::from(KeyCode::Enter)));
+        assert_eq!(
+            value_at(&app, 1, 0),
+            CellValue::Text("Ann".into()),
+            "No keeps it"
+        );
+        assert_eq!(form_rec(&app), Rec::Row(1));
+        form_key(&mut app, KeyCode::Enter);
+        assert!(!app.confirm_key(KeyEvent::from(KeyCode::Char('n'))));
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("Ann".into()));
+
+        form_key(&mut app, KeyCode::Enter);
+        assert!(!app.confirm_key(KeyEvent::from(KeyCode::Char('y'))));
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("Bob".into()));
+        assert_eq!(value_at(&app, 2, 0), CellValue::Text("Cara".into()));
+        assert!(app.sheet().cell(3, 0).is_none() && app.sheet().cell(3, 2).is_none());
+        assert_eq!(
+            value_at(&app, 2, 4),
+            CellValue::Text("note".into()),
+            "column E stays"
+        );
+        let f = |app: &App, r, c| app.sheet().cell(r, c).and_then(|x| x.formula.clone());
+        assert_eq!(f(&app, 9, 6).as_deref(), Some("B3"));
+        assert_eq!(f(&app, 10, 6).as_deref(), Some("#REF!"));
+        assert_eq!(f(&app, 1, 2).as_deref(), Some("B2*2"));
+        assert_eq!(value_at(&app, 9, 6), CellValue::Number(100.0));
+        assert_eq!(
+            (form_rec(&app), form(&app).position()),
+            (Rec::Row(1), "1 of 2".into())
+        );
+        assert_eq!(form(&app).fields[0].text, "Bob");
+
+        // The last record: the one before it shows.
+        form_key(&mut app, KeyCode::Down);
+        form_key(&mut app, KeyCode::Enter);
+        app.confirm_key(KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(
+            (form_rec(&app), form(&app).position()),
+            (Rec::Row(1), "1 of 1".into())
+        );
+        // The only record: the form closes.
+        form_key(&mut app, KeyCode::Enter);
+        app.confirm_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(app.data_form.is_none());
+        assert!(app.status.as_deref().unwrap().contains("no records left"));
+        assert!(app.sheet().cell(1, 0).is_none());
+
+        // Each delete is one undo step.
+        app.undo();
+        app.undo();
+        app.undo();
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("Ann".into()));
+        assert_eq!(value_at(&app, 3, 0), CellValue::Text("Cara".into()));
+        assert_eq!(f(&app, 9, 6).as_deref(), Some("B4"));
+        assert_eq!(f(&app, 10, 6).as_deref(), Some("B2"));
+    }
+
+    #[test]
+    fn data_form_criteria_find_matching_records() {
+        use dataform::Rec::Row;
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_button(&mut app, dataform::Button::Criteria);
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(form(&app).position(), "Criteria");
+        form_key(&mut app, KeyCode::Tab);
+        form_type(&mut app, ">10");
+        form_key(&mut app, KeyCode::Enter); // Find Next
+        assert_eq!(form_rec(&app), Row(2));
+        assert_eq!(form(&app).position(), "2 of 3");
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(form_rec(&app), Row(3));
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(form_rec(&app), Row(3));
+        assert_eq!(app.status.as_deref(), Some("No matching record"));
+        form_key(&mut app, KeyCode::Up);
+        assert_eq!(form_rec(&app), Row(2));
+        form_key(&mut app, KeyCode::Up);
+        assert_eq!(form_rec(&app), Row(2), "Ann's 5 doesn't match");
+
+        // Plain text begins with, ignoring case; a computed field matches
+        // its value; every criterion must hold.
+        form_button(&mut app, dataform::Button::Criteria);
+        form_key(&mut app, KeyCode::Enter);
+        form_type(&mut app, "c");
+        form_keys(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        form_type(&mut app, "200");
+        form_key(&mut app, KeyCode::Up); // Find Prev from Bob: no match before
+        assert_eq!(form_rec(&app), Row(2));
+        assert_eq!(app.status.as_deref(), Some("No matching record"));
+        form_button(&mut app, dataform::Button::Criteria);
+        form_key(&mut app, KeyCode::Enter);
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(form_rec(&app), Row(3));
+
+        // Form goes back to the record shown; Clear drops the criteria.
+        form_button(&mut app, dataform::Button::Criteria);
+        form_key(&mut app, KeyCode::Enter);
+        form_button(&mut app, dataform::Button::Criteria);
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            (form_rec(&app), form(&app).mode),
+            (Row(3), dataform::Mode::Form)
+        );
+        form_button(&mut app, dataform::Button::Criteria);
+        form_key(&mut app, KeyCode::Enter);
+        form_button(&mut app, dataform::Button::Clear);
+        form_key(&mut app, KeyCode::Enter);
+        assert!(form(&app).criteria().is_empty());
+        form_button(&mut app, dataform::Button::FindPrev);
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(form_rec(&app), Row(2));
+        form_key(&mut app, KeyCode::Up);
+        assert_eq!(form_rec(&app), Row(1));
+    }
+
+    #[test]
+    fn data_form_esc_restores_then_close_commits() {
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_type(&mut app, "x");
+        form_key(&mut app, KeyCode::Esc);
+        assert!(app.data_form.is_some(), "Esc with changes restores");
+        assert!(!form(&app).dirty());
+        form_key(&mut app, KeyCode::Esc);
+        assert!(app.data_form.is_none(), "Esc without changes closes");
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("Ann".into()));
+
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_type(&mut app, "x");
+        form_button(&mut app, dataform::Button::Close);
+        form_key(&mut app, KeyCode::Enter);
+        assert!(app.data_form.is_none());
+        assert_eq!(
+            value_at(&app, 1, 0),
+            CellValue::Text("Annx".into()),
+            "Close commits"
+        );
+    }
+
+    #[test]
+    fn data_form_on_a_protected_sheet_only_browses() {
+        let mut app = data_form_app();
+        app.toggle_protection();
+        app.ribbon_act(ribbon::Act::DataForm);
+        let protected = "Sheet is protected — unprotect it to edit (Review ▸ Protect)";
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(form_rec(&app), dataform::Rec::Row(2), "browsing works");
+        let undo_len = app.undo.len();
+        form_type(&mut app, "x");
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(app.status.as_deref(), Some(protected));
+        assert_eq!(form_rec(&app), dataform::Rec::Row(2));
+        form_key(&mut app, KeyCode::Esc); // Restore
+        form_button(&mut app, dataform::Button::Delete);
+        form_key(&mut app, KeyCode::Enter);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.status.as_deref(), Some(protected));
+        form_key(&mut app, KeyCode::BackTab); // New
+        form_key(&mut app, KeyCode::Enter);
+        form_type(&mut app, "Dan");
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some(protected));
+        assert_eq!(app.undo.len(), undo_len);
+        assert_eq!(value_at(&app, 2, 0), CellValue::Text("Bob".into()));
+        assert!(app.sheet().cell(4, 0).is_none());
+        // Criteria still search.
+        form_key(&mut app, KeyCode::Esc);
+        form_button(&mut app, dataform::Button::Criteria);
+        form_key(&mut app, KeyCode::Enter);
+        form_type(&mut app, "c");
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(form_rec(&app), dataform::Rec::Row(3));
+    }
+
+    #[test]
+    fn data_form_delete_refuses_to_split_an_array() {
+        let mut app = data_form_app();
+        put(&mut app, 0, 3, "Seq");
+        app.apply(vec![(1, 3, Cell::formula("SEQUENCE(3)"))]);
+        assert_eq!(
+            value_at(&app, 3, 3),
+            CellValue::Number(3.0),
+            "D2 spills to D4"
+        );
+        app.ribbon_act(ribbon::Act::DataForm);
+        assert_eq!(form(&app).area, (0, 0, 3, 3));
+        form_key(&mut app, KeyCode::Down);
+        let undo_len = app.undo.len();
+        form_button(&mut app, dataform::Button::Delete);
+        form_key(&mut app, KeyCode::Enter);
+        app.confirm_key(KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(app.status.as_deref(), Some(PART_OF_ARRAY));
+        assert_eq!(app.undo.len(), undo_len);
+        assert_eq!(value_at(&app, 2, 0), CellValue::Text("Bob".into()));
+        assert_eq!(form_rec(&app), dataform::Rec::Row(2));
+    }
+
+    #[test]
+    fn data_form_focus_stays_on_its_field_across_computed_columns() {
+        use dataform::Rec::Row;
+        // Calc is computed in records 1 and 3 but a constant in record 2.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        for (c, h) in ["Calc", "Name", "Note"].iter().enumerate() {
+            put(&mut app, 0, c as u32, h);
+        }
+        for (r, calc, name) in [
+            (1, "=LEN(B2)", "Ann"),
+            (2, "x", "Bob"),
+            (3, "=LEN(B4)", "Cy"),
+        ] {
+            put(&mut app, r, 0, calc);
+            put(&mut app, r, 1, name);
+        }
+        app.cur = (1, 1);
+        app.ribbon_act(ribbon::Act::DataForm);
+        assert_eq!(form(&app).focused_col(), Some(1), "Calc is read-only here");
+        form_key(&mut app, KeyCode::Tab);
+        assert_eq!(form(&app).focused_col(), Some(2));
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(form_rec(&app), Row(2));
+        assert_eq!(form(&app).focused_col(), Some(2), "Note keeps the focus");
+        form_type(&mut app, "zz");
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(value_at(&app, 2, 2), CellValue::Text("zz".into()));
+        assert_eq!(value_at(&app, 2, 1), CellValue::Text("Bob".into()));
+        assert_eq!(form(&app).focused_col(), Some(2));
+        // A field computed in the next record gives way to the nearest one.
+        form_keys(&mut app, &[KeyCode::Up, KeyCode::BackTab, KeyCode::BackTab]);
+        assert_eq!(form(&app).focused_col(), Some(0));
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(form(&app).focused_col(), Some(1));
+    }
+
+    #[test]
+    fn data_form_find_next_from_criteria_keeps_searching() {
+        use dataform::{Button, Mode, Rec::Row};
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_button(&mut app, Button::Criteria);
+        form_key(&mut app, KeyCode::Enter);
+        form_key(&mut app, KeyCode::Tab);
+        form_type(&mut app, ">10");
+        form_button(&mut app, Button::FindNext);
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!((form_rec(&app), form(&app).mode), (Row(2), Mode::Form));
+        assert_eq!(form(&app).focused_button(), Some(Button::FindNext));
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!((form_rec(&app), form(&app).mode), (Row(3), Mode::Form));
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(form_rec(&app), Row(3));
+        assert_eq!(app.status.as_deref(), Some("No matching record"));
+    }
+
+    #[test]
+    fn data_form_form_button_keeps_its_focus() {
+        use dataform::{Button, Mode};
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_button(&mut app, Button::Criteria);
+        form_key(&mut app, KeyCode::Enter);
+        form_button(&mut app, Button::Criteria); // reads Form
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(form(&app).mode, Mode::Form);
+        assert_eq!(form(&app).focused_button(), Some(Button::Criteria));
+        form_key(&mut app, KeyCode::Enter);
+        assert!(
+            app.data_form.is_some(),
+            "Enter again opens the criteria, not Close"
+        );
+        assert_eq!(form(&app).mode, Mode::Criteria);
+    }
+
+    #[test]
+    fn data_form_new_record_reads_fields_under_the_columns_format() {
+        use gridcore::sheet::Xf;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let styles = &mut app.pkg.workbook.styles;
+        let mut text_xf = Xf::default();
+        text_xf.set_code(Some("@".into()));
+        let text_fmt = styles.intern(text_xf);
+        let decorated = styles.intern(Xf {
+            bold: true,
+            fill: Some((255, 255, 0)),
+            ..Xf::default()
+        });
+        for (c, h) in ["Name", "Code", "Rate", "Price"].iter().enumerate() {
+            put(&mut app, 0, c as u32, h);
+        }
+        for r in 1..=2 {
+            put(&mut app, r, 0, "Ann");
+            app.pkg.workbook.sheets[0].set_cell(
+                r,
+                1,
+                Cell {
+                    style: text_fmt,
+                    ..Cell::text("001")
+                },
+            );
+            put(&mut app, r, 2, "5%");
+            app.pkg.workbook.sheets[0].set_cell(
+                r,
+                3,
+                Cell {
+                    style: decorated,
+                    ..Cell::number(1.0)
+                },
+            );
+        }
+        app.rebuild_engine();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_button(&mut app, dataform::Button::New);
+        form_key(&mut app, KeyCode::Enter);
+        for (i, text) in ["Dan", "007", "15", "$5"].iter().enumerate() {
+            if i > 0 {
+                form_key(&mut app, KeyCode::Tab);
+            }
+            form_type(&mut app, text);
+        }
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            value_at(&app, 3, 1),
+            CellValue::Text("007".into()),
+            "Text column"
+        );
+        assert_eq!(
+            value_at(&app, 3, 2),
+            CellValue::Number(0.15),
+            "percent column"
+        );
+        assert_eq!(value_at(&app, 3, 3), CellValue::Number(5.0));
+        let xf = |app: &App, r, c| {
+            let style = app.sheet().cell(r, c).unwrap().style;
+            app.pkg.workbook.styles.xf(style)
+        };
+        assert_eq!(xf(&app, 3, 2).numfmt, xf(&app, 2, 2).numfmt);
+        let price = xf(&app, 3, 3);
+        assert!(
+            price.bold && price.fill == Some((255, 255, 0)),
+            "the column's look stays"
+        );
+        // A formula typed into the Text column is text.
+        form_type(&mut app, "Eve");
+        form_key(&mut app, KeyCode::Tab);
+        form_type(&mut app, "=A1");
+        form_key(&mut app, KeyCode::Enter);
+        let code = app.sheet().cell(4, 1).unwrap();
+        assert_eq!(
+            (code.formula.as_deref(), &code.value),
+            (None, &CellValue::Text("=A1".into()))
+        );
+    }
+
+    /// [`data_form_app`]'s list on the second of two sheets, the form open.
+    fn data_form_on_second_sheet() -> App {
+        let mut app = data_form_app();
+        let si = app.pkg.add_sheet("Data");
+        let sheets = &mut app.pkg.workbook.sheets;
+        sheets[si].cells = std::mem::take(&mut sheets[0].cells);
+        app.sheet = si;
+        app.rebuild_engine();
+        app.ribbon_act(ribbon::Act::DataForm);
+        assert_eq!(
+            (form(&app).sheet, form(&app).sheet_name.as_str()),
+            (1, "Data")
+        );
+        app
+    }
+
+    #[test]
+    fn data_form_closes_when_an_agent_removes_its_sheet() {
+        use ctlcore::json::Json;
+        let mut app = data_form_on_second_sheet();
+        let args = Json::obj(vec![("sheet", Json::Num(1.0))]);
+        run_control(&mut app, "sheet.remove", &args).unwrap();
+        assert!(app.data_form.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Data Form closed: the workbook changed")
+        );
+        press(&mut app, KeyCode::Down);
+        // A read-only verb leaves the form open.
+        let mut app = data_form_on_second_sheet();
+        run_control(&mut app, "sheet.list", &Json::obj(vec![])).unwrap();
+        assert!(app.data_form.is_some());
+    }
+
+    #[test]
+    fn data_form_closes_when_its_sheet_is_gone() {
+        // However the sheet went, the next key closes the form, no panic.
+        let mut app = data_form_on_second_sheet();
+        assert!(app.pkg.remove_sheet(1));
+        app.sheet = 0;
+        form_key(&mut app, KeyCode::Down);
+        assert!(app.data_form.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Data Form closed: the workbook changed")
+        );
+        // Another sheet in its place (same index, other name) counts too.
+        // Yes to a Delete asked before it went deletes nothing.
+        let mut app = data_form_on_second_sheet();
+        form_button(&mut app, dataform::Button::Delete);
+        form_key(&mut app, KeyCode::Enter);
+        app.pkg.workbook.sheets[1].name = "Renamed".into();
+        assert!(!app.confirm_key(KeyEvent::from(KeyCode::Char('y'))));
+        assert!(app.data_form.is_none());
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("Ann".into()));
+    }
+
+    #[test]
+    fn data_form_closes_when_an_agent_sorts_or_filters_its_list() {
+        // A sort moves the records and a filter hides them: the form's
+        // record may be another one now (#690, #691).
+        for (verb, args) in [
+            (
+                "range.sort",
+                r#"{"range":"A1:C4","header":true,"keys":[{"col":"A","order":"desc"}]}"#,
+            ),
+            (
+                "filter.set",
+                r#"{"range":"A1:C4","col":"Name","criteria":{"values":["Bob"]}}"#,
+            ),
+        ] {
+            let mut app = data_form_app();
+            app.ribbon_act(ribbon::Act::DataForm);
+            let args = ctlcore::json::Json::parse(args).unwrap();
+            run_control(&mut app, verb, &args).unwrap();
+            assert!(app.data_form.is_none(), "{verb}");
+            assert_eq!(
+                app.status.as_deref(),
+                Some("Data Form closed: the workbook changed"),
+                "{verb}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_form_stays_open_over_an_agents_cell_edit() {
+        use ctlcore::json::Json;
+        let set = |app: &mut App, r: &str, t: &str| {
+            let args = Json::obj(vec![
+                ("ref", Json::Str(r.into())),
+                ("text", Json::Str(t.into())),
+            ]);
+            run_control(app, "cell.set", &args).unwrap();
+        };
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_type(&mut app, "x"); // Name: Annx, not yet written
+        set(&mut app, "B2", "9"); // this record's Qty, untouched in the form
+        set(&mut app, "A3", "Bea"); // another record
+        assert!(app.data_form.is_some(), "a cell edit leaves the form open");
+        let d = form(&app);
+        assert_eq!(d.fields[0].text, "Annx", "the typed text stays");
+        assert_eq!(d.fields[1].text, "9", "an untouched field reads the edit");
+        assert_eq!(d.fields[2].text, "18", "and so does a computed one");
+        form_type(&mut app, "y"); // the caret stayed at the end
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("Annxy".into()));
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(9.0));
+        assert_eq!(form(&app).fields[0].text, "Bea");
+        // Appending a sheet leaves it open too; renaming its sheet closes it.
+        run_control(&mut app, "sheet.add", &Json::obj(vec![])).unwrap();
+        assert!(app.data_form.is_some());
+        let args = Json::obj(vec![
+            ("sheet", Json::Num(0.0)),
+            ("name", Json::Str("Moved".into())),
+        ]);
+        run_control(&mut app, "sheet.rename", &args).unwrap();
+        assert!(app.data_form.is_none());
+    }
+
+    #[test]
+    fn data_form_closes_when_an_agent_inserts_a_row() {
+        use ctlcore::json::Json;
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_keys(&mut app, &[KeyCode::Down, KeyCode::Down]);
+        assert_eq!(form_rec(&app), dataform::Rec::Row(3));
+        form_button(&mut app, dataform::Button::Delete);
+        form_key(&mut app, KeyCode::Enter);
+        assert!(app.confirm.is_some(), "Delete is asking");
+        let args = Json::obj(vec![("at", Json::Num(0.0))]);
+        run_control(&mut app, "row.insert", &args).unwrap();
+        assert!(app.data_form.is_none());
+        assert!(app.confirm.is_none(), "the pending Delete is gone");
+        assert_eq!(value_at(&app, 4, 0), CellValue::Text("Cara".into()));
+    }
+
+    #[test]
+    fn data_form_swallows_ctrl_and_alt_chords() {
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_type(&mut app, "x");
+        form_key(&mut app, KeyCode::Down); // writes Annx
+        let undo_len = app.undo.len();
+        press_mod(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        press_mod(&mut app, KeyCode::Char('y'), KeyModifiers::CONTROL);
+        press_mod(&mut app, KeyCode::Char('h'), KeyModifiers::ALT);
+        assert!(app.data_form.is_some(), "the form stays open");
+        assert_eq!(app.undo.len(), undo_len, "Ctrl+Z doesn't reach the grid");
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("Annx".into()));
+        assert!(form(&app).changes().is_empty(), "nothing typed");
+        // AltGr (Ctrl+Alt with a character) types it.
+        press_mod(
+            &mut app,
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(form(&app).changes(), [(0, "Bob@".to_string())]);
+        // Plain keys arrive through the app's key handler too.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.data_form.is_none());
     }
 }
 

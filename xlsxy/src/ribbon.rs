@@ -68,6 +68,8 @@ pub enum Act {
     Consolidate,
     /// Data ▸ Outline.
     Subtotal,
+    /// Data ▸ Form…: Excel's data form over the list at the cursor.
+    DataForm,
     GroupOutline,
     UngroupOutline,
     ShowDetail,
@@ -438,7 +440,11 @@ fn data_groups() -> Vec<Group> {
                     Subtotal,
                     "Insert subtotals (or Remove All) at each change in a column",
                 )],
-                vec![],
+                vec![btn(
+                    "≣ Form…",
+                    DataForm,
+                    "Data Form: view, edit, add, delete and find records",
+                )],
             ],
         },
         Group {

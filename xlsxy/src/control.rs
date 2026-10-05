@@ -110,6 +110,77 @@ const FIND_CAP: usize = 200;
 
 mod datacmds;
 
+/// Whether `verb` is an agent edit of the workbook: its cells, sheets,
+/// tables or layout.
+fn edits(verb: &str) -> bool {
+    matches!(
+        verb,
+        "cell.set"
+            | "range.clear"
+            | "comment.add"
+            | "range.set"
+            | "sheet.import-csv"
+            | "sheet.import-text"
+            | "range.text-to-columns"
+            | "wb.replace-all"
+            | "wb.consolidate"
+            | "sheet.add"
+            | "sheet.remove"
+            | "sheet.rename"
+            | "table.rename"
+            | "table.resize"
+            | "table.convert"
+            | "pivot.create"
+            | "row.insert"
+            | "row.delete"
+            | "col.insert"
+            | "col.delete"
+            | "cell.format"
+            | "col.width"
+    )
+}
+
+/// Whether `verb` changes the workbook: an edit ([`edits`]), a filter or a
+/// sort (which hide or move rows, and signal activity themselves, only when
+/// they changed something), or another workbook opened or read back in its
+/// place. What a dialog over it shows may then be gone.
+pub fn mutates(verb: &str) -> bool {
+    edits(verb)
+        || matches!(
+            verb,
+            "filter.set"
+                | "filter.reapply"
+                | "filter.clear"
+                | "filter.off"
+                | "filter.by-cell"
+                | "filter.advanced"
+                | "range.sort"
+                | "wb.open"
+                | "wb.reload"
+        )
+}
+
+/// Whether `verb`, when it [`mutates`] the workbook, leaves every cell and
+/// sheet where it was: it writes, formats or annotates cells in place, or
+/// appends a sheet. A dialog over the workbook can stay open then, reading
+/// what it shows again; any other change (rows or columns moved, a sheet
+/// removed or renamed, a workbook opened, an import) may move what it
+/// shows.
+pub fn keeps_cells_in_place(verb: &str) -> bool {
+    matches!(
+        verb,
+        "cell.set"
+            | "range.set"
+            | "range.clear"
+            | "cell.format"
+            | "col.width"
+            | "comment.add"
+            | "wb.replace-all"
+            | "sheet.add"
+            | "table.rename"
+    )
+}
+
 /// Route one control verb against the live workbook, returning the JSON result
 /// or an error message.
 pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> {
@@ -199,31 +270,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
     if out.is_ok() {
         // An agent edit flashes this pane's status dot, so a watcher sees the
         // workbook being worked on.
-        if matches!(
-            verb,
-            "cell.set"
-                | "range.clear"
-                | "comment.add"
-                | "range.set"
-                | "sheet.import-csv"
-                | "sheet.import-text"
-                | "range.text-to-columns"
-                | "wb.replace-all"
-                | "wb.consolidate"
-                | "sheet.add"
-                | "sheet.remove"
-                | "sheet.rename"
-                | "table.rename"
-                | "table.resize"
-                | "table.convert"
-                | "pivot.create"
-                | "row.insert"
-                | "row.delete"
-                | "col.insert"
-                | "col.delete"
-                | "cell.format"
-                | "col.width"
-        ) {
+        if edits(verb) {
             ctlcore::signal_activity();
         }
         // The filter verbs and `range.sort` signal themselves, only when
