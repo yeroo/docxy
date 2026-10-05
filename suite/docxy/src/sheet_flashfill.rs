@@ -209,6 +209,16 @@ impl SheetView {
     }
 }
 
+/// Every sheet tab's preview the selection or an edit moved off, dropped:
+/// the per-frame step beside `stamp_autocorrect`.
+pub(crate) fn retire_stale_previews(tabs: &mut [DocTab]) {
+    for t in tabs {
+        if let Surface::Sheet(v) = &mut t.surface {
+            v.retire_stale_preview();
+        }
+    }
+}
+
 impl Docxy {
     /// Ctrl+E and Data › Flash Fill (#666): commit an open entry first, then
     /// fill the selected cell's column. No pattern opens Excel's message

@@ -1754,10 +1754,10 @@ fn every_sheet_tab_is_stamped_with_the_app_options() {
     assert!(matches!(tabs[2].surface, Surface::Sheet(_)));
 }
 
-/// FIX r5 m4: the per-frame stamp retires a Flash Fill preview the selection
+/// FIX r5 m4: the per-frame step retires a Flash Fill preview the selection
 /// moved off, so moving back cannot revive it.
 #[test]
-fn the_frame_stamp_retires_a_preview_the_selection_left() {
+fn the_frame_step_retires_a_preview_the_selection_left() {
     use gridcore::options::EditOptions;
     let mut tabs = vec![tab(Kind::Xlsx)];
     let Surface::Sheet(v) = &mut tabs[0].surface else {
@@ -1791,13 +1791,13 @@ fn the_frame_stamp_retires_a_preview_the_selection_left() {
     );
     let at = v.sel;
     v.sel = (9, 9);
-    stamp_edit_opts(&mut tabs, EditOptions::default());
+    crate::sheet_flashfill::retire_stale_previews(&mut tabs);
     let Surface::Sheet(v) = &mut tabs[0].surface else {
         unreachable!()
     };
-    assert!(v.flash_preview.is_none(), "dropped by the stamp");
+    assert!(v.flash_preview.is_none(), "dropped by the frame step");
     v.sel = at;
-    stamp_edit_opts(&mut tabs, EditOptions::default());
+    crate::sheet_flashfill::retire_stale_previews(&mut tabs);
     let Surface::Sheet(v) = &tabs[0].surface else {
         unreachable!()
     };

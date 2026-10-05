@@ -631,7 +631,9 @@ struct SheetView {
     /// Formula AutoComplete's list for the open editor (#686), kept with the
     /// buffer it was made for ([`sheet_complete::CompleteList`]).
     edit_complete: Option<sheet_complete::CompleteList>,
-    /// That list's scroll: its highlighted row is kept in view.
+    /// That list's scroll. A list rebuilt for new typing starts at the top and
+    /// scrolls once to the highlight it carries ([`SheetView::complete_now`]);
+    /// nothing scrolls it per frame, so the mouse wheel is free.
     fx_scroll: ScrollHandle,
     /// Flash Fill's greyed preview after a typed commit, and the last fill
     /// for its Options button (#666); each stands only while nothing has
@@ -1138,7 +1140,6 @@ fn stamp_edit_opts(tabs: &mut [DocTab], opts: EditOptions) {
     for t in tabs {
         if let Surface::Sheet(v) = &mut t.surface {
             v.edit_opts = opts;
-            v.retire_stale_preview();
         }
     }
 }
@@ -1679,7 +1680,6 @@ impl SheetView {
                 .as_deref()
                 .is_some_and(|b| self.edit_caret == b.chars().count());
             self.edit_type(c);
-            self.fx_scroll = ScrollHandle::new();
             self.autocorrect_typed(c, at_end);
         } else {
             self.begin_cell_edit(Some(String::new()));
@@ -1849,8 +1849,6 @@ impl SheetView {
     /// typed, so the commit's AutoCorrect leaves it (#667).
     fn edit_tail_left(&mut self) {
         self.edit_typed_tail = None;
-        // The completion list changes with the caret: it starts at the top.
-        self.fx_scroll = ScrollHandle::new();
     }
 
     fn edit_untouched(&self) -> bool {
@@ -14647,7 +14645,9 @@ impl Docxy {
             self.bar_open(target);
         }
         match act {
-            SheetAct::PickList => self.open_pick_menu(cx),
+            SheetAct::PickList => {
+                let _ = self.open_pick_menu(cx);
+            }
             SheetAct::FlashFill => self.sheet_flash_fill(cx),
             SheetAct::FlashUndo
             | SheetAct::FlashAccept
@@ -26147,6 +26147,8 @@ impl Render for Docxy {
         // before anything can reach it (#672), and its AutoCorrect (#667).
         stamp_edit_opts(&mut self.tabs, self.edit_opts);
         sheet_autocorrect::stamp_autocorrect(&mut self.tabs, &self.autocorrect);
+        sheet_flashfill::retire_stale_previews(&mut self.tabs);
+        sheet_complete::sync_lists(&mut self.tabs);
         // A new frame: what the probes recorded during the last one is now the
         // complete answer, and they start collecting this one afresh. Stale
         // entries cannot survive — a chart that was deleted simply does not

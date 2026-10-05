@@ -159,9 +159,24 @@ impl SheetView {
         });
         if demand || stale {
             self.edit_complete = self.complete_fresh(demand);
+            // A rebuilt list starts at the top and scrolls to the highlight
+            // it carries: once, on this event (not per frame, which would
+            // undo the mouse wheel).
             self.fx_scroll = ScrollHandle::new();
+            if let Some(c) = &self.edit_complete {
+                self.fx_scroll.scroll_to_item(c.sel);
+            }
         }
         self.edit_complete.as_ref().filter(|c| !c.closed)
+    }
+
+    /// Bring the kept list up to the buffer and caret (run each frame): when
+    /// typing or a caret move changed them, the list is rebuilt, its
+    /// highlight carried and its scroll followed once.
+    pub(crate) fn sync_complete(&mut self) {
+        if self.editing.is_some() {
+            self.complete_now(false);
+        }
     }
 
     /// Whether Formula AutoComplete's list is showing.
@@ -215,6 +230,16 @@ impl SheetView {
     }
 }
 
+/// Every sheet tab's formula list, in step with its editor: the per-frame
+/// beside `stamp_autocorrect`.
+pub(crate) fn sync_lists(tabs: &mut [DocTab]) {
+    for t in tabs {
+        if let Surface::Sheet(v) = &mut t.surface {
+            v.sync_complete();
+        }
+    }
+}
+
 impl Docxy {
     /// Alt+Down (#665, FRM-153): the drop-down the selected cell or the
     /// open editor has, in Excel's order — see [`alt_down_target`].
@@ -240,30 +265,38 @@ impl Docxy {
                 }
                 cx.notify();
             }
-            AltDown::PickList => self.open_pick_menu(cx),
+            // A refusal is in the status line already.
+            AltDown::PickList => {
+                let _ = self.open_pick_menu(cx);
+            }
         }
     }
 
     /// Pick From Drop-down List's menu under the selected cell (the window's
     /// corner when the cell is off screen). An empty list opens nothing and
     /// says so; a protected sheet is refused.
-    pub(crate) fn open_pick_menu(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_pick_menu(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        let refuse = |this: &mut Self, why: &str, cx: &mut Context<Self>| -> Result<(), String> {
+            this.set_status(why.to_string());
+            cx.notify();
+            Err(why.to_string())
+        };
         if self.protected_refused(cx) {
-            return;
+            return Err("this workbook is open in Protected View".into());
         }
         if self.sheet_protected() {
-            self.set_status("The sheet is protected: unprotect it to enter values");
-            cx.notify();
-            return;
+            return refuse(
+                self,
+                "The sheet is protected: unprotect it to enter values",
+                cx,
+            );
         }
         let Some(v) = self.active_sheet() else {
-            return;
+            return Err("the active tab is not a spreadsheet".into());
         };
         let values = v.pick_values();
         if values.is_empty() {
-            self.set_status("No entries above or below this cell to pick from");
-            cx.notify();
-            return;
+            return refuse(self, "No entries above or below this cell to pick from", cx);
         }
         let sel = v.sel;
         let at = self
@@ -271,6 +304,7 @@ impl Docxy {
             .map(|b| b.bottom_left())
             .unwrap_or_else(|_| point(px(160.), px(160.)));
         self.open_menu(menu::MenuTarget::PickList, at, menu::pick_menu(&values), cx);
+        Ok(())
     }
 
     /// A press on item `i` of Formula AutoComplete's list: it is

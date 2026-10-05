@@ -282,3 +282,29 @@ fn enter_commits_a_formula_as_typed_while_the_list_shows() {
         Some("Sal")
     );
 }
+
+#[test]
+fn a_rebuilt_list_keeps_its_highlight_and_follows_it_once() {
+    // FIX r6 m1: `=CO`, Down far, then typing narrows the list; the carried
+    // item stays highlighted and the frame step rebuilds the kept list.
+    let mut v = sales();
+    select(&mut v, 0, 7);
+    type_keys(&mut v, "=co");
+    v.complete_now(false);
+    for _ in 0..5 {
+        v.complete_step(true);
+    }
+    let was = v.complete_view().unwrap();
+    let label = was.list.items[was.sel].label.clone();
+    assert!(was.sel > 0, "{label}");
+    // The highlighted item still matches the longer prefix.
+    type_keys(&mut v, &label[2..3].to_lowercase());
+    v.sync_complete();
+    let kept = v.edit_complete.as_ref().expect("rebuilt and kept");
+    assert_eq!(kept.made_for, (v.editing.clone().unwrap(), v.edit_caret));
+    assert_eq!(kept.list.items[kept.sel].label, label, "the carried item");
+    // Nothing changed: the frame step leaves it (and the wheel) alone.
+    let again = v.edit_complete.clone();
+    v.sync_complete();
+    assert_eq!(v.edit_complete, again);
+}

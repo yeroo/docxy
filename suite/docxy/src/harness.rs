@@ -2130,15 +2130,7 @@ fn menu_open(
             if !app.active_is_sheet() {
                 return Err("the pick list opens on a sheet tab".into());
             }
-            app.open_pick_menu(cx);
-            if app.menu.is_none() {
-                return Err(app
-                    .tabs
-                    .get(app.active)
-                    .map(|t| t.status.to_string())
-                    .unwrap_or_else(|| "no pick list opened".into()));
-            }
-            Ok(())
+            app.open_pick_menu(cx)
         }
         // The Flash Fill Options button's menu (#666): there is one only
         // while the last fill stands.
