@@ -249,6 +249,19 @@ fn prompt_name(tab: &DocTab, known: &[PathBuf]) -> PromptName {
                 d
             }
         });
+    // A tab that saves as (read-only, repaired, converted) never proposes
+    // its own file: Save would write over what was opened that way.
+    let names_own = |stem: &str| {
+        let own = tab.path.as_deref();
+        own_dir.as_deref().is_some_and(|dir| {
+            writes_own_file(own, Some(&dir.join(format!("{stem}{ext}")))) && own.is_some()
+        })
+    };
+    let stem = if !in_place && names_own(&stem) {
+        format!("{stem} (copy)")
+    } else {
+        stem
+    };
     let mut locations: Vec<PathBuf> = Vec::new();
     for dir in own_dir.into_iter().chain(known.iter().cloned()) {
         if !locations.iter().any(|l| l == &dir) {
@@ -297,9 +310,10 @@ const BAD_NAME_CHARS: [char; 9] = ['\\', '/', ':', '*', '?', '"', '<', '>', '|']
 
 /// Where Save goes for the File name `stem` in `location`, with the fixed
 /// extension `ext`: the tab's own file in place when that is what it names
-/// and the tab saves in place (`in_place`), else that new file. An existing
-/// file that is not the tab's own (`own`) is refused, as are an empty name
-/// and one with characters a file name cannot hold.
+/// and the tab saves in place (`in_place`), else that new file. The tab's
+/// own file (`own`) when it does not save in place, an existing other file,
+/// an empty name and one with characters a file name cannot hold are
+/// refused.
 fn prompt_target(
     stem: &str,
     ext: &str,
@@ -328,6 +342,14 @@ fn prompt_target(
     let own_file = own.is_some_and(|own| writes_own_file(Some(own), Some(&target)));
     if own_file && in_place {
         return Ok(PromptSave::InPlace);
+    }
+    if own_file {
+        // Opened read-only, repaired or converted: Save is Save As, which
+        // never writes over the tab's own file from here.
+        return Err(format!(
+            "{} was not opened for saving in place; choose another name, or use More options...",
+            file_name(&target)
+        ));
     }
     if !own_file && target.exists() {
         return Err(format!(

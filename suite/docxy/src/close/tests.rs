@@ -1917,7 +1917,7 @@ fn a_markdown_document_keeps_its_extension() {
 #[test]
 fn a_tab_that_saves_as_never_saves_in_place_from_the_prompt() {
     // Read-only, repaired and converted tabs, and an imported .doc: Save is
-    // Save As today, so an unchanged name is a new file, never in place.
+    // Save As today, so the prompt never writes over the tab's own file.
     let mut cases = Vec::new();
     let mut read_only = tab(Kind::Docx);
     read_only.access.read_only = true;
@@ -1933,6 +1933,8 @@ fn a_tab_that_saves_as_never_saves_in_place_from_the_prompt() {
         let name = prompt_name(&tab, &known());
         assert_eq!(name.ext, ".docx");
         assert_eq!(name.locations[0], fixtures());
+        // The proposed name is a copy beside it, so Save (Enter) works.
+        assert_eq!(name.stem, "basic (copy)", "{:?}", tab.access);
         assert_eq!(
             prompt_target(
                 &name.stem,
@@ -1941,11 +1943,17 @@ fn a_tab_that_saves_as_never_saves_in_place_from_the_prompt() {
                 tab.path.as_deref(),
                 false
             ),
-            Ok(PromptSave::To(
-                fixtures().join(format!("{}.docx", name.stem))
-            )),
+            Ok(PromptSave::To(fixtures().join("basic (copy).docx"))),
             "{:?}",
             tab.access
+        );
+        // Typing its own name back is refused, never a silent overwrite.
+        let own = prompt_target("basic", ".docx", &fixtures(), tab.path.as_deref(), false);
+        assert!(
+            own.as_ref()
+                .unwrap_err()
+                .contains("not opened for saving in place"),
+            "{own:?}"
         );
     }
     let mut imported = tab(Kind::Docx);
@@ -1955,6 +1963,40 @@ fn a_tab_that_saves_as_never_saves_in_place_from_the_prompt() {
     let name = prompt_name(&imported, &known());
     assert_eq!((name.stem.as_str(), name.ext.as_str()), ("letter", ".docx"));
     assert_eq!(name.locations[0], fixtures());
+}
+
+#[test]
+fn the_prompts_default_save_leaves_a_read_only_original_alone() {
+    let dir = crate::open_mode_tests::Scratch::new();
+    let src = dir.path("report.docx");
+    std::fs::copy(fixtures().join("basic.docx"), &src).unwrap();
+    let before = std::fs::read(&src).unwrap();
+    let mut t = tab_from_path(&src);
+    t.access.read_only = true;
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!("{}", t.status)
+    };
+    ed.insert_str("Edited read-only");
+    t.dirty = true;
+    let name = prompt_name(&t, &known());
+    let PromptSave::To(target) = prompt_target(
+        &name.stem,
+        &name.ext,
+        &name.locations[0],
+        t.path.as_deref(),
+        saves_in_place(&t),
+    )
+    .unwrap() else {
+        panic!("a read-only tab never saves in place")
+    };
+    assert_eq!(target, dir.path("report (copy).docx"));
+    assert!(save_doc_tab(&mut t, Some(target.clone())), "{}", t.status);
+    assert_eq!(
+        std::fs::read(&src).unwrap(),
+        before,
+        "the original was written"
+    );
+    assert!(target.exists());
 }
 
 #[test]
