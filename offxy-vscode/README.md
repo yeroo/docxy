@@ -195,7 +195,7 @@ for the two ways a tab's semantics differ from a terminal instance.
   sidesteps the versioned-path problem entirely — see
   [docs/agent-control.md](../docs/agent-control.md#mcp-native-tools-in-claude-code).
 - **Tools** — the bundled server (`serverInfo.name` `"offxy"`) exposes exactly
-  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (83
+  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (88
   tools total): `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`,
   `docxy_read`, `docxy_find`, `docxy_replace_range`, `docxy_insert`,
   `docxy_append`, `docxy_save`, `docxy_export`, `docxy_export_pdf`,
@@ -205,7 +205,9 @@ for the two ways a tab's semantics differ from a terminal instance.
   `docxy_revision_current`, `docxy_revision_next`, `docxy_revision_previous`,
   `docxy_revision_accept`, `docxy_revision_reject`,
   `docxy_revisions_accept_all`, `docxy_revisions_reject_all`,
-  `docxy_compare`, `docxy_page_color`, `docxy_watermark`, `docxy_page_borders` (35) —
+  `docxy_compare`, `docxy_page_color`, `docxy_watermark`, `docxy_page_borders`,
+  `docxy_comment_resolve`, `docxy_comments_delete_all`, `docxy_display_mode`,
+  `docxy_track_changes`, `docxy_track_changes_set` (40) —
   `docxy_replace_range`/`docxy_insert`/`docxy_append` each take an optional
   `markdown` flag to splice formatted Markdown (headings, bold, lists,
   tables, links) into the document instead of plain text, and
@@ -213,7 +215,9 @@ for the two ways a tab's semantics differ from a terminal instance.
   color, highlight, font, size) and paragraph styles/alignment to a block
   range; the revision tools navigate imported changes and accept/reject one or
   all supported records as undoable edits; `docxy_page_color`,
-  `docxy_watermark` and `docxy_page_borders` act only on a terminal docxy
+  `docxy_watermark`, `docxy_page_borders`, `docxy_comment_resolve`,
+  `docxy_comments_delete_all`, `docxy_display_mode`, `docxy_track_changes` and
+  `docxy_track_changes_set` act only on a terminal docxy
   (a VS Code tab answers `unknown verb`) — and
   `xlsxy_list`, `xlsxy_new`, `xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`,
   `xlsxy_get`, `xlsxy_set`, `xlsxy_clear`,

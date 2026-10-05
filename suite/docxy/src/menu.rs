@@ -29,9 +29,45 @@ pub(crate) enum MenuTarget {
         group: String,
         label: String,
     },
+    /// A menu the sheet grid opens (#707): the Auto Fill Options and Paste
+    /// Options buttons, and the menus a right-drag of the fill handle or of
+    /// the selection's border opens on release.
+    Grid(GridMenu),
     /// The Quick Access Toolbar Undo button's drop-down (#619): the undo
     /// history, newest first.
     QatUndo,
+}
+
+/// Which grid menu ([`MenuTarget::Grid`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GridMenu {
+    FillOptions,
+    PasteOptions,
+    FillDrop,
+    BorderDrop,
+}
+
+impl GridMenu {
+    /// The name `menu-open {"grid": name}` takes and reports.
+    pub fn name(self) -> &'static str {
+        match self {
+            GridMenu::FillOptions => "fill-options",
+            GridMenu::PasteOptions => "paste-options",
+            GridMenu::FillDrop => "fill-drop",
+            GridMenu::BorderDrop => "border-drop",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<GridMenu> {
+        [
+            GridMenu::FillOptions,
+            GridMenu::PasteOptions,
+            GridMenu::FillDrop,
+            GridMenu::BorderDrop,
+        ]
+        .into_iter()
+        .find(|g| g.name() == s)
+    }
 }
 
 /// The Quick Access Toolbar's Undo split button, whose arrow opens
@@ -63,6 +99,7 @@ impl MenuTarget {
                     Json::Str(label.clone()),
                 ]),
             )]),
+            Self::Grid(g) => Json::obj(vec![("grid", Json::Str(g.name().into()))]),
             Self::QatUndo => Json::obj(vec![("qat", Json::Str(QAT_UNDO_ID.into()))]),
         }
     }
@@ -254,6 +291,7 @@ pub(crate) fn target_stands(
         (MenuTarget::Document, Some(_)) => {
             Err("the document menu does not run on a Project tab".into())
         }
+        (MenuTarget::Grid(_), Some(_)) => Err("a grid menu does not run on a Project tab".into()),
         (MenuTarget::Cell | MenuTarget::PickList | MenuTarget::FlashFill, Some(_)) => {
             Err("this menu runs on a sheet tab".into())
         }
@@ -264,6 +302,7 @@ pub(crate) fn target_stands(
             | MenuTarget::PickList
             | MenuTarget::FlashFill
             | MenuTarget::Ribbon { .. }
+            | MenuTarget::Grid(_)
             | MenuTarget::QatUndo,
             _,
         ) => Ok(()),
@@ -857,6 +896,17 @@ mod tests {
         };
         assert_eq!(target_stands(&ribbon, Some(Some(1))), Ok(()));
         assert_eq!(target_stands(&ribbon, None), Ok(()));
+        let grid = MenuTarget::Grid(GridMenu::FillOptions);
+        assert_eq!(target_stands(&grid, None), Ok(()));
+        assert!(target_stands(&grid, Some(None)).is_err());
+        assert_eq!(
+            grid.to_json().get("grid").and_then(Json::as_str),
+            Some("fill-options")
+        );
+        assert_eq!(
+            GridMenu::from_name("border-drop"),
+            Some(GridMenu::BorderDrop)
+        );
     }
 
     #[test]

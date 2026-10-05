@@ -57,6 +57,10 @@ pub(crate) enum ProjectAct {
     /// A task row's context menu › Delete Task: the selected task, whatever
     /// column the cursor is on; a summary asks first, as Delete on its ID does.
     DeleteTask,
+    /// Ctrl+K and a task row's context menu › Hyperlink...: the selected
+    /// task's hyperlink (display text, address, in-file location) in one
+    /// prompt. Keyboard and row-menu only, like Copy: no ribbon command.
+    Hyperlink,
     /// Ctrl+C / Ctrl+X / Ctrl+V on the cursor cell (see `clip.rs`).
     Copy,
     Cut,
@@ -542,7 +546,9 @@ pub(crate) fn project_row_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
         none("rm-notes", "Notes..."),
         none("rm-timeline", "Add to Timeline"),
         Separator,
-        none("rm-hyperlink", "Hyperlink..."),
+        // No link icon in the set yet; Project's chain is drawn by the
+        // column-chooser follow-up. The item still runs its command.
+        item("rm-hyperlink", "Hyperlink...", "", Hyperlink, task),
     ]
 }
 
@@ -559,6 +565,7 @@ pub(crate) enum PromptKind {
     Move,
     Assign,
     Find,
+    Hyperlink,
 }
 impl PromptKind {
     pub fn name(self) -> &'static str {
@@ -568,6 +575,7 @@ impl PromptKind {
             Self::Move => "move",
             Self::Assign => "assign",
             Self::Find => "find",
+            Self::Hyperlink => "hyperlink",
         }
     }
     fn label(self) -> &'static str {
@@ -577,6 +585,7 @@ impl PromptKind {
             Self::Move => "Move task by (1d / 1w / 4w; -1d back)",
             Self::Assign => "Assign resource (empty to clear)",
             Self::Find => "Find",
+            Self::Hyperlink => "Hyperlink (ADDRESS[#LOCATION] [| TEXT]; empty to remove)",
         }
     }
 }
@@ -602,6 +611,7 @@ impl ProjectView {
         let task = self.ed.project().tasks.get(self.ed.sel());
         let buf = match kind {
             PromptKind::Constraint => task.map(constraint_hint).unwrap_or_default(),
+            PromptKind::Hyperlink => task.map(hyperlink_hint).unwrap_or_default(),
             _ => String::new(),
         };
         self.prompt = Some(ProjectPrompt {
@@ -672,6 +682,8 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
             "f2" if m.shift => Some(UnlinkTasks),
             "f2" => Some(AddLink),
             "f" => Some(Find),
+            // Project's Insert Hyperlink on the selected task.
+            "k" => Some(Hyperlink),
             "z" => Some(Undo),
             "y" => Some(Redo),
             "s" => Some(Save),
@@ -802,6 +814,51 @@ fn assign_status(ed: &mut ProjectEditor, uid: i32, text: &str) -> Result<Option<
     })
 }
 
+/// The hyperlink prompt's initial text: `address#location | text`, parts
+/// omitted when the task does not store them — except the text's ` | `
+/// separator, which stays, so a text-only link prefills as ` | text` and
+/// parses back text-only instead of becoming the address.
+fn hyperlink_hint(task: &projcore::model::Task) -> String {
+    let mut buf = String::new();
+    if let Some(address) = &task.hyperlink_address {
+        buf.push_str(address);
+    }
+    if let Some(location) = &task.hyperlink_sub_address {
+        buf.push('#');
+        buf.push_str(location);
+    }
+    if let Some(text) = &task.hyperlink {
+        buf.push_str(" | ");
+        buf.push_str(text);
+    }
+    buf
+}
+
+/// Parse the prompt's `ADDRESS[#LOCATION] [| TEXT]`: the first ` | ` splits
+/// the display text, the first `#` splits the address from the location
+/// (Project's own address#subaddress convention, so an address cannot hold
+/// `#`), ends trimmed, an empty part absent. `| TEXT` typed without the
+/// leading space is text-only, like ` | TEXT`.
+fn parse_hyperlink(buf: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let (link, text) = match buf.trim_start().strip_prefix('|') {
+        Some(text) => ("", Some(text)),
+        None => match buf.split_once(" | ") {
+            Some((link, text)) => (link, Some(text)),
+            None => (buf, None),
+        },
+    };
+    let (address, location) = match link.split_once('#') {
+        Some((address, location)) => (Some(address), Some(location)),
+        None => (Some(link), None),
+    };
+    let clean = |s: Option<&str>| {
+        s.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    (clean(address), clean(location), clean(text))
+}
+
 fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, String> {
     if p.kind == PromptKind::Find {
         return Ok(v.find(&p.buf));
@@ -847,6 +904,36 @@ fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, 
             return Ok(Some(format!("Moved to {}", date(Some(start)))));
         }
         PromptKind::Assign => return assign_status(&mut v.ed, uid, &p.buf),
+        PromptKind::Hyperlink => {
+            let task = v.ed.project().task(uid).ok_or("No task selected")?;
+            // Enter on the prefill the prompt opened with changes nothing: a
+            // stored address can hold `#` or ` | `, which the grammar would
+            // re-split, and an address-only link would grow a display text.
+            // An empty buffer never counts: "empty to remove" must still
+            // remove a link whose stored parts are empty strings.
+            if !p.buf.is_empty() && p.buf == hyperlink_hint(task) {
+                return Ok(None);
+            }
+            let had_link = task.hyperlink.is_some()
+                || task.hyperlink_address.is_some()
+                || task.hyperlink_sub_address.is_some();
+            let (address, location, text) = parse_hyperlink(&p.buf);
+            // Text omitted displays the address, else the location, as
+            // Project's Text to display defaults.
+            let text = text
+                .or_else(|| address.clone())
+                .or_else(|| location.clone());
+            v.ed.set_hyperlink(
+                uid,
+                text.as_deref().unwrap_or(""),
+                address.as_deref().unwrap_or(""),
+                location.as_deref().unwrap_or(""),
+            )?;
+            return Ok(match text {
+                Some(text) => Some(format!("Hyperlink set: {text}")),
+                None => had_link.then(|| "Hyperlink removed".into()),
+            });
+        }
         PromptKind::Find => unreachable!(),
     }
     Ok(None)
@@ -1143,6 +1230,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             MoveTask => v.open_prompt(PromptKind::Move),
             Constraint => v.open_prompt(PromptKind::Constraint),
             Assign => v.open_prompt(PromptKind::Assign),
+            Hyperlink => v.open_prompt(PromptKind::Hyperlink),
             Find => v.open_prompt(PromptKind::Find),
             Baseline => {
                 if !v.ed.project().tasks.is_empty() {

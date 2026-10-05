@@ -19,6 +19,7 @@
 //! | Verb | Args | Result |
 //! |---|---|---|
 //! | `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?}` |
+//! | `app-info` | — | the build: `{version, commit, short_commit, branch, commit_date, dirty, last_pr, issue, ahead, built_at, profile, target, host, kind, manual, summary, …}` |
 //! | `doc.outline` | — | `{headings:[{index, level, text}]}` |
 //! | `doc.read` | `{start?, end?, range?}` | `{total, start, end, text, blocks:[…]}` |
 //! | `doc.find` | `{query, case_sensitive?}` | `{query, count, matches:[…]}` |
@@ -39,6 +40,11 @@
 //! | `doc.undo` / `doc.redo` | — | `{done}` (false = nothing to undo/redo) |
 //! | `doc.revisions` / `doc.revision-current` | — | stable revision ids, kinds, metadata, and current selection |
 //! | `doc.revision-next` / `doc.revision-previous` | — | navigate and return the selected stable revision |
+//! | `doc.track-changes` | — | `{enabled,author}` |
+//! | `doc.track-changes-set` | `{enabled}` | `{enabled,author}`; records typing and deletions as tracked changes (`w:ins` / `w:del`) and sets `w:trackRevisions` |
+//! | `doc.display-mode` | `{mode?}` | `{mode,label,editable}`; `mode` is `all`, `simple`, `none` or `original` (a view only, never saved) |
+//! | `doc.comment-resolve` | `{id, resolved?}` | `{id,resolved}`; no `resolved` toggles |
+//! | `doc.comments-delete-all` | — | `{deleted}`; markers and records, one undo step |
 //! | `doc.revision-accept` / `doc.revision-reject` | `{revision}` | structured applied/stale/unsupported/malformed outcome |
 //! | `doc.revisions-accept-all` / `doc.revisions-reject-all` | — | one undoable transaction and per-revision outcomes |
 //! | `doc.export-pdf` | `{path}` | `{path}` (absolutized; refuses to overwrite) |
@@ -91,10 +97,17 @@ pub(crate) fn mutation_kind_for_verb(verb: &str) -> Option<MutationKind> {
         | "doc.revision-reject"
         | "doc.revisions-accept-all"
         | "doc.revisions-reject-all" => MutationKind::Content,
+        "doc.comment-resolve" | "doc.comments-delete-all" => MutationKind::Comment,
+        "doc.track-changes-set" => MutationKind::PackageMetadata,
         "doc.format" | "doc.set-style" | "doc.page-color" | "doc.watermark"
         | "doc.page-borders" => MutationKind::Formatting,
         _ => return None,
     })
+}
+
+/// `app-info`: the build this binary is (see the `buildinfo` crate), as JSON.
+fn app_info() -> Result<Json, String> {
+    Json::parse(&buildinfo::get(env!("CARGO_PKG_VERSION")).json())
 }
 
 /// Route one control verb against the live document, returning the JSON result
@@ -108,6 +121,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
 
     let out = match verb {
         "doc.path" => Ok(path_info(app)),
+        "app-info" => app_info(),
         "doc.edit-anyway" => Ok(edit_anyway(app)),
         "doc.outline" => Ok(outline(app)),
         "doc.read" => read(app, args),
@@ -117,6 +131,11 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "doc.append" => append(app, args),
         "doc.export" => export(app, args),
         "doc.comments" => Ok(comments(app)),
+        "doc.display-mode" => display_mode(app, args),
+        "doc.track-changes" => Ok(track_changes(app)),
+        "doc.track-changes-set" => set_track_changes(app, args),
+        "doc.comment-resolve" => resolve_comment(app, args),
+        "doc.comments-delete-all" => Ok(delete_all_comments(app)),
         "doc.notes" => Ok(notes(app)),
         // Default section variant only — first-page/even-page headers and
         // footers (`app.headers.first`/`.even`, `app.footers.first`/`.even`)
@@ -351,6 +370,7 @@ fn comments(app: &App) -> Json {
                 ("date", Json::Str(c.date.clone())),
                 ("text", Json::Str(c.text.clone())),
                 ("anchor", Json::Str(c.quoted.clone())),
+                ("resolved", Json::Bool(c.resolved)),
             ])
         })
         .collect();
@@ -672,6 +692,73 @@ fn review_revision(app: &mut App, args: &Json, action: RevisionAction) -> Result
     Ok(revision_outcome_json(&outcome))
 }
 
+/// `doc.track-changes`: whether edits are recorded as tracked changes, and as
+/// whom.
+fn track_changes(app: &App) -> Json {
+    let editor = app.body_editor();
+    Json::obj(vec![
+        ("enabled", Json::Bool(editor.track_changes())),
+        (
+            "author",
+            Json::Str(editor.track_author().unwrap_or_default().to_string()),
+        ),
+    ])
+}
+
+/// `doc.track-changes-set`: turn Track Changes on or off (`enabled`), as
+/// Review ▸ Track does: the document's `w:trackRevisions` setting and the
+/// editor's recording. Not an undo step.
+fn set_track_changes(app: &mut App, args: &Json) -> Result<Json, String> {
+    let enabled = args
+        .get("enabled")
+        .and_then(Json::as_bool)
+        .ok_or("doc.track-changes-set needs 'enabled' (true or false)")?;
+    app.set_track_setting(enabled)?;
+    ctlcore::signal_activity();
+    Ok(track_changes(app))
+}
+
+/// `doc.display-mode`: Display for Review. With `mode` (`all`, `simple`,
+/// `none` or `original`) it chooses the view; either way it reports the
+/// current one and whether it can be edited. A view only: never a mutation.
+fn display_mode(app: &mut App, args: &Json) -> Result<Json, String> {
+    if let Some(name) = args.get_str("mode") {
+        let view = docxcore::markup::MarkupView::from_name(name)
+            .ok_or_else(|| format!("unknown mode '{name}' (all, simple, none or original)"))?;
+        app.set_markup(view);
+        ctlcore::signal_activity();
+    }
+    Ok(Json::obj(vec![
+        ("mode", Json::Str(app.markup.name().to_string())),
+        ("label", Json::Str(app.markup.label().to_string())),
+        ("editable", Json::Bool(app.markup.is_editable())),
+    ]))
+}
+
+/// `doc.comment-resolve`: resolve (`resolved` true), reopen (false) or, with
+/// no `resolved`, toggle the comment `id`.
+fn resolve_comment(app: &mut App, args: &Json) -> Result<Json, String> {
+    let id = args
+        .get_str("id")
+        .ok_or("doc.comment-resolve needs a comment 'id' (see doc.comments)")?;
+    let wanted = args.get("resolved").and_then(|v| v.as_bool());
+    let resolved = app
+        .set_comment_resolved(id, wanted)
+        .ok_or_else(|| format!("no comment with id {id}"))?;
+    ctlcore::signal_activity();
+    Ok(Json::obj(vec![
+        ("id", Json::Str(id.to_string())),
+        ("resolved", Json::Bool(resolved)),
+    ]))
+}
+
+/// `doc.comments-delete-all`: every comment and its markers, one undo step.
+fn delete_all_comments(app: &mut App) -> Json {
+    let deleted = app.remove_all_comments();
+    ctlcore::signal_activity();
+    Json::obj(vec![("deleted", Json::Num(deleted as f64))])
+}
+
 fn review_all_revisions(app: &mut App, action: RevisionAction) -> Json {
     let outcomes = match action {
         RevisionAction::Accept => app.editor.accept_all_revisions(),
@@ -809,6 +896,15 @@ fn markdown_flag(args: &Json) -> bool {
 /// bad bounds never leaves the mutation behind. See those functions' doc
 /// comments.
 fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, String> {
+    // The Markdown splice overwrites whole paragraphs, which Track Changes
+    // cannot record (the replaced text would just be gone): plain text is.
+    if app.body_editor().track_changes() {
+        return Err(
+            "Track Changes is on: a Markdown splice is not recorded as a tracked change; \
+             use plain text (no 'markdown'), or turn Track Changes off"
+                .to_string(),
+        );
+    }
     let mut blocks = agent::parse_markdown_blocks(text)?;
     if agent::blocks_carry_formatting(&blocks) {
         app.authorize_mutation(MutationKind::Formatting)
@@ -1283,6 +1379,51 @@ mod tests {
             })
             .collect();
         Document { body }
+    }
+
+    #[test]
+    fn app_info_reports_the_build() {
+        let mut app = app_with(&["A"]);
+        let info = dispatch(&mut app, "app-info", &Json::Null).unwrap();
+        for k in [
+            "version",
+            "commit",
+            "short_commit",
+            "branch",
+            "commit_date",
+            "dirty",
+            "last_pr",
+            "issue",
+            "ahead",
+            "built_at",
+            "profile",
+            "target",
+            "host",
+            "kind",
+            "manual",
+            "summary",
+        ] {
+            assert!(info.get(k).is_some(), "app-info lacks {k}: {info:?}");
+        }
+        assert_eq!(info.get_str("version"), Some(env!("CARGO_PKG_VERSION")));
+        let kind = info.get_str("kind").unwrap();
+        assert!(["release", "ci", "local"].contains(&kind), "{kind}");
+        // manual == (kind is local || dirty)
+        let dirty = info.get("dirty").and_then(Json::as_bool).unwrap();
+        assert_eq!(
+            info.get("manual").and_then(Json::as_bool),
+            Some(kind == "local" || dirty)
+        );
+        let commit = info.get_str("commit").unwrap();
+        assert!(
+            commit == "unknown"
+                || (commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
+        );
+        assert!(
+            info.get_str("summary")
+                .unwrap()
+                .contains(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     fn app_with(paras: &[&str]) -> App {
@@ -2019,6 +2160,71 @@ mod tests {
         assert_eq!(listed(&mut app), 1);
     }
 
+    fn comments_json(app: &mut App) -> Vec<(String, bool)> {
+        let r = dispatch(app, "doc.comments", &Json::Null).unwrap();
+        r.get("comments")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c.get_str("id").unwrap().to_string(),
+                    c.get("resolved").and_then(Json::as_bool).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// #621: `doc.comment-resolve` sets, reopens and toggles by id.
+    #[test]
+    fn doc_comment_resolve_sets_reopens_and_toggles() {
+        let mut app = app_with(&["The quick fox"]);
+        app.editor.select_all();
+        app.comment_input = Some("note".into());
+        app.commit_comment();
+        assert_eq!(comments_json(&mut app), [("1".to_string(), false)]);
+        let resolve = |app: &mut App, resolved: Option<bool>| {
+            let mut a = vec![("id", Json::Str("1".into()))];
+            if let Some(r) = resolved {
+                a.push(("resolved", Json::Bool(r)));
+            }
+            dispatch(app, "doc.comment-resolve", &args(a))
+        };
+        resolve(&mut app, Some(true)).unwrap();
+        assert_eq!(comments_json(&mut app), [("1".to_string(), true)]);
+        resolve(&mut app, Some(true)).unwrap();
+        assert_eq!(comments_json(&mut app), [("1".to_string(), true)]);
+        resolve(&mut app, None).unwrap();
+        assert_eq!(comments_json(&mut app), [("1".to_string(), false)]);
+        let err = dispatch(
+            &mut app,
+            "doc.comment-resolve",
+            &args(vec![("id", Json::Str("9".into()))]),
+        )
+        .unwrap_err();
+        assert!(err.contains("no comment with id 9"), "{err}");
+    }
+
+    /// #621: `doc.comments-delete-all` empties the list, keeps the text, and
+    /// `doc.undo` brings markers and records back.
+    #[test]
+    fn doc_comments_delete_all_then_undo() {
+        let mut app = app_with(&["The quick fox"]);
+        for _ in 0..2 {
+            app.editor.select_all();
+            app.comment_input = Some("note".into());
+            app.commit_comment();
+        }
+        let r = dispatch(&mut app, "doc.comments-delete-all", &Json::Null).unwrap();
+        assert_eq!(r.get("deleted").and_then(Json::as_f64), Some(2.0));
+        assert!(comments_json(&mut app).is_empty());
+        assert!(docxcore::inspect::comment_marker_ids(&app.editor.doc).is_empty());
+        assert_eq!(app.editor.doc.plain_text().trim(), "The quick fox");
+        dispatch(&mut app, "doc.undo", &Json::Null).unwrap();
+        assert_eq!(comments_json(&mut app).len(), 2);
+    }
+
     #[test]
     fn comments_empty_shape_on_plain_fixture() {
         let app = app_with(&["x"]);
@@ -2295,9 +2501,12 @@ mod tests {
 
     #[test]
     fn control_mutation_classification_covers_every_mutating_dispatch_verb() {
-        use MutationKind::{Content, Formatting, Structure};
+        use MutationKind::{Comment, Content, Formatting, PackageMetadata, Structure};
 
         let mutating = [
+            ("doc.comment-resolve", Comment),
+            ("doc.comments-delete-all", Comment),
+            ("doc.track-changes-set", PackageMetadata),
             ("doc.replace-range", Structure),
             ("doc.insert", Structure),
             ("doc.append", Structure),
@@ -2326,6 +2535,8 @@ mod tests {
             "doc.find",
             "doc.export",
             "doc.comments",
+            "doc.display-mode",
+            "doc.track-changes",
             "doc.notes",
             "doc.header",
             "doc.footer",
@@ -2405,6 +2616,15 @@ mod tests {
             ),
             ("doc.revisions-accept-all", Json::Null),
             ("doc.revisions-reject-all", Json::Null),
+            (
+                "doc.comment-resolve",
+                args(vec![("id", Json::Str("1".into()))]),
+            ),
+            ("doc.comments-delete-all", Json::Null),
+            (
+                "doc.track-changes-set",
+                args(vec![("enabled", Json::Bool(true))]),
+            ),
         ];
 
         for (verb, verb_args) in cases {
@@ -2499,6 +2719,9 @@ mod tests {
             "doc.revision-reject",
             "doc.revisions-accept-all",
             "doc.revisions-reject-all",
+            "doc.comment-resolve",
+            "doc.comments-delete-all",
+            "doc.track-changes-set",
         ] {
             assert!(mutation_kind_for_verb(verb).is_some(), "{verb}");
             let mut app = final_app(&dir);
@@ -3100,6 +3323,134 @@ mod tests {
             };
             assert!(dispatch(&mut app, verb, &a).is_ok(), "{verb}");
         }
+    }
+
+    /// #625: `doc.display-mode` sets and reports the view, and a view whose
+    /// text is not the document's refuses edits (but not comment verbs).
+    #[test]
+    fn doc_display_mode_sets_the_view_and_refuses_edits_in_view_only_modes() {
+        let mut app = app_with(&["hello"]);
+        let mode = |app: &mut App, m: Option<&str>| {
+            let a = m.map_or(Json::Null, |m| args(vec![("mode", Json::Str(m.into()))]));
+            dispatch(app, "doc.display-mode", &a)
+        };
+        let r = mode(&mut app, None).unwrap();
+        assert_eq!(r.get_str("mode"), Some("all"));
+        assert_eq!(r.get("editable").and_then(Json::as_bool), Some(true));
+        for (m, editable) in [("simple", true), ("none", false), ("original", false)] {
+            let r = mode(&mut app, Some(m)).unwrap();
+            assert_eq!(r.get_str("mode"), Some(m));
+            assert_eq!(r.get("editable").and_then(Json::as_bool), Some(editable));
+            let before = app.editor.doc.plain_text();
+            let inserted = dispatch(
+                &mut app,
+                "doc.insert",
+                &args(vec![
+                    ("at", Json::Num(0.0)),
+                    ("text", Json::Str("X".into())),
+                ]),
+            );
+            if editable {
+                inserted.unwrap();
+                assert!(app.editor.undo());
+            } else {
+                let err = inserted.unwrap_err();
+                assert!(err.starts_with("protection_denied:display_mode: "), "{err}");
+                assert_eq!(app.editor.doc.plain_text(), before);
+                // Comment verbs hold no text of the view.
+                dispatch(&mut app, "doc.comments-delete-all", &Json::Null).unwrap();
+            }
+        }
+        let err = mode(&mut app, Some("bogus")).unwrap_err();
+        assert!(err.contains("unknown mode"), "{err}");
+        // The view is not a mutation: the document is not modified by it.
+        let mut app = app_with(&["hello"]);
+        app.modified = false;
+        mode(&mut app, Some("none")).unwrap();
+        assert!(!app.modified);
+    }
+
+    /// Track Changes cannot record a Markdown splice, so it is refused (plain
+    /// text is recorded).
+    #[test]
+    fn markdown_splices_are_refused_while_tracking_and_plain_text_is_recorded() {
+        let mut app = app_with(&["One two three."]);
+        dispatch(
+            &mut app,
+            "doc.track-changes-set",
+            &args(vec![("enabled", Json::Bool(true))]),
+        )
+        .unwrap();
+        let before = app.editor.doc.clone();
+        for verb in ["doc.replace-range", "doc.insert", "doc.append"] {
+            let err = dispatch(
+                &mut app,
+                verb,
+                &args(vec![
+                    ("start", Json::Num(0.0)),
+                    ("at", Json::Num(0.0)),
+                    ("text", Json::Str("**x**".into())),
+                    ("markdown", Json::Bool(true)),
+                ]),
+            )
+            .unwrap_err();
+            assert!(err.contains("Track Changes is on"), "{verb}: {err}");
+        }
+        assert_eq!(app.editor.doc, before);
+        dispatch(
+            &mut app,
+            "doc.replace-range",
+            &args(vec![
+                ("start", Json::Num(0.0)),
+                ("text", Json::Str("Changed".into())),
+            ]),
+        )
+        .unwrap();
+        let mut rejected = app.editor.doc.clone();
+        rejected.reject_all_revisions();
+        assert_eq!(rejected.plain_text().trim_end(), "One two three.");
+    }
+
+    /// #624 D: `doc.track-changes-set` turns recording on, ordinary edits are
+    /// recorded, and `doc.track-changes` reports it.
+    #[test]
+    fn doc_track_changes_verbs_record_edits() {
+        let mut app = app_with(&["One two three."]);
+        let r = dispatch(&mut app, "doc.track-changes", &Json::Null).unwrap();
+        assert_eq!(r.get("enabled").and_then(Json::as_bool), Some(false));
+        let r = dispatch(
+            &mut app,
+            "doc.track-changes-set",
+            &args(vec![("enabled", Json::Bool(true))]),
+        )
+        .unwrap();
+        assert_eq!(r.get("enabled").and_then(Json::as_bool), Some(true));
+        assert!(!r.get_str("author").unwrap().is_empty());
+        assert!(app.pkg.track_revisions());
+        dispatch(
+            &mut app,
+            "doc.insert",
+            &args(vec![
+                ("at", Json::Num(0.0)),
+                ("text", Json::Str("New".into())),
+            ]),
+        )
+        .unwrap();
+        let revisions = dispatch(&mut app, "doc.revisions", &Json::Null).unwrap();
+        assert!(
+            !revisions.to_string().contains("\"revisions\":[]"),
+            "{revisions}"
+        );
+        let err = dispatch(&mut app, "doc.track-changes-set", &Json::Null).unwrap_err();
+        assert!(err.contains("enabled"), "{err}");
+        // Off again.
+        dispatch(
+            &mut app,
+            "doc.track-changes-set",
+            &args(vec![("enabled", Json::Bool(false))]),
+        )
+        .unwrap();
+        assert!(!app.pkg.track_revisions());
     }
 
     #[test]

@@ -69,6 +69,8 @@ pub struct Cli {
     /// `--read-only` (or `/r` on Windows) was passed: every workbook on the
     /// line opens read-only (#882). Documents and projects open as usual.
     pub read_only: bool,
+    /// `--version` (or `-V`) was passed: print the build info and exit (#1023).
+    pub version: bool,
     /// Positional arguments, in order.
     pub files: Vec<PathBuf>,
     /// `--`-prefixed arguments that are not ours. Kept rather than silently
@@ -92,6 +94,10 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Cli {
             }
             if arg == HARNESS_FLAG {
                 cli.harness = true;
+                continue;
+            }
+            if arg == "--version" || arg == "-V" {
+                cli.version = true;
                 continue;
             }
             if is_read_only_flag(&arg, cfg!(windows)) {
@@ -1013,6 +1019,25 @@ fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
     events
 }
 
+/// Where to click the open dialog's text field `name`: `x` pixels in from its
+/// left edge, or its middle, at the box's middle height.
+fn dialog_field_point(
+    app: &crate::Docxy,
+    name: &str,
+    x: Option<f64>,
+) -> Result<Point<Pixels>, String> {
+    if app.active_dialogs().is_none() {
+        return Err(crate::dialog::NONE_OPEN.into());
+    }
+    let b = app
+        .probes
+        .borrow()
+        .on_screen(&format!("dialog-field:{name}"))
+        .ok_or_else(|| format!("no field '{name}' is drawn in the open dialog"))?;
+    let at = x.map_or_else(|| b.center().x, |x| b.left() + px(x as f32));
+    Ok(point(at, b.center().y))
+}
+
 /// The centre of a named region's recorded bounds — where a pointer verb
 /// presses or releases. Errors name the region. Probe-backed regions read
 /// the frame that is on screen now (see `Docxy::region_bounds_live`), the
@@ -1033,6 +1058,35 @@ fn fill_handle_point(app: &crate::Docxy) -> Result<Point<Pixels>, String> {
         .ok_or_else(|| "the active tab is not a spreadsheet".to_string())?;
     let br = (v.sel.0.max(v.anchor.0), v.sel.1.max(v.anchor.1));
     Ok(app.cells_bounds(br, br)?.bottom_right())
+}
+
+/// The keystrokes of `key`'s and `real-key`'s arguments: `"key"`, or `"keys"`
+/// as a list. All are parsed before any is pressed, so a typo in the third
+/// does not leave the app half way through the sequence.
+fn key_args(args: &Json) -> Result<Vec<Keystroke>, String> {
+    let specs: Vec<String> = match args.get("keys") {
+        Some(Json::Arr(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "'keys' must be an array of strings".to_string())
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("'keys' must be an array of strings".to_string()),
+        None => vec![arg_str(args, "key")?.to_string()],
+    };
+    if specs.is_empty() {
+        return Err("'keys' is empty; there is nothing to press".to_string());
+    }
+    specs.iter().map(|s| parse_key(s)).collect()
+}
+
+/// `pointer-click`'s optional `"x"`: pixels in from a dialog field's left edge.
+fn field_x(args: &Json) -> Result<Option<f64>, String> {
+    args.get("x")
+        .map(|v| v.as_f64().ok_or_else(|| "'x' must be a number".to_string()))
+        .transpose()
 }
 
 /// The optional `"offset":[dx,dy]` on `pointer-drag`: logical pixels added to
@@ -1193,6 +1247,8 @@ struct ViewFlags {
     zoom: f32,
     dark: bool,
     gridlines: bool,
+    /// Display for Review (#625), by its control name.
+    display_mode: &'static str,
 }
 
 impl ViewFlags {
@@ -1208,6 +1264,7 @@ impl ViewFlags {
             zoom: app.zoom,
             dark: app.theme_pref.resolve(window.appearance()) == gpui_component::ThemeMode::Dark,
             gridlines: app.view_gridlines,
+            display_mode: app.markup.name(),
         }
     }
 }
@@ -1318,6 +1375,7 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
             Json::Str(if flags.dark { "dark" } else { "light" }.into()),
         ),
         ("gridlines", Json::Bool(flags.gridlines)),
+        ("display_mode", Json::Str(flags.display_mode.into())),
     ]);
     Json::obj(vec![
         ("text", Json::Str(flat.main().text.clone())),
@@ -1689,16 +1747,27 @@ fn sheet_menu_open(
         .iter()
         .find(|g| g.title == group)
         .ok_or_else(|| format!("no group '{group}' on tab '{tab}'"))?;
-    let id = g
+    let cmd = g
         .commands()
         .into_iter()
         .find(|c| g.menu_owner(c).is_none() && c.label == label)
-        .ok_or_else(|| format!("no command '{label}' in group '{group}'"))?
-        .id;
+        .ok_or_else(|| format!("no command '{label}' in group '{group}'"))?;
+    // A command whose menu is a `SheetMenu` (#707): Paste's arrow, Fill, Clear,
+    // Find & Select.
+    let sheet_menu = match (cmd.shape, cmd.act) {
+        (crate::sheet_ribbon::Shape::Split { menu, .. }, _) => Some(menu),
+        (_, crate::SheetAct::Menu(m)) => Some(m),
+        _ => None,
+    };
+    if let Some(m) = sheet_menu {
+        app.select_ribbon_tab(ribbon_tab, window, cx);
+        let at = menu_point(app, window, None, |b| b.center());
+        app.open_sheet_menu(m, at, cx);
+        return Ok(());
+    }
+    let id = cmd.id;
     if g.dropdown(id).is_none() {
-        return Err(format!(
-            "'{label}' is not a drop-down on the sheet ribbon (Sort & Filter is)"
-        ));
+        return Err(format!("sheet command '{label}' opens no menu"));
     }
     app.select_ribbon_tab(ribbon_tab, window, cx);
     open_ribbon_split_menu(app, id, window, cx)
@@ -2333,6 +2402,17 @@ fn menu_open(
                 // Where the pointer's press on the arrow opens it too.
                 open_ribbon_split_menu(app, id, window, cx)
             }
+            "grid" => {
+                let name = fields[0].1.as_str().unwrap_or_default();
+                let kind = crate::menu::GridMenu::from_name(name).ok_or_else(|| {
+                    format!(
+                        "no grid menu '{name}' (fill-options, paste-options, fill-drop, border-drop)"
+                    )
+                })?;
+                sheet(app)?;
+                let at = menu_point(app, window, None, |b| b.center());
+                app.open_grid_menu(kind, at, cx)
+            }
             // The Quick Access Toolbar Undo arrow (#619).
             "qat" => {
                 if fields[0].1.as_str() != Some(crate::menu::QAT_UNDO_ID) {
@@ -2346,7 +2426,7 @@ fn menu_open(
                 app.open_undo_menu(at, cx)
             }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, row, ribbon and qat are)"
+                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, row, ribbon, grid and qat are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
@@ -2391,6 +2471,23 @@ fn inspection_json(found: &crate::inspector::Inspection) -> Json {
     )
 }
 
+/// `account`'s reply: whether the Account page is open and what it shows.
+/// `badge` is whether the "Manual build" badge was drawn in the last frame (its
+/// own probe), not a copy of `manual`.
+fn account_json(app: &crate::Docxy) -> Json {
+    let info = crate::about::info();
+    let open = app.backstage && app.bs_account;
+    Json::obj(vec![
+        ("open", Json::Bool(open)),
+        ("line", Json::Str(info.short_line())),
+        ("manual", Json::Bool(info.manual())),
+        (
+            "badge",
+            Json::Bool(open && app.probes.borrow().get("account-manual-badge").is_some()),
+        ),
+    ])
+}
+
 /// Whether `verb` stands for a press outside an open menu, which closes it
 /// (#397). Reads leave it open, `key` and `type` reach the menu's own key
 /// gate, the `menu-*` verbs act on it, and a control-pipe verb closes it
@@ -2398,6 +2495,10 @@ fn inspection_json(found: &crate::inspector::Inspection) -> Json {
 fn closes_menu(verb: &str, args: &Json) -> bool {
     // Reading the backstage is a read; opening or closing it is a press.
     if verb == "backstage" {
+        return args.get_str("action") != Some("read");
+    }
+    // Reading the Account page is a read; the rest press it (#1023).
+    if verb == "account" {
         return args.get_str("action") != Some("read");
     }
     // Inspecting is a read; a Remove All is a press (#627).
@@ -2408,10 +2509,15 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
     if verb == "ribbon-layout" {
         return args.get("tab").is_some();
     }
+    // Reading the Office Clipboard is a read; its buttons are presses.
+    if verb == "office-clipboard" {
+        return args.get_str("action").is_some_and(|a| a != "read");
+    }
     matches!(
         verb,
         "click-cell"
             | "drag"
+            | "border-drag"
             | "fill-drag"
             | "save-as"
             | "convert"
@@ -2516,10 +2622,10 @@ fn clipboard_app_json(
                 return Json::obj(vec![
                     ("kind", Json::Str("grid".into())),
                     ("text", Json::Str(clip.text.clone())),
-                    ("rows", Json::Num(clip.cells.len() as f64)),
+                    ("rows", Json::Num(clip.block.cells.len() as f64)),
                     (
                         "cols",
-                        Json::Num(clip.cells.first().map_or(0, Vec::len) as f64),
+                        Json::Num(clip.block.cells.first().map_or(0, Vec::len) as f64),
                     ),
                 ]);
             }
@@ -2698,15 +2804,11 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
                 Json::obj(vec![("target", m.target.to_json())])
             }),
         ),
-        // The active tab's top dialog's id, or `none`; `dialog-read` has the rest.
+        // The top dialog's id (the app's own, else the active tab's), or `none`;
+        // `dialog-read` has the rest.
         (
             "dialog",
-            Json::Str(
-                app.tabs
-                    .get(app.active)
-                    .map_or("none", |t| t.dialogs.top_id())
-                    .into(),
-            ),
+            Json::Str(app.active_dialogs().map_or("none", |d| d.top_id()).into()),
         ),
     ];
     if let Some(v) = app.active_sheet() {
@@ -2715,6 +2817,16 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ("sel", Json::Str(a1(v.sel))),
             ("anchor", Json::Str(a1(v.anchor))),
             ("range", Json::Str(a1_range(v.range()))),
+            // Every area of the selection, the active one last (#670).
+            (
+                "areas",
+                Json::Arr(
+                    v.areas_all()
+                        .into_iter()
+                        .map(|a| Json::Str(a1_range(a)))
+                        .collect(),
+                ),
+            ),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
             // Flash Fill's greyed preview (#666): the range it covers and the
@@ -2765,6 +2877,22 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ),
             // The sheet comment editor New Comment opens, and its text.
             ("comment_edit", str_or_null(app.sheet_comment_edit.clone())),
+        ]);
+        // The option buttons a fill or a paste leaves (#668, #669), and
+        // the Office Clipboard's count.
+        out.extend([
+            (
+                "fill_options",
+                str_or_null(app.fill_options_live().map(|o| o.kind.label().to_string())),
+            ),
+            (
+                "paste_options",
+                str_or_null(app.paste_options_live().map(|o| o.item.label().to_string())),
+            ),
+            (
+                "office_clipboard",
+                Json::Num(app.office_clip.items.len() as f64),
+            ),
         ]);
     }
     let ov = app.grid_overlay();
@@ -2848,11 +2976,10 @@ fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
     ])
 }
 
-/// The active tab's dialogs, for a verb that drives one.
+/// The open dialogs (the app's own, else the active tab's), for a verb that
+/// drives one.
 fn open_dialogs(app: &mut crate::Docxy) -> Result<&mut crate::dialog::DialogStack, String> {
-    app.tabs
-        .get_mut(app.active)
-        .map(|t| &mut t.dialogs)
+    Some(app.active_dialogs_mut())
         .filter(|d| d.is_open())
         .ok_or_else(|| crate::dialog::NONE_OPEN.into())
 }
@@ -3039,6 +3166,27 @@ fn dispatch_verb(
             Done::ok(state(app, window))
         }
         "doc" => Done::ok(live_doc_state(app, window)?),
+        // The active document's comments, as a save would write them (#1027):
+        // `{comments:[{id, author, initials, text}]}`, in the order the comments
+        // part lists them (new ones last).
+        "comments" => {
+            let tab = app.tabs.get(app.active).ok_or(crate::dialog::NONE_OPEN)?;
+            let crate::Surface::Doc(ed) = &tab.surface else {
+                return Err("the active tab is not a document".into());
+            };
+            let items = crate::live_comments(tab, &ed.doc)
+                .iter()
+                .map(|c| {
+                    Json::obj(vec![
+                        ("id", Json::Str(c.id.clone())),
+                        ("author", Json::Str(c.author.clone())),
+                        ("initials", Json::Str(c.initials.clone())),
+                        ("text", Json::Str(c.text.clone())),
+                    ])
+                })
+                .collect();
+            Done::ok(Json::obj(vec![("comments", Json::Arr(items))]))
+        }
         // Header/footer editing state (#641): which area of which section and
         // variant, its labels, and the contextual tab's Options and Position.
         "hf-state" => Done::ok(crate::hf_tab::hf_state(app.tabs.get(app.active))),
@@ -3072,10 +3220,7 @@ fn dispatch_verb(
         }
         // Dialogs (#393). There is no `dialog-open`: a dialog opens through
         // the verb a person would use (`key`, `ribbon-click`, `click-cell`).
-        "dialog-read" => Done::ok(app.tabs.get(app.active).map_or_else(
-            || crate::dialog::DialogStack::default().to_json(),
-            |t| t.dialogs.to_json(),
-        )),
+        "dialog-read" => Done::ok(app.active_dialogs_mut().to_json()),
         // The control's input handler, the one the overlay's editable widgets
         // call too (#649).
         "dialog-set" => {
@@ -3106,10 +3251,7 @@ fn dispatch_verb(
                 unreachable!("state is an object")
             };
             // A close prompt's Save or Don't Save may have closed the last tab.
-            let dialog = app.tabs.get(app.active).map_or_else(
-                || crate::dialog::DialogStack::default().to_json(),
-                |t| t.dialogs.to_json(),
-            );
+            let dialog = app.active_dialogs_mut().to_json();
             match out.iter_mut().find(|(k, _)| k == "dialog") {
                 Some((_, v)) => *v = dialog,
                 None => out.push(("dialog".into(), dialog)),
@@ -3177,6 +3319,29 @@ fn dispatch_verb(
                     Json::Arr(items.map(|item| Json::Str(item.display.into())).collect()),
                 ),
             ]))
+        }
+        // File > Account and its About dialog (#1023). `open` is the rail item's
+        // handler and `about` the page's About button; the dialog it opens is an
+        // ordinary one, driven with `dialog-read` and `dialog-click` (Copy, Close).
+        "account" => {
+            let action = arg_str(args, "action")?;
+            match action {
+                "read" => {}
+                "open" | "about" => {
+                    app.refuse_under_dialog()?;
+                    if !app.backstage {
+                        return Err("File (backstage) is not open; use backstage open".into());
+                    }
+                    if action == "open" {
+                        app.open_account(cx);
+                    } else {
+                        app.open_about()?;
+                        cx.notify();
+                    }
+                }
+                _ => return Err("'action' must be open, about or read".into()),
+            }
+            Done::ok_drawn(account_json(app))
         }
         "theme-set" => {
             let pref = parse_theme_pref(arg_str(args, "theme")?)?;
@@ -3397,7 +3562,8 @@ fn dispatch_verb(
             Done::ok(state(app, window))
         }
         // Settings' User name... row (#620): opens its dialog on the active
-        // tab, which `dialog-set` and `dialog-click` then drive.
+        // tab's stack, or the app's own with no document open (#1027), which
+        // `dialog-set` and `dialog-click` then drive.
         "user-name" => {
             app.open_user_name_dialog()?;
             cx.notify();
@@ -3586,8 +3752,9 @@ fn dispatch_verb(
                 return Done::ok(state(app, window));
             }
             let cell = cell_arg(args, "cell")?;
+            let ctrl = arg_flag(args, "ctrl")?;
             sheet(app)?;
-            click_cell(app, cell, shift, dbl, window, cx);
+            click_cell(app, cell, shift, ctrl, dbl, window, cx);
             Done::ok(state(app, window))
         }
 
@@ -3596,6 +3763,20 @@ fn dispatch_verb(
         // exactly like an OS click. `item` is the drift guard for the
         // fill-handle case: which more-tabs item the point landed on.
         "pointer-click" => {
+            // A field of the open dialog: where a person clicks it, a number
+            // of pixels `x` in from its left edge (its middle without one).
+            if let Some(field) = args.get("dialog-field") {
+                let name = field
+                    .as_str()
+                    .ok_or("'dialog-field' must be a field name")?;
+                let p = dialog_field_point(app, name, field_x(args)?)?;
+                let mut done = Done::ok(Json::obj(vec![
+                    ("x", Json::Num(f64::from(p.x))),
+                    ("y", Json::Num(f64::from(p.y))),
+                ]))?;
+                done.input = click_events(p);
+                return Ok(done);
+            }
             app.refuse_under_dialog()?;
             let p = match (args.get("region"), args.get("at")) {
                 (Some(region), None) => {
@@ -3604,8 +3785,17 @@ fn dispatch_verb(
                 }
                 (None, Some(at)) => match at.as_str() {
                     Some("fill-handle") => fill_handle_point(app)?,
+                    // Backstage's Settings row for the User name dialog.
+                    Some("user-name-row") => app
+                        .probes
+                        .borrow()
+                        .on_screen("bs-user-name")
+                        .ok_or("the User name row is not drawn: open File (backstage) first")?
+                        .center(),
                     Some(other) => {
-                        return Err(format!("unknown pointer target '{other}' (fill-handle)"));
+                        return Err(format!(
+                            "unknown pointer target '{other}' (fill-handle, user-name-row)"
+                        ));
                     }
                     None => return Err("'at' must be a string".into()),
                 },
@@ -3622,7 +3812,7 @@ fn dispatch_verb(
                     Json::Num(item_at_point(&app.probes.borrow(), p) as f64),
                 ),
             ]))?;
-            done.pointer = click_events(p);
+            done.input = click_events(p);
             Ok(done)
         }
         "pointer-drag" => {
@@ -3649,7 +3839,7 @@ fn dispatch_verb(
                     Json::Arr(vec![Json::Num(f64::from(to.x)), Json::Num(f64::from(to.y))]),
                 ),
             ]))?;
-            done.pointer = drag_events(&path);
+            done.input = drag_events(&path);
             Ok(done)
         }
 
@@ -3747,10 +3937,31 @@ fn dispatch_verb(
         // `drag` verb presses the grid instead, so it sweeps a selection.
         "fill-drag" => {
             app.refuse_under_dialog()?;
-            if args.get("option").is_some() {
-                return Err("AutoFill Options are not implemented in this app".into());
+            // #668: `option` picks an Auto Fill Options kind after the fill,
+            // `ctrl` holds Ctrl, `right` drags with the right button (its
+            // menu is open in the reply), `double` double-clicks the handle.
+            let option = match args.get("option") {
+                Some(_) => {
+                    let name = arg_str(args, "option")?;
+                    Some(gridcore::edit::FillKind::from_label(name).ok_or_else(|| {
+                        format!("no Auto Fill Options kind '{name}' (copy, series, formats, values, days, weekdays, months, years, linear, growth)")
+                    })?)
+                }
+                None => None,
+            };
+            let (ctrl, right, double) = (
+                arg_flag(args, "ctrl")?,
+                arg_flag(args, "right")?,
+                arg_flag(args, "double")?,
+            );
+            if let Some(why) = fill_flags_refusal(option.is_some(), ctrl, right, double) {
+                return Err(why.into());
             }
-            let to = cell_arg(args, "to")?;
+            let to = if double {
+                (0, 0)
+            } else {
+                cell_arg(args, "to")?
+            };
             let from = match args.get("from") {
                 Some(_) => Some(range_arg(args, "from")?),
                 None => None,
@@ -3765,9 +3976,9 @@ fn dispatch_verb(
                 from.is_some(),
             )?;
             if let Some((start, end)) = from {
-                click_cell(app, start, false, false, window, cx);
+                click_cell(app, start, false, false, false, window, cx);
                 if end != start {
-                    click_cell(app, end, true, false, window, cx);
+                    click_cell(app, end, true, false, false, window, cx);
                 }
             }
             fill_press_refusal(
@@ -3777,7 +3988,34 @@ fn dispatch_verb(
                 false,
             )?;
             let src = sheet(app)?.range();
-            app.sheet_fill_start(cx);
+            if double {
+                app.sheet_fill_double(cx);
+                let after = sheet(app)?.range();
+                // The Auto Fill Options button a double-click's fill leaves
+                // too; with nothing filled there is none to pick from.
+                if let Some(kind) = option {
+                    if after == src {
+                        return Err(
+                            "'option' has no fill to change: the double-click filled nothing"
+                                .into(),
+                        );
+                    }
+                    app.sheet_fill_as(kind, cx);
+                }
+                let mut reply = state(app, window);
+                if let Json::Obj(fields) = &mut reply {
+                    let filled = (after != src).then(|| a1_range(after));
+                    fields.push(("filled".into(), str_or_null(filled)));
+                }
+                return Done::ok(reply);
+            }
+            // Pressed and moved as the handle's and the cells' own handlers
+            // press and move: a right press, and Ctrl held in each move.
+            if right {
+                app.sheet_fill_start_right(cx);
+            } else {
+                app.sheet_fill_start(cx);
+            }
             if app.sheet_fill.is_none() {
                 let locked = app
                     .tabs
@@ -3793,9 +4031,21 @@ fn dispatch_verb(
                 });
             }
             for (r, c) in drag_path((src.2, src.3), to) {
-                app.grid_drag_over(r, c, cx);
+                if right {
+                    app.sheet_fill_over(r, c, cx);
+                } else {
+                    app.grid_left_drag_over(r, c, ctrl, cx);
+                }
+            }
+            if right {
+                app.last_pointer = menu_point(app, window, None, |b| b.center());
+                app.sheet_fill_end(cx);
+                return Done::ok(crate::menu::read_json(app.menu.as_ref()));
             }
             app.grid_release(cx);
+            if let Some(kind) = option {
+                app.sheet_fill_as(kind, cx);
+            }
             let after = sheet(app)?.range();
             let mut reply = state(app, window);
             if let Json::Obj(fields) = &mut reply {
@@ -3805,6 +4055,103 @@ fn dispatch_verb(
             Done::ok(reply)
         }
 
+        // A drag of the selection by its border (#670): select `from` (a
+        // cell or range; the selection as it is when absent), grab its
+        // top-left, and drop it with its top-left on `to`. `ctrl` copies;
+        // `right` opens the drop menu, whose `choice` (a label) is then
+        // clicked; `replace` answers the "There's already data here"
+        // question (left open when absent).
+        "border-drag" => {
+            app.refuse_under_dialog()?;
+            let to = cell_arg(args, "to")?;
+            let (ctrl, right) = (arg_flag(args, "ctrl")?, arg_flag(args, "right")?);
+            let choice = match args.get("choice") {
+                Some(_) => {
+                    let label = arg_str(args, "choice")?;
+                    Some(crate::sheet_menus::DropChoice::from_label(label).ok_or_else(|| {
+                        format!("no drop choice '{label}' (Move Here, Copy Here, Copy Here as Values Only, Copy Here as Formats Only, Link Here, Cancel)")
+                    })?)
+                }
+                None => None,
+            };
+            if choice.is_some() && !right {
+                return Err("'choice' is the right-drag menu's; add \"right\": true".into());
+            }
+            if args.get("from").is_some() {
+                let (start, end) = range_arg(args, "from")?;
+                sheet(app)?;
+                click_cell(app, start, false, false, false, window, cx);
+                if end != start {
+                    click_cell(app, end, true, false, false, window, cx);
+                }
+            }
+            let (r0, c0, _, _) = sheet(app)?.range();
+            app.border_drag_start((r0, c0), right, cx);
+            if app.drops.border_drag.is_none() {
+                return Err(format!(
+                    "the drag did not start: {}",
+                    app.tabs
+                        .get(app.active)
+                        .map(|t| t.status.to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "another gesture is in flight".into())
+                ));
+            }
+            app.border_drag_over(to, ctrl, cx);
+            app.last_pointer = menu_point(app, window, None, |b| b.center());
+            app.border_drag_end(cx);
+            if right {
+                match choice {
+                    Some(choice) => app.border_drop_choice(choice, cx),
+                    None => return Done::ok(crate::menu::read_json(app.menu.as_ref())),
+                }
+            }
+            match args.get("replace") {
+                Some(Json::Bool(yes)) => {
+                    let asked = app
+                        .active_dialogs()
+                        .and_then(|d| d.top())
+                        .is_some_and(|d| d.owner == crate::dialog::DialogOwner::DropReplace);
+                    if !asked {
+                        return Err("the drop asked nothing; leave out 'replace'".into());
+                    }
+                    app.dialog_press(if *yes { "OK" } else { "Cancel" }, window, cx)?;
+                }
+                Some(_) => return Err("'replace' must be true or false".into()),
+                None => {}
+            }
+            Done::ok(state(app, window))
+        }
+
+        // The Office Clipboard pane (#669): `read` (the default), `open`,
+        // `close`, `paste` item `index`, `paste-all`, `clear-all`, `delete`
+        // item `index`. The same handler the pane's buttons call.
+        "office-clipboard" => {
+            let action = args.get_str("action").unwrap_or("read");
+            if action != "read" {
+                app.refuse_under_dialog()?;
+                sheet(app)?;
+                let index = match args.get("index") {
+                    Some(_) => Some(arg_usize(args, "index")?),
+                    None => None,
+                };
+                app.office_clip_act(action, index, cx)?;
+            }
+            Done::ok(Json::obj(vec![
+                ("open", Json::Bool(app.office_clip.open)),
+                (
+                    "items",
+                    Json::Arr(
+                        app.office_clip
+                            .items
+                            .iter()
+                            .map(|t| Json::Str(t.clone()))
+                            .collect(),
+                    ),
+                ),
+                ("state", state(app, window)),
+            ]))
+        }
         // The clipboard (#699). A harness instance has a private one (it starts
         // empty and never touches the OS clipboard); `write` puts text on it
         // as another app's copy would. Copy, cut and paste are the app's own
@@ -3817,7 +4164,10 @@ fn dispatch_verb(
                     app.clipboard_write(text, cx);
                 }
                 "paste-special" => {
-                    return Err("paste special is not implemented in this app".into());
+                    return Err(
+                        "clipboard does not paste special: press the app's own key (key ctrl+alt+v) or menu-click Paste Special… on the Paste gallery"
+                            .into(),
+                    );
                 }
                 action @ ("copy" | "cut" | "paste") => {
                     return Err(format!(
@@ -3838,13 +4188,32 @@ fn dispatch_verb(
         "drag" => {
             app.refuse_under_dialog()?;
             let (from, to) = drag_args(args)?;
+            let ctrl = arg_flag(args, "ctrl")?;
             sheet(app)?;
-            app.grid_press_cell(from, cx);
+            app.grid_press_cell(from, ctrl, cx);
             for (r, c) in drag_path(from, to) {
                 app.grid_drag_over(r, c, cx);
             }
             app.grid_release(cx);
             Done::ok(state(app, window))
+        }
+
+        // `key` and `type` through the window's own input path, as the OS
+        // delivers them (#1027): the events queue on the reply and the pump
+        // dispatches them through gpui, so a root that lacks its key handler
+        // (Backstage's once did) never sees them, where `key` calls `on_key`.
+        "real-key" | "real-type" => {
+            let strokes = if verb == "real-type" {
+                typed_keys(arg_str(args, "text")?)?
+            } else {
+                key_args(args)?
+            };
+            let mut done = Done::ok(Json::obj(vec![("keys", Json::Num(strokes.len() as f64))]))?;
+            done.input = strokes
+                .into_iter()
+                .map(|keystroke| PlatformInput::KeyDown(key_event(keystroke)))
+                .collect();
+            Ok(done)
         }
 
         // Type text, one key event per character.
@@ -3857,27 +4226,7 @@ fn dispatch_verb(
 
         // One key, or a list of them ("keys": ["ctrl+c", "down", "ctrl+v"]).
         "key" => {
-            let specs: Vec<String> = match args.get("keys") {
-                Some(Json::Arr(items)) => items
-                    .iter()
-                    .map(|v| {
-                        v.as_str()
-                            .map(str::to_string)
-                            .ok_or_else(|| "'keys' must be an array of strings".to_string())
-                    })
-                    .collect::<Result<_, _>>()?,
-                Some(_) => return Err("'keys' must be an array of strings".to_string()),
-                None => vec![arg_str(args, "key")?.to_string()],
-            };
-            if specs.is_empty() {
-                return Err("'keys' is empty; there is nothing to press".to_string());
-            }
-            // Parse them all before pressing any, so a typo in the third key
-            // does not leave the app half way through the sequence.
-            let strokes = specs
-                .iter()
-                .map(|s| parse_key(s))
-                .collect::<Result<Vec<_>, _>>()?;
+            let strokes = key_args(args)?;
             for stroke in strokes {
                 press(app, stroke, window, cx);
             }
@@ -4050,6 +4399,7 @@ fn dispatch_verb(
 
         // Persist and go. The reply is written first (see the pump).
         "quit" => {
+            app.commit_dialog_buffers_for_exit(cx);
             crate::close::commit_pending_for_exit(&mut app.tabs);
             // Not through `on_window_should_close`: clear the run marker here
             // too, or every harness relaunch would look like a crash (#632).
@@ -4058,7 +4408,7 @@ fn dispatch_verb(
                 result: Json::obj(vec![("quitting", Json::Bool(true))]),
                 quit: true,
                 draw: false,
-                pointer: Vec::new(),
+                input: Vec::new(),
             })
         }
 
@@ -4106,6 +4456,25 @@ fn is_action_key(stroke: &Keystroke) -> bool {
             .any(|(key, shift)| *key == stroke.key && *shift == m.shift)
 }
 
+/// Why `fill-drag` refuses its flags together: a right drag ends in the
+/// fill menu, not the Auto Fill Options button `option` picks from, and a
+/// double-click or a right drag holds no Ctrl. `None` when they go together.
+fn fill_flags_refusal(option: bool, ctrl: bool, right: bool, double: bool) -> Option<&'static str> {
+    if right && double {
+        Some("'right' and 'double' don't go together: a double-click is a left press")
+    } else if right && option {
+        Some(
+            "'option' picks from the Auto Fill Options button; a right drag opens the fill menu instead (menu-click its kind)",
+        )
+    } else if ctrl && (right || double) {
+        Some(
+            "'ctrl' swaps copy and series on a left drag; it does nothing to a right drag or a double-click",
+        )
+    } else {
+        None
+    }
+}
+
 /// Why `fill-drag` cannot press the fill handle, or `Ok` when it can. The
 /// handle is not there to press while File (backstage) covers the sheet or the
 /// more-tabs list covers the window, or while the grid does not draw it
@@ -4134,16 +4503,18 @@ fn fill_press_refusal(
 
 /// A click on a sheet cell, as the pointer makes it: press, the cell's click
 /// handler, release.
+#[allow(clippy::too_many_arguments)]
 fn click_cell(
     app: &mut crate::Docxy,
     cell: (u32, u32),
     shift: bool,
+    ctrl: bool,
     double: bool,
     window: &mut Window,
     cx: &mut Context<crate::Docxy>,
 ) {
-    app.grid_press_cell(cell, cx);
-    app.cell_click(cell.0, cell.1, shift, double, window, cx);
+    app.grid_press_cell(cell, ctrl, cx);
+    app.cell_click(cell.0, cell.1, shift, ctrl, double, window, cx);
     app.grid_release(cx);
 }
 
@@ -4241,7 +4612,10 @@ mod tests {
             text: "one\ntwo".into(),
         };
         let grid = crate::GridClip {
-            cells: vec![vec![Default::default(); 3]; 2],
+            block: gridcore::edit::ClipBlock {
+                cells: vec![vec![Default::default(); 3]; 2],
+                ..Default::default()
+            },
             text: "a\tb\tc\nd\te\tf\n".into(),
             ..Default::default()
         };
@@ -4476,6 +4850,7 @@ mod tests {
             zoom: 1.5,
             dark: true,
             gridlines: true,
+            display_mode: "all",
         };
         let state = doc_state(&editor(props, run), &flags);
         assert_eq!(state.get_str("text"), Some("abc\n"));
@@ -4553,6 +4928,7 @@ mod tests {
                 zoom: 1.0,
                 dark: false,
                 gridlines: true,
+                display_mode: "all",
             },
         );
         assert_ne!(state.get("para"), defaults.get("para"));
@@ -4650,6 +5026,7 @@ mod tests {
                 zoom: 1.0,
                 dark: false,
                 gridlines: true,
+                display_mode: "all",
             },
         );
         assert_eq!(state.get("cross_story"), Some(&Json::Bool(true)));
@@ -5280,6 +5657,24 @@ mod tests {
         );
     }
 
+    /// #1023: `--version` and `-V` are flags, not files or unknown options; after
+    /// `--` they are files.
+    #[test]
+    fn version_flag_is_parsed() {
+        for flag in ["--version", "-V"] {
+            let cli = parse_args(args(&[flag]));
+            assert!(cli.version, "{flag}");
+            assert!(
+                cli.files.is_empty() && cli.unknown_flags.is_empty(),
+                "{flag}"
+            );
+        }
+        assert!(!parse_args(args(&["a.xlsx"])).version);
+        let cli = parse_args(args(&["--", "--version"]));
+        assert!(!cli.version);
+        assert_eq!(cli.files, [PathBuf::from("--version")]);
+    }
+
     /// No arguments at all is the double-click case: nothing on, nothing to open.
     #[test]
     fn empty_command_line_is_a_plain_launch() {
@@ -5876,6 +6271,19 @@ mod tests {
         );
     }
 
+    /// #707 r9 m4: `fill-drag`'s flags that cannot go together are refused
+    /// rather than dropped.
+    #[test]
+    fn fill_drag_refuses_flags_that_do_not_go_together() {
+        assert!(fill_flags_refusal(true, false, true, false).is_some());
+        assert!(fill_flags_refusal(false, true, true, false).is_some());
+        assert!(fill_flags_refusal(false, true, false, true).is_some());
+        assert!(fill_flags_refusal(false, false, true, true).is_some());
+        assert_eq!(fill_flags_refusal(true, false, false, true), None);
+        assert_eq!(fill_flags_refusal(true, true, false, false), None);
+        assert_eq!(fill_flags_refusal(false, false, true, false), None);
+    }
+
     /// #699: `fill-drag` refuses before `from` is clicked when a click could
     /// not bring the handle back (an edit, a pointing reference, a cover), so
     /// a refusal changes nothing; a selected chart is left for the click to
@@ -6256,6 +6664,40 @@ mod tests {
     /// #545 (FIX r1 M1): `offset` is optional, is a two-number array, and is
     /// added to the resolved `to` point — the shape a drop-back-on-own-chip
     /// drag is built from.
+    /// `real-key` and `key` read their keys the same way; an empty list, a
+    /// non-string entry and a non-list are refused, and a bad key refuses all.
+    #[test]
+    fn key_args_reads_one_key_or_a_list_and_refuses_the_rest() {
+        let one = Json::obj(vec![("key", Json::Str("ctrl+a".into()))]);
+        assert_eq!(key_args(&one).unwrap().len(), 1);
+        let list = |items: Vec<Json>| Json::obj(vec![("keys", Json::Arr(items))]);
+        let two = list(vec![Json::Str("tab".into()), Json::Str("enter".into())]);
+        assert_eq!(key_args(&two).unwrap().len(), 2);
+        assert!(key_args(&list(vec![])).unwrap_err().contains("empty"));
+        assert!(key_args(&list(vec![Json::Num(1.)])).is_err());
+        assert!(key_args(&Json::obj(vec![("keys", Json::Str("tab".into()))])).is_err());
+        assert!(
+            key_args(&list(vec![
+                Json::Str("tab".into()),
+                Json::Str("hyper+a".into())
+            ]))
+            .is_err()
+        );
+        assert!(key_args(&Json::obj(vec![])).is_err());
+    }
+
+    /// `pointer-click`'s `x` is optional, and a present one must be a number.
+    #[test]
+    fn field_x_is_an_optional_number() {
+        assert_eq!(field_x(&Json::obj(vec![])), Ok(None));
+        assert_eq!(
+            field_x(&Json::obj(vec![("x", Json::Num(5.))])),
+            Ok(Some(5.0))
+        );
+        let bad = Json::obj(vec![("x", Json::Str("5".into()))]);
+        assert_eq!(field_x(&bad), Err("'x' must be a number".into()));
+    }
+
     #[test]
     fn drag_offset_is_an_optional_two_number_pair() {
         let no_offset = Json::obj(vec![]);

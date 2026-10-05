@@ -1178,6 +1178,43 @@ impl Editor {
         Ok(AssignOutcome::Assigned)
     }
 
+    /// Set a task's hyperlink — display text, address, in-file location — as
+    /// ONE undo step, like Project's Insert Hyperlink edits the three parts
+    /// together. Ends are trimmed; an empty part is absent, so empty strings
+    /// on all three remove the link. Setting the values a task already has
+    /// changes nothing. A blank row cannot take a hyperlink.
+    pub fn set_hyperlink(
+        &mut self,
+        uid: i32,
+        text: &str,
+        address: &str,
+        sub_address: &str,
+    ) -> Result<(), String> {
+        let i = self.index(uid)?;
+        if self.proj.tasks[i].is_null {
+            return Err("A blank row cannot take a hyperlink".into());
+        }
+        let norm = |s: &str| {
+            let s = s.trim();
+            (!s.is_empty()).then(|| s.to_string())
+        };
+        let (text, address, sub_address) = (norm(text), norm(address), norm(sub_address));
+        let task = &self.proj.tasks[i];
+        if task.hyperlink == text
+            && task.hyperlink_address == address
+            && task.hyperlink_sub_address == sub_address
+        {
+            return Ok(());
+        }
+        self.snapshot();
+        let task = &mut self.proj.tasks[i];
+        task.hyperlink = text;
+        task.hyperlink_address = address;
+        task.hyperlink_sub_address = sub_address;
+        self.changed();
+        Ok(())
+    }
+
     /// Project › Schedule › Set Baseline: record the plan as it is scheduled
     /// now (CPM, the dates a save writes) in the Baseline (slot 0) of every
     /// scheduled task, with its stored work and cost (absent ones stay

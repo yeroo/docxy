@@ -1,0 +1,16 @@
+[package]
+name = "buildinfo"
+description = "Build info stamped at compile time (commit, last merged PR, build kind, manual-build marker) shared by the suite and the terminal editors. Dependency-free."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["build-info", "git", "version", "build-script"]
+categories = ["development-tools::build-utils"]
+build = "build.rs"
+
+[lints]
+workspace = true

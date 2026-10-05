@@ -270,6 +270,7 @@ impl<'a> Runner<'a> {
                 cell,
                 shift,
                 double,
+                ctrl,
             } => self.verb(
                 out,
                 "click-cell",
@@ -277,15 +278,17 @@ impl<'a> Runner<'a> {
                     ("cell", Json::Str(cell.clone())),
                     ("shift", Json::Bool(*shift)),
                     ("double", Json::Bool(*double)),
+                    ("ctrl", Json::Bool(*ctrl)),
                 ]),
             ),
 
-            Action::Drag { from, to } => self.verb(
+            Action::Drag { from, to, ctrl } => self.verb(
                 out,
                 "drag",
                 Json::obj(vec![
                     ("from", Json::Str(from.clone())),
                     ("to", Json::Str(to.clone())),
+                    ("ctrl", Json::Bool(*ctrl)),
                 ]),
             ),
 

@@ -16,6 +16,7 @@
 //! | Verb | Args | Result |
 //! |---|---|---|
 //! | `wb.path` | — | `{path, modified, sheets, active, active_name, circular}` |
+//! | `app-info` | — | the build: `{version, commit, short_commit, branch, commit_date, dirty, last_pr, issue, ahead, built_at, profile, target, host, kind, manual, summary, …}` |
 //! | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 //! | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
 //! | `cell.get` | `{ref, sheet?}` | `{ref, row, col, value, formula?, text}` |
@@ -185,6 +186,11 @@ pub fn keeps_cells_in_place(verb: &str) -> bool {
     )
 }
 
+/// `app-info`: the build this binary is (see the `buildinfo` crate), as JSON.
+fn app_info() -> Result<Json, String> {
+    Json::parse(&buildinfo::get(env!("CARGO_PKG_VERSION")).json())
+}
+
 /// Route one control verb against the live workbook, returning the JSON result
 /// or an error message.
 pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> {
@@ -211,6 +217,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "sheet.import-text" => sheet_import_text(app, args),
         "range.text-to-columns" => range_text_to_columns(app, args),
         "app.options" => app_options(app, args),
+        "app-info" => app_info(),
         "app.autocorrect" => app_autocorrect(app, args),
         "range.flash-fill" => range_flash_fill(app, args),
         "wb.replace-all" => wb_replace_all(app, args),
@@ -2660,6 +2667,51 @@ mod tests {
         let mut a = App::new(new_xlsx(), "ctl-test.xlsx");
         a.os_clip = None;
         a
+    }
+
+    #[test]
+    fn app_info_reports_the_build() {
+        let mut app = app();
+        let info = dispatch(&mut app, "app-info", &Json::Null).unwrap();
+        for k in [
+            "version",
+            "commit",
+            "short_commit",
+            "branch",
+            "commit_date",
+            "dirty",
+            "last_pr",
+            "issue",
+            "ahead",
+            "built_at",
+            "profile",
+            "target",
+            "host",
+            "kind",
+            "manual",
+            "summary",
+        ] {
+            assert!(info.get(k).is_some(), "app-info lacks {k}: {info:?}");
+        }
+        assert_eq!(info.get_str("version"), Some(env!("CARGO_PKG_VERSION")));
+        let kind = info.get_str("kind").unwrap();
+        assert!(["release", "ci", "local"].contains(&kind), "{kind}");
+        // manual == (kind is local || dirty)
+        let dirty = info.get("dirty").and_then(Json::as_bool).unwrap();
+        assert_eq!(
+            info.get("manual").and_then(Json::as_bool),
+            Some(kind == "local" || dirty)
+        );
+        let commit = info.get_str("commit").unwrap();
+        assert!(
+            commit == "unknown"
+                || (commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
+        );
+        assert!(
+            info.get_str("summary")
+                .unwrap()
+                .contains(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     fn set(app: &mut App, r: &str, text: &str) {

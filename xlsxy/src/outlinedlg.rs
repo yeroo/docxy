@@ -1,7 +1,7 @@
 //! Data ▸ Outline's dialogs: Subtotal (with Remove All), Settings, and the
 //! Rows/Columns choice Group and Ungroup ask when the selection is neither
-//! whole rows nor whole columns; and Data Tools' Consolidate, which writes
-//! an outline when it links to its sources.
+//! whole rows nor whole columns; Data Tools' Consolidate, which writes an
+//! outline when it links to its sources; and Home's Paste Special (#669).
 //!
 //! ↑/↓ (Tab/Shift+Tab) move between fields, ←/→ change a choice, Space
 //! toggles a check box or presses the focused button. Enter is OK (or the
@@ -11,6 +11,7 @@
 use gridcore::edit::{
     Area, ConsolidateOptions, ConsolidateSettings, SubtotalFunc, SubtotalOptions,
 };
+use gridcore::edit::{PasteOp, PasteSpec, PasteWhat};
 use gridcore::outline::{Axis, OutlineSettings};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
@@ -34,6 +35,8 @@ pub enum Outcome {
     Axis(Axis),
     /// Consolidate's OK (the app fills in the book name).
     Consolidate(ConsolidateOptions),
+    /// Paste Special's OK.
+    PasteSpecial(PasteSpec),
 }
 
 /// The Subtotal dialog over one region.
@@ -544,6 +547,7 @@ pub enum Dialog {
     Settings(SettingsDialog),
     Axis(AxisDialog),
     Consolidate(ConsolidateDialog),
+    PasteSpecial(PasteSpecialDialog),
 }
 
 impl Dialog {
@@ -553,6 +557,7 @@ impl Dialog {
             Dialog::Settings(d) => d.key(code),
             Dialog::Axis(d) => d.key(code),
             Dialog::Consolidate(d) => d.key(code),
+            Dialog::PasteSpecial(d) => d.key(code),
         }
     }
 
@@ -562,7 +567,92 @@ impl Dialog {
             Dialog::Settings(d) => d.draw(f, area),
             Dialog::Axis(d) => d.draw(f, area),
             Dialog::Consolidate(d) => d.draw(f, area),
+            Dialog::PasteSpecial(d) => d.draw(f, area),
         }
+    }
+}
+
+/// What xlsxy's Paste Special offers: Excel's All, Formulas, Values and
+/// Formats (the gallery, the Options button and the Office Clipboard are
+/// the desktop suite's).
+pub const PASTE_WHATS: [PasteWhat; 4] = [
+    PasteWhat::All,
+    PasteWhat::Formulas,
+    PasteWhat::Values,
+    PasteWhat::Formats,
+];
+
+/// Home › Paste Special (Ctrl+Alt+V): what to paste, the operation, Skip
+/// blanks and Transpose, applied through gridcore's `paste_special_changes`.
+#[derive(Clone, Debug, Default)]
+pub struct PasteSpecialDialog {
+    /// Index into [`PASTE_WHATS`].
+    pub what: usize,
+    pub op: PasteOp,
+    pub skip_blanks: bool,
+    pub transpose: bool,
+    pub focus: usize,
+}
+
+impl PasteSpecialDialog {
+    /// What OK applies.
+    pub fn spec(&self) -> PasteSpec {
+        PasteSpec {
+            what: PASTE_WHATS[self.what.min(PASTE_WHATS.len() - 1)],
+            op: self.op,
+            skip_blanks: self.skip_blanks,
+            transpose: self.transpose,
+        }
+    }
+
+    pub fn key(&mut self, code: KeyCode) -> Outcome {
+        const N: usize = 6; // what, operation, the two boxes, OK, Cancel
+        let step = |s: &mut Self, by: i32| match s.focus {
+            0 => s.what = cycle(s.what, PASTE_WHATS.len(), by),
+            1 => {
+                let i = PasteOp::ALL.iter().position(|&o| o == s.op).unwrap_or(0);
+                s.op = PasteOp::ALL[cycle(i, PasteOp::ALL.len(), by)];
+            }
+            2 => s.skip_blanks = !s.skip_blanks,
+            3 => s.transpose = !s.transpose,
+            _ => {}
+        };
+        match code {
+            KeyCode::Esc => return Outcome::Cancel,
+            KeyCode::Up | KeyCode::BackTab => self.focus = (self.focus + N - 1) % N,
+            KeyCode::Down | KeyCode::Tab => self.focus = (self.focus + 1) % N,
+            KeyCode::Left => step(self, -1),
+            KeyCode::Right => step(self, 1),
+            KeyCode::Char(' ') => match self.focus {
+                4 => return Outcome::PasteSpecial(self.spec()),
+                5 => return Outcome::Cancel,
+                _ => step(self, 1),
+            },
+            KeyCode::Enter if self.focus == 5 => return Outcome::Cancel,
+            KeyCode::Enter => return Outcome::PasteSpecial(self.spec()),
+            _ => {}
+        }
+        Outcome::Pending
+    }
+
+    pub fn draw(&self, f: &mut Frame, area: Rect) {
+        let spec = self.spec();
+        let items = [
+            format!("Paste:      < {} >", spec.what.label()),
+            format!("Operation:  < {} >", spec.op.label()),
+            format!("{} Skip blanks", check(spec.skip_blanks)),
+            format!("{} Transpose", check(spec.transpose)),
+            "[ OK ]".into(),
+            "[ Cancel ]".into(),
+        ];
+        let mut lines = Vec::new();
+        for (i, t) in items.into_iter().enumerate() {
+            lines.push(item(t, i == self.focus));
+        }
+        lines.push(hint(
+            "Up/Down field  Left/Right choose  Space toggle  Enter OK  Esc Cancel",
+        ));
+        modal(f, area, " Paste Special ", lines, 52);
     }
 }
 
@@ -629,6 +719,28 @@ pub(crate) fn modal(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_special_stages_its_spec() {
+        let mut d = PasteSpecialDialog::default();
+        assert_eq!(d.spec(), PasteSpec::default());
+        d.key(KeyCode::Right); // Formulas
+        d.key(KeyCode::Right); // Values
+        d.key(KeyCode::Down);
+        d.key(KeyCode::Right); // Add
+        d.key(KeyCode::Down);
+        d.key(KeyCode::Char(' ')); // skip blanks
+        d.key(KeyCode::Down);
+        d.key(KeyCode::Char(' ')); // transpose
+        let want = PasteSpec {
+            what: PasteWhat::Values,
+            op: PasteOp::Add,
+            skip_blanks: true,
+            transpose: true,
+        };
+        assert_eq!(d.key(KeyCode::Enter), Outcome::PasteSpecial(want));
+        assert_eq!(d.key(KeyCode::Esc), Outcome::Cancel);
+    }
 
     fn dialog() -> SubtotalDialog {
         SubtotalDialog::new(

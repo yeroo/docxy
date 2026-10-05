@@ -17,6 +17,7 @@
 //! through [`col`] and [`rows`], `const fn`s that assert `len <= 3`: a table
 //! with a fourth row does not compile (#1018).
 
+use crate::sheet_menus::SheetMenu;
 use crate::{RibbonTab, SheetAct};
 
 /// A flex gap, in the unit the hand-drawn ribbon used for it (`gap_1` is a
@@ -45,6 +46,12 @@ pub(crate) enum Shape {
     /// A Large button that opens a drop-down (Sort & Filter); its items are
     /// the group's [`Dropdown`].
     Menu(Option<&'static str>),
+    /// A Large split button: the icon and text run the command, the arrow
+    /// under them opens `menu` (Home › Paste and its gallery, #707).
+    Split {
+        icon: Option<&'static str>,
+        menu: crate::sheet_menus::SheetMenu,
+    },
 }
 
 /// One sheet ribbon command.
@@ -173,8 +180,10 @@ pub(crate) const fn menu(
 
 pub(crate) struct Group {
     pub title: &'static str,
-    /// Draws the dialog-launcher glyph beside the title (inert).
+    /// Draws the dialog-launcher glyph beside the title.
     pub launcher: bool,
+    /// What the launcher runs; `None` draws it inert.
+    pub launch: Option<SheetAct>,
     pub body: Body,
 }
 
@@ -364,10 +373,20 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Clipboard",
                 launcher: true,
+                // The Office Clipboard pane (#669).
+                launch: Some(SheetAct::OfficeClipboard),
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
-                        Item::One(large("paste", "Paste", Some("paste"), SheetAct::Paste)),
+                        Item::One(cmd(
+                            "paste",
+                            "Paste",
+                            Shape::Split {
+                                icon: Some("paste"),
+                                menu: SheetMenu::Paste,
+                            },
+                            SheetAct::Paste,
+                        )),
                         col(
                             COL,
                             &[
@@ -382,6 +401,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Font",
                 launcher: true,
+                launch: None,
                 body: rows(&[
                     &[
                         combo("font-name", "Font", "Calibri", true),
@@ -422,6 +442,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Alignment",
                 launcher: true,
+                launch: None,
                 body: rows(&[
                     &[
                         glyph("top-align", "Top Align", "\u{2580}", SheetAct::Todo),
@@ -452,6 +473,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Number",
                 launcher: true,
+                launch: None,
                 body: rows(&[
                     &[cmd(
                         "number-format",
@@ -486,6 +508,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Styles",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_0P5,
                     items: &[
@@ -508,6 +531,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Cells",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_2,
                     items: &[
@@ -532,6 +556,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Editing",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -545,8 +570,13 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                     None,
                                     SheetAct::AutoSum,
                                 ),
-                                row("fill", "Fill", None, SheetAct::Todo),
-                                row("clear", "Clear", Some("clear-format"), SheetAct::Todo),
+                                row("fill", "Fill", None, SheetAct::Menu(SheetMenu::Fill)),
+                                row(
+                                    "clear",
+                                    "Clear",
+                                    Some("clear-format"),
+                                    SheetAct::Menu(SheetMenu::Clear),
+                                ),
                             ],
                         ),
                         menu(
@@ -575,7 +605,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             "find-select",
                             "Find & Select",
                             Some("find"),
-                            SheetAct::Todo,
+                            SheetAct::Menu(SheetMenu::FindSelect),
                         )),
                     ],
                 },
@@ -589,6 +619,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Tables",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -610,6 +641,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Charts",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -653,6 +685,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Sort & Filter",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -701,6 +734,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Data Tools",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -760,6 +794,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Outline",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -799,6 +834,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Show Level",
                 launcher: false,
+                launch: None,
                 body: rows(&[
                     &[
                         glyph("level-1", "Show Level 1", "1", SheetAct::ShowLevel(1)),
@@ -823,6 +859,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Proofing",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[Item::One(large(
@@ -836,6 +873,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Comments",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -864,6 +902,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Protect",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -891,6 +930,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
         groups: &[Group {
             title: "Window",
             launcher: false,
+            launch: None,
             body: Body::Strip {
                 gap: GAP_1,
                 items: &[Item::One(toggle(
@@ -1087,9 +1127,6 @@ mod tests {
                 "increase-decimal",
                 "decrease-decimal",
                 "cell-styles",
-                "fill",
-                "clear",
-                "find-select",
                 "circle-invalid",
                 "clear-validation-circles",
                 "spelling",
