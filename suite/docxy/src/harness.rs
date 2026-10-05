@@ -1054,6 +1054,35 @@ fn fill_handle_point(app: &crate::Docxy) -> Result<Point<Pixels>, String> {
     Ok(app.cells_bounds(br, br)?.bottom_right())
 }
 
+/// The keystrokes of `key`'s and `real-key`'s arguments: `"key"`, or `"keys"`
+/// as a list. All are parsed before any is pressed, so a typo in the third
+/// does not leave the app half way through the sequence.
+fn key_args(args: &Json) -> Result<Vec<Keystroke>, String> {
+    let specs: Vec<String> = match args.get("keys") {
+        Some(Json::Arr(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "'keys' must be an array of strings".to_string())
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("'keys' must be an array of strings".to_string()),
+        None => vec![arg_str(args, "key")?.to_string()],
+    };
+    if specs.is_empty() {
+        return Err("'keys' is empty; there is nothing to press".to_string());
+    }
+    specs.iter().map(|s| parse_key(s)).collect()
+}
+
+/// `pointer-click`'s optional `"x"`: pixels in from a dialog field's left edge.
+fn field_x(args: &Json) -> Result<Option<f64>, String> {
+    args.get("x")
+        .map(|v| v.as_f64().ok_or_else(|| "'x' must be a number".to_string()))
+        .transpose()
+}
+
 /// The optional `"offset":[dx,dy]` on `pointer-drag`: logical pixels added to
 /// the resolved `to` point, for a drop that lands near — not on — its
 /// target's centre (e.g. a drag that ends back on its own chip).
@@ -2897,7 +2926,8 @@ fn dispatch_verb(
         }
         "doc" => Done::ok(live_doc_state(app, window)?),
         // The active document's comments, as a save would write them (#1027):
-        // `{comments:[{id, author, initials, text}]}`, in document order.
+        // `{comments:[{id, author, initials, text}]}`, in the order the comments
+        // part lists them (new ones last).
         "comments" => {
             let tab = app.tabs.get(app.active).ok_or(crate::dialog::NONE_OPEN)?;
             let crate::Surface::Doc(ed) = &tab.surface else {
@@ -3409,7 +3439,7 @@ fn dispatch_verb(
                 let name = field
                     .as_str()
                     .ok_or("'dialog-field' must be a field name")?;
-                let p = dialog_field_point(app, name, args.get("x").and_then(Json::as_f64))?;
+                let p = dialog_field_point(app, name, field_x(args)?)?;
                 let mut done = Done::ok(Json::obj(vec![
                     ("x", Json::Num(f64::from(p.x))),
                     ("y", Json::Num(f64::from(p.y))),
@@ -3685,18 +3715,7 @@ fn dispatch_verb(
             let strokes = if verb == "real-type" {
                 typed_keys(arg_str(args, "text")?)?
             } else {
-                let spec = match args.get("keys") {
-                    Some(Json::Arr(items)) => items
-                        .iter()
-                        .map(|v| v.as_str().map(str::to_string))
-                        .collect::<Option<Vec<_>>>()
-                        .ok_or("'keys' must be an array of strings")?,
-                    Some(_) => return Err("'keys' must be an array of strings".to_string()),
-                    None => vec![arg_str(args, "key")?.to_string()],
-                };
-                spec.iter()
-                    .map(|s| parse_key(s))
-                    .collect::<Result<Vec<_>, _>>()?
+                key_args(args)?
             };
             let mut done = Done::ok(Json::obj(vec![("keys", Json::Num(strokes.len() as f64))]))?;
             done.input = strokes
@@ -3716,27 +3735,7 @@ fn dispatch_verb(
 
         // One key, or a list of them ("keys": ["ctrl+c", "down", "ctrl+v"]).
         "key" => {
-            let specs: Vec<String> = match args.get("keys") {
-                Some(Json::Arr(items)) => items
-                    .iter()
-                    .map(|v| {
-                        v.as_str()
-                            .map(str::to_string)
-                            .ok_or_else(|| "'keys' must be an array of strings".to_string())
-                    })
-                    .collect::<Result<_, _>>()?,
-                Some(_) => return Err("'keys' must be an array of strings".to_string()),
-                None => vec![arg_str(args, "key")?.to_string()],
-            };
-            if specs.is_empty() {
-                return Err("'keys' is empty; there is nothing to press".to_string());
-            }
-            // Parse them all before pressing any, so a typo in the third key
-            // does not leave the app half way through the sequence.
-            let strokes = specs
-                .iter()
-                .map(|s| parse_key(s))
-                .collect::<Result<Vec<_>, _>>()?;
+            let strokes = key_args(args)?;
             for stroke in strokes {
                 press(app, stroke, window, cx);
             }
@@ -6105,6 +6104,40 @@ mod tests {
     /// #545 (FIX r1 M1): `offset` is optional, is a two-number array, and is
     /// added to the resolved `to` point — the shape a drop-back-on-own-chip
     /// drag is built from.
+    /// `real-key` and `key` read their keys the same way; an empty list, a
+    /// non-string entry and a non-list are refused, and a bad key refuses all.
+    #[test]
+    fn key_args_reads_one_key_or_a_list_and_refuses_the_rest() {
+        let one = Json::obj(vec![("key", Json::Str("ctrl+a".into()))]);
+        assert_eq!(key_args(&one).unwrap().len(), 1);
+        let list = |items: Vec<Json>| Json::obj(vec![("keys", Json::Arr(items))]);
+        let two = list(vec![Json::Str("tab".into()), Json::Str("enter".into())]);
+        assert_eq!(key_args(&two).unwrap().len(), 2);
+        assert!(key_args(&list(vec![])).unwrap_err().contains("empty"));
+        assert!(key_args(&list(vec![Json::Num(1.)])).is_err());
+        assert!(key_args(&Json::obj(vec![("keys", Json::Str("tab".into()))])).is_err());
+        assert!(
+            key_args(&list(vec![
+                Json::Str("tab".into()),
+                Json::Str("hyper+a".into())
+            ]))
+            .is_err()
+        );
+        assert!(key_args(&Json::obj(vec![])).is_err());
+    }
+
+    /// `pointer-click`'s `x` is optional, and a present one must be a number.
+    #[test]
+    fn field_x_is_an_optional_number() {
+        assert_eq!(field_x(&Json::obj(vec![])), Ok(None));
+        assert_eq!(
+            field_x(&Json::obj(vec![("x", Json::Num(5.))])),
+            Ok(Some(5.0))
+        );
+        let bad = Json::obj(vec![("x", Json::Str("5".into()))]);
+        assert_eq!(field_x(&bad), Err("'x' must be a number".into()));
+    }
+
     #[test]
     fn drag_offset_is_an_optional_two_number_pair() {
         let no_offset = Json::obj(vec![]);

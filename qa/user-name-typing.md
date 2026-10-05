@@ -4,7 +4,7 @@ What the scripted harness cannot reach: a person's real keyboard and mouse in
 the desktop suite's window. `uiharness/cases/user-name.uit` covers the same
 paths with synthetic events dispatched through gpui's input path; run these
 once on each OS after a change to the window's key handling. Use a scratch
-config (`DOCXY_CONFIG` or a fresh profile), never your own.
+config (`DOCXY_CONFIG_DIR` or a fresh profile), never your own.
 
 **Setup for every case:** `cargo build -p docxy`, run the suite, open
 `assets/sample.docx`.
