@@ -198,18 +198,19 @@ pub(crate) fn commit_comment_buffer(tab: &mut DocTab, author: &str, text: &str) 
     true
 }
 
-/// The exit path's comment commit. The bar edits the note on the cell it was
-/// OPENED on — `cell`, with `seed` the raw text it opened with — and the
-/// commit lands there: a click moves the selection without closing the bar
-/// (only range fields point), so committing to the selected cell would delete
-/// or copy notes onto whatever cell was clicked last. The commit is skipped
-/// when it cannot change anything (Enter would dirty the tab, restamp the
-/// author and spend a whole-package undo step for these): the buffer equals
-/// the seed (raw compare — a file-loaded note keeps its whitespace, so a note
-/// "note\n" seeds "note\n" and a bar opened to read it must not rewrite it
-/// as "note"), or the note on `cell` already trims to the buffer (retyped or
-/// unchanged text; committing would only restamp its author). Enter's own
-/// path is [`commit_comment_buffer`], unchanged.
+/// The exit path's comment commit. A CHANGED buffer commits to the CURRENT
+/// SELECTION, exactly as Enter and the bar's own label do — the label reads
+/// "Comment on {cell}:" off the live selection, so that is the cell the user
+/// sees themselves editing. `cell`/`seed` — the cell the bar opened on and
+/// the raw text it opened with — serve ONLY the skip decision, so an
+/// untouched bar never deletes or copies after a click moved the selection:
+/// the commit is skipped when the buffer equals the seed (raw compare — a
+/// file-loaded note keeps its whitespace, so a note "note\n" seeds "note\n"
+/// and a bar opened to read it must not rewrite it as "note"), or the note on
+/// the bar's cell already trims to the buffer (retyped or unchanged text;
+/// committing would only restamp its author, wherever it landed), or the
+/// bar's cell has no note and the buffer is empty (the delete that isn't).
+/// Enter's own path is [`commit_comment_buffer`], unchanged.
 pub(crate) fn commit_comment_buffer_for_exit(
     tab: &mut DocTab,
     cell: (u32, u32),
@@ -217,42 +218,30 @@ pub(crate) fn commit_comment_buffer_for_exit(
     author: &str,
     text: &str,
 ) -> bool {
-    if tab.access.locked() {
-        return false;
-    }
-    let Surface::Sheet(v) = &mut tab.surface else {
-        return false;
+    let noop = match &tab.surface {
+        Surface::Sheet(v) => {
+            let trimmed = text.trim();
+            text == seed
+                || match v
+                    .pkg
+                    .comments()
+                    .iter()
+                    .find(|cm| cm.sheet == v.active && cm.row == cell.0 && cm.col == cell.1)
+                {
+                    Some(cm) => cm.text.trim() == trimmed,
+                    // No note on the bar's cell: an empty buffer's delete is
+                    // the only no-op; the seed compare above covers the
+                    // empty-on-empty case, this covers a note deleted under
+                    // the bar while it was open.
+                    None => trimmed.is_empty(),
+                }
+        }
+        _ => true,
     };
-    let trimmed = text.trim();
-    let noop = text == seed
-        || match v
-            .pkg
-            .comments()
-            .iter()
-            .find(|cm| cm.sheet == v.active && cm.row == cell.0 && cm.col == cell.1)
-        {
-            Some(cm) => cm.text.trim() == trimmed,
-            // No note there: an empty buffer's delete is the only no-op; the
-            // seed compare above covers the empty-on-empty case, this covers
-            // a note deleted under the bar while it was open.
-            None => trimmed.is_empty(),
-        };
     if noop {
         return false;
     }
-    // `comment_cell` acts on the selection; aim it at the bar's cell for the
-    // commit, then put the selection back.
-    let saved = v.sel;
-    v.sel = cell;
-    // The view takes the undo step itself: the whole package.
-    let ok = v.comment_cell(author, text);
-    v.sel = saved;
-    if !ok {
-        tab.status = DAMAGED_SHEET_STATUS.into();
-        return false;
-    }
-    tab.dirty = true;
-    true
+    commit_comment_buffer(tab, author, text)
 }
 
 /// Commit a sheet's open cell editor unless it was seeded from a cell and left
@@ -620,10 +609,10 @@ impl Docxy {
     pub(crate) fn commit_dialog_buffers_for_exit(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = self.sheet_comment_edit.take() {
             let author = self.comment_author();
-            // The bar edits the note on the cell it opened on, wherever the
-            // selection went while it was open; the seed is the text it
-            // opened with. The fallback is unreachable while the seed is set
-            // wherever the buffer is.
+            // The seed says what the bar opened with — the exit commit skips
+            // a buffer that is it. The commit itself lands on the current
+            // selection, as Enter and the bar's label do. The fallback is
+            // unreachable while the seed is set wherever the buffer is.
             let (cell, seed) = self.sheet_comment_seed.take().unwrap_or_else(|| {
                 let cell = self.active_sheet().map(|v| v.sel).unwrap_or_default();
                 (cell, self.selected_comment().unwrap_or_default())

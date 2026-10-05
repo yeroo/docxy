@@ -3371,8 +3371,9 @@ struct Docxy {
     sheet_comment_edit: Option<String>,
     // The cell a comment bar opened on and the text it opened with (its
     // seed): the selection moves freely while the bar is open, and an exit
-    // commit must land on the bar's cell and tell an untouched buffer from
-    // an edit. Set where the buffer opens, cleared with it.
+    // commit uses the seed only to tell an untouched buffer from an edit —
+    // so a bar merely open never deletes or copies onto a clicked cell.
+    // Set where the buffer opens, cleared with it.
     sheet_comment_seed: Option<((u32, u32), String)>,
     // Whether the data-validation list dropdown is open on the selected cell.
     sheet_dv_open: bool,
@@ -12790,8 +12791,8 @@ impl Docxy {
     /// Open the comment entry bar for the selected cell, seeded with its
     /// existing comment text (so New Comment doubles as Edit). The seed — the
     /// cell and the raw text — is remembered with the buffer: the selection
-    /// moves freely while the bar is open, and an exit commit must land on
-    /// the bar's cell and skip a buffer that is the seed, untouched.
+    /// moves freely while the bar is open, and an exit commit uses it only to
+    /// skip a buffer that is the seed, untouched, after a click moved on.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
         if let Some(cell) = self.active_sheet().map(|v| v.sel) {
             let text = self.selected_comment().unwrap_or_default();

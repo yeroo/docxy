@@ -2536,8 +2536,8 @@ fn exit_with_unchanged_rename_buffer_leaves_clean_tab_clean() {
     };
     assert_eq!(v.pkg.workbook.sheets[0].name, name);
 
-    // A case-only rename is not "unchanged" — the compare is exact — so it
-    // still commits and is taken (only names the other sheets hold decline).
+    // A case-only rename is not "unchanged" — the trims differ — so it still
+    // commits and is taken (only names the other sheets hold decline).
     let case = name.to_lowercase();
     assert_ne!(case, name);
     assert!(commit_rename_buffer_for_exit(&mut t, 0, &case));
@@ -2679,17 +2679,17 @@ fn exit_with_untouched_buffer_keeps_a_whitespace_note_intact() {
 }
 
 #[test]
-fn exit_comment_commit_targets_the_bar_cell_not_the_selection() {
-    // The bar opened on empty A1; the user typed, then clicked C5 — the
-    // selection moved, the bar stayed open (only range fields point). The
-    // commit lands on A1, the bar's cell, and the selection is left where
-    // the click put it.
+fn exit_comment_commit_follows_the_selection_like_enter() {
+    // The bar's label reads off the live selection ("Comment on C5:"), and
+    // Enter/Save write there — the exit commit agrees: a CHANGED buffer
+    // lands on the selected cell even when the bar opened elsewhere. Only an
+    // untouched buffer (the seed) is skipped after a click.
     let mut t = tab(Kind::Xlsx);
     {
         let Surface::Sheet(v) = &mut t.surface else {
             panic!()
         };
-        v.sel = (4, 4);
+        v.sel = (4, 4); // clicked here after opening the bar on A1
     }
     assert!(commit_comment_buffer_for_exit(
         &mut t,
@@ -2708,13 +2708,8 @@ fn exit_comment_commit_targets_the_bar_cell_not_the_selection() {
             .iter()
             .any(|cm| cm.sheet == v.active && cm.row == r && cm.col == c)
     };
-    assert!(at(0, 0), "on the bar's cell");
-    assert!(!at(4, 4), "not on the selected cell");
-    assert_eq!(
-        v.sel,
-        (4, 4),
-        "the selection is back where the click left it"
-    );
+    assert!(at(4, 4), "on the selected cell, where Enter would write");
+    assert!(!at(0, 0), "not on the bar's cell");
 }
 
 #[test]
