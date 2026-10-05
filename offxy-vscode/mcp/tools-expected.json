@@ -707,6 +707,44 @@
     }
   },
   {
+    "name": "docxy_comment_resolve",
+    "description": "Resolve a review comment, or reopen it (Review > Comments > Resolve): writes w15:done to commentsExtended.xml on save. Pass resolved to set the state; without it the comment toggles. Returns {id, resolved}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Comment id returned by docxy_comments."
+        },
+        "resolved": {
+          "type": "boolean",
+          "description": "Optional: true to resolve, false to reopen (default: toggle)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "id"
+      ]
+    }
+  },
+  {
+    "name": "docxy_comments_delete_all",
+    "description": "Delete every comment in the document (Review > Comments > Delete All): the comment records and their anchors, keeping the anchored text, as one undo step. Returns {deleted}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
     "name": "xlsxy_list",
     "description": "List the xlsxy editors currently running on this machine (instance/pane id, port, pid).",
     "inputSchema": {

@@ -3000,6 +3000,35 @@
                   }
                 }
               ]
+            },
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "resolvecomment",
+                  "label": "Resolve",
+                  "icon": "comment",
+                  "act": "ResolveComment",
+                  "keyTip": "V",
+                  "tip": {
+                    "title": "Resolve",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "deleteallcomments",
+                  "label": "Delete all",
+                  "icon": "table-dismiss",
+                  "act": "DeleteAllComments",
+                  "keyTip": "X",
+                  "tip": {
+                    "title": "Delete all",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
             }
           ]
         },

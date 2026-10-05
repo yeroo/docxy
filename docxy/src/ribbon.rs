@@ -69,6 +69,9 @@ pub enum Act {
     /// Add a comment on the selection / delete the selected comment.
     NewComment,
     DeleteComment,
+    /// Resolve / reopen the selected comment; delete every comment.
+    ResolveComment,
+    DeleteAllComments,
     /// Navigate and act on imported tracked changes.
     PrevRevision,
     NextRevision,
@@ -533,12 +536,26 @@ fn review_groups() -> Vec<Group> {
     vec![
         Group {
             title: "Comments",
-            width: 35,
+            width: 43,
             rows: [
                 vec![
                     btn("✎ New", 5, NewComment, "New comment on the selection"),
                     Seg::Gap("  "),
                     btn("✗ Delete", 8, DeleteComment, "Delete the selected comment"),
+                    Seg::Gap("  "),
+                    btn(
+                        "✓ Resolve",
+                        9,
+                        ResolveComment,
+                        "Resolve the selected comment, or reopen it",
+                    ),
+                    Seg::Gap("  "),
+                    btn(
+                        "✗ All",
+                        5,
+                        DeleteAllComments,
+                        "Delete every comment in the document",
+                    ),
                 ],
                 vec![
                     btn("‹ Prev", 6, PrevComment, "Previous comment"),

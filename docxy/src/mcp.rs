@@ -66,6 +66,8 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "docxy_page_color" => "doc.page-color",
         "docxy_watermark" => "doc.watermark",
         "docxy_page_borders" => "doc.page-borders",
+        "docxy_comment_resolve" => "doc.comment-resolve",
+        "docxy_comments_delete_all" => "doc.comments-delete-all",
         _ => return None,
     })
 }
@@ -563,6 +565,35 @@ fn tool_defs() -> Json {
             ],
             &["border"],
         ),
+        tool(
+            "docxy_comment_resolve",
+            "Resolve a review comment, or reopen it (Review > Comments > Resolve): writes \
+             w15:done to commentsExtended.xml on save. Pass resolved to set the state; \
+             without it the comment toggles. Returns {id, resolved}.",
+            vec![
+                (
+                    "id",
+                    prop("string", "Comment id returned by docxy_comments."),
+                ),
+                (
+                    "resolved",
+                    prop(
+                        "boolean",
+                        "Optional: true to resolve, false to reopen (default: toggle).",
+                    ),
+                ),
+                target(),
+            ],
+            &["id"],
+        ),
+        tool(
+            "docxy_comments_delete_all",
+            "Delete every comment in the document (Review > Comments > Delete All): the \
+             comment records and their anchors, keeping the anchored text, as one undo step. \
+             Returns {deleted}.",
+            vec![target()],
+            &[],
+        ),
     ])
 }
 
@@ -673,6 +704,9 @@ mod tests {
             "docxy_page_color",
             "docxy_watermark",
             "docxy_page_borders",
+            // #621: resolve / delete-all comments.
+            "docxy_comment_resolve",
+            "docxy_comments_delete_all",
         ];
         let save_pos = names.iter().position(|n| *n == "docxy_save").unwrap();
         assert_eq!(
@@ -728,6 +762,8 @@ mod tests {
         assert_eq!(required_of("docxy_page_color"), "[\"color\"]");
         assert_eq!(required_of("docxy_watermark"), "[]");
         assert_eq!(required_of("docxy_page_borders"), "[\"border\"]");
+        assert_eq!(required_of("docxy_comment_resolve"), "[\"id\"]");
+        assert_eq!(required_of("docxy_comments_delete_all"), "[]");
     }
 
     /// Wave-2: `docxy_insert`/`docxy_replace_range`/`docxy_append` gain an
@@ -897,6 +933,8 @@ mod tests {
         ("docxy_page_color", "doc.page-color"),
         ("docxy_watermark", "doc.watermark"),
         ("docxy_page_borders", "doc.page-borders"),
+        ("docxy_comment_resolve", "doc.comment-resolve"),
+        ("docxy_comments_delete_all", "doc.comments-delete-all"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.
@@ -944,9 +982,11 @@ mod tests {
 
     #[test]
     fn mutating_mcp_tools_forward_to_control_authorized_verbs() {
-        use crate::protection::MutationKind::{Content, Formatting, Structure};
+        use crate::protection::MutationKind::{Comment, Content, Formatting, Structure};
 
         let expected = [
+            ("docxy_comment_resolve", Comment),
+            ("docxy_comments_delete_all", Comment),
             ("docxy_replace_range", Structure),
             ("docxy_insert", Structure),
             ("docxy_append", Structure),

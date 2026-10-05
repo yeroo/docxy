@@ -39,6 +39,8 @@
 //! | `doc.undo` / `doc.redo` | — | `{done}` (false = nothing to undo/redo) |
 //! | `doc.revisions` / `doc.revision-current` | — | stable revision ids, kinds, metadata, and current selection |
 //! | `doc.revision-next` / `doc.revision-previous` | — | navigate and return the selected stable revision |
+//! | `doc.comment-resolve` | `{id, resolved?}` | `{id,resolved}`; no `resolved` toggles |
+//! | `doc.comments-delete-all` | — | `{deleted}`; markers and records, one undo step |
 //! | `doc.revision-accept` / `doc.revision-reject` | `{revision}` | structured applied/stale/unsupported/malformed outcome |
 //! | `doc.revisions-accept-all` / `doc.revisions-reject-all` | — | one undoable transaction and per-revision outcomes |
 //! | `doc.export-pdf` | `{path}` | `{path}` (absolutized; refuses to overwrite) |
@@ -91,6 +93,7 @@ pub(crate) fn mutation_kind_for_verb(verb: &str) -> Option<MutationKind> {
         | "doc.revision-reject"
         | "doc.revisions-accept-all"
         | "doc.revisions-reject-all" => MutationKind::Content,
+        "doc.comment-resolve" | "doc.comments-delete-all" => MutationKind::Comment,
         "doc.format" | "doc.set-style" | "doc.page-color" | "doc.watermark"
         | "doc.page-borders" => MutationKind::Formatting,
         _ => return None,
@@ -117,6 +120,8 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "doc.append" => append(app, args),
         "doc.export" => export(app, args),
         "doc.comments" => Ok(comments(app)),
+        "doc.comment-resolve" => resolve_comment(app, args),
+        "doc.comments-delete-all" => Ok(delete_all_comments(app)),
         "doc.notes" => Ok(notes(app)),
         // Default section variant only — first-page/even-page headers and
         // footers (`app.headers.first`/`.even`, `app.footers.first`/`.even`)
@@ -351,6 +356,7 @@ fn comments(app: &App) -> Json {
                 ("date", Json::Str(c.date.clone())),
                 ("text", Json::Str(c.text.clone())),
                 ("anchor", Json::Str(c.quoted.clone())),
+                ("resolved", Json::Bool(c.resolved)),
             ])
         })
         .collect();
@@ -670,6 +676,30 @@ fn review_revision(app: &mut App, args: &Json, action: RevisionAction) -> Result
         ctlcore::signal_activity();
     }
     Ok(revision_outcome_json(&outcome))
+}
+
+/// `doc.comment-resolve`: resolve (`resolved` true), reopen (false) or, with
+/// no `resolved`, toggle the comment `id`.
+fn resolve_comment(app: &mut App, args: &Json) -> Result<Json, String> {
+    let id = args
+        .get_str("id")
+        .ok_or("doc.comment-resolve needs a comment 'id' (see doc.comments)")?;
+    let wanted = args.get("resolved").and_then(|v| v.as_bool());
+    let resolved = app
+        .set_comment_resolved(id, wanted)
+        .ok_or_else(|| format!("no comment with id {id}"))?;
+    ctlcore::signal_activity();
+    Ok(Json::obj(vec![
+        ("id", Json::Str(id.to_string())),
+        ("resolved", Json::Bool(resolved)),
+    ]))
+}
+
+/// `doc.comments-delete-all`: every comment and its markers, one undo step.
+fn delete_all_comments(app: &mut App) -> Json {
+    let deleted = app.remove_all_comments();
+    ctlcore::signal_activity();
+    Json::obj(vec![("deleted", Json::Num(deleted as f64))])
 }
 
 fn review_all_revisions(app: &mut App, action: RevisionAction) -> Json {
@@ -2019,6 +2049,71 @@ mod tests {
         assert_eq!(listed(&mut app), 1);
     }
 
+    fn comments_json(app: &mut App) -> Vec<(String, bool)> {
+        let r = dispatch(app, "doc.comments", &Json::Null).unwrap();
+        r.get("comments")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c.get_str("id").unwrap().to_string(),
+                    c.get("resolved").and_then(Json::as_bool).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// #621: `doc.comment-resolve` sets, reopens and toggles by id.
+    #[test]
+    fn doc_comment_resolve_sets_reopens_and_toggles() {
+        let mut app = app_with(&["The quick fox"]);
+        app.editor.select_all();
+        app.comment_input = Some("note".into());
+        app.commit_comment();
+        assert_eq!(comments_json(&mut app), [("1".to_string(), false)]);
+        let resolve = |app: &mut App, resolved: Option<bool>| {
+            let mut a = vec![("id", Json::Str("1".into()))];
+            if let Some(r) = resolved {
+                a.push(("resolved", Json::Bool(r)));
+            }
+            dispatch(app, "doc.comment-resolve", &args(a))
+        };
+        resolve(&mut app, Some(true)).unwrap();
+        assert_eq!(comments_json(&mut app), [("1".to_string(), true)]);
+        resolve(&mut app, Some(true)).unwrap();
+        assert_eq!(comments_json(&mut app), [("1".to_string(), true)]);
+        resolve(&mut app, None).unwrap();
+        assert_eq!(comments_json(&mut app), [("1".to_string(), false)]);
+        let err = dispatch(
+            &mut app,
+            "doc.comment-resolve",
+            &args(vec![("id", Json::Str("9".into()))]),
+        )
+        .unwrap_err();
+        assert!(err.contains("no comment with id 9"), "{err}");
+    }
+
+    /// #621: `doc.comments-delete-all` empties the list, keeps the text, and
+    /// `doc.undo` brings markers and records back.
+    #[test]
+    fn doc_comments_delete_all_then_undo() {
+        let mut app = app_with(&["The quick fox"]);
+        for _ in 0..2 {
+            app.editor.select_all();
+            app.comment_input = Some("note".into());
+            app.commit_comment();
+        }
+        let r = dispatch(&mut app, "doc.comments-delete-all", &Json::Null).unwrap();
+        assert_eq!(r.get("deleted").and_then(Json::as_f64), Some(2.0));
+        assert!(comments_json(&mut app).is_empty());
+        assert!(docxcore::inspect::comment_marker_ids(&app.editor.doc).is_empty());
+        assert_eq!(app.editor.doc.plain_text().trim(), "The quick fox");
+        dispatch(&mut app, "doc.undo", &Json::Null).unwrap();
+        assert_eq!(comments_json(&mut app).len(), 2);
+    }
+
     #[test]
     fn comments_empty_shape_on_plain_fixture() {
         let app = app_with(&["x"]);
@@ -2295,9 +2390,11 @@ mod tests {
 
     #[test]
     fn control_mutation_classification_covers_every_mutating_dispatch_verb() {
-        use MutationKind::{Content, Formatting, Structure};
+        use MutationKind::{Comment, Content, Formatting, Structure};
 
         let mutating = [
+            ("doc.comment-resolve", Comment),
+            ("doc.comments-delete-all", Comment),
             ("doc.replace-range", Structure),
             ("doc.insert", Structure),
             ("doc.append", Structure),
@@ -2405,6 +2502,11 @@ mod tests {
             ),
             ("doc.revisions-accept-all", Json::Null),
             ("doc.revisions-reject-all", Json::Null),
+            (
+                "doc.comment-resolve",
+                args(vec![("id", Json::Str("1".into()))]),
+            ),
+            ("doc.comments-delete-all", Json::Null),
         ];
 
         for (verb, verb_args) in cases {
@@ -2499,6 +2601,8 @@ mod tests {
             "doc.revision-reject",
             "doc.revisions-accept-all",
             "doc.revisions-reject-all",
+            "doc.comment-resolve",
+            "doc.comments-delete-all",
         ] {
             assert!(mutation_kind_for_verb(verb).is_some(), "{verb}");
             let mut app = final_app(&dir);

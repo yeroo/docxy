@@ -3278,6 +3278,9 @@ struct Docxy {
     doc_scroll: ScrollHandle,
     // New-comment entry bar (Review ▸ New comment); routes keys while open.
     comment_open: bool,
+    /// The comment the Review tab's Resolve acts on: the one last clicked in
+    /// the Comments pane or added, with the tab it is in (ids are per document).
+    selected_comment: Option<(usize, String)>,
     comment_text: String,
     // Show formatting marks (¶, tab arrows) — View ▸ Show/Hide.
     show_marks: bool,
@@ -8484,6 +8487,7 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
         date: utc_now_iso(),
         text,
         quoted,
+        ..Comment::default()
     });
     tab.tracked_comment_ids.insert(id.to_string());
     tab.used_comment_ids.insert(id.to_string());
@@ -8499,6 +8503,18 @@ fn delete_doc_comment(tab: &mut DocTab, id: &str) {
     }
     tab.tracked_comment_ids.insert(id.to_string());
     tab.mark_dirty();
+}
+
+/// Set comment `id` of `tab` resolved (`Some(true)`), reopened (`Some(false)`)
+/// or the other of the two (`None`). The new state, `None` when `tab` lists
+/// no such comment. The state lives on the comment, so it follows the record
+/// through a delete and its undo, and a save writes it ([`doc_to_docx`]).
+fn set_doc_comment_resolved(tab: &mut DocTab, id: &str, resolved: Option<bool>) -> Option<bool> {
+    let c = tab.comments.iter_mut().find(|c| c.id == id)?;
+    c.resolved = resolved.unwrap_or(!c.resolved);
+    let now = c.resolved;
+    tab.mark_dirty();
+    Some(now)
 }
 
 /// The name and initials new comments are stamped with (#620), as Word's
@@ -8595,6 +8611,19 @@ fn doc_to_docx_styled(
                 pkg.add_comment(id, &c.author, &c.initials, &c.date, &c.text);
             }
         }
+    }
+    // Resolved state: `w15:done`, written where it differs from the part.
+    let stored: std::collections::HashMap<String, bool> = docxcore::comments::parse_comments(&pkg)
+        .into_iter()
+        .map(|c| (c.id, c.resolved))
+        .collect();
+    for c in comments {
+        if stored.get(&c.id).is_some_and(|&r| r != c.resolved) {
+            pkg.set_comment_resolved(&c.id, c.resolved);
+        }
+    }
+    if comments.is_empty() {
+        pkg.drop_empty_comment_parts();
     }
     docxcore::package::save_package(&pkg)
 }
@@ -9132,6 +9161,7 @@ impl Docxy {
             picker: None,
             doc_scroll: ScrollHandle::new(),
             comment_open: false,
+            selected_comment: None,
             comment_text: String::new(),
             show_marks: false,
             show_comments: false,
@@ -17227,6 +17257,55 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Resolve the selected comment, or reopen it when it is resolved. The
+    /// state is written to `commentsExtended.xml` on save.
+    fn resolve_selected_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        let active = self.active;
+        let id = self
+            .selected_comment
+            .clone()
+            .filter(|(tab, _)| *tab == active)
+            .map(|(_, id)| id);
+        if let Some(t) = self.tabs.get_mut(active) {
+            t.status = match id.and_then(|id| set_doc_comment_resolved(t, &id, None)) {
+                Some(true) => "Comment resolved".into(),
+                Some(false) => "Comment reopened".into(),
+                None => "Select a comment in the Comments pane first".into(),
+            };
+        }
+        self.refocus(window, cx);
+    }
+
+    /// The Resolve button of one comment card: select it and toggle it.
+    fn resolve_comment(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_comment = Some((self.active, id));
+        self.resolve_selected_comment(window, cx);
+    }
+
+    /// Whether the selected comment is resolved (Resolve shows pressed).
+    fn selected_comment_resolved(&self) -> bool {
+        let Some((tab, id)) = &self.selected_comment else {
+            return false;
+        };
+        self.tabs
+            .get(*tab)
+            .is_some_and(|t| t.comments.iter().any(|c| &c.id == id && c.resolved))
+    }
+
+    /// Delete every comment (Review ▸ Comments ▸ Delete all): the Document
+    /// Inspector's Remove All for comments, one undo step.
+    fn delete_all_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
+        let _ = self.inspect_remove_active(inspector::InspectCategory::Comments);
+        self.selected_comment = None;
+        self.refocus(window, cx);
+    }
+
     /// Select the text a comment is anchored to (find its quoted run).
     fn goto_comment(&mut self, quoted: String, window: &mut Window, cx: &mut Context<Self>) {
         if !quoted.is_empty() {
@@ -17268,63 +17347,85 @@ impl Docxy {
         for c in &comments {
             let id = c.id.clone();
             let quoted = c.quoted.clone();
-            list =
-                list.child(
-                    v_flex()
-                        .id(("cmt", id.parse::<usize>().unwrap_or(0)))
-                        .gap_1()
-                        .p_2()
-                        .rounded(px(4.))
-                        .border_1()
-                        .border_color(pal.border)
-                        .bg(pal.panel)
-                        .cursor_pointer()
-                        .hover(|d| d.border_color(hsla_u(BRAND)))
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(hsla_u(BRAND))
-                                        .child(SharedString::from(c.author.clone())),
-                                )
-                                .child(
-                                    div()
-                                        .id(("cmtx", id.parse::<usize>().unwrap_or(0)))
-                                        .px_1()
-                                        .rounded_sm()
-                                        .text_color(pal.dim)
-                                        .hover(|d| d.bg(pal.hover))
-                                        .child("\u{00d7}")
-                                        .on_click(cx.listener({
-                                            let id = id.clone();
-                                            move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.delete_comment(id.clone(), window, cx);
-                                            }
-                                        })),
-                                ),
-                        )
-                        .when(!c.quoted.is_empty(), |d| {
-                            d.child(
-                                div().text_size(px(11.)).italic().text_color(pal.dim).child(
-                                    SharedString::from(format!("\u{201C}{}\u{201D}", c.quoted)),
-                                ),
+            list = list.child(
+                v_flex()
+                    .id(("cmt", id.parse::<usize>().unwrap_or(0)))
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(pal.border)
+                    .bg(pal.panel)
+                    .cursor_pointer()
+                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(hsla_u(BRAND))
+                                    .child(SharedString::from(c.author.clone())),
                             )
-                        })
-                        .child(
+                            .child(
+                                div()
+                                    .id(("cmtr", id.parse::<usize>().unwrap_or(0)))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_size(px(11.))
+                                    .text_color(if c.resolved { hsla_u(BRAND) } else { pal.dim })
+                                    .hover(|d| d.bg(pal.hover))
+                                    .child(if c.resolved { "Reopen" } else { "Resolve" })
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.resolve_comment(id.clone(), window, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("cmtx", id.parse::<usize>().unwrap_or(0)))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_color(pal.dim)
+                                    .hover(|d| d.bg(pal.hover))
+                                    .child("\u{00d7}")
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.delete_comment(id.clone(), window, cx);
+                                        }
+                                    })),
+                            ),
+                    )
+                    .when(!c.quoted.is_empty(), |d| {
+                        d.child(
                             div()
-                                .text_size(px(13.))
-                                .text_color(pal.fg)
-                                .child(SharedString::from(c.text.clone())),
+                                .text_size(px(11.))
+                                .italic()
+                                .text_color(pal.dim)
+                                .child(SharedString::from(format!("\u{201C}{}\u{201D}", c.quoted))),
                         )
-                        .on_click(cx.listener(move |this, _, window, cx| {
+                    })
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(pal.fg)
+                            .child(SharedString::from(c.text.clone())),
+                    )
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, window, cx| {
+                            this.selected_comment = Some((this.active, id.clone()));
                             this.goto_comment(quoted.clone(), window, cx)
-                        })),
-                );
+                        }
+                    })),
+            );
         }
         v_flex()
             .w(px(280.))
@@ -20142,6 +20243,10 @@ enum Act {
     Super,
     Sub,
     NewComment,
+    /// Resolve the selected comment, or reopen it.
+    ResolveComment,
+    /// Delete every comment in the document.
+    DeleteAllComments,
     Sort,
     LineSpacing,
     ParaBorders,
@@ -20487,6 +20592,18 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                             )
                             .key("P"),
                             cmdt("togglenotes", "comment", "Notes pane", ToggleNotes, "").key("O"),
+                        ]),
+                        rs::column(vec![
+                            cmdt("resolvecomment", "comment", "Resolve", ResolveComment, "")
+                                .key("V"),
+                            cmdt(
+                                "deleteallcomments",
+                                "table-dismiss",
+                                "Delete all",
+                                DeleteAllComments,
+                                "",
+                            )
+                            .key("X"),
                         ]),
                     ],
                 ),
@@ -23263,6 +23380,8 @@ impl Docxy {
             FontName => self.toggle_picker(PickKind::FontName, window, cx),
             FontSize => self.toggle_picker(PickKind::FontSize, window, cx),
             NewComment => self.start_comment(window, cx),
+            ResolveComment => self.resolve_selected_comment(window, cx),
+            DeleteAllComments => self.delete_all_comments(window, cx),
             ShowHide => {
                 self.show_marks = !self.show_marks;
                 self.refocus(window, cx);
@@ -23366,10 +23485,10 @@ impl Docxy {
                 ClearFmt => e.clear_run_formatting(),
                 Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph
                 | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
-                | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField
-                | PageBreak | BlankPage | Cover(_) | ToggleNotes | InsertTable | InsertSymbol
-                | InsertEquation | LineSpacing | Hf(_) | Design(_) | Layout(_) | Mail(_)
-                | Table(_) | PrintLayout | ToggleRuler => {}
+                | ResolveComment | DeleteAllComments | ToggleComments | ToggleNav | DarkMode
+                | AutoHideRibbon | InsertField | PageBreak | BlankPage | Cover(_) | ToggleNotes
+                | InsertTable | InsertSymbol | InsertEquation | LineSpacing | Hf(_) | Design(_)
+                | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler => {}
             }),
         }
     }
@@ -25127,6 +25246,7 @@ impl Docxy {
             ParaBorders => pp.is_some_and(|p| p.borders.bottom.is_some()),
             ShowHide => self.show_marks,
             ToggleComments => self.show_comments,
+            ResolveComment => self.selected_comment_resolved(),
             ToggleNav => self.show_nav,
             ToggleNotes => self.show_notes,
             PrintLayout => self.page_view,

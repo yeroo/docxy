@@ -2331,9 +2331,205 @@ impl Package {
             return;
         };
         if let Some(range) = comment_range(&xml, id) {
+            let para_id = crate::comments::parse_comments_xml(&xml)
+                .into_iter()
+                .find(|c| c.id == id)
+                .and_then(|c| c.para_id);
             let mut out = xml;
             out.replace_range(range, "");
             self.set_part_text(name, &out);
+            if let Some(para_id) = para_id {
+                self.remove_comment_extras(&para_id);
+            }
+        }
+    }
+
+    /// Drop the `commentsExtended` / `commentsIds` entries of a removed
+    /// comment's `para_id`.
+    fn remove_comment_extras(&mut self, para_id: &str) {
+        for (part, tag, attr) in [
+            ("word/commentsExtended.xml", "w15:commentEx", "w15:paraId"),
+            ("word/commentsIds.xml", "w16cid:commentId", "w16cid:paraId"),
+        ] {
+            let Some(xml) = self.part_text(part) else {
+                continue;
+            };
+            let out = remove_tags_matching(&xml, tag, |t| {
+                crate::load::xml_attr_value(t, attr).as_deref() == Some(para_id)
+            });
+            if out != xml {
+                self.set_part_text(part, &out);
+            }
+        }
+    }
+
+    /// Mark the comment whose `w:id` is `id` (as written) resolved or
+    /// reopened: `w15:done` on its `w15:commentEx` in
+    /// `word/commentsExtended.xml`. The part (with its content-type override
+    /// and relationship) and the `w14:paraId` on the comment's last paragraph
+    /// are created when absent; an existing entry is patched in place, so
+    /// its other attributes (`w15:paraIdParent` of a reply) survive. False
+    /// when there is no such comment or it has no paragraph to key on.
+    pub fn set_comment_resolved(&mut self, id: &str, resolved: bool) -> bool {
+        let name = "word/comments.xml";
+        let Some(xml) = self.part_text(name) else {
+            return false;
+        };
+        let Some(range) = comment_range(&xml, id) else {
+            return false;
+        };
+        let el = &xml[range.clone()];
+        let para_id = match crate::comments::parse_comments_xml(&xml)
+            .into_iter()
+            .find(|c| c.id == id)
+            .and_then(|c| c.para_id)
+        {
+            Some(p) => p,
+            None => {
+                let fresh = self.fresh_para_id(id);
+                let Some(patched) = add_last_para_id(el, &fresh) else {
+                    return false;
+                };
+                let mut out = xml.clone();
+                out.replace_range(range, &patched);
+                self.set_part_text(name, &ensure_w14_root(&out));
+                fresh
+            }
+        };
+        self.set_comment_done(&para_id, resolved);
+        true
+    }
+
+    /// An unused `w14:paraId` (eight hex digits below 0x80000000), seeded
+    /// from the comment id so the result is deterministic.
+    fn fresh_para_id(&self, seed: &str) -> String {
+        let used: String = ["word/comments.xml", "word/document.xml"]
+            .iter()
+            .filter_map(|n| self.part_text(n))
+            .collect();
+        let mut n: u32 = 0x1000_0000
+            + seed
+                .bytes()
+                .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b)))
+                % 0x1000_0000;
+        loop {
+            let cand = format!("{n:08X}");
+            if !used.contains(&format!("\"{cand}\"")) {
+                return cand;
+            }
+            n += 1;
+        }
+    }
+
+    fn set_comment_done(&mut self, para_id: &str, resolved: bool) {
+        const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
+        let name = crate::comments::COMMENTS_EXTENDED_PART;
+        let done = if resolved { "1" } else { "0" };
+        let entry = format!("<w15:commentEx w15:paraId=\"{para_id}\" w15:done=\"{done}\"/>");
+        let Some(xml) = self.part_text(name) else {
+            let body = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                 <w15:commentsEx xmlns:w15=\"{W15_NS}\">{entry}</w15:commentsEx>"
+            );
+            self.add_part_with_rel(
+                name,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml",
+                "http://schemas.microsoft.com/office/2011/relationships/commentsExtended",
+                body,
+            );
+            return;
+        };
+        let existing = crate::load::start_tags(&xml, "w15:commentEx")
+            .into_iter()
+            .find(|(_, tag)| {
+                crate::load::xml_attr_value(tag, "w15:paraId").as_deref() == Some(para_id)
+            });
+        let out = match existing {
+            Some((at, tag)) => {
+                let new_tag = set_attr_value(tag, "w15:done", done);
+                format!("{}{}{}", &xml[..at], new_tag, &xml[at + tag.len()..])
+            }
+            None => match xml.rfind("</w15:commentsEx>") {
+                Some(close) => format!("{}{}{}", &xml[..close], entry, &xml[close..]),
+                None => return,
+            },
+        };
+        self.set_part_text(name, &out);
+    }
+
+    /// Add a new part with its content-type override and a relationship from
+    /// the main document part.
+    fn add_part_with_rel(&mut self, name: &str, content_type: &str, rel_type: &str, body: String) {
+        self.parts.push((name.to_string(), body.into_bytes()));
+        if let Some(b) = self.part("[Content_Types].xml") {
+            let ct = String::from_utf8_lossy(b).into_owned();
+            if !ct.contains(&format!("/{name}\"")) {
+                let ov = format!("<Override PartName=\"/{name}\" ContentType=\"{content_type}\"/>");
+                self.set_part(
+                    "[Content_Types].xml",
+                    ct.replacen("</Types>", &format!("{ov}</Types>"), 1)
+                        .into_bytes(),
+                );
+            }
+        }
+        let rels_name = "word/_rels/document.xml.rels";
+        if let Some(b) = self.part(rels_name) {
+            let rels = String::from_utf8_lossy(b).into_owned();
+            let target = name.strip_prefix("word/").unwrap_or(name);
+            if !rels.contains(&format!("Target=\"{target}\"")) {
+                let rid = next_rid(&rels);
+                let rel =
+                    format!("<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>");
+                self.set_part(
+                    rels_name,
+                    rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
+                        .into_bytes(),
+                );
+            }
+        }
+    }
+
+    /// Remove every comment: each `<w:comment>`, then the comment parts
+    /// (`comments.xml` and its `commentsExtended`, `commentsIds` and
+    /// `commentsExtensible` companions) with their relationships and
+    /// content-type overrides. Body markers are the editor's
+    /// ([`crate::editor::Editor::remove_all_comment_markers`]).
+    pub fn remove_all_comments(&mut self) {
+        for id in self.comment_ids() {
+            self.remove_comment_id(&id);
+        }
+        self.drop_empty_comment_parts();
+    }
+
+    /// Drop the comment parts once `comments.xml` holds no comment.
+    pub fn drop_empty_comment_parts(&mut self) {
+        const PARTS: [&str; 4] = [
+            "word/comments.xml",
+            "word/commentsExtended.xml",
+            "word/commentsIds.xml",
+            "word/commentsExtensible.xml",
+        ];
+        if self.part("word/comments.xml").is_none() || !self.comment_ids().is_empty() {
+            return;
+        }
+        self.parts.retain(|(n, _)| !PARTS.contains(&n.as_str()));
+        if let Some(ct) = self.part_text("[Content_Types].xml") {
+            let out = remove_tags_matching(&ct, "Override", |tag| {
+                PARTS
+                    .iter()
+                    .any(|p| tag.contains(&format!("PartName=\"/{p}\"")))
+            });
+            self.set_part_text("[Content_Types].xml", &out);
+        }
+        let rels_name = "word/_rels/document.xml.rels";
+        if let Some(rels) = self.part_text(rels_name) {
+            let out = remove_tags_matching(&rels, "Relationship", |tag| {
+                PARTS.iter().any(|p| {
+                    let target = p.strip_prefix("word/").unwrap_or(p);
+                    tag.contains(&format!("Target=\"{target}\""))
+                })
+            });
+            self.set_part_text(rels_name, &out);
         }
     }
 
@@ -3551,6 +3747,81 @@ fn extract_sectpr(xml: &str) -> String {
         }
     }
     best.map_or_else(String::new, |(s, e)| xml[s..e].to_string())
+}
+
+/// `xml` without each self-closing `<name …/>` element `drop` accepts.
+fn remove_tags_matching(xml: &str, name: &str, drop: impl Fn(&str) -> bool) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut at = 0;
+    for (start, tag) in crate::load::start_tags(xml, name) {
+        if tag.ends_with("/>") && drop(tag) {
+            out.push_str(&xml[at..start]);
+            at = start + tag.len();
+        }
+    }
+    out.push_str(&xml[at..]);
+    out
+}
+
+/// `tag` (a start tag) with attribute `name` set to `value`, added before
+/// the closing `>` or `/>` when it is absent.
+fn set_attr_value(tag: &str, name: &str, value: &str) -> String {
+    let key = format!("{name}=\"");
+    if let Some(i) = tag.find(&key) {
+        let v = i + key.len();
+        if let Some(e) = tag[v..].find('"') {
+            return format!("{}{}{}", &tag[..v], value, &tag[v + e..]);
+        }
+    }
+    let cut = tag.len() - if tag.ends_with("/>") { 2 } else { 1 };
+    format!("{} {key}{value}\"{}", tag[..cut].trim_end(), &tag[cut..])
+}
+
+/// `comment` (one `<w:comment>` element) with `w14:paraId` on its last
+/// `<w:p>` start tag.
+fn add_last_para_id(comment: &str, para_id: &str) -> Option<String> {
+    let (at, tag) = crate::load::start_tags(comment, "w:p").into_iter().last()?;
+    let patched = set_attr_value(tag, "w14:paraId", para_id);
+    Some(format!(
+        "{}{}{}",
+        &comment[..at],
+        patched,
+        &comment[at + tag.len()..]
+    ))
+}
+
+/// `comments.xml` with its root declaring `w14` and ignoring it for
+/// consumers that do not know the namespace.
+fn ensure_w14_root(xml: &str) -> String {
+    const W14_NS: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
+    const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+    let Some((at, tag)) = crate::load::start_tags(xml, "w:comments")
+        .into_iter()
+        .next()
+    else {
+        return xml.to_string();
+    };
+    let mut new_tag = tag.to_string();
+    let cut = |t: &str| t.len() - if t.ends_with("/>") { 2 } else { 1 };
+    if !new_tag.contains("xmlns:w14=") {
+        let c = cut(&new_tag);
+        new_tag.insert_str(c, &format!(" xmlns:w14=\"{W14_NS}\""));
+    }
+    if let Some(i) = new_tag.find("mc:Ignorable=\"") {
+        let v = i + "mc:Ignorable=\"".len();
+        let end = new_tag[v..].find('"').map_or(v, |e| v + e);
+        if !new_tag[v..end].split_whitespace().any(|t| t == "w14") {
+            new_tag.insert_str(v, "w14 ");
+        }
+    } else {
+        if !new_tag.contains("xmlns:mc=") {
+            let c = cut(&new_tag);
+            new_tag.insert_str(c, &format!(" xmlns:mc=\"{MC_NS}\""));
+        }
+        let c = cut(&new_tag);
+        new_tag.insert_str(c, " mc:Ignorable=\"w14\"");
+    }
+    format!("{}{}{}", &xml[..at], new_tag, &xml[at + tag.len()..])
 }
 
 /// The byte range of the `<w:comment>` element in `xml` (a `comments.xml`)
@@ -6387,5 +6658,112 @@ mod tests {
         );
         assert_eq!(p.comment_ids(), ["1", "2"]);
         assert_eq!(p.comment_xml("2").as_deref(), Some(two));
+    }
+
+    // ---- resolve / reopen / delete all (#621) -----------------------------
+
+    /// `with_comments` over a package with content types and a document
+    /// relationships part, as Word writes them.
+    fn with_comment_plumbing(xml: &str) -> Package {
+        let mut p = with_comments(xml);
+        p.set_part(
+            "[Content_Types].xml",
+            br#"<?xml version="1.0"?><Types xmlns="t"><Override PartName="/word/comments.xml" ContentType="c"/></Types>"#
+                .to_vec(),
+        );
+        p.parts.push((
+            "word/_rels/document.xml.rels".to_string(),
+            br#"<?xml version="1.0"?><Relationships xmlns="r"><Relationship Id="rId1" Type="t/comments" Target="comments.xml"/></Relationships>"#
+                .to_vec(),
+        ));
+        p
+    }
+
+    fn resolved_of(p: &Package, id: &str) -> bool {
+        crate::comments::parse_comments(p)
+            .into_iter()
+            .find(|c| c.id == id)
+            .unwrap()
+            .resolved
+    }
+
+    #[test]
+    fn set_comment_resolved_creates_part_paraid_and_round_trips() {
+        let mut p = with_comment_plumbing(&format!(
+            "{COMMENTS_OPEN}<w:comment w:id=\"1\" w:author=\"A\"><w:p><w:r><w:t>hi</w:t></w:r></w:p></w:comment></w:comments>"
+        ));
+        assert!(!resolved_of(&p, "1"));
+        assert!(p.set_comment_resolved("1", true));
+        let comments = p.part_text("word/comments.xml").unwrap();
+        assert!(comments.contains("<w:p w14:paraId=\""), "{comments}");
+        assert!(comments.contains("xmlns:w14="), "{comments}");
+        assert!(comments.contains("mc:Ignorable=\"w14\""), "{comments}");
+        let ext = p.part_text("word/commentsExtended.xml").unwrap();
+        assert!(ext.contains("w15:done=\"1\""), "{ext}");
+        let ct = p.part_text("[Content_Types].xml").unwrap();
+        assert!(ct.contains("/word/commentsExtended.xml"), "{ct}");
+        let rels = p.part_text("word/_rels/document.xml.rels").unwrap();
+        assert!(rels.contains("Target=\"commentsExtended.xml\""), "{rels}");
+        assert!(resolved_of(&p, "1"));
+        assert!(p.set_comment_resolved("1", false));
+        let ext = p.part_text("word/commentsExtended.xml").unwrap();
+        assert!(ext.contains("w15:done=\"0\""), "{ext}");
+        assert_eq!(ext.matches("<w15:commentEx").count(), 1, "{ext}");
+        assert!(!resolved_of(&p, "1"));
+        assert!(!p.set_comment_resolved("9", true));
+    }
+
+    #[test]
+    fn set_comment_resolved_patches_existing_entry_and_keeps_threads() {
+        let mut p = with_comments(&format!(
+            "{COMMENTS_OPEN}<w:comment w:id=\"1\"><w:p w14:paraId=\"0000AAAA\"/></w:comment>\
+             <w:comment w:id=\"2\"><w:p w14:paraId=\"0000BBBB\"/></w:comment></w:comments>"
+        ));
+        let ext = "<w15:commentsEx xmlns:w15=\"x\" w15:keep=\"k\">\
+                   <w15:commentEx w15:paraId=\"0000AAAA\" w15:done=\"0\"/>\
+                   <w15:commentEx w15:paraId=\"0000BBBB\" w15:paraIdParent=\"0000AAAA\" w15:done=\"0\" w15:x=\"y\"/>\
+                   </w15:commentsEx>";
+        p.parts.push((
+            "word/commentsExtended.xml".to_string(),
+            ext.as_bytes().to_vec(),
+        ));
+        assert!(p.set_comment_resolved("2", true));
+        let out = p.part_text("word/commentsExtended.xml").unwrap();
+        assert_eq!(
+            out,
+            ext.replace(
+                "w15:paraIdParent=\"0000AAAA\" w15:done=\"0\"",
+                "w15:paraIdParent=\"0000AAAA\" w15:done=\"1\""
+            )
+        );
+        assert!(resolved_of(&p, "2"));
+        assert!(!resolved_of(&p, "1"));
+        // Removing a comment drops its entry only.
+        p.remove_comment_id("1");
+        let out = p.part_text("word/commentsExtended.xml").unwrap();
+        assert!(!out.contains("w15:paraId=\"0000AAAA\""), "{out}");
+        assert!(out.contains("w15:x=\"y\""), "{out}");
+    }
+
+    #[test]
+    fn remove_all_comments_drops_every_comment_part() {
+        let mut p = with_comment_plumbing(&format!(
+            "{COMMENTS_OPEN}<w:comment w:id=\"1\"><w:p/></w:comment>\
+             <w:comment w:id=\"2\"><w:p/></w:comment></w:comments>"
+        ));
+        assert!(p.set_comment_resolved("1", true));
+        p.remove_all_comments();
+        for part in [
+            "word/comments.xml",
+            "word/commentsExtended.xml",
+            "word/commentsIds.xml",
+        ] {
+            assert!(p.part(part).is_none(), "{part}");
+        }
+        let ct = p.part_text("[Content_Types].xml").unwrap();
+        assert!(!ct.contains("comments"), "{ct}");
+        let rels = p.part_text("word/_rels/document.xml.rels").unwrap();
+        assert!(!rels.contains("comments"), "{rels}");
+        assert!(crate::comments::parse_comments(&p).is_empty());
     }
 }

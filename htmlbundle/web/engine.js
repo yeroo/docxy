@@ -608,6 +608,8 @@
     'Mail(UpdateLabels)': NOT_YET,
     'Mail(UseExistingList)': NOT_YET,
     NewComment: NOT_YET,
+    ResolveComment: NOT_YET,
+    DeleteAllComments: NOT_YET,
     ToggleComments: NOT_YET,
     ToggleNotes: NOT_YET,
     ToggleNav: NOT_YET,

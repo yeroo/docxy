@@ -2208,6 +2208,8 @@ impl App {
             NextComment => self.nav_comment(1),
             NewComment => self.start_comment(),
             DeleteComment => self.delete_comment(),
+            ResolveComment => self.resolve_comment(),
+            DeleteAllComments => self.delete_all_comments(),
             PrevRevision => self.navigate_revision(true),
             NextRevision => self.navigate_revision(false),
             AcceptRevision => self.review_current_revision(RevisionAction::Accept),
@@ -2982,6 +2984,7 @@ impl App {
             date: utc_now_iso(),
             text,
             quoted,
+            ..Default::default()
         };
         self.tracked_comments.insert(
             comment.id.clone(),
@@ -3062,6 +3065,29 @@ impl App {
     /// original XML), drop each one with no marker left that it holds.
     /// `pkg` is reloaded from every save, so it may hold one already.
     fn reconcile_tracked_comments(&mut self) {
+        self.reconcile_tracked_records();
+        self.sync_resolved_to_pkg();
+    }
+
+    /// Write each comment's resolved state into `pkg`'s `commentsExtended`
+    /// where it differs, and drop the comment parts when none is left.
+    fn sync_resolved_to_pkg(&mut self) {
+        let stored: std::collections::HashMap<String, bool> =
+            docxcore::comments::parse_comments(&self.pkg)
+                .into_iter()
+                .map(|c| (c.id, c.resolved))
+                .collect();
+        for c in &self.comments {
+            if stored.get(&c.id).is_some_and(|&r| r != c.resolved) {
+                self.pkg.set_comment_resolved(&c.id, c.resolved);
+            }
+        }
+        if !self.tracked_comments.is_empty() {
+            self.pkg.drop_empty_comment_parts();
+        }
+    }
+
+    fn reconcile_tracked_records(&mut self) {
         if self.tracked_comments.is_empty() {
             return;
         }
@@ -3133,6 +3159,100 @@ impl App {
         self.comment_active = !self.comments.is_empty();
         self.after_edit();
         self.status = Some(format!("Deleted comment by {}", c.author));
+    }
+
+    /// Resolve the navigation-selected comment, or reopen it when it is
+    /// resolved. The state is the comment's own (it follows the record of a
+    /// deleted one), and each save writes it to `commentsExtended.xml`.
+    fn resolve_comment(&mut self) {
+        if self.comments.is_empty() {
+            self.status = Some("No comments to resolve".to_string());
+            self.dirty = true;
+            return;
+        }
+        if !self.mutation_allowed(protection::MutationKind::Comment) {
+            return;
+        }
+        let id = self.comments[self.comment_sel.min(self.comments.len() - 1)]
+            .id
+            .clone();
+        if let Some(resolved) = self.set_comment_resolved(&id, None) {
+            self.status = Some(if resolved {
+                "Comment resolved".to_string()
+            } else {
+                "Comment reopened".to_string()
+            });
+        }
+    }
+
+    /// Set comment `id` resolved (`Some(true)`), reopened (`Some(false)`), or
+    /// the other of the two (`None`). The new state, or `None` when no
+    /// listed comment has that id. No protection check: callers authorize.
+    fn set_comment_resolved(&mut self, id: &str, resolved: Option<bool>) -> Option<bool> {
+        let c = self.comments.iter_mut().find(|c| c.id == id)?;
+        c.resolved = resolved.unwrap_or(!c.resolved);
+        let now = c.resolved;
+        if let Some(t) = self.tracked_comments.get_mut(id) {
+            t.comment.resolved = now;
+        }
+        self.modified = true;
+        self.dirty = true;
+        Some(now)
+    }
+
+    /// Delete every comment: all markers (one undo step per editor that
+    /// held some), and each comment's record kept, tracked, so an undo brings
+    /// back markers and record whole (#971), like [`App::delete_comment`].
+    fn delete_all_comments(&mut self) {
+        if self.comments.is_empty() && self.comment_marker_ids_everywhere().is_empty() {
+            self.status = Some("No comments to delete".to_string());
+            self.dirty = true;
+            return;
+        }
+        if !self.mutation_allowed(protection::MutationKind::Comment) {
+            return;
+        }
+        let n = self.remove_all_comments();
+        self.status = Some(format!("Deleted all comments ({n})"));
+    }
+
+    /// [`App::delete_all_comments`] without the checks: how many listed
+    /// comments went. No protection check: callers authorize.
+    fn remove_all_comments(&mut self) -> usize {
+        self.body_editor_mut().remove_all_comment_markers();
+        if self.hf_edit.is_some() {
+            self.editor.remove_all_comment_markers();
+        }
+        let still_marked = self.comment_marker_ids_everywhere();
+        let comments = std::mem::take(&mut self.comments);
+        for (idx, c) in comments.iter().enumerate() {
+            if still_marked.contains(&c.id) {
+                // Markers in a header or footer not being edited: as in
+                // Delete Comment, nothing could take them, so it goes now.
+                self.tracked_comments.remove(&c.id);
+                self.pkg.remove_comment_id(&c.id);
+            } else if let Some(t) = self.tracked_comments.get_mut(&c.id) {
+                t.index = idx;
+                t.comment = c.clone();
+                if t.raw.is_none() {
+                    t.raw = self.pkg.comment_xml(&c.id);
+                }
+            } else {
+                let raw = self.pkg.comment_xml(&c.id);
+                self.tracked_comments.insert(
+                    c.id.clone(),
+                    TrackedComment {
+                        comment: c.clone(),
+                        raw,
+                        index: idx,
+                    },
+                );
+            }
+        }
+        self.comment_sel = 0;
+        self.comment_active = false;
+        self.after_edit();
+        comments.len()
     }
 
     fn comment_input_key(&mut self, key: KeyEvent) -> bool {
@@ -3230,7 +3350,12 @@ impl App {
             } else {
                 head
             };
-            lines.push(RLine::styled(format!("▣ {who}  {date}"), hstyle));
+            let mark = if c.resolved { "✓" } else { "▣" };
+            let state = if c.resolved { "  (resolved)" } else { "" };
+            lines.push(RLine::styled(
+                format!("{mark} {who}  {date}{state}"),
+                hstyle,
+            ));
             if !c.quoted.is_empty() {
                 for w in wrap_str(&format!("“{}”", c.quoted), inner_w) {
                     lines.push(RLine::styled(w, quote));
@@ -12033,6 +12158,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         assert_eq!(doc.matches("w:id=\"1\"").count(), 3, "{doc}");
         assert!(comments.contains(RICH_COMMENT), "{comments}");
+    }
+
+    fn saved_pkg(path: &std::path::Path) -> docxcore::package::Package {
+        load_package(&std::fs::read(path).expect("saved")).unwrap()
+    }
+
+    fn saved_resolved(path: &std::path::Path) -> Vec<(String, bool)> {
+        docxcore::comments::parse_comments(&saved_pkg(path))
+            .into_iter()
+            .map(|c| (c.id, c.resolved))
+            .collect()
+    }
+
+    /// #621: Resolve toggles the selected comment and saves `w15:done`.
+    #[test]
+    fn resolve_and_reopen_comment_saves_done_state() {
+        let mut app = app_with_rich_comments(2);
+        app.comment_sel = 1;
+        app.run_act(ribbon::Act::ResolveComment);
+        assert!(app.comments[1].resolved && !app.comments[0].resolved);
+        let path = save_to_temp(&mut app, "cmt-resolve");
+        let pkg = saved_pkg(&path);
+        let ext = pkg.part_text("word/commentsExtended.xml").expect("part");
+        assert!(ext.contains("w15:done=\"1\""), "{ext}");
+        assert_eq!(
+            saved_resolved(&path),
+            [("1".to_string(), false), ("2".to_string(), true)]
+        );
+        // The save reloaded `pkg`: Reopen writes done=0 over the entry.
+        app.run_act(ribbon::Act::ResolveComment);
+        assert!(!app.comments[1].resolved);
+        app.save();
+        assert_eq!(
+            saved_resolved(&path),
+            [("1".to_string(), false), ("2".to_string(), false)]
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #621: a resolved comment loaded from a file shows resolved; and the
+    /// state follows the comment through a delete and its undo.
+    #[test]
+    fn resolved_state_survives_delete_and_undo() {
+        let mut app = app_with_rich_comments(1);
+        app.run_act(ribbon::Act::ResolveComment);
+        let path = save_to_temp(&mut app, "cmt-resolve-undo");
+        let mut app = App::new(saved_pkg(&path), "test.docx", false);
+        app.os_clip = None;
+        app.path = path.to_string_lossy().into_owned();
+        assert!(app.comments[0].resolved, "loaded as resolved");
+        app.run_act(ribbon::Act::DeleteComment);
+        app.save();
+        assert!(saved_pkg(&path).part("word/commentsExtended.xml").is_none());
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert!(app.comments[0].resolved);
+        app.save();
+        assert_eq!(saved_resolved(&path), [("1".to_string(), true)]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #621 A2: Delete All Comments removes records and markers, keeps the
+    /// anchored text, and one undo step restores both.
+    #[test]
+    fn delete_all_comments_is_one_undo_and_removes_every_part() {
+        let mut app = app_with_rich_comments(3);
+        app.comment_sel = 2;
+        app.run_act(ribbon::Act::ResolveComment);
+        app.run_act(ribbon::Act::DeleteAllComments);
+        assert!(app.comments.is_empty());
+        let path = save_to_temp(&mut app, "cmt-delete-all");
+        let pkg = saved_pkg(&path);
+        for part in ["word/comments.xml", "word/commentsExtended.xml"] {
+            assert!(pkg.part(part).is_none(), "{part}");
+        }
+        let doc = pkg.part_text("word/document.xml").unwrap();
+        assert!(!doc.contains("comment"), "{doc}");
+        assert!(doc.contains("The quick brown fox."), "{doc}");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(comment_ids(&app), ["1", "2", "3"]);
+        app.save();
+        let pkg = saved_pkg(&path);
+        let doc = pkg.part_text("word/document.xml").unwrap();
+        assert_eq!(doc.matches("w:commentRangeStart").count(), 3, "{doc}");
+        assert!(
+            pkg.part_text("word/comments.xml")
+                .unwrap()
+                .contains(RICH_COMMENT)
+        );
+        assert_eq!(
+            saved_resolved(&path),
+            [
+                ("1".to_string(), false),
+                ("2".to_string(), false),
+                ("3".to_string(), true)
+            ]
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// #971 A7: every save reloads `pkg`, so the deleted comment's XML must
