@@ -41,8 +41,9 @@ impl CloseStep {
 /// Whether closing a tab keeps its last AutoRecover copy as a draft (#613):
 /// a workbook `discarded` with Don't Save, with AutoRecover on (`minutes`)
 /// and "Keep the last AutoRecovered version" on (`keep`), and a hot-exit
-/// write while it was unsaved (`last_hot`). Window close never comes here:
-/// hot exit keeps those tabs as tabs.
+/// write while it was unsaved (`last_hot`). A window close comes here only
+/// for a tab answered Don't Save in its per-document questions (#630); a
+/// silent one keeps every tab as a tab (hot exit).
 fn should_keep_draft(
     kind: Kind,
     minutes: u32,
@@ -163,14 +164,14 @@ pub(crate) fn prepare_sheet_save(tab: &mut DocTab) -> Result<(), String> {
 
 /// What closing `tab` does: `answer` is how a dirty tab was answered, or
 /// `None` when it has not been asked yet.
-fn close_step(tab: &mut DocTab, answer: impl FnOnce(&DocTab) -> Option<CloseAnswer>) -> CloseStep {
+fn close_step(tab: &mut DocTab, answer: Option<CloseAnswer>) -> CloseStep {
     if let Err(message) = commit_pending_for_close(tab) {
         return CloseStep::Refuse(message);
     }
     if !tab.dirty {
         return CloseStep::Remove;
     }
-    match answer(tab) {
+    match answer {
         Some(CloseAnswer::Save) => CloseStep::Save,
         Some(CloseAnswer::Discard) => CloseStep::Discard,
         Some(CloseAnswer::Cancel) => CloseStep::Keep,
@@ -211,13 +212,14 @@ struct PromptName {
 /// after its own.
 fn prompt_name(tab: &DocTab, known: &[PathBuf]) -> PromptName {
     let in_place = saves_in_place(tab);
-    let own_ext = tab
-        .path
-        .as_deref()
-        .filter(|p| in_place && doc_target_allowed(p))
-        .and_then(|p| p.extension())
-        .map(|e| format!(".{}", e.to_string_lossy()));
-    let ext = own_ext.unwrap_or_else(|| ".docx".into());
+    // A tab that saves in place keeps its own extension, whatever it is
+    // (none at all included), so an unchanged name is its own file.
+    let ext = match tab.path.as_deref().filter(|_| in_place) {
+        Some(p) => p
+            .extension()
+            .map_or_else(String::new, |e| format!(".{}", e.to_string_lossy())),
+        None => ".docx".into(),
+    };
     let name = match tab.path.as_deref().filter(|_| in_place) {
         Some(path) => file_name(path),
         None => doc_save_as_name(tab),
@@ -253,9 +255,9 @@ fn prompt_name(tab: &DocTab, known: &[PathBuf]) -> PromptName {
     // its own file: Save would write over what was opened that way.
     let names_own = |stem: &str| {
         let own = tab.path.as_deref();
-        own_dir.as_deref().is_some_and(|dir| {
-            writes_own_file(own, Some(&dir.join(format!("{stem}{ext}")))) && own.is_some()
-        })
+        own_dir
+            .as_deref()
+            .is_some_and(|dir| writes_own_file(own, Some(&dir.join(format!("{stem}{ext}")))))
     };
     let stem = if !in_place && names_own(&stem) {
         format!("{stem} (copy)")
@@ -351,7 +353,7 @@ fn prompt_target(
             file_name(&target)
         ));
     }
-    if !own_file && target.exists() {
+    if target.exists() {
         return Err(format!(
             "{} already exists; choose another name, or use More options... to replace it",
             file_name(&target)
@@ -489,7 +491,7 @@ impl Docxy {
         self.project_prompt_cancel();
         let previous_active = self.active;
         let harness = self.harness.is_some();
-        let step = close_step(&mut self.tabs[i], |_| answer);
+        let step = close_step(&mut self.tabs[i], answer);
         if !step.removes() && self.active != i {
             self.active = i;
             self.drop_grid_state();

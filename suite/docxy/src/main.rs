@@ -12237,63 +12237,46 @@ impl Docxy {
 
     /// Excel's PROTECTED VIEW message bar (#610), under the ribbon while the
     /// active workbook came from the Internet: what it is, why, and the one
-    /// way out. Its colours are Excel's, in either theme.
+    /// way out.
     fn protected_view_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let ink = hsla_u(0x3B3B3B);
-        h_flex()
-            .id("pv-bar")
-            .w_full()
-            .h(px(36.))
-            .flex_none()
-            .items_center()
-            .gap_3()
-            .px_3()
-            .bg(hsla_u(0xFFF4CE))
-            .border_b_1()
-            .border_color(pal.border)
-            .text_size(px(12.))
-            .text_color(ink)
-            .child(
-                div()
-                    .flex_none()
-                    .font_weight(FontWeight::BOLD)
-                    .child(open_mode::PROTECTED_LABEL),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(open_mode::PROTECTED_TEXT),
-            )
-            .child(
-                div()
-                    .id("pv-enable")
-                    .flex_none()
-                    .px_3()
-                    .py_1()
-                    .border_1()
-                    .border_color(hsla_u(0x8A8886))
-                    .rounded_sm()
-                    .bg(hsla_u(0xFFFFFF))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(hsla_u(0xF3F2F1)))
-                    .child("Enable Editing")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.enable_editing(cx);
-                        this.refocus(window, cx);
-                    })),
-            )
-            .into_any_element()
+        self.message_bar(
+            pal,
+            ("pv-bar", "pv-enable"),
+            (open_mode::PROTECTED_LABEL, open_mode::PROTECTED_TEXT),
+            "Enable Editing",
+            Self::enable_editing,
+            cx,
+        )
     }
 
     /// Word's MARKED AS FINAL message bar (#617), under the ribbon while the
     /// active document is marked as final: what it is, and Edit Anyway.
     fn marked_final_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        self.message_bar(
+            pal,
+            ("final-bar", "final-edit-anyway"),
+            (open_mode::MARKED_FINAL_LABEL, open_mode::MARKED_FINAL_TEXT),
+            "Edit Anyway",
+            Self::edit_anyway,
+            cx,
+        )
+    }
+
+    /// Office's yellow message bar: a bold `label`, its `text`, and one
+    /// `button` that runs `press`. `ids` are the bar's and the button's.
+    /// Its colours are Office's, in either theme.
+    fn message_bar(
+        &self,
+        pal: Pal,
+        ids: (&'static str, &'static str),
+        (label, text): (&'static str, &'static str),
+        button: &'static str,
+        press: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let ink = hsla_u(0x3B3B3B);
         h_flex()
-            .id("final-bar")
+            .id(ids.0)
             .w_full()
             .h(px(36.))
             .flex_none()
@@ -12305,23 +12288,18 @@ impl Docxy {
             .border_color(pal.border)
             .text_size(px(12.))
             .text_color(ink)
-            .child(
-                div()
-                    .flex_none()
-                    .font_weight(FontWeight::BOLD)
-                    .child(open_mode::MARKED_FINAL_LABEL),
-            )
+            .child(div().flex_none().font_weight(FontWeight::BOLD).child(label))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .child(open_mode::MARKED_FINAL_TEXT),
+                    .child(text),
             )
             .child(
                 div()
-                    .id("final-edit-anyway")
+                    .id(ids.1)
                     .flex_none()
                     .px_3()
                     .py_1()
@@ -12331,9 +12309,9 @@ impl Docxy {
                     .bg(hsla_u(0xFFFFFF))
                     .cursor_pointer()
                     .hover(|d| d.bg(hsla_u(0xF3F2F1)))
-                    .child("Edit Anyway")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.edit_anyway(cx);
+                    .child(button)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        press(this, cx);
                         this.refocus(window, cx);
                     })),
             )
@@ -30955,7 +30933,7 @@ fn main() {
             //
             // ⚠️ Only `update_in`, never `read_with` / `update`. On Windows a
             // foreground task runs from a window message, and rfd's dialogs
-            // (Open, Save As, the ask-on-close prompt) pump those messages in
+            // (Open, Save As) pump those messages in
             // a modal loop while a gpui listener holds the App borrowed. The
             // plain entity calls `borrow()` the App and panic there, aborting
             // the process with the unsaved work this exists to keep;

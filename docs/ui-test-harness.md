@@ -494,8 +494,11 @@ in-app close prompt (#629), as Ctrl+W, File > Close and the tab's X do:
 file?` with `file-name`, `extension` (a label) and `location`, and the buttons
 Save, Don't Save, Cancel and More options... (refused under the harness, like
 every native dialog); its Save writes `<location>/<file-name><extension>`, or
-the tab's own file when that is what they name, and refuses an existing other
-file. Under the harness the only location offered after the tab's own folder
+the tab's own file in place when that is what they name and the tab saves in
+place (`extension` is then the file's own, whatever it is), and refuses an
+existing other file. A tab whose Save is Save As (opened read-only, repaired
+or converted) proposes `<name> (copy)` beside its file and refuses its own
+file's name. Under the harness the only location offered after the tab's own folder
 is the sandbox. A workbook or a Project asks `Save changes to <title> before
 closing?`. A tab with another dialog open is not closed: it comes to the
 front with `Close the open dialog first`.
