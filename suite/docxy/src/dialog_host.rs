@@ -67,6 +67,7 @@ fn apply_dialog(
             Err("Go To applies through Find & Select".into())
         }
         // Handled in `Docxy::fill_dialog_click`, before this.
+        DialogOwner::PasteSpecial { .. } => Err("Paste Special applies through Paste".into()),
         DialogOwner::Series | DialogOwner::JustifyOverflow | DialogOwner::CustomLists => {
             Err("a Fill dialog applies through Home › Fill".into())
         }
@@ -281,6 +282,10 @@ impl Docxy {
         if let Some(done) = self.fill_dialog_click(button) {
             return done;
         }
+        // And the copy Paste Special pastes (#669).
+        if let Some(done) = self.paste_dialog_click(button) {
+            return done;
+        }
         let reopen = reopen_on_top(self.tabs.get(self.active));
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
         dialog_click(tab, button)?;
@@ -320,6 +325,7 @@ impl Docxy {
                             | DialogOwner::Series
                             | DialogOwner::JustifyOverflow
                             | DialogOwner::CustomLists
+                            | DialogOwner::PasteSpecial { .. }
                     )
                 })
             })

@@ -103,8 +103,10 @@ pub(crate) enum Item {
 
 pub(crate) struct Group {
     pub title: &'static str,
-    /// Draws the dialog-launcher glyph beside the title (inert).
+    /// Draws the dialog-launcher glyph beside the title.
     pub launcher: bool,
+    /// What the launcher runs; `None` draws it inert.
+    pub launch: Option<SheetAct>,
     pub body: Body,
 }
 
@@ -241,6 +243,8 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Clipboard",
                 launcher: true,
+                // The Office Clipboard pane (#669).
+                launch: Some(SheetAct::OfficeClipboard),
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -267,6 +271,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Font",
                 launcher: true,
+                launch: None,
                 body: Body::Rows(&[
                     &[
                         combo("font-name", "Font", "Calibri", true),
@@ -307,6 +312,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Alignment",
                 launcher: true,
+                launch: None,
                 body: Body::Rows(&[
                     &[
                         glyph("top-align", "Top Align", "\u{2580}", SheetAct::Todo),
@@ -337,6 +343,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Number",
                 launcher: true,
+                launch: None,
                 body: Body::Rows(&[
                     &[cmd(
                         "number-format",
@@ -371,6 +378,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Styles",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_0P5,
                     items: &[
@@ -393,6 +401,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Cells",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_2,
                     items: &[
@@ -417,6 +426,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Editing",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -491,6 +501,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Tables",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -512,6 +523,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Charts",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -553,6 +565,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Data Tools",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -580,6 +593,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Outline",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -619,6 +633,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Show Level",
                 launcher: false,
+                launch: None,
                 body: Body::Rows(&[
                     &[
                         glyph("level-1", "Show Level 1", "1", SheetAct::ShowLevel(1)),
@@ -643,6 +658,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Proofing",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[Item::One(large(
@@ -656,6 +672,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Comments",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -684,6 +701,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Protect",
                 launcher: false,
+                launch: None,
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -711,6 +729,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
         groups: &[Group {
             title: "Window",
             launcher: false,
+            launch: None,
             body: Body::Strip {
                 gap: GAP_1,
                 items: &[Item::One(toggle(

@@ -2258,6 +2258,10 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
     if verb == "inspect" {
         return args.get_str("remove").is_some();
     }
+    // Reading the Office Clipboard is a read; its buttons are presses.
+    if verb == "office-clipboard" {
+        return args.get_str("action").is_some_and(|a| a != "read");
+    }
     matches!(
         verb,
         "click-cell"
@@ -2560,6 +2564,22 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
+        ]);
+        // The option buttons a fill or a paste leaves (#668, #669), and
+        // the Office Clipboard's count.
+        out.extend([
+            (
+                "fill_options",
+                str_or_null(app.fill_options_live().map(|o| o.kind.label().to_string())),
+            ),
+            (
+                "paste_options",
+                str_or_null(app.paste_options_live().map(|o| o.item.label().to_string())),
+            ),
+            (
+                "office_clipboard",
+                Json::Num(app.office_clip.items.len() as f64),
+            ),
         ]);
     }
     let ov = app.grid_overlay();
@@ -3530,6 +3550,35 @@ pub fn dispatch(
         // empty and never touches the OS clipboard); `write` puts text on it
         // as another app's copy would. Copy, cut and paste are the app's own
         // keys and buttons (`key ctrl+c`, `ribbon-click`), not a second route.
+        // The Office Clipboard pane (#669): `read` (the default), `open`,
+        // `close`, `paste` item `index`, `paste-all`, `clear-all`, `delete`
+        // item `index`. The same handler the pane's buttons call.
+        "office-clipboard" => {
+            let action = args.get_str("action").unwrap_or("read");
+            if action != "read" {
+                app.refuse_under_dialog()?;
+                sheet(app)?;
+                let index = match args.get("index") {
+                    Some(_) => Some(arg_usize(args, "index")?),
+                    None => None,
+                };
+                app.office_clip_act(action, index, cx)?;
+            }
+            Done::ok(Json::obj(vec![
+                ("open", Json::Bool(app.office_clip.open)),
+                (
+                    "items",
+                    Json::Arr(
+                        app.office_clip
+                            .items
+                            .iter()
+                            .map(|t| Json::Str(t.clone()))
+                            .collect(),
+                    ),
+                ),
+                ("state", state(app, window)),
+            ]))
+        }
         "clipboard" => {
             match arg_str(args, "action")? {
                 "read" => {}
@@ -3538,7 +3587,10 @@ pub fn dispatch(
                     app.clipboard_write(text, cx);
                 }
                 "paste-special" => {
-                    return Err("paste special is not implemented in this app".into());
+                    return Err(
+                        "clipboard does not paste special: press the app's own key (key ctrl+alt+v) or menu-click Paste Special… on the Paste gallery"
+                            .into(),
+                    );
                 }
                 action @ ("copy" | "cut" | "paste") => {
                     return Err(format!(

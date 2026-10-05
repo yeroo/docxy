@@ -75,6 +75,7 @@ mod sheet_select_tests;
 #[allow(dead_code)]
 mod sheet_menus;
 mod sheet_outline;
+mod sheet_paste;
 mod sheet_ribbon;
 mod style_gallery;
 mod table_dialogs;
@@ -978,6 +979,7 @@ fn multi_area_ok(act: SheetAct) -> bool {
         SheetAct::Cut
         | SheetAct::Paste
         | SheetAct::PasteAs(_)
+        | SheetAct::PasteAgain(_)
         | SheetAct::PasteSpecial
         | SheetAct::Drop(_)
         | SheetAct::RowHeight
@@ -1401,6 +1403,9 @@ struct GridClip {
     /// The sheet column each column of `cells` came from: a multi-area copy
     /// joins areas side by side (#670), so columns may be missing.
     cols: Vec<u32>,
+    /// The copy as Paste Special reads it (#669): the same cells, with the
+    /// source's column widths, validation and notes.
+    block: gridcore::edit::ClipBlock,
     /// A cut: its paste moves the cells, once (#664).
     cut: bool,
     /// The source's [`SheetView::edit_gen`] when it was taken (or last
@@ -1445,6 +1450,7 @@ impl GridClip {
         self.spent = true;
         self.cells = Vec::new();
         self.rows = Vec::new();
+        self.block = Default::default();
     }
 }
 
@@ -1662,12 +1668,13 @@ enum SheetAct {
     /// Home › Find & Select › Go To… and Go To Special….
     GoTo,
     GoToSpecial,
-    /// A Paste gallery or Paste Options item.
+    /// A Paste gallery item.
     PasteAs(sheet_menus::PasteItem),
+    /// A Paste Options choice: the last paste again, that way.
+    PasteAgain(sheet_menus::PasteItem),
     /// Paste Special… (Ctrl+Alt+V).
     PasteSpecial,
     /// The Clipboard group's launcher: the Office Clipboard pane.
-    #[allow(dead_code)] // #707: wired by a later commit
     OfficeClipboard,
     /// File › Options › Advanced › Edit Custom Lists….
     CustomLists,
@@ -3127,6 +3134,7 @@ impl SheetView {
             sheet: self.active,
             sheet_name: sheet.name.clone(),
             rect,
+            block: self.clip_block(rows.clone(), cols.clone()),
             rows,
             cols,
             cut,
@@ -3612,6 +3620,11 @@ struct Docxy {
     // right-drag of the fill handle waiting on its menu.
     fill_options: Option<sheet_fill::FillOptions>,
     fill_drop: Option<FillDrag>,
+    // The Paste Options button of the last paste of a copy (#669), what
+    // the Paste Special dialog pastes, and the Office Clipboard.
+    paste_options: Option<sheet_paste::PasteOptions>,
+    paste_special_source: Option<(gridcore::edit::ClipBlock, bool)>,
+    office_clip: sheet_paste::OfficeClipboard,
     // Where the pointer last was over the grid, window coordinates: where a
     // menu a release opens is drawn.
     last_pointer: Point<Pixels>,
@@ -9404,6 +9417,9 @@ impl Docxy {
             sheet_fill: None,
             fill_options: None,
             fill_drop: None,
+            paste_options: None,
+            paste_special_source: None,
+            office_clip: Default::default(),
             last_pointer: point(px(0.), px(0.)),
             custom_lists: Vec::new(),
             chart_sel: None,
@@ -11925,7 +11941,11 @@ impl Docxy {
             area_rows: Default::default(),
             options_button: self
                 .fill_options_live()
-                .map(|o| ((o.dest.2, o.dest.3), menu::GridMenu::FillOptions)),
+                .map(|o| ((o.dest.2, o.dest.3), menu::GridMenu::FillOptions))
+                .or_else(|| {
+                    self.paste_options_live()
+                        .map(|o| ((o.rect.2, o.rect.3), menu::GridMenu::PasteOptions))
+                }),
             // The border's range and the cap on its dashes both need the
             // visible-row list and the column window, which only `sheet_el`
             // has.
@@ -12840,6 +12860,8 @@ impl Docxy {
             }
         };
         clip.text = self.clipboard_write_recorded(std::mem::take(&mut clip.text), cx);
+        // Every copy and cut goes on the Office Clipboard too (#669).
+        self.office_clip.push(&clip.text);
         self.grid_clip = Some(clip);
         cx.notify();
     }
@@ -12874,6 +12896,17 @@ impl Docxy {
         cut
     }
 
+    /// After a paste of the live copy into its own workbook: the paste's own
+    /// undo step does not end copy mode.
+    fn grid_clip_restamp(&mut self) {
+        if let Some(mut ours) = self.grid_clip.take() {
+            if let Some(v) = self.active_sheet() {
+                ours.restamp(v);
+            }
+            self.grid_clip = Some(ours);
+        }
+    }
+
     /// End copy mode (Esc, an Enter paste, a pasted cut).
     fn grid_clip_spend(&mut self) {
         if let Some(clip) = self.grid_clip.as_mut() {
@@ -12898,6 +12931,22 @@ impl Docxy {
             };
             let res = v.paste_grid_clip(&clip);
             let landed = matches!(res, Ok(GridPasted::Done | GridPasted::KeptAsCopy(_)));
+            // A copy's paste leaves the Paste Options button (#669); a
+            // move does not, as in Excel.
+            self.paste_options = None;
+            if landed && !clip.cut {
+                if let Some(v) = self.active_sheet() {
+                    let rect = v.range();
+                    self.paste_options = Some(sheet_paste::PasteOptions {
+                        view: v.id,
+                        edit_gen: v.edit_gen,
+                        block: clip.block.clone(),
+                        at: (rect.0, rect.1),
+                        rect,
+                        item: sheet_menus::PasteItem::Paste,
+                    });
+                }
+            }
             // Copy mode stays on after a Ctrl+V: the paste's own undo step
             // does not end it.
             if landed && !clip.cut {
@@ -12940,33 +12989,19 @@ impl Docxy {
         let ClipRead::Text(text) = now else {
             return false;
         };
+        self.paste_text(&text, cx)
+    }
+
+    /// Paste `text` at the selection's top-left as TSV, each field read as
+    /// typed into its target cell (paste_cell: a leading `'` is
+    /// quote-prefixed text, a date brings its format), as xlsxy's and
+    /// gridwasm's pastes do. Whether it landed.
+    fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         let Some(v) = self.active_sheet_mut() else {
             return false;
         };
-        // Each field is read as typed into its target cell (paste_cell:
-        // a leading `'` is quote-prefixed text, a date brings its
-        // format), as xlsxy's and gridwasm's pastes do. The block goes at the
-        // selection's top-left.
         let (br, bc, _, _) = v.range();
-        let s = v.active;
-        let ctx = gridcore::entry::entry_ctx(&v.pkg.workbook, v.engine.clock);
-        let wb = &mut v.pkg.workbook;
-        let mut block = Vec::new();
-        for (dr, line) in text
-            .replace("\r\n", "\n")
-            .trim_end_matches('\n')
-            .split('\n')
-            .enumerate()
-        {
-            let mut row = Vec::new();
-            for (dc, f) in line.split('\t').enumerate() {
-                let style = wb.sheets[s]
-                    .cell(br + dr as u32, bc + dc as u32)
-                    .map_or(0, |cl| cl.style);
-                row.push(gridcore::entry::paste_cell(&mut wb.styles, style, f, &ctx));
-            }
-            block.push(row);
-        }
+        let block = v.text_block(text, (br, bc));
         if block.is_empty() {
             return false;
         }
@@ -15165,7 +15200,12 @@ impl Docxy {
                     .ok_or("no Auto Fill Options button is showing")?;
                 sheet_menus::fill_options(&opts.kinds(), Some(opts.kind))
             }
-            menu::GridMenu::PasteOptions => return Err("no Paste Options button is showing".into()),
+            menu::GridMenu::PasteOptions => {
+                let opts = self
+                    .paste_options_live()
+                    .ok_or("no Paste Options button is showing")?;
+                sheet_menus::paste_again_menu(opts.item)
+            }
             menu::GridMenu::FillDrop | menu::GridMenu::BorderDrop => {
                 return Err("a drop menu opens only when a right-drag ends".into());
             }
@@ -15384,10 +15424,14 @@ impl Docxy {
                 cx.notify();
             }
             SheetAct::FillAs(kind) => self.sheet_fill_as(kind, cx),
-            SheetAct::PasteAs(_)
-            | SheetAct::PasteSpecial
-            | SheetAct::OfficeClipboard
-            | SheetAct::Drop(_) => {
+            SheetAct::PasteAs(item) => self.sheet_paste_as(item, cx),
+            SheetAct::PasteAgain(item) => self.sheet_paste_again(item, cx),
+            SheetAct::PasteSpecial => self.open_paste_special(cx),
+            SheetAct::OfficeClipboard => {
+                self.office_clip.open = !self.office_clip.open;
+                cx.notify();
+            }
+            SheetAct::Drop(_) => {
                 self.set_status("Not available yet");
                 cx.notify();
             }
@@ -15530,6 +15574,10 @@ impl Docxy {
                     cx.notify();
                     return;
                 }
+            }
+            // Ctrl+Alt+V: Paste Special… (#669).
+            if alt && key == "v" && !editing {
+                return self.run_sheet_act(SheetAct::PasteSpecial, window, cx);
             }
             // Excel's entry shortcuts (#663). The harness spells Ctrl+Shift+"
             // and Ctrl+Shift+; by the shifted character, the platform by the
@@ -17822,6 +17870,162 @@ impl Docxy {
         }
         self.scroll_to_caret();
         self.refocus(window, cx);
+    }
+
+    /// The Office Clipboard task pane (#669): Paste All and Clear All, then
+    /// the copies, newest first; a click pastes one as values, its ✕
+    /// deletes it.
+    fn office_clip_panel(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let btn = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px_2()
+                .py_0p5()
+                .rounded(px(3.))
+                .border_1()
+                .border_color(pal.border)
+                .cursor_pointer()
+                .hover(|d| d.bg(pal.hover))
+                .text_size(px(11.))
+                .text_color(pal.fg)
+                .child(label)
+        };
+        let n = self.office_clip.items.len();
+        let mut list = v_flex().gap_1().px_2();
+        for (i, text) in self.office_clip.items.iter().enumerate() {
+            list = list.child(
+                h_flex()
+                    .id(SharedString::from(format!("office-clip-{i}")))
+                    .gap_1()
+                    .p_1()
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(pal.border)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(pal.hover))
+                    .child(div().flex_1().text_size(px(11.)).text_color(pal.fg).child(
+                        SharedString::from(sheet_paste::OfficeClipboard::preview(text)),
+                    ))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("office-clip-del-{i}")))
+                            .px_1()
+                            .text_color(pal.dim)
+                            .hover(|d| d.text_color(pal.fg))
+                            .child("\u{2715}")
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                cx.stop_propagation();
+                                this.office_clip_act("delete", Some(i), cx).ok();
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Err(e) = this.office_clip_act("paste", Some(i), cx) {
+                            this.set_status(e);
+                        }
+                        this.refocus(window, cx);
+                    })),
+            );
+        }
+        v_flex()
+            .w(px(SIDE_PANEL_W))
+            .h_full()
+            .flex_none()
+            .bg(pal.panel)
+            .border_r_1()
+            .border_color(pal.border)
+            .gap_2()
+            .py_2()
+            .child(
+                h_flex()
+                    .px_2()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(pal.fg)
+                            .child(SharedString::from(format!(
+                                "Clipboard  {n} of {}",
+                                sheet_paste::OFFICE_CLIPBOARD_CAP
+                            ))),
+                    )
+                    .child(btn("office-clip-close", "\u{2715}").on_click(cx.listener(
+                        |this, _, _w, cx| {
+                            this.office_clip.open = false;
+                            cx.notify();
+                        },
+                    ))),
+            )
+            .child(
+                h_flex()
+                    .px_2()
+                    .gap_2()
+                    .child(
+                        btn("office-clip-paste-all", "Paste All").on_click(cx.listener(
+                            |this, _, window, cx| {
+                                if let Err(e) = this.office_clip_act("paste-all", None, cx) {
+                                    this.set_status(e);
+                                }
+                                this.refocus(window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        btn("office-clip-clear-all", "Clear All").on_click(cx.listener(
+                            |this, _, _w, cx| {
+                                this.office_clip_act("clear-all", None, cx).ok();
+                            },
+                        )),
+                    ),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .text_size(px(11.))
+                    .text_color(pal.dim)
+                    .child(if n == 0 {
+                        "Copy or cut to collect items here. A click pastes one as values."
+                    } else {
+                        "Click an item to paste it as values:"
+                    }),
+            )
+            .child(list)
+            .into_any_element()
+    }
+
+    /// The Office Clipboard's actions, for the pane and the harness's
+    /// `office-clipboard` verb: `open`, `close`, `paste` item `index`,
+    /// `paste-all`, `clear-all`, `delete` item `index`.
+    pub(crate) fn office_clip_act(
+        &mut self,
+        action: &str,
+        index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let n = self.office_clip.items.len();
+        let item = |i: Option<usize>| -> Result<usize, String> {
+            let i = i.ok_or("this action names an item 'index'")?;
+            (i < n)
+                .then_some(i)
+                .ok_or_else(|| format!("the Office Clipboard has {n} item(s); there is no {i}"))
+        };
+        match action {
+            "open" => self.office_clip.open = true,
+            "close" => self.office_clip.open = false,
+            "paste" => self.office_paste(Some(item(index)?), cx)?,
+            "paste-all" => self.office_paste(None, cx)?,
+            "clear-all" => self.office_clip.items.clear(),
+            "delete" => {
+                let i = item(index)?;
+                self.office_clip.items.remove(i);
+            }
+            other => {
+                return Err(format!(
+                    "no Office Clipboard action '{other}' (open, close, paste, paste-all, clear-all, delete)"
+                ));
+            }
+        }
+        cx.notify();
+        Ok(())
     }
 
     /// The comments review side panel (toggled from Review/View ▸ Comments pane).
@@ -25297,11 +25501,21 @@ impl Docxy {
                     .gap_1()
                     .child(div().text_size(px(10.)).text_color(pal.dim).child(g.title))
                     .when(g.launcher, |d| {
+                        let launch = g.launch;
                         d.child(
                             div()
+                                .id(SharedString::from(format!("sheet-launch-{}", g.title)))
                                 .text_size(px(9.))
                                 .text_color(pal.dim)
-                                .child("\u{2921}"),
+                                .when(launch.is_some(), |d| {
+                                    d.cursor_pointer().hover(|d| d.text_color(pal.fg))
+                                })
+                                .child("\u{2921}")
+                                .when_some(launch, |d, act| {
+                                    d.on_click(cx.listener(move |this, _, window, cx| {
+                                        this.run_sheet_act(act, window, cx)
+                                    }))
+                                }),
                         )
                     })
                     .into_any_element(),
@@ -26840,6 +27054,9 @@ impl Render for Docxy {
             if self.panel_chart_shown().is_some() {
                 panel += SIDE_PANEL_W;
             }
+            if self.office_clip.open {
+                panel += SIDE_PANEL_W;
+            }
             let w = f32::from(window.viewport_size().width) - panel;
             self.reconcile_sheet_hscroll((w - SHEET_GUT).max(120.0));
             self.sheet_grid_w = w;
@@ -27830,6 +28047,9 @@ impl Render for Docxy {
         // `PanelEvent`), so a click on the grid can no longer close it mid-edit.
         let chart_panel =
             (!is_doc && self.panel_chart_shown().is_some()).then(|| self.chart_panel(pal, cx));
+        // The Office Clipboard (#669), docked left of the grid as Excel's is.
+        let office_panel = (self.active_is_sheet() && self.office_clip.open)
+            .then(|| self.office_clip_panel(pal, cx));
         let body = h_flex()
             .flex_1()
             .min_h(px(0.))
@@ -27847,6 +28067,7 @@ impl Render for Docxy {
                 }),
             )
             .when_some(nav_panel, |d, n| d.child(n))
+            .when_some(office_panel, |d, p| d.child(p))
             .child(content)
             .when_some(comments_panel, |d, p| d.child(p))
             .when_some(notes_panel, |d, p| d.child(p))

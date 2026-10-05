@@ -136,6 +136,11 @@ pub(crate) enum DialogOwner {
     /// File › Options › Edit Custom Lists (#668): an app setting, applied by
     /// `Docxy::fill_dialog_click`.
     CustomLists,
+    /// Paste Special… (#669); `clip` when a copy is live (else only text
+    /// is on the clipboard). Applied by `Docxy::paste_dialog_click`.
+    PasteSpecial {
+        clip: bool,
+    },
     /// Group's (Ungroup's) "Rows or Columns?" over a block selection (#693).
     OutlineAxis {
         ungroup: bool,

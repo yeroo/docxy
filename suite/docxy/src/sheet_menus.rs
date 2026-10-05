@@ -163,6 +163,30 @@ pub(crate) fn paste_options(clip: bool, text: bool) -> Vec<MenuItem> {
     items
 }
 
+/// The Paste Options button's menu: the gallery's items without Paste
+/// Special, each pasting the last paste again that way.
+pub(crate) fn paste_again_menu(current: PasteItem) -> Vec<MenuItem> {
+    let mut items = Vec::new();
+    for (k, section) in PasteItem::SECTIONS.iter().enumerate() {
+        if k > 0 {
+            items.push(sep());
+        }
+        for &p in *section {
+            items.push(MenuItem::Item(
+                Entry::new(
+                    p.id(),
+                    p.label(),
+                    "",
+                    Act::Sheet(SheetAct::PasteAgain(p)),
+                    true,
+                )
+                .checked(p == current),
+            ));
+        }
+    }
+    items
+}
+
 /// Home › Fill.
 pub(crate) fn fill_menu() -> Vec<MenuItem> {
     vec![
