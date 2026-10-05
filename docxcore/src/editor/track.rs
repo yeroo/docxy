@@ -108,7 +108,8 @@ impl Editor {
                         record_insert(props, &meta)
                     });
                 }
-                self.doc.initialize_revision_targets();
+                // It may sit inside another insertion, splitting it.
+                self.settle_revisions();
             }
             (None, What::Recorded(_)) => {
                 if let Some(p) = para_mut(&mut self.doc.body, path) {
@@ -116,6 +117,8 @@ impl Editor {
                         clear_insert_record(props)
                     });
                 }
+                // Untracked text in the middle of an insertion interrupts it.
+                self.settle_revisions();
             }
             (None, _) => {}
         }
@@ -150,39 +153,34 @@ impl Editor {
         if !any {
             return;
         }
-        let mut next = self.max_annotation_id();
-        let mut used: std::collections::HashSet<Option<String>> = Default::default();
+        let mut state = Stretches {
+            next: self.max_annotation_id(),
+            used: Default::default(),
+            open: None,
+        };
         for path in paths {
             let Some(para) = para_mut(&mut self.doc.body, &path) else {
                 continue;
             };
-            // The id the current stretch of adjacent runs has, and had.
-            let mut open: Option<(Option<String>, Option<String>)> = None;
+            state.open = None;
             for inline in &mut para.content {
-                if !has_record(inline) {
-                    open = None;
-                    continue;
-                }
-                with_props(inline, |props| {
-                    let Some(t) = &mut props.tracked_insert else {
-                        return;
-                    };
-                    let old = t.metadata.id.clone();
-                    match &open {
-                        Some((was, now)) if *was == old => t.metadata.id = now.clone(),
-                        _ => {
-                            if used.contains(&old) {
-                                next += 1;
-                                t.metadata.id = Some(next.to_string());
-                                t.metadata.target = Default::default();
-                            }
-                            used.insert(t.metadata.id.clone());
-                            open = Some((old, t.metadata.id.clone()));
+                match inline {
+                    // A deletion of part of an insertion sits inside it.
+                    Inline::Revision {
+                        kind: RevisionKind::Delete,
+                        content,
+                        ..
+                    } if !content.is_empty() && content.iter().all(has_record) => {
+                        for inner in content.iter_mut() {
+                            with_props(inner, |p| state.visit(p));
                         }
                     }
-                });
+                    i if has_record(i) => with_props(i, |p| state.visit(p)),
+                    _ => state.open = None,
+                }
             }
         }
+        self.doc.initialize_revision_targets();
     }
 
     /// Delete the character at editor offset `idx` of the paragraph at `path`:
@@ -214,7 +212,8 @@ impl Editor {
                     record_deletion(&mut p.content, idx, &author, meta);
                 }
                 if !merges {
-                    self.doc.initialize_revision_targets();
+                    // A deletion inside another insertion splits it.
+                    self.settle_revisions();
                 }
             }
         }
@@ -231,22 +230,28 @@ impl Editor {
         if self.track.is_none() {
             return false;
         }
-        let mut path = lo.path.clone();
-        let (first, last) = (*lo.path.last().unwrap(), *hi.path.last().unwrap());
-        for index in first..=last {
-            *path.last_mut().unwrap() = index;
-            let Some(para) = resolve_para(&self.doc.body, &path) else {
+        // Every paragraph from `lo` to `hi` in document order, the ones in a
+        // table between them included: the table itself stays.
+        let paths = super::all_paragraph_paths(&self.doc.body);
+        let (Some(first), Some(last)) = (
+            paths.iter().position(|p| *p == lo.path),
+            paths.iter().position(|p| *p == hi.path),
+        ) else {
+            return false;
+        };
+        for (k, path) in paths[first..=last].iter().enumerate() {
+            let Some(para) = resolve_para(&self.doc.body, path) else {
                 continue;
             };
             let len: usize = para.content.iter().map(inline_len).sum();
-            let (from, to) = match (index == first, index == last) {
+            let (from, to) = match (k == 0, first + k == last) {
                 (true, true) => (lo.offset, hi.offset),
                 (true, false) => (lo.offset, len),
                 (false, true) => (0, hi.offset.min(len)),
                 (false, false) => (0, len),
             };
             for _ in from..to {
-                self.delete_char_at(&path, from);
+                self.delete_char_at(path, from);
             }
         }
         true
@@ -377,15 +382,44 @@ enum Plan {
     Record { merges: bool },
 }
 
-fn is_own_deletion(inline: Option<&Inline>, author: &str) -> bool {
-    matches!(
-        inline,
-        Some(Inline::Revision {
-            kind: RevisionKind::Delete,
-            metadata,
-            ..
-        }) if metadata.author.as_deref() == Some(author)
-    )
+/// The tracked insertion a run-like inline sits in: `Some(None)` for none,
+/// `Some(Some(id))` for one, `None` for something that is not a run.
+fn insert_id_of(inline: &Inline) -> Option<Option<String>> {
+    match inline {
+        Inline::Run(r) => Some(
+            r.props
+                .tracked_insert
+                .as_ref()
+                .and_then(|t| t.metadata.id.clone()),
+        ),
+        Inline::Tab(p) | Inline::Break(_, p) => Some(
+            p.tracked_insert
+                .as_ref()
+                .and_then(|t| t.metadata.id.clone()),
+        ),
+        _ => None,
+    }
+}
+
+/// An adjacent deletion by `author` that text from insertion `insert` (`None`
+/// for text that is not recorded) may join: its runs are all in that same
+/// insertion (a deletion inside someone else's insertion is `w:ins` around
+/// `w:del`, so it stays apart from a deletion of ordinary text).
+fn is_own_deletion(inline: Option<&Inline>, author: &str, insert: &Option<String>) -> bool {
+    let Some(Inline::Revision {
+        kind: RevisionKind::Delete,
+        metadata,
+        content,
+        ..
+    }) = inline
+    else {
+        return false;
+    };
+    metadata.author.as_deref() == Some(author)
+        && !content.is_empty()
+        && content
+            .iter()
+            .all(|i| insert_id_of(i).as_ref() == Some(insert))
 }
 
 fn plan_delete(content: &[Inline], idx: usize, author: &str) -> Plan {
@@ -406,8 +440,12 @@ fn plan_delete(content: &[Inline], idx: usize, author: &str) -> Plan {
                 return Plan::Remove;
             }
             let first = idx == acc;
-            let merges = (first && i > 0 && is_own_deletion(content.get(i - 1), author))
-                || (last && is_own_deletion(content.get(i + 1), author));
+            let insert = props
+                .tracked_insert
+                .as_ref()
+                .and_then(|t| t.metadata.id.clone());
+            let merges = (first && i > 0 && is_own_deletion(content.get(i - 1), author, &insert))
+                || (last && is_own_deletion(content.get(i + 1), author, &insert));
             return Plan::Record { merges };
         }
         acc += len;
@@ -415,10 +453,12 @@ fn plan_delete(content: &[Inline], idx: usize, author: &str) -> Plan {
     Plan::Remove
 }
 
-/// The deleted copy of a run-like inline: no insertion record, struck through.
+/// The deleted copy of a run-like inline, struck through. It keeps the
+/// insertion it was recorded in (another reviewer's: the author's own text is
+/// removed outright), so Reject All and Original still drop it, and a save
+/// writes `w:ins` around the `w:del`, as Word does.
 fn deleted_props(props: &RunProps) -> RunProps {
     let mut p = props.clone();
-    clear_insert_record(&mut p);
     if p.revision_cues.deletions == 0 && !p.strike {
         p.strike = true;
         p.revision_cues.strike_added = true;
@@ -514,14 +554,15 @@ fn record_deletion(
         }
         _ => return,
     };
+    let insert = insert_id_of(&deleted).flatten();
     pieces[wrapper_at] = deletion_wrapper(meta.unwrap_or_default(), deleted);
     content.splice(i..=i, pieces);
     let mut at = i + wrapper_at;
 
     // Join the author's deletion just before, and just after, into one: the
     // older wrapper stays (its id, date and place), the new text goes into it.
-    let prev_own = at > 0 && is_own_deletion(content.get(at - 1), author);
-    let next_own = is_own_deletion(content.get(at + 1), author);
+    let prev_own = at > 0 && is_own_deletion(content.get(at - 1), author, &insert);
+    let next_own = is_own_deletion(content.get(at + 1), author, &insert);
     if !prev_own && !next_own {
         return;
     }
@@ -565,4 +606,40 @@ fn grow(into: &mut Inline, before: Vec<Inline>, after: Vec<Inline>) {
         }
     }
     *content = merged;
+}
+
+/// [`Editor::unshare_insert_ids`]'s walk: the ids in use, the next free one,
+/// and the stretch of adjacent recorded runs being read (its id as found, and
+/// as it now stands).
+struct Stretches {
+    next: u64,
+    used: std::collections::HashSet<Option<String>>,
+    open: Option<(Option<String>, Option<String>)>,
+}
+
+impl Stretches {
+    fn visit(&mut self, props: &mut RunProps) {
+        let Some(t) = &mut props.tracked_insert else {
+            return;
+        };
+        let old = t.metadata.id.clone();
+        match &self.open {
+            Some((was, now)) if *was == old => {
+                if t.metadata.id != *now {
+                    t.metadata.id = now.clone();
+                    // Its own revision now, not the old one's.
+                    t.metadata.target = Default::default();
+                }
+            }
+            _ => {
+                if self.used.contains(&old) {
+                    self.next += 1;
+                    t.metadata.id = Some(self.next.to_string());
+                    t.metadata.target = Default::default();
+                }
+                self.used.insert(t.metadata.id.clone());
+                self.open = Some((old, t.metadata.id.clone()));
+            }
+        }
+    }
 }

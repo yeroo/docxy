@@ -291,7 +291,7 @@ One JSON object per line; one reply line per request:
 | `doc.revision-accept` / `doc.revision-reject` | `{revision}` | structured applied/stale/unsupported/malformed outcome |
 | `doc.revisions-accept-all` / `doc.revisions-reject-all` | — | `{total,applied,outcomes:[…]}` from one undoable transaction |
 | `doc.track-changes` | — | `{enabled, author}` — whether edits are recorded as tracked changes, and as whom |
-| `doc.track-changes-set` | `{enabled}` | `{enabled, author}` — Review ▸ Track Changes: typing, paste, Replace and deletions are then recorded (`w:ins` / `w:del`, stamped with the reviewer and the time) and the document saves with `w:trackRevisions`. Not an undo step (the setting is package metadata). Refuses Markdown documents |
+| `doc.track-changes-set` | `{enabled}` | `{enabled, author}` — Review ▸ Track Changes: typing, paste, Replace and deletions are then recorded (`w:ins` / `w:del`, stamped with the reviewer and the time) and the document saves with `w:trackRevisions`. Not an undo step (the setting is package metadata). Refuses Markdown documents; while on, `doc.insert` / `doc.append` / `doc.replace-range` with `markdown:true` are refused (plain text is recorded) |
 | `doc.display-mode` | `{mode?}` | `{mode, label, editable}` — Review ▸ Display for Review: `all`, `simple`, `none` (No Markup) or `original`. A view only: never a mutation, never saved. While `none` or `original` is shown every edit verb is refused with `protection_denied:display_mode` (comment verbs still work) |
 
 Notes:
@@ -626,7 +626,9 @@ page-layout and printing verbs (`page.*`, `print-area.*`, `print-titles.set`,
 `page-break.*`, `print.pages`, `wb.export-pdf`) and the filter and sort verbs
 (`filter.*`, `range.sort`, `sheet.rows`, `wb.clock`), which only a terminal
 xlsxy answers so far; and docxy's `doc.page-color`, `doc.watermark`,
-`doc.page-borders` and `doc.compare`, which only a terminal docxy answers so
+`doc.page-borders`, `doc.compare`, `doc.comment-resolve`,
+`doc.comments-delete-all`, `doc.display-mode`, `doc.track-changes` and
+`doc.track-changes-set`, which only a terminal docxy answers so
 far — a tab answers `unknown verb`): a couple of internal-only verbs the extension host
 uses to compose its own `doc.path`/`wb.path` replies (`doc.blocks`, `wb.info`)
 are deliberately not in the tab's exposed verb set, and are rejected as

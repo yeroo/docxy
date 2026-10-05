@@ -823,6 +823,9 @@ struct TrackedComment {
     /// `comment`, which needs a numeric id (new comments always have one;
     /// any other is not written back).
     raw: Option<String>,
+    /// Its `commentsExtended` / `commentsIds` entries when it was deleted (the
+    /// reply link, the durable id), put back with `raw` ([`Package::comment_extras`]).
+    extras: Vec<(String, String)>,
     /// Where it sat in `comments`, so a restored one goes back there.
     index: usize,
 }
@@ -3069,6 +3072,7 @@ impl App {
             TrackedComment {
                 comment: comment.clone(),
                 raw: None,
+                extras: Vec::new(),
                 index: self.comments.len(),
             },
         );
@@ -3176,7 +3180,10 @@ impl App {
         for (id, t) in &self.tracked_comments {
             let c = &t.comment;
             match (live.contains(id), saved.contains(id), &t.raw) {
-                (true, false, Some(raw)) => self.pkg.insert_comment_xml(raw),
+                (true, false, Some(raw)) => {
+                    self.pkg.insert_comment_xml(raw);
+                    self.pkg.restore_comment_extras(&t.extras);
+                }
                 (true, false, None) => {
                     if let Ok(n) = id.parse::<i32>() {
                         self.pkg
@@ -3211,14 +3218,17 @@ impl App {
             // keep that XML too.
             if t.raw.is_none() {
                 t.raw = self.pkg.comment_xml(&c.id);
+                t.extras = self.pkg.comment_extras(&c.id);
             }
         } else {
             let raw = self.pkg.comment_xml(&c.id);
+            let extras = self.pkg.comment_extras(&c.id);
             self.tracked_comments.insert(
                 c.id.clone(),
                 TrackedComment {
                     comment: c.clone(),
                     raw,
+                    extras,
                     index,
                 },
             );
@@ -12306,6 +12316,63 @@ mod tests {
         assert!(app.comments[0].resolved);
         app.save();
         assert_eq!(saved_resolved(&path), [("1".to_string(), true)]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A Word-authored comment: its `w14:paraId`, a `commentsExtended` entry
+    /// that links it to a parent, and a `commentsIds` durable id. Delete All,
+    /// save, undo, save writes it back well-formed, with those entries.
+    #[test]
+    fn delete_all_then_undo_restores_word_authored_comment_extras() {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(MPara {
+                props: ParProps::default(),
+                content: vec![Inline::Run(Run {
+                    text: "The quick brown fox.".into(),
+                    props: RunProps::default(),
+                })],
+            })],
+        });
+        ed.select_all();
+        assert!(ed.add_comment("1"));
+        let word_comment = "<w:comment w:id=\"1\" w:author=\"Ann\" w:initials=\"A\" \
+            w:date=\"2020-01-02T03:04:05Z\"><w:p w14:paraId=\"1A2B\"><w:r><w:t>reply</w:t></w:r></w:p></w:comment>";
+        let mut pkg = new_package(ed.doc);
+        pkg.insert_comment_xml(word_comment);
+        pkg.restore_comment_extras(&[
+            (
+                "word/commentsExtended.xml".to_string(),
+                "<w15:commentEx w15:paraId=\"1A2B\" w15:paraIdParent=\"0F0F\" w15:done=\"0\"/>"
+                    .to_string(),
+            ),
+            (
+                "word/commentsIds.xml".to_string(),
+                "<w16cid:commentId w16cid:paraId=\"1A2B\" w16cid:durableId=\"7C7C7C7C\"/>"
+                    .to_string(),
+            ),
+        ]);
+        assert!(!pkg.comment_extras("1").is_empty(), "the fixture has them");
+        let mut app = App::new(pkg, "test.docx", false);
+        app.os_clip = None;
+        app.run_act(ribbon::Act::DeleteAllComments);
+        let path = save_to_temp(&mut app, "cmt-extras");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        app.save();
+        let pkg = saved_pkg(&path);
+        let comments = pkg.part_text("word/comments.xml").unwrap();
+        assert!(comments.contains(word_comment), "{comments}");
+        assert!(comments.contains("xmlns:w14="), "w14 declared: {comments}");
+        let ext = pkg
+            .part_text("word/commentsExtended.xml")
+            .expect("part back");
+        assert!(ext.contains("w15:paraIdParent=\"0F0F\""), "{ext}");
+        let ids = pkg.part_text("word/commentsIds.xml").expect("part back");
+        assert!(ids.contains("w16cid:durableId=\"7C7C7C7C\""), "{ids}");
+        let ct = pkg.part_text("[Content_Types].xml").unwrap();
+        assert!(
+            ct.contains("/word/commentsExtended.xml") && ct.contains("/word/commentsIds.xml"),
+            "{ct}"
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

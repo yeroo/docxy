@@ -1417,7 +1417,8 @@ fn collect_run_props_revisions(
     collect_property_revision(&props.property_change, parent, depth, out);
     // One entry per recorded insertion, however many runs it is in.
     if let Some(insert) = &props.tracked_insert {
-        let listed = out.last().is_some_and(|a| {
+        // (A deletion of part of it can sit between two runs of it.)
+        let listed = out.iter().rev().take(16).any(|a| {
             a.target == insert.metadata.target
                 && matches!(a.category, RevisionCategory::Inline(RevisionKind::Insert))
         });

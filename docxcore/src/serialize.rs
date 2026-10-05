@@ -147,12 +147,31 @@ fn write_paragraph(s: &mut String, p: &Paragraph) {
 /// The tracked insertion a run-like inline was recorded as (see
 /// [`crate::model::TrackedInsert`]).
 fn tracked_insert_of(item: &Inline) -> Option<&RevisionMetadata> {
-    match item {
-        Inline::Run(r) => r.props.tracked_insert.as_ref(),
-        Inline::Tab(props) | Inline::Break(_, props) => props.tracked_insert.as_ref(),
-        _ => None,
+    fn props(i: &Inline) -> Option<Option<&RevisionMetadata>> {
+        match i {
+            Inline::Run(r) => Some(r.props.tracked_insert.as_ref().map(|t| &t.metadata)),
+            Inline::Tab(props) | Inline::Break(_, props) => {
+                Some(props.tracked_insert.as_ref().map(|t| &t.metadata))
+            }
+            _ => None,
+        }
     }
-    .map(|t| &t.metadata)
+    match item {
+        // Text deleted from someone else's recorded insertion: Word's
+        // `<w:ins><w:del>…</w:del></w:ins>`.
+        Inline::Revision {
+            kind: RevisionKind::Delete,
+            content,
+            ..
+        } => {
+            let first = props(content.first()?)??;
+            content
+                .iter()
+                .all(|i| props(i).flatten().is_some_and(|m| m.id == first.id))
+                .then_some(first)
+        }
+        other => props(other).flatten(),
+    }
 }
 
 /// `content`, with each stretch of adjacent runs recorded as one tracked

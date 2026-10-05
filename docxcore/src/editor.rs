@@ -1298,11 +1298,28 @@ impl Editor {
     pub fn toggle_italic(&mut self) {
         self.toggle_run_prop(|p| p.italic, |p, v| p.italic = v);
     }
+    /// Underline over the selection. The underline a tracked insertion is drawn
+    /// with is a display cue, not the user's: it does not count as "already
+    /// underlined", and an explicit underline replaces it (so it is saved).
     pub fn toggle_underline(&mut self) {
-        self.toggle_run_prop(|p| p.underline, |p, v| p.underline = v);
+        self.toggle_run_prop(
+            |p| p.underline && !p.revision_cues.underline_added,
+            |p, v| {
+                p.underline = v || p.revision_cues.insertions > 0;
+                p.revision_cues.underline_added = !v && p.revision_cues.insertions > 0;
+            },
+        );
     }
+    /// Strike over the selection, as [`Editor::toggle_underline`] treats the
+    /// cue of a tracked deletion.
     pub fn toggle_strike(&mut self) {
-        self.toggle_run_prop(|p| p.strike, |p, v| p.strike = v);
+        self.toggle_run_prop(
+            |p| p.strike && !p.revision_cues.strike_added,
+            |p, v| {
+                p.strike = v || p.revision_cues.deletions > 0;
+                p.revision_cues.strike_added = !v && p.revision_cues.deletions > 0;
+            },
+        );
     }
 
     /// Run properties at the caret (used for toggles and the ribbon's on-states).
@@ -1601,6 +1618,8 @@ impl Editor {
                 "<w:commentRangeStart w:id=\"{id}\"/>"
             ))]],
         });
+        // Markers inside a recorded insertion interrupt it.
+        self.settle_revisions();
         true
     }
 

@@ -3283,8 +3283,10 @@ struct Docxy {
     // New-comment entry bar (Review ▸ New comment); routes keys while open.
     comment_open: bool,
     /// The comment the Review tab's Resolve acts on: the one last clicked in
-    /// the Comments pane or added, with the tab it is in (ids are per document).
-    selected_comment: Option<(usize, String)>,
+    /// the Comments pane, with the tab it is in (ids are per document). The tab
+    /// is named by its title and file ([`close::TabId`]), not its index, so
+    /// closing or moving tabs never points it at another document.
+    selected_comment: Option<(close::TabId, String)>,
     /// Display for Review (#625): how tracked changes are shown. A view only,
     /// not saved; No Markup and Original refuse edits.
     markup: docxcore::markup::MarkupView,
@@ -8602,6 +8604,18 @@ fn delete_doc_comment(tab: &mut DocTab, id: &str) {
     tab.mark_dirty();
 }
 
+/// The id of the selected comment when it belongs to the active tab (the tab
+/// the selection was made in, by title and file), else `None`.
+fn selected_comment_id(
+    tabs: &[DocTab],
+    active: usize,
+    selected: &Option<(close::TabId, String)>,
+) -> Option<String> {
+    let (tab, id) = selected.as_ref()?;
+    let here = tabs.get(active)?;
+    (here.title == tab.0 && here.path == tab.1).then(|| id.clone())
+}
+
 /// Set comment `id` of `tab` resolved (`Some(true)`), reopened (`Some(false)`)
 /// or the other of the two (`None`). The new state, `None` when `tab` lists
 /// no such comment. The state lives on the comment, so it follows the record
@@ -12255,9 +12269,10 @@ impl Docxy {
             .is_some_and(|t| t.access.locked())
     }
 
-    /// Refuse an edit in Protected View or a document marked as final,
-    /// saying how to edit; `true` when it was refused. Every gate that would
-    /// change the workbook or document asks this first.
+    /// Refuse an edit in Protected View, in a document marked as final, or
+    /// while Display for Review shows No Markup or Original (text that is not
+    /// the document's), saying how to edit; `true` when it was refused. Every
+    /// gate that would change the workbook or document asks this first.
     fn protected_refused(&mut self, cx: &mut Context<Self>) -> bool {
         if self.view_only_active() {
             self.set_status(VIEW_ONLY_STATUS);
@@ -17381,11 +17396,7 @@ impl Docxy {
             return self.refocus(window, cx);
         }
         let active = self.active;
-        let id = self
-            .selected_comment
-            .clone()
-            .filter(|(tab, _)| *tab == active)
-            .map(|(_, id)| id);
+        let id = selected_comment_id(&self.tabs, active, &self.selected_comment);
         if let Some(t) = self.tabs.get_mut(active) {
             t.status = match id.and_then(|id| set_doc_comment_resolved(t, &id, None)) {
                 Some(true) => "Comment resolved".into(),
@@ -17398,7 +17409,10 @@ impl Docxy {
 
     /// The Resolve button of one comment card: select it and toggle it.
     fn resolve_comment(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_comment = Some((self.active, id));
+        self.selected_comment = close::tab_ids(&self.tabs)
+            .into_iter()
+            .nth(self.active)
+            .map(|tab| (tab, id));
         self.resolve_selected_comment(window, cx);
     }
 
@@ -17433,12 +17447,12 @@ impl Docxy {
 
     /// Whether the selected comment is resolved (Resolve shows pressed).
     fn selected_comment_resolved(&self) -> bool {
-        let Some((tab, id)) = &self.selected_comment else {
+        let Some(id) = selected_comment_id(&self.tabs, self.active, &self.selected_comment) else {
             return false;
         };
         self.tabs
-            .get(*tab)
-            .is_some_and(|t| t.comments.iter().any(|c| &c.id == id && c.resolved))
+            .get(self.active)
+            .is_some_and(|t| t.comments.iter().any(|c| c.id == id && c.resolved))
     }
 
     /// Delete every comment (Review ▸ Comments ▸ Delete all): the Document
@@ -17567,7 +17581,10 @@ impl Docxy {
                     .on_click(cx.listener({
                         let id = id.clone();
                         move |this, _, window, cx| {
-                            this.selected_comment = Some((this.active, id.clone()));
+                            this.selected_comment = close::tab_ids(&this.tabs)
+                                .into_iter()
+                                .nth(this.active)
+                                .map(|tab| (tab, id.clone()));
                             this.goto_comment(quoted.clone(), window, cx)
                         }
                     })),

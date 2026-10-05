@@ -889,6 +889,15 @@ fn markdown_flag(args: &Json) -> bool {
 /// bad bounds never leaves the mutation behind. See those functions' doc
 /// comments.
 fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, String> {
+    // The Markdown splice overwrites whole paragraphs, which Track Changes
+    // cannot record (the replaced text would just be gone): plain text is.
+    if app.body_editor().track_changes() {
+        return Err(
+            "Track Changes is on: a Markdown splice is not recorded as a tracked change; \
+             use plain text (no 'markdown'), or turn Track Changes off"
+                .to_string(),
+        );
+    }
     let mut blocks = agent::parse_markdown_blocks(text)?;
     if agent::blocks_carry_formatting(&blocks) {
         app.authorize_mutation(MutationKind::Formatting)
@@ -3307,6 +3316,47 @@ mod tests {
         app.modified = false;
         mode(&mut app, Some("none")).unwrap();
         assert!(!app.modified);
+    }
+
+    /// Track Changes cannot record a Markdown splice, so it is refused (plain
+    /// text is recorded).
+    #[test]
+    fn markdown_splices_are_refused_while_tracking_and_plain_text_is_recorded() {
+        let mut app = app_with(&["One two three."]);
+        dispatch(
+            &mut app,
+            "doc.track-changes-set",
+            &args(vec![("enabled", Json::Bool(true))]),
+        )
+        .unwrap();
+        let before = app.editor.doc.clone();
+        for verb in ["doc.replace-range", "doc.insert", "doc.append"] {
+            let err = dispatch(
+                &mut app,
+                verb,
+                &args(vec![
+                    ("start", Json::Num(0.0)),
+                    ("at", Json::Num(0.0)),
+                    ("text", Json::Str("**x**".into())),
+                    ("markdown", Json::Bool(true)),
+                ]),
+            )
+            .unwrap_err();
+            assert!(err.contains("Track Changes is on"), "{verb}: {err}");
+        }
+        assert_eq!(app.editor.doc, before);
+        dispatch(
+            &mut app,
+            "doc.replace-range",
+            &args(vec![
+                ("start", Json::Num(0.0)),
+                ("text", Json::Str("Changed".into())),
+            ]),
+        )
+        .unwrap();
+        let mut rejected = app.editor.doc.clone();
+        rejected.reject_all_revisions();
+        assert_eq!(rejected.plain_text().trim_end(), "One two three.");
     }
 
     /// #624 D: `doc.track-changes-set` turns recording on, ordinary edits are

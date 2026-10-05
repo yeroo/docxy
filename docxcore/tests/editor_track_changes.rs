@@ -441,6 +441,8 @@ fn text_that_comes_between_two_runs_of_an_insertion_splits_its_id() {
     ed.set_track_changes(None);
     ed.caret.offset = 10;
     ed.insert_char('X');
+    // The ids are settled right away, not at some later split.
+    assert_distinct_ins(&ed, "right after the typing", 2);
     ed.set_track_changes(Some(TrackAuthor {
         author: "Ada".into(),
         clock,
@@ -451,4 +453,144 @@ fn text_that_comes_between_two_runs_of_an_insertion_splits_its_id() {
     at(&mut ed, 0);
     ed.paste(&Clip::from_text("z"));
     assert_distinct_ins(&ed, "untracked text between", 3);
+}
+
+fn as_author(ed: &mut Editor, name: &str) {
+    ed.set_track_changes(Some(TrackAuthor {
+        author: name.into(),
+        clock,
+    }));
+}
+
+/// Deleting inside another reviewer's recorded insertion keeps the text in
+/// that insertion: Reject All and Original still drop it.
+#[test]
+fn deleting_in_another_reviewers_insertion_stays_inside_it() {
+    let mut ed = editor();
+    at(&mut ed, 8);
+    ed.insert_str("abc");
+    as_author(&mut ed, "Bob");
+    at(&mut ed, 9);
+    ed.delete_forward(); // the b
+    assert_eq!(text(&ed), "One two acthree.");
+    let xml = xml(&ed);
+    assert!(
+        xml.contains("<w:ins w:id=\"1\" w:author=\"Ada\"")
+            && xml.contains("<w:del w:id=\"2\" w:author=\"Bob\""),
+        "{xml}"
+    );
+    let ins = xml.find("<w:ins w:id=\"1\"").unwrap();
+    let del = xml.find("<w:del w:id=\"2\"").unwrap();
+    assert!(ins < del, "the deletion is nested in an insertion: {xml}");
+    let mut rejected = ed.doc.clone();
+    assert!(
+        rejected
+            .reject_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    assert_eq!(
+        rejected.plain_text().trim_end(),
+        "One two three.",
+        "no b, no abc"
+    );
+    let original = ed.doc.markup_view(MarkupView::Original);
+    assert_eq!(original.plain_text().trim_end(), "One two three.");
+    let mut accepted = ed.doc.clone();
+    accepted.accept_all_revisions();
+    assert_eq!(accepted.plain_text().trim_end(), "One two acthree.");
+    // Rejecting just the insertion leaves no empty deletion behind.
+    let target = ed
+        .doc
+        .revisions()
+        .into_iter()
+        .find(|r| r.category == RevisionCategory::Inline(RevisionKind::Insert))
+        .unwrap()
+        .target;
+    assert!(ed.reject_revision(target).is_applied());
+    assert_eq!(text(&ed), "One two three.");
+    assert!(!xml_has_del(&ed), "{}", self::xml(&ed));
+}
+
+/// A recorded insertion split by Enter after its runs were formatted gives
+/// every run of the second half the new revision, not the old target.
+#[test]
+fn rejecting_the_first_half_of_a_split_formatted_insertion_keeps_the_second() {
+    let mut ed = editor();
+    at(&mut ed, 8);
+    ed.insert_str("abcd");
+    select(&mut ed, 9, 11); // "bc"
+    ed.toggle_bold();
+    ed.anchor = None;
+    ed.caret.offset = 10; // between b and c
+    ed.insert_newline();
+    let first = ed
+        .doc
+        .revisions()
+        .into_iter()
+        .find(|r| r.category == RevisionCategory::Inline(RevisionKind::Insert))
+        .unwrap()
+        .target;
+    assert!(ed.reject_revision(first).is_applied());
+    let rest = ed
+        .doc
+        .markup_view(MarkupView::NoMarkup)
+        .plain_text()
+        .replace('\n', "|");
+    assert!(rest.contains("|cdthree."), "the second half stays: {rest}");
+}
+
+/// Ctrl+U on a recorded insertion underlines it for real: the display cue is
+/// not the user's underline.
+#[test]
+fn underline_on_a_recorded_insertion_is_the_users_not_the_cue() {
+    let mut ed = editor();
+    at(&mut ed, 8);
+    ed.insert_str("xyz");
+    assert!(!xml(&ed).contains("<w:u "));
+    select(&mut ed, 8, 11);
+    ed.toggle_underline();
+    assert!(xml(&ed).contains("<w:u w:val=\"single\"/>"), "{}", xml(&ed));
+    ed.toggle_underline();
+    assert!(!xml(&ed).contains("<w:u "), "{}", xml(&ed));
+    // Still drawn as an insertion.
+    let Block::Paragraph(p) = &ed.doc.body[0] else {
+        panic!("paragraph")
+    };
+    assert!(
+        p.content
+            .iter()
+            .any(|i| matches!(i, Inline::Run(r) if r.text == "xyz" && r.props.underline))
+    );
+}
+
+#[test]
+fn a_tracked_selection_across_a_table_records_its_text_and_keeps_the_table() {
+    let doc = parse(&format!(
+        "{}<w:tbl><w:tr><w:tc>{}</w:tc></w:tr></w:tbl>{}",
+        para("alpha"),
+        para("cell"),
+        para("gamma")
+    ));
+    let mut ed = Editor::new(doc);
+    as_author(&mut ed, "Ada");
+    ed.anchor = Some(Caret {
+        path: vec![0],
+        offset: 3,
+    });
+    ed.caret = Caret {
+        path: vec![2],
+        offset: 2,
+    };
+    ed.delete_selection();
+    assert!(
+        ed.doc.body.iter().any(|b| matches!(b, Block::Table(_))),
+        "the table stays"
+    );
+    assert_eq!(
+        kinds(&ed.doc).len(),
+        3,
+        "alpha's tail, the cell, gamma's head"
+    );
+    assert!(xml(&ed).contains(">cell</w:delText>"), "{}", xml(&ed));
 }

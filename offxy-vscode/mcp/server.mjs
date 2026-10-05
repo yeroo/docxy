@@ -726,8 +726,9 @@ function docxyToolDefs() {
       'Turn Track Changes on or off (Review > Track Changes): typing and deletions are ' +
         'then recorded as tracked insertions and deletions (w:ins / w:del, stamped with the ' +
         'reviewer and the time), and the document saves with w:trackRevisions. Paragraph ' +
-        'marks, text in hyperlinks and formatting are not recorded. Not an undo step. ' +
-        'Returns {enabled, author}.',
+        'marks, text in hyperlinks and formatting are not recorded, and a Markdown splice ' +
+        '(markdown: true on insert, append or replace_range) is refused while it is on. ' +
+        'Not an undo step. Returns {enabled, author}.',
       Object.fromEntries([
         ['enabled', prop('boolean', 'true to record, false to stop.')],
         target(),

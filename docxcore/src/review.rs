@@ -170,7 +170,21 @@ impl Document {
         let targets = revision_postorder(&addresses, action);
         let mut outcomes = targets
             .into_iter()
-            .map(|(ordinal, target)| (ordinal, self.apply_revision_action(target, action)))
+            .map(|(ordinal, target)| {
+                let mut outcome = self.apply_revision_action(target, action);
+                // A deletion left with nothing by rejecting the insertion it
+                // was in goes with it: it was acted on, not stale.
+                if matches!(outcome, RevisionOutcome::Stale { .. }) {
+                    if let Some(a) = addresses.iter().find(|a| a.target == target) {
+                        outcome = RevisionOutcome::Applied {
+                            target,
+                            action,
+                            category: a.category.clone(),
+                        };
+                    }
+                }
+                (ordinal, outcome)
+            })
             .collect::<Vec<_>>();
         outcomes.sort_by_key(|(ordinal, _)| *ordinal);
         outcomes.into_iter().map(|(_, outcome)| outcome).collect()
@@ -297,12 +311,24 @@ fn sweep_inlines(
     }
     for inline in content.iter_mut() {
         match inline {
-            Inline::Revision { content, .. } => n += sweep_inlines(content, target, action),
+            Inline::Revision {
+                content,
+                content_changed,
+                ..
+            } => {
+                let swept = sweep_inlines(content, target, action);
+                if swept > 0 {
+                    *content_changed = true;
+                }
+                n += swept;
+            }
             Inline::Hyperlink(h) => n += sweep_inlines(&mut h.content, target, action),
             Inline::TextBox { blocks, .. } => n += sweep_tracked_inserts(blocks, target, action),
             _ => {}
         }
     }
+    // A deletion of text that was in a rejected insertion has nothing left.
+    content.retain(|i| !matches!(i, Inline::Revision { kind: RevisionKind::Delete, content, content_changed: true, .. } if content.is_empty()));
     n
 }
 

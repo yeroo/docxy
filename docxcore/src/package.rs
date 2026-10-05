@@ -2322,9 +2322,15 @@ impl Package {
             }
             return;
         }
+        // The namespaces a comment written by Word uses (`w14:paraId` in its
+        // paragraphs), declared and ignorable for readers that do not know them.
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-             <w:comments xmlns:w=\"{W_NS}\">{comment}</w:comments>"
+             <w:comments xmlns:w=\"{W_NS}\" \
+             xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" \
+             xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" \
+             xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\" \
+             mc:Ignorable=\"w14 w15\">{comment}</w:comments>"
         );
         self.parts.push((name.to_string(), body.into_bytes()));
         if let Some(b) = self.part("[Content_Types].xml") {
@@ -2382,13 +2388,88 @@ impl Package {
         }
     }
 
+    /// The `commentsExtended` / `commentsIds` entries of comment `id`, each as
+    /// (part name, element), for [`Package::restore_comment_extras`]: what a
+    /// removal takes (the reply link `w15:paraIdParent`, the durable id) and the
+    /// comment's own XML does not carry.
+    pub fn comment_extras(&self, id: &str) -> Vec<(String, String)> {
+        let Some(xml) = self.part_text("word/comments.xml") else {
+            return Vec::new();
+        };
+        let Some(para_id) = crate::comments::parse_comments_xml(&xml)
+            .into_iter()
+            .find(|c| c.id == id)
+            .and_then(|c| c.para_id)
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (part, tag, attr) in COMMENT_EXTRAS {
+            let Some(xml) = self.part_text(part) else {
+                continue;
+            };
+            for (_, el) in crate::load::start_tags(&xml, tag) {
+                if crate::load::xml_attr_value(el, attr).as_deref() == Some(para_id.as_str()) {
+                    out.push((part.to_string(), el.to_string()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Put back entries [`Package::comment_extras`] returned, creating a part
+    /// (with its content-type override and relationship) the removal dropped.
+    pub fn restore_comment_extras(&mut self, extras: &[(String, String)]) {
+        for (part, el) in extras {
+            let Some((_, tag, attr)) = COMMENT_EXTRAS.iter().find(|(p, ..)| p == part) else {
+                continue;
+            };
+            let para = crate::load::xml_attr_value(el, attr);
+            let root = match *tag {
+                "w15:commentEx" => "w15:commentsEx",
+                _ => "w16cid:commentsIds",
+            };
+            match self.part_text(part) {
+                Some(xml) => {
+                    let present = crate::load::start_tags(&xml, tag)
+                        .into_iter()
+                        .any(|(_, t)| crate::load::xml_attr_value(t, attr) == para);
+                    if present {
+                        continue;
+                    }
+                    if let Some(close) = xml.rfind(&format!("</{root}>")) {
+                        let out = format!("{}{}{}", &xml[..close], el, &xml[close..]);
+                        self.set_part_text(part, &out);
+                    }
+                }
+                None => {
+                    let (ns, ct, rel) = if root == "w15:commentsEx" {
+                        (
+                            "xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\"",
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml",
+                            "http://schemas.microsoft.com/office/2011/relationships/commentsExtended",
+                        )
+                    } else {
+                        (
+                            "xmlns:w16cid=\"http://schemas.microsoft.com/office/word/2016/wordml/cid\"",
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsIds+xml",
+                            "http://schemas.microsoft.com/office/2016/09/relationships/commentsIds",
+                        )
+                    };
+                    let body = format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                         <{root} {ns}>{el}</{root}>"
+                    );
+                    self.add_part_with_rel(part, ct, rel, body);
+                }
+            }
+        }
+    }
+
     /// Drop the `commentsExtended` / `commentsIds` entries of a removed
     /// comment's `para_id`.
     fn remove_comment_extras(&mut self, para_id: &str) {
-        for (part, tag, attr) in [
-            ("word/commentsExtended.xml", "w15:commentEx", "w15:paraId"),
-            ("word/commentsIds.xml", "w16cid:commentId", "w16cid:paraId"),
-        ] {
+        for (part, tag, attr) in COMMENT_EXTRAS {
             let Some(xml) = self.part_text(part) else {
                 continue;
             };
@@ -3771,6 +3852,13 @@ fn extract_sectpr(xml: &str) -> String {
     }
     best.map_or_else(String::new, |(s, e)| xml[s..e].to_string())
 }
+
+/// The parts that hold a per-comment entry keyed by `w14:paraId`: (part, entry
+/// element, its paraId attribute).
+const COMMENT_EXTRAS: [(&str, &str, &str); 2] = [
+    ("word/commentsExtended.xml", "w15:commentEx", "w15:paraId"),
+    ("word/commentsIds.xml", "w16cid:commentId", "w16cid:paraId"),
+];
 
 /// `xml` without each self-closing `<name …/>` element `drop` accepts.
 fn remove_tags_matching(xml: &str, name: &str, drop: impl Fn(&str) -> bool) -> String {

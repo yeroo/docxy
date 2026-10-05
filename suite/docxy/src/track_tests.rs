@@ -136,3 +136,34 @@ fn changing_the_reviewer_reauthors_a_recording_tab() {
         "earlier text keeps its author: {doc}"
     );
 }
+
+/// The selected comment is bound to its tab by title and file: closing an
+/// earlier tab leaves it on its own document, and another tab never gets it.
+#[test]
+fn the_selected_comment_follows_its_tab_not_its_index() {
+    use crate::{close, selected_comment_id};
+    let (a, _) = docx_tab(&Scratch::new());
+    let (mut b, _) = docx_tab(&Scratch::new());
+    b.title = "Other.docx".into();
+    let selected = Some((
+        close::tab_ids(std::slice::from_ref(&b))[0].clone(),
+        "3".to_string(),
+    ));
+    let mut tabs = vec![a, b];
+    // Selected in the second tab: it answers for that tab only.
+    assert_eq!(selected_comment_id(&tabs, 0, &selected), None);
+    assert_eq!(
+        selected_comment_id(&tabs, 1, &selected).as_deref(),
+        Some("3")
+    );
+    // The first tab closes: the selection is now on index 0, still its own.
+    tabs.remove(0);
+    assert_eq!(
+        selected_comment_id(&tabs, 0, &selected).as_deref(),
+        Some("3")
+    );
+    // And another document that takes index 0 does not inherit it.
+    let (c, _) = docx_tab(&Scratch::new());
+    let tabs = vec![c];
+    assert_eq!(selected_comment_id(&tabs, 0, &selected), None);
+}

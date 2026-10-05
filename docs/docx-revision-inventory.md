@@ -107,7 +107,12 @@ comment-marker id in the document.
   Backspace / Delete across a paragraph boundary), text inside a hyperlink, a
   field or other one-unit inline, formatting, table structure and a table cell
   range's Delete. A selection across paragraphs records the deletion of its
-  text in each paragraph and keeps the paragraph marks. Header and footer edits
+  text in each paragraph (the paragraphs of a table between them included; the
+  table stays) and keeps the paragraph marks. Text deleted from another
+  reviewer's recorded insertion stays inside it (`<w:ins><w:del>`), so Reject
+  All and Original still drop it. `doc.insert` / `doc.append` /
+  `doc.replace-range` with `markdown: true` are refused while Track Changes is
+  on (the splice overwrites whole paragraphs); plain text is recorded. Header and footer edits
   are not recorded. A copy of recorded text carries no record. Markdown
   documents refuse Track Changes.
 - The editor never saves its own `RunProps::tracked_insert` as formatting: the
