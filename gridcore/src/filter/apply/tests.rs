@@ -920,3 +920,30 @@ fn an_icon_filter_over_ten_thousand_rows_reads_the_rule_once() {
     assert_eq!(reads() - before, 1, "the rule's numbers are read once");
     menu(&wb, 0, 0, None).unwrap();
 }
+
+#[test]
+fn filter_by_a_cell_typed_below_the_list_keeps_the_other_criteria() {
+    let mut wb = filterlist();
+    auto_filter_on_range(&mut wb, 0, (0, 0, 19, 4)).unwrap();
+    set_criterion(
+        &mut wb,
+        0,
+        0,
+        Some(ColumnFilter::values(vec!["Noor".into()])),
+        today(),
+    )
+    .unwrap();
+    // Row 21 (index 20) is data just below the A1:E20 filter: it joins it.
+    filter_by_cell(&mut wb, 0, (20, 1), ByCell::Value, today()).unwrap();
+    let af = wb.sheets[0].auto_filter.as_ref().unwrap();
+    assert_eq!(af.range, (0, 0, 20, 4));
+    assert_eq!(af.criteria.len(), 2, "Rep's criterion stays");
+    // A cell outside the filter's columns: the filter is made again over
+    // that cell's list (Excel's Filter by Selected Cell does the same).
+    wb.sheets[0].set_cell(0, 7, t("Other"));
+    wb.sheets[0].set_cell(1, 7, t("x"));
+    filter_by_cell(&mut wb, 0, (1, 7), ByCell::Value, today()).unwrap();
+    let af = wb.sheets[0].auto_filter.as_ref().unwrap();
+    assert_eq!(af.range, (0, 7, 1, 7));
+    assert_eq!(af.criteria.len(), 1);
+}

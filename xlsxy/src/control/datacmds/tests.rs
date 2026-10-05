@@ -836,3 +836,53 @@ fn bad_keys_columns_and_clocks_are_refused() {
     ok(&mut a, "wb.clock", r#"{"date":"2024-02-29T23:59:59"}"#);
     ok(&mut a, "wb.clock", r#"{"date":null}"#);
 }
+
+#[test]
+fn a_longer_range_extends_the_filter_and_keeps_its_criteria() {
+    let mut a = filterlist();
+    ok(
+        &mut a,
+        "filter.set",
+        r#"{"range":"A1:D21","col":"Rep","criteria":{"values":["Noor"]}}"#,
+    );
+    // Records past a blank row 22.
+    for r in 23..=25u32 {
+        a.pkg.workbook.sheets[0].set_cell(
+            r - 1,
+            0,
+            Cell::text(if r == 24 { "Noor" } else { "Bo" }),
+        );
+        a.pkg.workbook.sheets[0].set_cell(r - 1, 1, Cell::text("Pen"));
+    }
+    let r = ok(
+        &mut a,
+        "filter.set",
+        r#"{"range":"A1:D25","col":"Product","criteria":null}"#,
+    );
+    assert_eq!(r.get_str("range"), Some("A1:D25"));
+    let af = a.pkg.workbook.sheets[0].auto_filter.as_ref().unwrap();
+    assert_eq!(af.criteria.len(), 1, "Rep's criterion stays");
+    assert_eq!(shown(&mut a, "A23:A25"), vec![24]);
+    assert_eq!(
+        a.pkg.workbook.defined_name("_xlnm._FilterDatabase", 0),
+        Some("Sheet1!$A$1:$D$25")
+    );
+}
+
+#[test]
+fn a_file_saved_filtered_reapplied_to_the_same_rows_stays_clean() {
+    let mut a = filterlist();
+    ok(
+        &mut a,
+        "filter.set",
+        r#"{"range":"A1:D21","col":"Rep","criteria":{"values":["Noor"]}}"#,
+    );
+    let bytes = gridcore::xlsx::save_xlsx(&a.pkg);
+    let mut b = App::new(gridcore::xlsx::load_xlsx(&bytes).unwrap(), "filtered.xlsx");
+    b.os_clip = None;
+    assert_eq!(b.pkg.workbook.sheets[0].filter_mode, Some(true));
+    let r = ok(&mut b, "filter.reapply", "{}");
+    assert_eq!(r.get("changed"), Some(&Json::Bool(false)));
+    assert!(!b.modified);
+    assert!(b.undo.is_empty());
+}

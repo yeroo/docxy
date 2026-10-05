@@ -32,6 +32,11 @@ fn eval_cf(
 /// The differential format conditional formatting applies to cell
 /// (sheet, row, col), if any. The lowest-`priority`-number matching rule wins.
 pub fn cell_dxf(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<Dxf> {
+    cell_dxf_rule(wb, sheet, row, col).map(|(_, d)| d)
+}
+
+/// [`cell_dxf`], with the winning rule's `priority`.
+fn cell_dxf_rule(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<(i32, Dxf)> {
     let s = wb.sheets.get(sheet)?;
     if s.cond_formats.is_empty() {
         return None;
@@ -62,7 +67,7 @@ pub fn cell_dxf(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<Dxf> 
             }
         }
     }
-    best.and_then(|(_, id)| wb.styles.dxfs.get(id).cloned())
+    best.and_then(|(p, id)| Some((p, wb.styles.dxfs.get(id).cloned()?)))
 }
 
 fn truthy(v: &Value) -> bool {
@@ -149,8 +154,10 @@ pub enum Shown {
     /// No fill, or the automatic font colour.
     None,
     Rgb((u8, u8, u8)),
-    /// A theme or indexed colour we don't resolve: it is some colour, so it
-    /// matches neither No Fill nor any colour.
+    /// A colour we can't read: a theme or indexed colour we don't resolve,
+    /// or a conditional-formatting rule we don't evaluate (Duplicate Values,
+    /// a colour scale, …) that may be colouring the cell, perhaps not at all.
+    /// It matches neither No Fill nor any colour.
     Unknown,
 }
 
@@ -176,7 +183,8 @@ impl Shown {
 }
 
 /// The fill a cell shows: conditional formatting's when a matching rule sets
-/// one, else its own.
+/// one, else its own; [`Shown::Unknown`] when we can't tell (a theme or
+/// indexed colour, or a rule we don't evaluate that may set it).
 pub fn cell_fill(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Shown {
     shown_color(wb, sheet, row, col, true)
 }
@@ -187,7 +195,14 @@ pub fn cell_font_color(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Shown
 }
 
 fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> Shown {
-    if let Some(d) = cell_dxf(wb, sheet, row, col) {
+    let winner = cell_dxf_rule(wb, sheet, row, col);
+    // A rule we don't evaluate (Duplicate Values, a colour scale, …) that
+    // takes precedence over the one that matched, or any such rule when
+    // none did, may be colouring the cell: then its colour is unknown.
+    if unevaluated_could_color(wb, sheet, row, col, fill, winner.as_ref().map(|w| w.0)) {
+        return Shown::Unknown;
+    }
+    if let Some((_, d)) = winner {
         let (rgb, unresolved) = if fill {
             (d.fill, d.fill_unresolved)
         } else {
@@ -199,11 +214,6 @@ fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> S
             None if unresolved => return Shown::Unknown,
             None => {}
         }
-    }
-    // A rule we don't evaluate (Duplicate Values, a colour scale, …) may be
-    // colouring the cell: then its colour is unknown, not the cell's own.
-    if unevaluated_could_color(wb, sheet, row, col, fill) {
-        return Shown::Unknown;
     }
     let style = wb
         .sheets
@@ -225,8 +235,16 @@ fn shown_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> S
 
 /// Does a conditional-formatting rule over the cell that we don't evaluate
 /// set the fill (`fill`) or the font colour? Its format does, or for a fill
-/// it is a colour scale.
-fn unevaluated_could_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill: bool) -> bool {
+/// it is a colour scale. With `before`, only a rule that takes precedence
+/// over that priority counts.
+fn unevaluated_could_color(
+    wb: &Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    fill: bool,
+    before: Option<i32>,
+) -> bool {
     let Some(s) = wb.sheets.get(sheet) else {
         return false;
     };
@@ -242,6 +260,9 @@ fn unevaluated_could_color(wb: &Workbook, sheet: usize, row: u32, col: u32, fill
             let CfKind::Other { rule_type, .. } = &rule.kind else {
                 return false;
             };
+            if before.is_some_and(|p| rule.priority >= p) {
+                return false;
+            }
             if fill && rule_type == "colorScale" {
                 return true;
             }

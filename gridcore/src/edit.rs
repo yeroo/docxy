@@ -513,9 +513,10 @@ fn sort_span(s: &Sheet, r1: u32, r2: u32) -> Option<(u32, u32)> {
     (r2 > r1).then_some((r2, cols - 1))
 }
 
-/// An array anchor moved from `from` to row `to` takes its block along: its
-/// `ref`, when the anchor owns it (starts there), is rewritten to its block
-/// ([`array_rect`]) at the new row. Left behind, it would name the old rows:
+/// An array anchor moved from cell `from` to cell `to` (a sort's row, or a
+/// left-to-right sort's column) takes its block along: its `ref`, when the
+/// anchor owns it (starts there), is rewritten to its block ([`array_rect`])
+/// at the new cell. Left behind, it would name the old cells:
 /// the cached block of an anchor the engine can't evaluate would no longer
 /// count as its own, and a CSE block would save as its anchor alone.
 fn move_own_array_ref(cell: &mut Cell, from: (u32, u32), to: (u32, u32)) {

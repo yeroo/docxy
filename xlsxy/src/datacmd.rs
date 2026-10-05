@@ -226,23 +226,34 @@ pub(crate) fn parse_filter_text(text: &str) -> Result<ColumnFilter, String> {
     Ok(ColumnFilter::Custom { and, conds })
 }
 
+/// `t` split around the first ASCII `word` in it, any case. Searched on
+/// `t` itself: a lowercased copy can be longer (`İ` is 2 bytes, its
+/// lowercase 3), so its byte offsets don't slice `t`.
 fn split_word<'a>(t: &'a str, word: &str) -> Option<(&'a str, &'a str)> {
-    let i = t.to_lowercase().find(word)?;
+    let i = t
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|&i| strip_prefix_ci(&t[i..], word).is_some())?;
     Some((&t[..i], &t[i + word.len()..]))
+}
+
+/// `s` without its leading ASCII `word`, matched in any case.
+fn strip_prefix_ci<'a>(s: &'a str, word: &str) -> Option<&'a str> {
+    s.get(..word.len())
+        .filter(|p| p.eq_ignore_ascii_case(word))
+        .map(|_| &s[word.len()..])
 }
 
 fn parse_condition(c: &str) -> Result<(String, String), String> {
     let c = c.trim();
-    let lower = c.to_lowercase();
     for (word, op, pat) in [
         ("!contains ", "notEqual", "*{}*"),
         ("contains ", "equal", "*{}*"),
         ("begins ", "equal", "{}*"),
         ("ends ", "equal", "*{}"),
     ] {
-        if lower.starts_with(word) {
-            let v = c[word.len()..].trim();
-            return Ok((op.to_string(), pat.replace("{}", v)));
+        if let Some(v) = strip_prefix_ci(c, word) {
+            return Ok((op.to_string(), pat.replace("{}", v.trim())));
         }
     }
     match gridcore::filter::parse(c) {
@@ -316,8 +327,8 @@ pub(crate) fn parse_sort_text(
                 },
                 top,
             }
-        } else if lower.starts_with("icon:") {
-            let (set, id) = first[5..]
+        } else if let Some(icon) = strip_prefix_ci(first, "icon:") {
+            let (set, id) = icon
                 .split_once('/')
                 .ok_or("Sort: icon:<set>/<id>, e.g. icon:3Arrows/2")?;
             SortOn::Icon {
@@ -325,8 +336,7 @@ pub(crate) fn parse_sort_text(
                 id: id.parse().map_err(|_| "Sort: bad icon id")?,
                 top,
             }
-        } else if lower.starts_with("list:") {
-            let items = &first[5..];
+        } else if let Some(items) = strip_prefix_ci(first, "list:") {
             let list = gridcore::edit::builtin_sort_list(items)
                 .unwrap_or_else(|| items.split('/').map(|s| s.trim().to_string()).collect());
             let asc = !rest.iter().skip(1).any(|w| w.eq_ignore_ascii_case("desc"));
@@ -878,6 +888,20 @@ mod tests {
             );
         }
         assert!(parse_filter_text("").is_err());
+        // Text whose lowercase is longer than itself (`İ` is 2 bytes, 3
+        // lowercased) splits on its own characters.
+        assert_eq!(
+            parse_filter_text("İstanbul or İzmir"),
+            Ok(custom(false, &[("equal", "İstanbul"), ("equal", "İzmir")]))
+        );
+        assert_eq!(
+            parse_filter_text("contains İ AND ends z"),
+            Ok(custom(true, &[("equal", "*İ*"), ("equal", "*z")]))
+        );
+        assert_eq!(
+            parse_filter_text("CONTAINS x"),
+            Ok(custom(false, &[("equal", "*x*")]))
+        );
         // A value that starts like `top` is a value.
         for v in ["topaz", "top shelf", "bottomline"] {
             assert_eq!(
@@ -937,7 +961,8 @@ mod tests {
         let (levels, opts, _) = parse_sort_text("1 asc /ltr").unwrap();
         assert!(opts.left_to_right);
         assert_eq!(levels[0].key, 0);
-        let (levels, ..) = parse_sort_text("A list:months").unwrap();
+        assert!(parse_sort_text("A İcon:x/1").is_err());
+        let (levels, ..) = parse_sort_text("A LIST:months").unwrap();
         assert!(matches!(&levels[0].on, SortOn::Value { list: Some(l), .. } if l.len() == 12));
         assert!(parse_sort_text("A sideways").is_err());
         // A colour that is not ASCII hex is refused, never a crash.

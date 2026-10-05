@@ -39,7 +39,8 @@ pub enum FilterError {
     NoFilter,
     /// The column is outside the filter's range.
     NotInFilter,
-    /// The cell's colour is one we can't read (a theme or indexed colour).
+    /// The cell's colour is one we can't read: a theme or indexed colour, or
+    /// a conditional-formatting rule we don't evaluate that may set it.
     NoColor,
     /// The cell shows no conditional-formatting icon.
     NoIcon,
@@ -213,6 +214,24 @@ pub fn auto_filter_on_range(
     Ok(range)
 }
 
+/// Extend the sheet's AutoFilter down to row `last` (its criteria kept),
+/// and its `_FilterDatabase` with it; a filter already reaching `last` is
+/// left as it is. Returns its range.
+pub fn auto_filter_extend(wb: &mut Workbook, sheet: usize, last: u32) -> Result<Area, FilterError> {
+    let af = wb
+        .sheets
+        .get_mut(sheet)
+        .and_then(|s| s.auto_filter.as_mut())
+        .ok_or(FilterError::NoFilter)?;
+    if last > af.range.2 {
+        af.range.2 = last;
+        let range = af.range;
+        set_name(wb, sheet, FILTER_DB, sheet, range);
+        return Ok(range);
+    }
+    Ok(af.range)
+}
+
 /// Turn AutoFilter off: every row of its range is shown again (Excel keeps no
 /// record of why a row is hidden), and the filter and its name go. Whether
 /// the sheet had one.
@@ -373,8 +392,10 @@ pub fn search(
 }
 
 /// Right-click › Filter › Filter by Selected Cell's Value / Color / Font
-/// Color / Icon: that column keeps the rows like the cell. Turns AutoFilter
-/// on over the cell's list first when the sheet has none.
+/// Color / Icon: that column keeps the rows like the cell. A cell in the
+/// sheet's filter (rows typed below it included) adds to its criteria; a
+/// cell outside it, or on a sheet with none, turns AutoFilter on over the
+/// cell's list first, as Excel does.
 pub fn filter_by_cell(
     wb: &mut Workbook,
     sheet: usize,
@@ -386,7 +407,10 @@ pub fn filter_by_cell(
         .sheets
         .get(sheet)
         .and_then(|s| s.auto_filter.as_ref())
-        .is_some_and(|af| (af.range.0..=af.range.2).contains(&r));
+        .is_some_and(|af| {
+            let (r1, c1, r2, c2) = grown_range(wb, sheet, af.range);
+            (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
+        });
     if !has {
         auto_filter_on(wb, sheet, (r, c))?;
     }

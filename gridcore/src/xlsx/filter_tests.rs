@@ -418,3 +418,27 @@ fn a_rule_we_do_not_evaluate_makes_its_cells_colour_unknown() {
         Err(crate::filter::FilterError::NoColor)
     );
 }
+
+#[test]
+fn a_rule_we_do_not_evaluate_wins_by_precedence() {
+    // B2: Duplicate Values (red) at priority 1 over `> 5` (green) at 2, so
+    // its colour is unknown; with the priorities swapped, `> 5` wins.
+    let rules = |dup: u8, gt: u8| {
+        format!(
+            r#"<conditionalFormatting sqref="B2:B3"><cfRule type="duplicateValues" dxfId="0" priority="{dup}"/><cfRule type="cellIs" dxfId="1" priority="{gt}" operator="greaterThan"><formula>1</formula></cfRule></conditionalFormatting>"#
+        )
+    };
+    let dxfs = r#"<dxfs count="2"><dxf><fill><patternFill><bgColor rgb="FFFF0000"/></patternFill></fill></dxf><dxf><fill><patternFill><bgColor rgb="FF00B050"/></patternFill></fill></dxf></dxfs>"#;
+    for (dup, gt, want) in [
+        (1, 2, crate::cf::Shown::Unknown),
+        (2, 1, crate::cf::Shown::Rgb((0, 0xB0, 0x50))),
+    ] {
+        let mut pkg = list(&rules(dup, gt), dxfs);
+        pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(
+            crate::cf::cell_fill(&pkg.workbook, 0, 1, 1),
+            want,
+            "dup={dup}"
+        );
+    }
+}

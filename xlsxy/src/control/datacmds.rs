@@ -195,22 +195,24 @@ fn criteria_arg(j: &Json) -> Result<Criteria, String> {
 /// `filter.set {sheet?, range?, col, criteria}`: turn the filter on over
 /// `range` when the sheet has none, then set (or with `null` clear) column
 /// `col`'s criteria and apply the filter. A `range` with the filter's header
-/// row and columns names the filter even after it grew; any other replaces
-/// the filter and its criteria.
+/// row and columns is the filter (a longer one extends it); any other
+/// replaces the filter and its criteria. The reply's `range` is the
+/// filter's.
 pub(super) fn filter_set(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
     let range = args.get_str("range").map(area).transpose()?;
     let col = args.get_str("col").ok_or("filter.set needs a 'col'")?;
     let crit = criteria_arg(args.get("criteria").unwrap_or(&Json::Null))?;
-    // The column, in the range the filter has (or will have once `range`
-    // turns it on there).
     let wb = &app.pkg.workbook;
     let have = wb.sheets[si].auto_filter.as_ref().map(|a| a.range);
-    // A range with the filter's header row and columns is the filter, even
-    // when it has grown over rows typed below it; any other range replaces
-    // the filter and its criteria.
-    let range = range.filter(|r| have.is_none_or(|h| (h.0, h.1, h.3) != (r.0, r.1, r.3)));
-    let target = range.or(have).ok_or_else(|| {
+    // A range with the filter's header row and columns is that filter: a
+    // shorter one names it after it grew, a longer one extends it, its
+    // criteria kept either way. Any other range replaces the filter and its
+    // criteria.
+    let same = |r: &Area| have.is_some_and(|h| (h.0, h.1, h.3) == (r.0, r.1, r.3));
+    let extend = range.filter(same).map(|r| r.2);
+    let replace = range.filter(|r| !same(r));
+    let target = replace.or(have).ok_or_else(|| {
         format!(
             "{} Pass a 'range' to turn it on.",
             gridcore::filter::FilterError::NoFilter
@@ -220,9 +222,15 @@ pub(super) fn filter_set(app: &mut App, args: &Json) -> Result<Json, String> {
     if c < target.1 || c > target.3 {
         return Err(format!("column '{col}' is outside {}", area_name(target)));
     }
-    let o = app.filter_command_on(si, |wb, si, today| {
-        if have != Some(target) {
-            gridcore::filter::auto_filter_on_range(wb, si, target)?;
+    let out = app.filter_command_on(si, |wb, si, today| {
+        match (replace, extend) {
+            (Some(r), _) => {
+                gridcore::filter::auto_filter_on_range(wb, si, r)?;
+            }
+            (None, Some(last)) => {
+                gridcore::filter::auto_filter_extend(wb, si, last)?;
+            }
+            (None, None) => {}
         }
         match crit {
             Criteria::Set(f) => gridcore::filter::set_criterion(wb, si, c, f, today),
@@ -231,7 +239,11 @@ pub(super) fn filter_set(app: &mut App, args: &Json) -> Result<Json, String> {
             }
         }
     })?;
-    Ok(outcome_json(o))
+    let mut reply = outcome_json(out);
+    if let (Json::Obj(fields), Ok(r)) = (&mut reply, filter_range(&app.pkg.workbook, si)) {
+        fields.push(("range".into(), Json::Str(area_name(r))));
+    }
+    Ok(reply)
 }
 
 /// `filter.reapply {sheet?}`.
