@@ -126,6 +126,80 @@ pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
     }
 }
 
+/// What the sheet-rename bar's Enter commits: rename the sheet and retarget
+/// the charts this session authored, which the workbook-side ref rewrite
+/// (`rename_sheet`) cannot see. `false` — nothing changed — when the tab
+/// takes no edits, isn't a workbook, or the name was declined (already taken).
+pub(crate) fn commit_rename_buffer(tab: &mut DocTab, idx: usize, buf: &str) -> bool {
+    if tab.access.locked() {
+        return false;
+    }
+    let Surface::Sheet(v) = &mut tab.surface else {
+        return false;
+    };
+    let old = v.pkg.workbook.sheets.get(idx).map(|s| s.name.clone());
+    // `rename_sheet` follows the refs inside the workbook (and declines a
+    // name already taken); a chart this session authored isn't in there yet,
+    // and would save pointing at a sheet name that no longer exists.
+    if !v.pkg.rename_sheet(idx, buf) {
+        return false;
+    }
+    if let Some(old) = old {
+        let new = buf.trim().to_string();
+        for c in &mut v.charts {
+            gridcore::edit::rename_sheet_in_chart(&mut c.data, &old, &new);
+        }
+    }
+    tab.dirty = true;
+    true
+}
+
+/// What the cell-comment bar's Enter commits: the buffer onto the selected
+/// cell, an empty one deleting the comment there. `false` — nothing changed —
+/// when the tab takes no edits or isn't a workbook; a damaged sheet's refusal
+/// says so on the tab's status.
+pub(crate) fn commit_comment_buffer(tab: &mut DocTab, author: &str, text: &str) -> bool {
+    if tab.access.locked() {
+        return false;
+    }
+    let Surface::Sheet(v) = &mut tab.surface else {
+        return false;
+    };
+    // The view takes the undo step itself: the whole package.
+    if !v.comment_cell(author, text) {
+        tab.status = DAMAGED_SHEET_STATUS.into();
+        return false;
+    }
+    tab.dirty = true;
+    true
+}
+
+/// The exit path's comment commit ([`commit_comment_buffer`] minus one quirk).
+/// Enter marks the tab dirty whenever its commit returns `true`, and an empty
+/// buffer returns `true` even when there is no comment to delete — harmless
+/// for a keypress, but at exit the bar may merely have been OPEN on such a
+/// cell, and a dirty tab then asks about changes that never happened. So the
+/// one case where the commit cannot change anything (an empty buffer on a
+/// cell with no comment) is skipped; a cell WITH a comment still commits —
+/// the empty buffer deletes it, as Enter would.
+pub(crate) fn commit_comment_buffer_for_exit(tab: &mut DocTab, author: &str, text: &str) -> bool {
+    let noop = match &tab.surface {
+        Surface::Sheet(v) => {
+            text.trim().is_empty()
+                && !v
+                    .pkg
+                    .comments()
+                    .iter()
+                    .any(|cm| cm.sheet == v.active && cm.row == v.sel.0 && cm.col == v.sel.1)
+        }
+        _ => true,
+    };
+    if noop {
+        return false;
+    }
+    commit_comment_buffer(tab, author, text)
+}
+
 /// Commit a sheet's open cell editor unless it was seeded from a cell and left
 /// unchanged. `commit_edit` also skips that case, but taking the buffer here
 /// would close the editor; cancelled close or Save As must leave it open.
@@ -468,6 +542,52 @@ impl Docxy {
         self.close_tab_with(i, None, window, cx);
     }
 
+    /// Fold the app's typed-but-uncommitted dialog buffers into the ACTIVE tab
+    /// before a window close, a harness `quit` or the active tab's own close
+    /// persists. The sheet cell editors, open header/footer and Project cells
+    /// live on the tabs and are folded by [`commit_pending_for_exit`]; what
+    /// remains lives on the app: the cell-comment bar, the sheet-rename bar
+    /// and a Chart panel range field. All three commit, as their Enter would
+    /// ([`ref_commit`] changes nothing on an invalid ref). The app's
+    /// rule/format bars (conditional formatting, data validation, row height)
+    /// and their range fields are NOT committed — a half-typed rule would
+    /// apply formatting the user never confirmed — and drop as Esc would.
+    ///
+    /// The drops happen even when the close is later cancelled: at this point
+    /// a window close cannot know whether its prompt will be answered or
+    /// cancelled, and the user buffers above are committed rather than dropped
+    /// for the same reason. A cancelled close therefore keeps the committed
+    /// text (its bar gone), never a half-typed rule.
+    pub(crate) fn commit_dialog_buffers_for_exit(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.sheet_comment_edit.take() {
+            let author = self.comment_author();
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                commit_comment_buffer_for_exit(t, &author, &text);
+            }
+        }
+        if let Some((idx, buf)) = self.sheet_rename.take() {
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                commit_rename_buffer(t, idx, &buf);
+            }
+        }
+        if let Some(f) = self.range_edit.take()
+            && !f.target.is_bar()
+            && !self.active_locked()
+        {
+            self.ref_commit(f.target, &f.buf, cx);
+            // What Esc does when the field goes: its last commit's message
+            // must not stand under a field nobody is in.
+            if matches!(&self.ref_msg, Some((t, _, _)) if *t == f.target) {
+                self.ref_msg = None;
+            }
+        }
+        // The rule/format bars and their buffers are deliberately dropped
+        // (see above): everything `bar_close` clears, plus the row-height
+        // bar's own buffer.
+        self.bar_close();
+        self.sheet_rowh_edit = None;
+    }
+
     /// Close tab `i`. A dirty tab with no `answer` (the harness's
     /// `close-tab` may give one) opens the close prompt on it, which answers
     /// later through [`Self::close_prompt_click`]. Returns why a Don't Save
@@ -491,6 +611,11 @@ impl Docxy {
         self.project_prompt_cancel();
         let previous_active = self.active;
         let harness = self.harness.is_some();
+        if i == self.active {
+            // The dialog buffers act on the active tab; committing them is
+            // what the closed tab's own prompt must see as dirty.
+            self.commit_dialog_buffers_for_exit(cx);
+        }
         let step = close_step(&mut self.tabs[i], answer);
         if !step.removes() && self.active != i {
             self.active = i;
@@ -707,6 +832,7 @@ impl Docxy {
             // Its question went away some other way: start again.
             self.quit_cancelled();
         }
+        self.commit_dialog_buffers_for_exit(cx);
         commit_pending_for_exit(&mut self.tabs);
         self.persist();
         if !(ask && self.ask_on_close && self.tabs.iter().any(|t| t.dirty)) {

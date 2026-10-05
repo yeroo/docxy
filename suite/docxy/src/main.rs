@@ -11940,20 +11940,12 @@ impl Docxy {
                     self.sheet_rename = None;
                     return;
                 }
-                if let Some(v) = self.active_sheet_mut() {
-                    let old = v.pkg.workbook.sheets.get(idx).map(|s| s.name.clone());
-                    // `rename_sheet` follows the refs inside the workbook (and
-                    // declines a name already taken); a chart this session
-                    // authored isn't in there yet, and would save pointing at a
-                    // sheet name that no longer exists.
-                    if let (true, Some(old)) = (v.pkg.rename_sheet(idx, &buf), old) {
-                        let new = buf.trim().to_string();
-                        for c in &mut v.charts {
-                            gridcore::edit::rename_sheet_in_chart(&mut c.data, &old, &new);
-                        }
-                    }
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    crate::close::commit_rename_buffer(t, idx, &buf);
                 }
                 self.sheet_rename = None;
+                // Enter marks the tab dirty even when the name was declined;
+                // that quirk predates the extraction and stays.
                 self.mark_sheet_dirty();
             }
             "backspace" => {
@@ -12988,8 +12980,9 @@ impl Docxy {
             return;
         };
         let author = self.comment_author();
-        // The view takes the undo step itself: the whole package.
-        self.sheet_try_edit(false, |v| v.comment_cell(&author, &text));
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            crate::close::commit_comment_buffer(t, &author, &text);
+        }
         cx.notify();
     }
 
