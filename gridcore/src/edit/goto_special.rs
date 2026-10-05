@@ -215,6 +215,11 @@ pub fn go_to_special(
     let s = wb.sheets.get(sheet).ok_or(NO_CELLS)?;
     let scope_v = special_scope(s, areas);
     let scope = scope_v.as_slice();
+    // Every cell-by-cell walk stays inside the used range: a whole-sheet
+    // selection must not walk 17 billion cells (#707 r3 M3).
+    let used = used_rect(s);
+    let clip_used = |a: Rect| used.and_then(|u| clip(a, u));
+    let scope_used: Vec<Rect> = scope.iter().filter_map(|&a| clip_used(a)).collect();
     let in_scope = |r: u32, c: u32| scope.iter().any(|&a| inside(r, c, a));
     let rects: Vec<Rect> = match kind {
         GoSpecial::Notes => cells_to_rects(
@@ -290,7 +295,7 @@ pub fn go_to_special(
                 }
             };
             let mut cells = Vec::new();
-            for &a in scope {
+            for &a in &scope_used {
                 for r in a.0..=a.2 {
                     for c in a.1..=a.3 {
                         let cmp = if rows { (r, active.1) } else { (active.0, c) };
@@ -319,8 +324,11 @@ pub fn go_to_special(
                 let Some(f) = s.cell(r, c).and_then(|x| x.formula.as_deref()) else {
                     continue;
                 };
-                for (r0, c0, r1, c1) in same_sheet_refs(wb, sheet, f) {
-                    for rr in r0..=r1.min(r0 + 100_000) {
+                for (r0, c0, r1, c1) in same_sheet_refs(wb, sheet, f)
+                    .into_iter()
+                    .filter_map(clip_used)
+                {
+                    for rr in r0..=r1 {
                         for cc in c0..=c1 {
                             if found.insert((rr, cc)) && all {
                                 frontier.push((rr, cc));
@@ -372,7 +380,7 @@ pub fn go_to_special(
             .collect(),
         GoSpecial::VisibleCells => {
             let mut rects = Vec::new();
-            for &a in scope {
+            for &a in &scope_used {
                 let mut row_runs: Vec<(u32, u32)> = Vec::new();
                 for r in a.0..=a.2 {
                     if s.row_hidden(r) {
@@ -406,13 +414,15 @@ pub fn go_to_special(
             s.cond_formats.iter().map(|cf| &cf.ranges),
             same,
             active,
-            scope,
+            &scope_used,
+            used,
         ),
         GoSpecial::DataValidation { same } => rule_ranges(
             s.validations.iter().map(|dv| &dv.ranges),
             same,
             active,
-            scope,
+            &scope_used,
+            used,
         ),
     };
     if rects.is_empty() {
@@ -425,12 +435,14 @@ pub fn go_to_special(
 }
 
 /// The ranges of every rule (or, `same`, of the rules covering `active`),
-/// clipped to `scope` for All.
+/// clipped to `scope` for All, and always to the `used` range, so a rule
+/// over whole columns is not walked cell by cell (#707 r3 M3).
 fn rule_ranges<'a>(
     rules: impl Iterator<Item = &'a Vec<Rect>>,
     same: bool,
     active: (u32, u32),
     scope: &[Rect],
+    used: Option<Rect>,
 ) -> Vec<Rect> {
     let mut cells = Vec::new();
     for ranges in rules {
@@ -439,12 +451,12 @@ fn rule_ranges<'a>(
         }
         for &a in ranges {
             let parts: Vec<Rect> = if same {
-                vec![a]
+                used.and_then(|u| clip(a, u)).into_iter().collect()
             } else {
                 scope.iter().filter_map(|&s| clip(a, s)).collect()
             };
             for p in parts {
-                for r in p.0..=p.2.min(p.0 + 100_000) {
+                for r in p.0..=p.2 {
                     for c in p.1..=p.3 {
                         cells.push((r, c));
                     }

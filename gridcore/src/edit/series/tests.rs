@@ -838,3 +838,120 @@ fn add_weekdays_matches_the_walk() {
     assert!(t.elapsed() < std::time::Duration::from_millis(50));
     assert_eq!(far - parts_to_serial(2024, 10, 4, 0, false), 7_000_000.0);
 }
+
+// ---- #707 r3 -------------------------------------------------------------------
+
+fn one_cell(
+    v0: f64,
+    kind: SeriesType,
+    step: f64,
+    stop: f64,
+) -> (Workbook, Result<usize, &'static str>) {
+    let mut wb = book(&[("A1", Cell::number(v0))]);
+    let r = fill_series(
+        &mut wb,
+        0,
+        (0, 0, 0, 0),
+        &spec(false, kind, step, Some(stop), false),
+        &[],
+    );
+    (wb, r)
+}
+
+/// M1: Growth from a negative seed runs down, and its stop is tested on
+/// that side; one already overshot by the first step writes nothing.
+#[test]
+fn growth_from_a_negative_seed() {
+    let (wb, r) = one_cell(-1.0, SeriesType::Growth, 2.0, -100.0);
+    assert_eq!(r, Ok(6));
+    assert_eq!(nums(&wb, &["A2", "A3", "A7"]), [-2.0, -4.0, -64.0]);
+    assert_eq!(shown(&wb, "A8"), CellValue::Empty);
+    let (wb, r) = one_cell(-1.0, SeriesType::Growth, 2.0, -1.5);
+    assert_eq!(r, Ok(0), "-2 is past -1.5 at once");
+    assert_eq!(shown(&wb, "A2"), CellValue::Empty);
+    let (_, r) = one_cell(-1.0, SeriesType::Growth, 2.0, 5.0);
+    assert_eq!(r, Err(STOP_UNREACHABLE), "it never turns positive");
+    // Shrinking toward zero never reaches zero or past it.
+    let (_, r) = one_cell(8.0, SeriesType::Growth, 0.5, 0.0);
+    assert_eq!(r, Err(STOP_UNREACHABLE));
+    let (wb, r) = one_cell(8.0, SeriesType::Growth, 0.5, 1.0);
+    assert_eq!(r, Ok(3));
+    assert_eq!(nums(&wb, &["A4"]), [1.0]);
+}
+
+/// M2: a series that does not move never reaches its stop, even one equal
+/// to its seed.
+#[test]
+fn a_stationary_series_with_its_seed_as_the_stop_is_refused() {
+    for (v0, kind, step) in [
+        (5.0, SeriesType::Linear, 0.0),
+        (5.0, SeriesType::Growth, 1.0),
+        (0.0, SeriesType::Growth, 3.0),
+        (5.0, SeriesType::Date(FillKind::Days), 0.0),
+    ] {
+        let (wb, r) = one_cell(v0, kind, step, v0);
+        assert_eq!(r, Err(STOP_UNREACHABLE), "{kind:?} {step}");
+        assert_eq!(shown(&wb, "A2"), CellValue::Empty);
+    }
+}
+
+/// m1: descending weekday seeds count as the day-by-day walk did, from
+/// every start day, both ways.
+#[test]
+fn weekdays_between_matches_the_walk_both_ways() {
+    let walk = |a: f64, b: f64, d1904: bool| {
+        let mut k = 0i64;
+        let mut s = a;
+        let dir = if b >= a { 1.0 } else { -1.0 };
+        while (dir > 0.0 && s < b) || (dir < 0.0 && s > b) {
+            s += dir;
+            if !weekend(s, d1904) {
+                k += dir as i64;
+            }
+        }
+        k
+    };
+    for d1904 in [false, true] {
+        let base = parts_to_serial(2024, 10, 1, 0, d1904);
+        for a in 0..7 {
+            for gap in -16..=16 {
+                let (x, y) = (base + f64::from(a), base + f64::from(a + gap));
+                assert_eq!(weekdays_between(x, y, d1904), walk(x, y, d1904), "{x} {y}");
+            }
+        }
+    }
+    // Two seeds on one weekend, descending, step backwards.
+    let mut wb = book(&[]);
+    let s = style(&mut wb, "yyyy-mm-dd");
+    for (r, (d, m)) in [(6u32, 10u32), (5, 10)].into_iter().enumerate() {
+        let mut c = Cell::number(parts_to_serial(2024, m, d, 0, false));
+        c.style = s;
+        wb.sheets[0].set_cell(r as u32, 0, c);
+    }
+    fill_with(&mut wb, "A1:A2", "A3", FillKind::Weekdays, false, &[]);
+    assert_eq!(nums(&wb, &["A3"]), [parts_to_serial(2024, 10, 4, 0, false)]);
+}
+
+/// m2: the weekday arithmetic leaves a non-date alone, and a date series
+/// that would step off the calendar is refused.
+#[test]
+fn weekdays_off_the_calendar_and_huge_steps() {
+    let t = std::time::Instant::now();
+    assert_eq!(add_weekdays(1e300, 3, false), 1e300);
+    assert!(add_weekdays(f64::NAN, 3, false).is_nan());
+    assert_eq!(add_weekdays(-5.0, 3, false), -5.0);
+    let far = add_weekdays(45000.0, i64::MAX, false);
+    assert!(far > MAX_SERIAL);
+    assert_eq!(weekdays_between(1e300, 45000.0, false), 0);
+    assert!(t.elapsed() < std::time::Duration::from_millis(50));
+    let mut wb = book(&[("A1", Cell::number(45000.0))]);
+    let r = fill_series(
+        &mut wb,
+        0,
+        (0, 0, 9, 0),
+        &spec(false, SeriesType::Date(FillKind::Years), 1e9, None, false),
+        &[],
+    );
+    assert_eq!(r, Err(STEP_OUT_OF_RANGE));
+    assert_eq!(shown(&wb, "A2"), CellValue::Empty);
+}

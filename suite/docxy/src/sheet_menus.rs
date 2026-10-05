@@ -279,8 +279,9 @@ fn fill_kind_items(
 }
 
 /// What a right-drag of the selection's border offers on release.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum DropChoice {
+    #[default]
     Move,
     Copy,
     CopyValues,

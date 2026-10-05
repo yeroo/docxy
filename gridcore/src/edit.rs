@@ -24,7 +24,7 @@ pub use goto_special::{
     GoSpecial, MAX_AREAS, NO_CELLS, TOO_MANY_AREAS, Types, current_region, go_to_special,
     resolve_reference, special_scope,
 };
-pub(crate) mod series;
+mod series;
 pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
 pub use series::{
     FillDir, FillKind, FillTarget, JUSTIFY_OVERFLOW, STEP_OUT_OF_RANGE, STOP_UNREACHABLE,

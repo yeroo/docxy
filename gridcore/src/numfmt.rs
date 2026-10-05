@@ -700,13 +700,39 @@ fn render_section(
     render_number(sect, x, explicit_sign)
 }
 
+/// The month names, January first.
+pub(crate) const MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// The day names, Sunday first (Excel's WEEKDAY order).
+pub(crate) const DAYS: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
 fn render_date(sect: &Section, serial: f64, date1904: bool) -> String {
     let Some(p) = serial_to_parts(serial, date1904) else {
         return fmt_general(serial);
     };
     let twelve_hour = sect.toks.iter().any(|t| matches!(t, Tok::AmPm));
     let mut out = String::new();
-    use crate::edit::series::{DAYS, MONTHS};
     // Day-of-week from the serial: Excel's WEEKDAY convention has serial 1
     // as a "Sunday", so Sunday-index = (serial - 1) mod 7.
     let dow = (serial.floor() as i64 - 1).rem_euclid(7);

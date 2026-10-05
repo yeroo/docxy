@@ -3579,7 +3579,7 @@ pub fn dispatch(
             }
             let (r0, c0, _, _) = sheet(app)?.range();
             app.border_drag_start((r0, c0), right, cx);
-            if app.border_drag.is_none() {
+            if app.drops.border_drag.is_none() {
                 return Err(format!(
                     "the drag did not start: {}",
                     app.tabs

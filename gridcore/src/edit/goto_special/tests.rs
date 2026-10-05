@@ -321,3 +321,54 @@ fn go_to_resolves_cells_ranges_sheets_and_names() {
     assert_eq!(resolve_reference(&wb, 0, "Nowhere!A1"), None);
     assert_eq!(resolve_reference(&wb, 0, "banana"), None);
 }
+
+/// #707 r3 M3: a whole-sheet selection, and a rule over whole columns,
+/// are searched within the used range, quickly.
+#[test]
+fn whole_sheet_scopes_are_clipped_to_the_used_range() {
+    use crate::sheet::{MAX_COLS, MAX_ROWS};
+    let wb = book(&[
+        ("A1", Cell::number(1.0)),
+        ("B1", Cell::number(1.0)),
+        ("C1", Cell::number(2.0)),
+        ("A2", Cell::number(5.0)),
+        ("B2", Cell::number(6.0)),
+        ("C2", Cell::number(5.0)),
+    ]);
+    let all = (0, 0, MAX_ROWS - 1, MAX_COLS - 1);
+    let t = std::time::Instant::now();
+    let found = go_to_special(&wb, 0, &[all], (0, 0), GoSpecial::RowDifferences, &[]);
+    assert_eq!(found, Ok(rects(&["C1", "B2"])));
+    let found = go_to_special(&wb, 0, &[all], (0, 0), GoSpecial::VisibleCells, &[]);
+    assert_eq!(found, Ok(rects(&["A1:C2"])));
+    let mut wb = wb;
+    wb.sheets[0].cond_formats.push(CondFormat {
+        ranges: vec![(0, 0, MAX_ROWS - 1, 1)],
+        rules: Vec::new(),
+        ix: None,
+    });
+    wb.sheets[0].set_cell(0, 3, Cell::formula("SUM(A:A)"));
+    let found = go_to_special(
+        &wb,
+        0,
+        &[rect("A1")],
+        (0, 0),
+        GoSpecial::ConditionalFormats { same: true },
+        &[],
+    );
+    assert_eq!(found, Ok(rects(&["A1:B2"])));
+    let found = go_to_special(
+        &wb,
+        0,
+        &[rect("D1")],
+        (0, 3),
+        GoSpecial::Precedents { all: false },
+        &[],
+    );
+    assert_eq!(found, Ok(rects(&["A1:A2"])));
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        t.elapsed()
+    );
+}

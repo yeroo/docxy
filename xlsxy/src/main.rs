@@ -6882,6 +6882,12 @@ impl App {
     /// when the selection is one cell deep along the fill, pull each cell
     /// from its neighbour before it.
     fn fill(&mut self, dir: FillDir) {
+        // A protected sheet refuses, as Delete does (#707 r3 m5).
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         let changes = fill_changes(self.sheet(), self.selection(), dir);
         if changes.is_empty() {
             return;
@@ -12292,6 +12298,23 @@ mod tests {
         app.open_paste_special();
         assert!(app.outline_dialog.is_none());
         assert!(app.status.as_deref().unwrap_or("").contains("cut"));
+    }
+
+    /// #707 r3 m5: Fill (Ctrl+D/R, Up, Left) refuses a protected sheet.
+    #[test]
+    fn fill_refuses_a_protected_sheet() {
+        let mut app = App::new(new_xlsx(), "prot.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(7.0));
+        app.pkg.workbook.sheets[0].set_protected(true);
+        for dir in [FillDir::Down, FillDir::Right, FillDir::Up, FillDir::Left] {
+            app.cur = (2, 2);
+            app.anchor = Some((0, 0));
+            app.fill(dir);
+            assert_eq!(app.sheet().cells.len(), 1, "{dir:?}");
+            assert!(app.status.as_deref().unwrap_or("").contains("protected"));
+        }
+        assert!(app.undo.is_empty());
     }
 
     /// #668: Fill Up and Fill Left.

@@ -111,32 +111,7 @@ impl FillKind {
     }
 }
 
-/// The month names, January first.
-pub(crate) const MONTHS: [&str; 12] = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-];
-
-/// The day names, Sunday first (Excel's WEEKDAY order).
-pub(crate) const DAYS: [&str; 7] = [
-    "Sunday",
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-];
+use crate::numfmt::{DAYS, MONTHS};
 
 /// Excel's built-in custom lists, as File › Options › Edit Custom Lists shows
 /// them: short and long day names, short and long month names.
@@ -544,54 +519,90 @@ pub(crate) fn add_months(serial: f64, months: i64, date1904: bool) -> f64 {
     parts_to_serial(ny, nm, nd, secs, date1904)
 }
 
-/// Whether the serial falls on a Saturday or Sunday, in the 1900 date
+/// The last serial a date can have (9999-12-31).
+const MAX_SERIAL: f64 = 2_958_465.0;
+
+/// Whether `serial` is a date Excel can show; the weekday arithmetic
+/// leaves anything else alone (#707 r3 m2).
+fn in_date_range(serial: f64) -> bool {
+    serial.is_finite() && (0.0..MAX_SERIAL + 1.0).contains(&serial)
+}
+
+/// Whether whole day `day` is a Saturday or Sunday, in the 1900 date
 /// system (serial 1, 1900-01-01, a Sunday in Excel's reckoning) or the
 /// 1904 one (serial 0, 1904-01-01, a Friday).
-fn weekend(serial: f64, date1904: bool) -> bool {
+fn weekend_day(day: i64, date1904: bool) -> bool {
     let shift = if date1904 { 5 } else { -1 };
-    let dow = (serial.floor() as i64 + shift).rem_euclid(7);
+    let dow = (day + shift).rem_euclid(7);
     dow == 0 || dow == 6
 }
 
-/// `serial` moved by `k` weekdays (Monday to Friday), in constant time
-/// (#707 r2 M2): a start on a weekend is first taken back to the weekday
-/// before it in the walk's direction (which moves to the same weekdays),
-/// every whole five weekdays is a week, and only the rest is walked.
+/// Whether the serial falls on a Saturday or Sunday (the tests' walk).
+#[cfg(test)]
+fn weekend(serial: f64, date1904: bool) -> bool {
+    weekend_day(serial.floor() as i64, date1904)
+}
+
+/// `serial` moved by `k` weekdays (Monday to Friday), in constant time and
+/// whole days (#707 r2 M2, r3 m2): a start on a weekend is first taken back
+/// to the weekday before it in the walk's direction (which moves to the
+/// same weekdays), every whole five weekdays is a week, and only the rest
+/// is walked. A serial that is no date, or a move off the calendar, is not
+/// walked.
 pub(crate) fn add_weekdays(serial: f64, k: i64, date1904: bool) -> f64 {
-    if k == 0 {
+    if k == 0 || !in_date_range(serial) {
         return serial;
     }
-    let dir = if k < 0 { -1.0 } else { 1.0 };
-    let mut s = serial;
-    while weekend(s, date1904) {
-        s -= dir;
+    let frac = serial - serial.floor();
+    let dir = k.signum();
+    let mut day = serial.floor() as i64;
+    while weekend_day(day, date1904) {
+        day -= dir;
     }
     let n = k.unsigned_abs();
-    s += dir * 7.0 * (n / 5) as f64;
+    let weeks = i128::from(dir) * 7 * i128::from(n / 5);
+    let moved = i128::from(day) + weeks;
+    if !(0..=MAX_SERIAL as i128 + 7).contains(&moved) {
+        return moved as f64 + frac;
+    }
+    day = moved as i64;
     let mut left = n % 5;
     while left > 0 {
-        s += dir;
-        if !weekend(s, date1904) {
+        day += dir;
+        if !weekend_day(day, date1904) {
             left -= 1;
         }
     }
-    s
+    day as f64 + frac
 }
 
-/// The weekdays in (`a`, `b`] (negative when `b` is before `a`), in
-/// constant time.
-fn weekdays_between(a: f64, b: f64, date1904: bool) -> i64 {
-    let (lo, hi, sign) = if b >= a { (a, b, 1) } else { (b, a, -1) };
-    let days = (hi - lo).round() as i64;
+/// The weekdays in the whole days `(lo, hi]`, in constant time.
+fn weekdays_in(lo: i64, hi: i64, date1904: bool) -> i64 {
+    let days = hi - lo;
     let mut n = days / 7 * 5;
-    let mut s = lo + (days / 7 * 7) as f64;
-    while s < hi {
-        s += 1.0;
-        if !weekend(s, date1904) {
+    let mut day = lo + days / 7 * 7;
+    while day < hi {
+        day += 1;
+        if !weekend_day(day, date1904) {
             n += 1;
         }
     }
-    sign * n
+    n
+}
+
+/// The weekdays from `a` to `b` as a walk from `a` counts them: those in
+/// `(a, b]` going forward, minus those in `[b, a)` going back (#707 r3 m1).
+/// 0 for a serial that is no date.
+fn weekdays_between(a: f64, b: f64, date1904: bool) -> i64 {
+    if !in_date_range(a) || !in_date_range(b) {
+        return 0;
+    }
+    let (da, db) = (a.floor() as i64, b.floor() as i64);
+    if db >= da {
+        weekdays_in(da, db, date1904)
+    } else {
+        -weekdays_in(db - 1, da - 1, date1904)
+    }
 }
 
 /// The whole-month step between date seeds that share a day of month and
@@ -631,9 +642,14 @@ fn date_at(ys: &[f64], n: f64, t: Temporal, kind: FillKind, date1904: bool, dir:
             let step = if m == 1 {
                 dir as i64
             } else {
-                // The weekdays between the last two seeds.
+                // The weekdays between the last two seeds; two on one
+                // weekend still step in their own direction.
                 let k = weekdays_between(ys[m - 2], last, date1904);
-                if k == 0 { 1 } else { k }
+                match k {
+                    0 if last < ys[m - 2] => -1,
+                    0 => 1,
+                    k => k,
+                }
             };
             add_weekdays(last, step * ahead.round() as i64, date1904)
         }
@@ -997,6 +1013,25 @@ pub(crate) fn series_changes(
                 return Err(STOP_UNREACHABLE);
             }
         }
+        // A date series that would step off the calendar (#707 r3 m2).
+        if let SeriesType::Date(unit) = spec.kind {
+            if !spec.trend {
+                let per = match unit {
+                    FillKind::Weekdays => 1.4,
+                    FillKind::Months => 31.0,
+                    FillKind::Years => 366.0,
+                    _ => 1.0,
+                } * spec.step.abs();
+                let mut steps = f64::from(len.saturating_sub(1));
+                if let (true, Some(stop)) = (single, stop) {
+                    steps = steps.min(((stop - v0).abs() / per.max(f64::MIN_POSITIVE)).ceil());
+                }
+                let end = v0 + spec.step.signum() * per * steps;
+                if !in_date_range(v0) || !in_date_range(end) {
+                    return Err(STEP_OUT_OF_RANGE);
+                }
+            }
+        }
         let style = first.style;
         let ys: Vec<f64> = seeds
             .iter()
@@ -1006,20 +1041,14 @@ pub(crate) fn series_changes(
             })
             .collect();
         // Whether `v` is past the stop value, in the series' direction.
-        let rising = match spec.kind {
-            SeriesType::Growth => spec.step >= 1.0,
-            _ => spec.step >= 0.0,
-        };
+        // Which way the series runs, as `stop_reachable` reads it too.
+        let dir = series_dir(spec, v0);
         let past = |v: f64| match stop {
-            Some(stop) => {
-                if rising {
-                    v > stop
-                } else {
-                    v < stop
-                }
-            }
+            Some(stop) if dir > 0.0 => v > stop,
+            Some(stop) if dir < 0.0 => v < stop,
             _ => false,
         };
+        let mut prev: Option<f64> = None;
         let start = if spec.trend { 0 } else { 1 };
         for i in start..len {
             let n = f64::from(i);
@@ -1051,9 +1080,12 @@ pub(crate) fn series_changes(
                     SeriesType::AutoFill => unreachable!(),
                 }
             };
-            if past(v) {
+            // Past the stop; and, the safety net, a series that has stopped
+            // moving never reaches it (#707 r3 M2).
+            if past(v) || (stop.is_some() && prev == Some(v)) {
                 break;
             }
+            prev = Some(v);
             let (r, c) = at(i);
             let mut cell = Cell::number(v);
             cell.style = sheet
@@ -1075,28 +1107,44 @@ pub const STEP_OUT_OF_RANGE: &str = "The step value is out of range.";
 /// Series' refusal of a stop value its step never reaches.
 pub const STOP_UNREACHABLE: &str = "The stop value can never be reached with this step value.";
 
+/// Which way a series from `v0` runs: +1 up, -1 down, 0 when it does not
+/// move (or, for Growth with a step of 0 or below, does not run one way).
+/// What both the stop check and `past` read (#707 r3 M1).
+fn series_dir(spec: &SeriesSpec, v0: f64) -> f64 {
+    let d = match spec.kind {
+        SeriesType::Growth if spec.step <= 0.0 => return 0.0,
+        SeriesType::Growth => v0 * spec.step - v0,
+        _ => spec.step,
+    };
+    if d > 0.0 {
+        1.0
+    } else if d < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
 /// Whether a series from `v0` stepping by `spec.step` ever reaches `stop`.
+/// A series that does not move never does, even a stop equal to its seed
+/// (#707 r3 M2); a growing or shrinking one only on its own side of the
+/// seed, and a shrinking one never at or past zero.
 fn stop_reachable(spec: &SeriesSpec, v0: f64, stop: f64) -> bool {
-    let step = spec.step;
+    let dir = series_dir(spec, v0);
+    if dir == 0.0 {
+        return false;
+    }
     match spec.kind {
         SeriesType::Growth => {
-            if v0 == 0.0 || step <= 0.0 || step == 1.0 {
-                return stop == v0;
-            }
             let ratio = stop / v0;
             ratio > 0.0
-                && if step > 1.0 {
+                && if spec.step > 1.0 {
                     ratio >= 1.0
                 } else {
                     ratio <= 1.0
                 }
         }
-        _ => {
-            if step == 0.0 {
-                return stop == v0;
-            }
-            (stop - v0) * step >= 0.0
-        }
+        _ => (stop - v0) * dir >= 0.0,
     }
 }
 

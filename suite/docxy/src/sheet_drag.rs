@@ -126,6 +126,84 @@ impl SheetView {
     }
 }
 
+/// The grid's drags waiting on something (#670, #668): a border drag in
+/// flight, a drop waiting on its menu or its replace question, and a fill
+/// handle's right-drag waiting on its menu. Kept apart from the app so the
+/// rules for ending and dropping them are tested without a window.
+#[derive(Default)]
+pub(crate) struct GridDrops {
+    pub border_drag: Option<BorderDrag>,
+    pub border_pending: Option<BorderDrag>,
+    pub border_pending_choice: DropChoice,
+    pub fill_drop: Option<crate::FillDrag>,
+}
+
+/// What a border drag's release does ([`GridDrops::end_border`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum BorderEnd {
+    /// Nothing: no drag, a drop in place, or a release in another view than
+    /// the drag started in (#707 r2 M4).
+    Nothing,
+    /// A right-drag: its menu opens, the drag pending on it.
+    Menu,
+    /// Drop it so: Move, or Copy with Ctrl held.
+    Drop(BorderDrag, DropChoice),
+}
+
+impl GridDrops {
+    /// A tab switch, or anything else that leaves the grid: every drag and
+    /// pending drop goes.
+    pub fn clear(&mut self) {
+        *self = GridDrops::default();
+    }
+
+    /// A new gesture starts: a drop still waiting on its menu or question
+    /// is over.
+    pub fn new_gesture(&mut self) {
+        self.border_pending = None;
+        self.fill_drop = None;
+    }
+
+    /// A right button let go off the grid: a right-drag of the selection's
+    /// border, or of the fill handle (`fill`), is cancelled with no menu,
+    /// as Excel drops it (#707 r2 M4). Whether one was.
+    pub fn cancel_right(&mut self, fill: &mut Option<crate::FillDrag>) -> bool {
+        let mut cancelled = false;
+        if fill.is_some_and(|f| f.right) {
+            *fill = None;
+            cancelled = true;
+        }
+        if self.border_drag.is_some_and(|d| d.right) {
+            self.border_drag = None;
+            cancelled = true;
+        }
+        cancelled
+    }
+
+    /// The border drag's release over the sheet view `active` (`None` off
+    /// a sheet).
+    pub fn end_border(&mut self, active: Option<u64>) -> BorderEnd {
+        let Some(d) = self.border_drag.take() else {
+            return BorderEnd::Nothing;
+        };
+        if !crate::gesture_stands(d.view, active) || d.dest_at() == (d.src.0, d.src.1) {
+            return BorderEnd::Nothing;
+        }
+        if d.right {
+            self.border_pending = Some(d);
+            return BorderEnd::Menu;
+        }
+        BorderEnd::Drop(
+            d,
+            if d.ctrl {
+                DropChoice::Copy
+            } else {
+                DropChoice::Move
+            },
+        )
+    }
+}
+
 /// The replace question, before a drop overwrites data.
 fn replace_question() -> Dialog {
     let mut d = Dialog::message(
@@ -150,13 +228,14 @@ impl Docxy {
         right: bool,
         cx: &mut gpui::Context<Self>,
     ) {
-        if self.grid_gesture_in_flight() || self.sheet_fill.is_some() || self.border_drag.is_some()
+        if self.grid_gesture_in_flight()
+            || self.sheet_fill.is_some()
+            || self.drops.border_drag.is_some()
         {
             return;
         }
         // A new gesture: a drop still waiting on its menu or question is over.
-        self.border_pending = None;
-        self.fill_drop = None;
+        self.drops.new_gesture();
         if self.protected_refused(cx) || self.multi_area_refused(cx) {
             return;
         }
@@ -167,7 +246,7 @@ impl Docxy {
         let Some(v) = self.active_sheet() else {
             return;
         };
-        self.border_drag = Some(BorderDrag {
+        self.drops.border_drag = Some(BorderDrag {
             src: v.range(),
             grab,
             over: grab,
@@ -185,7 +264,7 @@ impl Docxy {
         ctrl: bool,
         cx: &mut gpui::Context<Self>,
     ) {
-        let Some(d) = self.border_drag.as_mut() else {
+        let Some(d) = self.drops.border_drag.as_mut() else {
             return;
         };
         if d.over != cell || d.ctrl != ctrl {
@@ -198,33 +277,20 @@ impl Docxy {
     /// The release: a left drag moves (Ctrl copies), asking first when the
     /// drop lands on data; a right drag opens the drop menu.
     pub(crate) fn border_drag_end(&mut self, cx: &mut gpui::Context<Self>) {
-        let Some(d) = self.border_drag.take() else {
-            return;
-        };
-        // Released in another tab than it started in: nothing (#707 r2 M4).
-        if !self.gesture_view_is_active(d.view) {
-            return cx.notify();
+        let active = self.active_sheet().map(|v| v.id);
+        match self.drops.end_border(active) {
+            BorderEnd::Nothing => cx.notify(),
+            BorderEnd::Menu => {
+                let at = self.last_pointer;
+                self.open_menu(
+                    crate::menu::MenuTarget::Grid(crate::menu::GridMenu::BorderDrop),
+                    at,
+                    crate::sheet_menus::drop_menu(),
+                    cx,
+                );
+            }
+            BorderEnd::Drop(d, choice) => self.border_choose(d, choice, cx),
         }
-        if d.dest_at() == (d.src.0, d.src.1) {
-            return cx.notify();
-        }
-        if d.right {
-            self.border_pending = Some(d);
-            let at = self.last_pointer;
-            self.open_menu(
-                crate::menu::MenuTarget::Grid(crate::menu::GridMenu::BorderDrop),
-                at,
-                crate::sheet_menus::drop_menu(),
-                cx,
-            );
-            return;
-        }
-        let choice = if d.ctrl {
-            DropChoice::Copy
-        } else {
-            DropChoice::Move
-        };
-        self.border_choose(d, choice, cx);
     }
 
     /// Drop `d` as `choice`, asking first when it would overwrite data.
@@ -234,8 +300,8 @@ impl Docxy {
                 .active_sheet()
                 .is_some_and(|v| v.drop_hits_data(d.src, d.dest()));
         if hits {
-            self.border_pending = Some(d);
-            self.border_pending_choice = choice;
+            self.drops.border_pending = Some(d);
+            self.drops.border_pending_choice = choice;
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 tab.dialogs.push(replace_question());
             }
@@ -258,7 +324,7 @@ impl Docxy {
 
     /// A choice from the right-drag's drop menu.
     pub(crate) fn border_drop_choice(&mut self, choice: DropChoice, cx: &mut gpui::Context<Self>) {
-        let Some(d) = self.border_pending.take() else {
+        let Some(d) = self.drops.border_pending.take() else {
             self.set_status("There is no drag to drop");
             return cx.notify();
         };
@@ -275,9 +341,9 @@ impl Docxy {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.dialogs.pop();
         }
-        let pending = self.border_pending.take();
+        let pending = self.drops.border_pending.take();
         if let (true, Some(d)) = (ok, pending) {
-            let choice = self.border_pending_choice;
+            let choice = self.drops.border_pending_choice;
             self.border_apply(d, choice);
         }
         Some(Ok(()))
@@ -318,6 +384,90 @@ mod tests {
     fn formula(v: &SheetView, name: &str) -> Option<String> {
         let (r, c) = at(name);
         v.sheet().cell(r, c).and_then(|c| c.formula.clone())
+    }
+
+    fn drag(right: bool, view: u64) -> BorderDrag {
+        BorderDrag {
+            src: (0, 0, 0, 0),
+            grab: (0, 0),
+            over: (3, 3),
+            ctrl: false,
+            right,
+            view,
+        }
+    }
+
+    /// #707 r3 m4: a right-drag let go off the grid is cancelled, a fill
+    /// handle's too; a left one is not.
+    #[test]
+    fn a_right_release_off_the_grid_cancels_right_drags_only() {
+        let mut drops = GridDrops {
+            border_drag: Some(drag(true, 1)),
+            ..Default::default()
+        };
+        let mut fill = Some(crate::FillDrag {
+            src: (0, 0, 0, 0),
+            to: (2, 0),
+            ctrl: false,
+            right: true,
+            view: 1,
+        });
+        assert!(drops.cancel_right(&mut fill));
+        assert!(drops.border_drag.is_none() && fill.is_none());
+        drops.border_drag = Some(drag(false, 1));
+        assert!(!drops.cancel_right(&mut None));
+        assert!(
+            drops.border_drag.is_some(),
+            "a left drag ends at its own release"
+        );
+    }
+
+    /// #707 r3 m4: a tab switch drops everything pending.
+    #[test]
+    fn leaving_the_grid_clears_every_pending_drop() {
+        let mut drops = GridDrops {
+            border_drag: Some(drag(true, 1)),
+            border_pending: Some(drag(true, 1)),
+            border_pending_choice: DropChoice::Link,
+            fill_drop: Some(crate::FillDrag {
+                src: (0, 0, 0, 0),
+                to: (2, 0),
+                ctrl: false,
+                right: true,
+                view: 1,
+            }),
+        };
+        drops.clear();
+        assert!(drops.border_drag.is_none() && drops.border_pending.is_none());
+        assert!(drops.fill_drop.is_none());
+        assert_eq!(drops.border_pending_choice, DropChoice::Move);
+    }
+
+    /// #707 r3 m4: a border drag released in another view does nothing (no
+    /// menu, no drop); in its own, a right-drag waits on its menu and a
+    /// left one moves (Ctrl copies).
+    #[test]
+    fn a_border_drag_ends_only_in_its_own_view() {
+        let mut drops = GridDrops {
+            border_drag: Some(drag(true, 1)),
+            ..Default::default()
+        };
+        assert_eq!(drops.end_border(Some(2)), BorderEnd::Nothing);
+        assert!(drops.border_pending.is_none(), "no menu waits");
+        drops.border_drag = Some(drag(true, 1));
+        assert_eq!(drops.end_border(None), BorderEnd::Nothing, "a document tab");
+        drops.border_drag = Some(drag(true, 1));
+        assert_eq!(drops.end_border(Some(1)), BorderEnd::Menu);
+        assert!(drops.border_pending.is_some());
+        let mut ctrl = drag(false, 1);
+        ctrl.ctrl = true;
+        drops.border_drag = Some(ctrl);
+        assert_eq!(
+            drops.end_border(Some(1)),
+            BorderEnd::Drop(ctrl, DropChoice::Copy)
+        );
+        drops.new_gesture();
+        assert!(drops.border_pending.is_none());
     }
 
     /// #707 r2 M4: a drag released in another tab (or a document) than the
