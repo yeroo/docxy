@@ -56,16 +56,19 @@ dropped when the part is written.
 ([`docs/fidelity-gate.md`](docs/fidelity-gate.md)) saves every corpus `.docx`
 (the 248 docxy-corpus files plus the repo-tracked ones) the way an edited
 document is saved. It compares every part with the original and fails on any
-loss outside its shrink-only baseline. That baseline is where the losses
-described above are listed today:
+loss outside its shrink-only baseline. Where the losses described above stand:
 - unmodeled property children and attributes of modeled elements, including
-  `rsid*` and `w14:paraId`: fixed in #1063. The few entries left in that class
-  are run-alignment effects of #1069: a split run or an unwrapped `smartTag`
-  makes the comparator pair different runs;
+  `rsid*` and `w14:paraId`: fixed in #1063. That baseline class is gone. Only
+  a `w14:paraId` that the source itself repeats is still dropped, by design;
 - modeled property values rewritten to the supported set (tab alignment,
-  border width, `jc="distribute"`, underline style): #1068;
+  border width, `jc="distribute"`, underline style): #1068. An unedited
+  property is now written as loaded, so the gate's unedited saves no longer
+  hit it. An edited property is still generated from the supported set;
 - run content restructured (runs merged or split, `lastRenderedPageBreak`,
-  `smartTag`, row-level `sdt`): #1069.
+  `smartTag`, row-level `sdt`): #1069, which now holds every remaining docx
+  entry. That includes intact run properties that read as lost because a
+  split or unwrapped run makes the comparator pair different runs
+  (`MISALIGNED_RUNS` in `docxcore/tests/fidelity.rs`).
 
 A save with no edits writes the original parts back
 (`save_package_preserving_document`), and the gate holds that path

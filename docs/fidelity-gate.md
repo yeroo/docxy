@@ -164,6 +164,13 @@ its fix, and the classes are defined in `CLASSES` in `docxcore/tests/fidelity.rs
 The gate also fails on an entry that no class claims. A new kind of loss
 therefore needs a class and an issue, not just a line.
 
+Classes match by path, which can mislabel one case. A run that #1069 splits or
+unwraps can make the comparator pair the wrong runs, and then intact run
+properties read as lost or changed. Such entries are listed one by one in
+`MISALIGNED_RUNS`, each checked per character against the original, so the
+#1069 class claims them instead of #1068. An exact list cannot claim a loss in
+a file or at a path it does not name.
+
 The baseline keys on the index-free path, so one line covers every occurrence of
 that loss in that file. The trade-off: a new occurrence of an already listed loss
 at another index in the same file is not reported. The finding that does get

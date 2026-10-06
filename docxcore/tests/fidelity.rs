@@ -47,18 +47,10 @@ const CLASSES: &[LossClass] = &[
         },
     },
     LossClass {
-        name: "unmodeled property children and attributes dropped on save",
-        issue: "#1063",
-        matches: |e| {
-            matches!(e.kind, Kind::LostElement | Kind::LostAttr)
-                && (in_properties(&e.path) || is_modeled_element_attr(e))
-        },
-    },
-    LossClass {
         name: "modeled property values rewritten on save (values outside the supported set, \
                properties added)",
         issue: "#1068",
-        matches: |e| e.part == "word/document.xml" && in_properties(&e.path),
+        matches: |e| e.part == "word/document.xml" && in_properties(&e.path) && !misaligned_runs(e),
     },
     LossClass {
         name: "run and paragraph content restructured on save (runs merged or split, \
@@ -67,6 +59,89 @@ const CLASSES: &[LossClass] = &[
         matches: |e| e.part == "word/document.xml" && e.path.starts_with("/w:document/w:body/"),
     },
 ];
+
+/// Run-property findings that are no property loss: a run split or unwrapped
+/// by #1069 (a `w:tab` split off its text, an unwrapped `w:smartTag`, a dropped
+/// `w:lastRenderedPageBreak`) makes the comparator pair a run with a different
+/// one, so intact properties read as lost, changed or added. Checked per file
+/// when #1063 was fixed: every character's run properties and run attributes
+/// are the same in the original and the saved file. Listed entry by entry (file,
+/// kind, index-free path under `/w:document/w:body`), so the list cannot claim
+/// a loss in a file or at a path it does not name; such a loss is classed by
+/// the rules below like any other.
+const MISALIGNED_RUNS: &[(&str, &[(Kind, &str)])] = &[
+    (
+        "ext:Normalize/complex0.docx",
+        &[(Kind::LostElement, "/w:p/w:r/w:rPr")],
+    ),
+    (
+        "ext:bookmark/bookmark.docx",
+        &[
+            (Kind::LostElement, "/w:p/w:r/w:rPr"),
+            (Kind::LostElement, "/w:p/w:r/w:rPr/w:vertAlign"),
+        ],
+    ),
+    (
+        "ext:complex0.docx",
+        &[(Kind::LostElement, "/w:p/w:r/w:rPr")],
+    ),
+    (
+        "ext:complexDocx/complex0.docx",
+        &[(Kind::LostElement, "/w:p/w:r/w:rPr")],
+    ),
+    (
+        "ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx",
+        &[
+            (Kind::LostElement, "/w:p/w:r/w:rPr/w:color"),
+            (Kind::LostElement, "/w:p/w:r/w:rPr/w:i"),
+            (Kind::LostElement, "/w:p/w:r/w:rPr/w:lang"),
+            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:b"),
+            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:lang"),
+        ],
+    ),
+    (
+        "ext:mixed features/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx",
+        &[
+            (Kind::LostElement, "/w:p/w:r/w:rPr/w:color"),
+            (Kind::LostElement, "/w:p/w:r/w:rPr/w:i"),
+            (Kind::LostElement, "/w:p/w:r/w:rPr/w:lang"),
+            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:b"),
+            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:lang"),
+        ],
+    ),
+    (
+        "ext:page layout/page layout(big file)/A4.docx",
+        &[
+            (Kind::LostElement, "/w:p/w:r/w:rPr/w:kern"),
+            (Kind::LostAttr, "/w:p/w:r/w:rPr/w:rFonts/@w:hint"),
+            (Kind::ChangedValue, "/w:p/w:r/w:rPr/w:rFonts/@w:ascii"),
+            (Kind::ChangedValue, "/w:p/w:r/w:rPr/w:rFonts/@w:eastAsia"),
+            (Kind::ChangedValue, "/w:p/w:r/w:rPr/w:rFonts/@w:hAnsi"),
+            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:b"),
+            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:bCs"),
+            (Kind::ExtraAttr, "/w:p/w:r/w:rPr/w:rFonts/@w:hint"),
+        ],
+    ),
+    (
+        "ext:table/2007.docx",
+        &[
+            (Kind::LostElement, "/w:p/w:r/w:rPr/w:spacing"),
+            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:spacing"),
+        ],
+    ),
+];
+
+/// Whether `e` is one of [`MISALIGNED_RUNS`]; the #1069 class then claims it.
+fn misaligned_runs(e: &Entry) -> bool {
+    e.part == "word/document.xml"
+        && e.path
+            .strip_prefix("/w:document/w:body")
+            .is_some_and(|path| {
+                MISALIGNED_RUNS
+                    .iter()
+                    .any(|(file, entries)| *file == e.file && entries.contains(&(e.kind, path)))
+            })
+}
 
 /// Property containers of modeled elements. A path through one is property
 /// state; a path ending at one is the whole container.
@@ -83,18 +158,6 @@ const PROPERTIES: &[&str] = &[
 
 fn in_properties(path: &str) -> bool {
     path.split('/').any(|step| PROPERTIES.contains(&step))
-}
-
-/// An attribute directly on a modeled element (`w:p/@w:rsidR`, `w:tr/@w14:paraId`).
-fn is_modeled_element_attr(e: &Entry) -> bool {
-    let Some((owner, attr)) = e.path.rsplit_once("/@") else {
-        return false;
-    };
-    !attr.contains('/')
-        && owner
-            .rsplit('/')
-            .next()
-            .is_some_and(|el| matches!(el, "w:p" | "w:r" | "w:tbl" | "w:tr" | "w:tc"))
 }
 
 fn workspace_root() -> PathBuf {
@@ -838,4 +901,24 @@ fn glob_matches_runs() {
     assert!(glob("word/*.xml", "word/header1.xml"));
     assert!(!glob("word/*.xml", "word/media/a.png"));
     assert!(glob("a*b*c", "a-b-b-c"));
+}
+
+/// `MISALIGNED_RUNS` shrinks with the baseline: each of its entries is a
+/// baseline line, claimed by the #1069 class.
+#[test]
+fn misaligned_runs_are_baseline_entries_of_1069() {
+    let baseline = parse_baseline(include_str!("fidelity/baseline.txt")).expect("baseline.txt");
+    for (file, entries) in MISALIGNED_RUNS {
+        for (kind, path) in *entries {
+            let e = Entry {
+                file: file.to_string(),
+                part: "word/document.xml".to_string(),
+                kind: *kind,
+                path: format!("/w:document/w:body{path}"),
+            };
+            assert!(baseline.contains(&e), "not in baseline.txt: {e:?}");
+            let class = CLASSES.iter().find(|c| (c.matches)(&e)).expect("classed");
+            assert_eq!(class.issue, "#1069", "{e:?}");
+        }
+    }
 }
