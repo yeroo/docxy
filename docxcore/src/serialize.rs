@@ -3,8 +3,11 @@
 //! This is a *semantic* serializer: it re-emits the structure and properties we
 //! model (paragraphs, runs + rPr, tables, lists, hyperlinks). It is designed so
 //! that `parse_document_xml(document_to_xml(&doc)) == doc` for everything we
-//! model — see the round-trip tests. Unknown body content remains raw, while the
-//! body-level final `sectPr` is modeled so its revision can be reviewed.
+//! model — see the round-trip tests. A loaded document also keeps each modeled
+//! property's elements verbatim (`shadow`, #1063): an unedited property is
+//! written from them, so what the model does not represent survives a save.
+//! Unknown body content remains raw, while the body-level final `sectPr` is
+//! modeled so its revision can be reviewed.
 
 use crate::model::*;
 use crate::xml::{Event, XmlParser};
@@ -21,6 +24,7 @@ pub fn document_to_xml(doc: &Document) -> String {
     for block in &doc.body {
         write_block(&mut body, block);
     }
+    let body = without_duplicate_para_ids(body);
 
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
@@ -42,6 +46,51 @@ pub fn document_to_xml(doc: &Document) -> String {
     s.push_str(&body);
     s.push_str("</w:body></w:document>");
     s
+}
+
+/// `xml` without each `w14:paraId` on a `w:p`/`w:tr` that repeats an earlier
+/// one. A paragraph split, copied, pasted or merged keeps its loaded start-tag
+/// attributes, but Word requires paragraph ids to be unique in the document;
+/// the first occurrence keeps its id, so an unedited document is unchanged.
+fn without_duplicate_para_ids(xml: String) -> String {
+    const NAME: &str = "w14:paraId";
+    if xml.matches(NAME).nth(1).is_none() {
+        return xml;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
+    let base = xml.as_ptr() as usize;
+    let mut parser = XmlParser::new(&xml);
+    loop {
+        match parser.next() {
+            Event::Start => {
+                if !matches!(parser.name(), "w:p" | "w:tr") {
+                    continue;
+                }
+                let Some(attr) = parser.attrs().iter().find(|a| a.name == NAME) else {
+                    continue;
+                };
+                if seen.insert(attr.value.to_string()) {
+                    continue;
+                }
+                // From the whitespace before the name to the closing quote.
+                let name_at = attr.name.as_ptr() as usize - base;
+                let value_end = attr.value.as_ptr() as usize - base + attr.value.len() + 1;
+                let start = xml[..name_at].trim_end().len();
+                cuts.push(start..value_end);
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    let mut out = String::with_capacity(xml.len());
+    let mut at = 0;
+    for cut in cuts {
+        out.push_str(&xml[at..cut.start]);
+        at = cut.end;
+    }
+    out.push_str(&xml[at..]);
+    out
 }
 
 fn xml_uses_prefix(xml: &str, prefix: &str) -> bool {
@@ -138,7 +187,9 @@ fn write_block(s: &mut String, block: &Block) {
 }
 
 fn write_paragraph(s: &mut String, p: &Paragraph) {
-    s.push_str("<w:p>");
+    s.push_str("<w:p");
+    write_attrs(s, &p.props.element_attrs.0);
+    s.push('>');
     write_ppr(s, &p.props);
     write_inlines_tracking_inserts(s, &p.content);
     s.push_str("</w:p>");
@@ -284,6 +335,263 @@ fn local_name(raw: &str) -> &str {
     name.rsplit(':').next().unwrap_or(name)
 }
 
+/// The loaded elements of a props struct's modeled children
+/// ([`RunProps::shadow`] / [`ParProps::shadow`]), minus those also kept in
+/// `raw_props` (explicit-off toggles, a direct-left `w:jc`), which the
+/// `raw_props` path writes as before.
+struct Shadow<'a> {
+    elements: &'a [String],
+    raw_props: &'a [String],
+}
+
+impl<'a> Shadow<'a> {
+    fn new(elements: &'a [String], raw_props: &'a [String]) -> Self {
+        Shadow {
+            elements,
+            raw_props,
+        }
+    }
+
+    fn contains(&self, raw: &str) -> bool {
+        self.elements.iter().any(|e| e == raw)
+    }
+
+    fn elements(&self) -> impl Iterator<Item = &'a str> + '_ {
+        self.elements
+            .iter()
+            .filter(|e| !self.raw_props.contains(e))
+            .map(String::as_str)
+    }
+
+    /// The loaded element with this local name, if any.
+    fn find(&self, local: &str) -> Option<&'a str> {
+        self.elements
+            .iter()
+            .find(|e| local_name(e) == local)
+            .map(String::as_str)
+    }
+
+    /// The decoded attributes of the loaded element with this local name.
+    fn attrs(&self, local: &str) -> Vec<(String, String)> {
+        self.find(local).map(element_attrs_of).unwrap_or_default()
+    }
+}
+
+/// The decoded attributes of the start tag `raw` begins with.
+fn element_attrs_of(raw: &str) -> Vec<(String, String)> {
+    let mut p = XmlParser::new(raw);
+    if p.next() != Event::Start {
+        return Vec::new();
+    }
+    p.attrs()
+        .iter()
+        .map(|a| {
+            let mut v = String::new();
+            XmlParser::append_decoded(a.value, &mut v);
+            (a.name.to_string(), v)
+        })
+        .collect()
+}
+
+fn write_attrs(s: &mut String, attrs: &[(String, String)]) {
+    for (name, value) in attrs {
+        s.push(' ');
+        s.push_str(name);
+        s.push_str("=\"");
+        esc_attr(value, s);
+        s.push('"');
+    }
+}
+
+fn empty_element(name: &str, attrs: &[(String, String)]) -> String {
+    let mut x = format!("<{name}");
+    write_attrs(&mut x, attrs);
+    x.push_str("/>");
+    x
+}
+
+/// A modeled `w:rPr` property: the elements that carry it, and whether its
+/// value in `p` is still the one `orig` (parsed from the loaded elements) has.
+#[derive(Clone, Copy)]
+enum RprGroup {
+    Style,
+    Font,
+    Bold,
+    Italic,
+    Caps,
+    SmallCaps,
+    Strike,
+    Vanish,
+    Color,
+    Size,
+    Highlight,
+    Underline,
+    VertAlign,
+    Rtl,
+}
+
+impl RprGroup {
+    fn of(local: &str) -> Option<RprGroup> {
+        Some(match local {
+            "rStyle" => RprGroup::Style,
+            "rFonts" => RprGroup::Font,
+            "b" | "bCs" => RprGroup::Bold,
+            "i" | "iCs" => RprGroup::Italic,
+            "caps" => RprGroup::Caps,
+            "smallCaps" => RprGroup::SmallCaps,
+            "strike" | "dstrike" => RprGroup::Strike,
+            "vanish" => RprGroup::Vanish,
+            "color" => RprGroup::Color,
+            "sz" | "szCs" => RprGroup::Size,
+            "highlight" => RprGroup::Highlight,
+            "u" => RprGroup::Underline,
+            "vertAlign" => RprGroup::VertAlign,
+            "rtl" => RprGroup::Rtl,
+            _ => return None,
+        })
+    }
+
+    fn unchanged(self, p: &RunProps, orig: &RunProps) -> bool {
+        let rstyle = |r: &RunProps| {
+            r.style_id
+                .clone()
+                .or_else(|| r.code.then(|| "Code".to_string()))
+        };
+        match self {
+            RprGroup::Style => rstyle(p) == rstyle(orig),
+            RprGroup::Font => p.font == orig.font,
+            RprGroup::Bold => p.bold == orig.bold,
+            RprGroup::Italic => p.italic == orig.italic,
+            RprGroup::Caps => p.caps == orig.caps,
+            RprGroup::SmallCaps => p.small_caps == orig.small_caps,
+            RprGroup::Strike => p.user_strike() == orig.strike,
+            RprGroup::Vanish => p.vanish == orig.vanish,
+            RprGroup::Color => match (&p.color, &orig.color) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                (a, b) => a.is_none() && b.is_none(),
+            },
+            RprGroup::Size => p.size_half_pts == orig.size_half_pts,
+            RprGroup::Highlight => p.highlight == orig.highlight,
+            RprGroup::Underline => p.user_underline() == orig.underline,
+            RprGroup::VertAlign => p.vert_align == orig.vert_align,
+            RprGroup::Rtl => p.rtl == orig.rtl,
+        }
+    }
+}
+
+/// An edited `w:rFonts`. A loaded element keeps its other script slots
+/// (`w:eastAsia`, `w:cs`, `w:hint`, their themes); the new font replaces the
+/// ASCII and high-ANSI slots, and their theme fonts, which would otherwise
+/// take precedence over it.
+fn rfonts_xml(font: Option<&str>, loaded: Option<&str>) -> Option<String> {
+    let mut attrs = loaded.map(element_attrs_of).unwrap_or_default();
+    attrs.retain(|(n, _)| {
+        !matches!(
+            n.as_str(),
+            "w:ascii" | "w:hAnsi" | "w:asciiTheme" | "w:hAnsiTheme"
+        )
+    });
+    if let Some(f) = font {
+        if loaded.is_some() {
+            attrs.insert(0, ("w:hAnsi".to_string(), f.to_string()));
+        }
+        attrs.insert(0, ("w:ascii".to_string(), f.to_string()));
+    }
+    (!attrs.is_empty()).then(|| empty_element("w:rFonts", &attrs))
+}
+
+/// A modeled `w:pPr` property (see [`RprGroup`]).
+#[derive(Clone, Copy)]
+enum PprGroup {
+    Style,
+    Frame,
+    Num,
+    Borders,
+    Tabs,
+    Rtl,
+    Spacing,
+    Ind,
+    Align,
+}
+
+impl PprGroup {
+    fn of(local: &str) -> Option<PprGroup> {
+        Some(match local {
+            "pStyle" => PprGroup::Style,
+            "framePr" => PprGroup::Frame,
+            "numPr" => PprGroup::Num,
+            "pBdr" => PprGroup::Borders,
+            "tabs" => PprGroup::Tabs,
+            "bidi" => PprGroup::Rtl,
+            "spacing" => PprGroup::Spacing,
+            "ind" => PprGroup::Ind,
+            "jc" => PprGroup::Align,
+            _ => return None,
+        })
+    }
+
+    fn unchanged(self, p: &ParProps, orig: &ParProps) -> bool {
+        let style = |r: &ParProps| {
+            r.style_id
+                .clone()
+                .or_else(|| r.heading_level.map(|l| format!("Heading{l}")))
+        };
+        let num = |r: &ParProps| r.num_id.map(|n| (n, r.ilvl));
+        match self {
+            PprGroup::Style => style(p) == style(orig),
+            PprGroup::Frame => p.frame == orig.frame,
+            PprGroup::Num => num(p) == num(orig),
+            PprGroup::Borders => p.borders == orig.borders,
+            PprGroup::Tabs => p.tabs == orig.tabs,
+            PprGroup::Rtl => p.rtl == orig.rtl,
+            PprGroup::Spacing => p.spacing == orig.spacing,
+            PprGroup::Ind => {
+                (p.indent, p.indent_right, p.first_line)
+                    == (orig.indent, orig.indent_right, orig.first_line)
+            }
+            PprGroup::Align => p.align == orig.align,
+        }
+    }
+}
+
+/// The `w:ind` for edited indents. Of a loaded element, each indent the edit
+/// left alone keeps its attributes as loaded (`w:start`, `w:leftChars`, …);
+/// a changed one drops every attribute that sets it (a `*Chars` value would
+/// override the new twips) and takes the model's value.
+fn ind_xml(props: &ParProps, loaded: Option<&str>, orig: Option<&ParProps>) -> Option<String> {
+    let mut attrs = loaded.map(element_attrs_of).unwrap_or_default();
+    let base = orig.cloned().unwrap_or_default();
+    let mut set = |changed: bool, family: &[&str], new: Option<(&str, i32)>| {
+        if changed {
+            attrs.retain(|(n, _)| !family.iter().any(|f| n.strip_prefix("w:") == Some(f)));
+            if let Some((name, v)) = new {
+                attrs.push((format!("w:{name}"), v.to_string()));
+            }
+        }
+    };
+    set(
+        props.indent != base.indent || loaded.is_none(),
+        &["left", "start", "leftChars", "startChars"],
+        (props.indent != 0).then_some(("left", props.indent)),
+    );
+    set(
+        props.indent_right != base.indent_right || loaded.is_none(),
+        &["right", "end", "rightChars", "endChars"],
+        (props.indent_right != 0).then_some(("right", props.indent_right)),
+    );
+    let first = match props.first_line.cmp(&0) {
+        std::cmp::Ordering::Greater => Some(("firstLine", props.first_line)),
+        std::cmp::Ordering::Less => Some(("hanging", -props.first_line)),
+        std::cmp::Ordering::Equal => None,
+    };
+    set(
+        props.first_line != base.first_line || loaded.is_none(),
+        &["firstLine", "hanging", "firstLineChars", "hangingChars"],
+        first,
+    );
+    (!attrs.is_empty()).then(|| empty_element("w:ind", &attrs))
+}
+
 /// Append a tracked-property record as the final child of its current property
 /// container. Every `*PrChange` is last in the corresponding CT_*Pr schema.
 /// Parsed containers have already had this child separated by the loader; the
@@ -371,11 +679,17 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || !props.spacing.is_empty()
         || !props.tabs.is_empty()
         || !props.raw_props.is_empty()
+        || !props.shadow.is_empty()
         || props.property_change.is_some()
         || props.section_property_change.is_some();
     if !has_any {
         return;
     }
+    // A property whose value is still the one its loaded elements give is
+    // written from them verbatim (#1063); an edited one is generated below.
+    let shadow = Shadow::new(&props.shadow, &props.raw_props);
+    let orig = (!props.shadow.is_empty()).then(|| crate::load::ppr_of_children(&props.shadow));
+    let kept = |g: PprGroup| orig.as_ref().is_some_and(|o| g.unchanged(props, o));
 
     // Assemble children as (schema rank, xml) then stable-sort, so modeled and
     // preserved children interleave in the order `CT_PPr` requires (e.g. a
@@ -383,13 +697,19 @@ fn write_ppr(s: &mut String, props: &ParProps) {
     // `w:ind`/`w:jc`, and a paragraph-mark `w:rPr` stays just before `sectPr`).
     let mut parts: Vec<(u32, String)> = Vec::new();
 
-    if let Some(st) = &style {
+    for raw in shadow.elements() {
+        let name = local_name(raw);
+        if PprGroup::of(name).is_some_and(kept) {
+            parts.push((ppr_rank(name), raw.to_string()));
+        }
+    }
+    if let Some(st) = style.as_ref().filter(|_| !kept(PprGroup::Style)) {
         let mut x = String::from("<w:pStyle w:val=\"");
         esc_attr(st, &mut x);
         x.push_str("\"/>");
         parts.push((ppr_rank("pStyle"), x));
     }
-    if let Some(f) = &props.frame {
+    if let Some(f) = props.frame.as_ref().filter(|_| !kept(PprGroup::Frame)) {
         let mut x = String::from("<w:framePr");
         // CT_FramePr's attribute order.
         let int = |x: &mut String, name: &str, v: Option<i32>| {
@@ -422,7 +742,7 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         x.push_str("/>");
         parts.push((ppr_rank("framePr"), x));
     }
-    if let Some(num) = props.num_id {
+    if let Some(num) = props.num_id.filter(|_| !kept(PprGroup::Num)) {
         parts.push((
             ppr_rank("numPr"),
             format!(
@@ -431,7 +751,7 @@ fn write_ppr(s: &mut String, props: &ParProps) {
             ),
         ));
     }
-    if props.borders.top.is_some() || props.borders.bottom.is_some() {
+    if (props.borders.top.is_some() || props.borders.bottom.is_some()) && !kept(PprGroup::Borders) {
         let mut x = String::from("<w:pBdr>");
         for (tag, side) in [
             ("w:top", props.borders.top),
@@ -447,7 +767,7 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         x.push_str("</w:pBdr>");
         parts.push((ppr_rank("pBdr"), x));
     }
-    if !props.tabs.is_empty() {
+    if !props.tabs.is_empty() && !kept(PprGroup::Tabs) {
         let mut x = String::from("<w:tabs>");
         for t in &props.tabs {
             let val = match t.align {
@@ -470,7 +790,7 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         x.push_str("</w:tabs>");
         parts.push((ppr_rank("tabs"), x));
     }
-    if !props.spacing.is_empty() {
+    if !props.spacing.is_empty() && !kept(PprGroup::Spacing) {
         let sp = &props.spacing;
         let mut x = String::from("<w:spacing");
         // Emitted in CT_Spacing schema order (Word ignores attribute order, but
@@ -508,43 +828,30 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         x.push_str("/>");
         parts.push((ppr_rank("spacing"), x));
     }
-    if props.indent != 0 || props.first_line != 0 || props.indent_right != 0 {
-        let mut x = String::from("<w:ind");
-        if props.indent != 0 {
-            x.push_str(&format!(" w:left=\"{}\"", props.indent));
+    if !kept(PprGroup::Ind) {
+        if let Some(x) = ind_xml(props, shadow.find("ind"), orig.as_ref()) {
+            parts.push((ppr_rank("ind"), x));
         }
-        if props.indent_right != 0 {
-            x.push_str(&format!(" w:right=\"{}\"", props.indent_right));
-        }
-        // firstLine and hanging are mutually exclusive; both are non-negative.
-        match props.first_line.cmp(&0) {
-            std::cmp::Ordering::Greater => {
-                x.push_str(&format!(" w:firstLine=\"{}\"", props.first_line))
-            }
-            std::cmp::Ordering::Less => {
-                x.push_str(&format!(" w:hanging=\"{}\"", -props.first_line))
-            }
-            std::cmp::Ordering::Equal => {}
-        }
-        x.push_str("/>");
-        parts.push((ppr_rank("ind"), x));
     }
     match props.align {
+        _ if kept(PprGroup::Align) => {}
         Align::Left => {}
         Align::Center => parts.push((ppr_rank("jc"), "<w:jc w:val=\"center\"/>".into())),
         Align::Right => parts.push((ppr_rank("jc"), "<w:jc w:val=\"right\"/>".into())),
         Align::Justify => parts.push((ppr_rank("jc"), "<w:jc w:val=\"both\"/>".into())),
     }
-    if props.rtl {
+    if props.rtl && !kept(PprGroup::Rtl) {
         parts.push((ppr_rank("bidi"), "<w:bidi/>".into()));
     }
     // Preserved unmodeled pPr children (paragraph-mark `w:rPr`, `outlineLvl`,
     // shading, spacing, …), each ranked by its own element name.
     for raw in &props.raw_props {
         let name = local_name(raw);
-        let superseded = matches!(name, "jc" if props.align != Align::Left)
-            || matches!(name, "bidi" if props.rtl)
-            || matches!(name, "pPrChange" if props.property_change.is_some());
+        let unedited = shadow.contains(raw) && PprGroup::of(name).is_some_and(kept);
+        let superseded = !unedited
+            && (matches!(name, "jc" if props.align != Align::Left)
+                || matches!(name, "bidi" if props.rtl)
+                || matches!(name, "pPrChange" if props.property_change.is_some()));
         if !superseded {
             parts.push((ppr_rank(name), raw.clone()));
         }
@@ -586,12 +893,12 @@ fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunText
     match item {
         Inline::Run(r) => write_run(s, r, text_kind),
         Inline::Tab(props) => {
-            s.push_str("<w:r>");
+            write_run_start(s, props);
             write_rpr(s, props);
             s.push_str("<w:tab/></w:r>");
         }
         Inline::Break(kind, props) => {
-            s.push_str("<w:r>");
+            write_run_start(s, props);
             write_rpr(s, props);
             match kind {
                 BreakKind::Line => s.push_str("<w:br/>"),
@@ -735,8 +1042,15 @@ pub(crate) fn run_xml(r: &Run) -> String {
     s
 }
 
+/// `<w:r …>` with the run's loaded start-tag attributes.
+fn write_run_start(s: &mut String, props: &RunProps) {
+    s.push_str("<w:r");
+    write_attrs(s, &props.element_attrs.0);
+    s.push('>');
+}
+
 fn write_run(s: &mut String, r: &Run, text_kind: RunTextKind) {
-    s.push_str("<w:r>");
+    write_run_start(s, &r.props);
     write_rpr(s, &r.props);
     match text_kind {
         RunTextKind::Normal => s.push_str("<w:t xml:space=\"preserve\">"),
@@ -824,66 +1138,96 @@ fn write_rpr(s: &mut String, p: &RunProps) {
         || p.font.is_some()
         || p.style_id.is_some()
         || !p.raw_props.is_empty()
+        || !p.shadow.is_empty()
         || p.property_change.is_some();
     if !has_any {
         return;
     }
     let mut parts: Vec<(u32, String)> = Vec::new();
+    // A property whose value is still the one its loaded elements give is
+    // written from them verbatim (#1063); an edited one is generated below,
+    // keeping what the model does not own of the element it replaces.
+    let shadow = Shadow::new(&p.shadow, &p.raw_props);
+    let orig = (!p.shadow.is_empty()).then(|| crate::load::rpr_of_children(&p.shadow));
+    let kept = |g: RprGroup| orig.as_ref().is_some_and(|o| g.unchanged(p, o));
+    for raw in shadow.elements() {
+        let name = local_name(raw);
+        if RprGroup::of(name).is_some_and(kept) {
+            parts.push((rpr_rank(name), raw.to_string()));
+        }
+    }
     // Inline code carries the "Code" character style unless a more specific
     // character style is already set (which then implies the code styling).
     let rstyle = p
         .style_id
         .as_deref()
         .or(if p.code { Some("Code") } else { None });
-    if let Some(st) = rstyle {
+    if let Some(st) = rstyle.filter(|_| !kept(RprGroup::Style)) {
         let mut xml = String::from("<w:rStyle w:val=\"");
         esc_attr(st, &mut xml);
         xml.push_str("\"/>");
         parts.push((rpr_rank("rStyle"), xml));
     }
-    if let Some(f) = &p.font {
-        let mut xml = String::from("<w:rFonts w:ascii=\"");
-        esc_attr(f, &mut xml);
-        xml.push_str("\"/>");
-        parts.push((rpr_rank("rFonts"), xml));
+    if !kept(RprGroup::Font) {
+        if let Some(xml) = rfonts_xml(p.font.as_deref(), shadow.find("rFonts")) {
+            parts.push((rpr_rank("rFonts"), xml));
+        }
     }
-    if p.bold {
-        parts.push((rpr_rank("b"), "<w:b/>".to_string()));
+    // A toggle and its complex-script twin are one property: an edit writes
+    // both (when the twin was there) or neither, never a stale twin that
+    // would turn the toggle back on at the next load.
+    for (on, group, name, twin) in [
+        (p.bold, RprGroup::Bold, "b", "bCs"),
+        (p.italic, RprGroup::Italic, "i", "iCs"),
+    ] {
+        if on && !kept(group) {
+            parts.push((rpr_rank(name), format!("<w:{name}/>")));
+            if shadow.find(twin).is_some() {
+                parts.push((rpr_rank(twin), format!("<w:{twin}/>")));
+            }
+        }
     }
-    if p.italic {
-        parts.push((rpr_rank("i"), "<w:i/>".to_string()));
-    }
-    if p.caps {
+    if p.caps && !kept(RprGroup::Caps) {
         parts.push((rpr_rank("caps"), "<w:caps/>".to_string()));
     }
-    if p.small_caps {
+    if p.small_caps && !kept(RprGroup::SmallCaps) {
         parts.push((rpr_rank("smallCaps"), "<w:smallCaps/>".to_string()));
     }
-    if strike {
+    if strike && !kept(RprGroup::Strike) {
         parts.push((rpr_rank("strike"), "<w:strike/>".to_string()));
     }
-    if p.vanish {
+    if p.vanish && !kept(RprGroup::Vanish) {
         parts.push((rpr_rank("vanish"), "<w:vanish/>".to_string()));
     }
-    if let Some(c) = &p.color {
-        let mut xml = String::from("<w:color w:val=\"");
-        esc_attr(c, &mut xml);
-        xml.push_str("\"/>");
-        parts.push((rpr_rank("color"), xml));
+    if let Some(c) = p.color.as_ref().filter(|_| !kept(RprGroup::Color)) {
+        // The theme attributes would override the new value: drop them.
+        let mut attrs = shadow.attrs("color");
+        attrs.retain(|(n, _)| {
+            !matches!(
+                n.as_str(),
+                "w:val" | "w:themeColor" | "w:themeShade" | "w:themeTint"
+            )
+        });
+        attrs.insert(0, ("w:val".to_string(), c.clone()));
+        parts.push((rpr_rank("color"), empty_element("w:color", &attrs)));
     }
-    if let Some(sz) = p.size_half_pts {
+    if let Some(sz) = p.size_half_pts.filter(|_| !kept(RprGroup::Size)) {
         parts.push((rpr_rank("sz"), format!("<w:sz w:val=\"{sz}\"/>")));
+        if shadow.find("szCs").is_some() {
+            parts.push((rpr_rank("szCs"), format!("<w:szCs w:val=\"{sz}\"/>")));
+        }
     }
-    if let Some(h) = &p.highlight {
+    if let Some(h) = p.highlight.as_ref().filter(|_| !kept(RprGroup::Highlight)) {
         let mut xml = String::from("<w:highlight w:val=\"");
         esc_attr(h, &mut xml);
         xml.push_str("\"/>");
         parts.push((rpr_rank("highlight"), xml));
     }
-    if underline {
+    if underline && !kept(RprGroup::Underline) {
         parts.push((rpr_rank("u"), "<w:u w:val=\"single\"/>".to_string()));
     }
     match p.vert_align {
+        _ if kept(RprGroup::VertAlign) => {}
         VertAlign::Baseline => {}
         VertAlign::Superscript => parts.push((
             rpr_rank("vertAlign"),
@@ -894,7 +1238,7 @@ fn write_rpr(s: &mut String, p: &RunProps) {
             "<w:vertAlign w:val=\"subscript\"/>".to_string(),
         )),
     }
-    if p.rtl {
+    if p.rtl && !kept(RprGroup::Rtl) {
         parts.push((rpr_rank("rtl"), "<w:rtl/>".to_string()));
     }
     // Explicit-off toggles are retained as raw children so they remain distinct
@@ -902,19 +1246,22 @@ fn write_rpr(s: &mut String, p: &RunProps) {
     // property wins without emitting a contradictory duplicate.
     for raw in &p.raw_props {
         let name = local_name(raw);
-        let superseded = matches!(name, "b" if p.bold)
-            || matches!(name, "i" if p.italic)
-            || matches!(name, "caps" if p.caps)
-            || matches!(name, "smallCaps" if p.small_caps)
-            || matches!(name, "strike" if strike)
-            || matches!(name, "vanish" if p.vanish)
-            || matches!(name, "color" if p.color.is_some())
-            || matches!(name, "sz" if p.size_half_pts.is_some())
-            || matches!(name, "highlight" if p.highlight.is_some())
-            || matches!(name, "u" if underline)
-            || matches!(name, "vertAlign" if p.vert_align != VertAlign::Baseline)
-            || matches!(name, "rtl" if p.rtl)
-            || matches!(name, "rPrChange" if p.property_change.is_some());
+        // A loaded explicit-off toggle whose property is unedited stays.
+        let unedited = shadow.contains(raw) && RprGroup::of(name).is_some_and(kept);
+        let superseded = !unedited
+            && (matches!(name, "b" if p.bold)
+                || matches!(name, "i" if p.italic)
+                || matches!(name, "caps" if p.caps)
+                || matches!(name, "smallCaps" if p.small_caps)
+                || matches!(name, "strike" if strike)
+                || matches!(name, "vanish" if p.vanish)
+                || matches!(name, "color" if p.color.is_some())
+                || matches!(name, "sz" if p.size_half_pts.is_some())
+                || matches!(name, "highlight" if p.highlight.is_some())
+                || matches!(name, "u" if underline)
+                || matches!(name, "vertAlign" if p.vert_align != VertAlign::Baseline)
+                || matches!(name, "rtl" if p.rtl)
+                || matches!(name, "rPrChange" if p.property_change.is_some()));
         if !superseded {
             parts.push((rpr_rank(name), raw.clone()));
         }
@@ -1243,7 +1590,9 @@ fn write_sdt_close(s: &mut String, raw: &str, content_needs_close: bool) {
 }
 
 fn write_row(s: &mut String, row: &Row) {
-    s.push_str("<w:tr>");
+    s.push_str("<w:tr");
+    write_attrs(s, &row.element_attrs.0);
+    s.push('>');
     // trPr / tblPrEx precede the cells; preserved verbatim.
     let mut wrote_change = false;
     for raw in &row.raw_props {
@@ -1354,9 +1703,48 @@ mod tests {
     use super::*;
     use crate::load::{Relationships, parse_document_xml, parse_rels_xml};
 
+    /// `doc` saved and loaded again. The loaded copy's shadows (its modeled
+    /// properties' verbatim elements, #1063) are cleared: a document built in
+    /// code has none, and the round trip is about the modeled values.
     fn roundtrip(doc: &Document, rels: &Relationships) -> Document {
         let xml = document_to_xml(doc);
-        parse_document_xml(&xml, rels)
+        let mut doc = parse_document_xml(&xml, rels);
+        clear_shadows(&mut doc.body);
+        doc
+    }
+
+    fn clear_shadows(blocks: &mut [Block]) {
+        fn inlines(content: &mut [Inline]) {
+            for i in content {
+                match i {
+                    Inline::Run(r) => r.props.shadow.clear(),
+                    Inline::Tab(p) | Inline::Break(_, p) => p.shadow.clear(),
+                    Inline::Hyperlink(h) => {
+                        h.runs.iter_mut().for_each(|r| r.props.shadow.clear());
+                        inlines(&mut h.content);
+                    }
+                    Inline::Revision { content, .. } => inlines(content),
+                    Inline::TextBox { blocks, .. } => clear_shadows(blocks),
+                    _ => {}
+                }
+            }
+        }
+        for b in blocks {
+            match b {
+                Block::Paragraph(p) => {
+                    p.props.shadow.clear();
+                    inlines(&mut p.content);
+                }
+                Block::Table(t) => {
+                    for row in &mut t.rows {
+                        for cell in &mut row.cells {
+                            clear_shadows(&mut cell.blocks);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn run(text: &str, props: RunProps) -> Inline {
@@ -1490,6 +1878,7 @@ mod tests {
                 cells: vec![cell],
                 raw_props: vec!["<w:trPr><w:trHeight w:val=\"300\"/></w:trPr>".to_string()],
                 property_change: None,
+                ..Row::default()
             }],
             namespace_declarations: vec![],
             markup_compatibility_attributes: vec![],
@@ -1656,10 +2045,7 @@ mod tests {
             _ => panic!("no paragraph"),
         }
         // Round-trips (the w:anchor survives).
-        assert_eq!(
-            parse_document_xml(&document_to_xml(&d), &Relationships::default()),
-            d
-        );
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
 
         // A TOC entry (internal link carrying a tab) keeps the tab at top level
         // (so its leader dots still render) AND stays navigable: the text on each
@@ -1688,10 +2074,7 @@ mod tests {
             _ => panic!("no paragraph"),
         }
         // Round-trips within the model.
-        assert_eq!(
-            parse_document_xml(&document_to_xml(&d2), &Relationships::default()),
-            d2
-        );
+        assert_eq!(roundtrip(&d2, &Relationships::default()), d2);
     }
 
     /// A Word TOC entry: text, then a webHidden tab and page number.

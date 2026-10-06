@@ -313,6 +313,8 @@ pub fn template_row(row: &Row) -> Row {
         cells: row.cells.iter().map(template_cell).collect(),
         raw_props,
         property_change: None,
+        // The template's rsids; a repeated `w14:paraId` is dropped on save.
+        element_attrs: row.element_attrs.clone(),
     }
 }
 
@@ -513,6 +515,7 @@ mod tests {
                 .collect(),
             raw_props: trpr.map(|t| vec![t.to_string()]).unwrap_or_default(),
             property_change: None,
+            ..Row::default()
         }
     }
 

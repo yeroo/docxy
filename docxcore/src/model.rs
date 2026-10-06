@@ -32,6 +32,36 @@ pub struct TrackedInsert {
     pub metadata: RevisionMetadata,
 }
 
+/// Attributes of a modeled element's start tag (`w:p`, `w:r`, `w:tr`) that the
+/// model does not interpret: revision-session ids (`w:rsidR`, `w:rsidRPr`, …),
+/// `w14:paraId`/`w14:textId`, scoped namespace declarations. Decoded
+/// `(qualified name, value)` pairs in source order, written back on save
+/// (#1063).
+///
+/// This is preservation data, never formatting: equality always holds, so two
+/// runs that differ only in their rsids still merge, extend and compare as the
+/// same formatting.
+#[derive(Debug, Clone, Default)]
+pub struct ElementAttrs(pub Vec<(String, String)>);
+
+impl PartialEq for ElementAttrs {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ElementAttrs {}
+
+impl std::hash::Hash for ElementAttrs {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
+}
+
+impl ElementAttrs {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Character-level formatting (a resolved `w:rPr`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RunProps {
@@ -64,6 +94,15 @@ pub struct RunProps {
     /// toggles that must remain distinct from an absent/style-derived value.
     /// Preserved children are re-emitted in schema order.
     pub raw_props: Vec<String>,
+    /// Verbatim XML of the *modeled* `w:rPr` children as loaded (`w:b`,
+    /// `w:bCs`, `w:rFonts`, `w:sz`, `w:szCs`, `w:color`, …). On save, a
+    /// property whose modeled value still equals the one these parse to is
+    /// written from here, so attributes and pairs the model does not represent
+    /// (`w:rFonts w:hAnsi`, `w:color w:themeColor`, `w:szCs`) survive; an
+    /// edited property is generated from the model instead (#1063).
+    pub shadow: Vec<String>,
+    /// The `w:r` start tag's attributes (`w:rsidR`, `w:rsidRPr`, …).
+    pub element_attrs: ElementAttrs,
     /// A tracked `w:rPrChange`, when present. The owning `RunProps` is the
     /// current state; `previous` on the change retains the prior snapshot.
     pub property_change: Option<PropertyChange>,
@@ -548,6 +587,17 @@ pub struct ParProps {
     /// direct-left `w:jc` and disabled `w:bidi`. Preserved so save does not
     /// confuse a direct override with style inheritance.
     pub raw_props: Vec<String>,
+    /// Verbatim XML of the *modeled* `w:pPr` children as loaded (`w:pStyle`,
+    /// `w:jc`, `w:ind`, `w:tabs`, `w:pBdr`, `w:numPr`, …). On save, a property
+    /// whose modeled value still equals the one these parse to is written from
+    /// here, so what the model does not represent (`w:ind w:firstLineChars`,
+    /// clear tabs, left/right borders) survives; an edited property is
+    /// generated from the model instead (#1063).
+    pub shadow: Vec<String>,
+    /// The `w:p` start tag's attributes (`w:rsidR`, `w14:paraId`, …). Kept on
+    /// the paragraph properties so a split or copied paragraph carries them;
+    /// a duplicated `w14:paraId` is dropped when the part is written.
+    pub element_attrs: ElementAttrs,
     /// A tracked `w:pPrChange`; the remaining fields are the current state.
     pub property_change: Option<PropertyChange>,
     /// A `w:sectPrChange` nested in this paragraph's section-break properties.
@@ -862,6 +912,8 @@ pub struct Row {
     /// the first/last wrapped row.
     pub raw_props: Vec<String>,
     pub property_change: Option<PropertyChange>,
+    /// The `w:tr` start tag's attributes (`w:rsidR`, `w:rsidTr`, `w14:paraId`, …).
+    pub element_attrs: ElementAttrs,
 }
 
 /// An invisible table child anchored at the gap before `rows[at]` (or after the

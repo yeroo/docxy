@@ -119,6 +119,16 @@ fn decode_attr(raw: &str) -> String {
     s
 }
 
+/// The start tag's attributes at the parser's current Start event, decoded.
+fn element_attrs(p: &XmlParser) -> ElementAttrs {
+    ElementAttrs(
+        p.attrs()
+            .iter()
+            .map(|a| (a.name.to_string(), decode_attr(a.value)))
+            .collect(),
+    )
+}
+
 fn parse_int(s: &str) -> i32 {
     let b = s.as_bytes();
     let mut v = 0i32;
@@ -774,6 +784,7 @@ fn parse_blocks_until_end(p: &mut XmlParser, rels: &Relationships) -> Vec<Block>
 
 fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
     let mut para = Paragraph::default();
+    para.props.element_attrs = element_attrs(p);
     let mut fields = FieldCollapse::default();
     loop {
         match p.next() {
@@ -1489,7 +1500,10 @@ pub fn parse_textbox_blocks(raw: &str) -> Vec<Block> {
 
 fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
     loop {
-        match p.next() {
+        let event = p.next();
+        let shadow =
+            (event == Event::Start && SHADOW_PPR.contains(&p.name())).then(|| p.start_pos());
+        match event {
             Event::Start => match p.name() {
                 "w:pStyle" => {
                     let v = decode_attr(p.attr("w:val"));
@@ -1604,6 +1618,9 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
+        if let Some(start) = shadow {
+            props.shadow.push(p.raw_slice(start, p.pos()).to_string());
+        }
     }
 }
 
@@ -1708,7 +1725,10 @@ fn parse_numpr(p: &mut XmlParser, props: &mut ParProps) {
 /// true if the run held significant content we don't model (a drawing, field,
 /// embedded object, …) — in which case the caller preserves the whole run raw.
 fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
-    let mut props = RunProps::default();
+    let mut props = RunProps {
+        element_attrs: element_attrs(p),
+        ..RunProps::default()
+    };
     let mut had_raw = false;
     loop {
         match p.next() {
@@ -1785,18 +1805,15 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                         props.bold = toggle_on(val);
                         modeled = props.bold;
                     }
-                    "w:bCs" => {
-                        props.bold = toggle_on(val);
-                        modeled = false;
-                    }
+                    // The complex-script twins stay out of `raw_props`: the
+                    // shadow pairs them with their primary property, so an
+                    // edit to it rewrites or drops them together (#1063).
+                    "w:bCs" => props.bold = toggle_on(val),
                     "w:i" => {
                         props.italic = toggle_on(val);
                         modeled = props.italic;
                     }
-                    "w:iCs" => {
-                        props.italic = toggle_on(val);
-                        modeled = false;
-                    }
+                    "w:iCs" => props.italic = toggle_on(val),
                     "w:u" => {
                         props.underline = toggle_on(val);
                         modeled = props.underline;
@@ -1805,10 +1822,7 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                         props.strike = toggle_on(val);
                         modeled = props.strike;
                     }
-                    "w:dstrike" => {
-                        props.strike = toggle_on(val);
-                        modeled = false;
-                    }
+                    "w:dstrike" => props.strike = toggle_on(val),
                     "w:caps" => {
                         props.caps = toggle_on(val);
                         modeled = props.caps;
@@ -1876,16 +1890,78 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                     _ => modeled = false,
                 }
                 p.skip_element();
+                let raw = p.raw_slice(start, p.pos());
+                if SHADOW_RPR.contains(&name) {
+                    props.shadow.push(raw.to_string());
+                }
                 if !modeled {
-                    props
-                        .raw_props
-                        .push(p.raw_slice(start, p.pos()).to_string());
+                    props.raw_props.push(raw.to_string());
                 }
             }
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
     }
+}
+
+/// The `w:rPr` children the model reads a value from. Each is also kept
+/// verbatim in [`RunProps::shadow`], so save can write an unedited property
+/// exactly as loaded (#1063).
+pub(crate) const SHADOW_RPR: &[&str] = &[
+    "w:rStyle",
+    "w:rFonts",
+    "w:b",
+    "w:bCs",
+    "w:i",
+    "w:iCs",
+    "w:caps",
+    "w:smallCaps",
+    "w:strike",
+    "w:dstrike",
+    "w:vanish",
+    "w:color",
+    "w:sz",
+    "w:szCs",
+    "w:highlight",
+    "w:u",
+    "w:vertAlign",
+    "w:rtl",
+];
+
+/// The `w:pPr` children the model reads a value from, kept verbatim in
+/// [`ParProps::shadow`] (#1063).
+pub(crate) const SHADOW_PPR: &[&str] = &[
+    "w:pStyle",
+    "w:framePr",
+    "w:numPr",
+    "w:pBdr",
+    "w:tabs",
+    "w:bidi",
+    "w:spacing",
+    "w:ind",
+    "w:jc",
+];
+
+/// The run properties `children` (verbatim `w:rPr` children) parse to.
+pub(crate) fn rpr_of_children(children: &[String]) -> RunProps {
+    let xml = format!("<w:rPr>{}</w:rPr>", children.concat());
+    let mut p = XmlParser::new(&xml);
+    let mut props = RunProps::default();
+    if p.next() == Event::Start {
+        parse_rpr(&mut p, &mut props);
+    }
+    props
+}
+
+/// The paragraph properties `children` (verbatim `w:pPr` children) parse to.
+pub(crate) fn ppr_of_children(children: &[String]) -> ParProps {
+    let xml = format!("<w:pPr>{}</w:pPr>", children.concat());
+    let mut p = XmlParser::new(&xml);
+    let mut props = ParProps::default();
+    if p.next() == Event::Start {
+        parse_ppr(&mut p, &mut props);
+    }
+    props
 }
 
 /// Parse a `<w:hyperlink>`, pushing into `out`. External links and internal
@@ -2383,7 +2459,10 @@ fn parse_tblgrid(p: &mut XmlParser, grid: &mut Vec<u32>) {
 }
 
 fn parse_row(p: &mut XmlParser, rels: &Relationships) -> Row {
-    let mut row = Row::default();
+    let mut row = Row {
+        element_attrs: element_attrs(p),
+        ..Row::default()
+    };
     parse_cells_into(
         p,
         rels,

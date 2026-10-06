@@ -1530,8 +1530,11 @@ impl Editor {
     pub fn clear_run_formatting(&mut self) {
         self.map_props(|p| {
             let highlight = p.highlight.take();
+            // The run's rsids are bookkeeping, not formatting.
+            let element_attrs = std::mem::take(&mut p.element_attrs);
             *p = RunProps::default();
             p.highlight = highlight;
+            p.element_attrs = element_attrs;
         });
     }
 
