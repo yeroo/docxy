@@ -45,7 +45,8 @@ Supported verbs are `proj.path`, `task.list`, `task.get`, `task.fields`, `task.s
 `proj.save`, `proj.reload`, `proj.open` and `proj.new`, with the yppxy
 argument/result shapes, plus `app-info` (the build: version, commit, last merged PR, kind, `manual`; #1023). `proj.path` additionally
 reports `tab`, `imported`, `cell` (active column name), `cell_row` (zero-based row),
-and `cell_edit` (pending cell buffer, or `null` when closed). Reads and rejected
+`cell_edit` (pending cell buffer, or `null` when closed) and `selection` (the
+entry-table range's cell count, or `null`; #560). Reads and rejected
 edits leave selection, prompts, pending cell edits, history and scroll unchanged.
 Successful edits use the live editor's undo stack, reschedule, cancel the target's
 prompt, discard its uncommitted cell edit, and repaint. Successful `proj.reload`

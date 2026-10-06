@@ -452,9 +452,9 @@ mouse drag over the cells, Shift+click, or a click on a task's ID cell (the
 whole row, like Project's row header) selects too, and any other key, click
 or command clears it. Ctrl+C copies the range as TSV — one line per shown
 row, each field a cell's edit text with tabs and line breaks inside a field
-turned to spaces — and Ctrl+X copies it, then clears Name, Predecessors and
-Resource Names of the range's tasks as one undo step; Ctrl+V pastes from the
-range's top-left. With 2+ rows selected, Ctrl+F2 links the tasks
+turned to spaces — and Ctrl+X copies it, then clears whichever of Name,
+Predecessors and Resource Names the range covers, as one undo step; Ctrl+V
+pastes from the range's top-left. With 2+ rows selected, Ctrl+F2 links the tasks
 finish-to-start in row order and Ctrl+Shift+F2 unlinks them, each one undo
 step, the selection kept (#558). Pasting whole rows so that it inserts tasks
 is not done yet (its own issue).

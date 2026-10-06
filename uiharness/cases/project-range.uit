@@ -70,6 +70,15 @@ test a drag selects the rectangle and the release-click keeps it
   assert reply.tasks.2.name is A
   assert reply.tasks.3.name is B
 
+test a click leaves no drag armed, so hovering never extends a range
+  open copy:../fixtures/project-clipboard.xml
+  call pointer-click {"region":"cell:C1"}
+  # A hover with no button held: the cursor stays and no range forms, which
+  # only holds if the release ended the press's drag.
+  call pointer-move {"to":"cell:C2"}
+  assert cell_row is 0
+  assert selection is none
+
 test shift+click extends the range from the cursor
   open copy:../fixtures/project-clipboard.xml
   call click-cell {"cell":"C1"}
@@ -103,7 +112,7 @@ test ctrl+f2 links the selected rows and ctrl+shift+f2 unlinks them
   assert selection is 16
   key ctrl+f2
   call status-read {}
-  assert reply.items.2.text is Linked 1 tasks
+  assert reply.items.2.text is Added 1 link
   call task.list {}
   assert reply.tasks.1.predecessors.0.uid is 1
   assert selection is 16

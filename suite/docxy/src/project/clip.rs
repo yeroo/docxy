@@ -49,14 +49,15 @@ pub(crate) fn project_copy_text(v: &ProjectView) -> String {
     }
 }
 
-/// Clear the copied cells after the host copied them. A range: Name,
-/// Predecessors and Resource Names of every task in it clear as one undo
-/// step (other columns keep their value, Cut never deletes a task, a blank
-/// row is skipped, and a field that cannot clear cancels the whole cut,
-/// naming the cell); the range has no such column when only the copy
-/// happened — the status says so. Otherwise the cursor cell: Delete's
-/// clear, as one undo step, on Name, Predecessors and Resource Names; other
-/// columns keep their value, and Cut never deletes the task, even on its ID.
+/// Clear the copied cells after the host copied them. A range: whichever of
+/// Name, Predecessors and Resource Names the range covers clear for every
+/// task in it, as one undo step (other columns keep their value, Cut never
+/// deletes a task, a blank row is skipped, and a field that cannot clear
+/// cancels the whole cut, naming the cell). When the range covers none of
+/// them, only the copy happens — the status says so. Otherwise the cursor
+/// cell: Delete's clear, as one undo step, on Name, Predecessors and
+/// Resource Names; other columns keep their value, and Cut never deletes the
+/// task, even on its ID.
 pub(crate) fn project_cut(tab: &mut DocTab) {
     let Surface::Project(v) = &mut tab.surface else {
         return;
