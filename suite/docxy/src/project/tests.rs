@@ -793,6 +793,123 @@ fn navigation_clamps_and_preserves_dirty_state_even_on_an_empty_project() {
 }
 
 #[test]
+fn page_down_and_up_move_a_screen_of_rows_and_clamp() {
+    let mut t = new_project_tab();
+    for i in 0..100 {
+        view_mut(&mut t)
+            .ed
+            .add_task(None, &format!("Task {i}"), 480, false)
+            .unwrap();
+    }
+    view_mut(&mut t).page_rows = 10;
+    // Programmatic adds leave the latched entry row; Ctrl+Up takes the cursor
+    // to the first task, as the oracle test's sequence does.
+    let press = |t: &mut DocTab, key: &str| match key.strip_prefix("ctrl-") {
+        Some(key) => view_mut(t).ctrl_key(key),
+        None => view_mut(t).key(key, false),
+    };
+    assert!(press(&mut t, "ctrl-up"));
+    for (key, cursor, selected) in [
+        ("pagedown", 10, 10),
+        ("pageup", 0, 0),
+        ("pageup", 0, 0),
+        ("ctrl-down", 99, 99),
+        ("pagedown", 100, 99),
+        ("pageup", 90, 90),
+    ] {
+        assert!(press(&mut t, key), "{key}");
+        assert_eq!(
+            (view(&t).cursor_row(), view(&t).ed.sel()),
+            (cursor, selected),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn paging_skips_rows_under_collapsed_summaries() {
+    let mut p = untitled_project();
+    p.tasks = (0..20)
+        .map(|i| Task {
+            uid: i + 1,
+            id: i + 1,
+            name: format!("Task {i}"),
+            // Tasks 1..=5 are the summary's children, hidden once it collapses.
+            outline_level: if (1..=5).contains(&i) { 2 } else { 1 },
+            duration_min: 480,
+            ..Task::default()
+        })
+        .collect();
+    let mut t = project_tab(
+        "outline.yppx".into(),
+        None,
+        Surface::Project(ProjectView::new(p, false)),
+        false,
+        "loaded".into(),
+    );
+    view_mut(&mut t).ed.set_collapsed(1, true).unwrap();
+    view_mut(&mut t).page_rows = 3;
+    assert!(view_mut(&mut t).ctrl_key("up"));
+    assert!(view_mut(&mut t).key("pagedown", false));
+    // Visible rows are [0, 6, 7, 8, ...]: three visible steps from the summary
+    // land on task 8; three raw task indexes would land on the hidden task 3.
+    assert_eq!((view(&t).cursor_row(), view(&t).display_row()), (8, 3));
+    assert!(view(&t).ed.visible_rows().contains(&view(&t).ed.sel()));
+    assert!(view_mut(&mut t).key("pageup", false));
+    assert_eq!((view(&t).cursor_row(), view(&t).display_row()), (0, 0));
+}
+
+#[test]
+fn paging_keeps_the_column_and_leaves_the_plan_untouched() {
+    let mut t = new_project_tab();
+    for i in 0..20 {
+        view_mut(&mut t)
+            .ed
+            .add_task(None, &format!("Task {i}"), 480, false)
+            .unwrap();
+    }
+    view_mut(&mut t).page_rows = 7;
+    view_mut(&mut t).ctrl_key("up");
+    view_mut(&mut t).key("right", false);
+    let col = view(&t).col;
+    let tasks = view(&t).ed.project().tasks.len();
+    let dirty = view(&t).ed.dirty();
+    let undo = view(&t).ed.undo_depth();
+    for key in ["pagedown", "pageup"] {
+        assert!(view_mut(&mut t).key(key, false), "{key}");
+        assert_eq!(view(&t).col, col, "{key}");
+        assert_eq!(view(&t).ed.project().tasks.len(), tasks, "{key}");
+        assert_eq!(view(&t).ed.dirty(), dirty, "{key}");
+        assert_eq!(view(&t).ed.undo_depth(), undo, "{key}");
+    }
+}
+
+#[test]
+fn paging_on_an_empty_plan_stays_on_the_entry_row() {
+    let mut t = new_project_tab();
+    for key in ["pagedown", "pageup"] {
+        assert!(view_mut(&mut t).key(key, false), "{key}");
+        assert!(view(&t).on_entry_row());
+        assert_eq!(view(&t).cursor_row(), 0);
+    }
+}
+
+#[test]
+fn page_rows_for_fits_whole_rows_minus_one() {
+    assert_eq!(page_rows_for(280.), 9);
+    assert_eq!(
+        page_rows_for(28.),
+        1,
+        "one whole row, less one, clamps to 1"
+    );
+    assert_eq!(
+        page_rows_for(10.),
+        1,
+        "a height under one row still pages by one"
+    );
+}
+
+#[test]
 fn the_task_mode_column_names_each_tasks_mode_and_is_blank_on_a_blank_row() {
     let xml = std::fs::read_to_string(corpus("20-task-fields.xml")).unwrap();
     let mut ed = ProjectEditor::new(mspdi::read_mspdi(&xml).unwrap());

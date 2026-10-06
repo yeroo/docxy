@@ -1,0 +1,21 @@
+# PageUp/PageDown step the cell cursor a screen of rows, as in Project (#554).
+# gantt-scroll.xml has 100 flat tasks. The harness window's project-body shows
+# 17 rows, so paging steps 16; past the last task the cursor lands on the
+# entry row (selected_task 100, one past the last task).
+test project paging moves the cursor a screen of rows
+  open ../fixtures/gantt-scroll.xml
+  assert selected_task is 0
+  key pagedown
+  assert selected_task is 16
+  key pagedown
+  assert selected_task is 32
+  key pageup
+  assert selected_task is 16
+  key pageup
+  assert selected_task is 0
+  key pagedown pagedown pagedown pagedown pagedown pagedown
+  assert selected_task is 96
+  key pagedown
+  assert selected_task is 100
+  key pageup
+  assert selected_task is 84
