@@ -1225,11 +1225,12 @@ fn shift_enter_on_new_entry_row_matches_up() {
 #[test]
 fn shift_enter_with_invalid_value_keeps_the_edit() {
     let mut t = tab();
+    key(&mut t, "down");
     edit(&mut t, COL_DURATION, "abc");
     shift_key(&mut t, "enter");
     assert_eq!(v(&t).cell.as_ref().map(|c| c.buf.as_str()), Some("abc"));
     assert!(t.status.contains("Invalid duration"), "{}", t.status);
-    assert_eq!(v(&t).cursor_row(), 0);
+    assert_eq!(v(&t).cursor_row(), 1);
     assert_eq!(v(&t).ed.undo_depth(), 0);
     assert!(!t.dirty);
 }
