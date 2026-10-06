@@ -103,6 +103,7 @@ ext:footer & header/40101 2004.Rules and Regulations of the Board of Regents.doc
 ext:footer & header/40101 2004.Rules and Regulations of the Board of Regents.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
+ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:noBreakHyphen
 ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr/w:color
 ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr/w:i
 ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr/w:lang
@@ -119,10 +120,7 @@ ext:footer & header/Business Plan for a Startup Business_July.docx	word/document
 ext:footer & header/Business Plan for a Startup Business_July.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r/w:lastRenderedPageBreak
 ext:footer & header/Business Plan for a Startup Business_July.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:footer & header/Outreach_Toolkit_2007_After_the_Flood_Fact_Sheet[1].docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
-ext:hyperlink for splitPara/632404333468899776 PFVI_Nutrition.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:hyperlink for splitPara/632404333468899776 PFVI_Nutrition.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
-ext:hyperlink for splitPara/632404333468899776 PFVI_Nutrition.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:t/text()
-ext:hyperlink for splitPara/632404333468899776 PFVI_Nutrition.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r/w:t
 ext:hyperlink for splitPara/Hyperlink - internal.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:hyperlink/632399205748969391 Moon Tregillus.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:hyperlink/632399205748969391 Moon Tregillus.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
@@ -134,13 +132,11 @@ ext:hyperlink/632399964516872542 1.docx	word/document.xml	lost-element	/w:docume
 ext:hyperlink/632399964516872542 1.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
 ext:hyperlink/632399964516872542 1.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:t/text()
 ext:hyperlink/632399964516872542 1.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-ext:hyperlink/632404333468899776 PFVI_Nutrition.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:hyperlink/632404333468899776 PFVI_Nutrition.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
-ext:hyperlink/632404333468899776 PFVI_Nutrition.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:t/text()
-ext:hyperlink/632404333468899776 PFVI_Nutrition.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r/w:t
 ext:hyperlink/Hyperlink - internal.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:mixed features/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:mixed features/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
+ext:mixed features/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:noBreakHyphen
 ext:mixed features/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr/w:color
 ext:mixed features/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr/w:i
 ext:mixed features/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr/w:lang

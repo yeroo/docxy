@@ -418,3 +418,30 @@ fn a_leading_or_sole_soft_hyphen_keeps_the_start_caret_stop() {
     assert_eq!(lead.first(), Some(&(0, 0)), "{lead:?}");
     assert_eq!(lead.last(), Some(&(4, 3)), "{lead:?}");
 }
+
+/// BackgroundReport's paragraph 122 (CI, #1101): a tab run, a
+/// `lastRenderedPageBreak` run and plain runs, then a run that starts with
+/// the hyphen. The save splits the tab run (#1069), but the hyphen run comes
+/// back exactly as it was.
+#[test]
+fn a_hyphen_first_run_after_restructured_runs_saves_as_it_was() {
+    const SZ: &str = "<w:rPr><w:sz w:val=\"22\"/></w:rPr>";
+    let doc = load(&format!(
+        "<w:p><w:pPr><w:jc w:val=\"both\"/>{SZ}</w:pPr>\
+         <w:r>{SZ}<w:t>122.</w:t></w:r>\
+         <w:r>{SZ}<w:tab/><w:t xml:space=\"preserve\">Some ITU work in its </w:t></w:r>\
+         <w:r>{SZ}<w:lastRenderedPageBreak/><w:t>standardization groups, and educationa</w:t></w:r>\
+         <w:r>{SZ}<w:t>l work, in conjunction with op</w:t></w:r>\
+         <w:r>{SZ}<w:t>erators, is proceeding within ITU</w:t></w:r>\
+         <w:r>{SZ}<w:noBreakHyphen/><w:t>T Study Group 6.</w:t></w:r></w:p>"
+    ));
+    assert!(para_text(&doc).ends_with("within ITU\u{2011}T Study Group 6."));
+    let p = saved_para(&doc);
+    assert_eq!(p.matches("<w:noBreakHyphen/>").count(), 1, "{p}");
+    assert!(
+        p.ends_with(&format!(
+            "<w:r>{SZ}<w:noBreakHyphen/><w:t xml:space=\"preserve\">T Study Group 6.</w:t></w:r></w:p>"
+        )),
+        "{p}"
+    );
+}
