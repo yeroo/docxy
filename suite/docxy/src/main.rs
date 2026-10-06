@@ -31207,6 +31207,10 @@ impl Render for Docxy {
                 // tabs, outside the window) ends here; idempotent, so the grid's
                 // own handler having run first costs nothing.
                 this.grid_release(cx);
+                // A Project cell drag released off the table ends the same way.
+                if let Some(tab) = this.tabs.get_mut(this.active) {
+                    crate::project_cell_release(tab);
+                }
                 if this.selecting {
                     this.selecting = false;
                     let has_sel = matches!(this.tabs.get(this.active).map(|t| &t.surface), Some(Surface::Doc(ed)) if ed.has_selection());

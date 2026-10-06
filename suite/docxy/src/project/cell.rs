@@ -87,7 +87,97 @@ impl CellEdit {
     }
 }
 
+/// A range of cells: the shown task rows (uids, top to bottom) and the
+/// inclusive column span between the anchor and the cursor. Computed from
+/// [`ProjectView::selection`], never stored, so it cannot go stale: an
+/// anchor whose task was deleted, hidden or undone away degrades to no
+/// selection.
+#[derive(Clone, Debug)]
+pub(crate) struct Selection {
+    pub uids: Vec<i32>,
+    pub cols: std::ops::RangeInclusive<usize>,
+}
+
+impl Selection {
+    /// The drawing and the clipboard agree on what is in the range.
+    pub fn contains(&self, uid: i32, col: usize) -> bool {
+        self.uids.contains(&uid) && self.cols.contains(&col)
+    }
+
+    /// How many cells the range covers; the harness `state` reports it.
+    pub fn count(&self) -> usize {
+        self.uids.len() * self.cols.clone().count()
+    }
+}
+
 impl ProjectView {
+    /// The bounding box of the anchor and the cell cursor, or `None` when
+    /// there is no range: no anchor, the cursor on the entry row, the anchor
+    /// task gone or hidden under a collapsed summary, or the anchor on the
+    /// cursor. Both rows are positions among the shown rows, so rows a
+    /// collapsed summary hides never land in the range.
+    pub fn selection(&self) -> Option<Selection> {
+        let (anchor_uid, anchor_col) = self.anchor?;
+        let cursor_uid = self.selected_uid()?;
+        if anchor_uid == cursor_uid && anchor_col == self.col {
+            return None;
+        }
+        let rows = self.ed.visible_rows();
+        let pos = |uid: i32| {
+            rows.iter()
+                .position(|&i| self.ed.project().tasks[i].uid == uid)
+        };
+        let (a, c) = (pos(anchor_uid)?, pos(cursor_uid)?);
+        let (top, bottom) = if a <= c { (a, c) } else { (c, a) };
+        Some(Selection {
+            uids: rows[top..=bottom]
+                .iter()
+                .map(|&i| self.ed.project().tasks[i].uid)
+                .collect(),
+            cols: anchor_col.min(self.col)..=anchor_col.max(self.col),
+        })
+    }
+
+    /// Shift+arrow: extend (or shrink) the range from the anchor to the
+    /// cursor. The first extension anchors where the cursor is; later ones
+    /// move only the cursor, so the anchor never drifts. Up/Down move over
+    /// the shown rows and never step onto the entry row; on it, Shift+arrows
+    /// do nothing. A move that lands the cursor back on the anchor leaves no
+    /// range, which [`Self::selection`] then reports.
+    pub fn extend_selection(&mut self, key: &str) -> bool {
+        if !matches!(key, "up" | "down" | "left" | "right") {
+            return false;
+        }
+        if self.on_entry_row() {
+            return true;
+        }
+        let Some(uid) = self.selected_uid() else {
+            return true;
+        };
+        if self.anchor.is_none() {
+            self.anchor = Some((uid, self.col));
+        }
+        match key {
+            "left" | "right" => self.key(key, false),
+            _ => {
+                let rows = self.ed.visible_rows();
+                let at = self.display_row();
+                let next = if key == "up" {
+                    at.checked_sub(1)
+                } else if at + 1 < rows.len() {
+                    Some(at + 1)
+                } else {
+                    None
+                };
+                if let Some(at) = next {
+                    self.entry = false;
+                    self.ed.select(rows[at]);
+                }
+                true
+            }
+        }
+    }
+
     pub fn reveal_col(&mut self) {
         let left: f32 = WIDTHS[..self.col].iter().sum();
         let right = left + WIDTHS[self.col];
@@ -369,7 +459,125 @@ pub(crate) fn project_below_click(tab: &mut DocTab) {
     cell_click(tab, ClickTarget::Below, None, false);
 }
 
+/// The left press on a cell (`row` a task index, or the entry row's), as the
+/// cell's `on_mouse_down(Left)` delivers it. It commits an open cell edit
+/// exactly as a click does and gives up on a failed commit, then places the
+/// cursor. A plain press clears the range; a Shift press extends from the
+/// cursor; a press on a task's ID cell selects the whole row (and pins the
+/// range to whole rows while it drags). A press that made a range swallows
+/// the release-click through `drag_made_range`, so the gesture survives the
+/// `on_click` gpui delivers on release.
+pub(crate) fn project_cell_press(tab: &mut DocTab, row: usize, col: usize, shift: bool) {
+    // A levelling pass asked for first runs first, as on any click; see
+    // [`flush_level_pass`].
+    flush_level_pass(tab);
+    if !commit_project_cell(tab) {
+        return;
+    }
+    let Surface::Project(v) = &mut tab.surface else {
+        return;
+    };
+    v.dragging = true;
+    let col = col.min(COLUMN_COUNT - 1);
+    let uid = v.ed.project().tasks.get(row).map(|t| t.uid);
+    match (shift, uid) {
+        (true, Some(_)) => {
+            if let Some(cursor) = v.selected_uid() {
+                v.anchor = Some((cursor, v.col));
+            }
+            v.select_row(row);
+            v.col = col;
+            v.drag_made_range = v.anchor.is_some();
+        }
+        (true, None) => {
+            v.enter_entry_row();
+            v.col = col;
+            v.drag_made_range = false;
+        }
+        (false, Some(uid)) if col == COL_ID => {
+            v.anchor = Some((uid, COLUMN_COUNT - 1));
+            v.row_drag = true;
+            v.select_row(row);
+            v.col = COL_ID;
+            v.drag_made_range = true;
+        }
+        (false, uid) => {
+            // The press cell becomes the anchor: a drag grows the range from
+            // it, and a press-release that goes nowhere leaves the anchor on
+            // the cursor, which is no range at all.
+            v.anchor = uid.map(|uid| (uid, col));
+            v.row_drag = false;
+            if uid.is_some() {
+                v.select_row(row);
+            } else {
+                v.enter_entry_row();
+            }
+            v.col = col;
+            v.drag_made_range = false;
+        }
+    }
+    v.reveal_col();
+    complete_project(tab, true);
+}
+
+/// The pointer entering cell (`row`, `col`) with the left button held: the
+/// press's drag. The range grows to the rectangle between the press and this
+/// cell; rows are task indices as for [`project_cell_press`]. The entry row
+/// and past it end the gesture's reach (the range stops on the last task), as
+/// do rows hidden under a collapsed summary, which have no cell to enter.
+/// Whether the cursor actually moved is returned so the caller repaints only
+/// then.
+pub(crate) fn project_cell_drag_over(tab: &mut DocTab, row: usize, col: usize) -> bool {
+    let Surface::Project(v) = &mut tab.surface else {
+        return false;
+    };
+    if !v.dragging {
+        return false;
+    }
+    let Some(uid) = v.ed.project().tasks.get(row).map(|t| t.uid) else {
+        return false;
+    };
+    let col = col.min(COLUMN_COUNT - 1);
+    let moved = v.selected_uid() != Some(uid) || (!v.row_drag && v.col != col);
+    if !moved {
+        return false;
+    }
+    // From here the release-click must not undo the gesture.
+    v.drag_made_range = true;
+    v.select_row(row);
+    if !v.row_drag {
+        v.col = col;
+        v.reveal_col();
+    }
+    complete_project(tab, true);
+    true
+}
+
+/// The left release anywhere (the window-level mouse-up calls this): the
+/// gesture is over. `drag_made_range` stays until the release-click consumes
+/// it, so a drag released on the cell it swept does not clear its own range.
+pub(crate) fn project_cell_release(tab: &mut DocTab) {
+    let Surface::Project(v) = &mut tab.surface else {
+        return;
+    };
+    v.dragging = false;
+    v.row_drag = false;
+}
+
 fn cell_click(tab: &mut DocTab, target: ClickTarget, col: Option<usize>, double: bool) {
+    // A drag (or a Shift/ID press) made a range: the `on_click` gpui delivers
+    // on release must not clear it. The flag is spent either way, so a later
+    // genuine click is never swallowed; a double-click still runs (an ID
+    // cell's "ID is read-only", for one).
+    let swallowed = {
+        let Surface::Project(v) = &mut tab.surface else {
+            return;
+        };
+        std::mem::take(&mut v.drag_made_range)
+    };
+    if swallowed && !double {
+        return;
+    }
     // A levelling pass asked for first runs first, in the order the user
     // gave them; see [`flush_level_pass`].
     flush_level_pass(tab);
@@ -445,6 +653,11 @@ pub(crate) fn project_cell_state(v: &ProjectView) -> Vec<(String, ctlcore::json:
                 .as_ref()
                 .map(|c| Json::Str(c.buf.clone()))
                 .unwrap_or(Json::Null),
+        ),
+        (
+            "selection".into(),
+            v.selection()
+                .map_or(Json::Null, |s| Json::Num(s.count() as f64)),
         ),
     ]
 }
