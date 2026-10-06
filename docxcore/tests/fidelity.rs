@@ -30,22 +30,6 @@ const TRACKED: &[&str] = &[
     "docxcore/tests/fixtures",
 ];
 
-/// Files whose effective text (`effective_text`: the text Word shows, with
-/// non-breaking and soft hyphens, tabs and breaks as its control characters)
-/// must survive the save unchanged. Word's own text of these, before and
-/// after a save, is what found #1101; the element compare alone missed
-/// nothing there, but it reports a hyphen lost in a restructured run only as
-/// one more `#1069` entry.
-const EFFECTIVE_TEXT: &[&str] = &[
-    "ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx",
-    "ext:mixed features/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx",
-    "ext:hyperlink for splitPara/632404333468899776 PFVI_Nutrition.docx",
-    "ext:hyperlink/632404333468899776 PFVI_Nutrition.docx",
-    "ext:Normalize/complex0.docx",
-    "ext:complex0.docx",
-    "ext:complexDocx/complex0.docx",
-];
-
 /// Every class of known loss and the issue that owns its fix, first match
 /// wins. A baseline entry no class claims fails the gate.
 const CLASSES: &[LossClass] = &[
@@ -313,7 +297,6 @@ fn round_trip_fidelity_gate() {
     let mut not_preserved = Vec::new();
     let mut invalid = Vec::new();
     let mut text_lost = Vec::new();
-    let mut text_changed_elsewhere = 0usize;
     let mut allowed = vec![0usize; allow.len()];
     for (file, path) in &files {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -328,15 +311,8 @@ fn round_trip_fidelity_gate() {
             text_change = rt.text_change;
             rt.findings
         });
-        match text_change {
-            Some(why) if EFFECTIVE_TEXT.contains(&file.as_str()) => {
-                text_lost.push(format!("{file}: {why}"));
-            }
-            Some(why) => {
-                text_changed_elsewhere += 1;
-                eprintln!("fidelity: effective text changed (not gated): {file}: {why}");
-            }
-            None => {}
+        if let Some(why) = text_change {
+            text_lost.push(format!("{file}: {why}"));
         }
         if let Err(why) = preserved {
             not_preserved.push(format!("{file}: {why}"));
@@ -362,10 +338,13 @@ fn round_trip_fidelity_gate() {
         not_preserved.is_empty(),
         "save_package_preserving_document (the no-edit save) changed these packages: {not_preserved:?}"
     );
-    eprintln!("fidelity: effective text changed in {text_changed_elsewhere} ungated files");
+    // The text Word shows (`effective_text`: hyphens, tabs and breaks as its
+    // control characters) must survive the save. An element compare can file
+    // a character lost in a restructured run as one more #1069 entry; this
+    // cannot, and it is never baselined (#1101).
     assert!(
         text_lost.is_empty(),
-        "fidelity gate: the save changed the effective text of {} gated files (#1101)\n{}",
+        "fidelity gate: the save changed the effective text of {} files (#1101)\n{}",
         text_lost.len(),
         text_lost.join("\n")
     );

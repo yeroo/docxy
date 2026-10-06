@@ -102,11 +102,9 @@ characters for run content that is not `w:t`:
 A character lost inside a restructured run shows up here even when the element
 compare files it as one more run-restructuring entry.
 
-- For the files in `EFFECTIVE_TEXT` (`docxcore/tests/fidelity.rs`), any change
-  fails the gate. That list holds the corpus files Word's own text check found
-  #1101 in, and the change cannot be baselined.
-- For every other file, a change is printed as `effective text changed (not
-  gated)` and counted.
+A change in any file fails the gate, like a schema violation. It is never
+baselined, and the report names the file, both lengths and the first
+difference.
 
 ## Schema validation
 
