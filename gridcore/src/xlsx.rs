@@ -3058,6 +3058,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
 
     // --- regenerate each worksheet's sheetData (and cols/dimension) -------
     let mut any_formulas = false;
+    let rel_types = pkg.sheet_rel_types();
     for (idx, sheet) in wb.sheets.iter().enumerate() {
         let Some(part_name) = pkg.sheet_parts.get(idx) else {
             continue;
@@ -3066,8 +3067,18 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             .part(part_name)
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
-        let sheet_data = sheet_data_xml(sheet, &mut index_of, &mut any_formulas, new_cm.as_deref());
-        let updated = splice_worksheet(&source, sheet, &sheet_data, &wb.styles.dxfs, &mut dxf_for);
+        // Chart and dialog sheets have no cells: CT_Chartsheet and
+        // CT_Dialogsheet have no <sheetData>, so one spliced in is invalid.
+        let cellless = rel_types
+            .get(idx)
+            .is_some_and(|ty| ty.ends_with("/chartsheet") || ty.ends_with("/dialogsheet"));
+        let updated = if cellless {
+            source
+        } else {
+            let sheet_data =
+                sheet_data_xml(sheet, &mut index_of, &mut any_formulas, new_cm.as_deref());
+            splice_worksheet(&source, sheet, &sheet_data, &wb.styles.dxfs, &mut dxf_for)
+        };
         let updated = if tabs_selected {
             set_tab_selected(&updated, idx == active_tab)
         } else {
@@ -10698,6 +10709,33 @@ mod tests {
         let mut pkg = back;
         pkg.workbook.date1904 = false;
         assert!(!load_xlsx(&save_xlsx(&pkg)).unwrap().workbook.date1904);
+    }
+
+    /// #1064: a chartsheet has no cells, and CT_Chartsheet has no
+    /// `<sheetData>`; save writes the part back as it was.
+    #[test]
+    fn save_leaves_a_chartsheet_without_sheet_data() {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Chart1");
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let part = pkg.sheet_parts[1].clone();
+        let name = part.rsplit('/').next().unwrap().to_string();
+        let rels = String::from_utf8(pkg.part("xl/_rels/workbook.xml.rels").unwrap().to_vec())
+            .unwrap();
+        let at = rels.find(&format!("{name}\"")).unwrap();
+        let open = rels[..at].rfind("<Relationship").unwrap();
+        let rels = format!(
+            "{}{}",
+            &rels[..open],
+            rels[open..].replacen("/worksheet\"", "/chartsheet\"", 1)
+        );
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        let chart = r#"<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"/></sheetViews><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></chartsheet>"#;
+        pkg.set_part(&part, chart.as_bytes().to_vec());
+        let pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let saved = save_xlsx(&pkg);
+        let back = load_xlsx(&saved).unwrap();
+        assert_eq!(back.part(&part).unwrap(), chart.as_bytes());
     }
 
     /// #1064: Excel 2013+ writes `<x15:workbookPr chartTrackingRefBase>` in
