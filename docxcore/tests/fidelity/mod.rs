@@ -9,8 +9,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use docxcore::xml::{Event, XmlParser};
-use docxcore::zip::ZipArchive;
+use opccore::xml::{Event, XmlParser};
+use opccore::zip::ZipArchive;
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
