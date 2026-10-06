@@ -3892,12 +3892,11 @@ impl App {
                     let w = clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
                     (src, (fr, fc, fr + h - 1, fc + w - 1))
                 });
-                // The rules of the cut or copied cells replace the target's;
-                // a cut also takes them off its source.
+                // A copy's rules replace the target's (#688). A cut leaves
+                // validation where it is, on both sheets; see #1050.
                 let rules_from = {
                     let (fr, fc) = clip.from;
-                    // Only the part that fits the grid at the target is pasted
-                    // (the rest stays where it was, as its cells do).
+                    // Only the part that fits the grid at the target is pasted.
                     let h = (clip.cells.len().max(1) as u32).min(MAX_ROWS - r0);
                     let w = (clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32)
                         .min(MAX_COLS - c0);
@@ -3906,54 +3905,18 @@ impl App {
                 let rules = clip.rules.clone();
                 // A part that can't hold `<dataValidations>` would lose them
                 // on save: leave the rules where they are and say so.
-                let can_hold =
-                    self.pkg.takes_validations(here) && (!cut || self.pkg.takes_validations(src));
-                let lost = !can_hold && !rules.is_empty();
-                let rule_sheets = if same_sheet || src >= self.pkg.workbook.sheets.len() {
-                    vec![here]
-                } else {
-                    vec![src, here]
-                };
-                self.with_rules(&rule_sheets, |app| {
+                let can_hold = cut || self.pkg.takes_validations(here);
+                let lost = !cut && !can_hold && !rules.is_empty();
+                let write = |app: &mut Self| {
                     app.record_groups(keys, cut_from, |app| {
-                        if can_hold {
-                            if cut {
-                                // A cut moves: the formulas keep their text
-                                // (as the cut cells' own do).
-                                gridcore::validation::clear_validation(
-                                    &mut app.pkg.workbook.sheets[src],
-                                    rules_from,
-                                );
-                                let mut followed = rules.clone();
-                                let (src_name, dst_name) = (
-                                    app.pkg.workbook.sheets[src].name.clone(),
-                                    app.pkg.workbook.sheets[here].name.clone(),
-                                );
-                                gridcore::validation::follow_cut(
-                                    &mut followed,
-                                    &gridcore::formula::CellMove {
-                                        src: &src_name,
-                                        dst: &dst_name,
-                                        rect: rules_from,
-                                        dr: i64::from(r0) - i64::from(rules_from.0),
-                                        dc: i64::from(c0) - i64::from(rules_from.1),
-                                    },
-                                );
-                                gridcore::validation::move_rules(
-                                    &mut app.pkg.workbook.sheets[here],
-                                    &followed,
-                                    rules_from,
-                                    (r0, c0),
-                                );
-                            } else {
-                                gridcore::validation::paste_rules(
-                                    &mut app.pkg.workbook.sheets[here],
-                                    &rules,
-                                    rules_from,
-                                    (r0, c0),
-                                    (1, 1),
-                                );
-                            }
+                        if !cut && can_hold {
+                            gridcore::validation::paste_rules(
+                                &mut app.pkg.workbook.sheets[here],
+                                &rules,
+                                rules_from,
+                                (r0, c0),
+                                (1, 1),
+                            );
                         }
                         let (clears, late) = if same_sheet {
                             app.engine
@@ -3969,7 +3932,13 @@ impl App {
                             .paste_block_prechecked(wb, here, (r0, c0), &block);
                         app.engine.set_cells_prechecked(wb, src, late);
                     })
-                });
+                };
+                // A cut's undo entry holds no rules: it changes none.
+                if cut {
+                    write(self);
+                } else {
+                    self.with_rules(&[here], write);
+                }
                 self.status = Some(if source_locked {
                     "Pasted (source sheet is protected; cut kept as copy)".to_string()
                 } else if lost {
@@ -6242,6 +6211,26 @@ impl App {
                 c.0 -= 1;
             }
         }
+    }
+
+    /// Whether an overlay (a dialog, picker, prompt, the cell editor or an
+    /// alert) is open: the ribbon takes no keys then, and the validation marks
+    /// are not drawn over it.
+    fn overlay_open(&self) -> bool {
+        self.pivot_edit.is_some()
+            || self.model_view.is_some()
+            || self.prompt.is_some()
+            || self.edit.is_some()
+            || self.format_picker.is_some()
+            || self.format_dialog.is_some()
+            || self.text_dialog.is_some()
+            || self.outline_dialog.is_some()
+            || self.validation_dialog.is_some()
+            || self.data_form.is_some()
+            || self.sheet_picker.is_some()
+            || self.dv_picker.is_some()
+            || self.dv_alert.is_some()
+            || self.filter_picker.is_some()
     }
 
     /// Close the data-validation dialog, alert and dropdown, which hold a
@@ -9755,13 +9744,8 @@ fn num_short(v: f64) -> String {
 /// Circle Invalid Data's circles, drawn as red brackets round the cell, and
 /// the input message of the rule on the cursor cell as a tip under it.
 fn draw_validation_marks(app: &App, f: &mut Frame, grid: Rect) {
-    // Not over a dialog: they belong to the grid underneath it.
-    if app.validation_dialog.is_some()
-        || app.outline_dialog.is_some()
-        || app.text_dialog.is_some()
-        || app.format_dialog.is_some()
-        || app.data_form.is_some()
-    {
+    // Not over a dialog or picker: they belong to the grid underneath it.
+    if app.overlay_open() {
         return;
     }
     let on_screen = |r: u32, c: u32| -> Option<(u16, u16, u16)> {
@@ -10382,20 +10366,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // --- ribbon ---------------------------------------------------------------
-    let overlay_open = app.pivot_edit.is_some()
-        || app.model_view.is_some()
-        || app.prompt.is_some()
-        || app.edit.is_some()
-        || app.format_picker.is_some()
-        || app.format_dialog.is_some()
-        || app.text_dialog.is_some()
-        || app.outline_dialog.is_some()
-        || app.validation_dialog.is_some()
-        || app.data_form.is_some()
-        || app.sheet_picker.is_some()
-        || app.dv_picker.is_some()
-        || app.dv_alert.is_some()
-        || app.filter_picker.is_some();
+    let overlay_open = app.overlay_open();
     // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
     if key.code == KeyCode::F(9) && !overlay_open && !shift && !ctrl {
         app.ribbon_focus = if app.ribbon_focus == ribbon::Focus::None {
@@ -20088,7 +20059,7 @@ mod tests {
     }
 
     #[test]
-    fn pasting_a_validated_cell_gives_the_target_an_equal_rule_and_cut_moves_it() {
+    fn pasting_a_validated_cell_gives_the_target_an_equal_rule() {
         use gridcore::sheet::AlertStyle;
         let mut app = dv_app(AlertStyle::Stop);
         app.cur = (1, 1); // B2, validated
@@ -20106,17 +20077,6 @@ mod tests {
             ("10", "Score")
         );
         assert!(app.sheet().validations.iter().any(|d| d.covers(1, 1)));
-
-        // A cut takes the rule off its source.
-        app.cur = (2, 1); // B3
-        app.copy(true);
-        app.cur = (12, 1); // B13, outside the rule
-        app.paste_from(None);
-        assert!(app.sheet().validations.iter().any(|d| d.covers(12, 1)));
-        assert!(!app.sheet().validations.iter().any(|d| d.covers(2, 1)));
-        app.undo();
-        assert!(app.sheet().validations.iter().any(|d| d.covers(2, 1)));
-        assert!(!app.sheet().validations.iter().any(|d| d.covers(12, 1)));
     }
 
     #[test]
@@ -20702,29 +20662,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
-    fn a_cut_clipped_at_the_grid_edge_moves_only_the_rules_that_fit() {
-        use gridcore::sheet::AlertStyle;
-        let mut app = dv_app(AlertStyle::Stop);
-        // Rules on A1 and A2 (one rule each cell).
-        let mut a1 = app.sheet().validations[0].clone();
-        a1.ranges = vec![(0, 0, 0, 0)];
-        let mut a2 = a1.clone();
-        a2.ranges = vec![(1, 0, 1, 0)];
-        a2.formula1 = "20".into();
-        app.pkg.workbook.sheets[0].validations = vec![a1, a2];
-        app.cur = (0, 0);
-        app.anchor = Some((1, 0)); // A1:A2
-        app.copy(true);
-        app.anchor = None;
-        app.cur = (MAX_ROWS - 1, 3); // D1048576: only A1's cell fits
-        app.paste_from(None);
-        let sheet = app.sheet();
-        assert!(gridcore::validation::validation_at(sheet, MAX_ROWS - 1, 3).is_some());
-        // A2's cell was not moved, so its rule stays at A2.
-        assert!(gridcore::validation::validation_at(sheet, 1, 0).is_some());
-        assert!(gridcore::validation::validation_at(sheet, 0, 0).is_none());
-    }
-    #[test]
     fn circles_follow_the_dialog_and_structural_edits() {
         use gridcore::sheet::AlertStyle;
         let mut app = dv_app(AlertStyle::Stop);
@@ -20756,37 +20693,6 @@ mod tests {
         app.anchor = None;
         app.row_op(true);
         assert!(app.circles.is_empty());
-    }
-    #[test]
-    fn a_cut_keeps_a_rule_reading_the_cells_it_moved() {
-        use gridcore::sheet::AlertStyle;
-        let mut app = dv_app(AlertStyle::Stop);
-        app.pkg.workbook.sheets[0].validations.clear();
-        app.apply(vec![(1, 0, Cell::number(1.0))]); // A2 = 1
-        app.pkg.workbook.sheets[0]
-            .validations
-            .push(gridcore::sheet::DataValidation {
-                ranges: vec![(1, 1, 1, 1)], // B2
-                kind: "custom".into(),
-                formula1: "$A$2>0".into(),
-                allow_blank: true,
-                show_error: true,
-                ..Default::default()
-            });
-        app.cur = (1, 0);
-        app.anchor = Some((1, 1)); // A2:B2
-        app.copy(true);
-        app.anchor = None;
-        app.cur = (2, 0); // A3
-        app.paste_from(None);
-        let dv = gridcore::validation::validation_at(app.sheet(), 2, 1).expect("B3 has the rule");
-        assert_eq!(dv.formula1, "$A$3>0", "the reference followed the cut cell");
-        // Typing in B3 is checked against A3 (1), not the empty A2.
-        app.cur = (2, 1);
-        type_text(&mut app, "5");
-        press(&mut app, KeyCode::Enter);
-        assert!(app.dv_alert.is_none());
-        assert_eq!(value_at(&app, 2, 1), CellValue::Number(5.0));
     }
     #[test]
     fn removing_a_sheet_takes_its_circles_and_renumbers_the_rest() {
@@ -20851,35 +20757,47 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_of_part_of_a_rule_moves_a_piece_that_reads_the_moved_cells() {
-        // Relative B2>A2; cut A5:B5 to D5:E5: E5 reads E5>D5.
+    fn a_cut_leaves_validation_where_it_is() {
         let mut app = cut_rule_app("B2>A2");
-        cut_to(&mut app, ((4, 0), (4, 1)), 0, (4, 3));
-        assert!(!typed_refused(&mut app, 0, (4, 4), "5"));
-        assert!(typed_refused(&mut app, 0, (4, 4), "2"));
-        let sheet = app.sheet();
-        assert!(gridcore::validation::validation_at(sheet, 1, 1).is_some());
-        assert!(gridcore::validation::validation_at(sheet, 5, 1).is_some());
-        assert!(gridcore::validation::validation_at(sheet, 4, 1).is_none());
-        // B2>0: the reference to the moved cell follows it.
-        let mut app = cut_rule_app("B2>0");
-        cut_to(&mut app, ((4, 0), (4, 1)), 0, (4, 3));
-        assert!(!typed_refused(&mut app, 0, (4, 4), "5"));
-        assert!(typed_refused(&mut app, 0, (4, 4), "-5"));
-        // B5 alone to D5: D5>A5 (A5 outside the cut keeps its cell).
-        let mut app = cut_rule_app("B2>A2");
-        cut_to(&mut app, ((4, 1), (4, 1)), 0, (4, 3));
-        assert!(!typed_refused(&mut app, 0, (4, 3), "5"));
-        assert!(typed_refused(&mut app, 0, (4, 3), "2"));
+        // A rule of its own on the destination cells.
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(4, 3, 4, 4)], // D5:E5
+                kind: "whole".into(),
+                operator: "between".into(),
+                formula1: "1".into(),
+                formula2: "9".into(),
+                show_error: true,
+                ..Default::default()
+            });
+        let before = app.sheet().validations.clone();
+        cut_to(&mut app, ((4, 0), (4, 1)), 0, (4, 3)); // A5:B5 to D5:E5
+        assert_eq!(
+            app.sheet().validations,
+            before,
+            "no rule moved, cleared or changed"
+        );
+        // A typed entry at the source is still checked by the rule that stayed.
+        assert!(typed_refused(&mut app, 0, (4, 1), "-1"));
+        // The destination's own rule still applies there.
+        assert!(typed_refused(&mut app, 0, (4, 4), "50"));
+        // And one undo leaves them as they were.
+        app.undo();
+        assert_eq!(app.sheet().validations, before);
     }
-
     #[test]
-    fn a_cross_sheet_cut_keeps_references_outside_the_cut_on_the_source_sheet() {
-        let mut app = cut_rule_app("B2>$F$1");
-        cut_to(&mut app, ((4, 0), (4, 1)), 1, (4, 3));
-        // F1 is 10 on the source sheet (and empty on Other): 5 is refused.
-        assert!(typed_refused(&mut app, 1, (4, 4), "5"));
-        assert!(!typed_refused(&mut app, 1, (4, 4), "20"));
+    fn overlay_open_covers_the_dialogs_and_pickers() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        assert!(!app.overlay_open());
+        app.sheet_picker = Some(0);
+        assert!(app.overlay_open());
+        app.sheet_picker = None;
+        app.open_validation_dialog();
+        assert!(app.overlay_open());
+        app.validation_dialog = None;
+        assert!(!app.overlay_open());
     }
 }
 

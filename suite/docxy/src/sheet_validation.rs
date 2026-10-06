@@ -636,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn a_validated_cell_pastes_its_rule_and_a_cut_moves_it() {
+    fn a_validated_cell_pastes_its_rule() {
         let mut t = book(AlertStyle::Stop);
         let v = view(&mut t);
         v.anchor = at("B2");
@@ -647,22 +647,6 @@ mod tests {
         v.paste_grid_clip(&clip).unwrap();
         let (r, c) = at("F4");
         assert!(gridcore::validation::validation_at(v.sheet(), r, c).is_some());
-
-        // Cut B3, paste at B13: the rule goes from B3 to B13.
-        let v = view(&mut t);
-        v.anchor = at("B3");
-        v.sel = at("B3");
-        let clip = v.grid_clip(true).unwrap();
-        v.anchor = at("B13");
-        v.sel = at("B13");
-        assert_eq!(v.paste_grid_clip(&clip), Ok(crate::GridPasted::Done));
-        let sheet = view(&mut t).sheet();
-        assert!(gridcore::validation::validation_at(sheet, 12, 1).is_some());
-        assert!(gridcore::validation::validation_at(sheet, 2, 1).is_none());
-        assert!(view(&mut t).undo_step());
-        let sheet = view(&mut t).sheet();
-        assert!(gridcore::validation::validation_at(sheet, 2, 1).is_some());
-        assert!(gridcore::validation::validation_at(sheet, 12, 1).is_none());
     }
 
     // ---- #689 ----
@@ -1141,81 +1125,6 @@ mod tests {
 
     // ---- review r12 ----
 
-    /// A1 empty; A2 = 1 and B2 a custom Stop rule reading `formula`.
-    fn cut_book(formula: &str) -> DocTab {
-        let mut t = tab();
-        put(&mut t, "A2", Cell::number(1.0));
-        view(&mut t).pkg.workbook.sheets[0]
-            .validations
-            .push(DataValidation {
-                ranges: vec![(1, 1, 1, 1)],
-                kind: "custom".into(),
-                formula1: formula.into(),
-                allow_blank: true,
-                show_error: true,
-                ..Default::default()
-            });
-        t
-    }
-
-    fn cut_paste(t: &mut DocTab, to: &str) {
-        let v = view(t);
-        v.anchor = at("A2");
-        v.sel = at("B2");
-        std::mem::swap(&mut v.anchor, &mut v.sel);
-        let clip = v.grid_clip(true).unwrap();
-        v.anchor = at(to);
-        v.sel = at(to);
-        assert_eq!(v.paste_grid_clip(&clip), Ok(crate::GridPasted::Done));
-    }
-
-    #[test]
-    fn a_cut_keeps_a_rule_reading_the_cells_it_moved() {
-        let mut t = cut_book("$A$2>0");
-        cut_paste(&mut t, "A3");
-        let (r, c) = at("B3");
-        let dv =
-            gridcore::validation::validation_at(view(&mut t).sheet(), r, c).expect("B3 has it");
-        assert_eq!(dv.formula1, "$A$3>0", "the reference followed the cut cell");
-        // Typing in B3 is checked against A3 (which holds 1), not the empty A2.
-        select(&mut t, "B3");
-        assert_eq!(enter(&mut t, "5"), Some(true));
-        assert!(view(&mut t).dv_pending.is_none());
-    }
-
-    #[test]
-    fn a_cut_keeps_a_relative_rule_and_moves_to_another_sheet() {
-        // Relative: B2>A2 reads cells that moved with the cut, so it follows.
-        let mut t = cut_book("B2>A2");
-        cut_paste(&mut t, "A3");
-        let (r, c) = at("B3");
-        let dv = gridcore::validation::validation_at(view(&mut t).sheet(), r, c).unwrap();
-        assert_eq!(dv.formula1, "B3>A3");
-        // Onto another sheet of the workbook.
-        let mut t = cut_book("$A$2>0");
-        {
-            let v = view(&mut t);
-            v.pkg.workbook.sheets.push(gridcore::sheet::Sheet {
-                name: "Other".into(),
-                ..Default::default()
-            });
-            v.engine = crate::sheet_engine(&v.pkg.workbook);
-        }
-        let v = view(&mut t);
-        v.anchor = at("A2");
-        v.sel = at("B2");
-        std::mem::swap(&mut v.anchor, &mut v.sel);
-        let clip = v.grid_clip(true).unwrap();
-        v.active = 1;
-        v.anchor = at("A3");
-        v.sel = at("A3");
-        assert_eq!(v.paste_grid_clip(&clip), Ok(crate::GridPasted::Done));
-        let (r, c) = at("B3");
-        assert!(gridcore::validation::validation_at(&v.pkg.workbook.sheets[1], r, c).is_some());
-        let (r, c) = at("B2");
-        assert!(gridcore::validation::validation_at(&v.pkg.workbook.sheets[0], r, c).is_none());
-    }
-
     #[test]
     fn a_sort_that_moves_rows_clears_the_circles() {
         let mut t = book(AlertStyle::Stop);
@@ -1280,57 +1189,6 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_of_part_of_a_rule_moves_a_piece_that_reads_the_moved_cells() {
-        // Relative B2>A2; cut A5:B5 to D5:E5: E5 reads E5>D5 (D5 holds A5's 3).
-        let mut t = cut_rule_book("B2>A2");
-        cut_range(&mut t, ("A5", "B5"), "D5", 0);
-        assert!(!refused(&mut t, 0, "E5", "5"), "5 > 3");
-        assert!(refused(&mut t, 0, "E5", "2"), "2 > 3 is false");
-        // The rule keeps working on the cells it still covers.
-        let sheet = view(&mut t).sheet();
-        assert!(
-            gridcore::validation::validation_at(sheet, 1, 1).is_some(),
-            "B2 still ruled"
-        );
-        assert!(
-            gridcore::validation::validation_at(sheet, 5, 1).is_some(),
-            "B6 still ruled"
-        );
-        assert!(
-            gridcore::validation::validation_at(sheet, 4, 1).is_none(),
-            "B5 moved away"
-        );
-        // B2>0: the reference to the moved cell follows it.
-        let mut t = cut_rule_book("B2>0");
-        cut_range(&mut t, ("A5", "B5"), "D5", 0);
-        assert!(!refused(&mut t, 0, "E5", "5"));
-        assert!(refused(&mut t, 0, "E5", "-5"));
-        // Cutting B5 alone to D5: D5>A5 (A5 outside the cut keeps its cell).
-        let mut t = cut_rule_book("B2>A2");
-        cut_range(&mut t, ("B5", "B5"), "D5", 0);
-        assert!(!refused(&mut t, 0, "D5", "5"));
-        assert!(refused(&mut t, 0, "D5", "2"));
-    }
-
-    #[test]
-    fn a_cross_sheet_cut_keeps_references_outside_the_cut_on_the_source_sheet() {
-        let mut t = cut_rule_book("B2>$F$1");
-        view(&mut t)
-            .pkg
-            .workbook
-            .sheets
-            .push(gridcore::sheet::Sheet {
-                name: "Other".into(),
-                ..Default::default()
-            });
-        view(&mut t).engine = crate::sheet_engine(&view(&mut t).pkg.workbook);
-        cut_range(&mut t, ("A5", "B5"), "D5", 1);
-        // F1 is 10 on the source sheet (and empty on Other): 5 is refused.
-        assert!(refused(&mut t, 1, "E5", "5"));
-        assert!(!refused(&mut t, 1, "E5", "20"));
-    }
-
-    #[test]
     fn deleting_a_sheet_takes_its_circles_and_renumbers_the_rest() {
         let mut t = tab();
         let v = view(&mut t);
@@ -1340,5 +1198,41 @@ mod tests {
         v.circles = vec![(0, 1, 1), (1, 2, 2), (2, 3, 3)];
         assert!(v.delete_sheet(1));
         assert_eq!(v.circles, vec![(0, 1, 1), (1, 3, 3)]);
+        // Undoing the deletion brings the sheet back and renumbers: no circle
+        // is left pointing at the wrong sheet.
+        assert!(v.undo_step());
+        assert_eq!(v.pkg.workbook.sheets.len(), 3);
+        assert!(v.circles.is_empty());
+    }
+
+    #[test]
+    fn a_cut_leaves_validation_where_it_is() {
+        let mut t = cut_rule_book("B2>A2");
+        // A rule of its own on the destination cells.
+        view(&mut t).pkg.workbook.sheets[0]
+            .validations
+            .push(DataValidation {
+                ranges: vec![(4, 3, 4, 4)], // D5:E5
+                kind: "whole".into(),
+                operator: "between".into(),
+                formula1: "1".into(),
+                formula2: "9".into(),
+                show_error: true,
+                ..Default::default()
+            });
+        let before = view(&mut t).sheet().validations.clone();
+        cut_range(&mut t, ("A5", "B5"), "D5", 0);
+        assert_eq!(
+            view(&mut t).sheet().validations,
+            before,
+            "no rule moved, cleared or changed"
+        );
+        // A typed entry at the source is still checked by the rule that stayed.
+        assert!(refused(&mut t, 0, "B5", "-1"));
+        // The destination's own rule still applies there.
+        assert!(refused(&mut t, 0, "E5", "50"));
+        // One undo leaves them as they were.
+        assert!(view(&mut t).undo_step());
+        assert_eq!(view(&mut t).sheet().validations, before);
     }
 }

@@ -1204,74 +1204,6 @@ pub fn copy_rules(sheet: &Sheet, rect: Rect) -> Vec<DataValidation> {
         .collect()
 }
 
-/// A cut's rules ([`copy_rules`] of the cut rectangle, taken before the cut
-/// moves anything) with their references as a cut leaves them. A cut moves
-/// cells, so for each rule piece: (a) a reference into the cut block follows
-/// the block, (b) a reference outside it keeps reading the same cell (qualified
-/// with the source sheet when the cut changes sheets), as the cut cells' own
-/// formulas do ([`crate::formula::move_block_formula`]), and (c) the piece's
-/// anchor moves with it: its formulas are written for its own first cell
-/// (which `copy_rules` did), and are judged there. Install them with
-/// [`move_rules`], which keeps their text.
-pub fn follow_cut(rules: &mut [DataValidation], mv: &crate::formula::CellMove) {
-    for rule in rules {
-        for f in [&mut rule.formula1, &mut rule.formula2] {
-            if f.is_empty() || f.starts_with('"') {
-                continue;
-            }
-            if let Some(moved) = crate::formula::move_block_formula(f, mv) {
-                *f = moved;
-            }
-        }
-    }
-}
-
-/// A cut's rules ([`copy_rules`] of the cut's rectangle) put at `dst_origin`:
-/// like [`paste_rules`] once, except that the formulas keep their text. A
-/// cut moves, it does not copy: what a formula reads stays what it read (the
-/// references to the moved cells were already rewritten, [`crate::edit::move_refs`]),
-/// where a copy would carry its relative references along.
-pub fn move_rules(
-    dst: &mut Sheet,
-    rules: &[DataValidation],
-    src_rect: Rect,
-    dst_origin: (u32, u32),
-) {
-    let (h, w) = (src_rect.2 - src_rect.0 + 1, src_rect.3 - src_rect.1 + 1);
-    clear_validation(
-        dst,
-        (
-            dst_origin.0,
-            dst_origin.1,
-            dst_origin.0.saturating_add(h).saturating_sub(1),
-            dst_origin.1.saturating_add(w).saturating_sub(1),
-        ),
-    );
-    let (dr, dc) = (
-        i64::from(dst_origin.0) - i64::from(src_rect.0),
-        i64::from(dst_origin.1) - i64::from(src_rect.1),
-    );
-    for rule in rules {
-        let ranges: Vec<Rect> = rule
-            .ranges
-            .iter()
-            .filter_map(|&(r1, c1, r2, c2)| {
-                let shift = |v: u32, d: i64| u32::try_from(i64::from(v) + d).ok();
-                intersect(
-                    (
-                        shift(r1, dr)?,
-                        shift(c1, dc)?,
-                        shift(r2, dr)?,
-                        shift(c2, dc)?,
-                    ),
-                    (0, 0, MAX_ROWS - 1, MAX_COLS - 1),
-                )
-            })
-            .collect();
-        add_ranges(dst, rule, &ranges);
-    }
-}
-
 /// Paste `rules` ([`copy_rules`] of `src_rect`) so that `src_rect`'s corner
 /// lands on `dst_origin`, tiled `tiles` times (rows, columns). The pasted
 /// area loses the rules it had, whether or not the source had any, and each
@@ -2421,32 +2353,6 @@ mod tests {
     }
 
     // ---- review r12 ----
-
-    #[test]
-    fn a_cut_moves_a_rule_without_translating_its_formulas() {
-        // B2 holds a custom rule reading $A$2 (moved to $A$3 with the cut cell);
-        // cut A2:B2, paste at A3.
-        let mut s = Sheet::default();
-        let mut dv = rule("custom", "", "$A$3>0", ""); // already rewritten by the move
-        dv.ranges = vec![(1, 1, 1, 1)];
-        s.validations.push(dv);
-        let rules = copy_rules(&s, (1, 0, 1, 1)); // A2:B2
-        clear_validation(&mut s, (1, 0, 1, 1));
-        move_rules(&mut s, &rules, (1, 0, 1, 1), (2, 0));
-        let b3 = validation_at(&s, 2, 1).expect("B3 has the rule");
-        assert_eq!(b3.formula1, "$A$3>0");
-        assert!(validation_at(&s, 1, 1).is_none());
-        // A relative reference keeps its text too: it reads the same cells
-        // from the rule's new first cell.
-        let mut s = Sheet::default();
-        let mut dv = rule("custom", "", "B2>A2", "");
-        dv.ranges = vec![(1, 1, 1, 1)];
-        s.validations.push(dv);
-        let rules = copy_rules(&s, (1, 1, 1, 1));
-        clear_validation(&mut s, (1, 1, 1, 1));
-        move_rules(&mut s, &rules, (1, 1, 1, 1), (2, 1));
-        assert_eq!(validation_at(&s, 2, 1).unwrap().formula1, "B2>A2");
-    }
 
     #[test]
     fn an_input_message_only_rule_lets_a_blank_entry_in() {

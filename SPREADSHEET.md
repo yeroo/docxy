@@ -138,7 +138,9 @@ worksheet XML sources.
   carries the source's rules, and the Data Validation dialog edits them. A save
   leaves an untouched `<dataValidation>` byte for byte and rewrites only the
   attributes of an edited one (`DataValidation::orig`); new rules are appended.
-  x14 (`extLst`) validations are preserved, not edited.
+  x14 (`extLst`) validations are preserved, not edited. A cut-paste leaves
+  validation where it is, on both the source and the destination (moving a
+  cut's rules is #1050).
 - Rewrite the drawing part's anchors in place (`drawing::rewrite_anchors`) so a
   moved or deleted drawing persists. Every other byte of that part survives —
   including whole anchors for shapes and text boxes we don't model, which is
