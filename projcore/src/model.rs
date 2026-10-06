@@ -1114,8 +1114,11 @@ impl Assignment {
 }
 
 /// An MSPDI delay (tenths of a minute) in whole minutes, never negative.
+/// Rounds by division and remainder so an absurd stored value cannot
+/// overflow the rounding.
 fn tenths_to_min(tenths: Option<i64>) -> i64 {
-    (tenths.unwrap_or(0).max(0) + 5) / 10
+    let tenths = tenths.unwrap_or(0).max(0);
+    tenths / 10 + (tenths % 10 + 5) / 10
 }
 
 /// A recorded plan in one MSPDI baseline slot of an assignment.

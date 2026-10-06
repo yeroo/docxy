@@ -489,6 +489,16 @@ impl<'a> Scheduler<'a> {
         let durations = durations(proj);
         // The span the forward pass schedules each task with: its Duration,
         // extended when a delayed flat-work assignment runs past it (#469).
+        // One pass over the assignments: max extent per task UID.
+        let mut extents: HashMap<i32, i64> = HashMap::new();
+        for a in &proj.assignments {
+            if let Some(extent) = delayed_extent_min(proj, a) {
+                extents
+                    .entry(a.task_uid)
+                    .and_modify(|max| *max = (*max).max(extent))
+                    .or_insert(extent);
+            }
+        }
         let scheduled_spans: Vec<i64> = proj
             .tasks
             .iter()
@@ -496,12 +506,7 @@ impl<'a> Scheduler<'a> {
                 let extent = if t.duration_min == 0 {
                     0
                 } else {
-                    proj.assignments
-                        .iter()
-                        .filter(|a| a.task_uid == t.uid)
-                        .filter_map(|a| delayed_extent_min(proj, a))
-                        .max()
-                        .unwrap_or(0)
+                    extents.get(&t.uid).copied().unwrap_or(0)
                 };
                 t.duration_min.max(extent)
             })
@@ -3632,7 +3637,12 @@ impl Scheduler<'_> {
                 } else {
                     match delayed_extent_min(self.proj, a) {
                         Some(extent) => extent,
-                        None if contoured(a) => self.scheduled_span(ti),
+                        // A contour follows the task's span, unless the
+                        // assignment is complete: its recorded finish keeps
+                        // the stored-Duration end.
+                        None if contoured(a) && a.actual_finish.is_none() => {
+                            self.scheduled_span(ti)
+                        }
                         None => task.duration_min,
                     }
                 };
@@ -8585,6 +8595,71 @@ mod tests {
             )
         );
         assert_eq!(m.total_slack_min, -960);
+    }
+
+    #[test]
+    fn leveling_a_completed_contoured_assignment_keeps_its_duration_end() {
+        // T's delayed flat assignment extends it a day, but R1's contoured
+        // assignment is complete (a recorded ActualFinish): its booking ends
+        // with the stored Duration, so U on R1 levels onto Wednesday.
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "T", 960), task(2, "U", 480)],
+            resources: vec![worker(1, "R1", 1.0), worker(2, "R2", 1.0)],
+            assignments: vec![
+                Assignment {
+                    uid: 1,
+                    task_uid: 1,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 960,
+                    work_contour: Some(1),
+                    actual_finish: Some(at(3, 17)),
+                    ..Assignment::default()
+                },
+                Assignment {
+                    uid: 2,
+                    task_uid: 1,
+                    resource_uid: 2,
+                    units: 1.0,
+                    work_min: 960,
+                    delay: Some(480 * 10),
+                    ..Assignment::default()
+                },
+                Assignment {
+                    uid: 3,
+                    task_uid: 2,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 480,
+                    ..Assignment::default()
+                },
+            ],
+            ..Project::default()
+        };
+        let lv = level(&proj);
+        assert_eq!(
+            (lv.start(2), lv.finish(2)),
+            (Some(at(4, 8)), Some(at(4, 17)))
+        );
+    }
+
+    #[test]
+    fn delayed_assignment_with_an_actual_start_does_not_extend() {
+        // A recorded ActualStart stands in for the Delay, as in
+        // assignment_span: the task keeps its stored Duration.
+        let proj = Project {
+            assignments: vec![Assignment {
+                actual_start: Some(at(2, 8)),
+                ..delayed_assign(1, 1, Some(480 * 10), 8, 1.0)
+            }],
+            ..march2(vec![task(1, "A", 480)])
+        };
+        let s = schedule(&proj);
+        assert_eq!(
+            dates(&s, 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-02T17:00:00".into())
+        );
     }
 
     /// The classic worked example: A(2d)→B(3d), A→C(1d), B→D, C→D.
