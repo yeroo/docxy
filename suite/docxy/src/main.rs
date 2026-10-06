@@ -5061,13 +5061,13 @@ fn tracked_page(probe: &RulerProbe) -> Option<usize> {
 #[cfg(test)]
 mod ruler_geom_tests {
     use super::{
-        Block, EffIndent, Inline, LeadingItem, Pal, Paragraph, RulerChange, RulerDrag, RulerHandle,
-        RulerProbe, ScreenRect, caret_scroll_index, dragged_left_marker, eff_indent, hruler_geom,
+        Block, Document, EffIndent, Inline, LeadingItem, MarkupView, Pal, Paragraph, RulerChange,
+        RulerDrag, RulerHandle, RulerProbe, ScreenRect, dragged_left_marker, eff_indent, hruler_geom,
         hruler_hit, leading_items, next_tab_stop, page_needs_scroll, page_of_block, page_ranges_of,
-        paragraph_indent_layout, px_tw, ruler_colors, ruler_drag_result, tracked_page, tw_px,
-        vruler_geom,
+        paragraph_indent_layout, print_caret_page, px_tw, ruler_colors, ruler_drag_result,
+        tracked_page, tw_px, vruler_geom,
     };
-    use docxcore::model::{PageGeom, ParProps, Run, TabAlign, TabLeader, TabStop};
+    use docxcore::model::{PageGeom, ParProps, RevisionKind, RevisionMetadata, Run, TabAlign, TabLeader, TabStop};
 
     fn near(a: f32, b: f32) {
         assert!((a - b).abs() < 0.02, "{a} != {b}");
@@ -5659,19 +5659,64 @@ mod ruler_geom_tests {
     }
 
     #[test]
-    fn caret_scroll_index_targets_the_page_in_print_layout_and_the_block_in_draft() {
-        let ranges = vec![vec![(0, 2)], vec![(2, 4)], vec![(4, 6)]];
-        assert_eq!(caret_scroll_index(true, &ranges, 0), 0);
-        assert_eq!(caret_scroll_index(true, &ranges, 5), 2);
-        // Draft view's children are blocks: the index passes through.
-        assert_eq!(caret_scroll_index(false, &ranges, 5), 5);
+    fn print_caret_page_paginates_the_shown_body_not_the_live_body() {
+        let deletion = Inline::Revision {
+            kind: RevisionKind::Delete,
+            metadata: RevisionMetadata::default(),
+            raw: String::new(),
+            content: vec![Inline::Run(Run {
+                text: "x".repeat(20_000),
+                ..Run::default()
+            })],
+            content_changed: false,
+        };
+        let para = |content: Vec<Inline>| Block::Paragraph(Paragraph {
+            content,
+            ..Paragraph::default()
+        });
+        let mut body = vec![para(vec![deletion])];
+        body.extend((0..100).map(|i| {
+            para(vec![Inline::Run(Run {
+                text: format!("short {i}"),
+                ..Run::default()
+            })])
+        }));
+        let doc = Document { body };
+        let geom = PageGeom::default();
+        let live_pages = page_ranges_of(&doc.body, &geom).len();
+        let shown_pages = page_ranges_of(&doc.markup_view(MarkupView::Simple).body, &geom).len();
+        assert!(
+            shown_pages < live_pages,
+            "the deletion should add a page to the live body only: live {live_pages}, shown {shown_pages}"
+        );
+        let last = doc.body.len() - 1;
+        let page = print_caret_page(&doc, MarkupView::Simple, &geom, last);
+        assert_eq!(page, shown_pages - 1);
+        assert!(page < live_pages);
     }
 
     #[test]
-    fn caret_scroll_index_falls_back_to_the_last_page() {
-        let ranges = vec![vec![(0, 2)], vec![(2, 4)]];
-        assert_eq!(caret_scroll_index(true, &ranges, 99), 1);
-        assert_eq!(caret_scroll_index(true, &[], 7), 0);
+    fn print_caret_page_falls_back_to_the_last_page() {
+        let para = |text: &str| Block::Paragraph(Paragraph {
+            content: vec![Inline::Run(Run {
+                text: text.into(),
+                ..Run::default()
+            })],
+            ..Paragraph::default()
+        });
+        let geom = PageGeom::default();
+        let body: Vec<Block> = (0..8).map(|i| para(&format!("p{i}"))).collect();
+        let doc = Document { body };
+        let pages = page_ranges_of(&doc.body, &geom).len();
+        assert_eq!(print_caret_page(&doc, MarkupView::All, &geom, 0), 0);
+        // A block past every range (a live index after a paragraph merge, say)
+        // and an empty body both target an existing page, never past the sheets.
+        assert_eq!(
+            print_caret_page(&doc, MarkupView::All, &geom, usize::MAX),
+            pages - 1
+        );
+        let empty = Document { body: Vec::new() };
+        assert_eq!(print_caret_page(&empty, MarkupView::All, &geom, 7), 0);
     }
 
     #[test]
