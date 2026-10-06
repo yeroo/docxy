@@ -101,7 +101,8 @@ fn dispatch_mutation_kind(op: &str) -> Option<MutationKind> {
     Some(match op {
         "bold" | "italic" | "underline" | "strike" | "heading" | "list" | "align" | "indent"
         | "fontsize" | "color" | "vertalign" | "clearfmt" | "highlight" | "font" | "setsize"
-        | "linespacing" | "style" | "nospacing" | "case" | "borders" => MutationKind::Formatting,
+        | "linespacing" | "style" | "nospacing" | "case" | "borders" | "setind" | "firstline"
+        | "rightind" => MutationKind::Formatting,
         "insert" | "newline" | "backspace" | "delete" | "undo" | "redo" | "paste" | "replace"
         | "cut" | "sort" | "hrule" | "tab" => MutationKind::Content,
         _ => return None,
@@ -370,6 +371,18 @@ impl Session {
                 _ => Align::Left,
             }),
             "indent" => self.editor.change_indent(rest.trim().parse().unwrap_or(0)),
+            // Ruler drags: absolute indent values in twips (the page's drag
+            // math snaps and clamps them; see DocxyEngine.ruler).
+            "setind" => {
+                let mut a = rest.split('\t');
+                let left = a.next().unwrap_or("").trim().parse().unwrap_or(0);
+                let first = a.next().unwrap_or("").trim().parse().unwrap_or(0);
+                self.editor.set_indent(left, first);
+            }
+            "firstline" => self.editor.set_first_line(rest.trim().parse().unwrap_or(0)),
+            "rightind" => self
+                .editor
+                .set_right_indent(rest.trim().parse().unwrap_or(0)),
             "fontsize" => self.editor.resize_font(rest.trim().parse().unwrap_or(0)),
             "color" => {
                 let hex = rest.trim();
@@ -2779,6 +2792,9 @@ mod tests {
             "paste\tx",
             "replace\tnew\tx",
             "cut",
+            "setind\t720\t-360",
+            "firstline\t240",
+            "rightind\t720",
         ] {
             let (copied, applied) = read_only.dispatch(command);
             assert!(!applied, "protected command reported applied: {command}");
@@ -2814,6 +2830,41 @@ mod tests {
         );
         assert_ne!(formatting_only.editor.doc, before_format);
         assert!(formatting_only.is_dirty());
+    }
+
+    #[test]
+    fn protected_document_rejects_setind() {
+        let xml = "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+                   <w:body><w:p><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>";
+        let doc = docxcore::load::parse_document_xml(xml, &Default::default());
+
+        // Positive control: on an editable document the indent ops apply.
+        let mut editable = Session::open(&save_package(&new_package(doc))).expect("open");
+        for cmd in ["setind\t720\t-360", "firstline\t240", "rightind\t720"] {
+            let (_, applied) = editable.dispatch(cmd);
+            assert!(applied, "editable document rejected {cmd}");
+        }
+
+        // Read-only rejects them without touching the document or the dirty flag.
+        let mut read_only = Session::open(&read_only_revision_docx()).expect("open");
+        let original = read_only.editor.doc.clone();
+        for cmd in ["setind\t720\t-360", "firstline\t240", "rightind\t720"] {
+            let (_, applied) = read_only.dispatch(cmd);
+            assert!(!applied, "read-only document applied {cmd}");
+            assert_eq!(read_only.editor.doc, original, "{cmd}");
+            assert!(!read_only.is_dirty(), "{cmd}");
+        }
+
+        // Formatting-locked rejects the formatting op but still allows content.
+        let mut formatting_only =
+            Session::open(&protected_revision_docx("none", true)).expect("open");
+        let before = formatting_only.editor.doc.clone();
+        let (_, applied) = formatting_only.dispatch("setind\t720\t-360");
+        assert!(!applied);
+        assert_eq!(formatting_only.editor.doc, before);
+        assert!(!formatting_only.is_dirty());
+        let (_, applied) = formatting_only.dispatch("insert\tx");
+        assert!(applied);
     }
 
     #[test]

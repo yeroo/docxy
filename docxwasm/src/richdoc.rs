@@ -24,8 +24,8 @@ use std::collections::HashMap;
 use docxcore::editor::{inline_len, para_text_len};
 use docxcore::load::Relationships;
 use docxcore::model::{
-    Align, Block, BreakKind, Document, Inline, PageGeom, Paragraph, RevisionKind, RunProps, Table,
-    VMerge, VertAlign,
+    Align, Block, BreakKind, Document, Inline, PageGeom, Paragraph, RevisionKind, RunProps,
+    TabAlign, Table, VMerge, VertAlign,
 };
 use docxcore::styles::StyleSheet;
 
@@ -167,6 +167,28 @@ fn push_paragraph(out: &mut String, p: &Paragraph, path: &[usize], ctx: &Ctx<'_>
             ",\"ind\":{{\"left\":{},\"right\":{},\"first\":{}}}",
             props.indent, props.indent_right, props.first_line
         ));
+    }
+    // The ruler draws the paragraph's tab stops; like the suite's ruler_para,
+    // a paragraph with none of its own shows its style's.
+    let tabs = if props.tabs.is_empty() {
+        ctx.styles.effective_tabs(props.style_id.as_deref())
+    } else {
+        props.tabs.clone()
+    };
+    if !tabs.is_empty() {
+        out.push_str(",\"tabs\":[");
+        for (i, t) in tabs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let a = match t.align {
+                TabAlign::Left => "l",
+                TabAlign::Center => "c",
+                TabAlign::Right => "r",
+            };
+            out.push_str(&format!("{{\"pos\":{},\"a\":\"{a}\"}}", t.pos));
+        }
+        out.push(']');
     }
     let sp = &props.spacing;
     if !sp.is_empty() {
