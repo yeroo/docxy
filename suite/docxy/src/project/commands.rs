@@ -777,6 +777,21 @@ pub(crate) fn project_input(
         return None;
     }
     if let Some(act) = key_act(key, m) {
+        // A command acts on the cursor, so the range does not survive it —
+        // including the acts the host runs without apply_project_act (Save,
+        // Export, levelling). The clipboard trio is excepted: Cut and Paste
+        // clear the range themselves, Copy keeps it; Link and Unlink consume
+        // the range in apply_project_act, which exempts them.
+        if !matches!(
+            act,
+            ProjectAct::Copy
+                | ProjectAct::Cut
+                | ProjectAct::Paste
+                | ProjectAct::AddLink
+                | ProjectAct::UnlinkTasks
+        ) {
+            v.anchor = None;
+        }
         return Some(act);
     }
     if m.control && !m.alt && !m.platform {
@@ -1296,7 +1311,12 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                         }
                         Ok(n)
                     });
-                    status = Some(linked.map_or_else(|e| e, |n| format!("Linked {n} tasks")));
+                    status = Some(match linked {
+                        Ok(0) => "No links to add".into(),
+                        Ok(1) => "Added 1 link".into(),
+                        Ok(n) => format!("Added {n} links"),
+                        Err(e) => e,
+                    });
                 } else {
                     v.open_prompt(PromptKind::Predecessor);
                 }

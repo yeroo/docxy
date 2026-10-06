@@ -26551,9 +26551,12 @@ impl Docxy {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return Err("no tab is open".into());
         };
-        let Surface::Project(v) = &tab.surface else {
+        let Surface::Project(v) = &mut tab.surface else {
             return Err("the active tab is not a Project".into());
         };
+        // The menu acts on the row under the pointer: a stale drag flag must
+        // not swallow this click and leave the cursor on an older row.
+        v.drag_made_range = false;
         if row < v.ed.project().tasks.len() {
             project_cell_click(tab, row, col, false);
         } else {
@@ -31207,16 +31210,30 @@ impl Render for Docxy {
                 // tabs, outside the window) ends here; idempotent, so the grid's
                 // own handler having run first costs nothing.
                 this.grid_release(cx);
-                // A Project cell drag released off the table ends the same way.
-                if let Some(tab) = this.tabs.get_mut(this.active) {
-                    crate::project_cell_release(tab);
-                }
                 if this.selecting {
                     this.selecting = false;
                     let has_sel = matches!(this.tabs.get(this.active).map(|t| &t.surface), Some(Surface::Doc(ed)) if ed.has_selection());
                     this.mini_bar = has_sel.then_some(ev.position);
                     cx.notify();
                 }
+            }))
+            // A Project cell drag ends in the capture phase, before the click
+            // gpui synthesizes during mouse-up bubbling: a descendant's click
+            // handler stops that propagation, so a bubble-phase release can be
+            // skipped and leave the drag armed. The flag survives only where a
+            // release-click can follow (the release is over the table body).
+            .capture_any_mouse_up(cx.listener(|this, ev: &MouseUpEvent, _window, _cx| {
+                if ev.button != MouseButton::Left {
+                    return;
+                }
+                let Some(tab) = this.tabs.get_mut(this.active) else {
+                    return;
+                };
+                let may_click = match &tab.surface {
+                    Surface::Project(_) => crate::project_release_may_click(&this.probes, ev.position),
+                    _ => false,
+                };
+                crate::project_cell_release(tab, may_click);
             }))
             .bg(bg)
             .child(probe_tracked(&self.probes, "suite-root", self.tab_more_open))

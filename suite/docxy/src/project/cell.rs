@@ -92,7 +92,7 @@ impl CellEdit {
 /// [`ProjectView::selection`], never stored, so it cannot go stale: an
 /// anchor whose task was deleted, hidden or undone away degrades to no
 /// selection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Selection {
     pub uids: Vec<i32>,
     pub cols: std::ops::RangeInclusive<usize>,
@@ -154,13 +154,19 @@ impl ProjectView {
         let Some(uid) = self.selected_uid() else {
             return true;
         };
-        if self.anchor.is_none() {
+        let rows = self.ed.visible_rows();
+        // Anchor where the cursor is: on the first extension, or when the
+        // stored anchor's task is gone or hidden (a delete, an undo, a
+        // collapse) — an anchor that cannot resolve selects nothing.
+        let anchor_gone = self
+            .anchor
+            .is_some_and(|(uid, _)| !rows.iter().any(|&i| self.ed.project().tasks[i].uid == uid));
+        if self.anchor.is_none() || anchor_gone {
             self.anchor = Some((uid, self.col));
         }
         match key {
             "left" | "right" => self.key(key, false),
             _ => {
-                let rows = self.ed.visible_rows();
                 let at = self.display_row();
                 let next = if key == "up" {
                     at.checked_sub(1)
@@ -490,6 +496,9 @@ pub(crate) fn project_cell_press(tab: &mut DocTab, row: usize, col: usize, shift
             v.drag_made_range = v.anchor.is_some();
         }
         (true, None) => {
+            // Extending onto the entry row selects nothing; the old anchor
+            // does not survive either.
+            v.anchor = None;
             v.enter_entry_row();
             v.col = col;
             v.drag_made_range = false;
@@ -553,22 +562,29 @@ pub(crate) fn project_cell_drag_over(tab: &mut DocTab, row: usize, col: usize) -
     true
 }
 
-/// The left release anywhere (the window-level mouse-up calls this): the
-/// gesture is over. `drag_made_range` stays until the release-click consumes
-/// it, so a drag released on the cell it swept does not clear its own range.
-pub(crate) fn project_cell_release(tab: &mut DocTab) {
+/// The left release anywhere: the suite-root mouse-up's capture phase calls
+/// this, so no descendant's click handler can stop it and leave the drag
+/// armed. `may_click` says the release landed where gpui delivers a row or
+/// body release-click (over the entry-table body): that click still needs
+/// `drag_made_range` to know it must be swallowed. A release anywhere else
+/// leaves no click behind, so the flag is spent here — left set, it would
+/// swallow a later, genuine click.
+pub(crate) fn project_cell_release(tab: &mut DocTab, may_click: bool) {
     let Surface::Project(v) = &mut tab.surface else {
         return;
     };
     v.dragging = false;
     v.row_drag = false;
+    if !may_click {
+        v.drag_made_range = false;
+    }
 }
 
 fn cell_click(tab: &mut DocTab, target: ClickTarget, col: Option<usize>, double: bool) {
-    // A drag (or a Shift/ID press) made a range: the `on_click` gpui delivers
-    // on release must not clear it. The flag is spent either way, so a later
-    // genuine click is never swallowed; a double-click still runs (an ID
-    // cell's "ID is read-only", for one).
+    // A drag (or a Shift/ID press) made a range: the release-click gpui
+    // delivers on the gesture's element must not clear it. The flag is
+    // taken, so a later genuine click is never swallowed; a double-click
+    // still runs (an ID cell's "ID is read-only", for one).
     let swallowed = {
         let Surface::Project(v) = &mut tab.surface else {
             return;
@@ -577,6 +593,12 @@ fn cell_click(tab: &mut DocTab, target: ClickTarget, col: Option<usize>, double:
     };
     if swallowed && !double {
         return;
+    }
+    // A click reaches here only with no press before it — the row's chart
+    // half, the ruled rows below the table, a right-click's menu: it places
+    // the cursor like any plain click, so the range does not survive it.
+    if let Surface::Project(v) = &mut tab.surface {
+        v.anchor = None;
     }
     // A levelling pass asked for first runs first, in the order the user
     // gave them; see [`flush_level_pass`].

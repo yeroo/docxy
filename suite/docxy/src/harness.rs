@@ -3803,7 +3803,8 @@ fn dispatch_verb(
                     Some(crate::ShownRow::Task(i)) => {
                         crate::project_cell_press(tab, i, target.col, shift);
                         crate::project_cell_click(tab, i, Some(target.col), dbl);
-                        crate::project_cell_release(tab);
+                        // The verb's click already ran; no release-click follows.
+                        crate::project_cell_release(tab, false);
                     }
                     Some(crate::ShownRow::Entry) => {
                         // The press commits an open entry-row edit, so an
@@ -3818,7 +3819,8 @@ fn dispatch_verb(
                         } else {
                             crate::project_entry_click(tab, Some(target.col), dbl);
                         }
-                        crate::project_cell_release(tab);
+                        // The verb's click already ran; no release-click follows.
+                        crate::project_cell_release(tab, false);
                     }
                     None => return Err("Project cell is outside the entry table".into()),
                 }
@@ -3963,6 +3965,21 @@ fn dispatch_verb(
                 ),
             ]))?;
             done.input = drag_events(&path);
+            Ok(done)
+        }
+
+        // A bare pointer move with no button held, as the hover between
+        // gestures: `to` names a region, as for pointer-drag. Drives the
+        // move handlers exactly like a real hover, so a case can show they
+        // answer only an armed drag (a Project range extends on a held-button
+        // move, never on hover, #560 r1).
+        "pointer-move" => {
+            let to = region_point(app, arg_str(args, "to")?, window)?;
+            let mut done = Done::ok(Json::obj(vec![(
+                "to",
+                Json::Arr(vec![Json::Num(f64::from(to.x)), Json::Num(f64::from(to.y))]),
+            )]))?;
+            done.input = vec![mouse_move(to, None)];
             Ok(done)
         }
 
@@ -4342,7 +4359,8 @@ fn dispatch_verb(
                 for (i, c) in path {
                     crate::project_cell_drag_over(tab, i, c);
                 }
-                crate::project_cell_release(tab);
+                // The verb synthesizes no release-click.
+                crate::project_cell_release(tab, false);
                 app.refocus(window, cx);
                 return Done::ok(state(app, window));
             }
