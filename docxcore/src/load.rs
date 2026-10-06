@@ -134,31 +134,27 @@ const PART_ROOTS: [&str; 6] = [
 /// The namespace bindings in scope at the parser's current Start event that
 /// a save does not keep: those declared below the part root (on `w:body`,
 /// `w:tc`, a `w:rPr`, …), which the serializer rebuilds without them. A
-/// redeclaration of the part root's own binding is kept anyway: the saved
-/// root keeps it, so it is bound everywhere in the part (a rebuilt `w:tbl`
-/// redeclares it, which must not make a reload differ). The innermost
-/// binding of each prefix, as `(prefix, namespace)`.
+/// binding is kept anyway when every declaration of its prefix from the part
+/// root down has the root's value: the saved root keeps it, and nothing the
+/// save writes back in between (a `w:p`'s or a `w:tbl`'s declarations) can
+/// bind the prefix to another namespace. The innermost binding of each
+/// prefix, as `(prefix, namespace)`.
 fn rebuilt_bindings(p: &XmlParser) -> Vec<(String, String)> {
-    // The part root's declarations, as it made them (a descendant may have
-    // redeclared a prefix since).
-    let root: Vec<(String, String)> = p
-        .root_namespace_attrs()
-        .into_iter()
-        .filter(|scoped| PART_ROOTS.contains(&scoped.element_name))
-        .filter_map(|scoped| {
-            let prefix = scoped.attr.name.strip_prefix("xmlns:")?;
-            Some((prefix.to_string(), decode_attr(scoped.attr.value)))
-        })
-        .collect();
     let mut out: Vec<(String, String)> = Vec::new();
     for scoped in p.namespace_scoped_attrs() {
         let Some(prefix) = scoped.attr.name.strip_prefix("xmlns:") else {
             continue;
         };
+        if PART_ROOTS.contains(&scoped.element_name) {
+            continue;
+        }
         let ns = decode_attr(scoped.attr.value);
-        if !PART_ROOTS.contains(&scoped.element_name)
-            && !root.iter().any(|(p, n)| p == prefix && *n == ns)
-        {
+        let chain = p.namespace_declaration_chain(scoped.attr.name);
+        let root_kept = chain
+            .first()
+            .is_some_and(|first| PART_ROOTS.contains(&first.element_name))
+            && chain.iter().all(|d| decode_attr(d.attr.value) == ns);
+        if !root_kept {
             out.push((prefix.to_string(), ns));
         }
     }
@@ -1395,12 +1391,18 @@ fn property_element_names(scope: PropertyScope) -> (&'static str, &'static str) 
 /// Parse a complete `*PrChange` wrapper while retaining its exact XML. Unknown
 /// wrapper children do not make an otherwise valid prior snapshot unusable.
 fn parse_property_change(p: &mut XmlParser, scope: PropertyScope) -> PropertyChange {
-    let metadata = parse_revision_metadata(p);
+    let mut metadata = parse_revision_metadata(p);
     let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
     let complete = p.skip_element_complete();
     // The change is written back inside a rebuilt container: it keeps the
     // bindings its prefixes need, and so does the snapshot parsed from it.
     let raw = declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
+    // The metadata is read from the start tag as written back, declarations
+    // included, so a reload reads the same.
+    let mut written = XmlParser::new(&raw);
+    if written.next() == Event::Start {
+        metadata = parse_revision_metadata(&written);
+    }
     let previous = if complete {
         parse_property_snapshot(&raw, scope)
     } else {

@@ -384,7 +384,8 @@ struct TextBoxCopy {
     /// Byte range of its inner XML.
     inner: Range<usize>,
     /// Whether its inner XML equals the first copy's apart from `w14:paraId`
-    /// attributes (see `without_para_ids`), so it shows the same `blocks`.
+    /// attributes and prefixed namespace declarations (see `twin_key`), so it
+    /// shows the same `blocks`.
     /// The first copy is its own twin. Only twins may be rewritten
     /// from `blocks`; another box of a group keeps its own content.
     twin: bool,
@@ -420,26 +421,34 @@ fn text_box_copies(raw: &str) -> Vec<TextBoxCopy> {
     // A save may drop a repeated `w14:paraId` from one copy but not the other
     // (an id is never dropped in an `mc:Fallback`, #1063); that alone does not
     // make the copies differ.
-    let first = without_para_ids(first);
+    let first = twin_key(first);
     inners
         .iter()
         .map(|inner| TextBoxCopy {
-            twin: without_para_ids(&raw[inner.clone()]) == first,
+            twin: twin_key(&raw[inner.clone()]) == first,
             inner: inner.clone(),
         })
         .collect()
 }
 
-/// `xml` without the `w14:paraId` attributes of its start tags (text is
-/// left alone). Malformed XML is returned as it is.
-fn without_para_ids(xml: &str) -> String {
+/// `xml` as text-box copies are compared: without the `w14:paraId`
+/// attributes and the prefixed namespace declarations (`xmlns:p`) of its
+/// start tags; text is left alone. A save may drop a repeated id from one copy
+/// only, and the loader declares on a modeled copy's property elements the
+/// prefixes they inherit (#1063), which the raw copy inherits unchanged.
+/// Malformed XML is returned as it is.
+fn twin_key(xml: &str) -> String {
     use crate::xml::{Event, XmlParser};
     let mut cuts = Vec::new();
     let mut p = XmlParser::new(xml);
     loop {
         match p.next() {
             Event::Start => {
-                for a in p.attrs().iter().filter(|a| a.name == "w14:paraId") {
+                for a in p
+                    .attrs()
+                    .iter()
+                    .filter(|a| a.name == "w14:paraId" || a.name.starts_with("xmlns:"))
+                {
                     let Some(cut) = crate::serialize::attr_source_range(xml, a) else {
                         return xml.to_string();
                     };
@@ -1095,6 +1104,30 @@ mod tests {
             twins(&raw(&attr("11111111"), &attr("22222222"))),
             [true, true]
         );
+    }
+
+    /// Review r5: the loader declares on the modeled copy's property elements
+    /// a prefix the drawing run declares for both copies; the copies are still
+    /// twins after a save and reopen, and a removal reaches both.
+    #[test]
+    fn a_prefix_declared_on_the_drawing_run_keeps_the_copies_twins() {
+        let content = "<w:p><w:r><w:rPr><w:lang w:val=\"en-US\" ux:flag=\"1\"/></w:rPr>\
+            <w:t xml:space=\"preserve\">keep</w:t></w:r><w:r><w:rPr><w:vanish/>\
+            <w:lang w:val=\"en-US\" ux:flag=\"1\"/></w:rPr><w:t xml:space=\"preserve\">gone</w:t></w:r></w:p>";
+        let boxed = format!(
+            "<w:p><w:r xmlns:ux=\"urn:ux\"><mc:AlternateContent><mc:Choice Requires=\"wps\"><w:drawing><wps:txbx>\
+             <w:txbxContent>{content}</w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
+             <mc:Fallback><w:pict><v:shape><v:textbox><w:txbxContent>{content}</w:txbxContent>\
+             </v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>"
+        );
+        let xml = document_to_xml(&parse(&boxed));
+        assert!(xml.contains("<w:lang xmlns:ux=\"urn:ux\""), "{xml}");
+        let body = &xml[xml.find("<w:body>").unwrap() + 8..xml.find("</w:body>").unwrap()];
+        let mut reopened = parse(body);
+        assert_eq!(remove_hidden_text(&mut reopened), 1);
+        let xml = document_to_xml(&reopened);
+        assert!(!xml.contains("gone"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 2, "{xml}");
     }
 
     /// #917: deleting one comment strips only its markers. Text in the same

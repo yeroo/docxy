@@ -156,28 +156,27 @@ impl<'a> XmlParser<'a> {
             .map(|(attr, element_name)| XmlScopedAttr { element_name, attr })
     }
 
-    /// The namespace declarations of the outermost open element (the
-    /// document's root) as that element made them, including those a
-    /// descendant has since redeclared: a consumer that writes the root back
-    /// can tell a redeclaration of the root's own binding from a new one.
-    pub fn root_namespace_attrs(&self) -> Vec<XmlScopedAttr<'a>> {
-        let Some((root, later)) = self.namespace_changes.split_first() else {
+    /// Every declaration of the namespace attribute `name` (`xmlns:p`) on the
+    /// open elements, outermost first; the last is the one in effect. Empty
+    /// when the prefix is not bound. A consumer that writes back only some of
+    /// those elements can tell whether a binding survives without the rest.
+    pub fn namespace_declaration_chain(&self, name: &str) -> Vec<XmlScopedAttr<'a>> {
+        let Some(index) = self.m_namespaces.iter().position(|a| a.name == name) else {
             return Vec::new();
         };
-        root.iter()
-            .map(|(index, _)| {
-                // The first later scope to redeclare it saved the root's value.
-                later
-                    .iter()
-                    .flatten()
-                    .find(|(i, _)| i == index)
-                    .and_then(|(_, previous)| *previous)
-                    .unwrap_or(XmlScopedAttr {
-                        attr: self.m_namespaces[*index],
-                        element_name: self.m_namespace_elements[*index],
-                    })
-            })
-            .collect()
+        // Each redeclaring scope saved the value it replaced.
+        let mut chain: Vec<XmlScopedAttr<'a>> = self
+            .namespace_changes
+            .iter()
+            .flatten()
+            .filter(|(i, _)| *i == index)
+            .filter_map(|(_, previous)| *previous)
+            .collect();
+        chain.push(XmlScopedAttr {
+            attr: self.m_namespaces[index],
+            element_name: self.m_namespace_elements[index],
+        });
+        chain
     }
 
     /// Markup-compatibility attributes active at the current start element,
@@ -580,35 +579,30 @@ fn utf8_len(b: u8) -> usize {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn root_namespace_attrs_survive_a_descendant_redeclaring_them() {
-        let mut p = XmlParser::new(
-            "<r xmlns:a=\"urn:root\" xmlns:b=\"urn:b\"><c xmlns:a=\"urn:inner\"><d/></c></r>",
-        );
-        while !(p.next() == Event::Start && p.name() == "d") {}
-        let current: Vec<_> = p
-            .namespace_scoped_attrs()
-            .map(|s| (s.attr.value, s.element_name))
-            .collect();
-        assert!(current.contains(&("urn:inner", "c")));
-        let root: Vec<_> = p
-            .root_namespace_attrs()
-            .iter()
-            .map(|s| (s.attr.name, s.attr.value, s.element_name))
-            .collect();
-        assert_eq!(
-            root,
-            [("xmlns:a", "urn:root", "r"), ("xmlns:b", "urn:b", "r")]
-        );
-    }
-
     use super::*;
 
     fn decode(raw: &str) -> String {
         let mut s = String::new();
         XmlParser::append_decoded(raw, &mut s);
         s
+    }
+
+    #[test]
+    fn namespace_declaration_chain_lists_each_redeclaration_outermost_first() {
+        let mut p = XmlParser::new(
+            "<r xmlns:a=\"urn:root\"><c xmlns:a=\"urn:inner\"><e xmlns:a=\"urn:root\"><d/></e></c></r>",
+        );
+        while !(p.next() == Event::Start && p.name() == "d") {}
+        let chain: Vec<_> = p
+            .namespace_declaration_chain("xmlns:a")
+            .iter()
+            .map(|s| (s.attr.value, s.element_name))
+            .collect();
+        assert_eq!(
+            chain,
+            [("urn:root", "r"), ("urn:inner", "c"), ("urn:root", "e")]
+        );
+        assert!(p.namespace_declaration_chain("xmlns:b").is_empty());
     }
 
     #[test]

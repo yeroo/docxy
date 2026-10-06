@@ -818,3 +818,57 @@ fn requires_and_escaped_compatibility_values_keep_their_namespaces() {
         "{xml}"
     );
 }
+
+/// Review r5: a binding equal to the root's still comes along when an
+/// ancestor the save writes back (a `w:p`'s own declarations, a rebuilt
+/// `w:tbl`'s) binds the prefix to another namespace in between; otherwise the
+/// kept XML would resolve to that other namespace.
+#[test]
+fn a_root_binding_restored_below_a_rebinding_ancestor_comes_along() {
+    for body in [
+        "<w:p xmlns:ux=\"urn:b\"><w:pPr xmlns:ux=\"urn:a\"><w:keepNext ux:k=\"1\"/></w:pPr>\
+         <w:r><w:t>text</w:t></w:r></w:p>",
+        "<w:tbl xmlns:ux=\"urn:b\"><w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid><w:tr>\
+         <w:tc xmlns:ux=\"urn:a\"><w:p><w:pPr><ux:flag/></w:pPr><w:r><w:t>cell</w:t></w:r></w:p>\
+         </w:tc></w:tr></w:tbl><w:p/>",
+    ] {
+        let original = docx_with_root(
+            &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:ux=\"urn:a\">"),
+            &format!("<w:body>{body}</w:body>"),
+        );
+        let (pkg, editor) = open(&original);
+        let loaded = editor.doc.clone();
+        let saved = save(pkg, editor);
+        let xml = document_xml(&saved);
+        assert!(
+            xml.contains("<w:keepNext xmlns:ux=\"urn:a\" ux:k=\"1\"/>")
+                || xml.contains("<ux:flag xmlns:ux=\"urn:a\"/>"),
+            "{xml}"
+        );
+        let (_, reloaded) = open(&saved);
+        assert_eq!(reloaded.doc, loaded, "{xml}");
+    }
+}
+
+/// Review r5: a tracked change's metadata is read from its start tag as
+/// written back, declarations the loader adds included, so an untouched
+/// document reloads to the same model.
+#[test]
+fn a_property_change_with_an_inherited_binding_reloads_to_the_same_model() {
+    let date = "2026-01-01T00:00:00Z";
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\">"),
+        &format!(
+            "<w:body><w:p><w:r><w:rPr xmlns:ux=\"urn:ux\"><w:b/>\
+             <w:rPrChange w:id=\"1\" w:author=\"A\" w:date=\"{date}\"><w:rPr>\
+             <w:lang w:val=\"en-US\" ux:l=\"1\"/></w:rPr></w:rPrChange></w:rPr>\
+             <w:t>text</w:t></w:r></w:p></w:body>"
+        ),
+    );
+    let (pkg, editor) = open(&original);
+    let loaded = editor.doc.clone();
+    let saved = save(pkg, editor);
+    document_xml(&saved);
+    let (_, reloaded) = open(&saved);
+    assert_eq!(reloaded.doc, loaded);
+}
