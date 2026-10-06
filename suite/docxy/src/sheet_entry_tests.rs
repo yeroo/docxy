@@ -1619,8 +1619,8 @@ fn no_header() -> gridcore::edit::SortOptions {
 // ---- #510: an act that reads or rewrites cell content commits the open editor
 
 /// #510: everything that reads or rewrites cell content or moves cells
-/// closes the editor first; pure formatting, menus and sheet-wide settings
-/// leave it open, as Excel's edit mode does.
+/// closes the editor first; formatting and dialog/bar openers that neither
+/// read nor rewrite cell values, and the pick list, leave it open.
 #[test]
 fn acts_that_rewrite_cells_close_the_editor() {
     for act in [

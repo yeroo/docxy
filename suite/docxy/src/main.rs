@@ -1191,12 +1191,16 @@ fn act_commits_editor(act: SheetAct) -> bool {
 /// Does `act` paste the grid clipboard? (#510 r1) The commit that prepares
 /// the cell for it must not be the edit that ends copy mode (#664), so a
 /// paste-family act re-stamps what the commit bumped — the paste's own undo
-/// step already does. Other acts leave the stamp alone: a Cut makes a new
-/// clip, and a Sort and its like end copy mode as they should.
+/// step already does. A Paste Again is not in the set: it re-pastes the
+/// Paste Options block, which carries its own edit_gen stamp that a re-stamp
+/// of the clip does not touch, and its own re-paste re-stamps the clip when
+/// it lands. Its copy mode ending on the commit's edit is right, as for any
+/// other act: a Cut makes a new clip, and a Sort and its like end copy mode
+/// as they should.
 fn act_restamps_clip(act: SheetAct) -> bool {
     matches!(
         act,
-        SheetAct::Paste | SheetAct::PasteAs(_) | SheetAct::PasteAgain(_) | SheetAct::PasteSpecial
+        SheetAct::Paste | SheetAct::PasteAs(_) | SheetAct::PasteSpecial
     )
 }
 
