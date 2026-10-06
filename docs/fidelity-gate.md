@@ -181,13 +181,19 @@ git diff docxcore/tests/fidelity/baseline.txt   # should only remove lines
 The rewrite replaces the entries of every file in this run and keeps the
 entries of files it did not see. So run it with the full corpus fetched, or a
 partial run leaves stale lines for absent files behind for the next full run to
-flag. A diff that **adds** lines is a regression, not an update.
+flag. A diff that **adds** lines is a regression, not an update, with one
+exception. The comparator reports a difference once, at the root of the subtree
+that differs. So when a fix stops losing a whole container (a `w:rPr`, an
+attribute), any difference inside that node, or among runs aligned through it,
+becomes visible for the first time. Such an entry may be added under its own
+class, but only when an entry for the same file at that node or an ancestor goes
+away in the same diff. The PR lists each one (#1063 did this).
 
 ## What it does not cover
 
 - xlsx: #1064.
 - Fixing the losses it found:
-  - The unmodeled property children and attributes are #1063.
+  - The unmodeled property children and attributes were fixed by #1063.
   - The other classes in `baseline.txt` each name their issue.
 - Save paths other than `save_package` and `save_package_preserving_document`:
   the HTML bundle, Markdown, compare and merge.

@@ -38,6 +38,15 @@ const CLASSES: &[LossClass] = &[
         matches: |e| e.kind == Kind::LoadError && e.file.contains("password"),
     },
     LossClass {
+        name: "a w14:paraId the source repeats is dropped on save (paragraph ids must be unique)",
+        issue: "by design: #1063",
+        matches: |e| {
+            e.kind == Kind::LostAttr
+                && e.file.contains("conflicting IDs")
+                && e.path.ends_with("/@w14:paraId")
+        },
+    },
+    LossClass {
         name: "unmodeled property children and attributes dropped on save",
         issue: "#1063",
         matches: |e| {

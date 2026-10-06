@@ -28,11 +28,29 @@ but not understood/shown · **MISSING** = dropped or never parsed.
 (`package.rs:557`) and keeps every *other* part byte-for-byte. Whole unmodeled
 elements (bookmarks, `w:sym`, drawings, fields) survive because the loader
 captures them as opaque `Raw` nodes. Tracked-change wrappers are now modeled
-separately. But any **property child of a
-modeled element** — `pPr`, `rPr`, `tblPr`, `trPr`, `tcPr` — that isn't in the
-parser's whitelist is **silently dropped on save, even when the user never
-touched that paragraph.** This one architectural fact is the root cause of the
-top-ranked docx gaps.
+separately. Until #1063, any **property child of a
+modeled element** — `pPr`, `rPr`, `tblPr`, `trPr`, `tcPr` — that wasn't in the
+parser's whitelist, and every attribute the model didn't read, was **silently
+dropped on save, even when the user never touched that paragraph.** This one
+architectural fact was the root cause of the top-ranked docx gaps.
+
+**Fixed in #1063.** Unmodeled property children were already kept verbatim
+(`raw_props`). Now the loader also keeps:
+- the start-tag attributes of `w:p`, `w:r` and `w:tr` (`rsid*`, `w14:paraId`, …);
+- each *modeled* `pPr`/`rPr` child verbatim (`shadow`). On save, a property whose
+  value is unchanged is written from the shadow, so the parts of the element the
+  model doesn't represent survive: `w:rFonts w:hAnsi`/`w:eastAsia`/`w:hint`,
+  `w:szCs`, `w:color w:themeColor`, `w:ind w:firstLineChars`, clear tabs, and
+  left/right borders.
+
+An edited property is generated from the model and keeps what it can:
+- a font edit keeps the East Asian and complex-script slots;
+- a colour edit drops the theme colour that would override it;
+- an indent edit keeps the indents it didn't change.
+
+A toggle and its complex-script twin (`b`/`bCs`, `i`/`iCs`, `sz`/`szCs`) change
+together. A `w14:paraId` that a split, copy or new table row would repeat is
+dropped when the part is written.
 
 **Now measured in CI (#1060).** The round-trip fidelity gate
 ([`docs/fidelity-gate.md`](docs/fidelity-gate.md)) saves every corpus `.docx`
@@ -41,7 +59,9 @@ document is saved. It compares every part with the original and fails on any
 loss outside its shrink-only baseline. That baseline is where the losses
 described above are listed today:
 - unmodeled property children and attributes of modeled elements, including
-  `rsid*` and `w14:paraId`: the fix is #1063;
+  `rsid*` and `w14:paraId`: fixed in #1063. The few entries left in that class
+  are run-alignment effects of #1069: a split run or an unwrapped `smartTag`
+  makes the comparator pair different runs;
 - modeled property values rewritten to the supported set (tab alignment,
   border width, `jc="distribute"`, underline style): #1068;
 - run content restructured (runs merged or split, `lastRenderedPageBreak`,
