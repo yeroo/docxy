@@ -101,19 +101,33 @@ any existing copy alone and exits 0.
 normalizations the gate tolerates in every file:
 
 ```
-kind | part glob | index-free path glob | detail glob | reason
+kind | part glob | index-free path glob | detail glob | [once-with <kind> <part> |] reason
 extra-attr | word/document.xml | */w:t/@xml:space | preserve | The serializer writes xml:space="preserve" on every w:t. ...
 ```
 
 In the globs, `*` matches any run of characters, including `/`. The detail is
 what the report prints after the path:
-- for an attribute, its value;
-- for a lost or extra element, its attributes as `name="value"` pairs, sorted by
-  namespace and local name.
+
+| Finding | Detail |
+|---|---|
+| `lost-attr`, `extra-attr` | the attribute's decoded value, unquoted |
+| `changed-value` | `"old" -> "new"`, each value Rust-Debug-quoted |
+| `lost-element` / `extra-element` of text (`.../text()`) | the text, Rust-Debug-quoted |
+| `lost-element` / `extra-element` of an element | its attributes as `name="value"` pairs, sorted by namespace URI and local name, values Rust-Debug-quoted (so `"` and `\` are escaped); empty for a mismatched root element |
+| `part-bytes`, `load-error`, `panic` | free text (sizes, the error, the panic message) |
+| `part-missing`, `part-extra` | empty |
 
 So a rule can tolerate one specific element, such as the content-type
 `Override` for an added styles part, rather than every extra element at that
-path. A rule without a reason is a parse error. The test prints how many
+path.
+
+An optional `once-with <kind> <part> |` field before the reason narrows a rule
+further. The rule then applies only in a file that also has a finding of that
+kind in that part, and it absorbs one finding per file. The styles `Override`
+rule uses it, so a duplicate Override of a styles part the file already had
+still fails.
+
+A rule without a reason is a parse error. The test prints how many
 findings each rule absorbed.
 
 Shrinking the allowlist is progress. Growing it needs review: a rule hides that

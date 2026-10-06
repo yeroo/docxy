@@ -231,8 +231,37 @@ fn finish(mut b: Building) -> Elem {
     e
 }
 
+/// Whether every `&` in raw text or an attribute value starts a well-formed
+/// reference: one of the five predefined entities, `&#digits;` or `&#xhex;`.
+/// The decoder is lenient (a bare `&` decodes as itself), so without this
+/// `A&B` would compare equal to `A&amp;B`.
+fn valid_references(raw: &str) -> bool {
+    let mut rest = raw;
+    while let Some(at) = rest.find('&') {
+        let after = &rest[at + 1..];
+        let Some(semi) = after.find(';') else {
+            return false;
+        };
+        let name = &after[..semi];
+        let ok = match name.strip_prefix('#') {
+            Some(n) => match n.strip_prefix('x') {
+                Some(hex) => !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()),
+                None => !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()),
+            },
+            None => matches!(name, "amp" | "lt" | "gt" | "quot" | "apos"),
+        };
+        if !ok {
+            return false;
+        }
+        rest = &after[semi + 1..];
+    }
+    true
+}
+
 /// Parse an XML part into its canonical DOM. `None` when the part is not
-/// UTF-8 or is malformed; the caller then compares bytes instead.
+/// UTF-8 or is malformed: mismatched or unclosed tags, a duplicate attribute,
+/// a bare `&`, or content other than whitespace outside the root. The caller
+/// then compares bytes instead.
 pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     let text = std::str::from_utf8(bytes).ok()?;
@@ -248,6 +277,15 @@ pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
                     return None; // a second root element
                 }
                 let qname = parser.name();
+                let raw = parser.attrs();
+                if raw
+                    .iter()
+                    .enumerate()
+                    .any(|(i, a)| raw[..i].iter().any(|b| b.name == a.name))
+                    || raw.iter().any(|a| !valid_references(a.value))
+                {
+                    return None; // a duplicate attribute, or a bare `&`
+                }
                 let (uri, local) = resolve(&parser, qname, false);
                 let mut attrs: Vec<Attr> = parser
                     .attrs()
@@ -264,6 +302,12 @@ pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
                     })
                     .collect();
                 attrs.sort_by(|a, b| (&a.uri, &a.local).cmp(&(&b.uri, &b.local)));
+                if attrs
+                    .windows(2)
+                    .any(|w| (&w[0].uri, &w[0].local) == (&w[1].uri, &w[1].local))
+                {
+                    return None; // two prefixes for one expanded attribute name
+                }
                 stack.push(Building {
                     elem: Elem {
                         uri,
@@ -288,12 +332,19 @@ pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
                 }
             }
             Event::Text => {
-                if let Some(top) = stack.last_mut() {
-                    if parser.is_cdata() {
-                        top.text.push_str(parser.text());
-                    } else {
-                        XmlParser::append_decoded(parser.text(), &mut top.text);
+                let Some(top) = stack.last_mut() else {
+                    // Only whitespace may surround the root element.
+                    if parser.is_cdata() || !parser.text().chars().all(char::is_whitespace) {
+                        return None;
                     }
+                    continue;
+                };
+                if parser.is_cdata() {
+                    top.text.push_str(parser.text());
+                } else if valid_references(parser.text()) {
+                    XmlParser::append_decoded(parser.text(), &mut top.text);
+                } else {
+                    return None;
                 }
             }
             Event::Eof => break,
@@ -678,11 +729,15 @@ pub struct AllowRule {
     pub part: String,
     pub path: String,
     pub detail: String,
+    /// `once-with <kind> <part>`: the rule applies only in a file that also has
+    /// a finding of that kind in that part, and absorbs one finding per file.
+    pub once_with: Option<(Kind, String)>,
     pub reason: String,
 }
 
-/// Parse `kind | part-glob | path-glob | detail-glob | reason` lines. `#`
-/// starts a comment. Every rule needs a non-empty reason.
+/// Parse `kind | part-glob | path-glob | detail-glob | reason` lines, with an
+/// optional `once-with <kind> <part> |` before the reason. `#` starts a
+/// comment. Every rule needs a non-empty reason.
 pub fn parse_allowlist(text: &str) -> Result<Vec<AllowRule>, String> {
     let mut rules = Vec::new();
     for (n, line) in text.lines().enumerate() {
@@ -699,6 +754,25 @@ pub fn parse_allowlist(text: &str) -> Result<Vec<AllowRule>, String> {
         };
         let kind =
             Kind::parse(kind).ok_or(format!("allowlist line {}: unknown kind {kind:?}", n + 1))?;
+        let (once_with, reason) = match reason.strip_prefix("once-with ") {
+            Some(rest) => {
+                let (cond, reason) = rest.split_once('|').unwrap_or((rest, ""));
+                let (with_kind, with_part) = cond.trim().split_once(' ').unwrap_or((cond, ""));
+                let with_kind = Kind::parse(with_kind.trim()).ok_or(format!(
+                    "allowlist line {}: `once-with <kind> <part>` needs a known kind",
+                    n + 1
+                ))?;
+                let with_part = with_part.trim();
+                if with_part.is_empty() {
+                    return Err(format!(
+                        "allowlist line {}: `once-with <kind> <part>` needs a part",
+                        n + 1
+                    ));
+                }
+                (Some((with_kind, with_part.to_string())), reason.trim())
+            }
+            None => (None, reason),
+        };
         if reason.is_empty() {
             return Err(format!("allowlist line {}: a rule needs a reason", n + 1));
         }
@@ -707,6 +781,7 @@ pub fn parse_allowlist(text: &str) -> Result<Vec<AllowRule>, String> {
             part: part.to_string(),
             path: path.to_string(),
             detail: detail.to_string(),
+            once_with,
             reason: reason.to_string(),
         });
     }
@@ -720,6 +795,36 @@ impl AllowRule {
             && glob(&self.path, &f.key_path())
             && glob(&self.detail, &f.detail)
     }
+}
+
+/// Split one file's findings into those the allowlist does not cover (kept)
+/// and a count per rule of those it absorbed. A `once-with` rule applies only
+/// when the file has its companion finding, and to one finding.
+pub fn apply_allowlist(
+    found: Vec<Finding>,
+    rules: &[AllowRule],
+    counts: &mut [usize],
+) -> Vec<Finding> {
+    let has = |kind: Kind, part: &str| found.iter().any(|f| f.kind == kind && f.part == part);
+    let enabled: Vec<bool> = rules
+        .iter()
+        .map(|r| r.once_with.as_ref().is_none_or(|(k, p)| has(*k, p)))
+        .collect();
+    let mut used = vec![0usize; rules.len()];
+    let mut kept = Vec::new();
+    for f in &found {
+        let rule = rules.iter().enumerate().position(|(i, r)| {
+            enabled[i] && (r.once_with.is_none() || used[i] == 0) && r.matches(f)
+        });
+        match rule {
+            Some(i) => used[i] += 1,
+            None => kept.push(f.clone()),
+        }
+    }
+    for (c, u) in counts.iter_mut().zip(used) {
+        *c += u;
+    }
+    kept
 }
 
 /// `*` matches any run of characters (including `/`); everything else is literal.

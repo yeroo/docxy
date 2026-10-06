@@ -212,12 +212,8 @@ fn round_trip_fidelity_gate() {
         if let Err(why) = preserved {
             not_preserved.push(format!("{file}: {why}"));
         }
-        for f in found {
-            if let Some(rule) = allow.iter().position(|r| r.matches(&f)) {
-                allowed[rule] += 1;
-            } else {
-                findings.push((file.clone(), f));
-            }
+        for f in apply_allowlist(found, &allow, &mut allowed) {
+            findings.push((file.clone(), f));
         }
     }
     eprintln!(
@@ -446,6 +442,20 @@ fn malformed_or_non_utf8_xml_is_not_parsed() {
     // Balanced, but the end tags do not match their start tags.
     assert!(parse_xml(b"<a><b></c></a>").is_none());
     assert!(parse_xml(b"<a><b/></a>").is_some());
+    // Duplicate attributes: by name, by expanded name, and namespace declarations.
+    assert!(parse_xml(br#"<a k="1" k="2"/>"#).is_none());
+    assert!(parse_xml(br#"<a xmlns:p="urn:u" xmlns:q="urn:u" p:k="1" q:k="1"/>"#).is_none());
+    assert!(parse_xml(br#"<a xmlns:p="urn:u" xmlns:p="urn:v"/>"#).is_none());
+    // Content outside the root; whitespace there is fine.
+    assert!(parse_xml(b"<a/>garbage").is_none());
+    assert!(parse_xml(b"junk<a/>").is_none());
+    assert!(parse_xml(b"<a/><![CDATA[x]]>").is_none());
+    assert!(parse_xml(b"<?xml version=\"1.0\"?>\r\n<a/>\n").is_some());
+    // A bare `&`, in text or in an attribute value.
+    assert!(parse_xml(b"<a>A&B</a>").is_none());
+    assert!(parse_xml(br#"<a k="A&B"/>"#).is_none());
+    assert!(parse_xml(b"<a>A&bogus;B</a>").is_none());
+    assert!(parse_xml(b"<a>&#65;&#x41;&amp;</a>").is_some());
     assert!(parse_xml(b"\xff\xfe<\0a\0/\0>\0").is_none());
 }
 
@@ -481,6 +491,24 @@ fn packages_compare_xml_canonically_and_other_parts_by_bytes() {
 }
 
 #[test]
+fn ill_formed_xml_falls_back_to_a_byte_compare() {
+    use docxcore::zipwrite::write_zip;
+    let pkg = |doc: &[u8]| write_zip(&[("word/document.xml".to_string(), doc.to_vec())]);
+    for (original, saved) in [
+        (&br#"<a k="1"/>"#[..], &br#"<a k="1" k="2"/>"#[..]),
+        (b"<a/>", b"<a/>garbage"),
+        (b"<a>A&amp;B</a>", b"<a>A&B</a>"),
+    ] {
+        let found = compare_packages(&pkg(original), &pkg(saved));
+        assert_eq!(
+            found.iter().map(|f| f.kind).collect::<Vec<_>>(),
+            vec![Kind::PartBytes],
+            "{saved:?}"
+        );
+    }
+}
+
+#[test]
 fn parts_identical_compares_bytes_not_canonical_xml() {
     use docxcore::zipwrite::write_zip;
     let pkg = |doc: &[u8], extra: Option<&str>| {
@@ -506,37 +534,96 @@ fn parts_identical_compares_bytes_not_canonical_xml() {
     );
 }
 
-#[test]
-fn allowlist_tolerates_only_the_styles_content_type_override() {
-    let here = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fidelity");
-    let allow =
-        parse_allowlist(&std::fs::read_to_string(here.join("allowlist.txt")).unwrap()).unwrap();
+/// The [Content_Types].xml difference between an original with `before`
+/// overrides and a saved package with `after` overrides.
+fn content_type_findings(before: &str, after: &str) -> Vec<Finding> {
     const CT: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
     let types = |overrides: &str| {
         format!(
             r#"<Types xmlns="{CT}"><Default Extension="xml" ContentType="application/xml"/>{overrides}</Types>"#
         )
     };
-    let original = types("");
-    let tolerated = |added: &str| {
-        let found = compare_xml(
-            "[Content_Types].xml",
-            &parse_xml(original.as_bytes()).unwrap(),
-            &parse_xml(types(added).as_bytes()).unwrap(),
+    compare_xml(
+        "[Content_Types].xml",
+        &parse_xml(types(before).as_bytes()).unwrap(),
+        &parse_xml(types(after).as_bytes()).unwrap(),
+    )
+}
+
+const STYLES_OVERRIDE: &str = r#"<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>"#;
+
+fn real_allowlist() -> Vec<AllowRule> {
+    let here = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fidelity");
+    parse_allowlist(&std::fs::read_to_string(here.join("allowlist.txt")).unwrap()).unwrap()
+}
+
+/// What the real allowlist leaves of `found`, for one file.
+fn not_allowed(found: Vec<Finding>) -> Vec<(Kind, String)> {
+    let allow = real_allowlist();
+    let mut counts = vec![0; allow.len()];
+    apply_allowlist(found, &allow, &mut counts)
+        .into_iter()
+        .map(|f| (f.kind, f.part))
+        .collect()
+}
+
+fn styles_part_added() -> Finding {
+    Finding {
+        part: "word/styles.xml".into(),
+        kind: Kind::PartExtra,
+        path: String::new(),
+        detail: String::new(),
+    }
+}
+
+#[test]
+fn allowlist_tolerates_only_the_styles_content_type_override() {
+    // The styles part was added, with its override: both tolerated.
+    let mut found = content_type_findings("", STYLES_OVERRIDE);
+    found.push(styles_part_added());
+    assert_eq!(not_allowed(found), vec![]);
+
+    // An override for another part, or with another content type: not.
+    for other in [
+        r#"<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>"#,
+        r#"<Override PartName="/word/styles.xml" ContentType="application/xml"/>"#,
+    ] {
+        let mut found = content_type_findings("", other);
+        found.push(styles_part_added());
+        assert_eq!(
+            not_allowed(found),
+            vec![(Kind::ExtraElement, "[Content_Types].xml".into())]
         );
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].kind, Kind::ExtraElement);
-        allow.iter().any(|r| r.matches(&found[0]))
-    };
-    assert!(tolerated(
-        r#"<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>"#
-    ));
-    assert!(!tolerated(
-        r#"<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>"#
-    ));
-    assert!(!tolerated(
-        r#"<Override PartName="/word/styles.xml" ContentType="application/xml"/>"#
-    ));
+    }
+}
+
+#[test]
+fn styles_override_rule_needs_the_added_part_and_applies_once() {
+    // The styles part already existed; save repeats its override: not tolerated.
+    let found = content_type_findings(STYLES_OVERRIDE, &STYLES_OVERRIDE.repeat(2));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(
+        not_allowed(found),
+        vec![(Kind::ExtraElement, "[Content_Types].xml".into())]
+    );
+
+    // The part was added but the override appears twice: one is tolerated.
+    let mut found = content_type_findings("", &STYLES_OVERRIDE.repeat(2));
+    found.push(styles_part_added());
+    assert_eq!(
+        not_allowed(found),
+        vec![(Kind::ExtraElement, "[Content_Types].xml".into())]
+    );
+}
+
+#[test]
+fn once_with_needs_a_known_kind_a_part_and_a_reason() {
+    assert!(parse_allowlist("part-extra | * | * | * | once-with bogus x | r").is_err());
+    assert!(parse_allowlist("part-extra | * | * | * | once-with part-extra | r").is_err());
+    assert!(parse_allowlist("part-extra | * | * | * | once-with part-extra x |").is_err());
+    let rules = parse_allowlist("part-extra | * | * | * | once-with part-bytes a.xml | r").unwrap();
+    assert_eq!(rules[0].once_with, Some((Kind::PartBytes, "a.xml".into())));
+    assert_eq!(rules[0].reason, "r");
 }
 
 #[test]
