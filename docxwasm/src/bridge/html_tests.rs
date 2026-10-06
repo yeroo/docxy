@@ -388,6 +388,112 @@ fn paragraph_verbs_match_the_suite() {
 }
 
 #[test]
+fn setind_sets_left_and_first_line() {
+    let mut s = open(&docx_from_body(&para("plain text")));
+    let r = parse(&s.exec_json("setind\t720\t-360"));
+    assert_eq!(r.get("applied"), Some(&Json::Bool(true)));
+    assert_eq!(r.get("dirty"), Some(&Json::Bool(true)));
+    let paras = all_paragraphs(&s);
+    let ind = paras[0].get("ind").expect("ind in the doc JSON");
+    assert_eq!(ind.get("left").and_then(Json::as_i64), Some(720));
+    assert_eq!(ind.get("first").and_then(Json::as_i64), Some(-360));
+    assert_eq!(ind.get("right").and_then(Json::as_i64), Some(0));
+}
+
+#[test]
+fn firstline_leaves_left_alone() {
+    let mut s = open(&docx_from_body(&para("plain text")));
+    s.exec_json("setind\t720\t-360");
+    let r = parse(&s.exec_json("firstline\t240"));
+    assert_eq!(r.get("applied"), Some(&Json::Bool(true)));
+    let paras = all_paragraphs(&s);
+    let ind = paras[0].get("ind").expect("ind in the doc JSON");
+    assert_eq!(ind.get("left").and_then(Json::as_i64), Some(720));
+    assert_eq!(ind.get("first").and_then(Json::as_i64), Some(240));
+}
+
+#[test]
+fn rightind_sets_right_indent() {
+    let mut s = open(&docx_from_body(&para("plain text")));
+    let r = parse(&s.exec_json("rightind\t1440"));
+    assert_eq!(r.get("applied"), Some(&Json::Bool(true)));
+    let paras = all_paragraphs(&s);
+    let ind = paras[0].get("ind").expect("ind in the doc JSON");
+    assert_eq!(ind.get("right").and_then(Json::as_i64), Some(1440));
+    assert_eq!(ind.get("left").and_then(Json::as_i64), Some(0));
+    assert_eq!(ind.get("first").and_then(Json::as_i64), Some(0));
+}
+
+#[test]
+fn ruler_indent_survives_save() {
+    let mut s = open(&docx_from_body(&para("plain text")));
+    s.exec_json("setind\t720\t-360");
+    s.exec_json("rightind\t1440");
+    s.exec_json("firstline\t240");
+    let before = all_paragraphs(&s)[0]
+        .get("ind")
+        .expect("ind in the doc JSON")
+        .clone();
+    let saved = s.save();
+    let pkg = docxcore::package::load_package(&saved).unwrap();
+    let xml = String::from_utf8(pkg.part("word/document.xml").unwrap().to_vec()).unwrap();
+    assert!(xml.contains("<w:ind"), "{xml}");
+    let reopened = open(&saved);
+    let after = all_paragraphs(&reopened)[0]
+        .get("ind")
+        .expect("ind after reopen")
+        .clone();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn tabs_are_in_paragraph_json() {
+    let with_tabs = "<w:p><w:pPr><w:tabs>\
+                     <w:tab w:val=\"left\" w:pos=\"720\"/>\
+                     <w:tab w:val=\"right\" w:pos=\"2880\"/>\
+                     </w:tabs></w:pPr><w:r><w:t>x</w:t></w:r></w:p>";
+    let s = open(&docx_from_body(with_tabs));
+    let paras = all_paragraphs(&s);
+    let tabs = paras[0].get("tabs").expect("tabs in the doc JSON");
+    let tabs = arr(tabs);
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(tabs[0].get("pos").and_then(Json::as_i64), Some(720));
+    assert_eq!(tabs[0].get_str("a"), Some("l"));
+    assert_eq!(tabs[1].get("pos").and_then(Json::as_i64), Some(2880));
+    assert_eq!(tabs[1].get_str("a"), Some("r"));
+
+    let plain = open(&docx_from_body(&para("no stops")));
+    assert!(all_paragraphs(&plain)[0].get("tabs").is_none());
+}
+
+#[test]
+fn style_tabs_are_in_paragraph_json() {
+    // A paragraph with no tab stops of its own shows its style's, as the
+    // suite's ruler_para does for the built-in Header style (centre 4680,
+    // right 9360 — the Word default docxcore mirrors at package.rs:3030).
+    let doc = docxcore::load::parse_document_xml(
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+         <w:body><w:p><w:pPr><w:pStyle w:val=\"Header\"/></w:pPr>\
+         <w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>",
+        &Default::default(),
+    );
+    let mut pkg = new_package(doc);
+    assert!(pkg.set_part(
+        "word/styles.xml",
+        br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Header"><w:name w:val="header"/><w:pPr><w:tabs><w:tab w:val="center" w:pos="4680"/><w:tab w:val="right" w:pos="9360"/></w:tabs></w:pPr></w:style></w:styles>"#.to_vec(),
+    ));
+    let s = open(&save_package(&pkg));
+    let paras = all_paragraphs(&s);
+    let tabs = paras[0].get("tabs").expect("style tabs in the doc JSON");
+    let tabs = arr(tabs);
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(tabs[0].get("pos").and_then(Json::as_i64), Some(4680));
+    assert_eq!(tabs[0].get_str("a"), Some("c"));
+    assert_eq!(tabs[1].get("pos").and_then(Json::as_i64), Some(9360));
+    assert_eq!(tabs[1].get_str("a"), Some("r"));
+}
+
+#[test]
 fn tab_inserts_a_tab_inline() {
     let mut s = open(&docx_from_body(&para("ab")));
     s.exec_json("select\t0\t1\t0\t1");
@@ -431,6 +537,9 @@ fn read_only_documents_refuse_the_new_verbs() {
         "linespacing\t480",
         "style\tHeading1",
         "nospacing",
+        "setind\t720\t-360",
+        "firstline\t240",
+        "rightind\t720",
         "case",
         "borders",
         "sort",

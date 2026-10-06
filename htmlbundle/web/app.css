@@ -240,6 +240,62 @@ svg.icon * { fill: currentColor; }
 .marks .doc p::after { content: "\00b6"; color: #6b8fd6; }
 .marks .doc .tab::before { content: "\2192"; color: #6b8fd6; }
 
+/* ---- rulers (View > Ruler) ---- */
+.ruler {
+  --ruler-ground: var(--panel); --ruler-content: #ffffff;
+  --ruler-tick: color-mix(in srgb, var(--ink) 45%, transparent);
+  --ruler-marker: var(--ink); --ruler-guide: var(--brand);
+  background: var(--ruler-ground);
+}
+/* The suite's ruler_colors lightens the dark ground and keeps the ticks
+   near-black (suite/docxy/src/main.rs:4749); opaque so they stay readable
+   on it (~4.4:1 against the mixed ground). */
+:root[data-theme="dark"] .ruler {
+  --ruler-ground: color-mix(in srgb, var(--panel) 55%, var(--fg));
+  --ruler-tick: var(--ink);
+}
+.ruler[hidden] { display: none; }
+.ruler-h { position: sticky; top: 0; left: 0; width: 100%; height: 20px; z-index: 3; }
+.ruler-v { position: sticky; top: 0; left: 0; width: 18px; flex: none; z-index: 2; }
+.ruler-track { position: absolute; }
+.ruler-h .ruler-track { top: 0; height: 20px; }
+.ruler-v .ruler-track { left: 0; width: 18px; }
+.ruler-band { position: absolute; background: var(--ruler-content); }
+.ruler-h .ruler-band { top: 3px; bottom: 1px; }
+.ruler-v .ruler-band { left: 1px; right: 1px; }
+.ruler-ticks { position: absolute; inset: 0; pointer-events: none; }
+.ruler-h .ruler-ticks {
+  background:
+    repeating-linear-gradient(to right, var(--ruler-tick) 0 1px, transparent 1px var(--tick-minor, 12px)),
+    repeating-linear-gradient(to right, var(--ruler-tick) 0 1px, transparent 1px var(--tick-major, 96px));
+}
+.ruler-v .ruler-ticks {
+  background:
+    repeating-linear-gradient(to bottom, var(--ruler-tick) 0 1px, transparent 1px var(--tick-minor, 12px)),
+    repeating-linear-gradient(to bottom, var(--ruler-tick) 0 1px, transparent 1px var(--tick-major, 96px));
+}
+.ruler-tabs { position: absolute; inset: 0; pointer-events: none; }
+.ruler-tab {
+  position: absolute; bottom: 1px; margin-left: -3px; width: 0; height: 0;
+  border-left: 3px solid transparent; border-right: 3px solid transparent;
+  border-bottom: 5px solid var(--ruler-tick);
+}
+.ruler-m { position: absolute; }
+.ruler-m-first {
+  top: 0; transform: translateX(-50%); width: 0; height: 0; cursor: ew-resize;
+  border-left: 4px solid transparent; border-right: 4px solid transparent;
+  border-top: 7px solid var(--ruler-marker);
+}
+.ruler-m-left { top: 12px; transform: translateX(-50%); width: 7px; height: 7px; background: var(--ruler-marker); cursor: ew-resize; }
+.ruler-m-right {
+  top: 11px; transform: translateX(-50%); width: 0; height: 0; cursor: ew-resize;
+  border-left: 4px solid transparent; border-right: 4px solid transparent;
+  border-bottom: 7px solid var(--ruler-marker);
+}
+.ruler-guide { position: absolute; top: 0; display: none; width: 1px; height: 4000px; background: var(--ruler-guide); pointer-events: none; }
+.ruler-nums { position: absolute; inset: 0; pointer-events: none; }
+.ruler-num { position: absolute; right: 1px; font-size: 8px; line-height: 1; color: var(--ruler-tick); }
+
 /* ---- status bar ---- */
 .statusbar {
   display: flex; align-items: center; gap: 8px;
