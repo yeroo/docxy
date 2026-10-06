@@ -34,6 +34,23 @@ parser's whitelist is **silently dropped on save, even when the user never
 touched that paragraph.** This one architectural fact is the root cause of the
 top-ranked docx gaps.
 
+**Now measured in CI (#1060).** The round-trip fidelity gate
+([`docs/fidelity-gate.md`](docs/fidelity-gate.md)) saves every corpus `.docx`
+(the 248 docxy-corpus files plus the repo-tracked ones) the way an edited
+document is saved. It compares every part with the original and fails on any
+loss outside its shrink-only baseline. That baseline is where the losses
+described above are listed today:
+- unmodeled property children and attributes of modeled elements, including
+  `rsid*` and `w14:paraId`: the fix is #1063;
+- modeled property values rewritten to the supported set (tab alignment,
+  border width, `jc="distribute"`, underline style): #1068;
+- run content restructured (runs merged or split, `lastRenderedPageBreak`,
+  `smartTag`, row-level `sdt`): #1069.
+
+A save with no edits writes the original parts back
+(`save_package_preserving_document`), and the gate holds that path
+byte-identical.
+
 ### What's already solid (no action needed)
 
 Structural text editing, runs (b/i/u/strike/caps/color/size/font/highlight),

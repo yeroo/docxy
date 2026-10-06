@@ -47,6 +47,35 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked --features docxy/html-export
 
+  fidelity-gate:
+    name: docx fidelity gate
+    # Open + save with no edits must not lose anything (#1060): every
+    # docxy-corpus .docx round-trips through save_package and is compared
+    # part by part with the original, against the allowlist and the
+    # shrink-only baseline in docxcore/tests/fidelity/. The `test` job runs
+    # the same test without the external corpus (repo-tracked .docx only);
+    # here FIDELITY_REQUIRE_CORPUS makes a missing checkout a failure.
+    # See docs/fidelity-gate.md.
+    runs-on: ubuntu-latest
+    # What `--version` and File > Account report for this build (#1023).
+    env:
+      DOCXY_BUILD_KIND: ci
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check out docxy-corpus
+        uses: actions/checkout@v7
+        with:
+          repository: yeroo/docxy-corpus
+          path: corpus-ext
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fidelity gate
+        env:
+          FIDELITY_CORPUS: corpus-ext/files
+          FIDELITY_REQUIRE_CORPUS: "1"
+        run: cargo test -p docxcore --test fidelity --locked -- --nocapture
+
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest

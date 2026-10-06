@@ -35,6 +35,14 @@ cargo test --manifest-path suite/Cargo.toml
 cargo clippy --manifest-path suite/Cargo.toml --all-targets -- -D warnings
 ```
 
+Saving must not lose anything: the **docx round-trip fidelity gate**
+(`cargo test -p docxcore --test fidelity`) opens every corpus `.docx`, saves it
+with no edits and compares every part with the original. It fails on a loss not
+in its shrink-only baseline. Fetch the external corpus with
+`corpus/tools/fetch-corpus.sh` (or `.ps1`). How to read its report and how to
+update the baseline and the allowlist are in
+[`docs/fidelity-gate.md`](docs/fidelity-gate.md).
+
 The desktop suite's grid, its range-selector fields and the GPUI traps they rest
 on — the virtualized list swallowing `on_mouse_down`, per-cell edge rendering,
 how dashed borders are actually drawn — are written up in
