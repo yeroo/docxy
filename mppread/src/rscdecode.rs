@@ -24,11 +24,25 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<Vec<Resource>>
             return Err(format!("invalid or duplicate resource UID {uid} / ID {id}"));
         }
         // a2-material-cost-unassigned: +170 distinguishes work (0) from
-        // material/cost (1); +166 is 8 for material, 2 for cost.
+        // material/cost (1); +166 is 8 for material, 2 for cost. Generated
+        // snapshots can also hold +166 = 2 on a labelled material: cement
+        // UID 2 in corpus/mpp/snapshots/35-resource-material.mpp has +166 = 2
+        // and key 299 = "bags" (paired 21-material-resource.mpp has +166 = 8),
+        // so a (+170 = 1, +166 = 2) row with a non-empty key-299 label is
+        // Material; without one it stays Cost.
         let kind = match (u16_at(row, 170), u16_at(row, 166)) {
             (0, 2) => ResourceType::Work,
             (1, 8) => ResourceType::Material,
-            (1, 2) => ResourceType::Cost,
+            (1, 2) => {
+                if table
+                    .field(uid, 299)
+                    .is_some_and(|label| label.iter().any(|&byte| byte != 0))
+                {
+                    ResourceType::Material
+                } else {
+                    ResourceType::Cost
+                }
+            }
             other => return Err(format!("unknown resource type {other:?} for UID {uid}")),
         };
         let name = table
@@ -204,9 +218,12 @@ mod tests {
         // +166 = 2 (stale rate format; XML says StandardRateFormat 8) and
         // key 299 = "bags", and Project's XML names it Material.
         let markers = [(2, 0), (2, 1), (2, 1)];
-        let resources = decode(&build([10, 20, 30], markers, false, Some((2, "bags"))), false)
-            .unwrap()
-            .unwrap();
+        let resources = decode(
+            &build([10, 20, 30], markers, false, Some((2, "bags"))),
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             resources
                 .iter()
