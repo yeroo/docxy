@@ -117,6 +117,17 @@ test a click ends its drag: neither a hover nor a held move extends a range
   call pointer-drag {"from":"bar:1","to":"cell:C2"}
   assert selection is none
   assert cell_row is 0
+  # A drag released on the split gutter, where the root's hitbox is not even
+  # hovered: the window-level release still ends the gesture (the unit tests
+  # pin the disarm; this is the end-to-end pass). The gutter's centre is the
+  # split bar's middle, so the sweep leaves the table diagonally at C2.
+  call pointer-drag {"from":"cell:C1","to":"project-split"}
+  assert selection is 2
+  # A plain click after it behaves exactly as always: the cursor moves to
+  # the clicked cell and the range does not survive.
+  call click-cell {"cell":"C2"}
+  assert selection is none
+  assert cell_row is 1
 
 test a command clears the range wherever it ran from
   open copy:../fixtures/project-clipboard.xml

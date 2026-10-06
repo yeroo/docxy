@@ -569,18 +569,29 @@ pub(crate) fn project_cell_drag_over(tab: &mut DocTab, row: usize, col: usize) -
 /// runs between that release and that click; any later click reaches
 /// `cell_click` only after a press (a menu's right-button included), so this
 /// cannot clear a flag a coming release-click still needs.
+/// The suite-root mouse-down's capture phase calls this: every press starts
+/// a fresh gesture, so it disarms whatever a previous one left — the swallow
+/// flag (only the click gpui dispatches in the same mouse-up as a
+/// gesture's release may swallow, and no press runs between that release
+/// and that click) and the drag state a release the element listeners never
+/// saw could not clear (a release over the split gutter, outside the
+/// window). Only [`project_cell_press`] on a cell arms a new drag.
 pub(crate) fn project_cell_press_reset(tab: &mut DocTab) {
     let Surface::Project(v) = &mut tab.surface else {
         return;
     };
     v.drag_made_range = false;
+    v.dragging = false;
+    v.row_drag = false;
 }
 
-/// The left release anywhere: the suite-root mouse-up's capture phase calls
+/// The left release anywhere: a window-level mouse-up listener (registered
+/// each frame during paint, so it runs even where element listeners do not —
+/// over the split gutter, outside the window, in keyboard modality) calls
 /// this, so no descendant's click handler can stop it and leave the drag
 /// armed. `drag_made_range` is deliberately left standing: the release-click
 /// of this same mouse-up may still need it to be swallowed, and the next
-/// press of any kind spends it (see [`project_cell_press_reset`]).
+/// press of any kind disarms it (see [`project_cell_press_reset`]).
 pub(crate) fn project_cell_release(tab: &mut DocTab) {
     let Surface::Project(v) = &mut tab.surface else {
         return;

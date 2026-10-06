@@ -1677,3 +1677,25 @@ fn shift_extension_reanchors_when_the_anchor_task_is_gone() {
         "re-anchored at the cursor, then extended"
     );
 }
+
+#[test]
+fn a_bare_press_ends_a_drag_the_release_never_reached() {
+    let mut t = tab();
+    project_cell_press(&mut t, 0, COL_NAME, false);
+    project_cell_drag_over(&mut t, 1, COL_NAME);
+    // The release lands where even the window's element listeners never run
+    // (the split gutter, outside the window): the drag stays armed, and
+    // plain hover cannot extend it (the move gate). The next press of any
+    // kind — the suite-root mouse-down's capture phase — disarms it, on
+    // cells and bare chart-half/below-table presses alike.
+    project_cell_press_reset(&mut t);
+    assert!(!v(&t).dragging && !v(&t).row_drag);
+    assert!(
+        !project_cell_drag_over(&mut t, 2, COL_NAME),
+        "no fresh press armed a drag"
+    );
+    // The bare press's release-click places the cursor and drops the range.
+    project_cell_click(&mut t, 2, None, false);
+    assert_eq!(sel(&t), None);
+    assert_eq!((v(&t).ed.selected_uid(), v(&t).col), (Some(30), COL_NAME));
+}

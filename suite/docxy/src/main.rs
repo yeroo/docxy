@@ -13776,6 +13776,16 @@ impl Docxy {
             self.refocus(window, cx);
             return;
         }
+        // A command acts on the cursor, so the range does not survive it.
+        // Backstage Save and Save As reach this method directly, not through
+        // project_act, so the rule is applied here too (one rule, see
+        // [`project_act_clears_range`]).
+        if project_act_clears_range(ProjectAct::Save)
+            && let Some(Surface::Project(v)) =
+                self.tabs.get_mut(self.active).map(|t| &mut t.surface)
+        {
+            v.anchor = None;
+        }
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -31169,6 +31179,35 @@ impl Render for Docxy {
             .flatten()
             .map(|at| self.mini_bar_el(at, pal, cx));
 
+        // A Project cell drag ends at the window level, not the element
+        // level: the suite root's hitbox is not hovered for releases over
+        // the split gutter (block_mouse_except_scroll), outside the window,
+        // or in keyboard modality, and element listeners run only when
+        // hovered. Window listeners registered during paint run for every
+        // event of the next frame. The swallow flag is not touched at
+        // release; the press listener disarms it before any click the press
+        // could produce is dispatched.
+        let entity = cx.entity();
+        let pressed = entity.clone();
+        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
+            if phase == DispatchPhase::Capture && ev.button == MouseButton::Left {
+                entity.update(cx, |this, _cx| {
+                    if let Some(tab) = this.tabs.get_mut(this.active) {
+                        crate::project_cell_release(tab);
+                    }
+                });
+            }
+        });
+        window.on_mouse_event(move |_ev: &MouseDownEvent, phase, _window, cx| {
+            if phase == DispatchPhase::Capture {
+                pressed.update(cx, |this, _cx| {
+                    if let Some(tab) = this.tabs.get_mut(this.active) {
+                        crate::project_cell_press_reset(tab);
+                    }
+                });
+            }
+        });
+
         v_flex()
             .size_full()
             .relative()
@@ -31215,30 +31254,6 @@ impl Render for Docxy {
                     let has_sel = matches!(this.tabs.get(this.active).map(|t| &t.surface), Some(Surface::Doc(ed)) if ed.has_selection());
                     this.mini_bar = has_sel.then_some(ev.position);
                     cx.notify();
-                }
-            }))
-            // A Project cell drag ends in the capture phase, before the click
-            // gpui synthesizes during mouse-up bubbling: a descendant's click
-            // handler stops that propagation, so a bubble-phase release can be
-            // skipped and leave the drag armed. The swallow flag is not
-            // touched here; the next press of any kind spends it (the
-            // capture mouse-down below), so a release that ends where no
-            // click follows — the split gutter, the strips, outside — leaves
-            // nothing a later click can swallow.
-            .capture_any_mouse_up(cx.listener(|this, ev: &MouseUpEvent, _window, _cx| {
-                if ev.button != MouseButton::Left {
-                    return;
-                }
-                if let Some(tab) = this.tabs.get_mut(this.active) {
-                    crate::project_cell_release(tab);
-                }
-            }))
-            // Every press — a cell, the chart half of a row, the ruled rows
-            // below, a right-button — spends the swallow flag before any
-            // click it could produce is dispatched.
-            .capture_any_mouse_down(cx.listener(|this, _ev, _window, _cx| {
-                if let Some(tab) = this.tabs.get_mut(this.active) {
-                    crate::project_cell_press_reset(tab);
                 }
             }))
             .bg(bg)

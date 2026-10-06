@@ -464,7 +464,6 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
     )
 }
 
-/// A Project command's checked state on the ribbon.
 /// Whether a command act drops the entry-table range selection: every act
 /// clears it except the ones that keep or consume it — Copy keeps the
 /// highlight, Cut and Paste clear it when they run, Link and Unlink act on
@@ -475,6 +474,7 @@ pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
     !matches!(act, Copy | Cut | Paste | AddLink | UnlinkTasks)
 }
 
+/// A Project command's checked state on the ribbon.
 pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
     match act {
         ProjectAct::LevelAll => v.ed.leveled(),
@@ -1626,8 +1626,9 @@ impl Docxy {
         }
         self.project_prompt_cancel();
         // A command acts on the cursor, so the range does not survive it —
-        // here, one place, however the act was invoked (keys, ribbon, QAT,
-        // Backstage) and however it is handled below.
+        // here, one place, however the act reached the app (keys, the
+        // ribbon, the QAT, the row menus). Backstage Save and Save As go
+        // straight to save_project, which applies the same rule itself.
         if project_act_clears_range(act)
             && let Some(Surface::Project(v)) =
                 self.tabs.get_mut(self.active).map(|t| &mut t.surface)

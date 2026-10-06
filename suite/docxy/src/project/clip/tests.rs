@@ -418,7 +418,8 @@ fn copy_a_range_is_tsv_of_edit_texts() {
     let mut t = tab();
     select_range(&mut t, COL_NAME, 1, COL_DURATION);
     assert_eq!(project_copy_text(v(&t)), "A\t2d\nB\t2d\n");
-    // One row, several columns: no trailing newline, tabs between fields.
+    // One row, several columns: tabs between fields, and the line still
+    // ends with \n.
     select_range(&mut t, COL_MODE, 0, COL_DURATION);
     assert_eq!(
         project_copy_text(v(&t)),
