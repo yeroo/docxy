@@ -2832,11 +2832,25 @@ fn components_in_order(nodes: &[Key], edges: &HashMap<Key, Vec<Key>>) -> Vec<Vec
 /// clock/rand (CF conditions shouldn't be volatile). Returns the value, or
 /// `#NAME?` if the formula doesn't parse.
 pub fn eval_formula_at(wb: &Workbook, sheet: usize, row: u32, col: u32, src: &str) -> Value {
+    eval_formula_at_clock(wb, sheet, row, col, src, None)
+}
+
+/// [`eval_formula_at`] under the host's clock, so `TODAY()` and `NOW()` read
+/// it (data validation's rules and typed formulas; a rule that compares with
+/// today means today).
+pub fn eval_formula_at_clock(
+    wb: &Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    src: &str,
+    clock: Option<f64>,
+) -> Value {
     match formula::parse(src) {
         Ok(ast) => {
             let resolver = WbResolver {
                 wb,
-                clock: None,
+                clock,
                 rand_state: StdCell::new(0),
                 has_rand: false,
             };
@@ -2844,6 +2858,37 @@ pub fn eval_formula_at(wb: &Workbook, sheet: usize, row: u32, col: u32, src: &st
             ev.eval_formula(&ast)
         }
         Err(_) => Value::Err(ExcelError::Name),
+    }
+}
+
+/// [`eval_formula_at_clock`] for a typed formula that may be a dynamic array:
+/// the value of its top-left cell (an array's first element), which is what
+/// the cell would hold and so what a validation rule checks.
+pub fn eval_typed_formula_at_clock(
+    wb: &Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    src: &str,
+    clock: Option<f64>,
+) -> Value {
+    let Ok(ast) = formula::parse(src) else {
+        return Value::Err(ExcelError::Name);
+    };
+    let resolver = WbResolver {
+        wb,
+        clock,
+        rand_state: StdCell::new(0),
+        has_rand: false,
+    };
+    let mut ev = Eval::new(&resolver, sheet, (row, col));
+    match ev.eval_dynamic(&ast) {
+        formula::DynResult::Scalar(v) => v,
+        formula::DynResult::Array(m) => m
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next())
+            .unwrap_or(Value::Empty),
     }
 }
 

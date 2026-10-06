@@ -373,6 +373,7 @@ fn fifty_thousand_notes_and_rules_paste_fast() {
             operator: "greaterThan",
             formula1: "-1",
             formula2: None,
+            settings: None,
         })
         .collect();
     let t = std::time::Instant::now();

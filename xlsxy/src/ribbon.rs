@@ -56,6 +56,8 @@ pub enum Act {
     MergeCenter,
     CondFormat,
     DataValidation,
+    CircleInvalid,
+    ClearCircles,
     /// Data › Sort & Filter.
     Filter,
     ClearFilter,
@@ -394,11 +396,21 @@ fn data_groups() -> Vec<Group> {
             title: "Data Tools",
             width: 30,
             rows: [
-                vec![btn(
-                    "Validation",
-                    DataValidation,
-                    "Data validation (dropdown list)",
-                )],
+                vec![
+                    btn(
+                        "Validation…",
+                        DataValidation,
+                        "Data Validation: rule, input message and error alert",
+                    ),
+                    Seg::Gap(" "),
+                    btn(
+                        "Circle",
+                        CircleInvalid,
+                        "Circle Invalid Data: circle cells whose value breaks its rule",
+                    ),
+                    Seg::Gap(" "),
+                    btn("Clear ○", ClearCircles, "Clear Validation Circles"),
+                ],
                 vec![
                     btn(
                         "Remove Dup",

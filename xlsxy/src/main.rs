@@ -29,6 +29,7 @@ mod outlinedlg;
 mod ribbon;
 mod skill;
 mod textdlg;
+mod validationdlg;
 
 // Bring the trait's methods (`extensions`, `default_save_name`, …) into scope
 // for the `impl backstage::BackstageHost for App` call sites below.
@@ -39,7 +40,7 @@ use gridcore::comments::Comment;
 use gridcore::docprops::{CustomProperty, CustomValue, DocProperties};
 use gridcore::edit::{FillDir, fill_changes, replace_all_in_sheet};
 use gridcore::engine::{Engine, PART_OF_ARRAY};
-use gridcore::entry::{EntryCtx, entry_cell, entry_cell_ctx, entry_ctx, seed_text};
+use gridcore::entry::{EntryCtx, entry_cell_ctx, entry_ctx, seed_text};
 use gridcore::fcomplete::Completions;
 use gridcore::formula::{qualify_sheet_in_formula, translate_formula};
 use gridcore::frame::Agg;
@@ -1532,7 +1533,15 @@ struct UndoGroup {
     /// A restyle ([`App::apply_styles_on`]): undo/redo put back only each
     /// cell's style, so a spill the cells belong to stays whole.
     styles_only: bool,
+    /// The sheet's data-validation rules before and after the action, when it
+    /// changed them (a paste, the Data Validation dialog): undo and redo put
+    /// the matching state back.
+    rules: Option<(RuleState, RuleState)>,
 }
+
+/// A sheet's data-validation rules, and the elements of its part a save
+/// strikes ([`gridcore::sheet::Sheet::dv_removed`]).
+type RuleState = (Vec<gridcore::sheet::DataValidation>, Vec<usize>);
 
 /// The `(row, col, style)` a restyle group puts back: the style of each
 /// change's `before` or `after` cell (picked by `side`), default if absent.
@@ -1636,8 +1645,6 @@ enum PromptKind {
     GoTo,
     /// Conditional formatting: a comparison like ">500" applied to the selection.
     CondFormat,
-    /// Data validation: comma-separated allowed values → a dropdown list.
-    DataValidation,
     /// Custom AutoFilter, Top 10 or a date period for a filter column
     /// (`>10 and <=30`, `begins a`, `top 3`, `above average`, `this week`).
     CustomFilter,
@@ -1827,9 +1834,68 @@ const SHEET_GONE: usize = usize::MAX;
 #[derive(Clone)]
 struct ClipData {
     cells: Vec<Vec<Option<Cell>>>,
+    /// The data-validation rules of the copied cells
+    /// ([`gridcore::validation::copy_rules`]), which a paste puts on its target.
+    rules: Vec<gridcore::sheet::DataValidation>,
     sheet: usize,
     from: (u32, u32),
     cut: bool,
+}
+
+/// What a commit that raised a data-validation alert goes on to do once the
+/// entry is let in: the move the key or click would have made.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cont {
+    Nothing,
+    /// Enter (Shift+Enter moves up).
+    Enter(bool),
+    Move(i64, i64),
+    Click(u32, u32),
+}
+
+/// A button of a data-validation alert.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DvChoice {
+    Retry,
+    Yes,
+    No,
+    Ok,
+    Cancel,
+}
+
+impl DvChoice {
+    fn label(self) -> &'static str {
+        match self {
+            DvChoice::Retry => "Retry",
+            DvChoice::Yes => "Yes",
+            DvChoice::No => "No",
+            DvChoice::Ok => "OK",
+            DvChoice::Cancel => "Cancel",
+        }
+    }
+}
+
+/// The buttons of an alert style, Excel's: Stop Retry/Cancel, Warning
+/// Yes/No/Cancel, Information OK/Cancel. The first selected is the default
+/// (Warning's is No).
+fn dv_buttons(style: gridcore::sheet::AlertStyle) -> &'static [DvChoice] {
+    use gridcore::sheet::AlertStyle;
+    match style {
+        AlertStyle::Stop => &[DvChoice::Retry, DvChoice::Cancel],
+        AlertStyle::Warning => &[DvChoice::Yes, DvChoice::No, DvChoice::Cancel],
+        AlertStyle::Information => &[DvChoice::Ok, DvChoice::Cancel],
+    }
+}
+
+/// A typed entry that broke its cell's data-validation rule, waiting for the
+/// user's answer. The editor stays open behind it with the typed text.
+struct DvAlert {
+    /// The cell and what the entry would put there.
+    cell: (u32, u32),
+    entry: Cell,
+    violation: gridcore::validation::Violation,
+    sel: usize,
+    cont: Cont,
 }
 
 /// The AutoCorrect switches File › Options shows (#667): the ones xlsxy
@@ -1845,10 +1911,12 @@ const AC_OPTION_KEYS: [&str; 8] = [
     "ac_math_replace",
 ];
 
-/// A drop-down list over the cursor cell: a `list` validation's allowed
-/// values, or Pick From Drop-down List's column entries (Alt+Down, #665).
+/// A drop-down list over the cursor cell: a `list` validation's choices, or
+/// Pick From Drop-down List's column entries (Alt+Down, #665).
 struct DvPicker {
-    values: Vec<String>,
+    /// The labels shown and the values they stand for, so picking enters the
+    /// value exactly.
+    choices: Vec<gridcore::validation::ListChoice>,
     /// The highlighted row. A validation list opens on the cell's value (or
     /// the first); the pick list opens on none, so Down lands on the first.
     sel: Option<usize>,
@@ -1977,6 +2045,14 @@ struct App {
     sheet_picker: Option<usize>,
     /// The list-validation dropdown, open on a `list`-validated cell.
     dv_picker: Option<DvPicker>,
+    /// The data-validation alert a typed entry raised, until answered.
+    dv_alert: Option<DvAlert>,
+    /// The Data Validation dialog.
+    validation_dialog: Option<validationdlg::ValidationDialog>,
+    /// Circle Invalid Data's circles: (sheet, row, col). View state, never saved.
+    circles: Vec<(usize, u32, u32)>,
+    /// What the commit now running goes on to do, for an alert it raises.
+    commit_cont: Cont,
     /// A filter button's drop-down (Alt+Down on the filter's header row).
     filter_picker: Option<datacmd::FilterPicker>,
     /// A sort waiting on the Sort Warning's answer.
@@ -2126,6 +2202,10 @@ impl App {
             startup_import: false,
             sheet_picker: None,
             dv_picker: None,
+            dv_alert: None,
+            validation_dialog: None,
+            circles: Vec::new(),
+            commit_cont: Cont::Nothing,
             filter_picker: None,
             pending_sort: None,
             custom_filter_col: None,
@@ -2367,6 +2447,8 @@ impl App {
     /// limit, or it would change part of an array ([`PART_OF_ARRAY`]).
     /// A live AutoComplete proposal commits as the value it completes to,
     /// in that value's case; a fixed decimal point shifts a typed number.
+    /// Also false, the editor kept, while the entry breaks its cell's
+    /// data-validation rule: [`App::dv_alert`] holds it until it is answered.
     fn commit_edit(&mut self) -> bool {
         let Some(mut edit) = self.edit.take() else {
             return true;
@@ -2422,6 +2504,36 @@ impl App {
                 return false;
             }
         };
+        // The cell's data-validation rule: a breaking entry raises its alert
+        // and waits, the editor kept with the text.
+        if let Some(v) = gridcore::validation::check_entry(
+            &mut self.pkg.workbook,
+            self.sheet,
+            r,
+            c,
+            &cell,
+            now_serial(),
+        ) {
+            let sel = if v.style == gridcore::sheet::AlertStyle::Warning {
+                1
+            } else {
+                0
+            };
+            self.dv_alert = Some(DvAlert {
+                cell: (r, c),
+                entry: cell,
+                violation: v,
+                sel,
+                cont: std::mem::replace(&mut self.commit_cont, Cont::Nothing),
+            });
+            self.edit = Some(EditState {
+                cursor: text.chars().count(),
+                text,
+                seed,
+                ..EditState::default()
+            });
+            return false;
+        }
         // A typed URL, e-mail address or network path becomes a hyperlink
         // (ENT-120) when it commits as text.
         let link = (!took)
@@ -2448,6 +2560,73 @@ impl App {
 
     fn cancel_edit(&mut self) {
         self.edit = None;
+    }
+
+    /// Commit the editor, then do `cont` once the entry is in. A data-validation
+    /// alert holds `cont` until it is answered Yes or OK.
+    fn commit_edit_then(&mut self, cont: Cont) -> bool {
+        self.commit_cont = cont;
+        let ok = self.commit_edit();
+        self.commit_cont = Cont::Nothing;
+        if ok {
+            self.run_cont(cont);
+        }
+        ok
+    }
+
+    fn run_cont(&mut self, cont: Cont) {
+        match cont {
+            Cont::Nothing => {}
+            Cont::Enter(shift) => self.enter_move(shift),
+            Cont::Move(dr, dc) => self.move_cur(dr, dc, false),
+            Cont::Click(r, c) => self.click_cell(r, c, Instant::now()),
+        }
+    }
+
+    /// The user's answer to the data-validation alert. Retry and No leave the
+    /// editor open with its text, Cancel drops the entry, Yes and OK let it in.
+    fn dv_alert_choose(&mut self, choice: DvChoice) {
+        let Some(alert) = self.dv_alert.take() else {
+            return;
+        };
+        match choice {
+            DvChoice::Retry | DvChoice::No => {}
+            DvChoice::Cancel => self.edit = None,
+            DvChoice::Yes | DvChoice::Ok => {
+                let (r, c) = alert.cell;
+                if self.apply(vec![(r, c, alert.entry)]) {
+                    self.edit = None;
+                    self.run_cont(alert.cont);
+                }
+            }
+        }
+    }
+
+    fn dv_alert_key(&mut self, code: KeyCode) {
+        let Some(alert) = self.dv_alert.as_mut() else {
+            return;
+        };
+        let buttons = dv_buttons(alert.violation.style);
+        let n = buttons.len();
+        match code {
+            KeyCode::Left | KeyCode::Up | KeyCode::BackTab => alert.sel = (alert.sel + n - 1) % n,
+            KeyCode::Right | KeyCode::Down | KeyCode::Tab => alert.sel = (alert.sel + 1) % n,
+            KeyCode::Enter => {
+                let choice = buttons[alert.sel];
+                self.dv_alert_choose(choice);
+            }
+            KeyCode::Esc => self.dv_alert_choose(DvChoice::Cancel),
+            KeyCode::Char(ch) => {
+                let ch = ch.to_ascii_lowercase();
+                if let Some(&choice) = buttons
+                    .iter()
+                    .find(|b| b.label().to_ascii_lowercase().starts_with(ch))
+                {
+                    self.dv_alert_choose(choice);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Commit `cell` at (r, c) of the active sheet with a hyperlink to `url`,
@@ -2630,11 +2809,13 @@ impl App {
                     .map(|(&(r, c), (b, a))| (r, c, b, a))
                     .collect(),
                 styles_only: false,
+                rules: None,
             })
             .collect();
         self.undo.push(UndoAction::Cells(undo));
         self.redo.clear();
         self.modified = true;
+        self.prune_circles();
         self.warn_new_circles(&circles_before);
     }
 
@@ -2679,6 +2860,7 @@ impl App {
             sheet: sheet_idx,
             changes,
             styles_only: true,
+            rules: None,
         }]));
         self.redo.clear();
         self.modified = true;
@@ -2847,6 +3029,14 @@ impl App {
             after.model_rename = Some((old.to_string(), new.to_string()));
         }
         self.rebuild_engine();
+        // Validation circles name cells: an edit that moved them leaves them
+        // pointing at the wrong ones, and one that wrote in place may have
+        // made a circled value valid.
+        if sync_headers {
+            self.prune_circles();
+        } else {
+            self.circles.clear();
+        }
         if self.circles_shown() && self.engine.circular_refs().len() > circles_before {
             self.circle_warning_pending = true;
         }
@@ -2942,6 +3132,7 @@ impl App {
     }
 
     fn restore(&mut self, snap: &WbSnapshot) {
+        self.circles.clear();
         self.cancel_cut();
         self.put_back(snap);
         if let Some((old, new)) = &snap.model_rename {
@@ -3380,10 +3571,76 @@ impl App {
         self.ensure_visible();
     }
 
+    fn rule_state(&self, sheet: usize) -> RuleState {
+        self.pkg
+            .workbook
+            .sheets
+            .get(sheet)
+            .map(|s| (s.validations.clone(), s.dv_removed.clone()))
+            .unwrap_or_default()
+    }
+
+    fn put_rules(&mut self, sheet: usize, state: &RuleState) {
+        if let Some(s) = self.pkg.workbook.sheets.get_mut(sheet) {
+            s.validations = state.0.clone();
+            s.dv_removed = state.1.clone();
+        }
+    }
+
+    /// Run `f`, which may change the data-validation rules of `sheets`, so that
+    /// one undo step puts them back with whatever cells `f` recorded; a step of
+    /// their own when it recorded none. A structural step already holds them.
+    fn with_rules<R>(&mut self, sheets: &[usize], f: impl FnOnce(&mut Self) -> R) -> R {
+        let before: Vec<RuleState> = sheets.iter().map(|&s| self.rule_state(s)).collect();
+        let depth = self.undo.len();
+        let out = f(self);
+        // Rules changed: a circled cell may be valid now (or a clean one not).
+        self.prune_circles();
+        let changed: Vec<(usize, RuleState, RuleState)> = sheets
+            .iter()
+            .zip(before)
+            .map(|(&s, b)| (s, b, self.rule_state(s)))
+            .filter(|(_, b, a)| b != a)
+            .collect();
+        if changed.is_empty() {
+            return out;
+        }
+        let recorded = self.undo.len() > depth;
+        let mut groups = match (recorded, self.undo.last_mut()) {
+            (true, Some(UndoAction::Cells(groups))) => std::mem::take(groups),
+            (true, _) => return out,
+            _ => Vec::new(),
+        };
+        for (sheet, b, a) in changed {
+            match groups
+                .iter_mut()
+                .find(|g| g.sheet == sheet && g.rules.is_none())
+            {
+                Some(g) => g.rules = Some((b, a)),
+                None => groups.push(UndoGroup {
+                    sheet,
+                    changes: Vec::new(),
+                    styles_only: false,
+                    rules: Some((b, a)),
+                }),
+            }
+        }
+        if recorded {
+            self.undo.pop();
+        }
+        self.undo.push(UndoAction::Cells(groups));
+        self.redo.clear();
+        self.modified = true;
+        out
+    }
+
     fn undo(&mut self) {
         match self.undo.pop() {
             Some(UndoAction::Cells(groups)) => {
                 for group in groups.iter().rev() {
+                    if let Some((before, _)) = &group.rules {
+                        self.put_rules(group.sheet, before);
+                    }
                     if group.styles_only {
                         let styles = group_styles(group, |ch| &ch.2);
                         self.engine
@@ -3397,6 +3654,7 @@ impl App {
                 self.show_undo_group(groups.last());
                 self.redo.push(UndoAction::Cells(groups));
                 self.modified = true;
+                self.prune_circles();
                 self.status = Some("Undid".to_string());
             }
             Some(UndoAction::Structural { before, after }) => {
@@ -3422,6 +3680,9 @@ impl App {
         match self.redo.pop() {
             Some(UndoAction::Cells(groups)) => {
                 for group in &groups {
+                    if let Some((_, after)) = &group.rules {
+                        self.put_rules(group.sheet, after);
+                    }
                     if group.styles_only {
                         let styles = group_styles(group, |ch| &ch.3);
                         self.engine
@@ -3435,6 +3696,7 @@ impl App {
                 self.show_undo_group(groups.last());
                 self.undo.push(UndoAction::Cells(groups));
                 self.modified = true;
+                self.prune_circles();
                 self.status = Some("Redid".to_string());
             }
             Some(UndoAction::Structural { before, after }) => {
@@ -3471,8 +3733,10 @@ impl App {
             tsv.push('\n');
             rows.push(row);
         }
+        let rules = gridcore::validation::copy_rules(self.sheet(), (r1, c1, r2, c2));
         self.clip = Some(ClipData {
             cells: rows,
+            rules,
             sheet: self.sheet,
             from: (r1, c1),
             cut,
@@ -3628,23 +3892,58 @@ impl App {
                     let w = clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
                     (src, (fr, fc, fr + h - 1, fc + w - 1))
                 });
-                self.record_groups(keys, cut_from, |app| {
-                    let (clears, late) = if same_sheet {
+                // A copy's rules replace the target's (#688). A cut leaves
+                // validation where it is, on both sheets; see #1050.
+                let rules_from = {
+                    let (fr, fc) = clip.from;
+                    // Only the part that fits the grid at the target is pasted.
+                    let h = (clip.cells.len().max(1) as u32).min(MAX_ROWS - r0);
+                    let w = (clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32)
+                        .min(MAX_COLS - c0);
+                    (fr, fc, fr + h - 1, fc + w - 1)
+                };
+                let rules = clip.rules.clone();
+                // A part that can't hold `<dataValidations>` would lose them
+                // on save: leave the rules where they are and say so.
+                let can_hold = cut || self.pkg.takes_validations(here);
+                let lost = !cut && !can_hold && !rules.is_empty();
+                let write = |app: &mut Self| {
+                    app.record_groups(keys, cut_from, |app| {
+                        if !cut && can_hold {
+                            gridcore::validation::paste_rules(
+                                &mut app.pkg.workbook.sheets[here],
+                                &rules,
+                                rules_from,
+                                (r0, c0),
+                                (1, 1),
+                            );
+                        }
+                        let (clears, late) = if same_sheet {
+                            app.engine
+                                .split_frozen_blanks(&app.pkg.workbook, src, clears)
+                        } else {
+                            (clears, Vec::new())
+                        };
+                        // Checked whole above: each part is written without
+                        // deciding again against what the clears recalculated.
+                        let wb = &mut app.pkg.workbook;
+                        app.engine.set_cells_prechecked(wb, src, clears);
                         app.engine
-                            .split_frozen_blanks(&app.pkg.workbook, src, clears)
-                    } else {
-                        (clears, Vec::new())
-                    };
-                    // Checked whole above: each part is written without
-                    // deciding again against what the clears recalculated.
-                    let wb = &mut app.pkg.workbook;
-                    app.engine.set_cells_prechecked(wb, src, clears);
-                    app.engine
-                        .paste_block_prechecked(wb, here, (r0, c0), &block);
-                    app.engine.set_cells_prechecked(wb, src, late);
-                });
+                            .paste_block_prechecked(wb, here, (r0, c0), &block);
+                        app.engine.set_cells_prechecked(wb, src, late);
+                    })
+                };
+                // A cut's undo entry holds no rules: it changes none.
+                if cut {
+                    write(self);
+                } else {
+                    self.with_rules(&[here], write);
+                }
                 self.status = Some(if source_locked {
                     "Pasted (source sheet is protected; cut kept as copy)".to_string()
+                } else if lost {
+                    "Pasted (its data validation was not kept: this sheet can't hold it)"
+                        .to_string()
                 } else {
                     "Pasted".to_string()
                 });
@@ -4782,62 +5081,120 @@ impl App {
         self.sheet().validations.iter().find(|v| v.covers(r, c))
     }
 
-    /// The allowed values for a `list` validation: the inline CSV, or the cells
-    /// of the range / named range its `formula1` points at.
-    fn resolve_list_values(&self, dv: &gridcore::sheet::DataValidation) -> Vec<String> {
-        if let Some(v) = dv.list_values() {
-            return v;
+    /// The allowed values for a `list` validation at the cursor: read the way
+    /// the entry check reads them, so a picked value is one it accepts
+    /// ([`gridcore::validation::list_choices`]).
+    fn resolve_list_values(&self) -> Vec<gridcore::validation::ListChoice> {
+        let (r, c) = self.cur;
+        gridcore::validation::list_choices(&self.pkg.workbook, self.sheet, r, c, now_serial())
+            .unwrap_or_default()
+    }
+
+    /// Data ▸ Data Validation: the dialog over the selection, showing the rule
+    /// on its first cell.
+    fn open_validation_dialog(&mut self) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
         }
-        let refstr = dv.formula1.trim();
-        if refstr.is_empty() {
-            return Vec::new();
-        }
-        // A named range resolves to its own reference formula first.
-        let resolved = self
-            .pkg
-            .workbook
-            .defined_names
-            .iter()
-            .find(|d| d.name.eq_ignore_ascii_case(refstr))
-            .map(|d| d.formula.clone());
-        let refstr = resolved.as_deref().unwrap_or(refstr);
-        // Optional Sheet! prefix; the range itself may carry `$` anchors.
-        let (sheet_name, rng) = match refstr.rsplit_once('!') {
-            Some((s, r)) => (Some(s.trim_matches(['\'', ' ', '='])), r),
-            None => (None, refstr),
+        let range = self.selection();
+        let current = gridcore::validation::validation_at(self.sheet(), range.0, range.1).cloned();
+        self.validation_dialog = Some(validationdlg::ValidationDialog::new(
+            self.sheet,
+            range,
+            current.as_ref(),
+            self.pkg.workbook.date1904,
+        ));
+    }
+
+    fn validation_dialog_key(&mut self, code: KeyCode) {
+        let Some(d) = self.validation_dialog.as_mut() else {
+            return;
         };
-        let sidx = match sheet_name {
-            Some(n) => self
-                .pkg
-                .workbook
-                .sheets
-                .iter()
-                .position(|s| s.name.eq_ignore_ascii_case(n))
-                .unwrap_or(self.sheet),
-            None => self.sheet,
-        };
-        let clean = rng.replace('$', "");
-        let Some((r1, c1, r2, c2)) = gridcore::sheet::parse_range_name(&clean)
-            .or_else(|| gridcore::sheet::parse_cell_name(&clean).map(|(r, c)| (r, c, r, c)))
-        else {
-            return Vec::new();
-        };
-        let sheet = &self.pkg.workbook.sheets[sidx];
-        let styles = &self.pkg.workbook.styles;
-        let date1904 = self.pkg.workbook.date1904;
-        let mut out = Vec::new();
-        // Bound the scan: dropdowns are small, and a whole-column ref is huge.
-        for r in r1..=r2.min(r1.saturating_add(1024)) {
-            for c in c1..=c2 {
-                if let Some(cell) = sheet.cell(r, c) {
-                    let text = format_with(&styles.xf(cell.style), &cell.value, date1904);
-                    if !text.is_empty() {
-                        out.push(text);
+        let outcome = d.key(code);
+        match outcome {
+            validationdlg::Outcome::Pending => {}
+            validationdlg::Outcome::Cancel => self.validation_dialog = None,
+            validationdlg::Outcome::Ok => {
+                let Some(d) = self.validation_dialog.clone() else {
+                    return;
+                };
+                let ctx = entry_ctx(&self.pkg.workbook, now_serial());
+                match d.rule(&ctx) {
+                    Err(why) => self.status = Some(why),
+                    // The part can't hold a rule: refused whole, as any edit
+                    // a save couldn't write is.
+                    Ok(_) if !self.pkg.takes_validations(d.sheet) => {
+                        self.status = Some(WRITE_REFUSED.into());
+                    }
+                    Ok(rule) => {
+                        self.validation_dialog = None;
+                        let (sheet, range) = (d.sheet, d.range);
+                        self.with_rules(&[sheet], |app| {
+                            gridcore::validation::set_validation(
+                                &mut app.pkg.workbook.sheets[sheet],
+                                range,
+                                &rule,
+                                d.apply_all,
+                            );
+                        });
+                        self.status = Some("Data validation applied".into());
                     }
                 }
             }
+            validationdlg::Outcome::ClearAll => {
+                let Some(d) = self.validation_dialog.take() else {
+                    return;
+                };
+                let (sheet, range) = (d.sheet, d.range);
+                self.with_rules(&[sheet], |app| {
+                    gridcore::validation::clear_all_validation(
+                        &mut app.pkg.workbook.sheets[sheet],
+                        range,
+                        d.apply_all,
+                    );
+                });
+                self.status = Some("Data validation cleared".into());
+            }
         }
-        out
+    }
+
+    /// Data ▸ Circle Invalid Data: circle every cell of the sheet whose value
+    /// breaks its rule.
+    fn circle_invalid(&mut self) {
+        let sheet = self.sheet;
+        let cells = gridcore::validation::invalid_cells(&self.pkg.workbook, sheet, now_serial());
+        self.circles.retain(|&(s, ..)| s != sheet);
+        self.status = Some(match cells.len() {
+            0 => "No invalid data".to_string(),
+            n => format!("{n} invalid cell(s) circled"),
+        });
+        self.circles
+            .extend(cells.into_iter().map(|(r, c)| (sheet, r, c)));
+    }
+
+    fn clear_circles(&mut self) {
+        self.circles.clear();
+        self.status = Some("Validation circles cleared".into());
+    }
+
+    /// Drop the circles round cells that are valid now.
+    fn prune_circles(&mut self) {
+        if self.circles.is_empty() {
+            return;
+        }
+        let sheets: std::collections::BTreeSet<usize> =
+            self.circles.iter().map(|&(s, ..)| s).collect();
+        let invalid: std::collections::BTreeSet<(usize, u32, u32)> = sheets
+            .into_iter()
+            .flat_map(|s| {
+                gridcore::validation::invalid_cells(&self.pkg.workbook, s, now_serial())
+                    .into_iter()
+                    .map(move |(r, c)| (s, r, c))
+            })
+            .collect();
+        self.circles.retain(|c| invalid.contains(c));
     }
 
     /// Open the dropdown for the `list` validation on the cursor cell, if there
@@ -4850,16 +5207,21 @@ impl App {
             self.status = Some(format!("Data validation — {}", dv.describe()));
             return;
         }
+        // `showDropDown="1"` hides the in-cell dropdown.
+        if !dv.show_dropdown {
+            self.status = Some(format!("Data validation — {}", dv.describe()));
+            return;
+        }
         let dv = dv.clone();
-        let values = self.resolve_list_values(&dv);
-        if values.is_empty() {
+        let choices = self.resolve_list_values();
+        if choices.is_empty() {
             self.status = Some(format!("List: {} (no resolvable values)", dv.formula1));
             return;
         }
         let current = self.current_input_text();
-        let sel = values.iter().position(|v| *v == current).unwrap_or(0);
+        let sel = choices.iter().position(|c| c.label == current).unwrap_or(0);
         self.dv_picker = Some(DvPicker {
-            values,
+            choices,
             sel: Some(sel),
             pick: false,
         });
@@ -4876,12 +5238,20 @@ impl App {
         }
         let (r, c) = self.cur;
         let values = gridcore::entry::pick_list(self.sheet(), r, c);
-        if values.is_empty() {
+        let choices: Vec<gridcore::validation::ListChoice> = values
+            .into_iter()
+            .map(|label| gridcore::validation::ListChoice {
+                label,
+                value: None,
+                code: None,
+            })
+            .collect();
+        if choices.is_empty() {
             self.status = Some("No entries above or below this cell to pick from".into());
             return false;
         }
         self.dv_picker = Some(DvPicker {
-            values,
+            choices,
             sel: None,
             pick: true,
         });
@@ -4949,8 +5319,15 @@ impl App {
             .map_err(|e| e.message().to_string())?;
         let mut changes = Vec::new();
         for (r, text) in &fill.fills {
-            let cell = entry_cell(&mut self.pkg.workbook, si, *r, fill.col, text, now_serial())
-                .map_err(|e| e.to_string())?;
+            let cell = gridcore::entry::entry_cell(
+                &mut self.pkg.workbook,
+                si,
+                *r,
+                fill.col,
+                text,
+                now_serial(),
+            )
+            .map_err(|e| e.to_string())?;
             changes.push((*r, fill.col, cell));
         }
         if !self.apply_on(si, changes) {
@@ -5114,7 +5491,7 @@ impl App {
         let Some(p) = self.dv_picker.as_mut() else {
             return;
         };
-        let last = p.values.len().saturating_sub(1);
+        let last = p.choices.len().saturating_sub(1);
         match code {
             KeyCode::Esc => self.dv_picker = None,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -5127,31 +5504,32 @@ impl App {
             KeyCode::End => p.sel = Some(last),
             KeyCode::Enter | KeyCode::Tab => {
                 // Nothing highlighted (a pick list just opened): close.
-                let Some(value) = p.sel.and_then(|i| p.values.get(i)).cloned() else {
+                let Some(choice) = p.sel.and_then(|i| p.choices.get(i)).cloned() else {
                     self.dv_picker = None;
                     return;
                 };
                 let pick = p.pick;
                 self.dv_picker = None;
                 if pick {
-                    self.pick_value(value);
+                    self.pick_value(choice.label);
                     return;
                 }
                 let (r, c) = self.cur;
-                match entry_cell(
+                // A range choice goes in as its own value, an inline item as
+                // typing its label would be (stored as text where typing would
+                // make a formula or quote-prefixed text): what passes the check.
+                let Ok(cell) = gridcore::validation::pick_cell(
                     &mut self.pkg.workbook,
                     self.sheet,
                     r,
                     c,
-                    &value,
+                    &choice,
                     now_serial(),
-                ) {
-                    Ok(cell) => {
-                        if self.apply(vec![(r, c, cell)]) {
-                            self.status = Some(format!("Set {} = {value}", cell_name(r, c)));
-                        }
-                    }
-                    Err(e) => self.status = Some(e.to_string()),
+                ) else {
+                    return;
+                };
+                if self.apply(vec![(r, c, cell)]) {
+                    self.status = Some(format!("Set {} = {}", cell_name(r, c), choice.label));
                 }
             }
             _ => {}
@@ -5280,7 +5658,9 @@ impl App {
             WrapText => self.toggle_wrap(),
             RowHeight => self.open_prompt(PromptKind::RowHeight),
             CondFormat => self.open_prompt(PromptKind::CondFormat),
-            DataValidation => self.open_prompt(PromptKind::DataValidation),
+            DataValidation => self.open_validation_dialog(),
+            CircleInvalid => self.circle_invalid(),
+            ClearCircles => self.clear_circles(),
             Filter => {
                 let sel = self.selection();
                 let range = ((sel.0, sel.1) != (sel.2, sel.3)).then_some(sel);
@@ -5822,7 +6202,52 @@ impl App {
         }
     }
 
+    /// Sheet `gone` was removed: its circles go and those of the sheets after
+    /// it follow their renumbering.
+    fn sheet_removed_circles(&mut self, gone: usize) {
+        self.circles.retain(|&(s, ..)| s != gone);
+        for c in &mut self.circles {
+            if c.0 > gone {
+                c.0 -= 1;
+            }
+        }
+    }
+
+    /// Whether an overlay (a dialog, picker, prompt, the cell editor or an
+    /// alert) is open: the ribbon takes no keys then, and the validation marks
+    /// are not drawn over it.
+    fn overlay_open(&self) -> bool {
+        self.pivot_edit.is_some()
+            || self.model_view.is_some()
+            || self.prompt.is_some()
+            || self.edit.is_some()
+            || self.format_picker.is_some()
+            || self.format_dialog.is_some()
+            || self.text_dialog.is_some()
+            || self.outline_dialog.is_some()
+            || self.validation_dialog.is_some()
+            || self.data_form.is_some()
+            || self.sheet_picker.is_some()
+            || self.dv_picker.is_some()
+            || self.dv_alert.is_some()
+            || self.filter_picker.is_some()
+    }
+
+    /// Close the data-validation dialog, alert and dropdown, which hold a
+    /// sheet, a cell and choices read from a workbook that has changed under
+    /// them; an alert takes its editor with it.
+    fn close_validation_ui(&mut self) {
+        self.validation_dialog = None;
+        self.dv_picker = None;
+        if self.dv_alert.take().is_some() {
+            self.edit = None;
+        }
+        self.commit_cont = Cont::Nothing;
+    }
+
     fn reset_view(&mut self) {
+        self.close_validation_ui();
+        self.circles.clear();
         // A workbook opens on the sheet it was saved on.
         let wb = &self.pkg.workbook;
         self.sheet = wb.active_tab.min(wb.sheets.len().saturating_sub(1));
@@ -7405,34 +7830,6 @@ impl App {
         });
     }
 
-    /// Create a list data-validation (dropdown) over the selection from a
-    /// comma-separated list of allowed values.
-    fn commit_data_validation(&mut self, text: &str) {
-        let items: Vec<&str> = text
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if items.is_empty() {
-            self.status = Some("Data validation: enter comma-separated values".into());
-            return;
-        }
-        let f1 = format!("\"{}\"", items.join(","));
-        let (r1, c1, r2, c2) = self.selection();
-        let s = self.sheet;
-        if !self
-            .pkg
-            .add_data_validation(s, (r1, c1, r2, c2), "list", "", &f1, None)
-        {
-            self.status = Some(WRITE_REFUSED.into());
-            return;
-        }
-        self.undo.clear();
-        self.redo.clear();
-        self.modified = true;
-        self.status = Some(format!("Dropdown list: {} values", items.len()));
-    }
-
     /// Apply a "Highlight Cells" conditional-format rule to the selection from a
     /// typed comparison (">500", "<=100", "=42"; leading operator parsed, default
     /// greaterThan) using Excel's Light-Red-Fill / Dark-Red-Text preset.
@@ -7953,9 +8350,6 @@ impl App {
                 "Highlight (>500, =42, 100..500 between, 'clear'): ",
                 String::new(),
             ),
-            PromptKind::DataValidation => {
-                ("Dropdown list (comma-separated values): ", String::new())
-            }
             PromptKind::CustomFilter => (
                 "Filter (>10 and <=30, begins a, top 3, top 25%, above average, this week): ",
                 String::new(),
@@ -8020,7 +8414,6 @@ impl App {
             }
             PromptKind::GoTo => self.goto(&text),
             PromptKind::CondFormat => self.commit_cond_format(&text),
-            PromptKind::DataValidation => self.commit_data_validation(&text),
             PromptKind::CustomFilter => self.commit_custom_filter(&text),
             PromptKind::FilterByCell => self.commit_filter_by_cell(&text),
             PromptKind::AdvancedFilter => self.commit_advanced_filter(&text),
@@ -8176,6 +8569,7 @@ impl App {
         let name = self.pkg.workbook.sheets[self.sheet].name.clone();
         let gone = self.sheet;
         if self.pkg.remove_sheet(gone) {
+            self.sheet_removed_circles(gone);
             self.cancel_cut();
             // The copy names its sheet by index: one deleted leaves it no
             // sheet (it still pastes its cells as a copy, but Paste Special
@@ -8824,6 +9218,9 @@ fn draw(app: &mut App, f: &mut Frame) {
     if let Some(d) = &app.outline_dialog {
         d.draw(f, grid);
     }
+    if let Some(d) = &app.validation_dialog {
+        d.draw(f, grid);
+    }
     if let Some(d) = &app.data_form {
         d.draw(f, grid);
     }
@@ -8838,6 +9235,10 @@ fn draw(app: &mut App, f: &mut Frame) {
         draw_dv_picker(app, p, f, grid);
     } else if let Some((list, sel)) = app.edit.as_ref().and_then(|e| e.complete.as_ref()) {
         draw_completions(app, list, *sel, f, grid);
+    }
+    draw_validation_marks(app, f, grid);
+    if let Some(a) = &app.dv_alert {
+        draw_dv_alert(a, f, grid);
     }
     if let Some(p) = &app.filter_picker {
         datacmd::draw_filter_picker(app, p, f, grid);
@@ -9340,13 +9741,136 @@ fn num_short(v: f64) -> String {
     }
 }
 
+/// Circle Invalid Data's circles, drawn as red brackets round the cell, and
+/// the input message of the rule on the cursor cell as a tip under it.
+fn draw_validation_marks(app: &App, f: &mut Frame, grid: Rect) {
+    // Not over a dialog or picker: they belong to the grid underneath it.
+    if app.overlay_open() {
+        return;
+    }
+    let on_screen = |r: u32, c: u32| -> Option<(u16, u16, u16)> {
+        let (x, w) = app
+            .vis_cols
+            .iter()
+            .find(|&&(col, ..)| col == c)
+            .map(|&(_, x, w)| (x, w))?;
+        let y = grid.y + app.vis_rows.iter().position(|&row| row == r)? as u16;
+        (y < grid.y + grid.height).then_some((x, y, w))
+    };
+    for &(s, r, c) in &app.circles {
+        if s != app.sheet {
+            continue;
+        }
+        let Some((x, y, w)) = on_screen(r, c) else {
+            continue;
+        };
+        if w < 2 {
+            continue;
+        }
+        let red = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
+        let buf = f.buffer_mut();
+        for (cx, ch) in [(x, "("), (x + w - 1, ")")] {
+            if let Some(cell) = buf.cell_mut((cx, y)) {
+                cell.set_symbol(ch).set_style(red);
+            }
+        }
+    }
+    if app.edit.is_some() || app.dv_alert.is_some() || app.dv_picker.is_some() {
+        return;
+    }
+    let Some(dv) = gridcore::validation::validation_at(app.sheet(), app.cur.0, app.cur.1) else {
+        return;
+    };
+    let msg = dv.prompt.as_deref().unwrap_or_default();
+    if !dv.show_input || (msg.is_empty() && dv.prompt_title.is_empty()) {
+        return;
+    }
+    let Some((x, y, _)) = on_screen(app.cur.0, app.cur.1) else {
+        return;
+    };
+    let w = (msg.chars().count().max(dv.prompt_title.chars().count()) as u16 + 2)
+        .clamp(12, grid.width.max(12))
+        .min(grid.width);
+    let h = if dv.prompt_title.is_empty() || msg.is_empty() {
+        1
+    } else {
+        2
+    };
+    if y + 1 + h > grid.y + grid.height {
+        return;
+    }
+    let area = Rect::new(x.min(grid.x + grid.width.saturating_sub(w)), y + 1, w, h);
+    f.render_widget(Clear, area);
+    let mut lines = Vec::new();
+    if !dv.prompt_title.is_empty() {
+        lines.push(RLine::from(RSpan::styled(
+            fit(&format!(" {}", dv.prompt_title), w as usize, false),
+            Style::new().add_modifier(Modifier::BOLD),
+        )));
+    }
+    if !msg.is_empty() {
+        lines.push(RLine::from(RSpan::raw(fit(
+            &format!(" {msg}"),
+            w as usize,
+            false,
+        ))));
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::new().fg(Color::Black).bg(Color::Yellow)),
+        area,
+    );
+}
+
+/// The data-validation alert, centred on the grid: the rule's title, its
+/// message and the style's buttons.
+fn draw_dv_alert(a: &DvAlert, f: &mut Frame, grid: Rect) {
+    let msg = &a.violation.message;
+    let w = ((msg.chars().count().max(a.violation.title.chars().count()) + 4) as u16)
+        .clamp(30, grid.width.max(30))
+        .min(grid.width);
+    let h = 5.min(grid.height);
+    let area = Rect::new(
+        grid.x + grid.width.saturating_sub(w) / 2,
+        grid.y + grid.height.saturating_sub(h) / 2,
+        w,
+        h,
+    );
+    f.render_widget(Clear, area);
+    let buttons: Vec<RSpan> = dv_buttons(a.violation.style)
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| {
+            let style = if i == a.sel {
+                Style::new().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::new()
+            };
+            [
+                RSpan::styled(format!(" {} ", b.label()), style),
+                RSpan::raw(" "),
+            ]
+        })
+        .collect();
+    let lines = vec![
+        RLine::from(RSpan::styled(
+            fit(&format!(" {}", a.violation.title), w as usize, false),
+            Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )),
+        RLine::from(RSpan::raw(fit(&format!(" {msg}"), w as usize, false))),
+        RLine::from(RSpan::raw("")),
+        RLine::from(buttons),
+    ];
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 fn draw_dv_picker(app: &App, p: &DvPicker, f: &mut Frame, grid: Rect) {
     let title = if p.pick {
         " Pick from list"
     } else {
         " Choose value"
     };
-    draw_list_popup(app, title, &p.values, p.sel, f, grid);
+    let labels: Vec<String> = p.choices.iter().map(|c| c.label.clone()).collect();
+    draw_list_popup(app, title, &labels, p.sel, f, grid);
 }
 
 /// Formula AutoComplete's list (#686) under the cell being edited.
@@ -9383,7 +9907,7 @@ fn draw_list_popup(
     }
     let widest = values
         .iter()
-        .map(|v| v.chars().count())
+        .map(|c| c.chars().count())
         .max()
         .unwrap_or(6)
         .max(title.chars().count())
@@ -9785,6 +10309,12 @@ fn run_control(
             app.close_data_form();
         }
     }
+    // The data-validation dialog, alert and dropdown hold a sheet or a cell:
+    // a verb that moves them (a sheet removed, a workbook opened or reloaded)
+    // closes them, the alert's editor with it.
+    if result.is_ok() && control::mutates(verb) && !control::keeps_cells_in_place(verb) {
+        app.close_validation_ui();
+    }
     app.flush_circle_warning();
     result
 }
@@ -9836,18 +10366,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // --- ribbon ---------------------------------------------------------------
-    let overlay_open = app.pivot_edit.is_some()
-        || app.model_view.is_some()
-        || app.prompt.is_some()
-        || app.edit.is_some()
-        || app.format_picker.is_some()
-        || app.format_dialog.is_some()
-        || app.text_dialog.is_some()
-        || app.outline_dialog.is_some()
-        || app.data_form.is_some()
-        || app.sheet_picker.is_some()
-        || app.dv_picker.is_some()
-        || app.filter_picker.is_some();
+    let overlay_open = app.overlay_open();
     // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
     if key.code == KeyCode::F(9) && !overlay_open && !shift && !ctrl {
         app.ribbon_focus = if app.ribbon_focus == ribbon::Focus::None {
@@ -9879,6 +10398,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         app.outline_dialog_key(key.code);
         return false;
     }
+    if app.validation_dialog.is_some() {
+        app.validation_dialog_key(key.code);
+        return false;
+    }
     if app.data_form.is_some() {
         app.data_form_key(key);
         return false;
@@ -9887,6 +10410,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // --- sheet picker ---------------------------------------------------------
     if app.sheet_picker.is_some() {
         app.sheet_picker_key(key.code);
+        return false;
+    }
+
+    // --- data-validation alert -------------------------------------------------
+    if app.dv_alert.is_some() {
+        app.dv_alert_key(key.code);
         return false;
     }
 
@@ -10008,30 +10537,23 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => app.cancel_edit(),
             KeyCode::Enter => {
-                if app.commit_edit() {
-                    app.enter_move(shift);
-                }
+                app.commit_edit_then(Cont::Enter(shift));
             }
             KeyCode::Tab => {
-                if app.commit_edit() {
-                    app.move_cur(0, if shift { -1 } else { 1 }, false);
-                }
+                app.commit_edit_then(Cont::Move(0, if shift { -1 } else { 1 }));
             }
             KeyCode::BackTab => {
-                if app.commit_edit() {
-                    app.move_cur(0, -1, false);
-                }
+                app.commit_edit_then(Cont::Move(0, -1));
             }
             // In type-over mode, arrows commit and move (Excel behavior).
             KeyCode::Up | KeyCode::Down if replace => {
-                if app.commit_edit() {
-                    app.move_cur(if key.code == KeyCode::Up { -1 } else { 1 }, 0, false);
-                }
+                app.commit_edit_then(Cont::Move(if key.code == KeyCode::Up { -1 } else { 1 }, 0));
             }
             KeyCode::Left | KeyCode::Right if replace => {
-                if app.commit_edit() {
-                    app.move_cur(0, if key.code == KeyCode::Left { -1 } else { 1 }, false);
-                }
+                app.commit_edit_then(Cont::Move(
+                    0,
+                    if key.code == KeyCode::Left { -1 } else { 1 },
+                ));
             }
             KeyCode::Left => {
                 if let Some(e) = &mut app.edit {
@@ -10282,6 +10804,10 @@ fn char_index(s: &str, char_pos: usize) -> usize {
 }
 
 fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
+    // A data-validation alert is answered from the keyboard.
+    if app.dv_alert.is_some() {
+        return false;
+    }
     // A modal confirmation owns the mouse while open — even over the welcome
     // screen or the backstage.
     if app.confirm.is_some() {
@@ -10292,7 +10818,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
     }
     // An outline dialog is modal: a click under it (a sheet tab, a ribbon
     // command) must not change what its OK acts on.
-    if app.outline_dialog.is_some() || app.data_form.is_some() {
+    if app.outline_dialog.is_some() || app.validation_dialog.is_some() || app.data_form.is_some() {
         return false;
     }
     // The welcome screen owns the whole terminal; handle its clicks here so
@@ -10396,8 +10922,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
             }
             let Some(col) = col else { return false };
             if app.edit.is_some() {
-                // Clicking outside while editing commits first.
-                if !app.commit_edit() {
+                // Clicking outside while editing commits first; a
+                // data-validation alert keeps the editor and the click waits.
+                if drag {
+                    if !app.commit_edit_then(Cont::Nothing) {
+                        return false;
+                    }
+                } else {
+                    app.commit_edit_then(Cont::Click(row, col));
                     return false;
                 }
             }
@@ -12758,7 +13290,8 @@ mod tests {
         assert!(app.current_validation().is_some());
         app.open_dv_dropdown();
         let p = app.dv_picker.as_ref().expect("dropdown opened");
-        assert_eq!(p.values, vec!["Yes", "No", "Maybe"]);
+        let labels: Vec<_> = p.choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["Yes", "No", "Maybe"]);
         // Move to "No" and commit → the cell takes that value.
         app.dv_picker_key(KeyCode::Down);
         app.dv_picker_key(KeyCode::Enter);
@@ -12770,6 +13303,61 @@ mod tests {
         assert!(app.current_validation().is_none());
         app.open_dv_dropdown();
         assert!(app.dv_picker.is_none());
+    }
+
+    #[test]
+    fn picking_a_number_from_an_inline_list_enters_a_number() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(0, 0, 4, 0)],
+                kind: "list".into(),
+                formula1: "\"1,2,3\"".into(),
+                ..Default::default()
+            });
+        app.cur = (0, 0);
+        app.open_dv_dropdown();
+        app.dv_picker_key(KeyCode::Down);
+        app.dv_picker_key(KeyCode::Enter);
+        assert_eq!(
+            app.sheet().cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(2.0))
+        );
+    }
+
+    #[test]
+    fn picking_from_an_inline_list_reads_the_label_under_the_cells_format() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(0, 0, 4, 0)],
+                kind: "list".into(),
+                formula1: "\"001,002\"".into(),
+                ..Default::default()
+            });
+        let text = app.pkg.workbook.styles.intern(gridcore::sheet::Xf {
+            code: Some("@".into()),
+            ..Default::default()
+        });
+        app.pkg.workbook.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                style: text,
+                ..Cell::default()
+            },
+        );
+        app.cur = (0, 0);
+        app.open_dv_dropdown();
+        app.dv_picker_key(KeyCode::Enter);
+        assert_eq!(
+            app.sheet().cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Text("001".into()))
+        );
     }
 
     #[test]
@@ -13076,6 +13664,7 @@ mod tests {
         // Even a clip left pointing past the sheets is refused, not a panic.
         app.clip = Some(ClipData {
             cells: vec![vec![Some(Cell::number(1.0))]],
+            rules: Vec::new(),
             sheet: 9,
             from: (0, 0),
             cut: false,
@@ -14558,23 +15147,6 @@ mod tests {
         assert!(!app.sheet().row_hidden(1));
         app.ribbon_act(ribbon::Act::Filter);
         assert!(app.sheet().auto_filter.is_none());
-    }
-
-    #[test]
-    fn commit_data_validation_creates_list() {
-        let mut app = App::new(new_xlsx(), "t.xlsx");
-        app.os_clip = None;
-        app.cur = (0, 0);
-        app.anchor = Some((4, 0)); // A1:A5
-        app.commit_data_validation("Laptop, Monitor , Dock");
-        let dvs = &app.pkg.workbook.sheets[0].validations;
-        assert_eq!(dvs.len(), 1);
-        assert_eq!(dvs[0].kind, "list");
-        assert_eq!(dvs[0].formula1, "\"Laptop,Monitor,Dock\"");
-        assert!(dvs[0].covers(2, 0));
-        // Round-trips + the dropdown resolves the values.
-        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
-        assert_eq!(re.workbook.sheets[0].validations.len(), 1);
     }
 
     #[test]
@@ -18146,7 +18718,8 @@ mod tests {
     }
 
     fn put(app: &mut App, r: u32, c: u32, text: &str) {
-        let cell = entry_cell(&mut app.pkg.workbook, app.sheet, r, c, text, None).unwrap();
+        let cell = gridcore::entry::entry_cell(&mut app.pkg.workbook, app.sheet, r, c, text, None)
+            .unwrap();
         app.pkg.workbook.sheets[app.sheet].set_cell(r, c, cell);
         app.rebuild_engine();
     }
@@ -19314,6 +19887,30 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.data_form.is_none());
     }
+    // ---- #687: data-validation alerts on typed entry ----
+
+    fn dv_app(style: gridcore::sheet::AlertStyle) -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.apply(vec![(1, 1, Cell::number(50.0))]);
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(1, 1, 9, 1)], // B2:B10
+                kind: "whole".into(),
+                operator: "between".into(),
+                formula1: "10".into(),
+                formula2: "90".into(),
+                allow_blank: true,
+                show_error: true,
+                error_style: style,
+                error_title: "Score".into(),
+                error: "10 to 90 only".into(),
+                ..Default::default()
+            });
+        app.cur = (1, 1);
+        app
+    }
 
     // ---- #712: Pick From Drop-down List, Flash Fill, AutoCorrect, Formula
     // AutoComplete ----
@@ -19354,14 +19951,282 @@ mod tests {
     }
 
     #[test]
+    fn stop_alert_refuses_the_issue_entries() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        type_text(&mut app, "250");
+        press(&mut app, KeyCode::Enter);
+        let a = app.dv_alert.as_ref().expect("Stop alert raised");
+        assert_eq!(a.violation.title, "Score");
+        assert_eq!(a.violation.message, "10 to 90 only");
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(50.0));
+        // Enter on Retry: back to the editor with the text, no move.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_none());
+        assert_eq!(app.edit.as_ref().map(|e| e.text.as_str()), Some("250"));
+        assert_eq!(app.cur, (1, 1));
+        // Commit again, then Cancel: the edit is dropped, the old content kept.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_some());
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.edit.is_none() && app.dv_alert.is_none());
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(50.0));
+
+        // 45.5 into B3 is refused too.
+        app.cur = (2, 1);
+        type_text(&mut app, "45.5");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_some());
+        assert_eq!(value_at(&app, 2, 1), CellValue::Empty);
+        // A good entry goes in and moves.
+        press(&mut app, KeyCode::Esc);
+        app.cur = (2, 1);
+        type_text(&mut app, "45");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_none());
+        assert_eq!(value_at(&app, 2, 1), CellValue::Number(45.0));
+        assert_eq!(app.cur, (3, 1));
+    }
+
+    #[test]
+    fn warning_asks_yes_no_and_information_lets_the_entry_in() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Warning);
+        type_text(&mut app, "250");
+        press(&mut app, KeyCode::Enter);
+        // No is the default: the editor stays.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_none() && app.edit.is_some());
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(50.0));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(250.0));
+        assert_eq!(app.cur, (2, 1), "Yes enters the value and makes the move");
+
+        let mut app = dv_app(AlertStyle::Information);
+        type_text(&mut app, "250");
+        press(&mut app, KeyCode::Tab);
+        assert!(app.dv_alert.is_some());
+        assert_eq!(app.cur, (1, 1));
+        press(&mut app, KeyCode::Enter); // OK
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(250.0));
+        assert_eq!(app.cur, (1, 2), "OK makes the Tab move");
+    }
+
+    #[test]
+    fn show_error_off_lets_anything_in() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.pkg.workbook.sheets[0].validations[0].show_error = false;
+        type_text(&mut app, "250");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_none());
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(250.0));
+    }
+    // ---- #688: a paste replaces the target's data-validation rule ----
+
+    fn ranges_of(app: &App) -> Vec<Vec<(u32, u32, u32, u32)>> {
+        app.sheet()
+            .validations
+            .iter()
+            .map(|d| d.ranges.clone())
+            .collect()
+    }
+
+    #[test]
+    fn pasting_an_unvalidated_cell_splits_the_rule_and_undo_restores_it() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.apply(vec![(1, 7, Cell::number(1000.0))]); // H2, no rule
+        app.cur = (1, 7);
+        app.copy(false);
+        app.cur = (5, 1); // B6
+        app.paste_from(None);
+        assert_eq!(value_at(&app, 5, 1), CellValue::Number(1000.0));
+        assert_eq!(ranges_of(&app), vec![vec![(1, 1, 4, 1), (6, 1, 9, 1)]]);
+        // The save carries the split sqref.
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        assert_eq!(
+            re.workbook.sheets[0].validations[0].ranges,
+            vec![(1, 1, 4, 1), (6, 1, 9, 1)]
+        );
+        // One undo puts the cell and the rule back; redo does both again.
+        app.undo();
+        assert_eq!(value_at(&app, 5, 1), CellValue::Empty);
+        assert_eq!(ranges_of(&app), vec![vec![(1, 1, 9, 1)]]);
+        app.redo();
+        assert_eq!(ranges_of(&app), vec![vec![(1, 1, 4, 1), (6, 1, 9, 1)]]);
+    }
+
+    #[test]
+    fn pasting_a_validated_cell_gives_the_target_an_equal_rule() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.cur = (1, 1); // B2, validated
+        app.copy(false);
+        app.cur = (3, 5); // F4
+        app.paste_from(None);
+        let dv = app
+            .sheet()
+            .validations
+            .iter()
+            .find(|d| d.covers(3, 5))
+            .expect("F4 validated");
+        assert_eq!(
+            (dv.formula1.as_str(), dv.error_title.as_str()),
+            ("10", "Score")
+        );
+        assert!(app.sheet().validations.iter().any(|d| d.covers(1, 1)));
+    }
+
+    #[test]
+    fn external_text_paste_leaves_the_rule_alone() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.clip = None;
+        app.clip_text = None;
+        app.cur = (5, 1);
+        app.paste_from(Some("1000".into()));
+        assert_eq!(value_at(&app, 5, 1), CellValue::Number(1000.0));
+        assert_eq!(ranges_of(&app), vec![vec![(1, 1, 9, 1)]]);
+    }
+    // ---- #689: the Data Validation dialog and Circle Invalid Data ----
+
+    fn dialog_keys(app: &mut App, keys: &[KeyCode]) {
+        for &k in keys {
+            handle_key(app, KeyEvent::new(k, KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn dialog_creates_a_rule_in_one_undo_step_and_clear_all_removes_it() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.cur = (1, 1);
+        app.anchor = Some((9, 1)); // B2:B10
+        app.open_validation_dialog();
+        assert!(app.validation_dialog.is_some());
+        // Tab strip -> Allow: Whole number; Data: between; 10 .. 90.
+        dialog_keys(
+            &mut app,
+            &[KeyCode::Down, KeyCode::Right, KeyCode::Down, KeyCode::Down],
+        );
+        type_text(&mut app, "10");
+        press(&mut app, KeyCode::Down);
+        type_text(&mut app, "90");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.validation_dialog.is_none(), "{:?}", app.status);
+        let dv = &app.sheet().validations[0];
+        assert_eq!(dv.ranges, vec![(1, 1, 9, 1)]);
+        assert_eq!(
+            (dv.kind.as_str(), dv.formula1.as_str(), dv.formula2.as_str()),
+            ("whole", "10", "90")
+        );
+        // It round-trips through a save.
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].validations.len(), 1);
+        app.undo();
+        assert!(app.sheet().validations.is_empty());
+        app.redo();
+        assert_eq!(app.sheet().validations.len(), 1);
+
+        // Reopen on B3: the dialog shows the rule; Clear All removes it there.
+        app.cur = (2, 1);
+        app.anchor = None;
+        app.open_validation_dialog();
+        dialog_keys(
+            &mut app,
+            &[
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+            ],
+        );
+        // Focus walks Allow, Data, Min, Max, Ignore blank, Apply all, OK, Clear All.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.validation_dialog.is_none());
+        let ranges = ranges_of(&app);
+        assert_eq!(ranges, vec![vec![(1, 1, 1, 1), (3, 1, 9, 1)]]);
+        app.undo();
+        assert_eq!(ranges_of(&app), vec![vec![(1, 1, 9, 1)]]);
+    }
+
+    #[test]
+    fn dialog_apply_to_all_rewrites_every_range_with_the_same_settings() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        let mut other = app.sheet().validations[0].clone();
+        other.ranges = vec![(1, 5, 4, 5)]; // F2:F5, same settings
+        app.pkg.workbook.sheets[0].validations.push(other);
+        app.cur = (1, 1);
+        app.open_validation_dialog();
+        // Allow stays Whole number; Min 10 -> 11; tick Apply all; OK.
+        dialog_keys(&mut app, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        type_text(&mut app, "11");
+        dialog_keys(&mut app, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        let dvs = &app.sheet().validations;
+        assert!(dvs.iter().all(|d| d.formula1 == "11"), "{:?}", app.status);
+        assert!(dvs.iter().any(|d| d.covers(2, 5)) && dvs.iter().any(|d| d.covers(9, 1)));
+    }
+
+    #[test]
+    fn circle_invalid_data_and_clear_circles() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.apply(vec![(2, 1, Cell::number(250.0))]); // B3: a value that got in
+        app.circle_invalid();
+        assert_eq!(app.circles, vec![(0, 2, 1)]);
+        // Fixing the cell takes its circle away.
+        app.apply(vec![(2, 1, Cell::number(20.0))]);
+        assert!(app.circles.is_empty());
+        app.apply(vec![(3, 1, Cell::number(1.0))]);
+        app.circle_invalid();
+        assert_eq!(app.circles.len(), 1);
+        app.clear_circles();
+        assert!(app.circles.is_empty());
+        // Circles are view state: a save knows nothing of them.
+        app.circle_invalid();
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].validations.len(), 1);
+    }
+
+    #[test]
+    fn the_dropdown_honours_show_dropdown() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(0, 0, 4, 0)],
+                kind: "list".into(),
+                formula1: "\"a,b\"".into(),
+                show_dropdown: false,
+                ..Default::default()
+            });
+        app.cur = (0, 0);
+        app.open_dv_dropdown();
+        assert!(app.dv_picker.is_none());
+    }
+
+    #[test]
     fn ent_case_030_alt_down_picks_from_the_column() {
         let mut app = pick_app();
         app.cur = (7, 0);
         alt(&mut app, KeyCode::Down);
         let p = app.dv_picker.as_ref().expect("the pick list");
         assert!(p.pick);
+        let labels: Vec<_> = p.choices.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(
-            p.values,
+            labels,
             ["Gadgets", "Gizmos", "Grommets", "Sprockets", "Widgets"]
         );
         assert_eq!(p.sel, None, "nothing highlighted until Down");
@@ -19418,7 +20283,8 @@ mod tests {
         alt(&mut app, KeyCode::Down);
         let p = app.dv_picker.as_ref().unwrap();
         assert!(!p.pick);
-        assert_eq!(p.values, ["Yes", "No"]);
+        let labels: Vec<_> = p.choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["Yes", "No"]);
         assert_eq!(p.sel, Some(0));
         press(&mut app, KeyCode::Esc);
         // A protected sheet opens no pick list.
@@ -19763,6 +20629,175 @@ mod tests {
             assert!(keys.contains(&k), "{k}");
         }
         assert!(!keys.contains(&gridcore::options::KEY_FLASH_FILL_AUTO));
+    }
+    #[test]
+    fn a_verb_that_moves_sheets_closes_the_validation_dialog_and_alert() {
+        use ctlcore::json::Json;
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Second");
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.sheet = 1;
+        app.cur = (1, 1);
+        app.open_validation_dialog();
+        assert!(app.validation_dialog.is_some());
+        // The sheet the dialog is over is removed: no panic, the dialog closes.
+        let args = Json::obj(vec![("sheet", Json::Num(1.0))]);
+        run_control(&mut app, "sheet.remove", &args).unwrap();
+        assert!(app.validation_dialog.is_none());
+        assert_eq!(app.sheet, 0);
+
+        // An alert pending on a typed entry goes when the workbook is reloaded.
+        let mut app = dv_app(gridcore::sheet::AlertStyle::Warning);
+        let dir = std::env::temp_dir().join(format!("xlsxy-dv-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("book.xlsx");
+        std::fs::write(&path, save_xlsx(&app.pkg)).unwrap();
+        app.path = path.to_string_lossy().into_owned();
+        type_text(&mut app, "250");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_some());
+        run_control(&mut app, "wb.reload", &Json::Null).unwrap();
+        assert!(app.dv_alert.is_none() && app.edit.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn circles_follow_the_dialog_and_structural_edits() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        app.apply(vec![(2, 1, Cell::number(250.0))]);
+        app.circle_invalid();
+        assert_eq!(app.circles.len(), 1);
+        // Loosening the rule through the dialog makes B3 valid: its circle goes.
+        app.cur = (1, 1);
+        app.anchor = Some((9, 1));
+        app.open_validation_dialog();
+        dialog_keys(&mut app, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "1");
+        dialog_keys(&mut app, &[KeyCode::Down]);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "500");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.validation_dialog.is_none(), "{:?}", app.status);
+        assert!(app.circles.is_empty());
+        // A row inserted above clears circles: they name cells that moved.
+        app.apply(vec![(3, 1, Cell::number(600.0))]);
+        app.circle_invalid();
+        assert_eq!(app.circles.len(), 1);
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.row_op(true);
+        assert!(app.circles.is_empty());
+    }
+    #[test]
+    fn removing_a_sheet_takes_its_circles_and_renumbers_the_rest() {
+        use ctlcore::json::Json;
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Second");
+        pkg.add_sheet("Third");
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.circles = vec![(0, 1, 1), (1, 2, 2), (2, 3, 3)];
+        let args = Json::obj(vec![("sheet", Json::Num(1.0))]);
+        run_control(&mut app, "sheet.remove", &args).unwrap();
+        assert_eq!(app.circles, vec![(0, 1, 1), (1, 3, 3)]);
+        // The TUI's own delete (the active sheet) does the same.
+        app.sheet = 0;
+        app.delete_current_sheet();
+        assert_eq!(app.circles, vec![(0, 3, 3)]);
+    }
+    // ---- review r13: a cut of part of a rule ----
+
+    fn cut_rule_app(formula: &str) -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.add_sheet("Other");
+        app.apply(vec![(4, 0, Cell::number(3.0)), (0, 5, Cell::number(10.0))]); // A5, F1
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(1, 1, 9, 1)], // B2:B10
+                kind: "custom".into(),
+                formula1: formula.into(),
+                allow_blank: true,
+                show_error: true,
+                ..Default::default()
+            });
+        app
+    }
+
+    fn cut_to(app: &mut App, from: ((u32, u32), (u32, u32)), sheet: usize, to: (u32, u32)) {
+        app.cur = from.0;
+        app.anchor = Some(from.1);
+        app.copy(true);
+        app.anchor = None;
+        app.sheet = sheet;
+        app.cur = to;
+        app.paste_from(None);
+    }
+
+    fn typed_refused(app: &mut App, sheet: usize, cell: (u32, u32), text: &str) -> bool {
+        let entry =
+            gridcore::entry::entry_cell(&mut app.pkg.workbook, sheet, cell.0, cell.1, text, None)
+                .unwrap();
+        gridcore::validation::check_entry(
+            &mut app.pkg.workbook,
+            sheet,
+            cell.0,
+            cell.1,
+            &entry,
+            None,
+        )
+        .is_some()
+    }
+
+    #[test]
+    fn a_cut_leaves_validation_where_it_is() {
+        let mut app = cut_rule_app("B2>A2");
+        // A rule of its own on the destination cells.
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(4, 3, 4, 4)], // D5:E5
+                kind: "whole".into(),
+                operator: "between".into(),
+                formula1: "1".into(),
+                formula2: "9".into(),
+                show_error: true,
+                ..Default::default()
+            });
+        let before = app.sheet().validations.clone();
+        cut_to(&mut app, ((4, 0), (4, 1)), 0, (4, 3)); // A5:B5 to D5:E5
+        assert_eq!(
+            app.sheet().validations,
+            before,
+            "no rule moved, cleared or changed"
+        );
+        // A typed entry at the source is still checked by the rule that stayed.
+        assert!(typed_refused(&mut app, 0, (4, 1), "-1"));
+        // The destination's own rule still applies there.
+        assert!(typed_refused(&mut app, 0, (4, 4), "50"));
+        // And one undo leaves them as they were.
+        app.undo();
+        assert_eq!(app.sheet().validations, before);
+    }
+    #[test]
+    fn overlay_open_covers_the_dialogs_and_pickers() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        assert!(!app.overlay_open());
+        app.sheet_picker = Some(0);
+        assert!(app.overlay_open());
+        app.sheet_picker = None;
+        app.open_validation_dialog();
+        assert!(app.overlay_open());
+        app.validation_dialog = None;
+        assert!(!app.overlay_open());
     }
 }
 

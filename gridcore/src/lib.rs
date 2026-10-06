@@ -63,4 +63,5 @@ pub mod print;
 pub mod sheet;
 pub mod stats;
 pub mod textio;
+pub mod validation;
 pub mod xlsx;
