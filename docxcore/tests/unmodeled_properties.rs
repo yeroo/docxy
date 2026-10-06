@@ -377,3 +377,18 @@ fn rsids_do_not_make_runs_different_formatting() {
     assert_ne!(a.props.element_attrs.0, b.props.element_attrs.0);
     assert_eq!(a.props, b.props);
 }
+
+/// A save writes property children in schema order; the shadow of source in
+/// another order is kept in that order too, so a saved and reloaded document
+/// equals the one loaded.
+#[test]
+fn out_of_order_properties_reload_to_the_same_document() {
+    let original = docx(
+        "<w:p><w:pPr><w:bidi/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr>\
+         <w:r><w:rPr><w:szCs w:val=\"24\"/><w:b/></w:rPr><w:t>text</w:t></w:r></w:p>",
+    );
+    let (pkg, editor) = open(&original);
+    let loaded = editor.doc.clone();
+    let (_, reloaded) = open(&save(pkg, editor));
+    assert_eq!(reloaded.doc, loaded);
+}

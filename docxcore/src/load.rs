@@ -1622,6 +1622,11 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
             props.shadow.push(p.raw_slice(start, p.pos()).to_string());
         }
     }
+    // In the order a save writes them, so a saved and reloaded paragraph
+    // has the same shadow as the one loaded from out-of-order source.
+    props
+        .shadow
+        .sort_by_key(|raw| crate::serialize::ppr_rank(crate::serialize::local_name(raw)));
 }
 
 /// The `w:ins`/`w:del` children of a paragraph-mark `w:rPr`, in order.
@@ -1902,6 +1907,10 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
             Event::Text => {}
         }
     }
+    // In the order a save writes them (see `parse_ppr`).
+    props
+        .shadow
+        .sort_by_key(|raw| crate::serialize::rpr_rank(crate::serialize::local_name(raw)));
 }
 
 /// The `w:rPr` children the model reads a value from. Each is also kept

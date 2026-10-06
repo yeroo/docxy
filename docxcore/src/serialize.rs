@@ -273,7 +273,7 @@ fn write_inlines_tracking_inserts(s: &mut String, content: &[Inline]) {
 /// keep their relative order. Word (and strict validators) reject `<w:pPr>`
 /// children out of this order, so both modeled and preserved (`raw_props`)
 /// children are emitted through this rank.
-fn ppr_rank(local: &str) -> u32 {
+pub(crate) fn ppr_rank(local: &str) -> u32 {
     const ORDER: [&str; 36] = [
         "pStyle",
         "keepNext",
@@ -323,7 +323,7 @@ fn ppr_rank(local: &str) -> u32 {
 
 /// The local element name of a serialized child (`"<w:spacing …/>"` → `spacing`),
 /// used to rank preserved `raw_props` against the modeled children.
-fn local_name(raw: &str) -> &str {
+pub(crate) fn local_name(raw: &str) -> &str {
     let t = raw.trim_start();
     let Some(rest) = t.strip_prefix('<') else {
         return "";
@@ -1063,7 +1063,7 @@ fn write_run(s: &mut String, r: &Run, text_kind: RunTextKind) {
     }
 }
 
-fn rpr_rank(local: &str) -> u32 {
+pub(crate) fn rpr_rank(local: &str) -> u32 {
     const ORDER: [&str; 41] = [
         "rStyle",
         "rFonts",
