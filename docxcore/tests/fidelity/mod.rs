@@ -747,6 +747,102 @@ pub fn compare_packages(original: &[u8], saved: &[u8]) -> Vec<Finding> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Effective text (#1101)
+
+const W_URI: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const MC_URI: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+
+/// The text Word shows for a `word/document.xml` tree, with the characters
+/// its `Range.Text` uses for run content that is not `w:t`: a non-breaking
+/// hyphen is U+001E, a soft hyphen U+001F, a line break (`w:br`, `w:cr`)
+/// U+000B, a page break U+000C, a column break U+000E, a tab (`w:tab`,
+/// `w:ptab`) U+0009, a symbol `(`, and a paragraph end U+000D. Field codes
+/// and `mc:Fallback` copies are left out. An element-by-element compare can
+/// miss such a character when the run around it is restructured too; this
+/// cannot.
+pub fn effective_text(root: &Elem) -> String {
+    fn walk(e: &Elem, out: &mut String) {
+        if e.uri == MC_URI && e.local == "Fallback" {
+            return;
+        }
+        if e.uri == W_URI {
+            let mark = match e.local.as_str() {
+                "t" | "delText" => {
+                    for c in &e.children {
+                        if let Node::Text(t) = c {
+                            out.push_str(t);
+                        }
+                    }
+                    return;
+                }
+                "instrText" | "delInstrText" => return,
+                "noBreakHyphen" => Some('\u{1e}'),
+                "softHyphen" => Some('\u{1f}'),
+                "tab" | "ptab" => Some('\t'),
+                "cr" => Some('\u{b}'),
+                "br" => Some(
+                    match e.attrs.iter().find(|a| a.uri == W_URI && a.local == "type") {
+                        Some(a) if a.value == "page" => '\u{c}',
+                        Some(a) if a.value == "column" => '\u{e}',
+                        _ => '\u{b}',
+                    },
+                ),
+                "sym" => Some('('),
+                _ => None,
+            };
+            if let Some(mark) = mark {
+                out.push(mark);
+                return;
+            }
+        }
+        // Tab stops and other properties hold no text.
+        if e.uri == W_URI && matches!(e.local.as_str(), "pPr" | "rPr" | "tblPr" | "sectPr") {
+            return;
+        }
+        for c in &e.children {
+            if let Node::Elem(child) = c {
+                walk(child, out);
+            }
+        }
+        if e.uri == W_URI && e.local == "p" {
+            out.push('\r');
+        }
+    }
+    let mut out = String::new();
+    walk(root, &mut out);
+    out
+}
+
+/// Where the effective text of `word/document.xml` differs between two
+/// packages: the first differing character and a little context, or `None`
+/// when it is the same (or either side has no readable part).
+pub fn effective_text_change(original: &[u8], saved: &[u8]) -> Option<String> {
+    let text = |bytes: &[u8]| {
+        read_parts(bytes)
+            .and_then(|parts| parts.get("word/document.xml").and_then(|b| parse_xml(b)))
+            .map(|root| effective_text(&root))
+    };
+    let (a, b) = (text(original)?, text(saved)?);
+    if a == b {
+        return None;
+    }
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let at = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let context = |s: &[char]| -> String {
+        s[at.saturating_sub(20)..(at + 20).min(s.len())]
+            .iter()
+            .collect::<String>()
+    };
+    Some(format!(
+        "{} -> {} chars, first difference at {at}: {:?} -> {:?}",
+        a.len(),
+        b.len(),
+        context(&a),
+        context(&b)
+    ))
+}
+
 /// Run one file's round trip, turning a panic into a [`Kind::Panic`] finding.
 pub fn guarded(f: impl FnOnce() -> Vec<Finding>) -> Vec<Finding> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {

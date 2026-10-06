@@ -225,11 +225,13 @@ fn corpus(root: &Path) -> (Vec<(String, PathBuf)>, Option<PathBuf>) {
 }
 
 /// One file's round trip: its findings, whether the preserving save is
-/// byte-identical, and the schema violations the save introduced.
+/// byte-identical, the schema violations the save introduced, and how the
+/// document's effective text changed, if it did.
 struct RoundTrip {
     findings: Vec<Finding>,
     preserving: Result<(), String>,
     schema: Vec<Violation>,
+    text_change: Option<String>,
 }
 
 /// The round trip under test: what docxy's save does for a modified
@@ -251,6 +253,7 @@ fn round_trip(bytes: &[u8]) -> RoundTrip {
                 findings: vec![f],
                 preserving: Ok(()),
                 schema: Vec::new(),
+                text_change: None,
             };
         }
     };
@@ -261,6 +264,7 @@ fn round_trip(bytes: &[u8]) -> RoundTrip {
         findings: compare_packages(bytes, &saved),
         preserving,
         schema: new_violations(&validate_package(bytes), &validate_package(&saved)),
+        text_change: effective_text_change(bytes, &saved),
     }
 }
 
@@ -292,18 +296,24 @@ fn round_trip_fidelity_gate() {
     let mut present = BTreeSet::new();
     let mut not_preserved = Vec::new();
     let mut invalid = Vec::new();
+    let mut text_lost = Vec::new();
     let mut allowed = vec![0usize; allow.len()];
     for (file, path) in &files {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         present.insert(file.clone());
         let mut preserved = Ok(());
         let mut schema = Vec::new();
+        let mut text_change = None;
         let found = guarded(|| {
             let rt = round_trip(&bytes);
             preserved = rt.preserving;
             schema = rt.schema;
+            text_change = rt.text_change;
             rt.findings
         });
+        if let Some(why) = text_change {
+            text_lost.push(format!("{file}: {why}"));
+        }
         if let Err(why) = preserved {
             not_preserved.push(format!("{file}: {why}"));
         }
@@ -327,6 +337,16 @@ fn round_trip_fidelity_gate() {
     assert!(
         not_preserved.is_empty(),
         "save_package_preserving_document (the no-edit save) changed these packages: {not_preserved:?}"
+    );
+    // The text Word shows (`effective_text`: hyphens, tabs and breaks as its
+    // control characters) must survive the save. An element compare can file
+    // a character lost in a restructured run as one more #1069 entry; this
+    // cannot, and it is never baselined (#1101).
+    assert!(
+        text_lost.is_empty(),
+        "fidelity gate: the save changed the effective text of {} files (#1101)\n{}",
+        text_lost.len(),
+        text_lost.join("\n")
     );
     // Word rejects these as corrupt, lost or not: never baselined (#1083).
     assert!(
@@ -621,6 +641,88 @@ fn malformed_or_non_utf8_xml_is_not_parsed() {
         );
     }
     assert!(parse_xml(b"\xff\xfe<\0a\0/\0>\0").is_none());
+}
+
+fn document_package(body: &str) -> Vec<u8> {
+    let part = |n: &str, b: String| (n.to_string(), b.into_bytes());
+    docxcore::zipwrite::write_zip(&[
+        part(
+            "[Content_Types].xml",
+            "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+             <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+             <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+             <Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+             </Types>"
+                .into(),
+        ),
+        part(
+            "_rels/.rels",
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+             <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>\
+             </Relationships>"
+                .into(),
+        ),
+        part(
+            "word/document.xml",
+            format!("<w:document {W_NS}><w:body>{body}</w:body></w:document>"),
+        ),
+    ])
+}
+
+#[test]
+fn effective_text_has_word_characters_for_run_content() {
+    let xml = format!(
+        "<w:document {W_NS} xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\">\
+         <w:body><w:p><w:pPr><w:tabs><w:tab w:val=\"left\" w:pos=\"1\"/></w:tabs></w:pPr>\
+         <w:r><w:t>e</w:t><w:noBreakHyphen/><w:t>c</w:t><w:softHyphen/><w:tab/><w:br/><w:cr/>\
+         <w:br w:type=\"page\"/><w:br w:type=\"column\"/><w:sym w:char=\"F0E0\"/></w:r>\
+         <w:r><w:instrText> PAGE </w:instrText></w:r>\
+         <mc:AlternateContent><mc:Choice Requires=\"x\"><w:r><w:t>1</w:t></w:r></mc:Choice>\
+         <mc:Fallback><w:r><w:t>1</w:t></w:r></mc:Fallback></mc:AlternateContent></w:p>\
+         <w:p><w:r><w:delText>d</w:delText></w:r></w:p></w:body></w:document>"
+    );
+    let root = parse_xml(xml.as_bytes()).unwrap();
+    assert_eq!(
+        effective_text(&root),
+        "e\u{1e}c\u{1f}\t\u{b}\u{b}\u{c}\u{e}(1\rd\r"
+    );
+}
+
+#[test]
+fn a_lost_hyphen_is_an_effective_text_change() {
+    let original =
+        document_package("<w:p><w:r><w:t>e</w:t><w:noBreakHyphen/><w:t>commerce</w:t></w:r></w:p>");
+    // Split into runs, the text compares the same.
+    let split = document_package(
+        "<w:p><w:r><w:t>e</w:t></w:r><w:r><w:noBreakHyphen/></w:r><w:r><w:t>commerce</w:t></w:r></w:p>",
+    );
+    assert_eq!(effective_text_change(&original, &split), None);
+    let lost = document_package("<w:p><w:r><w:t>e</w:t><w:t>commerce</w:t></w:r></w:p>");
+    let why = effective_text_change(&original, &lost).expect("a change");
+    assert!(why.contains("first difference at 1"), "{why}");
+    // A literal U+2011 is not the element either.
+    let literal = document_package("<w:p><w:r><w:t>e\u{2011}commerce</w:t></w:r></w:p>");
+    assert!(effective_text_change(&original, &literal).is_some());
+}
+
+/// The gate's own round trip keeps every hyphen and the run that holds only
+/// one (#1101).
+#[test]
+fn the_round_trip_keeps_the_effective_text_of_hyphens() {
+    let original = document_package(
+        "<w:p><w:r><w:t>ITU</w:t><w:noBreakHyphen/><w:t>T</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>insufficien</w:t><w:softHyphen/><w:t>tly</w:t></w:r></w:p>\
+         <w:p><w:r><w:softHyphen/></w:r><w:bookmarkStart w:id=\"1\" w:name=\"A\"/>\
+         <w:bookmarkEnd w:id=\"1\"/></w:p>",
+    );
+    let rt = round_trip(&original);
+    assert_eq!(rt.text_change, None);
+    let lost: Vec<_> = rt
+        .findings
+        .iter()
+        .filter(|f| f.part == "word/document.xml" && f.path.contains("Hyphen"))
+        .collect();
+    assert!(lost.is_empty(), "{lost:?}");
 }
 
 #[test]

@@ -713,6 +713,8 @@ fn transform_run_props(
     restored.property_change = None;
     // The run's start-tag attributes (rsids) are not run properties.
     restored.element_attrs = std::mem::take(&mut props.element_attrs);
+    // Nor is how its hyphens are written: the text keeps them (#1101).
+    restored.hyphen_elements = props.hyphen_elements;
     *props = restored;
     Some(Ok(RevisionCategory::Property(PropertyScope::Run)))
 }

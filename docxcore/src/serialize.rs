@@ -1168,14 +1168,44 @@ fn write_run_start(s: &mut String, props: &RunProps) {
 fn write_run(s: &mut String, r: &Run, text_kind: RunTextKind) {
     write_run_start(s, &r.props);
     write_rpr(s, &r.props);
+    if r.props.hyphen_elements {
+        // U+2011 / U+00AD came from `w:noBreakHyphen` / `w:softHyphen` and go
+        // back as them, between the text pieces, with no empty `w:t` (#1101).
+        // A deleted run's hyphens are the same elements: there is no
+        // deleted-text form of them.
+        let mut piece = String::new();
+        for ch in r.text.chars() {
+            let element = match ch {
+                '\u{2011}' => "<w:noBreakHyphen/>",
+                '\u{ad}' => "<w:softHyphen/>",
+                _ => {
+                    piece.push(ch);
+                    continue;
+                }
+            };
+            if !piece.is_empty() {
+                write_run_text(s, &std::mem::take(&mut piece), text_kind);
+            }
+            s.push_str(element);
+        }
+        if !piece.is_empty() {
+            write_run_text(s, &piece, text_kind);
+        }
+    } else {
+        write_run_text(s, &r.text, text_kind);
+    }
+    s.push_str("</w:r>");
+}
+
+fn write_run_text(s: &mut String, text: &str, text_kind: RunTextKind) {
     match text_kind {
         RunTextKind::Normal => s.push_str("<w:t xml:space=\"preserve\">"),
         RunTextKind::Deleted => s.push_str("<w:delText xml:space=\"preserve\">"),
     }
-    esc_text(&r.text, s);
+    esc_text(text, s);
     match text_kind {
-        RunTextKind::Normal => s.push_str("</w:t></w:r>"),
-        RunTextKind::Deleted => s.push_str("</w:delText></w:r>"),
+        RunTextKind::Normal => s.push_str("</w:t>"),
+        RunTextKind::Deleted => s.push_str("</w:delText>"),
     }
 }
 

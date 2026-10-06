@@ -93,6 +93,13 @@ pub struct RunProps {
     pub shadow: Vec<String>,
     /// The `w:r` start tag's attributes (`w:rsidR`, `w:rsidRPr`, …).
     pub element_attrs: ElementAttrs,
+    /// The run was loaded with `w:noBreakHyphen` / `w:softHyphen` content,
+    /// held in `text` as U+2011 / U+00AD: a save writes those characters back
+    /// as the elements. Unset, they stay literal `w:t` text (#1101). Unlike
+    /// `element_attrs` it takes part in equality, so a merge on equal
+    /// properties never moves the characters into a run that writes them as
+    /// text.
+    pub hyphen_elements: bool,
     /// A tracked `w:rPrChange`, when present. The owning `RunProps` is the
     /// current state; `previous` on the change retains the prior snapshot.
     pub property_change: Option<PropertyChange>,

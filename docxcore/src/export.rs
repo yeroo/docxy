@@ -933,7 +933,11 @@ fn emit_table(flow: &mut dyn Flow, t: &Table, opts: &PdfOptions) {
             .collect();
         let text = cols.join("    ");
         let seg = Seg {
-            cells: text.chars().map(plain_cell).collect(),
+            cells: text
+                .chars()
+                .filter_map(printed_char)
+                .map(plain_cell)
+                .collect(),
             brk: None,
         };
         emit_segments(flow, vec![seg], opts.base_font_size, Align::Left);
@@ -1731,6 +1735,18 @@ impl Flow for Pager<'_> {
     }
 }
 
+/// The character a PDF prints for `ch`, if any (#1101). A soft hyphen
+/// prints only at a line break, which this layout never hyphenates at, so it
+/// is left out; a non-breaking hyphen has no WinAnsi byte and prints as a
+/// hyphen.
+fn printed_char(ch: char) -> Option<char> {
+    match ch {
+        '\u{ad}' => None,
+        '\u{2011}' => Some('-'),
+        _ => Some(ch),
+    }
+}
+
 fn plain_cell(ch: char) -> PCell {
     PCell {
         ch,
@@ -1765,7 +1781,11 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
     let mut segs: Vec<Seg> = vec![Seg::default()];
     // Complex fields: only the outermost field's result is replaced.
     let mut fields: Vec<OpenField> = Vec::new();
-    fn push(segs: &mut [Seg], cell: PCell) {
+    fn push(segs: &mut [Seg], mut cell: PCell) {
+        let Some(ch) = printed_char(cell.ch) else {
+            return;
+        };
+        cell.ch = ch;
         segs.last_mut().unwrap().cells.push(cell);
     }
     fn new_line(segs: &mut Vec<Seg>) {
@@ -1783,7 +1803,9 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                     .first_mut()
                     .filter(|f| f.separated && f.kind.is_some());
                 let mut mark = outer.map(|f| (f.kind.unwrap(), &mut f.emitted));
-                for ch in r.text.chars() {
+                // Only a printed character carries a page field's marker: a
+                // soft hyphen first would take it along when left out.
+                for ch in r.text.chars().filter_map(printed_char) {
                     let field = mark.as_mut().map(|(kind, emitted)| {
                         let first = !**emitted;
                         **emitted = true;
@@ -1866,10 +1888,11 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                 let kind = crate::field::instr_of(raw)
                     .as_deref()
                     .and_then(page_field_kind);
-                let text = if kind.is_some() && text.is_empty() {
+                let printed: String = text.chars().filter_map(printed_char).collect();
+                let text = if kind.is_some() && printed.is_empty() {
                     "#"
                 } else {
-                    text.as_str()
+                    printed.as_str()
                 };
                 // The result's own formatting (#642: a complex field's result
                 // runs are inside the Field).
@@ -2377,6 +2400,18 @@ mod tests {
         let pdf = to_pdf(&d, &PdfOptions::default());
         // 0x95 is the WinAnsi bullet byte; must appear in a content stream.
         assert!(pdf.windows(1).any(|w| w == [0x95]));
+    }
+
+    /// A non-breaking hyphen prints as a hyphen (WinAnsi has no U+2011), a
+    /// soft hyphen not at all (#1101).
+    #[test]
+    fn hyphens_print_as_a_hyphen_and_nothing() {
+        let d = doc(vec![text_para("e\u{2011}commerce co\u{ad}op")]);
+        let texts: String = pages_of(&d, &PdfOptions::default())
+            .iter()
+            .flat_map(|p| p.texts.iter().map(|t| t.2.clone()))
+            .collect();
+        assert!(texts.contains("e-commerce coop"), "{texts:?}");
     }
 
     // ---- page layout (#637) ----
@@ -3100,6 +3135,48 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert!(pages[1].exact("2"), "{:?}", pages[1].texts);
         assert!(!pages[1].has("9"), "the cached result is replaced");
+    }
+
+    /// A soft hyphen in a page field's result prints nothing, and does not
+    /// take the page number's marker with it (#1101 r2).
+    #[test]
+    fn a_soft_hyphen_in_a_page_field_result_keeps_the_page_number() {
+        let soft = |cached: &str| Inline::Field {
+            raw: format!(
+                r#"<w:fldSimple w:instr="PAGE"><w:r><w:softHyphen/><w:t>{cached}</w:t></w:r></w:fldSimple>"#
+            ),
+            text: format!("\u{ad}{cached}"),
+        };
+        let d = doc(vec![para(vec![
+            run("p1", RunProps::default()),
+            page_break(),
+            run("at ", RunProps::default()),
+            soft("9"),
+        ])]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        assert!(pages[1].exact("2"), "{:?}", pages[1].texts);
+        // Its whole result a soft hyphen: the page number still shows.
+        let d = doc(vec![para(vec![
+            run("p1", RunProps::default()),
+            page_break(),
+            run("at ", RunProps::default()),
+            soft(""),
+        ])]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        assert!(pages[1].exact("2"), "{:?}", pages[1].texts);
+        // A loose complex field's result.
+        let d = doc(vec![para(vec![
+            run("p1", RunProps::default()),
+            page_break(),
+            run("at ", RunProps::default()),
+            fld_char("begin"),
+            instr(" PAGE "),
+            fld_char("separate"),
+            run("\u{ad}", RunProps::default()),
+            fld_char("end"),
+        ])]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        assert!(pages[1].exact("2"), "{:?}", pages[1].texts);
     }
 
     #[test]

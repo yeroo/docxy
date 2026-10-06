@@ -7900,15 +7900,24 @@ fn clip_has_formatting(clip: &Clip) -> bool {
         })
     }
 
+    // How a run's hyphens are written is not formatting (#1101).
+    fn formatted(props: &RunProps) -> bool {
+        *props
+            != RunProps {
+                hyphen_elements: props.hyphen_elements,
+                ..RunProps::default()
+            }
+    }
+
     fn inline_has_formatting(inline: &Inline) -> bool {
         match inline {
-            Inline::Run(run) => run.props != RunProps::default(),
+            Inline::Run(run) => formatted(&run.props),
             Inline::Hyperlink(link) => {
-                link.runs.iter().any(|run| run.props != RunProps::default())
+                link.runs.iter().any(|run| formatted(&run.props))
                     || link.content.iter().any(inline_has_formatting)
             }
             // A tab or a break is a run in OOXML and carries its own rPr (#279).
-            Inline::Tab(props) | Inline::Break(_, props) => *props != RunProps::default(),
+            Inline::Tab(props) | Inline::Break(_, props) => formatted(props),
             Inline::Revision { content, .. } => content.iter().any(inline_has_formatting),
             Inline::TextBox { blocks, .. } => blocks_have_formatting(blocks),
             Inline::SmartArt { .. }
@@ -8877,6 +8886,30 @@ mod tests {
         assert_eq!(maps[0].segs[0].start, 0);
         assert_eq!(maps[1].segs[0].start, 8);
         assert_eq!(maps[0].segs[0].col_for_offset(0), Some(0));
+    }
+
+    /// Projected lines show a non-breaking hyphen as `-` and a soft hyphen
+    /// not at all, as identity rendering does; the soft hyphen keeps its
+    /// logical offset (#1101).
+    #[test]
+    fn bidi_renderer_shows_hyphens_like_identity_rendering() {
+        let doc = bidi_doc(vec![bidi_para("e\u{2011}mail co\u{ad}op")]);
+        let (lines, maps) = docxcore::render::render_mapped(&doc, &bidi_opts(20));
+        assert_eq!(lines[0].plain(), "e-mail coop");
+        assert_eq!(maps[0].segs[0].col_for_offset(8), Some(8));
+        assert_eq!(maps[0].segs[0].col_for_offset(10), Some(9));
+    }
+
+    /// In a right-to-left paragraph a trailing soft hyphen's end stop is
+    /// the leftmost, where the line logically ends (#1101 r2).
+    #[test]
+    fn bidi_renderer_puts_a_trailing_soft_hyphen_stop_at_the_rtl_end() {
+        let mut rtl = ParProps::default();
+        rtl.rtl = true;
+        let doc = bidi_doc(vec![bidi_para_with(rtl, vec![bidi_run("אב\u{ad}")])]);
+        let (_, maps) = docxcore::render::render_mapped(&doc, &bidi_opts(10));
+        assert_eq!(maps[0].edge_caret(false).map(|c| c.offset), Some(3));
+        assert_eq!(maps[0].edge_caret(true).map(|c| c.offset), Some(0));
     }
 
     #[test]
@@ -13172,6 +13205,29 @@ mod tests {
         assert!(!clip_has_formatting(&Clip {
             paras: vec![vec![brk(false)]],
         }));
+    }
+
+    /// Text copied from a run with hyphen elements is not formatted
+    /// content: a formatting-protected document takes it (#1101 r2).
+    #[test]
+    fn a_clip_of_a_hyphen_run_carries_no_formatting_1101() {
+        let doc = docxcore::load::parse_document_xml(
+            "<w:document><w:body><w:p><w:r><w:t>e</w:t><w:noBreakHyphen/>\
+             <w:t>commerce</w:t></w:r></w:p></w:body></w:document>",
+            &Default::default(),
+        );
+        let mut ed = Editor::new(doc);
+        for (from, to) in [(0, 10), (2, 6)] {
+            ed.anchor = Some(Caret::top(0, from));
+            ed.caret = Caret::top(0, to);
+            let clip = ed.copy().unwrap();
+            assert!(!clip_has_formatting(&clip), "{from}..{to}: {clip:?}");
+        }
+        // Bold still is.
+        ed.anchor = Some(Caret::top(0, 0));
+        ed.caret = Caret::top(0, 10);
+        ed.toggle_bold();
+        assert!(clip_has_formatting(&ed.copy().unwrap()));
     }
 
     fn vim_app(paras: &[&str]) -> App {

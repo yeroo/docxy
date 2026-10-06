@@ -1175,8 +1175,9 @@ fn char_width(c: char) -> usize {
         || (0x202A..=0x202E).contains(&u)
         || (0x2066..=0x2069).contains(&u)
         || u == 0x061C
+        || u == 0x00AD
     {
-        return 0; // combining marks / zero-width
+        return 0; // combining marks / zero-width (a soft hyphen is not drawn)
     }
     let wide = matches!(u,
         0x1100..=0x115F   // Hangul Jamo
@@ -1210,8 +1211,22 @@ fn is_bidi_format(ch: char) -> bool {
 }
 
 fn glyph_display(g: &Glyph) -> Option<char> {
-    let ch = g.disp.unwrap_or(g.ch);
-    (!is_bidi_format(ch)).then_some(ch)
+    match g.disp {
+        Some(ch) => (!is_bidi_format(ch)).then_some(ch),
+        None => hyphen_display(g.ch).unwrap_or((!is_bidi_format(g.ch)).then_some(g.ch)),
+    }
+}
+
+/// How a terminal shows a non-breaking or soft hyphen (#1101): U+2011 as a
+/// plain `-` (many terminal fonts lack it), U+00AD not at all (terminals
+/// disagree on its width). `None` for any other character. The model keeps
+/// the characters; this is display only.
+fn hyphen_display(ch: char) -> Option<Option<char>> {
+    match ch {
+        '\u{2011}' => Some(Some('-')),
+        '\u{ad}' => Some(None),
+        _ => None,
+    }
 }
 
 /// Display width of a glyph (its shown char), in terminal cells.
@@ -1521,7 +1536,14 @@ fn flatten_para(
                 // The run style behind the tab — so an underlined tab draws its
                 // underline across the whole filled width (Word's "line" trick).
                 let tab_style = style_from_run(rp);
-                let cur = segs.last().unwrap().glyphs.len();
+                // In columns: a wide glyph takes two, a soft hyphen none.
+                let cur = segs
+                    .last()
+                    .unwrap()
+                    .glyphs
+                    .iter()
+                    .map(glyph_w)
+                    .sum::<usize>();
                 // The next tab stop at or beyond the current column, else a default
                 // stop every 8 cells. `>= cur` (not `> cur`) matters at narrow
                 // widths: a left stop can project onto the very column where the
@@ -1921,7 +1943,9 @@ fn project_line(
             .iter()
             .map(|g| BidiInputGlyph {
                 ch: g.ch,
-                display: g.disp.map(|ch| ch.to_string()),
+                display: g.disp.map(|ch| ch.to_string()).or_else(|| {
+                    hyphen_display(g.ch).map(|shown| shown.map(String::from).unwrap_or_default())
+                }),
                 logical_offset: g.src,
                 direction: g.dir,
             })
@@ -2090,7 +2114,7 @@ fn projected_caret_stops(visual: &BidiVisualLine) -> Vec<LineCaretStop> {
     let mut stops = Vec::new();
     let mut extents = projected_logical_extents(visual);
     extents.sort_by_key(|extent| extent.cells.start);
-    for extent in extents {
+    for extent in &extents {
         if extent.cells.start == extent.cells.end {
             continue;
         }
@@ -2115,6 +2139,42 @@ fn projected_caret_stops(visual: &BidiVisualLine) -> Vec<LineCaretStop> {
             continue;
         }
         compacted.push(stop);
+    }
+    // Zero-width content at either logical end of the line (a soft hyphen
+    // before `abc` or after it, or all there is) still starts or ends the
+    // line: keep a stop for that offset at its column, or Home/End and
+    // Shift+End would stop short of it (#1101). Visual order puts the
+    // logical start first in a left-to-right extent and last in a
+    // right-to-left one, and the end the other way round.
+    let first = extents.iter().map(|extent| extent.start).min();
+    let last = extents.iter().map(|extent| extent.end).max();
+    for (offset, is_end) in [(first, false), (last, true)] {
+        let Some(offset) = offset else {
+            continue;
+        };
+        if compacted.iter().any(|stop| stop.offset == offset) {
+            continue;
+        }
+        let Some(extent) = extents.iter().find(|extent| {
+            extent.cells.start == extent.cells.end
+                && if is_end {
+                    extent.end == offset
+                } else {
+                    extent.start == offset
+                }
+        }) else {
+            continue;
+        };
+        let col = extent.cells.start;
+        let after_stops_at_col = is_end == (extent.level % 2 == 0);
+        let at = compacted.partition_point(|stop| {
+            if after_stops_at_col {
+                stop.col <= col
+            } else {
+                stop.col < col
+            }
+        });
+        compacted.insert(at, LineCaretStop { offset, col });
     }
     compacted
 }
