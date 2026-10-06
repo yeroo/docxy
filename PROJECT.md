@@ -393,8 +393,8 @@ row menu, in Project's order (#397): Cut, Copy, Paste, Scroll to Task, Insert
 Task (a blank row above), Delete Task (the task whatever column the cursor is
 on; a summary asks first), Inactivate Task, Manually / Auto Schedule, Assign
 Resources... and Information... run their commands, and Hyperlink... opens the
-hyperlink prompt (below); Paste Special..., Text
-Styles..., Font..., Fill Down, Clear Contents, Notes... and Add to Timeline
+hyperlink prompt (below); Notes... opens the notes prompt (below); Paste Special..., Text
+Styles..., Font..., Fill Down, Clear Contents and Add to Timeline
 are drawn greyed until they exist. A bar, a column header and
 the ribbon have no menu yet, and the document's Bold / Italic menu never opens
 on a Project. docxy's extras have no ribbon
@@ -423,6 +423,16 @@ removed`, or no status when there was none) and a set reports
 (#408). The registry fields `Hyperlink`, `Hyperlink Address` and
 `Hyperlink SubAddress` read them for every `FieldReader` consumer; the Entry
 table has no Hyperlink column or indicator yet (follow-ups).
+
+Task › Properties › Notes... (keytip Alt, T, T; "N" is Insert › Task) and a
+task row's menu › Notes... open one prompt on the selected task's notes:
+prefilled from the stored notes with `\n` standing for a newline, committed
+with Enter (`Notes set`, or `Notes removed` on an empty buffer, no status
+when unchanged), cancelled with Escape, never on the entry row. An empty
+buffer removes the notes; the notes are one undo step, kept on save (#417).
+Multi-line notes survive the prompt because the prefill escapes them; the
+same escaped form is what a typed buffer decodes, leniently — an unknown
+`\x` stays verbatim.
 
 Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste cells through the system clipboard
 as tab-separated text (#369). Copy takes the cursor cell's edit text (a
