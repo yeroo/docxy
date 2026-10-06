@@ -897,6 +897,7 @@ fn parse_workbook_xml(
 ) {
     let mut sheets = Vec::new();
     let mut date1904 = false;
+    let mut seen_workbook_pr = false;
     let mut iterate = None;
     let mut names = Vec::new();
     let mut p = XmlParser::new(xml);
@@ -920,7 +921,11 @@ fn parse_workbook_xml(
                     let hidden = matches!(p.attr("state"), "hidden" | "veryHidden");
                     sheets.push((name, rid, hidden));
                 }
-                "workbookPr" => {
+                // The workbook's own comes first (CT_Workbook puts it ahead
+                // of extLst); `<x15:workbookPr>` in extLst shares the local
+                // name but has no date1904, and must not reset it.
+                "workbookPr" if !seen_workbook_pr => {
+                    seen_workbook_pr = true;
                     let v = p.attr("date1904");
                     date1904 = v == "1" || v == "true";
                 }
@@ -10693,6 +10698,20 @@ mod tests {
         let mut pkg = back;
         pkg.workbook.date1904 = false;
         assert!(!load_xlsx(&save_xlsx(&pkg)).unwrap().workbook.date1904);
+    }
+
+    /// #1064: Excel 2013+ writes `<x15:workbookPr chartTrackingRefBase>` in
+    /// extLst; it must not reset the date system the real workbookPr set.
+    #[test]
+    fn date1904_survives_an_x15_workbook_pr_in_ext_lst() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let x15 = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/main";
+        let xml = format!(
+            "<workbook xmlns=\"{ns}\" xmlns:x15=\"{x15}\"><workbookPr date1904=\"true\"/>\
+             <sheets/><extLst><ext uri=\"{{B58B0392-4F1F-4190-BB64-5DF3571DCE5F}}\">\
+             <x15:workbookPr chartTrackingRefBase=\"1\"/></ext></extLst></workbook>"
+        );
+        assert!(parse_workbook_xml(&xml).1);
     }
 
     #[test]
