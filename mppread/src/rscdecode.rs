@@ -76,6 +76,15 @@ mod tests {
     use crate::cfb::{Node, write_cfb_tree};
 
     fn file(ids: [u32; 3], markers: [(u16, u16); 3], bad_name: bool) -> Vec<u8> {
+        build(ids, markers, bad_name, None)
+    }
+
+    fn build(
+        ids: [u32; 3],
+        markers: [(u16, u16); 3],
+        bad_name: bool,
+        label: Option<(u32, &str)>,
+    ) -> Vec<u8> {
         let mut fm = vec![0u8; 16];
         fm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
         fm[8..12].copy_from_slice(&9u32.to_le_bytes());
@@ -111,7 +120,7 @@ mod tests {
         }
         let mut vm = vec![0u8; 24];
         vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
-        vm[8..12].copy_from_slice(&3u32.to_le_bytes());
+        vm[8..12].copy_from_slice(&(3u32 + u32::from(label.is_some())).to_le_bytes());
         let mut v2 = Vec::new();
         for (i, name) in ["Worker", "Material", "Cost"].iter().enumerate() {
             let uid = (i + 1) as u32;
@@ -123,6 +132,18 @@ mod tests {
             if i != 0 || !bad_name {
                 b.extend([0, 0]);
             }
+            v2.extend((b.len() as u32).to_le_bytes());
+            v2.extend(b);
+        }
+        if let Some((uid, text)) = label {
+            // Key 299 is the UTF-16 material label ("bags" for cement UID 2 in
+            // corpus/mpp/snapshots/35-resource-material.mpp).
+            vm.extend(uid.to_le_bytes());
+            vm.extend((v2.len() as u32).to_le_bytes());
+            vm.extend(299u16.to_le_bytes());
+            vm.extend(0x0c40u16.to_le_bytes());
+            let mut b: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            b.extend([0, 0]);
             v2.extend((b.len() as u32).to_le_bytes());
             v2.extend(b);
         }
@@ -173,6 +194,51 @@ mod tests {
             decode(&file([10, 20, 30], markers, true), false)
                 .unwrap_err()
                 .contains("invalid resource name")
+        );
+    }
+
+    #[test]
+    fn material_with_label_and_stale_rate_format_is_material() {
+        // (+170 = 1, +166 = 2) with a key-299 material label is Material:
+        // cement UID 2 in corpus/mpp/snapshots/35-resource-material.mpp has
+        // +166 = 2 (stale rate format; XML says StandardRateFormat 8) and
+        // key 299 = "bags", and Project's XML names it Material.
+        let markers = [(2, 0), (2, 1), (2, 1)];
+        let resources = decode(&build([10, 20, 30], markers, false, Some((2, "bags"))), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resources
+                .iter()
+                .map(|r| (r.uid, r.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, ResourceType::Work),
+                (2, ResourceType::Material),
+                (3, ResourceType::Cost)
+            ]
+        );
+    }
+
+    #[test]
+    fn cost_without_label_stays_cost() {
+        // (+170 = 1, +166 = 2) without a key-299 label stays Cost: travel
+        // budget UID 3 in corpus/mpp/snapshots/36-resource-cost.mpp has
+        // +166 = 2 and no key 299, and Project's XML names it Cost.
+        let markers = [(2, 0), (2, 1), (2, 1)];
+        let resources = decode(&file([10, 20, 30], markers, false), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resources
+                .iter()
+                .map(|r| (r.uid, r.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, ResourceType::Work),
+                (2, ResourceType::Cost),
+                (3, ResourceType::Cost)
+            ]
         );
     }
 }

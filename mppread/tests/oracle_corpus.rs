@@ -1063,7 +1063,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
     true
 }
 
-fn compare_assignment_oracle(mpp: &Path, xml: &Path, snapshot: bool) {
+fn compare_assignment_oracle(mpp: &Path, xml: &Path) {
     use std::collections::HashMap;
     let imported = mppread::project::project_from_mpp(&std::fs::read(mpp).unwrap())
         .unwrap_or_else(|e| panic!("{}: {e}", mpp.display()));
@@ -1106,26 +1106,14 @@ fn compare_assignment_oracle(mpp: &Path, xml: &Path, snapshot: bool) {
             mpp.display(),
             a.uid
         );
-        // Generated snapshots decode Material resources as Cost (tracked as a
-        // separate resource-type issue); Cost assignments default units to 1.
-        let material_decoded_as_cost = snapshot
-            && expected.resources.iter().any(|r| {
-                r.uid == a.resource_uid && r.kind == projcore::model::ResourceType::Material
-            })
-            && imported
-                .resources
-                .iter()
-                .any(|r| r.uid == a.resource_uid && r.kind == projcore::model::ResourceType::Cost);
-        if !material_decoded_as_cost {
-            assert!(
-                (a.units - e.units).abs() < 1e-6,
-                "{} assignment UID {} units {} vs {}",
-                mpp.display(),
-                a.uid,
-                a.units,
-                e.units
-            );
-        }
+        assert!(
+            (a.units - e.units).abs() < 1e-6,
+            "{} assignment UID {} units {} vs {}",
+            mpp.display(),
+            a.uid,
+            a.units,
+            e.units
+        );
         assert_eq!(
             a.work_min,
             e.work_min,
@@ -1193,20 +1181,13 @@ fn compare_assignment_oracle(mpp: &Path, xml: &Path, snapshot: bool) {
             mpp.display(),
             got.uid
         );
-        // Generated snapshots encode Material resources as Cost; this is
-        // tracked separately from assignment baseline decoding.
-        if !(snapshot
-            && want.kind == projcore::model::ResourceType::Material
-            && got.kind == projcore::model::ResourceType::Cost)
-        {
-            assert_eq!(
-                got.kind,
-                want.kind,
-                "{} resource UID {} kind",
-                mpp.display(),
-                got.uid
-            );
-        }
+        assert_eq!(
+            got.kind,
+            want.kind,
+            "{} resource UID {} kind",
+            mpp.display(),
+            got.uid
+        );
         assert!(
             (got.max_units - want.max_units).abs() < 1e-6,
             "{} resource UID {} max units {} vs {}",
@@ -1239,7 +1220,7 @@ fn assignment_oracles() {
     let snapshots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
     if snapshots.join("01-empty.mpp").exists() {
         for (mpp, xml) in pairs(&snapshots, "") {
-            compare_assignment_oracle(&mpp, &xml, true);
+            compare_assignment_oracle(&mpp, &xml);
         }
     }
     let generated = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/assnbaseline");
@@ -1247,7 +1228,7 @@ fn assignment_oracles() {
         let cases = pairs(&generated, "");
         assert_eq!(cases.len(), 4);
         for (mpp, xml) in &cases {
-            compare_assignment_oracle(mpp, xml, false);
+            compare_assignment_oracle(mpp, xml);
             let imported =
                 mppread::project::project_from_mpp(&std::fs::read(mpp).unwrap()).unwrap();
             let expected =
@@ -1290,7 +1271,6 @@ fn assignment_oracles() {
             compare_assignment_oracle(
                 &dir.join(format!("{stem}.mpp")),
                 &dir.join(format!("{stem}.xml")),
-                false,
             );
         }
     }
