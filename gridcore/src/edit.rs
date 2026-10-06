@@ -2191,6 +2191,18 @@ pub fn resize_table(
     rect: (u32, u32, u32, u32),
 ) -> Result<(), String> {
     let idx = table_index(wb, name)?;
+    resize_table_at(wb, idx, rect, false)
+}
+
+/// [`resize_table`] on table `idx`. A new column with no header text is
+/// `Column<its position>` as Resize Table names it, or, when `lowest_free`,
+/// the lowest `Column<n>` no column has, as Excel's AutoExpansion names it.
+fn resize_table_at(
+    wb: &mut Workbook,
+    idx: usize,
+    rect: (u32, u32, u32, u32),
+    lowest_free: bool,
+) -> Result<(), String> {
     let t = &wb.tables[idx];
     let (r1, c1, r2, c2) = rect;
     if r1 > r2 || c1 > c2 || r2 >= MAX_ROWS || c2 >= MAX_COLS {
@@ -2243,7 +2255,18 @@ pub fn resize_table(
         let header = (header_rows > 0)
             .then(|| wb.sheets[sheet].cell(r1, c).map(|cl| cl.value.clone()))
             .flatten();
-        let nm = table_column_name(header.as_ref(), c - c1 + 1, &taken);
+        let n = if lowest_free {
+            (1..)
+                .find(|n| {
+                    !taken
+                        .iter()
+                        .any(|x| x.eq_ignore_ascii_case(&format!("Column{n}")))
+                })
+                .unwrap_or(1)
+        } else {
+            c - c1 + 1
+        };
+        let nm = table_column_name(header.as_ref(), n, &taken);
         taken.push(nm.clone());
         if header_rows > 0 && !matches!(&header, Some(CellValue::Text(t)) if *t == nm) {
             let sh = &mut wb.sheets[sheet];
@@ -2266,6 +2289,119 @@ pub fn resize_table(
         Vec::new()
     };
     Ok(())
+}
+
+/// Excel's AutoExpansion ("Include new rows and columns in table"): the
+/// cell `(r, c)` on `sheet` was just typed, and a non-blank entry directly
+/// below a table without a totals row adds a row to it, one directly right
+/// of it (header row to last row) adds a column. A new column takes its
+/// header cell's text as its name, else the lowest free `Column<n>`; a new
+/// row takes each calculated column's formula in its blank cells
+/// ([`crate::sheet::Table::calculated_formulas`]). A table the grown range
+/// would run into another table, a PivotTable or part of an array formula
+/// stays as it is ([`resize_table`]'s rules). True when a table grew.
+pub fn auto_expand_table(wb: &mut Workbook, sheet: usize, (r, c): (u32, u32)) -> bool {
+    let typed = wb.sheets.get(sheet).and_then(|s| s.cell(r, c));
+    if typed.is_none_or(Cell::is_blank) || wb.table_at(sheet, r, c).is_some() {
+        return false;
+    }
+    let grown = wb.tables.iter().enumerate().find_map(|(i, t)| {
+        let (r1, c1, r2, c2) = t.range;
+        if t.sheet != sheet {
+            return None;
+        }
+        if t.totals_rows == 0 && r == r2 + 1 && (c1..=c2).contains(&c) {
+            Some((i, (r1, c1, r, c2)))
+        } else if c == c2 + 1 && (r1..=r2).contains(&r) {
+            Some((i, (r1, c1, r2, c)))
+        } else {
+            None
+        }
+    });
+    let Some((idx, rect)) = grown else {
+        return false;
+    };
+    let old = wb.tables[idx].range;
+    if resize_table_at(wb, idx, rect, true).is_err() {
+        return false;
+    }
+    if rect.2 > old.2 {
+        fill_new_row(wb, idx, rect.2);
+    }
+    true
+}
+
+/// Row `row` was just added to table `idx`: each of its blank cells in a
+/// calculated column takes the column's formula, moved to the row.
+fn fill_new_row(wb: &mut Workbook, idx: usize, row: u32) {
+    let t = &wb.tables[idx];
+    let (first, c1, sheet) = (t.range.0 + t.header_rows, t.range.1, t.sheet);
+    let formulas: Vec<(u32, String)> = (t.calculated_formulas.iter().enumerate())
+        .filter_map(|(j, f)| Some((c1 + j as u32, f.clone()?)))
+        .collect();
+    let sh = &mut wb.sheets[sheet];
+    for (c, f) in formulas {
+        let cur = sh.cell(row, c).cloned().unwrap_or_default();
+        if !cur.is_blank() {
+            continue;
+        }
+        let moved = translate_formula(&f, i64::from(row) - i64::from(first), 0).unwrap_or(f);
+        sh.set_cell(
+            row,
+            c,
+            Cell {
+                style: cur.style,
+                ..Cell::formula(&moved)
+            },
+        );
+    }
+}
+
+/// Excel's calculated column ("Fill formulas in tables to create
+/// calculated columns"): the formula just typed at `(r, c)` on `sheet`, in
+/// a data cell of a table column whose other data cells are all blank,
+/// fills the column (moved to each row) and becomes the column's
+/// calculated-column formula. A column with any other content keeps it:
+/// the formula is then an exception, as a value typed into a calculated
+/// column is. An array formula fills nothing. True when the column became
+/// calculated.
+pub fn fill_calculated_column(wb: &mut Workbook, sheet: usize, (r, c): (u32, u32)) -> bool {
+    let Some(cell) = wb.sheets.get(sheet).and_then(|s| s.cell(r, c)) else {
+        return false;
+    };
+    let Some(src) = cell.formula.clone().filter(|_| !cell.is_array_formula()) else {
+        return false;
+    };
+    let Some(idx) = (wb.tables.iter()).position(|t| t.contains(sheet, r, c)) else {
+        return false;
+    };
+    let t = &wb.tables[idx];
+    let Some((d1, d2)) = t.data_rows().filter(|&(d1, d2)| (d1..=d2).contains(&r)) else {
+        return false;
+    };
+    let sh = &wb.sheets[sheet];
+    if (d1..=d2).any(|rr| rr != r && sh.cell(rr, c).is_some_and(|cl| !cl.is_blank())) {
+        return false;
+    }
+    let j = (c - t.range.1) as usize;
+    let at = |rr: u32| {
+        translate_formula(&src, i64::from(rr) - i64::from(r), 0).unwrap_or_else(|| src.clone())
+    };
+    let first = at(d1);
+    let sh = &mut wb.sheets[sheet];
+    for rr in (d1..=d2).filter(|&rr| rr != r) {
+        let style = sh.cell(rr, c).map_or(0, |cl| cl.style);
+        sh.set_cell(
+            rr,
+            c,
+            Cell {
+                style,
+                ..Cell::formula(&at(rr))
+            },
+        );
+    }
+    wb.tables[idx].set_calculated_formula(j, Some(first));
+    true
 }
 
 /// Excel's Convert to Range: table `name` stops being a table. Every
@@ -4736,5 +4872,224 @@ mod table_tests {
         assert_eq!(formula(&wb, 0, "C2"), "SUM(#REF!)");
         assert_eq!(formula(&wb, 0, "C3"), "ROWS(#REF!)");
         assert_eq!(value(&mut wb, 0, "C2"), CellValue::Error("#REF!".into()));
+    }
+
+    /// The #682 table `Sales` on A1:D5 (Item, Qty, Price, Region; Qty 4,
+    /// 10, 3, 20) with `=SUM(Sales[Qty])` in F2.
+    fn sales_682() -> Workbook {
+        let mut sh = Sheet {
+            name: "Sheet1".into(),
+            ..Sheet::default()
+        };
+        for (c, h) in ["Item", "Qty", "Price", "Region"].iter().enumerate() {
+            sh.set_cell(0, c as u32, Cell::text(h));
+        }
+        let rows = [("Pen", 4.0), ("Ink", 10.0), ("Pad", 3.0), ("Tape", 20.0)];
+        for (i, (item, qty)) in rows.into_iter().enumerate() {
+            let r = i as u32 + 1;
+            sh.set_cell(r, 0, Cell::text(item));
+            sh.set_cell(r, 1, Cell::number(qty));
+            sh.set_cell(r, 2, Cell::number(1.5));
+            sh.set_cell(r, 3, Cell::text("North"));
+        }
+        sh.set_cell(1, 5, Cell::formula("SUM(Sales[Qty])"));
+        let mut wb = Workbook {
+            sheets: vec![sh],
+            ..Workbook::default()
+        };
+        wb.tables.push(Table {
+            name: "Sales".into(),
+            range: (0, 0, 4, 3),
+            header_rows: 1,
+            columns: ["Item", "Qty", "Price", "Region"]
+                .map(String::from)
+                .to_vec(),
+            ..Table::default()
+        });
+        wb
+    }
+
+    /// The #682 table `Calc` on A1:C4 (Qty 2, 3, 4; Price 5, 6, 7; Line
+    /// empty).
+    fn calc_682() -> Workbook {
+        let mut sh = Sheet {
+            name: "Sheet1".into(),
+            ..Sheet::default()
+        };
+        for (c, h) in ["Qty", "Price", "Line"].iter().enumerate() {
+            sh.set_cell(0, c as u32, Cell::text(h));
+        }
+        for (i, (q, p)) in [(2.0, 5.0), (3.0, 6.0), (4.0, 7.0)].into_iter().enumerate() {
+            sh.set_cell(i as u32 + 1, 0, Cell::number(q));
+            sh.set_cell(i as u32 + 1, 1, Cell::number(p));
+        }
+        let mut wb = Workbook {
+            sheets: vec![sh],
+            ..Workbook::default()
+        };
+        wb.tables.push(Table {
+            name: "Calc".into(),
+            range: (0, 0, 3, 2),
+            header_rows: 1,
+            columns: ["Qty", "Price", "Line"].map(String::from).to_vec(),
+            ..Table::default()
+        });
+        wb
+    }
+
+    /// Type `cell` at `at` on sheet 0, as an entry is typed: written, then
+    /// the table grows, then a formula may make a calculated column.
+    fn type_at(wb: &mut Workbook, at: &str, cell: Cell) -> (bool, bool) {
+        let (r, c) = parse_cell_name(at).unwrap();
+        wb.sheets[0].set_cell(r, c, cell);
+        let grew = auto_expand_table(wb, 0, (r, c));
+        let filled = fill_calculated_column(wb, 0, (r, c));
+        (grew, filled)
+    }
+
+    #[test]
+    fn typing_below_a_table_grows_it() {
+        let mut wb = sales_682();
+        assert_eq!(value(&mut wb, 0, "F2"), CellValue::Number(37.0));
+        assert_eq!(type_at(&mut wb, "A6", Cell::text("Tape")), (true, false));
+        assert_eq!(wb.tables[0].range, (0, 0, 5, 3));
+        type_at(&mut wb, "B6", Cell::number(5.0));
+        assert_eq!(wb.tables[0].range, (0, 0, 5, 3));
+        assert_eq!(value(&mut wb, 0, "F2"), CellValue::Number(42.0));
+    }
+
+    #[test]
+    fn typing_right_adds_column1() {
+        let mut wb = sales_682();
+        assert_eq!(type_at(&mut wb, "E3", Cell::text("x")), (true, false));
+        let t = &wb.tables[0];
+        assert_eq!(t.range, (0, 0, 4, 4));
+        assert_eq!(t.columns[4], "Column1");
+        assert_eq!(
+            wb.sheets[0].cell(0, 4).unwrap().value,
+            CellValue::Text("Column1".into())
+        );
+        // The next one is Column2, whatever its position.
+        type_at(&mut wb, "F2", Cell::text("y"));
+        assert_eq!(wb.tables[0].columns[5], "Column2");
+    }
+
+    #[test]
+    fn typing_a_header_right_of_a_table_names_the_column() {
+        let mut wb = sales_682();
+        type_at(&mut wb, "E1", Cell::text("Region"));
+        let t = &wb.tables[0];
+        assert_eq!(t.range, (0, 0, 4, 4));
+        // Made unique, as every new column name is.
+        assert_eq!(t.columns[4], "Region2");
+    }
+
+    #[test]
+    fn no_growth_below_a_totals_row() {
+        let mut wb = sales_682();
+        wb.tables[0].totals_rows = 1;
+        assert_eq!(type_at(&mut wb, "A6", Cell::text("Tape")), (false, false));
+        assert_eq!(wb.tables[0].range, (0, 0, 4, 3));
+        // Columns may still grow beside it.
+        assert_eq!(type_at(&mut wb, "E2", Cell::text("x")), (true, false));
+        assert_eq!(wb.tables[0].range, (0, 0, 4, 4));
+    }
+
+    #[test]
+    fn no_growth_across_a_gap_a_corner_or_a_blank() {
+        let mut wb = sales_682();
+        for at in ["A7", "F3", "E6"] {
+            assert_eq!(
+                type_at(&mut wb, at, Cell::text("x")),
+                (false, false),
+                "{at}"
+            );
+        }
+        assert_eq!(type_at(&mut wb, "A6", Cell::default()), (false, false));
+        assert_eq!(wb.tables[0].range, (0, 0, 4, 3));
+    }
+
+    #[test]
+    fn no_growth_when_the_grown_range_conflicts() {
+        let mut wb = sales_682();
+        // Another table right below Sales, one column further right.
+        wb.tables.push(other_table("Next", 0, (5, 1, 7, 2)));
+        assert_eq!(type_at(&mut wb, "A6", Cell::text("x")), (false, false));
+        assert_eq!(wb.tables[0].range, (0, 0, 4, 3));
+    }
+
+    #[test]
+    fn formula_in_empty_column_fills_and_records() {
+        let mut wb = calc_682();
+        assert_eq!(
+            type_at(&mut wb, "C2", Cell::formula("[@Qty]*[@Price]")),
+            (false, true)
+        );
+        assert_eq!(formula(&wb, 0, "C3"), "[@Qty]*[@Price]");
+        assert_eq!(formula(&wb, 0, "C4"), "[@Qty]*[@Price]");
+        assert_eq!(value(&mut wb, 0, "C3"), CellValue::Number(18.0));
+        assert_eq!(value(&mut wb, 0, "C4"), CellValue::Number(28.0));
+        assert_eq!(wb.tables[0].calculated_formula(2), Some("[@Qty]*[@Price]"));
+    }
+
+    #[test]
+    fn a_relative_formula_fills_relative_to_each_row() {
+        let mut wb = calc_682();
+        type_at(&mut wb, "C3", Cell::formula("A3*B3"));
+        assert_eq!(formula(&wb, 0, "C2"), "A2*B2");
+        assert_eq!(formula(&wb, 0, "C4"), "A4*B4");
+        // Recorded as in the first data row.
+        assert_eq!(wb.tables[0].calculated_formula(2), Some("A2*B2"));
+    }
+
+    #[test]
+    fn new_row_gets_calculated_formula() {
+        let mut wb = calc_682();
+        type_at(&mut wb, "C2", Cell::formula("[@Qty]*[@Price]"));
+        assert_eq!(type_at(&mut wb, "A5", Cell::number(5.0)), (true, false));
+        type_at(&mut wb, "B5", Cell::number(2.0));
+        assert_eq!(wb.tables[0].range, (0, 0, 4, 2));
+        assert_eq!(formula(&wb, 0, "C5"), "[@Qty]*[@Price]");
+        assert_eq!(value(&mut wb, 0, "C5"), CellValue::Number(10.0));
+    }
+
+    #[test]
+    fn value_in_calculated_column_is_an_exception() {
+        let mut wb = calc_682();
+        type_at(&mut wb, "C2", Cell::formula("[@Qty]*[@Price]"));
+        assert_eq!(type_at(&mut wb, "C3", Cell::number(99.0)), (false, false));
+        assert_eq!(wb.sheets[0].cell(2, 2).unwrap().formula, None);
+        assert_eq!(formula(&wb, 0, "C4"), "[@Qty]*[@Price]");
+        assert_eq!(wb.tables[0].calculated_formula(2), Some("[@Qty]*[@Price]"));
+    }
+
+    #[test]
+    fn non_empty_column_does_not_fill() {
+        let mut wb = calc_682();
+        wb.sheets[0].set_cell(3, 2, Cell::number(1.0));
+        assert_eq!(
+            type_at(&mut wb, "C2", Cell::formula("[@Qty]*2")),
+            (false, false)
+        );
+        assert!(wb.sheets[0].cell(2, 2).is_none());
+        assert_eq!(
+            wb.sheets[0].cell(3, 2).unwrap().value,
+            CellValue::Number(1.0)
+        );
+        assert!(wb.tables[0].calculated_formulas.is_empty());
+    }
+
+    #[test]
+    fn a_formula_typed_right_of_a_table_grows_then_fills() {
+        let mut wb = sales_682();
+        assert_eq!(
+            type_at(&mut wb, "E2", Cell::formula("[@Qty]*2")),
+            (true, true)
+        );
+        assert_eq!(wb.tables[0].range, (0, 0, 4, 4));
+        for (at, want) in [("E3", 20.0), ("E4", 6.0), ("E5", 40.0)] {
+            assert_eq!(formula(&wb, 0, at), "[@Qty]*2");
+            assert_eq!(value(&mut wb, 0, at), CellValue::Number(want), "{at}");
+        }
     }
 }

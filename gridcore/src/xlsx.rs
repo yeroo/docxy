@@ -6799,8 +6799,8 @@ fn sync_calculated_formulas(xml: &str, table: &str, formulas: &[Option<String>])
             .map_or(String::new(), |(p, _)| format!("{p}:"));
         let calc =
             format!("<{prefix}calculatedColumnFormula>{body}</{prefix}calculatedColumnFormula>");
-        if open.ends_with("/>") {
-            let head = open[..open.len() - 2].trim_end();
+        if let Some(head) = open.strip_suffix("/>") {
+            let head = head.trim_end();
             edits.push((s, e, format!("{head}>{calc}</{qname}>")));
             continue;
         }
