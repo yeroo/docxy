@@ -2291,6 +2291,20 @@ fn resize_table_at(
     Ok(())
 }
 
+/// Whether an entry typed at `(r, c)` on `sheet` could grow a table or
+/// fill a calculated column ([`auto_expand_table`],
+/// [`fill_calculated_column`]): it sits in a table's data rows, or directly
+/// below or right of a table. A cheap test, so a host snapshots the
+/// workbook for the undo step only when it is true.
+pub fn typed_entry_near_table(wb: &Workbook, sheet: usize, (r, c): (u32, u32)) -> bool {
+    wb.tables.iter().any(|t| {
+        let (r1, c1, r2, c2) = t.range;
+        t.sheet == sheet
+            && ((r1..=r2 + 1).contains(&r) && (c1..=c2).contains(&c)
+                || c == c2 + 1 && (r1..=r2).contains(&r))
+    })
+}
+
 /// Excel's AutoExpansion ("Include new rows and columns in table"): the
 /// cell `(r, c)` on `sheet` was just typed, and a non-blank entry directly
 /// below a table without a totals row adds a row to it, one directly right

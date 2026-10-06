@@ -1591,10 +1591,12 @@ struct WbSnapshot {
 }
 
 /// Whether `wb` differs from the snapshot `before` in what a filter or sort
-/// command can change: cells, rows' hidden state and attributes, columns,
-/// merges, the AutoFilter, and the defined names.
+/// command or a table AutoCorrect can change: cells, rows' hidden state and
+/// attributes, columns, merges, the AutoFilter, the defined names and the
+/// tables.
 fn wb_changed(before: &WbSnapshot, wb: &gridcore::sheet::Workbook) -> bool {
     before.names != wb.defined_names
+        || before.tables != wb.tables
         || before.sheets.len() != wb.sheets.len()
         || before.sheets.iter().zip(&wb.sheets).any(|(a, b)| {
             a.cells != b.cells
@@ -2544,6 +2546,9 @@ impl App {
             Some(url) => self.apply_with_link(r, c, cell, url),
             None => self.apply(vec![(r, c, cell)]),
         };
+        if applied {
+            self.table_autocorrect(self.sheet, (r, c));
+        }
         if !applied {
             // Refused (part of an array): keep the editor open, as Excel does.
             self.edit = Some(EditState {
@@ -2677,6 +2682,32 @@ impl App {
     /// and agent control edits (which may target a non-active sheet).
     fn apply_on(&mut self, sheet_idx: usize, changes: Vec<(u32, u32, Cell)>) -> bool {
         self.apply_groups(vec![(sheet_idx, changes)])
+    }
+
+    /// Excel's table AutoCorrect after an entry was typed at `at` on sheet
+    /// `sheet` (#682): a table beside it grows to take it
+    /// ([`gridcore::edit::auto_expand_table`]), then a formula typed into an
+    /// empty table column fills it ([`gridcore::edit::fill_calculated_column`]),
+    /// each when its AutoCorrect switch is on. As in Excel, that is an undo
+    /// step of its own after the entry's: Ctrl+Z puts the table back and
+    /// keeps what was typed.
+    fn table_autocorrect(&mut self, sheet: usize, at: (u32, u32)) {
+        let opts = self.autocorrect.opts;
+        if !(opts.table_rows_cols || opts.table_formulas)
+            || !gridcore::edit::typed_entry_near_table(&self.pkg.workbook, sheet, at)
+        {
+            return;
+        }
+        let changed = self.try_structural_if_changed(|wb| {
+            if opts.table_rows_cols {
+                gridcore::edit::auto_expand_table(wb, sheet, at);
+            }
+            if opts.table_formulas {
+                gridcore::edit::fill_calculated_column(wb, sheet, at);
+            }
+            Ok(())
+        });
+        debug_assert!(changed.is_ok());
     }
 
     /// Apply per-sheet cell changes, in order ([`Engine::set_cells`]: blanks
