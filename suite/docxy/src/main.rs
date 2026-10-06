@@ -98,6 +98,7 @@ mod table_dialogs;
 mod table_tab;
 mod table_view;
 mod tabstrip;
+mod text_input;
 #[cfg(test)]
 mod track_tests;
 mod trusted;
@@ -4020,6 +4021,8 @@ struct Docxy {
     tab_more_open: bool,
     focus: FocusHandle,
     focused: bool,
+    /// Dead-key and IME composition from the platform (#1072).
+    ime: text_input::ImeState,
     ribbon_tab: RibbonTab,
     ribbon_min: bool,
     backstage: bool,
@@ -10418,6 +10421,7 @@ impl Docxy {
             tab_more_open: false,
             focus: cx.focus_handle(),
             focused: false,
+            ime: text_input::ImeState::default(),
             ribbon_tab: RibbonTab::Home,
             ribbon_min: false,
             backstage: false,
@@ -30418,7 +30422,7 @@ impl Render for Docxy {
                 .relative()
                 .bg(bg)
                 .track_focus(&self.focus)
-                .key_routing(cx)
+                .key_routing(&self.focus, cx)
                 .child(probe_tracked(
                     &self.probes,
                     "suite-root",
@@ -31170,7 +31174,7 @@ impl Render for Docxy {
             .size_full()
             .relative()
             .track_focus(&self.focus)
-            .key_routing(cx)
+            .key_routing(&self.focus, cx)
             // Ruler drags are tracked at the window level so they keep working when
             // the pointer leaves the thin ruler strip (gpui move events are
             // hitbox-scoped, so a ruler-only handler would stop the moment the
@@ -31251,18 +31255,33 @@ fn col_px(units: f64) -> f32 {
     ((units * 7.0 + 6.0) as f32).clamp(28.0, 320.0)
 }
 
-/// The window root's keyboard: every key to [`Docxy::on_key`] and the two
+/// The window root's keyboard: every key to [`Docxy::on_key`] (on macOS
+/// printable keys by way of AppKit's input context and the input handler,
+/// for dead keys and IME composition, #1072; see `text_input`) and the two
 /// bound actions (Tab, Shift+Tab), which gpui matches before it delivers a
 /// key-down. Both of `render`'s roots, the Backstage one too, take it from
 /// here: Backstage without it dropped every key a dialog opened from it
 /// should have had (#1027).
 trait KeyRouting: Sized {
-    fn key_routing(self, cx: &mut Context<Docxy>) -> Self;
+    fn key_routing(self, focus: &FocusHandle, cx: &mut Context<Docxy>) -> Self;
 }
 
 impl KeyRouting for Div {
-    fn key_routing(self, cx: &mut Context<Docxy>) -> Self {
-        self.on_key_down(cx.listener(Docxy::on_key))
+    fn key_routing(self, focus: &FocusHandle, cx: &mut Context<Docxy>) -> Self {
+        let (focus, view) = (focus.clone(), cx.entity());
+        // The input handler is registered at paint, while the root has focus.
+        let input = canvas(
+            |_, _, _| {},
+            move |bounds, _, window, cx| {
+                if text_input::MACOS {
+                    window.handle_input(&focus, ElementInputHandler::new(bounds, view), cx);
+                }
+            },
+        )
+        .absolute()
+        .size_full();
+        self.child(input)
+            .on_key_down(cx.listener(Docxy::route_key))
             .on_action(
                 cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)),
             )

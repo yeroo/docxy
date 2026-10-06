@@ -354,6 +354,8 @@ State keys, as the app reports them after every driving verb:
 | `field`, `field_text` | the focused reference field, and its buffer |
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
 | `picking`, `range_preview`, `sel_hidden` | point mode |
+| `find_open`, `find_query`, `replace_text` | the find bar (Ctrl+F) and its Find and Replace fields; Down moves to Replace |
+| `ime_marked` | the input handler's marked text (a dead key's accent or an IME's provisional text, typed nowhere yet), or null (#1072) |
 | `selected_task`, `tasks`, `bar_<id>`, `baseline_<id>` | Project: cell cursor's row (zero-based; equals `tasks` on the entry row below the last task), task count, and each task's drawn bar and baseline bar by displayed ID |
 | `selected_row` | Project: the cell cursor's drawn row, **one-based** like `rows[].row` (a collapsed summary's hidden subtasks are not counted); the `rows` reply's `count + 1` on the entry row |
 | `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name (empty on the entry row), and `none` or the filename of the last successful Gantt export |
@@ -593,6 +595,22 @@ Backstage with no dialog up edit nothing under it. `call comments {}` reads the
 active document's comments `{comments:[{id,author,initials,text}]}`. The cases are in
 `uiharness/cases/user-name.uit`; `user-name-no-document.uit` closes every tab,
 so it has its own file (cases in one file share one instance).
+
+On macOS the window root leaves printable keys (no Ctrl, Cmd or Fn, and not
+a held key's repeat) to AppKit's input context, which hands them back through
+the input handler, so dead keys and IME composition work (#1072). It does so
+only while the root has the focus and letters are text: an open dialog always
+takes text, and otherwise KeyTips or an open menu takes letters as commands.
+Any other key stays with `on_key`. `real-key`/`real-type` never pass through
+AppKit, so for a key the root left to it the harness sends the handler the
+`insertText:` AppKit would; for a key `on_key` kept, and on every other
+platform, they go as before. `call ime-mark
+{"text":"´"}`, `call ime-commit {"text":"é"}` and `call ime-unmark {}` call the
+input handler's own methods with what AppKit sends for marked text
+(`setMarkedText:`, which types nothing), a commit (`insertText:`, typed as keys
+through the same handler as typing) and `unmarkText` (the marked text is
+committed as it stands). They work on every platform, though only macOS
+registers the handler. The cases are in `uiharness/cases/ime-dead-key.uit`.
 
 `call autocorrect {}` opens Settings' AutoCorrect Options... dialog (#667,
 id `autocorrect`) on the active tab, as the backstage row does. Its tabs are
