@@ -27,7 +27,8 @@ pub enum ButtonClick {
 pub struct HlMode {
     pub colour: String,
     pub latched: bool,
-    /// The tab the mode belongs to: it ends when another tab takes over.
+    /// The tab the mode belongs to. The app ends the mode on a tab switch, a
+    /// close or open; this also keeps a stray mode from acting on another tab.
     pub tab: usize,
     started: Instant,
 }
@@ -46,11 +47,15 @@ impl HlMode {
     /// `has_selection` whether the document has a non-empty selection.
     pub fn click(
         mode: &mut Option<HlMode>,
+        tab: usize,
         has_selection: bool,
         last: &str,
-        tab: usize,
         now: Instant,
     ) -> ButtonClick {
+        // A mode left over from another tab is none at all.
+        if mode.as_ref().is_some_and(|m| m.tab != tab) {
+            *mode = None;
+        }
         match mode {
             Some(m) if !m.latched && now.duration_since(m.started) <= LATCH_WINDOW => {
                 m.latched = true;
@@ -96,12 +101,12 @@ mod tests {
         let mut m = None;
         let now = t0();
         assert_eq!(
-            HlMode::click(&mut m, true, "yellow", 0, now),
+            HlMode::click(&mut m, 0, true, "yellow", now),
             ButtonClick::OpenPicker
         );
         assert!(m.is_none());
         assert_eq!(
-            HlMode::click(&mut m, false, "green", 0, now),
+            HlMode::click(&mut m, 0, false, "green", now),
             ButtonClick::Started
         );
         let m = m.unwrap();
@@ -113,24 +118,37 @@ mod tests {
     fn quick_second_click_latches_and_a_slow_one_ends() {
         let now = t0();
         let mut m = None;
-        HlMode::click(&mut m, false, "yellow", 0, now);
+        HlMode::click(&mut m, 0, false, "yellow", now);
         assert_eq!(
-            HlMode::click(&mut m, false, "yellow", 0, now + Duration::from_millis(200)),
+            HlMode::click(&mut m, 0, false, "yellow", now + Duration::from_millis(200)),
             ButtonClick::Latched
         );
         assert!(m.as_ref().unwrap().latched);
         // A third click ends it, however fast.
         assert_eq!(
-            HlMode::click(&mut m, false, "yellow", 0, now + Duration::from_millis(300)),
+            HlMode::click(&mut m, 0, false, "yellow", now + Duration::from_millis(300)),
             ButtonClick::Ended
         );
         assert!(m.is_none());
-        HlMode::click(&mut m, false, "yellow", 0, now);
+        HlMode::click(&mut m, 0, false, "yellow", now);
         assert_eq!(
-            HlMode::click(&mut m, false, "yellow", 0, now + Duration::from_millis(900)),
+            HlMode::click(&mut m, 0, false, "yellow", now + Duration::from_millis(900)),
             ButtonClick::Ended
         );
         assert!(m.is_none());
+    }
+
+    #[test]
+    fn a_mode_from_another_tab_does_not_latch_or_end() {
+        let now = t0();
+        let mut m = Some(HlMode::start("pink", 1, now));
+        // On tab 0 the click starts a fresh mode with the last colour.
+        assert_eq!(
+            HlMode::click(&mut m, 0, false, "yellow", now),
+            ButtonClick::Started
+        );
+        let m = m.unwrap();
+        assert_eq!((m.tab, m.colour.as_str(), m.latched), (0, "yellow", false));
     }
 
     #[test]

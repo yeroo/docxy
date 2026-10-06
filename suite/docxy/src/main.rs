@@ -11393,6 +11393,8 @@ impl Docxy {
     /// added or deleted — they name something else, so every such transition
     /// goes through here.
     fn drop_grid_state(&mut self) {
+        // The highlighting mode belongs to the tab it started on (#623).
+        self.hl_mode = None;
         self.chart_drop_selection();
         self.bar_close();
         // The bars that act on Enter point into the grid too: a rename names
@@ -17124,8 +17126,10 @@ impl Docxy {
     fn select_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_project_passes(cx);
         self.project_prompt_cancel();
-        // A menu belongs to the tab it opened on.
+        // A menu belongs to the tab it opened on, and so does the highlighting
+        // mode (#623).
         self.close_menu();
+        self.hl_mode = None;
         if i < self.tabs.len() {
             self.active = i;
             // A converted tab restored from the session converts as it comes
@@ -17891,9 +17895,11 @@ impl Docxy {
         let Some(i) = open else {
             let tab = tab_from_path_mode(&path, mode, &trusted)?;
             self.tabs.push(tab);
+            self.hl_mode = None;
             self.active = self.tabs.len() - 1;
             return Ok(true);
         };
+        self.hl_mode = None;
         self.active = i;
         let tab = &self.tabs[i];
         Ok(match reopen_step(reopen, tab.dirty, tab.access, mode) {
@@ -18101,6 +18107,7 @@ impl Docxy {
     /// Paste at the caret: the document clip while it is still what the
     /// clipboard holds (formatting intact), else the clipboard's text.
     fn do_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hl_mode = None;
         if self.protected_refused(cx) {
             return self.refocus(window, cx);
         }
@@ -18277,9 +18284,9 @@ impl Docxy {
         let last = self.hl_last.clone();
         let r = hl_mode::HlMode::click(
             &mut self.hl_mode,
+            tab,
             has_sel,
             &last,
-            tab,
             std::time::Instant::now(),
         );
         match r {
@@ -18299,7 +18306,10 @@ impl Docxy {
 
     /// Esc, or anything else that takes the editor, ends the mode.
     fn end_highlight_mode(&mut self) -> bool {
-        self.hl_mode.take().is_some()
+        match self.hl_mode.take() {
+            Some(m) => m.tab == self.active,
+            None => false,
+        }
     }
 
     /// A drag-selection came up: in highlighting mode, paint what it crossed.
@@ -26808,6 +26818,11 @@ impl Docxy {
         }
         // A document edit is its own undo step, named for the Undo drop-down
         // (#619) and kept for Repeat (#618) when it can be repeated.
+        // Any other command takes the editor and ends the highlighting mode
+        // (#623); the Text highlight button handles its own click.
+        if !matches!(act, Act::Highlight) {
+            self.hl_mode = None;
+        }
         let since = docxcore::editor::undo_serial_counter();
         let untouched = repeat_untouched(&self.repeat);
         if act_undo_name(act).is_some() {
