@@ -4990,6 +4990,45 @@ fn ruler_scroll_view(
         .into_any_element()
 }
 
+/// The page whose column ranges hold top-level `block` — the block→page
+/// mapping `paginate`/`paginate_cols` produced. `None` when no range
+/// contains it.
+fn page_of_block(ranges: &[Vec<(usize, usize)>], block: usize) -> Option<usize> {
+    ranges
+        .iter()
+        .position(|cols| cols.iter().any(|&(s, e)| s <= block && block < e))
+}
+
+/// Whether scrolling to `page` would change what the person sees: its painted
+/// rect misses the viewport, or either rect isn't painted yet (then assume it
+/// might). `tracked_page`'s visibility test, inverted.
+fn page_needs_scroll(probe: &RulerProbe, page: usize) -> bool {
+    let Some(viewport) = probe.viewport else {
+        return true;
+    };
+    !probe
+        .pages
+        .get(page)
+        .and_then(|p| *p)
+        .is_some_and(|r| r.intersects(&viewport))
+}
+
+/// The Print Layout page scroll target for a caret at top-level `block`: the
+/// page holding it in the shown body's pagination (the markup view the render
+/// paginates), the last page when no range contains it — never past the
+/// rendered sheets.
+fn print_caret_page(
+    doc: &Document,
+    view: MarkupView,
+    geom: &docxcore::model::PageGeom,
+    block: usize,
+) -> usize {
+    let ranges = page_ranges_of(&doc.markup_view(view).body, geom);
+    // `block` addresses the live body; the view-only markup modes can merge
+    // paragraphs, so a merged block lands on the last page.
+    page_of_block(&ranges, block).unwrap_or(ranges.len().saturating_sub(1))
+}
+
 fn tracked_page(probe: &RulerProbe) -> Option<usize> {
     let viewport = probe.viewport?;
     let visible = |i: usize| {
@@ -5000,11 +5039,7 @@ fn tracked_page(probe: &RulerProbe) -> Option<usize> {
             .is_some_and(|r| r.intersects(&viewport))
     };
     if let Some(block) = probe.caret_block {
-        if let Some(i) = probe
-            .ranges
-            .iter()
-            .position(|cols| cols.iter().any(|&(s, e)| s <= block && block < e))
-        {
+        if let Some(i) = page_of_block(&probe.ranges, block) {
             if visible(i) {
                 return Some(i);
             }
@@ -5031,12 +5066,15 @@ fn tracked_page(probe: &RulerProbe) -> Option<usize> {
 #[cfg(test)]
 mod ruler_geom_tests {
     use super::{
-        EffIndent, LeadingItem, Pal, RulerChange, RulerDrag, RulerHandle, RulerProbe, ScreenRect,
-        dragged_left_marker, eff_indent, hruler_geom, hruler_hit, leading_items, next_tab_stop,
-        paragraph_indent_layout, px_tw, ruler_colors, ruler_drag_result, tracked_page, tw_px,
-        vruler_geom,
+        Block, Document, EffIndent, Inline, LeadingItem, MarkupView, Pal, Paragraph, RulerChange,
+        RulerDrag, RulerHandle, RulerProbe, ScreenRect, dragged_left_marker, eff_indent,
+        hruler_geom, hruler_hit, leading_items, next_tab_stop, page_needs_scroll, page_of_block,
+        page_ranges_of, paragraph_indent_layout, print_caret_page, px_tw, ruler_colors,
+        ruler_drag_result, tracked_page, tw_px, vruler_geom,
     };
-    use docxcore::model::{PageGeom, ParProps, TabAlign, TabLeader, TabStop};
+    use docxcore::model::{
+        PageGeom, ParProps, RevisionKind, RevisionMetadata, Run, TabAlign, TabLeader, TabStop,
+    };
 
     fn near(a: f32, b: f32) {
         assert!((a - b).abs() < 0.02, "{a} != {b}");
@@ -5595,6 +5633,135 @@ mod ruler_geom_tests {
         assert_eq!(tracked_page(&p), Some(0));
         p.pointer = Some((100.0, 700.0));
         assert_eq!(tracked_page(&p), Some(0));
+    }
+
+    #[test]
+    fn page_of_block_maps_blocks_to_pages() {
+        let single_col = vec![vec![(0, 2)], vec![(2, 4)], vec![(4, 6)]];
+        assert_eq!(page_of_block(&single_col, 0), Some(0));
+        assert_eq!(page_of_block(&single_col, 3), Some(1));
+        assert_eq!(page_of_block(&single_col, 5), Some(2));
+        assert_eq!(page_of_block(&single_col, 6), None);
+        let two_col = vec![vec![(0, 1), (1, 3)], vec![(3, 4)]];
+        assert_eq!(page_of_block(&two_col, 2), Some(0));
+        assert_eq!(page_of_block(&two_col, 3), Some(1));
+    }
+
+    #[test]
+    fn page_of_block_matches_real_pagination() {
+        let para = |text: &str| {
+            Block::Paragraph(Paragraph {
+                content: vec![Inline::Run(Run {
+                    text: text.into(),
+                    ..Run::default()
+                })],
+                ..Paragraph::default()
+            })
+        };
+        let body: Vec<Block> = (0..300).map(|i| para(&format!("paragraph {i}"))).collect();
+        let ranges = page_ranges_of(&body, &PageGeom::default());
+        assert!(ranges.len() > 1, "expected multiple pages, got {ranges:?}");
+        let last = body.len() - 1;
+        assert_eq!(page_of_block(&ranges, last), Some(ranges.len() - 1));
+    }
+
+    #[test]
+    fn print_caret_page_paginates_the_shown_body_not_the_live_body() {
+        let deletion = Inline::Revision {
+            kind: RevisionKind::Delete,
+            metadata: RevisionMetadata::default(),
+            raw: String::new(),
+            content: vec![Inline::Run(Run {
+                text: "x".repeat(20_000),
+                ..Run::default()
+            })],
+            content_changed: false,
+        };
+        let para = |content: Vec<Inline>| {
+            Block::Paragraph(Paragraph {
+                content,
+                ..Paragraph::default()
+            })
+        };
+        let mut body = vec![para(vec![deletion])];
+        body.extend((0..100).map(|i| {
+            para(vec![Inline::Run(Run {
+                text: format!("short {i}"),
+                ..Run::default()
+            })])
+        }));
+        let doc = Document { body };
+        let geom = PageGeom::default();
+        let live_pages = page_ranges_of(&doc.body, &geom).len();
+        let shown_pages = page_ranges_of(&doc.markup_view(MarkupView::Simple).body, &geom).len();
+        assert!(
+            shown_pages < live_pages,
+            "the deletion should add a page to the live body only: live {live_pages}, shown {shown_pages}"
+        );
+        let last = doc.body.len() - 1;
+        let page = print_caret_page(&doc, MarkupView::Simple, &geom, last);
+        assert_eq!(page, shown_pages - 1);
+        assert!(page < live_pages);
+    }
+
+    #[test]
+    fn print_caret_page_falls_back_to_the_last_page() {
+        let para = |text: &str| {
+            Block::Paragraph(Paragraph {
+                content: vec![Inline::Run(Run {
+                    text: text.into(),
+                    ..Run::default()
+                })],
+                ..Paragraph::default()
+            })
+        };
+        let geom = PageGeom::default();
+        let body: Vec<Block> = (0..8).map(|i| para(&format!("p{i}"))).collect();
+        let doc = Document { body };
+        let pages = page_ranges_of(&doc.body, &geom).len();
+        assert_eq!(print_caret_page(&doc, MarkupView::All, &geom, 0), 0);
+        // A block past every range (a live index after a paragraph merge, say)
+        // and an empty body both target an existing page, never past the sheets.
+        assert_eq!(
+            print_caret_page(&doc, MarkupView::All, &geom, usize::MAX),
+            pages - 1
+        );
+        let empty = Document { body: Vec::new() };
+        assert_eq!(print_caret_page(&empty, MarkupView::All, &geom, 7), 0);
+    }
+
+    #[test]
+    fn page_needs_scroll_misses_only_when_the_page_is_off_screen() {
+        let mut p = RulerProbe {
+            viewport: Some(ScreenRect {
+                x: 0.0,
+                y: 0.0,
+                w: 500.0,
+                h: 500.0,
+            }),
+            pages: vec![
+                Some(ScreenRect {
+                    x: 20.0,
+                    y: 0.0,
+                    w: 400.0,
+                    h: 500.0,
+                }),
+                Some(ScreenRect {
+                    x: 20.0,
+                    y: 700.0,
+                    w: 400.0,
+                    h: 500.0,
+                }),
+            ],
+            ..RulerProbe::default()
+        };
+        assert!(!page_needs_scroll(&p, 0));
+        assert!(page_needs_scroll(&p, 1));
+        // An unpainted page rect or viewport: the caret may be off-screen.
+        p.pages[0] = None;
+        assert!(page_needs_scroll(&p, 0));
+        p.viewport = None;
+        assert!(page_needs_scroll(&p, 1));
     }
 
     #[test]
@@ -17968,11 +18135,25 @@ impl Docxy {
 
     /// Scroll the document so the caret's top-level block is in view (keyboard
     /// navigation/typing in a long document shouldn't let the caret drift off).
+    /// Print Layout's scroll children are pages, not blocks, so the caret's
+    /// block maps to its page first; a page already in view isn't re-aligned
+    /// (scroll_to_item would snap its top over the caret).
     fn scroll_to_caret(&self) {
         if let Some(t) = self.tabs.get(self.active) {
             if let Surface::Doc(ed) = &t.surface {
                 if let Some(&b) = ed.caret.path.first() {
-                    self.doc_scroll.scroll_to_item(b);
+                    if self.page_view {
+                        let page = print_caret_page(&ed.doc, self.markup, &final_page_geom(t), b);
+                        let needs_scroll = {
+                            let probe = self.ruler_probe.borrow();
+                            page_needs_scroll(&probe, page)
+                        };
+                        if needs_scroll {
+                            self.doc_scroll.scroll_to_item(page);
+                        }
+                    } else {
+                        self.doc_scroll.scroll_to_item(b);
+                    }
                 }
             }
         }
@@ -25213,9 +25394,13 @@ fn block_height_est(b: &Block, content_w: f32) -> f32 {
     }
 }
 
-/// A tab's print-layout pages: each page's column block ranges, flowed with
-/// the final section's geometry (the render and header/footer navigation
-/// share it, so Next and Previous walk the pages the person sees).
+/// A tab's print-layout pages over the live editor body: each page's column
+/// block ranges, flowed with the final section's geometry. Header/footer
+/// navigation and the status-bar page count share it, so Next and Previous
+/// walk the pages the person sees. The render — and `scroll_to_caret`, which
+/// must land on the sheet the person sees — paginate the shown markup-view
+/// body instead, whose revision filters can make it shorter than the live
+/// body.
 fn page_ranges(tab: &DocTab) -> Vec<Vec<(usize, usize)>> {
     let Surface::Doc(ed) = &tab.surface else {
         return Vec::new();
