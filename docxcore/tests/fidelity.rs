@@ -343,6 +343,47 @@ fn entities_compare_decoded() {
 }
 
 #[test]
+fn long_numeric_references_decode() {
+    let a =
+        format!(r#"<w:t xmlns:w="{W}" w:x="&#000000000065;">&#x00000000041;&#0000000066;</w:t>"#);
+    let b = format!(r#"<w:t xmlns:w="{W}" w:x="A">AB</w:t>"#);
+    assert_eq!(kinds(&diff(&a, &b)), vec![]);
+}
+
+#[test]
+fn line_ends_normalize_to_lf() {
+    let a = format!("<w:t xmlns:w=\"{W}\">a\r\nb\rc</w:t>");
+    let b = format!("<w:t xmlns:w=\"{W}\">a\nb\nc</w:t>");
+    assert_eq!(kinds(&diff(&a, &b)), vec![]);
+}
+
+#[test]
+fn attribute_whitespace_normalizes_before_references_decode() {
+    // Literal tab, CR and LF in a value are spaces...
+    let a = format!("<w:x xmlns:w=\"{W}\" w:v=\"a\tb\r\nc\"/>");
+    let b = format!(r#"<w:x xmlns:w="{W}" w:v="a b c"/>"#);
+    assert_eq!(kinds(&diff(&a, &b)), vec![]);
+    // ...but a tab written as a reference stays a tab.
+    let a = format!(r#"<w:x xmlns:w="{W}" w:v="a&#9;b"/>"#);
+    let b = format!(r#"<w:x xmlns:w="{W}" w:v="a b"/>"#);
+    assert_eq!(
+        kinds(&diff(&a, &b)),
+        vec![(Kind::ChangedValue, "/w:x/@w:v".into())]
+    );
+}
+
+#[test]
+fn non_breaking_space_between_elements_is_text() {
+    const NBSP: char = '\u{a0}';
+    let a = format!("<w:p xmlns:w=\"{W}\"><w:r/>{NBSP}<w:r/></w:p>");
+    let b = format!(r#"<w:p xmlns:w="{W}"><w:r/><w:r/></w:p>"#);
+    assert_eq!(
+        kinds(&diff(&a, &b)),
+        vec![(Kind::LostElement, "/w:p/text()".into())]
+    );
+}
+
+#[test]
 fn cdata_is_text() {
     let a = format!(r#"<w:t xmlns:w="{W}">a&lt;b</w:t>"#);
     let b = format!(r#"<w:t xmlns:w="{W}"><![CDATA[a<b]]></w:t>"#);
@@ -456,6 +497,26 @@ fn malformed_or_non_utf8_xml_is_not_parsed() {
     assert!(parse_xml(br#"<a k="A&B"/>"#).is_none());
     assert!(parse_xml(b"<a>A&bogus;B</a>").is_none());
     assert!(parse_xml(b"<a>&#65;&#x41;&amp;</a>").is_some());
+    // A raw `<` in an attribute value.
+    assert!(parse_xml(br#"<a k="a<b"/>"#).is_none());
+    // References to characters XML does not allow, and overflowing ones (no panic).
+    for bad in [
+        "&#0;",
+        "&#xD800;",
+        "&#x110000;",
+        "&#9999999999;",
+        "&#x;",
+        "&#;",
+    ] {
+        assert!(
+            parse_xml(format!("<a>{bad}</a>").as_bytes()).is_none(),
+            "{bad}"
+        );
+        assert!(
+            parse_xml(format!(r#"<a k="{bad}"/>"#).as_bytes()).is_none(),
+            "{bad}"
+        );
+    }
     assert!(parse_xml(b"\xff\xfe<\0a\0/\0>\0").is_none());
 }
 
@@ -498,6 +559,7 @@ fn ill_formed_xml_falls_back_to_a_byte_compare() {
         (&br#"<a k="1"/>"#[..], &br#"<a k="1" k="2"/>"#[..]),
         (b"<a/>", b"<a/>garbage"),
         (b"<a>A&amp;B</a>", b"<a>A&B</a>"),
+        (br#"<a k="a&lt;b"/>"#, br#"<a k="a<b"/>"#),
     ] {
         let found = compare_packages(&pkg(original), &pkg(saved));
         assert_eq!(

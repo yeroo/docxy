@@ -29,11 +29,19 @@ Every part of the original is compared with its saved counterpart:
     prefix rename is equal.
   - Attribute order, namespace declarations, the XML declaration, comments and
     whitespace-only text between elements are ignored.
-  - Entities are decoded first (`&#38;` equals `&amp;`) and CDATA is text.
+  - Line ends normalize to LF, and in attribute values a literal tab, CR or LF
+    is a space (an XML processor's normalizations).
+  - References are decoded first (`&#38;` equals `&amp;`), and CDATA is text.
+  - "Whitespace" means space, tab, CR and LF; a non-breaking space is text.
   - Element and attribute content and text are compared exactly, and so is a
     whitespace-only text that is an element's whole content (`<w:t> </w:t>`).
-- **Every other part**, and any XML part that is not UTF-8 or is malformed, must
-  be byte-equal.
+- **Every other part** must be byte-equal. So must any XML part that is not UTF-8
+  or is malformed. Malformed covers:
+  - mismatched or unclosed tags;
+  - a duplicate attribute;
+  - an ill-formed or illegal character reference;
+  - a `<` in an attribute value;
+  - content outside the root.
 - Missing and extra parts are reported.
 
 Child lists are aligned in two passes. Identical subtrees are matched first,

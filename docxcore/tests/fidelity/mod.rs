@@ -187,10 +187,77 @@ fn resolve(parser: &XmlParser<'_>, qname: &str, is_attr: bool) -> (String, Strin
     (uri, local.to_string())
 }
 
+/// A namespace URI from its declaration; an ill-formed one is kept raw (the
+/// declaration's own attribute check rejects the element anyway).
 fn decode(raw: &str) -> String {
+    decode_attr(raw).unwrap_or_else(|| raw.to_string())
+}
+
+/// XML whitespace: space, tab, CR and LF (not NBSP or other Unicode spaces).
+fn is_xml_ws(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n')
+}
+
+/// A legal XML 1.0 `Char`.
+fn is_xml_char(cp: u32) -> bool {
+    matches!(cp, 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
+}
+
+/// Decode raw character data, strictly: every `&` must start one of the five
+/// predefined entities or a numeric reference (`&#digits;`, `&#xhex;`, any
+/// number of leading zeros) to a legal XML `Char`. `None` otherwise, so a
+/// bare `&` cannot compare equal to `&amp;`. The comparator does not use
+/// `XmlParser::append_decoded`, which is lenient by design.
+fn decode_text(raw: &str) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
-    XmlParser::append_decoded(raw, &mut out);
-    out
+    let mut rest = raw;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let semi = after.find(';')?;
+        let name = &after[..semi];
+        let ch = match name.strip_prefix('#') {
+            Some(n) => {
+                let (digits, radix) = match n.strip_prefix('x') {
+                    Some(hex) => (hex, 16),
+                    None => (n, 10),
+                };
+                if digits.is_empty() {
+                    return None;
+                }
+                let mut cp: u32 = 0;
+                for d in digits.chars() {
+                    cp = cp.checked_mul(radix)?.checked_add(d.to_digit(radix)?)?;
+                }
+                if !is_xml_char(cp) {
+                    return None;
+                }
+                char::from_u32(cp)?
+            }
+            None => match name {
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                _ => return None,
+            },
+        };
+        out.push(ch);
+        rest = &after[semi + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Decode a raw attribute value: a literal `<` is ill-formed, and literal
+/// tab, CR and LF normalize to a space before references are decoded (XML
+/// attribute-value normalization), so a `&#9;` survives as a tab.
+fn decode_attr(raw: &str) -> Option<String> {
+    if raw.contains('<') {
+        return None;
+    }
+    decode_text(&raw.replace(['\t', '\r', '\n'], " "))
 }
 
 struct Building {
@@ -213,7 +280,7 @@ fn finish(mut b: Building) -> Elem {
     // element whose only content is whitespace (`<w:t> </w:t>`) keeps it.
     if e.children.iter().any(|c| matches!(c, Node::Elem(_))) {
         e.children
-            .retain(|c| !matches!(c, Node::Text(t) if t.chars().all(char::is_whitespace)));
+            .retain(|c| !matches!(c, Node::Text(t) if t.chars().all(is_xml_ws)));
     }
     let mut h = DefaultHasher::new();
     0u8.hash(&mut h);
@@ -231,41 +298,18 @@ fn finish(mut b: Building) -> Elem {
     e
 }
 
-/// Whether every `&` in raw text or an attribute value starts a well-formed
-/// reference: one of the five predefined entities, `&#digits;` or `&#xhex;`.
-/// The decoder is lenient (a bare `&` decodes as itself), so without this
-/// `A&B` would compare equal to `A&amp;B`.
-fn valid_references(raw: &str) -> bool {
-    let mut rest = raw;
-    while let Some(at) = rest.find('&') {
-        let after = &rest[at + 1..];
-        let Some(semi) = after.find(';') else {
-            return false;
-        };
-        let name = &after[..semi];
-        let ok = match name.strip_prefix('#') {
-            Some(n) => match n.strip_prefix('x') {
-                Some(hex) => !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()),
-                None => !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()),
-            },
-            None => matches!(name, "amp" | "lt" | "gt" | "quot" | "apos"),
-        };
-        if !ok {
-            return false;
-        }
-        rest = &after[semi + 1..];
-    }
-    true
-}
-
 /// Parse an XML part into its canonical DOM. `None` when the part is not
 /// UTF-8 or is malformed: mismatched or unclosed tags, a duplicate attribute,
-/// a bare `&`, or content other than whitespace outside the root. The caller
-/// then compares bytes instead.
+/// an ill-formed reference or a `<` in an attribute value, or content other
+/// than whitespace outside the root. The caller then compares bytes instead.
+/// Line ends normalize to LF first, as an XML processor's do.
 pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let text = std::str::from_utf8(bytes).ok()?;
-    let mut parser = XmlParser::new(text);
+    let text = std::str::from_utf8(bytes)
+        .ok()?
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut parser = XmlParser::new(&text);
     let mut stack: Vec<Building> = Vec::new();
     let mut root = None;
     loop {
@@ -282,25 +326,24 @@ pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
                     .iter()
                     .enumerate()
                     .any(|(i, a)| raw[..i].iter().any(|b| b.name == a.name))
-                    || raw.iter().any(|a| !valid_references(a.value))
                 {
-                    return None; // a duplicate attribute, or a bare `&`
+                    return None; // a duplicate attribute
+                }
+                let mut attrs = Vec::new();
+                for a in raw {
+                    let value = decode_attr(a.value)?;
+                    if a.name == "xmlns" || a.name.starts_with("xmlns:") {
+                        continue;
+                    }
+                    let (uri, local) = resolve(&parser, a.name, true);
+                    attrs.push(Attr {
+                        uri,
+                        local,
+                        qname: a.name.to_string(),
+                        value,
+                    });
                 }
                 let (uri, local) = resolve(&parser, qname, false);
-                let mut attrs: Vec<Attr> = parser
-                    .attrs()
-                    .iter()
-                    .filter(|a| a.name != "xmlns" && !a.name.starts_with("xmlns:"))
-                    .map(|a| {
-                        let (uri, local) = resolve(&parser, a.name, true);
-                        Attr {
-                            uri,
-                            local,
-                            qname: a.name.to_string(),
-                            value: decode(a.value),
-                        }
-                    })
-                    .collect();
                 attrs.sort_by(|a, b| (&a.uri, &a.local).cmp(&(&b.uri, &b.local)));
                 if attrs
                     .windows(2)
@@ -334,17 +377,15 @@ pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
             Event::Text => {
                 let Some(top) = stack.last_mut() else {
                     // Only whitespace may surround the root element.
-                    if parser.is_cdata() || !parser.text().chars().all(char::is_whitespace) {
+                    if parser.is_cdata() || !parser.text().chars().all(is_xml_ws) {
                         return None;
                     }
                     continue;
                 };
                 if parser.is_cdata() {
                     top.text.push_str(parser.text());
-                } else if valid_references(parser.text()) {
-                    XmlParser::append_decoded(parser.text(), &mut top.text);
                 } else {
-                    return None;
+                    top.text.push_str(&decode_text(parser.text())?);
                 }
             }
             Event::Eof => break,
