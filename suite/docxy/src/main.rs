@@ -47,6 +47,7 @@ mod doc_protected_tests;
 mod harness;
 mod hf;
 mod hf_tab;
+mod hl_mode;
 mod html_bundle;
 mod inspector;
 mod layout_tab;
@@ -1281,6 +1282,21 @@ impl RangeEdit {
         }
     }
 }
+
+/// Whether the highlighting mode is on, for the page's pointer (#623). The
+/// page text is built by free functions that see no app state; `render` sets it.
+static HL_CURSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The text pointer over page text, or the highlighter's crosshair in the mode.
+fn doc_text_cursor<E: Styled>(d: E) -> E {
+    if HL_CURSOR.load(std::sync::atomic::Ordering::Relaxed) {
+        d.cursor_crosshair()
+    } else {
+        d.cursor_text()
+    }
+}
+
+const HL_MODE_STATUS: &str = "Highlighting - drag to highlight, Esc to stop";
 
 /// Where the idx-th chart of the active sheet lives: authored this session, or
 /// loaded from the file as a drawing.
@@ -4136,6 +4152,10 @@ struct Docxy {
     ruler_probe: std::rc::Rc<std::cell::RefCell<RulerProbe>>,
     // A text drag-selection is in progress (mouse down in the doc, not yet up).
     selecting: bool,
+    /// Word's highlighting mode (#623): a drag highlights what it crosses.
+    hl_mode: Option<hl_mode::HlMode>,
+    /// The last highlight colour chosen; the mode starts with it.
+    hl_last: String,
     // A spreadsheet drag-select is in progress (left button held over cells).
     // The first dragged-over cell plants the anchor; later ones extend the range.
     sheet_dragging: bool,
@@ -10286,6 +10306,8 @@ impl Docxy {
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
             selecting: false,
+            hl_mode: None,
+            hl_last: hl_mode::DEFAULT_COLOUR.to_string(),
             sheet_dragging: false,
             sheet_fill: None,
             fill_options: None,
@@ -18223,7 +18245,80 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         self.picker = None;
+        if let Some(n) = &name {
+            self.hl_last = n.clone();
+        }
+        // With a collapsed caret a colour starts the highlighting mode (#623).
+        if name.is_some() && !self.doc_has_selection() {
+            let tab = self.active;
+            let colour = name.unwrap_or_default();
+            self.hl_mode = Some(hl_mode::HlMode::start(
+                &colour,
+                tab,
+                std::time::Instant::now(),
+            ));
+            self.set_status(HL_MODE_STATUS);
+            return self.refocus(window, cx);
+        }
         self.with_editor(window, cx, |e| e.set_highlight(name));
+    }
+
+    fn doc_has_selection(&mut self) -> bool {
+        self.edit_target().is_some_and(|e| e.has_selection())
+    }
+
+    /// The Text highlight button (#623): a click with nothing selected starts
+    /// the highlighting mode, a quick second click latches it, a later one
+    /// ends it; with a selection it opens the swatch picker as before.
+    fn highlight_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let has_sel = self.doc_has_selection();
+        let was_on = self.hl_mode.is_some();
+        let tab = self.active;
+        let last = self.hl_last.clone();
+        let r = hl_mode::HlMode::click(
+            &mut self.hl_mode,
+            has_sel,
+            &last,
+            tab,
+            std::time::Instant::now(),
+        );
+        match r {
+            hl_mode::ButtonClick::OpenPicker => self.toggle_picker(PickKind::Highlight, window, cx),
+            hl_mode::ButtonClick::Started | hl_mode::ButtonClick::Latched => {
+                self.picker = None;
+                self.set_status(HL_MODE_STATUS);
+                self.refocus(window, cx);
+            }
+            hl_mode::ButtonClick::Ended => {
+                debug_assert!(was_on);
+                self.set_status("Highlighting off");
+                self.refocus(window, cx);
+            }
+        }
+    }
+
+    /// Esc, or anything else that takes the editor, ends the mode.
+    fn end_highlight_mode(&mut self) -> bool {
+        self.hl_mode.take().is_some()
+    }
+
+    /// A drag-selection came up: in highlighting mode, paint what it crossed.
+    fn highlight_drag_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hl_mode.as_ref().is_some_and(|m| m.tab != self.active) {
+            self.hl_mode = None;
+        }
+        let selected = self.doc_has_selection();
+        if let Some(colour) = hl_mode::HlMode::drag_end(&mut self.hl_mode, selected) {
+            self.hl_last = colour.clone();
+            self.with_editor(window, cx, |e| {
+                e.set_highlight(Some(colour));
+                // Back to a caret at the end of the drag, ready for the next.
+                e.clear_selection();
+            });
+            if self.hl_mode.is_none() {
+                self.set_status("Highlighting off");
+            }
+        }
     }
 
     fn apply_font(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -20049,6 +20144,12 @@ impl Docxy {
         // or cell under it.
         if self.menu.is_some() {
             return self.menu_key(&ev.keystroke.key, window, cx);
+        }
+        // Esc ends the highlighting mode (#623) before it does anything else.
+        if ev.keystroke.key == "escape" && self.end_highlight_mode() {
+            self.set_status("Highlighting off");
+            cx.notify();
+            return;
         }
         // Word's and Excel's document keys come before every surface's own,
         // so they work on any tab, in Protected View and in a document
@@ -24725,7 +24826,7 @@ fn emit_words(
                             word_off + word_str[..byte].chars().count()
                         }
                     };
-                    d.cursor_text()
+                    doc_text_cursor(d)
                         .on_mouse_down(MouseButton::Left, {
                             let ent = ent.clone();
                             let path = path.clone();
@@ -24871,14 +24972,13 @@ fn emit_tab(
             .when_some(click, |d, c| {
                 let ent = c.ent.clone();
                 let path = c.path.to_vec();
-                d.cursor_text()
-                    .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
-                        cx.stop_propagation();
-                        let extend = ev.modifiers.shift;
-                        ent.update(cx, |this, cx| {
-                            this.set_caret(path.clone(), pos, extend, window, cx)
-                        });
-                    })
+                doc_text_cursor(d).on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                    cx.stop_propagation();
+                    let extend = ev.modifiers.shift;
+                    ent.update(cx, |this, cx| {
+                        this.set_caret(path.clone(), pos, extend, window, cx)
+                    });
+                })
             })
             .into_any_element(),
     );
@@ -26743,7 +26843,7 @@ impl Docxy {
             }
             Find => self.toggle_find(window, cx),
             FontColor => self.toggle_picker(PickKind::Color, window, cx),
-            Highlight => self.toggle_picker(PickKind::Highlight, window, cx),
+            Highlight => self.highlight_click(window, cx),
             FontName => self.toggle_picker(PickKind::FontName, window, cx),
             FontSize => self.toggle_picker(PickKind::FontSize, window, cx),
             NewComment => self.start_comment(window, cx),
@@ -29669,6 +29769,10 @@ impl Docxy {
 
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        HL_CURSOR.store(
+            self.hl_mode.as_ref().is_some_and(|m| m.tab == self.active),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // A tab created since the last frame holds the app's Editing options
         // before anything can reach it (#672), and its AutoCorrect (#667).
         stamp_edit_opts(&mut self.tabs, self.edit_opts);
@@ -30855,7 +30959,10 @@ impl Render for Docxy {
             }))
             // End a text drag-selection or a ruler drag wherever the button is
             // released; a non-empty text selection pops the mini formatting toolbar.
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, _w, cx| {
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, w, cx| {
+                if this.selecting && this.hl_mode.is_some() {
+                    this.highlight_drag_end(w, cx);
+                }
                 if this.ruler_drag.is_some() {
                     this.ruler_drag_end(cx);
                 }

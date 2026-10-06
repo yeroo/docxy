@@ -14410,6 +14410,17 @@ mod tests {
     }
 
     #[test]
+    fn clear_formatting_keeps_highlight_622() {
+        let mut app = app_with(&["text"]);
+        app.editor.select_all();
+        app.run_act(ribbon::Act::Bold);
+        app.editor.set_highlight(Some("yellow".into()));
+        app.run_act(ribbon::Act::ClearFormatting);
+        assert!(!run0(&app).props.bold);
+        assert_eq!(run0(&app).props.highlight.as_deref(), Some("yellow"));
+    }
+
+    #[test]
     fn lesson_16_page_break() {
         let mut app = app_with(&["text"]);
         app.editor.move_end();
