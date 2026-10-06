@@ -2499,6 +2499,9 @@ impl SheetView {
             Ok([(cr, cc, cell)]) => {
                 self.engine
                     .set_cell(&mut self.pkg.workbook, (s, cr, cc), cell);
+                // An entry typed into one cell, as `commit_edit_taken` writes
+                // one that breaks no rule.
+                self.table_autocorrect(s, (cr, cc));
             }
             Err(cells) => self
                 .engine
