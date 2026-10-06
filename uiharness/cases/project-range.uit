@@ -1,0 +1,104 @@
+# Range selection in the Project entry table (#560) and range Link/Unlink
+# (#558). The fixture has two two-day tasks, A and B.
+
+test shift+arrows extend a range and ctrl+c copies it as TSV
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  key shift+down
+  key shift+right
+  assert selection is 4
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.text is "A\t2d\nB\t2d"
+  # A plain arrow moves the cursor and clears the range.
+  key down
+  assert selection is none
+  assert cell is Duration
+
+test ctrl+v with a range pastes from its top-left and clears it
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"D2"}
+  key shift+up
+  assert selection is 2
+  call clipboard {"action":"write","text":"X\t3d\nY\t4d"}
+  key ctrl+v
+  call task.list {}
+  assert reply.tasks.0.name is X
+  assert reply.tasks.1.name is Y
+  assert reply.tasks.0.duration_days is 3
+  assert selection is none
+  assert cell is Name
+  key ctrl+z
+  call task.list {}
+  assert reply.tasks.0.name is A
+
+test ctrl+x over a range copies it and clears names in one undo step
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  key shift+down
+  key ctrl+x
+  call clipboard {"action":"read"}
+  assert reply.text is "A\nB"
+  call task.list {}
+  assert reply.tasks.0.name is ""
+  assert reply.tasks.1.name is ""
+  assert reply.tasks.0.duration_days is 2
+  assert selection is none
+  key ctrl+z
+  call task.list {}
+  assert reply.tasks.0.name is A
+  assert reply.tasks.1.name is B
+
+test a drag selects the rectangle and the release-click keeps it
+  open copy:../fixtures/project-clipboard.xml
+  drag C1 -> C2
+  assert selection is 2
+  # The same through real pointer events: press, moves, release hit-test the
+  # cells' own handlers.
+  call pointer-drag {"from":"cell:C1","to":"cell:D2"}
+  assert selection is 4
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.text is "A\t2d\nB\t2d"
+
+test shift+click extends the range from the cursor
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  call click-cell {"cell":"D2","shift":true}
+  assert selection is 4
+  assert cell_row is 1
+
+test a click on the ID cell selects the whole row, and drags whole rows
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"A1"}
+  assert selection is 8
+  assert cell is ID
+  drag A1 -> A2
+  assert selection is 16
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.text is "1\tAuto Scheduled\tA\t2d\t2026-01-05\t2026-01-07\t\t\n2\tAuto Scheduled\tB\t2d\t2026-01-05\t2026-01-07\t\t"
+
+test ctrl+f2 links the selected rows and ctrl+shift+f2 unlinks them
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"A1"}
+  key shift+down
+  key ctrl+f2
+  call status-read {}
+  assert reply.items.2.text is Linked 1 tasks
+  call task.list {}
+  assert reply.tasks.1.predecessors.0.uid is 1
+  assert selection is 2
+  key ctrl+shift+f2
+  call status-read {}
+  assert reply.items.2.text is Removed 1 link
+  key ctrl+z
+  key ctrl+z
+  call task.list {}
+  assert reply.tasks.1.predecessors.0.uid is 1
+
+test ctrl+f2 with one row opens the predecessor prompt
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"A1"}
+  key ctrl+f2
+  assert prompt is predecessor:
