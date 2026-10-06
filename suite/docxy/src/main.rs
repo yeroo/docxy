@@ -5013,15 +5013,20 @@ fn page_needs_scroll(probe: &RulerProbe, page: usize) -> bool {
         .is_some_and(|r| r.intersects(&viewport))
 }
 
-/// The `doc-scroll` child index keyboard navigation scrolls to: the page
-/// holding `block` in Print Layout (the last page when no range contains it —
-/// never past the rendered sheets), the block itself in Draft view.
-fn caret_scroll_index(page_view: bool, ranges: &[Vec<(usize, usize)>], block: usize) -> usize {
-    if page_view {
-        page_of_block(ranges, block).unwrap_or(ranges.len().saturating_sub(1))
-    } else {
-        block
-    }
+/// The Print Layout page scroll target for a caret at top-level `block`: the
+/// page holding it in the shown body's pagination (the markup view the render
+/// paginates), the last page when no range contains it — never past the
+/// rendered sheets.
+fn print_caret_page(
+    doc: &Document,
+    view: MarkupView,
+    geom: &docxcore::model::PageGeom,
+    block: usize,
+) -> usize {
+    let ranges = page_ranges_of(&doc.markup_view(view).body, geom);
+    // `block` addresses the live body; the view-only markup modes can merge
+    // paragraphs, so a merged block lands on the last page.
+    page_of_block(&ranges, block).unwrap_or(ranges.len().saturating_sub(1))
 }
 
 fn tracked_page(probe: &RulerProbe) -> Option<usize> {
@@ -5062,12 +5067,14 @@ fn tracked_page(probe: &RulerProbe) -> Option<usize> {
 mod ruler_geom_tests {
     use super::{
         Block, Document, EffIndent, Inline, LeadingItem, MarkupView, Pal, Paragraph, RulerChange,
-        RulerDrag, RulerHandle, RulerProbe, ScreenRect, dragged_left_marker, eff_indent, hruler_geom,
-        hruler_hit, leading_items, next_tab_stop, page_needs_scroll, page_of_block, page_ranges_of,
-        paragraph_indent_layout, print_caret_page, px_tw, ruler_colors, ruler_drag_result,
-        tracked_page, tw_px, vruler_geom,
+        RulerDrag, RulerHandle, RulerProbe, ScreenRect, dragged_left_marker, eff_indent,
+        hruler_geom, hruler_hit, leading_items, next_tab_stop, page_needs_scroll, page_of_block,
+        page_ranges_of, paragraph_indent_layout, print_caret_page, px_tw, ruler_colors,
+        ruler_drag_result, tracked_page, tw_px, vruler_geom,
     };
-    use docxcore::model::{PageGeom, ParProps, RevisionKind, RevisionMetadata, Run, TabAlign, TabLeader, TabStop};
+    use docxcore::model::{
+        PageGeom, ParProps, RevisionKind, RevisionMetadata, Run, TabAlign, TabLeader, TabStop,
+    };
 
     fn near(a: f32, b: f32) {
         assert!((a - b).abs() < 0.02, "{a} != {b}");
@@ -5670,10 +5677,12 @@ mod ruler_geom_tests {
             })],
             content_changed: false,
         };
-        let para = |content: Vec<Inline>| Block::Paragraph(Paragraph {
-            content,
-            ..Paragraph::default()
-        });
+        let para = |content: Vec<Inline>| {
+            Block::Paragraph(Paragraph {
+                content,
+                ..Paragraph::default()
+            })
+        };
         let mut body = vec![para(vec![deletion])];
         body.extend((0..100).map(|i| {
             para(vec![Inline::Run(Run {
@@ -5697,13 +5706,15 @@ mod ruler_geom_tests {
 
     #[test]
     fn print_caret_page_falls_back_to_the_last_page() {
-        let para = |text: &str| Block::Paragraph(Paragraph {
-            content: vec![Inline::Run(Run {
-                text: text.into(),
-                ..Run::default()
-            })],
-            ..Paragraph::default()
-        });
+        let para = |text: &str| {
+            Block::Paragraph(Paragraph {
+                content: vec![Inline::Run(Run {
+                    text: text.into(),
+                    ..Run::default()
+                })],
+                ..Paragraph::default()
+            })
+        };
         let geom = PageGeom::default();
         let body: Vec<Block> = (0..8).map(|i| para(&format!("p{i}"))).collect();
         let doc = Document { body };
@@ -18132,13 +18143,7 @@ impl Docxy {
             if let Surface::Doc(ed) = &t.surface {
                 if let Some(&b) = ed.caret.path.first() {
                     if self.page_view {
-                        // Paginate the body the render shows (the markup
-                        // view): its revision filters can make it shorter
-                        // than the live body, whose pagination then doesn't
-                        // match the rendered sheets.
-                        let shown = ed.doc.markup_view(self.markup);
-                        let ranges = page_ranges_of(&shown.body, &final_page_geom(t));
-                        let page = caret_scroll_index(true, &ranges, b);
+                        let page = print_caret_page(&ed.doc, self.markup, &final_page_geom(t), b);
                         let needs_scroll = {
                             let probe = self.ruler_probe.borrow();
                             page_needs_scroll(&probe, page)
@@ -18147,8 +18152,7 @@ impl Docxy {
                             self.doc_scroll.scroll_to_item(page);
                         }
                     } else {
-                        self.doc_scroll
-                            .scroll_to_item(caret_scroll_index(false, &[], b));
+                        self.doc_scroll.scroll_to_item(b);
                     }
                 }
             }
