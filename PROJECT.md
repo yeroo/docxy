@@ -304,9 +304,9 @@ task: its bookings are placed first, and auto tasks level around them.
 The suite's Project tab edits Task Mode, Name, Duration, Start, Finish,
 Predecessors, and Resource Names directly in the selected cell. Task Mode takes
 `Manually Scheduled` or `Auto Scheduled`, or any start of them (`m`, `auto`). Enter/F2 or a double-click opens
-the existing value; typing replaces it. Enter commits and moves down, Tab and
-Shift+Tab commit and move between columns, and Escape cancels. Invalid input
-stays open for correction. ID and an auto summary's dates/duration are
+the existing value; typing replaces it. Enter commits and moves down,
+Shift+Enter commits and moves up, Tab and Shift+Tab commit and move between
+columns, and Escape cancels. Invalid input stays open for correction. ID and an auto summary's dates/duration are
 read-only. A manual summary's Start, Finish and Duration set its own span as
 they do for a manual task, without touching its subtasks; its Gantt row adds
 the subtasks' rolled-up span as a thin bar above its own, the part past its

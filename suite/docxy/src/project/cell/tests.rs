@@ -1177,6 +1177,77 @@ fn a_rejected_value_keeps_the_editor_open_on_up_or_down() {
 }
 
 #[test]
+fn shift_enter_commits_and_moves_up() {
+    let mut t = tab();
+    key(&mut t, "down");
+    edit(&mut t, COL_NAME, "Renamed");
+    shift_key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert_eq!(v(&t).ed.project().tasks[1].name, "Renamed");
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (0, COL_NAME));
+    assert!(t.dirty);
+}
+
+#[test]
+fn shift_enter_on_first_row_commits_and_stays() {
+    let mut t = tab();
+    edit(&mut t, COL_NAME, "Renamed");
+    shift_key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert_eq!(v(&t).ed.project().tasks[0].name, "Renamed");
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (0, COL_NAME));
+}
+
+#[test]
+fn shift_enter_on_new_entry_row_matches_up() {
+    let mut t = new_project_tab();
+    let col = v(&t).col;
+    project_input(&mut t, "a", Some("A"), Modifiers::default());
+    shift_key(&mut t, "enter");
+    let tasks = &v(&t).ed.project().tasks;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(
+        (
+            tasks[0].name.as_str(),
+            tasks[0].duration_min,
+            tasks[0].estimated
+        ),
+        ("A", 480, Some(true))
+    );
+    assert!(v(&t).cell.is_none());
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (0, col));
+    assert!(!v(&t).on_entry_row());
+}
+
+#[test]
+fn shift_enter_with_invalid_value_keeps_the_edit() {
+    let mut t = tab();
+    key(&mut t, "down");
+    edit(&mut t, COL_DURATION, "abc");
+    shift_key(&mut t, "enter");
+    assert_eq!(v(&t).cell.as_ref().map(|c| c.buf.as_str()), Some("abc"));
+    assert!(t.status.contains("Invalid duration"), "{}", t.status);
+    assert_eq!(v(&t).cursor_row(), 1);
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    assert!(!t.dirty);
+}
+
+#[test]
+fn enter_still_moves_down() {
+    let mut t = tab();
+    edit(&mut t, COL_NAME, "Renamed");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert_eq!(v(&t).ed.project().tasks[0].name, "Renamed");
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (1, COL_NAME));
+    assert!(t.dirty);
+}
+
+#[test]
 fn up_or_down_from_an_unchanged_editor_closes_it_and_moves() {
     // F2 on a task, then Down: no undo step, one row down.
     let mut t = tab();
