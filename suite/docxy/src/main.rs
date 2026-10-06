@@ -5031,12 +5031,12 @@ fn tracked_page(probe: &RulerProbe) -> Option<usize> {
 #[cfg(test)]
 mod ruler_geom_tests {
     use super::{
-        EffIndent, LeadingItem, Pal, RulerChange, RulerDrag, RulerHandle, RulerProbe, ScreenRect,
-        dragged_left_marker, eff_indent, hruler_geom, hruler_hit, leading_items, next_tab_stop,
-        paragraph_indent_layout, px_tw, ruler_colors, ruler_drag_result, tracked_page, tw_px,
-        vruler_geom,
+        Block, EffIndent, Inline, LeadingItem, Pal, Paragraph, RulerChange, RulerDrag, RulerHandle,
+        RulerProbe, ScreenRect, dragged_left_marker, eff_indent, hruler_geom, hruler_hit,
+        leading_items, next_tab_stop, page_of_block, page_ranges_of, paragraph_indent_layout,
+        px_tw, ruler_colors, ruler_drag_result, tracked_page, tw_px, vruler_geom,
     };
-    use docxcore::model::{PageGeom, ParProps, TabAlign, TabLeader, TabStop};
+    use docxcore::model::{PageGeom, ParProps, Run, TabAlign, TabLeader, TabStop};
 
     fn near(a: f32, b: f32) {
         assert!((a - b).abs() < 0.02, "{a} != {b}");
@@ -5595,6 +5595,36 @@ mod ruler_geom_tests {
         assert_eq!(tracked_page(&p), Some(0));
         p.pointer = Some((100.0, 700.0));
         assert_eq!(tracked_page(&p), Some(0));
+    }
+
+    #[test]
+    fn page_of_block_maps_blocks_to_pages() {
+        let single_col = vec![vec![(0, 2)], vec![(2, 4)], vec![(4, 6)]];
+        assert_eq!(page_of_block(&single_col, 0), Some(0));
+        assert_eq!(page_of_block(&single_col, 3), Some(1));
+        assert_eq!(page_of_block(&single_col, 5), Some(2));
+        assert_eq!(page_of_block(&single_col, 6), None);
+        let two_col = vec![vec![(0, 1), (1, 3)], vec![(3, 4)]];
+        assert_eq!(page_of_block(&two_col, 2), Some(0));
+        assert_eq!(page_of_block(&two_col, 3), Some(1));
+    }
+
+    #[test]
+    fn page_of_block_matches_real_pagination() {
+        let para = |text: &str| {
+            Block::Paragraph(Paragraph {
+                content: vec![Inline::Run(Run {
+                    text: text.into(),
+                    ..Run::default()
+                })],
+                ..Paragraph::default()
+            })
+        };
+        let body: Vec<Block> = (0..300).map(|i| para(&format!("paragraph {i}"))).collect();
+        let ranges = page_ranges_of(&body, &PageGeom::default());
+        assert!(ranges.len() > 1, "expected multiple pages, got {ranges:?}");
+        let last = body.len() - 1;
+        assert_eq!(page_of_block(&ranges, last), Some(ranges.len() - 1));
     }
 
     #[test]
