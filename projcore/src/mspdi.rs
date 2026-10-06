@@ -1794,8 +1794,10 @@ fn scheduled_dates(
 ///   of its own and derives from the task's calendar, as Project makes one for
 ///   each resource, has the same working time.
 ///
-/// An assignment `Delay` is not one: it moves the assignment within its task,
-/// whose duration already includes it, not the task.
+/// An assignment `Delay` is not one: the schedule moves the assignment within
+/// its task, not the task. (An assignment whose flat work runs past the task's
+/// stored `Duration` does extend the task's scheduled finish, as does
+/// Project's; that the schedule models, issue #469.)
 ///
 /// Known limits, not checked: recurring calendar exceptions and untracked
 /// splits, and on a `.mpp` import an assignment `LevelingDelay` and
