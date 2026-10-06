@@ -1642,6 +1642,16 @@ impl Docxy {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
+        // Paging steps by the rows the body shows; until the first layout the
+        // probe is absent and the view keeps its default.
+        let body_h = self
+            .probes
+            .borrow()
+            .current("project-body")
+            .map(|b| f32::from(b.size.height));
+        if let (Some(body_h), Surface::Project(v)) = (body_h, &mut tab.surface) {
+            v.page_rows = page_rows_for(body_h);
+        }
         if let Some(act) = project_input(
             tab,
             ev.keystroke.key.as_str(),

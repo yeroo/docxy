@@ -647,6 +647,8 @@ any printable character replaces it. Left/Right move between columns, and
 Home/End (or Ctrl+Left/Right) go to the row's first and last column. Up/Down
 move between rows; Ctrl+Up/Down go to the first and last task, and
 Ctrl+Home/End to the first task's first column and the last task's last column.
+PageUp/PageDown move a screen of rows, keeping the column; past the last task
+PageDown lands on the entry row.
 Down from the last task, or a click below it, goes to the entry row, where
 typing appends a task (`click C<n>` addresses it, where `n` is one past the last drawn row). Tab/Shift+Tab move
 between columns.

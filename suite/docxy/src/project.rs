@@ -22,6 +22,13 @@ pub(super) use timeline::*;
 mod rows;
 pub(super) use rows::*;
 
+/// Whole rows a PageUp/PageDown steps by: the rows that fit in the
+/// `project-body` probe, less one, so the cursor's landing row stays on
+/// screen. Always at least 1.
+fn page_rows_for(body_h: f32) -> usize {
+    ((body_h / ROW_H).floor() as usize).saturating_sub(1).max(1)
+}
+
 pub(super) struct ProjectView {
     pub ed: ProjectEditor,
     pub scroll: UniformListScrollHandle,
@@ -32,6 +39,10 @@ pub(super) struct ProjectView {
     pub scale: GanttScale,
     pub prompt: Option<ProjectPrompt>,
     pub col: usize,
+    /// PageUp/PageDown step the cursor by this many rows. `project_key`
+    /// refreshes it from the `project-body` probe height on each keydown;
+    /// until the first layout it stays at the default of 10.
+    pub page_rows: usize,
     pub cell: Option<CellEdit>,
     /// The cell cursor is on the entry row below the last task, where typing
     /// appends a task, as in Project; see [`Self::on_entry_row`]. Entering it
@@ -83,6 +94,7 @@ impl ProjectView {
             scale,
             prompt: None,
             col: COL_NAME,
+            page_rows: 10,
             cell: None,
             entry,
             exported: None,
@@ -222,6 +234,28 @@ impl ProjectView {
         if matches!(key, "home" | "end") {
             self.col = if key == "home" { 0 } else { COLUMN_COUNT - 1 };
             self.reveal_col();
+            return true;
+        }
+        // PageUp/PageDown step a screen of rows, as in Project; rows hidden
+        // under collapsed summaries are skipped, and past the last task the
+        // cursor lands on the entry row.
+        if matches!(key, "pageup" | "pagedown") {
+            let rows = self.ed.visible_rows();
+            if rows.is_empty() {
+                return true;
+            }
+            let at = self.display_row();
+            let target = if key == "pagedown" {
+                (at + self.page_rows).min(rows.len())
+            } else {
+                at.saturating_sub(self.page_rows)
+            };
+            if target == rows.len() {
+                self.enter_entry_row();
+            } else {
+                self.entry = false;
+                self.ed.select(rows[target]);
+            }
             return true;
         }
         // Rows under collapsed summaries are skipped.
