@@ -1883,7 +1883,25 @@ fn parse_worksheet(
                     if meta != CellMeta::default() {
                         cell.meta = Some(Box::new(meta));
                     }
-                    if !(cell.is_blank() && cell.style == 0 && cell.f_attrs.is_none()) {
+                    // An empty cell with the default style carries nothing,
+                    // unless its row or column has a style: then the cell
+                    // pins the default, and without it the cell would show
+                    // the row's or column's format (#1064).
+                    let pins_default = || {
+                        let styled = |s: Option<&str>| s.is_some_and(|s| s.trim() != "0");
+                        sheet.row_attrs.get(&row).is_some_and(|a| {
+                            matches!(
+                                crate::sheet::xml_attr(a, "customFormat"),
+                                Some("1" | "true")
+                            ) && styled(crate::sheet::xml_attr(a, "s"))
+                        }) || sheet.col_defs.iter().any(|d| {
+                            (d.min..=d.max).contains(&col)
+                                && styled(crate::sheet::xml_attr(&d.attrs, "style"))
+                        })
+                    };
+                    if !(cell.is_blank() && cell.style == 0 && cell.f_attrs.is_none())
+                        || pins_default()
+                    {
                         sheet.cells.insert((row, col), cell);
                     }
                 }
@@ -10818,6 +10836,20 @@ mod tests {
         );
         assert!(!xml.contains("sheetData"), "{xml}");
         assert_eq!(back.workbook.sheets[1].page_setup.margins.left, 1.5);
+    }
+
+    /// #1064: an empty cell with the default style under a row or column
+    /// style pins the default; dropping it would give it that style.
+    #[test]
+    fn an_empty_default_cell_under_a_row_or_column_style_is_kept() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let xml = format!(
+            r#"<worksheet xmlns="{ns}"><cols><col min="3" max="3" width="9" style="7"/></cols><sheetData><row r="1" s="5" customFormat="1"><c r="A1"/></row><row r="2"><c r="B2"/><c r="C2" s="0"/></row></sheetData></worksheet>"#
+        );
+        let sheet = parse_worksheet(&xml, &[], &Default::default());
+        assert!(sheet.cells.contains_key(&(0, 0)), "under the row style");
+        assert!(!sheet.cells.contains_key(&(1, 1)), "nothing to pin");
+        assert!(sheet.cells.contains_key(&(1, 2)), "under the column style");
     }
 
     /// #1064: Excel 2013+ writes `<x15:workbookPr chartTrackingRefBase>` in
