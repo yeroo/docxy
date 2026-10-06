@@ -1,6 +1,7 @@
 //! Project control policy over live tabs and the shared control server pump.
 use crate::*;
 use ctlcore::json::Json;
+use gpui::EntityInputHandler as _;
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
@@ -378,7 +379,18 @@ pub(crate) fn attach_with_dispatch(
                         let events = std::mem::take(&mut done.input);
                         let _ = cx.update(|window, cx| {
                             for event in events {
-                                window.dispatch_event(event, cx);
+                                let deferred = text_input::deferred_text(&event);
+                                // A key the root left to the input context
+                                // gets the `insertText:` AppKit would send
+                                // (#1072): this input never passes through
+                                // AppKit, so nothing else would type it.
+                                if window.dispatch_event(event, cx).propagate
+                                    && let Some(text) = deferred
+                                {
+                                    let _ = target.update(cx, |this, cx| {
+                                        this.replace_text_in_range(None, &text, window, cx)
+                                    });
+                                }
                             }
                         });
                     }
