@@ -3756,6 +3756,17 @@ fn cell_xml(
     }
 }
 
+/// The used range of `sheet`'s cells as (first row, first col, last row,
+/// last col), or `None` for a sheet with no cells.
+fn sheet_bounds(sheet: &Sheet) -> Option<(u32, u32, u32, u32)> {
+    sheet.cells.keys().fold(None, |acc, &(r, c)| {
+        Some(match acc {
+            None => (r, c, r, c),
+            Some((r0, c0, r1, c1)) => (r0.min(r), c0.min(c), r1.max(r), c1.max(c)),
+        })
+    })
+}
+
 /// Replace `<sheetData>…</sheetData>` (or `<sheetData/>`) in the original
 /// worksheet XML, refresh `<dimension>`, and regenerate `<cols>`.
 ///
@@ -3792,12 +3803,12 @@ fn splice_worksheet(
         }
     };
 
-    // <dimension ref="…"/> → recomputed used range.
-    let (rows, cols) = sheet.used_size();
-    let dim = if rows == 0 {
-        "A1".to_string()
-    } else {
-        format!("A1:{}", cell_name(rows - 1, cols.max(1) - 1))
+    // <dimension ref="…"/> → recomputed used range, from its first cell as
+    // Excel writes it: `C4:D8`, or `B2` for a single cell.
+    let dim = match sheet_bounds(sheet) {
+        None => "A1".to_string(),
+        Some((r0, c0, r1, c1)) if (r0, c0) == (r1, c1) => cell_name(r0, c0),
+        Some((r0, c0, r1, c1)) => format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1)),
     };
     if let Some((i, _)) = worksheet_child_span(&out, "dimension") {
         if attr_at(&out, i, "ref").is_some() {
@@ -12061,6 +12072,27 @@ b",
         let ws =
             String::from_utf8_lossy(pkg2.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
         assert!(ws.contains("<dimension ref=\"A1:Z100\"/>"), "{ws}");
+    }
+
+    /// #1064: the dimension starts at the first used cell, as Excel writes
+    /// it, and a single cell is one reference.
+    #[test]
+    fn dimension_starts_at_the_first_used_cell() {
+        let dim = |cells: &[(u32, u32)]| {
+            let mut pkg = new_xlsx();
+            for &(r, c) in cells {
+                pkg.workbook.sheets[0].set_cell(r, c, Cell::number(1.0));
+            }
+            let pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+            let ws = String::from_utf8_lossy(pkg.part(&pkg.sheet_parts[0]).unwrap()).into_owned();
+            let at = ws.find("<dimension ref=\"").unwrap() + "<dimension ref=\"".len();
+            ws[at..at + ws[at..].find('"').unwrap()].to_string()
+        };
+        assert_eq!(dim(&[]), "A1");
+        assert_eq!(dim(&[(0, 0)]), "A1");
+        assert_eq!(dim(&[(1, 1)]), "B2");
+        assert_eq!(dim(&[(3, 2), (7, 3)]), "C4:D8");
+        assert_eq!(dim(&[(3, 3), (7, 2)]), "C4:D8");
     }
 
     #[test]
