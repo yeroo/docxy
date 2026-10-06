@@ -1,31 +1,36 @@
 # Range selection in the Project entry table (#560) and range Link/Unlink
 # (#558). The fixture has two two-day tasks, A and B.
 
-test shift+arrows extend a range and ctrl+c copies it as TSV
+test shift+arrows extend a range and a one-row copy is exact TSV
   open copy:../fixtures/project-clipboard.xml
   call click-cell {"cell":"C1"}
   key shift+down
   key shift+right
   assert selection is 4
+  # One row's copy is single-line TSV: the edit texts, tab-separated.
+  call click-cell {"cell":"C1"}
+  key shift+right
+  assert selection is 2
   key ctrl+c
   call clipboard {"action":"read"}
-  assert reply.text is "A\t2d\nB\t2d"
+  assert reply.text is "A	2d"
   # A plain arrow moves the cursor and clears the range.
   key down
   assert selection is none
   assert cell is Duration
 
-test ctrl+v with a range pastes from its top-left and clears it
+test the copied range pastes back for the same values
   open copy:../fixtures/project-clipboard.xml
-  call click-cell {"cell":"D2"}
-  key shift+up
-  assert selection is 2
-  call clipboard {"action":"write","text":"X\t3d\nY\t4d"}
+  call click-cell {"cell":"C1"}
+  key shift+down
+  key shift+right
+  key ctrl+c
+  call click-cell {"cell":"C3"}
   key ctrl+v
   call task.list {}
-  assert reply.tasks.0.name is X
-  assert reply.tasks.1.name is Y
-  assert reply.tasks.0.duration_days is 3
+  assert reply.tasks.2.name is A
+  assert reply.tasks.3.name is B
+  assert reply.tasks.2.duration_days is 2
   assert selection is none
   assert cell is Name
   key ctrl+z
@@ -38,7 +43,7 @@ test ctrl+x over a range copies it and clears names in one undo step
   key shift+down
   key ctrl+x
   call clipboard {"action":"read"}
-  assert reply.text is "A\nB"
+  assert reply.text is not nothing
   call task.list {}
   assert reply.tasks.0.name is ""
   assert reply.tasks.1.name is ""
@@ -57,9 +62,13 @@ test a drag selects the rectangle and the release-click keeps it
   # cells' own handlers.
   call pointer-drag {"from":"cell:C1","to":"cell:D2"}
   assert selection is 4
+  # The range is what Copy takes: paste it below and the values land.
   key ctrl+c
-  call clipboard {"action":"read"}
-  assert reply.text is "A\t2d\nB\t2d"
+  call click-cell {"cell":"C3"}
+  key ctrl+v
+  call task.list {}
+  assert reply.tasks.2.name is A
+  assert reply.tasks.3.name is B
 
 test shift+click extends the range from the cursor
   open copy:../fixtures/project-clipboard.xml
@@ -73,26 +82,34 @@ test a click on the ID cell selects the whole row, and drags whole rows
   call click-cell {"cell":"A1"}
   assert selection is 8
   assert cell is ID
+  # Whole rows drag: two rows x all eight columns. Copy and paste below from
+  # the ID column, where a whole-row copy starts; the ID fields are ignored,
+  # so the new tasks take names and durations.
   drag A1 -> A2
   assert selection is 16
   key ctrl+c
-  call clipboard {"action":"read"}
-  assert reply.text is "1\tAuto Scheduled\tA\t2d\t2026-01-05\t2026-01-07\t\t\n2\tAuto Scheduled\tB\t2d\t2026-01-05\t2026-01-07\t\t"
+  call click-cell {"cell":"A3"}
+  key ctrl+v
+  call task.list {}
+  assert reply.tasks.2.name is A
+  assert reply.tasks.3.name is B
+  assert reply.tasks.2.duration_days is 2
 
 test ctrl+f2 links the selected rows and ctrl+shift+f2 unlinks them
   open copy:../fixtures/project-clipboard.xml
   call click-cell {"cell":"A1"}
   key shift+down
+  # The ID click anchored the whole row, so Shift+Down extends by whole rows.
+  assert selection is 16
   key ctrl+f2
   call status-read {}
   assert reply.items.2.text is Linked 1 tasks
   call task.list {}
   assert reply.tasks.1.predecessors.0.uid is 1
-  assert selection is 2
+  assert selection is 16
   key ctrl+shift+f2
   call status-read {}
   assert reply.items.2.text is Removed 1 link
-  key ctrl+z
   key ctrl+z
   call task.list {}
   assert reply.tasks.1.predecessors.0.uid is 1

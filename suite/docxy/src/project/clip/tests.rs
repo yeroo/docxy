@@ -558,3 +558,36 @@ fn paste_with_a_range_pastes_down_and_right_from_its_top_left() {
 fn sel_count(t: &DocTab) -> Option<usize> {
     v(t).selection().map(|s| s.count())
 }
+
+#[test]
+fn whole_rows_copy_and_paste_back_from_the_id_column() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../uiharness/fixtures/project-clipboard.xml");
+    let mut t = crate::project_tab_from_path(&path);
+    // Whole rows via an ID press + drag, as the uit does; the copy starts at
+    // the ID column, so the paste has to start there too (the ID field is
+    // ignored, as on any paste).
+    crate::project_cell_press(&mut t, 0, COL_ID, false);
+    crate::project_cell_drag_over(&mut t, 1, COL_ID);
+    crate::project_cell_release(&mut t);
+    let text = {
+        let Surface::Project(v) = &t.surface else {
+            panic!()
+        };
+        project_copy_text(v)
+    };
+    crate::project_cell_press(&mut t, 2, COL_ID, false);
+    crate::project_cell_release(&mut t);
+    paste_project_text(&mut t, &text);
+    assert_eq!(
+        tasks(&t),
+        [
+            (1, "A".into(), 960),
+            (2, "B".into(), 960),
+            (3, "A".into(), 960),
+            (4, "B".into(), 960),
+        ],
+        "{}",
+        t.status
+    );
+}
