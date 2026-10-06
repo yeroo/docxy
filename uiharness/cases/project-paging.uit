@@ -1,21 +1,34 @@
 # PageUp/PageDown step the cell cursor a screen of rows, as in Project (#554).
-# gantt-scroll.xml has 100 flat tasks. The harness window's project-body shows
-# 17 rows, so paging steps 16; past the last task the cursor lands on the
-# entry row (selected_task 100, one past the last task).
+# gantt-scroll.xml has 100 flat tasks. The page size is the harness window's
+# project-body rows minus one, which varies with platform chrome (17 rows on
+# one Xvfb, 16 on CI), so this case asserts only facts that hold at every page
+# size: the window is fixed at 800px, the body holds under 100 rows, and
+# page_rows is at least 1. The exact arithmetic (16 vs 15 etc.) is pinned in
+# the unit tests in suite/docxy/src/project/tests.rs.
 test project paging moves the cursor a screen of rows
   open ../fixtures/gantt-scroll.xml
   assert selected_task is 0
-  key pagedown
-  assert selected_task is 16
-  key pagedown
-  assert selected_task is 32
-  key pageup
-  assert selected_task is 16
+  # PageUp on the first task stays put.
   key pageup
   assert selected_task is 0
-  key pagedown pagedown pagedown pagedown pagedown pagedown
-  assert selected_task is 96
+  # A page down moves, but not past the plan: the body shows far fewer than
+  # 100 rows, so one page lands strictly inside the tasks.
   key pagedown
-  assert selected_task is 100
+  assert selected_task is not 0
+  assert selected_task is not 100
+  # A page up returns to the first task.
   key pageup
-  assert selected_task is 84
+  assert selected_task is 0
+  # Enough pages down reach the entry row (one past the last task) at any page
+  # size; once clamped at the end, more pages stay there.
+  key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+  key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+  key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+  key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+  assert selected_task is 100
+  # Enough pages up climb back to the first task at any page size.
+  key pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup
+  key pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup
+  key pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup
+  key pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup pageup
+  assert selected_task is 0
