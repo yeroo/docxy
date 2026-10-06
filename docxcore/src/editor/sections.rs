@@ -872,14 +872,89 @@ mod tests {
     }
 
     #[test]
-    fn backspace_into_a_plain_paragraph_is_unchanged_748() {
+    fn backspace_into_a_section_closing_paragraph_removes_its_break_645() {
+        // "one" closes section 0: Backspace at the start of "two" deletes
+        // "one"'s paragraph mark, so the break goes and "onetwo" is section 0
+        // of what is now two sections.
         let mut e = three();
-        let brk = props_of(&e, 0).section_break.clone();
+        let before = e.doc.clone();
         e.caret = Caret::top(1, 0);
         e.backspace();
         assert_eq!(text_of(&e, 0), "onetwo");
-        assert_eq!(props_of(&e, 0).section_break, brk);
-        assert_eq!(e.sections().len(), 3);
+        assert_eq!(props_of(&e, 0).section_break, None);
+        assert_eq!(e.sections().len(), 2);
+        assert!(e.undo());
+        assert_eq!(e.doc, before);
+    }
+
+    /// "Wide" (landscape section) / the empty section-break paragraph /
+    /// "Tall" in the portrait body section (#645).
+    fn wide_tall() -> Editor {
+        let mut doc = Document {
+            body: vec![
+                para("Wide", None),
+                para(
+                    "",
+                    Some(&sect(
+                        "<w:pgSz w:w=\"15840\" w:h=\"12240\" w:orient=\"landscape\"/>",
+                    )),
+                ),
+                para("Tall", None),
+            ],
+        };
+        doc.set_trailing_section_properties(SectionProperties {
+            raw: sect("<w:pgSz w:w=\"12240\" w:h=\"15840\"/>"),
+            property_change: None,
+        });
+        Editor::new(doc)
+    }
+
+    #[test]
+    fn delete_on_the_section_break_paragraph_removes_the_break_645() {
+        let mut e = wide_tall();
+        let before = e.doc.clone();
+        e.caret = Caret::top(1, 0);
+        e.delete_forward();
+        assert_eq!(text_of(&e, 1), "Tall");
+        assert_eq!(props_of(&e, 1).section_break, None);
+        assert_eq!(e.sections().len(), 1);
+        assert_eq!(saved_sect_prs(&e), 1);
+        assert!(!crate::serialize::document_to_xml(&e.doc).contains("landscape"));
+        assert!(e.undo());
+        assert_eq!(e.doc, before);
+    }
+
+    #[test]
+    fn delete_at_the_end_of_a_text_paragraph_with_the_break_removes_it_645() {
+        let mut e = wide_tall();
+        e.doc.body[1] = para("end", props_of(&e, 1).section_break.as_deref());
+        e.caret = Caret::top(1, 3);
+        e.delete_forward();
+        assert_eq!(text_of(&e, 1), "endTall");
+        assert_eq!(e.sections().len(), 1);
+    }
+
+    #[test]
+    fn delete_selection_across_the_break_removes_it_645() {
+        let mut e = wide_tall();
+        e.anchor = Some(Caret::top(1, 0));
+        e.caret = Caret::top(2, 1);
+        assert!(e.delete_selection());
+        assert_eq!(text_of(&e, 1), "all");
+        assert_eq!(e.sections().len(), 1);
+    }
+
+    #[test]
+    fn deleting_a_break_mid_section_keeps_the_later_break_645() {
+        // [A¶brk1][B¶][C¶brk2][trailing]: Delete at the end of A joins A and
+        // B and drops brk1; brk2 still closes the (now longer) first section.
+        let mut e = three();
+        e.caret = Caret::top(0, 3);
+        e.delete_forward();
+        assert_eq!(text_of(&e, 0), "onetwo");
+        assert_eq!(props_of(&e, 0).section_break, None);
+        assert_eq!(e.sections().len(), 2);
+        assert_eq!(start_of(&e.sections()[0]), SectionStart::OddPage);
     }
 
     #[test]
