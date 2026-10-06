@@ -76,12 +76,8 @@ ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B79/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/C18/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/C19/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/C20/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/C21/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/C22/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/C23/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/C24/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/D17/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/D18/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/D19/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/D20/formula-text
@@ -114,11 +110,9 @@ ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/H18/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/H19/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/H20/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/H21/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/H22/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/H23/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/H24/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/H25/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/I17/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/I18/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/I19/formula-text
@@ -173,7 +167,6 @@ ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/N23/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/N24/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/N25/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/O17/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/O18/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/O19/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/O20/formula-text
@@ -182,7 +175,6 @@ ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/O23/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/O24/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/O25/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/P17/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/P18/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/P19/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/Q17/formula-text
@@ -196,15 +188,12 @@ ext:libreoffice/sc/qa/unit/data/xlsx/ceiling-floor.xlsx	xl/worksheets/sheet1.xml
 ext:libreoffice/sc/qa/unit/data/xlsx/ceiling-floor.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/D35/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/ceiling-floor.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/D36/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/ceiling-floor.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/D37/formula-text
-ext:libreoffice/sc/qa/unit/data/xlsx/tablerefsnamed.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/G3/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/tablerefsnamed.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/G4/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/tablerefsnamed.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/G5/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/tablerefsnamed.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/G6/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/tablerefsnamed.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/G7/formula-text
-ext:libreoffice/sc/qa/unit/data/xlsx/tdf98481.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B5/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/tdf98481.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/C5/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/tdf98481.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/D5/formula-text
-ext:libreoffice/sc/qa/unit/data/xlsx/tdf98481.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/E2/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/tdf98481.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/E3/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/tdf98481.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/E4/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E100/formula-text
@@ -215,7 +204,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E105/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E106/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E107/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E108/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E109/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E110/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E111/formula-text
@@ -227,7 +215,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E118/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E119/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E120/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E121/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E122/formula-text
@@ -275,7 +262,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E41/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E42/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E43/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E44/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E45/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E46/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E47/formula-text
@@ -307,7 +293,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	changed-value	/cells/E79/formula-text
@@ -339,7 +324,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E105/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E106/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E107/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E108/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E109/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E110/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E111/formula-text
@@ -351,7 +335,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E118/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E119/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E120/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E121/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E122/formula-text
@@ -374,7 +357,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E138/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E139/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E14/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E140/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E141/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E142/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E143/formula-text
@@ -386,7 +368,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E149/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E15/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E150/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E152/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E153/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E154/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E155/formula-text
@@ -421,7 +402,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E181/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E182/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E183/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E184/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E185/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E186/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E187/formula-text
@@ -472,7 +452,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E41/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E42/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E43/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E44/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E45/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E46/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E47/formula-text
@@ -504,7 +483,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	changed-value	/cells/E79/formula-text
@@ -548,7 +526,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E118/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E119/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E120/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E121/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E122/formula-text
@@ -571,7 +548,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E138/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E139/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E14/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E140/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E141/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E142/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E143/formula-text
@@ -641,7 +617,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E201/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E202/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E203/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E204/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E205/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E206/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E207/formula-text
@@ -655,7 +630,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E214/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E215/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E216/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E218/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E219/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E22/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E220/formula-text
@@ -691,7 +665,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E248/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E249/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E25/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E250/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E251/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E252/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E253/formula-text
@@ -726,7 +699,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E28/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E280/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E281/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E282/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E283/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E284/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E285/formula-text
@@ -792,7 +764,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	changed-value	/cells/E79/formula-text
@@ -824,7 +795,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E105/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E106/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E107/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E108/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E109/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E110/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E111/formula-text
@@ -836,7 +806,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E118/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E119/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E120/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E121/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E122/formula-text
@@ -859,7 +828,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E138/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E139/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E14/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E140/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E141/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E142/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E143/formula-text
@@ -894,7 +862,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E17/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E170/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E171/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E172/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E173/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E174/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E175/formula-text
@@ -929,7 +896,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E201/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E202/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E203/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E204/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E205/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E206/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E207/formula-text
@@ -957,7 +923,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E41/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E42/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E43/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E44/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E45/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E46/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E47/formula-text
@@ -989,7 +954,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	changed-value	/cells/E79/formula-text
@@ -1033,7 +997,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E118/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E119/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E120/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E121/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E122/formula-text
@@ -1056,7 +1019,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E138/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E139/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E14/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E140/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E141/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E142/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E143/formula-text
@@ -1126,7 +1088,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E201/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E202/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E203/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E204/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E205/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E206/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E207/formula-text
@@ -1196,7 +1157,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E265/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E266/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E267/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E268/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E269/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E27/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E270/formula-text
@@ -1267,7 +1227,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E33/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E330/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E331/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E332/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E333/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E334/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E335/formula-text
@@ -1337,7 +1296,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E393/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E394/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E395/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E396/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E397/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E398/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E399/formula-text
@@ -1411,7 +1369,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	changed-value	/cells/E79/formula-text
@@ -1443,7 +1400,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E105/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E106/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E107/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E108/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E109/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E110/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E111/formula-text
@@ -1455,7 +1411,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E118/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E119/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E120/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E121/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E122/formula-text
@@ -1507,7 +1462,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E41/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E42/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E43/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E44/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E45/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E46/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E47/formula-text
@@ -1539,7 +1493,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	changed-value	/cells/E79/formula-text
@@ -1583,7 +1536,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E118/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E119/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E120/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E121/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E122/formula-text
@@ -1606,7 +1558,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E138/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E139/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E14/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E140/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E141/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E142/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E143/formula-text
@@ -1676,7 +1627,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E201/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E202/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E203/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E204/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E205/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E206/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E207/formula-text
@@ -1746,7 +1696,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E265/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E266/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E267/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E268/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E269/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E27/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E270/formula-text
@@ -1817,7 +1766,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E33/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E330/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E331/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E332/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E333/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E334/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E335/formula-text
@@ -1887,7 +1835,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E393/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E394/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E395/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E396/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E397/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E398/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E399/formula-text
@@ -1958,7 +1905,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E458/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E459/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E46/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E460/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E461/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E462/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E463/formula-text
@@ -2017,7 +1963,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	changed-value	/cells/E79/formula-text
@@ -2049,10 +1994,8 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E105/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E106/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E107/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E108/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E109/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E110/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E13/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E14/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E15/formula-text
@@ -2084,7 +2027,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E41/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E42/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E43/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E44/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E45/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E46/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E47/formula-text
@@ -2116,7 +2058,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	changed-value	/cells/E79/formula-text
@@ -2148,7 +2089,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E105/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E106/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E107/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E108/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E109/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E110/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E111/formula-text
@@ -2159,7 +2099,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E116/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E118/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E13/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E14/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E15/formula-text
@@ -2191,7 +2130,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E41/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E42/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E43/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E44/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E45/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E46/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E47/formula-text
@@ -2223,7 +2161,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E79/formula-text
@@ -2247,7 +2184,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E97/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E98/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	changed-value	/cells/E99/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E13/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E14/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E15/formula-text
@@ -2279,7 +2215,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E41/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E42/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E43/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E44/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E45/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E46/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E47/formula-text
@@ -2301,7 +2236,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E63/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E64/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	changed-value	/cells/E65/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/E13/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/E14/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/E15/formula-text
@@ -2343,7 +2277,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet2.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/E51/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/E52/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/E53/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet24.xml	changed-value	/cells/E13/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet24.xml	changed-value	/cells/E14/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet24.xml	changed-value	/cells/E15/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet24.xml	changed-value	/cells/E16/formula-text
@@ -2383,7 +2316,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E105/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E106/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E107/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E108/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E109/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E110/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E111/formula-text
@@ -2395,7 +2327,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E118/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E119/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E120/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E121/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E122/formula-text
@@ -2418,7 +2349,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E138/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E139/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E14/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E140/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E141/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E142/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E143/formula-text
@@ -2453,7 +2383,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E17/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E170/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E171/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E172/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E173/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E174/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E175/formula-text
@@ -2511,7 +2440,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E41/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E42/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E43/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E44/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E45/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E46/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E47/formula-text
@@ -2543,7 +2471,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E79/formula-text
@@ -2567,7 +2494,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E97/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E98/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	changed-value	/cells/E99/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E13/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E14/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E15/formula-text
@@ -2599,7 +2525,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E41/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E42/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E43/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E44/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E45/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E46/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E47/formula-text
@@ -2631,11 +2556,9 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	changed-value	/cells/E79/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet5.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet5.xml	changed-value	/cells/E13/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet5.xml	changed-value	/cells/E14/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet5.xml	changed-value	/cells/E15/formula-text
@@ -2676,7 +2599,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E105/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E106/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E107/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E108/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E109/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E110/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E111/formula-text
@@ -2688,7 +2610,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E118/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E119/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E120/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E121/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E122/formula-text
@@ -2711,7 +2632,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E138/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E139/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E14/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E140/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E141/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E142/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E143/formula-text
@@ -2746,7 +2666,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E17/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E170/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E171/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E172/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E173/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E174/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E175/formula-text
@@ -2804,7 +2723,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E41/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E42/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E43/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E44/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E45/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E46/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E47/formula-text
@@ -2836,7 +2754,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	changed-value	/cells/E79/formula-text
@@ -2868,7 +2785,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E105/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E106/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E107/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E108/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E109/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E110/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E111/formula-text
@@ -2880,7 +2796,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E118/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E119/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E120/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E121/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E122/formula-text
@@ -2921,7 +2836,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E41/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E42/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E43/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E44/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E45/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E46/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E47/formula-text
@@ -2953,7 +2867,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	changed-value	/cells/E79/formula-text
@@ -2997,7 +2910,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E118/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E119/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E120/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E121/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E122/formula-text
@@ -3020,7 +2932,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E138/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E139/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E14/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E140/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E141/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E142/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E143/formula-text
@@ -3090,7 +3001,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E201/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E202/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E203/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E204/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E205/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E206/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E207/formula-text
@@ -3191,7 +3101,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	changed-value	/cells/E79/formula-text
@@ -3223,7 +3132,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E105/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E106/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E107/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E108/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E109/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E110/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E111/formula-text
@@ -3235,7 +3143,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E117/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E118/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E119/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E12/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E120/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E121/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E122/formula-text
@@ -3285,7 +3192,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E41/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E42/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E43/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E44/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E45/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E46/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E47/formula-text
@@ -3317,7 +3223,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E73/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E74/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E75/formula-text
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E76/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E77/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E78/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E79/formula-text

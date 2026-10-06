@@ -1756,9 +1756,9 @@ fn parse_worksheet(
     let mut sheet = Sheet::default();
     let mut p = XmlParser::new(xml);
 
-    // Shared-formula masters: si → (row, col, source).
-    let mut shared_masters: BTreeMap<u32, (u32, u32, String)> = BTreeMap::new();
-    // Followers to fill in after the pass: (row, col, si).
+    // Shared-formula masters: si → (row, col, source, the master's raw <f> attrs).
+    let mut shared_masters: BTreeMap<u32, (u32, u32, String, String)> = BTreeMap::new();
+    // Every shared <f>, masters included, to resolve after the pass: (row, col, si).
     let mut followers: Vec<(u32, u32, u32)> = Vec::new();
 
     let mut cur_row: u32 = 0;
@@ -2173,9 +2173,21 @@ fn parse_worksheet(
     // refs by the offset. If the master doesn't parse, preserve the group
     // verbatim (master keeps its text; followers keep the si marker).
     for (row, col, si) in followers {
-        let Some((mr, mc, src)) = shared_masters.get(&si) else {
+        let Some((mr, mc, src, master_attrs)) = shared_masters.get(&si) else {
             continue;
         };
+        if (row, col) == (*mr, *mc) {
+            // The master keeps its text; when it does not translate, it also
+            // keeps its original attrs (ref too), even for a one-cell group.
+            if translate_formula(src, 0, 0).is_none() {
+                if let Some(mcell) = sheet.cells.get_mut(&(*mr, *mc)) {
+                    if mcell.f_attrs.is_none() {
+                        mcell.f_attrs = Some(master_attrs.clone());
+                    }
+                }
+            }
+            continue;
+        }
         let dr = row as i64 - *mr as i64;
         let dc = col as i64 - *mc as i64;
         let translated = translate_formula(src, dr, dc);
@@ -2185,14 +2197,6 @@ fn parse_worksheet(
                 None => {
                     cell.formula = Some(String::new());
                     cell.f_attrs = Some(format!(" t=\"shared\" si=\"{si}\""));
-                }
-            }
-        }
-        if translated.is_none() {
-            // Master keeps its original shared attrs too.
-            if let Some(mcell) = sheet.cells.get_mut(&(*mr, *mc)) {
-                if mcell.f_attrs.is_none() {
-                    mcell.f_attrs = Some(format!(" t=\"shared\" si=\"{si}\""));
                 }
             }
         }
@@ -2269,7 +2273,7 @@ fn parse_cell_body(
     shared: &[String],
     row: u32,
     col: u32,
-    shared_masters: &mut BTreeMap<u32, (u32, u32, String)>,
+    shared_masters: &mut BTreeMap<u32, (u32, u32, String, String)>,
     followers: &mut Vec<(u32, u32, u32)>,
 ) -> Cell {
     let mut v_text: Option<String> = None;
@@ -2307,22 +2311,17 @@ fn parse_cell_body(
                                     // claim the slot (which would leave the
                                     // group's source empty), so key on `ref`.
                                     if !ref_attr.is_empty() {
-                                        shared_masters.insert(si, (row, col, String::new()));
+                                        // Keep the master's own `<f>` attrs
+                                        // (ref included) for the fallback.
+                                        shared_masters
+                                            .insert(si, (row, col, String::new(), raw_f_attrs(p)));
                                     }
                                 }
                             }
                             "" | "normal" => {}
                             _ => {
                                 // array / dataTable — preserve verbatim.
-                                let mut attrs = String::new();
-                                for a in p.attrs() {
-                                    attrs.push(' ');
-                                    attrs.push_str(a.name);
-                                    attrs.push_str("=\"");
-                                    attrs.push_str(&esc_raw_attr(a.value));
-                                    attrs.push('"');
-                                }
-                                f_attrs = Some(attrs);
+                                f_attrs = Some(raw_f_attrs(p));
                             }
                         }
                     }
@@ -2423,6 +2422,19 @@ fn parse_cell_body(
         spill,
         meta: None,
     }
+}
+
+/// The `<f>` the parser is on, its attributes re-serialised verbatim.
+fn raw_f_attrs(p: &XmlParser) -> String {
+    let mut attrs = String::new();
+    for a in p.attrs() {
+        attrs.push(' ');
+        attrs.push_str(a.name);
+        attrs.push_str("=\"");
+        attrs.push_str(&esc_raw_attr(a.value));
+        attrs.push('"');
+    }
+    attrs
 }
 
 /// The `<brk>` the parser is on; `None` when its `id` is unreadable.
@@ -13785,6 +13797,38 @@ b",
         assert_eq!(resaved(&pkg).1, restyled);
         eng.set_styles(&mut pkg.workbook, 0, &[(0, 1, 0), (0, 6, 0)]);
         assert_eq!(resaved(&pkg).1, unedited);
+    }
+
+    #[test]
+    fn untranslatable_one_cell_shared_group_keeps_its_attrs() {
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="shared" ref="B1" si="0">[1]Sheet1!A1*2</f><v>2</v></c></row>"#;
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<f t="shared" ref="B1" si="0">[1]Sheet1!A1*2</f>"#),
+            "{ws}"
+        );
+    }
+
+    /// A shared group whose master does not translate is kept verbatim: the
+    /// master keeps its text and `ref`, the followers their `si` marker.
+    #[test]
+    fn untranslatable_shared_group_keeps_master_text_and_ref() {
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="shared" ref="B1:B3" si="0">[1]Sheet1!A1*2</f><v>2</v></c></row>"#,
+            r#"<row r="2"><c r="A2"><v>2</v></c><c r="B2"><f t="shared" si="0"/><v>4</v></c></row>"#,
+            r#"<row r="3"><c r="A3"><v>3</v></c><c r="B3"><f t="shared" si="0"/><v>6</v></c></row>"#,
+        );
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="B1"><f t="shared" ref="B1:B3" si="0">[1]Sheet1!A1*2</f>"#),
+            "{ws}"
+        );
+        assert!(ws.contains(r#"<c r="B2"><f t="shared" si="0"/>"#), "{ws}");
+        assert!(ws.contains(r#"<c r="B3"><f t="shared" si="0"/>"#), "{ws}");
+        let b1 = pkg.workbook.sheets[0].cell(0, 1).unwrap();
+        assert_eq!(b1.formula.as_deref(), Some("[1]Sheet1!A1*2"));
     }
 
     #[test]
