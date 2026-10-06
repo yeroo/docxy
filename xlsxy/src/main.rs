@@ -16097,6 +16097,80 @@ mod tests {
         assert_eq!((stats.total, stats.compared, stats.matched), (1, 1, 1));
     }
 
+    /// #681: Excel saves a `#SPILL!` cell as `#VALUE!` with value metadata
+    /// pointing at a rich `_error` (#657 decodes it on load), so `--verify`
+    /// compares `#SPILL!` with `#SPILL!`: the spilling formulas of a table,
+    /// last row included, match Excel's cache.
+    #[test]
+    fn verify_matches_a_rich_spill_error_in_a_table() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let pkg_rel = "http://schemas.openxmlformats.org/package/2006/relationships";
+        let rd = "http://schemas.microsoft.com/office/2017/06/relationships";
+        let rich = "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata";
+        let spill = |r: u32| {
+            format!(
+                r#"<c r="B{r}" t="e" cm="1" vm="1"><f t="array" ref="B{r}">_xlfn.SEQUENCE(3)</f><v>#VALUE!</v></c>"#
+            )
+        };
+        let rows = format!(
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>Qty</t></is></c><c r="B1" t="inlineStr"><is><t>Calc</t></is></c></row><row r="2"><c r="A2"><v>1</v></c>{}</row><row r="3"><c r="A3"><v>2</v></c>{}</row><row r="4"><c r="A4"><v>3</v></c>{}</row>"#,
+            spill(2),
+            spill(3),
+            spill(4)
+        );
+        let parts: Vec<(String, Vec<u8>)> = vec![
+            (
+                "[Content_Types].xml".into(),
+                r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/tables/table1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/><Override PartName="/xl/metadata.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml"/></Types>"#.into(),
+            ),
+            (
+                "_rels/.rels".into(),
+                format!(r#"<?xml version="1.0"?><Relationships xmlns="{pkg_rel}"><Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#).into_bytes(),
+            ),
+            (
+                "xl/workbook.xml".into(),
+                format!(r#"<?xml version="1.0"?><workbook xmlns="{ns}" xmlns:r="{rel}"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#).into_bytes(),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels".into(),
+                format!(r#"<?xml version="1.0"?><Relationships xmlns="{pkg_rel}"><Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{rel}/sheetMetadata" Target="metadata.xml"/><Relationship Id="rId3" Type="{rd}/rdRichValue" Target="richData/rdrichvalue.xml"/><Relationship Id="rId4" Type="{rd}/rdRichValueStructure" Target="richData/rdrichvaluestructure.xml"/></Relationships>"#).into_bytes(),
+            ),
+            (
+                "xl/worksheets/sheet1.xml".into(),
+                format!(r#"<?xml version="1.0"?><worksheet xmlns="{ns}" xmlns:r="{rel}"><sheetData>{rows}</sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>"#).into_bytes(),
+            ),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels".into(),
+                format!(r#"<?xml version="1.0"?><Relationships xmlns="{pkg_rel}"><Relationship Id="rId1" Type="{rel}/table" Target="../tables/table1.xml"/></Relationships>"#).into_bytes(),
+            ),
+            (
+                "xl/tables/table1.xml".into(),
+                format!(r#"<?xml version="1.0"?><table xmlns="{ns}" id="1" name="Sp" displayName="Sp" ref="A1:B4"><autoFilter ref="A1:B4"/><tableColumns count="2"><tableColumn id="1" name="Qty"/><tableColumn id="2" name="Calc"/></tableColumns></table>"#).into_bytes(),
+            ),
+            (
+                "xl/metadata.xml".into(),
+                format!(r#"<?xml version="1.0"?><metadata xmlns="{ns}" xmlns:xlrd="{rich}" xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray"><metadataTypes count="2"><metadataType name="XLDAPR" minSupportedVersion="120000" cellMeta="1"/><metadataType name="XLRICHVALUE" minSupportedVersion="120000"/></metadataTypes><futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}}"><xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk></futureMetadata><futureMetadata name="XLRICHVALUE" count="1"><bk><extLst><ext uri="{{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}}"><xlrd:rvb i="0"/></ext></extLst></bk></futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata><valueMetadata count="1"><bk><rc t="2" v="0"/></bk></valueMetadata></metadata>"#).into_bytes(),
+            ),
+            (
+                "xl/richData/rdrichvalue.xml".into(),
+                format!(r#"<?xml version="1.0"?><rvData xmlns="{rich}" count="1"><rv s="0"><v>0</v><v>8</v></rv></rvData>"#).into_bytes(),
+            ),
+            (
+                "xl/richData/rdrichvaluestructure.xml".into(),
+                format!(r#"<?xml version="1.0"?><rvStructures xmlns="{rich}" count="1"><s t="_error"><k n="propagated" t="b"/><k n="errorType" t="i"/></s></rvStructures>"#).into_bytes(),
+            ),
+        ];
+        let pkg = gridcore::xlsx::load_xlsx(&opccore::zipwrite::write_zip(&parts)).unwrap();
+        assert_eq!(pkg.workbook.tables.len(), 1);
+        let (report, stats) = verify_report(&pkg, "sp.xlsx");
+        assert_eq!(
+            (stats.total, stats.compared, stats.matched),
+            (3, 3, 3),
+            "{report}"
+        );
+    }
+
     #[test]
     fn a_general_number_is_fitted_to_its_column() {
         let general = gridcore::sheet::Xf::default();

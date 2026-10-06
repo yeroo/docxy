@@ -1814,7 +1814,7 @@ impl Sheet {
 
 /// An Excel Table (ListObject): a named rectangular region with headers,
 /// resolvable by structured references (`Table1[Amount]`, `[@Price]`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Table {
     /// The displayName — what formulas use.
     pub name: String,
