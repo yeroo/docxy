@@ -179,7 +179,7 @@ Pivot tables are read + refreshable (partial).
 |---|-----|--------------|---------|-----------|
 | **X6** | **Conditional formatting** — parsed-through, not evaluated/rendered | **51** | PRESERVED | Borderline (display) — high value for the compare tool |
 | **X7** | **AutoFilter** state not applied | **35** | PRESERVED | Borderline |
-| **X8** | **Data validation** not enforced/surfaced | **16** | PRESERVED | Borderline |
+| **X8** | **Data validation** — enforced on typed entry (Stop/Warning/Information alerts), carried through paste, edited in the Data Validation dialog, Circle Invalid Data (#687 #688 #689; `gridcore::validation`); x14 (`extLst`) rules stay preserved-only | **16** | DONE | Done |
 | **X9** | **Frozen/split panes** not driven from the file's `pane` state | **19** | PARTIAL | In-scope (grid UX) — cheap |
 | **X10** | **Hyperlinks** not modeled/clickable | 8 | PRESERVED | In-scope — cheap |
 | **X11** | **Images** preserved but **not rendered** in the TUI | 16 | PRESERVED | Display — can reuse docxy's `ratatui-image` pipeline |

@@ -145,14 +145,14 @@ One `RefTarget` variant per input, one `ref_commit` arm per variant:
 | `SeriesValues(i)` | series card | re-reads **only** that series' numbers, from **one line** — one column on a column-oriented chart, one row on a row-oriented one (`series_values_shape_err`; see [`chart-orientation.md`](chart-orientation.md)). Excel splits a two-dimensional pick into a series per line and reads such a ref the long way, while `range_numbers` flattens row-major, so a wider pick is refused rather than written out in the wrong order |
 | `Categories` | Chart panel | the category-axis labels, from **one line** of cells — one column on a column-oriented chart (`A2:A5`), one row on a row-oriented one (`B1:D1`), exactly as `SeriesValues(i)` follows the orientation (`categories_shape_err`). Labels name a series' *points*, and a series' points run down rows one way round and along columns the other, so the labels run the same way each derivation writes them. A **single cell** is one row and one column at once and goes through either way, which is what a row chart two columns wide has. A rectangle is refused by the same check on both orientations, for the reason that first motivated it: `range_labels` flattens row-major while Excel derives its own list from the ref itself, so the cache written beside the ref would contradict it the moment Excel refreshes. Taking either line on either orientation would also put the field at odds with `infer_by_row`, which reads a chart's orientation back *out* of the shape of its `<c:cat>` — see [`chart-orientation.md`](chart-orientation.md). `parse_chart` shuts the same door on import — a multi-level `<c:cat>` makes the chart `complex` rather than arriving in a state the field would not accept |
 | `CondFormat` | Conditional Formatting bar | the cells the rule applies to |
-| `Validation` | Data Validation bar | the cells the list applies to |
 
-Data › Text to Columns and Custom Sort used to be bars with a field here; they
-are now Excel's Convert Text to Columns Wizard (`ttc_dialog.rs`, #692) and Sort
-dialog (`sheet_sort.rs`, #691), form dialogs that act on the selection or the
-list around it, so they have no reference field.
+Data › Data Validation, Text to Columns and Custom Sort used to be bars with a field here (Data Validation's was `Validation`, the cells its list applied to); they
+are now Excel's Data Validation dialog (`sheet_validation.rs`, #689), Convert Text to
+Columns Wizard (`ttc_dialog.rs`, #692) and Sort dialog (`sheet_sort.rs`, #691),
+form dialogs that act on the selection or the list around it, so they have no
+reference field.
 
-The two bars *display* the current selection in their field until you pin a
+The bar *displays* the current selection in its field until you pin a
 range into it (`bar_target` → `bar_open` → `bar_seed`; see "The entry bars follow
 the selection until you pin them" below), so leaving the field alone does exactly
 what the bar did before it had one. At apply time `bar_cells()` is the
@@ -286,12 +286,11 @@ ASCII matches only at its own case: `бюджет!A1` does not find `Бюдже�
 same fold decides `preview_range` (which delegates to `sheet_index_of`), the
 sheet-name uniqueness check, and `bar_range_text` — the **preview** that spells
 a reference back out — so changing it here alone would let resolution and the
-preview disagree about one reference. It is not, however, universal: the
-in-workbook hyperlink jump (`sheet_follow_hyperlink`) and a validation list's
-range source (`dv_list_values`) still match a sheet name byte for byte, so
-`=Budget!A1:A9` as a DV source finds nothing if the sheet is spelt `budget`.
-That is a separate, older inconsistency this reference syntax didn't reach, not
-a counter-rule. Two sheets differing only in case — which Excel forbids but a
+preview disagree about one reference. It is not, however, universal: the in-workbook hyperlink jump
+(`sheet_follow_hyperlink`) still matches a sheet name byte for byte. A
+validation list's range source (`dv_list_values`) folds ASCII case like the
+entry check does, so the dropdown and the check agree. The hyperlink jump is a separate, older inconsistency this reference syntax
+didn't reach, not a counter-rule. Two sheets differing only in case — which Excel forbids but a
 hand-built file can carry — resolve to the first, in each of the folding
 lookups above.
 
@@ -302,7 +301,6 @@ field:
 | Target | Foreign sheet | Why |
 |--------|---------------|-----|
 | `ChartRange`, `SeriesName`, `SeriesValues`, `Categories` | resolved | a chart plots numbers that needn't live on the sheet it floats over |
-| `Validation` | resolved | the rule is built while looking at the lookup sheet holding the list, and applies to the entry sheet holding the boxes |
 | `CondFormat` | refused | a rule paints the cells in front of you — *these* cells |
 | `ChartTitle` | n/a | not a range at all |
 
@@ -312,13 +310,7 @@ whether or not that sheet exists — the objection is *where the bar acts*, not 
 unknown name. A bar that resolves answers instead with the sheet actually found,
 spelled the way the workbook spells it, so `budget!a1:a9` comes back
 `=Budget!$A$1:$A$9` and the field stops disagreeing with the tab it names
-(`bar_ref_text`; the sheet a bar acts on is then derived from its pinned range by
-`bar_sheet_index`, never stored beside it, so the two cannot drift).
-
-⚠️ The Validation bar's range field is the **applies-to** range, not the list
-source — the bar's own text is a literal comma-separated list. What a qualifier
-buys there is building the rule where the boxes are while looking at the sheet
-holding the list. A range-valued list source is separate work.
+(`bar_ref_text`).
 
 Anything else is rejected with a message quoting what was typed. Multi-area,
 whole-column (`A:C`), whole-row, 3D and structured references still work **in
@@ -378,7 +370,7 @@ Parsing is likewise one function. `parse_ref_text` returns the sheet and the
 cells **separately** (`RefText`) instead of a bare rectangle, so no caller can
 quietly drop half the answer; resolving the sheet half is then `sheet_index_of`
 alone, wrapped as `Docxy::ref_sheet_index` for the view and reached from
-`chart_ref_of`, `bar_ref_text` and `bar_sheet_index`.
+`chart_ref_of` and `bar_ref_text`.
 
 ### The entry bars follow the selection until you pin them
 
@@ -394,11 +386,10 @@ but not yet Entered still counts. After a pick with the mouse the field keeps
 the keyboard, so the next thing typed goes into the *range* — Enter or Escape
 hands it back to the bar's own buffer.
 
-⚠️ The two bars share **one** `bar_field`/`bar_range` pair, so only one may be
-open at a time: `bar_open` closes the others (and `bar_close` closes the bars,
-not just their fields). Two on screen would aim the first at cells pinned for
-the second — `sheet_key` routes to whichever opened first, while `bar_seed` and
-`bar_cells` read the slot the second one overwrote.
+⚠️ The Conditional Formatting bar is the only one left with a range field, and it
+uses the one `bar_field`/`bar_range` pair: `bar_open` closes any other bar (and
+`bar_close` closes the bar, not just its field), so a stale pin never aims it at
+cells pinned for an earlier open.
 
 ⚠️ `bar_open` also clears `range_edit`/`range_pick` outright, not just a field
 belonging to a bar. A Chart panel field left focused keeps `range_field_active`
@@ -412,7 +403,7 @@ asks the bars *before* a field that isn't one of theirs, so focusing a panel
 field would draw a focused border and a caret while every keystroke went to the
 bar — and a drag on the grid still rewrote and committed the chart's field. So
 `ref_field`'s focus handler calls `typing_bars_close` for any non-bar target:
-whatever swallows typing (the two bars, the comment and row-height bars, the
+whatever swallows typing (the Conditional Formatting bar, the comment and row-height bars, the
 find bar) loses it to the field the user just clicked.
 
 ## Pointing while typing a formula

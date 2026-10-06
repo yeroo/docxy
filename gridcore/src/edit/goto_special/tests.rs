@@ -277,6 +277,7 @@ fn conditional_formats_and_validation_all_or_same() {
         formula2: String::new(),
         prompt: None,
         ix: None,
+        ..DataValidation::default()
     });
     let dv = |same| GoSpecial::DataValidation { same };
     assert_eq!(go(&wb, &["A1"], "A1", dv(false)), Ok(rects(&["B5:B6"])));
@@ -393,6 +394,7 @@ fn visible_cells_rules_and_precedents_reach_past_the_data() {
         formula2: String::new(),
         prompt: None,
         ix: None,
+        ..DataValidation::default()
     });
     assert_eq!(
         go(&wb, &["B2"], "B2", GoSpecial::DataValidation { same: true }),

@@ -214,9 +214,10 @@ then PageUp/PageDown/Home/End scroll the page), so nothing reaches the tab
 hidden under it.
 
 Reference fields, for `focus`: `chart-range`, `chart-title`, `categories`,
-`series-name:N`, `series-values:N`, `cond-format`, `validation`.
+`series-name:N`, `series-values:N`, `cond-format`.
 Data › Text to Columns is a dialog (`text-to-columns`), driven with the
-`dialog-*` verbs like the others.
+`dialog-*` verbs like the others, and so is Data › Data Validation
+(`data-validation`, with its alert `data-validation-alert`).
 
 **`open` always loads the file from disk.** The cases in a script share one
 instance — a process per case would multiply a two-second launch by however
@@ -496,8 +497,8 @@ that do nothing yet (Format Painter, Underline, Cell Styles, Spelling, …) are
 implemented`) instead of replying green over a no-op. `ribbon-click` resolves
 by id, else label, else the drawn text (`Σ AutoSum`), selects the tab and runs
 the button's own `run_sheet_act` (a drop-down button opens its menu; a menu item
-is clicked through the menu, see below). Buttons that open a bar (Filter, Custom
-Sort, Data Validation, …) leave it open for `type` and `key enter`, as a click
+is clicked through the menu, see below). Buttons that open a bar (Conditional
+Formatting, …) leave it open for `type` and `key enter`, as a click
 does. Home's Paste is a split button, and Fill, Clear and Find & Select open
 menus (#707): `menu-open {"ribbon": [tab, group, command]}` opens them, and a
 `ribbon-click` of Fill, Clear or Find & Select opens its menu as the click

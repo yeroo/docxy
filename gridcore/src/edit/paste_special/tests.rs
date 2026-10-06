@@ -209,6 +209,7 @@ fn validation_replaces_the_destinations_and_comes_back_as_rules() {
         formula2: String::new(),
         prompt: None,
         ix: None,
+        ..DataValidation::default()
     });
     wb.sheets[0].validations.push(DataValidation {
         ranges: vec![(0, 2, 5, 2)],
@@ -218,6 +219,7 @@ fn validation_replaces_the_destinations_and_comes_back_as_rules() {
         formula2: "9".into(),
         prompt: None,
         ix: Some(0),
+        ..DataValidation::default()
     });
     let clip = copy(&wb, 0, "A1:A2");
     let p = paste(
@@ -530,9 +532,9 @@ fn a_malformed_block_is_refused_and_never_panics() {
         operator: String::new(),
         formula1: "\"a\"".into(),
         formula2: String::new(),
-        prompt: None,
         cells: vec![(5, 5)],
         anchor: (0, 0),
+        settings: DataValidation::default(),
     }];
     let _ = paste_special_extras(&clip, at("C1"), &PasteSpec::of(PasteWhat::Validation));
 }
@@ -784,6 +786,7 @@ fn custom_rule(ranges: Vec<Area>, f: &str) -> DataValidation {
         formula2: String::new(),
         prompt: None,
         ix: None,
+        ..DataValidation::default()
     }
 }
 

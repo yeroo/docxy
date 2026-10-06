@@ -76,6 +76,10 @@ fn apply_dialog(
         }
         // Handled in `sheet_consolidate::click`, before this.
         DialogOwner::Consolidate { .. } => Err("Consolidate applies through the Data tab".into()),
+        // Handled in `sheet_validation::click` and `alert_click`, before this.
+        DialogOwner::DataValidation { .. } | DialogOwner::DataValidationAlert => {
+            Err("data validation applies through the Data tab".into())
+        }
         // Handled in `sheet_filter::click` and `sheet_sort::click`, before this.
         DialogOwner::FilterMenu { .. }
         | DialogOwner::CustomFilter { .. }
@@ -204,6 +208,13 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
     }
     // Consolidate's Add and Delete edit its list; OK consolidates (#694).
     if let Some(done) = crate::sheet_consolidate::click(tab, button) {
+        return done;
+    }
+    // The data-validation alert and dialog (#687, #689).
+    if let Some(done) = crate::sheet_validation::alert_click(tab, button) {
+        return done;
+    }
+    if let Some(done) = crate::sheet_validation::click(tab, button) {
         return done;
     }
     // The filter drop-down and its dialogs (#690), and the sorts (#691).

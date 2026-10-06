@@ -1687,6 +1687,7 @@ fn sheet_remove(app: &mut App, args: &Json) -> Result<Json, String> {
     }
     // A pending cut's source sheet may be gone or renumbered.
     app.cancel_cut();
+    app.sheet_removed_circles(si);
     // Indices above the removed sheet shift down by one; an unaffected
     // sheet below it keeps its index untouched. Only reset the viewport
     // when the ACTIVE sheet itself is the one that just disappeared —

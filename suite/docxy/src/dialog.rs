@@ -125,6 +125,15 @@ pub(crate) enum DialogOwner {
         row: u32,
         col: u32,
     },
+    /// Excel's Data Validation dialog (#689) over `range` of `sheet`. OK and
+    /// Clear All apply in `sheet_validation::click`.
+    DataValidation {
+        sheet: usize,
+        range: (u32, u32, u32, u32),
+    },
+    /// The alert a typed entry that breaks its cell's rule raises (#687); its
+    /// presses are handled in `sheet_validation::alert_click`.
+    DataValidationAlert,
     /// A filter button's drop-down on absolute column `col` of `sheet`'s
     /// AutoFilter (#690); its buttons apply in `sheet_filter::click`.
     FilterMenu {

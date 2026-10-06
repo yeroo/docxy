@@ -221,11 +221,15 @@ pub struct ClipRule {
     pub operator: String,
     pub formula1: String,
     pub formula2: String,
-    pub prompt: Option<String>,
     pub cells: Vec<(usize, usize)>,
     /// The source rule's anchor (the top-left of its ranges, as
     /// `shift_rule_ranges` reads it): its formulas are relative to it.
     pub anchor: (u32, u32),
+    /// The source rule with its ranges and element dropped: everything else
+    /// a paste of it carries (alert, input message, blanks, dropdown). Its
+    /// formulas are the source's; the rule's own `formula1`/`formula2` are
+    /// the moved ones a paste writes.
+    pub settings: crate::sheet::DataValidation,
 }
 
 /// The positions in sorted `v` of the values `lo..=hi`.
@@ -301,8 +305,13 @@ impl ClipBlock {
                     operator: dv.operator.clone(),
                     formula1: dv.formula1.clone(),
                     formula2: dv.formula2.clone(),
-                    prompt: dv.prompt.clone(),
                     cells,
+                    settings: crate::sheet::DataValidation {
+                        ranges: Vec::new(),
+                        ix: None,
+                        orig: None,
+                        ..dv.clone()
+                    },
                 })
             })
             .collect();
