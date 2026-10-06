@@ -408,12 +408,13 @@ pub(crate) fn project_cell_input(tab: &mut DocTab, key: &str, text: Option<&str>
         // Save commits the buffer before host dispatch; other chords cannot alter it.
         return;
     }
-    // Up and Down commit and move a row, as Enter does, in Project.
+    // Up, Down, and Shift+Enter commit and move a row, as Enter does, in Project.
     if matches!(key, "enter" | "tab" | "up" | "down") {
         if commit_project_cell(tab) {
             if let Surface::Project(v) = &mut tab.surface {
                 v.key(
                     match key {
+                        "enter" if m.shift => "up",
                         "enter" => "down",
                         "up" | "down" => key,
                         _ if m.shift => "left",
