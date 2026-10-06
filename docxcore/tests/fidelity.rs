@@ -1016,11 +1016,136 @@ fn schema_reports_children_out_of_order() {
 #[test]
 fn schema_reports_a_duplicate_singleton() {
     assert_eq!(
-        schema("<w:p><w:r><w:rPr><w:b/><w:i/><w:b/></w:rPr></w:r></w:p>"),
+        schema("<w:p><w:pPr><w:jc w:val=\"left\"/><w:jc w:val=\"right\"/></w:pPr></w:p>"),
         [violation(
             "duplicate",
-            "/w:document/w:body/w:p/w:r/w:rPr",
-            "w:b"
+            "/w:document/w:body/w:p/w:pPr",
+            "w:jc"
+        )]
+    );
+}
+
+#[test]
+fn schema_run_properties_are_a_repeatable_choice() {
+    // Transitional EG_RPrBase is an unbounded choice: any order, repeats.
+    assert_eq!(
+        schema(
+            "<w:p><w:pPr><w:rPr><w:ins w:id=\"1\" w:author=\"a\"/><w:sz w:val=\"2\"/><w:b/>\
+             <w:b/></w:rPr></w:pPr><w:r><w:rPr><w:b/><w:i/><w:b/><w:kern w:val=\"2\"/>\
+             <w:kern w:val=\"2\"/><w:rStyle w:val=\"s\"/><w:rPrChange w:id=\"2\" w:author=\"a\">\
+             <w:rPr><w:i/><w:b/></w:rPr></w:rPrChange></w:rPr><w:t>a</w:t></w:r></w:p>"
+        ),
+        []
+    );
+    // Only the paragraph mark's revision marks and rPrChange are placed.
+    assert_eq!(
+        schema(
+            "<w:p><w:pPr><w:rPr><w:b/><w:ins w:id=\"1\" w:author=\"a\"/></w:rPr></w:pPr>\
+             <w:r><w:rPr><w:rPrChange w:id=\"2\" w:author=\"a\"/><w:b/></w:rPr></w:r></w:p>"
+        ),
+        [
+            violation("order", "/w:document/w:body/w:p/w:pPr/w:rPr", "w:ins"),
+            violation("order", "/w:document/w:body/w:p/w:r/w:rPr", "w:b"),
+        ]
+    );
+}
+
+#[test]
+fn schema_border_sides_are_physical_and_logical() {
+    let borders = |sides: &str| {
+        schema(&format!(
+            "<w:tbl><w:tblPr><w:tblBorders>{sides}</w:tblBorders></w:tblPr><w:tblGrid/></w:tbl>"
+        ))
+    };
+    assert_eq!(
+        borders("<w:top/><w:start/><w:left/><w:bottom/><w:end/><w:right/><w:insideH/>"),
+        []
+    );
+    assert_eq!(
+        borders("<w:left/><w:start/>"),
+        [violation(
+            "order",
+            "/w:document/w:body/w:tbl/w:tblPr/w:tblBorders",
+            "w:start"
+        )]
+    );
+}
+
+#[test]
+fn schema_row_revisions_follow_the_row_properties() {
+    let row = |trpr: &str| {
+        schema(&format!(
+            "<w:tbl><w:tblPr/><w:tblGrid/><w:tr><w:trPr>{trpr}</w:trPr><w:tc><w:p/></w:tc></w:tr></w:tbl>"
+        ))
+    };
+    assert_eq!(
+        row("<w:tblHeader/><w:cantSplit/><w:tblHeader/><w:ins w:id=\"1\" w:author=\"a\"/>"),
+        []
+    );
+    assert_eq!(
+        row("<w:ins w:id=\"1\" w:author=\"a\"/><w:cantSplit/>"),
+        [violation(
+            "order",
+            "/w:document/w:body/w:tbl/w:tr/w:trPr",
+            "w:cantSplit"
+        )]
+    );
+}
+
+#[test]
+fn schema_only_range_markup_precedes_the_table_properties() {
+    assert_eq!(
+        schema("<w:tbl><w:bookmarkStart w:id=\"0\" w:name=\"t\"/><w:tblPr/><w:tblGrid/></w:tbl>"),
+        []
+    );
+    assert_eq!(
+        schema("<w:tbl><w:proofErr w:type=\"spellStart\"/><w:tblPr/><w:tblGrid/></w:tbl>"),
+        [
+            violation("order", "/w:document/w:body/w:tbl", "w:tblPr"),
+            violation("order", "/w:document/w:body/w:tbl", "w:tblGrid"),
+        ]
+    );
+}
+
+#[test]
+fn schema_revision_snapshots_have_their_own_models() {
+    // A paragraph mark's snapshot (CT_ParaRPrOriginal) has the revision marks.
+    assert_eq!(
+        schema(
+            "<w:p><w:pPr><w:rPr><w:rPrChange w:id=\"1\" w:author=\"a\"><w:rPr>\
+             <w:ins w:id=\"2\" w:author=\"a\"/><w:b/></w:rPr></w:rPrChange></w:rPr></w:pPr></w:p>"
+        ),
+        []
+    );
+    // A run's (CT_RPrOriginal) does not, nor a nested rPrChange.
+    assert_eq!(
+        schema(
+            "<w:p><w:r><w:rPr><w:rPrChange w:id=\"1\" w:author=\"a\"><w:rPr>\
+             <w:ins w:id=\"2\" w:author=\"a\"/><w:rPrChange/></w:rPr></w:rPrChange></w:rPr></w:r></w:p>"
+        ),
+        [
+            violation(
+                "not-allowed",
+                "/w:document/w:body/w:p/w:r/w:rPr/w:rPrChange/w:rPr",
+                "w:ins"
+            ),
+            violation(
+                "not-allowed",
+                "/w:document/w:body/w:p/w:r/w:rPr/w:rPrChange/w:rPr",
+                "w:rPrChange"
+            ),
+        ]
+    );
+    // A paragraph's snapshot (CT_PPrBase) ends at cnfStyle.
+    assert_eq!(
+        schema(
+            "<w:p><w:pPr><w:jc w:val=\"left\"/><w:pPrChange w:id=\"1\" w:author=\"a\"><w:pPr>\
+             <w:jc w:val=\"right\"/><w:sectPr/></w:pPr></w:pPrChange></w:pPr></w:p>"
+        ),
+        [violation(
+            "not-allowed",
+            "/w:document/w:body/w:p/w:pPr/w:pPrChange/w:pPr",
+            "w:sectPr"
         )]
     );
 }

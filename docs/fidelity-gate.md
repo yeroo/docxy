@@ -89,7 +89,7 @@ CI's checkout produce the same keys.
 A save can lose nothing and still write a file Word refuses as corrupt (#1083:
 an unwrapped smart tag left its `w:smartTagPr` directly under `w:p`). So the
 gate also validates every saved package against a subset of the
-WordprocessingML schema (ECMA-376 Part 1, transitional `wml.xsd`), in
+WordprocessingML schema (the transitional `wml.xsd` of ECMA-376 Part 4), in
 `docxcore/tests/fidelity/schema.rs`. It needs no Word, .NET or XSD, and checks
 a subset of what the Open XML SDK validator does.
 
@@ -97,13 +97,22 @@ Every part whose root element is in the `w:` namespace is checked: the
 document, headers, footers, footnotes, endnotes, comments, numbering and
 styles. These containers have a content model, wherever they occur:
 
-- ordered sequences: `pPr`, `rPr` (a paragraph mark's `rPr` leads with its
-  revision marks), `tblPr`, `tblPrEx`, `tcPr`, `sectPr`, `pBdr`, `pgBorders`,
-  `tblBorders`, `tcBorders`, `tblCellMar`, `tcMar`, `tbl`, `tr`;
+- ordered sequences: `pPr`, `tblPr`, `tblPrEx`, `tcPr`, `sectPr`, `pBdr`,
+  `pgBorders`, `tblBorders`, `tcBorders`, `tblCellMar`, `tcMar` (each side
+  both physical and logical: `start` then `left`, `end` then `right`), `tbl`
+  (only range markup before `tblPr`), `tr`;
+- repeatable choices with an ordered head or tail: `rPr` (its properties come
+  in any order and may repeat; a paragraph mark's `rPr` leads with its
+  revision marks, and `rPrChange` is last) and `trPr` (row properties, then
+  `ins`, `del`, `trPrChange`);
 - allowed children: `body` (`sectPr` last), `p` (`pPr` first), `r` (`rPr`
   first), `hyperlink`, `smartTag` (`smartTagPr` first), `tc` (`tcPr` first,
-  then at least one block), `trPr`, and the block containers `hdr`, `ftr`,
+  then at least one block), and the block containers `hdr`, `ftr`,
   `footnote`, `endnote`, `comment`, `txbxContent` and `docPartBody`.
+
+A revision's snapshot of properties (`pPrChange/pPr`, `rPrChange/rPr`,
+`tblPrChange/tblPr`, ...) has the narrower model the schema gives it: no
+nested change, and a paragraph's snapshot ends at `cnfStyle`.
 
 A child breaks one of four rules:
 

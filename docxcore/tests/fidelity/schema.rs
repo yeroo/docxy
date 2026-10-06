@@ -1,5 +1,6 @@
 //! Schema validation of saved WordprocessingML (#1083): a dependency-free
-//! subset of the ECMA-376 content models of the containers docxy writes, so a
+//! subset of the content models (the transitional `wml.xsd` of ECMA-376 Part
+//! 4) of the containers docxy writes, so a
 //! save that Word would reject as corrupt fails CI without Word or the Open
 //! XML SDK. See "Schema validation" in `docs/fidelity-gate.md`.
 //!
@@ -78,7 +79,7 @@ impl Violation {
 }
 
 // ---------------------------------------------------------------------------
-// Content models (ECMA-376 Part 1, transitional wml.xsd)
+// Content models (ECMA-376 Part 4, transitional wml.xsd)
 
 #[derive(Clone, Copy)]
 enum Occurs {
@@ -117,9 +118,8 @@ type Slot = (Names, Occurs);
 use Names::{Groups, One};
 use Occurs::{Many, Optional, Plus, Required};
 
-/// EG_RangeMarkupElements and the rest of EG_RunLevelElements (less math,
-/// which is not `w:`).
-const RUN_LEVEL: &[&str] = &[
+/// EG_RangeMarkupElements.
+const RANGE_MARKUP: &[&str] = &[
     "bookmarkStart",
     "bookmarkEnd",
     "moveFromRangeStart",
@@ -136,6 +136,10 @@ const RUN_LEVEL: &[&str] = &[
     "customXmlMoveFromRangeEnd",
     "customXmlMoveToRangeStart",
     "customXmlMoveToRangeEnd",
+];
+
+/// The rest of EG_RunLevelElements (less math, which is not `w:`).
+const RUN_OTHER: &[&str] = &[
     "proofErr",
     "permStart",
     "permEnd",
@@ -235,7 +239,8 @@ const PPR_BASE: &[&str] = &[
     "cnfStyle",
 ];
 
-/// EG_RPrBase, in order.
+/// EG_RPrBase: an unordered choice that may repeat (CT_RPr and its kin take
+/// it `minOccurs="0" maxOccurs="unbounded"`).
 const RPR_BASE: &[&str] = &[
     "rStyle",
     "rFonts",
@@ -352,8 +357,8 @@ const SECTPR_BASE: &[&str] = &[
     "printerSettings",
 ];
 
-/// CT_TrPrBase: an unordered choice.
-const TRPR: &[&str] = &[
+/// CT_TrPrBase: an unordered choice that may repeat.
+const TRPR_BASE: &[&str] = &[
     "cnfStyle",
     "divId",
     "gridBefore",
@@ -366,15 +371,14 @@ const TRPR: &[&str] = &[
     "tblCellSpacing",
     "jc",
     "hidden",
-    "ins",
-    "del",
-    "trPrChange",
 ];
 
 /// Block content, as in a body or a cell (EG_BlockLevelElts).
-const BLOCKS: Names = Groups(&[BLOCK, RUN_LEVEL]);
+const BLOCKS: Names = Groups(&[BLOCK, RANGE_MARKUP, RUN_OTHER]);
 /// Paragraph content (EG_PContent and run-level markup).
-const INLINE: Names = Groups(&[P_CONTENT, RUN_LEVEL]);
+const INLINE: Names = Groups(&[P_CONTENT, RANGE_MARKUP, RUN_OTHER]);
+/// The paragraph mark's revision marks (EG_ParaRPrTrackChanges), in order.
+const PARA_RPR_REVISIONS: &[&str] = &["ins", "del", "moveFrom", "moveTo"];
 
 /// Each name once, in order.
 fn each(names: &'static [&'static str]) -> impl Iterator<Item = Slot> {
@@ -385,20 +389,20 @@ fn opt(name: &'static str) -> Slot {
     (One(name), Optional)
 }
 
-/// The model of a `w:` container, by its local name and its parent's.
-fn model(local: &str, parent: &str) -> Option<Vec<Slot>> {
-    // Border and margin sides: transitional `left`/`right` or `start`/`end`.
+/// The model of a `w:` container, by its local name and its ancestors' (the
+/// parent last): a revision's snapshot of properties (`pPrChange/pPr`, ...)
+/// has a narrower model than the properties themselves.
+fn model(local: &str, ancestors: &[&str]) -> Option<Vec<Slot>> {
+    let up = |n: usize| ancestors.len().checked_sub(n).map_or("", |i| ancestors[i]);
+    let parent = up(1);
+    // Border and margin sides: transitional has both the physical and the
+    // logical side, each optional.
     let sides = |extra: &'static [&'static str]| -> Vec<Slot> {
-        [
-            opt("top"),
-            (Groups(&[&["left", "start"]]), Optional),
-            opt("bottom"),
-            (Groups(&[&["right", "end"]]), Optional),
-        ]
-        .into_iter()
-        .chain(each(extra))
-        .collect()
+        each(&["top", "start", "left", "bottom", "end", "right"])
+            .chain(each(extra))
+            .collect()
     };
+    let rpr_base: Slot = (Groups(&[RPR_BASE]), Many);
     Some(match local {
         "body" => vec![(BLOCKS, Many), opt("sectPr")],
         "hdr" | "ftr" | "footnote" | "endnote" | "comment" | "txbxContent" | "docPartBody" => {
@@ -409,37 +413,61 @@ fn model(local: &str, parent: &str) -> Option<Vec<Slot>> {
         "smartTag" => vec![opt("smartTagPr"), (INLINE, Many)],
         "r" => vec![opt("rPr"), (Groups(&[RUN_CONTENT]), Many)],
         "tbl" => vec![
-            (Groups(&[RUN_LEVEL]), Many),
+            (Groups(&[RANGE_MARKUP]), Many),
             (One("tblPr"), Required),
             (One("tblGrid"), Required),
-            (Groups(&[&["tr", "customXml", "sdt"], RUN_LEVEL]), Many),
+            (
+                Groups(&[&["tr", "customXml", "sdt"], RANGE_MARKUP, RUN_OTHER]),
+                Many,
+            ),
         ],
         "tr" => vec![
             opt("tblPrEx"),
             opt("trPr"),
-            (Groups(&[&["tc", "customXml", "sdt"], RUN_LEVEL]), Many),
+            (
+                Groups(&[&["tc", "customXml", "sdt"], RANGE_MARKUP, RUN_OTHER]),
+                Many,
+            ),
         ],
         "tc" => vec![opt("tcPr"), (BLOCKS, Plus)],
-        // CT_PPr: also the base (pPrChange) and general (styles) forms.
+        // CT_PPrBase in a revision's snapshot.
+        "pPr" if parent == "pPrChange" => each(PPR_BASE).collect(),
+        // CT_PPr; a style's CT_PPrGeneral is a subset.
         "pPr" => each(PPR_BASE)
             .chain([opt("rPr"), opt("sectPr"), opt("pPrChange")])
             .collect(),
         // CT_ParaRPr: the paragraph mark's revision marks come first.
-        "rPr" if parent == "pPr" => each(&["ins", "del", "moveFrom", "moveTo"])
-            .chain(each(RPR_BASE))
-            .chain([opt("rPrChange")])
+        "rPr" if parent == "pPr" => each(PARA_RPR_REVISIONS)
+            .chain([rpr_base, opt("rPrChange")])
             .collect(),
-        "rPr" => each(RPR_BASE).chain([opt("rPrChange")]).collect(),
+        // CT_ParaRPrOriginal: a paragraph mark's snapshot.
+        "rPr" if parent == "rPrChange" && up(2) == "rPr" && up(3) == "pPr" => {
+            each(PARA_RPR_REVISIONS).chain([rpr_base]).collect()
+        }
+        // CT_RPrOriginal: a run's snapshot.
+        "rPr" if parent == "rPrChange" => vec![rpr_base],
+        "rPr" => vec![rpr_base, opt("rPrChange")],
+        "tblPr" if parent == "tblPrChange" => each(TBLPR_BASE).collect(),
         "tblPr" => each(TBLPR_BASE).chain([opt("tblPrChange")]).collect(),
+        "tblPrEx" if parent == "tblPrExChange" => each(TBLPREX_BASE).collect(),
         "tblPrEx" => each(TBLPREX_BASE).chain([opt("tblPrExChange")]).collect(),
-        "trPr" => vec![(Groups(&[TRPR]), Many)],
+        "trPr" if parent == "trPrChange" => vec![(Groups(&[TRPR_BASE]), Many)],
+        "trPr" => vec![
+            (Groups(&[TRPR_BASE]), Many),
+            opt("ins"),
+            opt("del"),
+            opt("trPrChange"),
+        ],
+        // CT_TcPrInner in a revision's snapshot: no tcPrChange.
         "tcPr" => each(TCPR_BASE)
             .chain([
                 opt("headers"),
                 (Groups(&[&["cellIns", "cellDel", "cellMerge"]]), Optional),
-                opt("tcPrChange"),
             ])
+            .chain((parent != "tcPrChange").then(|| opt("tcPrChange")))
             .collect(),
+        // CT_SectPrBase in a revision's snapshot: no header references.
+        "sectPr" if parent == "sectPrChange" => each(SECTPR_BASE).collect(),
         "sectPr" => [(Groups(&[&["headerReference", "footerReference"]]), Many)]
             .into_iter()
             .chain(each(SECTPR_BASE))
@@ -475,26 +503,34 @@ fn step_name(e: &Elem) -> String {
 pub fn validate(part: &str, root: &Elem) -> Vec<Violation> {
     let mut out = Vec::new();
     let path = format!("/{}", step_name(root));
-    walk(part, &path, root, "", &mut out);
+    walk(part, &path, root, &mut Vec::new(), &mut out);
     out
 }
 
-fn walk(part: &str, path: &str, e: &Elem, parent: &str, out: &mut Vec<Violation>) {
+/// `ancestors`: the local names above `e` (`""` for a foreign element).
+fn walk<'a>(
+    part: &str,
+    path: &str,
+    e: &'a Elem,
+    ancestors: &mut Vec<&'a str>,
+    out: &mut Vec<Violation>,
+) {
     if e.uri == MC && e.local == "AlternateContent" {
         return;
     }
     if is_w(e) {
-        if let Some(slots) = model(&e.local, parent) {
+        if let Some(slots) = model(&e.local, ancestors) {
             check(part, path, e, &slots, out);
         }
     }
-    let local = if is_w(e) { e.local.as_str() } else { "" };
+    ancestors.push(if is_w(e) { e.local.as_str() } else { "" });
     for (child, step) in e.children.iter().zip(child_steps(path, &e.children)) {
         if let Node::Elem(c) = child {
             let step = normalize_step(&step, c);
-            walk(part, &step, c, local, out);
+            walk(part, &step, c, ancestors, out);
         }
     }
+    ancestors.pop();
 }
 
 /// `child_steps` writes the qname as written; key on `w:<local>` instead.
@@ -535,7 +571,9 @@ fn check(part: &str, path: &str, e: &Elem, slots: &[Slot], out: &mut Vec<Violati
             used[i] += 1;
         } else if (0..slots.len()).any(|i| fits(i) && !open(i, &used)) {
             push(Rule::Duplicate, step_name(c));
-        } else if (0..cur).any(fits) {
+        } else if let Some(i) = (0..cur).find(|&i| fits(i)) {
+            // Present, just misplaced: not also `missing`.
+            used[i] += 1;
             push(Rule::Order, step_name(c));
         } else {
             push(Rule::NotAllowed, step_name(c));
