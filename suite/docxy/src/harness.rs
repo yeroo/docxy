@@ -3797,12 +3797,17 @@ fn dispatch_verb(
                             .into(),
                     );
                 }
+                let count = v.ed.project().tasks.len();
                 match target.at {
                     Some(crate::ShownRow::Task(i)) => {
-                        crate::project_cell_click(tab, i, Some(target.col), dbl)
+                        crate::project_cell_press(tab, i, target.col, shift);
+                        crate::project_cell_click(tab, i, Some(target.col), dbl);
+                        crate::project_cell_release(tab);
                     }
                     Some(crate::ShownRow::Entry) => {
-                        crate::project_entry_click(tab, Some(target.col), dbl)
+                        crate::project_cell_press(tab, count, target.col, shift);
+                        crate::project_entry_click(tab, Some(target.col), dbl);
+                        crate::project_cell_release(tab);
                     }
                     None => return Err("Project cell is outside the entry table".into()),
                 }
@@ -4291,11 +4296,45 @@ fn dispatch_verb(
         }
 
         // A drag: the press plants the anchor, each cell crossed is a move, the
-        // release commits whatever the moves armed.
+        // release commits whatever the moves armed. On a Project tab the ends
+        // are entry-table cells, as for `click-cell`.
         "drag" => {
             app.refuse_under_dialog()?;
             let (from, to) = drag_args(args)?;
             let ctrl = arg_flag(args, "ctrl")?;
+            if app.active_is_project() {
+                let tab = &mut app.tabs[app.active];
+                let (from_i, path) = {
+                    let crate::Surface::Project(v) = &tab.surface else {
+                        return Err("Project is not loaded".into());
+                    };
+                    if from.1 as usize >= crate::COLUMN_COUNT
+                        || to.1 as usize >= crate::COLUMN_COUNT
+                    {
+                        return Err("Project cell is outside the entry table".into());
+                    }
+                    // Rows are drawn rows, as for `click-cell`; the entry row
+                    // and past it move nothing (the range stops on the last
+                    // task), so they map to the entry row's press/drag no-ops.
+                    let count = v.ed.project().tasks.len();
+                    let at = |r: u32| match crate::shown_task(&v.ed, r as usize) {
+                        Some(crate::ShownRow::Task(i)) => i,
+                        _ => count,
+                    };
+                    let path = drag_path(from, to)
+                        .into_iter()
+                        .map(|(r, c)| (at(r), c as usize))
+                        .collect::<Vec<_>>();
+                    (at(from.0), path)
+                };
+                crate::project_cell_press(tab, from_i, from.1 as usize, false);
+                for (i, c) in path {
+                    crate::project_cell_drag_over(tab, i, c);
+                }
+                crate::project_cell_release(tab);
+                app.refocus(window, cx);
+                return Done::ok(state(app, window));
+            }
             sheet(app)?;
             app.grid_press_cell(from, ctrl, cx);
             for (r, c) in drag_path(from, to) {
