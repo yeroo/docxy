@@ -360,6 +360,7 @@ fn project_instruction_paths_exist() {
             "View Task Information",
             Constraint,
         ),
+        ("Task", "Properties", "Notes...", "Notes", Notes),
         ("Task", "Editing", "Find...", "Find...", Find),
         (
             "Task",
@@ -2800,6 +2801,137 @@ fn hyperlink_prompt_empty_buffer_removes_empty_stored_parts() {
     assert_eq!(hyperlink_parts(&t), (None, Some(String::new()), None));
 }
 
+/// #454: Task › Properties › Notes... opens the prompt prefilled with the
+/// one-line form of the stored notes; Enter commits as one undo step.
+#[test]
+fn notes_prompt_prefills_and_commit_sets_notes_and_undo_restores() {
+    let mut t = tab();
+    // No notes yet: the prompt opens with an empty buffer.
+    apply_project_act(&mut t, ProjectAct::Notes);
+    let p = v(&t).prompt.as_ref().unwrap();
+    assert_eq!(p.kind, PromptKind::Notes);
+    assert_eq!(p.uid, Some(2));
+    assert_eq!(p.buf, "");
+    vm(&mut t).cancel_prompt();
+    // Multi-line notes prefill escaped, newlines intact.
+    vm(&mut t).ed.set_notes(2, "Line 1\nLine 2").unwrap();
+    apply_project_act(&mut t, ProjectAct::Notes);
+    assert_eq!(v(&t).prompt.as_ref().unwrap().buf, "Line 1\\nLine 2");
+    vm(&mut t).cancel_prompt();
+    // Enter on a new buffer commits, as ONE undo step on top of the edit
+    // above.
+    let depth = v(&t).ed.undo_depth();
+    commit(&mut t, ProjectAct::Notes, "run the checks");
+    assert_eq!(
+        v(&t).ed.project().task(2).unwrap().notes.as_deref(),
+        Some("run the checks")
+    );
+    assert_eq!(t.status.as_ref(), "Notes set");
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(
+        v(&t).ed.project().task(2).unwrap().notes.as_deref(),
+        Some("Line 1\nLine 2")
+    );
+}
+
+/// #454: the prefill escapes newlines, so Enter on it unchanged keeps a
+/// multi-line note intact, pushing no undo step and reporting nothing.
+#[test]
+fn notes_prompt_multiline_notes_survive_enter_on_prefill() {
+    let mut t = tab();
+    vm(&mut t).ed.set_notes(2, "a\nb").unwrap();
+    vm(&mut t).ed.mark_saved();
+    let depth = v(&t).ed.undo_depth();
+    let status = t.status.clone();
+    apply_project_act(&mut t, ProjectAct::Notes);
+    assert_eq!(v(&t).prompt.as_ref().unwrap().buf, "a\\nb");
+    press(&mut t, "enter");
+    assert_eq!(
+        v(&t).ed.project().task(2).unwrap().notes.as_deref(),
+        Some("a\nb")
+    );
+    assert_eq!(v(&t).ed.undo_depth(), depth);
+    assert_eq!(t.status, status);
+    assert!(!t.dirty);
+}
+
+#[test]
+fn notes_prompt_empty_removes_and_reports() {
+    let mut t = tab();
+    // Nothing to remove: no status, no history.
+    let status = t.status.clone();
+    commit(&mut t, ProjectAct::Notes, "");
+    assert_eq!(v(&t).ed.project().task(2).unwrap().notes, None);
+    assert_eq!(t.status, status);
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    // A removed note says so, as one undo step holding the previous note.
+    vm(&mut t).ed.set_notes(2, "docs").unwrap();
+    commit(&mut t, ProjectAct::Notes, "");
+    assert_eq!(v(&t).ed.project().task(2).unwrap().notes, None);
+    assert_eq!(t.status.as_ref(), "Notes removed");
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(
+        v(&t).ed.project().task(2).unwrap().notes.as_deref(),
+        Some("docs")
+    );
+}
+
+#[test]
+fn notes_prompt_does_not_open_on_the_entry_row() {
+    let mut t = tab();
+    vm(&mut t).enter_entry_row();
+    let status = t.status.clone();
+    apply_project_act(&mut t, ProjectAct::Notes);
+    assert!(v(&t).prompt.is_none());
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    assert_eq!(t.status, status);
+    assert!(!t.dirty);
+}
+
+/// #454: the row menu's Notes... opens the prompt on a task row only, like
+/// Information....
+#[test]
+fn row_menu_notes_is_enabled_on_a_task_row() {
+    let mut t = tab();
+    let enabled = |t: &DocTab| enabled_items(t).contains(&"Notes...".to_string());
+    assert!(enabled(&t), "a task row notes");
+    // A blank row in the middle of the plan has no task to note.
+    let i = vm(&mut t).ed.insert_blank_row(Some(2)).unwrap();
+    vm(&mut t).ed.select(i);
+    assert!(!enabled(&t), "a blank row does not");
+    vm(&mut t).enter_entry_row();
+    assert!(!enabled(&t), "the entry row does not");
+}
+
+/// #454: Task › Properties › Notes... is on the ribbon with Project's
+/// label and screentip, in the ribbon inventory.
+#[test]
+fn ribbon_has_task_properties_notes() {
+    use ProjectAct::*;
+    let r = project_ribbon();
+    let task = r.tabs.iter().find(|t| t.name == "Task").unwrap();
+    let props = task
+        .groups
+        .iter()
+        .find(|g| g.title == "Properties")
+        .unwrap();
+    let cmds: Vec<_> = props
+        .items
+        .iter()
+        .flat_map(|c| match c {
+            Control::Large(c) => vec![c],
+            Control::Column(c) => c.iter().collect(),
+            _ => vec![],
+        })
+        .collect();
+    let notes = cmds.iter().find(|c| c.id == "pr-notes").unwrap();
+    assert_eq!(notes.label, "Notes...");
+    assert_eq!(notes.tip.title, "Notes");
+    assert!(matches!(notes.act, Act::Project(Notes)));
+    assert!(ProjectAct::RIBBON.contains(&Notes));
+}
+
 #[test]
 fn hyperlink_prompt_does_not_open_on_the_entry_row() {
     let mut t = tab();
@@ -3266,6 +3398,7 @@ fn the_row_menu_enables_by_the_row_under_the_cursor() {
         "Auto Schedule",
         "Assign Resources...",
         "Information...",
+        "Notes...",
         "Hyperlink...",
     ];
     assert_eq!(enabled_items(&t), all_task);
