@@ -728,6 +728,9 @@ impl Docxy {
         if remove {
             // Saving temporarily activates the target. A successful close must
             // preserve the same previous tab as a clean close or Don't Save.
+            // Before the removal shifts the indexes, so the status reset hits
+            // the tab the highlighting mode started on (#623).
+            self.cancel_highlight_mode();
             self.active = previous_active;
             remove_tab(&mut self.tabs, &mut self.active, i);
             // The Info page's result is keyed by tab index (#627).

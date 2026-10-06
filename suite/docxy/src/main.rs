@@ -20008,6 +20008,7 @@ impl Docxy {
             return;
         }
         self.mini_bar = None;
+        self.cancel_highlight_mode();
         // On a sheet, Tab commits the edit and advances one cell to the right.
         if self.active_is_sheet() {
             // A Chart-panel range field swallows Tab the same way it swallows
@@ -20121,6 +20122,7 @@ impl Docxy {
             return;
         }
         self.mini_bar = None;
+        self.cancel_highlight_mode();
         // On a sheet, Shift+Tab commits and moves one cell to the left.
         if self.active_is_sheet() {
             // Same as Tab above: the field has the keyboard first, then
@@ -20162,11 +20164,14 @@ impl Docxy {
             return self.menu_key(&ev.keystroke.key, window, cx);
         }
         // The highlighting mode (#623) ends on Esc, which it consumes, and on
-        // any other key but a bare modifier. KeyTips and the find bar take
-        // their own Esc first, and the KeyTips' Alt leaves the mode be.
+        // any other key but a bare modifier. KeyTips, the find bar and the
+        // comment bar take their keys (Esc included) first; the KeyTips' Alt
+        // leaves the mode be.
         let hl_key = ev.keystroke.key.as_str();
         if self.hl_mode.is_some()
             && self.keytips == KeyTip::Off
+            && !self.find_open
+            && !self.comment_open
             && !matches!(
                 hl_key,
                 "shift" | "control" | "alt" | "platform" | "function"
@@ -20174,7 +20179,7 @@ impl Docxy {
         {
             if hl_key != "escape" {
                 self.cancel_highlight_mode();
-            } else if !self.find_open && self.cancel_highlight_mode() {
+            } else if self.cancel_highlight_mode() {
                 cx.notify();
                 return;
             }
@@ -26834,9 +26839,9 @@ impl Docxy {
         if refused {
             return self.refocus(window, cx);
         }
-        // A command that edits or moves the document, or opens Find, takes the
-        // editor and ends the highlighting mode (#623). The Text highlight
-        // button handles its own click, and the view-only toggles leave it be.
+        // Every command ends the highlighting mode (#623) except the Text
+        // highlight button, which handles its own click, and the view-only
+        // toggles listed here; a new command ends it unless listed.
         if !matches!(
             act,
             Act::Highlight
@@ -26846,6 +26851,7 @@ impl Docxy {
                 | Act::AutoHideRibbon
                 | Act::ToggleRuler
                 | Act::ToggleComments
+                | Act::ToggleNotes
                 | Act::Markup(_)
                 | Act::PrintLayout
         ) {
@@ -29713,6 +29719,7 @@ impl Docxy {
         }
         self.flush_project_passes(cx);
         self.close_menu();
+        self.cancel_highlight_mode();
         self.tab_more_open = false;
         if tabstrip::move_index(&mut self.tabs, &mut self.active, from, to) {
             // The Info page's result is keyed by tab index (#627).
