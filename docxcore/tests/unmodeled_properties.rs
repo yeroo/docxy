@@ -24,14 +24,24 @@ const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006
 /// A minimal package whose `word/document.xml` body is `body`, under a root
 /// that declares `w14` (ignorable), as Word writes it.
 fn docx(body: &str) -> Vec<u8> {
+    docx_with_root(
+        &format!(
+            "<w:document xmlns:w=\"{W_NS}\" xmlns:w14=\"{W14_NS}\" xmlns:mc=\"{MC_NS}\" \
+             mc:Ignorable=\"w14\">"
+        ),
+        &format!("<w:body>{body}</w:body>"),
+    )
+}
+
+/// A minimal package whose `word/document.xml` is `root` (the `w:document`
+/// start tag), then `body` (the whole `w:body` element).
+fn docx_with_root(root: &str, body: &str) -> Vec<u8> {
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
     let root_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
     let document = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-         <w:document xmlns:w=\"{W_NS}\" xmlns:w14=\"{W14_NS}\" xmlns:mc=\"{MC_NS}\" \
-         mc:Ignorable=\"w14\"><w:body>{body}</w:body></w:document>"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n{root}{body}</w:document>"
     );
     write_zip(&[
         (
@@ -391,4 +401,157 @@ fn out_of_order_properties_reload_to_the_same_document() {
     let loaded = editor.doc.clone();
     let (_, reloaded) = open(&save(pkg, editor));
     assert_eq!(reloaded.doc, loaded);
+}
+
+/// Review r1: an attribute in a prefix declared below the root (on `w:body`,
+/// `w:tc`) brings its declaration along; `w:body` and `w:tc` are rebuilt on
+/// save without theirs, which would leave the prefix unbound.
+#[test]
+fn attributes_keep_namespaces_declared_below_the_root() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\">"),
+        &format!(
+            "<w:body xmlns:w14=\"{W14_NS}\"><w:p w14:paraId=\"1A2B3C4D\"><w:r><w:t>body</w:t></w:r></w:p>\
+             <w:tbl><w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid><w:tr><w:tc xmlns:ux=\"urn:ux\">\
+             <w:p ux:mark=\"1\"><w:r ux:mark=\"2\"><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>\
+             <w:p/></w:body>"
+        ),
+    );
+    let (pkg, editor) = open(&original);
+    let xml = document_xml(&save(pkg, editor));
+    assert!(
+        xml.contains(&format!(
+            "<w:p w14:paraId=\"1A2B3C4D\" xmlns:w14=\"{W14_NS}\">"
+        )),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<w:p ux:mark=\"1\" xmlns:ux=\"urn:ux\">")
+            && xml.contains("<w:r ux:mark=\"2\" xmlns:ux=\"urn:ux\">"),
+        "{xml}"
+    );
+}
+
+/// Review r1: a header or footer is written through `blocks_to_xml`, which
+/// keeps its paragraph ids unique as the document body does.
+#[test]
+fn a_split_header_paragraph_keeps_its_para_id_once() {
+    let header = format!(
+        "<w:hdr xmlns:w=\"{W_NS}\" xmlns:w14=\"{W14_NS}\">\
+         <w:p w:rsidR=\"00AA0001\" w14:paraId=\"1A2B3C4D\"><w:r><w:t>HeaderText</w:t></w:r></w:p></w:hdr>"
+    );
+    let blocks = docxcore::load::parse_header_footer(&header, &Default::default());
+    let mut editor = Editor::new(docxcore::model::Document { body: blocks });
+    editor.set_caret(Caret::top(0, 6));
+    editor.insert_newline();
+    let xml = docxcore::serialize::blocks_to_xml(&editor.doc.body);
+    assert_eq!(xml.matches("<w:p w:rsidR=\"00AA0001\"").count(), 2, "{xml}");
+    assert_eq!(para_ids(&xml), ["1A2B3C4D"], "{xml}");
+}
+
+/// Review r1: the shadow is kept in schema order, so a twin before its
+/// primary (`w:szCs` before `w:sz`, `w:bCs` before `w:b`) must parse the same
+/// either way; otherwise an untouched size reads as edited and both are
+/// rewritten to one value.
+#[test]
+fn twins_before_their_primary_survive_an_untouched_save() {
+    let body = "<w:p><w:r><w:rPr><w:bCs/><w:b w:val=\"0\"/><w:iCs w:val=\"0\"/><w:i/>\
+                <w:szCs w:val=\"30\"/><w:sz w:val=\"20\"/></w:rPr><w:t>text</w:t></w:r></w:p>";
+    let (original, saved) = round_trip(body);
+    let rpr = rpr_of(&document_xml(&saved), "text").to_string();
+    for kept in [
+        "<w:b w:val=\"0\"/>",
+        "<w:bCs/>",
+        "<w:i/>",
+        "<w:iCs w:val=\"0\"/>",
+        "<w:sz w:val=\"20\"/>",
+        "<w:szCs w:val=\"30\"/>",
+    ] {
+        assert!(rpr.contains(kept), "{kept} lost: {rpr}");
+    }
+    // Reordered into schema order, the values are the same.
+    let (_, loaded) = open(&original);
+    let (_, reloaded) = open(&saved);
+    let Block::Paragraph(p) = &loaded.doc.body[0] else {
+        panic!("paragraph");
+    };
+    let Inline::Run(r) = &p.content[0] else {
+        panic!("run");
+    };
+    assert!(!r.props.bold && r.props.italic, "{rpr}");
+    assert_eq!(r.props.size_half_pts, Some(20));
+    assert_eq!(reloaded.doc, loaded.doc);
+}
+
+/// Review r1: picking the colour or font a run already has, while a theme
+/// value overrides it, makes the pick take effect.
+#[test]
+fn picking_the_loaded_color_or_font_drops_the_theme_that_overrides_it() {
+    let xml = edited(
+        "<w:p><w:r><w:rPr><w:rFonts w:ascii=\"Arial\" w:asciiTheme=\"minorHAnsi\" w:cs=\"Arial\"/>\
+         <w:color w:val=\"FF0000\" w:themeColor=\"accent1\"/></w:rPr><w:t>text</w:t></w:r></w:p>",
+        |e| {
+            e.set_color(Some("FF0000".to_string()));
+            e.set_font("Arial");
+        },
+    );
+    assert_eq!(
+        rpr_of(&xml, "text"),
+        "<w:rPr><w:rFonts w:ascii=\"Arial\" w:hAnsi=\"Arial\" w:cs=\"Arial\"/>\
+         <w:color w:val=\"FF0000\"/></w:rPr>",
+        "{xml}"
+    );
+}
+
+/// Review r1: a font edit fills the high-ANSI slot too, also on a run with no
+/// direct `w:rFonts`.
+#[test]
+fn a_new_font_fills_the_ascii_and_high_ansi_slots() {
+    let xml = edited("<w:p><w:r><w:t>text</w:t></w:r></w:p>", |e| {
+        e.set_font("Courier New")
+    });
+    assert_eq!(
+        rpr_of(&xml, "text"),
+        "<w:rPr><w:rFonts w:ascii=\"Courier New\" w:hAnsi=\"Courier New\"/></w:rPr>",
+        "{xml}"
+    );
+}
+
+/// Review r1: rejecting a tracked property change restores the properties,
+/// not the start-tag attributes, which are not properties.
+#[test]
+fn rejecting_a_property_change_keeps_rsids_and_para_id() {
+    let date = "2026-01-01T00:00:00Z";
+    let (pkg, mut editor) = open(&docx(&format!(
+        "<w:p w:rsidR=\"00AA0001\" w14:paraId=\"1A2B3C4D\"><w:pPr><w:jc w:val=\"center\"/>\
+         <w:pPrChange w:id=\"1\" w:author=\"A\" w:date=\"{date}\"><w:pPr/></w:pPrChange></w:pPr>\
+         <w:r w:rsidR=\"00AA0002\"><w:rPr><w:b/>\
+         <w:rPrChange w:id=\"2\" w:author=\"A\" w:date=\"{date}\"><w:rPr/></w:rPrChange></w:rPr>\
+         <w:t>text</w:t></w:r></w:p>"
+    )));
+    let outcomes = editor.reject_all_revisions();
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+    let xml = document_xml(&save(pkg, editor));
+    assert!(!xml.contains("w:jc") && !xml.contains("<w:b/>"), "{xml}");
+    assert!(
+        xml.contains("<w:p w:rsidR=\"00AA0001\" w14:paraId=\"1A2B3C4D\">")
+            && xml.contains("<w:r w:rsidR=\"00AA0002\">"),
+        "{xml}"
+    );
+}
+
+/// Review r1: tabs and line ends in a kept attribute value are written as
+/// character references, so they are not normalized to spaces on reload.
+#[test]
+fn whitespace_references_in_kept_attributes_survive() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:ux=\"urn:ux\">"),
+        "<w:body><w:p ux:label=\"A&#10;B&#9;C&#13;D\"><w:r><w:t>text</w:t></w:r></w:p></w:body>",
+    );
+    let (pkg, editor) = open(&original);
+    let xml = document_xml(&save(pkg, editor));
+    assert!(
+        xml.contains("<w:p ux:label=\"A&#10;B&#9;C&#13;D\">"),
+        "{xml}"
+    );
 }

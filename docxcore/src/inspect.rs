@@ -992,6 +992,29 @@ mod tests {
         assert_eq!(xml.matches("keep").count(), 2, "{xml}");
     }
 
+    /// #1063: text-box paragraphs keep their `w14:paraId`, the same in the
+    /// Choice and the Fallback copy. A save must not drop it from the Fallback
+    /// as a repeat, or the reopened copies differ and a second removal no
+    /// longer reaches the Fallback.
+    #[test]
+    fn inspect_removal_after_reopen_reaches_a_fallback_with_para_ids() {
+        let boxed = two_copy_text_box(&format!(
+            "<w:p w14:paraId=\"1A2B3C4D\" w:rsidR=\"00A1B2C3\">\
+             <w:commentRangeStart w:id=\"5\"/>{VISIBLE}<w:commentRangeEnd w:id=\"5\"/>{HIDDEN}</w:p>"
+        ));
+        let mut doc = parse(&boxed);
+        assert_eq!(remove_all_comment_markers(&mut doc), 1 + 1);
+        let xml = document_to_xml(&doc);
+        assert_eq!(xml.matches("w14:paraId=\"1A2B3C4D\"").count(), 2, "{xml}");
+        let body = &xml[xml.find("<w:body>").unwrap() + 8..xml.find("</w:body>").unwrap()];
+        let mut reopened = parse(body);
+        assert_eq!(remove_hidden_text(&mut reopened), 1);
+        let xml = document_to_xml(&reopened);
+        assert!(!xml.contains("gone"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+        assert_eq!(xml.matches("w14:paraId=\"1A2B3C4D\"").count(), 2, "{xml}");
+    }
+
     /// #917: deleting one comment strips only its markers. Text in the same
     /// raw run and a `w:customXml` wrapper around its range stay; a run left
     /// holding only `w:rPr` goes; the other comments' markers stay.

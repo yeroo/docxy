@@ -52,16 +52,6 @@ impl PartialEq for ElementAttrs {
 
 impl Eq for ElementAttrs {}
 
-impl std::hash::Hash for ElementAttrs {
-    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
-}
-
-impl ElementAttrs {
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
 /// Character-level formatting (a resolved `w:rPr`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RunProps {

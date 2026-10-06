@@ -711,6 +711,8 @@ fn transform_run_props(
     };
     overlay_revision_cues(&mut restored, props.revision_cues);
     restored.property_change = None;
+    // The run's start-tag attributes (rsids) are not run properties.
+    restored.element_attrs = std::mem::take(&mut props.element_attrs);
     *props = restored;
     Some(Ok(RevisionCategory::Property(PropertyScope::Run)))
 }
@@ -770,6 +772,8 @@ fn transform_par_props(
     );
     restored.mark_revisions = std::mem::take(&mut props.mark_revisions);
     restored.property_change = None;
+    // Nor are the paragraph's start-tag attributes (rsids, `w14:paraId`).
+    restored.element_attrs = std::mem::take(&mut props.element_attrs);
     *props = restored;
     Some(Ok(RevisionCategory::Property(PropertyScope::Paragraph)))
 }

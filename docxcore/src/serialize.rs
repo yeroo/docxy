@@ -2,12 +2,14 @@
 //!
 //! This is a *semantic* serializer: it re-emits the structure and properties we
 //! model (paragraphs, runs + rPr, tables, lists, hyperlinks). It is designed so
-//! that `parse_document_xml(document_to_xml(&doc)) == doc` for everything we
-//! model — see the round-trip tests. A loaded document also keeps each modeled
+//! that `parse_document_xml(document_to_xml(&doc))` has every modeled value of
+//! `doc` (see the round-trip tests). A loaded document also keeps each modeled
 //! property's elements verbatim (`shadow`, #1063): an unedited property is
 //! written from them, so what the model does not represent survives a save.
-//! Unknown body content remains raw, while the body-level final `sectPr` is
-//! modeled so its revision can be reviewed.
+//! The reloaded copy has the shadow of what was written, so it equals `doc`
+//! exactly when `doc` was itself loaded and not edited; otherwise it is equal
+//! once shadows are cleared. Unknown body content remains raw, while the
+//! body-level final `sectPr` is modeled so its revision can be reviewed.
 
 use crate::model::*;
 use crate::xml::{Event, XmlParser};
@@ -20,11 +22,7 @@ const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
 
 /// Serialize a document to the bytes of `word/document.xml`.
 pub fn document_to_xml(doc: &Document) -> String {
-    let mut body = String::new();
-    for block in &doc.body {
-        write_block(&mut body, block);
-    }
-    let body = without_duplicate_para_ids(body);
+    let body = blocks_to_xml(&doc.body);
 
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
@@ -51,7 +49,10 @@ pub fn document_to_xml(doc: &Document) -> String {
 /// `xml` without each `w14:paraId` on a `w:p`/`w:tr` that repeats an earlier
 /// one. A paragraph split, copied, pasted or merged keeps its loaded start-tag
 /// attributes, but Word requires paragraph ids to be unique in the document;
-/// the first occurrence keeps its id, so an unedited document is unchanged.
+/// the first occurrence keeps its id, so an unedited document whose ids are
+/// already unique is unchanged. An `mc:Fallback` is another rendering of its
+/// `mc:Choice` (a text box's VML copy holds the same paragraphs), so ids
+/// inside it are neither counted nor dropped.
 fn without_duplicate_para_ids(xml: String) -> String {
     const NAME: &str = "w14:paraId";
     if xml.matches(NAME).nth(1).is_none() {
@@ -61,10 +62,21 @@ fn without_duplicate_para_ids(xml: String) -> String {
     let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
     let base = xml.as_ptr() as usize;
     let mut parser = XmlParser::new(&xml);
+    // Open elements, and how many of them are `mc:Fallback`.
+    let mut open: Vec<bool> = Vec::new();
+    let mut in_fallback = 0usize;
     loop {
         match parser.next() {
+            Event::End => {
+                if open.pop() == Some(true) {
+                    in_fallback -= 1;
+                }
+            }
             Event::Start => {
-                if !matches!(parser.name(), "w:p" | "w:tr") {
+                let fallback = parser.name() == "mc:Fallback";
+                open.push(fallback);
+                in_fallback += usize::from(fallback);
+                if in_fallback > 0 || !matches!(parser.name(), "w:p" | "w:tr") {
                     continue;
                 }
                 let Some(attr) = parser.attrs().iter().find(|a| a.name == NAME) else {
@@ -147,7 +159,9 @@ pub fn blocks_to_xml(blocks: &[Block]) -> String {
     for block in blocks {
         write_block(&mut s, block);
     }
-    s
+    // Every part written from blocks (the body, a header or footer, a text
+    // box's content) keeps its paragraph ids unique.
+    without_duplicate_para_ids(s)
 }
 
 fn esc_text(s: &str, out: &mut String) {
@@ -377,6 +391,33 @@ impl<'a> Shadow<'a> {
     }
 }
 
+/// Strip `attrs` from the loaded element named `local` in `shadow`, dropping
+/// the element when nothing is left. An explicit property edit calls it, so
+/// the edit is written from the model even when it sets the loaded value, and
+/// the attributes it replaces (a theme colour or font that would override it)
+/// go with it.
+pub(crate) fn forget_shadow_attrs(shadow: &mut Vec<String>, local: &str, attrs: &[&str]) {
+    shadow.retain_mut(|raw| {
+        if local_name(raw) != local {
+            return true;
+        }
+        let name = raw
+            .trim_start()
+            .trim_start_matches('<')
+            .split([' ', '/', '>', '\t', '\n', '\r'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let mut kept = element_attrs_of(raw);
+        kept.retain(|(n, _)| !attrs.contains(&n.as_str()));
+        if kept.is_empty() {
+            return false;
+        }
+        *raw = empty_element(&name, &kept);
+        true
+    });
+}
+
 /// The decoded attributes of the start tag `raw` begins with.
 fn element_attrs_of(raw: &str) -> Vec<(String, String)> {
     let mut p = XmlParser::new(raw);
@@ -393,12 +434,22 @@ fn element_attrs_of(raw: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Decoded attributes as ` name="value"`. Tabs and line ends are written as
+/// character references, which attribute-value normalization keeps (a literal
+/// one would load back as a space).
 fn write_attrs(s: &mut String, attrs: &[(String, String)]) {
     for (name, value) in attrs {
         s.push(' ');
         s.push_str(name);
         s.push_str("=\"");
-        esc_attr(value, s);
+        for ch in value.chars() {
+            match ch {
+                '\t' => s.push_str("&#9;"),
+                '\n' => s.push_str("&#10;"),
+                '\r' => s.push_str("&#13;"),
+                _ => esc_attr(ch.encode_utf8(&mut [0; 4]), s),
+            }
+        }
         s.push('"');
     }
 }
@@ -479,10 +530,10 @@ impl RprGroup {
     }
 }
 
-/// An edited `w:rFonts`. A loaded element keeps its other script slots
-/// (`w:eastAsia`, `w:cs`, `w:hint`, their themes); the new font replaces the
-/// ASCII and high-ANSI slots, and their theme fonts, which would otherwise
-/// take precedence over it.
+/// An edited `w:rFonts`. The new font fills the ASCII and high-ANSI slots
+/// (Word's font box sets both), replacing their theme fonts, which would
+/// otherwise take precedence over it; a loaded element keeps its other script
+/// slots (`w:eastAsia`, `w:cs`, `w:hint`, their themes).
 fn rfonts_xml(font: Option<&str>, loaded: Option<&str>) -> Option<String> {
     let mut attrs = loaded.map(element_attrs_of).unwrap_or_default();
     attrs.retain(|(n, _)| {
@@ -492,9 +543,7 @@ fn rfonts_xml(font: Option<&str>, loaded: Option<&str>) -> Option<String> {
         )
     });
     if let Some(f) = font {
-        if loaded.is_some() {
-            attrs.insert(0, ("w:hAnsi".to_string(), f.to_string()));
-        }
+        attrs.insert(0, ("w:hAnsi".to_string(), f.to_string()));
         attrs.insert(0, ("w:ascii".to_string(), f.to_string()));
     }
     (!attrs.is_empty()).then(|| empty_element("w:rFonts", &attrs))
