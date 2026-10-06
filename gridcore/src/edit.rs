@@ -1583,8 +1583,9 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
 /// it adds a row above it) or delete it: so the formula is moved as the
 /// first row from the first data row down that survives holds it (a data
 /// row, or the row after a deleted block that took every data row; the row
-/// a header-only table's first data row would be), then read back in the
-/// first data row of the moved table. A column edit, or one on another
+/// a header-only table's first data row would be), else the row above it
+/// (a delete at the foot of the grid), then read back in the first data row
+/// of the moved table. A column edit, or one on another
 /// sheet, moves it as a cell formula, as does a row edit that leaves no
 /// row to anchor on.
 fn shift_calculated_formulas(
@@ -1602,8 +1603,10 @@ fn shift_calculated_formulas(
         .then(|| {
             let first = t.range.0 + t.header_rows;
             let reach = u32::try_from(shift.delta.unsigned_abs()).unwrap_or(u32::MAX);
-            let kept =
-                (first..=first.saturating_add(reach)).find(|&r| point(r, shift).is_some())?;
+            let last = first.saturating_add(reach).min(MAX_ROWS - 1);
+            let kept = (first..=last)
+                .chain(first.checked_sub(1))
+                .find(|&r| point(r, shift).is_some())?;
             let (lo, _) = span(t.range.0, t.range.2, shift)?;
             Some((first, kept, point(kept, shift)?, lo + t.header_rows))
         })
@@ -2177,10 +2180,12 @@ fn rewrite_workbook_formulas(
             dn.formula = updated;
         }
     }
-    // A table's calculated-column formulas sit in its first data row.
+    // A table's calculated-column formulas sit in its first data row, or,
+    // in a table with none, in its last row: a site inside the table, so
+    // its bare references still name it.
     for t in &mut wb.tables {
-        let (r1, c1, ..) = t.range;
-        let row = r1 + t.header_rows;
+        let (r1, c1, r2, _) = t.range;
+        let row = (r1 + t.header_rows).min(r2);
         let sheet = t.sheet;
         for (j, slot) in t.calculated_formulas.iter_mut().enumerate() {
             let Some(src) = slot else {
@@ -2266,14 +2271,16 @@ pub fn resize_table(
     resize_table_at(wb, idx, rect, false)
 }
 
-/// [`resize_table`] on table `idx`. A new column with no header text is
-/// `Column<its position>` as Resize Table names it, or, when `lowest_free`,
-/// the lowest `Column<n>` no column has, as Excel's AutoExpansion names it.
+/// [`resize_table`] on table `idx`, or, when `auto`, Excel's AutoExpansion
+/// of it. A new column with no header text is `Column<its position>` as
+/// Resize Table names it, or, for AutoExpansion, the lowest `Column<n>` no
+/// column has. AutoExpansion grows a table that has no data row (its rows
+/// all deleted) by a column too, where Resize Table wants a data row.
 fn resize_table_at(
     wb: &mut Workbook,
     idx: usize,
     rect: (u32, u32, u32, u32),
-    lowest_free: bool,
+    auto: bool,
 ) -> Result<(), String> {
     let t = &wb.tables[idx];
     let (r1, c1, r2, c2) = rect;
@@ -2286,7 +2293,8 @@ fn resize_table_at(
     if !rects_overlap(t.range, rect) {
         return Err("The new range must overlap the table".into());
     }
-    if r2 - r1 < t.header_rows + t.totals_rows {
+    let same_rows = (r1, r2) == (t.range.0, t.range.2);
+    if r2 - r1 < t.header_rows + t.totals_rows && !(auto && same_rows) {
         return Err("A table needs at least one data row".into());
     }
     // The totals row is the table's last row: a new bottom would leave its
@@ -2327,7 +2335,7 @@ fn resize_table_at(
         let header = (header_rows > 0)
             .then(|| wb.sheets[sheet].cell(r1, c).map(|cl| cl.value.clone()))
             .flatten();
-        let n = if lowest_free {
+        let n = if auto {
             (1..)
                 .find(|n| {
                     !taken
@@ -2388,7 +2396,7 @@ pub fn typed_entry_near_table(wb: &Workbook, sheet: usize, (r, c): (u32, u32)) -
     }
     if let Some(t) = wb.tables.iter().find(|t| t.contains(sheet, r, c)) {
         let data = t.data_rows().is_some_and(|(d1, d2)| (d1..=d2).contains(&r));
-        let cse = cell.f_attrs.as_deref().is_some_and(is_array_f);
+        let cse = cell.f_attrs.as_deref().is_some_and(is_array_f) && !cell.is_dynamic();
         return data && cell.formula.is_some() && !cse;
     }
     wb.tables.iter().any(|t| {
@@ -2493,7 +2501,7 @@ pub fn fill_calculated_column(wb: &mut Workbook, sheet: usize, (r, c): (u32, u32
     let Some(cell) = wb.sheets.get(sheet).and_then(|s| s.cell(r, c)) else {
         return false;
     };
-    let cse = cell.f_attrs.as_deref().is_some_and(is_array_f);
+    let cse = cell.f_attrs.as_deref().is_some_and(is_array_f) && !cell.is_dynamic();
     let Some(src) = cell.formula.clone().filter(|_| !cse) else {
         return false;
     };
@@ -5311,10 +5319,30 @@ mod table_tests {
             wb.sheets[0].set_cell(r, c, cell);
             typed_entry_near_table(wb, 0, (r, c))
         };
-        // Inside: a non-array formula in the data rows only.
+        // Inside: a formula (not a legacy CSE one) in the data rows only.
         assert!(!near(&mut wb, "A2", Cell::number(9.0)));
         assert!(near(&mut wb, "C3", Cell::formula("A3")));
         assert!(!near(&mut wb, "C1", Cell::formula("A3")));
+        let dynamic = |f: &str, attrs: Option<&str>| Cell {
+            f_attrs: attrs.map(str::to_string),
+            meta: Some(Box::new(crate::sheet::CellMeta {
+                modern: true,
+                dynamic: true,
+                ..Default::default()
+            })),
+            ..Cell::formula(f)
+        };
+        assert!(near(&mut wb, "C3", dynamic("A3:A4", None)));
+        // A loaded dynamic array keeps its `t="array"`: not a CSE one.
+        let loaded = dynamic("A3:A4", Some(" t=\"array\" ref=\"C3:C4\""));
+        assert!(near(&mut wb, "C3", loaded));
+        let cse = Cell {
+            f_attrs: Some(" t=\"array\" ref=\"C3\"".into()),
+            ..Cell::formula("A3")
+        };
+        assert!(!near(&mut wb, "C3", cse));
+        assert!(!fill_calculated_column(&mut wb, 0, (2, 2)));
+        wb.sheets[0].set_cell(2, 2, Cell::default());
         // Beside: below, right, not diagonal or blank.
         assert!(near(&mut wb, "B5", Cell::number(1.0)));
         assert!(near(&mut wb, "D1", Cell::text("x")));
@@ -5418,5 +5446,53 @@ mod table_tests {
             wb.tables[0].calculated_formulas[2].as_deref(),
             Some("A2*B2")
         );
+    }
+
+    /// A header renamed while its table has no data row reaches the bare
+    /// references of the table's calculated formulas, which sit in the table.
+    #[test]
+    fn a_header_rename_in_a_header_only_table_reaches_its_formulas() {
+        let mut wb = calc_682();
+        type_at(&mut wb, "C2", Cell::formula("[@Qty]*[@Price]"));
+        delete_rows(&mut wb, 0, 1, 3);
+        wb.sheets[0].set_cell(0, 1, Cell::text("Cost"));
+        sync_table_headers(&mut wb, 0, &[(0, 1)]);
+        assert_eq!(
+            wb.tables[0].calculated_formulas[2].as_deref(),
+            Some("[@Qty]*[@Cost]")
+        );
+        type_at(&mut wb, "A2", Cell::number(5.0));
+        type_at(&mut wb, "B2", Cell::number(2.0));
+        assert_eq!(formula(&wb, 0, "C2"), "[@Qty]*[@Cost]");
+        assert_eq!(value(&mut wb, 0, "C2"), CellValue::Number(10.0));
+    }
+
+    /// Deleting every data row of a table on the grid's last rows keeps its
+    /// relative formula reading its first data row.
+    #[test]
+    fn deleting_the_data_rows_of_a_table_at_the_foot_of_the_grid() {
+        let mut wb = calc_682();
+        let last = MAX_ROWS - 1;
+        wb.tables[0] = other_table("Foot", 0, (last - 2, 0, last, 2));
+        wb.tables[0].set_calculated_formula(2, Some("A1048575*B1048575".into()));
+        delete_rows(&mut wb, 0, last - 1, 2);
+        assert_eq!(wb.tables[0].range, (last - 2, 0, last - 2, 2));
+        assert_eq!(
+            wb.tables[0].calculated_formulas[2].as_deref(),
+            Some("A1048575*B1048575")
+        );
+    }
+
+    /// A table whose data rows are all deleted still grows right when a
+    /// header is typed beside it; Resize Table keeps wanting a data row.
+    #[test]
+    fn a_header_only_table_grows_right() {
+        let mut wb = calc_682();
+        delete_rows(&mut wb, 0, 1, 3);
+        assert_eq!(type_at(&mut wb, "D1", Cell::text("Total")), (true, false));
+        assert_eq!(wb.tables[0].range, (0, 0, 0, 3));
+        assert_eq!(wb.tables[0].columns[3], "Total");
+        let err = resize_table(&mut wb, "Calc", (0, 0, 0, 4)).unwrap_err();
+        assert_eq!(err, "A table needs at least one data row");
     }
 }

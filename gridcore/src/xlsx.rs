@@ -21138,6 +21138,23 @@ mod table_command_tests {
         assert_eq!(column_formula(&reload(&pkg), &part), "B2*2");
     }
 
+    /// A header renamed after every data row went still renames the saved
+    /// calculated formula.
+    #[test]
+    fn a_header_rename_in_a_header_only_table_saves_its_formula() {
+        let mut pkg = one_table();
+        let part = pkg.workbook.tables[0].part.clone();
+        resize_table(&mut pkg.workbook, "Table1", (0, 0, 2, 2)).unwrap();
+        pkg.workbook.tables[0].set_calculated_formula(2, Some("[@Qty]*2".into()));
+        crate::edit::delete_rows(&mut pkg.workbook, 0, 1, 2);
+        pkg.workbook.sheets[0].set_cell(0, 1, Cell::text("Units"));
+        crate::edit::sync_table_headers(&mut pkg.workbook, 0, &[(0, 1)]);
+        assert_eq!(
+            column_formula(&reload(&pkg), &part),
+            "Table1[[#This Row],[Units]]*2"
+        );
+    }
+
     /// A sheet rename reaches the saved calculated formula.
     #[test]
     fn a_sheet_rename_reaches_the_saved_calculated_formula() {
