@@ -1031,7 +1031,7 @@ fn wheel_events(p: Point<Pixels>, dy: f32) -> Vec<PlatformInput> {
 /// unpressed hover and the press at the start, pressed moves (which arm and
 /// carry the drag) along the middle, the release at the end.
 fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
-    let mut events = Vec::with_capacity(path.len() + 1);
+    let mut events = Vec::with_capacity(path.len() + 2);
     events.push(mouse_move(path[0], None));
     events.push(mouse_down(path[0]));
     events.extend(
@@ -1039,6 +1039,10 @@ fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
             .iter()
             .map(|&p| mouse_move(p, Some(MouseButton::Left))),
     );
+    // A pressed move at the destination too: handlers that track the drag
+    // (the Project range, a chart reorder) see the final cell before the
+    // release, not only the MouseUp.
+    events.push(mouse_move(path[path.len() - 1], Some(MouseButton::Left)));
     events.push(mouse_up(path[path.len() - 1]));
     events
 }

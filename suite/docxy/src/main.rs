@@ -31183,36 +31183,62 @@ impl Render for Docxy {
         // level: the suite root's hitbox is not hovered for releases over
         // the split gutter (block_mouse_except_scroll), outside the window,
         // or in keyboard modality, and element listeners run only when
-        // hovered. Window listeners registered during paint run for every
-        // event of the next frame. The swallow flag is not touched at
-        // release; the press listener disarms it before any click the press
-        // could produce is dispatched.
-        let entity = cx.entity();
-        let pressed = entity.clone();
-        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
-            if phase == DispatchPhase::Capture && ev.button == MouseButton::Left {
-                entity.update(cx, |this, _cx| {
-                    if let Some(tab) = this.tabs.get_mut(this.active) {
-                        crate::project_cell_release(tab);
+        // hovered. Window listeners run for every event of the next frame.
+        // They are registered from a canvas's paint callback: a view's
+        // render runs in Prepaint and window.on_mouse_event asserts it is
+        // called during paint. The swallow flag is not touched at release;
+        // the press listener disarms it before any click the press could
+        // produce is dispatched.
+        let released = cx.entity();
+        let pressed = cx.entity();
+        let gesture_listeners = canvas(
+            |_b, _w, _a| {},
+            move |_b, _s, window: &mut Window, _cx: &mut App| {
+                window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
+                    if phase == DispatchPhase::Capture && ev.button == MouseButton::Left {
+                        released.update(cx, |this, _cx| {
+                            let Some(tab) = this.tabs.get_mut(this.active) else {
+                                return;
+                            };
+                            // A release lands where the last move never did
+                            // (a fast flick): the drag takes the cell under
+                            // the pointer before it ends.
+                            if matches!(&tab.surface, Surface::Project(v) if v.dragging)
+                                && let Some((row, col)) = match &tab.surface {
+                                    Surface::Project(v) => this
+                                        .probes
+                                        .borrow()
+                                        .current("project-body")
+                                        .and_then(|b| crate::project_cell_at(v, b, ev.position)),
+                                    _ => None,
+                                }
+                            {
+                                crate::project_cell_drag_over(tab, row, col);
+                            }
+                            crate::project_cell_release(tab);
+                        });
                     }
                 });
-            }
-        });
-        window.on_mouse_event(move |_ev: &MouseDownEvent, phase, _window, cx| {
-            if phase == DispatchPhase::Capture {
-                pressed.update(cx, |this, _cx| {
-                    if let Some(tab) = this.tabs.get_mut(this.active) {
-                        crate::project_cell_press_reset(tab);
+                window.on_mouse_event(move |_ev: &MouseDownEvent, phase, _window, cx| {
+                    if phase == DispatchPhase::Capture {
+                        pressed.update(cx, |this, _cx| {
+                            if let Some(tab) = this.tabs.get_mut(this.active) {
+                                crate::project_cell_press_reset(tab);
+                            }
+                        });
                     }
                 });
-            }
-        });
+            },
+        )
+        .absolute()
+        .size_full();
 
         v_flex()
             .size_full()
             .relative()
             .track_focus(&self.focus)
             .key_routing(cx)
+            .child(gesture_listeners)
             // Ruler drags are tracked at the window level so they keep working when
             // the pointer leaves the thin ruler strip (gpui move events are
             // hitbox-scoped, so a ruler-only handler would stop the moment the

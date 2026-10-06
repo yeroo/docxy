@@ -351,7 +351,8 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
             "cell",
             "cell_row",
             "cell_edit",
-            "selection"
+            "selection",
+            "cell_drag"
         ]
     );
 }

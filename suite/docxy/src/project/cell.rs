@@ -562,17 +562,10 @@ pub(crate) fn project_cell_drag_over(tab: &mut DocTab, row: usize, col: usize) -
     true
 }
 
-/// The suite-root mouse-down's capture phase calls this: every press — a
-/// cell, the chart half of a row, the ruled rows below, a right-button —
-/// spends the swallow flag. The flag is only meaningful for the click gpui
-/// dispatches in the same mouse-up as the gesture's release, and no press
-/// runs between that release and that click; any later click reaches
-/// `cell_click` only after a press (a menu's right-button included), so this
-/// cannot clear a flag a coming release-click still needs.
-/// The suite-root mouse-down's capture phase calls this: every press starts
-/// a fresh gesture, so it disarms whatever a previous one left — the swallow
-/// flag (only the click gpui dispatches in the same mouse-up as a
-/// gesture's release may swallow, and no press runs between that release
+/// The window-level mouse-down listener (capture phase) calls this: every
+/// press starts a fresh gesture, so it disarms whatever a previous one left —
+/// the swallow flag (only the click gpui dispatches in the same mouse-up as
+/// a gesture's release may swallow, and no press runs between that release
 /// and that click) and the drag state a release the element listeners never
 /// saw could not clear (a release over the split gutter, outside the
 /// window). Only [`project_cell_press`] on a cell arms a new drag.
@@ -703,6 +696,10 @@ pub(crate) fn project_cell_state(v: &ProjectView) -> Vec<(String, ctlcore::json:
             v.selection()
                 .map_or(Json::Null, |s| Json::Num(s.count() as f64)),
         ),
+        // Whether a cell drag gesture is armed (between a press and its
+        // release); the window-level release must clear it even where no
+        // element listener runs, and a uit case pins that.
+        ("cell_drag".into(), Json::Bool(v.dragging)),
     ]
 }
 

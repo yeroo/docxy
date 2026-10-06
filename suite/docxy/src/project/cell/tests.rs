@@ -1686,8 +1686,8 @@ fn a_bare_press_ends_a_drag_the_release_never_reached() {
     // The release lands where even the window's element listeners never run
     // (the split gutter, outside the window): the drag stays armed, and
     // plain hover cannot extend it (the move gate). The next press of any
-    // kind — the suite-root mouse-down's capture phase — disarms it, on
-    // cells and bare chart-half/below-table presses alike.
+    // kind — the window-level mouse-down listener — disarms it, on cells and
+    // bare chart-half/below-table presses alike.
     project_cell_press_reset(&mut t);
     assert!(!v(&t).dragging && !v(&t).row_drag);
     assert!(
@@ -1698,4 +1698,49 @@ fn a_bare_press_ends_a_drag_the_release_never_reached() {
     project_cell_click(&mut t, 2, None, false);
     assert_eq!(sel(&t), None);
     assert_eq!((v(&t).ed.selected_uid(), v(&t).col), (Some(30), COL_NAME));
+}
+
+#[test]
+fn collapsing_a_summary_drops_the_range() {
+    let mut t = tab();
+    vm(&mut t).ed.indent(20, 1).unwrap();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    shift(&mut t, "down");
+    shift(&mut t, "down");
+    assert_eq!(sel(&t), Some((vec![10, 20, 30], COL_NAME, COL_NAME)));
+    // The glyph's click is a plain click: collapsing drops the range, and
+    // expanding cannot revive it. The cursor stays on the task it was on.
+    toggle_project_collapse(&mut t, 10);
+    assert_eq!(sel(&t), None);
+    assert_eq!(v(&t).ed.selected_uid(), Some(30));
+    toggle_project_collapse(&mut t, 10);
+    assert_eq!(sel(&t), None, "expanding does not revive the old anchor");
+}
+
+#[test]
+fn the_release_position_maps_to_the_cell_under_it() {
+    let t = tab();
+    let body = Bounds {
+        origin: point(px(0.), px(0.)),
+        size: size(px(1200.), px(600.)),
+    };
+    assert_eq!(
+        crate::project_cell_at(v(&t), body, point(px(10.), px(10.))),
+        Some((0, COL_ID))
+    );
+    assert_eq!(
+        crate::project_cell_at(v(&t), body, point(px(10.), px(ROW_H + 5.))),
+        Some((1, COL_ID))
+    );
+    // Over the chart side (past the last column) there is no cell.
+    assert_eq!(
+        crate::project_cell_at(v(&t), body, point(px(2000.), px(10.))),
+        None
+    );
+    // The entry row maps to the task count, which drag_over ignores.
+    assert_eq!(
+        crate::project_cell_at(v(&t), body, point(px(10.), px(3. * ROW_H + 2.))),
+        Some((3, COL_ID))
+    );
 }

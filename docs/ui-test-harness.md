@@ -359,6 +359,7 @@ State keys, as the app reports them after every driving verb:
 | `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name (empty on the entry row), and `none` or the filename of the last successful Gantt export |
 | `cell`, `cell_row`, `cell_edit` | Project: active column name, zero-based row index, and open cell editor buffer (`null` when closed) |
 | `selection` | Project: the entry-table range selection's cell count, or `null` when none. Shift+arrows, a drag, Shift+click (`click-cell {"shift":true}`) or an ID-cell click make one; `drag` sweeps it (#560) |
+| `cell_drag` | Project: `true` while a cell drag gesture is armed (between a press and its release). The window-level release clears it even where no element listener runs (over the split gutter, outside the window), which a real-pointer case pins |
 | `undo_depth`, `redo_depth` | Project: number of available undo and redo steps |
 | `table_w`, `gantt_w` | Project: entry-table pane and Gantt chart widths in px. Split-bar drags move them; `table_w + 6 + gantt_w + 16` is the window width |
 | `timeline`, `timeline_start`, `timeline_finish` | Project: `shown`/`hidden`, and the Timeline's Start/Finish labels (`Mon 3/2/26`; the displayed span, leveled while leveling is on) |

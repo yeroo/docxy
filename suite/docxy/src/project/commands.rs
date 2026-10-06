@@ -1473,6 +1473,9 @@ pub(crate) fn toggle_project_collapse(tab: &mut DocTab, uid: i32) {
     let Surface::Project(v) = &mut tab.surface else {
         return;
     };
+    // The glyph's click is a plain click: the range does not survive it, so
+    // collapsing cannot park an old anchor that expanding would revive.
+    v.anchor = None;
     let before = v.cursor_row();
     if let Err(e) = v.ed.toggle_collapsed(uid) {
         tab.status = e.into();
