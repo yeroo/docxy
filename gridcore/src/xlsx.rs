@@ -3069,11 +3069,13 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             .unwrap_or_default();
         // Chart and dialog sheets have no cells: CT_Chartsheet and
         // CT_Dialogsheet have no <sheetData>, so one spliced in is invalid.
+        // Their page layout is edited like a worksheet's (its children keep
+        // CT_Worksheet's relative order).
         let cellless = rel_types
             .get(idx)
             .is_some_and(|ty| ty.ends_with("/chartsheet") || ty.ends_with("/dialogsheet"));
         let updated = if cellless {
-            source
+            page::set_page_setup(&source, &sheet.page_setup, &sheet.page_setup_loaded)
         } else {
             let sheet_data =
                 sheet_data_xml(sheet, &mut index_of, &mut any_formulas, new_cm.as_deref());
@@ -5463,7 +5465,8 @@ fn set_dxfs(xml: &str, dxfs: &[crate::sheet::Dxf]) -> String {
 }
 
 /// Rewrite the frozen-pane state of the first `<sheetView>` from the model's
-/// `freeze` (rows, cols): inserts/updates `<pane … state="frozen"/>`, removes it
+/// `freeze` (rows, cols): a pane that already says the same is left exactly
+/// as written; otherwise inserts/updates `<pane … state="frozen"/>`, removes it
 /// when unfrozen, and creates a `<sheetViews>` block if the worksheet lacks one.
 /// Idempotent — a second save with the same freeze is byte-identical.
 fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
@@ -10800,10 +10803,21 @@ mod tests {
         pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
         let chart = r#"<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"/></sheetViews><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></chartsheet>"#;
         pkg.set_part(&part, chart.as_bytes().to_vec());
-        let pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
         let saved = save_xlsx(&pkg);
         let back = load_xlsx(&saved).unwrap();
         assert_eq!(back.part(&part).unwrap(), chart.as_bytes());
+
+        // Its page layout still saves.
+        pkg.workbook.sheets[1].page_setup.margins.left = 1.5;
+        let back = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let xml = String::from_utf8(back.part(&part).unwrap().to_vec()).unwrap();
+        assert!(
+            xml.contains(r#"<pageMargins left="1.5" right="0.7""#),
+            "{xml}"
+        );
+        assert!(!xml.contains("sheetData"), "{xml}");
+        assert_eq!(back.workbook.sheets[1].page_setup.margins.left, 1.5);
     }
 
     /// #1064: Excel 2013+ writes `<x15:workbookPr chartTrackingRefBase>` in
