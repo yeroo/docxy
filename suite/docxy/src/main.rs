@@ -1168,6 +1168,56 @@ fn act_targets_cells(act: SheetAct) -> bool {
     )
 }
 
+/// Does `act` need a closed cell editor? (#510) Everything that reads or
+/// rewrites cell content or moves cells does. What keeps the editor open is
+/// formatting and dialog/bar openers that neither read nor rewrite cell
+/// values, plus the pick list, which commits its own entry
+/// ([`SheetView::pick_value`]).
+fn act_commits_editor(act: SheetAct) -> bool {
+    act_targets_cells(act)
+        && !matches!(
+            act,
+            SheetAct::Bold
+                | SheetAct::Italic
+                | SheetAct::AlignL
+                | SheetAct::AlignC
+                | SheetAct::AlignR
+                | SheetAct::WrapText
+                | SheetAct::GrowFont
+                | SheetAct::ShrinkFont
+                | SheetAct::Percent
+                | SheetAct::Currency
+                | SheetAct::Comma
+                | SheetAct::FillColor
+                | SheetAct::FontColor
+                | SheetAct::ToggleBorder
+                | SheetAct::FormatCells
+                | SheetAct::RowHeight
+                | SheetAct::CondFormat
+                | SheetAct::DataValidation
+                | SheetAct::FreezePanes
+                | SheetAct::Merge
+                | SheetAct::PickList
+                | SheetAct::PickItem(_)
+        )
+}
+
+/// Does `act` paste the grid clipboard? (#510 r1) The commit that prepares
+/// the cell for it must not be the edit that ends copy mode (#664), so a
+/// paste-family act re-stamps what the commit bumped — the paste's own undo
+/// step already does. A Paste Again is not in the set: it re-pastes the
+/// Paste Options block, which carries its own edit_gen stamp that a re-stamp
+/// of the clip does not touch, and its own re-paste re-stamps the clip when
+/// it lands. Its copy mode ending on the commit's edit is right, as for any
+/// other act: a Cut makes a new clip, and a Sort and its like end copy mode
+/// as they should.
+fn act_restamps_clip(act: SheetAct) -> bool {
+    matches!(
+        act,
+        SheetAct::Paste | SheetAct::PasteAs(_) | SheetAct::PasteSpecial
+    )
+}
+
 /// What a commit does once its entry is in: the move a key makes, or the
 /// selection change a click makes. A data-validation alert holds it for Yes
 /// or OK (Retry, No and Cancel never do it).
@@ -2358,6 +2408,16 @@ impl SheetView {
         let took = self.take_proposal();
         self.autocorrect_commit(took);
         self.commit_edit_taken(took)
+    }
+
+    /// Commit an open editor before an act runs (#510). None when there is
+    /// no editor; Some(wrote) is the commit's result — true when the buffer
+    /// was written, false when it was refused (the editor stays open with
+    /// [`SheetView::entry_error`] set) or closed untouched (nothing written,
+    /// so the caller must not mark the tab dirty).
+    fn close_editor_for_act(&mut self) -> Option<bool> {
+        self.editing.as_ref()?;
+        Some(self.commit_edit())
     }
 
     /// [`SheetView::commit_edit`] after the proposal was taken (`took`) and
@@ -16319,6 +16379,30 @@ impl Docxy {
         // A multi-area selection runs only what acts on every area (#670).
         if !multi_area_ok(act) && self.multi_area_refused(cx) {
             return self.refocus(window, cx);
+        }
+        // A command that reads or rewrites cell content sees the committed
+        // entry, not a stale buffer (#510): the editor commits once, here.
+        // A written commit dirties the tab like the Enter path does; a
+        // refused one leaves the editor open, says why, and the command
+        // does not run; an untouched seed closes having written nothing.
+        if act_commits_editor(act) {
+            // A paste-family command must still see a clip the commit's own
+            // undo step would read as the edit that ends copy mode (#664).
+            let clip_live = self.grid_clip_current().is_some();
+            match self.active_sheet_mut().map(SheetView::close_editor_for_act) {
+                Some(Some(true)) => {
+                    self.mark_sheet_dirty();
+                    if clip_live && act_restamps_clip(act) {
+                        self.grid_clip_restamp();
+                    }
+                }
+                Some(Some(false)) if self.active_sheet().is_some_and(|v| v.editing.is_some()) => {
+                    self.sheet_entry_refused(cx);
+                    cx.notify();
+                    return self.refocus(window, cx);
+                }
+                _ => {}
+            }
         }
         // Before anything reads the selection — including the bar seeding below
         // — the grid takes it back, so a command that acts on cells acts on

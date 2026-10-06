@@ -220,9 +220,10 @@ pub(crate) fn retire_stale_previews(tabs: &mut [DocTab]) {
 }
 
 impl Docxy {
-    /// Ctrl+E and Data › Flash Fill (#666): commit an open entry first, then
-    /// fill the selected cell's column. No pattern opens Excel's message
-    /// (ENT-110); the status counts what changed.
+    /// Ctrl+E and Data › Flash Fill (#666): fill the selected cell's column.
+    /// `run_sheet_act` has committed the open entry already (#510). No
+    /// pattern opens Excel's message (ENT-110); the status counts what
+    /// changed.
     pub(crate) fn sheet_flash_fill(&mut self, cx: &mut Context<Self>) {
         if self.protected_refused(cx) {
             return;
@@ -230,10 +231,6 @@ impl Docxy {
         if self.sheet_protected() {
             self.set_status("The sheet is protected: unprotect it to Flash Fill");
             cx.notify();
-            return;
-        }
-        let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
-        if editing && !self.sheet_commit_move(0, 0, cx) {
             return;
         }
         let Some(v) = self.active_sheet_mut() else {
