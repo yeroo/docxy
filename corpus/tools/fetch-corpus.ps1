@@ -33,8 +33,13 @@ New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 try {
     Write-Host "Cloning $RepoUrl (shallow, depth 1) ..."
     $cloneDir = Join-Path $TmpDir "docxy-corpus"
+    # Windows PowerShell 5.1 turns a native command's stderr under `2>&1`
+    # into error records, which "Stop" would throw on before the SKIP below.
+    $ErrorActionPreference = "Continue"
     $cloneLog = & git clone --depth 1 --quiet $RepoUrl $cloneDir 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    $cloneExit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($cloneExit -ne 0) {
         Write-Host ($cloneLog | Out-String)
         Write-Host ""
         Write-Host "SKIP: could not clone $RepoUrl (offline?). corpus\ is unchanged." -ForegroundColor Yellow
