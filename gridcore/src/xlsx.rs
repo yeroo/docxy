@@ -5478,8 +5478,15 @@ fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
         if fr > 0 {
             a.push_str(&format!(" ySplit=\"{fr}\""));
         }
+        // The pane holding the cursor is the one past both splits, as Excel
+        // writes it: rows only leave the bottom pane, columns the right one.
+        let active = match (fr > 0, fc > 0) {
+            (true, true) => "bottomRight",
+            (true, false) => "bottomLeft",
+            _ => "topRight",
+        };
         format!(
-            "<pane{a} topLeftCell=\"{}\" activePane=\"bottomRight\" state=\"frozen\"/>",
+            "<pane{a} topLeftCell=\"{}\" activePane=\"{active}\" state=\"frozen\"/>",
             cell_name(fr, fc)
         )
     };
@@ -5494,6 +5501,21 @@ fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
             put_worksheet_child(xml, "sheetViews", &new_views(), None, true)
         };
     };
+    // A pane that already says what the model says stays as it is: its
+    // scroll position (`topLeftCell`), active pane, and a split that is not
+    // frozen are view state the model does not keep (#1064).
+    if let Some((ps, _)) = view.pane {
+        let split = |a: &str| attr_at(xml, ps, a).and_then(|v| v.parse::<u32>().ok());
+        let frozen = matches!(attr_at(xml, ps, "state"), Some("frozen" | "frozenSplit"));
+        let has = if frozen {
+            (split("ySplit").unwrap_or(0), split("xSplit").unwrap_or(0))
+        } else {
+            (0, 0)
+        };
+        if has == freeze {
+            return xml.to_string();
+        }
+    }
     // Drop its existing <pane> first (idempotent; also handles unfreeze).
     let mut out = xml.to_string();
     if let Some((ps, pe)) = view.pane {
@@ -9552,6 +9574,41 @@ mod tests {
         );
     }
 
+    /// #1064: a loaded pane the model agrees with is kept as written (its
+    /// scroll position, active pane, a split that is not frozen); a new one
+    /// gets the active pane Excel would write.
+    #[test]
+    fn save_keeps_a_pane_the_model_agrees_with() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let ws = |pane: &str| {
+            format!(
+                "<worksheet xmlns=\"{ns}\"><sheetViews><sheetView workbookViewId=\"0\">{pane}</sheetView></sheetViews><sheetData/></worksheet>"
+            )
+        };
+        for pane in [
+            r#"<pane ySplit="10" topLeftCell="A590" activePane="bottomLeft" state="frozen"/>"#,
+            r#"<pane xSplit="0" ySplit="6" topLeftCell="A7" activePane="bottomLeft" state="frozen"/>"#,
+            r#"<pane xSplit="5220" topLeftCell="F1" activePane="topRight"/>"#,
+        ] {
+            let xml = ws(pane);
+            let freeze = parse_worksheet(&xml, &[], &Default::default()).freeze;
+            assert_eq!(set_freeze_pane(&xml, freeze), xml);
+        }
+        let new = |freeze| set_freeze_pane(&ws(""), freeze);
+        assert!(new((2, 0)).contains(r#"activePane="bottomLeft""#));
+        assert!(new((0, 2)).contains(r#"activePane="topRight""#));
+        assert!(new((2, 2)).contains(r#"activePane="bottomRight""#));
+        // A changed freeze still replaces the pane.
+        let moved = set_freeze_pane(
+            &ws(r#"<pane ySplit="10" topLeftCell="A11" activePane="bottomLeft" state="frozen"/>"#),
+            (3, 0),
+        );
+        assert!(
+            moved.contains(r#"<pane ySplit="3" topLeftCell="A4""#),
+            "{moved}"
+        );
+    }
+
     #[test]
     fn rename_sheet_updates_model_and_workbook_xml() {
         let mut pkg = new_xlsx();
@@ -10731,8 +10788,8 @@ mod tests {
         let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
         let part = pkg.sheet_parts[1].clone();
         let name = part.rsplit('/').next().unwrap().to_string();
-        let rels = String::from_utf8(pkg.part("xl/_rels/workbook.xml.rels").unwrap().to_vec())
-            .unwrap();
+        let rels =
+            String::from_utf8(pkg.part("xl/_rels/workbook.xml.rels").unwrap().to_vec()).unwrap();
         let at = rels.find(&format!("{name}\"")).unwrap();
         let open = rels[..at].rfind("<Relationship").unwrap();
         let rels = format!(
