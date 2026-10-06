@@ -194,7 +194,10 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match route(&ev.keystroke, ev.is_held, MACOS) {
+        // The handler is registered only while the root has the focus, so a
+        // key deferred without it would reach no one.
+        let defers = MACOS && self.focus.is_focused(window);
+        match route(&ev.keystroke, ev.is_held, defers) {
             // Left propagating, so gpui hands it to AppKit's input context,
             // which answers through the handler below.
             Route::Defer => self.ime.defer(ev),
