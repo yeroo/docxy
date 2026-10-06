@@ -382,16 +382,16 @@ fn parse_range(r: &str) -> Option<(u32, u32, u32, u32)> {
 }
 
 /// `formula` with its relative references moved by (rows, cols), as Excel
-/// fills a shared formula from its master; `None` when one would leave the
-/// grid. Independent of gridcore's own translation, which is under test:
-/// a reference is `$`-optional column letters and row digits (or a column or
-/// row range) standing alone, not inside a string, a quoted sheet name, a
-/// `[...]` (structured or external reference), a name or a function call.
-fn shift_formula(formula: &str, rows: i64, cols: i64) -> Option<String> {
+/// fills a shared formula from its master; a reference that would leave the
+/// grid becomes `#REF!`. Independent of gridcore's own translation, which is
+/// under test: a reference is `$`-optional column letters and row digits (or
+/// a column or row range) standing alone, not inside a string, a quoted
+/// sheet name, a `[...]` (structured or external reference), a name or a
+/// function call.
+fn shift_formula(formula: &str, rows: i64, cols: i64) -> String {
     let s: Vec<char> = formula.chars().collect();
     let mut out = String::new();
     let mut i = 0;
-    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '.' || c == '\\';
     while i < s.len() {
         let c = s[i];
         // Literals and quoted or bracketed names pass through.
@@ -429,20 +429,20 @@ fn shift_formula(formula: &str, rows: i64, cols: i64) -> Option<String> {
             }
             continue;
         }
-        let at_boundary = i == 0 || !(word(s[i - 1]) || s[i - 1] == '$');
+        let at_boundary = i == 0 || !(is_word(s[i - 1]) || s[i - 1] == '$');
         if at_boundary {
             if let Some((text, len)) = shift_ref(&s[i..], rows, cols) {
                 let next = s.get(i + len).copied();
-                if !next.is_some_and(|n| word(n) || n == '(' || n == '!') {
-                    out.push_str(&text?);
+                if !next.is_some_and(|n| is_word(n) || n == '(' || n == '!') {
+                    out.push_str(&text);
                     i += len;
                     continue;
                 }
             }
         }
         // Anything else, a whole word at a time, so `LOG10` stays a name.
-        if word(c) {
-            while i < s.len() && word(s[i]) {
+        if is_word(c) {
+            while i < s.len() && is_word(s[i]) {
                 out.push(s[i]);
                 i += 1;
             }
@@ -451,19 +451,28 @@ fn shift_formula(formula: &str, rows: i64, cols: i64) -> Option<String> {
             i += 1;
         }
     }
-    Some(out)
+    out
 }
 
-/// A reference at the start of `s`: (its shifted text, or `None` when it
-/// leaves the grid; its length). A cell (`$A$1`), a column range (`A:$C`) or
-/// a row range (`1:$3`).
-#[allow(clippy::type_complexity)]
-fn shift_ref(s: &[char], rows: i64, cols: i64) -> Option<(Option<String>, usize)> {
-    // One part: optional `$`, letters and/or digits.
-    let part = |at: usize| -> Option<(bool, String, bool, String, usize)> {
-        let mut i = at;
-        let col_abs = s.get(i) == Some(&'$');
-        if col_abs {
+/// A character of a name, a number or a reference.
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '.' || c == '\\'
+}
+
+/// One side of a reference: `$`-optional column letters and/or row digits.
+struct RefPart {
+    col_abs: bool,
+    letters: String,
+    row_abs: bool,
+    digits: String,
+    len: usize,
+}
+
+impl RefPart {
+    fn read(s: &[char]) -> Option<RefPart> {
+        let mut i = 0;
+        let lead = s.first() == Some(&'$');
+        if lead {
             i += 1;
         }
         let ls = i;
@@ -471,8 +480,8 @@ fn shift_ref(s: &[char], rows: i64, cols: i64) -> Option<(Option<String>, usize)
             i += 1;
         }
         let letters: String = s[ls..i].iter().collect();
-        let row_abs = s.get(i) == Some(&'$');
-        if row_abs && !letters.is_empty() {
+        let mid = !letters.is_empty() && s.get(i) == Some(&'$');
+        if mid {
             i += 1;
         }
         let ds = i;
@@ -485,71 +494,85 @@ fn shift_ref(s: &[char], rows: i64, cols: i64) -> Option<(Option<String>, usize)
         }
         // A `$` before digits alone belongs to the row.
         let (col_abs, row_abs) = if letters.is_empty() {
-            (false, col_abs)
+            (false, lead)
         } else {
-            (col_abs, row_abs)
+            (lead, mid)
         };
-        Some((col_abs, letters, row_abs, digits, i - at))
-    };
-    let shift_col = |abs: bool, letters: &str| -> Option<Option<String>> {
-        let n = i64::from(col_number(letters)?);
-        let n = if abs { n } else { n + cols };
-        let lead = if abs { "$" } else { "" };
-        Some(
-            (1..=16_384)
-                .contains(&n)
-                .then(|| format!("{lead}{}", col_letters(n as u32))),
-        )
-    };
-    let shift_row = |abs: bool, digits: &str| -> Option<Option<String>> {
-        let n: i64 = digits.parse().ok()?;
-        if !(1..=1_048_576).contains(&n) {
-            return None;
-        }
-        let n = if abs { n } else { n + rows };
-        let lead = if abs { "$" } else { "" };
-        Some((1..=1_048_576).contains(&n).then(|| format!("{lead}{n}")))
-    };
-    let one = |p: &(bool, String, bool, String, usize)| -> Option<Option<String>> {
-        let (ca, letters, ra, digits, _) = p;
-        match (letters.is_empty(), digits.is_empty()) {
-            (false, false) => {
-                let (c, r) = (shift_col(*ca, letters)?, shift_row(*ra, digits)?);
-                Some(c.zip(r).map(|(c, r)| format!("{c}{r}")))
-            }
-            (false, true) => shift_col(*ca, letters),
-            (true, false) => shift_row(*ra, digits),
-            (true, true) => None,
-        }
-    };
-    let first = part(0)?;
-    let (_, l1, _, d1, n1) = &first;
-    let cell = !l1.is_empty() && !d1.is_empty();
-    if s.get(*n1) == Some(&':') {
-        if let Some(second) = part(n1 + 1) {
-            let (_, l2, _, d2, n2) = &second;
-            let same_shape = l1.is_empty() == l2.is_empty() && d1.is_empty() == d2.is_empty();
-            if same_shape && (cell || !(l1.is_empty() && d1.is_empty())) {
-                let text = one(&first)?
-                    .zip(one(&second)?)
-                    .map(|(a, b)| format!("{a}:{b}"));
-                return Some((text, n1 + 1 + n2));
-            }
-        }
+        Some(RefPart {
+            col_abs,
+            letters,
+            row_abs,
+            digits,
+            len: i,
+        })
     }
-    // A lone column or row is no reference (a name, a number).
-    if !cell {
-        return None;
+
+    /// Shifted, or `None` when it leaves the grid. Its column and row must
+    /// name the grid before the shift too, else it is no reference: the
+    /// outer `Option` is `None`.
+    fn shifted(&self, rows: i64, cols: i64) -> Option<Option<String>> {
+        let mut out = String::new();
+        if !self.letters.is_empty() {
+            let n = i64::from(col_number(&self.letters)?);
+            let n = if self.col_abs { n } else { n + cols };
+            if !(1..=16_384).contains(&n) {
+                return Some(None);
+            }
+            out.push_str(if self.col_abs { "$" } else { "" });
+            out.push_str(&col_letters(n as u32));
+        }
+        if !self.digits.is_empty() {
+            let n: i64 = self.digits.parse().ok()?;
+            if !(1..=1_048_576).contains(&n) {
+                return None;
+            }
+            let n = if self.row_abs { n } else { n + rows };
+            if !(1..=1_048_576).contains(&n) {
+                return Some(None);
+            }
+            out.push_str(if self.row_abs { "$" } else { "" });
+            out.push_str(&n.to_string());
+        }
+        Some(Some(out))
     }
-    Some((one(&first)?, *n1))
+}
+
+/// A reference at the start of `s`: (its shifted text, `#REF!` when it
+/// leaves the grid; its length). A cell (`$A$1`), a cell range, a column
+/// range (`A:$C`) or a row range (`1:$3`); a lone column or row is a name or
+/// a number, not a reference.
+fn shift_ref(s: &[char], rows: i64, cols: i64) -> Option<(String, usize)> {
+    let first = RefPart::read(s)?;
+    let cell = !first.letters.is_empty() && !first.digits.is_empty();
+    let range = (s.get(first.len) == Some(&':'))
+        .then(|| RefPart::read(&s[first.len + 1..]))
+        .flatten()
+        .filter(|second| {
+            first.letters.is_empty() == second.letters.is_empty()
+                && first.digits.is_empty() == second.digits.is_empty()
+        });
+    let refs = |text: Option<String>| text.unwrap_or_else(|| "#REF!".into());
+    match range {
+        Some(second) => {
+            let (a, b) = (first.shifted(rows, cols)?, second.shifted(rows, cols)?);
+            let text = a.zip(b).map(|(a, b)| format!("{a}:{b}"));
+            Some((refs(text), first.len + 1 + second.len))
+        }
+        None if cell => Some((refs(first.shifted(rows, cols)?), first.len)),
+        None => None,
+    }
 }
 
 /// A formula as Excel compares it: spaces outside strings dropped, names
-/// upper-cased, the `_xlfn.`/`_xlws.` future-function prefixes dropped.
+/// upper-cased, the `_xlfn.`/`_xlws.` future-function prefixes dropped where
+/// a name starts (not inside a string or a quoted sheet name).
 fn normalized(formula: &str) -> String {
+    let s: Vec<char> = formula.chars().collect();
     let mut out = String::new();
     let mut quote = None;
-    for c in formula.chars() {
+    let mut i = 0;
+    while i < s.len() {
+        let c = s[i];
         match quote {
             Some(q) => {
                 out.push(c);
@@ -562,10 +585,19 @@ fn normalized(formula: &str) -> String {
                 out.push(c);
             }
             None if c.is_whitespace() => {}
-            None => out.extend(c.to_uppercase()),
+            None => {
+                let starts_name = i == 0 || !is_word(s[i - 1]);
+                let prefix: String = s[i..s.len().min(i + 6)].iter().collect();
+                if starts_name && ["_XLFN.", "_XLWS."].contains(&prefix.to_uppercase().as_str()) {
+                    i += 6;
+                    continue;
+                }
+                out.extend(c.to_uppercase());
+            }
         }
+        i += 1;
     }
-    out.replace("_XLFN.", "").replace("_XLWS.", "")
+    out
 }
 
 fn is_true(v: Option<&str>) -> bool {
@@ -681,11 +713,11 @@ fn read_sheet(root: &Elem, sst: &[Vec<(Option<u64>, String)>]) -> SheetRead {
         let resolved = masters.get(&si).and_then(|((mr, mc), text, range)| {
             let (r0, c0, r1, c1) = (*range)?;
             ((r0..=r1).contains(&at.0) && (c0..=c1).contains(&at.1)).then_some(())?;
-            shift_formula(
+            Some(shift_formula(
                 text,
                 i64::from(at.0) - i64::from(*mr),
                 i64::from(at.1) - i64::from(*mc),
-            )
+            ))
         });
         if let Some(cell) = sheet.cells.get_mut(&at) {
             cell.formula = Some(match resolved {
@@ -913,17 +945,19 @@ fn read_string(e: &Elem) -> bool {
     children_within(e, &["t", "r"]) && elems(e, "r").all(|r| children_within(r, &["rPr", "t"]))
 }
 
+/// A formula's attributes the check reads: t, si and ref (and `xml:space`).
+fn read_formula(f: &Elem) -> bool {
+    f.attrs.iter().all(|a| {
+        (a.uri.is_empty() && matches!(a.local.as_str(), "t" | "si" | "ref")) || a.local == "space"
+    })
+}
+
 /// A cell whose every part the check reads: attributes r, s and t; a `<v>`,
-/// an `<f>` with t, si and ref (and `xml:space`), and an `<is>` it reads.
+/// an `<f>` and an `<is>` it reads.
 fn read_whole(c: &Elem) -> bool {
     attrs_within(c, &["r", "s", "t"])
         && children_within(c, &["v", "f", "is"])
-        && elems(c, "f").all(|f| {
-            f.attrs.iter().all(|a| {
-                (a.uri.is_empty() && matches!(a.local.as_str(), "t" | "si" | "ref"))
-                    || a.local == "space"
-            })
-        })
+        && elems(c, "f").all(read_formula)
         && elems(c, "is").all(read_string)
 }
 
@@ -950,20 +984,19 @@ fn covered_by_check(f: &Finding, original: &Elem, saved: &Elem) -> bool {
     };
     let whole = matches!(f.kind, Kind::LostElement | Kind::ExtraElement);
     match rest {
-        // A row carrying nothing but its number and span hint: its cells
-        // are compared one by one.
-        "" => whole && element().is_some_and(|row| attrs_within(row, &["r", "spans"])),
-        "/c" => whole && element().is_some_and(read_whole),
-        "/c/@r" | "/c/@s" | "/c/@t" => true,
-        "/c/f" => {
+        // A row carrying nothing but its number and span hint, and cells the
+        // check reads whole: those are compared one by one.
+        "" => {
             whole
-                && element().is_some_and(|f| {
-                    f.attrs.iter().all(|a| {
-                        (a.uri.is_empty() && matches!(a.local.as_str(), "t" | "si" | "ref"))
-                            || a.local == "space"
-                    })
+                && element().is_some_and(|row| {
+                    attrs_within(row, &["r", "spans"])
+                        && children_within(row, &["c"])
+                        && elems(row, "c").all(read_whole)
                 })
         }
+        "/c" => whole && element().is_some_and(read_whole),
+        "/c/@r" | "/c/@s" | "/c/@t" => true,
+        "/c/f" => whole && element().is_some_and(read_formula),
         "/c/f/@t" | "/c/f/@si" | "/c/f/@ref" | "/c/f/@space" | "/c/f/text()" => true,
         "/c/is" => whole && element().is_some_and(read_string),
         _ if rest.starts_with("/c/v") => true,
@@ -1391,27 +1424,67 @@ fn strings_are_read_through_the_workbooks_shared_strings_with_their_runs() {
 
 #[test]
 fn shared_formulas_shift_like_excel_fills_them() {
-    assert_eq!(shift_formula("C1+1", 0, 1).as_deref(), Some("D1+1"));
-    assert_eq!(
-        shift_formula("$C$1+C$1+$C1", 2, 3).as_deref(),
-        Some("$C$1+F$1+$C3")
-    );
-    assert_eq!(
-        shift_formula("SUM(A1:B2)*LOG10(A1)", 1, 0).as_deref(),
-        Some("SUM(A2:B3)*LOG10(A2)")
-    );
-    assert_eq!(
-        shift_formula("SUM(A:A,1:1)", 1, 1).as_deref(),
-        Some("SUM(B:B,2:2)")
-    );
+    let shift = shift_formula;
+    assert_eq!(shift("C1+1", 0, 1), "D1+1");
+    assert_eq!(shift("$C$1+C$1+$C1", 2, 3), "$C$1+F$1+$C3");
+    assert_eq!(shift("SUM(A1:B2)*LOG10(A1)", 1, 0), "SUM(A2:B3)*LOG10(A2)");
+    assert_eq!(shift("SUM(A:A,1:1)", 1, 1), "SUM(B:B,2:2)");
     // Strings, sheet names, structured references and names stay.
     assert_eq!(
-        shift_formula(r#"'A1 x'!A1&"A1"&Sheet1!A1&T[A1]&Tax"#, 1, 0).as_deref(),
-        Some(r#"'A1 x'!A2&"A1"&Sheet1!A2&T[A1]&Tax"#)
+        shift(r#"'A1 x'!A1&"A1"&Sheet1!A1&T[A1]&Tax"#, 1, 0),
+        r#"'A1 x'!A2&"A1"&Sheet1!A2&T[A1]&Tax"#
     );
-    // A number is no row, and leaving the grid is #REF!.
-    assert_eq!(shift_formula("A1*10", 1, 0).as_deref(), Some("A2*10"));
-    assert_eq!(shift_formula("A1", -1, 0), None);
+    // A number is no row.
+    assert_eq!(shift("A1*10", 1, 0), "A2*10");
+    // A reference that leaves the grid is #REF!, the rest still moves.
+    assert_eq!(shift("XFD1+A1", 0, 1), "#REF!+B1");
+    assert_eq!(shift("SUM(A1:XFD1)+A1", 0, 1), "SUM(#REF!)+B1");
+    assert_eq!(shift("A1", -1, 0), "#REF!");
+}
+
+#[test]
+fn an_expansion_off_the_grid_agrees_with_ref() {
+    // What gridcore writes for a follower whose master points past the last
+    // column: the sheet check resolves the follower to the same #REF!.
+    let master = r#"<c r="A1"><f t="shared" ref="A1:B1" si="0">XFD1+A1</f><v>1</v></c>"#;
+    let original =
+        format!(r#"<row r="1">{master}<c r="B1"><f t="shared" si="0"/><v>1</v></c></row>"#);
+    // gridcore's own blank workbook with this sheet in place of its first.
+    let blank = load_xlsx(&gridcore::xlsx::save_xlsx(&gridcore::xlsx::new_xlsx())).unwrap();
+    let parts: Vec<(String, Vec<u8>)> = blank
+        .part_names()
+        .into_iter()
+        .map(|n| {
+            let bytes = if n == "xl/worksheets/sheet1.xml" {
+                sheet(&original)
+            } else {
+                blank.part(n).unwrap().to_vec()
+            };
+            (n.to_string(), bytes)
+        })
+        .collect();
+    let bytes = opccore::zipwrite::write_zip(&parts);
+    let saved = save_xlsx_for_path(&load_xlsx(&bytes).unwrap(), Path::new("book.xlsx"));
+    let sheet1 = opccore::zip::ZipArchive::open(&saved)
+        .and_then(|z| z.read("xl/worksheets/sheet1.xml"))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&sheet1).contains("<f>#REF!+B1</f>"),
+        "{}",
+        String::from_utf8_lossy(&sheet1)
+    );
+    let mut covered = 0;
+    let found: Vec<_> = check_sheets(
+        &bytes,
+        &saved,
+        compare_packages(&bytes, &saved),
+        &mut covered,
+    )
+    .into_iter()
+    .filter(|f| f.path.starts_with("/cells/"))
+    .map(|f| (f.path, f.detail))
+    .collect();
+    assert_eq!(found, vec![]);
 }
 
 #[test]
@@ -1436,6 +1509,19 @@ fn a_shared_formulas_follower_must_be_its_masters_formula_shifted() {
             "{wrong}"
         );
     }
+    // A `_xlfn.` inside a string is text, not a prefix (#1064 r3).
+    let literal = |text: &str| format!(r#"<row r="1"><c r="A1"><f>{text}</f><v>1</v></c></row>"#);
+    assert_eq!(
+        cells(&literal(r#""_XLFN.Error""#), &literal(r#""Error""#)),
+        at_cell("A1", "formula")
+    );
+    assert_eq!(
+        cells(
+            &literal("ISO.CEILING(A2)"),
+            &literal("_xlfn.ISO.CEILING(A2)")
+        ),
+        at_cell("A1", "formula-text")
+    );
     // The same formula in other words is formula-text.
     assert_eq!(
         cells(&original, &saved(r#"<c r="B1"><f>d1 + 1</f><v>1</v></c>"#)),
@@ -1533,6 +1619,16 @@ fn what_the_check_does_not_read_stays_structural() {
             ),
             (Kind::ChangedValue, "/cells/B1/value".to_string()),
         ]
+    );
+    // A dropped row whose cell carries more than the check reads stays a
+    // lost row (#1064 r3).
+    let found = cells(
+        r#"<row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2" ph="1"/></row>"#,
+        r#"<row r="1"><c r="A1"><v>1</v></c></row>"#,
+    );
+    assert_eq!(
+        found,
+        vec![(Kind::LostElement, "/worksheet/sheetData/row[2]".to_string())]
     );
     // A phonetic run of an inline string is not read.
     let found = cells(
