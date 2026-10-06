@@ -6769,12 +6769,12 @@ fn element_text(el: &str) -> String {
 /// already means the same (the same parse, after the rewrites the save
 /// made) keeps its text, so an unchanged part stays as loaded. A column the
 /// model holds no formula for loses the part's, unless that is an array
-/// formula (which the model doesn't hold); a model that knows no formulas
+/// formula (which the model doesn't hold) or an empty element (which loads
+/// as none); a model that knows no formulas
 /// at all leaves the part's alone. A new formula is written as Excel writes
 /// one, its bare references qualified by the table's name `table`
 /// (`[@Qty]` is `Sales[[#This Row],[Qty]]`).
 fn sync_calculated_formulas(xml: &str, table: &str, formulas: &[Option<String>]) -> String {
-    use crate::formula::Expr;
     if formulas.is_empty() {
         return xml.to_string();
     }
@@ -6783,22 +6783,9 @@ fn sync_calculated_formulas(xml: &str, table: &str, formulas: &[Option<String>])
     };
     // A formula with its bare references naming `table`.
     let qualified = |src: &str| {
-        crate::formula::parse(src).ok().map(|e| {
-            crate::formula::map_expr(&e, &|x| match x {
-                Expr::Structured {
-                    table: None,
-                    item,
-                    col1,
-                    col2,
-                } => Some(Expr::Structured {
-                    table: Some(table.to_string()),
-                    item: *item,
-                    col1: col1.clone(),
-                    col2: col2.clone(),
-                }),
-                _ => None,
-            })
-        })
+        crate::formula::parse(src)
+            .ok()
+            .map(|e| crate::formula::qualify_bare_refs(&e, table))
     };
     let mut edits = Vec::new();
     for (j, (s, e)) in child_spans(xml, span, "tableColumn")
@@ -6817,9 +6804,12 @@ fn sync_calculated_formulas(xml: &str, table: &str, formulas: &[Option<String>])
             })
             .flatten();
         let Some(f) = formulas.get(j).and_then(Option::as_deref) else {
+            // Only a formula the model cleared goes: an empty element (which
+            // loads as none) stays as the file has it.
             if let Some((a, b)) = existing {
                 let tag = &xml[a..tag_end(xml, a)];
-                if !matches!(tag_attr(tag, "array"), Some("1" | "true")) {
+                let array = matches!(tag_attr(tag, "array"), Some("1" | "true"));
+                if !array && !element_text(&xml[a..b]).trim().is_empty() {
                     edits.push((a, b, String::new()));
                 }
             }
@@ -21196,6 +21186,18 @@ mod table_command_tests {
                 .iter()
                 .all(Option::is_none)
         );
+    }
+
+    /// An empty formula element loads as none and saves as the file has it.
+    #[test]
+    fn an_empty_calculated_formula_element_saves_unchanged() {
+        let mut pkg = one_table();
+        let part = pkg.workbook.tables[0].part.clone();
+        column_child(&mut pkg, &part, "Item", "<calculatedColumnFormula/>");
+        calculated(&mut pkg, &part, "Qty", "LEN(Table1[[#This Row],[Item]])");
+        let re = reload(&pkg);
+        assert_eq!(re.workbook.tables[0].calculated_formulas[0], None);
+        assert_eq!(text(&reload(&re), &part), text(&pkg, &part));
     }
 
     /// A CDATA formula loads as its text and saves unchanged.

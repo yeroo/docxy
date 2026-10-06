@@ -1651,10 +1651,7 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
             i += 1;
             continue;
         }
-        let inside = |(s, cell): FormulaSite| match (s, cell) {
-            (Some(s), Some((r, c))) => t.contains(s, r, c),
-            _ => false,
-        };
+        let inside = |site: FormulaSite| site.inside(&t);
         if deleted.iter().all(|&d| d) {
             rewrite_workbook_formulas(
                 wb,
@@ -2078,11 +2075,8 @@ pub fn sync_table_headers(wb: &mut Workbook, sheet: usize, cells: &[(u32, u32)])
             rewrite_workbook_formulas(
                 wb,
                 |_, _| true,
-                |e, (s, cell)| {
-                    let inside = match (s, cell) {
-                        (Some(s), Some((r, c))) => t.contains(s, r, c),
-                        _ => false,
-                    };
+                |e, site| {
+                    let inside = site.inside(&t);
                     crate::formula::rename_table_columns_in_expr(e, &t.name, inside, &map)
                 },
             );
@@ -2138,8 +2132,28 @@ pub fn table_range_conflict(
 }
 
 /// Where a formula sits, for the table rewrites: its sheet (a defined name
-/// has none) and its cell (a conditional-format or validation rule has none).
-type FormulaSite = (Option<usize>, Option<(u32, u32)>);
+/// has none), its cell (a conditional-format or validation rule has none),
+/// and, for a table's calculated-column formula, that table's name.
+#[derive(Clone, Copy)]
+struct FormulaSite<'a> {
+    sheet: Option<usize>,
+    cell: Option<(u32, u32)>,
+    table: Option<&'a str>,
+}
+
+impl FormulaSite<'_> {
+    /// Whether the formula sits inside table `t`, so that its bare
+    /// references name it: a cell of its range, or one of its calculated
+    /// formulas (read in its first data row, which a table with no data row
+    /// lacks).
+    fn inside(&self, t: &crate::sheet::Table) -> bool {
+        match (self.table, self.sheet, self.cell) {
+            (Some(owner), ..) => owner.eq_ignore_ascii_case(&t.name),
+            (None, Some(s), Some((r, c))) => t.contains(s, r, c),
+            _ => false,
+        }
+    }
+}
 
 /// Rewrite every formula a table edit can reach (a table or column rename, a
 /// conversion, a column delete through a table): cell
@@ -2150,8 +2164,13 @@ type FormulaSite = (Option<usize>, Option<(u32, u32)>);
 fn rewrite_workbook_formulas(
     wb: &mut Workbook,
     rules: impl Fn(usize, &[Area]) -> bool,
-    f: impl Fn(&Expr, FormulaSite) -> Expr,
+    f: impl Fn(&Expr, FormulaSite<'_>) -> Expr,
 ) {
+    let at = |sheet, cell| FormulaSite {
+        sheet,
+        cell,
+        table: None,
+    };
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
         for (&(r, c), cell) in sheet.cells.iter_mut() {
             let Some(src) = &cell.formula else {
@@ -2160,7 +2179,7 @@ fn rewrite_workbook_formulas(
             if cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a)) {
                 continue;
             }
-            if let Some(updated) = rewrite_if_changed(src, |e| f(e, (Some(s), Some((r, c))))) {
+            if let Some(updated) = rewrite_if_changed(src, |e| f(e, at(Some(s), Some((r, c))))) {
                 cell.formula = Some(updated);
             }
         }
@@ -2168,30 +2187,33 @@ fn rewrite_workbook_formulas(
             if !rules(s, ranges) {
                 return;
             }
-            if let Some(updated) = rewrite_if_changed(src, |e| f(e, (Some(s), None))) {
+            if let Some(updated) = rewrite_if_changed(src, |e| f(e, at(Some(s), None))) {
                 *src = updated;
             }
         });
     }
     for dn in &mut wb.defined_names {
         if let Some(updated) =
-            crate::formula::rewrite_defined_name(&dn.formula, |e| f(e, (None, None)), None)
+            crate::formula::rewrite_defined_name(&dn.formula, |e| f(e, at(None, None)), None)
         {
             dn.formula = updated;
         }
     }
-    // A table's calculated-column formulas sit in its first data row, or,
-    // in a table with none, in its last row: a site inside the table, so
-    // its bare references still name it.
+    // A table's calculated-column formulas sit in its first data row (one
+    // below the header of a table that has no data row) and inside it.
     for t in &mut wb.tables {
-        let (r1, c1, r2, _) = t.range;
-        let row = (r1 + t.header_rows).min(r2);
-        let sheet = t.sheet;
+        let (r1, c1, ..) = t.range;
+        let row = r1 + t.header_rows;
+        let (sheet, name) = (t.sheet, t.name.clone());
         for (j, slot) in t.calculated_formulas.iter_mut().enumerate() {
             let Some(src) = slot else {
                 continue;
             };
-            let site = (Some(sheet), Some((row, c1 + j as u32)));
+            let site = FormulaSite {
+                sheet: Some(sheet),
+                cell: Some((row, c1 + j as u32)),
+                table: Some(&name),
+            };
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, site)) {
                 *slot = Some(updated);
             }
@@ -2332,9 +2354,11 @@ fn resize_table_at(
         }
         column_ids.push(0);
         calculated.push(None);
-        let header = (header_rows > 0)
-            .then(|| wb.sheets[sheet].cell(r1, c).map(|cl| cl.value.clone()))
+        let header_cell = (header_rows > 0)
+            .then(|| wb.sheets[sheet].cell(r1, c))
             .flatten();
+        let formula = header_cell.is_some_and(|cl| cl.formula.is_some());
+        let header = header_cell.map(|cl| cl.value.clone());
         let n = if auto {
             (1..)
                 .find(|n| {
@@ -2348,7 +2372,10 @@ fn resize_table_at(
         };
         let nm = table_column_name(header.as_ref(), n, &taken);
         taken.push(nm.clone());
-        if header_rows > 0 && !matches!(&header, Some(CellValue::Text(t)) if *t == nm) {
+        // A header is its column's name as text: a formula (`=A10`) is
+        // written over with the name it reads as.
+        let reads_as_name = !formula && matches!(&header, Some(CellValue::Text(t)) if *t == nm);
+        if header_rows > 0 && !reads_as_name {
             let sh = &mut wb.sheets[sheet];
             let mut cell = sh.cell(r1, c).cloned().unwrap_or_default();
             cell.value = CellValue::Text(nm.clone());
@@ -2421,30 +2448,38 @@ pub fn auto_expand_table(wb: &mut Workbook, sheet: usize, (r, c): (u32, u32)) ->
     if typed.is_none_or(Cell::is_blank) || wb.table_at(sheet, r, c).is_some() {
         return false;
     }
-    let grown = wb.tables.iter().enumerate().find_map(|(i, t)| {
-        let (r1, c1, r2, c2) = t.range;
-        if t.sheet != sheet {
-            return None;
+    let candidates: Vec<(usize, Area)> = (wb.tables.iter().enumerate())
+        .filter_map(|(i, t)| {
+            let (r1, c1, r2, c2) = t.range;
+            if t.sheet != sheet {
+                None
+            } else if t.totals_rows == 0 && r == r2 + 1 && (c1..=c2).contains(&c) {
+                Some((i, (r1, c1, r, c2)))
+            } else if c == c2 + 1 && (r1..=r2).contains(&r) {
+                Some((i, (r1, c1, r2, c)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // The first table beside the entry that can take it: one whose grown
+    // range would run into another table, a PivotTable, part of an array
+    // formula or a merged region (a table holds no merges) is passed over.
+    for (idx, rect) in candidates {
+        let merges = &wb.sheets[sheet].merges;
+        if merges.iter().any(|&m| rects_overlap(m, rect)) {
+            continue;
         }
-        if t.totals_rows == 0 && r == r2 + 1 && (c1..=c2).contains(&c) {
-            Some((i, (r1, c1, r, c2)))
-        } else if c == c2 + 1 && (r1..=r2).contains(&r) {
-            Some((i, (r1, c1, r2, c)))
-        } else {
-            None
+        let old = wb.tables[idx].range;
+        if resize_table_at(wb, idx, rect, true).is_err() {
+            continue;
         }
-    });
-    let Some((idx, rect)) = grown else {
-        return false;
-    };
-    let old = wb.tables[idx].range;
-    if resize_table_at(wb, idx, rect, true).is_err() {
-        return false;
+        if rect.2 > old.2 {
+            fill_new_row(wb, idx, rect.2);
+        }
+        return true;
     }
-    if rect.2 > old.2 {
-        fill_new_row(wb, idx, rect.2);
-    }
-    true
+    false
 }
 
 /// Row `row` was just added to table `idx`: each of its blank cells in a
@@ -2523,7 +2558,16 @@ pub fn fill_calculated_column(wb: &mut Workbook, sheet: usize, (r, c): (u32, u32
     };
     let first = at(d1);
     let recorded = t.calculated_formulas.get(j).cloned().flatten();
-    let same = recorded.is_some_and(|f| f == first || parse(&f).ok() == parse(&first).ok());
+    // The same formula, however spelled: `[@Qty]*2` is `Calc[@Qty]*2` (as a
+    // saved file spells it) in its own table.
+    let meaning = |f: &str| {
+        parse(f)
+            .ok()
+            .map(|e| crate::formula::qualify_bare_refs(&e, &t.name))
+    };
+    let same = recorded.is_some_and(|f| {
+        f == first || matches!((meaning(&f), meaning(&first)), (Some(a), Some(b)) if a == b)
+    });
     let sh = &mut wb.sheets[sheet];
     let mut filled = false;
     for rr in (d1..=d2).filter(|&rr| rr != r) {
@@ -2594,6 +2638,20 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
     if let Some(dn) = wb.defined_names.iter().find(|d| iterates(&d.formula)) {
         return Err(format!("The name {} iterates this table", dn.name));
     }
+    // A calculated formula a new row would take, which no cell may hold yet.
+    let calculated = (wb.tables.iter()).find(|other| {
+        other
+            .calculated_formulas
+            .iter()
+            .flatten()
+            .any(|f| iterates(f))
+    });
+    if let Some(other) = calculated {
+        return Err(format!(
+            "The calculated column of table {} iterates this table",
+            other.name
+        ));
+    }
     let info = t.info();
     let sheet_name = wb.sheets[t.sheet].name.clone();
     let target = crate::formula::TableToRange {
@@ -2604,14 +2662,11 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
     rewrite_workbook_formulas(
         wb,
         |_, _| true,
-        |e, (s, cell)| {
+        |e, site| {
             let host = crate::formula::FormulaHost {
-                same_sheet: s == Some(t.sheet),
-                row: cell.map(|(r, _)| r),
-                inside: match (s, cell) {
-                    (Some(s), Some((r, c))) => t.contains(s, r, c),
-                    _ => false,
-                },
+                same_sheet: site.sheet == Some(t.sheet),
+                row: site.cell.map(|(r, _)| r),
+                inside: site.inside(&t),
             };
             crate::formula::table_refs_to_cells_in_expr(e, &target, host)
         },
@@ -5494,5 +5549,99 @@ mod table_tests {
         assert_eq!(wb.tables[0].columns[3], "Total");
         let err = resize_table(&mut wb, "Calc", (0, 0, 0, 4)).unwrap_err();
         assert_eq!(err, "A table needs at least one data row");
+    }
+
+    /// Convert to Range reads a header-only table's calculated formula in
+    /// its first data row, as the formula is written: a this-row reference
+    /// to the converted table becomes that row's cell, not #REF!.
+    #[test]
+    fn convert_to_range_reads_a_header_only_tables_formula_in_its_first_data_row() {
+        let mut wb = calc_682();
+        resize_table(&mut wb, "Calc", (0, 0, 9, 2)).unwrap();
+        wb.tables.push(other_table("Other", 0, (0, 4, 3, 5)));
+        wb.tables[1].set_calculated_formula(1, Some("Calc[@Qty]*2".into()));
+        delete_rows(&mut wb, 0, 1, 3);
+        assert_eq!(wb.tables[1].range, (0, 4, 0, 5));
+        convert_table_to_range(&mut wb, "Calc").unwrap();
+        assert_eq!(
+            wb.tables[0].calculated_formulas[1].as_deref(),
+            Some("$A2*2")
+        );
+    }
+
+    /// A calculated formula no cell holds yet still keeps Convert to Range
+    /// from turning a table it iterates into cells.
+    #[test]
+    fn convert_to_range_refuses_a_calculated_formula_iterating_the_table() {
+        let mut wb = calc_682();
+        wb.tables.push(other_table("Other", 0, (0, 4, 0, 5)));
+        wb.tables[1].set_calculated_formula(1, Some("SUMX(Calc,[@Qty])".into()));
+        let err = convert_table_to_range(&mut wb, "Calc").unwrap_err();
+        assert_eq!(
+            err,
+            "The calculated column of table Other iterates this table"
+        );
+        assert_eq!(wb.tables.len(), 2);
+    }
+
+    /// A formula typed as a new header leaves its text, as a header always
+    /// reads as its column's name.
+    #[test]
+    fn a_formula_header_typed_beside_a_table_becomes_its_text() {
+        let mut wb = sales_682();
+        let header = Cell {
+            value: CellValue::Text("Label".into()),
+            ..Cell::formula("A10")
+        };
+        assert_eq!(type_at(&mut wb, "E1", header), (true, false));
+        assert_eq!(wb.tables[0].columns[4], "Label");
+        let e1 = wb.sheets[0].cell(0, 4).unwrap();
+        assert_eq!(
+            (e1.formula.as_deref(), &e1.value),
+            (None, &CellValue::Text("Label".into()))
+        );
+    }
+
+    /// An entry beside two tables grows the one that can take it, whichever
+    /// was made first.
+    #[test]
+    fn a_conflicting_candidate_lets_the_next_table_grow() {
+        let mut wb = Workbook {
+            sheets: vec![Sheet {
+                name: "Sheet1".into(),
+                ..Sheet::default()
+            }],
+            ..Workbook::default()
+        };
+        wb.tables.push(other_table("Left", 0, (0, 0, 2, 1)));
+        wb.tables.push(other_table("Right", 0, (0, 2, 1, 3)));
+        assert_eq!(type_at(&mut wb, "C3", Cell::text("x")), (true, false));
+        assert_eq!(wb.tables[0].range, (0, 0, 2, 1));
+        assert_eq!(wb.tables[1].range, (0, 2, 2, 3));
+    }
+
+    /// A table holds no merged cells: an entry whose row would take one in
+    /// grows nothing and fills nothing.
+    #[test]
+    fn no_growth_into_a_merged_region() {
+        let mut wb = calc_682();
+        type_at(&mut wb, "C2", Cell::formula("A2*2"));
+        wb.sheets[0].merges.push((4, 1, 4, 2));
+        assert_eq!(type_at(&mut wb, "A5", Cell::number(5.0)), (false, false));
+        assert_eq!(wb.tables[0].range, (0, 0, 3, 2));
+        assert!(wb.sheets[0].cell(4, 2).is_none());
+    }
+
+    /// A recorded formula spelled as a saved file spells it is the same
+    /// formula as the bare one typed again: no change, no undo step.
+    #[test]
+    fn a_saved_spelling_of_the_recorded_formula_is_no_change() {
+        let mut wb = calc_682();
+        resize_table(&mut wb, "Calc", (0, 0, 1, 2)).unwrap();
+        wb.tables[0].set_calculated_formula(2, Some("Calc[[#This Row],[Qty]]*2".into()));
+        assert_eq!(
+            type_at(&mut wb, "C2", Cell::formula("[@Qty]*2")),
+            (false, false)
+        );
     }
 }

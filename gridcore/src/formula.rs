@@ -2976,6 +2976,26 @@ pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
     walk(e, old, new)
 }
 
+/// `e` with its bare structured references (`[@Qty]`, `[Qty]`) qualified
+/// by `table`, the table the formula sits in: what they name there, spelled
+/// as a formula outside it (or a file) spells them.
+pub fn qualify_bare_refs(e: &Expr, table: &str) -> Expr {
+    map_expr(e, &|x| match x {
+        Expr::Structured {
+            table: None,
+            item,
+            col1,
+            col2,
+        } => Some(Expr::Structured {
+            table: Some(table.to_string()),
+            item: *item,
+            col1: col1.clone(),
+            col2: col2.clone(),
+        }),
+        _ => None,
+    })
+}
+
 /// Rebuild `e`, letting `f` replace any node: where `f` returns `Some`, that
 /// replacement stands in for the node (its children are not visited);
 /// elsewhere the walk descends into arguments, operands and array items.
