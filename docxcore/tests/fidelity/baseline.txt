@@ -1643,7 +1643,7 @@ repo:corpus/word-import/source.docx	word/document.xml	lost-attr	/w:document/w:bo
 repo:corpus/word-import/source.docx	word/document.xml	lost-attr	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r/@w:rsidRPr
 repo:docxcore/tests/fixtures/row-content-controls.docx	word/document.xml	lost-attr	/w:document/w:body/w:tbl/w:sdt/w:sdtContent/w:sdt/w:sdtContent/w:tr/@w:rsidR
 
-# modeled property values rewritten on save (values outside the supported set, properties added) (#1060, own issue pending)
+# modeled property values rewritten on save (values outside the supported set, properties added) (#1068)
 ext:Normalize/complex0.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:pPr/w:pBdr/w:bottom/@w:sz
 ext:Normalize/complex0.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:pPr/w:pBdr/w:top/@w:sz
 ext:Normalize/complex0.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:pPr/w:tabs/w:tab/@w:val
@@ -1717,7 +1717,7 @@ ext:table/2007.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w
 ext:table/2007.docx	word/document.xml	changed-value	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r/w:rPr/w:sz/@w:val
 ext:table/2007.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r/w:rPr/w:spacing
 
-# run and paragraph content restructured on save (runs merged or split, lastRenderedPageBreak, smartTag, row-level sdt, special characters) (#1060, own issue pending)
+# run and paragraph content restructured on save (runs merged or split, lastRenderedPageBreak, smartTag, row-level sdt, special characters) (#1069)
 ext:MiscNode/WithMiscNodes.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:smartTag
 ext:MiscNode/WithMiscNodes.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r
 ext:MiscNode/WithMiscNodes.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:smartTagPr

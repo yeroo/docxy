@@ -48,13 +48,13 @@ const CLASSES: &[LossClass] = &[
     LossClass {
         name: "modeled property values rewritten on save (values outside the supported set, \
                properties added)",
-        issue: "#1060, own issue pending",
+        issue: "#1068",
         matches: |e| e.part == "word/document.xml" && in_properties(&e.path),
     },
     LossClass {
         name: "run and paragraph content restructured on save (runs merged or split, \
                lastRenderedPageBreak, smartTag, row-level sdt, special characters)",
-        issue: "#1060, own issue pending",
+        issue: "#1069",
         matches: |e| e.part == "word/document.xml" && e.path.starts_with("/w:document/w:body/"),
     },
 ];

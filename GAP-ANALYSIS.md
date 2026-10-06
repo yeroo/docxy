@@ -43,9 +43,9 @@ described above are listed today:
 - unmodeled property children and attributes of modeled elements, including
   `rsid*` and `w14:paraId`: the fix is #1063;
 - modeled property values rewritten to the supported set (tab alignment,
-  border width, `jc="distribute"`, underline style);
+  border width, `jc="distribute"`, underline style): #1068;
 - run content restructured (runs merged or split, `lastRenderedPageBreak`,
-  `smartTag`, row-level `sdt`).
+  `smartTag`, row-level `sdt`): #1069.
 
 A save with no edits writes the original parts back
 (`save_package_preserving_document`), and the gate holds that path
