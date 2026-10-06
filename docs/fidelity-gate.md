@@ -1,11 +1,12 @@
-# The docx round-trip fidelity gate
+# The round-trip fidelity gate
 
 Saving must never silently destroy a user's document (#1060). The fidelity gate
 opens every corpus `.docx`, saves it with no edits, and compares every package
-part with the original. A loss nobody has accepted fails the build.
+part with the original. A loss nobody has accepted fails the build. The same
+gate runs over `.xlsx` (#1064); [xlsx](#xlsx) below covers what differs.
 
-It is a plain cargo test, `docxcore/tests/fidelity.rs`, and the `docx fidelity
-gate` job runs it in CI on every PR.
+It is a plain cargo test, `docxcore/tests/fidelity.rs`, and the `fidelity gate
+(docx, xlsx)` job runs it in CI on every PR.
 
 ## What it checks
 
@@ -196,11 +197,53 @@ becomes visible for the first time. Such an entry may be added under its own
 class, but only when an entry for the same file at that node or an ancestor goes
 away in the same diff. The PR lists each one (#1063 did this).
 
-## What it does not cover
+## xlsx
 
-- xlsx: #1064.
+`gridcore/tests/fidelity.rs` runs the same gate over `.xlsx`. It shares the
+comparator, the allowlist and baseline formats, and the NEW / STALE /
+UNCLASSIFIED rules: it includes `docxcore/tests/fidelity/mod.rs` by path, so
+there is one comparator. Its own files are `gridcore/tests/fidelity/allowlist.txt`
+and `gridcore/tests/fidelity/baseline.txt`, and its classes are `CLASSES` in
+`gridcore/tests/fidelity.rs`.
+
+```sh
+corpus/tools/fetch-corpus.sh          # also populates corpus/xlsx-ext
+cargo test -p gridcore --test fidelity -- --nocapture
+```
+
+- **The round trip** is `load_xlsx`, then `save_xlsx_for_path` with the file's
+  own path: what xlsxy writes on save. It leaves out `stamp_save`, which
+  rewrites `docProps` with the current time on purpose. xlsx has no separate
+  no-edit save like docx's `save_package_preserving_document`: every save
+  regenerates each worksheet's `<sheetData>`, `<cols>` and `<dimension>` from
+  the model, so the gate measures that.
+- **The files**: the repo-tracked `.xlsx` in `assets/`, `corpus/xlsx/`,
+  `corpus/legacy/addin/`, `corpus/legacy/extra/`, `offxy-vscode/mcp/templates/`
+  and `uiharness/fixtures/`, plus every `.xlsx` under `FIDELITY_XLSX_CORPUS`
+  (default `corpus/xlsx-ext`, the docxy-corpus `xlsx-ext/` directory), searched
+  recursively. `FIDELITY_REQUIRE_CORPUS` and `FIDELITY_UPDATE_BASELINE` work as
+  for docx. `FIDELITY_UPDATE_BASELINE=1 cargo test --workspace` rewrites both
+  baselines.
+- **Equivalences.** A regenerated worksheet differs from the source in ways a
+  detail glob cannot tell apart from a loss. Examples: `0.14000000000000001`
+  written `0.14`, and a dropped `<c r="B2"/>` whose summary looks like a dropped
+  cell that had a value. `EQUIVALENCES` in `gridcore/tests/fidelity.rs` checks
+  such findings against the original part and drops them before the allowlist.
+  The test prints a count per rule, as it does for the allowlist. The rules are:
+  - the same double in another spelling, in a number cell or a column width;
+  - a boolean spelled `1`/`0`;
+  - an empty cell with the default style;
+  - a row holding only such cells.
+
+  Growing this list needs the same review as the allowlist.
+
+## What it does not cover
 - Fixing the losses it found:
   - The unmodeled property children and attributes were fixed by #1063.
   - The other classes in `baseline.txt` each name their issue.
 - Save paths other than `save_package` and `save_package_preserving_document`:
   the HTML bundle, Markdown, compare and merge.
+- For xlsx:
+  - other file types (`.xlsm`, `.xltx`, `.xlsb`), and Save As to another type;
+  - what xlsxy does around a save, such as recalculation on open and
+    `stamp_save`. Only the library's round trip is checked.
