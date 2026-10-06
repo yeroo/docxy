@@ -277,7 +277,11 @@ pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
                 });
             }
             Event::End => {
-                let done = finish(stack.pop()?);
+                let open = stack.pop()?;
+                if open.elem.qname != parser.name() {
+                    return None; // mismatched end tag
+                }
+                let done = finish(open);
                 match stack.last_mut() {
                     Some(parent) => parent.elem.children.push(Node::Elem(done)),
                     None => root = Some(done),
@@ -390,10 +394,17 @@ fn compare_elem(part: &str, path: &str, a: &Elem, b: &Elem, out: &mut Vec<Findin
     }
 }
 
+/// The detail of a lost or extra child: a text's value, or an element's
+/// attributes (sorted, as written), which allowlist rules can match on.
 fn summary(n: &Node) -> String {
     match n {
         Node::Text(t) => format!("{t:?}"),
-        Node::Elem(_) => String::new(),
+        Node::Elem(e) => e
+            .attrs
+            .iter()
+            .map(|a| format!("{}={:?}", a.qname, a.value))
+            .collect::<Vec<_>>()
+            .join(" "),
     }
 }
 
@@ -567,6 +578,23 @@ fn is_xml_part(name: &str, types: &(BTreeSet<String>, BTreeSet<String>)) -> bool
         || types.1.contains(name)
 }
 
+/// Whether `saved` holds exactly the parts of `original`, byte for byte (the
+/// container itself may differ). `Err` names the first difference.
+pub fn parts_identical(original: &[u8], saved: &[u8]) -> Result<(), String> {
+    let a = read_parts(original).ok_or("original is not a readable ZIP")?;
+    let b = read_parts(saved).ok_or("saved package is not a readable ZIP")?;
+    if let Some(name) = a.keys().find(|n| !b.contains_key(*n)) {
+        return Err(format!("{name}: missing"));
+    }
+    if let Some(name) = b.keys().find(|n| !a.contains_key(*n)) {
+        return Err(format!("{name}: extra"));
+    }
+    match a.iter().find(|(n, bytes)| b[*n] != **bytes) {
+        Some((name, _)) => Err(format!("{name}: bytes differ")),
+        None => Ok(()),
+    }
+}
+
 /// Compare every part of `saved` with `original`: XML parts canonically,
 /// everything else byte for byte, plus missing and extra parts.
 pub fn compare_packages(original: &[u8], saved: &[u8]) -> Vec<Finding> {
@@ -649,11 +677,12 @@ pub struct AllowRule {
     pub kind: Kind,
     pub part: String,
     pub path: String,
+    pub detail: String,
     pub reason: String,
 }
 
-/// Parse `kind | part-glob | path-glob | reason` lines. `#` starts a comment.
-/// Every rule needs a non-empty reason.
+/// Parse `kind | part-glob | path-glob | detail-glob | reason` lines. `#`
+/// starts a comment. Every rule needs a non-empty reason.
 pub fn parse_allowlist(text: &str) -> Result<Vec<AllowRule>, String> {
     let mut rules = Vec::new();
     for (n, line) in text.lines().enumerate() {
@@ -661,10 +690,10 @@ pub fn parse_allowlist(text: &str) -> Result<Vec<AllowRule>, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let fields: Vec<&str> = line.splitn(4, '|').map(str::trim).collect();
-        let [kind, part, path, reason] = fields[..] else {
+        let fields: Vec<&str> = line.splitn(5, '|').map(str::trim).collect();
+        let [kind, part, path, detail, reason] = fields[..] else {
             return Err(format!(
-                "allowlist line {}: expected `kind | part | path | reason`",
+                "allowlist line {}: expected `kind | part | path | detail | reason`",
                 n + 1
             ));
         };
@@ -677,6 +706,7 @@ pub fn parse_allowlist(text: &str) -> Result<Vec<AllowRule>, String> {
             kind,
             part: part.to_string(),
             path: path.to_string(),
+            detail: detail.to_string(),
             reason: reason.to_string(),
         });
     }
@@ -685,7 +715,10 @@ pub fn parse_allowlist(text: &str) -> Result<Vec<AllowRule>, String> {
 
 impl AllowRule {
     pub fn matches(&self, f: &Finding) -> bool {
-        self.kind == f.kind && glob(&self.part, &f.part) && glob(&self.path, &f.key_path())
+        self.kind == f.kind
+            && glob(&self.part, &f.part)
+            && glob(&self.path, &f.key_path())
+            && glob(&self.detail, &f.detail)
     }
 }
 

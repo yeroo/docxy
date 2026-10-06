@@ -99,12 +99,15 @@ fn flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
+/// Collect the `.docx` under `dir`. An unreadable directory is an error, not
+/// an empty one: a silently shrunken corpus would pass vacuously.
 fn docx_files(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("fidelity: {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|e| panic!("fidelity: {}: {e}", dir.display()))
+            .path();
         if path.is_dir() {
             if recursive {
                 docx_files(&path, true, out);
@@ -151,7 +154,7 @@ fn corpus(root: &Path) -> (Vec<(String, PathBuf)>, Option<PathBuf>) {
 /// The round trip under test: what docxy's save does for a modified
 /// document's untouched content. Users' no-edit saves take the preserving
 /// path instead; `preserving` reports whether that one is byte-identical.
-fn round_trip(bytes: &[u8]) -> (Vec<Finding>, bool) {
+fn round_trip(bytes: &[u8]) -> (Vec<Finding>, Result<(), String>) {
     let mut pkg = match load_package(bytes) {
         Ok(pkg) => pkg,
         Err(e) => {
@@ -161,10 +164,10 @@ fn round_trip(bytes: &[u8]) -> (Vec<Finding>, bool) {
                 path: String::new(),
                 detail: format!("{e:?}"),
             };
-            return (vec![f], true);
+            return (vec![f], Ok(()));
         }
     };
-    let preserving = compare_packages(bytes, &save_package_preserving_document(&pkg)).is_empty();
+    let preserving = parts_identical(bytes, &save_package_preserving_document(&pkg));
     pkg.document = Editor::new(pkg.document.clone()).doc;
     (compare_packages(bytes, &save_package(&pkg)), preserving)
 }
@@ -200,14 +203,14 @@ fn round_trip_fidelity_gate() {
     for (file, path) in &files {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         present.insert(file.clone());
-        let mut preserved = true;
+        let mut preserved = Ok(());
         let found = guarded(|| {
             let (found, ok) = round_trip(&bytes);
             preserved = ok;
             found
         });
-        if !preserved {
-            not_preserved.push(file.clone());
+        if let Err(why) = preserved {
+            not_preserved.push(format!("{file}: {why}"));
         }
         for f in found {
             if let Some(rule) = allow.iter().position(|r| r.matches(&f)) {
@@ -440,6 +443,9 @@ fn moved_child_is_lost_plus_extra() {
 #[test]
 fn malformed_or_non_utf8_xml_is_not_parsed() {
     assert!(parse_xml(b"<a><b></a>").is_none());
+    // Balanced, but the end tags do not match their start tags.
+    assert!(parse_xml(b"<a><b></c></a>").is_none());
+    assert!(parse_xml(b"<a><b/></a>").is_some());
     assert!(parse_xml(b"\xff\xfe<\0a\0/\0>\0").is_none());
 }
 
@@ -475,6 +481,75 @@ fn packages_compare_xml_canonically_and_other_parts_by_bytes() {
 }
 
 #[test]
+fn parts_identical_compares_bytes_not_canonical_xml() {
+    use docxcore::zipwrite::write_zip;
+    let pkg = |doc: &[u8], extra: Option<&str>| {
+        let mut parts = vec![("word/document.xml".to_string(), doc.to_vec())];
+        parts.extend(extra.map(|n| (n.to_string(), b"<x/>".to_vec())));
+        write_zip(&parts)
+    };
+    let original = pkg(br#"<a xmlns="urn:x" k="1" j="2"/>"#, None);
+    assert_eq!(parts_identical(&original, &original), Ok(()));
+    // Canonically equal (attribute order), but not the same bytes.
+    let reordered = pkg(br#"<a xmlns="urn:x" j="2" k="1"/>"#, None);
+    assert!(compare_packages(&original, &reordered).is_empty());
+    assert_eq!(
+        parts_identical(&original, &reordered),
+        Err("word/document.xml: bytes differ".into())
+    );
+    assert_eq!(
+        parts_identical(
+            &original,
+            &pkg(br#"<a xmlns="urn:x" k="1" j="2"/>"#, Some("b.xml"))
+        ),
+        Err("b.xml: extra".into())
+    );
+}
+
+#[test]
+fn allowlist_tolerates_only_the_styles_content_type_override() {
+    let here = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fidelity");
+    let allow =
+        parse_allowlist(&std::fs::read_to_string(here.join("allowlist.txt")).unwrap()).unwrap();
+    const CT: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
+    let types = |overrides: &str| {
+        format!(
+            r#"<Types xmlns="{CT}"><Default Extension="xml" ContentType="application/xml"/>{overrides}</Types>"#
+        )
+    };
+    let original = types("");
+    let tolerated = |added: &str| {
+        let found = compare_xml(
+            "[Content_Types].xml",
+            &parse_xml(original.as_bytes()).unwrap(),
+            &parse_xml(types(added).as_bytes()).unwrap(),
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind, Kind::ExtraElement);
+        allow.iter().any(|r| r.matches(&found[0]))
+    };
+    assert!(tolerated(
+        r#"<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>"#
+    ));
+    assert!(!tolerated(
+        r#"<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>"#
+    ));
+    assert!(!tolerated(
+        r#"<Override PartName="/word/styles.xml" ContentType="application/xml"/>"#
+    ));
+}
+
+#[test]
+#[should_panic(expected = "fidelity:")]
+fn unreadable_corpus_directory_is_an_error() {
+    docx_files(
+        &workspace_root().join("corpus/no-such-dir"),
+        false,
+        &mut Vec::new(),
+    );
+}
+
+#[test]
 fn panic_becomes_a_finding() {
     let found = guarded(|| panic!("boom"));
     assert_eq!(found.len(), 1);
@@ -484,12 +559,13 @@ fn panic_becomes_a_finding() {
 
 #[test]
 fn allowlist_needs_a_reason_and_matches_by_glob() {
-    assert!(parse_allowlist("extra-attr | word/document.xml | */w:t/@xml:space |").is_err());
-    assert!(parse_allowlist("extra-attr | word/document.xml | */w:t/@xml:space").is_err());
-    assert!(parse_allowlist("bogus | * | * | r").is_err());
-    let rules =
-        parse_allowlist("# c\nextra-attr | word/*.xml | */w:t/@xml:space | serializer adds it\n")
-            .unwrap();
+    assert!(parse_allowlist("extra-attr | word/document.xml | */w:t/@xml:space | * |").is_err());
+    assert!(parse_allowlist("extra-attr | word/document.xml | */w:t/@xml:space | *").is_err());
+    assert!(parse_allowlist("bogus | * | * | * | r").is_err());
+    let rules = parse_allowlist(
+        "# c\nextra-attr | word/*.xml | */w:t/@xml:space | * | serializer adds it\n",
+    )
+    .unwrap();
     let f = |kind, path: &str| Finding {
         part: "word/document.xml".into(),
         kind,

@@ -101,12 +101,20 @@ any existing copy alone and exits 0.
 normalizations the gate tolerates in every file:
 
 ```
-kind | part glob | index-free path glob | reason
-extra-attr | word/document.xml | */w:t/@xml:space | The serializer writes xml:space="preserve" on every w:t. ...
+kind | part glob | index-free path glob | detail glob | reason
+extra-attr | word/document.xml | */w:t/@xml:space | preserve | The serializer writes xml:space="preserve" on every w:t. ...
 ```
 
-In the globs, `*` matches any run of characters, including `/`. A rule without
-a reason is a parse error. The test prints how many findings each rule absorbed.
+In the globs, `*` matches any run of characters, including `/`. The detail is
+what the report prints after the path:
+- for an attribute, its value;
+- for a lost or extra element, its attributes as `name="value"` pairs, sorted by
+  namespace and local name.
+
+So a rule can tolerate one specific element, such as the content-type
+`Override` for an added styles part, rather than every extra element at that
+path. A rule without a reason is a parse error. The test prints how many
+findings each rule absorbed.
 
 Shrinking the allowlist is progress. Growing it needs review: a rule hides that
 difference in **every** file, now and later. A real loss that is not fixed yet
