@@ -24,6 +24,7 @@
     themePref: 'auto',
     keytips: 'off',
     showMarks: false,
+    showRuler: false,
     webLayout: false,
     ribbonMin: false,
     zoom: 1,
@@ -170,6 +171,198 @@
     applyTheme();
   }
 
+  // ---- rulers (View > Ruler) ----------------------------------------------------
+  //
+  // Two DOM strips, mirroring the suite's rulers (#543): a horizontal one over
+  // the page's text column (margins shaded, first/left/right indent markers and
+  // the caret paragraph's tab stops, draggable with 1/8" snapping) and a
+  // vertical one pinned to the surface's left edge whose scale follows the
+  // page. The frames stick to the scrollport; the tracks inside them are
+  // redrawn from the page rect on scroll, zoom, resize, re-render and caret
+  // moves. All marker math is DocxyEngine.ruler (node-tested against the suite).
+
+  function buildRulers() {
+    el.rulerH = h('div', { class: 'ruler ruler-h', id: 'ruler-h', hidden: true }, [
+      el.rulerHTrack = h('div', { class: 'ruler-track' }, [
+        h('div', { class: 'ruler-band' }),
+        h('div', { class: 'ruler-ticks' }),
+        el.rulerHTabs = h('div', { class: 'ruler-tabs' }),
+        el.rulerHMark = h('div', { class: 'ruler-markers' }, [
+          el.rulerMFirst = h('div', { class: 'ruler-m ruler-m-first' }),
+          el.rulerMLeft = h('div', { class: 'ruler-m ruler-m-left' }),
+          el.rulerMRight = h('div', { class: 'ruler-m ruler-m-right' }),
+        ]),
+        el.rulerHGuide = h('div', { class: 'ruler-guide' }),
+      ]),
+    ]);
+    el.rulerV = h('div', { class: 'ruler ruler-v', id: 'ruler-v', hidden: true }, [
+      el.rulerVTrack = h('div', { class: 'ruler-track' }, [
+        h('div', { class: 'ruler-band' }),
+        h('div', { class: 'ruler-ticks' }),
+        el.rulerVNums = h('div', { class: 'ruler-nums' }),
+      ]),
+    ]);
+  }
+
+  // The caret's paragraph JSON (what paraHtml rendered), wherever it nests.
+  function caretPara() {
+    if (!S.model || !S.lastCaret) return null;
+    var want = String(S.lastCaret.p);
+    var found = null;
+    var walk = function (blocks) {
+      for (var i = 0; i < blocks.length && !found; i++) {
+        var b = blocks[i];
+        if (b.t === 'p') {
+          if (String(b.p) === want) found = b;
+        } else if (b.t === 'tbl') {
+          b.rows.forEach(function (row) {
+            row.forEach(function (cell) { walk(cell.blocks); });
+          });
+        }
+      }
+    };
+    walk(S.model.blocks);
+    return found;
+  }
+
+  // The derived zoom: getBoundingClientRect is zoom-aware, offsetWidth is not,
+  // and their ratio is the only engine-neutral scale (Chromium vs Firefox).
+  function pageScale() {
+    var rect = el.page.getBoundingClientRect();
+    return rect.width / el.page.offsetWidth;
+  }
+
+  function drawRulers() {
+    if (!el.rulerH) return;
+    var on = S.showRuler && !S.webLayout && !!S.model;
+    el.rulerH.hidden = !on;
+    el.rulerV.hidden = !on;
+    if (!on) return;
+    var rect = el.page.getBoundingClientRect();
+    var zoom = pageScale();
+    var pg = S.model.page;
+    var mlPx = pg.left / TW, mrPx = pg.right / TW;
+    // Horizontal: the track sits over the page; geometry works in track coords.
+    var hRect = el.rulerH.getBoundingClientRect();
+    el.rulerHTrack.style.left = (rect.left - hRect.left) + 'px';
+    el.rulerHTrack.style.width = rect.width + 'px';
+    var p = caretPara();
+    var eff = p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0 };
+    var g = E.ruler.geometry({ left: 0, right: rect.width }, mlPx, mrPx, zoom, zoom, eff, p ? p.tabs : null);
+    var band = el.rulerHTrack.querySelector('.ruler-band');
+    band.style.left = g.contentX + 'px';
+    band.style.width = Math.max(0, g.contentRight - g.contentX) + 'px';
+    var ticks = el.rulerHTrack.querySelector('.ruler-ticks');
+    ticks.style.setProperty('--tick-minor', rnd(12 * zoom) + 'px');
+    ticks.style.setProperty('--tick-major', rnd(96 * zoom) + 'px');
+    el.rulerHTabs.textContent = '';
+    g.tabs.forEach(function (x) {
+      el.rulerHTabs.appendChild(h('div', { class: 'ruler-tab', style: 'left:' + x + 'px' }));
+    });
+    el.rulerMFirst.style.left = g.firstX + 'px';
+    el.rulerMLeft.style.left = g.leftX + 'px';
+    el.rulerMRight.style.left = g.rightX + 'px';
+    el.rulerMFirst.hidden = el.rulerMLeft.hidden = el.rulerMRight.hidden = !p;
+    // Vertical: the frame is pinned; the track follows the page vertically.
+    // The negative margin keeps the strip from displacing .pages below it.
+    var vh = el.surface.clientHeight;
+    el.rulerV.style.height = vh + 'px';
+    el.rulerV.style.marginBottom = -vh + 'px';
+    var vRect = el.rulerV.getBoundingClientRect();
+    el.rulerVTrack.style.top = (rect.top - vRect.top) + 'px';
+    el.rulerVTrack.style.height = rect.height + 'px';
+    var mtPx = pg.top / TW, mbPx = pg.bottom / TW;
+    var vband = el.rulerVTrack.querySelector('.ruler-band');
+    vband.style.top = mtPx * zoom + 'px';
+    vband.style.bottom = mbPx * zoom + 'px';
+    var vticks = el.rulerVTrack.querySelector('.ruler-ticks');
+    vticks.style.setProperty('--tick-minor', rnd(12 * zoom) + 'px');
+    vticks.style.setProperty('--tick-major', rnd(96 * zoom) + 'px');
+    el.rulerVNums.textContent = '';
+    var inch = 96 * zoom;
+    for (var i = 0; i * inch < rect.height && i < 100; i++) {
+      el.rulerVNums.appendChild(h('div', { class: 'ruler-num', text: String(i), style: 'top:' + rnd(i * inch + 1) + 'px' }));
+    }
+  }
+
+  function rnd(x) { return Math.round(x * 100) / 100; }
+
+  // Drag a marker: pointer-captured on the strip, one engine command on
+  // pointerup (a single undo step), a live guide while moving. The selection
+  // is left alone; the command applies to the caret paragraph.
+  var rulerDrag = null;
+
+  function rulerHandleAt(x) {
+    var hit = 6; // px tolerance on each side of a marker
+    var xs = [
+      ['first', parseFloat(el.rulerMFirst.style.left) || 0],
+      ['left', parseFloat(el.rulerMLeft.style.left) || 0],
+      ['right', parseFloat(el.rulerMRight.style.left) || 0],
+    ];
+    var best = null, bestD = hit + 1;
+    xs.forEach(function (m) {
+      var d = Math.abs(m[1] - x);
+      if (d <= hit && d < bestD) { best = m[0]; bestD = d; }
+    });
+    return best;
+  }
+
+  function rulerGuideX(handle, res, g) {
+    return handle === 'right' ? g.contentRight - E.ruler.twToPx(res.guide, g.zoom)
+      : g.contentX + E.ruler.twToPx(res.guide, g.zoom);
+  }
+
+  function wireRuler() {
+    el.surface.addEventListener('scroll', drawRulers);
+    var strip = el.rulerH;
+    strip.addEventListener('pointerdown', function (e) {
+      if (!S.showRuler || S.webLayout) return;
+      if (e.button !== undefined && e.button !== 0) return;
+      var trackRect = el.rulerHTrack.getBoundingClientRect();
+      var handle = rulerHandleAt(e.clientX - trackRect.left);
+      if (!handle) return;
+      e.preventDefault(); // keep the caret and selection where they are
+      var rect = el.page.getBoundingClientRect();
+      var zoom = pageScale();
+      var pg = S.model.page;
+      var p = caretPara();
+      rulerDrag = {
+        handle: handle,
+        startX: e.clientX,
+        zoom: zoom,
+        eff: p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0 },
+        geom: E.ruler.geometry({ left: 0, right: rect.width }, pg.left / TW, pg.right / TW, zoom, zoom,
+          p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0 }, null),
+      };
+      try { strip.setPointerCapture(e.pointerId); } catch (err) { /* older engines */ }
+    });
+    strip.addEventListener('pointermove', function (e) {
+      if (!rulerDrag) return;
+      var res = E.ruler.dragResult(rulerDrag.handle, rulerDrag.eff, e.clientX - rulerDrag.startX, rulerDrag.zoom);
+      var g = rulerDrag.geom;
+      var x = rulerGuideX(rulerDrag.handle, res, g);
+      var marker = rulerDrag.handle === 'first' ? el.rulerMFirst
+        : rulerDrag.handle === 'left' ? el.rulerMLeft : el.rulerMRight;
+      marker.style.left = x + 'px';
+      el.rulerHGuide.style.left = x + 'px';
+      el.rulerHGuide.style.display = 'block';
+    });
+    var finish = function (e) {
+      if (!rulerDrag) return;
+      var drag = rulerDrag;
+      rulerDrag = null;
+      el.rulerHGuide.style.display = 'none';
+      var res = E.ruler.dragResult(drag.handle, drag.eff, e.clientX - drag.startX, drag.zoom);
+      run(res.cmd);
+    };
+    strip.addEventListener('pointerup', finish);
+    strip.addEventListener('pointercancel', function () {
+      rulerDrag = null;
+      el.rulerHGuide.style.display = 'none';
+      drawRulers();
+    });
+  }
+
   // ---- chrome ---------------------------------------------------------------
 
   function bundleFileName() {
@@ -208,6 +401,9 @@
       role: 'textbox', 'aria-multiline': 'true', 'aria-label': 'Document',
     });
     el.page.appendChild(el.doc);
+    buildRulers();
+    el.surface.appendChild(el.rulerH);
+    el.surface.appendChild(el.rulerV);
     el.surface.appendChild(h('div', { class: 'pages' }, [el.page]));
     el.backstage = buildBackstage();
     el.status = h('span', { class: 'state', id: 'status-state' });
@@ -234,6 +430,7 @@
     S.zoom = Math.min(3, Math.max(0.5, Math.round(z * 10) / 10));
     el.page.style.zoom = S.zoom;
     el.zoomPct.textContent = Math.round(S.zoom * 100) + '%';
+    drawRulers();
   }
 
   function updateChip() {
@@ -441,6 +638,7 @@
     ParaBorders: function (s) { return s.borderBottom; },
     ShowHide: function () { return S.showMarks; },
     PrintLayout: function () { return !S.webLayout; },
+    ToggleRuler: function () { return S.showRuler; },
     // The Styles gallery's selected item follows the paragraph (suite rule).
     Normal: function (s) { return (s.style === null || s.style === 'Normal') && !s.noSpacing; },
     NoSpacing: function (s) { return s.noSpacing; },
@@ -564,6 +762,12 @@
       case 'layout':
         S.webLayout = !S.webLayout;
         el.surface.classList.toggle('web', S.webLayout);
+        drawRulers();
+        refreshRibbonState();
+        break;
+      case 'ruler':
+        S.showRuler = !S.showRuler;
+        drawRulers();
         refreshRibbonState();
         break;
       case 'theme': cycleTheme(); break;
@@ -920,6 +1124,7 @@
       if (url) img.src = url;
     });
     updateStats();
+    drawRulers();
   }
 
   function updateStats() {
@@ -1059,6 +1264,7 @@
     } else {
       refreshRibbonState();
     }
+    drawRulers();
   }
 
   // ---- input -------------------------------------------------------------------
@@ -1430,6 +1636,7 @@
       S.engine = engine;
       engine.open(payload.bytes);
       buildChrome();
+      wireRuler();
       applyTheme();
       renderTabs();
       renderRibbon();
@@ -1452,7 +1659,7 @@
       if (popupEl && !popupEl.contains(e.target)) hidePopup();
       hideTip();
     });
-    window.addEventListener('resize', function () { if (el.ribbon) layoutRibbon(); });
+    window.addEventListener('resize', function () { if (el.ribbon) { layoutRibbon(); drawRulers(); } });
     if (darkQuery && darkQuery.addEventListener) {
       darkQuery.addEventListener('change', function () { if (S.themePref === 'auto') applyTheme(); });
     }
