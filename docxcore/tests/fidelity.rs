@@ -1267,6 +1267,84 @@ fn schema_counts_only_violations_the_save_added() {
 }
 
 #[test]
+fn schema_places_math_without_checking_it() {
+    let m = "xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\"";
+    // A cell holding only math has its content; math interleaves with runs.
+    assert_eq!(
+        schema(&format!(
+            "<w:tbl {m}><w:tblPr/><w:tblGrid/><w:tr><w:tc><m:oMathPara><m:oMath><m:r><w:jc/>\
+             <w:jc/></m:r></m:oMath></m:oMathPara></w:tc></w:tr></w:tbl>\
+             <w:p {m}><w:r><w:t>x</w:t></w:r><m:oMath/><w:r><w:t>y</w:t></w:r></w:p>"
+        )),
+        []
+    );
+    // But not before the paragraph's properties.
+    assert_eq!(
+        schema(&format!("<w:p {m}><m:oMath/><w:pPr/></w:p>")),
+        [violation("order", "/w:document/w:body/w:p", "w:pPr")]
+    );
+}
+
+#[test]
+fn schema_style_properties_have_the_general_models() {
+    let xml = format!(
+        "<w:styles {W_NS}><w:style w:styleId=\"s\"><w:pPr><w:jc w:val=\"left\"/><w:rPr/>\
+         <w:sectPr/></w:pPr><w:tblPr><w:tblW w:w=\"0\"/><w:tblPrChange/></w:tblPr>\
+         <w:tblStylePr w:type=\"firstRow\"><w:pPr><w:pPrChange/></w:pPr><w:tblPr>\
+         <w:tblPrChange/></w:tblPr></w:tblStylePr></w:style></w:styles>"
+    );
+    assert_eq!(
+        schema_of(&xml),
+        [
+            violation("not-allowed", "/w:styles/w:style/w:pPr", "w:rPr"),
+            violation("not-allowed", "/w:styles/w:style/w:pPr", "w:sectPr"),
+            violation("not-allowed", "/w:styles/w:style/w:tblPr", "w:tblPrChange"),
+            violation(
+                "not-allowed",
+                "/w:styles/w:style/w:tblStylePr/w:tblPr",
+                "w:tblPrChange"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn schema_validates_utf16_parts() {
+    use docxcore::zipwrite::write_zip;
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?><w:hdr {W_NS}><w:p><w:smartTagPr/></w:p></w:hdr>"
+    );
+    let le: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(xml.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let be: Vec<u8> = xml.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let pkg = write_zip(&[
+        ("word/header1.xml".to_string(), le),
+        ("word/header2.xml".to_string(), be),
+    ]);
+    let found: Vec<_> = validate_package(&pkg)
+        .into_iter()
+        .map(|v| (v.part, v.rule.as_str(), v.child))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                "word/header1.xml".to_string(),
+                "not-allowed",
+                "w:smartTagPr".to_string()
+            ),
+            (
+                "word/header2.xml".to_string(),
+                "not-allowed",
+                "w:smartTagPr".to_string()
+            ),
+        ]
+    );
+}
+
+#[test]
 fn schema_is_clean_on_the_saved_smart_tag_fixture_1083() {
     let path = workspace_root().join("docxcore/tests/fixtures/smarttag-pr.docx");
     let bytes = std::fs::read(path).unwrap();

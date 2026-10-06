@@ -24,6 +24,7 @@ use super::{Elem, Node, child_steps, parse_xml, read_parts, strip_indices};
 const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const W_STRICT: &str = "http://purl.oclc.org/ooxml/wordprocessingml/main";
 const MC: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+const MATH: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Rule {
@@ -138,8 +139,11 @@ const RANGE_MARKUP: &[&str] = &[
     "customXmlMoveToRangeEnd",
 ];
 
-/// The rest of EG_RunLevelElements (less math, which is not `w:`).
+/// The rest of EG_RunLevelElements. Math (EG_MathContent) is not `w:`: its
+/// two elements take the names `m:oMath` and `m:oMathPara` here.
 const RUN_OTHER: &[&str] = &[
+    "m:oMath",
+    "m:oMathPara",
     "proofErr",
     "permStart",
     "permEnd",
@@ -432,6 +436,10 @@ fn model(local: &str, ancestors: &[&str]) -> Option<Vec<Slot>> {
         "tc" => vec![opt("tcPr"), (BLOCKS, Plus)],
         // CT_PPrBase in a revision's snapshot.
         "pPr" if parent == "pPrChange" => each(PPR_BASE).collect(),
+        // CT_PPrGeneral: a style's, a list level's or a default's.
+        "pPr" if matches!(parent, "style" | "tblStylePr" | "lvl" | "pPrDefault") => {
+            each(PPR_BASE).chain([opt("pPrChange")]).collect()
+        }
         // CT_PPr; a style's CT_PPrGeneral is a subset.
         "pPr" => each(PPR_BASE)
             .chain([opt("rPr"), opt("sectPr"), opt("pPrChange")])
@@ -447,7 +455,10 @@ fn model(local: &str, ancestors: &[&str]) -> Option<Vec<Slot>> {
         // CT_RPrOriginal: a run's snapshot.
         "rPr" if parent == "rPrChange" => vec![rpr_base],
         "rPr" => vec![rpr_base, opt("rPrChange")],
-        "tblPr" if parent == "tblPrChange" => each(TBLPR_BASE).collect(),
+        // CT_TblPrBase: a revision's snapshot, or a table style's.
+        "tblPr" if matches!(parent, "tblPrChange" | "style" | "tblStylePr") => {
+            each(TBLPR_BASE).collect()
+        }
         "tblPr" => each(TBLPR_BASE).chain([opt("tblPrChange")]).collect(),
         "tblPrEx" if parent == "tblPrExChange" => each(TBLPREX_BASE).collect(),
         "tblPrEx" => each(TBLPREX_BASE).chain([opt("tblPrExChange")]).collect(),
@@ -556,10 +567,16 @@ fn check(part: &str, path: &str, e: &Elem, slots: &[Slot], out: &mut Vec<Violati
     };
     for c in &e.children {
         let Node::Elem(c) = c else { continue };
-        if !is_w(c) {
+        let math;
+        let name = if is_w(c) {
+            c.local.as_str()
+        } else if c.uri == MATH && matches!(c.local.as_str(), "oMath" | "oMathPara") {
+            // Placed (a cell may hold only math), its content not checked.
+            math = format!("m:{}", c.local);
+            &math
+        } else {
             continue;
-        }
-        let name = c.local.as_str();
+        };
         let fits = |i: usize| slots[i].0.contains(name);
         let open = |i: usize, used: &[usize]| match slots[i].1 {
             Many | Plus => true,
@@ -599,11 +616,31 @@ pub fn validate_package(pkg: &[u8]) -> Vec<Violation> {
         if !name.ends_with(".xml") {
             continue;
         }
-        if let Some(root) = parse_xml(bytes).filter(is_w) {
+        if let Some(root) = parse_xml(&utf8(bytes)).filter(is_w) {
             out.extend(validate(name, &root));
         }
     }
     out
+}
+
+/// An XML part as UTF-8: a UTF-16 one (by its byte order mark, or by a
+/// leading `<` without one) is decoded; anything else is left to `parse_xml`.
+fn utf8(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let (body, le) = match bytes {
+        [0xFF, 0xFE, rest @ ..] => (rest, true),
+        [0xFE, 0xFF, rest @ ..] => (rest, false),
+        [b'<', 0, ..] => (bytes, true),
+        [0, b'<', ..] => (bytes, false),
+        _ => return bytes.into(),
+    };
+    let units = body.as_chunks::<2>().0.iter().map(|&u| match le {
+        true => u16::from_le_bytes(u),
+        false => u16::from_be_bytes(u),
+    });
+    match char::decode_utf16(units).collect::<Result<String, _>>() {
+        Ok(text) if body.len() % 2 == 0 => text.into_bytes().into(),
+        _ => bytes.into(),
+    }
 }
 
 /// The violations `saved` adds over `original`: for each key, those beyond
