@@ -1717,3 +1717,30 @@ fn collapsing_a_summary_drops_the_range() {
     toggle_project_collapse(&mut t, 10);
     assert_eq!(sel(&t), None, "expanding does not revive the old anchor");
 }
+
+#[test]
+fn the_window_level_gesture_end_reaches_every_project_tab() {
+    let mut tabs = vec![tab(), tab()];
+    project_cell_press(&mut tabs[0], 0, COL_NAME, false);
+    project_cell_drag_over(&mut tabs[0], 1, COL_NAME);
+    assert!(v(&tabs[0]).dragging);
+    // A gesture can outlive its tab's activation (a tab switch mid-drag,
+    // F11): the window-level press reset and release run over EVERY Project
+    // tab, not only the active one.
+    crate::project_cell_press_reset_all(&mut tabs);
+    assert!(
+        !v(&tabs[0]).dragging && !v(&tabs[0]).drag_made_range,
+        "the reset reached the background tab's gesture"
+    );
+    project_cell_press(&mut tabs[0], 0, COL_NAME, false);
+    project_cell_drag_over(&mut tabs[0], 1, COL_NAME);
+    crate::project_cell_release_all(&mut tabs);
+    assert!(
+        !v(&tabs[0]).dragging,
+        "the release ended the background drag"
+    );
+    assert!(
+        sel(&tabs[0]).is_some(),
+        "ending the drag does not clear the gesture's range"
+    );
+}

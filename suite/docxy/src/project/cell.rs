@@ -448,6 +448,39 @@ pub(crate) fn project_cell_click(tab: &mut DocTab, row: usize, col: Option<usize
     cell_click(tab, ClickTarget::Task(row), col, double);
 }
 
+/// A cell or row click's target: whether `row` is a task is read from the
+/// CURRENT task list — the press may have committed an open entry-row edit
+/// and made the row a task without a redraw in between, and the closure that
+/// runs was captured when the frame was painted.
+pub(crate) fn project_row_click(tab: &mut DocTab, row: usize, col: Option<usize>, double: bool) {
+    let is_task = matches!(
+        &tab.surface,
+        Surface::Project(v) if v.ed.project().tasks.get(row).is_some()
+    );
+    if is_task {
+        project_cell_click(tab, row, col, double);
+    } else {
+        project_entry_click(tab, col, double);
+    }
+}
+
+/// The window-level release applies to EVERY Project tab: a gesture can
+/// outlive its tab's activation (a tab switch mid-drag, F11), and the
+/// release that ends it must reach it wherever it lives.
+pub(crate) fn project_cell_release_all(tabs: &mut [DocTab]) {
+    for tab in tabs {
+        project_cell_release(tab);
+    }
+}
+
+/// The window-level press reset applies to every Project tab, for the same
+/// reason as [`project_cell_release_all`].
+pub(crate) fn project_cell_press_reset_all(tabs: &mut [DocTab]) {
+    for tab in tabs {
+        project_cell_press_reset(tab);
+    }
+}
+
 /// A click on the entry row below the last task, in column `col` (`None`:
 /// outside the table, the column stays). The cursor goes to the entry row,
 /// where typing appends a task, unless the click commits an open entry-row

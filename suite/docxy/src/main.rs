@@ -26567,11 +26567,7 @@ impl Docxy {
         // The menu acts on the row under the pointer: a stale drag flag must
         // not swallow this click and leave the cursor on an older row.
         v.drag_made_range = false;
-        if row < v.ed.project().tasks.len() {
-            project_cell_click(tab, row, col, false);
-        } else {
-            project_entry_click(tab, col, false);
-        }
+        crate::project_row_click(tab, row, col, false);
         let Surface::Project(v) = &tab.surface else {
             return Err("the active tab is not a Project".into());
         };
@@ -31188,7 +31184,9 @@ impl Render for Docxy {
         // render runs in Prepaint and window.on_mouse_event asserts it is
         // called during paint. The swallow flag is not touched at release;
         // the press listener disarms it before any click the press could
-        // produce is dispatched.
+        // produce is dispatched. Both apply to every Project tab: a gesture
+        // can outlive its tab's activation (a tab switch mid-drag, F11), and
+        // the release that ends it must reach it wherever it lives.
         let released = cx.entity();
         let pressed = cx.entity();
         let gesture_listeners = canvas(
@@ -31197,18 +31195,14 @@ impl Render for Docxy {
                 window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
                     if phase == DispatchPhase::Capture && ev.button == MouseButton::Left {
                         released.update(cx, |this, _cx| {
-                            if let Some(tab) = this.tabs.get_mut(this.active) {
-                                crate::project_cell_release(tab);
-                            }
+                            crate::project_cell_release_all(&mut this.tabs);
                         });
                     }
                 });
                 window.on_mouse_event(move |_ev: &MouseDownEvent, phase, _window, cx| {
                     if phase == DispatchPhase::Capture {
                         pressed.update(cx, |this, _cx| {
-                            if let Some(tab) = this.tabs.get_mut(this.active) {
-                                crate::project_cell_press_reset(tab);
-                            }
+                            crate::project_cell_press_reset_all(&mut this.tabs);
                         });
                     }
                 });

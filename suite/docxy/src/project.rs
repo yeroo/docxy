@@ -1108,20 +1108,7 @@ fn editable_row_cells(
                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                     cx.stop_propagation();
                     if let Some(tab) = this.tabs.get_mut(index) {
-                        let double = ev.click_count() >= 2;
-                        // The press may have committed an open entry-row
-                        // edit and made this row a task without a redraw in
-                        // between: decide from the current task list, not
-                        // the uid captured when the frame was painted.
-                        let is_task = matches!(
-                            &tab.surface,
-                            Surface::Project(v) if v.ed.project().tasks.get(row).is_some()
-                        );
-                        if is_task {
-                            project_cell_click(tab, row, Some(col), double);
-                        } else {
-                            project_entry_click(tab, Some(col), double);
-                        }
+                        project_row_click(tab, row, Some(col), ev.click_count() >= 2);
                     }
                     this.refocus(window, cx);
                 }))
@@ -1383,33 +1370,9 @@ pub(super) fn project_el(
                                                             if let Some(tab) =
                                                                 this.tabs.get_mut(index)
                                                             {
-                                                                // The press may have
-                                                                // committed an open
-                                                                // entry-row edit and
-                                                                // made this row a task
-                                                                // without a redraw in
-                                                                // between: decide from
-                                                                // the current task
-                                                                // list, not the frame
-                                                                // this row rendered in.
-                                                                let is_task = matches!(
-                                                                    &tab.surface,
-                                                                    Surface::Project(v) if v
-                                                                        .ed
-                                                                        .project()
-                                                                        .tasks
-                                                                        .get(i)
-                                                                        .is_some()
+                                                                project_row_click(
+                                                                    tab, i, None, false,
                                                                 );
-                                                                if is_task {
-                                                                    project_cell_click(
-                                                                        tab, i, None, false,
-                                                                    );
-                                                                } else {
-                                                                    project_entry_click(
-                                                                        tab, None, false,
-                                                                    );
-                                                                }
                                                             }
                                                             this.refocus(window, cx);
                                                         },
