@@ -972,7 +972,7 @@ mod win {
     }
     unsafe fn vt_font_size_put(t: &WordFont_Impl, v: f32) -> HRESULT {
         let hp = (v * 2.0).round() as u32;
-        set_font(t.doc, t.all, |p| p.size_half_pts = Some(hp));
+        set_font(t.doc, t.all, |p| put_font_size(p, hp));
         S_OK
     }
     unsafe fn vt_font_name_get(t: &WordFont_Impl, ret: *mut BSTR) -> HRESULT {
@@ -1611,6 +1611,12 @@ mod win {
         p.forget_loaded_font();
     }
 
+    /// `_Font.Size` put (half-points), shared as [`put_font_name`] is.
+    fn put_font_size(p: &mut RunProps, half_pts: u32) {
+        p.size_half_pts = Some(half_pts);
+        p.forget_loaded_size();
+    }
+
     /// `_Font.Color` put, shared as [`put_font_name`] is.
     fn put_font_color(p: &mut RunProps, hex: &str) {
         p.color = Some(hex.to_string());
@@ -1745,7 +1751,7 @@ mod win {
                         if is_put(wflags) {
                             if let Some(pt) = arg(params, 0).and_then(|v| f64::try_from(v).ok()) {
                                 let hp = (pt * 2.0).round() as u32;
-                                set_font(doc, all, |p| p.size_half_pts = Some(hp));
+                                set_font(doc, all, |p| put_font_size(p, hp));
                             }
                         }
                     }

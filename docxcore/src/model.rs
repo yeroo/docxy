@@ -123,6 +123,16 @@ impl RunProps {
         );
     }
 
+    /// Call after setting `size_half_pts` explicitly. A loaded `w:szCs` takes
+    /// the new size too, as Word's size box sets both; otherwise a size equal
+    /// to the loaded `w:sz` would leave a different complex-script size as
+    /// loaded (#1063).
+    pub fn forget_loaded_size(&mut self) {
+        if let Some(size) = self.size_half_pts {
+            crate::serialize::set_shadow_val(&mut self.shadow, "szCs", &size.to_string());
+        }
+    }
+
     /// Call after setting `color` explicitly: as [`RunProps::forget_loaded_font`]
     /// for `w:color`. Clearing the colour drops the loaded `w:color` whole,
     /// so no `w:color` without its required `w:val` is written.

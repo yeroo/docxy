@@ -1391,7 +1391,6 @@ fn property_element_names(scope: PropertyScope) -> (&'static str, &'static str) 
 /// Parse a complete `*PrChange` wrapper while retaining its exact XML. Unknown
 /// wrapper children do not make an otherwise valid prior snapshot unusable.
 fn parse_property_change(p: &mut XmlParser, scope: PropertyScope) -> PropertyChange {
-    let mut metadata = parse_revision_metadata(p);
     let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
     let complete = p.skip_element_complete();
     // The change is written back inside a rebuilt container: it keeps the
@@ -1400,9 +1399,13 @@ fn parse_property_change(p: &mut XmlParser, scope: PropertyScope) -> PropertyCha
     // The metadata is read from the start tag as written back, declarations
     // included, so a reload reads the same.
     let mut written = XmlParser::new(&raw);
-    if written.next() == Event::Start {
-        metadata = parse_revision_metadata(&written);
-    }
+    let first = written.next();
+    debug_assert_eq!(
+        first,
+        Event::Start,
+        "a captured element starts with its tag"
+    );
+    let metadata = parse_revision_metadata(&written);
     let previous = if complete {
         parse_property_snapshot(&raw, scope)
     } else {

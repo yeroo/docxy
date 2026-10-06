@@ -812,6 +812,7 @@ fn apply_run_patch_props(props: &mut RunProps, patch: &RunPatch) {
     }
     if let Some(sz) = patch.size_half_pts {
         props.size_half_pts = Some(sz);
+        props.forget_loaded_size();
     }
 }
 

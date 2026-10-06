@@ -448,6 +448,26 @@ pub(crate) const COLOR_VALUE: &[&str] = &["w:val", "w:themeColor", "w:themeShade
 /// the edit is written from the model even when it sets the loaded value, and
 /// the attributes it replaces (a theme colour or font that would override it)
 /// go with it.
+/// Set `w:val` of the loaded element named `local` in `shadow` (the other
+/// attributes stay), so it reads as edited to `val`.
+pub(crate) fn set_shadow_val(shadow: &mut [String], local: &str, val: &str) {
+    for raw in shadow.iter_mut().filter(|raw| local_name(raw) == local) {
+        let name = raw
+            .trim_start()
+            .trim_start_matches('<')
+            .split([' ', '/', '>', '\t', '\n', '\r'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let mut attrs = element_attrs_of(raw);
+        match attrs.iter_mut().find(|(n, _)| n == "w:val") {
+            Some((_, v)) => *v = val.to_string(),
+            None => attrs.insert(0, ("w:val".to_string(), val.to_string())),
+        }
+        *raw = empty_element(&name, &attrs);
+    }
+}
+
 pub(crate) fn forget_shadow_attrs(shadow: &mut Vec<String>, local: &str, attrs: &[&str]) {
     shadow.retain_mut(|raw| {
         if local_name(raw) != local {

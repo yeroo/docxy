@@ -872,3 +872,43 @@ fn a_property_change_with_an_inherited_binding_reloads_to_the_same_model() {
     let (_, reloaded) = open(&saved);
     assert_eq!(reloaded.doc, loaded);
 }
+
+/// Review r6: setting the size a run already has in `w:sz` sets its
+/// complex-script size as well, as Word's size box does; an equal pair stays
+/// as loaded.
+#[test]
+fn setting_the_loaded_size_sets_the_complex_script_size_too() {
+    let xml = edited(
+        "<w:p><w:r><w:rPr><w:sz w:val=\"22\"/><w:szCs w:val=\"30\"/></w:rPr><w:t>text</w:t></w:r></w:p>",
+        |e| e.set_font_size(22),
+    );
+    assert_eq!(
+        rpr_of(&xml, "text"),
+        "<w:rPr><w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/></w:rPr>",
+        "{xml}"
+    );
+    let (pkg, mut editor) = open(&docx(
+        "<w:p><w:r><w:rPr><w:sz w:val=\"22\"/><w:szCs w:val=\"30\"/></w:rPr><w:t>text</w:t></w:r></w:p>",
+    ));
+    let patch = docxcore::agent::RunPatch {
+        size_half_pts: Some(22),
+        ..Default::default()
+    };
+    docxcore::agent::format_range(&mut editor, 0, 0, &patch).expect("formatted");
+    let xml = document_xml(&save(pkg, editor));
+    assert!(
+        rpr_of(&xml, "text").contains("<w:szCs w:val=\"22\"/>"),
+        "{xml}"
+    );
+}
+
+/// Review r6: Decrease Indent clamped to zero twips still clears a loaded
+/// character-unit left indent.
+#[test]
+fn decrease_indent_to_zero_clears_a_character_unit_left_indent() {
+    let xml = edited(
+        "<w:p><w:pPr><w:ind w:leftChars=\"100\"/></w:pPr><w:r><w:t>text</w:t></w:r></w:p>",
+        |e| e.change_indent(-720),
+    );
+    assert!(!xml.contains("leftChars"), "{xml}");
+}

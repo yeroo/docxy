@@ -1501,7 +1501,10 @@ impl Editor {
         });
     }
     pub fn set_font_size(&mut self, half_pts: u32) {
-        self.map_props(move |p| p.size_half_pts = Some(half_pts));
+        self.map_props(move |p| {
+            p.size_half_pts = Some(half_pts);
+            p.forget_loaded_size();
+        });
     }
     pub fn set_font(&mut self, name: &str) {
         let name = name.to_string();
@@ -1598,7 +1601,14 @@ impl Editor {
     /// Increase/decrease the left indent of the selected paragraphs by `delta`
     /// twips (clamped at 0).
     pub fn change_indent(&mut self, delta: i32) {
-        self.for_each_para(|pr| pr.indent = (pr.indent + delta).max(0));
+        self.for_each_para(|pr| {
+            pr.indent = (pr.indent + delta).max(0);
+            // The loaded left indent goes, character units included: a
+            // decrease clamped to zero twips must still clear `w:leftChars`.
+            if delta != 0 {
+                pr.forget_loaded_indent(&[IndentSide::Left]);
+            }
+        });
     }
 
     /// Set the left indent and first-line delta (twips) of the selected
