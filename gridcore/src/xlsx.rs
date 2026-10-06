@@ -2312,30 +2312,15 @@ fn parse_cell_body(
                                     if !ref_attr.is_empty() {
                                         // Keep the master's own `<f>` attrs
                                         // (ref included) for the fallback.
-                                        let mut attrs = String::new();
-                                        for a in p.attrs() {
-                                            attrs.push(' ');
-                                            attrs.push_str(a.name);
-                                            attrs.push_str("=\"");
-                                            attrs.push_str(&esc_raw_attr(a.value));
-                                            attrs.push('"');
-                                        }
-                                        shared_masters.insert(si, (row, col, String::new(), attrs));
+                                        shared_masters
+                                            .insert(si, (row, col, String::new(), raw_f_attrs(p)));
                                     }
                                 }
                             }
                             "" | "normal" => {}
                             _ => {
                                 // array / dataTable — preserve verbatim.
-                                let mut attrs = String::new();
-                                for a in p.attrs() {
-                                    attrs.push(' ');
-                                    attrs.push_str(a.name);
-                                    attrs.push_str("=\"");
-                                    attrs.push_str(&esc_raw_attr(a.value));
-                                    attrs.push('"');
-                                }
-                                f_attrs = Some(attrs);
+                                f_attrs = Some(raw_f_attrs(p));
                             }
                         }
                     }
@@ -2436,6 +2421,19 @@ fn parse_cell_body(
         spill,
         meta: None,
     }
+}
+
+/// The `<f>` the parser is on, its attributes re-serialised verbatim.
+fn raw_f_attrs(p: &XmlParser) -> String {
+    let mut attrs = String::new();
+    for a in p.attrs() {
+        attrs.push(' ');
+        attrs.push_str(a.name);
+        attrs.push_str("=\"");
+        attrs.push_str(&esc_raw_attr(a.value));
+        attrs.push('"');
+    }
+    attrs
 }
 
 /// The `<brk>` the parser is on; `None` when its `id` is unreadable.
@@ -13816,6 +13814,9 @@ b",
             "{ws}"
         );
         assert!(ws.contains(r#"<c r="B2"><f t="shared" si="0"/>"#), "{ws}");
+        assert!(ws.contains(r#"<c r="B3"><f t="shared" si="0"/>"#), "{ws}");
+        let b1 = pkg.workbook.sheets[0].cell(0, 1).unwrap();
+        assert_eq!(b1.formula.as_deref(), Some("[1]Sheet1!A1*2"));
     }
 
     #[test]
