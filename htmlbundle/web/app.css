@@ -242,8 +242,9 @@ svg.icon * { fill: currentColor; }
 
 /* ---- rulers (View > Ruler) ---- */
 .ruler {
-  --ruler-ground: var(--panel); --ruler-content: #ffffff; --ruler-line: var(--border);
-  --ruler-ink: var(--dim); --ruler-marker: var(--fg); --ruler-guide: var(--brand);
+  --ruler-ground: var(--panel); --ruler-content: #ffffff;
+  --ruler-tick: color-mix(in srgb, var(--ink) 45%, transparent);
+  --ruler-marker: var(--ink); --ruler-guide: var(--brand);
   background: var(--ruler-ground);
 }
 .ruler[hidden] { display: none; }
@@ -258,19 +259,19 @@ svg.icon * { fill: currentColor; }
 .ruler-ticks { position: absolute; inset: 0; pointer-events: none; }
 .ruler-h .ruler-ticks {
   background:
-    repeating-linear-gradient(to right, var(--ruler-line) 0 1px, transparent 1px var(--tick-minor, 12px)),
-    repeating-linear-gradient(to right, var(--ruler-line) 0 1px, transparent 1px var(--tick-major, 96px));
+    repeating-linear-gradient(to right, var(--ruler-tick) 0 1px, transparent 1px var(--tick-minor, 12px)),
+    repeating-linear-gradient(to right, var(--ruler-tick) 0 1px, transparent 1px var(--tick-major, 96px));
 }
 .ruler-v .ruler-ticks {
   background:
-    repeating-linear-gradient(to bottom, var(--ruler-line) 0 1px, transparent 1px var(--tick-minor, 12px)),
-    repeating-linear-gradient(to bottom, var(--ruler-line) 0 1px, transparent 1px var(--tick-major, 96px));
+    repeating-linear-gradient(to bottom, var(--ruler-tick) 0 1px, transparent 1px var(--tick-minor, 12px)),
+    repeating-linear-gradient(to bottom, var(--ruler-tick) 0 1px, transparent 1px var(--tick-major, 96px));
 }
 .ruler-tabs { position: absolute; inset: 0; pointer-events: none; }
 .ruler-tab {
   position: absolute; bottom: 1px; margin-left: -3px; width: 0; height: 0;
   border-left: 3px solid transparent; border-right: 3px solid transparent;
-  border-bottom: 5px solid var(--ruler-ink);
+  border-bottom: 5px solid var(--ruler-tick);
 }
 .ruler-m { position: absolute; }
 .ruler-m-first {
@@ -278,15 +279,15 @@ svg.icon * { fill: currentColor; }
   border-left: 4px solid transparent; border-right: 4px solid transparent;
   border-top: 7px solid var(--ruler-marker);
 }
-.ruler-m-left { top: 8px; transform: translateX(-50%); width: 7px; height: 7px; background: var(--ruler-marker); cursor: ew-resize; }
+.ruler-m-left { top: 12px; transform: translateX(-50%); width: 7px; height: 7px; background: var(--ruler-marker); cursor: ew-resize; }
 .ruler-m-right {
-  top: 1px; width: 0; height: 0; cursor: ew-resize;
-  border-top: 4px solid transparent; border-bottom: 4px solid transparent;
-  border-right: 7px solid var(--ruler-marker);
+  top: 11px; transform: translateX(-50%); width: 0; height: 0; cursor: ew-resize;
+  border-left: 4px solid transparent; border-right: 4px solid transparent;
+  border-bottom: 7px solid var(--ruler-marker);
 }
 .ruler-guide { position: absolute; top: 0; display: none; width: 1px; height: 4000px; background: var(--ruler-guide); pointer-events: none; }
 .ruler-nums { position: absolute; inset: 0; pointer-events: none; }
-.ruler-num { position: absolute; right: 1px; font-size: 8px; line-height: 1; color: var(--ruler-ink); }
+.ruler-num { position: absolute; right: 1px; font-size: 8px; line-height: 1; color: var(--ruler-tick); }
 
 /* ---- status bar ---- */
 .statusbar {

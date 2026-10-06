@@ -347,19 +347,27 @@
 
   // The indent the paragraph renders with (paraHtml's two-step logic): a list
   // paragraph with no explicit indent gets the synthetic 360+360*level left and
-  // -360 first. `listLeft` is the left-marker drag floor — the synthetic list
-  // indent when it applied, else 0 (the suite's max(list_step) clamp).
+  // -360 first. `listLeft` is the left-marker drag floor — for a list paragraph
+  // it is ALWAYS the synthetic list indent, even with an explicit left, because
+  // paraHtml re-synthesizes a left of 0 (a drag below the floor would render
+  // back at the synthetic value, not where it was dropped). `list`/`level` are
+  // carried for the first-line nudge in dragResult.
   function effIndent(p) {
     var ind = p.ind;
+    var list = !!p.list;
+    var level = p.level || 0;
     var left = ind ? ind.left : 0;
-    var listLeft = 0;
-    if (p.list && !left) {
-      left = 360 + 360 * (p.level || 0);
-      listLeft = left;
-    }
+    if (list && !left) left = 360 + 360 * level;
     var first = ind ? ind.first : 0;
-    if (p.list && !first) first = -360;
-    return { left: left, first: first, right: ind ? ind.right : 0, listLeft: listLeft };
+    if (list && !first) first = -360;
+    return {
+      left: left,
+      first: first,
+      right: ind ? ind.right : 0,
+      listLeft: list ? 360 + 360 * level : 0,
+      list: list,
+      level: level,
+    };
   }
 
   // Marker and tab-stop x positions from the page rect (viewport coords, CSS
@@ -386,12 +394,17 @@
     var delta = pxToTw(dxPx, zoom);
     if (handle === 'first') {
       var firstMarker = Math.max(snapTwips(eff.left + eff.first + delta), 0);
-      return { cmd: 'firstline\t' + (firstMarker - eff.left), marker: firstMarker, guide: firstMarker };
+      var first = firstMarker - eff.left;
+      // paraHtml re-synthesizes first = -360 for a list paragraph whose first
+      // is 0, which would render the drop one grid step off; nudge a zero
+      // result to the nearest non-zero grid value, in the drag's direction.
+      if (eff.list && first === 0) first = delta >= 0 ? 180 : -180;
+      return { cmd: 'firstline\t' + first, marker: firstMarker, guide: firstMarker };
     }
     if (handle === 'left') {
       var leftMarker = Math.max(snapTwips(eff.left + delta), eff.listLeft || 0);
-      var first = Math.max(eff.first, -leftMarker);
-      return { cmd: 'setind\t' + leftMarker + '\t' + first, marker: leftMarker, guide: leftMarker };
+      var leftFirst = Math.max(eff.first, -leftMarker);
+      return { cmd: 'setind\t' + leftMarker + '\t' + leftFirst, marker: leftMarker, guide: leftMarker };
     }
     var right = snapTwips(Math.max(eff.right - delta, 0));
     return { cmd: 'rightind\t' + right, marker: right, guide: right };

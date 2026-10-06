@@ -192,24 +192,27 @@ test('ruler twToPx/pxToTw round-trip at every zoom', () => {
 test('ruler effIndent mirrors paraHtml exactly', () => {
   const R = E.ruler;
   const ind = (left, right, first) => ({ left, right, first });
-  assert.deepEqual(R.effIndent({ list: '•', level: 0, segs: [] }),
-    { left: 360, first: -360, right: 0, listLeft: 360 });
+  const list = { left: 360, first: -360, right: 0, listLeft: 360, list: true, level: 0 };
+  assert.deepEqual(R.effIndent({ list: '•', level: 0, segs: [] }), list);
   assert.deepEqual(R.effIndent({ list: '•', level: 2, segs: [] }),
-    { left: 1080, first: -360, right: 0, listLeft: 1080 });
-  // Explicit left suppresses the synthetic list indent; first == 0 still gets -360.
+    { left: 1080, first: -360, right: 0, listLeft: 1080, list: true, level: 2 });
+  // Explicit left suppresses the synthetic indent, but the drag floor is still
+  // the synthetic list indent (paraHtml re-synthesizes a left of 0); first == 0
+  // still gets -360.
   assert.deepEqual(R.effIndent({ list: '•', level: 1, ind: ind(720, 0, 0), segs: [] }),
-    { left: 720, first: -360, right: 0, listLeft: 0 });
+    { left: 720, first: -360, right: 0, listLeft: 720, list: true, level: 1 });
   // Non-list paragraphs use the raw values.
   assert.deepEqual(R.effIndent({ ind: ind(1440, 1440, -720) }),
-    { left: 1440, first: -720, right: 1440, listLeft: 0 });
-  assert.deepEqual(R.effIndent({}), { left: 0, first: 0, right: 0, listLeft: 0 });
+    { left: 1440, first: -720, right: 1440, listLeft: 0, list: false, level: 0 });
+  assert.deepEqual(R.effIndent({}),
+    { left: 0, first: 0, right: 0, listLeft: 0, list: false, level: 0 });
   assert.deepEqual(R.effIndent({ ind: ind(720, 0, -360) }),
-    { left: 720, first: -360, right: 0, listLeft: 0 });
+    { left: 720, first: -360, right: 0, listLeft: 0, list: false, level: 0 });
 });
 
 test('ruler dragResult mirrors ruler_drag_result', () => {
   const R = E.ruler;
-  const eff = (left, first, right, listLeft = 0) => ({ left, first, right, listLeft });
+  const eff = (left, first, right, extra = {}) => ({ left, first, right, listLeft: 0, list: false, level: 0, ...extra });
   // 720 twips of drag -> First(720), one firstline command.
   assert.deepEqual(R.dragResult('first', eff(0, 0, 0), 48, 1),
     { cmd: 'firstline\t720', marker: 720, guide: 720 });
@@ -220,10 +223,20 @@ test('ruler dragResult mirrors ruler_drag_result', () => {
   assert.deepEqual(R.dragResult('left', eff(0, 0, 0), 48, 1),
     { cmd: 'setind\t720\t0', marker: 720, guide: 720 });
   // A list paragraph's left marker clamps at its synthetic indent (level 0 and 2).
-  assert.deepEqual(R.dragResult('left', eff(360, -360, 0, 360), -48, 1),
+  assert.deepEqual(R.dragResult('left', eff(360, -360, 0, { listLeft: 360, list: true }), -48, 1),
     { cmd: 'setind\t360\t-360', marker: 360, guide: 360 });
-  assert.deepEqual(R.dragResult('left', eff(1080, -360, 0, 1080), -96, 1),
+  assert.deepEqual(R.dragResult('left', eff(1080, -360, 0, { listLeft: 1080, list: true }), -96, 1),
     { cmd: 'setind\t1080\t-360', marker: 1080, guide: 1080 });
+  // A list with an explicit left still floors at the synthetic list indent.
+  assert.deepEqual(R.dragResult('left', eff(720, -360, 0, { listLeft: 720, list: true, level: 1 }), -96, 1),
+    { cmd: 'setind\t720\t-360', marker: 720, guide: 720 });
+  // A list first-line drag landing exactly on the left indent (first = 0)
+  // nudges to the nearest non-zero grid value, in the drag's direction —
+  // paraHtml would otherwise re-render it at the synthetic -360.
+  assert.deepEqual(R.dragResult('first', eff(360, -360, 0, { listLeft: 360, list: true }), 24, 1),
+    { cmd: 'firstline\t180', marker: 360, guide: 360 });
+  assert.deepEqual(R.dragResult('first', eff(360, -360, 0, { listLeft: 360, list: true }), -24, 1),
+    { cmd: 'firstline\t-360', marker: 0, guide: 0 });
   // Right shrinks with a rightward drag and clamps at 0.
   assert.deepEqual(R.dragResult('right', eff(0, 0, 1440), -48, 1),
     { cmd: 'rightind\t2160', marker: 2160, guide: 2160 });
@@ -250,4 +263,8 @@ test('ruler geometry places markers and tab stops at the suite positions', () =>
   assert.equal(g2.leftX, 292 + 720 * 2 / 15);
   assert.equal(g2.firstX, 292 + (720 - 360) * 2 / 15);
   assert.deepEqual(g2.tabs, [292 + 720 * 2 / 15]);
+  // A non-zero right indent pulls the right marker in from the content edge.
+  const g3 = R.geometry({ left: 100, right: 916, width: 816 }, 96, 96, 1, 1,
+    { left: 0, first: 0, right: 360 }, null);
+  assert.equal(g3.rightX, 820 - 360 / 15);
 });

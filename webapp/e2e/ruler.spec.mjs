@@ -21,7 +21,6 @@ async function markerDeltas(page) {
       const r = document.querySelector(sel).getBoundingClientRect();
       return r.left + r.width / 2;
     };
-    const right = document.querySelector('.ruler-m-right').getBoundingClientRect().left;
     return {
       scale: r.width / pageEl.offsetWidth,
       padL: parseFloat(cs.paddingLeft),
@@ -29,7 +28,7 @@ async function markerDeltas(page) {
       padR: parseFloat(cs.paddingRight),
       left: left('.ruler-m-left') - r.left,
       first: left('.ruler-m-first') - r.left,
-      right: right - r.left,
+      right: left('.ruler-m-right') - r.left,
     };
   });
 }
@@ -72,6 +71,25 @@ test('markers sit at the caret paragraph rendered indents at zoom 1 and 2', asyn
   await guard.check();
 });
 
+test('markers follow a pure caret move to the hanging-indent paragraph', async ({ page, guard }, testInfo) => {
+  await openBundle(page, bundleCopy(testInfo, 'rulers.docx'));
+  await showRulers(page);
+  await page.locator('p[data-p="1"]').click(); // "Hanging indent": left 1440, hanging 720, right 1440.
+  await expect.poll(async () => {
+    const m = await markerDeltas(page);
+    return Math.abs(m.left - (m.padL + 1440 / 15) * m.scale);
+  }, { message: 'left marker' }).toBeLessThanOrEqual(2);
+  await expect.poll(async () => {
+    const m = await markerDeltas(page);
+    return Math.abs(m.first - (m.padL + 720 / 15) * m.scale);
+  }, { message: 'first-line marker at left + hanging' }).toBeLessThanOrEqual(2);
+  await expect.poll(async () => {
+    const m = await markerDeltas(page);
+    return Math.abs(m.right - (m.w - (m.padR + 1440 / 15) * m.scale));
+  }, { message: 'right marker pulled in by the right indent' }).toBeLessThanOrEqual(2);
+  await guard.check();
+});
+
 test('a list paragraph shows the synthetic indent markers', async ({ page, guard }, testInfo) => {
   await openBundle(page, bundleCopy(testInfo, 'rulers.docx'));
   await showRulers(page);
@@ -111,14 +129,57 @@ test('dragging the left marker snaps to the grid; one undo restores it', async (
   await guard.check();
 });
 
+test('the left square is draggable where first is 0', async ({ page, guard }, testInfo) => {
+  await openBundle(page, bundleCopy(testInfo, 'rulers.docx'));
+  await showRulers(page);
+  await page.locator('p[data-p="2"]').click(); // plain paragraph: first == left.
+  const box = (await page.locator('.ruler-m-left').boundingBox());
+  const y = box.y + box.height / 2;
+  await page.mouse.move(box.x + box.width / 2, y);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 + 30, y, { steps: 5 });
+  await page.mouse.up();
+  // Bottom half of the strip drags the LEFT marker (the suite's hruler_hit
+  // row split), not the first-line triangle that shares its x.
+  // snap(0 + 450) lands on 540 (27pt); first stays 0 and is not written.
+  await expect(page.locator('p[data-p="2"]')).toHaveAttribute('style', /margin-left:27pt/);
+  await expect(page.locator('p[data-p="2"]')).not.toHaveAttribute('style', /text-indent/);
+  await guard.check();
+});
+
+test('clicking a marker without moving is not an edit', async ({ page, guard }, testInfo) => {
+  await openBundle(page, bundleCopy(testInfo, 'rulers.docx'));
+  await showRulers(page);
+  await page.locator('p[data-p="0"]').click();
+  const box = (await page.locator('.ruler-m-left').boundingBox());
+  const y = box.y + box.height / 2;
+  await page.mouse.move(box.x + box.width / 2, y);
+  await page.mouse.down();
+  await page.mouse.up();
+  // No movement: no command, so the document is still clean and the
+  // on-grid indent is untouched.
+  const chip = await page.locator('#doc-chip').textContent();
+  expect(chip).not.toContain('•');
+  await expect(page.locator('p[data-p="0"]')).toHaveAttribute('style', /margin-left:72pt/);
+  await guard.check();
+});
+
 test('the rulers follow the theme', async ({ page, guard }, testInfo) => {
   await openBundle(page, bundleCopy(testInfo, 'rulers.docx'));
   await showRulers(page);
   const bg = () => page.locator('#ruler-h').evaluate((n) => getComputedStyle(n).backgroundColor);
+  const colors = () => page.evaluate(() => ({
+    band: getComputedStyle(document.querySelector('.ruler-band')).backgroundColor,
+    marker: getComputedStyle(document.querySelector('.ruler-m-left')).backgroundColor,
+  }));
   const light = await bg();
   const darkButton = page.locator('#ribbon [data-act="DarkMode"]');
   await darkButton.click(); // auto -> light
   await darkButton.click(); // light -> dark
   expect(await bg()).not.toEqual(light);
+  // Markers stay dark on the white content band in dark mode, as the
+  // suite's ruler_colors keeps them near-black in both themes.
+  const dark = await colors();
+  expect(dark.marker).not.toEqual(dark.band);
   await guard.check();
 });

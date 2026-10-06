@@ -247,14 +247,18 @@
     el.rulerHTrack.style.left = (rect.left - hRect.left) + 'px';
     el.rulerHTrack.style.width = rect.width + 'px';
     var p = caretPara();
-    var eff = p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0 };
+    var eff = p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0, list: false, level: 0 };
     var g = E.ruler.geometry({ left: 0, right: rect.width }, mlPx, mrPx, zoom, zoom, eff, p ? p.tabs : null);
     var band = el.rulerHTrack.querySelector('.ruler-band');
     band.style.left = g.contentX + 'px';
     band.style.width = Math.max(0, g.contentRight - g.contentX) + 'px';
     var ticks = el.rulerHTrack.querySelector('.ruler-ticks');
+    // The snap grid is zeroed at the text column, so the ticks are too: for
+    // margins that are not multiples of 180 twips the page edge would
+    // otherwise put every grid line between the snapped positions.
     ticks.style.setProperty('--tick-minor', rnd(12 * zoom) + 'px');
     ticks.style.setProperty('--tick-major', rnd(96 * zoom) + 'px');
+    ticks.style.backgroundPosition = rnd(g.contentX) + 'px 0';
     el.rulerHTabs.textContent = '';
     g.tabs.forEach(function (x) {
       el.rulerHTabs.appendChild(h('div', { class: 'ruler-tab', style: 'left:' + x + 'px' }));
@@ -292,19 +296,27 @@
   // is left alone; the command applies to the caret paragraph.
   var rulerDrag = null;
 
-  function rulerHandleAt(x) {
-    var hit = 6; // px tolerance on each side of a marker
-    var xs = [
-      ['first', parseFloat(el.rulerMFirst.style.left) || 0],
-      ['left', parseFloat(el.rulerMLeft.style.left) || 0],
-      ['right', parseFloat(el.rulerMRight.style.left) || 0],
-    ];
-    var best = null, bestD = hit + 1;
-    xs.forEach(function (m) {
-      var d = Math.abs(m[1] - x);
-      if (d <= hit && d < bestD) { best = m[0]; bestD = d; }
-    });
-    return best;
+  function rulerHandleAt(x, y) {
+    // Mirror the suite's hruler_hit: the first-line marker owns the top half
+    // (y < 11), the left and right markers the bottom half, 7px of tolerance.
+    var firstX = parseFloat(el.rulerMFirst.style.left) || 0;
+    var leftX = parseFloat(el.rulerMLeft.style.left) || 0;
+    var rightX = parseFloat(el.rulerMRight.style.left) || 0;
+    if (y < 11 && Math.abs(x - firstX) <= 7) return 'first';
+    if (y >= 11 && Math.abs(x - leftX) <= 7) return 'left';
+    if (y >= 11 && Math.abs(x - rightX) <= 7) return 'right';
+    return null;
+  }
+
+  // Does a drag result actually change the effective indent? A no-move or
+  // no-change drop must not dirty the document or spend an undo step.
+  function dragChanges(drag, res) {
+    var eff = drag.eff;
+    if (drag.handle === 'first') return res.marker - eff.left !== eff.first;
+    if (drag.handle === 'left') {
+      return res.marker !== eff.left || Math.max(eff.first, -res.marker) !== eff.first;
+    }
+    return res.marker !== eff.right;
   }
 
   function rulerGuideX(handle, res, g) {
@@ -318,21 +330,22 @@
     strip.addEventListener('pointerdown', function (e) {
       if (!S.showRuler || S.webLayout) return;
       if (e.button !== undefined && e.button !== 0) return;
+      var stripRect = strip.getBoundingClientRect();
       var trackRect = el.rulerHTrack.getBoundingClientRect();
-      var handle = rulerHandleAt(e.clientX - trackRect.left);
+      var handle = rulerHandleAt(e.clientX - trackRect.left, e.clientY - stripRect.top);
       if (!handle || el.rulerMLeft.hidden) return;
       e.preventDefault(); // keep the caret and selection where they are
       var rect = el.page.getBoundingClientRect();
       var zoom = pageScale();
       var pg = S.model.page;
       var p = caretPara();
+      var eff = p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0, list: false, level: 0 };
       rulerDrag = {
         handle: handle,
         startX: e.clientX,
         zoom: zoom,
-        eff: p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0 },
-        geom: E.ruler.geometry({ left: 0, right: rect.width }, pg.left / TW, pg.right / TW, zoom, zoom,
-          p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0 }, null),
+        eff: eff,
+        geom: E.ruler.geometry({ left: 0, right: rect.width }, pg.left / TW, pg.right / TW, zoom, zoom, eff, null),
       };
       try { strip.setPointerCapture(e.pointerId); } catch (err) { /* older engines */ }
     });
@@ -353,7 +366,10 @@
       rulerDrag = null;
       el.rulerHGuide.style.display = 'none';
       var res = E.ruler.dragResult(drag.handle, drag.eff, e.clientX - drag.startX, drag.zoom);
-      run(res.cmd);
+      // A click without movement, or a drop back on the starting values, is
+      // not an edit: no command, no dirty, no undo step.
+      if (e.clientX !== drag.startX && dragChanges(drag, res)) run(res.cmd);
+      else drawRulers();
     };
     strip.addEventListener('pointerup', finish);
     strip.addEventListener('pointercancel', function () {
