@@ -999,10 +999,11 @@ pub struct Assignment {
     pub cost: Option<Rate>,
     /// Which of the resource's rate tables prices it: 0 = A .. 4 = E.
     pub cost_rate_table: Option<u8>,
-    /// Delays as MSPDI stores them (tenths of a minute). They move the
-    /// assignment's own start ([`crate::assign::assignment_span`]), never its
-    /// task in CPM, whose duration already includes them. The format is a
-    /// duration unit code.
+    /// Delays as MSPDI stores them (tenths of a minute). A `Delay` moves the
+    /// assignment's own start ([`crate::assign::assignment_span`]); one whose
+    /// flat work then runs past the task's stored `Duration` also extends the
+    /// task's scheduled finish in CPM, which otherwise counts the Duration
+    /// alone. The format is a duration unit code.
     pub delay: Option<i64>,
     pub leveling_delay: Option<i64>,
     pub leveling_delay_format: Option<u8>,
@@ -1113,8 +1114,11 @@ impl Assignment {
 }
 
 /// An MSPDI delay (tenths of a minute) in whole minutes, never negative.
+/// Rounds by division and remainder so an absurd stored value cannot
+/// overflow the rounding.
 fn tenths_to_min(tenths: Option<i64>) -> i64 {
-    (tenths.unwrap_or(0).max(0) + 5) / 10
+    let tenths = tenths.unwrap_or(0).max(0);
+    tenths / 10 + (tenths % 10 + 5) / 10
 }
 
 /// A recorded plan in one MSPDI baseline slot of an assignment.

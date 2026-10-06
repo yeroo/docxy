@@ -18,7 +18,7 @@ use crate::model::{
     AccrueAt, Assignment, Calendar, LagFormat, LagKind, Project, Rate, Resource, ResourceType,
     Task, TimephasedValue, WorkCalendar,
 };
-use crate::schedule::{HORIZON_DAYS, Schedule, working_minutes_on};
+use crate::schedule::{HORIZON_DAYS, MAX_LAG_MIN, Schedule, working_minutes_on};
 use std::collections::{HashMap, HashSet};
 
 /// The calendar a task is scheduled on: its own, else the project default,
@@ -143,6 +143,28 @@ pub fn assignment_span(
         None => r.early_finish,
     };
     Some((start, finish.max(start)))
+}
+
+/// How far into its task a delayed flat-work assignment runs, in whole
+/// working minutes from the task's start: its `Delay` plus its work at its
+/// units. A task finishes with such an assignment, past its stored
+/// `Duration`, as Project schedules it (issue #469). `None` for an
+/// assignment that cannot extend its task: no `Delay`, recorded actuals
+/// (its own `Start`/`Finish` stand, as in `assignment_span`), a contour
+/// (its units are its peak), or a non-work resource (its work is a
+/// quantity).
+pub(crate) fn delayed_extent_min(proj: &Project, a: &Assignment) -> Option<i64> {
+    if a.delay_min() == 0
+        || a.actual_start.is_some()
+        || a.actual_finish.is_some()
+        || !is_flat_work(proj, a)
+    {
+        return None;
+    }
+    // Absurd Units can overflow the work span; cap it where the horizon
+    // saturates anyway.
+    let work = (a.work_min.max(0) as f64 / a.units).round() as i64;
+    Some(a.delay_min().saturating_add(work).min(MAX_LAG_MIN))
 }
 
 /// A stored decimal as a number; absent or unreadable is 0.
@@ -912,6 +934,93 @@ mod tests {
             ..delayed(5)
         };
         assert_eq!(span(&proj, &both).0, at(4, 13));
+    }
+
+    #[test]
+    fn delayed_extent_is_the_delay_plus_the_flat_work_at_its_units() {
+        let proj = plan(at(2, 8), 5);
+        // S43's shape (issue #469): 16h of work at 100%, 8h in, runs three
+        // working days from the task's start.
+        let flat = Assignment {
+            delay: Some(480 * 10),
+            ..assignment(1, 1, 1.0, 16)
+        };
+        assert_eq!(delayed_extent_min(&proj, &flat), Some(480 + 960));
+        // Units scale the work, not the delay.
+        let half = Assignment {
+            delay: Some(480 * 10),
+            ..assignment(1, 1, 0.5, 16)
+        };
+        assert_eq!(delayed_extent_min(&proj, &half), Some(480 + 1920));
+    }
+
+    #[test]
+    fn delayed_extent_skips_undelayed_contoured_non_work_and_actualled() {
+        let mut proj = plan(at(2, 8), 5);
+        proj.resources = vec![
+            resource(1, ResourceType::Work, "0", "0"),
+            resource(2, ResourceType::Material, "0", "0"),
+        ];
+        let flat = Assignment {
+            delay: Some(480 * 10),
+            ..assignment(1, 1, 1.0, 16)
+        };
+        assert_eq!(delayed_extent_min(&proj, &flat), Some(1440));
+        // No delay: the assignment starts with its task, whose stored
+        // Duration already covers its work.
+        assert_eq!(delayed_extent_min(&proj, &assignment(1, 1, 1.0, 16)), None);
+        // A contour's units are its peak, not its average: the finish is not
+        // start + work ÷ units.
+        let contoured = Assignment {
+            work_contour: Some(3),
+            ..flat.clone()
+        };
+        assert_eq!(delayed_extent_min(&proj, &contoured), None);
+        // A material's work is a quantity and a cost resource has none.
+        let material = Assignment {
+            resource_uid: 2,
+            ..flat.clone()
+        };
+        assert_eq!(delayed_extent_min(&proj, &material), None);
+        proj.resources
+            .push(resource(3, ResourceType::Cost, "0", "0"));
+        let cost = Assignment {
+            resource_uid: 3,
+            ..flat.clone()
+        };
+        assert_eq!(delayed_extent_min(&proj, &cost), None);
+        // Zero units spread the work over no time.
+        let ununits = Assignment {
+            units: 0.0,
+            ..flat.clone()
+        };
+        assert_eq!(delayed_extent_min(&proj, &ununits), None);
+        // A recorded ActualFinish stands: the assignment dates are actuals.
+        let done = Assignment {
+            actual_finish: Some(at(3, 12)),
+            ..flat.clone()
+        };
+        assert_eq!(delayed_extent_min(&proj, &done), None);
+        // A recorded ActualStart stands in for the Delay, as in
+        // assignment_span.
+        let started = Assignment {
+            actual_start: Some(at(2, 9)),
+            ..flat
+        };
+        assert_eq!(delayed_extent_min(&proj, &started), None);
+    }
+
+    #[test]
+    fn a_huge_delay_rounds_without_overflowing() {
+        // An absurd stored Delay (tenths of a minute) saturates where the
+        // horizon caps it; the tenths-to-minutes rounding must not overflow
+        // a debug build on the way.
+        let proj = plan(at(2, 8), 5);
+        let huge = Assignment {
+            delay: Some(i64::MAX),
+            ..assignment(1, 1, 1.0, 16)
+        };
+        assert_eq!(delayed_extent_min(&proj, &huge), Some(MAX_LAG_MIN));
     }
 
     #[test]

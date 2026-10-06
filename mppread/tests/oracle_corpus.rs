@@ -799,7 +799,9 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             }
             if task.uid == 55 && expected_task.name == "S43 delayed start" {
                 // Project's delayed assignment makes this task's Duration
-                // shorter than the working span; the assignment delay is not decoded.
+                // shorter than its scheduled span, which the MSPDI path now
+                // models (issue #469); the .mpp import decodes no assignments
+                // yet (#342), so its stored dates stay excluded here.
                 assert_eq!(task.duration_min, expected_task.duration_min);
                 dropped[1] += 1;
                 continue;

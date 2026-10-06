@@ -57,11 +57,17 @@
 //! leveling is separate from CPM. Free slack is computed precisely for
 //! finish-to-start successors and falls back to total slack otherwise.
 //!
+//! An assignment `Delay` (working time from the task's start) moves the
+//! assignment within its task; one whose flat work then runs past the task's
+//! stored `Duration` extends the task's scheduled finish with it, as Project
+//! schedules it (issue #469).
+//!
 //! A task is critical when its total slack is at most the plan's
 //! `CriticalSlackLimit` (0 days by default). With `MultipleCriticalPaths`, a
 //! leaf without successor links is late by its own early finish rather than
 //! the project finish, so it and its drivers each form a critical path.
 
+use crate::assign::{contoured, delayed_extent_min};
 use crate::datetime::DateTime;
 use crate::model::{
     Calendar, ConstraintType, LagKind, LinkType, Predecessor, Project, ResourceType, Task, Tracked,
@@ -324,6 +330,12 @@ struct Scheduler<'a> {
     /// Each task's stored working duration. Leaf percent lags use it; summary
     /// percent lags use their rolled or manual span (see `percent_offset`).
     durations: HashMap<i32, i64>,
+    /// The span the forward pass schedules each task with: its Duration,
+    /// extended when a delayed flat-work assignment runs past it (issue
+    /// #469). Milestones keep their zero span. Dense, keyed by task index
+    /// because every caller holds the index; an assignment belongs to a task
+    /// by UID, so duplicate-UID tasks share their assignments' extents.
+    scheduled_spans: Vec<i64>,
     /// The calendar summaries measure their spans and slack on.
     summary_cal: WorkCalendar,
     /// Each manual summary's own start and finish (absolute minutes).
@@ -474,8 +486,34 @@ impl<'a> Scheduler<'a> {
 
         // Horizon: enough working minutes for all work and resolved lag, plus a wide
         // margin, and enough wall-clock reach to cover any far constraint date.
-        let work: i64 = proj.tasks.iter().map(|t| t.duration_min.max(0)).sum();
         let durations = durations(proj);
+        // The span the forward pass schedules each task with: its Duration,
+        // extended when a delayed flat-work assignment runs past it (#469).
+        // One pass over the assignments: max extent per task UID.
+        let mut extents: HashMap<i32, i64> = HashMap::new();
+        for a in &proj.assignments {
+            if let Some(extent) = delayed_extent_min(proj, a) {
+                extents
+                    .entry(a.task_uid)
+                    .and_modify(|max| *max = (*max).max(extent))
+                    .or_insert(extent);
+            }
+        }
+        let scheduled_spans: Vec<i64> = proj
+            .tasks
+            .iter()
+            .map(|t| {
+                let extent = if t.duration_min == 0 {
+                    0
+                } else {
+                    extents.get(&t.uid).copied().unwrap_or(0)
+                };
+                t.duration_min.max(extent)
+            })
+            .collect();
+        let work: i64 = scheduled_spans
+            .iter()
+            .fold(0i64, |total, &span| total.saturating_add(span.max(0)));
         let summary_cal = summary_calendar(proj);
         let manual_spans = manual_summary_spans(proj, &summary_cal);
         // Every supported summary span lies within the two-sided
@@ -649,6 +687,7 @@ impl<'a> Scheduler<'a> {
             raw_anchor,
             earliest_origin,
             durations,
+            scheduled_spans,
             floors: manual_summary_floors(proj, &manual_spans),
             summary_cal,
             manual_spans,
@@ -856,7 +895,7 @@ impl<'a> Scheduler<'a> {
                 .or_insert((i64::MAX, i64::MIN, 0));
             span.0 = span.0.min(dates.raw);
             span.1 = span.1.max(dates.floor);
-            span.2 = span.2.max(t.duration_min.max(0));
+            span.2 = span.2.max(self.scheduled_span(i));
         }
         spans
             .into_iter()
@@ -1213,7 +1252,7 @@ impl<'a> Scheduler<'a> {
                 .into_iter()
                 .map(|(uid, link, offset, start, finish)| {
                     let successor = &self.proj.tasks[graph.by_uid[&uid]];
-                    self.fixed_successor_cap(task, successor, link, offset, start, finish)
+                    self.fixed_successor_cap(i, successor, link, offset, start, finish)
                 })
                 .min();
             if let Some(start) = cap {
@@ -1221,7 +1260,7 @@ impl<'a> Scheduler<'a> {
                 let finish = if task.duration_min == 0 {
                     start
                 } else {
-                    tl.abs_finish(tl.to_index(start) + task.duration_min)
+                    tl.abs_finish(tl.to_index(start) + self.scheduled_span(i))
                 };
                 caps.insert(task.uid, (start, finish));
                 if let Some(floor) = alap.get_mut(&task.uid)
@@ -1233,16 +1272,23 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// The working span the forward pass schedules the task at `index` with:
+    /// its stored Duration, extended when a delayed flat-work assignment runs
+    /// past it (issue #469). Milestones keep their zero span.
+    fn scheduled_span(&self, index: usize) -> i64 {
+        self.scheduled_spans[index]
+    }
+
     fn fixed_successor_cap(
         &self,
-        predecessor: &Task,
+        predecessor: usize,
         successor: &Task,
         link: LinkType,
         offset: Offset,
         start: i64,
         finish: i64,
     ) -> i64 {
-        let pred_tl = self.tl(predecessor);
+        let pred_tl = self.tl(&self.proj.tasks[predecessor]);
         let succ_tl = self.tl(successor);
         inverse_link(
             pred_tl,
@@ -1254,7 +1300,7 @@ impl<'a> Scheduler<'a> {
                 finish,
                 milestone: successor.duration_min == 0,
             },
-            predecessor.duration_min,
+            self.scheduled_span(predecessor),
         )
         .start
     }
@@ -1287,6 +1333,14 @@ impl<'a> Scheduler<'a> {
             let mut finish_link: Option<i64> = None;
             let mut fs_milestone_start: Option<i64> = None;
             let mut finish_bounds = Vec::new();
+            // A finish-link start derived backward must leave room for the
+            // span the forward pass schedules (#469); a fixed task's slack
+            // keeps measuring from its stored Duration, as before.
+            let link_span = if fixed(t) {
+                t.duration_min
+            } else {
+                self.scheduled_span(i)
+            };
             for p in graph.incoming.get(&t.uid).into_iter().flatten() {
                 let Some((ps_abs, pf_abs)) = self.absolute_span(p.uid, graph, &es_abs, &ef_abs)
                 else {
@@ -1312,13 +1366,13 @@ impl<'a> Scheduler<'a> {
                             finish_bounds.push((tl.to_index(pf_abs), pf_abs));
                         }
                         finish_link = finish_link.max(Some(tl.to_index(cf)));
-                        tl.abs_start(tl.to_index(cf) - t.duration_min)
+                        tl.abs_start(tl.to_index(cf) - link_span)
                     }
                     LinkType::StartFinish => {
                         let bound = sf_bound(tl, ps_abs, lag);
                         finish_bounds.push(bound);
                         finish_link = finish_link.max(Some(bound.0));
-                        tl.abs_start(bound.0 - t.duration_min)
+                        tl.abs_start(bound.0 - link_span)
                     }
                 };
                 if matches!(p.link, LinkType::FinishStart | LinkType::StartStart) {
@@ -1437,7 +1491,8 @@ impl<'a> Scheduler<'a> {
                             held_milestone = Some(instant);
                             instant
                         } else {
-                            tl.abs_start(tl.to_index(df) - t.duration_min).max(floor)
+                            tl.abs_start(tl.to_index(df) - self.scheduled_span(i))
+                                .max(floor)
                         };
                         start_abs = start_abs.max(bound);
                     }
@@ -1452,10 +1507,11 @@ impl<'a> Scheduler<'a> {
                             held_milestone = Some(milestone);
                             milestone
                         } else {
-                            tl.abs_start(tl.to_index(df) - t.duration_min)
+                            tl.abs_start(tl.to_index(df) - self.scheduled_span(i))
                         };
-                        // Floor the finish date, not the duration-derived start
-                        // of a linked task. Unlinked tasks retain anchor semantics.
+                        // Floor the finish date, not the span-derived start
+                        // of a linked task. Unlinked tasks retain anchor
+                        // semantics.
                         if linked_start.is_none() {
                             start_abs = start_abs.max(floor);
                         }
@@ -1504,7 +1560,9 @@ impl<'a> Scheduler<'a> {
                     tl.snap(start_abs)
                 };
             let s_idx = tl.to_index(s_abs);
-            let f_idx = s_idx + t.duration_min;
+            // A delayed flat-work assignment finishes past the task's stored
+            // Duration: the task finishes with it (issue #469).
+            let f_idx = s_idx + self.scheduled_span(i);
             let f_abs =
                 finish_instant(t, tl, s_abs, f_idx, finish_bounds.into_iter(), finish_bound);
             driven_es.insert(t.uid, tl.to_index(driven_start));
@@ -1550,10 +1608,13 @@ impl<'a> Scheduler<'a> {
             // includes its Stop..Resume gap), and its constraints and deadline
             // are ignored.
             let pinned = fixed(t);
+            // The late window holds the same span the forward pass scheduled:
+            // a delayed assignment can extend it past the stored Duration, and
+            // slack stays measured against that extended finish (#469).
             let span = if pinned {
                 ef[&t.uid] - es[&t.uid]
             } else {
-                t.duration_min
+                self.scheduled_span(i)
             };
             // Every task must finish by the project finish, even when an
             // SS/SF successor only bounds its start. With multiple critical
@@ -1689,11 +1750,11 @@ impl<'a> Scheduler<'a> {
                     let finish_index = if finish_constraint {
                         pre.to_index(dates.raw)
                     } else {
-                        pre.to_index(pre.snap(dates.raw)) + t.duration_min
+                        pre.to_index(pre.snap(dates.raw)) + span
                     };
                     // A date at or before the absolute cap is clamped there,
                     // keeping the full duration after the first instant.
-                    let mut finish_index = finish_index.max(t.duration_min);
+                    let mut finish_index = finish_index.max(span);
                     // A start constraint's window can finish after the
                     // project start, where a deadline may bound it tighter.
                     // Like any unlinked deadline it is floored at the project
@@ -1701,7 +1762,7 @@ impl<'a> Scheduler<'a> {
                     // raw date, nor a milestone's window, which ends by then.
                     if let Some(deadline) = t.deadline.filter(|_| !finish_constraint) {
                         let (d_f, _) = finish_instants(pre, deadline.minutes(), dates.floor);
-                        let d_index = pre.to_index(d_f).max(t.duration_min);
+                        let d_index = pre.to_index(d_f).max(span);
                         if d_index < finish_index {
                             debug_assert_ne!(t.duration_min, 0);
                             finish_index = d_index;
@@ -1714,7 +1775,7 @@ impl<'a> Scheduler<'a> {
                     ) || f_abs <= finish_abs;
                     if binds {
                         let (s_abs, f_abs) = if t.duration_min != 0 {
-                            (pre.abs_start(finish_index - t.duration_min), f_abs)
+                            (pre.abs_start(finish_index - span), f_abs)
                         } else {
                             // As `milestone`, on the pre-start timeline, for
                             // start and finish constraints alike: a morning
@@ -1750,7 +1811,7 @@ impl<'a> Scheduler<'a> {
                         hard_finish_bound = true;
                     }
                     ConstraintType::StartNoLaterThan => {
-                        let bound = tl.abs_finish(tl.to_index(ds) + t.duration_min);
+                        let bound = tl.abs_finish(tl.to_index(ds) + span);
                         if bound <= finish_abs {
                             finish_abs = bound;
                             hard_finish_bound = true;
@@ -1759,7 +1820,7 @@ impl<'a> Scheduler<'a> {
                         }
                     }
                     ConstraintType::MustStartOn => {
-                        finish_abs = tl.abs_finish(tl.to_index(ds) + t.duration_min);
+                        finish_abs = tl.abs_finish(tl.to_index(ds) + span);
                         hard_finish_bound = true;
                         milestone_late = (span == 0).then_some(milestone);
                     }
@@ -1884,8 +1945,19 @@ impl<'a> Scheduler<'a> {
                 total = total.min(early - driven);
             }
             // A tracked task finishes where its actuals put it, not at its
-            // start plus its duration.
-            let finish = tracked.map(|_| tl.to_index(e_f));
+            // start plus its duration; an auto task finishes where the
+            // forward pass placed it — a delayed flat-work assignment extends
+            // that past the stored Duration (#469). A pinned (manual) task
+            // still measures from its start plus its stored Duration rather
+            // than its pinned finish, a known gap.
+            let finish = tracked.map(|_| tl.to_index(e_f)).unwrap_or_else(|| {
+                tl.to_index(e_s)
+                    + if fixed(t) {
+                        t.duration_min
+                    } else {
+                        self.scheduled_span(i)
+                    }
+            });
             let free = self.free_slack(
                 t,
                 tl,
@@ -2047,19 +2119,22 @@ impl<'a> Scheduler<'a> {
 
     /// Free slack: for finish-to-start successors, how long this task can slip
     /// before the earliest successor must move. `None` ⇒ fall back to total.
-    /// `finish`, when given, replaces the finish index `start + duration`.
+    /// `finish` is the task's scheduled finish index (its actuals for a
+    /// tracked task, the forward pass's placement for an auto task; a pinned
+    /// manual task still measures from its start plus its stored Duration, a
+    /// known gap).
     fn free_slack(
         &self,
         t: &Task,
         tl: &Timeline,
         early: (&HashMap<i32, i64>, &HashMap<i32, i64>),
-        finish: Option<i64>,
+        finish: i64,
         graph_and_groups: (&LeafGraph, &[Vec<SuccessorAggregate>]),
         legacy: bool,
     ) -> Option<i64> {
         let (graph, group_early) = graph_and_groups;
         let (es_abs, ef_abs) = early;
-        let ef_idx = finish.unwrap_or_else(|| tl.to_index(es_abs[&t.uid]) + t.duration_min);
+        let ef_idx = finish;
         let mut min_gap: Option<i64> = None;
         let mut bounds = Vec::new();
         for edge in graph.succs.get(&t.uid).into_iter().flatten() {
@@ -2413,7 +2488,7 @@ fn lag_minutes(p: &Predecessor, durations: &HashMap<i32, i64>) -> i64 {
 }
 
 /// Wall-clock minutes of the widest timeline, plus a day.
-const MAX_LAG_MIN: i64 = (2 * HORIZON_DAYS + 2) * 1440;
+pub(crate) const MAX_LAG_MIN: i64 = (2 * HORIZON_DAYS + 2) * 1440;
 
 /// Zero-lag FS milestones preserve the actual finish, including across
 /// calendars and SF morning endpoints. Nonzero lag uses the finish side of
@@ -3351,24 +3426,26 @@ fn fits(bookings: &[Booking], cap: &[(i64, f64)], units: f64, lo: i64, hi: i64) 
 }
 
 /// Earliest index ≥ `start` where one resource can take `units` over
-/// `[cand + from, cand + dur)`, `from` being its assignment's delay into the
-/// task. Tries the next booking end or capacity change that could free the
-/// window; when none is left (the resource has no capacity from some point
-/// on), the task stays at `start`.
+/// `[cand + from, cand + end)`, `from` its assignment's delay into the task
+/// and `end` the offset where that assignment's own work ends (delay + work ÷
+/// units, the stored Duration, or the scheduled span for a contour). Tries
+/// the next booking end or capacity change that could free the window; when
+/// none is left (the resource has no capacity from some point on), the task
+/// stays at `start`.
 fn earliest_feasible(
     bookings: &[Booking],
     cap: &[(i64, f64)],
     units: f64,
     start: i64,
     from: i64,
-    dur: i64,
+    end: i64,
 ) -> i64 {
-    if from >= dur {
+    if from >= end {
         return start;
     }
     let mut cand = start;
     loop {
-        let (lo, hi) = (cand + from, cand + dur);
+        let (lo, hi) = (cand + from, cand + end);
         if fits(bookings, cap, units, lo, hi) {
             return cand;
         }
@@ -3384,28 +3461,31 @@ fn earliest_feasible(
     }
 }
 
-/// A task's booking on one resource: its units and its delay into the task.
-type Demand = (i32, f64, i64);
+/// A task's booking on one resource: its units, its delay into the task, and
+/// the end of its own assignment there (delay + work ÷ units, the stored
+/// Duration, or the scheduled span for a contour; issue #469).
+type Demand = (i32, f64, i64, i64);
 
 /// Earliest index ≥ `start` feasible for all of a task's resources at once,
 /// except that a resource with no capacity for it anywhere later (see
 /// [`earliest_feasible`]) accepts any index: the result is then the earliest
 /// where every other resource fits, which leaves that one overallocated.
+/// Each resource must be free over its own demand window
+/// `[cand + from, cand + end)`.
 fn place_all(
     res: &[Demand],
     bookings: &HashMap<i32, Vec<Booking>>,
     caps: &HashMap<i32, Capacity>,
     start: i64,
-    dur: i64,
 ) -> i64 {
     let mut cand = start;
     loop {
         let mut next: Option<i64> = None;
-        for &(rid, units, from) in res {
+        for &(rid, units, from, end) in res {
             let bk = bookings.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]);
             // Every work resource has a capacity; nothing else is booked.
             let cap = &caps[&rid];
-            let c = earliest_feasible(bk, cap, units, cand, from, dur);
+            let c = earliest_feasible(bk, cap, units, cand, from, end);
             if c > cand {
                 next = Some(next.map_or(c, |n: i64| n.min(c)));
             }
@@ -3417,15 +3497,29 @@ fn place_all(
     }
 }
 
-/// Book a task placed at `[start, finish)` on each of its resources, each from
-/// its own delay into the task; a delay past the finish books nothing.
+/// Book a fixed task's resources from each demand's delay through the task's
+/// scheduled finish; a delay past the finish books nothing.
 fn book(bookings: &mut HashMap<i32, Vec<Booking>>, res: &[Demand], start: i64, finish: i64) {
-    for &(rid, units, from) in res {
+    for &(rid, units, from, _) in res {
         if start + from < finish {
             bookings
                 .entry(rid)
                 .or_default()
                 .push((start + from, finish, units));
+        }
+    }
+}
+
+/// Book an auto task's resources over each demand's own window
+/// `[start + from, start + end)`: a delayed assignment's work past the stored
+/// Duration must not book an undelayed sibling's resource (#469).
+fn book_demands(bookings: &mut HashMap<i32, Vec<Booking>>, res: &[Demand], start: i64) {
+    for &(rid, units, from, end) in res {
+        if from < end {
+            bookings
+                .entry(rid)
+                .or_default()
+                .push((start + from, start + end, units));
         }
     }
 }
@@ -3525,10 +3619,38 @@ impl Scheduler<'_> {
         let mut assign: HashMap<i32, Vec<Demand>> = HashMap::new();
         for a in &self.proj.assignments {
             if caps.contains_key(&a.resource_uid) {
+                // An assignment whose TaskUID names no task never levels:
+                // nothing reads its entry, so skip it rather than index a
+                // missing task.
+                let Some(&ti) = graph.by_uid.get(&a.task_uid) else {
+                    continue;
+                };
+                // A resource is needed over its own assignment's window:
+                // from its Delay to the end of its work, the stored Duration
+                // for undelayed work, or the scheduled span when the work
+                // cannot be dated on its own (a contour) (#469). A
+                // milestone occupies one instant and works no span, so its
+                // window stays empty, delayed or not.
+                let task = &self.proj.tasks[ti];
+                let end = if task.duration_min == 0 {
+                    0
+                } else {
+                    match delayed_extent_min(self.proj, a) {
+                        Some(extent) => extent,
+                        // A contour follows the task's span, unless the
+                        // assignment is complete: its recorded finish keeps
+                        // the stored-Duration end.
+                        None if contoured(a) && a.actual_finish.is_none() => {
+                            self.scheduled_span(ti)
+                        }
+                        None => task.duration_min,
+                    }
+                };
                 assign.entry(a.task_uid).or_default().push((
                     a.resource_uid,
                     if a.units > 0.0 { a.units } else { 1.0 },
                     a.delay_min(),
+                    end,
                 ));
             }
         }
@@ -3631,9 +3753,14 @@ impl Scheduler<'_> {
                 .unwrap_or(0);
             let earliest = cpm_start_idx + floor;
             let res = assign.get(&t.uid).cloned().unwrap_or_default();
-            let placed = place_all(&res, &bookings, &caps, earliest, t.duration_min);
+            // Finish with the span CPM scheduled — a delayed assignment's
+            // work past the stored Duration moves with the task — but each
+            // resource is booked only over its own assignment's window
+            // (#469).
+            let span = self.scheduled_span(i);
+            let placed = place_all(&res, &bookings, &caps, earliest);
             delay.insert(t.uid, placed - cpm_start_idx);
-            book(&mut bookings, &res, placed, placed + t.duration_min);
+            book_demands(&mut bookings, &res, placed);
             // A predecessor can move only its instant, keeping its working
             // index (an elapsed lag into nonworking time, #104); a successor
             // that keeps that instant (a milestone, an SF finish) must follow.
@@ -3729,7 +3856,7 @@ impl Scheduler<'_> {
                         t,
                         tl,
                         s_abs,
-                        placed + t.duration_min,
+                        placed + span,
                         bounds,
                         self.constraint_dates(
                             t,
@@ -7913,6 +8040,626 @@ mod tests {
             proj.tasks[1].constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 5, 17, 0));
             assert_eq!(*schedule(&proj).get(2).unwrap(), baseline);
         }
+    }
+
+    /// The 43-assignment-delay oracle's working day (08:30-12:00 &
+    /// 13:00-17:30, 480 minutes), Mon-Fri: a task starting Monday 08:30
+    /// finishes at 17:30 `days` working days later.
+    fn s43_week() -> Week {
+        let mut week = Calendar::standard_week();
+        for day in week.iter_mut().filter(|d| d.working()) {
+            day.times = vec![
+                WorkingTime {
+                    from: 8 * 60 + 30,
+                    to: 12 * 60,
+                },
+                WorkingTime {
+                    from: 13 * 60,
+                    to: 17 * 60 + 30,
+                },
+            ];
+        }
+        week
+    }
+
+    /// `tasks` from Monday 2026-03-02 08:30 on the S43 oracle's calendar,
+    /// carrying `assigns`.
+    fn delayed_plan(tasks: Vec<Task>, assigns: Vec<Assignment>) -> Project {
+        Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 30)),
+            calendars: vec![Calendar::base(1, "S43", s43_week())],
+            default_calendar_uid: 1,
+            tasks,
+            assignments: assigns,
+            ..Project::default()
+        }
+    }
+
+    /// A work assignment of `hours` at `units`, `delay` tenths of a minute in.
+    fn delayed_assign(
+        uid: i32,
+        task: i32,
+        delay: Option<i64>,
+        hours: i64,
+        units: f64,
+    ) -> Assignment {
+        Assignment {
+            uid,
+            task_uid: task,
+            units,
+            work_min: hours * 60,
+            delay,
+            ..Assignment::default()
+        }
+    }
+
+    #[test]
+    fn delayed_assignment_extends_task_finish() {
+        // S43 (issue #469): a 16h task whose assignment starts 8h in with 16h
+        // of work at 100%. Project finishes the task with its assignment,
+        // three working days after its start, not at start + Duration.
+        let proj = delayed_plan(
+            vec![task(1, "A", 2 * 480)],
+            vec![delayed_assign(1, 1, Some(480 * 10), 16, 1.0)],
+        );
+        let s = schedule(&proj);
+        assert_eq!(
+            dates(&s, 1),
+            ("2026-03-02T08:30:00".into(), "2026-03-04T17:30:00".into())
+        );
+        // The stored Duration is untouched: only the scheduled finish moves.
+        assert_eq!(proj.tasks[0].duration_min, 960);
+    }
+
+    #[test]
+    fn delayed_assignment_pushes_fs_successor() {
+        // The successor starts after the extended finish, and the project
+        // finishes a day later with it.
+        let mut b = task(2, "B", 480);
+        b.predecessors.push(fs(1));
+        let proj = delayed_plan(
+            vec![task(1, "A", 2 * 480), b],
+            vec![delayed_assign(1, 1, Some(480 * 10), 16, 1.0)],
+        );
+        let s = schedule(&proj);
+        assert_eq!(dates(&s, 1).1, "2026-03-04T17:30:00".to_string());
+        assert_eq!(s.get(1).unwrap().free_slack_min, 0);
+        assert_eq!(
+            dates(&s, 2),
+            ("2026-03-05T08:30:00".into(), "2026-03-05T17:30:00".into())
+        );
+        assert_eq!(s.project_finish.to_mspdi(), "2026-03-05T17:30:00");
+    }
+
+    #[test]
+    fn delayed_assignment_extension_keeps_slack_non_negative() {
+        // A delayed task on a chain is critical: its slack measures from its
+        // extended finish, so it stays zero rather than gaining a day.
+        let mut b = task(2, "B", 480);
+        b.predecessors.push(fs(1));
+        let mut c = task(3, "C", 480);
+        c.predecessors.push(fs(2));
+        let proj = delayed_plan(
+            vec![task(1, "A", 2 * 480), b, c],
+            vec![delayed_assign(1, 1, Some(480 * 10), 16, 1.0)],
+        );
+        let s = schedule(&proj);
+        let a = s.get(1).unwrap();
+        assert_eq!(a.total_slack_min, 0);
+        assert!(a.critical);
+        assert_eq!(a.late_finish.to_mspdi(), "2026-03-04T17:30:00");
+    }
+
+    #[test]
+    fn delayed_assignment_with_mso_constraint_keeps_late_finish_at_early_finish() {
+        // A MustStartOn pins the start; the late window must still hold the
+        // assignment-extended span, so the task does not report a late finish
+        // before its early one and negative slack.
+        let mut a = task(1, "A", 2 * 480);
+        a.constraint = ConstraintType::MustStartOn;
+        a.constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 30));
+        let proj = delayed_plan(vec![a], vec![delayed_assign(1, 1, Some(480 * 10), 16, 1.0)]);
+        let s = schedule(&proj);
+        let a = s.get(1).unwrap();
+        assert_eq!(a.early_finish.to_mspdi(), "2026-03-04T17:30:00");
+        assert_eq!(a.late_finish.to_mspdi(), "2026-03-04T17:30:00");
+        assert_eq!(a.total_slack_min, 0);
+    }
+
+    #[test]
+    fn undelayed_and_contoured_assignment_do_not_extend() {
+        // No delay: the stored Duration already covers the work.
+        let undelayed = delayed_plan(
+            vec![task(1, "A", 2 * 480)],
+            vec![delayed_assign(1, 1, None, 16, 1.0)],
+        );
+        assert_eq!(
+            dates(&schedule(&undelayed), 1).1,
+            "2026-03-03T17:30:00".to_string()
+        );
+        // A contour's units are its peak, so they cannot date the finish.
+        let mut contoured = delayed_assign(1, 1, Some(480 * 10), 16, 1.0);
+        contoured.work_contour = Some(3);
+        let proj = delayed_plan(vec![task(1, "A", 2 * 480)], vec![contoured]);
+        assert_eq!(
+            dates(&schedule(&proj), 1).1,
+            "2026-03-03T17:30:00".to_string()
+        );
+        // Neither does a material's delayed quantity: the delayed_assign has
+        // resource UID 0, where a material's work is a quantity, not time.
+        let mut material_proj = delayed_plan(
+            vec![task(1, "A", 2 * 480)],
+            vec![delayed_assign(1, 1, Some(480 * 10), 16, 1.0)],
+        );
+        material_proj.resources = vec![Resource {
+            kind: ResourceType::Material,
+            ..Resource::default()
+        }];
+        assert_eq!(
+            dates(&schedule(&material_proj), 1).1,
+            "2026-03-03T17:30:00".to_string()
+        );
+        let mut done = delayed_assign(1, 1, Some(480 * 10), 16, 1.0);
+        done.actual_finish = Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 30));
+        let proj = delayed_plan(vec![task(1, "A", 2 * 480)], vec![done]);
+        assert_eq!(
+            dates(&schedule(&proj), 1).1,
+            "2026-03-03T17:30:00".to_string()
+        );
+    }
+
+    #[test]
+    fn delayed_assignment_pre_start_late_window_holds_the_extended_span() {
+        // An SNLT date before the project start is measured on a pre-start
+        // timeline. Its late window must hold the assignment-extended span:
+        // the violated constraint shows as negative total slack agreeing with
+        // the finish slack, not a hidden one.
+        let mut a = task(1, "A", 2 * 480);
+        a.constraint = ConstraintType::StartNoLaterThan;
+        a.constraint_date = Some(DateTime::from_ymd_hm(2026, 2, 27, 8, 30));
+        let proj = delayed_plan(vec![a], vec![delayed_assign(1, 1, Some(480 * 10), 16, 1.0)]);
+        let s = schedule(&proj);
+        let a = s.get(1).unwrap();
+        assert_eq!(a.early_start.to_mspdi(), "2026-03-02T08:30:00");
+        assert_eq!(a.early_finish.to_mspdi(), "2026-03-04T17:30:00");
+        assert_eq!(a.late_start.to_mspdi(), "2026-02-27T08:30:00");
+        assert_eq!(a.total_slack_min, -480);
+        assert_eq!(a.finish_slack_min, a.total_slack_min);
+    }
+
+    #[test]
+    fn delayed_assignment_alap_cap_respects_the_extended_span() {
+        // An ALAP task before a pinned manual successor is capped so it
+        // finishes before the successor starts. Ordinary late dates float
+        // with the project finish, so only the cap sees the successor's
+        // actual dates — and it must back off the extended span, not the
+        // stored Duration.
+        let mut a = task(1, "A", 2 * 480);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut m = manual(2, "M", 480, at(5, 8));
+        m.predecessors.push(fs(1));
+        let proj = Project {
+            assignments: vec![delayed_assign(1, 1, Some(480 * 10), 16, 1.0)],
+            ..march2(vec![a, m, task(3, "Long", 10 * 480)])
+        };
+        let s = schedule(&proj);
+        assert_eq!(
+            dates(&s, 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-04T17:00:00".into())
+        );
+        assert_eq!(dates(&s, 2).0, "2026-03-05T08:00:00".to_string());
+    }
+
+    #[test]
+    fn delayed_assignment_huge_extension_fits_the_horizon() {
+        // A tiny Units value spreads the work years past the stored
+        // Duration; the timeline budget must cover the extended span, not
+        // just the Duration plus the default padding.
+        let proj = delayed_plan(
+            vec![task(1, "A", 480)],
+            vec![Assignment {
+                work_min: 200_000,
+                ..delayed_assign(1, 1, Some(480 * 10), 0, 0.1)
+            }],
+        );
+        let s = schedule(&proj);
+        let a = s.get(1).unwrap();
+        assert_eq!(a.early_start.to_mspdi(), "2026-03-02T08:30:00");
+        assert_eq!(
+            working_minutes_between(&proj, a.early_start, a.early_finish),
+            480 + 2_000_000
+        );
+    }
+
+    #[test]
+    fn leveling_keeps_a_moved_delayed_tasks_extension() {
+        // B's delayed assignment runs a day past its stored Duration. When
+        // leveling moves B for the shared resource, the finish and the
+        // booking must carry the whole extended span with them.
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "A", 960), task(2, "B", 960), task(3, "C", 480)],
+            resources: vec![worker(1, "R", 1.0)],
+            assignments: vec![
+                Assignment {
+                    uid: 1,
+                    task_uid: 1,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 960,
+                    ..Assignment::default()
+                },
+                Assignment {
+                    uid: 2,
+                    task_uid: 2,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 960,
+                    delay: Some(480 * 10),
+                    ..Assignment::default()
+                },
+                Assignment {
+                    uid: 3,
+                    task_uid: 3,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 480,
+                    ..Assignment::default()
+                },
+            ],
+            ..Project::default()
+        };
+        let lv = level(&proj);
+        assert_eq!(
+            (lv.start(1), lv.finish(1)),
+            (Some(at(2, 8)), Some(at(3, 17)))
+        );
+        assert_eq!(
+            (lv.start(2), lv.finish(2)),
+            (Some(at(3, 8)), Some(at(5, 17)))
+        );
+        // C waits for B's whole extended booking: Friday, not Thursday.
+        assert_eq!(
+            (lv.start(3), lv.finish(3)),
+            (Some(at(6, 8)), Some(at(6, 17)))
+        );
+    }
+
+    #[test]
+    fn delayed_assignment_honored_fnlt_derives_its_start_from_the_span() {
+        // An honored FNLT moves the task earlier so its finish meets the
+        // bound; with an extended span the start must leave room for the
+        // span, not the stored Duration.
+        let p = task(1, "P", 960);
+        let mut a = task(2, "A", 2 * 480);
+        a.predecessors.push(fs(1));
+        a.constraint = ConstraintType::FinishNoLaterThan;
+        a.constraint_date = Some(at(5, 17));
+        let mut proj = Project {
+            assignments: vec![delayed_assign(1, 2, Some(480 * 10), 16, 1.0)],
+            ..march2(vec![p, a])
+        };
+        proj.honor_constraints = true;
+        let s = schedule(&proj);
+        let a = s.get(2).unwrap();
+        assert_eq!(
+            (a.early_start.to_mspdi(), a.early_finish.to_mspdi()),
+            (
+                "2026-03-03T08:00:00".to_string(),
+                "2026-03-05T17:00:00".to_string()
+            )
+        );
+        // The earlier start costs the violated FS link, shown as slack.
+        assert!(a.total_slack_min < 0);
+    }
+
+    #[test]
+    fn delayed_assignment_fnlt_cap_leaves_room_for_the_span() {
+        // The five-day predecessor pushes the linked start past the
+        // duration-derived window; the FNLT cap must still land the extended
+        // finish on its bound.
+        let p = task(1, "P", 5 * 480);
+        let mut a = task(2, "A", 2 * 480);
+        a.predecessors.push(fs(1));
+        a.constraint = ConstraintType::FinishNoLaterThan;
+        a.constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 10, 17, 0));
+        let mut proj = Project {
+            assignments: vec![delayed_assign(1, 2, Some(480 * 10), 16, 1.0)],
+            ..march2(vec![p, a])
+        };
+        proj.honor_constraints = true;
+        let s = schedule(&proj);
+        let a = s.get(2).unwrap();
+        assert_eq!(
+            (a.early_start.to_mspdi(), a.early_finish.to_mspdi()),
+            (
+                "2026-03-06T08:00:00".to_string(),
+                "2026-03-10T17:00:00".to_string()
+            )
+        );
+        assert!(a.total_slack_min < 0);
+    }
+
+    #[test]
+    fn delayed_assignment_fne_start_uses_the_span() {
+        // A finish-no-earlier-than start derived from the bound must leave
+        // room for the extended span, so the finish meets the bound.
+        let mut a = task(1, "A", 2 * 480);
+        a.constraint = ConstraintType::FinishNoEarlierThan;
+        a.constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 5, 17, 30));
+        let proj = delayed_plan(vec![a], vec![delayed_assign(1, 1, Some(480 * 10), 16, 1.0)]);
+        let s = schedule(&proj);
+        assert_eq!(
+            dates(&s, 1),
+            ("2026-03-03T08:30:00".into(), "2026-03-05T17:30:00".into())
+        );
+    }
+
+    #[test]
+    fn delayed_assignment_ff_link_derives_its_start_from_the_span() {
+        // A zero-lag FF link asks the task to finish with its predecessor;
+        // the derived start must leave room for the extended span.
+        let mut a = task(1, "A", 2 * 480);
+        a.predecessors
+            .push(Predecessor::working(2, LinkType::FinishFinish, 0));
+        let proj = Project {
+            assignments: vec![delayed_assign(1, 1, Some(480 * 10), 16, 1.0)],
+            ..march2(vec![a, task(2, "B", 4 * 480)])
+        };
+        let s = schedule(&proj);
+        let a = s.get(1).unwrap();
+        assert_eq!(
+            (a.early_start.to_mspdi(), a.early_finish.to_mspdi()),
+            (
+                "2026-03-03T08:00:00".to_string(),
+                "2026-03-05T17:00:00".to_string()
+            )
+        );
+        assert_eq!(a.total_slack_min, 0);
+    }
+
+    #[test]
+    fn leveling_books_each_resource_over_its_own_assignment_window() {
+        // T's delayed R2 assignment extends a day past its stored Duration;
+        // that extra day must not book R1, whose own assignment ends with the
+        // Duration. U on R1 levels onto Wednesday, not Thursday.
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "T", 960), task(2, "U", 480)],
+            resources: vec![worker(1, "R1", 1.0), worker(2, "R2", 1.0)],
+            assignments: vec![
+                Assignment {
+                    uid: 1,
+                    task_uid: 1,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 960,
+                    ..Assignment::default()
+                },
+                Assignment {
+                    uid: 2,
+                    task_uid: 1,
+                    resource_uid: 2,
+                    units: 1.0,
+                    work_min: 960,
+                    delay: Some(480 * 10),
+                    ..Assignment::default()
+                },
+                Assignment {
+                    uid: 3,
+                    task_uid: 2,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 480,
+                    ..Assignment::default()
+                },
+            ],
+            ..Project::default()
+        };
+        let lv = level(&proj);
+        // T finishes at its extended span's end: Wednesday, not Tuesday.
+        assert_eq!(lv.finish(1), Some(at(4, 17)));
+        // R1's own assignment ends Tuesday; U levels onto Wednesday, not
+        // Thursday (where a span-long R1 booking would push it).
+        assert_eq!(
+            (lv.start(2), lv.finish(2)),
+            (Some(at(4, 8)), Some(at(4, 17)))
+        );
+    }
+
+    #[test]
+    fn delayed_assignment_tiny_units_saturate_the_extent() {
+        // A nonsense Units value saturates the extent where the horizon caps
+        // it instead of overflowing the span arithmetic in a debug build.
+        let mut tiny = delayed_assign(1, 1, Some(480 * 10), 16, 1.0);
+        tiny.units = 1e-18;
+        let proj = delayed_plan(vec![task(1, "A", 480)], vec![tiny]);
+        let s = schedule(&proj);
+        let a = s.get(1).unwrap();
+        assert_eq!(a.early_start.to_mspdi(), "2026-03-02T08:30:00");
+        assert!(
+            working_minutes_between(&proj, a.early_start, a.early_finish) > 480 * 366,
+            "the extension survives saturation"
+        );
+    }
+
+    #[test]
+    fn leveling_skips_an_assignment_whose_task_uid_names_no_task() {
+        // A dangling TaskUID (an orphan row a file carried in) must not
+        // panic the demand build; nothing ever reads its entry.
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "A", 960)],
+            resources: vec![worker(1, "R", 1.0)],
+            assignments: vec![
+                Assignment {
+                    uid: 1,
+                    task_uid: 1,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 960,
+                    ..Assignment::default()
+                },
+                Assignment {
+                    uid: 2,
+                    task_uid: 99,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 480,
+                    ..Assignment::default()
+                },
+            ],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        assert_eq!(dates(&s, 1).0, "2026-03-02T08:00:00".to_string());
+        let lv = level(&proj);
+        assert_eq!(
+            (lv.start(1), lv.finish(1)),
+            (Some(at(2, 8)), Some(at(3, 17)))
+        );
+    }
+
+    #[test]
+    fn leveling_a_delayed_milestone_books_no_resource_window() {
+        // A milestone occupies one instant and works no span; a delayed
+        // assignment on it must not move it or book its resource, so C
+        // levels right after A.
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "A", 960), task(2, "M", 0), task(3, "C", 480)],
+            resources: vec![worker(1, "R", 1.0)],
+            assignments: vec![
+                Assignment {
+                    uid: 1,
+                    task_uid: 1,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 960,
+                    ..Assignment::default()
+                },
+                Assignment {
+                    uid: 2,
+                    task_uid: 2,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 480,
+                    delay: Some(480 * 10),
+                    ..Assignment::default()
+                },
+                Assignment {
+                    uid: 3,
+                    task_uid: 3,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 480,
+                    ..Assignment::default()
+                },
+            ],
+            ..Project::default()
+        };
+        let lv = level(&proj);
+        // The milestone keeps its CPM instant and no booking; A holds R
+        // Monday-Tuesday, so C levels onto Wednesday (pre-fix, M's booking
+        // pushes C to Thursday).
+        assert_eq!(
+            (lv.start(2), lv.finish(2)),
+            (Some(at(2, 8)), Some(at(2, 8)))
+        );
+        assert_eq!(
+            (lv.start(3), lv.finish(3)),
+            (Some(at(4, 8)), Some(at(4, 17)))
+        );
+    }
+
+    #[test]
+    fn delayed_assignment_ff_link_keeps_a_pinned_manual_tasks_slack() {
+        // The extended finish-link derivation is for auto tasks: a pinned
+        // manual task's slack keeps measuring from its stored Duration, so
+        // the two-day FF violation still shows as -960.
+        let p = task(1, "P", 4 * 480);
+        let mut m = manual(2, "M", 2 * 480, at(2, 8));
+        m.predecessors
+            .push(Predecessor::working(1, LinkType::FinishFinish, 0));
+        let proj = Project {
+            assignments: vec![delayed_assign(1, 2, Some(960 * 10), 16, 1.0)],
+            ..march2(vec![p, m])
+        };
+        let s = schedule(&proj);
+        let m = s.get(2).unwrap();
+        assert_eq!(
+            (m.early_start.to_mspdi(), m.early_finish.to_mspdi()),
+            (
+                "2026-03-02T08:00:00".to_string(),
+                "2026-03-03T17:00:00".to_string()
+            )
+        );
+        assert_eq!(m.total_slack_min, -960);
+    }
+
+    #[test]
+    fn leveling_a_completed_contoured_assignment_keeps_its_duration_end() {
+        // T's delayed flat assignment extends it a day, but R1's contoured
+        // assignment is complete (a recorded ActualFinish): its booking ends
+        // with the stored Duration, so U on R1 levels onto Wednesday.
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "T", 960), task(2, "U", 480)],
+            resources: vec![worker(1, "R1", 1.0), worker(2, "R2", 1.0)],
+            assignments: vec![
+                Assignment {
+                    uid: 1,
+                    task_uid: 1,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 960,
+                    work_contour: Some(1),
+                    actual_finish: Some(at(3, 17)),
+                    ..Assignment::default()
+                },
+                Assignment {
+                    uid: 2,
+                    task_uid: 1,
+                    resource_uid: 2,
+                    units: 1.0,
+                    work_min: 960,
+                    delay: Some(480 * 10),
+                    ..Assignment::default()
+                },
+                Assignment {
+                    uid: 3,
+                    task_uid: 2,
+                    resource_uid: 1,
+                    units: 1.0,
+                    work_min: 480,
+                    ..Assignment::default()
+                },
+            ],
+            ..Project::default()
+        };
+        let lv = level(&proj);
+        assert_eq!(
+            (lv.start(2), lv.finish(2)),
+            (Some(at(4, 8)), Some(at(4, 17)))
+        );
+    }
+
+    #[test]
+    fn delayed_assignment_with_an_actual_start_does_not_extend() {
+        // A recorded ActualStart stands in for the Delay, as in
+        // assignment_span: the task keeps its stored Duration.
+        let proj = Project {
+            assignments: vec![Assignment {
+                actual_start: Some(at(2, 8)),
+                ..delayed_assign(1, 1, Some(480 * 10), 8, 1.0)
+            }],
+            ..march2(vec![task(1, "A", 480)])
+        };
+        let s = schedule(&proj);
+        assert_eq!(
+            dates(&s, 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-02T17:00:00".into())
+        );
     }
 
     /// The classic worked example: A(2d)→B(3d), A→C(1d), B→D, C→D.
