@@ -2279,6 +2279,13 @@ impl SheetView {
             return false;
         }
         self.push_undo_snapshot(snap);
+        // Validation circles of the removed sheet go; later sheets renumber.
+        self.circles.retain(|&(s, ..)| s != idx);
+        for c in &mut self.circles {
+            if c.0 > idx {
+                c.0 -= 1;
+            }
+        }
         // Drop views on the removed sheet; shift indices above it down one.
         self.pivot_views.retain(|d| d.out_sheet != idx);
         for d in &mut self.pivot_views {
@@ -3704,6 +3711,12 @@ impl SheetView {
             ));
         }
         self.push_undo();
+        // The cut's rule pieces, taken before anything moves: each is
+        // re-anchored at its own first cell and its references follow the cut
+        // as the cut cells' own do (`validation::follow_cut` says how).
+        let mut pieces =
+            gridcore::validation::copy_rules(&self.pkg.workbook.sheets[src], clip.rect);
+        gridcore::validation::follow_cut(&mut pieces, &mv);
         // References follow first, and the engine is rebuilt on them, so the
         // writes below recalculate what reads the moved cells where they land.
         gridcore::edit::move_refs(&mut self.pkg.workbook, src, &mv);
@@ -3725,15 +3738,10 @@ impl SheetView {
         // target, whose own are replaced.
         let can_hold = self.pkg.takes_validations(dst) && self.pkg.takes_validations(src);
         if can_hold {
-            // The rules as they are now, after the references to the moved
-            // cells were rewritten (not the copy-time snapshot, which would
-            // reinstall the old references), put where the cells went with
-            // their formulas as they are: a cut moves, it does not copy.
-            let live = gridcore::validation::copy_rules(&self.pkg.workbook.sheets[src], clip.rect);
             gridcore::validation::clear_validation(&mut self.pkg.workbook.sheets[src], clip.rect);
             gridcore::validation::move_rules(
                 &mut self.pkg.workbook.sheets[dst],
-                &live,
+                &pieces,
                 clip.rect,
                 at,
             );

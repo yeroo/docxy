@@ -1204,11 +1204,15 @@ pub fn copy_rules(sheet: &Sheet, rect: Rect) -> Vec<DataValidation> {
         .collect()
 }
 
-/// A cut's rules ([`copy_rules`] of the cut rectangle) with the references
-/// to the cut cells following them, as the cut cells' own formulas do: a
-/// reference inside the block moves with it, one outside keeps reading what
-/// it read. For a host that does not rewrite the workbook's other formulas
-/// (the suite's cut already did, [`crate::edit::move_refs`]).
+/// A cut's rules ([`copy_rules`] of the cut rectangle, taken before the cut
+/// moves anything) with their references as a cut leaves them. A cut moves
+/// cells, so for each rule piece: (a) a reference into the cut block follows
+/// the block, (b) a reference outside it keeps reading the same cell (qualified
+/// with the source sheet when the cut changes sheets), as the cut cells' own
+/// formulas do ([`crate::formula::move_block_formula`]), and (c) the piece's
+/// anchor moves with it: its formulas are written for its own first cell
+/// (which `copy_rules` did), and are judged there. Install them with
+/// [`move_rules`], which keeps their text.
 pub fn follow_cut(rules: &mut [DataValidation], mv: &crate::formula::CellMove) {
     for rule in rules {
         for f in [&mut rule.formula1, &mut rule.formula2] {

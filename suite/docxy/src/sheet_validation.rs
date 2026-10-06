@@ -1239,4 +1239,106 @@ mod tests {
         assert!(changed);
         assert!(view(&mut t).circles.is_empty());
     }
+
+    // ---- review r13 ----
+
+    /// A custom Stop rule `formula` on B2:B10, A5 = 3 and F1 = 10.
+    fn cut_rule_book(formula: &str) -> DocTab {
+        let mut t = tab();
+        put(&mut t, "A5", Cell::number(3.0));
+        put(&mut t, "F1", Cell::number(10.0));
+        view(&mut t).pkg.workbook.sheets[0]
+            .validations
+            .push(DataValidation {
+                ranges: vec![(1, 1, 9, 1)],
+                kind: "custom".into(),
+                formula1: formula.into(),
+                allow_blank: true,
+                show_error: true,
+                ..Default::default()
+            });
+        t
+    }
+
+    fn cut_range(t: &mut DocTab, from: (&str, &str), to: &str, sheet: usize) {
+        let v = view(t);
+        v.anchor = at(from.0);
+        v.sel = at(from.1);
+        let clip = v.grid_clip(true).unwrap();
+        v.active = sheet;
+        v.anchor = at(to);
+        v.sel = at(to);
+        assert_eq!(v.paste_grid_clip(&clip), Ok(crate::GridPasted::Done));
+    }
+
+    /// Would typing `text` into `cell` of `sheet` be refused?
+    fn refused(t: &mut DocTab, sheet: usize, cell: &str, text: &str) -> bool {
+        let (r, c) = at(cell);
+        let wb = &mut view(t).pkg.workbook;
+        let entry = gridcore::entry::entry_cell(wb, sheet, r, c, text, None).unwrap();
+        gridcore::validation::check_entry(wb, sheet, r, c, &entry, None).is_some()
+    }
+
+    #[test]
+    fn a_cut_of_part_of_a_rule_moves_a_piece_that_reads_the_moved_cells() {
+        // Relative B2>A2; cut A5:B5 to D5:E5: E5 reads E5>D5 (D5 holds A5's 3).
+        let mut t = cut_rule_book("B2>A2");
+        cut_range(&mut t, ("A5", "B5"), "D5", 0);
+        assert!(!refused(&mut t, 0, "E5", "5"), "5 > 3");
+        assert!(refused(&mut t, 0, "E5", "2"), "2 > 3 is false");
+        // The rule keeps working on the cells it still covers.
+        let sheet = view(&mut t).sheet();
+        assert!(
+            gridcore::validation::validation_at(sheet, 1, 1).is_some(),
+            "B2 still ruled"
+        );
+        assert!(
+            gridcore::validation::validation_at(sheet, 5, 1).is_some(),
+            "B6 still ruled"
+        );
+        assert!(
+            gridcore::validation::validation_at(sheet, 4, 1).is_none(),
+            "B5 moved away"
+        );
+        // B2>0: the reference to the moved cell follows it.
+        let mut t = cut_rule_book("B2>0");
+        cut_range(&mut t, ("A5", "B5"), "D5", 0);
+        assert!(!refused(&mut t, 0, "E5", "5"));
+        assert!(refused(&mut t, 0, "E5", "-5"));
+        // Cutting B5 alone to D5: D5>A5 (A5 outside the cut keeps its cell).
+        let mut t = cut_rule_book("B2>A2");
+        cut_range(&mut t, ("B5", "B5"), "D5", 0);
+        assert!(!refused(&mut t, 0, "D5", "5"));
+        assert!(refused(&mut t, 0, "D5", "2"));
+    }
+
+    #[test]
+    fn a_cross_sheet_cut_keeps_references_outside_the_cut_on_the_source_sheet() {
+        let mut t = cut_rule_book("B2>$F$1");
+        view(&mut t)
+            .pkg
+            .workbook
+            .sheets
+            .push(gridcore::sheet::Sheet {
+                name: "Other".into(),
+                ..Default::default()
+            });
+        view(&mut t).engine = crate::sheet_engine(&view(&mut t).pkg.workbook);
+        cut_range(&mut t, ("A5", "B5"), "D5", 1);
+        // F1 is 10 on the source sheet (and empty on Other): 5 is refused.
+        assert!(refused(&mut t, 1, "E5", "5"));
+        assert!(!refused(&mut t, 1, "E5", "20"));
+    }
+
+    #[test]
+    fn deleting_a_sheet_takes_its_circles_and_renumbers_the_rest() {
+        let mut t = tab();
+        let v = view(&mut t);
+        for name in ["Second", "Third"] {
+            v.pkg.add_sheet(name);
+        }
+        v.circles = vec![(0, 1, 1), (1, 2, 2), (2, 3, 3)];
+        assert!(v.delete_sheet(1));
+        assert_eq!(v.circles, vec![(0, 1, 1), (1, 3, 3)]);
+    }
 }

@@ -4294,9 +4294,11 @@ fn dv_attr_edits(
     element
 }
 
-/// The element's formulas when the model has a different number of them than
-/// the part (an operator that takes one bound or two, a rule that gained or
-/// lost its formula): every `<formula1>`/`<formula2>` child replaced.
+/// The element's formulas rebuilt: every `<formula1>`/`<formula2>` child
+/// replaced. For an edited rule when the model has a different number of them
+/// than the part (an operator that takes one bound or two, a rule that gained
+/// or lost its formula), or when the part holds one as markup (a CDATA
+/// section), which can't be rewritten in place.
 fn dv_rebuild_formulas(element: &str, dv: &crate::sheet::DataValidation) -> String {
     let Some(open) = start_tag_end(element) else {
         return element.to_string();

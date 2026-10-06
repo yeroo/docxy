@@ -6233,9 +6233,6 @@ impl App {
         }
     }
 
-    /// Close the data-validation dialog, alert and dropdown, which hold a
-    /// sheet, a cell and choices read from a workbook that has changed under
-    /// them; an alert takes its editor with it.
     /// Sheet `gone` was removed: its circles go and those of the sheets after
     /// it follow their renumbering.
     fn sheet_removed_circles(&mut self, gone: usize) {
@@ -6247,6 +6244,9 @@ impl App {
         }
     }
 
+    /// Close the data-validation dialog, alert and dropdown, which hold a
+    /// sheet, a cell and choices read from a workbook that has changed under
+    /// them; an alert takes its editor with it.
     fn close_validation_ui(&mut self) {
         self.validation_dialog = None;
         self.dv_picker = None;
@@ -9755,6 +9755,15 @@ fn num_short(v: f64) -> String {
 /// Circle Invalid Data's circles, drawn as red brackets round the cell, and
 /// the input message of the rule on the cursor cell as a tip under it.
 fn draw_validation_marks(app: &App, f: &mut Frame, grid: Rect) {
+    // Not over a dialog: they belong to the grid underneath it.
+    if app.validation_dialog.is_some()
+        || app.outline_dialog.is_some()
+        || app.text_dialog.is_some()
+        || app.format_dialog.is_some()
+        || app.data_form.is_some()
+    {
+        return;
+    }
     let on_screen = |r: u32, c: u32| -> Option<(u16, u16, u16)> {
         let (x, w) = app
             .vis_cols
@@ -20795,6 +20804,82 @@ mod tests {
         app.sheet = 0;
         app.delete_current_sheet();
         assert_eq!(app.circles, vec![(0, 3, 3)]);
+    }
+    // ---- review r13: a cut of part of a rule ----
+
+    fn cut_rule_app(formula: &str) -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.add_sheet("Other");
+        app.apply(vec![(4, 0, Cell::number(3.0)), (0, 5, Cell::number(10.0))]); // A5, F1
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(1, 1, 9, 1)], // B2:B10
+                kind: "custom".into(),
+                formula1: formula.into(),
+                allow_blank: true,
+                show_error: true,
+                ..Default::default()
+            });
+        app
+    }
+
+    fn cut_to(app: &mut App, from: ((u32, u32), (u32, u32)), sheet: usize, to: (u32, u32)) {
+        app.cur = from.0;
+        app.anchor = Some(from.1);
+        app.copy(true);
+        app.anchor = None;
+        app.sheet = sheet;
+        app.cur = to;
+        app.paste_from(None);
+    }
+
+    fn typed_refused(app: &mut App, sheet: usize, cell: (u32, u32), text: &str) -> bool {
+        let entry =
+            gridcore::entry::entry_cell(&mut app.pkg.workbook, sheet, cell.0, cell.1, text, None)
+                .unwrap();
+        gridcore::validation::check_entry(
+            &mut app.pkg.workbook,
+            sheet,
+            cell.0,
+            cell.1,
+            &entry,
+            None,
+        )
+        .is_some()
+    }
+
+    #[test]
+    fn a_cut_of_part_of_a_rule_moves_a_piece_that_reads_the_moved_cells() {
+        // Relative B2>A2; cut A5:B5 to D5:E5: E5 reads E5>D5.
+        let mut app = cut_rule_app("B2>A2");
+        cut_to(&mut app, ((4, 0), (4, 1)), 0, (4, 3));
+        assert!(!typed_refused(&mut app, 0, (4, 4), "5"));
+        assert!(typed_refused(&mut app, 0, (4, 4), "2"));
+        let sheet = app.sheet();
+        assert!(gridcore::validation::validation_at(sheet, 1, 1).is_some());
+        assert!(gridcore::validation::validation_at(sheet, 5, 1).is_some());
+        assert!(gridcore::validation::validation_at(sheet, 4, 1).is_none());
+        // B2>0: the reference to the moved cell follows it.
+        let mut app = cut_rule_app("B2>0");
+        cut_to(&mut app, ((4, 0), (4, 1)), 0, (4, 3));
+        assert!(!typed_refused(&mut app, 0, (4, 4), "5"));
+        assert!(typed_refused(&mut app, 0, (4, 4), "-5"));
+        // B5 alone to D5: D5>A5 (A5 outside the cut keeps its cell).
+        let mut app = cut_rule_app("B2>A2");
+        cut_to(&mut app, ((4, 1), (4, 1)), 0, (4, 3));
+        assert!(!typed_refused(&mut app, 0, (4, 3), "5"));
+        assert!(typed_refused(&mut app, 0, (4, 3), "2"));
+    }
+
+    #[test]
+    fn a_cross_sheet_cut_keeps_references_outside_the_cut_on_the_source_sheet() {
+        let mut app = cut_rule_app("B2>$F$1");
+        cut_to(&mut app, ((4, 0), (4, 1)), 1, (4, 3));
+        // F1 is 10 on the source sheet (and empty on Other): 5 is refused.
+        assert!(typed_refused(&mut app, 1, (4, 4), "5"));
+        assert!(!typed_refused(&mut app, 1, (4, 4), "20"));
     }
 }
 

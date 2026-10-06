@@ -147,11 +147,12 @@ One `RefTarget` variant per input, one `ref_commit` arm per variant:
 | `CondFormat` | Conditional Formatting bar | the cells the rule applies to |
 
 Data › Data Validation, Text to Columns and Custom Sort used to be bars with a field here (Data Validation's was `Validation`, the cells its list applied to); they
-are now Excel's Convert Text to Columns Wizard (`ttc_dialog.rs`, #692) and Sort
-dialog (`sheet_sort.rs`, #691), form dialogs that act on the selection or the
-list around it, so they have no reference field.
+are now Excel's Data Validation dialog (`sheet_validation.rs`, #689), Convert Text to
+Columns Wizard (`ttc_dialog.rs`, #692) and Sort dialog (`sheet_sort.rs`, #691),
+form dialogs that act on the selection or the list around it, so they have no
+reference field.
 
-The two bars *display* the current selection in their field until you pin a
+The bar *displays* the current selection in its field until you pin a
 range into it (`bar_target` → `bar_open` → `bar_seed`; see "The entry bars follow
 the selection until you pin them" below), so leaving the field alone does exactly
 what the bar did before it had one. At apply time `bar_cells()` is the
@@ -385,11 +386,10 @@ but not yet Entered still counts. After a pick with the mouse the field keeps
 the keyboard, so the next thing typed goes into the *range* — Enter or Escape
 hands it back to the bar's own buffer.
 
-⚠️ The two bars share **one** `bar_field`/`bar_range` pair, so only one may be
-open at a time: `bar_open` closes the others (and `bar_close` closes the bars,
-not just their fields). Two on screen would aim the first at cells pinned for
-the second — `sheet_key` routes to whichever opened first, while `bar_seed` and
-`bar_cells` read the slot the second one overwrote.
+⚠️ The Conditional Formatting bar is the only one left with a range field, and it
+uses the one `bar_field`/`bar_range` pair: `bar_open` closes any other bar (and
+`bar_close` closes the bar, not just its field), so a stale pin never aims it at
+cells pinned for an earlier open.
 
 ⚠️ `bar_open` also clears `range_edit`/`range_pick` outright, not just a field
 belonging to a bar. A Chart panel field left focused keeps `range_field_active`
@@ -403,7 +403,7 @@ asks the bars *before* a field that isn't one of theirs, so focusing a panel
 field would draw a focused border and a caret while every keystroke went to the
 bar — and a drag on the grid still rewrote and committed the chart's field. So
 `ref_field`'s focus handler calls `typing_bars_close` for any non-bar target:
-whatever swallows typing (the two bars, the comment and row-height bars, the
+whatever swallows typing (the Conditional Formatting bar, the comment and row-height bars, the
 find bar) loses it to the field the user just clicked.
 
 ## Pointing while typing a formula
