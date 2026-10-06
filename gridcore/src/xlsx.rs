@@ -1756,9 +1756,9 @@ fn parse_worksheet(
     let mut sheet = Sheet::default();
     let mut p = XmlParser::new(xml);
 
-    // Shared-formula masters: si → (row, col, source).
+    // Shared-formula masters: si → (row, col, source, the master's raw <f> attrs).
     let mut shared_masters: BTreeMap<u32, (u32, u32, String, String)> = BTreeMap::new();
-    // Followers to fill in after the pass: (row, col, si).
+    // Every shared <f>, masters included, to resolve after the pass: (row, col, si).
     let mut followers: Vec<(u32, u32, u32)> = Vec::new();
 
     let mut cur_row: u32 = 0;
@@ -2177,6 +2177,15 @@ fn parse_worksheet(
             continue;
         };
         if (row, col) == (*mr, *mc) {
+            // The master keeps its text; when it does not translate, it also
+            // keeps its original attrs (ref too), even for a one-cell group.
+            if translate_formula(src, 0, 0).is_none() {
+                if let Some(mcell) = sheet.cells.get_mut(&(*mr, *mc)) {
+                    if mcell.f_attrs.is_none() {
+                        mcell.f_attrs = Some(master_attrs.clone());
+                    }
+                }
+            }
             continue;
         }
         let dr = row as i64 - *mr as i64;
@@ -2188,14 +2197,6 @@ fn parse_worksheet(
                 None => {
                     cell.formula = Some(String::new());
                     cell.f_attrs = Some(format!(" t=\"shared\" si=\"{si}\""));
-                }
-            }
-        }
-        if translated.is_none() {
-            // The master keeps its text and its original attrs (ref too).
-            if let Some(mcell) = sheet.cells.get_mut(&(*mr, *mc)) {
-                if mcell.f_attrs.is_none() {
-                    mcell.f_attrs = Some(master_attrs.clone());
                 }
             }
         }
@@ -13796,6 +13797,17 @@ b",
         assert_eq!(resaved(&pkg).1, restyled);
         eng.set_styles(&mut pkg.workbook, 0, &[(0, 1, 0), (0, 6, 0)]);
         assert_eq!(resaved(&pkg).1, unedited);
+    }
+
+    #[test]
+    fn untranslatable_one_cell_shared_group_keeps_its_attrs() {
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="shared" ref="B1" si="0">[1]Sheet1!A1*2</f><v>2</v></c></row>"#;
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<f t="shared" ref="B1" si="0">[1]Sheet1!A1*2</f>"#),
+            "{ws}"
+        );
     }
 
     /// A shared group whose master does not translate is kept verbatim: the
