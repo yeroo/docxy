@@ -53,9 +53,11 @@ jobs:
     # docxy-corpus .docx round-trips through save_package, and every .xlsx
     # through save_xlsx_for_path, and is compared part by part with the
     # original, against the allowlist and the shrink-only baseline in
-    # docxcore/tests/fidelity/ and gridcore/tests/fidelity/. The `test` job
-    # runs the same tests without the external corpus (repo-tracked files
-    # only); here FIDELITY_REQUIRE_CORPUS makes a missing checkout a failure.
+    # docxcore/tests/fidelity/ and gridcore/tests/fidelity/. Each saved .docx
+    # is also schema-validated: a violation the save added fails, with no
+    # baseline (#1083). The `test` job runs the same tests without the
+    # external corpus (repo-tracked files only); here FIDELITY_REQUIRE_CORPUS
+    # makes a missing checkout a failure.
     # See docs/fidelity-gate.md.
     runs-on: ubuntu-latest
     # What `--version` and File > Account report for this build (#1023).

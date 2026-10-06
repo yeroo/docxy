@@ -1,8 +1,8 @@
 //! Round-trip fidelity gate (#1060): open every corpus `.docx`, save it with
 //! no edits, and compare every package part with the original. Fails on any
 //! loss not covered by `fidelity/allowlist.txt` or `fidelity/baseline.txt`,
-//! and on a baseline entry that no longer reproduces. See
-//! `docs/fidelity-gate.md`.
+//! on a baseline entry that no longer reproduces, and on a schema violation
+//! the save added (`fidelity/schema.rs`, #1083). See `docs/fidelity-gate.md`.
 //!
 //! - `FIDELITY_CORPUS=<dir>`: the docxy-corpus `files/` checkout (default
 //!   `corpus/files`; relative paths resolve against the workspace root).
@@ -17,6 +17,7 @@ mod comparator;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use comparator::schema::{Violation, new_violations, validate, validate_package};
 use comparator::*;
 use docxcore::editor::Editor;
 use docxcore::package::{load_package, save_package, save_package_preserving_document};
@@ -223,10 +224,20 @@ fn corpus(root: &Path) -> (Vec<(String, PathBuf)>, Option<PathBuf>) {
     (files, ext)
 }
 
+/// One file's round trip: its findings, whether the preserving save is
+/// byte-identical, and the schema violations the save introduced.
+struct RoundTrip {
+    findings: Vec<Finding>,
+    preserving: Result<(), String>,
+    schema: Vec<Violation>,
+}
+
 /// The round trip under test: what docxy's save does for a modified
-/// document's untouched content. Users' no-edit saves take the preserving
-/// path instead; `preserving` reports whether that one is byte-identical.
-fn round_trip(bytes: &[u8]) -> (Vec<Finding>, Result<(), String>) {
+/// document's untouched content, and what the suite's save does for every
+/// document, edited or not (#1083). docxy's own no-edit save takes the
+/// preserving path instead; `preserving` reports whether that one is
+/// byte-identical.
+fn round_trip(bytes: &[u8]) -> RoundTrip {
     let mut pkg = match load_package(bytes) {
         Ok(pkg) => pkg,
         Err(e) => {
@@ -236,12 +247,21 @@ fn round_trip(bytes: &[u8]) -> (Vec<Finding>, Result<(), String>) {
                 path: String::new(),
                 detail: format!("{e:?}"),
             };
-            return (vec![f], Ok(()));
+            return RoundTrip {
+                findings: vec![f],
+                preserving: Ok(()),
+                schema: Vec::new(),
+            };
         }
     };
     let preserving = parts_identical(bytes, &save_package_preserving_document(&pkg));
     pkg.document = Editor::new(pkg.document.clone()).doc;
-    (compare_packages(bytes, &save_package(&pkg)), preserving)
+    let saved = save_package(&pkg);
+    RoundTrip {
+        findings: compare_packages(bytes, &saved),
+        preserving,
+        schema: new_violations(&validate_package(bytes), &validate_package(&saved)),
+    }
 }
 
 #[test]
@@ -271,19 +291,23 @@ fn round_trip_fidelity_gate() {
     let mut findings: Vec<(String, Finding)> = Vec::new();
     let mut present = BTreeSet::new();
     let mut not_preserved = Vec::new();
+    let mut invalid = Vec::new();
     let mut allowed = vec![0usize; allow.len()];
     for (file, path) in &files {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         present.insert(file.clone());
         let mut preserved = Ok(());
+        let mut schema = Vec::new();
         let found = guarded(|| {
-            let (found, ok) = round_trip(&bytes);
-            preserved = ok;
-            found
+            let rt = round_trip(&bytes);
+            preserved = rt.preserving;
+            schema = rt.schema;
+            rt.findings
         });
         if let Err(why) = preserved {
             not_preserved.push(format!("{file}: {why}"));
         }
+        invalid.extend(schema.iter().map(|v| v.line(file)));
         for f in apply_allowlist(found, &allow, &mut allowed) {
             findings.push((file.clone(), f));
         }
@@ -303,6 +327,13 @@ fn round_trip_fidelity_gate() {
     assert!(
         not_preserved.is_empty(),
         "save_package_preserving_document (the no-edit save) changed these packages: {not_preserved:?}"
+    );
+    // Word rejects these as corrupt, lost or not: never baselined (#1083).
+    assert!(
+        invalid.is_empty(),
+        "fidelity gate: save introduced {} schema violations (docs/fidelity-gate.md)\n{}",
+        invalid.len(),
+        invalid.join("\n")
     );
 
     if flag("FIDELITY_UPDATE_BASELINE") {
@@ -921,4 +952,404 @@ fn misaligned_runs_are_baseline_entries_of_1069() {
             assert_eq!(class.issue, "#1069", "{e:?}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Schema validation (#1083), on tiny synthetic XML.
+
+const W_NS: &str = "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"";
+
+/// The violations of a `w:body`'s content: (rule, parent path, child).
+fn schema(body: &str) -> Vec<(&'static str, String, String)> {
+    let xml = format!("<w:document {W_NS}><w:body>{body}</w:body></w:document>");
+    schema_of(&xml)
+}
+
+fn schema_of(xml: &str) -> Vec<(&'static str, String, String)> {
+    let root = parse_xml(xml.as_bytes()).expect("well-formed");
+    validate("word/document.xml", &root)
+        .into_iter()
+        .map(|v| (v.rule.as_str(), v.parent, v.child))
+        .collect()
+}
+
+fn violation(rule: &'static str, parent: &str, child: &str) -> (&'static str, String, String) {
+    (rule, parent.to_string(), child.to_string())
+}
+
+#[test]
+fn schema_accepts_a_valid_document() {
+    let body = "<w:p><w:pPr><w:pStyle w:val=\"T\"/><w:spacing w:after=\"0\"/><w:jc w:val=\"center\"/>\
+                <w:rPr><w:ins w:id=\"1\" w:author=\"a\"/><w:b/></w:rPr></w:pPr>\
+                <w:bookmarkStart w:id=\"0\" w:name=\"b\"/><w:r><w:rPr><w:b/><w:sz w:val=\"20\"/></w:rPr>\
+                <w:t>a</w:t><w:tab/><w:t>b</w:t></w:r><w:bookmarkEnd w:id=\"0\"/><w:r><w:t>c</w:t></w:r>\
+                <w:hyperlink w:anchor=\"x\"><w:r><w:t>d</w:t></w:r></w:hyperlink>\
+                <w:smartTag w:element=\"place\"><w:smartTagPr><w:attr w:name=\"n\" w:val=\"v\"/></w:smartTagPr>\
+                <w:r><w:t>e</w:t></w:r></w:smartTag></w:p>\
+                <w:tbl><w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders><w:top w:val=\"single\"/>\
+                <w:start w:val=\"single\"/><w:insideV w:val=\"single\"/></w:tblBorders></w:tblPr>\
+                <w:tblGrid><w:gridCol/></w:tblGrid><w:tr><w:trPr><w:tblHeader/><w:cantSplit/></w:trPr>\
+                <w:tc><w:tcPr><w:tcW w:w=\"1\"/><w:vAlign w:val=\"top\"/></w:tcPr><w:bookmarkStart w:id=\"1\" w:name=\"c\"/>\
+                <w:p/></w:tc></w:tr></w:tbl>\
+                <w:sectPr><w:headerReference r:id=\"h\" xmlns:r=\"urn:r\"/><w:pgSz w:w=\"1\"/><w:pgMar w:top=\"1\"/>\
+                <w:cols/><w:docGrid/></w:sectPr>";
+    assert_eq!(schema(body), []);
+}
+
+#[test]
+fn schema_reports_children_out_of_order() {
+    // The mutation proof's ordering case: `w:jc` written before `w:spacing`.
+    assert_eq!(
+        schema("<w:p><w:pPr><w:jc w:val=\"left\"/><w:spacing w:after=\"0\"/></w:pPr></w:p>"),
+        [violation(
+            "order",
+            "/w:document/w:body/w:p/w:pPr",
+            "w:spacing"
+        )]
+    );
+    assert_eq!(
+        schema("<w:p><w:r><w:t>a</w:t></w:r><w:pPr/></w:p>"),
+        [violation("order", "/w:document/w:body/w:p", "w:pPr")]
+    );
+}
+
+#[test]
+fn schema_reports_a_duplicate_singleton() {
+    assert_eq!(
+        schema("<w:p><w:pPr><w:jc w:val=\"left\"/><w:jc w:val=\"right\"/></w:pPr></w:p>"),
+        [violation(
+            "duplicate",
+            "/w:document/w:body/w:p/w:pPr",
+            "w:jc"
+        )]
+    );
+}
+
+#[test]
+fn schema_run_properties_are_a_repeatable_choice() {
+    // Transitional EG_RPrBase is an unbounded choice: any order, repeats.
+    assert_eq!(
+        schema(
+            "<w:p><w:pPr><w:rPr><w:ins w:id=\"1\" w:author=\"a\"/><w:sz w:val=\"2\"/><w:b/>\
+             <w:b/></w:rPr></w:pPr><w:r><w:rPr><w:b/><w:i/><w:b/><w:kern w:val=\"2\"/>\
+             <w:kern w:val=\"2\"/><w:rStyle w:val=\"s\"/><w:rPrChange w:id=\"2\" w:author=\"a\">\
+             <w:rPr><w:i/><w:b/></w:rPr></w:rPrChange></w:rPr><w:t>a</w:t></w:r></w:p>"
+        ),
+        []
+    );
+    // Only the paragraph mark's revision marks and rPrChange are placed.
+    assert_eq!(
+        schema(
+            "<w:p><w:pPr><w:rPr><w:b/><w:ins w:id=\"1\" w:author=\"a\"/></w:rPr></w:pPr>\
+             <w:r><w:rPr><w:rPrChange w:id=\"2\" w:author=\"a\"/><w:b/></w:rPr></w:r></w:p>"
+        ),
+        [
+            violation("order", "/w:document/w:body/w:p/w:pPr/w:rPr", "w:ins"),
+            violation("order", "/w:document/w:body/w:p/w:r/w:rPr", "w:b"),
+        ]
+    );
+}
+
+#[test]
+fn schema_border_sides_are_physical_and_logical() {
+    let borders = |sides: &str| {
+        schema(&format!(
+            "<w:tbl><w:tblPr><w:tblBorders>{sides}</w:tblBorders></w:tblPr><w:tblGrid/></w:tbl>"
+        ))
+    };
+    assert_eq!(
+        borders("<w:top/><w:start/><w:left/><w:bottom/><w:end/><w:right/><w:insideH/>"),
+        []
+    );
+    assert_eq!(
+        borders("<w:left/><w:start/>"),
+        [violation(
+            "order",
+            "/w:document/w:body/w:tbl/w:tblPr/w:tblBorders",
+            "w:start"
+        )]
+    );
+}
+
+#[test]
+fn schema_row_revisions_follow_the_row_properties() {
+    let row = |trpr: &str| {
+        schema(&format!(
+            "<w:tbl><w:tblPr/><w:tblGrid/><w:tr><w:trPr>{trpr}</w:trPr><w:tc><w:p/></w:tc></w:tr></w:tbl>"
+        ))
+    };
+    assert_eq!(
+        row("<w:tblHeader/><w:cantSplit/><w:tblHeader/><w:ins w:id=\"1\" w:author=\"a\"/>"),
+        []
+    );
+    assert_eq!(
+        row("<w:ins w:id=\"1\" w:author=\"a\"/><w:cantSplit/>"),
+        [violation(
+            "order",
+            "/w:document/w:body/w:tbl/w:tr/w:trPr",
+            "w:cantSplit"
+        )]
+    );
+}
+
+#[test]
+fn schema_only_range_markup_precedes_the_table_properties() {
+    assert_eq!(
+        schema("<w:tbl><w:bookmarkStart w:id=\"0\" w:name=\"t\"/><w:tblPr/><w:tblGrid/></w:tbl>"),
+        []
+    );
+    assert_eq!(
+        schema("<w:tbl><w:proofErr w:type=\"spellStart\"/><w:tblPr/><w:tblGrid/></w:tbl>"),
+        [
+            violation("order", "/w:document/w:body/w:tbl", "w:tblPr"),
+            violation("order", "/w:document/w:body/w:tbl", "w:tblGrid"),
+        ]
+    );
+}
+
+#[test]
+fn schema_revision_snapshots_have_their_own_models() {
+    // A paragraph mark's snapshot (CT_ParaRPrOriginal) has the revision marks.
+    assert_eq!(
+        schema(
+            "<w:p><w:pPr><w:rPr><w:rPrChange w:id=\"1\" w:author=\"a\"><w:rPr>\
+             <w:ins w:id=\"2\" w:author=\"a\"/><w:b/></w:rPr></w:rPrChange></w:rPr></w:pPr></w:p>"
+        ),
+        []
+    );
+    // A run's (CT_RPrOriginal) does not, nor a nested rPrChange.
+    assert_eq!(
+        schema(
+            "<w:p><w:r><w:rPr><w:rPrChange w:id=\"1\" w:author=\"a\"><w:rPr>\
+             <w:ins w:id=\"2\" w:author=\"a\"/><w:rPrChange/></w:rPr></w:rPrChange></w:rPr></w:r></w:p>"
+        ),
+        [
+            violation(
+                "not-allowed",
+                "/w:document/w:body/w:p/w:r/w:rPr/w:rPrChange/w:rPr",
+                "w:ins"
+            ),
+            violation(
+                "not-allowed",
+                "/w:document/w:body/w:p/w:r/w:rPr/w:rPrChange/w:rPr",
+                "w:rPrChange"
+            ),
+        ]
+    );
+    // A paragraph's snapshot (CT_PPrBase) ends at cnfStyle.
+    assert_eq!(
+        schema(
+            "<w:p><w:pPr><w:jc w:val=\"left\"/><w:pPrChange w:id=\"1\" w:author=\"a\"><w:pPr>\
+             <w:jc w:val=\"right\"/><w:sectPr/></w:pPr></w:pPrChange></w:pPr></w:p>"
+        ),
+        [violation(
+            "not-allowed",
+            "/w:document/w:body/w:p/w:pPr/w:pPrChange/w:pPr",
+            "w:sectPr"
+        )]
+    );
+}
+
+#[test]
+fn schema_reports_smart_tag_properties_under_a_paragraph_1083() {
+    // What save wrote for an unwrapped smart tag before #1083.
+    assert_eq!(
+        schema(
+            "<w:p><w:smartTagPr><w:attr w:name=\"n\" w:val=\"v\"/></w:smartTagPr>\
+             <w:r><w:t>2003</w:t></w:r></w:p>"
+        ),
+        [violation(
+            "not-allowed",
+            "/w:document/w:body/w:p",
+            "w:smartTagPr"
+        )]
+    );
+}
+
+#[test]
+fn schema_wants_the_section_last_in_the_body() {
+    assert_eq!(
+        schema("<w:p/><w:sectPr/><w:p/>"),
+        [violation("order", "/w:document/w:body", "w:p")]
+    );
+}
+
+#[test]
+fn schema_reports_missing_required_children() {
+    assert_eq!(
+        schema("<w:tbl><w:tblPr/><w:tr><w:tc><w:tcPr/></w:tc></w:tr></w:tbl>"),
+        [
+            violation("missing", "/w:document/w:body/w:tbl", "w:tblGrid"),
+            violation("missing", "/w:document/w:body/w:tbl/w:tr/w:tc", "w:p"),
+        ]
+    );
+}
+
+#[test]
+fn schema_paragraph_mark_and_run_properties_differ() {
+    // Revision marks lead a paragraph mark's rPr (CT_ParaRPr) but are not run
+    // properties.
+    assert_eq!(
+        schema(
+            "<w:p><w:pPr><w:rPr><w:del w:id=\"1\" w:author=\"a\"/><w:b/></w:rPr></w:pPr>\
+             <w:r><w:rPr><w:del w:id=\"2\" w:author=\"a\"/></w:rPr></w:r></w:p>"
+        ),
+        [violation(
+            "not-allowed",
+            "/w:document/w:body/w:p/w:r/w:rPr",
+            "w:del"
+        )]
+    );
+}
+
+#[test]
+fn schema_ignores_foreign_namespaces_and_alternate_content() {
+    let body = "<w:p xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" \
+                xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\">\
+                <w:pPr><w14:foo/><w:jc w:val=\"left\"/></w:pPr>\
+                <mc:AlternateContent><mc:Choice Requires=\"w14\"><w:p><w:pPr><w:jc/><w:spacing/></w:pPr></w:p>\
+                </mc:Choice></mc:AlternateContent><w:r><w:t>x</w:t></w:r></w:p>";
+    assert_eq!(schema(body), []);
+    // A `w:` container inside foreign content (a text box) is still checked.
+    let body = "<w:p><w:r><w:drawing><wp:inline xmlns:wp=\"urn:wp\"><w:txbxContent><w:p>\
+                <w:smartTagPr/></w:p></w:txbxContent></wp:inline></w:drawing></w:r></w:p>";
+    assert_eq!(
+        schema(body),
+        [violation(
+            "not-allowed",
+            "/w:document/w:body/w:p/w:r/w:drawing/wp:inline/w:txbxContent/w:p",
+            "w:smartTagPr"
+        )]
+    );
+}
+
+#[test]
+fn schema_keys_on_the_namespace_not_the_prefix() {
+    let xml = "<x:document xmlns:x=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+               <x:body><x:p><x:smartTagPr/></x:p></x:body></x:document>";
+    assert_eq!(
+        schema_of(xml),
+        [violation(
+            "not-allowed",
+            "/w:document/w:body/w:p",
+            "w:smartTagPr"
+        )]
+    );
+}
+
+#[test]
+fn schema_counts_only_violations_the_save_added() {
+    let doc = |body: &str| {
+        let xml = format!("<w:document {W_NS}><w:body>{body}</w:body></w:document>");
+        validate("word/document.xml", &parse_xml(xml.as_bytes()).unwrap())
+    };
+    let bad_order = "<w:p><w:pPr><w:jc/><w:spacing/></w:pPr></w:p>";
+    // One already in the original is not new, wherever the save put it.
+    let original = doc(&format!("<w:p/>{bad_order}"));
+    let saved = doc(&format!("{bad_order}<w:p/>"));
+    assert_eq!(new_violations(&original, &saved), []);
+    // A second one at the same place is.
+    let saved = doc(&format!("{bad_order}{bad_order}"));
+    let new = new_violations(&original, &saved);
+    assert_eq!(new.len(), 1);
+    assert_eq!(new[0].rule.as_str(), "order");
+    // So is another child broken under the same parent by the same rule: a
+    // fixed violation does not pay for a new one.
+    let original = doc("<w:p><w:pPr><w:jc/><w:spacing/></w:pPr></w:p>");
+    let saved = doc("<w:p><w:pPr><w:jc/><w:ind/></w:pPr></w:p>");
+    let new = new_violations(&original, &saved);
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0].child, "w:ind");
+    assert_eq!(
+        new[0].line("ext:a.docx"),
+        "SCHEMA ext:a.docx | word/document.xml | order | /w:document/w:body/w:p/w:pPr/w:ind"
+    );
+}
+
+#[test]
+fn schema_places_math_without_checking_it() {
+    let m = "xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\"";
+    // A cell holding only math has its content; math interleaves with runs.
+    assert_eq!(
+        schema(&format!(
+            "<w:tbl {m}><w:tblPr/><w:tblGrid/><w:tr><w:tc><m:oMathPara><m:oMath><m:r><w:jc/>\
+             <w:jc/></m:r></m:oMath></m:oMathPara></w:tc></w:tr></w:tbl>\
+             <w:p {m}><w:r><w:t>x</w:t></w:r><m:oMath/><w:r><w:t>y</w:t></w:r></w:p>"
+        )),
+        []
+    );
+    // But not before the paragraph's properties.
+    assert_eq!(
+        schema(&format!("<w:p {m}><m:oMath/><w:pPr/></w:p>")),
+        [violation("order", "/w:document/w:body/w:p", "w:pPr")]
+    );
+}
+
+#[test]
+fn schema_style_properties_have_the_general_models() {
+    let xml = format!(
+        "<w:styles {W_NS}><w:style w:styleId=\"s\"><w:pPr><w:jc w:val=\"left\"/><w:rPr/>\
+         <w:sectPr/></w:pPr><w:tblPr><w:tblW w:w=\"0\"/><w:tblPrChange/></w:tblPr>\
+         <w:tblStylePr w:type=\"firstRow\"><w:pPr><w:pPrChange/></w:pPr><w:tblPr>\
+         <w:tblPrChange/></w:tblPr></w:tblStylePr></w:style></w:styles>"
+    );
+    assert_eq!(
+        schema_of(&xml),
+        [
+            violation("not-allowed", "/w:styles/w:style/w:pPr", "w:rPr"),
+            violation("not-allowed", "/w:styles/w:style/w:pPr", "w:sectPr"),
+            violation("not-allowed", "/w:styles/w:style/w:tblPr", "w:tblPrChange"),
+            violation(
+                "not-allowed",
+                "/w:styles/w:style/w:tblStylePr/w:tblPr",
+                "w:tblPrChange"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn schema_validates_utf16_parts() {
+    use docxcore::zipwrite::write_zip;
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?><w:hdr {W_NS}><w:p><w:smartTagPr/></w:p></w:hdr>"
+    );
+    let le: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(xml.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let be: Vec<u8> = xml.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let pkg = write_zip(&[
+        ("word/header1.xml".to_string(), le),
+        ("word/header2.xml".to_string(), be),
+    ]);
+    let found: Vec<_> = validate_package(&pkg)
+        .into_iter()
+        .map(|v| (v.part, v.rule.as_str(), v.child))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                "word/header1.xml".to_string(),
+                "not-allowed",
+                "w:smartTagPr".to_string()
+            ),
+            (
+                "word/header2.xml".to_string(),
+                "not-allowed",
+                "w:smartTagPr".to_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn schema_is_clean_on_the_saved_smart_tag_fixture_1083() {
+    let path = workspace_root().join("docxcore/tests/fixtures/smarttag-pr.docx");
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(validate_package(&bytes), []);
+    let rt = round_trip(&bytes);
+    assert_eq!(rt.schema, []);
+    assert!(rt.preserving.is_ok());
 }
