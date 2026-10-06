@@ -801,15 +801,18 @@ fn apply_run_patch_props(props: &mut RunProps, patch: &RunPatch) {
     }
     if let Some((r, g, b)) = patch.color {
         props.color = Some(format!("{r:02X}{g:02X}{b:02X}"));
+        props.forget_loaded_color();
     }
     if let Some(h) = &patch.highlight {
         props.highlight = h.clone();
     }
     if let Some(f) = &patch.font {
         props.font = Some(f.clone());
+        props.forget_loaded_font();
     }
     if let Some(sz) = patch.size_half_pts {
         props.size_half_pts = Some(sz);
+        props.forget_loaded_size();
     }
 }
 

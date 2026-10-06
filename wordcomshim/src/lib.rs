@@ -972,7 +972,7 @@ mod win {
     }
     unsafe fn vt_font_size_put(t: &WordFont_Impl, v: f32) -> HRESULT {
         let hp = (v * 2.0).round() as u32;
-        set_font(t.doc, t.all, |p| p.size_half_pts = Some(hp));
+        set_font(t.doc, t.all, |p| put_font_size(p, hp));
         S_OK
     }
     unsafe fn vt_font_name_get(t: &WordFont_Impl, ret: *mut BSTR) -> HRESULT {
@@ -982,7 +982,7 @@ mod win {
     }
     unsafe fn vt_font_name_put(t: &WordFont_Impl, v: *const u16) -> HRESULT {
         let n = unsafe { pcwstr(v) };
-        set_font(t.doc, t.all, |p| p.font = Some(n.clone()));
+        set_font(t.doc, t.all, |p| put_font_name(p, &n));
         S_OK
     }
     unsafe fn vt_font_color_get(_t: &WordFont_Impl, ret: *mut i32) -> HRESULT {
@@ -990,7 +990,7 @@ mod win {
     }
     unsafe fn vt_font_color_put(t: &WordFont_Impl, v: i32) -> HRESULT {
         if let Some(hex) = word_color_hex(v) {
-            set_font(t.doc, t.all, |p| p.color = Some(hex.clone()));
+            set_font(t.doc, t.all, |p| put_font_color(p, &hex));
         }
         S_OK
     }
@@ -1603,6 +1603,26 @@ mod win {
     into_disp!(WordFont, IFont);
     into_disp!(ParaFmt, IParaFmt);
 
+    /// `_Font.Name` put, shared by the vtable and the late-bound (IDispatch)
+    /// path: the font is saved from the model, without a loaded theme font
+    /// overriding it (#1063).
+    fn put_font_name(p: &mut RunProps, name: &str) {
+        p.font = Some(name.to_string());
+        p.forget_loaded_font();
+    }
+
+    /// `_Font.Size` put (half-points), shared as [`put_font_name`] is.
+    fn put_font_size(p: &mut RunProps, half_pts: u32) {
+        p.size_half_pts = Some(half_pts);
+        p.forget_loaded_size();
+    }
+
+    /// `_Font.Color` put, shared as [`put_font_name`] is.
+    fn put_font_color(p: &mut RunProps, hex: &str) {
+        p.color = Some(hex.to_string());
+        p.forget_loaded_color();
+    }
+
     /// Apply a RunProps change to the current format (`all=false`) or to every run
     /// in the document (`all=true`).
     fn set_font(doc: usize, all: bool, f: impl Fn(&mut RunProps)) {
@@ -1731,21 +1751,21 @@ mod win {
                         if is_put(wflags) {
                             if let Some(pt) = arg(params, 0).and_then(|v| f64::try_from(v).ok()) {
                                 let hp = (pt * 2.0).round() as u32;
-                                set_font(doc, all, |p| p.size_half_pts = Some(hp));
+                                set_font(doc, all, |p| put_font_size(p, hp));
                             }
                         }
                     }
                     142 => {
                         if is_put(wflags) {
                             if let Some(nm) = arg_string(params, 0) {
-                                set_font(doc, all, |p| p.font = Some(nm.clone()));
+                                set_font(doc, all, |p| put_font_name(p, &nm));
                             }
                         }
                     }
                     159 => {
                         if is_put(wflags) {
                             if let Some(hex) = arg_i32(params, 0).and_then(word_color_hex) {
-                                set_font(doc, all, |p| p.color = Some(hex.clone()));
+                                set_font(doc, all, |p| put_font_color(p, &hex));
                             }
                         }
                     }
@@ -2071,6 +2091,34 @@ mod win {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// #1063: `_Font.Name`/`.Color` puts (vtable and IDispatch alike) drop
+        /// the loaded theme font/colour that would override the value set.
+        #[test]
+        fn font_name_and_color_puts_replace_the_loaded_theme() {
+            let xml = "<w:document><w:body><w:p><w:r><w:rPr>\
+                <w:rFonts w:ascii=\"Arial\" w:asciiTheme=\"minorHAnsi\" w:cs=\"Arial\"/>\
+                <w:color w:val=\"FF0000\" w:themeColor=\"accent1\"/></w:rPr>\
+                <w:t>x</w:t></w:r></w:p></w:body></w:document>";
+            let mut doc = docxcore::load::parse_document_xml(xml, &Default::default());
+            let Block::Paragraph(p) = &mut doc.body[0] else {
+                panic!("paragraph");
+            };
+            let docxcore::model::Inline::Run(r) = &mut p.content[0] else {
+                panic!("run");
+            };
+            put_font_name(&mut r.props, "Arial");
+            put_font_color(&mut r.props, "FF0000");
+            let out = docxcore::serialize::document_to_xml(&doc);
+            assert!(
+                !out.contains("Theme") && !out.contains("themeColor"),
+                "{out}"
+            );
+            assert!(
+                out.contains("<w:rFonts w:ascii=\"Arial\" w:hAnsi=\"Arial\" w:cs=\"Arial\"/>"),
+                "{out}"
+            );
+        }
 
         fn state_with_section_sentinel() -> DocState {
             let mut state = DocState::new();

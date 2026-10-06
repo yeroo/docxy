@@ -628,7 +628,7 @@ fn enter_at_the_end_of_a_placeholder_continues_it() {
     );
     let xml = blocks_to_xml(&e.doc.body);
     assert!(
-        xml.contains("<w:sdtContent><w:r><w:rPr><w:sz w:val=\"72\"/></w:rPr><w:t xml:space=\"preserve\">Line2</w:t>"),
+        xml.contains("<w:sdtContent><w:r><w:rPr><w:sz w:val=\"72\"/><w:szCs w:val=\"72\"/></w:rPr><w:t xml:space=\"preserve\">Line2</w:t>"),
         "the new line is in the control, formatted as it: {xml}"
     );
     let mut r = reloaded(&e);

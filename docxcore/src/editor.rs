@@ -1501,14 +1501,23 @@ impl Editor {
         });
     }
     pub fn set_font_size(&mut self, half_pts: u32) {
-        self.map_props(move |p| p.size_half_pts = Some(half_pts));
+        self.map_props(move |p| {
+            p.size_half_pts = Some(half_pts);
+            p.forget_loaded_size();
+        });
     }
     pub fn set_font(&mut self, name: &str) {
         let name = name.to_string();
-        self.map_props(move |p| p.font = Some(name.clone()));
+        self.map_props(move |p| {
+            p.font = Some(name.clone());
+            p.forget_loaded_font();
+        });
     }
     pub fn set_color(&mut self, hex: Option<String>) {
-        self.map_props(move |p| p.color = hex.clone());
+        self.map_props(move |p| {
+            p.color = hex.clone();
+            p.forget_loaded_color();
+        });
     }
     pub fn set_highlight(&mut self, name: Option<String>) {
         self.map_props(move |p| p.highlight = name.clone());
@@ -1530,8 +1539,11 @@ impl Editor {
     pub fn clear_run_formatting(&mut self) {
         self.map_props(|p| {
             let highlight = p.highlight.take();
+            // The run's rsids are bookkeeping, not formatting.
+            let element_attrs = std::mem::take(&mut p.element_attrs);
             *p = RunProps::default();
             p.highlight = highlight;
+            p.element_attrs = element_attrs;
         });
     }
 
@@ -1589,7 +1601,14 @@ impl Editor {
     /// Increase/decrease the left indent of the selected paragraphs by `delta`
     /// twips (clamped at 0).
     pub fn change_indent(&mut self, delta: i32) {
-        self.for_each_para(|pr| pr.indent = (pr.indent + delta).max(0));
+        self.for_each_para(|pr| {
+            pr.indent = (pr.indent + delta).max(0);
+            // The loaded left indent goes, character units included: a
+            // decrease clamped to zero twips must still clear `w:leftChars`.
+            if delta != 0 {
+                pr.forget_loaded_indent(&[IndentSide::Left]);
+            }
+        });
     }
 
     /// Set the left indent and first-line delta (twips) of the selected
@@ -1599,18 +1618,25 @@ impl Editor {
         self.for_each_para(move |pr| {
             pr.indent = left.max(0);
             pr.first_line = first_line;
+            pr.forget_loaded_indent(&[IndentSide::Left, IndentSide::FirstLine]);
         });
     }
 
     /// Set just the first-line delta (twips) of the selected paragraphs, leaving
     /// the left indent alone. Used by the First-line / Hanging ribbon buttons.
     pub fn set_first_line(&mut self, first_line: i32) {
-        self.for_each_para(move |pr| pr.first_line = first_line);
+        self.for_each_para(move |pr| {
+            pr.first_line = first_line;
+            pr.forget_loaded_indent(&[IndentSide::FirstLine]);
+        });
     }
 
     /// Set the right indent (twips, clamped at 0) of the selected paragraphs.
     pub fn set_right_indent(&mut self, right: i32) {
-        self.for_each_para(move |pr| pr.indent_right = right.max(0));
+        self.for_each_para(move |pr| {
+            pr.indent_right = right.max(0);
+            pr.forget_loaded_indent(&[IndentSide::Right]);
+        });
     }
 
     /// The left indent and first-line delta at the caret (for syncing the

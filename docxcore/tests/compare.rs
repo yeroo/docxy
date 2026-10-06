@@ -604,6 +604,36 @@ fn markup_whose_prefix_the_revised_root_binds_differently_is_dropped() {
     assert_eq!(texts(&resolved(&reloaded(&result), false)), ["Keep gone"]);
 }
 
+/// #1063: the start-tag attributes and property elements an original
+/// paragraph keeps follow the same rule as its unmodeled properties: in a
+/// prefix the revised root binds differently they are dropped, otherwise kept.
+#[test]
+fn original_start_tag_attributes_in_a_rebound_prefix_are_dropped() {
+    let original = pkg_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:w14=\"urn:not-w14\">"),
+        "<w:p><w:r><w:t xml:space=\"preserve\">Keep</w:t></w:r></w:p>\
+         <w:p w:rsidR=\"00AA0001\" w14:paraId=\"0000AAAA\">\
+         <w:r w:rsidRPr=\"00AA0002\" w14:odd=\"1\"><w:rPr><w:rFonts w:hAnsi=\"Arial\" w14:odd=\"1\"/></w:rPr>\
+         <w:t>gone</w:t></w:r></w:p>",
+    );
+    let revised = pkg_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:w14=\"{W14}\">"),
+        &p("Keep"),
+    );
+    let result = compare(&original, &revised);
+    let xml = saved_document_xml(&result);
+    assert!(!xml.contains("w14:paraId=\"0000AAAA\""), "{xml}");
+    assert!(!xml.contains("w14:odd"), "{xml}");
+    assert!(!xml.contains("urn:not-w14"), "{xml}");
+    // The deleted run's attribute in an unaffected prefix survives. (The
+    // deleted paragraph itself takes its lender's properties, rsids and all.)
+    assert!(xml.contains("<w:r w:rsidRPr=\"00AA0002\">"), "{xml}");
+    assert_eq!(
+        texts(&resolved(&reloaded(&result), false)),
+        ["Keep", "gone"]
+    );
+}
+
 #[test]
 fn simple_fields_inside_revisions_become_run_level_complex_fields() {
     let field = |result: &str| {

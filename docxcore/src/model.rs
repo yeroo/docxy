@@ -32,6 +32,26 @@ pub struct TrackedInsert {
     pub metadata: RevisionMetadata,
 }
 
+/// Attributes of a modeled element's start tag (`w:p`, `w:r`, `w:tr`) that the
+/// model does not interpret: revision-session ids (`w:rsidR`, `w:rsidRPr`, …),
+/// `w14:paraId`/`w14:textId`, scoped namespace declarations. Decoded
+/// `(qualified name, value)` pairs in source order, written back on save
+/// (#1063).
+///
+/// This is preservation data, never formatting: equality always holds, so two
+/// runs that differ only in their rsids still merge, extend and compare as the
+/// same formatting.
+#[derive(Debug, Clone, Default)]
+pub struct ElementAttrs(pub Vec<(String, String)>);
+
+impl PartialEq for ElementAttrs {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ElementAttrs {}
+
 /// Character-level formatting (a resolved `w:rPr`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RunProps {
@@ -64,6 +84,15 @@ pub struct RunProps {
     /// toggles that must remain distinct from an absent/style-derived value.
     /// Preserved children are re-emitted in schema order.
     pub raw_props: Vec<String>,
+    /// Verbatim XML of the *modeled* `w:rPr` children as loaded (`w:b`,
+    /// `w:bCs`, `w:rFonts`, `w:sz`, `w:szCs`, `w:color`, …). On save, a
+    /// property whose modeled value still equals the one these parse to is
+    /// written from here, so attributes and pairs the model does not represent
+    /// (`w:rFonts w:hAnsi`, `w:color w:themeColor`, `w:szCs`) survive; an
+    /// edited property is generated from the model instead (#1063).
+    pub shadow: Vec<String>,
+    /// The `w:r` start tag's attributes (`w:rsidR`, `w:rsidRPr`, …).
+    pub element_attrs: ElementAttrs,
     /// A tracked `w:rPrChange`, when present. The owning `RunProps` is the
     /// current state; `previous` on the change retains the prior snapshot.
     pub property_change: Option<PropertyChange>,
@@ -82,6 +111,44 @@ pub struct RunProps {
 }
 
 impl RunProps {
+    /// Call after setting `font` explicitly. The loaded `w:rFonts` keeps only
+    /// what a font edit does not replace (the East Asian and complex-script
+    /// slots), so the font is written from the model, without a theme font
+    /// overriding it, even when it is the loaded one (#1063).
+    pub fn forget_loaded_font(&mut self) {
+        crate::serialize::forget_shadow_attrs(
+            &mut self.shadow,
+            "rFonts",
+            crate::serialize::RFONTS_LATIN,
+        );
+    }
+
+    /// Call after setting `size_half_pts` explicitly. A loaded `w:szCs` takes
+    /// the new size too, as Word's size box sets both; otherwise a size equal
+    /// to the loaded `w:sz` would leave a different complex-script size as
+    /// loaded (#1063).
+    pub fn forget_loaded_size(&mut self) {
+        if let Some(size) = self.size_half_pts {
+            crate::serialize::set_shadow_val(&mut self.shadow, "szCs", &size.to_string());
+        }
+    }
+
+    /// Call after setting `color` explicitly: as [`RunProps::forget_loaded_font`]
+    /// for `w:color`. Clearing the colour drops the loaded `w:color` whole,
+    /// so no `w:color` without its required `w:val` is written.
+    pub fn forget_loaded_color(&mut self) {
+        if self.color.is_none() {
+            self.shadow
+                .retain(|raw| crate::serialize::local_name(raw) != "color");
+        } else {
+            crate::serialize::forget_shadow_attrs(
+                &mut self.shadow,
+                "color",
+                crate::serialize::COLOR_VALUE,
+            );
+        }
+    }
+
     /// Whether the text is underlined as the user set it: the underline a
     /// tracked insertion is drawn with is a display cue, not formatting.
     pub fn user_underline(&self) -> bool {
@@ -548,6 +615,17 @@ pub struct ParProps {
     /// direct-left `w:jc` and disabled `w:bidi`. Preserved so save does not
     /// confuse a direct override with style inheritance.
     pub raw_props: Vec<String>,
+    /// Verbatim XML of the *modeled* `w:pPr` children as loaded (`w:pStyle`,
+    /// `w:jc`, `w:ind`, `w:tabs`, `w:pBdr`, `w:numPr`, …). On save, a property
+    /// whose modeled value still equals the one these parse to is written from
+    /// here, so what the model does not represent (`w:ind w:firstLineChars`,
+    /// clear tabs, left/right borders) survives; an edited property is
+    /// generated from the model instead (#1063).
+    pub shadow: Vec<String>,
+    /// The `w:p` start tag's attributes (`w:rsidR`, `w14:paraId`, …). Kept on
+    /// the paragraph properties so a split or copied paragraph carries them;
+    /// a duplicated `w14:paraId` is dropped when the part is written.
+    pub element_attrs: ElementAttrs,
     /// A tracked `w:pPrChange`; the remaining fields are the current state.
     pub property_change: Option<PropertyChange>,
     /// A `w:sectPrChange` nested in this paragraph's section-break properties.
@@ -557,6 +635,36 @@ pub struct ParProps {
     /// verbatim in `raw_props`). A mark inserted by one reviewer and deleted by
     /// another carries both an `ins` and a `del`.
     pub mark_revisions: Vec<ParagraphMarkRevision>,
+}
+
+/// One indent of a paragraph's `w:ind`: see [`ParProps::forget_loaded_indent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndentSide {
+    Left,
+    Right,
+    FirstLine,
+}
+
+impl ParProps {
+    /// Call after setting indents explicitly. The loaded `w:ind` loses every
+    /// attribute that sets one of `sides`, in twips or in character units
+    /// (`w:leftChars`, `w:firstLineChars`, …), and keeps the other indents
+    /// as loaded; so the indents set are written from the model, without a
+    /// character-unit value overriding them, even when they equal the loaded
+    /// twips (#1063).
+    pub fn forget_loaded_indent(&mut self, sides: &[IndentSide]) {
+        use crate::serialize::{IND_FIRST_LINE, IND_LEFT, IND_RIGHT};
+        let attrs: Vec<&str> = sides
+            .iter()
+            .flat_map(|side| match side {
+                IndentSide::Left => IND_LEFT,
+                IndentSide::Right => IND_RIGHT,
+                IndentSide::FirstLine => IND_FIRST_LINE,
+            })
+            .copied()
+            .collect();
+        crate::serialize::forget_shadow_attrs(&mut self.shadow, "ind", &attrs);
+    }
 }
 
 /// A tracked change on a paragraph mark (`w:pPr/w:rPr/w:ins` or `w:del`).
@@ -862,6 +970,8 @@ pub struct Row {
     /// the first/last wrapped row.
     pub raw_props: Vec<String>,
     pub property_change: Option<PropertyChange>,
+    /// The `w:tr` start tag's attributes (`w:rsidR`, `w:rsidTr`, `w14:paraId`, …).
+    pub element_attrs: ElementAttrs,
 }
 
 /// An invisible table child anchored at the gap before `rows[at]` (or after the

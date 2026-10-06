@@ -383,8 +383,10 @@ fn remove_inlines(content: &mut Vec<Inline>, target: Target) -> usize {
 struct TextBoxCopy {
     /// Byte range of its inner XML.
     inner: Range<usize>,
-    /// Whether its inner XML equals the first copy's, so it shows the same
-    /// `blocks`. The first copy is its own twin. Only twins may be rewritten
+    /// Whether its inner XML equals the first copy's apart from `w14:paraId`
+    /// attributes and prefixed namespace declarations (see `twin_key`), so it
+    /// shows the same `blocks`.
+    /// The first copy is its own twin. Only twins may be rewritten
     /// from `blocks`; another box of a group keeps its own content.
     twin: bool,
 }
@@ -416,13 +418,51 @@ fn text_box_copies(raw: &str) -> Vec<TextBoxCopy> {
     let Some(first) = inners.first().map(|r| &raw[r.clone()]) else {
         return Vec::new();
     };
+    // A save may drop a repeated `w14:paraId` from one copy but not the other
+    // (an id is never dropped in an `mc:Fallback`, #1063); that alone does not
+    // make the copies differ.
+    let first = twin_key(first);
     inners
         .iter()
         .map(|inner| TextBoxCopy {
-            twin: raw[inner.clone()] == *first,
+            twin: twin_key(&raw[inner.clone()]) == first,
             inner: inner.clone(),
         })
         .collect()
+}
+
+/// `xml` as text-box copies are compared: without the `w14:paraId`
+/// attributes and the prefixed namespace declarations (`xmlns:p`) of its
+/// start tags; text is left alone. A save may drop a repeated id from one copy
+/// only, and the loader declares on a modeled copy's property elements the
+/// prefixes they inherit (#1063), which the raw copy inherits unchanged.
+/// Malformed XML is returned as it is.
+fn twin_key(xml: &str) -> String {
+    use crate::xml::{Event, XmlParser};
+    let mut cuts = Vec::new();
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                for a in p
+                    .attrs()
+                    .iter()
+                    .filter(|a| a.name == "w14:paraId" || a.name.starts_with("xmlns:"))
+                {
+                    let Some(cut) = crate::serialize::attr_source_range(xml, a) else {
+                        return xml.to_string();
+                    };
+                    cuts.push(cut);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    if p.is_malformed() {
+        return xml.to_string();
+    }
+    crate::serialize::without_ranges(xml, &cuts)
 }
 
 /// What `target` counts in a text box's `raw` beyond what its `blocks`
@@ -989,6 +1029,104 @@ mod tests {
         let xml = document_to_xml(&doc);
         assert!(!xml.contains("gone"), "{xml}");
         assert!(!xml.contains("comment"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+    }
+
+    /// #1063: text-box paragraphs keep their `w14:paraId`, the same in the
+    /// Choice and the Fallback copy. A save must not drop it from the Fallback
+    /// as a repeat, or the reopened copies differ and a second removal no
+    /// longer reaches the Fallback.
+    #[test]
+    fn inspect_removal_after_reopen_reaches_a_fallback_with_para_ids() {
+        let boxed = two_copy_text_box(&format!(
+            "<w:p w14:paraId=\"1A2B3C4D\" w:rsidR=\"00A1B2C3\">\
+             <w:commentRangeStart w:id=\"5\"/>{VISIBLE}<w:commentRangeEnd w:id=\"5\"/>{HIDDEN}</w:p>"
+        ));
+        let mut doc = parse(&boxed);
+        assert_eq!(remove_all_comment_markers(&mut doc), 1 + 1);
+        let xml = document_to_xml(&doc);
+        assert_eq!(xml.matches("w14:paraId=\"1A2B3C4D\"").count(), 2, "{xml}");
+        let body = &xml[xml.find("<w:body>").unwrap() + 8..xml.find("</w:body>").unwrap()];
+        let mut reopened = parse(body);
+        assert_eq!(remove_hidden_text(&mut reopened), 1);
+        let xml = document_to_xml(&reopened);
+        assert!(!xml.contains("gone"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+        assert_eq!(xml.matches("w14:paraId=\"1A2B3C4D\"").count(), 2, "{xml}");
+    }
+
+    /// Review r2: a duplicated text box (a copy, a mail-merge record) repeats
+    /// its paragraph ids. After an Inspect pass syncs the copies, the save
+    /// drops the repeat from the second box's Choice but never from a
+    /// Fallback, so its copies differ by an id; they are still twins after a
+    /// reopen, and a removal reaches both.
+    #[test]
+    fn inspect_removal_reaches_both_copies_of_a_duplicated_text_box() {
+        let boxed = two_copy_text_box(&format!(
+            "<w:p w14:paraId=\"1A2B3C4D\">\
+             <w:commentRangeStart w:id=\"5\"/>{VISIBLE}<w:commentRangeEnd w:id=\"5\"/>{HIDDEN}</w:p>"
+        ));
+        let mut doc = parse(&format!("{boxed}{boxed}"));
+        assert_eq!(remove_all_comment_markers(&mut doc), 4);
+        let xml = document_to_xml(&doc);
+        assert_eq!(xml.matches("w14:paraId=\"1A2B3C4D\"").count(), 3, "{xml}");
+        let body = &xml[xml.find("<w:body>").unwrap() + 8..xml.find("</w:body>").unwrap()];
+        let mut reopened = parse(body);
+        assert_eq!(remove_hidden_text(&mut reopened), 2);
+        let xml = document_to_xml(&reopened);
+        assert!(!xml.contains("gone"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 4, "{xml}");
+    }
+
+    /// Review r3: copies are twins apart from `w14:paraId` attributes only,
+    /// never apart from text that happens to look like one.
+    #[test]
+    fn text_box_twins_ignore_para_id_attributes_but_not_text() {
+        let raw = |a: &str, b: &str| {
+            format!(
+                "<v:group><w:txbxContent>{a}</w:txbxContent><w:txbxContent>{b}</w:txbxContent></v:group>"
+            )
+        };
+        let text =
+            |id: &str| format!("<w:p><w:r><w:t>Example w14:paraId=\"{id}\"</w:t></w:r></w:p>");
+        let attr = |id: &str| format!("<w:p w14:paraId=\"{id}\"><w:r><w:t>Same</w:t></w:r></w:p>");
+        let twins = |raw: &str| {
+            text_box_copies(raw)
+                .iter()
+                .map(|c| c.twin)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            twins(&raw(&text("11111111"), &text("22222222"))),
+            [true, false]
+        );
+        assert_eq!(
+            twins(&raw(&attr("11111111"), &attr("22222222"))),
+            [true, true]
+        );
+    }
+
+    /// Review r5: the loader declares on the modeled copy's property elements
+    /// a prefix the drawing run declares for both copies; the copies are still
+    /// twins after a save and reopen, and a removal reaches both.
+    #[test]
+    fn a_prefix_declared_on_the_drawing_run_keeps_the_copies_twins() {
+        let content = "<w:p><w:r><w:rPr><w:lang w:val=\"en-US\" ux:flag=\"1\"/></w:rPr>\
+            <w:t xml:space=\"preserve\">keep</w:t></w:r><w:r><w:rPr><w:vanish/>\
+            <w:lang w:val=\"en-US\" ux:flag=\"1\"/></w:rPr><w:t xml:space=\"preserve\">gone</w:t></w:r></w:p>";
+        let boxed = format!(
+            "<w:p><w:r xmlns:ux=\"urn:ux\"><mc:AlternateContent><mc:Choice Requires=\"wps\"><w:drawing><wps:txbx>\
+             <w:txbxContent>{content}</w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
+             <mc:Fallback><w:pict><v:shape><v:textbox><w:txbxContent>{content}</w:txbxContent>\
+             </v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>"
+        );
+        let xml = document_to_xml(&parse(&boxed));
+        assert!(xml.contains("<w:lang xmlns:ux=\"urn:ux\""), "{xml}");
+        let body = &xml[xml.find("<w:body>").unwrap() + 8..xml.find("</w:body>").unwrap()];
+        let mut reopened = parse(body);
+        assert_eq!(remove_hidden_text(&mut reopened), 1);
+        let xml = document_to_xml(&reopened);
+        assert!(!xml.contains("gone"), "{xml}");
         assert_eq!(xml.matches("keep").count(), 2, "{xml}");
     }
 

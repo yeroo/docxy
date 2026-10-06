@@ -458,26 +458,23 @@ fn parse_rpr_default(p: &mut XmlParser, run: &mut PartialRun) {
 }
 
 fn parse_partial_rpr(p: &mut XmlParser, run: &mut PartialRun) {
+    // The same precedence as direct formatting (`RprPairs`).
+    let mut pairs = crate::load::RprPairs::default();
     loop {
         match p.next() {
             Event::Start => {
                 let name = p.name();
                 let val = p.attr("w:val");
+                if pairs.read(name, val) {
+                    p.skip_element();
+                    continue;
+                }
                 match name {
-                    "w:b" | "w:bCs" => run.bold = Some(toggle(val)),
-                    "w:i" | "w:iCs" => run.italic = Some(toggle(val)),
                     "w:u" => run.underline = Some(toggle(val)),
-                    "w:strike" | "w:dstrike" => run.strike = Some(toggle(val)),
                     "w:rtl" => run.rtl = Some(toggle(val)),
                     "w:color" => {
                         if !val.is_empty() && val != "auto" {
                             run.color = Some(val.to_ascii_uppercase());
-                        }
-                    }
-                    "w:sz" | "w:szCs" => {
-                        let v = parse_uint(val);
-                        if v > 0 {
-                            run.size = Some(v);
                         }
                     }
                     "w:rFonts" => {
@@ -493,6 +490,18 @@ fn parse_partial_rpr(p: &mut XmlParser, run: &mut PartialRun) {
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
+    }
+    if let Some(on) = pairs.bold() {
+        run.bold = Some(on);
+    }
+    if let Some(on) = pairs.italic() {
+        run.italic = Some(on);
+    }
+    if let Some(on) = pairs.strike() {
+        run.strike = Some(on);
+    }
+    if let Some(v) = pairs.size() {
+        run.size = Some(v);
     }
 }
 
@@ -611,6 +620,43 @@ mod tests {
         let eff = ss.effective_run(Some("Heading1"), None, &RunProps::default());
         assert!(eff.bold);
         assert_eq!(eff.size_half_pts, Some(32));
+    }
+
+    /// Review r2: a style's twins resolve like direct formatting's: the
+    /// primary wins over its complex-script twin in either order, and
+    /// `w:dstrike` adds to `w:strike` (#1063).
+    #[test]
+    fn style_twins_resolve_like_direct_formatting() {
+        let rpr = [
+            "<w:sz w:val=\"22\"/><w:szCs w:val=\"28\"/><w:b w:val=\"0\"/><w:bCs/>\
+             <w:strike/><w:dstrike w:val=\"0\"/>",
+            "<w:szCs w:val=\"28\"/><w:sz w:val=\"22\"/><w:bCs/><w:b w:val=\"0\"/>\
+             <w:dstrike w:val=\"0\"/><w:strike/>",
+        ];
+        for rpr in rpr {
+            let xml = format!(
+                "<w:styles><w:style w:type=\"paragraph\" w:styleId=\"S\"><w:rPr>{rpr}</w:rPr>\
+                 </w:style></w:styles>"
+            );
+            let eff = parse_styles_xml(&xml).effective_run(Some("S"), None, &RunProps::default());
+            assert_eq!(eff.size_half_pts, Some(22), "{rpr}");
+            assert!(!eff.bold && eff.strike, "{rpr}");
+            let doc = crate::load::parse_document_xml(
+                &format!(
+                    "<w:document><w:body><w:p><w:r><w:rPr>{rpr}</w:rPr><w:t>x</w:t></w:r></w:p>\
+                     </w:body></w:document>"
+                ),
+                &Default::default(),
+            );
+            let crate::model::Block::Paragraph(p) = &doc.body[0] else {
+                panic!("paragraph");
+            };
+            let crate::model::Inline::Run(r) = &p.content[0] else {
+                panic!("run");
+            };
+            assert_eq!(r.props.size_half_pts, Some(22), "{rpr}");
+            assert!(!r.props.bold && r.props.strike, "{rpr}");
+        }
     }
 
     #[test]

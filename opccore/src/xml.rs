@@ -156,6 +156,29 @@ impl<'a> XmlParser<'a> {
             .map(|(attr, element_name)| XmlScopedAttr { element_name, attr })
     }
 
+    /// Every declaration of the namespace attribute `name` (`xmlns:p`) on the
+    /// open elements, outermost first; the last is the one in effect. Empty
+    /// when the prefix is not bound. A consumer that writes back only some of
+    /// those elements can tell whether a binding survives without the rest.
+    pub fn namespace_declaration_chain(&self, name: &str) -> Vec<XmlScopedAttr<'a>> {
+        let Some(index) = self.m_namespaces.iter().position(|a| a.name == name) else {
+            return Vec::new();
+        };
+        // Each redeclaring scope saved the value it replaced.
+        let mut chain: Vec<XmlScopedAttr<'a>> = self
+            .namespace_changes
+            .iter()
+            .flatten()
+            .filter(|(i, _)| *i == index)
+            .filter_map(|(_, previous)| *previous)
+            .collect();
+        chain.push(XmlScopedAttr {
+            attr: self.m_namespaces[index],
+            element_name: self.m_namespace_elements[index],
+        });
+        chain
+    }
+
     /// Markup-compatibility attributes active at the current start element,
     /// together with the element on which each attribute was declared.
     ///
@@ -562,6 +585,24 @@ mod tests {
         let mut s = String::new();
         XmlParser::append_decoded(raw, &mut s);
         s
+    }
+
+    #[test]
+    fn namespace_declaration_chain_lists_each_redeclaration_outermost_first() {
+        let mut p = XmlParser::new(
+            "<r xmlns:a=\"urn:root\"><c xmlns:a=\"urn:inner\"><e xmlns:a=\"urn:root\"><d/></e></c></r>",
+        );
+        while !(p.next() == Event::Start && p.name() == "d") {}
+        let chain: Vec<_> = p
+            .namespace_declaration_chain("xmlns:a")
+            .iter()
+            .map(|s| (s.attr.value, s.element_name))
+            .collect();
+        assert_eq!(
+            chain,
+            [("urn:root", "r"), ("urn:inner", "c"), ("urn:root", "e")]
+        );
+        assert!(p.namespace_declaration_chain("xmlns:b").is_empty());
     }
 
     #[test]

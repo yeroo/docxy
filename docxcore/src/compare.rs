@@ -762,6 +762,8 @@ impl<'o> Compare<'o> {
         props.property_change = None;
         props.mark_revisions.clear();
         self.drop_conflicting(&mut props.raw_props);
+        self.drop_conflicting(&mut props.shadow);
+        self.drop_conflicting_attrs(&mut props.element_attrs);
         if props
             .style_id
             .as_ref()
@@ -785,6 +787,8 @@ impl<'o> Compare<'o> {
         props.property_change = None;
         props.revision_cues = Default::default();
         self.drop_conflicting(&mut props.raw_props);
+        self.drop_conflicting(&mut props.shadow);
+        self.drop_conflicting_attrs(&mut props.element_attrs);
         if props
             .style_id
             .as_ref()
@@ -803,6 +807,18 @@ impl Compare<'_> {
         self.conflicts.iter().any(|prefix| {
             xml.contains(&format!("<{prefix}:")) || xml.contains(&format!(" {prefix}:"))
         })
+    }
+
+    /// Drop original start-tag attributes (`w14:paraId`, …) in such a prefix,
+    /// or redeclaring it. They are bookkeeping, not formatting, so dropping
+    /// them is not reported.
+    fn drop_conflicting_attrs(&self, attrs: &mut crate::model::ElementAttrs) {
+        attrs.0.retain(|(name, _)| {
+            let prefix = name
+                .strip_prefix("xmlns:")
+                .or_else(|| name.split_once(':').map(|(p, _)| p));
+            !prefix.is_some_and(|p| self.conflicts.iter().any(|c| c == p))
+        });
     }
 
     /// Drop preserved original property children that use such a prefix.

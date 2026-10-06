@@ -164,6 +164,13 @@ its fix, and the classes are defined in `CLASSES` in `docxcore/tests/fidelity.rs
 The gate also fails on an entry that no class claims. A new kind of loss
 therefore needs a class and an issue, not just a line.
 
+Classes match by path, which can mislabel one case. A run that #1069 splits or
+unwraps can make the comparator pair the wrong runs, and then intact run
+properties read as lost or changed. Such entries are listed one by one in
+`MISALIGNED_RUNS`, each checked per character against the original, so the
+#1069 class claims them instead of #1068. An exact list cannot claim a loss in
+a file or at a path it does not name.
+
 The baseline keys on the index-free path, so one line covers every occurrence of
 that loss in that file. The trade-off: a new occurrence of an already listed loss
 at another index in the same file is not reported. The finding that does get
@@ -181,13 +188,19 @@ git diff docxcore/tests/fidelity/baseline.txt   # should only remove lines
 The rewrite replaces the entries of every file in this run and keeps the
 entries of files it did not see. So run it with the full corpus fetched, or a
 partial run leaves stale lines for absent files behind for the next full run to
-flag. A diff that **adds** lines is a regression, not an update.
+flag. A diff that **adds** lines is a regression, not an update, with one
+exception. The comparator reports a difference once, at the root of the subtree
+that differs. So when a fix stops losing a whole container (a `w:rPr`, an
+attribute), any difference inside that node, or among runs aligned through it,
+becomes visible for the first time. Such an entry may be added under its own
+class, but only when an entry for the same file at that node or an ancestor goes
+away in the same diff. The PR lists each one (#1063 did this).
 
 ## What it does not cover
 
 - xlsx: #1064.
 - Fixing the losses it found:
-  - The unmodeled property children and attributes are #1063.
+  - The unmodeled property children and attributes were fixed by #1063.
   - The other classes in `baseline.txt` each name their issue.
 - Save paths other than `save_package` and `save_package_preserving_document`:
   the HTML bundle, Markdown, compare and merge.
