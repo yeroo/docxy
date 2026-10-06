@@ -114,6 +114,13 @@ impl<'a> ZipArchive<'a> {
             return Some(src.to_vec());
         }
         if entry.method == 8 {
+            // No stream at all for an empty entry: zero compressed bytes is
+            // not a valid deflate stream, but writers emit it for empty
+            // files and directory entries, and other readers (LibreOffice
+            // among them) open such packages.
+            if entry.comp_size == 0 && entry.uncomp_size == 0 {
+                return Some(Vec::new());
+            }
             let out = inflate_raw(src, deflate_cap(entry.uncomp_size))?;
             if out.len() == entry.uncomp_size as usize {
                 return Some(out);
@@ -276,6 +283,15 @@ mod tests {
     fn zero_declared_empty_deflate_extracts_empty() {
         // Fixed-Huffman block holding only the end-of-block symbol.
         let zip = deflate_zip(&[0x03, 0x00], 0);
+        let arc = ZipArchive::open(&zip).expect("open");
+        assert_eq!(arc.read("a"), Some(Vec::new()));
+    }
+
+    /// #1064: an empty file or directory entry written as deflate with no
+    /// stream bytes at all extracts as empty, as other readers allow.
+    #[test]
+    fn deflate_entry_with_no_stream_bytes_extracts_empty() {
+        let zip = deflate_zip(&[], 0);
         let arc = ZipArchive::open(&zip).expect("open");
         assert_eq!(arc.read("a"), Some(Vec::new()));
     }

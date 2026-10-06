@@ -1,11 +1,12 @@
-# The docx round-trip fidelity gate
+# The round-trip fidelity gate
 
 Saving must never silently destroy a user's document (#1060). The fidelity gate
 opens every corpus `.docx`, saves it with no edits, and compares every package
-part with the original. A loss nobody has accepted fails the build.
+part with the original. A loss nobody has accepted fails the build. The same
+gate runs over `.xlsx` (#1064); [xlsx](#xlsx) below covers what differs.
 
-It is a plain cargo test, `docxcore/tests/fidelity.rs`, and the `docx fidelity
-gate` job runs it in CI on every PR.
+It is a plain cargo test, `docxcore/tests/fidelity.rs`, and the `fidelity gate
+(docx, xlsx)` job runs it in CI on every PR.
 
 ## What it checks
 
@@ -196,11 +197,96 @@ becomes visible for the first time. Such an entry may be added under its own
 class, but only when an entry for the same file at that node or an ancestor goes
 away in the same diff. The PR lists each one (#1063 did this).
 
-## What it does not cover
+## xlsx
 
-- xlsx: #1064.
+`gridcore/tests/fidelity.rs` runs the same gate over `.xlsx`. It shares the
+comparator, the allowlist and baseline formats, and the NEW / STALE /
+UNCLASSIFIED rules: it includes `docxcore/tests/fidelity/mod.rs` by path, so
+there is one comparator. Its own files are `gridcore/tests/fidelity/allowlist.txt`
+and `gridcore/tests/fidelity/baseline.txt`, and its classes are `CLASSES` in
+`gridcore/tests/fidelity.rs`.
+
+```sh
+corpus/tools/fetch-corpus.sh          # also populates corpus/xlsx-ext
+cargo test -p gridcore --test fidelity -- --nocapture
+```
+
+- **The round trip** is `load_xlsx`, then `save_xlsx_for_path` with the file's
+  own path: what xlsxy writes on save. It leaves out `stamp_save`, which
+  rewrites `docProps` with the current time on purpose. xlsx has no separate
+  no-edit save like docx's `save_package_preserving_document`: every save
+  regenerates each worksheet's `<sheetData>`, `<cols>` and `<dimension>` from
+  the model, so the gate measures that.
+- **The files**: the repo-tracked `.xlsx` in `assets/`, `corpus/xlsx/`,
+  `corpus/legacy/addin/`, `corpus/legacy/extra/`, `offxy-vscode/mcp/templates/`
+  and `uiharness/fixtures/`, plus every `.xlsx` under `FIDELITY_XLSX_CORPUS`
+  (default `corpus/xlsx-ext`, the docxy-corpus `xlsx-ext/` directory), searched
+  recursively. `FIDELITY_REQUIRE_CORPUS` and `FIDELITY_UPDATE_BASELINE` work as
+  for docx. `FIDELITY_UPDATE_BASELINE=1 cargo test --workspace` rewrites both
+  baselines.
+- **The sheet check.** A regenerated worksheet differs from its source in ways
+  that change nothing a reader sees, and a structural finding cannot tell them
+  from a loss. Examples: `0.14000000000000001` written `0.14`; an inline string
+  moved to the shared strings; a shared formula expanded per cell; a dropped
+  `<c r="B2"/>`; `customWidth="true"` written `1`. So each worksheet is also
+  read the way a spreadsheet reads it.
+
+  **Per cell** either side lists, it compares three things:
+  - the **value**. Shared strings are found through the workbook's
+    relationship. Shared and inline strings are resolved, run formatting
+    included; phonetic runs are not read. Numbers compare as doubles, along
+    with booleans and errors.
+  - the **formula**: its text, plus kind and range for array and data-table
+    formulas. A shared formula's follower is resolved from its master by
+    shifting the master's relative references. The test does that with its
+    own shifter, not gridcore's. A follower that has no master covering it
+    does not resolve.
+  - the **effective style**: the cell's own `s`, else its row's (with
+    `customFormat`), else its column's.
+
+  **Per column**, it compares the `<col>` attributes: width (as a double),
+  `customWidth`, `style`, `hidden`, `bestFit`, `phonetic`, `outlineLevel` and
+  `collapsed`.
+
+  A difference is a `changed-value` finding at one of these paths:
+  - `/cells/<ref>/value`
+  - `/cells/<ref>/style`
+  - `/cells/<ref>/formula-text`: the same formula in other words, meaning
+    spaces, case or the `_xlfn.` prefix;
+  - `/cells/<ref>/formula`: any other formula change, including a lost,
+    added or unresolved formula;
+  - `/cols/<letters or range>/<attribute>`: one path covers a run of
+    adjacent columns that differ the same way.
+
+  Each baseline line covers that cell or column run only. A new loss in
+  another cell is NEW, and so is a changed formula filed where only
+  re-serialization is baselined.
+
+  The structural findings the check covers are dropped. Covered are:
+  - all of `<cols>`;
+  - a lost or extra `<c>` whose attributes are within `r`, `s` and `t` and
+    whose children are `<v>`, `<f>` (with `t`, `si`, `ref`) and `<is>`
+    (`<t>` and runs);
+  - the `<v>` and `<f>` text;
+  - the `<is>` text and runs;
+  - the cell attributes `r`, `s` and `t`;
+  - the formula attributes `t`, `si` and `ref`;
+  - rows carrying nothing but `r` and `spans`.
+
+  Everything else stays structural. That includes other row attributes,
+  other cell attributes (`vm`, `cm`, `ph`), other formula attributes (`ca`,
+  `aca`), phonetic runs, and a lost cell that carried any of them. Those
+  baseline lines are index-free like docx's, so one line covers every
+  occurrence in that sheet. The test prints how many findings the check
+  covered.
+
+## What it does not cover
 - Fixing the losses it found:
   - The unmodeled property children and attributes were fixed by #1063.
   - The other classes in `baseline.txt` each name their issue.
 - Save paths other than `save_package` and `save_package_preserving_document`:
   the HTML bundle, Markdown, compare and merge.
+- For xlsx:
+  - other file types (`.xlsm`, `.xltx`, `.xlsb`), and Save As to another type;
+  - what xlsxy does around a save, such as recalculation on open and
+    `stamp_save`. Only the library's round trip is checked.

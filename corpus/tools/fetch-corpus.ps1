@@ -6,14 +6,15 @@
 # corpus\xlsx-ext with its payload (so files removed upstream go away too),
 # copies the manifests, and discards the clone. Run it again to update.
 #
-# The round-trip fidelity gate (docs/fidelity-gate.md) reads corpus\files;
-# the compare launchers and verify sweeps use the rest.
+# The round-trip fidelity gate (docs/fidelity-gate.md) reads corpus\files
+# (docx) and corpus\xlsx-ext (xlsx); the compare launchers and verify sweeps
+# use the rest.
 #
 # Usage (from anywhere):
 #   corpus/tools/fetch-corpus.ps1
 #
 # Offline (the clone fails), it prints a SKIP notice and exits 0, leaving any
-# existing copy alone: the gate then runs the repo-tracked .docx only.
+# existing copy alone: the gate then runs the repo-tracked .docx and .xlsx only.
 
 $ErrorActionPreference = "Stop"
 

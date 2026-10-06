@@ -1,0 +1,29 @@
+# Round-trip fidelity allowlist for xlsx (#1064): deliberate, benign
+# normalizations the gate tolerates. One rule per line:
+#
+#   kind | part glob | index-free path glob | detail glob | reason
+#   kind | part glob | index-free path glob | detail glob | once-with <kind> <part> | reason
+#
+# `*` matches any run of characters, including `/`. The detail is what the
+# report prints after the path (see docxcore/tests/fidelity/allowlist.txt for
+# its form per kind). `once-with <kind> <part>` limits a rule to files that also
+# have a finding of that kind in that part, and to one finding per file.
+#
+# Worksheet cells and columns are compared by the sheet check in
+# gridcore/tests/fidelity.rs (per cell reference and per column), not here.
+#
+# The reason is mandatory. Shrinking this file is progress; growing it needs
+# review. Losses that are real but not fixed yet belong in baseline.txt, not
+# here.
+
+part-missing | xl/calcChain.xml | * | * | Save drops the calc chain when the workbook has formulas: Excel rebuilds it, so a stale chain can never corrupt anything (gridcore/src/xlsx.rs module docs).
+lost-element | [Content_Types].xml | /Types/Override | ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml" PartName="/xl/calcChain.xml" | once-with part-missing xl/calcChain.xml | The content-type override of that dropped calc chain: only in a file whose calc chain was dropped, and only once.
+lost-element | xl/_rels/workbook.xml.rels | /Relationships/Relationship | Id="*" Target="calcChain.xml" Type="*/relationships/calcChain" | once-with part-missing xl/calcChain.xml | The workbook relationship to that dropped calc chain: only in a file whose calc chain was dropped, and only once.
+extra-attr | xl/workbook.xml | /workbook/calcPr/@fullCalcOnLoad | 1 | Save asks Excel to recalculate on open whenever the workbook has formulas, since it drops the calc chain and cached values may be stale.
+extra-element | xl/workbook.xml | /workbook/calcPr | calcId="0" fullCalcOnLoad="1" | The same request where the workbook has no calcPr: one is added, asking only for a full recalculation.
+extra-element | [Content_Types].xml | /Types/Override | ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml" PartName="/xl/workbook.xml" | Save names the workbook part's content type for the target file type (save_xlsx_as), where the source relied on a Default instead.
+extra-attr | xl/pivotCache/pivotCacheDefinition*.xml | /pivotCacheDefinition/@refreshOnLoad | 1 | Save asks Excel to rebuild each pivot table from its definition on open, so a layout gridcore refreshed and Excel's agree (save_xlsx pivots section).
+lost-attr | xl/worksheets/*.xml | /worksheet/sheetData/row/@spans | * | Row spans are an optional optimization hint (CT_Row); the writer does not compute them.
+lost-attr | xl/worksheets/*.xml | /worksheet/sheetData/row/c/f/@aca | false | aca="false" is the schema default; the writer omits it.
+extra-element | [Content_Types].xml | /Types/Override | ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml" PartName="/xl/sharedStrings.xml" | once-with part-extra xl/sharedStrings.xml | The content-type override of a shared-strings part save added: only in a file that gained one, and only once.
+extra-element | xl/_rels/workbook.xml.rels | /Relationships/Relationship | Id="*" Target="sharedStrings.xml" Type="*/relationships/sharedStrings" | once-with part-extra xl/sharedStrings.xml | The workbook relationship to a shared-strings part save added: only in a file that gained one, and only once.
