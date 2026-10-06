@@ -13,7 +13,6 @@ ext:Normalize/conflicting IDs.docx	word/document.xml	lost-attr	/w:document/w:bod
 # run and paragraph content restructured on save (runs merged or split, lastRenderedPageBreak, smartTag, row-level sdt, special characters) (#1069)
 ext:MiscNode/WithMiscNodes.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:smartTag
 ext:MiscNode/WithMiscNodes.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r
-ext:MiscNode/WithMiscNodes.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:smartTagPr
 ext:Normalize/complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:Normalize/complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:Normalize/complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr
@@ -73,7 +72,6 @@ ext:columns/columns1.docx	word/document.xml	extra-element	/w:document/w:body/w:p
 ext:columns/columns2.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:columns/columns2.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
 ext:columns/columns2.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-ext:columns/columns2.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:smartTagPr
 ext:complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr
@@ -141,7 +139,6 @@ ext:hyperlink/632399964516872542 1.docx	word/document.xml	lost-element	/w:docume
 ext:hyperlink/632399964516872542 1.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
 ext:hyperlink/632399964516872542 1.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:t/text()
 ext:hyperlink/632399964516872542 1.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-ext:hyperlink/632399964516872542 1.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:smartTagPr
 ext:hyperlink/632404333468899776 PFVI_Nutrition.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:hyperlink/632404333468899776 PFVI_Nutrition.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:hyperlink/632404333468899776 PFVI_Nutrition.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:softHyphen
@@ -183,7 +180,6 @@ ext:page layout/page layout(big file)/A4.docx	word/document.xml	changed-value	/w
 ext:page layout/page layout(big file)/A4.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:page layout/page layout(big file)/A4.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r/w:rPr/w:b
 ext:page layout/page layout(big file)/A4.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r/w:rPr/w:bCs
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:smartTagPr
 ext:page layout/page layout(big file)/A4.docx	word/document.xml	extra-attr	/w:document/w:body/w:p/w:r/@w:rsidR
 ext:page layout/page layout(big file)/A4.docx	word/document.xml	extra-attr	/w:document/w:body/w:p/w:r/w:rPr/w:rFonts/@w:hint
 ext:page layout/page layout(big file)/Indent_Spacing.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
@@ -196,7 +192,6 @@ ext:page layout/page layout(big file)/pageBorders.docx	word/document.xml	lost-el
 ext:page layout/page layout(big file)/pageBorders.docx	word/document.xml	lost-attr	/w:document/w:body/w:p/w:r/@w:rsidRPr
 ext:page layout/page layout(big file)/pageBorders.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:t/text()
 ext:page layout/page layout(big file)/pageBorders.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-ext:page layout/page layout(big file)/pageBorders.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:smartTagPr
 ext:page layout/pagelayout with break in the end/Columns-Right.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:page layout/text direction/text direction-2.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:paragraph/Paragraph.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
@@ -226,9 +221,7 @@ ext:table/2003 Consumer Confidence Report.docx	word/document.xml	lost-element	/w
 ext:table/2003 Consumer Confidence Report.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r/w:t
 ext:table/2003 Consumer Confidence Report.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:smartTag
 ext:table/2003 Consumer Confidence Report.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-ext:table/2003 Consumer Confidence Report.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:smartTagPr
 ext:table/2003 Consumer Confidence Report.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r
-ext:table/2003 Consumer Confidence Report.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:smartTagPr
 ext:table/2007.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:table/2007.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr/w:spacing
 ext:table/2007.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
@@ -237,7 +230,6 @@ ext:table/2007.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr
 ext:table/2007.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:t/text()
 ext:table/2007.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:table/2007.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r/w:rPr/w:spacing
-ext:table/2007.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:smartTagPr
 ext:table/TableComments/column with comments.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:commentRangeEnd
 ext:table/TableComments/crossTableComment.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:commentRangeEnd
 ext:table/TableComments/rowWithComment.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:commentRangeEnd
