@@ -12,6 +12,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 
+pub mod schema;
+
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
 /// Above this many LCS cells, child alignment falls back to pairing in order.

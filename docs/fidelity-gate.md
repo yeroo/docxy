@@ -15,12 +15,14 @@ The gate round-trips each file the way docxy saves an **edited** document:
 `word/document.xml` from the semantic model, so it is where untouched
 paragraphs of an edited document lose what the model does not understand.
 
-A user who saves **without** editing gets `save_package_preserving_document`,
-which writes the original parts back. The gate asserts that path is
-byte-identical part for part. That check has no baseline: any difference fails
-outright. "The gate reports a loss in X" therefore means "X is lost once the
-user edits anything in the document". It does not mean "X is lost by
-open+save".
+In docxy, a user who saves **without** editing gets
+`save_package_preserving_document`, which writes the original parts back. The
+gate asserts that path is byte-identical part for part. That check has no
+baseline: any difference fails outright. "The gate reports a loss in X"
+therefore means "X is lost once the user edits anything in the document". It
+does not mean "X is lost by open+save" in docxy. The suite has no preserving
+path: it saves every document through `save_package`, edited or not, so there
+a reported loss is lost by open+save too (#1083).
 
 Every part of the original is compared with its saved counterpart:
 
@@ -81,6 +83,55 @@ The kinds are:
 Files are named `repo:<path>` for repo-tracked `.docx` and `ext:<path>` for the
 external corpus, relative to the `FIDELITY_CORPUS` directory. So a local copy and
 CI's checkout produce the same keys.
+
+## Schema validation
+
+A save can lose nothing and still write a file Word refuses as corrupt (#1083:
+an unwrapped smart tag left its `w:smartTagPr` directly under `w:p`). So the
+gate also validates every saved package against a subset of the
+WordprocessingML schema (ECMA-376 Part 1, transitional `wml.xsd`), in
+`docxcore/tests/fidelity/schema.rs`. It needs no Word, .NET or XSD, and checks
+a subset of what the Open XML SDK validator does.
+
+Every part whose root element is in the `w:` namespace is checked: the
+document, headers, footers, footnotes, endnotes, comments, numbering and
+styles. These containers have a content model, wherever they occur:
+
+- ordered sequences: `pPr`, `rPr` (a paragraph mark's `rPr` leads with its
+  revision marks), `tblPr`, `tblPrEx`, `tcPr`, `sectPr`, `pBdr`, `pgBorders`,
+  `tblBorders`, `tcBorders`, `tblCellMar`, `tcMar`, `tbl`, `tr`;
+- allowed children: `body` (`sectPr` last), `p` (`pPr` first), `r` (`rPr`
+  first), `hyperlink`, `smartTag` (`smartTagPr` first), `tc` (`tcPr` first,
+  then at least one block), `trPr`, and the block containers `hdr`, `ftr`,
+  `footnote`, `endnote`, `comment`, `txbxContent` and `docPartBody`.
+
+A child breaks one of four rules:
+
+| Rule | Meaning |
+|---|---|
+| `not-allowed` | Its parent's model has no place for it. |
+| `order` | It comes after a sibling the schema puts after it. |
+| `duplicate` | It repeats where the schema allows one. |
+| `missing` | A required child is absent (`tblPr`, `tblGrid`, a cell's block). |
+
+Children in another namespace (extensions, DrawingML, math) are not checked,
+but `w:` containers inside them are, so text box paragraphs count. An
+`mc:AlternateContent` subtree is skipped.
+
+The original package is validated too. A violation is counted by part, parent
+path without indices, rule and child, and only the ones the save **added** fail:
+a count above the original's. A non-conforming original therefore does not
+fail the gate, and a violation the save fixed does not cover a new one. A
+failure is reported as:
+
+```
+SCHEMA ext:table/2007.docx | word/document.xml | not-allowed | /w:document/w:body/w:p[39]/w:smartTagPr
+```
+
+Schema violations have no allowlist and no baseline: Word rejects the file
+whether or not anything was lost, so any new one fails the gate, also under
+`FIDELITY_UPDATE_BASELINE`. When one appears, fix the writer, or fix the table
+in `schema.rs` if the schema allows the construct.
 
 ## Running it locally
 
@@ -284,6 +335,9 @@ cargo test -p gridcore --test fidelity -- --nocapture
 - Fixing the losses it found:
   - The unmodeled property children and attributes were fixed by #1063.
   - The other classes in `baseline.txt` each name their issue.
+- Whether Word opens the file. Schema validation catches the structural part
+  of that, by a subset of the schema. Attribute values, relationship targets
+  and the containers it has no model for are not checked.
 - Save paths other than `save_package` and `save_package_preserving_document`:
   the HTML bundle, Markdown, compare and merge.
 - For xlsx:
