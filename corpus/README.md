@@ -16,18 +16,29 @@ and to drive the corpus verify sweeps.
   [`word-import/README.md`](word-import/README.md).
 - `tools/classify.py`, `tools/classify_xlsx.py` — regenerate the manifests by
   scanning each file's parts/XML.
+- `tools/fetch-corpus.sh` / `.ps1` — fetch or update the third-party corpus
+  below.
 
 ## What lives in the separate corpus repos
 
 The large third-party binary corpus (~14 MB) was moved to
 [**github.com/yeroo/docxy-corpus**](https://github.com/yeroo/docxy-corpus) so it
-doesn't bloat this repo's history. It is **not** needed to build or test the
-crates — only the local `compare/` / `compare-xlsx/` launchers and the verify
-sweeps use it. These paths are git-ignored here; populate them from that repo:
+doesn't bloat this repo's history. It is **not** needed to build the crates. The
+local `compare/` / `compare-xlsx/` launchers and the verify sweeps use it, and so
+does the round-trip fidelity gate. CI checks it out for the gate; locally the
+gate skips it with a notice when it is absent (see
+[`docs/fidelity-gate.md`](../docs/fidelity-gate.md)). These paths are git-ignored
+here; populate or update them from that repo with:
+
+```sh
+corpus/tools/fetch-corpus.sh     # or .ps1 on Windows
+```
+
+which does the equivalent of:
 
 ```sh
 # from the root of a docxy checkout
-git clone https://github.com/yeroo/docxy-corpus /tmp/docxy-corpus
+git clone --depth 1 https://github.com/yeroo/docxy-corpus /tmp/docxy-corpus
 cp -r /tmp/docxy-corpus/files    corpus/files          # OpenXML SDK .docx (MIT)
 cp -r /tmp/docxy-corpus/xlsx-ext corpus/xlsx-ext        # LibreOffice+OOo .xlsx
 cp    /tmp/docxy-corpus/*.json   corpus/                # manifests
