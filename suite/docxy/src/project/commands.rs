@@ -18,6 +18,10 @@ pub(crate) enum ProjectAct {
     AutoSchedule,
     MoveTask,
     Constraint,
+    /// Task › Properties › Notes... and a task row's context menu › Notes...:
+    /// the selected task's notes in one prompt (`\n` types a newline; empty
+    /// removes), like Project's Notes command.
+    Notes,
     Baseline,
     ClearBaseline,
     Recalc,
@@ -84,6 +88,7 @@ impl ProjectAct {
         Self::AutoSchedule,
         Self::MoveTask,
         Self::Constraint,
+        Self::Notes,
         Self::Baseline,
         Self::ClearBaseline,
         Self::Recalc,
@@ -244,15 +249,28 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                 rs::group(
                     "Properties",
                     70,
-                    vec![Control::Large(cmds(
-                        "pr-constraint",
-                        "print-layout",
-                        "Information...",
-                        "View Task Information",
-                        Constraint,
-                        "Alt, T, C",
-                        "C",
-                    ))],
+                    vec![
+                        Control::Large(cmds(
+                            "pr-constraint",
+                            "print-layout",
+                            "Information...",
+                            "View Task Information",
+                            Constraint,
+                            "Alt, T, C",
+                            "C",
+                        )),
+                        // Project 2024's keytips take "N" for Insert › Task;
+                        // "T" is free on the Task tab.
+                        rs::column(vec![cmds(
+                            "pr-notes",
+                            "comment",
+                            "Notes...",
+                            "Notes",
+                            Notes,
+                            "Alt, T, T",
+                            "T",
+                        )]),
+                    ],
                 ),
                 rs::group(
                     "Editing",
@@ -543,7 +561,7 @@ pub(crate) fn project_row_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
             Constraint,
             task,
         ),
-        none("rm-notes", "Notes..."),
+        item("rm-notes", "Notes...", "comment", Notes, task),
         none("rm-timeline", "Add to Timeline"),
         Separator,
         // No link icon in the set yet; Project's chain is drawn by the
@@ -566,6 +584,7 @@ pub(crate) enum PromptKind {
     Assign,
     Find,
     Hyperlink,
+    Notes,
 }
 impl PromptKind {
     pub fn name(self) -> &'static str {
@@ -576,6 +595,7 @@ impl PromptKind {
             Self::Assign => "assign",
             Self::Find => "find",
             Self::Hyperlink => "hyperlink",
+            Self::Notes => "notes",
         }
     }
     fn label(self) -> &'static str {
@@ -586,6 +606,7 @@ impl PromptKind {
             Self::Assign => "Assign resource (empty to clear)",
             Self::Find => "Find",
             Self::Hyperlink => "Hyperlink (ADDRESS[#LOCATION] [| TEXT]; empty to remove)",
+            Self::Notes => "Notes (\\n = new line; empty to remove)",
         }
     }
 }
@@ -612,6 +633,9 @@ impl ProjectView {
         let buf = match kind {
             PromptKind::Constraint => task.map(constraint_hint).unwrap_or_default(),
             PromptKind::Hyperlink => task.map(hyperlink_hint).unwrap_or_default(),
+            PromptKind::Notes => task
+                .map(|t| projcore::text::notes_to_line(t.notes.as_deref().unwrap_or("")))
+                .unwrap_or_default(),
             _ => String::new(),
         };
         self.prompt = Some(ProjectPrompt {
@@ -934,6 +958,26 @@ fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, 
                 None => had_link.then(|| "Hyperlink removed".into()),
             });
         }
+        PromptKind::Notes => {
+            let notes = projcore::text::notes_from_line(&p.buf);
+            // Decoding the prefill gives back the stored notes exactly
+            // (notes_from_line ∘ notes_to_line is the identity), so the
+            // changed flag the editor reports on the normalised comparison
+            // is exact. An empty buffer still removes a note that exists,
+            // and stored empty notes count as none, so "empty to remove" is
+            // not swallowed.
+            if !v.ed.set_notes(uid, &notes)? {
+                return Ok(None);
+            }
+            return Ok(Some(
+                if notes.is_empty() {
+                    "Notes removed"
+                } else {
+                    "Notes set"
+                }
+                .into(),
+            ));
+        }
         PromptKind::Find => unreachable!(),
     }
     Ok(None)
@@ -1229,6 +1273,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             }
             MoveTask => v.open_prompt(PromptKind::Move),
             Constraint => v.open_prompt(PromptKind::Constraint),
+            Notes => v.open_prompt(PromptKind::Notes),
             Assign => v.open_prompt(PromptKind::Assign),
             Hyperlink => v.open_prompt(PromptKind::Hyperlink),
             Find => v.open_prompt(PromptKind::Find),

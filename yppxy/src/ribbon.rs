@@ -21,6 +21,7 @@ pub enum Act {
     InsertBlankRow,
     Milestone,
     Constraint,
+    Notes,
     Find,
     // Resource
     Assign,
@@ -170,7 +171,11 @@ fn task_groups() -> Vec<Group> {
                     Constraint,
                     "View Task Information — set a date constraint, SNET/MSO/… (c)",
                 )],
-                Vec::new(),
+                vec![btn(
+                    "📝 Notes...",
+                    Notes,
+                    "Notes — the task's notes, one line; \\n is a new line, empty removes",
+                )],
             ],
         },
         Group {
@@ -340,6 +345,7 @@ mod tests {
                 "View Task Information",
                 Constraint,
             ),
+            ("Task", "Properties", "Notes...", "Notes", Notes),
             ("Task", "Editing", "Find...", "Find...", Find),
             (
                 "Resource",

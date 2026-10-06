@@ -673,7 +673,8 @@ baseline commands are on the ribbon under Project's names; renaming and
 durations are cell edits, and there is no ribbon Delete Task, Clear Resources,
 Export Gantt, Scroll Left/Right or Go to Start (Project has none): use Delete on
 the ID or Resource Names cell, Ctrl+E, Alt+Left/Right and Alt+Home.
-Predecessors in cells use **displayed IDs**. Ctrl+F
+Predecessors in cells use **displayed IDs** (a cross-project link shows its
+external reference). Ctrl+F
 opens Find; F3 repeats and reveals the selected row. Ctrl+Z/Y undo/redo, Ctrl+S
 saves, and Ctrl+E exports Markdown. Use `open copy:` before save/export. Project
 ribbon KeyTips are File/Task/Resource/Report/Project/View = F/T/U/R/P/W after
@@ -1177,10 +1178,10 @@ Each item is `{id, label, enabled, checked, key_tip, submenu}` (`submenu` null
 or the submenu's items), a separator `{separator: true}` and a section heading
 `{heading}`. An item with no command behind it yet is drawn greyed and read
 `enabled: false`, so the order stays Project's: on the row menu those are
-Paste Special..., Text Styles..., Font..., Fill Down, Clear Contents, Notes...,
-Add to Timeline and Hyperlink.... The rest follow the row: Scroll to Task,
-Inactivate Task, Manually/Auto Schedule, Assign Resources... and
-Information... need a real task, Delete Task any task row (a blank one too), and
+Paste Special..., Text Styles..., Font..., Fill Down, Clear Contents
+and Add to Timeline. The rest follow the row: Scroll to Task,
+Inactivate Task, Manually/Auto Schedule, Assign Resources..., Information...
+and Notes... need a real task, Delete Task any task row (a blank one too), and
 Cut, Copy, Paste and Insert Task any row, the entry row included. `checked`
 is the ribbon's pressed state (Inactivate Task, the task's mode). Delete Task
 deletes the selected task whatever column the cursor is on; a summary asks

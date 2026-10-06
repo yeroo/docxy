@@ -153,6 +153,100 @@ fn edited_hyperlink_survives_save_and_reload() {
 }
 
 #[test]
+fn set_notes_is_one_undo_step() {
+    let mut ed = editor();
+    let before = ed.project().clone();
+    assert!(ed.set_notes(10, "Line 1\nLine 2").unwrap());
+    // The notes land as ONE undo step.
+    assert_eq!(ed.undo_depth(), 1);
+    assert!(ed.dirty());
+    assert_eq!(
+        ed.project().task(10).unwrap().notes.as_deref(),
+        Some("Line 1\nLine 2")
+    );
+    let after = ed.project().clone();
+    assert!(ed.undo());
+    assert_eq!(ed.project(), &before);
+    assert!(ed.redo());
+    assert_eq!(ed.project(), &after);
+}
+
+#[test]
+fn set_notes_empty_removes_and_noop_pushes_nothing() {
+    let mut ed = editor();
+    assert!(ed.set_notes(10, "docs").unwrap());
+    ed.mark_saved();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    // The value a task already has changes nothing: no undo step, no dirt.
+    assert!(!ed.set_notes(10, "docs").unwrap());
+    assert_eq!((ed.undo_depth(), ed.redo_depth(), ed.dirty()), history);
+    // Empty text removes the notes, as one undo step holding the old value.
+    assert!(ed.set_notes(10, "").unwrap());
+    assert_eq!(ed.undo_depth(), history.0 + 1);
+    assert_eq!(ed.project().task(10).unwrap().notes, None);
+    assert!(ed.undo());
+    assert_eq!(
+        ed.project().task(10).unwrap().notes.as_deref(),
+        Some("docs")
+    );
+    // Removing the restored note changes it; removing what is not there is
+    // a no-op.
+    assert!(ed.set_notes(10, "").unwrap());
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    assert!(!ed.set_notes(10, "").unwrap());
+    assert_eq!((ed.undo_depth(), ed.redo_depth(), ed.dirty()), history);
+}
+
+#[test]
+fn set_notes_normalises_newlines_and_keeps_whitespace() {
+    let mut ed = editor();
+    // `\r\n` and a lone `\r` become `\n` …
+    ed.set_notes(10, "a\r\nb\rc").unwrap();
+    assert_eq!(
+        ed.project().task(10).unwrap().notes.as_deref(),
+        Some("a\nb\nc")
+    );
+    // … and nothing is trimmed: a note of only a line break stays, and so
+    // does surrounding whitespace.
+    ed.set_notes(10, "\n").unwrap();
+    assert_eq!(ed.project().task(10).unwrap().notes.as_deref(), Some("\n"));
+    ed.set_notes(10, " d ").unwrap();
+    assert_eq!(ed.project().task(10).unwrap().notes.as_deref(), Some(" d "));
+}
+
+#[test]
+fn set_notes_refuses_blank_row_and_unknown_uid() {
+    let mut ed = editor();
+    let i = ed.insert_blank_row(Some(10)).unwrap();
+    let blank = ed.project().tasks[i].uid;
+    // Both rejections leave the plan and its history untouched.
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    assert_eq!(ed.set_notes(999, "n").unwrap_err(), "no task with uid 999");
+    assert_eq!(
+        ed.set_notes(blank, "n").unwrap_err(),
+        "A blank row cannot take notes"
+    );
+    unchanged(&ed, &before, history);
+}
+
+#[test]
+fn set_notes_survive_mspdi_save() {
+    let mut ed = editor();
+    ed.set_notes(10, "Line 1\nLine 2 & <x>").unwrap();
+    let xml = crate::mspdi::write_mspdi(ed.project());
+    assert!(xml.contains("<Notes>Line 1\nLine 2 &amp; &lt;x&gt;</Notes>"));
+    assert_eq!(
+        crate::mspdi::read_mspdi(&xml).unwrap().tasks,
+        ed.project().tasks
+    );
+    // Clearing the notes drops the element again.
+    ed.set_notes(10, "").unwrap();
+    let xml = crate::mspdi::write_mspdi(ed.project());
+    assert!(!xml.contains("<Notes>"));
+}
+
+#[test]
 fn resources_preserve_allocations_and_undo_creation_together() {
     let mut ed = editor();
     ed.set_resources(10, &["Alice".into(), "Bob".into()])

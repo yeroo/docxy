@@ -331,6 +331,9 @@ enum PromptKind {
     VimCommand,
     Constraint,
     Assign,
+    /// The task the prompt opened on: selecting another row while the
+    /// prompt is open must not redirect the commit.
+    Notes(i32),
 }
 
 /// What a confirmed (Yes) modal should do.
@@ -627,6 +630,23 @@ impl App {
         }
     }
 
+    /// Set the task's notes from the one-line form: `\n` is a newline, an
+    /// empty buffer removes the notes, an unchanged buffer reports nothing.
+    fn set_notes(&mut self, uid: i32, text: &str) {
+        let notes = projcore::text::notes_from_line(text);
+        match self.ed.set_notes(uid, &notes) {
+            Ok(true) => {
+                self.status = if notes.is_empty() {
+                    "Notes removed".into()
+                } else {
+                    "Notes set".into()
+                };
+            }
+            Ok(false) => {}
+            Err(message) => self.status = message,
+        }
+    }
+
     /// Snapshot the current computed schedule as the baseline (the saved plan).
     fn set_baseline(&mut self) {
         self.ed.set_baseline();
@@ -700,6 +720,24 @@ impl App {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Constraint,
                     label: "Constraint".into(),
+                    buf: cur,
+                });
+            }
+            Act::Notes => {
+                let Some(uid) = self.ed.selected_uid() else {
+                    return;
+                };
+                // The one-line form: a stored newline prefills as `\n`, so
+                // Enter on the prefill cannot destroy it.
+                let cur = self
+                    .ed
+                    .project()
+                    .task(uid)
+                    .map(|t| projcore::text::notes_to_line(t.notes.as_deref().unwrap_or("")))
+                    .unwrap_or_default();
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::Notes(uid),
+                    label: "Notes".into(),
                     buf: cur,
                 });
             }
@@ -1408,6 +1446,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
                     PromptKind::VimCommand => app.vim_run(&text),
                     PromptKind::Constraint => app.set_constraint(&text),
                     PromptKind::Assign => app.assign_resource(&text),
+                    PromptKind::Notes(uid) => app.set_notes(uid, &text),
                     PromptKind::SaveAs => {
                         if !text.trim().is_empty() {
                             if let Err(e) = app.save_to_path(text.trim()) {
@@ -3690,6 +3729,130 @@ mod tests {
         let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
         app.apply_act(Act::CalculateProject);
         assert_eq!(app.status, "Rescheduled (automatic on every edit)");
+    }
+
+    /// #454: Task › Properties › Notes... opens the "Notes" prompt on the
+    /// task's notes; Enter sets or clears them, one undo step.
+    #[test]
+    fn notes_ribbon_button_sets_and_clears_notes() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        // No notes yet: an empty buffer under the "Notes" label.
+        app.apply_act(Act::Notes);
+        let p = app.prompt.as_ref().unwrap();
+        assert!(matches!(p.kind, PromptKind::Notes(_)));
+        assert_eq!(p.label, "Notes");
+        assert_eq!(p.buf, "");
+        // Enter on a typed buffer sets the notes.
+        for c in "ab".chars() {
+            on_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.ed.project().task(1).unwrap().notes.as_deref(),
+            Some("ab")
+        );
+        assert_eq!(app.status, "Notes set");
+        assert_eq!(app.ed.undo_depth(), 1);
+        // The prefill escapes a newline; typing `\n` decodes back to one.
+        app.apply_act(Act::Notes);
+        for _ in 0..2 {
+            on_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            );
+        }
+        for c in ['a', '\\', 'n', 'b'] {
+            on_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.ed.project().task(1).unwrap().notes.as_deref(),
+            Some("a\nb")
+        );
+        assert_eq!(app.status, "Notes set");
+        // Clearing the buffer removes the notes; undo brings them back.
+        app.apply_act(Act::Notes);
+        // The stored newline prefills escaped.
+        assert_eq!(app.prompt.as_ref().unwrap().buf, "a\\nb");
+        for _ in 0..4 {
+            on_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            );
+        }
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.ed.project().task(1).unwrap().notes, None);
+        assert_eq!(app.status, "Notes removed");
+        assert!(app.ed.undo());
+        assert_eq!(
+            app.ed.project().task(1).unwrap().notes.as_deref(),
+            Some("a\nb")
+        );
+    }
+
+    /// #454 r1: the Notes prompt belongs to the task it opened on —
+    /// selecting another row while it is open (a click does) must not
+    /// redirect the commit.
+    #[test]
+    fn notes_prompt_keeps_the_task_it_opened_on() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.ed.add_task(None, "Second", 480, false).unwrap();
+        let a = app.ed.project().tasks[0].uid;
+        let b = app.ed.project().tasks[1].uid;
+        app.ed.select(0);
+        app.apply_act(Act::Notes);
+        for c in "for A".chars() {
+            on_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        // A click moves the selection while the prompt is open.
+        app.ed.select(1);
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.ed.project().task(a).unwrap().notes.as_deref(),
+            Some("for A")
+        );
+        assert_eq!(app.ed.project().task(b).unwrap().notes, None);
+        assert_eq!(app.status, "Notes set");
+        // Enter on the unchanged prefill after moving away changes nothing
+        // and pushes no undo step.
+        app.apply_act(Act::Notes);
+        app.ed.select(1);
+        let depth = app.ed.undo_depth();
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.ed.project().task(a).unwrap().notes.as_deref(),
+            Some("for A")
+        );
+        assert_eq!(app.ed.project().task(b).unwrap().notes, None);
+        assert_eq!(app.ed.undo_depth(), depth);
+        assert!(app.status.is_empty());
+    }
+
+    /// #454 r1: a note holding a backslash and a newline survives Enter on
+    /// its escaped prefill.
+    #[test]
+    fn notes_prompt_backslash_newline_note_survives_its_prefill() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.ed.set_notes(1, "a\\b\nc").unwrap();
+        let depth = app.ed.undo_depth();
+        app.apply_act(Act::Notes);
+        assert_eq!(app.prompt.as_ref().unwrap().buf, "a\\\\b\\nc");
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.ed.project().task(1).unwrap().notes.as_deref(),
+            Some("a\\b\nc")
+        );
+        assert_eq!(app.ed.undo_depth(), depth);
+        assert!(app.status.is_empty());
     }
 
     #[test]
