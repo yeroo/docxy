@@ -247,6 +247,9 @@ test ribbon act with an open editor commits first
   assert editing is false
   assert cell A7 is 99
   assert dirty is true
+  call clipboard {"action":"read"}
+  assert reply.app.kind is grid
+  assert reply.text is 99
 
 # #510: a cell act only closes an untouched seeded editor; it writes nothing
 # and the tab stays clean.
@@ -260,4 +263,34 @@ test an untouched editor a cell act closes stays clean
   call ribbon-click {"tab":"Home","command":"Copy"}
   assert editing is false
   assert dirty is false
+  assert cells unchanged
+  call clipboard {"action":"read"}
+  assert reply.app.kind is grid
+
+# #510 r1: Ctrl+V with an open editor commits the entry first, and the paste
+# still lands — the commit's own undo step must not end copy mode (#664).
+test paste with an open editor commits first and still pastes
+  open copy:../fixtures/basic.xlsx
+  click A2
+  click B2 shift
+  key ctrl+c
+  click D2
+  type x
+  key ctrl+v
+  assert cell D2 is North
+  assert cell E2 is 10
+  assert dirty is true
+
+# #510 r1: a refused entry (a formula that does not parse) stops the act:
+# the editor stays open and the command does not run. Fails if the early
+# return on a refused commit is removed.
+test a refused entry stops a ribbon act
+  open copy:../fixtures/basic.xlsx
+  click A1
+  snapshot A1
+  type =SUM(A1
+  assert editing is true
+  call menu-open {"target":{"ribbon":["Home","Editing","Clear"]}}
+  call menu-click {"label":"Clear Contents"}
+  assert editing is true
   assert cells unchanged

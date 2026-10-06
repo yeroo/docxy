@@ -1155,8 +1155,10 @@ fn act_targets_cells(act: SheetAct) -> bool {
 }
 
 /// Does `act` need a closed cell editor? (#510) Everything that reads or
-/// rewrites cell content or moves cells does; pure formatting, menus, and
-/// sheet-wide settings leave the editor open, as Excel's edit mode does.
+/// rewrites cell content or moves cells does. What keeps the editor open is
+/// formatting and dialog/bar openers that neither read nor rewrite cell
+/// values, plus the pick list, which commits its own entry
+/// ([`SheetView::pick_value`]).
 fn act_commits_editor(act: SheetAct) -> bool {
     act_targets_cells(act)
         && !matches!(
@@ -1181,7 +1183,21 @@ fn act_commits_editor(act: SheetAct) -> bool {
                 | SheetAct::DataValidation
                 | SheetAct::FreezePanes
                 | SheetAct::Merge
+                | SheetAct::PickList
+                | SheetAct::PickItem(_)
         )
+}
+
+/// Does `act` paste the grid clipboard? (#510 r1) The commit that prepares
+/// the cell for it must not be the edit that ends copy mode (#664), so a
+/// paste-family act re-stamps what the commit bumped — the paste's own undo
+/// step already does. Other acts leave the stamp alone: a Cut makes a new
+/// clip, and a Sort and its like end copy mode as they should.
+fn act_restamps_clip(act: SheetAct) -> bool {
+    matches!(
+        act,
+        SheetAct::Paste | SheetAct::PasteAs(_) | SheetAct::PasteAgain(_) | SheetAct::PasteSpecial
+    )
 }
 
 /// A live text field: which target it edits, its buffer, the caret and the
@@ -16104,8 +16120,16 @@ impl Docxy {
         // refused one leaves the editor open, says why, and the command
         // does not run; an untouched seed closes having written nothing.
         if act_commits_editor(act) {
+            // A paste-family command must still see a clip the commit's own
+            // undo step would read as the edit that ends copy mode (#664).
+            let clip_live = self.grid_clip_current().is_some();
             match self.active_sheet_mut().map(SheetView::close_editor_for_act) {
-                Some(Some(true)) => self.mark_sheet_dirty(),
+                Some(Some(true)) => {
+                    self.mark_sheet_dirty();
+                    if clip_live && act_restamps_clip(act) {
+                        self.grid_clip_restamp();
+                    }
+                }
                 Some(Some(false)) if self.active_sheet().is_some_and(|v| v.editing.is_some()) => {
                     self.sheet_entry_refused(cx);
                     cx.notify();

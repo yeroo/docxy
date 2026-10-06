@@ -1647,10 +1647,29 @@ fn acts_that_rewrite_cells_close_the_editor() {
         SheetAct::Merge,
         SheetAct::ProtectSheet,
         SheetAct::Menu(sheet_menus::SheetMenu::Clear),
+        // The pick list commits its own entry (sheet_complete::pick_value),
+        // so it must not find the buffer committed ahead of it.
+        SheetAct::PickList,
+        SheetAct::PickItem(0),
         SheetAct::Todo,
     ] {
         assert!(!act_commits_editor(act), "{act:?}");
     }
+}
+
+/// #510 r1: picking after typing commits once — the pick replaces the buffer
+/// and is the only commit, so one undo step restores the cell to empty.
+#[test]
+fn pick_value_after_typing_commits_once() {
+    let mut v = view();
+    put(&mut v, 0, 0, Cell::text("apple"));
+    put(&mut v, 1, 0, Cell::text("apple"));
+    select(&mut v, 2, 0);
+    type_fresh(&mut v, "ap");
+    assert!(v.pick_value("apple"));
+    assert_eq!(value(&v, 2, 0), CellValue::Text("apple".into()));
+    assert!(v.editing.is_none());
+    assert_eq!(v.undo.len(), 1, "exactly one commit: the pick's own");
 }
 
 /// #510: the commit lands on the editor's origin cell, not on whatever cell
