@@ -114,7 +114,7 @@ jobs:
       - name: Generate coverage (lcov)
         run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           # Public repo: tokenless upload works; a token (repo secret) just
