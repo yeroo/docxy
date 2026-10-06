@@ -4990,6 +4990,15 @@ fn ruler_scroll_view(
         .into_any_element()
 }
 
+/// The page whose column ranges hold top-level `block` — the block→page
+/// mapping `paginate`/`paginate_cols` produced. `None` when no range
+/// contains it.
+fn page_of_block(ranges: &[Vec<(usize, usize)>], block: usize) -> Option<usize> {
+    ranges
+        .iter()
+        .position(|cols| cols.iter().any(|&(s, e)| s <= block && block < e))
+}
+
 fn tracked_page(probe: &RulerProbe) -> Option<usize> {
     let viewport = probe.viewport?;
     let visible = |i: usize| {
@@ -5000,11 +5009,7 @@ fn tracked_page(probe: &RulerProbe) -> Option<usize> {
             .is_some_and(|r| r.intersects(&viewport))
     };
     if let Some(block) = probe.caret_block {
-        if let Some(i) = probe
-            .ranges
-            .iter()
-            .position(|cols| cols.iter().any(|&(s, e)| s <= block && block < e))
-        {
+        if let Some(i) = page_of_block(&probe.ranges, block) {
             if visible(i) {
                 return Some(i);
             }
@@ -17998,11 +18003,20 @@ impl Docxy {
 
     /// Scroll the document so the caret's top-level block is in view (keyboard
     /// navigation/typing in a long document shouldn't let the caret drift off).
+    /// Print Layout's scroll children are pages, not blocks, so the caret's
+    /// block maps to its page first.
     fn scroll_to_caret(&self) {
         if let Some(t) = self.tabs.get(self.active) {
             if let Surface::Doc(ed) = &t.surface {
                 if let Some(&b) = ed.caret.path.first() {
-                    self.doc_scroll.scroll_to_item(b);
+                    if self.page_view {
+                        let ranges = page_ranges(t);
+                        let page =
+                            page_of_block(&ranges, b).unwrap_or(ranges.len().saturating_sub(1));
+                        self.doc_scroll.scroll_to_item(page);
+                    } else {
+                        self.doc_scroll.scroll_to_item(b);
+                    }
                 }
             }
         }
