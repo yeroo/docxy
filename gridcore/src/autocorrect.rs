@@ -32,11 +32,12 @@ pub struct AcOptions {
     pub replace_text: bool,
     /// AutoFormat As You Type › Internet and network paths with hyperlinks.
     pub hyperlinks: bool,
-    /// AutoFormat As You Type › Include new rows and columns in table
-    /// (stored; the table rules live with the tables).
+    /// AutoFormat As You Type › Include new rows and columns in table: the
+    /// host runs [`crate::edit::auto_expand_table`] after an entry.
     pub table_rows_cols: bool,
     /// AutoFormat As You Type › Fill formulas in tables to create calculated
-    /// columns (stored; the table rules live with the tables).
+    /// columns: the host runs [`crate::edit::fill_calculated_column`] after
+    /// an entry.
     pub table_formulas: bool,
     /// Actions › Enable additional actions in the right-click menu (stored).
     pub additional_actions: bool,

@@ -1615,3 +1615,68 @@ fn by(col: u32) -> [gridcore::edit::SortLevel; 1] {
 fn no_header() -> gridcore::edit::SortOptions {
     gridcore::edit::SortOptions::default()
 }
+
+// ---- #682: typing beside a table grows it; a formula fills its column ------
+
+/// The issue's `Calc` table on A1:C4 (Qty 2, 3, 4; Price 5, 6, 7; Line
+/// empty) with `=SUM(Calc[Qty])` in E1.
+fn calc_view() -> SheetView {
+    let mut v = view();
+    for (c, h) in ["Qty", "Price", "Line"].iter().enumerate() {
+        put(&mut v, 0, c as u32, Cell::text(h));
+    }
+    for (i, (q, p)) in [(2.0, 5.0), (3.0, 6.0), (4.0, 7.0)].into_iter().enumerate() {
+        put(&mut v, i as u32 + 1, 0, Cell::number(q));
+        put(&mut v, i as u32 + 1, 1, Cell::number(p));
+    }
+    v.pkg
+        .add_table(0, (0, 0, 3, 2), true, "TableStyleMedium2")
+        .unwrap();
+    gridcore::edit::rename_table(&mut v.pkg.workbook, "Table1", "Calc").unwrap();
+    v.engine = sheet_engine(&v.pkg.workbook);
+    put(&mut v, 0, 4, Cell::formula("SUM(Calc[Qty])"));
+    v
+}
+
+fn type_at(v: &mut SheetView, r: u32, c: u32, text: &str) {
+    select(v, r, c);
+    type_fresh(v, text);
+    assert!(v.commit_edit(), "{text}");
+}
+
+#[test]
+fn typed_entries_grow_tables_and_fill_calculated_columns() {
+    let mut v = calc_view();
+    type_at(&mut v, 1, 2, "=[@Qty]*[@Price]");
+    assert_eq!(value(&v, 3, 2), CellValue::Number(28.0));
+    type_at(&mut v, 4, 0, "5");
+    assert_eq!(v.pkg.workbook.tables[0].range, (0, 0, 4, 2));
+    assert_eq!(value(&v, 0, 4), CellValue::Number(14.0));
+    type_at(&mut v, 4, 1, "2");
+    assert_eq!(value(&v, 4, 2), CellValue::Number(10.0));
+    // B5's entry, then A5's expansion: the table is back, A5 stays.
+    assert!(v.undo_step());
+    assert!(v.undo_step());
+    assert_eq!(v.pkg.workbook.tables[0].range, (0, 0, 3, 2));
+    assert_eq!(value(&v, 4, 0), CellValue::Number(5.0));
+    assert!(v.redo_step());
+    assert_eq!(v.pkg.workbook.tables[0].range, (0, 0, 4, 2));
+}
+
+#[test]
+fn the_autocorrect_switches_turn_the_table_rules_off() {
+    let mut v = calc_view();
+    let mut ac = (*v.autocorrect).clone();
+    ac.opts.table_rows_cols = false;
+    v.autocorrect = std::rc::Rc::new(ac);
+    type_at(&mut v, 4, 0, "5");
+    assert_eq!(v.pkg.workbook.tables[0].range, (0, 0, 3, 2));
+
+    let mut v = calc_view();
+    let mut ac = (*v.autocorrect).clone();
+    ac.opts.table_formulas = false;
+    v.autocorrect = std::rc::Rc::new(ac);
+    type_at(&mut v, 1, 2, "=[@Qty]*[@Price]");
+    assert_eq!(value(&v, 2, 2), CellValue::Empty);
+    assert!(v.pkg.workbook.tables[0].calculated_formulas.is_empty());
+}
