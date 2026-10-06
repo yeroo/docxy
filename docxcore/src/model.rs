@@ -627,6 +627,36 @@ pub struct ParProps {
     pub mark_revisions: Vec<ParagraphMarkRevision>,
 }
 
+/// One indent of a paragraph's `w:ind`: see [`ParProps::forget_loaded_indent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndentSide {
+    Left,
+    Right,
+    FirstLine,
+}
+
+impl ParProps {
+    /// Call after setting indents explicitly. The loaded `w:ind` loses every
+    /// attribute that sets one of `sides`, in twips or in character units
+    /// (`w:leftChars`, `w:firstLineChars`, …), and keeps the other indents
+    /// as loaded; so the indents set are written from the model, without a
+    /// character-unit value overriding them, even when they equal the loaded
+    /// twips (#1063).
+    pub fn forget_loaded_indent(&mut self, sides: &[IndentSide]) {
+        use crate::serialize::{IND_FIRST_LINE, IND_LEFT, IND_RIGHT};
+        let attrs: Vec<&str> = sides
+            .iter()
+            .flat_map(|side| match side {
+                IndentSide::Left => IND_LEFT,
+                IndentSide::Right => IND_RIGHT,
+                IndentSide::FirstLine => IND_FIRST_LINE,
+            })
+            .copied()
+            .collect();
+        crate::serialize::forget_shadow_attrs(&mut self.shadow, "ind", &attrs);
+    }
+}
+
 /// A tracked change on a paragraph mark (`w:pPr/w:rPr/w:ins` or `w:del`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParagraphMarkRevision {

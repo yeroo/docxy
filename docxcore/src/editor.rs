@@ -1608,18 +1608,25 @@ impl Editor {
         self.for_each_para(move |pr| {
             pr.indent = left.max(0);
             pr.first_line = first_line;
+            pr.forget_loaded_indent(&[IndentSide::Left, IndentSide::FirstLine]);
         });
     }
 
     /// Set just the first-line delta (twips) of the selected paragraphs, leaving
     /// the left indent alone. Used by the First-line / Hanging ribbon buttons.
     pub fn set_first_line(&mut self, first_line: i32) {
-        self.for_each_para(move |pr| pr.first_line = first_line);
+        self.for_each_para(move |pr| {
+            pr.first_line = first_line;
+            pr.forget_loaded_indent(&[IndentSide::FirstLine]);
+        });
     }
 
     /// Set the right indent (twips, clamped at 0) of the selected paragraphs.
     pub fn set_right_indent(&mut self, right: i32) {
-        self.for_each_para(move |pr| pr.indent_right = right.max(0));
+        self.for_each_para(move |pr| {
+            pr.indent_right = right.max(0);
+            pr.forget_loaded_indent(&[IndentSide::Right]);
+        });
     }
 
     /// The left indent and first-line delta at the caret (for syncing the

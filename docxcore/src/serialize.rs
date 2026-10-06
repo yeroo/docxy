@@ -410,6 +410,21 @@ impl<'a> Shadow<'a> {
 /// high-ANSI slots and the theme fonts that would take precedence over them.
 pub(crate) const RFONTS_LATIN: &[&str] = &["w:ascii", "w:hAnsi", "w:asciiTheme", "w:hAnsiTheme"];
 
+/// The `w:ind` attributes that set the left (start) indent, in twips or in
+/// character units; an edit of the left indent replaces all of them.
+pub(crate) const IND_LEFT: &[&str] = &["w:left", "w:start", "w:leftChars", "w:startChars"];
+
+/// As [`IND_LEFT`] for the right (end) indent.
+pub(crate) const IND_RIGHT: &[&str] = &["w:right", "w:end", "w:rightChars", "w:endChars"];
+
+/// As [`IND_LEFT`] for the first-line or hanging indent.
+pub(crate) const IND_FIRST_LINE: &[&str] = &[
+    "w:firstLine",
+    "w:hanging",
+    "w:firstLineChars",
+    "w:hangingChars",
+];
+
 /// The `w:color` attributes a colour edit replaces: the value and the theme
 /// colour that would take precedence over it.
 pub(crate) const COLOR_VALUE: &[&str] = &["w:val", "w:themeColor", "w:themeShade", "w:themeTint"];
@@ -630,7 +645,7 @@ fn ind_xml(props: &ParProps, loaded: Option<&str>, orig: Option<&ParProps>) -> O
     let base = orig.cloned().unwrap_or_default();
     let mut set = |changed: bool, family: &[&str], new: Option<(&str, i32)>| {
         if changed {
-            attrs.retain(|(n, _)| !family.iter().any(|f| n.strip_prefix("w:") == Some(f)));
+            attrs.retain(|(n, _)| !family.contains(&n.as_str()));
             if let Some((name, v)) = new {
                 attrs.push((format!("w:{name}"), v.to_string()));
             }
@@ -638,12 +653,12 @@ fn ind_xml(props: &ParProps, loaded: Option<&str>, orig: Option<&ParProps>) -> O
     };
     set(
         props.indent != base.indent || loaded.is_none(),
-        &["left", "start", "leftChars", "startChars"],
+        IND_LEFT,
         (props.indent != 0).then_some(("left", props.indent)),
     );
     set(
         props.indent_right != base.indent_right || loaded.is_none(),
-        &["right", "end", "rightChars", "endChars"],
+        IND_RIGHT,
         (props.indent_right != 0).then_some(("right", props.indent_right)),
     );
     let first = match props.first_line.cmp(&0) {
@@ -653,7 +668,7 @@ fn ind_xml(props: &ParProps, loaded: Option<&str>, orig: Option<&ParProps>) -> O
     };
     set(
         props.first_line != base.first_line || loaded.is_none(),
-        &["firstLine", "hanging", "firstLineChars", "hangingChars"],
+        IND_FIRST_LINE,
         first,
     );
     (!attrs.is_empty()).then(|| empty_element("w:ind", &attrs))

@@ -344,12 +344,21 @@ fn paragraph_edits_keep_what_they_do_not_change() {
     }
     assert_eq!(ppr.matches("<w:jc ").count(), 1, "{ppr}");
 
-    // A left-indent edit drops the character-unit left indent (it would
-    // override the new twips) and keeps the first-line indent as loaded.
-    let xml = edited(RICH_PARAGRAPH, |e| e.set_indent(720, 210));
+    // A left-indent change (Increase Indent: 420 -> 720 twips) drops the
+    // character-unit left indent (it would override the new twips) and keeps
+    // the first-line indent as loaded.
+    let xml = edited(RICH_PARAGRAPH, |e| e.change_indent(300));
     let ppr = &xml[xml.find("<w:pPr>").unwrap()..xml.find("</w:pPr>").unwrap()];
     assert!(
         ppr.contains("<w:ind w:firstLineChars=\"100\" w:firstLine=\"210\" w:left=\"720\"/>"),
+        "{ppr}"
+    );
+    // Setting the indents explicitly (the Paragraph dialog) replaces both it
+    // sets, character units included.
+    let xml = edited(RICH_PARAGRAPH, |e| e.set_indent(720, 210));
+    let ppr = &xml[xml.find("<w:pPr>").unwrap()..xml.find("</w:pPr>").unwrap()];
+    assert!(
+        ppr.contains("<w:ind w:left=\"720\" w:firstLine=\"210\"/>"),
         "{ppr}"
     );
 }
@@ -649,4 +658,71 @@ fn agent_format_drops_the_theme_that_overrides_a_color_or_font() {
          <w:color w:val=\"FF0000\"/></w:rPr>",
         "{xml}"
     );
+}
+
+/// Review r3: setting an indent explicitly also clears a loaded
+/// character-unit value for it, which would otherwise override the twips
+/// set, even when they equal the loaded twips; other indents stay as loaded.
+#[test]
+fn setting_an_indent_clears_its_loaded_character_units() {
+    let xml = edited(
+        "<w:p><w:pPr><w:ind w:firstLineChars=\"100\"/></w:pPr><w:r><w:t>text</w:t></w:r></w:p>",
+        |e| e.set_indent(0, 0),
+    );
+    assert!(!xml.contains("<w:ind"), "{xml}");
+    let xml = edited(
+        "<w:p><w:pPr><w:ind w:leftChars=\"20\" w:rightChars=\"50\"/></w:pPr>\
+         <w:r><w:t>text</w:t></w:r></w:p>",
+        |e| e.set_right_indent(0),
+    );
+    assert!(xml.contains("<w:ind w:leftChars=\"20\"/>"), "{xml}");
+}
+
+/// Review r3: a markup-compatibility attribute names prefixes in its value
+/// (`mc:Ignorable="ux"`); a binding for them declared below the root comes
+/// along too, on a start tag and on a kept property element.
+#[test]
+fn prefixes_named_by_markup_compatibility_attributes_stay_declared() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\">"),
+        "<w:body xmlns:ux=\"urn:ux\"><w:p mc:Ignorable=\"ux\"><w:pPr>\
+         <w:keepNext mc:Ignorable=\"ux\"/></w:pPr><w:r><w:t>text</w:t></w:r></w:p></w:body>",
+    );
+    let (pkg, editor) = open(&original);
+    let xml = document_xml(&save(pkg, editor));
+    assert!(
+        xml.contains("<w:p mc:Ignorable=\"ux\" xmlns:ux=\"urn:ux\">")
+            && xml.contains("<w:keepNext xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"/>"),
+        "{xml}"
+    );
+}
+
+/// Review r3: a tracked property change, and the whole property containers
+/// kept verbatim (`w:sectPr`, `w:tcPr`, `w:trPr`), keep the bindings declared
+/// on their rebuilt ancestors too.
+#[test]
+fn property_changes_and_containers_keep_namespaces_declared_below_the_root() {
+    let date = "2026-01-01T00:00:00Z";
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\">"),
+        &format!(
+            "<w:body xmlns:ux=\"urn:ux\"><w:p><w:r><w:rPr xmlns:uy=\"urn:uy\"><w:b/>\
+             <w:rPrChange w:id=\"1\" w:author=\"A\" w:date=\"{date}\"><w:rPr>\
+             <w:lang w:val=\"en-US\" uy:l=\"1\"/></w:rPr></w:rPrChange></w:rPr>\
+             <w:t>text</w:t></w:r></w:p>\
+             <w:tbl><w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid><w:tr>\
+             <w:trPr><w:trHeight w:val=\"300\" ux:h=\"1\"/></w:trPr>\
+             <w:tc xmlns:uz=\"urn:uz\"><w:tcPr><w:tcW w:w=\"2000\" w:type=\"dxa\" uz:w=\"1\"/></w:tcPr>\
+             <w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>\
+             <w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\" ux:s=\"1\"/></w:sectPr></w:body>"
+        ),
+    );
+    let (pkg, mut editor) = open(&original);
+    editor.set_caret(Caret::top(0, 4));
+    editor.insert_str("!");
+    // `document_xml` checks that every prefix stays bound.
+    let xml = document_xml(&save(pkg, editor));
+    for kept in ["uy:l=\"1\"", "ux:h=\"1\"", "uz:w=\"1\"", "ux:s=\"1\""] {
+        assert!(xml.contains(kept), "{kept} lost: {xml}");
+    }
 }

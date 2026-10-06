@@ -383,8 +383,9 @@ fn remove_inlines(content: &mut Vec<Inline>, target: Target) -> usize {
 struct TextBoxCopy {
     /// Byte range of its inner XML.
     inner: Range<usize>,
-    /// Whether its inner XML equals the first copy's, so it shows the same
-    /// `blocks`. The first copy is its own twin. Only twins may be rewritten
+    /// Whether its inner XML equals the first copy's apart from `w14:paraId`
+    /// attributes (see `without_para_ids`), so it shows the same `blocks`.
+    /// The first copy is its own twin. Only twins may be rewritten
     /// from `blocks`; another box of a group keeps its own content.
     twin: bool,
 }
@@ -429,23 +430,40 @@ fn text_box_copies(raw: &str) -> Vec<TextBoxCopy> {
         .collect()
 }
 
-/// `xml` without its ` w14:paraId="…"` attributes.
+/// `xml` without the `w14:paraId` attributes of its start tags (text is
+/// left alone). Malformed XML is returned as it is.
 fn without_para_ids(xml: &str) -> String {
-    const ATTR: &str = " w14:paraId=\"";
-    let mut out = String::with_capacity(xml.len());
-    let mut rest = xml;
-    while let Some(at) = rest.find(ATTR) {
-        out.push_str(&rest[..at]);
-        let value = &rest[at + ATTR.len()..];
-        match value.find('"') {
-            Some(end) => rest = &value[end + 1..],
-            None => {
-                rest = &rest[at..];
-                break;
+    use crate::xml::{Event, XmlParser};
+    let base = xml.as_ptr() as usize;
+    let mut cuts = Vec::new();
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                for a in p.attrs().iter().filter(|a| a.name == "w14:paraId") {
+                    let (name_at, value_at) = (a.name.as_ptr() as usize, a.value.as_ptr() as usize);
+                    let inside = |at: usize| at >= base && at <= base + xml.len();
+                    if !inside(name_at) || !inside(value_at) || value_at < name_at {
+                        return xml.to_string();
+                    }
+                    let start = xml[..name_at - base].trim_end().len();
+                    cuts.push(start..value_at - base + a.value.len() + 1);
+                }
             }
+            Event::Eof => break,
+            _ => {}
         }
     }
-    out.push_str(rest);
+    if p.is_malformed() {
+        return xml.to_string();
+    }
+    let mut out = String::with_capacity(xml.len());
+    let mut at = 0;
+    for cut in cuts {
+        out.push_str(&xml[at..cut.start]);
+        at = cut.end;
+    }
+    out.push_str(&xml[at..]);
     out
 }
 
@@ -1060,6 +1078,34 @@ mod tests {
         let xml = document_to_xml(&reopened);
         assert!(!xml.contains("gone"), "{xml}");
         assert_eq!(xml.matches("keep").count(), 4, "{xml}");
+    }
+
+    /// Review r3: copies are twins apart from `w14:paraId` attributes only,
+    /// never apart from text that happens to look like one.
+    #[test]
+    fn text_box_twins_ignore_para_id_attributes_but_not_text() {
+        let raw = |a: &str, b: &str| {
+            format!(
+                "<v:group><w:txbxContent>{a}</w:txbxContent><w:txbxContent>{b}</w:txbxContent></v:group>"
+            )
+        };
+        let text =
+            |id: &str| format!("<w:p><w:r><w:t>Example w14:paraId=\"{id}\"</w:t></w:r></w:p>");
+        let attr = |id: &str| format!("<w:p w14:paraId=\"{id}\"><w:r><w:t>Same</w:t></w:r></w:p>");
+        let twins = |raw: &str| {
+            text_box_copies(raw)
+                .iter()
+                .map(|c| c.twin)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            twins(&raw(&text("11111111"), &text("22222222"))),
+            [true, false]
+        );
+        assert_eq!(
+            twins(&raw(&attr("11111111"), &attr("22222222"))),
+            [true, true]
+        );
     }
 
     /// #917: deleting one comment strips only its markers. Text in the same

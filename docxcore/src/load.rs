@@ -131,10 +131,35 @@ const PART_ROOTS: [&str; 6] = [
     "w:comments",
 ];
 
+thread_local! {
+    /// The `xmlns:` declarations of each table being parsed, innermost last:
+    /// the serializer redeclares them on the rebuilt `w:tbl`
+    /// ([`Table::namespace_declarations`]), so a save keeps them inside it.
+    static TABLE_SCOPES: std::cell::RefCell<Vec<Vec<(String, String)>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A table's entry in [`TABLE_SCOPES`] while it is parsed.
+struct TableScope;
+
+impl TableScope {
+    fn enter(declarations: &[(String, String)]) -> TableScope {
+        TABLE_SCOPES.with(|s| s.borrow_mut().push(declarations.to_vec()));
+        TableScope
+    }
+}
+
+impl Drop for TableScope {
+    fn drop(&mut self) {
+        TABLE_SCOPES.with(|s| s.borrow_mut().pop());
+    }
+}
+
 /// The namespace bindings in scope at the parser's current Start event that
 /// a save does not keep: those declared below the part root (on `w:body`,
-/// `w:tc`, a `w:rPr`, …), which the serializer rebuilds without them. The
-/// innermost binding of each prefix, as `(prefix, namespace)`.
+/// `w:tc`, a `w:rPr`, …), which the serializer rebuilds without them, unless
+/// the enclosing table redeclares them. The innermost binding of each
+/// prefix, as `(prefix, namespace)`.
 fn rebuilt_bindings(p: &XmlParser) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for scoped in p.namespace_scoped_attrs() {
@@ -146,11 +171,40 @@ fn rebuilt_bindings(p: &XmlParser) -> Vec<(String, String)> {
             out.push((prefix.to_string(), decode_attr(scoped.attr.value)));
         }
     }
+    TABLE_SCOPES.with(|scopes| {
+        if let Some(table) = scopes.borrow().last() {
+            out.retain(|(prefix, ns)| {
+                !table
+                    .iter()
+                    .any(|(decl, value)| decl.strip_prefix("xmlns:") == Some(prefix) && value == ns)
+            });
+        }
+    });
     out
 }
 
+/// The prefixes a markup-compatibility attribute (`mc:Ignorable`,
+/// `mc:ProcessContent`, …) names in its value: a list of prefixes, or of
+/// qualified names (`ux:*`). None for any other attribute.
+fn mce_value_prefixes<'a>(name: &str, value: &'a str) -> impl Iterator<Item = &'a str> {
+    let local = name.rsplit(':').next().unwrap_or_default();
+    let named = matches!(
+        local,
+        "Ignorable"
+            | "MustUnderstand"
+            | "ProcessContent"
+            | "PreserveElements"
+            | "PreserveAttributes"
+    ) && name.contains(':');
+    value
+        .split_whitespace()
+        .filter(move |_| named)
+        .map(|token| token.split_once(':').map_or(token, |(prefix, _)| prefix))
+}
+
 /// The prefixes `raw` (an element captured verbatim) uses in element and
-/// attribute names, and those its own start tag declares.
+/// attribute names, or names in markup-compatibility attribute values, and
+/// those its own start tag declares.
 fn prefixes_of(raw: &str) -> (Vec<String>, Vec<String>) {
     let (mut used, mut own): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     let add = |name: &str, used: &mut Vec<String>| {
@@ -173,6 +227,9 @@ fn prefixes_of(raw: &str) -> (Vec<String>, Vec<String>) {
                         }
                     } else {
                         add(a.name, &mut used);
+                        for prefix in mce_value_prefixes(a.name, a.value) {
+                            add(&format!("{prefix}:"), &mut used);
+                        }
                     }
                 }
                 first = false;
@@ -221,7 +278,14 @@ fn element_attrs(p: &XmlParser) -> ElementAttrs {
     let prefixes: Vec<String> = attrs
         .iter()
         .filter(|(name, _)| name != "xmlns" && !name.starts_with("xmlns:"))
-        .filter_map(|(name, _)| name.split_once(':').map(|(prefix, _)| prefix.to_string()))
+        .flat_map(|(name, value)| {
+            name.split_once(':')
+                .map(|(prefix, _)| prefix)
+                .into_iter()
+                .chain(mce_value_prefixes(name, value))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
         .filter(|prefix| prefix != "xml")
         .collect();
     let bindings = rebuilt_bindings(p);
@@ -851,9 +915,9 @@ fn parse_blocks_until_end(p: &mut XmlParser, rels: &Relationships) -> Vec<Block>
                 // save writes back (see `parse_sdt_block`).
                 "w:sdt" => parse_sdt_block(p, rels, &mut blocks),
                 "w:sectPr" => {
-                    let start = p.start_pos();
+                    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
                     p.skip_element();
-                    let raw = p.raw_slice(start, p.pos());
+                    let raw = &declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
                     let (current, property_change) =
                         split_property_change_container(raw, PropertyScope::Section);
                     blocks.push(Block::SectionProperties(SectionProperties {
@@ -1350,9 +1414,11 @@ fn property_element_names(scope: PropertyScope) -> (&'static str, &'static str) 
 /// wrapper children do not make an otherwise valid prior snapshot unusable.
 fn parse_property_change(p: &mut XmlParser, scope: PropertyScope) -> PropertyChange {
     let metadata = parse_revision_metadata(p);
-    let start = p.start_pos();
+    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
     let complete = p.skip_element_complete();
-    let raw = p.raw_slice(start, p.pos()).to_string();
+    // The change is written back inside a rebuilt container: it keeps the
+    // bindings its prefixes need, and so does the snapshot parsed from it.
+    let raw = declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
     let previous = if complete {
         parse_property_snapshot(&raw, scope)
     } else {
@@ -1677,9 +1743,9 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                 "w:sectPr" => {
                     // A mid-document section break. Its current properties stay
                     // exact XML while a tracked prior snapshot is actionable.
-                    let start = p.start_pos();
+                    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
                     p.skip_element();
-                    let raw = p.raw_slice(start, p.pos());
+                    let raw = &declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
                     let (current, change) =
                         split_property_change_container(raw, PropertyScope::Section);
                     props.section_break = Some(current);
@@ -2334,7 +2400,7 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
     // unconditionally and redeclare it there. In particular, `mc`/`w15` may be
     // used only by preserved markup or QName-valued attributes, which cannot be
     // inferred from a search for `w15:` elements.
-    let namespace_declarations = p
+    let namespace_declarations: Vec<(String, String)> = p
         .namespace_scoped_attrs()
         .filter_map(|scoped| {
             let mut value = String::new();
@@ -2350,6 +2416,7 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
             (!guaranteed).then(|| (scoped.attr.name.to_string(), value))
         })
         .collect();
+    let _scope = TableScope::enter(&namespace_declarations);
     let markup_compatibility_attributes = reconstructed_markup_compatibility_attrs(p);
     let mut table = Table {
         namespace_declarations,
@@ -2371,9 +2438,9 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
                 }
                 // Whole table properties (borders/shading/width/style) preserved.
                 "w:tblPr" => {
-                    let start = p.start_pos();
+                    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
                     p.skip_element();
-                    let raw = p.raw_slice(start, p.pos());
+                    let raw = &declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
                     let (current, change) =
                         split_property_change_container(raw, PropertyScope::Table);
                     table.raw_tblpr = Some(current);
@@ -2664,9 +2731,9 @@ fn parse_cells_into(
             Event::Start => match p.name() {
                 "w:tc" => cells.push(parse_cell(p, rels)),
                 "w:trPr" => {
-                    let start = p.start_pos();
+                    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
                     p.skip_element();
-                    let property_xml = p.raw_slice(start, p.pos());
+                    let property_xml = &declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
                     let (current, change) =
                         split_property_change_container(property_xml, PropertyScope::TableRow);
                     raw.push(current);
@@ -2701,9 +2768,9 @@ fn parse_cell(p: &mut XmlParser, rels: &Relationships) -> Cell {
                 // more than gridSpan/vMerge — so a cell the model can fully
                 // describe still round-trips exactly (no spurious raw).
                 "w:tcPr" => {
-                    let start = p.start_pos();
+                    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
                     let has_extra = parse_tcpr(p, &mut cell);
-                    let raw = p.raw_slice(start, p.pos());
+                    let raw = &declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
                     cell.unsupported_revisions = unsupported_cell_revisions(raw);
                     let (current, change) =
                         split_property_change_container(raw, PropertyScope::TableCell);
