@@ -1334,3 +1334,258 @@ fn f11_commits_the_cell_before_the_new_project_and_an_invalid_cell_stays() {
         assert_eq!(v(&t).ed.project().task(10).unwrap().name, "Task 1");
     }
 }
+
+// ---- Range selection (#560) -------------------------------------------------
+
+fn shift(t: &mut DocTab, key_name: &str) {
+    let m = Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    };
+    assert_eq!(project_input(t, key_name, None, m), None);
+}
+
+/// The selection as (uids, first col, last col) for a straight assertion.
+fn sel(t: &DocTab) -> Option<(Vec<i32>, usize, usize)> {
+    v(t).selection()
+        .map(|s| (s.uids, *s.cols.start(), *s.cols.end()))
+}
+
+#[test]
+fn shift_arrows_extend_a_rectangle_and_plain_arrows_clear_it() {
+    let mut t = tab();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    shift(&mut t, "down");
+    assert_eq!(sel(&t), Some((vec![10, 20], COL_NAME, COL_NAME)));
+    shift(&mut t, "right");
+    assert_eq!(sel(&t), Some((vec![10, 20], COL_NAME, COL_DURATION)));
+    // A plain arrow moves the cursor and clears the range.
+    key(&mut t, "down");
+    assert_eq!(sel(&t), None);
+    assert_eq!(
+        (v(&t).ed.selected_uid(), v(&t).col),
+        (Some(30), COL_DURATION)
+    );
+}
+
+#[test]
+fn shift_down_stops_on_the_last_task_and_never_selects_the_entry_row() {
+    let mut t = tab();
+    vm(&mut t).ed.select(2);
+    vm(&mut t).col = COL_NAME;
+    shift(&mut t, "down");
+    // The last task stays put: anchor on cursor means no range.
+    assert_eq!(sel(&t), None);
+    assert!(!v(&t).on_entry_row());
+    // On the entry row Shift+arrows do nothing at all.
+    vm(&mut t).enter_entry_row();
+    shift(&mut t, "up");
+    shift(&mut t, "down");
+    assert_eq!(sel(&t), None);
+    assert!(v(&t).on_entry_row());
+    // Back on the grid, Shift+Up from the first task stays on it.
+    vm(&mut t).ed.select(0);
+    shift(&mut t, "up");
+    assert_eq!(sel(&t), None);
+}
+
+#[test]
+fn selection_skips_rows_hidden_under_a_collapsed_summary() {
+    let mut t = tab();
+    vm(&mut t).ed.indent(20, 1).unwrap();
+    assert!(vm(&mut t).ed.set_collapsed(10, true).is_ok());
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    shift(&mut t, "down");
+    // The hidden row 20 is not in the range; the box is the two shown rows.
+    assert_eq!(sel(&t), Some((vec![10, 30], COL_NAME, COL_NAME)));
+    assert_eq!(v(&t).ed.selected_uid(), Some(30));
+}
+
+#[test]
+fn selection_is_none_when_the_anchor_task_is_deleted() {
+    let mut t = tab();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    shift(&mut t, "down");
+    assert!(sel(&t).is_some());
+    // An edit that removes the anchor task (an agent's task.del, an undo):
+    // no stale highlight, no panic.
+    vm(&mut t).ed.delete_task(10).unwrap();
+    assert_eq!(sel(&t), None);
+    assert!(vm(&mut t).ed.undo());
+    assert_eq!(sel(&t), Some((vec![10, 20], COL_NAME, COL_NAME)));
+}
+
+#[test]
+fn shrinking_back_to_the_anchor_leaves_no_range() {
+    let mut t = tab();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    shift(&mut t, "down");
+    shift(&mut t, "up");
+    assert_eq!(sel(&t), None);
+    // Extending again anchors where the cursor was, not where it started.
+    shift(&mut t, "down");
+    assert_eq!(sel(&t), Some((vec![10, 20], COL_NAME, COL_NAME)));
+}
+
+#[test]
+fn press_drag_release_selects_the_rectangle() {
+    let mut t = tab();
+    project_cell_press(&mut t, 0, COL_NAME, false);
+    assert!(v(&t).dragging);
+    assert!(!v(&t).drag_made_range, "the press cell is not a drag yet");
+    assert!(project_cell_drag_over(&mut t, 1, COL_NAME));
+    assert!(project_cell_drag_over(&mut t, 2, COL_DURATION));
+    assert!(
+        !project_cell_drag_over(&mut t, 2, COL_DURATION),
+        "no move, no redraw"
+    );
+    project_cell_release(&mut t);
+    assert!(!v(&t).dragging);
+    assert_eq!(sel(&t), Some((vec![10, 20, 30], COL_NAME, COL_DURATION)));
+    // A drag onto the entry row stops on the last task.
+    project_cell_press(&mut t, 0, COL_NAME, false);
+    assert!(!project_cell_drag_over(&mut t, 3, COL_NAME));
+    project_cell_release(&mut t);
+    assert_eq!(sel(&t), None, "no travel: the press cleared the range");
+}
+
+#[test]
+fn a_click_after_a_drag_keeps_the_range() {
+    let mut t = tab();
+    project_cell_press(&mut t, 0, COL_NAME, false);
+    project_cell_drag_over(&mut t, 2, COL_NAME);
+    project_cell_release(&mut t);
+    // gpui delivers the release-click on the cell the drag ended on (and its
+    // row): neither may clear the gesture's range.
+    project_cell_click(&mut t, 2, Some(COL_NAME), false);
+    assert_eq!(sel(&t), Some((vec![10, 20, 30], COL_NAME, COL_NAME)));
+    // The next plain click runs normally and clears it.
+    project_cell_press(&mut t, 1, COL_NAME, false);
+    project_cell_release(&mut t);
+    project_cell_click(&mut t, 1, Some(COL_NAME), false);
+    assert_eq!(sel(&t), None);
+    assert_eq!((v(&t).ed.selected_uid(), v(&t).col), (Some(20), COL_NAME));
+}
+
+#[test]
+fn a_drag_released_below_the_table_keeps_the_range() {
+    let mut t = tab();
+    project_cell_press(&mut t, 0, COL_NAME, false);
+    project_cell_drag_over(&mut t, 1, COL_NAME);
+    // The release lands below the table: the body's on_click is swallowed.
+    project_cell_release(&mut t);
+    project_below_click(&mut t);
+    assert_eq!(sel(&t), Some((vec![10, 20], COL_NAME, COL_NAME)));
+    // The window-level release ends the gesture and is idempotent.
+    project_cell_release(&mut t);
+    assert_eq!(sel(&t), Some((vec![10, 20], COL_NAME, COL_NAME)));
+}
+
+#[test]
+fn a_plain_press_without_drag_clears_it() {
+    let mut t = tab();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    shift(&mut t, "down");
+    assert!(sel(&t).is_some());
+    // Press and release on one cell: a click, the range does not survive.
+    project_cell_press(&mut t, 1, COL_DURATION, false);
+    assert!(!v(&t).drag_made_range);
+    project_cell_release(&mut t);
+    project_cell_click(&mut t, 1, Some(COL_DURATION), false);
+    assert_eq!(sel(&t), None);
+}
+
+#[test]
+fn shift_click_extends_from_the_cursor() {
+    let mut t = tab();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    project_cell_press(&mut t, 2, COL_DURATION, true);
+    // The release-click is swallowed, so the range stays.
+    project_cell_release(&mut t);
+    project_cell_click(&mut t, 2, Some(COL_DURATION), false);
+    assert_eq!(sel(&t), Some((vec![10, 20, 30], COL_NAME, COL_DURATION)));
+    // And a second Shift+click re-anchors at the cursor, as specified.
+    project_cell_press(&mut t, 1, COL_NAME, true);
+    project_cell_release(&mut t);
+    project_cell_click(&mut t, 1, Some(COL_NAME), false);
+    assert_eq!(sel(&t), Some((vec![20, 30], COL_NAME, COL_DURATION)));
+}
+
+#[test]
+fn clicking_the_id_cell_selects_the_whole_row_and_keeps_the_cursor_on_id() {
+    let mut t = tab();
+    project_cell_press(&mut t, 1, COL_ID, false);
+    assert!(v(&t).row_drag);
+    project_cell_release(&mut t);
+    // The single click on the ID cell selects the whole row (all 8 columns).
+    project_cell_click(&mut t, 1, Some(COL_ID), false);
+    let s = v(&t).selection().unwrap();
+    assert_eq!(s.count(), COLUMN_COUNT);
+    assert_eq!(s.uids, [20]);
+    assert_eq!((v(&t).ed.selected_uid(), v(&t).col), (Some(20), COL_ID));
+    // Dragging down from an ID cell selects whole rows.
+    project_cell_press(&mut t, 0, COL_ID, false);
+    assert!(project_cell_drag_over(&mut t, 2, COL_DURATION));
+    project_cell_release(&mut t);
+    let s = v(&t).selection().unwrap();
+    assert_eq!(s.count(), 3 * COLUMN_COUNT);
+    assert_eq!(s.uids, [10, 20, 30]);
+    assert_eq!(v(&t).col, COL_ID, "the cursor column stays on ID");
+    // A double-click on ID is not swallowed: the read-only status still shows.
+    project_cell_press(&mut t, 0, COL_ID, false);
+    project_cell_release(&mut t);
+    project_cell_click(&mut t, 0, Some(COL_ID), true);
+    assert_eq!(t.status.as_ref(), "ID is read-only");
+}
+
+#[test]
+fn commands_and_typing_clear_the_range_but_commands_keep_it() {
+    let mut t = tab();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    // Typing opens the cell and clears the range.
+    shift(&mut t, "down");
+    assert!(sel(&t).is_some());
+    project_input(&mut t, "x", Some("x"), Modifiers::default());
+    assert_eq!(sel(&t), None);
+    key(&mut t, "escape");
+    // Escape with nothing open clears it too.
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    shift(&mut t, "down");
+    project_input(&mut t, "escape", None, Modifiers::default());
+    assert_eq!(sel(&t), None);
+    // Any other command clears it: Undo as the example.
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    shift(&mut t, "down");
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(sel(&t), None);
+    // Link and Unlink keep it (Copy does too; Cut and Paste clear it
+    // themselves, in clip.rs).
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    shift(&mut t, "down");
+    apply_project_act(&mut t, ProjectAct::AddLink);
+    assert!(sel(&t).is_some(), "Link Tasks keeps the range");
+    apply_project_act(&mut t, ProjectAct::UnlinkTasks);
+    assert!(sel(&t).is_some(), "Unlink Tasks keeps the range");
+}
+
+#[test]
+fn selection_is_part_of_the_harness_state() {
+    use ctlcore::json::Json;
+    let mut t = tab();
+    assert_eq!(state(&t, "selection"), Json::Null);
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    shift(&mut t, "down");
+    shift(&mut t, "right");
+    assert_eq!(state(&t, "selection"), Json::Num(4.));
+}

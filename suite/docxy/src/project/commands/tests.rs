@@ -3534,3 +3534,129 @@ fn set_baseline_is_a_split_with_clear_baseline_in_its_menu() {
         Some(Act::Project(ProjectAct::ClearBaseline))
     ));
 }
+
+// ---- Range Link / Unlink (#558, over a #560 selection) ----------------------
+
+/// Select `n` rows down from the first task on the ID column, Shift+Down.
+fn select_rows_down(t: &mut DocTab, n: usize) {
+    vm(t).ed.select(0);
+    vm(t).col = COL_ID;
+    let m = Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    };
+    for _ in 0..n {
+        assert_eq!(project_input(t, "down", None, m), None);
+    }
+}
+
+#[test]
+fn ctrl_f2_links_selected_rows_in_row_order_in_one_undo_step() {
+    let mut t = tab();
+    vm(&mut t).ed.add_task(None, "Third", 480, false).unwrap();
+    select_rows_down(&mut t, 2);
+    let depth = v(&t).ed.undo_depth();
+    chord(&mut t, "f2", ctrl());
+    assert_eq!(t.status.as_ref(), "Linked 2 tasks");
+    assert_eq!(
+        v(&t).ed.project().task(2).unwrap().predecessors,
+        [projcore::Predecessor::fs(1)]
+    );
+    assert_eq!(
+        v(&t).ed.project().task(3).unwrap().predecessors,
+        [projcore::Predecessor::fs(2)]
+    );
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1, "one undo step");
+    // The cursor and the selection are unchanged.
+    assert_eq!(v(&t).ed.selected_uid(), Some(3));
+    assert_eq!(v(&t).selection().unwrap().uids, [1, 2, 3]);
+    // Again: every pair is already linked, so nothing happens.
+    chord(&mut t, "f2", ctrl());
+    assert_eq!(t.status.as_ref(), "Linked 0 tasks");
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    chord(&mut t, "z", ctrl());
+    assert_eq!(predecessors(&t, 2), 0);
+    assert_eq!(predecessors(&t, 3), 0);
+    assert_eq!(v(&t).ed.undo_depth(), depth);
+}
+
+#[test]
+fn ctrl_shift_f2_unlinks_every_selected_task_in_one_undo_step() {
+    let mut t = tab();
+    vm(&mut t).ed.add_task(None, "Third", 480, false).unwrap();
+    // A chain 1 -> 2 -> 3: unlink counts every link touching the selection,
+    // each exactly once.
+    vm(&mut t)
+        .ed
+        .add_predecessor(2, 1, LinkType::FinishStart, 0)
+        .unwrap();
+    vm(&mut t)
+        .ed
+        .add_predecessor(3, 2, LinkType::FinishStart, 0)
+        .unwrap();
+    select_rows_down(&mut t, 2);
+    let depth = v(&t).ed.undo_depth();
+    chord(&mut t, "f2", ctrl_shift());
+    assert_eq!(t.status.as_ref(), "Removed 2 links");
+    assert!(predecessors(&t, 2) == 0 && predecessors(&t, 3) == 0);
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1, "one undo step");
+    // The range survives, and one undo brings both links back.
+    assert_eq!(v(&t).selection().unwrap().uids, [1, 2, 3]);
+    chord(&mut t, "z", ctrl());
+    assert_eq!(predecessors(&t, 2), 1);
+    assert_eq!(predecessors(&t, 3), 1);
+}
+
+#[test]
+fn link_over_a_range_with_a_cycle_cancels_the_whole_link() {
+    let mut t = tab();
+    vm(&mut t).ed.add_task(None, "Third", 480, false).unwrap();
+    // Task 1 already depends on task 3: linking 1 -> 2 and then 2 -> 3
+    // would close a circle, so the whole batch cancels, naming the pair.
+    vm(&mut t)
+        .ed
+        .add_link(1, projcore::Predecessor::fs(3))
+        .unwrap();
+    select_rows_down(&mut t, 2);
+    let depth = v(&t).ed.undo_depth();
+    chord(&mut t, "f2", ctrl());
+    assert!(
+        t.status
+            .starts_with("Task 3 Predecessors: Linking task 3 to task 2"),
+        "{}",
+        t.status
+    );
+    assert!(t.status.contains("circular relationship"));
+    assert_eq!(predecessors(&t, 2), 0, "1 -> 2 was rolled back with it");
+    assert_eq!(v(&t).ed.undo_depth(), depth, "a cancelled batch is no edit");
+}
+
+#[test]
+fn ctrl_f2_without_a_range_still_opens_the_prompt() {
+    let mut t = tab();
+    chord(&mut t, "f2", ctrl());
+    assert_eq!(
+        v(&t).prompt.as_ref().map(|p| p.kind),
+        Some(PromptKind::Predecessor)
+    );
+    // A one-row selection (an ID click) is not a range: the prompt opens too.
+    let mut t = tab();
+    project_cell_press(&mut t, 1, COL_ID, false);
+    project_cell_release(&mut t);
+    project_cell_click(&mut t, 1, Some(COL_ID), false);
+    assert_eq!(v(&t).selection().unwrap().count(), COLUMN_COUNT);
+    chord(&mut t, "f2", ctrl());
+    assert_eq!(
+        v(&t).prompt.as_ref().map(|p| p.kind),
+        Some(PromptKind::Predecessor)
+    );
+    // And the single-task unlink wording is untouched.
+    let mut t = tab();
+    vm(&mut t)
+        .ed
+        .add_predecessor(2, 1, LinkType::FinishStart, 0)
+        .unwrap();
+    vm(&mut t).ed.select(1);
+    chord(&mut t, "f2", ctrl_shift());
+    assert_eq!(t.status.as_ref(), "Removed 1 link");
+}
