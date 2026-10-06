@@ -92,7 +92,7 @@ jobs:
       DOCXY_BUILD_KIND: ci
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux clipboard deps (arboard)
         run: |
