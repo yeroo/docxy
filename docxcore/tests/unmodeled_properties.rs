@@ -73,7 +73,37 @@ fn document_xml(bytes: &[u8]) -> String {
         parse_xml(xml.as_bytes()).is_some(),
         "saved document.xml is not well-formed:\n{xml}"
     );
+    let unbound = unbound_prefixes(&xml);
+    assert!(unbound.is_empty(), "unbound prefixes {unbound:?}:\n{xml}");
     xml
+}
+
+/// The prefixes `xml` uses, in element or attribute names, where no
+/// declaration binds them.
+fn unbound_prefixes(xml: &str) -> Vec<String> {
+    use docxcore::xml::{Event, XmlParser};
+    let mut out = Vec::new();
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let names = std::iter::once(p.name())
+                    .chain(p.attrs().iter().map(|a| a.name))
+                    .filter(|n| *n != "xmlns" && !n.starts_with("xmlns:"))
+                    .filter_map(|n| n.split_once(':').map(|(prefix, _)| prefix))
+                    .filter(|prefix| *prefix != "xml")
+                    .collect::<Vec<_>>();
+                for prefix in names {
+                    let decl = format!("xmlns:{prefix}");
+                    if !p.namespace_attrs().iter().any(|a| a.name == decl) {
+                        out.push(prefix.to_string());
+                    }
+                }
+            }
+            Event::Eof => return out,
+            _ => {}
+        }
+    }
 }
 
 /// The differences in `word/document.xml` the gate would report: those its
@@ -456,6 +486,7 @@ fn a_split_header_paragraph_keeps_its_para_id_once() {
 #[test]
 fn twins_before_their_primary_survive_an_untouched_save() {
     let body = "<w:p><w:r><w:rPr><w:bCs/><w:b w:val=\"0\"/><w:iCs w:val=\"0\"/><w:i/>\
+                <w:dstrike/><w:strike w:val=\"0\"/>\
                 <w:szCs w:val=\"30\"/><w:sz w:val=\"20\"/></w:rPr><w:t>text</w:t></w:r></w:p>";
     let (original, saved) = round_trip(body);
     let rpr = rpr_of(&document_xml(&saved), "text").to_string();
@@ -466,6 +497,8 @@ fn twins_before_their_primary_survive_an_untouched_save() {
         "<w:iCs w:val=\"0\"/>",
         "<w:sz w:val=\"20\"/>",
         "<w:szCs w:val=\"30\"/>",
+        "<w:dstrike/>",
+        "<w:strike w:val=\"0\"/>",
     ] {
         assert!(rpr.contains(kept), "{kept} lost: {rpr}");
     }
@@ -478,7 +511,8 @@ fn twins_before_their_primary_survive_an_untouched_save() {
     let Inline::Run(r) = &p.content[0] else {
         panic!("run");
     };
-    assert!(!r.props.bold && r.props.italic, "{rpr}");
+    // Double strikethrough adds to an explicit-off single one.
+    assert!(!r.props.bold && r.props.italic && r.props.strike, "{rpr}");
     assert_eq!(r.props.size_half_pts, Some(20));
     assert_eq!(reloaded.doc, loaded.doc);
 }
@@ -552,6 +586,67 @@ fn whitespace_references_in_kept_attributes_survive() {
     let xml = document_xml(&save(pkg, editor));
     assert!(
         xml.contains("<w:p ux:label=\"A&#10;B&#9;C&#13;D\">"),
+        "{xml}"
+    );
+}
+
+/// Review r2: a property element kept verbatim (the shadow of a modeled one,
+/// or an unmodeled one) brings along the namespace declarations its prefixes
+/// need from its container or another rebuilt ancestor.
+#[test]
+fn kept_property_elements_keep_namespaces_declared_on_their_containers() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\">"),
+        "<w:body xmlns:ux=\"urn:ux\"><w:p><w:pPr xmlns:uy=\"urn:uy\">\
+         <w:keepNext ux:k=\"1\"/><w:jc w:val=\"center\" uy:j=\"1\"/></w:pPr>\
+         <w:r><w:rPr xmlns:uz=\"urn:uz\"><w:color w:val=\"FF0000\" uz:flag=\"1\"/>\
+         <w:lang w:val=\"en-US\" ux:l=\"1\"/></w:rPr><w:t>text</w:t></w:r></w:p></w:body>",
+    );
+    let (pkg, mut editor) = open(&original);
+    editor.set_caret(Caret::top(0, 4));
+    editor.insert_str("!");
+    let xml = document_xml(&save(pkg, editor));
+    for kept in [
+        "<w:keepNext xmlns:ux=\"urn:ux\" ux:k=\"1\"/>",
+        "<w:jc xmlns:uy=\"urn:uy\" w:val=\"center\" uy:j=\"1\"/>",
+        "<w:color xmlns:uz=\"urn:uz\" w:val=\"FF0000\" uz:flag=\"1\"/>",
+        "<w:lang xmlns:ux=\"urn:ux\" w:val=\"en-US\" ux:l=\"1\"/>",
+    ] {
+        assert!(xml.contains(kept), "{kept} lost: {xml}");
+    }
+}
+
+/// Review r2: clearing a colour drops the loaded `w:color` whole, never
+/// leaving one without its required `w:val`.
+#[test]
+fn clearing_a_color_drops_the_loaded_color_element() {
+    let xml = edited(
+        "<w:p><w:r><w:rPr><w:color w:val=\"FF0000\" w14:foo=\"1\"/><w:b/></w:rPr>\
+         <w:t>text</w:t></w:r></w:p>",
+        |e| e.set_color(None),
+    );
+    assert_eq!(rpr_of(&xml, "text"), "<w:rPr><w:b/></w:rPr>", "{xml}");
+}
+
+/// Review r2: `doc.format` (the agent) replaces a colour or font as the
+/// editor's setters do, theme override included.
+#[test]
+fn agent_format_drops_the_theme_that_overrides_a_color_or_font() {
+    let (pkg, mut editor) = open(&docx(
+        "<w:p><w:r><w:rPr><w:rFonts w:ascii=\"Arial\" w:hAnsi=\"Calibri\" w:cs=\"Arial\"/>\
+         <w:color w:val=\"FF0000\" w:themeColor=\"accent1\"/></w:rPr><w:t>text</w:t></w:r></w:p>",
+    ));
+    let patch = docxcore::agent::RunPatch {
+        color: Some((0xFF, 0, 0)),
+        font: Some("Arial".to_string()),
+        ..Default::default()
+    };
+    docxcore::agent::format_range(&mut editor, 0, 0, &patch).expect("formatted");
+    let xml = document_xml(&save(pkg, editor));
+    assert_eq!(
+        rpr_of(&xml, "text"),
+        "<w:rPr><w:rFonts w:ascii=\"Arial\" w:hAnsi=\"Arial\" w:cs=\"Arial\"/>\
+         <w:color w:val=\"FF0000\"/></w:rPr>",
         "{xml}"
     );
 }

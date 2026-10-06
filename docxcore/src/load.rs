@@ -119,21 +119,100 @@ fn decode_attr(raw: &str) -> String {
     s
 }
 
-/// The start tag's attributes at the parser's current Start event, decoded.
-///
-/// An attribute in a prefix bound on an ancestor below the part root
-/// (`w:body`, `w:tc`, …) also brings that binding along, as a declaration on
-/// this tag: those ancestors are rebuilt on save without their declarations,
-/// while a part root (`w:document`, `w:hdr`, …) keeps its own.
+/// The part roots, whose start tags a save writes back as loaded
+/// (`save_package` re-emits `w:document`'s, a header or footer keeps its
+/// wrapper), so a namespace declared there stays declared.
+const PART_ROOTS: [&str; 6] = [
+    "w:document",
+    "w:hdr",
+    "w:ftr",
+    "w:footnotes",
+    "w:endnotes",
+    "w:comments",
+];
+
+/// The namespace bindings in scope at the parser's current Start event that
+/// a save does not keep: those declared below the part root (on `w:body`,
+/// `w:tc`, a `w:rPr`, …), which the serializer rebuilds without them. The
+/// innermost binding of each prefix, as `(prefix, namespace)`.
+fn rebuilt_bindings(p: &XmlParser) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for scoped in p.namespace_scoped_attrs() {
+        let Some(prefix) = scoped.attr.name.strip_prefix("xmlns:") else {
+            continue;
+        };
+        out.retain(|(p, _)| p != prefix);
+        if !PART_ROOTS.contains(&scoped.element_name) {
+            out.push((prefix.to_string(), decode_attr(scoped.attr.value)));
+        }
+    }
+    out
+}
+
+/// The prefixes `raw` (an element captured verbatim) uses in element and
+/// attribute names, and those its own start tag declares.
+fn prefixes_of(raw: &str) -> (Vec<String>, Vec<String>) {
+    let (mut used, mut own): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let add = |name: &str, used: &mut Vec<String>| {
+        if let Some((prefix, _)) = name.split_once(':') {
+            if prefix != "xml" && prefix != "xmlns" && !used.iter().any(|u| u == prefix) {
+                used.push(prefix.to_string());
+            }
+        }
+    };
+    let mut q = XmlParser::new(raw);
+    let mut first = true;
+    loop {
+        match q.next() {
+            Event::Start => {
+                add(q.name(), &mut used);
+                for a in q.attrs() {
+                    if let Some(prefix) = a.name.strip_prefix("xmlns:") {
+                        if first {
+                            own.push(prefix.to_string());
+                        }
+                    } else {
+                        add(a.name, &mut used);
+                    }
+                }
+                first = false;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    (used, own)
+}
+
+/// `raw` with a declaration on its start tag for each prefix it uses that is
+/// bound in `bindings` (see [`rebuilt_bindings`]) and not declared there
+/// already, so it stays well-formed wherever a save writes it (#1063).
+fn declare_rebuilt(raw: &str, bindings: &[(String, String)]) -> String {
+    if bindings.is_empty() {
+        return raw.to_string();
+    }
+    let (used, own) = prefixes_of(raw);
+    let mut decls = String::new();
+    for (prefix, ns) in bindings {
+        if used.contains(prefix) && !own.contains(prefix) {
+            decls.push_str(&format!(" xmlns:{prefix}=\""));
+            crate::serialize::esc_attr(ns, &mut decls);
+            decls.push('"');
+        }
+    }
+    if decls.is_empty() {
+        return raw.to_string();
+    }
+    let name_end = raw[1..]
+        .find([' ', '\t', '\n', '\r', '/', '>'])
+        .map_or(raw.len(), |i| i + 1);
+    format!("{}{decls}{}", &raw[..name_end], &raw[name_end..])
+}
+
+/// The start tag's attributes at the parser's current Start event, decoded,
+/// with a declaration for each prefix they use that a save does not keep
+/// (see [`rebuilt_bindings`]).
 fn element_attrs(p: &XmlParser) -> ElementAttrs {
-    const ROOTS: [&str; 6] = [
-        "w:document",
-        "w:hdr",
-        "w:ftr",
-        "w:footnotes",
-        "w:endnotes",
-        "w:comments",
-    ];
     let mut attrs: Vec<(String, String)> = p
         .attrs()
         .iter()
@@ -145,18 +224,14 @@ fn element_attrs(p: &XmlParser) -> ElementAttrs {
         .filter_map(|(name, _)| name.split_once(':').map(|(prefix, _)| prefix.to_string()))
         .filter(|prefix| prefix != "xml")
         .collect();
+    let bindings = rebuilt_bindings(p);
     for prefix in prefixes {
         let decl = format!("xmlns:{prefix}");
         if attrs.iter().any(|(name, _)| *name == decl) {
             continue;
         }
-        // The innermost binding of the prefix in scope.
-        let binding = p
-            .namespace_scoped_attrs()
-            .filter(|scoped| scoped.attr.name == decl)
-            .last();
-        if let Some(scoped) = binding.filter(|s| !ROOTS.contains(&s.element_name)) {
-            attrs.push((decl, decode_attr(scoped.attr.value)));
+        if let Some((_, ns)) = bindings.iter().find(|(p, _)| *p == prefix) {
+            attrs.push((decl, ns.clone()));
         }
     }
     ElementAttrs(attrs)
@@ -1534,8 +1609,8 @@ pub fn parse_textbox_blocks(raw: &str) -> Vec<Block> {
 fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
     loop {
         let event = p.next();
-        let shadow =
-            (event == Event::Start && SHADOW_PPR.contains(&p.name())).then(|| p.start_pos());
+        let shadow = (event == Event::Start && SHADOW_PPR.contains(&p.name()))
+            .then(|| (p.start_pos(), rebuilt_bindings(p)));
         match event {
             Event::Start => match p.name() {
                 "w:pStyle" => {
@@ -1546,7 +1621,7 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     p.skip_element();
                 }
                 "w:jc" => {
-                    let start = p.start_pos();
+                    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
                     props.align = map_align(p.attr("w:val"));
                     p.skip_element();
                     // Explicit left is distinct from no direct value: it can
@@ -1554,17 +1629,17 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     if props.align == Align::Left {
                         props
                             .raw_props
-                            .push(p.raw_slice(start, p.pos()).to_string());
+                            .push(declare_rebuilt(p.raw_slice(start, p.pos()), &bindings));
                     }
                 }
                 "w:bidi" => {
-                    let start = p.start_pos();
+                    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
                     props.rtl = toggle_on(p.attr("w:val"));
                     p.skip_element();
                     if !props.rtl {
                         props
                             .raw_props
-                            .push(p.raw_slice(start, p.pos()).to_string());
+                            .push(declare_rebuilt(p.raw_slice(start, p.pos()), &bindings));
                     }
                 }
                 "w:numPr" => parse_numpr(p, props),
@@ -1651,8 +1726,10 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
-        if let Some(start) = shadow {
-            props.shadow.push(p.raw_slice(start, p.pos()).to_string());
+        if let Some((start, bindings)) = &shadow {
+            props
+                .shadow
+                .push(declare_rebuilt(p.raw_slice(*start, p.pos()), bindings));
         }
     }
     // In the order a save writes them, so a saved and reloaded paragraph
@@ -1694,9 +1771,9 @@ pub(crate) fn parse_mark_revisions(rpr: &str) -> Vec<ParagraphMarkRevision> {
 /// Capture the verbatim XML of the element the parser is positioned at (its
 /// Start event), consuming it, and append it to `out`.
 fn capture_element(p: &mut XmlParser, out: &mut Vec<String>) {
-    let start = p.start_pos();
+    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
     p.skip_element();
-    out.push(p.raw_slice(start, p.pos()).to_string());
+    out.push(declare_rebuilt(p.raw_slice(start, p.pos()), &bindings));
 }
 
 fn frame_int(p: &XmlParser, name: &str) -> Option<i32> {
@@ -1830,44 +1907,88 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
     had_raw
 }
 
+/// The values one `w:rPr` gives its paired properties, whatever the order
+/// of its children: a complex-script twin (`w:bCs`, `w:iCs`, `w:szCs`)
+/// counts only when its primary element is absent, and `w:dstrike` adds to
+/// `w:strike`. A save writes the children in schema order, which must load
+/// back the same (#1063). Direct formatting and styles both read through it.
+#[derive(Default)]
+pub(crate) struct RprPairs {
+    bold: [Option<bool>; 2],
+    italic: [Option<bool>; 2],
+    strike: [Option<bool>; 2],
+    size: [Option<u32>; 2],
+}
+
+impl RprPairs {
+    /// Record the element `name` with `w:val` `val`; false when it is not
+    /// one of the pairs.
+    pub(crate) fn read(&mut self, name: &str, val: &str) -> bool {
+        let on = toggle_on(val);
+        match name {
+            "w:b" => self.bold[0] = Some(on),
+            "w:bCs" => self.bold[1] = Some(on),
+            "w:i" => self.italic[0] = Some(on),
+            "w:iCs" => self.italic[1] = Some(on),
+            "w:strike" => self.strike[0] = Some(on),
+            "w:dstrike" => self.strike[1] = Some(on),
+            "w:sz" | "w:szCs" => {
+                let v = parse_int(val);
+                if v > 0 {
+                    self.size[usize::from(name == "w:szCs")] = Some(v as u32);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    pub(crate) fn bold(&self) -> Option<bool> {
+        self.bold[0].or(self.bold[1])
+    }
+
+    pub(crate) fn italic(&self) -> Option<bool> {
+        self.italic[0].or(self.italic[1])
+    }
+
+    pub(crate) fn strike(&self) -> Option<bool> {
+        match self.strike {
+            [None, None] => None,
+            [a, b] => Some(a.unwrap_or(false) || b.unwrap_or(false)),
+        }
+    }
+
+    pub(crate) fn size(&self) -> Option<u32> {
+        self.size[0].or(self.size[1])
+    }
+}
+
 fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
-    // A complex-script twin (`w:bCs`, `w:iCs`, `w:szCs`) gives the value only
-    // when its primary element is absent, and `w:dstrike` adds to `w:strike`,
-    // so the modeled values do not depend on the children's order: a save
-    // writes them in schema order, which must load back the same (#1063).
-    let (mut bold, mut italic, mut size) = (None, None, None);
-    let (mut bold_cs, mut italic_cs, mut size_cs) = (None, None, None);
-    let (mut strike, mut dstrike) = (None, None);
+    let mut pairs = RprPairs::default();
     loop {
         match p.next() {
             Event::Start => {
                 let name = p.name();
                 let val = p.attr("w:val");
                 let start = p.start_pos();
+                let bindings = rebuilt_bindings(p);
                 let mut modeled = true;
                 match name {
-                    "w:b" => {
-                        bold = Some(toggle_on(val));
+                    // An explicit-off primary stays in `raw_props` too. The
+                    // complex-script twins stay out of it: the shadow pairs
+                    // them with their primary property, so an edit to it
+                    // rewrites or drops them together (#1063).
+                    "w:b" | "w:i" | "w:strike" => {
+                        pairs.read(name, val);
                         modeled = toggle_on(val);
                     }
-                    // The complex-script twins stay out of `raw_props`: the
-                    // shadow pairs them with their primary property, so an
-                    // edit to it rewrites or drops them together (#1063).
-                    "w:bCs" => bold_cs = Some(toggle_on(val)),
-                    "w:i" => {
-                        italic = Some(toggle_on(val));
-                        modeled = toggle_on(val);
+                    "w:bCs" | "w:iCs" | "w:dstrike" | "w:sz" | "w:szCs" => {
+                        pairs.read(name, val);
                     }
-                    "w:iCs" => italic_cs = Some(toggle_on(val)),
                     "w:u" => {
                         props.underline = toggle_on(val);
                         modeled = props.underline;
                     }
-                    "w:strike" => {
-                        strike = Some(toggle_on(val));
-                        modeled = toggle_on(val);
-                    }
-                    "w:dstrike" => dstrike = Some(toggle_on(val)),
                     "w:caps" => {
                         props.caps = toggle_on(val);
                         modeled = props.caps;
@@ -1905,15 +2026,6 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                             props.highlight = Some(val.to_string());
                         }
                     }
-                    "w:sz" | "w:szCs" => {
-                        let v = parse_int(val);
-                        let slot = if name == "w:sz" {
-                            &mut size
-                        } else {
-                            &mut size_cs
-                        };
-                        *slot = Some((v > 0).then_some(v as u32));
-                    }
                     "w:rFonts" => {
                         let ascii = p.attr("w:ascii");
                         if !ascii.is_empty() {
@@ -1938,28 +2050,28 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                     _ => modeled = false,
                 }
                 p.skip_element();
-                let raw = p.raw_slice(start, p.pos());
+                let raw = declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
                 if SHADOW_RPR.contains(&name) {
-                    props.shadow.push(raw.to_string());
+                    props.shadow.push(raw.clone());
                 }
                 if !modeled {
-                    props.raw_props.push(raw.to_string());
+                    props.raw_props.push(raw);
                 }
             }
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
     }
-    if let Some(on) = bold.or(bold_cs) {
+    if let Some(on) = pairs.bold() {
         props.bold = on;
     }
-    if let Some(on) = italic.or(italic_cs) {
+    if let Some(on) = pairs.italic() {
         props.italic = on;
     }
-    if strike.is_some() || dstrike.is_some() {
-        props.strike = strike.unwrap_or(false) || dstrike.unwrap_or(false);
+    if let Some(on) = pairs.strike() {
+        props.strike = on;
     }
-    if let Some(Some(v)) = size.or(size_cs) {
+    if let Some(v) = pairs.size() {
         props.size_half_pts = Some(v);
     }
     // In the order a save writes them (see `parse_ppr`).

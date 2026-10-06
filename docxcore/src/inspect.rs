@@ -416,13 +416,37 @@ fn text_box_copies(raw: &str) -> Vec<TextBoxCopy> {
     let Some(first) = inners.first().map(|r| &raw[r.clone()]) else {
         return Vec::new();
     };
+    // A save may drop a repeated `w14:paraId` from one copy but not the other
+    // (an id is never dropped in an `mc:Fallback`, #1063); that alone does not
+    // make the copies differ.
+    let first = without_para_ids(first);
     inners
         .iter()
         .map(|inner| TextBoxCopy {
-            twin: raw[inner.clone()] == *first,
+            twin: without_para_ids(&raw[inner.clone()]) == first,
             inner: inner.clone(),
         })
         .collect()
+}
+
+/// `xml` without its ` w14:paraId="…"` attributes.
+fn without_para_ids(xml: &str) -> String {
+    const ATTR: &str = " w14:paraId=\"";
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(at) = rest.find(ATTR) {
+        out.push_str(&rest[..at]);
+        let value = &rest[at + ATTR.len()..];
+        match value.find('"') {
+            Some(end) => rest = &value[end + 1..],
+            None => {
+                rest = &rest[at..];
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// What `target` counts in a text box's `raw` beyond what its `blocks`
@@ -1013,6 +1037,29 @@ mod tests {
         assert!(!xml.contains("gone"), "{xml}");
         assert_eq!(xml.matches("keep").count(), 2, "{xml}");
         assert_eq!(xml.matches("w14:paraId=\"1A2B3C4D\"").count(), 2, "{xml}");
+    }
+
+    /// Review r2: a duplicated text box (a copy, a mail-merge record) repeats
+    /// its paragraph ids. After an Inspect pass syncs the copies, the save
+    /// drops the repeat from the second box's Choice but never from a
+    /// Fallback, so its copies differ by an id; they are still twins after a
+    /// reopen, and a removal reaches both.
+    #[test]
+    fn inspect_removal_reaches_both_copies_of_a_duplicated_text_box() {
+        let boxed = two_copy_text_box(&format!(
+            "<w:p w14:paraId=\"1A2B3C4D\">\
+             <w:commentRangeStart w:id=\"5\"/>{VISIBLE}<w:commentRangeEnd w:id=\"5\"/>{HIDDEN}</w:p>"
+        ));
+        let mut doc = parse(&format!("{boxed}{boxed}"));
+        assert_eq!(remove_all_comment_markers(&mut doc), 4);
+        let xml = document_to_xml(&doc);
+        assert_eq!(xml.matches("w14:paraId=\"1A2B3C4D\"").count(), 3, "{xml}");
+        let body = &xml[xml.find("<w:body>").unwrap() + 8..xml.find("</w:body>").unwrap()];
+        let mut reopened = parse(body);
+        assert_eq!(remove_hidden_text(&mut reopened), 2);
+        let xml = document_to_xml(&reopened);
+        assert!(!xml.contains("gone"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 4, "{xml}");
     }
 
     /// #917: deleting one comment strips only its markers. Text in the same

@@ -111,6 +111,34 @@ pub struct RunProps {
 }
 
 impl RunProps {
+    /// Call after setting `font` explicitly. The loaded `w:rFonts` keeps only
+    /// what a font edit does not replace (the East Asian and complex-script
+    /// slots), so the font is written from the model, without a theme font
+    /// overriding it, even when it is the loaded one (#1063).
+    pub fn forget_loaded_font(&mut self) {
+        crate::serialize::forget_shadow_attrs(
+            &mut self.shadow,
+            "rFonts",
+            crate::serialize::RFONTS_LATIN,
+        );
+    }
+
+    /// Call after setting `color` explicitly: as [`RunProps::forget_loaded_font`]
+    /// for `w:color`. Clearing the colour drops the loaded `w:color` whole,
+    /// so no `w:color` without its required `w:val` is written.
+    pub fn forget_loaded_color(&mut self) {
+        if self.color.is_none() {
+            self.shadow
+                .retain(|raw| crate::serialize::local_name(raw) != "color");
+        } else {
+            crate::serialize::forget_shadow_attrs(
+                &mut self.shadow,
+                "color",
+                crate::serialize::COLOR_VALUE,
+            );
+        }
+    }
+
     /// Whether the text is underlined as the user set it: the underline a
     /// tracked insertion is drawn with is a display cue, not formatting.
     pub fn user_underline(&self) -> bool {

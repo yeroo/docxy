@@ -982,7 +982,10 @@ mod win {
     }
     unsafe fn vt_font_name_put(t: &WordFont_Impl, v: *const u16) -> HRESULT {
         let n = unsafe { pcwstr(v) };
-        set_font(t.doc, t.all, |p| p.font = Some(n.clone()));
+        set_font(t.doc, t.all, |p| {
+            p.font = Some(n.clone());
+            p.forget_loaded_font();
+        });
         S_OK
     }
     unsafe fn vt_font_color_get(_t: &WordFont_Impl, ret: *mut i32) -> HRESULT {
@@ -990,7 +993,10 @@ mod win {
     }
     unsafe fn vt_font_color_put(t: &WordFont_Impl, v: i32) -> HRESULT {
         if let Some(hex) = word_color_hex(v) {
-            set_font(t.doc, t.all, |p| p.color = Some(hex.clone()));
+            set_font(t.doc, t.all, |p| {
+                p.color = Some(hex.clone());
+                p.forget_loaded_color();
+            });
         }
         S_OK
     }

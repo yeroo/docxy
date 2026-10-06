@@ -1507,24 +1507,13 @@ impl Editor {
         let name = name.to_string();
         self.map_props(move |p| {
             p.font = Some(name.clone());
-            // Saved from the model even when it is the loaded font, without
-            // the theme fonts that would override it (#1063).
-            crate::serialize::forget_shadow_attrs(
-                &mut p.shadow,
-                "rFonts",
-                &["w:ascii", "w:hAnsi", "w:asciiTheme", "w:hAnsiTheme"],
-            );
+            p.forget_loaded_font();
         });
     }
     pub fn set_color(&mut self, hex: Option<String>) {
         self.map_props(move |p| {
             p.color = hex.clone();
-            // As for `set_font`: no theme colour overrides the chosen one.
-            crate::serialize::forget_shadow_attrs(
-                &mut p.shadow,
-                "color",
-                &["w:val", "w:themeColor", "w:themeShade", "w:themeTint"],
-            );
+            p.forget_loaded_color();
         });
     }
     pub fn set_highlight(&mut self, name: Option<String>) {

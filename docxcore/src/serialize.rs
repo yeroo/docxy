@@ -61,20 +61,24 @@ fn without_duplicate_para_ids(xml: String) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
     let base = xml.as_ptr() as usize;
+    let local = |name: &str| name.rsplit(':').next().unwrap_or_default().to_string();
     let mut parser = XmlParser::new(&xml);
-    // Open elements, and how many of them are `mc:Fallback`.
-    let mut open: Vec<bool> = Vec::new();
+    // Open elements by local name, and how many of them are a fallback. A
+    // `Fallback` child of an `AlternateContent` is one whatever its prefix:
+    // the part's root, which binds it, is not in `xml`.
+    let mut open: Vec<(String, bool)> = Vec::new();
     let mut in_fallback = 0usize;
     loop {
         match parser.next() {
             Event::End => {
-                if open.pop() == Some(true) {
+                if open.pop().is_some_and(|(_, fallback)| fallback) {
                     in_fallback -= 1;
                 }
             }
             Event::Start => {
-                let fallback = parser.name() == "mc:Fallback";
-                open.push(fallback);
+                let fallback = local(parser.name()) == "Fallback"
+                    && open.last().is_some_and(|(n, _)| n == "AlternateContent");
+                open.push((local(parser.name()), fallback));
                 in_fallback += usize::from(fallback);
                 if in_fallback > 0 || !matches!(parser.name(), "w:p" | "w:tr") {
                     continue;
@@ -86,14 +90,25 @@ fn without_duplicate_para_ids(xml: String) -> String {
                     continue;
                 }
                 // From the whitespace before the name to the closing quote.
-                let name_at = attr.name.as_ptr() as usize - base;
-                let value_end = attr.value.as_ptr() as usize - base + attr.value.len() + 1;
-                let start = xml[..name_at].trim_end().len();
+                // An attribute without a quoted value (malformed XML kept
+                // raw) has no place in `xml` to cut.
+                let (name_at, value_at) =
+                    (attr.name.as_ptr() as usize, attr.value.as_ptr() as usize);
+                let inside = |at: usize| at >= base && at <= base + xml.len();
+                if !inside(name_at) || !inside(value_at) || value_at < name_at {
+                    return xml;
+                }
+                let value_end = value_at - base + attr.value.len() + 1;
+                let start = xml[..name_at - base].trim_end().len();
                 cuts.push(start..value_end);
             }
             Event::Eof => break,
             _ => {}
         }
+    }
+    // Malformed XML (kept raw) is left exactly as it is.
+    if parser.is_malformed() {
+        return xml;
     }
     let mut out = String::with_capacity(xml.len());
     let mut at = 0;
@@ -391,6 +406,14 @@ impl<'a> Shadow<'a> {
     }
 }
 
+/// The `w:rFonts` attributes a font edit sets or replaces: the ASCII and
+/// high-ANSI slots and the theme fonts that would take precedence over them.
+pub(crate) const RFONTS_LATIN: &[&str] = &["w:ascii", "w:hAnsi", "w:asciiTheme", "w:hAnsiTheme"];
+
+/// The `w:color` attributes a colour edit replaces: the value and the theme
+/// colour that would take precedence over it.
+pub(crate) const COLOR_VALUE: &[&str] = &["w:val", "w:themeColor", "w:themeShade", "w:themeTint"];
+
 /// Strip `attrs` from the loaded element named `local` in `shadow`, dropping
 /// the element when nothing is left. An explicit property edit calls it, so
 /// the edit is written from the model even when it sets the loaded value, and
@@ -536,12 +559,7 @@ impl RprGroup {
 /// slots (`w:eastAsia`, `w:cs`, `w:hint`, their themes).
 fn rfonts_xml(font: Option<&str>, loaded: Option<&str>) -> Option<String> {
     let mut attrs = loaded.map(element_attrs_of).unwrap_or_default();
-    attrs.retain(|(n, _)| {
-        !matches!(
-            n.as_str(),
-            "w:ascii" | "w:hAnsi" | "w:asciiTheme" | "w:hAnsiTheme"
-        )
-    });
+    attrs.retain(|(n, _)| !RFONTS_LATIN.contains(&n.as_str()));
     if let Some(f) = font {
         attrs.insert(0, ("w:hAnsi".to_string(), f.to_string()));
         attrs.insert(0, ("w:ascii".to_string(), f.to_string()));
@@ -1251,12 +1269,7 @@ fn write_rpr(s: &mut String, p: &RunProps) {
     if let Some(c) = p.color.as_ref().filter(|_| !kept(RprGroup::Color)) {
         // The theme attributes would override the new value: drop them.
         let mut attrs = shadow.attrs("color");
-        attrs.retain(|(n, _)| {
-            !matches!(
-                n.as_str(),
-                "w:val" | "w:themeColor" | "w:themeShade" | "w:themeTint"
-            )
-        });
+        attrs.retain(|(n, _)| !COLOR_VALUE.contains(&n.as_str()));
         attrs.insert(0, ("w:val".to_string(), c.clone()));
         parts.push((rpr_rank("color"), empty_element("w:color", &attrs)));
     }
@@ -1760,6 +1773,15 @@ mod tests {
         let mut doc = parse_document_xml(&xml, rels);
         clear_shadows(&mut doc.body);
         doc
+    }
+
+    /// Review r2: malformed XML kept raw (attributes without a value) is left
+    /// as it is by the paraId dedupe, which used to panic on it.
+    #[test]
+    fn para_id_dedupe_leaves_malformed_raw_xml_alone() {
+        let raw = "<w:customXml><w:p w14:paraId/><w:p w14:paraId/></w:customXml>";
+        let xml = blocks_to_xml(&[Block::Raw(raw.to_string())]);
+        assert_eq!(xml, raw);
     }
 
     fn clear_shadows(blocks: &mut [Block]) {
