@@ -1717,30 +1717,3 @@ fn collapsing_a_summary_drops_the_range() {
     toggle_project_collapse(&mut t, 10);
     assert_eq!(sel(&t), None, "expanding does not revive the old anchor");
 }
-
-#[test]
-fn the_release_position_maps_to_the_cell_under_it() {
-    let t = tab();
-    let body = Bounds {
-        origin: point(px(0.), px(0.)),
-        size: size(px(1200.), px(600.)),
-    };
-    assert_eq!(
-        crate::project_cell_at(v(&t), body, point(px(10.), px(10.))),
-        Some((0, COL_ID))
-    );
-    assert_eq!(
-        crate::project_cell_at(v(&t), body, point(px(10.), px(ROW_H + 5.))),
-        Some((1, COL_ID))
-    );
-    // Over the chart side (past the last column) there is no cell.
-    assert_eq!(
-        crate::project_cell_at(v(&t), body, point(px(2000.), px(10.))),
-        None
-    );
-    // The entry row maps to the task count, which drag_over ignores.
-    assert_eq!(
-        crate::project_cell_at(v(&t), body, point(px(10.), px(3. * ROW_H + 2.))),
-        Some((3, COL_ID))
-    );
-}

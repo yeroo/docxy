@@ -1109,7 +1109,15 @@ fn editable_row_cells(
                     cx.stop_propagation();
                     if let Some(tab) = this.tabs.get_mut(index) {
                         let double = ev.click_count() >= 2;
-                        if uid.is_some() {
+                        // The press may have committed an open entry-row
+                        // edit and made this row a task without a redraw in
+                        // between: decide from the current task list, not
+                        // the uid captured when the frame was painted.
+                        let is_task = matches!(
+                            &tab.surface,
+                            Surface::Project(v) if v.ed.project().tasks.get(row).is_some()
+                        );
+                        if is_task {
                             project_cell_click(tab, row, Some(col), double);
                         } else {
                             project_entry_click(tab, Some(col), double);
@@ -1118,40 +1126,6 @@ fn editable_row_cells(
                     this.refocus(window, cx);
                 }))
         }))
-}
-
-/// The entry-table cell under a window position: the task index and column
-/// the point lands on, or `None` over the chart side, past the last drawn
-/// row, or past the last column. Rows come from the body probe's bounds and
-/// the list's vertical scroll, columns from the table's widths and its
-/// horizontal offset. The release of a cell drag applies its position
-/// through this, so a release past the last move still lands on the cell
-/// under the pointer.
-pub(super) fn project_cell_at(
-    v: &ProjectView,
-    body: Bounds<Pixels>,
-    pos: Point<Pixels>,
-) -> Option<(usize, usize)> {
-    let x = f32::from(pos.x) - f32::from(body.left()) + v.table_x.get();
-    let mut left = 0.;
-    let col = WIDTHS.iter().position(|&w| {
-        let hit = x >= left && x < left + w;
-        left += w;
-        hit
-    })?;
-    let scroll_y = -f32::from(v.scroll.0.borrow().base_handle.offset().y);
-    let y = f32::from(pos.y) - f32::from(body.top()) + scroll_y;
-    if y < 0. {
-        return None;
-    }
-    let shown = v.ed.visible_rows().len();
-    let row = (y / ROW_H).floor() as usize;
-    (row <= shown).then(|| {
-        (
-            list_task(&v.ed.visible_rows(), v.ed.project().tasks.len(), row),
-            col,
-        )
-    })
 }
 
 fn inactive_row(proj: &projcore::Project, index: usize) -> bool {
@@ -1330,7 +1304,6 @@ pub(super) fn project_el(
                                             .map(|r| {
                                                 let i = list_task(&rows, tasks.len(), r);
                                                 let task = tasks.get(i);
-                                                let is_task = task.is_some();
                                                 let indent = task
                                                     .map_or(0, |t| t.outline_level)
                                                     .saturating_sub(1)
@@ -1410,6 +1383,24 @@ pub(super) fn project_el(
                                                             if let Some(tab) =
                                                                 this.tabs.get_mut(index)
                                                             {
+                                                                // The press may have
+                                                                // committed an open
+                                                                // entry-row edit and
+                                                                // made this row a task
+                                                                // without a redraw in
+                                                                // between: decide from
+                                                                // the current task
+                                                                // list, not the frame
+                                                                // this row rendered in.
+                                                                let is_task = matches!(
+                                                                    &tab.surface,
+                                                                    Surface::Project(v) if v
+                                                                        .ed
+                                                                        .project()
+                                                                        .tasks
+                                                                        .get(i)
+                                                                        .is_some()
+                                                                );
                                                                 if is_task {
                                                                     project_cell_click(
                                                                         tab, i, None, false,

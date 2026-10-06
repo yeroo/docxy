@@ -196,3 +196,23 @@ test ctrl+f2 with one row opens the predecessor prompt
   call click-cell {"cell":"A1"}
   key ctrl+f2
   assert prompt is predecessor:
+
+test a press that commits the entry row keeps the click on the new task
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C3"}
+  type Design
+  # pointer-click dispatches press and release back to back, with no redraw
+  # in between: the release runs the entry row's stale click closure. The
+  # press committed the edit and made the row a task, so the click must
+  # resolve against the current task list and stay on the new task.
+  call pointer-click {"region":"cell:D3"}
+  assert tasks is 3
+  assert cell_row is 2
+  assert cell is Duration
+  # Typing now hits the new task's Duration; no second task appears.
+  type 3d
+  key enter
+  assert tasks is 3
+  call task.list {}
+  assert reply.tasks.2.name is Design
+  assert reply.tasks.2.duration_days is 3

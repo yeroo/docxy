@@ -946,8 +946,10 @@ pub fn region_name(region: Region) -> String {
 
 /// The 10 points a `pointer-drag` visits: the two ends plus 8 interpolated
 /// moves strictly between them, at k/9 of the distance. gpui arms the drag on
-/// the first pressed move more than 2px from the press, so a from→to distance
-/// of about 2.25px or less never arms and acts as a click.
+/// the first pressed move more than 2px from the press, and `drag_events`
+/// also sends a pressed move at the destination itself, so a from→to
+/// distance (including `offset`) of 2px or less never arms and acts as a
+/// click.
 fn pointer_drag_path(from: Point<Pixels>, to: Point<Pixels>) -> Vec<Point<Pixels>> {
     let mut path = Vec::with_capacity(10);
     path.push(from);
@@ -1028,8 +1030,10 @@ fn wheel_events(p: Point<Pixels>, dy: f32) -> Vec<PlatformInput> {
 }
 
 /// The press-moves-release a `pointer-drag` dispatches along `path`: an
-/// unpressed hover and the press at the start, pressed moves (which arm and
-/// carry the drag) along the middle, the release at the end.
+/// unpressed hover and the press at the start, then pressed moves (which arm
+/// and carry the drag) — eight between the ends and a ninth at the
+/// destination, so the drag's handlers see the final cell before the
+/// release at the end.
 fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
     let mut events = Vec::with_capacity(path.len() + 2);
     events.push(mouse_move(path[0], None));
@@ -1039,9 +1043,6 @@ fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
             .iter()
             .map(|&p| mouse_move(p, Some(MouseButton::Left))),
     );
-    // A pressed move at the destination too: handlers that track the drag
-    // (the Project range, a chart reorder) see the final cell before the
-    // release, not only the MouseUp.
     events.push(mouse_move(path[path.len() - 1], Some(MouseButton::Left)));
     events.push(mouse_up(path[path.len() - 1]));
     events
@@ -7033,15 +7034,33 @@ mod tests {
                 + (f32::from(p.y) - f32::from(press.y)).powi(2))
             .sqrt()
         };
+        // The pressed moves drag_events actually sends: the eight between
+        // the ends and the ninth at the destination.
+        let pressed_moves = |from: Point<Pixels>, to: Point<Pixels>| {
+            drag_events(&pointer_drag_path(from, to))
+                .into_iter()
+                .filter_map(|e| match e {
+                    PlatformInput::MouseMove(m) => {
+                        (m.pressed_button == Some(MouseButton::Left)).then_some(m.position)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
         let press = point(px(100.), px(100.));
-        let short = pointer_drag_path(press, point(px(106.), px(100.)));
+        let short = pressed_moves(press, point(px(106.), px(100.)));
         assert!(
-            short[1..9].iter().any(|p| dist_from_press(p, &press) > 2.0),
+            short.iter().any(|p| dist_from_press(p, &press) > 2.0),
             "a 6px drag must arm gpui's drag"
         );
-        let tiny = pointer_drag_path(press, point(px(102.), px(100.)));
+        assert_eq!(
+            short.last(),
+            Some(&point(px(106.), px(100.))),
+            "the destination gets a pressed move, so the drag sees the final cell"
+        );
+        let tiny = pressed_moves(press, point(px(102.), px(100.)));
         assert!(
-            tiny[1..9].iter().all(|p| dist_from_press(p, &press) <= 2.0),
+            tiny.iter().all(|p| dist_from_press(p, &press) <= 2.0),
             "a 2px drag must never arm — it acts as a click"
         );
     }

@@ -31197,25 +31197,9 @@ impl Render for Docxy {
                 window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
                     if phase == DispatchPhase::Capture && ev.button == MouseButton::Left {
                         released.update(cx, |this, _cx| {
-                            let Some(tab) = this.tabs.get_mut(this.active) else {
-                                return;
-                            };
-                            // A release lands where the last move never did
-                            // (a fast flick): the drag takes the cell under
-                            // the pointer before it ends.
-                            if matches!(&tab.surface, Surface::Project(v) if v.dragging)
-                                && let Some((row, col)) = match &tab.surface {
-                                    Surface::Project(v) => this
-                                        .probes
-                                        .borrow()
-                                        .current("project-body")
-                                        .and_then(|b| crate::project_cell_at(v, b, ev.position)),
-                                    _ => None,
-                                }
-                            {
-                                crate::project_cell_drag_over(tab, row, col);
+                            if let Some(tab) = this.tabs.get_mut(this.active) {
+                                crate::project_cell_release(tab);
                             }
-                            crate::project_cell_release(tab);
                         });
                     }
                 });
