@@ -1154,6 +1154,36 @@ fn act_targets_cells(act: SheetAct) -> bool {
     )
 }
 
+/// Does `act` need a closed cell editor? (#510) Everything that reads or
+/// rewrites cell content or moves cells does; pure formatting, menus, and
+/// sheet-wide settings leave the editor open, as Excel's edit mode does.
+fn act_commits_editor(act: SheetAct) -> bool {
+    act_targets_cells(act)
+        && !matches!(
+            act,
+            SheetAct::Bold
+                | SheetAct::Italic
+                | SheetAct::AlignL
+                | SheetAct::AlignC
+                | SheetAct::AlignR
+                | SheetAct::WrapText
+                | SheetAct::GrowFont
+                | SheetAct::ShrinkFont
+                | SheetAct::Percent
+                | SheetAct::Currency
+                | SheetAct::Comma
+                | SheetAct::FillColor
+                | SheetAct::FontColor
+                | SheetAct::ToggleBorder
+                | SheetAct::FormatCells
+                | SheetAct::RowHeight
+                | SheetAct::CondFormat
+                | SheetAct::DataValidation
+                | SheetAct::FreezePanes
+                | SheetAct::Merge
+        )
+}
+
 /// A live text field: which target it edits, its buffer, the caret and the
 /// selection anchor (equal to the caret when nothing is selected).
 #[derive(Clone)]
@@ -2290,6 +2320,16 @@ impl SheetView {
         let took = self.take_proposal();
         self.autocorrect_commit(took);
         self.commit_edit_taken(took)
+    }
+
+    /// Commit an open editor before an act runs (#510). None when there is
+    /// no editor; Some(wrote) is the commit's result — true when the buffer
+    /// was written, false when it was refused (the editor stays open with
+    /// [`SheetView::entry_error`] set) or closed untouched (nothing written,
+    /// so the caller must not mark the tab dirty).
+    fn close_editor_for_act(&mut self) -> Option<bool> {
+        self.editing.as_ref()?;
+        Some(self.commit_edit())
     }
 
     /// [`SheetView::commit_edit`] after the proposal was taken (`took`) and
@@ -16057,6 +16097,22 @@ impl Docxy {
         // A multi-area selection runs only what acts on every area (#670).
         if !multi_area_ok(act) && self.multi_area_refused(cx) {
             return self.refocus(window, cx);
+        }
+        // A command that reads or rewrites cell content sees the committed
+        // entry, not a stale buffer (#510): the editor commits once, here.
+        // A written commit dirties the tab like the Enter path does; a
+        // refused one leaves the editor open, says why, and the command
+        // does not run; an untouched seed closes having written nothing.
+        if act_commits_editor(act) {
+            match self.active_sheet_mut().map(SheetView::close_editor_for_act) {
+                Some(Some(true)) => self.mark_sheet_dirty(),
+                Some(Some(false)) if self.active_sheet().is_some_and(|v| v.editing.is_some()) => {
+                    self.sheet_entry_refused(cx);
+                    cx.notify();
+                    return self.refocus(window, cx);
+                }
+                _ => {}
+            }
         }
         // Before anything reads the selection — including the bar seeding below
         // — the grid takes it back, so a command that acts on cells acts on

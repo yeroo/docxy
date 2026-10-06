@@ -1615,3 +1615,90 @@ fn by(col: u32) -> [gridcore::edit::SortLevel; 1] {
 fn no_header() -> gridcore::edit::SortOptions {
     gridcore::edit::SortOptions::default()
 }
+
+// ---- #510: an act that reads or rewrites cell content commits the open editor
+
+/// #510: everything that reads or rewrites cell content or moves cells
+/// closes the editor first; pure formatting, menus and sheet-wide settings
+/// leave it open, as Excel's edit mode does.
+#[test]
+fn acts_that_rewrite_cells_close_the_editor() {
+    for act in [
+        SheetAct::Paste,
+        SheetAct::Cut,
+        SheetAct::Copy,
+        SheetAct::RemoveDuplicates,
+        SheetAct::TextToColumns,
+        SheetAct::Subtotal,
+        SheetAct::Fill(gridcore::edit::FillDir::Down),
+        SheetAct::Clear(gridcore::edit::ClearWhat::Contents),
+        SheetAct::FormatAsTable,
+        SheetAct::Filter,
+        SheetAct::SortAsc,
+        SheetAct::InsertRow,
+        SheetAct::AutoSum,
+    ] {
+        assert!(act_commits_editor(act), "{act:?}");
+    }
+    for act in [
+        SheetAct::Bold,
+        SheetAct::Percent,
+        SheetAct::FormatCells,
+        SheetAct::Merge,
+        SheetAct::ProtectSheet,
+        SheetAct::Menu(sheet_menus::SheetMenu::Clear),
+        SheetAct::Todo,
+    ] {
+        assert!(!act_commits_editor(act), "{act:?}");
+    }
+}
+
+/// #510: the commit lands on the editor's origin cell, not on whatever cell
+/// the selection has moved to, and records exactly one undo step.
+#[test]
+fn close_editor_for_act_commits_the_buffer_to_its_origin() {
+    let mut v = view();
+    type_fresh(&mut v, "42");
+    select(&mut v, 1, 1);
+    assert_eq!(v.close_editor_for_act(), Some(true));
+    assert_eq!(value(&v, 0, 0), CellValue::Number(42.0));
+    assert_eq!(value(&v, 1, 1), CellValue::default(), "B2 stays empty");
+    assert!(v.editing.is_none());
+    assert_eq!(v.undo.len(), 1);
+}
+
+/// #510: a refused commit (a formula that does not parse) leaves the editor
+/// open with its error and records nothing; the act must not run.
+#[test]
+fn close_editor_for_act_keeps_a_refused_editor_open() {
+    let mut v = view();
+    type_fresh(&mut v, "=SUM(A1");
+    assert_eq!(v.close_editor_for_act(), Some(false));
+    assert!(v.editing.is_some(), "the editor stays open");
+    assert!(v.entry_error.is_some());
+    assert!(v.undo.is_empty(), "a refused commit records no undo step");
+}
+
+/// #510: no editor open — nothing happens.
+#[test]
+fn close_editor_for_act_without_editor_is_a_noop() {
+    let mut v = view();
+    assert_eq!(v.close_editor_for_act(), None);
+    assert!(v.undo.is_empty());
+    assert!(v.entry_error.is_none());
+}
+
+/// #510: a seeded editor left untouched closes without writing or recording
+/// an undo step, so the tab must not turn dirty for a byte-identical
+/// workbook (the Enter path's guarantee, sheet-edit.uit's first case).
+#[test]
+fn close_editor_for_act_closes_an_untouched_editor_without_writing() {
+    let mut v = view();
+    put(&mut v, 0, 0, Cell::text("old"));
+    v.begin_cell_edit(None);
+    assert!(v.edit_untouched(), "seeded from the cell");
+    assert_eq!(v.close_editor_for_act(), Some(false));
+    assert!(v.editing.is_none());
+    assert_eq!(value(&v, 0, 0), CellValue::Text("old".into()));
+    assert!(v.undo.is_empty());
+}

@@ -235,3 +235,29 @@ test f9 replaces a formula with its value
   key enter
   call cell {"cell":"H6"}
   assert reply.value is 42
+
+# #510: a ribbon act that reads or rewrites cell content commits the open
+# editor to its origin cell first; the act then sees the committed value.
+test ribbon act with an open editor commits first
+  open copy:../fixtures/basic.xlsx
+  click A7
+  type 99
+  assert editing is true
+  call ribbon-click {"tab":"Home","command":"Copy"}
+  assert editing is false
+  assert cell A7 is 99
+  assert dirty is true
+
+# #510: a cell act only closes an untouched seeded editor; it writes nothing
+# and the tab stays clean.
+test an untouched editor a cell act closes stays clean
+  open copy:../fixtures/basic.xlsx
+  click A1
+  assert dirty is false
+  snapshot A1
+  key f2
+  assert editing is true
+  call ribbon-click {"tab":"Home","command":"Copy"}
+  assert editing is false
+  assert dirty is false
+  assert cells unchanged
