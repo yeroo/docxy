@@ -434,20 +434,16 @@ fn text_box_copies(raw: &str) -> Vec<TextBoxCopy> {
 /// left alone). Malformed XML is returned as it is.
 fn without_para_ids(xml: &str) -> String {
     use crate::xml::{Event, XmlParser};
-    let base = xml.as_ptr() as usize;
     let mut cuts = Vec::new();
     let mut p = XmlParser::new(xml);
     loop {
         match p.next() {
             Event::Start => {
                 for a in p.attrs().iter().filter(|a| a.name == "w14:paraId") {
-                    let (name_at, value_at) = (a.name.as_ptr() as usize, a.value.as_ptr() as usize);
-                    let inside = |at: usize| at >= base && at <= base + xml.len();
-                    if !inside(name_at) || !inside(value_at) || value_at < name_at {
+                    let Some(cut) = crate::serialize::attr_source_range(xml, a) else {
                         return xml.to_string();
-                    }
-                    let start = xml[..name_at - base].trim_end().len();
-                    cuts.push(start..value_at - base + a.value.len() + 1);
+                    };
+                    cuts.push(cut);
                 }
             }
             Event::Eof => break,
@@ -457,14 +453,7 @@ fn without_para_ids(xml: &str) -> String {
     if p.is_malformed() {
         return xml.to_string();
     }
-    let mut out = String::with_capacity(xml.len());
-    let mut at = 0;
-    for cut in cuts {
-        out.push_str(&xml[at..cut.start]);
-        at = cut.end;
-    }
-    out.push_str(&xml[at..]);
-    out
+    crate::serialize::without_ranges(xml, &cuts)
 }
 
 /// What `target` counts in a text box's `raw` beyond what its `blocks`

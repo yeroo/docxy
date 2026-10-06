@@ -1603,8 +1603,6 @@ mod win {
     into_disp!(WordFont, IFont);
     into_disp!(ParaFmt, IParaFmt);
 
-    /// Apply a RunProps change to the current format (`all=false`) or to every run
-    /// in the document (`all=true`).
     /// `_Font.Name` put, shared by the vtable and the late-bound (IDispatch)
     /// path: the font is saved from the model, without a loaded theme font
     /// overriding it (#1063).
@@ -1619,6 +1617,8 @@ mod win {
         p.forget_loaded_color();
     }
 
+    /// Apply a RunProps change to the current format (`all=false`) or to every run
+    /// in the document (`all=true`).
     fn set_font(doc: usize, all: bool, f: impl Fn(&mut RunProps)) {
         reg(|r| {
             if let Some(d) = r.docs.get_mut(doc) {

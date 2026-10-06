@@ -726,3 +726,95 @@ fn property_changes_and_containers_keep_namespaces_declared_below_the_root() {
         assert!(xml.contains(kept), "{kept} lost: {xml}");
     }
 }
+
+/// Review r4: a binding declared on `w:body` (or `w:tc`) comes along on the
+/// cell content that uses it, so the content stays well-formed after it moves
+/// out of the table, which redeclared the binding on the rebuilt `w:tbl`.
+#[test]
+fn cell_content_moved_out_of_its_table_keeps_its_namespaces() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\">"),
+        "<w:body xmlns:ux=\"urn:ux\"><w:tbl><w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid>\
+         <w:tr><w:tc><w:p ux:p=\"1\"><w:pPr><w:keepNext ux:k=\"1\"/></w:pPr>\
+         <w:r><w:rPr><w:lang w:val=\"en-US\" ux:l=\"1\"/></w:rPr><w:t>cell</w:t></w:r></w:p>\
+         </w:tc></w:tr></w:tbl><w:p/></w:body>",
+    );
+    let (pkg, mut editor) = open(&original);
+    editor.set_caret(Caret::at(vec![0, 0, 0, 0], 0));
+    editor.select_cell().expect("cell selected");
+    editor
+        .table_to_text(docxcore::editor::CellSep::Paragraph)
+        .expect("converted");
+    assert!(matches!(editor.doc.body[0], Block::Paragraph(_)));
+    // `document_xml` checks that every prefix stays bound.
+    let xml = document_xml(&save(pkg, editor));
+    for kept in ["ux:p=\"1\"", "ux:k=\"1\"", "ux:l=\"1\""] {
+        assert!(xml.contains(kept), "{kept} lost: {xml}");
+    }
+}
+
+/// Review r4: a binding the part root declares stays declared there on save,
+/// so a table, which the save redeclares it on, reloads to the same model.
+#[test]
+fn a_table_using_a_root_declared_prefix_reloads_to_the_same_model() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:ux=\"urn:ux\">"),
+        "<w:body><w:tbl><w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\" ux:t=\"1\"/></w:tblPr>\
+         <w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid>\
+         <w:tr><w:tc><w:tcPr><w:tcW w:w=\"2000\" w:type=\"dxa\" ux:c=\"1\"/></w:tcPr>\
+         <w:p ux:p=\"1\"><w:pPr><w:keepNext ux:k=\"1\"/></w:pPr>\
+         <w:r><w:rPr><w:lang w:val=\"en-US\" ux:l=\"1\"/></w:rPr><w:t>cell</w:t></w:r></w:p>\
+         </w:tc></w:tr></w:tbl><w:p/></w:body>",
+    );
+    let (pkg, editor) = open(&original);
+    let loaded = editor.doc.clone();
+    let saved = save(pkg, editor);
+    let xml = document_xml(&saved);
+    assert!(!xml.contains("<w:keepNext xmlns:ux"), "{xml}");
+    let (_, reloaded) = open(&saved);
+    assert_eq!(reloaded.doc, loaded);
+}
+
+/// Review r4: rejecting a tracked change restores a snapshot that keeps the
+/// bindings declared around it.
+#[test]
+fn a_rejected_property_change_keeps_the_snapshots_namespaces() {
+    let date = "2026-01-01T00:00:00Z";
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\">"),
+        &format!(
+            "<w:body><w:p><w:r><w:rPr xmlns:ux=\"urn:ux\"><w:b/>\
+             <w:rPrChange w:id=\"1\" w:author=\"A\" w:date=\"{date}\"><w:rPr>\
+             <w:lang w:val=\"en-US\" ux:l=\"1\"/></w:rPr></w:rPrChange></w:rPr>\
+             <w:t>text</w:t></w:r></w:p></w:body>"
+        ),
+    );
+    let (pkg, mut editor) = open(&original);
+    assert_eq!(editor.reject_all_revisions().len(), 1);
+    let xml = document_xml(&save(pkg, editor));
+    assert!(
+        !xml.contains("<w:b/>") && xml.contains("ux:l=\"1\""),
+        "{xml}"
+    );
+}
+
+/// Review r4: an `mc:Choice`'s unprefixed `Requires`, and a markup-
+/// compatibility value written with character references, name prefixes
+/// too.
+#[test]
+fn requires_and_escaped_compatibility_values_keep_their_namespaces() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\">"),
+        "<w:body xmlns:ux=\"urn:ux\" xmlns:uy=\"urn:uy\"><w:p><w:pPr>\
+         <w:keepNext mc:Ignorable=\"u&#120;\"/>\
+         <mc:AlternateContent><mc:Choice Requires=\"uy\"><w:keepLines/></mc:Choice>\
+         </mc:AlternateContent></w:pPr><w:r><w:t>text</w:t></w:r></w:p></w:body>",
+    );
+    let (pkg, editor) = open(&original);
+    let xml = document_xml(&save(pkg, editor));
+    assert!(
+        xml.contains("<w:keepNext xmlns:ux=\"urn:ux\"")
+            && xml.contains("<mc:AlternateContent xmlns:uy=\"urn:uy\">"),
+        "{xml}"
+    );
+}

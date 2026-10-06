@@ -60,7 +60,6 @@ fn without_duplicate_para_ids(xml: String) -> String {
     }
     let mut seen = std::collections::HashSet::new();
     let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
-    let base = xml.as_ptr() as usize;
     let local = |name: &str| name.rsplit(':').next().unwrap_or_default().to_string();
     let mut parser = XmlParser::new(&xml);
     // Open elements by local name, and how many of them are a fallback. A
@@ -89,18 +88,10 @@ fn without_duplicate_para_ids(xml: String) -> String {
                 if seen.insert(attr.value.to_string()) {
                     continue;
                 }
-                // From the whitespace before the name to the closing quote.
-                // An attribute without a quoted value (malformed XML kept
-                // raw) has no place in `xml` to cut.
-                let (name_at, value_at) =
-                    (attr.name.as_ptr() as usize, attr.value.as_ptr() as usize);
-                let inside = |at: usize| at >= base && at <= base + xml.len();
-                if !inside(name_at) || !inside(value_at) || value_at < name_at {
+                let Some(cut) = attr_source_range(&xml, attr) else {
                     return xml;
-                }
-                let value_end = value_at - base + attr.value.len() + 1;
-                let start = xml[..name_at - base].trim_end().len();
-                cuts.push(start..value_end);
+                };
+                cuts.push(cut);
             }
             Event::Eof => break,
             _ => {}
@@ -110,6 +101,29 @@ fn without_duplicate_para_ids(xml: String) -> String {
     if parser.is_malformed() {
         return xml;
     }
+    without_ranges(&xml, &cuts)
+}
+
+/// The source range of attribute `attr` of a start tag parsed from `xml`,
+/// from the whitespace before its name to its closing quote: the text to cut
+/// to remove it. None for an attribute without a quoted value (malformed XML,
+/// whose synthetic empty value is not in `xml`).
+pub(crate) fn attr_source_range(
+    xml: &str,
+    attr: &crate::xml::XmlAttr,
+) -> Option<std::ops::Range<usize>> {
+    let base = xml.as_ptr() as usize;
+    let (name_at, value_at) = (attr.name.as_ptr() as usize, attr.value.as_ptr() as usize);
+    let inside = |at: usize| at >= base && at <= base + xml.len();
+    if !inside(name_at) || !inside(value_at) || value_at < name_at {
+        return None;
+    }
+    let start = xml[..name_at - base].trim_end().len();
+    Some(start..value_at - base + attr.value.len() + 1)
+}
+
+/// `xml` without the byte ranges `cuts` (in order, not overlapping).
+pub(crate) fn without_ranges(xml: &str, cuts: &[std::ops::Range<usize>]) -> String {
     let mut out = String::with_capacity(xml.len());
     let mut at = 0;
     for cut in cuts {
