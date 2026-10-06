@@ -3557,7 +3557,7 @@ fn ctrl_f2_links_selected_rows_in_row_order_in_one_undo_step() {
     select_rows_down(&mut t, 2);
     let depth = v(&t).ed.undo_depth();
     chord(&mut t, "f2", ctrl());
-    assert_eq!(t.status.as_ref(), "Linked 2 tasks");
+    assert_eq!(t.status.as_ref(), "Added 2 links");
     assert_eq!(
         v(&t).ed.project().task(2).unwrap().predecessors,
         [projcore::Predecessor::fs(1)]
@@ -3572,7 +3572,7 @@ fn ctrl_f2_links_selected_rows_in_row_order_in_one_undo_step() {
     assert_eq!(v(&t).selection().unwrap().uids, [1, 2, 3]);
     // Again: every pair is already linked, so nothing happens.
     chord(&mut t, "f2", ctrl());
-    assert_eq!(t.status.as_ref(), "Linked 0 tasks");
+    assert_eq!(t.status.as_ref(), "No links to add");
     assert_eq!(v(&t).ed.undo_depth(), depth + 1);
     chord(&mut t, "z", ctrl());
     assert_eq!(predecessors(&t, 2), 0);
@@ -3642,7 +3642,7 @@ fn ctrl_f2_without_a_range_still_opens_the_prompt() {
     // A one-row selection (an ID click) is not a range: the prompt opens too.
     let mut t = tab();
     project_cell_press(&mut t, 1, COL_ID, false);
-    project_cell_release(&mut t);
+    project_cell_release(&mut t, true);
     project_cell_click(&mut t, 1, Some(COL_ID), false);
     assert_eq!(v(&t).selection().unwrap().count(), COLUMN_COUNT);
     chord(&mut t, "f2", ctrl());
@@ -3659,4 +3659,31 @@ fn ctrl_f2_without_a_range_still_opens_the_prompt() {
     vm(&mut t).ed.select(1);
     chord(&mut t, "f2", ctrl_shift());
     assert_eq!(t.status.as_ref(), "Removed 1 link");
+}
+
+#[test]
+fn host_handled_commands_clear_the_range() {
+    use ProjectAct::*;
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    };
+    // Save runs in the host, levelling returns before apply_project_act's
+    // clearing: neither leaves the range standing (AC1).
+    for (key_name, m, act) in [("s", ctrl(), Save), ("l", ctrl_shift(), Level)] {
+        let mut t = tab();
+        vm(&mut t).ed.select(0);
+        vm(&mut t).col = COL_NAME;
+        assert_eq!(project_input(&mut t, "down", None, shift), None);
+        assert!(v(&t).selection().is_some());
+        assert_eq!(project_input(&mut t, key_name, None, m), Some(act));
+        assert_eq!(v(&t).selection(), None, "{act:?}");
+    }
+    // Copy is the exception: the highlight survives the copy.
+    let mut t = tab();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    assert_eq!(project_input(&mut t, "down", None, shift), None);
+    assert_eq!(project_input(&mut t, "c", None, ctrl()), Some(Copy));
+    assert!(v(&t).selection().is_some());
 }
