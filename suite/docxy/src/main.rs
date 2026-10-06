@@ -5037,9 +5037,10 @@ fn tracked_page(probe: &RulerProbe) -> Option<usize> {
 mod ruler_geom_tests {
     use super::{
         Block, EffIndent, Inline, LeadingItem, Pal, Paragraph, RulerChange, RulerDrag, RulerHandle,
-        RulerProbe, ScreenRect, dragged_left_marker, eff_indent, hruler_geom, hruler_hit,
-        leading_items, next_tab_stop, page_of_block, page_ranges_of, paragraph_indent_layout,
-        px_tw, ruler_colors, ruler_drag_result, tracked_page, tw_px, vruler_geom,
+        RulerProbe, ScreenRect, caret_scroll_index, dragged_left_marker, eff_indent, hruler_geom,
+        hruler_hit, leading_items, next_tab_stop, page_needs_scroll, page_of_block, page_ranges_of,
+        paragraph_indent_layout, px_tw, ruler_colors, ruler_drag_result, tracked_page, tw_px,
+        vruler_geom,
     };
     use docxcore::model::{PageGeom, ParProps, Run, TabAlign, TabLeader, TabStop};
 
@@ -5630,6 +5631,56 @@ mod ruler_geom_tests {
         assert!(ranges.len() > 1, "expected multiple pages, got {ranges:?}");
         let last = body.len() - 1;
         assert_eq!(page_of_block(&ranges, last), Some(ranges.len() - 1));
+    }
+
+    #[test]
+    fn caret_scroll_index_targets_the_page_in_print_layout_and_the_block_in_draft() {
+        let ranges = vec![vec![(0, 2)], vec![(2, 4)], vec![(4, 6)]];
+        assert_eq!(caret_scroll_index(true, &ranges, 0), 0);
+        assert_eq!(caret_scroll_index(true, &ranges, 5), 2);
+        // Draft view's children are blocks: the index passes through.
+        assert_eq!(caret_scroll_index(false, &ranges, 5), 5);
+    }
+
+    #[test]
+    fn caret_scroll_index_falls_back_to_the_last_page() {
+        let ranges = vec![vec![(0, 2)], vec![(2, 4)]];
+        assert_eq!(caret_scroll_index(true, &ranges, 99), 1);
+        assert_eq!(caret_scroll_index(true, &[], 7), 0);
+    }
+
+    #[test]
+    fn page_needs_scroll_misses_only_when_the_page_is_off_screen() {
+        let mut p = RulerProbe {
+            viewport: Some(ScreenRect {
+                x: 0.0,
+                y: 0.0,
+                w: 500.0,
+                h: 500.0,
+            }),
+            pages: vec![
+                Some(ScreenRect {
+                    x: 20.0,
+                    y: 0.0,
+                    w: 400.0,
+                    h: 500.0,
+                }),
+                Some(ScreenRect {
+                    x: 20.0,
+                    y: 700.0,
+                    w: 400.0,
+                    h: 500.0,
+                }),
+            ],
+            ..RulerProbe::default()
+        };
+        assert!(!page_needs_scroll(&p, 0));
+        assert!(page_needs_scroll(&p, 1));
+        // An unpainted page rect or viewport: the caret may be off-screen.
+        p.pages[0] = None;
+        assert!(page_needs_scroll(&p, 0));
+        p.viewport = None;
+        assert!(page_needs_scroll(&p, 1));
     }
 
     #[test]
