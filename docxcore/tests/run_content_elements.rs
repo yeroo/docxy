@@ -399,3 +399,22 @@ fn a_trailing_soft_hyphen_keeps_the_end_caret_stop() {
     let last = seg.visual.last().unwrap();
     assert_eq!((last.offset, last.col), (4, 3), "{:?}", seg.visual);
 }
+
+/// A line that starts with a soft hyphen, or holds nothing else, keeps its
+/// start caret stop too (review r2).
+#[test]
+fn a_leading_or_sole_soft_hyphen_keeps_the_start_caret_stop() {
+    let stops = |body: &str| {
+        let doc = load(&format!("<w:p><w:r>{body}</w:r></w:p>"));
+        let (_, maps) = docxcore::render::render_mapped(&doc, &RenderOptions::default());
+        maps[0].segs[0]
+            .visual
+            .iter()
+            .map(|s| (s.offset, s.col))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(stops("<w:softHyphen/>"), [(0, 0), (1, 0)]);
+    let lead = stops("<w:softHyphen/><w:t>abc</w:t>");
+    assert_eq!(lead.first(), Some(&(0, 0)), "{lead:?}");
+    assert_eq!(lead.last(), Some(&(4, 3)), "{lead:?}");
+}

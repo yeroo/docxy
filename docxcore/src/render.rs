@@ -2140,24 +2140,41 @@ fn projected_caret_stops(visual: &BidiVisualLine) -> Vec<LineCaretStop> {
         }
         compacted.push(stop);
     }
-    // Zero-width content at the line's logical end (`abc` + a soft hyphen)
-    // still ends the line: keep a stop for that offset, at its column, or
-    // End and Shift+End would stop short of it (#1101).
-    let end = extents.iter().map(|extent| extent.end).max();
-    if let Some(last) = extents
-        .iter()
-        .find(|extent| Some(extent.end) == end && extent.cells.start == extent.cells.end)
-    {
-        if !compacted.iter().any(|stop| stop.offset == last.end) {
-            let at = compacted.partition_point(|stop| stop.col <= last.cells.end);
-            compacted.insert(
-                at,
-                LineCaretStop {
-                    offset: last.end,
-                    col: last.cells.end,
-                },
-            );
+    // Zero-width content at either logical end of the line (a soft hyphen
+    // before `abc` or after it, or all there is) still starts or ends the
+    // line: keep a stop for that offset at its column, or Home/End and
+    // Shift+End would stop short of it (#1101). Visual order puts the
+    // logical start first in a left-to-right extent and last in a
+    // right-to-left one, and the end the other way round.
+    let first = extents.iter().map(|extent| extent.start).min();
+    let last = extents.iter().map(|extent| extent.end).max();
+    for (offset, is_end) in [(first, false), (last, true)] {
+        let Some(offset) = offset else {
+            continue;
+        };
+        if compacted.iter().any(|stop| stop.offset == offset) {
+            continue;
         }
+        let Some(extent) = extents.iter().find(|extent| {
+            extent.cells.start == extent.cells.end
+                && if is_end {
+                    extent.end == offset
+                } else {
+                    extent.start == offset
+                }
+        }) else {
+            continue;
+        };
+        let col = extent.cells.start;
+        let after_stops_at_col = is_end == (extent.level % 2 == 0);
+        let at = compacted.partition_point(|stop| {
+            if after_stops_at_col {
+                stop.col <= col
+            } else {
+                stop.col < col
+            }
+        });
+        compacted.insert(at, LineCaretStop { offset, col });
     }
     compacted
 }
