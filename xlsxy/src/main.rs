@@ -2601,6 +2601,9 @@ impl App {
                 let (r, c) = alert.cell;
                 if self.apply(vec![(r, c, alert.entry)]) {
                     self.edit = None;
+                    // A typed entry, as `commit_edit` writes one that breaks
+                    // no rule.
+                    self.table_autocorrect(self.sheet, (r, c));
                     self.run_cont(alert.cont);
                 }
             }
@@ -20117,6 +20120,28 @@ mod tests {
         press(&mut app, KeyCode::Enter); // OK
         assert_eq!(value_at(&app, 1, 1), CellValue::Number(250.0));
         assert_eq!(app.cur, (1, 2), "OK makes the Tab move");
+    }
+
+    /// #682: an entry a warning let in below a table grows it, as one that
+    /// broke no rule does.
+    #[test]
+    fn an_accepted_warning_entry_below_a_table_grows_it() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Warning);
+        put(&mut app, 0, 0, "Item");
+        put(&mut app, 0, 1, "Score");
+        put(&mut app, 1, 0, "x");
+        app.pkg
+            .add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
+            .unwrap();
+        app.rebuild_engine();
+        app.cur = (2, 1);
+        type_text(&mut app, "250");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_some());
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(value_at(&app, 2, 1), CellValue::Number(250.0));
+        assert_eq!(app.pkg.workbook.tables[0].range, (0, 0, 2, 1));
     }
 
     #[test]
