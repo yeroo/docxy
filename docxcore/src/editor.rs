@@ -1541,9 +1541,12 @@ impl Editor {
             let highlight = p.highlight.take();
             // The run's rsids are bookkeeping, not formatting.
             let element_attrs = std::mem::take(&mut p.element_attrs);
+            // Nor is how its hyphens are written (#1101).
+            let hyphen_elements = p.hyphen_elements;
             *p = RunProps::default();
             p.highlight = highlight;
             p.element_attrs = element_attrs;
+            p.hyphen_elements = hyphen_elements;
         });
     }
 

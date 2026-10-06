@@ -1210,8 +1210,22 @@ fn is_bidi_format(ch: char) -> bool {
 }
 
 fn glyph_display(g: &Glyph) -> Option<char> {
-    let ch = g.disp.unwrap_or(g.ch);
-    (!is_bidi_format(ch)).then_some(ch)
+    match g.disp {
+        Some(ch) => (!is_bidi_format(ch)).then_some(ch),
+        None => hyphen_display(g.ch).unwrap_or((!is_bidi_format(g.ch)).then_some(g.ch)),
+    }
+}
+
+/// How a terminal shows a non-breaking or soft hyphen (#1101): U+2011 as a
+/// plain `-` (many terminal fonts lack it), U+00AD not at all (terminals
+/// disagree on its width). `None` for any other character. The model keeps
+/// the characters; this is display only.
+fn hyphen_display(ch: char) -> Option<Option<char>> {
+    match ch {
+        '\u{2011}' => Some(Some('-')),
+        '\u{ad}' => Some(None),
+        _ => None,
+    }
 }
 
 /// Display width of a glyph (its shown char), in terminal cells.
@@ -1921,7 +1935,9 @@ fn project_line(
             .iter()
             .map(|g| BidiInputGlyph {
                 ch: g.ch,
-                display: g.disp.map(|ch| ch.to_string()),
+                display: g.disp.map(|ch| ch.to_string()).or_else(|| {
+                    hyphen_display(g.ch).map(|shown| shown.map(String::from).unwrap_or_default())
+                }),
                 logical_offset: g.src,
                 direction: g.dir,
             })

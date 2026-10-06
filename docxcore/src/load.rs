@@ -1907,7 +1907,16 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
         ..RunProps::default()
     };
     let mut had_raw = false;
+    // The previous child was text (`w:t`) or a hyphen element: the Run it
+    // left at the end of `out` (which holds this `w:r` only) can take a
+    // hyphen element, so `e<w:noBreakHyphen/>commerce` is one Run and saves
+    // as one `w:r` again (#1101).
+    let mut after_text = false;
+    let mut after_hyphen = false;
     loop {
+        let (was_text, was_hyphen) = (after_text, after_hyphen);
+        after_text = false;
+        after_hyphen = false;
         match p.next() {
             Event::Start => match p.name() {
                 "w:rPr" => parse_rpr(p, &mut props),
@@ -1915,9 +1924,40 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                 // like `w:t` so deleted content is visible (a normal run has none).
                 "w:t" | "w:delText" => {
                     let text = read_text(p);
+                    after_text = true;
+                    // Text after a hyphen element joins its Run; `w:t` after
+                    // `w:t` stays two Runs as before.
+                    if let (true, Some(Inline::Run(run))) = (was_hyphen, out.last_mut()) {
+                        run.text.push_str(&text);
+                        continue;
+                    }
                     out.push(Inline::Run(Run {
                         text,
                         props: props.clone(),
+                    }));
+                }
+                // Held in the text as U+2011 / U+00AD; the run's
+                // `hyphen_elements` writes them back as these elements.
+                name @ ("w:noBreakHyphen" | "w:softHyphen") => {
+                    let ch = if name == "w:noBreakHyphen" {
+                        '\u{2011}'
+                    } else {
+                        '\u{ad}'
+                    };
+                    p.skip_element();
+                    after_hyphen = true;
+                    if let (true, Some(Inline::Run(run))) = (was_text || was_hyphen, out.last_mut())
+                    {
+                        run.text.push(ch);
+                        run.props.hyphen_elements = true;
+                        continue;
+                    }
+                    out.push(Inline::Run(Run {
+                        text: ch.to_string(),
+                        props: RunProps {
+                            hyphen_elements: true,
+                            ..props.clone()
+                        },
                     }));
                 }
                 "w:cr" => {
@@ -1956,6 +1996,19 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                 | "w:commentReference"
                 | "w:footnoteReference"
                 | "w:endnoteReference"
+                | "w:footnoteRef"
+                | "w:endnoteRef"
+                | "w:annotationRef"
+                | "w:separator"
+                | "w:continuationSeparator"
+                | "w:ptab"
+                | "w:pgNum"
+                | "w:dayShort"
+                | "w:dayLong"
+                | "w:monthShort"
+                | "w:monthLong"
+                | "w:yearShort"
+                | "w:yearLong"
                 | "mc:AlternateContent" => {
                     had_raw = true;
                     p.skip_element();
@@ -1963,7 +2016,8 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
-            Event::Text => {}
+            // Whitespace between children does not separate them.
+            Event::Text => (after_text, after_hyphen) = (was_text, was_hyphen),
         }
     }
     had_raw

@@ -8879,6 +8879,18 @@ mod tests {
         assert_eq!(maps[0].segs[0].col_for_offset(0), Some(0));
     }
 
+    /// Projected lines show a non-breaking hyphen as `-` and a soft hyphen
+    /// not at all, as identity rendering does; the soft hyphen keeps its
+    /// logical offset (#1101).
+    #[test]
+    fn bidi_renderer_shows_hyphens_like_identity_rendering() {
+        let doc = bidi_doc(vec![bidi_para("e\u{2011}mail co\u{ad}op")]);
+        let (lines, maps) = docxcore::render::render_mapped(&doc, &bidi_opts(20));
+        assert_eq!(lines[0].plain(), "e-mail coop");
+        assert_eq!(maps[0].segs[0].col_for_offset(8), Some(8));
+        assert_eq!(maps[0].segs[0].col_for_offset(10), Some(9));
+    }
+
     #[test]
     fn bidi_renderer_keeps_alignment_separate_from_reordering() {
         let mut right = ParProps::default();
