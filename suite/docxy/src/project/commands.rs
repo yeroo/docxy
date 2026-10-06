@@ -959,16 +959,16 @@ fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, 
             });
         }
         PromptKind::Notes => {
-            let task = v.ed.project().task(uid).ok_or("No task selected")?;
             let notes = projcore::text::notes_from_line(&p.buf);
-            // Enter on the prefill the prompt opened with changes nothing:
-            // the one-line form is a bijection, so the comparison is exact.
-            // An empty buffer still removes a note that exists, and stored
-            // empty notes count as none, so "empty to remove" is not swallowed.
-            if notes == task.notes.as_deref().unwrap_or("") {
+            // Decoding the prefill gives back the stored notes exactly
+            // (notes_from_line ∘ notes_to_line is the identity), so the
+            // changed flag the editor reports on the normalised comparison
+            // is exact. An empty buffer still removes a note that exists,
+            // and stored empty notes count as none, so "empty to remove" is
+            // not swallowed.
+            if !v.ed.set_notes(uid, &notes)? {
                 return Ok(None);
             }
-            v.ed.set_notes(uid, &notes)?;
             return Ok(Some(
                 if notes.is_empty() {
                     "Notes removed"

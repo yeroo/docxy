@@ -156,7 +156,7 @@ fn edited_hyperlink_survives_save_and_reload() {
 fn set_notes_is_one_undo_step() {
     let mut ed = editor();
     let before = ed.project().clone();
-    ed.set_notes(10, "Line 1\nLine 2").unwrap();
+    assert!(ed.set_notes(10, "Line 1\nLine 2").unwrap());
     // The notes land as ONE undo step.
     assert_eq!(ed.undo_depth(), 1);
     assert!(ed.dirty());
@@ -174,14 +174,14 @@ fn set_notes_is_one_undo_step() {
 #[test]
 fn set_notes_empty_removes_and_noop_pushes_nothing() {
     let mut ed = editor();
-    ed.set_notes(10, "docs").unwrap();
+    assert!(ed.set_notes(10, "docs").unwrap());
     ed.mark_saved();
     let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
     // The value a task already has changes nothing: no undo step, no dirt.
-    ed.set_notes(10, "docs").unwrap();
+    assert!(!ed.set_notes(10, "docs").unwrap());
     assert_eq!((ed.undo_depth(), ed.redo_depth(), ed.dirty()), history);
     // Empty text removes the notes, as one undo step holding the old value.
-    ed.set_notes(10, "").unwrap();
+    assert!(ed.set_notes(10, "").unwrap());
     assert_eq!(ed.undo_depth(), history.0 + 1);
     assert_eq!(ed.project().task(10).unwrap().notes, None);
     assert!(ed.undo());
@@ -189,10 +189,11 @@ fn set_notes_empty_removes_and_noop_pushes_nothing() {
         ed.project().task(10).unwrap().notes.as_deref(),
         Some("docs")
     );
-    // Removing notes that are not there is a no-op too.
-    ed.set_notes(10, "").unwrap();
+    // Removing the restored note changes it; removing what is not there is
+    // a no-op.
+    assert!(ed.set_notes(10, "").unwrap());
     let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
-    ed.set_notes(10, "").unwrap();
+    assert!(!ed.set_notes(10, "").unwrap());
     assert_eq!((ed.undo_depth(), ed.redo_depth(), ed.dirty()), history);
 }
 
