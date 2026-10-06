@@ -224,18 +224,35 @@ cargo test -p gridcore --test fidelity -- --nocapture
   recursively. `FIDELITY_REQUIRE_CORPUS` and `FIDELITY_UPDATE_BASELINE` work as
   for docx. `FIDELITY_UPDATE_BASELINE=1 cargo test --workspace` rewrites both
   baselines.
-- **Equivalences.** A regenerated worksheet differs from the source in ways a
-  detail glob cannot tell apart from a loss. Examples: `0.14000000000000001`
-  written `0.14`, and a dropped `<c r="B2"/>` whose summary looks like a dropped
-  cell that had a value. `EQUIVALENCES` in `gridcore/tests/fidelity.rs` checks
-  such findings against the original part and drops them before the allowlist.
-  The test prints a count per rule, as it does for the allowlist. The rules are:
-  - the same double in another spelling, in a number cell or a column width;
-  - a boolean spelled `1`/`0`;
-  - an empty cell with the default style;
-  - a row holding only such cells.
+- **The cell check.** A regenerated worksheet differs from its source in ways
+  that change nothing a reader sees, and a structural finding cannot tell
+  them from a loss. Examples: `0.14000000000000001` written `0.14`, an inline
+  string moved to the shared strings, a shared formula expanded per cell, a
+  dropped `<c r="B2"/>`. So each worksheet is also read the way a spreadsheet
+  reads it. For every cell either side lists, it compares three things:
+  - the **value**: shared and inline strings resolved, run formatting
+    included; numbers as doubles; booleans; errors;
+  - the **formula**: its text, plus kind and range for array and data-table
+    formulas. A shared formula's follower agrees with any formula;
+  - the **effective style**: the cell's own `s`, else its row's (with
+    `customFormat`), else its column's.
 
-  Growing this list needs the same review as the allowlist.
+  A difference is a `changed-value` finding at `/cells/<ref>/value`,
+  `/cells/<ref>/formula` or `/cells/<ref>/style`. Its baseline line covers
+  that one cell, so a new loss in another cell of the same sheet is NEW.
+
+  The structural findings the check covers are dropped: cells, their `<v>`,
+  `<is>` and `<f>` text, the cell attributes `r`, `s` and `t`, the formula
+  attributes `t`, `si` and `ref`, and rows carrying nothing but `r` and
+  `spans`. Other row attributes, other cell attributes (`vm`, `cm`, `ph`) and
+  other formula attributes (`ca`, `aca`) stay structural findings. Their
+  baseline lines are index-free like docx's, so one line covers every
+  occurrence in that sheet. The test prints how many findings the check
+  covered.
+- **Equivalences.** `EQUIVALENCES` in `gridcore/tests/fidelity.rs` drops what
+  else a glob cannot express, today only a column width in another spelling
+  of the same double. It checks against the original part and is counted like
+  the allowlist, and growing it needs the same review.
 
 ## What it does not cover
 - Fixing the losses it found:
