@@ -23265,10 +23265,10 @@ mod repeat_tests {
         let mut rec = None;
         select(&mut ed, 0, 3, 4);
         key(&mut ed, &mut rec, "enter", true, false);
-        let x = xml(&ed);
-        assert!(x.contains("<w:br w:type=\"page\"/>"));
-        assert!(x.contains("One") && x.contains("Two"));
-        assert!(!x.contains("One Two"));
+        assert!(xml(&ed).contains("<w:br w:type=\"page\"/>"));
+        assert_eq!(text(&ed, 0), "One\nTwo");
+        assert!(ed.undo());
+        assert_eq!(text(&ed, 0), "One Two");
     }
 
     /// #619's reproduction: `one`, Enter, `two`, Ctrl+A, Ctrl+B.

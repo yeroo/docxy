@@ -490,6 +490,33 @@ mod tests {
     }
 
     #[test]
+    fn show_hide_labels_a_new_section_break_by_the_section_it_starts_645() {
+        let mut e = three();
+        e.caret = Caret::top(1, 1);
+        e.insert_section_break(SectionStart::Continuous).unwrap();
+        let opts = crate::render::RenderOptions {
+            width: 40,
+            show_invisibles: true,
+            ..Default::default()
+        };
+        let lines: Vec<String> = crate::render::render(&e.doc, &opts)
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        let marks: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("Section Break"))
+            .collect();
+        // Each mark reads the sectPr of the section after it: "t" starts odd
+        // page (the old type of "two b"), "wo" continuous (the new break's),
+        // and "three" next page (the trailing sectPr).
+        assert_eq!(marks.len(), 3, "{lines:?}");
+        assert!(marks[0].contains("(Odd Page)"), "{marks:?}");
+        assert!(marks[1].contains("(Continuous)"), "{marks:?}");
+        assert!(marks[2].contains("(Next Page)"), "{marks:?}");
+    }
+
+    #[test]
     fn a_break_in_a_closing_paragraph_leaves_its_break_on_the_second_half() {
         let mut e = three();
         e.caret = Caret::top(2, 3); // "two| b", which closes section 1

@@ -3111,13 +3111,13 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
     }
 }
 
-/// A merge that removes the paragraph `gone` into `kept`: the surviving
-/// paragraph mark is `gone`'s, so its section mark (the break and its tracked
-/// change, or none) ends the merged paragraph, as in Word. Deleting the mark
-/// of a section-closing paragraph (#645) removes that break and the text
-/// before it takes the following section's setup; deleting the mark of a
-/// section's last paragraph keeps the break (#748). Its tracked
-/// insertion/deletion records replace `kept`'s too.
+/// A merge that removes the paragraph `gone` into `kept`: the paragraph mark
+/// deleted is always `kept`'s, so the surviving mark is `gone`'s (its section
+/// break and tracked change, or none), as in Word. When `kept` closed a section
+/// its break is removed and the text before it joins the following section
+/// (#645); when `gone` is the section's last paragraph its break survives on
+/// the merged paragraph (#748). Its tracked insertion/deletion records replace
+/// `kept`'s too.
 fn keep_section_mark(kept: &mut ParProps, gone: ParProps) {
     crate::review::adopt_mark_revisions(kept, &gone);
     kept.section_break = gone.section_break;
