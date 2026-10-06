@@ -224,35 +224,61 @@ cargo test -p gridcore --test fidelity -- --nocapture
   recursively. `FIDELITY_REQUIRE_CORPUS` and `FIDELITY_UPDATE_BASELINE` work as
   for docx. `FIDELITY_UPDATE_BASELINE=1 cargo test --workspace` rewrites both
   baselines.
-- **The cell check.** A regenerated worksheet differs from its source in ways
-  that change nothing a reader sees, and a structural finding cannot tell
-  them from a loss. Examples: `0.14000000000000001` written `0.14`, an inline
-  string moved to the shared strings, a shared formula expanded per cell, a
-  dropped `<c r="B2"/>`. So each worksheet is also read the way a spreadsheet
-  reads it. For every cell either side lists, it compares three things:
-  - the **value**: shared and inline strings resolved, run formatting
-    included; numbers as doubles; booleans; errors;
+- **The sheet check.** A regenerated worksheet differs from its source in ways
+  that change nothing a reader sees, and a structural finding cannot tell them
+  from a loss. Examples: `0.14000000000000001` written `0.14`; an inline string
+  moved to the shared strings; a shared formula expanded per cell; a dropped
+  `<c r="B2"/>`; `customWidth="true"` written `1`. So each worksheet is also
+  read the way a spreadsheet reads it.
+
+  **Per cell** either side lists, it compares three things:
+  - the **value**. Shared strings are found through the workbook's
+    relationship. Shared and inline strings are resolved, run formatting
+    included; phonetic runs are not read. Numbers compare as doubles, along
+    with booleans and errors.
   - the **formula**: its text, plus kind and range for array and data-table
-    formulas. A shared formula's follower agrees with any formula;
+    formulas. A shared formula's follower is resolved from its master by
+    shifting the master's relative references. The test does that with its
+    own shifter, not gridcore's. A follower that has no master covering it
+    does not resolve.
   - the **effective style**: the cell's own `s`, else its row's (with
     `customFormat`), else its column's.
 
-  A difference is a `changed-value` finding at `/cells/<ref>/value`,
-  `/cells/<ref>/formula` or `/cells/<ref>/style`. Its baseline line covers
-  that one cell, so a new loss in another cell of the same sheet is NEW.
+  **Per column**, it compares the `<col>` attributes: width (as a double),
+  `customWidth`, `style`, `hidden`, `bestFit`, `phonetic`, `outlineLevel` and
+  `collapsed`.
 
-  The structural findings the check covers are dropped: cells, their `<v>`,
-  `<is>` and `<f>` text, the cell attributes `r`, `s` and `t`, the formula
-  attributes `t`, `si` and `ref`, and rows carrying nothing but `r` and
-  `spans`. Other row attributes, other cell attributes (`vm`, `cm`, `ph`) and
-  other formula attributes (`ca`, `aca`) stay structural findings. Their
+  A difference is a `changed-value` finding at one of these paths:
+  - `/cells/<ref>/value`
+  - `/cells/<ref>/style`
+  - `/cells/<ref>/formula-text`: the same formula in other words, meaning
+    spaces, case or the `_xlfn.` prefix;
+  - `/cells/<ref>/formula`: any other formula change, including a lost,
+    added or unresolved formula;
+  - `/cols/<letters or range>/<attribute>`: one path covers a run of
+    adjacent columns that differ the same way.
+
+  Each baseline line covers that cell or column run only. A new loss in
+  another cell is NEW, and so is a changed formula filed where only
+  re-serialization is baselined.
+
+  The structural findings the check covers are dropped. Covered are:
+  - all of `<cols>`;
+  - a lost or extra `<c>` whose attributes are within `r`, `s` and `t` and
+    whose children are `<v>`, `<f>` (with `t`, `si`, `ref`) and `<is>`
+    (`<t>` and runs);
+  - the `<v>` and `<f>` text;
+  - the `<is>` text and runs;
+  - the cell attributes `r`, `s` and `t`;
+  - the formula attributes `t`, `si` and `ref`;
+  - rows carrying nothing but `r` and `spans`.
+
+  Everything else stays structural. That includes other row attributes,
+  other cell attributes (`vm`, `cm`, `ph`), other formula attributes (`ca`,
+  `aca`), phonetic runs, and a lost cell that carried any of them. Those
   baseline lines are index-free like docx's, so one line covers every
   occurrence in that sheet. The test prints how many findings the check
   covered.
-- **Equivalences.** `EQUIVALENCES` in `gridcore/tests/fidelity.rs` drops what
-  else a glob cannot express, today only a column width in another spelling
-  of the same double. It checks against the original part and is counted like
-  the allowlist, and growing it needs the same review.
 
 ## What it does not cover
 - Fixing the losses it found:

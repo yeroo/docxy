@@ -9,9 +9,8 @@
 # its form per kind). `once-with <kind> <part>` limits a rule to files that also
 # have a finding of that kind in that part, and to one finding per file.
 #
-# Cells are compared by the cell check in gridcore/tests/fidelity.rs (values,
-# formulas, effective styles, per cell reference), and a few equivalences a glob
-# cannot express by EQUIVALENCES there, not here.
+# Worksheet cells and columns are compared by the sheet check in
+# gridcore/tests/fidelity.rs (per cell reference and per column), not here.
 #
 # The reason is mandatory. Shrinking this file is progress; growing it needs
 # review. Losses that are real but not fixed yet belong in baseline.txt, not
@@ -26,4 +25,5 @@ extra-element | [Content_Types].xml | /Types/Override | ContentType="application
 extra-attr | xl/pivotCache/pivotCacheDefinition*.xml | /pivotCacheDefinition/@refreshOnLoad | 1 | Save asks Excel to rebuild each pivot table from its definition on open, so a layout gridcore refreshed and Excel's agree (save_xlsx pivots section).
 lost-attr | xl/worksheets/*.xml | /worksheet/sheetData/row/@spans | * | Row spans are an optional optimization hint (CT_Row); the writer does not compute them.
 lost-attr | xl/worksheets/*.xml | /worksheet/sheetData/row/c/f/@aca | false | aca="false" is the schema default; the writer omits it.
-changed-value | xl/worksheets/*.xml | /worksheet/cols/col/@customWidth | "true" -> "1" | The same xsd:boolean, spelled 1.
+extra-element | [Content_Types].xml | /Types/Override | ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml" PartName="/xl/sharedStrings.xml" | once-with part-extra xl/sharedStrings.xml | The content-type override of a shared-strings part save added: only in a file that gained one, and only once.
+extra-element | xl/_rels/workbook.xml.rels | /Relationships/Relationship | Id="*" Target="sharedStrings.xml" Type="*/relationships/sharedStrings" | once-with part-extra xl/sharedStrings.xml | The workbook relationship to a shared-strings part save added: only in a file that gained one, and only once.
