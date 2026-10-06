@@ -1524,9 +1524,15 @@ impl Editor {
         self.map_props(move |p| p.vert_align = new);
     }
 
-    /// Reset character formatting (Ctrl+Space) over the selection.
+    /// Reset character formatting (Ctrl+Space) over the selection. Text
+    /// highlight survives, as in Word: it is a review mark, not character
+    /// formatting.
     pub fn clear_run_formatting(&mut self) {
-        self.map_props(|p| *p = RunProps::default());
+        self.map_props(|p| {
+            let highlight = p.highlight.take();
+            *p = RunProps::default();
+            p.highlight = highlight;
+        });
     }
 
     /// Cycle the case of the selected text (Word's Shift+F3): all-caps →
@@ -3779,6 +3785,53 @@ fn tab_props_at(content: &[Inline], offset: usize) -> RunProps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_run_formatting_keeps_highlight_622() {
+        let styled = RunProps {
+            bold: true,
+            highlight: Some("yellow".into()),
+            ..Default::default()
+        };
+        let mut ed = selected(vec![run("Mark", styled)], 0, 4);
+        ed.clear_run_formatting();
+        let Inline::Run(r) = &first_para(&ed).content[0] else {
+            panic!("expected a run");
+        };
+        assert!(!r.props.bold);
+        assert_eq!(r.props.highlight.as_deref(), Some("yellow"));
+        let xml = crate::serialize::run_xml(r);
+        assert!(xml.contains("<w:highlight w:val=\"yellow\"/>"), "{xml}");
+        assert!(!xml.contains("<w:b/>"), "{xml}");
+        // One undo step restores the bold.
+        assert!(ed.undo());
+        let Inline::Run(r) = &first_para(&ed).content[0] else {
+            panic!("expected a run");
+        };
+        assert!(r.props.bold);
+        assert_eq!(r.props.highlight.as_deref(), Some("yellow"));
+    }
+
+    #[test]
+    fn clear_run_formatting_without_highlight_leaves_no_rpr_622() {
+        let mut ed = selected(
+            vec![run(
+                "Mark",
+                RunProps {
+                    bold: true,
+                    ..Default::default()
+                },
+            )],
+            0,
+            4,
+        );
+        ed.clear_run_formatting();
+        let Inline::Run(r) = &first_para(&ed).content[0] else {
+            panic!("expected a run");
+        };
+        assert_eq!(r.props, RunProps::default());
+        assert!(!crate::serialize::run_xml(r).contains("w:rPr"));
+    }
 
     #[test]
     fn run_props_at_paragraph_start_reads_first_run() {
