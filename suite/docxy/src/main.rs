@@ -4999,6 +4999,31 @@ fn page_of_block(ranges: &[Vec<(usize, usize)>], block: usize) -> Option<usize> 
         .position(|cols| cols.iter().any(|&(s, e)| s <= block && block < e))
 }
 
+/// Whether scrolling to `page` would change what the person sees: its painted
+/// rect misses the viewport, or either rect isn't painted yet (then assume it
+/// might). `tracked_page`'s visibility test, inverted.
+fn page_needs_scroll(probe: &RulerProbe, page: usize) -> bool {
+    let Some(viewport) = probe.viewport else {
+        return true;
+    };
+    !probe
+        .pages
+        .get(page)
+        .and_then(|p| *p)
+        .is_some_and(|r| r.intersects(&viewport))
+}
+
+/// The `doc-scroll` child index keyboard navigation scrolls to: the page
+/// holding `block` in Print Layout (the last page when no range contains it —
+/// never past the rendered sheets), the block itself in Draft view.
+fn caret_scroll_index(page_view: bool, ranges: &[Vec<(usize, usize)>], block: usize) -> usize {
+    if page_view {
+        page_of_block(ranges, block).unwrap_or(ranges.len().saturating_sub(1))
+    } else {
+        block
+    }
+}
+
 fn tracked_page(probe: &RulerProbe) -> Option<usize> {
     let viewport = probe.viewport?;
     let visible = |i: usize| {
@@ -18055,18 +18080,30 @@ impl Docxy {
     /// Scroll the document so the caret's top-level block is in view (keyboard
     /// navigation/typing in a long document shouldn't let the caret drift off).
     /// Print Layout's scroll children are pages, not blocks, so the caret's
-    /// block maps to its page first.
+    /// block maps to its page first; a page already in view isn't re-aligned
+    /// (scroll_to_item would snap its top over the caret).
     fn scroll_to_caret(&self) {
         if let Some(t) = self.tabs.get(self.active) {
             if let Surface::Doc(ed) = &t.surface {
                 if let Some(&b) = ed.caret.path.first() {
                     if self.page_view {
-                        let ranges = page_ranges(t);
-                        let page =
-                            page_of_block(&ranges, b).unwrap_or(ranges.len().saturating_sub(1));
-                        self.doc_scroll.scroll_to_item(page);
+                        // Paginate the body the render shows (the markup
+                        // view): its revision filters can make it shorter
+                        // than the live body, whose pagination then doesn't
+                        // match the rendered sheets.
+                        let shown = ed.doc.markup_view(self.markup);
+                        let ranges = page_ranges_of(&shown.body, &final_page_geom(t));
+                        let page = caret_scroll_index(true, &ranges, b);
+                        let needs_scroll = {
+                            let probe = self.ruler_probe.borrow();
+                            page_needs_scroll(&probe, page)
+                        };
+                        if needs_scroll {
+                            self.doc_scroll.scroll_to_item(page);
+                        }
                     } else {
-                        self.doc_scroll.scroll_to_item(b);
+                        self.doc_scroll
+                            .scroll_to_item(caret_scroll_index(false, &[], b));
                     }
                 }
             }
@@ -25308,9 +25345,13 @@ fn block_height_est(b: &Block, content_w: f32) -> f32 {
     }
 }
 
-/// A tab's print-layout pages: each page's column block ranges, flowed with
-/// the final section's geometry (the render and header/footer navigation
-/// share it, so Next and Previous walk the pages the person sees).
+/// A tab's print-layout pages over the live editor body: each page's column
+/// block ranges, flowed with the final section's geometry. Header/footer
+/// navigation and the status-bar page count share it, so Next and Previous
+/// walk the pages the person sees. The render — and `scroll_to_caret`, which
+/// must land on the sheet the person sees — paginate the shown markup-view
+/// body instead, whose revision filters can make it shorter than the live
+/// body.
 fn page_ranges(tab: &DocTab) -> Vec<Vec<(usize, usize)>> {
     let Surface::Doc(ed) = &tab.surface else {
         return Vec::new();
