@@ -31,6 +31,10 @@ pub struct HlMode {
     /// close or open; this also keeps a stray mode from acting on another tab.
     pub tab: usize,
     started: Instant,
+    /// The mode began with a click on the button. Only such a mode can be
+    /// latched by the second click of a double-click; a swatch pick starts one
+    /// that a nearby button click ends instead.
+    from_button: bool,
 }
 
 impl HlMode {
@@ -40,6 +44,7 @@ impl HlMode {
             latched: false,
             tab,
             started: now,
+            from_button: false,
         }
     }
 
@@ -57,7 +62,9 @@ impl HlMode {
             *mode = None;
         }
         match mode {
-            Some(m) if !m.latched && now.duration_since(m.started) <= LATCH_WINDOW => {
+            Some(m)
+                if m.from_button && !m.latched && now.duration_since(m.started) <= LATCH_WINDOW =>
+            {
                 m.latched = true;
                 ButtonClick::Latched
             }
@@ -67,7 +74,9 @@ impl HlMode {
             }
             None if has_selection => ButtonClick::OpenPicker,
             None => {
-                *mode = Some(HlMode::start(last, tab, now));
+                let mut m = HlMode::start(last, tab, now);
+                m.from_button = true;
+                *mode = Some(m);
                 ButtonClick::Started
             }
         }
@@ -149,6 +158,17 @@ mod tests {
         );
         let m = m.unwrap();
         assert_eq!((m.tab, m.colour.as_str(), m.latched), (0, "yellow", false));
+    }
+
+    #[test]
+    fn a_swatch_started_mode_is_not_latched_by_a_quick_button_click() {
+        let now = t0();
+        let mut m = Some(HlMode::start("pink", 0, now));
+        assert_eq!(
+            HlMode::click(&mut m, 0, false, "yellow", now + Duration::from_millis(100)),
+            ButtonClick::Ended
+        );
+        assert!(m.is_none());
     }
 
     #[test]

@@ -11394,7 +11394,7 @@ impl Docxy {
     /// goes through here.
     fn drop_grid_state(&mut self) {
         // The highlighting mode belongs to the tab it started on (#623).
-        self.hl_mode = None;
+        self.cancel_highlight_mode();
         self.chart_drop_selection();
         self.bar_close();
         // The bars that act on Enter point into the grid too: a rename names
@@ -17129,7 +17129,7 @@ impl Docxy {
         // A menu belongs to the tab it opened on, and so does the highlighting
         // mode (#623).
         self.close_menu();
-        self.hl_mode = None;
+        self.cancel_highlight_mode();
         if i < self.tabs.len() {
             self.active = i;
             // A converted tab restored from the session converts as it comes
@@ -17894,12 +17894,12 @@ impl Docxy {
         let trusted = trusted::TrustStore::load(&config_root());
         let Some(i) = open else {
             let tab = tab_from_path_mode(&path, mode, &trusted)?;
+            self.cancel_highlight_mode();
             self.tabs.push(tab);
-            self.hl_mode = None;
             self.active = self.tabs.len() - 1;
             return Ok(true);
         };
-        self.hl_mode = None;
+        self.cancel_highlight_mode();
         self.active = i;
         let tab = &self.tabs[i];
         Ok(match reopen_step(reopen, tab.dirty, tab.access, mode) {
@@ -18107,7 +18107,7 @@ impl Docxy {
     /// Paste at the caret: the document clip while it is still what the
     /// clipboard holds (formatting intact), else the clipboard's text.
     fn do_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.hl_mode = None;
+        self.cancel_highlight_mode();
         if self.protected_refused(cx) {
             return self.refocus(window, cx);
         }
@@ -18304,18 +18304,24 @@ impl Docxy {
         }
     }
 
-    /// Esc, or anything else that takes the editor, ends the mode.
-    fn end_highlight_mode(&mut self) -> bool {
-        match self.hl_mode.take() {
-            Some(m) => m.tab == self.active,
-            None => false,
+    /// End the highlighting mode, whatever ended it, and take its status
+    /// text off the tab it started on. True when it was on for the active tab.
+    fn cancel_highlight_mode(&mut self) -> bool {
+        let Some(m) = self.hl_mode.take() else {
+            return false;
+        };
+        if let Some(t) = self.tabs.get_mut(m.tab) {
+            if t.status == HL_MODE_STATUS {
+                t.status = "Highlighting off".into();
+            }
         }
+        m.tab == self.active
     }
 
     /// A drag-selection came up: in highlighting mode, paint what it crossed.
     fn highlight_drag_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.hl_mode.as_ref().is_some_and(|m| m.tab != self.active) {
-            self.hl_mode = None;
+            self.cancel_highlight_mode();
         }
         let selected = self.doc_has_selection();
         if let Some(colour) = hl_mode::HlMode::drag_end(&mut self.hl_mode, selected) {
@@ -20155,11 +20161,23 @@ impl Docxy {
         if self.menu.is_some() {
             return self.menu_key(&ev.keystroke.key, window, cx);
         }
-        // Esc ends the highlighting mode (#623) before it does anything else.
-        if ev.keystroke.key == "escape" && self.end_highlight_mode() {
-            self.set_status("Highlighting off");
-            cx.notify();
-            return;
+        // The highlighting mode (#623) ends on Esc, which it consumes, and on
+        // any other key but a bare modifier. KeyTips and the find bar take
+        // their own Esc first, and the KeyTips' Alt leaves the mode be.
+        let hl_key = ev.keystroke.key.as_str();
+        if self.hl_mode.is_some()
+            && self.keytips == KeyTip::Off
+            && !matches!(
+                hl_key,
+                "shift" | "control" | "alt" | "platform" | "function"
+            )
+        {
+            if hl_key != "escape" {
+                self.cancel_highlight_mode();
+            } else if !self.find_open && self.cancel_highlight_mode() {
+                cx.notify();
+                return;
+            }
         }
         // Word's and Excel's document keys come before every surface's own,
         // so they work on any tab, in Protected View and in a document
@@ -26816,13 +26834,25 @@ impl Docxy {
         if refused {
             return self.refocus(window, cx);
         }
+        // A command that edits or moves the document, or opens Find, takes the
+        // editor and ends the highlighting mode (#623). The Text highlight
+        // button handles its own click, and the view-only toggles leave it be.
+        if !matches!(
+            act,
+            Act::Highlight
+                | Act::ShowHide
+                | Act::ToggleNav
+                | Act::DarkMode
+                | Act::AutoHideRibbon
+                | Act::ToggleRuler
+                | Act::ToggleComments
+                | Act::Markup(_)
+                | Act::PrintLayout
+        ) {
+            self.cancel_highlight_mode();
+        }
         // A document edit is its own undo step, named for the Undo drop-down
         // (#619) and kept for Repeat (#618) when it can be repeated.
-        // Any other command takes the editor and ends the highlighting mode
-        // (#623); the Text highlight button handles its own click.
-        if !matches!(act, Act::Highlight) {
-            self.hl_mode = None;
-        }
         let since = docxcore::editor::undo_serial_counter();
         let untouched = repeat_untouched(&self.repeat);
         if act_undo_name(act).is_some() {
