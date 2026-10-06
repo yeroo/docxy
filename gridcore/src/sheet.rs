@@ -1814,7 +1814,7 @@ impl Sheet {
 
 /// An Excel Table (ListObject): a named rectangular region with headers,
 /// resolvable by structured references (`Table1[Amount]`, `[@Price]`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Table {
     /// The displayName — what formulas use.
     pub name: String,
@@ -1832,6 +1832,16 @@ pub struct Table {
     /// part, or one whose ids don't tell its columns apart): the save then
     /// matches columns by name.
     pub column_ids: Vec<u32>,
+    /// Each column's calculated-column formula (`calculatedColumnFormula`,
+    /// without `=`), parallel to [`Self::columns`]: the formula a new data
+    /// row takes in that column. Its relative references are as written in
+    /// the first data row. Kept as cell formulas are (loaded text, or typed
+    /// text such as `[@Qty]*[@Price]`). Empty when no column had one as
+    /// loaded (the save then leaves the part's formulas alone); otherwise a
+    /// slot per column, and a `None` slot has none: the save drops a formula
+    /// the part still gives it (an array formula, which the model doesn't
+    /// hold, stays).
+    pub calculated_formulas: Vec<Option<String>>,
     /// The xl/tables/*.xml part backing this table (its `ref` is patched on
     /// save when the range moved).
     pub part: String,
@@ -1843,6 +1853,18 @@ impl Table {
         let r1 = self.range.0 + self.header_rows;
         let r2 = self.range.2.checked_sub(self.totals_rows)?;
         (r1 <= r2).then_some((r1, r2))
+    }
+
+    /// Give column `j` the calculated-column formula `f` (`None` clears it,
+    /// and the save then drops it from the part), growing
+    /// [`Self::calculated_formulas`] to a slot per column as needed.
+    pub fn set_calculated_formula(&mut self, j: usize, f: Option<String>) {
+        if self.calculated_formulas.len() < self.columns.len() {
+            self.calculated_formulas.resize(self.columns.len(), None);
+        }
+        if let Some(slot) = self.calculated_formulas.get_mut(j) {
+            *slot = f;
+        }
     }
 
     /// 0-based sheet column of a named table column.

@@ -184,6 +184,7 @@ fn sales() -> SheetView {
             .map(String::from)
             .to_vec(),
         column_ids: Vec::new(),
+        calculated_formulas: Vec::new(),
         part: String::new(),
     });
     v

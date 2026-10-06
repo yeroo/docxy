@@ -778,6 +778,7 @@ mod tests {
             columns: vec!["K".into(), "V".into()],
             part: String::new(),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
         });
         let m = DataModel::from_workbook(&wb);
         assert_eq!(m.eval_measure("SUM(T[V])"), v(7.0));

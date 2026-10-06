@@ -296,6 +296,7 @@ mod tests {
                 totals_rows: 0,
                 columns: vec!["Item".into(), "Qty".into(), "Price".into(), "Region".into()],
                 column_ids: Vec::new(),
+                calculated_formulas: Vec::new(),
                 part: String::new(),
             }],
             defined_names: vec![

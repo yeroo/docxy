@@ -987,6 +987,8 @@ fn cell_set(app: &mut App, args: &Json) -> Result<Json, String> {
     if !app.apply_on(si, vec![(r, c, cell)]) {
         return Err(format!("cell.set: {PART_OF_ARRAY}"));
     }
+    // A typed entry: the tables beside it may grow, as in the grid.
+    app.table_autocorrect(si, (r, c));
     let s = &app.pkg.workbook.sheets[si];
     match s.cell(r, c) {
         Some(cell) => Ok(cell_json(r, c, cell)),
@@ -6870,6 +6872,152 @@ mod table_verb_tests {
             formula_value(&mut a, "F2"),
             (Some("=SUM(Calc[Line])".into()), Some("66".into()))
         );
+    }
+
+    /// #682: the issue's `Sales` on A1:D5 (Item, Qty, Price, Region; Qty
+    /// 4, 10, 3, 20) with `=SUM(Sales[Qty])` in F2, typed on the surface.
+    fn app_682_sales() -> App {
+        let mut a = App::new(new_xlsx(), "ctl-682.xlsx");
+        a.os_clip = None;
+        let sh = &mut a.pkg.workbook.sheets[0];
+        for (c, h) in ["Item", "Qty", "Price", "Region"].iter().enumerate() {
+            sh.set_cell(0, c as u32, Cell::text(h));
+        }
+        for (i, q) in [4.0, 10.0, 3.0, 20.0].into_iter().enumerate() {
+            let r = i as u32 + 1;
+            sh.set_cell(r, 0, Cell::text("Pen"));
+            sh.set_cell(r, 1, Cell::number(q));
+            sh.set_cell(r, 2, Cell::number(1.0));
+            sh.set_cell(r, 3, Cell::text("North"));
+        }
+        a.pkg
+            .add_table(0, (0, 0, 4, 3), true, "TableStyleMedium2")
+            .unwrap();
+        gridcore::edit::rename_table(&mut a.pkg.workbook, "Table1", "Sales").unwrap();
+        a.rebuild_engine();
+        call(
+            &mut a,
+            "cell.set",
+            vec![("ref", "F2"), ("text", "=SUM(Sales[Qty])")],
+        )
+        .unwrap();
+        a
+    }
+
+    /// #682: the issue's `Calc` on A1:C4 (Qty 2, 3, 4; Price 5, 6, 7; Line
+    /// empty).
+    fn app_682_calc() -> App {
+        let mut a = App::new(new_xlsx(), "ctl-682.xlsx");
+        a.os_clip = None;
+        let sh = &mut a.pkg.workbook.sheets[0];
+        for (c, h) in ["Qty", "Price", "Line"].iter().enumerate() {
+            sh.set_cell(0, c as u32, Cell::text(h));
+        }
+        for (i, (q, p)) in [(2.0, 5.0), (3.0, 6.0), (4.0, 7.0)].into_iter().enumerate() {
+            sh.set_cell(i as u32 + 1, 0, Cell::number(q));
+            sh.set_cell(i as u32 + 1, 1, Cell::number(p));
+        }
+        a.pkg
+            .add_table(0, (0, 0, 3, 2), true, "TableStyleMedium2")
+            .unwrap();
+        gridcore::edit::rename_table(&mut a.pkg.workbook, "Table1", "Calc").unwrap();
+        a.rebuild_engine();
+        a
+    }
+
+    fn value(a: &mut App, at: &str) -> Option<String> {
+        call(a, "cell.get", vec![("ref", at)])
+            .unwrap()
+            .get_str("text")
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    }
+
+    fn set(a: &mut App, at: &str, text: &str) {
+        call(a, "cell.set", vec![("ref", at), ("text", text)]).unwrap();
+    }
+
+    #[test]
+    fn typing_below_and_right_grows_the_table_and_saves_it() {
+        let mut a = app_682_sales();
+        assert_eq!(value(&mut a, "F2").as_deref(), Some("37"));
+        set(&mut a, "A6", "Tape");
+        set(&mut a, "B6", "5");
+        assert_eq!(a.pkg.workbook.tables[0].range, (0, 0, 5, 3));
+        assert_eq!(value(&mut a, "F2").as_deref(), Some("42"));
+        set(&mut a, "E3", "x");
+        assert_eq!(a.pkg.workbook.tables[0].range, (0, 0, 5, 4));
+        assert_eq!(value(&mut a, "E1").as_deref(), Some("Column1"));
+        let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&a.pkg)).unwrap();
+        let part = &re.workbook.tables[0].part;
+        let xml = String::from_utf8(re.part(part).unwrap().to_vec()).unwrap();
+        assert!(xml.contains(r#"ref="A1:E6""#), "{xml}");
+        assert!(xml.contains(r#"name="Column1""#), "{xml}");
+        assert_eq!(re.workbook.tables[0].columns[4], "Column1");
+    }
+
+    #[test]
+    fn a_formula_in_an_empty_column_becomes_a_calculated_column() {
+        let mut a = app_682_calc();
+        set(&mut a, "C2", "=[@Qty]*[@Price]");
+        assert_eq!(value(&mut a, "C2").as_deref(), Some("10"));
+        assert_eq!(value(&mut a, "C3").as_deref(), Some("18"));
+        assert_eq!(value(&mut a, "C4").as_deref(), Some("28"));
+        set(&mut a, "A5", "5");
+        set(&mut a, "B5", "2");
+        assert_eq!(value(&mut a, "C5").as_deref(), Some("10"));
+        let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&a.pkg)).unwrap();
+        let part = &re.workbook.tables[0].part;
+        let xml = String::from_utf8(re.part(part).unwrap().to_vec()).unwrap();
+        assert!(
+            xml.contains("<calculatedColumnFormula>Calc[[#This Row],[Qty]]*Calc[[#This Row],[Price]]</calculatedColumnFormula>"),
+            "{xml}"
+        );
+        // A value typed later is an exception; nothing refills.
+        set(&mut a, "C3", "1");
+        assert_eq!(value(&mut a, "C3").as_deref(), Some("1"));
+        assert_eq!(value(&mut a, "C4").as_deref(), Some("28"));
+    }
+
+    /// As in Excel, the AutoCorrect is its own undo step after the entry:
+    /// one Ctrl+Z puts the table back and keeps the entry, a second takes
+    /// the entry; redo replays both.
+    #[test]
+    fn the_table_autocorrect_undoes_before_the_entry() {
+        let mut a = app_682_sales();
+        set(&mut a, "A6", "Tape");
+        a.undo();
+        assert_eq!(a.pkg.workbook.tables[0].range, (0, 0, 4, 3));
+        assert_eq!(value(&mut a, "A6").as_deref(), Some("Tape"));
+        a.undo();
+        assert_eq!(value(&mut a, "A6"), None);
+        a.redo();
+        assert_eq!(value(&mut a, "A6").as_deref(), Some("Tape"));
+        assert_eq!(a.pkg.workbook.tables[0].range, (0, 0, 4, 3));
+        a.redo();
+        assert_eq!(a.pkg.workbook.tables[0].range, (0, 0, 5, 3));
+
+        let mut a = app_682_calc();
+        set(&mut a, "C2", "=[@Qty]*[@Price]");
+        a.undo();
+        assert_eq!(value(&mut a, "C2").as_deref(), Some("10"));
+        assert_eq!(value(&mut a, "C3"), None);
+        assert!(a.pkg.workbook.tables[0].calculated_formulas.is_empty());
+        a.redo();
+        assert_eq!(value(&mut a, "C3").as_deref(), Some("18"));
+    }
+
+    /// The AutoCorrect switches turn each rule off.
+    #[test]
+    fn the_autocorrect_switches_turn_the_table_rules_off() {
+        let mut a = app_682_sales();
+        a.autocorrect.opts.table_rows_cols = false;
+        set(&mut a, "A6", "Tape");
+        assert_eq!(a.pkg.workbook.tables[0].range, (0, 0, 4, 3));
+        let mut a = app_682_calc();
+        a.autocorrect.opts.table_formulas = false;
+        set(&mut a, "C2", "=[@Qty]*[@Price]");
+        assert_eq!(value(&mut a, "C3"), None);
     }
 }
 

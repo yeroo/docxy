@@ -537,6 +537,25 @@ mod tests {
         assert_eq!(view(&mut t).sel, at("B4"));
     }
 
+    /// #682: an entry a warning let in below a table grows it, as one that
+    /// broke no rule does.
+    #[test]
+    fn an_accepted_warning_entry_below_a_table_grows_it() {
+        let mut t = book(AlertStyle::Warning);
+        put(&mut t, "A1", Cell::text("Item"));
+        put(&mut t, "B1", Cell::text("Score"));
+        put(&mut t, "A2", Cell::text("x"));
+        view(&mut t)
+            .pkg
+            .add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
+            .unwrap();
+        select(&mut t, "B3");
+        enter(&mut t, "250");
+        press(&mut t, "Yes").unwrap();
+        assert_eq!(value(&mut t, "B3"), CellValue::Number(250.0));
+        assert_eq!(view(&mut t).pkg.workbook.tables[0].range, (0, 0, 2, 1));
+    }
+
     #[test]
     fn a_warning_asks_yes_no_and_an_information_alert_lets_the_entry_in() {
         let mut t = book(AlertStyle::Warning);

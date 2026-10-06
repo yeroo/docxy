@@ -164,7 +164,8 @@ pub(super) fn move_refs_with(
 ) {
     let names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
     let (r0, c0, r1, c1) = mv.rect;
-    rewrite_workbook_formulas(wb, rules, |e, (sheet, cell)| {
+    rewrite_workbook_formulas(wb, rules, |e, site| {
+        let (sheet, cell) = (site.sheet, site.cell);
         let moved = sheet == Some(src)
             && cell.is_some_and(|(r, c)| (r0..=r1).contains(&r) && (c0..=c1).contains(&c));
         if moved {

@@ -1591,10 +1591,12 @@ struct WbSnapshot {
 }
 
 /// Whether `wb` differs from the snapshot `before` in what a filter or sort
-/// command can change: cells, rows' hidden state and attributes, columns,
-/// merges, the AutoFilter, and the defined names.
+/// command or a table AutoCorrect can change: cells, rows' hidden state and
+/// attributes, columns, merges, the AutoFilter, the defined names and the
+/// tables.
 fn wb_changed(before: &WbSnapshot, wb: &gridcore::sheet::Workbook) -> bool {
     before.names != wb.defined_names
+        || before.tables != wb.tables
         || before.sheets.len() != wb.sheets.len()
         || before.sheets.iter().zip(&wb.sheets).any(|(a, b)| {
             a.cells != b.cells
@@ -2544,6 +2546,9 @@ impl App {
             Some(url) => self.apply_with_link(r, c, cell, url),
             None => self.apply(vec![(r, c, cell)]),
         };
+        if applied {
+            self.table_autocorrect(self.sheet, (r, c));
+        }
         if !applied {
             // Refused (part of an array): keep the editor open, as Excel does.
             self.edit = Some(EditState {
@@ -2596,6 +2601,9 @@ impl App {
                 let (r, c) = alert.cell;
                 if self.apply(vec![(r, c, alert.entry)]) {
                     self.edit = None;
+                    // A typed entry, as `commit_edit` writes one that breaks
+                    // no rule.
+                    self.table_autocorrect(self.sheet, (r, c));
                     self.run_cont(alert.cont);
                 }
             }
@@ -2677,6 +2685,32 @@ impl App {
     /// and agent control edits (which may target a non-active sheet).
     fn apply_on(&mut self, sheet_idx: usize, changes: Vec<(u32, u32, Cell)>) -> bool {
         self.apply_groups(vec![(sheet_idx, changes)])
+    }
+
+    /// Excel's table AutoCorrect after an entry was typed at `at` on sheet
+    /// `sheet` (#682): a table beside it grows to take it
+    /// ([`gridcore::edit::auto_expand_table`]), then a formula typed into an
+    /// empty table column fills it ([`gridcore::edit::fill_calculated_column`]),
+    /// each when its AutoCorrect switch is on. As in Excel, that is an undo
+    /// step of its own after the entry's: Ctrl+Z puts the table back and
+    /// keeps what was typed.
+    fn table_autocorrect(&mut self, sheet: usize, at: (u32, u32)) {
+        let opts = self.autocorrect.opts;
+        if !(opts.table_rows_cols || opts.table_formulas)
+            || !gridcore::edit::typed_entry_near_table(&self.pkg.workbook, sheet, at)
+        {
+            return;
+        }
+        let changed = self.try_structural_if_changed(|wb| {
+            if opts.table_rows_cols {
+                gridcore::edit::auto_expand_table(wb, sheet, at);
+            }
+            if opts.table_formulas {
+                gridcore::edit::fill_calculated_column(wb, sheet, at);
+            }
+            Ok(())
+        });
+        debug_assert!(changed.is_ok());
     }
 
     /// Apply per-sheet cell changes, in order ([`Engine::set_cells`]: blanks
@@ -16097,6 +16131,80 @@ mod tests {
         assert_eq!((stats.total, stats.compared, stats.matched), (1, 1, 1));
     }
 
+    /// #681: Excel saves a `#SPILL!` cell as `#VALUE!` with value metadata
+    /// pointing at a rich `_error` (#657 decodes it on load), so `--verify`
+    /// compares `#SPILL!` with `#SPILL!`: the spilling formulas of a table,
+    /// last row included, match Excel's cache.
+    #[test]
+    fn verify_matches_a_rich_spill_error_in_a_table() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let pkg_rel = "http://schemas.openxmlformats.org/package/2006/relationships";
+        let rd = "http://schemas.microsoft.com/office/2017/06/relationships";
+        let rich = "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata";
+        let spill = |r: u32| {
+            format!(
+                r#"<c r="B{r}" t="e" cm="1" vm="1"><f t="array" ref="B{r}">_xlfn.SEQUENCE(3)</f><v>#VALUE!</v></c>"#
+            )
+        };
+        let rows = format!(
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>Qty</t></is></c><c r="B1" t="inlineStr"><is><t>Calc</t></is></c></row><row r="2"><c r="A2"><v>1</v></c>{}</row><row r="3"><c r="A3"><v>2</v></c>{}</row><row r="4"><c r="A4"><v>3</v></c>{}</row>"#,
+            spill(2),
+            spill(3),
+            spill(4)
+        );
+        let parts: Vec<(String, Vec<u8>)> = vec![
+            (
+                "[Content_Types].xml".into(),
+                r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/tables/table1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/><Override PartName="/xl/metadata.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml"/></Types>"#.into(),
+            ),
+            (
+                "_rels/.rels".into(),
+                format!(r#"<?xml version="1.0"?><Relationships xmlns="{pkg_rel}"><Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#).into_bytes(),
+            ),
+            (
+                "xl/workbook.xml".into(),
+                format!(r#"<?xml version="1.0"?><workbook xmlns="{ns}" xmlns:r="{rel}"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#).into_bytes(),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels".into(),
+                format!(r#"<?xml version="1.0"?><Relationships xmlns="{pkg_rel}"><Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{rel}/sheetMetadata" Target="metadata.xml"/><Relationship Id="rId3" Type="{rd}/rdRichValue" Target="richData/rdrichvalue.xml"/><Relationship Id="rId4" Type="{rd}/rdRichValueStructure" Target="richData/rdrichvaluestructure.xml"/></Relationships>"#).into_bytes(),
+            ),
+            (
+                "xl/worksheets/sheet1.xml".into(),
+                format!(r#"<?xml version="1.0"?><worksheet xmlns="{ns}" xmlns:r="{rel}"><sheetData>{rows}</sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>"#).into_bytes(),
+            ),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels".into(),
+                format!(r#"<?xml version="1.0"?><Relationships xmlns="{pkg_rel}"><Relationship Id="rId1" Type="{rel}/table" Target="../tables/table1.xml"/></Relationships>"#).into_bytes(),
+            ),
+            (
+                "xl/tables/table1.xml".into(),
+                format!(r#"<?xml version="1.0"?><table xmlns="{ns}" id="1" name="Sp" displayName="Sp" ref="A1:B4"><autoFilter ref="A1:B4"/><tableColumns count="2"><tableColumn id="1" name="Qty"/><tableColumn id="2" name="Calc"/></tableColumns></table>"#).into_bytes(),
+            ),
+            (
+                "xl/metadata.xml".into(),
+                format!(r#"<?xml version="1.0"?><metadata xmlns="{ns}" xmlns:xlrd="{rich}" xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray"><metadataTypes count="2"><metadataType name="XLDAPR" minSupportedVersion="120000" cellMeta="1"/><metadataType name="XLRICHVALUE" minSupportedVersion="120000"/></metadataTypes><futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}}"><xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk></futureMetadata><futureMetadata name="XLRICHVALUE" count="1"><bk><extLst><ext uri="{{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}}"><xlrd:rvb i="0"/></ext></extLst></bk></futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata><valueMetadata count="1"><bk><rc t="2" v="0"/></bk></valueMetadata></metadata>"#).into_bytes(),
+            ),
+            (
+                "xl/richData/rdrichvalue.xml".into(),
+                format!(r#"<?xml version="1.0"?><rvData xmlns="{rich}" count="1"><rv s="0"><v>0</v><v>8</v></rv></rvData>"#).into_bytes(),
+            ),
+            (
+                "xl/richData/rdrichvaluestructure.xml".into(),
+                format!(r#"<?xml version="1.0"?><rvStructures xmlns="{rich}" count="1"><s t="_error"><k n="propagated" t="b"/><k n="errorType" t="i"/></s></rvStructures>"#).into_bytes(),
+            ),
+        ];
+        let pkg = gridcore::xlsx::load_xlsx(&opccore::zipwrite::write_zip(&parts)).unwrap();
+        assert_eq!(pkg.workbook.tables.len(), 1);
+        let (report, stats) = verify_report(&pkg, "sp.xlsx");
+        assert_eq!(
+            (stats.total, stats.compared, stats.matched),
+            (3, 3, 3),
+            "{report}"
+        );
+    }
+
     #[test]
     fn a_general_number_is_fitted_to_its_column() {
         let general = gridcore::sheet::Xf::default();
@@ -17702,6 +17810,7 @@ mod tests {
             columns: cols.iter().map(|s| s.to_string()).collect(),
             part: String::new(),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
         };
         pkg.workbook
             .tables
@@ -20013,6 +20122,28 @@ mod tests {
         assert_eq!(app.cur, (1, 2), "OK makes the Tab move");
     }
 
+    /// #682: an entry a warning let in below a table grows it, as one that
+    /// broke no rule does.
+    #[test]
+    fn an_accepted_warning_entry_below_a_table_grows_it() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Warning);
+        put(&mut app, 0, 0, "Item");
+        put(&mut app, 0, 1, "Score");
+        put(&mut app, 1, 0, "x");
+        app.pkg
+            .add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
+            .unwrap();
+        app.rebuild_engine();
+        app.cur = (2, 1);
+        type_text(&mut app, "250");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dv_alert.is_some());
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(value_at(&app, 2, 1), CellValue::Number(250.0));
+        assert_eq!(app.pkg.workbook.tables[0].range, (0, 0, 2, 1));
+    }
+
     #[test]
     fn show_error_off_lets_anything_in() {
         use gridcore::sheet::AlertStyle;
@@ -20528,6 +20659,7 @@ mod tests {
                 .map(String::from)
                 .to_vec(),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
             part: String::new(),
         });
         app.rebuild_engine();

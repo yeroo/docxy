@@ -2469,6 +2469,7 @@ impl SheetView {
         self.editing = None;
         self.end_cell_edit();
         self.push_undo();
+        let typed = cell.is_some();
         if let Some(cell) = cell {
             self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
         }
@@ -2476,7 +2477,37 @@ impl SheetView {
         if let (Some(url), Some(sh)) = (link, self.pkg.workbook.sheets.get_mut(s)) {
             sh.hyperlinks.insert((r, c), url);
         }
+        if typed {
+            self.table_autocorrect(s, (r, c));
+        }
         true
+    }
+
+    /// Excel's table AutoCorrect after an entry was typed at `at` on sheet
+    /// `sheet` (#682): a table beside it grows to take it
+    /// ([`gridcore::edit::auto_expand_table`]), then a formula typed into an
+    /// empty table column fills it ([`gridcore::edit::fill_calculated_column`]),
+    /// each when its AutoCorrect switch is on. As in Excel, an undo step of
+    /// its own after the entry's: Ctrl+Z puts the table back and keeps what
+    /// was typed.
+    fn table_autocorrect(&mut self, sheet: usize, at: (u32, u32)) {
+        let opts = self.autocorrect.opts;
+        if !(opts.table_rows_cols || opts.table_formulas)
+            || !gridcore::edit::typed_entry_near_table(&self.pkg.workbook, sheet, at)
+        {
+            return;
+        }
+        let snap = self.snapshot();
+        let wb = &mut self.pkg.workbook;
+        let grew = opts.table_rows_cols && gridcore::edit::auto_expand_table(wb, sheet, at);
+        let filled = opts.table_formulas && gridcore::edit::fill_calculated_column(wb, sheet, at);
+        if !(grew || filled) {
+            return;
+        }
+        self.push_undo_snapshot(snap);
+        // Structured references now cover a grown table: recalculate.
+        self.engine = sheet_engine(&self.pkg.workbook);
+        self.engine.recalc_all(&mut self.pkg.workbook);
     }
 
     /// Check the entry `cells` (written for `origin`, the cell typed in)
@@ -2528,6 +2559,9 @@ impl SheetView {
             Ok([(cr, cc, cell)]) => {
                 self.engine
                     .set_cell(&mut self.pkg.workbook, (s, cr, cc), cell);
+                // An entry typed into one cell, as `commit_edit_taken` writes
+                // one that breaks no rule.
+                self.table_autocorrect(s, (cr, cc));
             }
             Err(cells) => self
                 .engine

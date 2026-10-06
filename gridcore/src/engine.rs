@@ -1598,6 +1598,12 @@ impl Engine {
         }
         self.supported.insert(key);
         let (s, r, c) = key;
+        // Excel never spills into or out of a table: the tables on this
+        // sheet, taken before the sheet is borrowed for the writes.
+        let tables: Vec<(u32, u32, u32, u32)> = (wb.tables.iter())
+            .filter(|t| t.sheet == s)
+            .map(|t| t.range)
+            .collect();
         let Some(sheet) = wb.sheets.get_mut(s) else {
             return Vec::new();
         };
@@ -1632,11 +1638,19 @@ impl Engine {
             }
             DynResult::Array(m) => {
                 let (h, w) = (m.len() as u32, m[0].len() as u32);
-                // Blocked when the array runs off the grid, or any target
-                // cell (other than the anchor) holds content that isn't this
-                // anchor's previous spill.
+                // Blocked when the array runs off the grid, when its block
+                // (anchor included) touches a table — Excel never lets a
+                // formula spill inside one, nor out of one — or when any
+                // target cell (other than the anchor) holds content that
+                // isn't this anchor's previous spill.
                 let off_grid = r + h > crate::sheet::MAX_ROWS || c + w > crate::sheet::MAX_COLS;
+                let block = (r, c, r + h - 1, c + w - 1);
+                let in_table = h * w > 1
+                    && tables.iter().any(|t| {
+                        t.0 <= block.2 && block.0 <= t.2 && t.1 <= block.3 && block.1 <= t.3
+                    });
                 let blocked = off_grid
+                    || in_table
                     || (r..r + h).any(|rr| {
                         (c..c + w).any(|cc| {
                             if (rr, cc) == (r, c) {
@@ -3368,6 +3382,7 @@ mod tests {
             columns: vec!["Item".into(), "Qty".into(), "Amount".into()],
             part: String::new(),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
         });
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
@@ -4106,6 +4121,83 @@ mod tests {
         set(&mut eng, &mut wb, "A3", Cell::default());
         assert_eq!(value_at(&wb, "A1"), CellValue::Number(1.0));
         assert_eq!(value_at(&wb, "A3"), CellValue::Number(3.0));
+    }
+
+    /// The table `Sp` on A1:B4 (Qty 1, 2, 3; Calc), with `cells` added.
+    fn sp_table(cells: &[(&str, Cell)]) -> Workbook {
+        let mut all = vec![
+            ("A1", Cell::text("Qty")),
+            ("B1", Cell::text("Calc")),
+            ("A2", Cell::number(1.0)),
+            ("A3", Cell::number(2.0)),
+            ("A4", Cell::number(3.0)),
+        ];
+        all.extend(cells.iter().cloned());
+        let mut wb = wb_one_sheet(&all);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sp".to_string(),
+            range: (0, 0, 3, 1),
+            header_rows: 1,
+            columns: vec!["Qty".into(), "Calc".into()],
+            ..Default::default()
+        });
+        wb
+    }
+
+    /// #681: Excel never lets a formula spill inside a table, so a spilling
+    /// formula in the table's last row is `#SPILL!` too, not a spill out
+    /// below the table.
+    #[test]
+    fn spill_in_table_last_row_is_spill_error() {
+        let mut wb = sp_table(&[
+            ("B2", array_formula("SEQUENCE(3)")),
+            ("B3", array_formula("SEQUENCE(3)")),
+            ("B4", array_formula("SEQUENCE(3)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        for a in ["B2", "B3", "B4"] {
+            assert_eq!(value_at(&wb, a), CellValue::Error("#SPILL!".into()), "{a}");
+        }
+        assert_eq!(value_at(&wb, "B5"), CellValue::Empty);
+        assert_eq!(value_at(&wb, "B6"), CellValue::Empty);
+    }
+
+    /// A one-cell result is no spill: it stays a value inside a table.
+    #[test]
+    fn spill_one_by_one_in_table_is_not_a_spill() {
+        let mut wb = sp_table(&[("B4", array_formula("SEQUENCE(1)"))]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "B4"), CellValue::Number(1.0));
+    }
+
+    /// An anchor outside a table can't spill into its blank cells either,
+    /// while one beside it spills as usual.
+    #[test]
+    fn spill_into_a_table_from_outside_is_spill_error() {
+        let mut wb = wb_one_sheet(&[
+            ("C1", Cell::text("Head")),
+            ("D1", array_formula("SEQUENCE(1,2)")),
+            ("F1", array_formula("SEQUENCE(3)")),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Below".to_string(),
+            range: (1, 4, 3, 4),
+            header_rows: 1,
+            columns: vec!["Col".into()],
+            ..Default::default()
+        });
+        // D1 would spill into E1, above the table: fine. F1's block F1:F3
+        // is beside the table E2:E4: fine. An anchor above it is not.
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(1.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "F3"), CellValue::Number(3.0));
+        set(&mut eng, &mut wb, "E1", array_formula("SEQUENCE(3)"));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(value_at(&wb, "E3"), CellValue::Empty);
     }
 
     #[test]
@@ -5235,6 +5327,7 @@ mod tests {
             columns: vec!["Qty".into(), "Price".into()],
             part: String::new(),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
         });
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
@@ -5271,6 +5364,7 @@ mod tests {
             columns: vec!["Qty".into(), "Price".into()],
             part: String::new(),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
         });
         // A defined name whose definition is the bare table name.
         wb.defined_names.push(crate::sheet::DefinedName {
@@ -5317,6 +5411,7 @@ mod tests {
             columns: vec!["Item".into(), "Qty".into(), "Price".into(), "Calc".into()],
             part: String::new(),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
         });
         wb
     }
@@ -5531,6 +5626,7 @@ mod tests {
             columns: vec!["Qty".into(), "Price".into(), "Amount".into()],
             part: String::new(),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
         });
         let mut eng = Engine::new(&wb);
         let scalar = [
