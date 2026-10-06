@@ -18,7 +18,7 @@ use crate::model::{
     AccrueAt, Assignment, Calendar, LagFormat, LagKind, Project, Rate, Resource, ResourceType,
     Task, TimephasedValue, WorkCalendar,
 };
-use crate::schedule::{HORIZON_DAYS, Schedule, working_minutes_on};
+use crate::schedule::{HORIZON_DAYS, MAX_LAG_MIN, Schedule, working_minutes_on};
 use std::collections::{HashMap, HashSet};
 
 /// The calendar a task is scheduled on: its own, else the project default,
@@ -155,7 +155,10 @@ pub(crate) fn delayed_extent_min(proj: &Project, a: &Assignment) -> Option<i64> 
     if a.delay_min() == 0 || a.actual_finish.is_some() || !is_flat_work(proj, a) {
         return None;
     }
-    Some(a.delay_min() + (a.work_min.max(0) as f64 / a.units).round() as i64)
+    // Absurd Units can overflow the work span; cap it where the horizon
+    // saturates anyway.
+    let work = (a.work_min.max(0) as f64 / a.units).round() as i64;
+    Some(a.delay_min().saturating_add(work).min(MAX_LAG_MIN))
 }
 
 /// A stored decimal as a number; absent or unreadable is 0.
