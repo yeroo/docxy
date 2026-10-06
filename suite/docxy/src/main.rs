@@ -31220,20 +31220,26 @@ impl Render for Docxy {
             // A Project cell drag ends in the capture phase, before the click
             // gpui synthesizes during mouse-up bubbling: a descendant's click
             // handler stops that propagation, so a bubble-phase release can be
-            // skipped and leave the drag armed. The flag survives only where a
-            // release-click can follow (the release is over the table body).
+            // skipped and leave the drag armed. The swallow flag is not
+            // touched here; the next press of any kind spends it (the
+            // capture mouse-down below), so a release that ends where no
+            // click follows — the split gutter, the strips, outside — leaves
+            // nothing a later click can swallow.
             .capture_any_mouse_up(cx.listener(|this, ev: &MouseUpEvent, _window, _cx| {
                 if ev.button != MouseButton::Left {
                     return;
                 }
-                let Some(tab) = this.tabs.get_mut(this.active) else {
-                    return;
-                };
-                let may_click = match &tab.surface {
-                    Surface::Project(_) => crate::project_release_may_click(&this.probes, ev.position),
-                    _ => false,
-                };
-                crate::project_cell_release(tab, may_click);
+                if let Some(tab) = this.tabs.get_mut(this.active) {
+                    crate::project_cell_release(tab);
+                }
+            }))
+            // Every press — a cell, the chart half of a row, the ruled rows
+            // below, a right-button — spends the swallow flag before any
+            // click it could produce is dispatched.
+            .capture_any_mouse_down(cx.listener(|this, _ev, _window, _cx| {
+                if let Some(tab) = this.tabs.get_mut(this.active) {
+                    crate::project_cell_press_reset(tab);
+                }
             }))
             .bg(bg)
             .child(probe_tracked(&self.probes, "suite-root", self.tab_more_open))

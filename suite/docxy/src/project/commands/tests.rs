@@ -3642,7 +3642,7 @@ fn ctrl_f2_without_a_range_still_opens_the_prompt() {
     // A one-row selection (an ID click) is not a range: the prompt opens too.
     let mut t = tab();
     project_cell_press(&mut t, 1, COL_ID, false);
-    project_cell_release(&mut t, true);
+    project_cell_release(&mut t);
     project_cell_click(&mut t, 1, Some(COL_ID), false);
     assert_eq!(v(&t).selection().unwrap().count(), COLUMN_COUNT);
     chord(&mut t, "f2", ctrl());
@@ -3662,28 +3662,46 @@ fn ctrl_f2_without_a_range_still_opens_the_prompt() {
 }
 
 #[test]
-fn host_handled_commands_clear_the_range() {
+fn the_range_clearing_rule_is_one_place_and_covers_host_handled_acts() {
     use ProjectAct::*;
+    // Every command act clears the range except the ones that keep or
+    // consume it. The rule lives in project_act_clears_range, which the
+    // host-side dispatch (keys, ribbon, QAT, Backstage — Save, Export and
+    // levelling included, which apply_project_act never sees) and
+    // apply_project_act both use, so the paths cannot drift apart.
+    for act in [
+        Save,
+        ExportGantt,
+        Level,
+        LevelAll,
+        ClearLeveling,
+        Undo,
+        Redo,
+        AddTask,
+        InsertBlankRow,
+        FindNext,
+    ] {
+        assert!(project_act_clears_range(act), "{act:?}");
+    }
+    for act in [Copy, Cut, Paste, AddLink, UnlinkTasks] {
+        assert!(!project_act_clears_range(act), "{act:?}");
+    }
+    // project_input maps the chord without touching the range; the clearing
+    // runs when the act is dispatched.
     let shift = Modifiers {
         shift: true,
         ..Modifiers::default()
     };
-    // Save runs in the host, levelling returns before apply_project_act's
-    // clearing: neither leaves the range standing (AC1).
-    for (key_name, m, act) in [("s", ctrl(), Save), ("l", ctrl_shift(), Level)] {
-        let mut t = tab();
-        vm(&mut t).ed.select(0);
-        vm(&mut t).col = COL_NAME;
-        assert_eq!(project_input(&mut t, "down", None, shift), None);
-        assert!(v(&t).selection().is_some());
-        assert_eq!(project_input(&mut t, key_name, None, m), Some(act));
-        assert_eq!(v(&t).selection(), None, "{act:?}");
-    }
-    // Copy is the exception: the highlight survives the copy.
     let mut t = tab();
     vm(&mut t).ed.select(0);
     vm(&mut t).col = COL_NAME;
     assert_eq!(project_input(&mut t, "down", None, shift), None);
+    assert!(v(&t).selection().is_some());
+    assert_eq!(project_input(&mut t, "s", None, ctrl()), Some(Save));
+    assert!(
+        v(&t).selection().is_some(),
+        "the clearing is project_act's job"
+    );
     assert_eq!(project_input(&mut t, "c", None, ctrl()), Some(Copy));
     assert!(v(&t).selection().is_some());
 }

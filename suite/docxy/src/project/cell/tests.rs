@@ -1443,13 +1443,13 @@ fn press_drag_release_selects_the_rectangle() {
         !project_cell_drag_over(&mut t, 2, COL_DURATION),
         "no move, no redraw"
     );
-    project_cell_release(&mut t, false);
+    project_cell_release(&mut t);
     assert!(!v(&t).dragging);
     assert_eq!(sel(&t), Some((vec![10, 20, 30], COL_NAME, COL_DURATION)));
     // A drag onto the entry row stops on the last task.
     project_cell_press(&mut t, 0, COL_NAME, false);
     assert!(!project_cell_drag_over(&mut t, 3, COL_NAME));
-    project_cell_release(&mut t, false);
+    project_cell_release(&mut t);
     assert_eq!(sel(&t), None, "no travel: the press cleared the range");
 }
 
@@ -1458,14 +1458,14 @@ fn a_click_after_a_drag_keeps_the_range() {
     let mut t = tab();
     project_cell_press(&mut t, 0, COL_NAME, false);
     project_cell_drag_over(&mut t, 2, COL_NAME);
-    project_cell_release(&mut t, true);
+    project_cell_release(&mut t);
     // gpui delivers the release-click on the cell the drag ended on (and its
     // row): neither may clear the gesture's range.
     project_cell_click(&mut t, 2, Some(COL_NAME), false);
     assert_eq!(sel(&t), Some((vec![10, 20, 30], COL_NAME, COL_NAME)));
     // The next plain click runs normally and clears it.
     project_cell_press(&mut t, 1, COL_NAME, false);
-    project_cell_release(&mut t, true);
+    project_cell_release(&mut t);
     project_cell_click(&mut t, 1, Some(COL_NAME), false);
     assert_eq!(sel(&t), None);
     assert_eq!((v(&t).ed.selected_uid(), v(&t).col), (Some(20), COL_NAME));
@@ -1477,11 +1477,11 @@ fn a_drag_released_below_the_table_keeps_the_range() {
     project_cell_press(&mut t, 0, COL_NAME, false);
     project_cell_drag_over(&mut t, 1, COL_NAME);
     // The release lands below the table: the body's on_click is swallowed.
-    project_cell_release(&mut t, true);
+    project_cell_release(&mut t);
     project_below_click(&mut t);
     assert_eq!(sel(&t), Some((vec![10, 20], COL_NAME, COL_NAME)));
     // The window-level release ends the gesture and is idempotent.
-    project_cell_release(&mut t, false);
+    project_cell_release(&mut t);
     assert_eq!(sel(&t), Some((vec![10, 20], COL_NAME, COL_NAME)));
 }
 
@@ -1495,7 +1495,7 @@ fn a_plain_press_without_drag_clears_it() {
     // Press and release on one cell: a click, the range does not survive.
     project_cell_press(&mut t, 1, COL_DURATION, false);
     assert!(!v(&t).drag_made_range);
-    project_cell_release(&mut t, true);
+    project_cell_release(&mut t);
     project_cell_click(&mut t, 1, Some(COL_DURATION), false);
     assert_eq!(sel(&t), None);
 }
@@ -1507,12 +1507,12 @@ fn shift_click_extends_from_the_cursor() {
     vm(&mut t).col = COL_NAME;
     project_cell_press(&mut t, 2, COL_DURATION, true);
     // The release-click is swallowed, so the range stays.
-    project_cell_release(&mut t, true);
+    project_cell_release(&mut t);
     project_cell_click(&mut t, 2, Some(COL_DURATION), false);
     assert_eq!(sel(&t), Some((vec![10, 20, 30], COL_NAME, COL_DURATION)));
     // And a second Shift+click re-anchors at the cursor, as specified.
     project_cell_press(&mut t, 1, COL_NAME, true);
-    project_cell_release(&mut t, true);
+    project_cell_release(&mut t);
     project_cell_click(&mut t, 1, Some(COL_NAME), false);
     assert_eq!(sel(&t), Some((vec![20, 30], COL_NAME, COL_DURATION)));
 }
@@ -1522,7 +1522,7 @@ fn clicking_the_id_cell_selects_the_whole_row_and_keeps_the_cursor_on_id() {
     let mut t = tab();
     project_cell_press(&mut t, 1, COL_ID, false);
     assert!(v(&t).row_drag);
-    project_cell_release(&mut t, true);
+    project_cell_release(&mut t);
     // The single click on the ID cell selects the whole row (all 8 columns).
     project_cell_click(&mut t, 1, Some(COL_ID), false);
     let s = v(&t).selection().unwrap();
@@ -1532,14 +1532,14 @@ fn clicking_the_id_cell_selects_the_whole_row_and_keeps_the_cursor_on_id() {
     // Dragging down from an ID cell selects whole rows.
     project_cell_press(&mut t, 0, COL_ID, false);
     assert!(project_cell_drag_over(&mut t, 2, COL_DURATION));
-    project_cell_release(&mut t, true);
+    project_cell_release(&mut t);
     let s = v(&t).selection().unwrap();
     assert_eq!(s.count(), 3 * COLUMN_COUNT);
     assert_eq!(s.uids, [10, 20, 30]);
     assert_eq!(v(&t).col, COL_ID, "the cursor column stays on ID");
     // A double-click on ID is not swallowed: the read-only status still shows.
     project_cell_press(&mut t, 0, COL_ID, false);
-    project_cell_release(&mut t, false);
+    project_cell_release(&mut t);
     project_cell_click(&mut t, 0, Some(COL_ID), true);
     assert_eq!(t.status.as_ref(), "ID is read-only");
 }
@@ -1612,7 +1612,7 @@ fn a_click_without_a_press_clears_the_range() {
     project_cell_press(&mut t, 3, COL_NAME, true);
     assert_eq!(sel(&t), None);
     assert!(v(&t).on_entry_row());
-    project_cell_release(&mut t, false);
+    project_cell_release(&mut t);
 }
 
 #[test]
@@ -1620,15 +1620,27 @@ fn a_drag_released_off_the_table_does_not_swallow_the_next_click() {
     let mut t = tab();
     project_cell_press(&mut t, 0, COL_NAME, false);
     project_cell_drag_over(&mut t, 1, COL_NAME);
-    // The release lands off the table: no click follows it, so the release
-    // itself spends the swallow flag.
-    project_cell_release(&mut t, false);
-    assert!(!v(&t).drag_made_range);
+    // The release lands off the table (the split gutter, a strip, outside):
+    // no click follows it, so the flag stands until the next press.
+    project_cell_release(&mut t);
+    assert!(v(&t).drag_made_range);
     assert_eq!(sel(&t), Some((vec![10, 20], COL_NAME, COL_NAME)));
-    // A later click (a right-click's menu, the chart half) runs normally.
+    // The next press of any kind — the suite-root mouse-down's capture phase
+    // calls project_cell_press_reset, so a press on the chart half or below
+    // the table does this too — spends the flag before its click runs.
+    project_cell_press_reset(&mut t);
+    assert!(!v(&t).drag_made_range);
     project_cell_click(&mut t, 2, Some(COL_NAME), false);
     assert_eq!(sel(&t), None, "the plain click clears what it did not make");
     assert_eq!((v(&t).ed.selected_uid(), v(&t).col), (Some(30), COL_NAME));
+    // The same through a real cell press, which resets the flag itself.
+    project_cell_press(&mut t, 0, COL_NAME, false);
+    project_cell_drag_over(&mut t, 1, COL_NAME);
+    project_cell_release(&mut t);
+    project_cell_press(&mut t, 2, COL_NAME, false);
+    assert!(!v(&t).drag_made_range, "the press spent the flag");
+    project_cell_click(&mut t, 2, Some(COL_NAME), false);
+    assert_eq!(sel(&t), None);
 }
 
 #[test]
@@ -1636,9 +1648,9 @@ fn a_drag_released_over_the_table_keeps_the_flag_for_its_click() {
     let mut t = tab();
     project_cell_press(&mut t, 0, COL_NAME, false);
     project_cell_drag_over(&mut t, 1, COL_NAME);
-    // Over the body a release-click follows: the flag outlives the release
-    // so the click is swallowed and the range stays.
-    project_cell_release(&mut t, true);
+    // A release-click follows in this same mouse-up: the flag outlives the
+    // release so the click is swallowed and the range stays.
+    project_cell_release(&mut t);
     assert!(v(&t).drag_made_range);
     project_cell_click(&mut t, 1, Some(COL_NAME), false);
     assert_eq!(sel(&t), Some((vec![10, 20], COL_NAME, COL_NAME)));

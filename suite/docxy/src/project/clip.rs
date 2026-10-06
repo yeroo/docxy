@@ -14,11 +14,12 @@ use super::*;
 /// cursor cell. The range is one line per shown row, one field per selected
 /// column, each field exactly what a single-cell copy of that cell gives
 /// ([`cell_edit_text`], a blank row's shown text); a tab or line break
-/// inside a field becomes a space so the TSV stays valid. Lines join with
-/// `\n` and the text ends without one.
+/// inside a field becomes a space so the TSV stays valid. Every line ends
+/// with `\n`, as a spreadsheet's copy does, so a last row of empty fields
+/// survives the paste's TSV parse.
 pub(crate) fn project_copy_text(v: &ProjectView) -> String {
     if let Some(sel) = v.selection() {
-        return sel
+        let mut text = sel
             .uids
             .iter()
             .map(|&uid| {
@@ -38,6 +39,8 @@ pub(crate) fn project_copy_text(v: &ProjectView) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        text.push('\n');
+        return text;
     }
     let Some(task) = v.selected_uid().and_then(|uid| v.ed.project().task(uid)) else {
         return String::new();

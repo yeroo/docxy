@@ -562,29 +562,39 @@ pub(crate) fn project_cell_drag_over(tab: &mut DocTab, row: usize, col: usize) -
     true
 }
 
+/// The suite-root mouse-down's capture phase calls this: every press — a
+/// cell, the chart half of a row, the ruled rows below, a right-button —
+/// spends the swallow flag. The flag is only meaningful for the click gpui
+/// dispatches in the same mouse-up as the gesture's release, and no press
+/// runs between that release and that click; any later click reaches
+/// `cell_click` only after a press (a menu's right-button included), so this
+/// cannot clear a flag a coming release-click still needs.
+pub(crate) fn project_cell_press_reset(tab: &mut DocTab) {
+    let Surface::Project(v) = &mut tab.surface else {
+        return;
+    };
+    v.drag_made_range = false;
+}
+
 /// The left release anywhere: the suite-root mouse-up's capture phase calls
 /// this, so no descendant's click handler can stop it and leave the drag
-/// armed. `may_click` says the release landed where gpui delivers a row or
-/// body release-click (over the entry-table body): that click still needs
-/// `drag_made_range` to know it must be swallowed. A release anywhere else
-/// leaves no click behind, so the flag is spent here — left set, it would
-/// swallow a later, genuine click.
-pub(crate) fn project_cell_release(tab: &mut DocTab, may_click: bool) {
+/// armed. `drag_made_range` is deliberately left standing: the release-click
+/// of this same mouse-up may still need it to be swallowed, and the next
+/// press of any kind spends it (see [`project_cell_press_reset`]).
+pub(crate) fn project_cell_release(tab: &mut DocTab) {
     let Surface::Project(v) = &mut tab.surface else {
         return;
     };
     v.dragging = false;
     v.row_drag = false;
-    if !may_click {
-        v.drag_made_range = false;
-    }
 }
 
 fn cell_click(tab: &mut DocTab, target: ClickTarget, col: Option<usize>, double: bool) {
-    // A drag (or a Shift/ID press) made a range: the release-click gpui
-    // delivers on the gesture's element must not clear it. The flag is
-    // taken, so a later genuine click is never swallowed; a double-click
-    // still runs (an ID cell's "ID is read-only", for one).
+    // A range-making gesture's release (a drag, a Shift or ID press) is
+    // followed by the click gpui dispatches for that same release: that click
+    // must not undo the gesture, so it is swallowed. The flag is taken, so a
+    // later click is never swallowed; a double-click still runs (an ID
+    // cell's "ID is read-only", for one).
     let swallowed = {
         let Surface::Project(v) = &mut tab.surface else {
             return;
@@ -594,9 +604,10 @@ fn cell_click(tab: &mut DocTab, target: ClickTarget, col: Option<usize>, double:
     if swallowed && !double {
         return;
     }
-    // A click reaches here only with no press before it — the row's chart
-    // half, the ruled rows below the table, a right-click's menu: it places
-    // the cursor like any plain click, so the range does not survive it.
+    // Any other click — a plain pressed click, a double-click, or one with no
+    // press at all (the row's chart half, the ruled rows below, a
+    // right-click's menu) — places the cursor, so the range does not survive
+    // it.
     if let Surface::Project(v) = &mut tab.surface {
         v.anchor = None;
     }

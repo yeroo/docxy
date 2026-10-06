@@ -1120,28 +1120,6 @@ fn editable_row_cells(
         }))
 }
 
-/// Whether a left release at `pos` can be followed by a row or body
-/// release-click: it landed over the entry-table body — the cells, the
-/// chart half of the rows, or the ruled rows below the entry row — right
-/// scrollbar strip excluded. The suite-root mouse-up's capture phase asks
-/// this to decide whether `drag_made_range` must outlive the release (a
-/// click is coming that may need swallowing) or can be spent (the drag
-/// ended over the ribbon, the headers and strips, or outside, where no
-/// click follows).
-pub(super) fn project_release_may_click(
-    probes: &Rc<std::cell::RefCell<Probes>>,
-    pos: Point<Pixels>,
-) -> bool {
-    let Some(body) = probes.borrow().current("project-body") else {
-        return false;
-    };
-    let (x, y) = (f32::from(pos.x), f32::from(pos.y));
-    x >= f32::from(body.left())
-        && x <= f32::from(body.right()) - SCROLLBAR_W
-        && y >= f32::from(body.top())
-        && y <= f32::from(body.bottom())
-}
-
 fn inactive_row(proj: &projcore::Project, index: usize) -> bool {
     proj.tasks
         .get(index)

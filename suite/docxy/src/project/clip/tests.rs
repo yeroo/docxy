@@ -417,12 +417,12 @@ fn ctrl_c_with_shift_arrows_maps_to_the_range_acts() {
 fn copy_a_range_is_tsv_of_edit_texts() {
     let mut t = tab();
     select_range(&mut t, COL_NAME, 1, COL_DURATION);
-    assert_eq!(project_copy_text(v(&t)), "A\t2d\nB\t2d");
+    assert_eq!(project_copy_text(v(&t)), "A\t2d\nB\t2d\n");
     // One row, several columns: no trailing newline, tabs between fields.
     select_range(&mut t, COL_MODE, 0, COL_DURATION);
     assert_eq!(
         project_copy_text(v(&t)),
-        "Auto Scheduled\tA\t2d",
+        "Auto Scheduled\tA\t2d\n",
         "the cursor's row copies top to bottom, left to right"
     );
 }
@@ -432,7 +432,7 @@ fn copy_a_range_replaces_tabs_and_newlines_inside_a_field() {
     let mut t = tab();
     vm(&mut t).ed.rename(1, "a\tb\rc\nd").unwrap();
     select_range(&mut t, COL_NAME, 0, COL_DURATION);
-    assert_eq!(project_copy_text(v(&t)), "a b c d\t2d");
+    assert_eq!(project_copy_text(v(&t)), "a b c d\t2d\n");
     // The single-cell path does not replace them (range-only rule).
     at(&mut t, 0, COL_NAME);
     assert_eq!(project_copy_text(v(&t)), "a\tb\rc\nd");
@@ -443,7 +443,7 @@ fn copy_then_paste_a_range_round_trips() {
     let mut t = tab();
     select_range(&mut t, COL_NAME, 1, COL_DURATION);
     let text = project_copy_text(v(&t));
-    assert_eq!(text, "A\t2d\nB\t2d");
+    assert_eq!(text, "A\t2d\nB\t2d\n");
     at(&mut t, 2, COL_NAME);
     let depth = v(&t).ed.undo_depth();
     paste_project_text(&mut t, &text);
@@ -512,7 +512,7 @@ fn cut_a_range_never_deletes_a_task_even_across_the_id_column() {
     // Whole rows: an ID-press drag over both tasks.
     crate::project_cell_press(&mut t, 0, COL_ID, false);
     crate::project_cell_drag_over(&mut t, 1, COL_ID);
-    crate::project_cell_release(&mut t, false);
+    crate::project_cell_release(&mut t);
     let depth = v(&t).ed.undo_depth();
     project_cut(&mut t);
     assert_eq!(tasks(&t).len(), 2, "both tasks survive their ID cells");
@@ -569,7 +569,7 @@ fn whole_rows_copy_and_paste_back_from_the_id_column() {
     // ignored, as on any paste).
     crate::project_cell_press(&mut t, 0, COL_ID, false);
     crate::project_cell_drag_over(&mut t, 1, COL_ID);
-    crate::project_cell_release(&mut t, false);
+    crate::project_cell_release(&mut t);
     let text = {
         let Surface::Project(v) = &t.surface else {
             panic!()
@@ -577,7 +577,7 @@ fn whole_rows_copy_and_paste_back_from_the_id_column() {
         project_copy_text(v)
     };
     crate::project_cell_press(&mut t, 2, COL_ID, false);
-    crate::project_cell_release(&mut t, false);
+    crate::project_cell_release(&mut t);
     paste_project_text(&mut t, &text);
     assert_eq!(
         tasks(&t),

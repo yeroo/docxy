@@ -465,6 +465,16 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
 }
 
 /// A Project command's checked state on the ribbon.
+/// Whether a command act drops the entry-table range selection: every act
+/// clears it except the ones that keep or consume it — Copy keeps the
+/// highlight, Cut and Paste clear it when they run, Link and Unlink act on
+/// it. The rule lives here, one place, so keys, the ribbon, the QAT and
+/// Backstage cannot drift apart.
+pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
+    use ProjectAct::*;
+    !matches!(act, Copy | Cut | Paste | AddLink | UnlinkTasks)
+}
+
 pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
     match act {
         ProjectAct::LevelAll => v.ed.leveled(),
@@ -777,21 +787,6 @@ pub(crate) fn project_input(
         return None;
     }
     if let Some(act) = key_act(key, m) {
-        // A command acts on the cursor, so the range does not survive it —
-        // including the acts the host runs without apply_project_act (Save,
-        // Export, levelling). The clipboard trio is excepted: Cut and Paste
-        // clear the range themselves, Copy keeps it; Link and Unlink consume
-        // the range in apply_project_act, which exempts them.
-        if !matches!(
-            act,
-            ProjectAct::Copy
-                | ProjectAct::Cut
-                | ProjectAct::Paste
-                | ProjectAct::AddLink
-                | ProjectAct::UnlinkTasks
-        ) {
-            v.anchor = None;
-        }
         return Some(act);
     }
     if m.control && !m.alt && !m.platform {
@@ -1215,8 +1210,9 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     v.cancel_prompt();
     // A command acts on the cursor: the range does not survive it. (Copy,
     // Cut and Paste are handled by the host before they reach here; Cut and
-    // Paste clear the range themselves, and Link/Unlink below keep it.)
-    if !matches!(act, AddLink | UnlinkTasks) {
+    // Paste clear the range themselves, and Link/Unlink below are exempt in
+    // [`project_act_clears_range`], which the host-side dispatch also uses.)
+    if project_act_clears_range(act) {
         v.anchor = None;
     }
     let before = (v.cursor_row(), v.display_row());
@@ -1629,6 +1625,15 @@ impl Docxy {
             return;
         }
         self.project_prompt_cancel();
+        // A command acts on the cursor, so the range does not survive it —
+        // here, one place, however the act was invoked (keys, ribbon, QAT,
+        // Backstage) and however it is handled below.
+        if project_act_clears_range(act)
+            && let Some(Surface::Project(v)) =
+                self.tabs.get_mut(self.active).map(|t| &mut t.surface)
+        {
+            v.anchor = None;
+        }
         match act {
             ProjectAct::Save => return self.save_project(false, window, cx),
             ProjectAct::NewProject => return self.add_tab(Kind::Project, window, cx),
