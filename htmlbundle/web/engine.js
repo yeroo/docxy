@@ -349,9 +349,9 @@
   // paragraph with no explicit indent gets the synthetic 360+360*level left and
   // -360 first. paraHtml re-synthesizes only an exact 0, so the left-marker
   // drag floor is: the synthetic list indent when it applies (a dragged left
-  // of 0 would render back at the synthetic value); otherwise 180, the
-  // smallest non-zero grid value, for a list paragraph with an explicit left
-  // (a drag to exactly 0 would render back at the synthetic value too).
+  // of 0 would render back at the synthetic value); otherwise the smaller of
+  // 180 (the smallest non-zero grid value) and the explicit left, so an
+  // explicit 1..179 is never pushed rightward.
   // `list` marks list paragraphs for the first-line nudge in dragResult.
   function effIndent(p) {
     var ind = p.ind;
@@ -366,7 +366,7 @@
       left: left,
       first: first,
       right: ind ? ind.right : 0,
-      listLeft: !list ? 0 : (synthetic ? 360 + 360 * level : 180),
+      listLeft: !list ? 0 : (synthetic ? 360 + 360 * level : Math.min(180, left)),
       list: list,
     };
   }

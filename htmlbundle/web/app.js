@@ -247,7 +247,7 @@
     el.rulerHTrack.style.left = (rect.left - hRect.left) + 'px';
     el.rulerHTrack.style.width = rect.width + 'px';
     var p = caretPara();
-    var eff = p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0, list: false };
+    var eff = E.ruler.effIndent(p || {});
     var g = E.ruler.geometry({ left: 0, right: rect.width }, mlPx, mrPx, zoom, eff, p ? p.tabs : null);
     var band = el.rulerHTrack.querySelector('.ruler-band');
     band.style.left = g.contentX + 'px';
@@ -341,13 +341,13 @@
       var zoom = pageScale();
       var pg = S.model.page;
       var p = caretPara();
-      var eff = p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0, list: false };
+      var eff = E.ruler.effIndent(p || {});
       rulerDrag = {
         handle: handle,
         startX: e.clientX,
         zoom: zoom,
         eff: eff,
-        startCaret: S.lastCaret,
+        startPara: S.lastCaret ? String(S.lastCaret.p) : null,
         geom: E.ruler.geometry({ left: 0, right: rect.width }, pg.left / TW, pg.right / TW, zoom, eff, null),
       };
       try { strip.setPointerCapture(e.pointerId); } catch (err) { /* older engines */ }
@@ -368,9 +368,14 @@
       var drag = rulerDrag;
       rulerDrag = null;
       el.rulerHGuide.style.display = 'none';
-      // A changed selection mid-drag means the caret paragraph is no longer
-      // the one the drag computed for: abort and redraw instead of applying.
-      if (S.lastCaret !== drag.startCaret) { drawRulers(); return; }
+      // A changed caret paragraph mid-drag means the values were computed
+      // for a different paragraph: abort and redraw instead of applying.
+      // syncSelection first — the selectionchange handler defers to rAF, so
+      // S.lastCaret can be a frame stale; compare paragraph ids, so moving
+      // within the same paragraph does not abort.
+      syncSelection();
+      var nowPara = S.lastCaret ? String(S.lastCaret.p) : null;
+      if (nowPara !== drag.startPara) { drawRulers(); return; }
       var res = E.ruler.dragResult(drag.handle, drag.eff, e.clientX - drag.startX, drag.zoom);
       // A click without movement, or a drop back on the starting values, is
       // not an edit: no command, no dirty, no undo step.

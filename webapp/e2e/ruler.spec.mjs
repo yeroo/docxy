@@ -190,25 +190,55 @@ test('the rulers follow the theme', async ({ page, guard }, testInfo) => {
   await openBundle(page, bundleCopy(testInfo, 'rulers.docx'));
   await showRulers(page);
   const bg = () => page.locator('#ruler-h').evaluate((n) => getComputedStyle(n).backgroundColor);
-  const colors = () => page.evaluate(() => ({
-    ground: getComputedStyle(document.getElementById('ruler-h')).backgroundColor,
-    band: getComputedStyle(document.querySelector('.ruler-band')).backgroundColor,
-    marker: getComputedStyle(document.querySelector('.ruler-m-left')).backgroundColor,
-    num: getComputedStyle(document.querySelector('.ruler-num')).color,
-    statusbar: getComputedStyle(document.querySelector('.statusbar')).backgroundColor,
-  }));
   const light = await bg();
   const darkButton = page.locator('#ribbon [data-act="DarkMode"]');
   await darkButton.click(); // auto -> light
   await darkButton.click(); // light -> dark
   expect(await bg()).not.toEqual(light);
-  const dark = await colors();
+  const dark = await page.evaluate(() => {
+    // Normalise any CSS colour (including color-mix) through a canvas.
+    const cv = document.createElement('canvas').getContext('2d');
+    const rgba = (s) => {
+      cv.fillStyle = '#000';
+      cv.fillStyle = s;
+      const n = cv.fillStyle;
+      if (n[0] === '#') {
+        const h = n.length === 4 ? n.slice(1).split('').map((c) => c + c).join('') : n.slice(1);
+        return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16), 1];
+      }
+      if (n.startsWith('color(')) { // color(srgb r g b [/ a]), floats 0..1
+        const parts = n.slice(6, -1).split(/[\s/]+/).filter(Boolean).slice(1);
+        const v = parts.slice(0, 3).map((x) => Math.round(parseFloat(x) * 255));
+        v.push(parts.length > 3 ? parseFloat(parts[3]) : 1);
+        return v;
+      }
+      return n.match(/rgba?\(([^)]+)\)/)[1].split(',').map(Number);
+    };
+    const ground = rgba(getComputedStyle(document.getElementById('ruler-h')).backgroundColor);
+    const num = rgba(getComputedStyle(document.querySelector('.ruler-num')).color);
+    const band = rgba(getComputedStyle(document.querySelector('.ruler-band')).backgroundColor);
+    const marker = rgba(getComputedStyle(document.querySelector('.ruler-m-left')).backgroundColor);
+    const statusbar = rgba(getComputedStyle(document.querySelector('.statusbar')).backgroundColor);
+    // WCAG relative luminance; translucent colours composite over the ground.
+    const lum = (v) => {
+      const rgb = v.length > 3 && v[3] < 1
+        ? [0, 1, 2].map((i) => v[i] * v[3] + ground[i] * (1 - v[3])) : v;
+      const f = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+      return 0.2126 * f(rgb[0]) + 0.7152 * f(rgb[1]) + 0.0722 * f(rgb[2]);
+    };
+    const a = lum(num), b = lum(ground);
+    return {
+      contrast: (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05),
+      marker: marker.slice(0, 3).join(','), band: band.slice(0, 3).join(','),
+      ground: ground.slice(0, 3).join(','), statusbar: statusbar.slice(0, 3).join(','),
+    };
+  });
   // Markers stay dark on the white content band in dark mode, as the
   // suite's ruler_colors keeps them near-black in both themes; the ground
-  // lightens away from the statusbar panel so the dark ticks and numbers
-  // stay readable over it.
+  // lightens away from the statusbar panel, and the numbers keep at least
+  // 3:1 against it.
   expect(dark.marker).not.toEqual(dark.band);
   expect(dark.ground).not.toEqual(dark.statusbar);
-  expect(dark.num).not.toEqual(dark.ground);
+  expect(dark.contrast).toBeGreaterThanOrEqual(3);
   await guard.check();
 });

@@ -197,9 +197,13 @@ test('ruler effIndent mirrors paraHtml exactly', () => {
   assert.deepEqual(R.effIndent({ list: '•', level: 2, segs: [] }),
     { left: 1080, first: -360, right: 0, listLeft: 1080, list: true });
   // Explicit left suppresses the synthetic indent; the drag floor is then the
-  // smallest non-zero grid value (only an exact 0 is re-synthesized).
+  // smaller of 180 (the smallest non-zero grid value) and the explicit left,
+  // so an explicit 1..179 is never pushed rightward (only an exact 0 is
+  // re-synthesized).
   assert.deepEqual(R.effIndent({ list: '•', level: 1, ind: ind(720, 0, 0), segs: [] }),
     { left: 720, first: -360, right: 0, listLeft: 180, list: true });
+  assert.deepEqual(R.effIndent({ list: '•', level: 0, ind: ind(90, 0, 0), segs: [] }),
+    { left: 90, first: -360, right: 0, listLeft: 90, list: true });
   // Non-list paragraphs use the raw values.
   assert.deepEqual(R.effIndent({ ind: ind(1440, 1440, -720) }),
     { left: 1440, first: -720, right: 1440, listLeft: 0, list: false });
@@ -226,13 +230,17 @@ test('ruler dragResult mirrors ruler_drag_result', () => {
     { cmd: 'setind\t360\t-360', marker: 360, guide: 360 });
   assert.deepEqual(R.dragResult('left', eff(1080, -360, 0, { listLeft: 1080, list: true }), -96, 1),
     { cmd: 'setind\t1080\t-360', marker: 1080, guide: 1080 });
-  // A list with an explicit non-zero left floors at 180: free drags land on
-  // the grid (level 2, explicit 720 dragged left -> 540; a short rightward
-  // drag stays near 720 instead of jumping to the synthetic 1080).
+  // A list with an explicit non-zero left floors at min(180, left): free
+  // drags land on the grid (level 2, explicit 720 dragged left -> 540; a
+  // short rightward drag stays near 720 instead of jumping to the synthetic
+  // 1080), and an explicit left below 180 is never pushed rightward (the
+  // marker clamps at 90, so the page's no-change check suppresses the drop).
   assert.deepEqual(R.dragResult('left', eff(720, -360, 0, { listLeft: 180, list: true }), -12, 1),
     { cmd: 'setind\t540\t-360', marker: 540, guide: 540 });
   assert.deepEqual(R.dragResult('left', eff(720, -360, 0, { listLeft: 180, list: true }), 12, 1),
     { cmd: 'setind\t900\t-360', marker: 900, guide: 900 });
+  assert.deepEqual(R.dragResult('left', eff(90, -360, 0, { listLeft: 90, list: true }), -12, 1),
+    { cmd: 'setind\t90\t-90', marker: 90, guide: 90 });
   // A list first-line drag landing exactly on the left indent (first = 0)
   // nudges to the nearest non-zero grid value in the drag's direction —
   // paraHtml would otherwise re-render it at the synthetic -360, two grid
