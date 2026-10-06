@@ -331,7 +331,9 @@ fn formatting_verbs_apply_over_the_selection() {
     assert_eq!(seg.get_str("va"), Some("sub"));
     s.exec_json("clearfmt");
     let props = s.editor.caret_props();
-    assert!(props.font.is_none() && props.highlight.is_none());
+    // Highlight is a review mark, not character formatting: it survives (#622).
+    assert!(props.font.is_none());
+    assert_eq!(props.highlight.as_deref(), Some("yellow"));
     assert_eq!(props.vert_align, VertAlign::Baseline);
     // Bad arguments are no-ops, not mutations.
     for bad in ["setsize\t0", "setsize\tbig", "font\t", "linespacing\t-1"] {
