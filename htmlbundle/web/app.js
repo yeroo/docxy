@@ -247,18 +247,20 @@
     el.rulerHTrack.style.left = (rect.left - hRect.left) + 'px';
     el.rulerHTrack.style.width = rect.width + 'px';
     var p = caretPara();
-    var eff = p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0, list: false, level: 0 };
-    var g = E.ruler.geometry({ left: 0, right: rect.width }, mlPx, mrPx, zoom, zoom, eff, p ? p.tabs : null);
+    var eff = p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0, list: false };
+    var g = E.ruler.geometry({ left: 0, right: rect.width }, mlPx, mrPx, zoom, eff, p ? p.tabs : null);
     var band = el.rulerHTrack.querySelector('.ruler-band');
     band.style.left = g.contentX + 'px';
     band.style.width = Math.max(0, g.contentRight - g.contentX) + 'px';
     var ticks = el.rulerHTrack.querySelector('.ruler-ticks');
-    // The snap grid is zeroed at the text column, so the ticks are too: for
-    // margins that are not multiples of 180 twips the page edge would
-    // otherwise put every grid line between the snapped positions.
+    // Ticks live only over the text column: the pattern zeroes at the text
+    // origin, the margins stay shaded ground, and no offset arithmetic can
+    // spill grid lines into them.
+    ticks.style.left = g.contentX + 'px';
+    ticks.style.width = Math.max(0, g.contentRight - g.contentX) + 'px';
+    ticks.style.right = 'auto';
     ticks.style.setProperty('--tick-minor', rnd(12 * zoom) + 'px');
     ticks.style.setProperty('--tick-major', rnd(96 * zoom) + 'px');
-    ticks.style.backgroundPosition = rnd(g.contentX) + 'px 0';
     el.rulerHTabs.textContent = '';
     g.tabs.forEach(function (x) {
       el.rulerHTabs.appendChild(h('div', { class: 'ruler-tab', style: 'left:' + x + 'px' }));
@@ -339,13 +341,14 @@
       var zoom = pageScale();
       var pg = S.model.page;
       var p = caretPara();
-      var eff = p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0, list: false, level: 0 };
+      var eff = p ? E.ruler.effIndent(p) : { left: 0, first: 0, right: 0, listLeft: 0, list: false };
       rulerDrag = {
         handle: handle,
         startX: e.clientX,
         zoom: zoom,
         eff: eff,
-        geom: E.ruler.geometry({ left: 0, right: rect.width }, pg.left / TW, pg.right / TW, zoom, zoom, eff, null),
+        startCaret: S.lastCaret,
+        geom: E.ruler.geometry({ left: 0, right: rect.width }, pg.left / TW, pg.right / TW, zoom, eff, null),
       };
       try { strip.setPointerCapture(e.pointerId); } catch (err) { /* older engines */ }
     });
@@ -365,6 +368,9 @@
       var drag = rulerDrag;
       rulerDrag = null;
       el.rulerHGuide.style.display = 'none';
+      // A changed selection mid-drag means the caret paragraph is no longer
+      // the one the drag computed for: abort and redraw instead of applying.
+      if (S.lastCaret !== drag.startCaret) { drawRulers(); return; }
       var res = E.ruler.dragResult(drag.handle, drag.eff, e.clientX - drag.startX, drag.zoom);
       // A click without movement, or a drop back on the starting values, is
       // not an edit: no command, no dirty, no undo step.

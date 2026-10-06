@@ -133,6 +133,11 @@ test('the left square is draggable where first is 0', async ({ page, guard }, te
   await openBundle(page, bundleCopy(testInfo, 'rulers.docx'));
   await showRulers(page);
   await page.locator('p[data-p="2"]').click(); // plain paragraph: first == left.
+  // Wait for the caret-move redraw before grabbing the marker's box.
+  await expect.poll(async () => {
+    const m = await markerDeltas(page);
+    return Math.abs(m.left - m.padL * m.scale);
+  }, { message: 'left marker at the plain paragraph origin' }).toBeLessThanOrEqual(2);
   const box = (await page.locator('.ruler-m-left').boundingBox());
   const y = box.y + box.height / 2;
   await page.mouse.move(box.x + box.width / 2, y);
@@ -164,22 +169,46 @@ test('clicking a marker without moving is not an edit', async ({ page, guard }, 
   await guard.check();
 });
 
+test('a no-move click on an off-grid indent neither snaps nor dirties', async ({ page, guard }, testInfo) => {
+  await openBundle(page, bundleCopy(testInfo, 'rulers-offgrid.docx'));
+  await showRulers(page);
+  await page.locator('p[data-p="0"]').click(); // w:left=567: not a 180 multiple.
+  const box = (await page.locator('.ruler-m-left').boundingBox());
+  const y = box.y + box.height / 2;
+  await page.mouse.move(box.x + box.width / 2, y);
+  await page.mouse.down();
+  await page.mouse.up();
+  // A click is not a drag: the off-grid indent must not snap (that would
+  // rewrite 28.35pt to 27pt) and the document stays clean.
+  const chip = await page.locator('#doc-chip').textContent();
+  expect(chip).not.toContain('•');
+  await expect(page.locator('p[data-p="0"]')).toHaveAttribute('style', /margin-left:28\.35pt/);
+  await guard.check();
+});
+
 test('the rulers follow the theme', async ({ page, guard }, testInfo) => {
   await openBundle(page, bundleCopy(testInfo, 'rulers.docx'));
   await showRulers(page);
   const bg = () => page.locator('#ruler-h').evaluate((n) => getComputedStyle(n).backgroundColor);
   const colors = () => page.evaluate(() => ({
+    ground: getComputedStyle(document.getElementById('ruler-h')).backgroundColor,
     band: getComputedStyle(document.querySelector('.ruler-band')).backgroundColor,
     marker: getComputedStyle(document.querySelector('.ruler-m-left')).backgroundColor,
+    num: getComputedStyle(document.querySelector('.ruler-num')).color,
+    statusbar: getComputedStyle(document.querySelector('.statusbar')).backgroundColor,
   }));
   const light = await bg();
   const darkButton = page.locator('#ribbon [data-act="DarkMode"]');
   await darkButton.click(); // auto -> light
   await darkButton.click(); // light -> dark
   expect(await bg()).not.toEqual(light);
-  // Markers stay dark on the white content band in dark mode, as the
-  // suite's ruler_colors keeps them near-black in both themes.
   const dark = await colors();
+  // Markers stay dark on the white content band in dark mode, as the
+  // suite's ruler_colors keeps them near-black in both themes; the ground
+  // lightens away from the statusbar panel so the dark ticks and numbers
+  // stay readable over it.
   expect(dark.marker).not.toEqual(dark.band);
+  expect(dark.ground).not.toEqual(dark.statusbar);
+  expect(dark.num).not.toEqual(dark.ground);
   await guard.check();
 });

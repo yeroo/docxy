@@ -347,35 +347,36 @@
 
   // The indent the paragraph renders with (paraHtml's two-step logic): a list
   // paragraph with no explicit indent gets the synthetic 360+360*level left and
-  // -360 first. `listLeft` is the left-marker drag floor — for a list paragraph
-  // it is ALWAYS the synthetic list indent, even with an explicit left, because
-  // paraHtml re-synthesizes a left of 0 (a drag below the floor would render
-  // back at the synthetic value, not where it was dropped). `list`/`level` are
-  // carried for the first-line nudge in dragResult.
+  // -360 first. paraHtml re-synthesizes only an exact 0, so the left-marker
+  // drag floor is: the synthetic list indent when it applies (a dragged left
+  // of 0 would render back at the synthetic value); otherwise 180, the
+  // smallest non-zero grid value, for a list paragraph with an explicit left
+  // (a drag to exactly 0 would render back at the synthetic value too).
+  // `list` marks list paragraphs for the first-line nudge in dragResult.
   function effIndent(p) {
     var ind = p.ind;
     var list = !!p.list;
     var level = p.level || 0;
     var left = ind ? ind.left : 0;
-    if (list && !left) left = 360 + 360 * level;
+    var synthetic = list && !left;
+    if (synthetic) left = 360 + 360 * level;
     var first = ind ? ind.first : 0;
     if (list && !first) first = -360;
     return {
       left: left,
       first: first,
       right: ind ? ind.right : 0,
-      listLeft: list ? 360 + 360 * level : 0,
+      listLeft: !list ? 0 : (synthetic ? 360 + 360 * level : 180),
       list: list,
-      level: level,
     };
   }
 
   // Marker and tab-stop x positions from the page rect (viewport coords, CSS
-  // zoom already applied), the unzoomed padding px, and the rect-derived scale
-  // (rect.width / offsetWidth — never trust S.zoom across engines).
-  function geometry(rect, mlPx, mrPx, scale, zoom, indent, tabs) {
-    var contentX = rect.left + mlPx * scale;
-    var contentRight = rect.right - mrPx * scale;
+  // zoom already applied) and the rect-derived zoom (rect.width /
+  // offsetWidth — never trust S.zoom across engines).
+  function geometry(rect, mlPx, mrPx, zoom, indent, tabs) {
+    var contentX = rect.left + mlPx * zoom;
+    var contentRight = rect.right - mrPx * zoom;
     return {
       contentX: contentX,
       contentRight: contentRight,
@@ -395,11 +396,12 @@
     if (handle === 'first') {
       var firstMarker = Math.max(snapTwips(eff.left + eff.first + delta), 0);
       var first = firstMarker - eff.left;
-      // paraHtml re-synthesizes first = -360 for a list paragraph whose first
-      // is 0, which would render the drop one grid step off; nudge a zero
-      // result to the nearest non-zero grid value, in the drag's direction.
+      // paraHtml re-synthesizes first 0 as -360 — two grid steps away — so a
+      // dropped first of 0 would render two steps off; nudge it to the nearest
+      // non-zero grid value (±180), in the drag's direction. The marker/guide
+      // report the nudged position (eff.left + first), which is what renders.
       if (eff.list && first === 0) first = delta >= 0 ? 180 : -180;
-      return { cmd: 'firstline\t' + first, marker: firstMarker, guide: firstMarker };
+      return { cmd: 'firstline\t' + first, marker: eff.left + first, guide: eff.left + first };
     }
     if (handle === 'left') {
       var leftMarker = Math.max(snapTwips(eff.left + delta), eff.listLeft || 0);

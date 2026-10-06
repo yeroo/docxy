@@ -247,6 +247,11 @@ svg.icon * { fill: currentColor; }
   --ruler-marker: var(--ink); --ruler-guide: var(--brand);
   background: var(--ruler-ground);
 }
+/* The suite's ruler_colors lightens the ground in dark so the near-black
+   ticks and numbers stay readable over it (suite/docxy/src/main.rs:4749). */
+:root[data-theme="dark"] .ruler {
+  --ruler-ground: color-mix(in srgb, var(--panel) 55%, var(--fg));
+}
 .ruler[hidden] { display: none; }
 .ruler-h { position: sticky; top: 0; left: 0; width: 100%; height: 20px; z-index: 3; }
 .ruler-v { position: sticky; top: 0; left: 0; width: 18px; flex: none; z-index: 2; }
