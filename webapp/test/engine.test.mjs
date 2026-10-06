@@ -159,3 +159,95 @@ test('engine commands are well-formed verbs', () => {
     assert.ok(verbs.has(op.split('\t')[0]), `${act}: unknown verb in ${JSON.stringify(op)}`);
   }
 });
+
+// ---- ruler math (View > Ruler) -------------------------------------------------
+//
+// The numbers below are the suite's oracle (suite/docxy/src/main.rs): snap_twips
+// (~24480), tw_px/px_tw (~4608), ruler_drag_result (~5604) and the page's own
+// paraHtml effective indent (app.js), which the markers must match.
+
+test('ruler snapTwips matches the suite 180-twip grid', () => {
+  const R = E.ruler;
+  for (const [v, want] of [[0, 0], [89, 0], [90, 180], [179, 180], [180, 180], [269, 180],
+    [270, 360], [-89, 0], [-90, -180], [-179, -180], [-269, -180], [-270, -360], [720, 720]]) {
+    assert.equal(R.snapTwips(v), want, `snapTwips(${v})`);
+  }
+  assert.equal(R.snapTwips(2147483647), 2147483647, 'clamped like the Rust i32 cast');
+  assert.equal(R.snapTwips(-2147483648), -2147483648, 'clamped like the Rust i32 cast');
+});
+
+test('ruler twToPx/pxToTw round-trip at every zoom', () => {
+  const R = E.ruler;
+  assert.equal(R.twToPx(720, 1), 48, 'tw_px: t * zoom / 15');
+  for (const zoom of [0.5, 1, 1.5, 3]) {
+    for (const t of [0, 180, -360, 720, 1440]) {
+      assert.equal(R.pxToTw(R.twToPx(t, zoom), zoom), t, `round trip ${t} @ ${zoom}`);
+    }
+  }
+  // Rust f32::round is half away from zero; Math.round is not.
+  assert.equal(R.pxToTw(24.5, 1), 368);
+  assert.equal(R.pxToTw(-24.5, 1), -368);
+});
+
+test('ruler effIndent mirrors paraHtml exactly', () => {
+  const R = E.ruler;
+  const ind = (left, right, first) => ({ left, right, first });
+  assert.deepEqual(R.effIndent({ list: '•', level: 0, segs: [] }),
+    { left: 360, first: -360, right: 0, listLeft: 360 });
+  assert.deepEqual(R.effIndent({ list: '•', level: 2, segs: [] }),
+    { left: 1080, first: -360, right: 0, listLeft: 1080 });
+  // Explicit left suppresses the synthetic list indent; first == 0 still gets -360.
+  assert.deepEqual(R.effIndent({ list: '•', level: 1, ind: ind(720, 0, 0), segs: [] }),
+    { left: 720, first: -360, right: 0, listLeft: 0 });
+  // Non-list paragraphs use the raw values.
+  assert.deepEqual(R.effIndent({ ind: ind(1440, 1440, -720) }),
+    { left: 1440, first: -720, right: 1440, listLeft: 0 });
+  assert.deepEqual(R.effIndent({}), { left: 0, first: 0, right: 0, listLeft: 0 });
+  assert.deepEqual(R.effIndent({ ind: ind(720, 0, -360) }),
+    { left: 720, first: -360, right: 0, listLeft: 0 });
+});
+
+test('ruler dragResult mirrors ruler_drag_result', () => {
+  const R = E.ruler;
+  const eff = (left, first, right, listLeft = 0) => ({ left, first, right, listLeft });
+  // 720 twips of drag -> First(720), one firstline command.
+  assert.deepEqual(R.dragResult('first', eff(0, 0, 0), 48, 1),
+    { cmd: 'firstline\t720', marker: 720, guide: 720 });
+  // The first-line marker's absolute position clamps at 0.
+  assert.deepEqual(R.dragResult('first', eff(720, -720, 0), -48, 1),
+    { cmd: 'firstline\t-720', marker: 0, guide: 0 });
+  // A plain left drag snaps and writes first = max(first, -marker).
+  assert.deepEqual(R.dragResult('left', eff(0, 0, 0), 48, 1),
+    { cmd: 'setind\t720\t0', marker: 720, guide: 720 });
+  // A list paragraph's left marker clamps at its synthetic indent (level 0 and 2).
+  assert.deepEqual(R.dragResult('left', eff(360, -360, 0, 360), -48, 1),
+    { cmd: 'setind\t360\t-360', marker: 360, guide: 360 });
+  assert.deepEqual(R.dragResult('left', eff(1080, -360, 0, 1080), -96, 1),
+    { cmd: 'setind\t1080\t-360', marker: 1080, guide: 1080 });
+  // Right shrinks with a rightward drag and clamps at 0.
+  assert.deepEqual(R.dragResult('right', eff(0, 0, 1440), -48, 1),
+    { cmd: 'rightind\t2160', marker: 2160, guide: 2160 });
+  assert.deepEqual(R.dragResult('right', eff(0, 0, 180), 48, 1),
+    { cmd: 'rightind\t0', marker: 0, guide: 0 });
+});
+
+test('ruler geometry places markers and tab stops at the suite positions', () => {
+  const R = E.ruler;
+  // Page rect in viewport coords, unzoomed padding px, then scale and zoom.
+  const g1 = R.geometry({ left: 100, right: 916, width: 816 }, 96, 96, 1, 1,
+    { left: 720, first: -360, right: 0 }, [{ pos: 720, a: 'l' }, { pos: 4680, a: 'c' }]);
+  assert.equal(g1.contentX, 196, 'page left + margin * scale');
+  assert.equal(g1.contentRight, 820, 'page right - margin * scale');
+  assert.equal(g1.leftX, 196 + 48);
+  assert.equal(g1.firstX, 196 + 48 - 24);
+  assert.equal(g1.rightX, 820);
+  assert.deepEqual(g1.tabs, [196 + 48, 196 + 4680 / 15]);
+  // Zoom 2: the rect is already zoomed; the scale converts the unzoomed padding.
+  const g2 = R.geometry({ left: 100, right: 1732, width: 1632 }, 96, 96, 2, 2,
+    { left: 720, first: -360, right: 0 }, [{ pos: 720, a: 'l' }]);
+  assert.equal(g2.contentX, 292);
+  assert.equal(g2.contentRight, 1732 - 192);
+  assert.equal(g2.leftX, 292 + 720 * 2 / 15);
+  assert.equal(g2.firstX, 292 + (720 - 360) * 2 / 15);
+  assert.deepEqual(g2.tabs, [292 + 720 * 2 / 15]);
+});

@@ -317,6 +317,95 @@
     return i;
   }
 
+  // ---- ruler math (View > Ruler) ---------------------------------------------
+  //
+  // Pure geometry for the page's DOM rulers, mirroring the suite's snap_twips,
+  // tw_px/px_tw, ruler_drag_result and hruler_geom (suite/docxy/src/main.rs), and
+  // the page's own paraHtml effective indent, so node tests can pin the numbers.
+  // Everything here is unit twips / px math; the page supplies DOM rects.
+
+  var RULER_GRID = 180; // 1/8 inch, the suite's snap grid
+
+  // Nearest gridline, rounding half away from zero like the Rust i64 math.
+  function snapTwips(v) {
+    var n = Math.trunc(v);
+    var rounded = n >= 0 ? Math.trunc((n + RULER_GRID / 2) / RULER_GRID)
+      : Math.trunc((n - RULER_GRID / 2) / RULER_GRID);
+    var out = Math.max(-2147483648, Math.min(2147483647, rounded * RULER_GRID));
+    return out === 0 ? 0 : out; // normalize -0
+  }
+
+  function twToPx(t, zoom) {
+    return t * zoom / 15;
+  }
+
+  // f32::round is half away from zero; Math.round is not.
+  function pxToTw(p, zoom) {
+    var n = p * 15 / zoom;
+    return n < 0 ? Math.ceil(n - 0.5) : Math.floor(n + 0.5);
+  }
+
+  // The indent the paragraph renders with (paraHtml's two-step logic): a list
+  // paragraph with no explicit indent gets the synthetic 360+360*level left and
+  // -360 first. `listLeft` is the left-marker drag floor — the synthetic list
+  // indent when it applied, else 0 (the suite's max(list_step) clamp).
+  function effIndent(p) {
+    var ind = p.ind;
+    var left = ind ? ind.left : 0;
+    var listLeft = 0;
+    if (p.list && !left) {
+      left = 360 + 360 * (p.level || 0);
+      listLeft = left;
+    }
+    var first = ind ? ind.first : 0;
+    if (p.list && !first) first = -360;
+    return { left: left, first: first, right: ind ? ind.right : 0, listLeft: listLeft };
+  }
+
+  // Marker and tab-stop x positions from the page rect (viewport coords, CSS
+  // zoom already applied), the unzoomed padding px, and the rect-derived scale
+  // (rect.width / offsetWidth — never trust S.zoom across engines).
+  function geometry(rect, mlPx, mrPx, scale, zoom, indent, tabs) {
+    var contentX = rect.left + mlPx * scale;
+    var contentRight = rect.right - mrPx * scale;
+    return {
+      contentX: contentX,
+      contentRight: contentRight,
+      firstX: contentX + twToPx(indent.left + indent.first, zoom),
+      leftX: contentX + twToPx(indent.left, zoom),
+      rightX: contentRight - twToPx(indent.right, zoom),
+      tabs: (tabs || []).map(function (t) { return contentX + twToPx(t.pos, zoom); }),
+      zoom: zoom,
+    };
+  }
+
+  // One ruler-marker drag: `handle` is 'first' | 'left' | 'right', `eff` the
+  // caret paragraph's effIndent, `dxPx` the pointer delta in px. Returns the
+  // engine command (one undo step) plus the marker/guide position in twips.
+  function dragResult(handle, eff, dxPx, zoom) {
+    var delta = pxToTw(dxPx, zoom);
+    if (handle === 'first') {
+      var firstMarker = Math.max(snapTwips(eff.left + eff.first + delta), 0);
+      return { cmd: 'firstline\t' + (firstMarker - eff.left), marker: firstMarker, guide: firstMarker };
+    }
+    if (handle === 'left') {
+      var leftMarker = Math.max(snapTwips(eff.left + delta), eff.listLeft || 0);
+      var first = Math.max(eff.first, -leftMarker);
+      return { cmd: 'setind\t' + leftMarker + '\t' + first, marker: leftMarker, guide: leftMarker };
+    }
+    var right = snapTwips(Math.max(eff.right - delta, 0));
+    return { cmd: 'rightind\t' + right, marker: right, guide: right };
+  }
+
+  var ruler = {
+    snapTwips: snapTwips,
+    twToPx: twToPx,
+    pxToTw: pxToTw,
+    effIndent: effIndent,
+    geometry: geometry,
+    dragResult: dragResult,
+  };
+
   // ---- what each ribbon act does in the browser -----------------------------
   //
   // Keyed by the suite's Act name (the snapshot's "act"). A string is an engine
@@ -368,6 +457,7 @@
     PrintLayout: { ui: 'layout' },
     DarkMode: { ui: 'theme' },
     AutoHideRibbon: { ui: 'ribbon' },
+    ToggleRuler: { ui: 'ruler' },
     // The suite's launchers are placeholders too; say the same thing.
     LaunchFont: { ui: 'message', text: 'Font — advanced dialog coming soon' },
     LaunchParagraph: { ui: 'message', text: 'Paragraph — advanced dialog coming soon' },
@@ -618,7 +708,6 @@
     'Markup(Original)': NOT_YET,
     'Markup(Simple)': NOT_YET,
     ToggleNav: NOT_YET,
-    ToggleRuler: NOT_YET,
   };
 
   root.DocxyEngine = {
@@ -640,5 +729,6 @@
     scalarOffset: scalarOffset,
     utf16Offset: utf16Offset,
     SLOT_IDS: SLOT_IDS,
+    ruler: ruler,
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);
