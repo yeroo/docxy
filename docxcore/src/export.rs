@@ -933,7 +933,11 @@ fn emit_table(flow: &mut dyn Flow, t: &Table, opts: &PdfOptions) {
             .collect();
         let text = cols.join("    ");
         let seg = Seg {
-            cells: text.chars().map(plain_cell).collect(),
+            cells: text
+                .chars()
+                .filter_map(printed_char)
+                .map(plain_cell)
+                .collect(),
             brk: None,
         };
         emit_segments(flow, vec![seg], opts.base_font_size, Align::Left);
@@ -1731,6 +1735,18 @@ impl Flow for Pager<'_> {
     }
 }
 
+/// The character a PDF prints for `ch`, if any (#1101). A soft hyphen
+/// prints only at a line break, which this layout never hyphenates at, so it
+/// is left out; a non-breaking hyphen has no WinAnsi byte and prints as a
+/// hyphen.
+fn printed_char(ch: char) -> Option<char> {
+    match ch {
+        '\u{ad}' => None,
+        '\u{2011}' => Some('-'),
+        _ => Some(ch),
+    }
+}
+
 fn plain_cell(ch: char) -> PCell {
     PCell {
         ch,
@@ -1765,7 +1781,11 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
     let mut segs: Vec<Seg> = vec![Seg::default()];
     // Complex fields: only the outermost field's result is replaced.
     let mut fields: Vec<OpenField> = Vec::new();
-    fn push(segs: &mut [Seg], cell: PCell) {
+    fn push(segs: &mut [Seg], mut cell: PCell) {
+        let Some(ch) = printed_char(cell.ch) else {
+            return;
+        };
+        cell.ch = ch;
         segs.last_mut().unwrap().cells.push(cell);
     }
     fn new_line(segs: &mut Vec<Seg>) {
@@ -2377,6 +2397,18 @@ mod tests {
         let pdf = to_pdf(&d, &PdfOptions::default());
         // 0x95 is the WinAnsi bullet byte; must appear in a content stream.
         assert!(pdf.windows(1).any(|w| w == [0x95]));
+    }
+
+    /// A non-breaking hyphen prints as a hyphen (WinAnsi has no U+2011), a
+    /// soft hyphen not at all (#1101).
+    #[test]
+    fn hyphens_print_as_a_hyphen_and_nothing() {
+        let d = doc(vec![text_para("e\u{2011}commerce co\u{ad}op")]);
+        let texts: String = pages_of(&d, &PdfOptions::default())
+            .iter()
+            .flat_map(|p| p.texts.iter().map(|t| t.2.clone()))
+            .collect();
+        assert!(texts.contains("e-commerce coop"), "{texts:?}");
     }
 
     // ---- page layout (#637) ----

@@ -1926,10 +1926,14 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                     let text = read_text(p);
                     after_text = true;
                     // Text after a hyphen element joins its Run; `w:t` after
-                    // `w:t` stays two Runs as before.
+                    // `w:t` stays two Runs as before. Text with a literal
+                    // U+2011 / U+00AD never joins: that Run writes them as
+                    // the elements.
                     if let (true, Some(Inline::Run(run))) = (was_hyphen, out.last_mut()) {
-                        run.text.push_str(&text);
-                        continue;
+                        if !has_hyphen_char(&text) {
+                            run.text.push_str(&text);
+                            continue;
+                        }
                     }
                     out.push(Inline::Run(Run {
                         text,
@@ -1948,9 +1952,12 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                     after_hyphen = true;
                     if let (true, Some(Inline::Run(run))) = (was_text || was_hyphen, out.last_mut())
                     {
-                        run.text.push(ch);
-                        run.props.hyphen_elements = true;
-                        continue;
+                        // Nor does a hyphen join a Run holding literal ones.
+                        if run.props.hyphen_elements || !has_hyphen_char(&run.text) {
+                            run.text.push(ch);
+                            run.props.hyphen_elements = true;
+                            continue;
+                        }
                     }
                     out.push(Inline::Run(Run {
                         text: ch.to_string(),
@@ -2021,6 +2028,12 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
         }
     }
     had_raw
+}
+
+/// Whether `text` holds a non-breaking or soft hyphen character, which a Run
+/// with `hyphen_elements` would write as an element (#1101).
+fn has_hyphen_char(text: &str) -> bool {
+    text.contains(['\u{2011}', '\u{ad}'])
 }
 
 /// The values one `w:rPr` gives its paired properties, whatever the order

@@ -1175,8 +1175,9 @@ fn char_width(c: char) -> usize {
         || (0x202A..=0x202E).contains(&u)
         || (0x2066..=0x2069).contains(&u)
         || u == 0x061C
+        || u == 0x00AD
     {
-        return 0; // combining marks / zero-width
+        return 0; // combining marks / zero-width (a soft hyphen is not drawn)
     }
     let wide = matches!(u,
         0x1100..=0x115F   // Hangul Jamo
@@ -1535,7 +1536,14 @@ fn flatten_para(
                 // The run style behind the tab — so an underlined tab draws its
                 // underline across the whole filled width (Word's "line" trick).
                 let tab_style = style_from_run(rp);
-                let cur = segs.last().unwrap().glyphs.len();
+                // In columns: a wide glyph takes two, a soft hyphen none.
+                let cur = segs
+                    .last()
+                    .unwrap()
+                    .glyphs
+                    .iter()
+                    .map(glyph_w)
+                    .sum::<usize>();
                 // The next tab stop at or beyond the current column, else a default
                 // stop every 8 cells. `>= cur` (not `> cur`) matters at narrow
                 // widths: a left stop can project onto the very column where the
@@ -2106,7 +2114,7 @@ fn projected_caret_stops(visual: &BidiVisualLine) -> Vec<LineCaretStop> {
     let mut stops = Vec::new();
     let mut extents = projected_logical_extents(visual);
     extents.sort_by_key(|extent| extent.cells.start);
-    for extent in extents {
+    for extent in &extents {
         if extent.cells.start == extent.cells.end {
             continue;
         }
@@ -2131,6 +2139,25 @@ fn projected_caret_stops(visual: &BidiVisualLine) -> Vec<LineCaretStop> {
             continue;
         }
         compacted.push(stop);
+    }
+    // Zero-width content at the line's logical end (`abc` + a soft hyphen)
+    // still ends the line: keep a stop for that offset, at its column, or
+    // End and Shift+End would stop short of it (#1101).
+    let end = extents.iter().map(|extent| extent.end).max();
+    if let Some(last) = extents
+        .iter()
+        .find(|extent| Some(extent.end) == end && extent.cells.start == extent.cells.end)
+    {
+        if !compacted.iter().any(|stop| stop.offset == last.end) {
+            let at = compacted.partition_point(|stop| stop.col <= last.cells.end);
+            compacted.insert(
+                at,
+                LineCaretStop {
+                    offset: last.end,
+                    col: last.cells.end,
+                },
+            );
+        }
     }
     compacted
 }

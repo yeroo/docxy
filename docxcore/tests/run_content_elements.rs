@@ -316,3 +316,86 @@ fn a_last_rendered_page_break_is_not_written() {
     let doc = load("<w:p><w:r><w:lastRenderedPageBreak/><w:t>a</w:t></w:r></w:p>");
     assert!(!saved_para(&doc).contains("lastRenderedPageBreak"));
 }
+
+/// Rejecting a formatting change restores the old properties, not how the
+/// run's hyphens are written (review r1).
+#[test]
+fn rejecting_a_formatting_change_keeps_the_hyphen_an_element() {
+    for (element, ch) in [
+        ("<w:noBreakHyphen/>", '\u{2011}'),
+        ("<w:softHyphen/>", '\u{ad}'),
+    ] {
+        let mut doc = load(&format!(
+            "<w:p><w:r><w:rPr><w:b/><w:rPrChange w:id=\"1\" w:author=\"A\"><w:rPr/>\
+             </w:rPrChange></w:rPr><w:t>e</w:t>{element}<w:t>mail</w:t></w:r></w:p>"
+        ));
+        doc.initialize_revision_targets();
+        doc.reject_all_revisions();
+        assert!(!runs(&doc)[0].props.bold, "{element}: rejected");
+        assert_eq!(para_text(&doc), format!("e{ch}mail"));
+        let p = saved_para(&doc);
+        assert!(p.contains(element), "{element}: {p}");
+        assert!(!p.contains(ch), "{element}: {p}");
+    }
+}
+
+/// Literal hyphen characters and hyphen elements in one `w:r` never share a
+/// Run, so each saves as it was (review r1).
+#[test]
+fn literal_and_element_hyphens_in_one_run_each_save_as_they_were() {
+    for body in [
+        "<w:t>a\u{2011}b</w:t><w:softHyphen/><w:t>c</w:t>",
+        "<w:t>a</w:t><w:softHyphen/><w:t>b\u{2011}c</w:t>",
+        "<w:t>a</w:t><w:noBreakHyphen/><w:t>\u{ad}</w:t><w:noBreakHyphen/>",
+    ] {
+        let doc = load(&format!("<w:p><w:r>{body}</w:r></w:p>"));
+        let p = saved_para(&doc);
+        let elements = body.matches("Hyphen/>").count();
+        assert_eq!(p.matches("Hyphen/>").count(), elements, "{body}: {p}");
+        let literals = body.matches(['\u{2011}', '\u{ad}']).count();
+        assert_eq!(
+            p.matches(['\u{2011}', '\u{ad}']).count(),
+            literals,
+            "{body}: {p}"
+        );
+        assert_eq!(
+            parse_document_xml(&document_to_xml(&doc), &Relationships::default()),
+            doc
+        );
+    }
+}
+
+/// A soft hyphen takes no column before a tab: the tab stops where it would
+/// without it, left or right aligned (review r1).
+#[test]
+fn a_soft_hyphen_does_not_move_a_tab() {
+    let pair = |ppr: &str, with: &str, without: &str| {
+        let doc = |runs: &str| load(&format!("<w:p>{ppr}<w:r>{runs}</w:r></w:p>"));
+        (rendered(&doc(with), 40), rendered(&doc(without), 40))
+    };
+    let (with, without) = pair(
+        "",
+        "<w:t>abcdefg</w:t><w:softHyphen/><w:tab/><w:t>x</w:t>",
+        "<w:t>abcdefg</w:t><w:tab/><w:t>x</w:t>",
+    );
+    assert_eq!(with, without);
+    assert_eq!(with, ["abcdefg x"]);
+    // The text after a right tab is measured without it.
+    let (with, without) = pair(
+        "<w:pPr><w:tabs><w:tab w:val=\"right\" w:pos=\"4000\"/></w:tabs></w:pPr>",
+        "<w:t>q</w:t><w:tab/><w:t>a</w:t><w:softHyphen/><w:t>b</w:t>",
+        "<w:t>q</w:t><w:tab/><w:t>ab</w:t>",
+    );
+    assert_eq!(with, without);
+}
+
+/// A soft hyphen at the end of a paragraph keeps the end's caret stop, so
+/// End reaches past it (review r1).
+#[test]
+fn a_trailing_soft_hyphen_keeps_the_end_caret_stop() {
+    let doc = load("<w:p><w:r><w:t>abc</w:t><w:softHyphen/></w:r></w:p>");
+    let (_, maps) = docxcore::render::render_mapped(&doc, &RenderOptions::default());
+    let seg = &maps[0].segs[0];
+    let last = seg.visual.last().unwrap();
+    assert_eq!((last.offset, last.col), (4, 3), "{:?}", seg.visual);
+}
