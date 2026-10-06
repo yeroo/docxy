@@ -274,11 +274,11 @@ svg.icon * { fill: currentColor; }
 }
 .ruler-m { position: absolute; }
 .ruler-m-first {
-  top: 0; margin-left: -4px; width: 0; height: 0; cursor: ew-resize;
+  top: 0; transform: translateX(-50%); width: 0; height: 0; cursor: ew-resize;
   border-left: 4px solid transparent; border-right: 4px solid transparent;
   border-top: 7px solid var(--ruler-marker);
 }
-.ruler-m-left { top: 8px; margin-left: -4px; width: 7px; height: 7px; background: var(--ruler-marker); cursor: ew-resize; }
+.ruler-m-left { top: 8px; transform: translateX(-50%); width: 7px; height: 7px; background: var(--ruler-marker); cursor: ew-resize; }
 .ruler-m-right {
   top: 1px; width: 0; height: 0; cursor: ew-resize;
   border-top: 4px solid transparent; border-bottom: 4px solid transparent;

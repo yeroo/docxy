@@ -320,7 +320,7 @@
       if (e.button !== undefined && e.button !== 0) return;
       var trackRect = el.rulerHTrack.getBoundingClientRect();
       var handle = rulerHandleAt(e.clientX - trackRect.left);
-      if (!handle) return;
+      if (!handle || el.rulerMLeft.hidden) return;
       e.preventDefault(); // keep the caret and selection where they are
       var rect = el.page.getBoundingClientRect();
       var zoom = pageScale();
