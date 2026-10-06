@@ -279,7 +279,9 @@ impl Session {
                     let wb = &mut self.pkg.workbook;
                     match gridcore::entry::entry_cell(wb, self.active, r, c, text, today) {
                         Ok(cell) => {
-                            self.apply(vec![(r, c, cell)]);
+                            if self.apply(vec![(r, c, cell)]) {
+                                self.table_autocorrect(self.active, (r, c));
+                            }
                         }
                         Err(e) => {
                             self.err = Some(e.to_string());
@@ -670,6 +672,31 @@ impl Session {
             }
             None => {}
         }
+    }
+
+    /// Excel's table AutoCorrect after an entry was typed at `at` on sheet
+    /// `sheet` (#682): a table beside it grows to take it, then a formula
+    /// typed into an empty table column fills it
+    /// ([`gridcore::edit::auto_expand_table`],
+    /// [`gridcore::edit::fill_calculated_column`]). As in Excel, an undo
+    /// step of its own after the entry's.
+    fn table_autocorrect(&mut self, sheet: usize, at: (u32, u32)) {
+        if !gridcore::edit::typed_entry_near_table(&self.pkg.workbook, sheet, at) {
+            return;
+        }
+        let before = WbSnapshot::of(&self.pkg.workbook);
+        let wb = &mut self.pkg.workbook;
+        let grew = gridcore::edit::auto_expand_table(wb, sheet, at);
+        let filled = gridcore::edit::fill_calculated_column(wb, sheet, at);
+        if !(grew || filled) {
+            return;
+        }
+        self.rebuild_engine();
+        let after = WbSnapshot::of(&self.pkg.workbook);
+        self.undo.push(UndoAction::Structural { before, after });
+        self.edits += 1;
+        self.redo.clear();
+        self.dirty = true;
     }
 
     /// Snapshot-run-snapshot for structural edits (row/col ops, renames):
@@ -4465,6 +4492,57 @@ mod tests {
         s.dispatch("undo");
         let v = s.view_json(None);
         assert!(v.contains("3.75"), "one undo restores: {v}");
+    }
+
+    /// #682: the issue's `Calc` table (A1:C4, Qty 2, 3, 4; Price 5, 6, 7;
+    /// Line empty), opened from a saved file.
+    fn calc_682_session() -> Session {
+        let mut pkg = gridcore::xlsx::new_xlsx();
+        let sh = &mut pkg.workbook.sheets[0];
+        for (c, h) in ["Qty", "Price", "Line"].iter().enumerate() {
+            sh.set_cell(0, c as u32, Cell::text(h));
+        }
+        for (i, (q, p)) in [(2.0, 5.0), (3.0, 6.0), (4.0, 7.0)].into_iter().enumerate() {
+            sh.set_cell(i as u32 + 1, 0, Cell::number(q));
+            sh.set_cell(i as u32 + 1, 1, Cell::number(p));
+        }
+        pkg.add_table(0, (0, 0, 3, 2), true, "TableStyleMedium2")
+            .unwrap();
+        gridcore::edit::rename_table(&mut pkg.workbook, "Table1", "Calc").unwrap();
+        Session::open(&gridcore::xlsx::save_xlsx(&pkg)).expect("open")
+    }
+
+    fn cell_text(s: &mut Session, at: &str) -> String {
+        s.ctl(&format!(r#"{{"verb":"cell.get","args":{{"ref":"{at}"}}}}"#))
+    }
+
+    /// #682 through the bridge: a formula in the empty column fills it, a
+    /// new row below takes it, and each AutoCorrect undoes on its own
+    /// before the entry.
+    #[test]
+    fn typed_entries_grow_tables_and_fill_calculated_columns() {
+        let mut s = calc_682_session();
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"C2","text":"=[@Qty]*[@Price]"}}"#);
+        assert!(
+            cell_text(&mut s, "C4").contains("\"text\":\"28\""),
+            "{}",
+            cell_text(&mut s, "C4")
+        );
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"A5","text":"5"}}"#);
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"B5","text":"2"}}"#);
+        assert_eq!(s.pkg.workbook.tables[0].range, (0, 0, 4, 2));
+        assert!(
+            cell_text(&mut s, "C5").contains("\"text\":\"10\""),
+            "{}",
+            cell_text(&mut s, "C5")
+        );
+        // B5's entry, then A5's expansion: the table is back, A5 stays.
+        s.dispatch("undo");
+        s.dispatch("undo");
+        assert_eq!(s.pkg.workbook.tables[0].range, (0, 0, 3, 2));
+        assert!(cell_text(&mut s, "A5").contains("\"text\":\"5\""));
+        s.dispatch("redo");
+        assert_eq!(s.pkg.workbook.tables[0].range, (0, 0, 4, 2));
     }
 
     #[test]
