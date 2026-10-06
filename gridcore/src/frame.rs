@@ -1155,6 +1155,7 @@ mod tests {
             ],
             part: String::new(),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
         });
         let f = Frame::from_table(&wb, "sales").unwrap();
         assert_eq!(f.rows(), 6);

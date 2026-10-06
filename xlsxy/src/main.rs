@@ -17776,6 +17776,7 @@ mod tests {
             columns: cols.iter().map(|s| s.to_string()).collect(),
             part: String::new(),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
         };
         pkg.workbook
             .tables
@@ -20602,6 +20603,7 @@ mod tests {
                 .map(String::from)
                 .to_vec(),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
             part: String::new(),
         });
         app.rebuild_engine();

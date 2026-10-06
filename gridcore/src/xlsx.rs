@@ -606,6 +606,10 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
     let mut totals_rows = 0u32;
     let mut columns = Vec::new();
     let mut ids: Vec<Option<u32>> = Vec::new();
+    // Each column's `calculatedColumnFormula`, and whether its text is
+    // being read.
+    let mut calculated: Vec<Option<String>> = Vec::new();
+    let mut in_calc = false;
     loop {
         match p.next() {
             Event::Start => match local(p.name()) {
@@ -625,12 +629,35 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
                 "tableColumn" => {
                     columns.push(decode(p.attr("name")));
                     ids.push(p.attr("id").parse().ok().filter(|&id| id != 0));
+                    calculated.push(None);
+                }
+                "calculatedColumnFormula" => {
+                    in_calc = !matches!(p.attr("array"), "1" | "true");
+                    if let (true, Some(f)) = (in_calc, calculated.last_mut()) {
+                        f.get_or_insert_default();
+                    }
                 }
                 _ => {}
             },
+            Event::Text if in_calc => {
+                if let Some(Some(f)) = calculated.last_mut() {
+                    XmlParser::append_decoded(p.text(), f);
+                }
+            }
+            Event::End if local(p.name()) == "calculatedColumnFormula" => in_calc = false,
             Event::Eof => break,
             _ => {}
         }
+    }
+    // An empty element, or an array formula (`array="1"`, which a new row
+    // can't take as a plain formula), gives no formula.
+    for f in &mut calculated {
+        if f.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            *f = None;
+        }
+    }
+    if calculated.iter().all(Option::is_none) {
+        calculated.clear();
     }
     // Ids the part doesn't give for every column, or gives twice, can't
     // tell its columns apart: the save then matches them by name.
@@ -649,6 +676,7 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
         totals_rows,
         columns,
         column_ids,
+        calculated_formulas: calculated,
         part: part.to_string(),
     })
 }
@@ -6701,6 +6729,7 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
                 &converted,
             );
         }
+        updated = sync_calculated_formulas(&updated, &t.name, &t.calculated_formulas);
         p.1 = updated.into_bytes();
     }
     for (part, dropped) in &dropped_columns {
@@ -6709,6 +6738,94 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
     for c in &converted {
         drop_table_part(parts, &c.part);
     }
+}
+
+/// Give each `tableColumn` of a table part (in the model's column order, as
+/// [`sync_table_columns`] left them) the model's calculated-column formula
+/// ([`crate::sheet::Table::calculated_formulas`]). An element whose formula
+/// already means the same (the same parse, after the rewrites the save
+/// made) keeps its text, so an unchanged part stays as loaded; a column the
+/// model has no formula for keeps whatever the part has. A new formula is
+/// written as Excel writes one, its bare references qualified by the
+/// table's name `table` (`[@Qty]` is `Sales[[#This Row],[Qty]]`).
+fn sync_calculated_formulas(xml: &str, table: &str, formulas: &[Option<String>]) -> String {
+    use crate::formula::Expr;
+    if formulas.iter().all(Option::is_none) {
+        return xml.to_string();
+    }
+    let Some(&span) = table_children(xml, "tableColumns").first() else {
+        return xml.to_string();
+    };
+    // A formula with its bare references naming `table`.
+    let qualified = |src: &str| {
+        crate::formula::parse(src).ok().map(|e| {
+            crate::formula::map_expr(&e, &|x| match x {
+                Expr::Structured {
+                    table: None,
+                    item,
+                    col1,
+                    col2,
+                } => Some(Expr::Structured {
+                    table: Some(table.to_string()),
+                    item: *item,
+                    col1: col1.clone(),
+                    col2: col2.clone(),
+                }),
+                _ => None,
+            })
+        })
+    };
+    let mut edits = Vec::new();
+    for ((s, e), f) in child_spans(xml, span, "tableColumn")
+        .into_iter()
+        .zip(formulas)
+    {
+        let Some(f) = f else {
+            continue;
+        };
+        let want = qualified(f);
+        let body = esc_text(&match &want {
+            Some(e) => crate::formula::to_file_string(e),
+            None => crate::formula::file_formula(f).into_owned(),
+        });
+        let open_end = tag_end(xml, s);
+        let open = &xml[s..open_end];
+        let qname = open[1..]
+            .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .next()
+            .unwrap_or("tableColumn");
+        let prefix = qname
+            .rsplit_once(':')
+            .map_or(String::new(), |(p, _)| format!("{p}:"));
+        let calc =
+            format!("<{prefix}calculatedColumnFormula>{body}</{prefix}calculatedColumnFormula>");
+        if open.ends_with("/>") {
+            let head = open[..open.len() - 2].trim_end();
+            edits.push((s, e, format!("{head}>{calc}</{qname}>")));
+            continue;
+        }
+        let existing = element_children(&xml[s..e])
+            .into_iter()
+            .find(|(n, _, _)| n == "calculatedColumnFormula")
+            .map(|(_, a, b)| (s + a, s + b));
+        match existing {
+            Some((a, b)) => {
+                let el = &xml[a..b];
+                let text = el
+                    .find('>')
+                    .filter(|_| !el.ends_with("/>"))
+                    .and_then(|o| el.rfind("</").map(|c| decode(&el[o + 1..c])));
+                let same = text
+                    .as_deref()
+                    .is_some_and(|t| t == f || (want.is_some() && qualified(t) == want));
+                if !same {
+                    edits.push((a, b, calc));
+                }
+            }
+            None => edits.push((open_end, open_end, calc)),
+        }
+    }
+    apply_edits(xml.to_string(), edits)
 }
 
 /// Table `part` lost the columns whose ids are `dropped`: the query table
@@ -7819,6 +7936,7 @@ impl SheetPackage {
             header_rows: u32::from(has_header),
             totals_rows: 0,
             column_ids: (1..=names.len() as u32).collect(),
+            calculated_formulas: Vec::new(),
             columns: names,
             part,
         });
@@ -20893,5 +21011,95 @@ mod table_command_tests {
             .add_table(dest, (r1, c1, r1 + 3, c1 + 1), true, "TableStyleMedium2")
             .unwrap_err();
         assert!(err.contains("PivotTable"), "{err}");
+    }
+
+    /// #682: a part's `calculatedColumnFormula` loads into the model, and a
+    /// save of an unchanged table writes its part as it was.
+    #[test]
+    fn calculated_formulas_load_and_resave_unchanged() {
+        let mut pkg = one_table();
+        let part = pkg.workbook.tables[0].part.clone();
+        calculated(&mut pkg, &part, "Qty", "LEN(Table1[[#This Row],[Item]])");
+        let re = reload(&pkg);
+        assert_eq!(
+            re.workbook.tables[0].calculated_formulas,
+            vec![None, Some("LEN(Table1[[#This Row],[Item]])".to_string())]
+        );
+        let saved = text(&re, &part);
+        assert_eq!(text(&reload(&re), &part), saved);
+        assert_eq!(saved, text(&pkg, &part));
+    }
+
+    /// A column renamed by its header renames it in the model's formula and
+    /// in the part's alike, so the save keeps the part's rewrite.
+    #[test]
+    fn a_header_rename_reaches_the_model_formula_too() {
+        let mut pkg = one_table();
+        let part = pkg.workbook.tables[0].part.clone();
+        calculated(&mut pkg, &part, "Qty", "LEN(Table1[[#This Row],[Item]])");
+        let mut re = reload(&pkg);
+        re.workbook.sheets[0].set_cell(0, 0, Cell::text("Name"));
+        crate::edit::sync_table_headers(&mut re.workbook, 0, &[(0, 0)]);
+        let f = re.workbook.tables[0]
+            .calculated_formula(1)
+            .unwrap()
+            .to_string();
+        assert!(f.contains("Name") && !f.contains("Item"), "{f}");
+        let again = reload(&re);
+        assert_eq!(
+            column_formula(&again, &part),
+            "LEN(Table1[[#This Row],[Name]])"
+        );
+        let model = again.workbook.tables[0].calculated_formula(1).unwrap();
+        assert_eq!(
+            crate::formula::parse(model),
+            crate::formula::parse("LEN(Table1[[#This Row],[Name]])")
+        );
+    }
+
+    /// A grown table with a calculated formula on its new column saves the
+    /// new `ref`, the column, and the formula in the file's spelling.
+    #[test]
+    fn a_new_calculated_formula_saves_on_a_grown_table() {
+        let mut pkg = one_table();
+        let part = pkg.workbook.tables[0].part.clone();
+        resize_table(&mut pkg.workbook, "Table1", (0, 0, 3, 2)).unwrap();
+        pkg.workbook.tables[0].set_calculated_formula(2, Some("[@Qty]*2".into()));
+        let re = reload(&pkg);
+        let xml = text(&re, &part);
+        assert!(xml.contains(r#"ref="A1:C4""#), "{xml}");
+        assert!(
+            xml.contains(r#"name="Column3"><calculatedColumnFormula>Table1[[#This Row],[Qty]]*2</calculatedColumnFormula></tableColumn>"#),
+            "{xml}"
+        );
+        let t = &re.workbook.tables[0];
+        assert_eq!(t.calculated_formulas.len(), 3);
+        assert_eq!(t.calculated_formula(2), Some("Table1[[#This Row],[Qty]]*2"));
+        // Saved again, it says the same.
+        assert_eq!(text(&reload(&re), &part), xml);
+    }
+
+    /// Row and column edits move the A1 references of a calculated formula
+    /// as they move the cells' formulas, and a deleted column takes its
+    /// formula with it.
+    #[test]
+    fn calculated_formulas_follow_row_and_column_edits() {
+        let mut pkg = one_table();
+        pkg.workbook.sheets[0].set_cell(9, 5, Cell::number(2.0));
+        resize_table(&mut pkg.workbook, "Table1", (0, 0, 2, 2)).unwrap();
+        pkg.workbook.tables[0].set_calculated_formula(1, Some("$F$10".into()));
+        pkg.workbook.tables[0].set_calculated_formula(2, Some("[@Qty]*$F$10".into()));
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 5, 1);
+        assert_eq!(
+            pkg.workbook.tables[0].calculated_formula(2),
+            Some("[@Qty]*$F$11")
+        );
+        crate::edit::delete_cols(&mut pkg.workbook, 0, 1, 1);
+        let t = &pkg.workbook.tables[0];
+        assert_eq!(t.columns, vec!["Item", "Column3"]);
+        assert_eq!(
+            t.calculated_formulas,
+            vec![None, Some("#REF!*$E$11".to_string())]
+        );
     }
 }

@@ -1434,6 +1434,17 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
             dn.formula = updated;
         }
     }
+    // A table's calculated-column formulas move like its cells' formulas.
+    for t in &mut wb.tables {
+        let home_is_target = t.sheet == idx;
+        for src in t.calculated_formulas.iter_mut().flatten() {
+            if let Some(updated) =
+                adjust_formula_for_edit(src, home_is_target, &target_name, &shift)
+            {
+                *src = updated;
+            }
+        }
+    }
 
     // Conditional formatting and data validation follow the cells they cover,
     // and their formulas move like cell formulas.
@@ -1605,6 +1616,13 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
             .filter(|&(j, _)| kept(j))
             .map(|(_, &id)| id)
             .collect();
+        // As rewritten above: a survivor's formula naming a deleted column
+        // now reads #REF!, as its cells do.
+        let calculated = std::mem::take(&mut tm.calculated_formulas);
+        for (j, f) in calculated.into_iter().enumerate().filter(|&(j, _)| kept(j)) {
+            let k = (0..j).filter(|&x| kept(x)).count();
+            tm.set_calculated_formula(k, f);
+        }
         i += 1;
     }
 }
@@ -2087,6 +2105,21 @@ fn rewrite_workbook_formulas(
             dn.formula = updated;
         }
     }
+    // A table's calculated-column formulas sit in its first data row.
+    for t in &mut wb.tables {
+        let (r1, c1, ..) = t.range;
+        let row = r1 + t.header_rows;
+        let sheet = t.sheet;
+        for (j, slot) in t.calculated_formulas.iter_mut().enumerate() {
+            let Some(src) = slot else {
+                continue;
+            };
+            let site = (Some(sheet), Some((row, c1 + j as u32)));
+            if let Some(updated) = rewrite_if_changed(src, |e| f(e, site)) {
+                *slot = Some(updated);
+            }
+        }
+    }
 }
 
 fn table_index(wb: &Workbook, name: &str) -> Result<usize, String> {
@@ -2190,18 +2223,23 @@ pub fn resize_table(
             .then(|| old_columns.get((c - oc1) as usize).cloned())
             .flatten()
     };
-    // A kept column keeps its id; a new one has none in the part yet.
+    // A kept column keeps its id and calculated formula; a new one has
+    // neither yet.
     let old_ids = t.column_ids.clone();
+    let old_calculated = t.calculated_formulas.clone();
     let mut column_ids = Vec::new();
+    let mut calculated = Vec::new();
     let mut taken: Vec<String> = (c1..=c2).filter_map(kept).collect();
     let mut columns = Vec::new();
     for c in c1..=c2 {
         if let Some(n) = kept(c) {
             columns.push(n);
             column_ids.push(old_ids.get((c - oc1) as usize).copied().unwrap_or(0));
+            calculated.push(old_calculated.get((c - oc1) as usize).cloned().flatten());
             continue;
         }
         column_ids.push(0);
+        calculated.push(None);
         let header = (header_rows > 0)
             .then(|| wb.sheets[sheet].cell(r1, c).map(|cl| cl.value.clone()))
             .flatten();
@@ -2222,6 +2260,11 @@ pub fn resize_table(
     if !old_ids.is_empty() {
         t.column_ids = column_ids;
     }
+    t.calculated_formulas = if calculated.iter().any(Option::is_some) {
+        calculated
+    } else {
+        Vec::new()
+    };
     Ok(())
 }
 
@@ -4185,6 +4228,7 @@ mod table_tests {
             columns: vec!["Item".into(), "Qty".into(), "Dbl".into()],
             part: "xl/tables/table1.xml".into(),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
         });
         wb
     }
@@ -4251,6 +4295,7 @@ mod table_tests {
             columns: (range.1..=range.3).map(|c| format!("C{c}")).collect(),
             part: format!("xl/tables/{name}.xml"),
             column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
         }
     }
 
@@ -4519,6 +4564,7 @@ mod table_tests {
                 .map(String::from)
                 .to_vec(),
             column_ids: vec![1, 2, 3, 4],
+            calculated_formulas: Vec::new(),
             part: "xl/tables/table1.xml".into(),
         });
         wb
@@ -4667,6 +4713,7 @@ mod table_tests {
             totals_rows: 0,
             columns: ["Qty", "Price", "Line"].map(String::from).to_vec(),
             column_ids: vec![1, 2, 3],
+            calculated_formulas: Vec::new(),
             part: "xl/tables/table1.xml".into(),
         });
         put(&mut wb, 0, "F2", "SUM(Calc[Line])");
