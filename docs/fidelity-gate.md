@@ -84,6 +84,30 @@ Files are named `repo:<path>` for repo-tracked `.docx` and `ext:<path>` for the
 external corpus, relative to the `FIDELITY_CORPUS` directory. So a local copy and
 CI's checkout produce the same keys.
 
+## Effective text
+
+The gate also compares the effective text of `word/document.xml` before and
+after the save (#1101). This is the text Word shows, with its `Range.Text`
+characters for run content that is not `w:t`:
+
+| Content | Character |
+|---|---|
+| `w:noBreakHyphen` | U+001E |
+| `w:softHyphen` | U+001F |
+| `w:tab`, `w:ptab` | tab |
+| `w:br`, `w:cr` | U+000B (U+000C for a page break, U+000E for a column break) |
+| `w:sym` | `(` |
+| paragraph end | CR |
+
+A character lost inside a restructured run shows up here even when the element
+compare files it as one more run-restructuring entry.
+
+- For the files in `EFFECTIVE_TEXT` (`docxcore/tests/fidelity.rs`), any change
+  fails the gate. That list holds the corpus files Word's own text check found
+  #1101 in, and the change cannot be baselined.
+- For every other file, a change is printed as `effective text changed (not
+  gated)` and counted.
+
 ## Schema validation
 
 A save can lose nothing and still write a file Word refuses as corrupt (#1083:
