@@ -3798,6 +3798,7 @@ fn dispatch_verb(
                     );
                 }
                 let count = v.ed.project().tasks.len();
+                let entry_edit = v.cell.as_ref().is_some_and(|c| c.uid.is_none());
                 match target.at {
                     Some(crate::ShownRow::Task(i)) => {
                         crate::project_cell_press(tab, i, target.col, shift);
@@ -3805,8 +3806,18 @@ fn dispatch_verb(
                         crate::project_cell_release(tab);
                     }
                     Some(crate::ShownRow::Entry) => {
+                        // The press commits an open entry-row edit, so an
+                        // append is visible before the click runs: the
+                        // release lands on the new task's row, exactly as a
+                        // pointer's re-hit-tested click does.
                         crate::project_cell_press(tab, count, target.col, shift);
-                        crate::project_entry_click(tab, Some(target.col), dbl);
+                        let appended = entry_edit
+                            && matches!(&tab.surface, crate::Surface::Project(v) if v.ed.project().tasks.len() > count);
+                        if appended {
+                            crate::project_cell_click(tab, count, Some(target.col), dbl);
+                        } else {
+                            crate::project_entry_click(tab, Some(target.col), dbl);
+                        }
                         crate::project_cell_release(tab);
                     }
                     None => return Err("Project cell is outside the entry table".into()),
