@@ -239,3 +239,7 @@ repo:corpus/legacy/word/fields-breaks.docx	word/document.xml	changed-value	/w:do
 repo:corpus/legacy/word/fields-breaks.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 repo:corpus/word-import/source.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
 repo:corpus/word-import/source.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
+repo:docxcore/tests/fixtures/smarttag-pr.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
+repo:docxcore/tests/fixtures/smarttag-pr.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:smartTag
+repo:docxcore/tests/fixtures/smarttag-pr.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
+repo:docxcore/tests/fixtures/smarttag-pr.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r

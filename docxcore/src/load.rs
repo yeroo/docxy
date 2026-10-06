@@ -3150,7 +3150,11 @@ mod tests {
         let run = |t: &str| format!("<w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r>");
         let nested = tag(
             "place",
-            &format!("{}{}", tag("PlaceType", &run("University")), run(" of Texas")),
+            &format!(
+                "{}{}",
+                tag("PlaceType", &run("University")),
+                run(" of Texas")
+            ),
         );
         let xml = format!(
             "<w:document><w:body><w:p>{nested}</w:p>\
