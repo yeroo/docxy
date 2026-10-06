@@ -79,10 +79,12 @@ pub(crate) fn route(keystroke: &Keystroke, is_held: bool, macos: bool, takes_tex
     }
 }
 
-/// Whether typed letters are text: not while KeyTips are up or a menu is
-/// open, where `on_key` takes them as commands.
-pub(crate) fn takes_text(keytips_up: bool, menu_open: bool) -> bool {
-    !keytips_up && !menu_open
+/// Whether typed letters are text: always under an open dialog, which takes
+/// every key before KeyTips or a menu may (`modal_takes_key`), and otherwise
+/// not while KeyTips are up or a menu is open, where `on_key` takes them as
+/// commands. KeyTips raised before a dialog opened stay set under it.
+pub(crate) fn takes_text(dialog_open: bool, keytips_up: bool, menu_open: bool) -> bool {
+    dialog_open || (!keytips_up && !menu_open)
 }
 
 /// The text AppKit would commit for a key event the root may defer: what the
@@ -236,7 +238,11 @@ impl Docxy {
     }
 
     fn takes_text(&self) -> bool {
-        takes_text(self.keytips != crate::KeyTip::Off, self.menu.is_some())
+        takes_text(
+            self.active_dialogs().is_some_and(|d| d.is_open()),
+            self.keytips != crate::KeyTip::Off,
+            self.menu.is_some(),
+        )
     }
 
     fn type_committed(
@@ -486,25 +492,48 @@ mod tests {
     /// input method composes them.
     #[test]
     fn letters_stay_with_on_key_while_keytips_or_a_menu_is_up() {
-        assert!(takes_text(false, false));
-        assert!(!takes_text(true, false));
-        assert!(!takes_text(false, true));
+        assert!(takes_text(false, false, false));
+        assert!(!takes_text(false, true, false));
+        assert!(!takes_text(false, false, true));
+        assert!(!takes_text(false, true, true));
         for k in [
             plain("h", "h"),
             stroke("e", Some("´"), alt()),
             plain("space", " "),
         ] {
             assert_eq!(
-                route(&k, false, true, takes_text(true, false)),
+                route(&k, false, true, takes_text(false, true, false)),
                 Route::AppStop,
                 "{}",
                 k.key
             );
             assert_eq!(
-                route(&k, false, true, takes_text(false, true)),
+                route(&k, false, true, takes_text(false, false, true)),
                 Route::AppStop,
                 "{}",
                 k.key
+            );
+        }
+    }
+
+    /// An open dialog takes every key first, so its fields compose even with
+    /// KeyTips left up (F10, then File > Settings > User name... by mouse)
+    /// or a menu still set under it.
+    #[test]
+    fn an_open_dialog_takes_text_over_keytips_and_menus() {
+        for (keytips, menu) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert!(
+                takes_text(true, keytips, menu),
+                "keytips {keytips}, menu {menu}"
+            );
+            assert_eq!(
+                route(
+                    &stroke("e", Some("´"), alt()),
+                    false,
+                    true,
+                    takes_text(true, keytips, menu)
+                ),
+                Route::Defer
             );
         }
     }

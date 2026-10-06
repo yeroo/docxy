@@ -596,11 +596,15 @@ active document's comments `{comments:[{id,author,initials,text}]}`. The cases a
 `uiharness/cases/user-name.uit`; `user-name-no-document.uit` closes every tab,
 so it has its own file (cases in one file share one instance).
 
-On macOS the window root leaves printable keys (no Ctrl, Cmd or Fn) to
-AppKit's input context, which hands them back through the input handler, so
-dead keys and IME composition work (#1072). `real-key`/`real-type` never pass
-through AppKit, so for such a key the harness sends the handler the
-`insertText:` AppKit would; elsewhere they go as before. `call ime-mark
+On macOS the window root leaves printable keys (no Ctrl, Cmd or Fn, and not
+a held key's repeat) to AppKit's input context, which hands them back through
+the input handler, so dead keys and IME composition work (#1072). It does so
+only while the root has the focus and letters are text: an open dialog always
+takes text, and otherwise KeyTips or an open menu takes letters as commands.
+Any other key stays with `on_key`. `real-key`/`real-type` never pass through
+AppKit, so for a key the root left to it the harness sends the handler the
+`insertText:` AppKit would; for a key `on_key` kept, and on every other
+platform, they go as before. `call ime-mark
 {"text":"´"}`, `call ime-commit {"text":"é"}` and `call ime-unmark {}` call the
 input handler's own methods with what AppKit sends for marked text
 (`setMarkedText:`, which types nothing), a commit (`insertText:`, typed as keys
