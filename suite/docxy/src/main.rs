@@ -20212,6 +20212,8 @@ impl Docxy {
                 }
                 // Redo, or Repeat with nothing to redo (#618).
                 "y" => redo_or_repeat(ed, repeat),
+                "enter" if shift => yes(|| ed.insert_break(docxcore::model::BreakKind::Column)),
+                "enter" => yes(|| ed.insert_break(docxcore::model::BreakKind::Page)),
                 "a" => no(|| ed.select_all()),
                 // Ctrl+Tab types a tab inside a table cell, where Tab moves to
                 // the next cell (Word). gpui binds no action to it, so it
@@ -22413,6 +22415,8 @@ enum Repeat {
     Typing,
     Enter,
     Tab,
+    /// Ctrl+Enter / Ctrl+Shift+Enter: a page or column break at the caret.
+    Break(docxcore::model::BreakKind),
     /// A command [`repeatable_act`] allows.
     Act(Act),
 }
@@ -22424,6 +22428,8 @@ impl Repeat {
             Repeat::Typing => None,
             Repeat::Enter => Some("Enter"),
             Repeat::Tab => Some("Tab"),
+            Repeat::Break(docxcore::model::BreakKind::Column) => Some("Column Break"),
+            Repeat::Break(_) => Some("Page Break"),
             Repeat::Act(act) => act_undo_name(act),
         }
     }
@@ -22555,6 +22561,7 @@ fn redo_or_repeat(ed: &mut Editor, rec: &mut Option<RepeatRecord>) -> bool {
         }
         Repeat::Enter => ed.insert_newline(),
         Repeat::Tab => ed.insert_tab(),
+        Repeat::Break(kind) => ed.insert_break(kind),
         Repeat::Act(act) => apply_doc_act(ed, act),
     }
     if !ed.undo_serial().is_some_and(|s| s > since) {
@@ -22616,6 +22623,8 @@ fn key_repeat(key: &str, ctrl: bool, shift: bool) -> Option<Repeat> {
         (true, "m") => Repeat::Act(Act::IndentInc),
         (_, "tab") if !shift => Repeat::Tab,
         (false, "enter") => Repeat::Enter,
+        (true, "enter") if shift => Repeat::Break(docxcore::model::BreakKind::Column),
+        (true, "enter") => Repeat::Break(docxcore::model::BreakKind::Page),
         _ => return None,
     })
 }
@@ -22711,6 +22720,8 @@ mod repeat_tests {
             (true, "b") => ed.toggle_bold(),
             (true, "a") => ed.select_all(),
             (false, "enter") => ed.insert_newline(),
+            (true, "enter") if shift => ed.insert_break(docxcore::model::BreakKind::Column),
+            (true, "enter") => ed.insert_break(docxcore::model::BreakKind::Page),
             other => panic!("no key {other:?} in this test"),
         }
         if let Some(what) = noted {
@@ -23192,6 +23203,14 @@ mod repeat_tests {
             key_repeat("enter", false, false),
             Some(Repeat::Enter)
         ));
+        assert!(matches!(
+            key_repeat("enter", true, false),
+            Some(Repeat::Break(docxcore::model::BreakKind::Page))
+        ));
+        assert!(matches!(
+            key_repeat("enter", true, true),
+            Some(Repeat::Break(docxcore::model::BreakKind::Column))
+        ));
         assert!(key_repeat("y", true, false).is_none());
         assert!(key_repeat("f4", false, false).is_none());
         assert!(key_repeat("left", false, false).is_none());
@@ -23210,6 +23229,46 @@ mod repeat_tests {
         // Protected View still refuses both (#633).
         assert!(!open_mode::protected_allows_doc_key("f4", false, false));
         assert!(!open_mode::protected_allows_doc_key("y", true, false));
+    }
+
+    /// #644: Ctrl+Enter and Ctrl+Shift+Enter insert a page and a column break
+    /// at the caret, replace a selection, undo as one step and Repeat.
+    #[test]
+    fn ctrl_enter_inserts_page_and_column_breaks_644() {
+        let xml = |ed: &Editor| docxcore::serialize::document_to_xml(&ed.doc);
+        for (shift, ty, name) in [
+            (false, "page", "Page Break"),
+            (true, "column", "Column Break"),
+        ] {
+            let mut ed = Editor::new(docxcore::markdown::from_markdown("One Two\n"));
+            let mut rec = None;
+            ed.set_caret(Caret::at(vec![0], 4));
+            let before = ed.doc.clone();
+            key(&mut ed, &mut rec, "enter", true, shift);
+            assert_eq!(text(&ed, 0), "One \nTwo");
+            assert!(
+                xml(&ed).contains(&format!("<w:br w:type=\"{ty}\"/>")),
+                "{ty}"
+            );
+            assert!(xml(&ed).contains("One "), "{ty}");
+            assert_eq!(ed.undo_names()[0], name);
+            // Repeat (F4) does it again, as one more step.
+            assert!(redo_or_repeat(&mut ed, &mut rec));
+            assert_eq!(xml(&ed).matches(&format!("w:type=\"{ty}\"")).count(), 2);
+            assert!(ed.undo());
+            assert_eq!(xml(&ed).matches(&format!("w:type=\"{ty}\"")).count(), 1);
+            assert!(ed.undo());
+            assert_eq!(ed.doc, before);
+        }
+        // A selection is replaced.
+        let mut ed = Editor::new(docxcore::markdown::from_markdown("One Two\n"));
+        let mut rec = None;
+        select(&mut ed, 0, 3, 4);
+        key(&mut ed, &mut rec, "enter", true, false);
+        assert!(xml(&ed).contains("<w:br w:type=\"page\"/>"));
+        assert_eq!(text(&ed, 0), "One\nTwo");
+        assert!(ed.undo());
+        assert_eq!(text(&ed, 0), "One Two");
     }
 
     /// #619's reproduction: `one`, Enter, `two`, Ctrl+A, Ctrl+B.

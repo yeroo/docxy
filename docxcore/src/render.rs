@@ -1086,6 +1086,11 @@ fn render_blocks(
                     me.bottom.is_some() && eff(blocks.get(bi + 1)).bottom == me.bottom;
                 let mut sub_imgs = Vec::new();
                 let mut sub_mmd = Vec::new();
+                let next_sect = if p.props.section_break.is_some() {
+                    following_section_pr(&blocks[bi + 1..])
+                } else {
+                    None
+                };
                 let sub = render_paragraph(
                     p,
                     &path,
@@ -1095,6 +1100,7 @@ fn render_blocks(
                     &mut sub_mmd,
                     suppress_top,
                     suppress_bottom,
+                    next_sect,
                 );
                 absorb(&mut out, sub, sub_imgs, images, sub_mmd, mermaid);
             }
@@ -1799,6 +1805,36 @@ fn break_separator(kind: BreakKind, width: usize, inv: bool) -> Line {
         BreakKind::Column => "Column Break",
         BreakKind::Line | BreakKind::Clear(_) => "",
     };
+    labeled_separator(label, width, inv)
+}
+
+/// The `sectPr` that types the section starting after a break: the next
+/// section-break paragraph's, else the trailing body one. A closing
+/// paragraph's own `sectPr` holds the type of the boundary before its section.
+fn following_section_pr(rest: &[Block]) -> Option<&str> {
+    rest.iter().find_map(|b| match b {
+        Block::Paragraph(p) => p.props.section_break.as_deref(),
+        Block::SectionProperties(s) => Some(s.raw.as_str()),
+        _ => None,
+    })
+}
+
+/// The Show/Hide mark of a section break: "Section Break (Next Page)" and so
+/// on, by how the section after it starts.
+fn section_break_separator(next_sect: Option<&str>, width: usize) -> Line {
+    let start = match next_sect.map_or(Default::default(), |s| {
+        crate::sect::SectionSetup::parse(s).start
+    }) {
+        crate::sect::SectionStart::NextPage => "Next Page",
+        crate::sect::SectionStart::Continuous => "Continuous",
+        crate::sect::SectionStart::EvenPage => "Even Page",
+        crate::sect::SectionStart::OddPage => "Odd Page",
+        crate::sect::SectionStart::NextColumn => "Next Column",
+    };
+    labeled_separator(&format!("Section Break ({start})"), width, true)
+}
+
+fn labeled_separator(label: &str, width: usize, inv: bool) -> Line {
     let mid = if inv && !label.is_empty() {
         format!(" {label} ")
     } else {
@@ -2111,6 +2147,9 @@ fn render_paragraph(
     // and the bottom rule when the one below does.
     suppress_top: bool,
     suppress_bottom: bool,
+    // The `sectPr` of the section a section-break paragraph starts (the next
+    // break's, else the trailing one): its `w:type` is how that section starts.
+    next_sect: Option<&str>,
 ) -> Vec<(Line, LineMap)> {
     let heading = para.props.heading_level;
     let is_list = para.props.num_id.is_some();
@@ -2309,6 +2348,14 @@ fn render_paragraph(
             }
             line_idx += 1;
         }
+    }
+    // Show/Hide marks where a section ends. Text view only: Print layout
+    // separates the sections itself.
+    if opts.show_invisibles && !opts.page_view && para.props.section_break.is_some() {
+        out.push((
+            section_break_separator(next_sect, width),
+            LineMap::default(),
+        ));
     }
     if let Some(k) = borders.bottom {
         if !suppress_bottom {
@@ -2814,6 +2861,7 @@ fn render_floating_canvas(
                 &mut Vec::new(),
                 false,
                 false,
+                None,
             ) {
                 let s = line.plain();
                 // Skip leading blank lines so the heading hugs the top.
@@ -5429,6 +5477,58 @@ mod tests {
         assert!(
             matches!((h, b, f), (Some(h), Some(b), Some(f)) if h < b && b < f),
             "expected header < body < footer, got h={h:?} b={b:?} f={f:?}"
+        );
+    }
+
+    #[test]
+    fn show_hide_marks_a_section_break_with_its_type_645() {
+        let break_para = |ty: &str| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    section_break: Some(format!(r#"<w:sectPr>{ty}</w:sectPr>"#)),
+                    ..ParProps::default()
+                },
+                content: Vec::new(),
+            })
+        };
+        let render_plain = |ty: &str, inv: bool, page_view: bool| -> Vec<String> {
+            let mut o = opts(60);
+            o.show_invisibles = inv;
+            o.page_view = page_view;
+            // The break's own sectPr types the boundary before its section;
+            // the label reads the one that starts the section after it.
+            let body = vec![
+                break_para(r#"<w:type w:val="oddPage"/>"#),
+                para(vec![run("after", RunProps::default())]),
+                Block::SectionProperties(crate::model::SectionProperties {
+                    raw: format!("<w:sectPr>{ty}</w:sectPr>"),
+                    property_change: None,
+                }),
+            ];
+            render(&doc(body), &o).iter().map(|l| l.plain()).collect()
+        };
+        for (ty, label) in [
+            ("", "Section Break (Next Page)"),
+            (
+                r#"<w:type w:val="continuous"/>"#,
+                "Section Break (Continuous)",
+            ),
+            (r#"<w:type w:val="evenPage"/>"#, "Section Break (Even Page)"),
+            (r#"<w:type w:val="oddPage"/>"#, "Section Break (Odd Page)"),
+            (
+                r#"<w:type w:val="nextColumn"/>"#,
+                "Section Break (Next Column)",
+            ),
+        ] {
+            let on = render_plain(ty, true, false);
+            assert!(on.iter().any(|l| l.contains(label)), "{label}: {on:?}");
+        }
+        let off = render_plain("", false, false);
+        assert!(!off.iter().any(|l| l.contains("Section Break")), "{off:?}");
+        let page = render_plain("", true, true);
+        assert!(
+            !page.iter().any(|l| l.contains("Section Break")),
+            "{page:?}"
         );
     }
 

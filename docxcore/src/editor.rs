@@ -3111,17 +3111,17 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
     }
 }
 
-/// A merge that removes the paragraph `gone` into `kept`: when `gone` closes
-/// a section, its section mark (the break and its tracked change) ends the
-/// merged paragraph, as in Word, replacing any `kept` had (#748). Otherwise
-/// `kept`'s props stay as they are. The surviving paragraph mark is `gone`'s,
-/// so its tracked insertion/deletion records replace `kept`'s.
+/// A merge that removes the paragraph `gone` into `kept`: the paragraph mark
+/// deleted is always `kept`'s, so the surviving mark is `gone`'s (its section
+/// break and tracked change, or none), as in Word. When `kept` closed a section
+/// its break is removed and the text before it joins the following section
+/// (#645); when `gone` is the section's last paragraph its break survives on
+/// the merged paragraph (#748). Its tracked insertion/deletion records replace
+/// `kept`'s too.
 fn keep_section_mark(kept: &mut ParProps, gone: ParProps) {
     crate::review::adopt_mark_revisions(kept, &gone);
-    if gone.section_break.is_some() || gone.section_property_change.is_some() {
-        kept.section_break = gone.section_break;
-        kept.section_property_change = gone.section_property_change;
-    }
+    kept.section_break = gone.section_break;
+    kept.section_property_change = gone.section_property_change;
 }
 
 /// Split `content` at caret offset `o`: `content` keeps what is before it,
