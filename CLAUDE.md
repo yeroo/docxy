@@ -20,8 +20,10 @@
 - On macOS the window root (`KeyRouting`) leaves printable keys to AppKit and
   registers `text_input`'s `EntityInputHandler`, which replays a commit of the
   key's own text as that key and types composed text as keys into `on_key`;
-  marked text types nothing. The handler is macOS-only: Windows and Linux
-  would hand it every character `on_key` already typed (#1072).
+  marked text types nothing. While KeyTips or a menu is up, letters stay with
+  `on_key`. The handler is macOS-only (Windows and Linux would hand it every
+  character `on_key` already typed), and off macOS the root never stops a key's
+  propagation: a handled key-down on Windows is never translated (#1072).
 
 ## Build info
 

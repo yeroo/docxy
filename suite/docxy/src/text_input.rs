@@ -3,15 +3,21 @@
 //!
 //! macOS delivers a dead key (⌥E on ABC) and an input method's composition as
 //! *marked text*: `setMarkedText:` with the provisional "´", then `insertText:`
-//! with the composed "é". gpui runs a window's key listeners first and gives
-//! AppKit's input context the key only when they leave it propagating, and the
-//! input context reaches the app only through a registered
+//! with the composed "é". For a printable key with nothing being composed,
+//! gpui runs the window's key listeners first and gives AppKit's input
+//! context the key only when they leave it propagating. While text is marked,
+//! for keys with no text (arrows, Backspace, Esc) and, under an input-method
+//! source (Japanese, Chinese, Korean), for printable keys too, the input
+//! context gets the key first and the listeners see it only if it is not used.
+//! Either way the input context reaches the app only through a registered
 //! [`EntityInputHandler`]. The suite had none, so `on_key` typed the dead key's
 //! spacing accent itself and the next letter separately ("´e").
 //!
 //! So on macOS the window root's key listener ([`Docxy::route_key`]) leaves
 //! printable keys to AppKit ([`Route::Defer`]) and the handler here hands what
-//! AppKit commits back to [`Docxy::on_key`]. A commit that is exactly the
+//! AppKit commits back to [`Docxy::on_key`]. While KeyTips or a menu is up,
+//! letters are commands, not text: the root keeps them and the handler tells
+//! gpui it takes no text, so an input method does not compose them. A commit that is exactly the
 //! deferred key's own text (plain typing, Shift, an ⌥ chord that is not a dead
 //! key) replays that key event unchanged, so every surface sees the keystroke
 //! it saw before. A composed commit ("é", a CJK phrase) arrives as one typed
@@ -19,9 +25,11 @@
 //!
 //! The handler is registered on macOS only: Windows sends every WM_CHAR to a
 //! registered handler and Linux every unhandled printable key, and `on_key`
-//! has already typed those. Everything else here builds everywhere, and
-//! [`route`] takes the platform as an argument, so the macOS rules are tested
-//! on every CI leg.
+//! has already typed those. Off macOS the root also leaves every key
+//! propagating, as it always has: on Windows a handled key-down is never
+//! translated, which would lose WM_CHAR and the system's Alt+F4 and Alt+Space.
+//! Everything else here builds everywhere, and [`route`] takes the platform
+//! as an argument, so the macOS rules are tested on every CI leg.
 
 use std::ops::Range;
 
@@ -46,35 +54,47 @@ pub(crate) enum Route {
     AppStop,
     /// `on_key` sees it and it still propagates: a Cmd chord, which AppKit
     /// offers to the menu bar and the system (Cmd+Q, Cmd+H, Cmd+`) when the
-    /// window leaves it unhandled.
+    /// window leaves it unhandled, and every key off macOS.
     AppPropagate,
 }
 
-/// The route for one key-down. Printable text with no Ctrl, Cmd or Fn goes to
-/// AppKit (the keys gpui itself would let an input method see); a held key's
-/// repeats stay with `on_key`, as they always have. Off macOS, nothing defers.
-pub(crate) fn route(keystroke: &Keystroke, is_held: bool, macos: bool) -> Route {
+/// The route for one key-down. On macOS, printable text with no Ctrl, Cmd or
+/// Fn goes to AppKit (the keys gpui itself would let an input method see)
+/// while the app `takes_text` (see [`takes_text`]); a held key's repeats stay
+/// with `on_key`, as they always have. Off macOS every key goes to `on_key`
+/// and propagates, exactly as before #1072.
+pub(crate) fn route(keystroke: &Keystroke, is_held: bool, macos: bool, takes_text: bool) -> Route {
     let m = &keystroke.modifiers;
-    if m.platform {
+    if !macos || m.platform {
         return Route::AppPropagate;
     }
     let printable = keystroke
         .key_char
         .as_deref()
         .is_some_and(|text| !text.is_empty() && !text.chars().any(char::is_control));
-    if macos && printable && !m.control && !m.function && !is_held {
+    if takes_text && printable && !m.control && !m.function && !is_held {
         Route::Defer
     } else {
         Route::AppStop
     }
 }
 
-/// The text AppKit would commit for a key event the root defers: what the
+/// Whether typed letters are text: not while KeyTips are up or a menu is
+/// open, where `on_key` takes them as commands.
+pub(crate) fn takes_text(keytips_up: bool, menu_open: bool) -> bool {
+    !keytips_up && !menu_open
+}
+
+/// The text AppKit would commit for a key event the root may defer: what the
 /// harness's queued real input types for itself, since it never reaches
-/// AppKit. `None` for any other event, and for every event off macOS.
+/// AppKit. `None` for any other event, and for every event off macOS. It
+/// assumes the app takes text; a key the root kept instead stopped
+/// propagating, and the harness types only a key that propagated.
 pub(crate) fn deferred_text(event: &PlatformInput) -> Option<String> {
     match event {
-        PlatformInput::KeyDown(ev) if route(&ev.keystroke, ev.is_held, MACOS) == Route::Defer => {
+        PlatformInput::KeyDown(ev)
+            if route(&ev.keystroke, ev.is_held, MACOS, true) == Route::Defer =>
+        {
             ev.keystroke.key_char.clone()
         }
         _ => None,
@@ -123,8 +143,10 @@ pub(crate) struct ImeState {
     /// The provisional text (`setMarkedText:`), shown nowhere yet; `None`
     /// when nothing is being composed.
     marked: Option<String>,
-    /// The last key left to AppKit, until its text comes back or another key
-    /// arrives.
+    /// The last key left to AppKit, until its text comes back, it becomes
+    /// marked text, or another key reaches the root's listener. (A key the
+    /// input context takes first, during a composition, does not clear it,
+    /// and `mark` has by then.)
     pending: Option<KeyDownEvent>,
 }
 
@@ -196,8 +218,8 @@ impl Docxy {
     ) {
         // The handler is registered only while the root has the focus, so a
         // key deferred without it would reach no one.
-        let defers = MACOS && self.focus.is_focused(window);
-        match route(&ev.keystroke, ev.is_held, defers) {
+        let takes = self.focus.is_focused(window) && self.takes_text();
+        match route(&ev.keystroke, ev.is_held, MACOS, takes) {
             // Left propagating, so gpui hands it to AppKit's input context,
             // which answers through the handler below.
             Route::Defer => self.ime.defer(ev),
@@ -211,6 +233,10 @@ impl Docxy {
                 self.on_key(ev, window, cx);
             }
         }
+    }
+
+    fn takes_text(&self) -> bool {
+        takes_text(self.keytips != crate::KeyTip::Off, self.menu.is_some())
     }
 
     fn type_committed(
@@ -311,6 +337,12 @@ impl EntityInputHandler for Docxy {
         None
     }
 
+    // Under an input-method source gpui hands printable keys to the input
+    // context before the root only while this is true.
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        self.takes_text()
+    }
+
     fn text_length_utf16(
         &mut self,
         _window: &mut Window,
@@ -353,21 +385,21 @@ mod tests {
     fn printable_keys_defer_to_text_input_on_macos() {
         // ⌥E on ABC: the dead key's spacing accent is its key_char.
         assert_eq!(
-            route(&stroke("e", Some("´"), alt()), false, true),
+            route(&stroke("e", Some("´"), alt()), false, true, true),
             Route::Defer
         );
-        assert_eq!(route(&plain("a", "a"), false, true), Route::Defer);
+        assert_eq!(route(&plain("a", "a"), false, true, true), Route::Defer);
         let shift = Modifiers {
             shift: true,
             ..Default::default()
         };
         assert_eq!(
-            route(&stroke("a", Some("A"), shift), false, true),
+            route(&stroke("a", Some("A"), shift), false, true, true),
             Route::Defer
         );
         // Space too: AppKit hands " " back and it replays as the same key,
         // and ⌥E then Space commits the accent itself.
-        assert_eq!(route(&plain("space", " "), false, true), Route::Defer);
+        assert_eq!(route(&plain("space", " "), false, true, true), Route::Defer);
     }
 
     #[test]
@@ -390,10 +422,10 @@ mod tests {
             ("tab", stroke("tab", Some("\t"), Modifiers::default())),
             ("backspace", stroke("backspace", None, Modifiers::default())),
         ] {
-            assert_eq!(route(&k, false, true), Route::AppStop, "{what}");
+            assert_eq!(route(&k, false, true, true), Route::AppStop, "{what}");
         }
         // A held key's repeats are typed by on_key, as before.
-        assert_eq!(route(&plain("a", "a"), true, true), Route::AppStop);
+        assert_eq!(route(&plain("a", "a"), true, true, true), Route::AppStop);
     }
 
     #[test]
@@ -404,24 +436,76 @@ mod tests {
         };
         for macos in [true, false] {
             assert_eq!(
-                route(&stroke("c", Some("c"), cmd), false, macos),
+                route(&stroke("c", Some("c"), cmd), false, macos, true),
                 Route::AppPropagate
             );
             assert_eq!(
-                route(&stroke("q", None, cmd), false, macos),
+                route(&stroke("q", None, cmd), false, macos, true),
                 Route::AppPropagate
             );
         }
     }
 
     #[test]
-    fn nothing_defers_off_macos() {
+    /// Off macOS every key reaches `on_key` and propagates, as before: a
+    /// stopped key-down on Windows is never translated (no WM_CHAR, no
+    /// Alt+F4).
+    fn every_key_propagates_off_macos() {
+        let ctrl = Modifiers {
+            control: true,
+            ..Default::default()
+        };
         for k in [
             plain("a", "a"),
             stroke("e", Some("´"), alt()),
             plain("space", " "),
+            stroke("f4", None, alt()),
+            stroke("space", Some(" "), alt()),
+            stroke("a", Some("a"), ctrl),
+            stroke("left", None, Modifiers::default()),
+            stroke("enter", Some("\r"), Modifiers::default()),
         ] {
-            assert_eq!(route(&k, false, false), Route::AppStop, "{}", k.key);
+            for takes in [true, false] {
+                assert_eq!(
+                    route(&k, false, false, takes),
+                    Route::AppPropagate,
+                    "{}",
+                    k.key
+                );
+                assert_eq!(
+                    route(&k, true, false, takes),
+                    Route::AppPropagate,
+                    "{}",
+                    k.key
+                );
+            }
+        }
+    }
+
+    /// KeyTips' and menus' letters are commands: the root keeps them, so no
+    /// input method composes them.
+    #[test]
+    fn letters_stay_with_on_key_while_keytips_or_a_menu_is_up() {
+        assert!(takes_text(false, false));
+        assert!(!takes_text(true, false));
+        assert!(!takes_text(false, true));
+        for k in [
+            plain("h", "h"),
+            stroke("e", Some("´"), alt()),
+            plain("space", " "),
+        ] {
+            assert_eq!(
+                route(&k, false, true, takes_text(true, false)),
+                Route::AppStop,
+                "{}",
+                k.key
+            );
+            assert_eq!(
+                route(&k, false, true, takes_text(false, true)),
+                Route::AppStop,
+                "{}",
+                k.key
+            );
         }
     }
 
@@ -497,11 +581,13 @@ mod tests {
         ime.forget_key();
         let keys = ime.commit("—");
         assert_eq!(keys, [typed(plain("—", "—"))]);
-        // A key that became marked text is part of the composition.
+        // A key that became marked text is part of the composition: the
+        // commit types the accent, not the ⌥E it came from.
         ime.defer(&typed(stroke("e", Some("´"), alt())));
         ime.mark("´");
-        assert_eq!(key_chars(&ime.commit("´")), ["´"]);
-        assert_eq!(ime.commit("´")[0].keystroke.modifiers, Modifiers::default());
+        let keys = ime.commit("´");
+        assert_eq!(keys, [typed(plain("´", "´"))]);
+        assert_eq!(keys[0].keystroke.modifiers, Modifiers::default());
     }
 
     #[test]
