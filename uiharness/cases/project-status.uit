@@ -4,7 +4,7 @@ test project status bar reports Ready, Edit and Busy
   assert reply.items.0.id is state
   assert reply.items.0.text is Ready
   assert reply.items.1.id is new-tasks
-  assert reply.items.1.text is New Tasks: Auto Scheduled
+  assert reply.items.1.text is ⚙ New Tasks: Auto Scheduled
   assert reply.items.2.id is message
   assert reply.items.2.text is loaded — 1 tasks
   assert app_state is Ready
@@ -36,3 +36,11 @@ test project status bar reports Ready, Edit and Busy
   assert reply.app_state is Busy
   assert status is Resource leveling OFF
   assert app_state is Ready
+  # The same plan with NewTasksAreManual set: the glyph and label flip
+  # together; state and message items are where they were.
+  open copy:../fixtures/project-status-manual.xml
+  call status-read {}
+  assert reply.items.0.text is Ready
+  assert reply.items.1.id is new-tasks
+  assert reply.items.1.text is 📌 New Tasks: Manually Scheduled
+  assert reply.items.2.text is loaded — 1 tasks

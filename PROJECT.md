@@ -107,7 +107,7 @@ clears history while retaining the find query and leveling preference.
   to auto clears the pin and the scheduler places it by its links and
   constraints again. Either is one undo step. A summary switched to manual
   keeps the dates it shows instead of rolling up (see **Manual summaries**
-  below). The status bar's `New Tasks: …` (yppxy's `M`) switches the plan's
+  below). The status bar's `⚙/📌 New Tasks: …` (yppxy's `M`) switches the plan's
   default.
 - **Dependencies** are the four link types with lag/lead: Finish-to-Start,
   Start-to-Start, Finish-to-Finish, Start-to-Finish. A lag is working time,
