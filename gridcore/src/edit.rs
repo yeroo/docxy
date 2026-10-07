@@ -1035,19 +1035,7 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
     }
     for sheet in &mut wb.sheets {
         for cell in sheet.cells.values_mut() {
-            let Some(src) = &cell.formula else {
-                continue;
-            };
-            let updated = match cell.f_attrs.as_deref() {
-                Some(a) if !is_array_f(a) => continue, // preserved verbatim
-                // An array formula is ours, but its loaded text is only
-                // reprinted when the rename really touches it.
-                Some(_) => rewrite_if_changed(src, |e| rename_sheet_in_expr(e, &old, new_name)),
-                None => rename_sheet_in_formula(src, &old, new_name),
-            };
-            if let Some(updated) = updated {
-                cell.formula = Some(updated);
-            }
+            rename_sheet_in_cell(cell, &old, new_name);
         }
     }
     for dn in &mut wb.defined_names {
@@ -1086,13 +1074,7 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
     // too (a list on another sheet). Only one the rename touches is
     // reprinted, so the loaded spelling stays otherwise.
     for sheet in &mut wb.sheets {
-        for_each_rule_formula(sheet, |_, src| {
-            if let Some(updated) =
-                rewrite_if_changed(src, |e| rename_sheet_in_expr(e, &old, new_name))
-            {
-                *src = updated;
-            }
-        });
+        for_each_rule_formula(sheet, |_, src| rename_sheet_in_rule(src, &old, new_name));
     }
     // A chart's refs name their sheet the same way, and a save writes them back
     // out as `<c:f>` — left behind, they'd point at a sheet that no longer
@@ -1105,6 +1087,48 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
         }
     }
     wb.sheets[idx].name = new_name.to_string();
+}
+
+/// The part of [`rename_sheet`] for one cell: its formula's references to
+/// sheet `old` now name `new_name`. A loaded shared or other non-array
+/// formula keeps its text verbatim. Also for cells held outside the
+/// workbook, such as an undo history's.
+pub fn rename_sheet_in_cell(cell: &mut Cell, old: &str, new_name: &str) {
+    let Some(src) = &cell.formula else {
+        return;
+    };
+    let updated = match cell.f_attrs.as_deref() {
+        Some(a) if !is_array_f(a) => return, // preserved verbatim
+        // An array formula is ours, but its loaded text is only
+        // reprinted when the rename really touches it.
+        Some(_) => rewrite_if_changed(src, |e| rename_sheet_in_expr(e, old, new_name)),
+        None => rename_sheet_in_formula(src, old, new_name),
+    };
+    if let Some(updated) = updated {
+        cell.formula = Some(updated);
+    }
+}
+
+/// The part of [`rename_sheet`] for data-validation rules held outside a
+/// sheet (an undo history's): their formulas' references to `old` now name
+/// `new_name`, as the sheet's own rules' do.
+pub fn rename_sheet_in_validations(
+    rules: &mut [crate::sheet::DataValidation],
+    old: &str,
+    new_name: &str,
+) {
+    for dv in rules {
+        rename_sheet_in_rule(&mut dv.formula1, old, new_name);
+        rename_sheet_in_rule(&mut dv.formula2, old, new_name);
+    }
+}
+
+/// A rule formula is reprinted only when the rename touches it, so the
+/// loaded spelling stays otherwise.
+fn rename_sheet_in_rule(src: &mut String, old: &str, new_name: &str) {
+    if let Some(updated) = rewrite_if_changed(src, |e| rename_sheet_in_expr(e, old, new_name)) {
+        *src = updated;
+    }
 }
 
 /// Before the sheets named in `removed` leave the workbook, turn every cell
