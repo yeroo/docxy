@@ -1,0 +1,93 @@
+# F4 and Ctrl+Y are Excel's one Redo/Repeat command (#859): with a redo
+# pending both redo and select what they redo; with nothing to redo both
+# repeat the last format on the selection. Bold is read from the Home ribbon's
+# Bold toggle, which shows the active cell.
+
+test ctrl y repeats the last format with nothing to redo
+  open copy:../fixtures/basic.xlsx
+  click A1
+  key ctrl+b
+  click C2
+  key ctrl+y
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.4.checked is true
+
+test f4 redoes a pending redo and selects it
+  open copy:../fixtures/basic.xlsx
+  click A1
+  key ctrl+b
+  click C3
+  key f4
+  key ctrl+z
+  click C4
+  key f4
+  assert sel is C3
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.4.checked is true
+  click C4
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.4.checked is false
+
+test ctrl y redoes a pending redo and selects it
+  open copy:../fixtures/basic.xlsx
+  click A1
+  key ctrl+b
+  click C3
+  key ctrl+y
+  key ctrl+z
+  click C4
+  key ctrl+y
+  assert sel is C3
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.4.checked is true
+  click C4
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.4.checked is false
+
+test typing leaves the last format to repeat
+  open copy:../fixtures/basic.xlsx
+  click E1
+  key ctrl+i
+  click E2
+  type typed
+  key enter
+  click E3
+  key f4
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.5.id is italic
+  assert reply.tabs.1.groups.1.commands.5.checked is true
+
+test nothing to redo or repeat changes nothing
+  open copy:../fixtures/basic.xlsx
+  click C2
+  key f4
+  key ctrl+y
+  assert dirty is false
+
+test ctrl y while typing repeats nothing
+  open copy:../fixtures/basic.xlsx
+  click A1
+  key ctrl+b
+  click E5
+  type x
+  key ctrl+y
+  assert editing is true
+  key escape
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.4.checked is false
+  # The last undo step is still A1's bold: nothing was recorded on top.
+  key ctrl+z
+  click A1
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.4.checked is false
+
+test a protected sheet repeats nothing
+  open copy:../fixtures/basic.xlsx
+  click A1
+  key ctrl+b
+  call ribbon-click {"tab":"Review","command":"Protect Sheet"}
+  click C2
+  key f4
+  key ctrl+y
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.4.checked is false
