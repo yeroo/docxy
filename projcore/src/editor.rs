@@ -1897,21 +1897,20 @@ fn recompute_summaries(proj: &mut Project) {
 }
 
 /// Renumber the stored WBS codes a structural edit moved. A stored code that
-/// equals the task's outline number before the edit is a generated one, as
-/// Project writes without a custom mask: it follows the task's new outline
-/// number, so the WBS field and a save show it and a task the edit added
-/// cannot collide with it. A stored code that differs — an explicit
-/// override, or one from a custom mask, which never equals an outline
-/// number — stays as the plan holds it. Undo needs nothing here: it swaps
-/// whole-project snapshots. `wbs_level` is not touched.
+/// equals the task's outline number before the edit is treated as generated
+/// (whatever the plan's mask) and follows the task's new outline number, so
+/// the WBS field and a save show it and a task the edit added cannot collide
+/// with it. A stored code that differs from the old outline number — an
+/// explicit override, or a masked code like `PRJ-01.02` — stays as the plan
+/// holds it. A numeric override that equals its outline number is
+/// indistinguishable from a generated code and is renumbered too; telling
+/// the two apart would need per-task tracking we do not keep. Undo needs
+/// nothing here: it swaps whole-project snapshots. `wbs_level` is not
+/// touched.
 fn renumber_wbs(old: &[Task], new: &mut [Task]) {
-    // No row's uid, blank state or level changed, so no outline number did
-    // (the same rows `follow_outline` judges by).
-    if old.len() == new.len()
-        && old.iter().zip(new.iter()).all(|(o, n)| {
-            (o.uid, o.is_null, o.outline_level) == (n.uid, n.is_null, n.outline_level)
-        })
-    {
+    // With no row's uid, blank state or level changed, no outline number
+    // did (the rows `follow_outline` already judged by).
+    if links::same_outline(old, new) {
         return;
     }
     // Key the old outline numbers by uid: a uid the edit added has no old

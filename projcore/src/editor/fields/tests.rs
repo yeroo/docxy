@@ -754,9 +754,10 @@ fn a_rename_leaves_stored_wbs_alone() {
 }
 
 #[test]
-fn a_masked_code_is_never_renumbered() {
-    // A code from a custom mask never equals an outline number, so a
-    // structural edit leaves it exactly as read.
+fn a_code_that_differs_from_the_outline_number_is_never_renumbered() {
+    // A stored code that differs from the task's outline number — an
+    // explicit override, or a masked code like PRJ-01.02 — is kept by a
+    // structural edit; the plan's mask is not parsed.
     let tasks = vec![
         task(1, "A", 480),
         Task {

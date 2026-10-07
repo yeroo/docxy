@@ -20,7 +20,7 @@
 //! accrue when it is absent or Invalid), Constraint Type (As Soon As
 //! Possible), Leveling Delay (0 edays). WBS is the stored code, else the outline
 //! number; a structural edit renumbers a stored code that equals the task's
-//! outline number (a generated one) and keeps an explicit override.
+//! outline number (treated as generated) and keeps one that differs from it.
 //! Estimated and Milestone are what the
 //! grid shows (a summary is estimated when a leaf below it is; a zero-length
 //! leaf is a milestone). A blank row reads only its ID and Unique ID; every
@@ -493,8 +493,9 @@ impl<'a> FieldReader<'a> {
             Field::OutlineLevel => int(i64::from(task.outline_level)),
             // The stored code (a file's, or an MPP override), else the outline
             // number. A structural edit renumbers a stored code that equals
-            // the task's outline number (a generated one) and keeps an
-            // explicit override; a save writes the same one the field shows.
+            // the task's outline number (treated as generated) and keeps one
+            // that differs (an override or a masked code); a save writes the
+            // same one the field shows.
             Field::Wbs => optional_text(task.wbs.as_deref().or(self.outline_number(task.uid))),
             Field::LevelingDelay => {
                 // Stored in tenths of a minute; Project shows it in elapsed
