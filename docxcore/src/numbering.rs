@@ -276,6 +276,24 @@ pub fn compute_markers(doc: &Document, num: &Numbering) -> HashMap<Vec<usize>, S
     out
 }
 
+/// The markers of `doc`'s list paragraphs as a save of it numbers them: by
+/// `pkg`'s `word/numbering.xml`, or, with no package or no numbering part in
+/// it, by the two lists a new Markdown package defines (`numId` 1 bullets, 2
+/// decimal), which is the package a save of such a document is written into.
+pub fn package_markers(
+    pkg: Option<&crate::package::Package>,
+    doc: &Document,
+) -> HashMap<Vec<usize>, String> {
+    let xml = pkg
+        .and_then(|p| p.part_text("word/numbering.xml"))
+        .or_else(|| {
+            crate::package::new_markdown_package(Document::default())
+                .part_text("word/numbering.xml")
+        })
+        .unwrap_or_default();
+    compute_markers(doc, &parse_numbering_xml(&xml))
+}
+
 fn walk(
     blocks: &[Block],
     prefix: &mut Vec<usize>,
