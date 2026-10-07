@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use opccore::xml::{Event, XmlParser};
-use opccore::zip::ZipArchive;
+use opccore::zip::{ZipArchive, ZipEntry};
 use opccore::zipwrite::write_zip;
 
 mod consolidate;
@@ -240,7 +240,7 @@ fn is_strict_workbook(wb_xml: &str) -> bool {
 pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     let zip = open_container(data)?;
     let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
-    for (e, name) in zip.entries().iter().zip(entry_part_names(&zip)?) {
+    for (e, name) in part_entries(&zip)? {
         let bytes = zip.extract(e).ok_or(XlsxError::CorruptPart)?;
         parts.push((name, utf8_part(bytes)));
     }
@@ -257,12 +257,14 @@ fn utf8_part(bytes: Vec<u8>) -> Vec<u8> {
     }
 }
 
-/// The part name of each container entry, in entry order. Some writers
-/// separate segments with `\` (`xl\workbook.xml`), and Excel opens those
-/// packages, so it becomes the OPC `/` here and on save (#1095). Two entries
-/// that only differ in their separators would become one part:
-/// [`XlsxError::CorruptPart`].
-fn entry_part_names(zip: &ZipArchive) -> Result<Vec<String>, XlsxError> {
+/// The container entries that are parts, each with its part name, in entry
+/// order. Some writers separate segments with `\\` (`xl\\workbook.xml`), and
+/// Excel opens those packages, so it becomes the OPC `/` here and on save
+/// (#1095). Two entries that only differ in their separators would become one
+/// part: [`XlsxError::CorruptPart`]. A directory entry is no part (see
+/// [`is_directory_entry`]): kept, a save would write it as a part with no
+/// content type, which Excel repairs (#1156).
+fn part_entries<'a>(zip: &'a ZipArchive<'_>) -> Result<Vec<(&'a ZipEntry, String)>, XlsxError> {
     let names: Vec<String> = zip
         .entries()
         .iter()
@@ -272,7 +274,29 @@ fn entry_part_names(zip: &ZipArchive) -> Result<Vec<String>, XlsxError> {
     if names.iter().collect::<HashSet<_>>().len() != raw.len() {
         return Err(XlsxError::CorruptPart);
     }
-    Ok(names)
+    let dirs: HashSet<&str> = names
+        .iter()
+        .flat_map(|n| n.match_indices('/').map(|(i, _)| &n[..i]))
+        .collect();
+    Ok(zip
+        .entries()
+        .iter()
+        .zip(names.iter())
+        .filter(|(e, name)| !is_directory_entry(name, e.uncomp_size, &dirs))
+        .map(|(e, name)| (e, name.clone()))
+        .collect())
+}
+
+/// Whether the entry `name` (with `/` separators) of `size` bytes is a
+/// directory, not a part: its name ends with `/`, or it is empty and either
+/// some entry lies under it (`xl` beside `xl/workbook.xml`) or its name has
+/// no extension (an empty `xl/media`). tdf124525.xlsx marks `_rels`, `xl` and
+/// others as directories only in their ZIP attributes (#1156). An empty part
+/// with an extension (`docProps/thumbnail.wmf`) is still a part. `dirs` holds
+/// every directory an entry name lies in.
+fn is_directory_entry(name: &str, size: u64, dirs: &HashSet<&str>) -> bool {
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    name.ends_with('/') || (size == 0 && (dirs.contains(name) || !leaf.contains('.')))
 }
 
 /// The ZIP container of an `.xlsx`, or why `data` is not one.
