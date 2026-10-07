@@ -40,14 +40,33 @@ pub struct TrackedInsert {
 ///
 /// This is preservation data, never formatting: equality always holds, so two
 /// runs that differ only in their rsids still merge, extend and compare as the
-/// same formatting.
+/// same formatting. Only [`strictly_equal`] tells them apart.
 #[derive(Debug, Clone, Default)]
 pub struct ElementAttrs(pub Vec<(String, String)>);
 
+thread_local! {
+    /// Set while [`strictly_equal`] compares: element attributes count.
+    static STRICT_ATTRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl PartialEq for ElementAttrs {
-    fn eq(&self, _: &Self) -> bool {
-        true
+    fn eq(&self, other: &Self) -> bool {
+        !STRICT_ATTRS.with(std::cell::Cell::get) || self.0 == other.0
     }
+}
+
+/// `a == b` with every [`ElementAttrs`] inside compared too: for where one
+/// value stands in for the other and must save the same, such as an undo
+/// step sharing a block with its neighbour (#853).
+pub fn strictly_equal<T: PartialEq + ?Sized>(a: &T, b: &T) -> bool {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STRICT_ATTRS.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(STRICT_ATTRS.with(|s| s.replace(true)));
+    a == b
 }
 
 impl Eq for ElementAttrs {}

@@ -4500,7 +4500,8 @@ impl App {
                 }
             }
             // insert_str inserts as if typed, so the text adopts the caret's run.
-            PasteOpt::Merge => self.editor.insert_str(&ps.text),
+            // One step however long, not typing's 128-character steps.
+            PasteOpt::Merge => self.editor.one_step("Paste", |ed| ed.insert_str(&ps.text)),
             PasteOpt::Unformatted => self.editor.paste(&Clip::from_text(&ps.text)),
             PasteOpt::Hyperlink => {
                 let url = ps.text.trim().to_string();
@@ -5081,7 +5082,9 @@ impl App {
             }
             PickerKind::FontColor => self.editor.set_color(color_hex(item)),
             PickerKind::Highlight => self.editor.set_highlight(highlight_name(item)),
-            PickerKind::Symbol => self.editor.insert_str(item),
+            PickerKind::Symbol => self
+                .editor
+                .one_step("Insert Symbol", |ed| ed.insert_str(item)),
             PickerKind::LineSpacing => {
                 if let Some(line) = line_spacing_twips(item) {
                     self.editor.set_line_spacing(line, "auto");
@@ -5987,6 +5990,8 @@ impl App {
             let mut changed = false;
             for _ in 0..n {
                 changed |= self.editor.redo();
+                // Vim's redo in Normal mode selects nothing.
+                self.editor.clear_selection();
             }
             if changed {
                 self.after_edit();
@@ -6100,9 +6105,13 @@ impl App {
                     return;
                 }
                 let n = self.vim.as_mut().unwrap().take_count();
-                for _ in 0..n {
-                    self.editor.delete_forward();
-                }
+                // One command, one undo step, though each Delete is a step
+                // of its own (#853).
+                self.editor.one_step("Delete", |ed| {
+                    for _ in 0..n {
+                        ed.delete_forward();
+                    }
+                });
                 self.after_edit();
             }
             'D' => {
@@ -6126,6 +6135,11 @@ impl App {
                 let mut changed = false;
                 for _ in 0..n {
                     changed |= self.editor.undo();
+                    // Undoing a deleted selection selects it again (#853),
+                    // which Vim's `u` in Normal mode never does. Cleared
+                    // after each one, so the next undo's redo entry holds
+                    // no selection for Ctrl+R to bring back either.
+                    self.editor.clear_selection();
                 }
                 if changed {
                     self.after_edit();
@@ -13135,6 +13149,33 @@ mod tests {
         assert!(para_text(&app, 0).starts_with("plain"));
     }
 
+    /// #853: Paste Special's Merge Formatting inserts as if typed, but it
+    /// is one paste: one undo step however long, not 128-character steps.
+    #[test]
+    fn paste_special_merge_is_one_undo_step_853() {
+        let mut app = app_with(&["dest"]);
+        app.ensure_rendered(40);
+        let text = "m".repeat(300);
+        app.os_clip = None;
+        app.clipboard = Some(Clip::from_text(&text));
+        app.clip_text = Some(text.clone());
+        app.run_act(ribbon::Act::PasteSpecial);
+        let at = {
+            let ps = app.paste_special.as_ref().expect("dialog opened");
+            ps.opts
+                .iter()
+                .position(|o| *o == PasteOpt::Merge)
+                .expect("Merge")
+        };
+        for _ in 0..at {
+            app.on_key(key(KeyCode::Down));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(para_text(&app, 0).starts_with(&text));
+        assert!(app.editor.undo());
+        assert_eq!(para_text(&app, 0), "dest");
+    }
+
     #[test]
     fn paste_special_esc_cancels_without_editing() {
         let mut app = app_with(&["dest"]);
@@ -14109,6 +14150,62 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["two", "three"]);
+    }
+
+    #[test]
+    fn vim_undo_leaves_no_selection_853() {
+        let mut app = vim_app(&["one two"]);
+        app.editor.move_home();
+        app.on_key(key(KeyCode::Char('D'))); // cut to the line end
+        assert_eq!(first_line(&app), "");
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(first_line(&app), "one two");
+        assert!(!app.editor.has_selection(), "u selects nothing");
+        // Ctrl+Z outside Vim selects the text again, as Word does.
+        app.vim = None;
+        app.editor.move_home();
+        app.editor.anchor = Some(app.editor.caret.clone());
+        app.editor.move_end();
+        app.editor.backspace();
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(first_line(&app), "one two");
+        assert!(app.editor.has_selection());
+    }
+
+    /// #853: each Delete is an undo step, but `3x` is one command: one `u`
+    /// puts all three back.
+    #[test]
+    fn vim_counted_x_is_one_undo_step_853() {
+        let mut app = vim_app(&["abcdef"]);
+        app.editor.move_home();
+        app.on_key(key(KeyCode::Char('3')));
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(first_line(&app), "def");
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(first_line(&app), "abcdef");
+        assert!(!app.editor.undo(), "one step");
+    }
+
+    /// #853: a counted `u` leaves no selection in the redo history either,
+    /// so Ctrl+R then `x` deletes one character, not a line.
+    #[test]
+    fn vim_counted_undo_then_redo_selects_nothing_853() {
+        let mut app = vim_app(&["one", "two", "three"]);
+        let full = app.editor.doc.body.len();
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Char('d')));
+        }
+        assert_eq!(first_line(&app), "three");
+        app.on_key(key(KeyCode::Char('2')));
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(app.editor.doc.body.len(), full);
+        assert!(!app.editor.has_selection());
+        app.on_key(ctrl(KeyCode::Char('r')));
+        assert!(!app.editor.has_selection(), "Ctrl+R selects nothing");
+        let lines = app.editor.doc.body.len();
+        app.editor.move_home();
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.editor.doc.body.len(), lines, "x deleted a character");
     }
 
     #[test]
