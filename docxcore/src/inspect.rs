@@ -234,10 +234,11 @@ fn count_blocks(blocks: &[Block], target: Target) -> usize {
         .sum()
 }
 
-/// The raw XML of an inline that the walk strips comment markers from.
-/// Hyperlinks and revisions are not here: their children are walked, and a
-/// changed wrapper is rebuilt from them. Text boxes are not either: their
-/// raw holds copies of their blocks ([`text_box_extra`]).
+/// The raw XML of an inline that [`count_inlines`] counts in, for any
+/// target. Hyperlinks and revisions are not here: their children are walked,
+/// and a changed wrapper is rebuilt from them. Text boxes are not either:
+/// their raw holds copies of their blocks ([`text_box_extra`]). Comment
+/// markers are read from more inlines: [`comment_marker_raw`].
 fn marker_raw(inline: &Inline) -> Option<&str> {
     match inline {
         Inline::Raw(raw) | Inline::Field { raw, .. } | Inline::UnsupportedRevision { raw, .. } => {
@@ -247,29 +248,31 @@ fn marker_raw(inline: &Inline) -> Option<&str> {
     }
 }
 
-fn marker_raw_mut(inline: &mut Inline) -> Option<&mut String> {
-    match inline {
-        Inline::Raw(raw) | Inline::Field { raw, .. } | Inline::UnsupportedRevision { raw, .. } => {
-            Some(raw)
-        }
-        _ => None,
-    }
-}
-
-/// [`marker_raw`] for comment markers, which can also sit in a footnote
-/// reference's run (`w:footnoteReference` then `w:commentReference`), kept
-/// whole as its raw (#1107).
+/// The raw XML comment markers are read from: [`marker_raw`]'s, and the run
+/// of a footnote or endnote reference, chart, SmartArt or equation, each
+/// kept whole as its raw and written back verbatim, so a
+/// `w:commentReference` sharing that run sits there (#1107).
 fn comment_marker_raw(inline: &Inline) -> Option<&str> {
     match inline {
-        Inline::FootnoteRef { raw, .. } => Some(raw),
+        Inline::FootnoteRef { raw, .. }
+        | Inline::Chart { raw, .. }
+        | Inline::SmartArt { raw, .. }
+        | Inline::Equation { raw, .. } => Some(raw),
         _ => marker_raw(inline),
     }
 }
 
-fn comment_marker_raw_mut(inline: &mut Inline) -> Option<&mut String> {
+/// [`comment_marker_raw`], to strip markers from.
+fn marker_raw_mut(inline: &mut Inline) -> Option<&mut String> {
     match inline {
-        Inline::FootnoteRef { raw, .. } => Some(raw),
-        _ => marker_raw_mut(inline),
+        Inline::Raw(raw)
+        | Inline::Field { raw, .. }
+        | Inline::UnsupportedRevision { raw, .. }
+        | Inline::FootnoteRef { raw, .. }
+        | Inline::Chart { raw, .. }
+        | Inline::SmartArt { raw, .. }
+        | Inline::Equation { raw, .. } => Some(raw),
+        _ => None,
     }
 }
 
@@ -344,7 +347,7 @@ fn remove_inlines(content: &mut Vec<Inline>, target: Target) -> usize {
             return true;
         };
         let plain_raw = matches!(inline, Inline::Raw(_));
-        let Some(raw) = comment_marker_raw_mut(inline) else {
+        let Some(raw) = marker_raw_mut(inline) else {
             return true;
         };
         let (out, n) = strip_markers(raw, id);
@@ -1149,6 +1152,38 @@ mod tests {
         let xml = document_to_xml(&reopened);
         assert!(!xml.contains("gone"), "{xml}");
         assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+    }
+
+    /// SmartArt and equation runs are kept whole as their raw and written
+    /// back verbatim, so a comment reference sharing one is found and
+    /// removed there, and the drawing stays.
+    #[test]
+    fn a_comment_reference_in_a_drawing_run_is_found_and_removed_1107() {
+        let reference = "<w:commentReference w:id=\"2\"/>";
+        let mut doc = Document {
+            body: vec![Block::Paragraph(crate::model::Paragraph {
+                content: vec![
+                    Inline::SmartArt {
+                        raw: format!("<w:r><w:drawing>smart</w:drawing>{reference}</w:r>"),
+                        text: Vec::new(),
+                    },
+                    Inline::Equation {
+                        raw: format!("<w:r><w:object>eq</w:object>{reference}</w:r>"),
+                        text: "x".into(),
+                        latex: None,
+                    },
+                ],
+                ..Default::default()
+            })],
+        };
+        let ids: Vec<String> = comment_marker_ids(&doc).into_iter().collect();
+        assert_eq!(ids, ["2"]);
+        assert_eq!(count_blocks(&doc.body, Target::CommentMarkers(None)), 2);
+        assert_eq!(remove_comment_markers(&mut doc, "2"), 2);
+        let xml = document_to_xml(&doc);
+        assert_eq!(count_markers(&xml, None), 0, "{xml}");
+        assert!(xml.contains("<w:drawing>smart</w:drawing>"), "{xml}");
+        assert!(xml.contains("<w:object>eq</w:object>"), "{xml}");
     }
 
     /// A footnote reference's run is kept whole as its raw, so a comment

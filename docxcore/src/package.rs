@@ -1040,14 +1040,14 @@ impl Package {
 
     /// Keep the parts whose name `keep` accepts, and always the main document
     /// part, still found at `doc_index` when a part listed before it goes
-    /// (#1107).
+    /// (#1107): the last entry of that name, as [`load_package`] picks it.
     fn retain_parts(&mut self, mut keep: impl FnMut(&str) -> bool) {
         let doc_name = self.parts[self.doc_index].0.clone();
         self.parts.retain(|(n, _)| *n == doc_name || keep(n));
         self.doc_index = self
             .parts
             .iter()
-            .position(|(n, _)| *n == doc_name)
+            .rposition(|(n, _)| *n == doc_name)
             .expect("the main document part is kept");
     }
 
@@ -7112,6 +7112,41 @@ mod tests {
         assert_eq!(saved.document.body.len(), 2);
         let rels = saved.part_text("word/_rels/document.xml.rels").unwrap();
         assert!(rels.contains("Relationships"), "{rels}");
+    }
+
+    /// Two document entries (a malformed ZIP): the load and the save after
+    /// dropping parts both take the last one, so an edit is not written to
+    /// the entry a reload ignores (#1107).
+    #[test]
+    fn dropping_parts_keeps_the_last_of_two_document_entries_1107() {
+        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let document = |text: &str| {
+            format!(
+                "<w:document xmlns:w=\"{W_NS}\"><w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"
+            )
+            .into_bytes()
+        };
+        let parts = vec![
+            (
+                "[Content_Types].xml".to_string(),
+                br#"<?xml version="1.0"?><Types/>"#.to_vec(),
+            ),
+            ("word/document.xml".to_string(), document("Stale")),
+            (
+                "word/comments.xml".to_string(),
+                format!("<w:comments xmlns:w=\"{W_NS}\"></w:comments>").into_bytes(),
+            ),
+            ("word/document.xml".to_string(), document("Hi")),
+        ];
+        let mut p = load_package(&write_zip(&parts)).unwrap();
+        assert!(p.document.plain_text().starts_with("Hi"));
+        p.drop_empty_comment_parts();
+        p.document
+            .body
+            .push(Block::Paragraph(crate::model::Paragraph::default()));
+        let saved = load_package(&save_package(&p)).unwrap();
+        assert!(saved.document.plain_text().starts_with("Hi"));
+        assert_eq!(saved.document.body.len(), 2);
     }
 
     // ---- Track Changes setting (#624) --------------------------------------
