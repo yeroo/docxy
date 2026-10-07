@@ -115,6 +115,7 @@ mod track_tests;
 mod trusted;
 mod ttc_dialog;
 mod user_name;
+mod windows;
 use open_mode::{OpenMode, Reopen, ReopenStep, reopen_step};
 use project::*;
 
@@ -282,7 +283,7 @@ impl ThemePref {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PersistTab {
     kind: Kind,
     title: String,
@@ -9644,7 +9645,7 @@ fn hot_dir_in(root: &std::path::Path) -> PathBuf {
 /// after a tab close or reorder, the old session can pair `tab-N` with another
 /// tab's `path`. The AutoRecover tick never reorders, so it does not widen this.
 fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: Prefs) {
-    write_session_forgetting(root, tabs, active, prefs, &[]);
+    write_session_forgetting(root, tabs, active, prefs, &[], &[], 0);
 }
 
 /// [`write_session`], with the unsaved work of the tabs at `forget` left out
@@ -9656,10 +9657,18 @@ fn write_session_forgetting(
     active: usize,
     prefs: Prefs,
     forget: &[usize],
+    // The other windows' last-written tabs, appended after this window's:
+    // one session.json holds every window's tabs (#587). Never merged into
+    // `forget`, whose indices name THIS window's tabs only.
+    extra: &[PersistTab],
+    // The hot-sidecar index base: window with registry seq `s` writes
+    // `tab-{s * 1000 + i}` so two windows never share a sidecar name. 0
+    // keeps the single-window names (`tab-{i}`) exactly.
+    hot_base: usize,
 ) {
     let hd = hot_dir_in(root);
     let _ = std::fs::create_dir_all(&hd);
-    let tabs = tabs
+    let mut tabs: Vec<PersistTab> = tabs
         .iter()
         .enumerate()
         .map(|(i, t)| {
@@ -9667,7 +9676,7 @@ fn write_session_forgetting(
                 *t.last_hot.borrow_mut() = None;
                 return forgotten(persist_tab_meta(t));
             }
-            let persisted = persist_tab(&hd, i, t);
+            let persisted = persist_tab(&hd, hot_base + i, t);
             // Every tab is rewritten in this one call, so the path names this
             // tab's content even after a later close shifts the indices.
             *t.last_hot.borrow_mut() = persisted
@@ -9678,6 +9687,7 @@ fn write_session_forgetting(
             persisted
         })
         .collect();
+    tabs.extend(extra.iter().cloned());
     let session = Session {
         tabs,
         active,
@@ -9700,6 +9710,116 @@ fn write_session_forgetting(
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = opccore::fsio::write_atomic(&p, json.as_bytes());
+    }
+}
+
+/// Nothing else from `close::commit_pending_for_exit` runs here: committing
+/// a sheet or Project cell editor would close the user's in-progress edit under
+/// them, and a level pass rewrites the status. So text still in an open cell
+/// editor is not in the recovery copy until it is committed.
+#[cfg(test)]
+mod session_union_tests {
+    use super::{
+        doc_name, sample_doc, session_path_in, write_session_forgetting, DocTab, EditOptions,
+        Kind, PersistTab, Prefs, Session, ThemePref,
+    };
+    use std::path::PathBuf;
+
+    fn prefs() -> Prefs {
+        Prefs {
+            theme: ThemePref::Auto,
+            ask_on_close: false,
+            autorecover_minutes: 10,
+            keep_drafts: true,
+            edit_opts: EditOptions::default(),
+            custom_lists: vec![],
+            autocorrect: String::new(),
+            user_name: "Tester".into(),
+            user_initials: "T".into(),
+        }
+    }
+
+    fn doc_tab(title: &str, dirty: bool) -> DocTab {
+        sample_doc().into_tab(Kind::Docx, title.into(), None, dirty)
+    }
+
+    fn fresh_root(name: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("docxy-session-union-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn session_json(root: &std::path::Path) -> Session {
+        serde_json::from_slice(&std::fs::read(session_path_in(root)).unwrap()).unwrap()
+    }
+
+    /// #587 decision 6: one session.json holds every window's tabs. Each
+    /// window's write appends the others' last snapshots, and the second
+    /// window's sidecar names take its seq offset so the files never collide.
+    #[test]
+    fn two_windows_union_reaches_session_with_distinct_sidecars() {
+        let root = fresh_root("two");
+        let win0 = vec![doc_tab("alpha.docx", true)];
+        write_session_forgetting(&root, &win0, 0, prefs(), &[], &[], 0);
+        // What window 0 wrote becomes the snapshot window 1 appends.
+        let snap0 = session_json(&root).tabs;
+        let win1 = vec![doc_tab("beta.docx", true)];
+        write_session_forgetting(&root, &win1, 0, prefs(), &[], &snap0, 1000);
+
+        let session = session_json(&root);
+        assert_eq!(session.tabs.len(), 2, "both windows' tabs reach the one session");
+        let hots: Vec<&str> = session
+            .tabs
+            .iter()
+            .filter_map(|t| t.hot.as_deref())
+            .collect();
+        assert_eq!(hots.len(), 2, "both dirty tabs keep a hot sidecar: {hots:?}");
+        assert!(hots.iter().any(|h| h.ends_with("tab-0.docx")), "{hots:?}");
+        assert!(hots.iter().any(|h| h.ends_with("tab-1000.docx")), "{hots:?}");
+        for h in &hots {
+            assert!(std::path::Path::new(h).exists(), "sidecar written: {h}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A single-window run keeps the exact bytes and sidecar names it wrote
+    /// before #587: the union append is empty and the offset base is 0.
+    #[test]
+    fn single_window_write_is_byte_identical_to_before() {
+        let root = fresh_root("single");
+        write_session_forgetting(
+            &root,
+            &[doc_tab("one.docx", true), doc_tab("two.docx", false)],
+            0,
+            prefs(),
+            &[],
+            &[],
+            0,
+        );
+        let first = std::fs::read(session_path_in(&root)).unwrap();
+        write_session_forgetting(
+            &root,
+            &[doc_tab("one.docx", true), doc_tab("two.docx", false)],
+            0,
+            prefs(),
+            &[],
+            &[],
+            0,
+        );
+        let second = std::fs::read(session_path_in(&root)).unwrap();
+        assert_eq!(first, second, "the same input writes the same bytes");
+        let session: Session = serde_json::from_slice(&second).unwrap();
+        let hots: Vec<&str> = session
+            .tabs
+            .iter()
+            .filter_map(|t| t.hot.as_deref())
+            .collect();
+        assert_eq!(hots.len(), 2, "every tab names its sidecar");
+        assert!(hots[0].ends_with("tab-0.docx"), "no offset in the names: {hots:?}");
+        assert!(hots[1].ends_with("tab-1.docx"), "no offset in the names: {hots:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

@@ -2202,7 +2202,7 @@ fn dont_save_on_quit_drops_a_never_saved_tab_and_forgets_a_files_edits() {
     assert_eq!(forget, [1]);
     assert_eq!(active, 1);
 
-    write_session_forgetting(&root.0, &tabs, active, prefs(), &forget);
+    write_session_forgetting(&root.0, &tabs, active, prefs(), &forget, &[], 0);
     let session = root.session();
     assert!(session.tabs[0].dirty);
     assert!(
