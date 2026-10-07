@@ -4,11 +4,15 @@
 //! Written: paragraphs, bold / italic / underline / strikethrough /
 //! superscript / subscript / caps / small caps / hidden, fonts, sizes and
 //! colours, paragraph alignment and direction, headings (`heading N` styles
-//! in the stylesheet), lists (a list table Word numbers from, plus the
-//! marker in `\listtext` that plain readers show), tables (`\trowd … \cell
-//! … \row`, vertical merges), hyperlinks as `HYPERLINK` fields, tabs and
-//! line / page / column breaks. Every character past ASCII is `\uN?`, so the
-//! file is 7-bit and needs no code page.
+//! in the stylesheet, with their style's character formatting), lists (a
+//! list table Word numbers from, each level's format, start and number text
+//! taken from the document's numbering, plus the marker in `\listtext` that
+//! plain readers show), tables (`\trowd … \cell … \row`, the grid's column
+//! edges, columns skipped before a row, vertical merges), hyperlinks as
+//! `HYPERLINK` fields, tabs and line / page / column breaks. Formatting a
+//! paragraph or run takes from its styles is resolved and written as direct
+//! formatting, as the PDF exporter resolves it. Every character past ASCII is
+//! `\uN?`, so the file is 7-bit and needs no code page.
 //!
 //! Like the plain-text writer, tracked changes are their final view. Not
 //! written: pictures, objects, headers and footers, notes (a reference is
@@ -19,54 +23,106 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
+use crate::export_context::ExportContext;
 use crate::model::{
-    Align, Block, BreakKind, Cell, Document, Inline, Paragraph, RevisionKind, Row, RunProps, Table,
+    Align, Block, BreakKind, Cell, Document, Inline, Paragraph, RevisionKind, RunProps, Table,
     VMerge, VertAlign,
 };
+use crate::numbering::{LevelDef, NumFmt, Numbering};
+use crate::styles::StyleSheet;
+use crate::table::{GridMap, RowMap};
 
 /// Twips per table column when the table has no grid for it.
 const DEFAULT_COLUMN: u32 = 2160;
 
-/// The RTF for `doc`. `markers` are its list paragraphs' markers by tree path
-/// ([`crate::numbering::compute_markers`]).
-pub fn to_rtf(doc: &Document, markers: &HashMap<Vec<usize>, String>) -> String {
+/// The RTF for `doc`, its lists and styles as `ctx` defines them.
+pub fn to_rtf(doc: &Document, ctx: &ExportContext) -> String {
+    let markers = ctx.markers(doc);
     let mut w = Writer {
-        markers,
+        markers: &markers,
+        numbering: &ctx.numbering,
+        styles: &ctx.styles,
         body: String::new(),
         fonts: vec!["Calibri".to_string()],
         colors: Vec::new(),
         lists: Vec::new(),
+        heading_styles: Default::default(),
     };
     let mut path = Vec::new();
     w.blocks(&doc.body, &mut path, false);
     w.finish()
 }
 
-/// A list definition written to the list table: one per `numId` used, its
-/// levels numbered or bulleted as the first marker seen at that level says.
+/// A list definition written to the list table: one per `numId` used.
 struct ListDef {
     num_id: i32,
     levels: [Option<LevelKind>; 9],
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum LevelKind {
     Bullet,
-    /// `\levelnfcN` and the character after the number (`.`, `)`).
-    Number(u8, char),
+    Number {
+        /// `\levelnfcN`.
+        nfc: u8,
+        /// `\levelstartatN`.
+        start: i32,
+        /// The number text, `%1`…`%9` standing for the levels' numbers
+        /// (`w:lvlText`).
+        text: String,
+    },
+}
+
+impl LevelKind {
+    fn from_def(def: &LevelDef) -> LevelKind {
+        let nfc = match def.format {
+            NumFmt::Bullet => return LevelKind::Bullet,
+            NumFmt::Decimal => 0,
+            NumFmt::UpperRoman => 1,
+            NumFmt::LowerRoman => 2,
+            NumFmt::UpperLetter => 3,
+            NumFmt::LowerLetter => 4,
+        };
+        LevelKind::Number {
+            nfc,
+            start: def.start,
+            text: def.text.clone(),
+        }
+    }
 }
 
 struct Writer<'a> {
     markers: &'a HashMap<Vec<usize>, String>,
+    numbering: &'a Numbering,
+    styles: &'a StyleSheet,
     body: String,
     fonts: Vec<String>,
     /// `RRGGBB`, `\cfN` being the index plus one (0 is "auto").
     colors: Vec<String>,
     lists: Vec<ListDef>,
+    /// The paragraph style of the first heading of each level, whose
+    /// character formatting the stylesheet's `heading N` carries.
+    heading_styles: [Option<String>; 9],
 }
 
 impl Writer<'_> {
-    fn finish(self) -> String {
+    fn finish(mut self) -> String {
+        // The stylesheet first: its formatting adds to the font and colour
+        // tables written before it.
+        let mut sheet = String::from("{\\stylesheet{\\s0 Normal;}");
+        for level in 1..=9usize {
+            let _ = write!(sheet, "{{\\s{level}\\outlinelevel{}", level - 1);
+            let style = self.heading_styles[level - 1]
+                .clone()
+                .unwrap_or_else(|| format!("Heading{level}"));
+            let props = self
+                .styles
+                .effective_run(Some(&style), None, &RunProps::default());
+            let formatting = self.props_words(&props);
+            sheet.push_str(&formatting);
+            let _ = write!(sheet, " heading {level};}}");
+        }
+        sheet.push_str("}\n");
         let mut out = String::from("{\\rtf1\\ansi\\ansicpg1252\\uc1\\deff0\n{\\fonttbl");
         for (i, f) in self.fonts.iter().enumerate() {
             let _ = write!(out, "{{\\f{i}\\fnil\\fcharset0 ");
@@ -82,22 +138,14 @@ impl Writer<'_> {
             }
             out.push_str("}\n");
         }
-        out.push_str("{\\stylesheet{\\s0 Normal;}");
-        for level in 1..=9 {
-            let _ = write!(
-                out,
-                "{{\\s{level}\\outlinelevel{} heading {level};}}",
-                level - 1
-            );
-        }
-        out.push_str("}\n");
+        out.push_str(&sheet);
         if !self.lists.is_empty() {
             out.push_str("{\\*\\listtable");
             for (i, list) in self.lists.iter().enumerate() {
                 let id = i + 1;
                 let _ = write!(out, "{{\\list\\listtemplateid{id}");
                 for (l, kind) in list.levels.iter().enumerate() {
-                    list_level(l, kind.unwrap_or(LevelKind::Bullet), &mut out);
+                    list_level(l, kind.as_ref().unwrap_or(&LevelKind::Bullet), &mut out);
                 }
                 let _ = write!(out, "{{\\listname ;}}\\listid{id}}}");
             }
@@ -129,16 +177,22 @@ impl Writer<'_> {
     }
 
     fn paragraph(&mut self, p: &Paragraph, path: &[usize], in_table: bool, end: &str) {
+        let pstyle = p.props.style_id.as_deref();
         self.body.push_str("\\pard\\plain");
         if let Some(level) = p.props.heading_level.filter(|l| (1..=9).contains(l)) {
             let _ = write!(self.body, "\\s{level}\\outlinelevel{}", level - 1);
+            let slot = &mut self.heading_styles[usize::from(level) - 1];
+            if slot.is_none() {
+                *slot = p.props.style_id.clone();
+            }
         }
-        self.body.push_str(match p.props.align {
-            Align::Left => "\\ql",
-            Align::Center => "\\qc",
-            Align::Right => "\\qr",
-            Align::Justify => "\\qj",
-        });
+        self.body
+            .push_str(match self.styles.effective_align(pstyle, p.props.align) {
+                Align::Left => "\\ql",
+                Align::Center => "\\qc",
+                Align::Right => "\\qr",
+                Align::Justify => "\\qj",
+            });
         if p.props.rtl {
             self.body.push_str("\\rtlpar");
         }
@@ -163,33 +217,39 @@ impl Writer<'_> {
             escape(&m, &mut self.body);
             self.body.push_str("\\tab}");
         }
-        self.inlines(&p.content);
+        self.inlines(&p.content, pstyle);
         self.body.push_str(end);
         self.body.push('\n');
     }
 
-    /// The `\lsN` for `num_id`, recording what level `ilvl` is.
+    /// The `\lsN` for `num_id`. Its levels are the document's numbering
+    /// definition; a level it does not define is what its first marker
+    /// says.
     fn list(&mut self, num_id: i32, ilvl: usize, marker: Option<&str>) -> usize {
         let i = match self.lists.iter().position(|l| l.num_id == num_id) {
             Some(i) => i,
             None => {
-                self.lists.push(ListDef {
-                    num_id,
-                    levels: [None; 9],
+                let numbering = self.numbering;
+                let levels = std::array::from_fn(|l| {
+                    numbering
+                        .level(num_id, l as i32)
+                        .map(|def| LevelKind::from_def(&def))
                 });
+                self.lists.push(ListDef { num_id, levels });
                 self.lists.len() - 1
             }
         };
         let level = &mut self.lists[i].levels[ilvl];
         if level.is_none() {
-            *level = Some(marker.map_or(LevelKind::Bullet, level_kind));
+            *level = Some(marker.map_or(LevelKind::Bullet, |m| level_kind(m, ilvl)));
         }
         i + 1
     }
 
     fn table(&mut self, t: &Table, path: &mut Vec<usize>) {
+        let map = GridMap::of(t);
         for (ri, row) in t.rows.iter().enumerate() {
-            let def = row_definition(t, row);
+            let def = row_definition(t, row.cells.as_slice(), &map.rows[ri]);
             self.body.push_str(&def);
             for (ci, cell) in row.cells.iter().enumerate() {
                 path.push(ri);
@@ -251,10 +311,10 @@ impl Writer<'_> {
         }
     }
 
-    fn inlines(&mut self, content: &[Inline]) {
+    fn inlines(&mut self, content: &[Inline], pstyle: Option<&str>) {
         for inline in content {
             match inline {
-                Inline::Run(r) => self.run(&r.text, &r.props),
+                Inline::Run(r) => self.run(&r.text, &r.props, pstyle),
                 Inline::Hyperlink(h) => {
                     let mut inst = String::from("HYPERLINK ");
                     match (&h.target, &h.anchor) {
@@ -268,18 +328,18 @@ impl Writer<'_> {
                     }
                     if inst.is_empty() {
                         for r in &h.runs {
-                            self.run(&r.text, &r.props);
+                            self.run(&r.text, &r.props, pstyle);
                         }
-                        self.inlines(&h.content);
+                        self.inlines(&h.content, pstyle);
                         continue;
                     }
                     self.body.push_str("{\\field{\\*\\fldinst {");
                     escape(&inst, &mut self.body);
                     self.body.push_str("}}{\\fldrslt {");
                     for r in &h.runs {
-                        self.run(&r.text, &r.props);
+                        self.run(&r.text, &r.props, pstyle);
                     }
-                    self.inlines(&h.content);
+                    self.inlines(&h.content, pstyle);
                     self.body.push_str("}}}");
                 }
                 Inline::Break(kind, props) => {
@@ -288,16 +348,20 @@ impl Writer<'_> {
                         BreakKind::Page => "\\page",
                         BreakKind::Column => "\\column",
                     };
-                    self.control_run(word, props);
+                    self.control_run(word, props, pstyle);
                 }
-                Inline::Tab(props) => self.control_run("\\tab", props),
-                Inline::SmartArt { text, .. } => self.run(&text.join("\n"), &RunProps::default()),
-                Inline::Chart { chart, .. } => {
-                    self.run(chart.title.as_deref().unwrap_or(""), &RunProps::default())
+                Inline::Tab(props) => self.control_run("\\tab", props, pstyle),
+                Inline::SmartArt { text, .. } => {
+                    self.run(&text.join("\n"), &RunProps::default(), pstyle)
                 }
-                Inline::Equation { text, .. } => self.run(text, &RunProps::default()),
+                Inline::Chart { chart, .. } => self.run(
+                    chart.title.as_deref().unwrap_or(""),
+                    &RunProps::default(),
+                    pstyle,
+                ),
+                Inline::Equation { text, .. } => self.run(text, &RunProps::default(), pstyle),
                 Inline::Field { raw, text } => {
-                    self.run(text, &crate::load::field_result_props(raw))
+                    self.run(text, &crate::load::field_result_props(raw), pstyle)
                 }
                 Inline::TextBox { blocks, .. } => {
                     let mut first = true;
@@ -305,14 +369,14 @@ impl Writer<'_> {
                         if !std::mem::take(&mut first) {
                             self.body.push_str("\\line ");
                         }
-                        self.inlines(&p.content);
+                        self.inlines(&p.content, p.props.style_id.as_deref());
                     }
                 }
                 Inline::Revision {
                     kind: RevisionKind::Insert,
                     content,
                     ..
-                } => self.inlines(content),
+                } => self.inlines(content, pstyle),
                 Inline::Revision {
                     kind: RevisionKind::Delete,
                     ..
@@ -326,14 +390,22 @@ impl Writer<'_> {
         }
     }
 
-    fn run(&mut self, text: &str, props: &RunProps) {
+    /// The formatting text with direct properties `props` has in a paragraph
+    /// of style `pstyle`: its styles resolved, as the PDF exporter does.
+    fn effective(&self, props: &RunProps, pstyle: Option<&str>) -> RunProps {
+        self.styles
+            .effective_run(pstyle, props.style_id.as_deref(), props)
+    }
+
+    fn run(&mut self, text: &str, props: &RunProps, pstyle: Option<&str>) {
         if text.is_empty() {
             return;
         }
+        let eff = self.effective(props, pstyle);
+        let words = self.props_words(&eff);
         self.body.push('{');
-        let start = self.body.len();
-        self.run_props(props);
-        if self.body.len() > start {
+        if !words.is_empty() {
+            self.body.push_str(&words);
             self.body.push(' ');
         }
         escape(text, &mut self.body);
@@ -341,14 +413,19 @@ impl Writer<'_> {
     }
 
     /// A tab or break, in its run's formatting.
-    fn control_run(&mut self, word: &str, props: &RunProps) {
+    fn control_run(&mut self, word: &str, props: &RunProps, pstyle: Option<&str>) {
+        let eff = self.effective(props, pstyle);
+        let words = self.props_words(&eff);
         self.body.push('{');
-        self.run_props(props);
+        self.body.push_str(&words);
         self.body.push_str(word);
         self.body.push('}');
     }
 
-    fn run_props(&mut self, p: &RunProps) {
+    /// The control words for run properties `p`, adding its font and colour
+    /// to their tables.
+    fn props_words(&mut self, p: &RunProps) -> String {
+        let mut out = String::new();
         let flags = [
             (p.bold, "\\b"),
             (p.italic, "\\i"),
@@ -362,7 +439,7 @@ impl Writer<'_> {
         ];
         for (on, word) in flags {
             if on {
-                self.body.push_str(word);
+                out.push_str(word);
             }
         }
         let font = p
@@ -377,10 +454,10 @@ impl Writer<'_> {
                     self.fonts.len() - 1
                 }
             };
-            let _ = write!(self.body, "\\f{i}");
+            let _ = write!(out, "\\f{i}");
         }
         if let Some(size) = p.size_half_pts {
-            let _ = write!(self.body, "\\fs{size}");
+            let _ = write!(out, "\\fs{size}");
         }
         if let Some(color) = p
             .color
@@ -395,41 +472,40 @@ impl Writer<'_> {
                     self.colors.len() - 1
                 }
             };
-            let _ = write!(self.body, "\\cf{}", i + 1);
+            let _ = write!(out, "\\cf{}", i + 1);
         }
+        out
     }
 }
 
-/// `\trowd` and the cell definitions for `row`: each cell's right edge from
-/// the table grid (the columns it spans), its vertical merge.
-fn row_definition(t: &Table, row: &Row) -> String {
-    let mut def = String::from("\\trowd\\trgaph108\\trleft0");
-    let mut col = 0usize;
-    let mut right = 0u32;
-    for cell in &row.cells {
-        let span = cell.grid_span.max(1) as usize;
-        for c in col..col + span {
-            right += t
-                .grid
-                .get(c)
-                .copied()
-                .filter(|&w| w > 0)
-                .unwrap_or(DEFAULT_COLUMN);
-        }
-        col += span;
+/// `\trowd` and the cell definitions for a row laid on the grid as `map`
+/// says: the row starts past the columns `w:gridBefore` skips, and each
+/// cell's right edge is the grid's edge after the columns it spans.
+fn row_definition(t: &Table, cells: &[Cell], map: &RowMap) -> String {
+    let width = |c: usize| {
+        t.grid
+            .get(c)
+            .copied()
+            .filter(|&w| w > 0)
+            .unwrap_or(DEFAULT_COLUMN)
+    };
+    let edge = |end: usize| (0..end).map(width).sum::<u32>();
+    let mut def = format!("\\trowd\\trgaph108\\trleft{}", edge(map.before));
+    for (cell, &(start, span)) in cells.iter().zip(&map.cells) {
         match cell.v_merge {
             VMerge::Restart => def.push_str("\\clvmgf"),
             VMerge::Continue => def.push_str("\\clvmrg"),
             VMerge::None => {}
         }
-        let _ = write!(def, "\\cellx{right}");
+        let _ = write!(def, "\\cellx{}", edge(start + span.max(1)));
     }
     def
 }
 
 /// A list level's `\listlevel` group: Word's default indents, a tab after
-/// the number, and a decimal / letter / roman number or a bullet.
-fn list_level(level: usize, kind: LevelKind, out: &mut String) {
+/// the number, and a numbered level's format, start and number text, or a
+/// bullet.
+fn list_level(level: usize, kind: &LevelKind, out: &mut String) {
     let indent = 720 * (level + 1);
     match kind {
         LevelKind::Bullet => {
@@ -439,45 +515,78 @@ fn list_level(level: usize, kind: LevelKind, out: &mut String) {
                  {{\\leveltext\\'01\\u8226 ?;}}{{\\levelnumbers;}}\\fi-360\\li{indent}}}"
             );
         }
-        LevelKind::Number(nfc, suffix) => {
+        LevelKind::Number { nfc, start, text } => {
+            let (leveltext, numbers) = level_text(text);
             let _ = write!(
                 out,
-                "{{\\listlevel\\levelnfc{nfc}\\levelnfcn{nfc}\\leveljc0\\levelstartat1\\levelfollow0\
-                 {{\\leveltext\\'02\\'{level:02x}"
+                "{{\\listlevel\\levelnfc{nfc}\\levelnfcn{nfc}\\leveljc0\\levelstartat{start}\
+                 \\levelfollow0{{\\leveltext{leveltext};}}{{\\levelnumbers{numbers};}}\
+                 \\fi-360\\li{indent}}}"
             );
-            escape(&suffix.to_string(), out);
-            let _ = write!(out, ";}}{{\\levelnumbers\\'01;}}\\fi-360\\li{indent}}}");
         }
     }
 }
 
-/// What a marker says its level is: a number (`1.`, `a)`, `iv.`) and its
-/// format, or a bullet.
-fn level_kind(marker: &str) -> LevelKind {
+/// A `w:lvlText` (`%1.%2.`) as RTF's `\leveltext` (its length, then the
+/// text, each `%N` as the placeholder `\'0(N-1)`) and `\levelnumbers` (the
+/// 1-based position of each placeholder in that text).
+fn level_text(text: &str) -> (String, String) {
+    let mut body = String::new();
+    let mut numbers = String::new();
+    let mut len = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if let Some(d) = chars
+                .peek()
+                .and_then(|d| d.to_digit(10))
+                .filter(|d| (1..=9).contains(d))
+            {
+                chars.next();
+                len += 1;
+                let _ = write!(body, "\\'{:02x}", d - 1);
+                let _ = write!(numbers, "\\'{len:02x}");
+                continue;
+            }
+        }
+        len += c.len_utf16();
+        escape(&c.to_string(), &mut body);
+    }
+    (format!("\\'{len:02x}{body}"), numbers)
+}
+
+/// What a level's first marker says it is, for a list the document's
+/// numbering does not define: a number (`1.`, `a)`, `i.`, `1.1.`) and its
+/// format, or a bullet. The first marker of a level is its first number, so
+/// a lone `i` is roman, not the ninth letter.
+fn level_kind(marker: &str, ilvl: usize) -> LevelKind {
     let m = marker.trim();
     if !crate::import::marker_is_numbered(m) {
         return LevelKind::Bullet;
     }
     let suffix = m.chars().last().unwrap_or('.');
-    let body: String = m
-        .trim_end_matches(['.', ')'])
-        .trim_start_matches('(')
-        .to_string();
-    let roman = |s: &str, set: &str| s.len() > 1 && s.chars().all(|c| set.contains(c));
-    let nfc = if body.chars().all(|c| c.is_ascii_digit()) {
+    let body = m.trim_end_matches(['.', ')']).trim_start_matches('(');
+    // The last number of a compound marker (`1.2.`) is this level's.
+    let own = body.rsplit('.').next().unwrap_or(body);
+    let all_in = |set: &str| !own.is_empty() && own.chars().all(|c| set.contains(c));
+    let nfc = if own.chars().all(|c| c.is_ascii_digit()) {
         0
-    } else if roman(&body, "ivxlcdm") {
+    } else if all_in("ivxlcdm") {
         2
-    } else if roman(&body, "IVXLCDM") {
+    } else if all_in("IVXLCDM") {
         1
-    } else if body.chars().all(|c| c.is_lowercase()) {
+    } else if own.chars().all(|c| c.is_lowercase()) {
         4
-    } else if body.chars().all(|c| c.is_uppercase()) {
+    } else if own.chars().all(|c| c.is_uppercase()) {
         3
     } else {
         0
     };
-    LevelKind::Number(nfc, suffix)
+    LevelKind::Number {
+        nfc,
+        start: 1,
+        text: format!("%{}{suffix}", ilvl + 1),
+    }
 }
 
 /// A text box's paragraphs, its tables' included, in order.
@@ -546,7 +655,7 @@ mod tests {
     }
 
     fn rtf(doc: &Document) -> String {
-        to_rtf(doc, &crate::numbering::package_markers(None, doc))
+        to_rtf(doc, &ExportContext::for_package(None))
     }
 
     fn back(doc: &Document) -> Document {
@@ -878,10 +987,182 @@ mod tests {
 
     #[test]
     fn markers_say_their_level_kind() {
-        assert_eq!(level_kind("1."), LevelKind::Number(0, '.'));
-        assert_eq!(level_kind("a)"), LevelKind::Number(4, ')'));
-        assert_eq!(level_kind("B."), LevelKind::Number(3, '.'));
-        assert_eq!(level_kind("iv."), LevelKind::Number(2, '.'));
-        assert_eq!(level_kind("\u{2022}"), LevelKind::Bullet);
+        let num = |nfc, suffix: &str, ilvl: usize| LevelKind::Number {
+            nfc,
+            start: 1,
+            text: format!("%{}{suffix}", ilvl + 1),
+        };
+        assert_eq!(level_kind("1.", 0), num(0, ".", 0));
+        assert_eq!(level_kind("a)", 0), num(4, ")", 0));
+        assert_eq!(level_kind("B.", 0), num(3, ".", 0));
+        assert_eq!(level_kind("iv.", 0), num(2, ".", 0));
+        // A level's first marker: a lone i is roman (FIX r1 #1).
+        assert_eq!(level_kind("i.", 0), num(2, ".", 0));
+        assert_eq!(level_kind("I.", 1), num(1, ".", 1));
+        // A compound marker is numbered, by its last number.
+        assert_eq!(level_kind("1.1.", 1), num(0, ".", 1));
+        assert_eq!(level_kind("\u{2022}", 0), LevelKind::Bullet);
+    }
+
+    /// The list's numbering definition, not its first marker, gives each
+    /// level's format, start and number text (FIX r1 #1).
+    #[test]
+    fn list_levels_come_from_the_numbering_definition() {
+        let numbering = crate::numbering::parse_numbering_xml(
+            r#"<w:numbering>
+            <w:abstractNum w:abstractNumId="0">
+              <w:lvl w:ilvl="0"><w:start w:val="5"/><w:numFmt w:val="lowerRoman"/><w:lvlText w:val="%1)"/></w:lvl>
+              <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2."/></w:lvl>
+            </w:abstractNum>
+            <w:num w:numId="7"><w:abstractNumId w:val="0"/></w:num>
+            </w:numbering>"#,
+        );
+        let ctx = ExportContext {
+            numbering,
+            ..ExportContext::default()
+        };
+        let item = |ilvl, s: &str| {
+            para(
+                ParProps {
+                    num_id: Some(7),
+                    ilvl,
+                    ..ParProps::default()
+                },
+                vec![plain(s)],
+            )
+        };
+        let doc = Document {
+            body: vec![item(0, "five"), item(1, "nested"), item(0, "six")],
+        };
+        let s = to_rtf(&doc, &ctx);
+        assert!(
+            s.contains("\\levelnfc2\\levelnfcn2\\leveljc0\\levelstartat5\\levelfollow0{\\leveltext\\'02\\'00);}{\\levelnumbers\\'01;}"),
+            "{s}"
+        );
+        assert!(
+            s.contains("\\levelnfc0\\levelnfcn0\\leveljc0\\levelstartat1\\levelfollow0{\\leveltext\\'04\\'00.\\'01.;}{\\levelnumbers\\'01\\'03;}"),
+            "{s}"
+        );
+        assert!(s.contains("{\\listtext v)\\tab}"), "{s}");
+        assert!(s.contains("{\\listtext v.1.\\tab}"), "{s}");
+        // Read back, every item is numbered, the compound one included.
+        let back = import_rtf(s.as_bytes()).unwrap();
+        let ordered: Vec<(Option<i32>, i32)> = paras(&back)
+            .iter()
+            .map(|p| (p.props.num_id, p.props.ilvl))
+            .collect();
+        assert_eq!(ordered, [(Some(2), 0), (Some(2), 1), (Some(2), 0)]);
+    }
+
+    #[test]
+    fn level_text_counts_placeholders_and_text() {
+        assert_eq!(
+            level_text("%1."),
+            ("\\'02\\'00.".to_string(), "\\'01".to_string())
+        );
+        assert_eq!(
+            level_text("(%2)"),
+            ("\\'03(\\'01)".to_string(), "\\'02".to_string())
+        );
+        assert_eq!(
+            level_text("%1.%2.%3"),
+            (
+                "\\'05\\'00.\\'01.\\'02".to_string(),
+                "\\'01\\'03\\'05".to_string()
+            )
+        );
+        // A literal % stays text.
+        assert_eq!(
+            level_text("%%1"),
+            ("\\'02%\\'00".to_string(), "\\'02".to_string())
+        );
+    }
+
+    /// Formatting from styles is written (FIX r1 #3): a run in a bold
+    /// character style is bold, a paragraph its style centres is centred,
+    /// and a heading's stylesheet entry carries its style's formatting.
+    #[test]
+    fn styles_are_resolved_into_direct_formatting() {
+        let styles = crate::styles::parse_styles_xml(
+            r#"<w:styles>
+            <w:style w:type="character" w:styleId="Strong"><w:name w:val="Strong"/><w:rPr><w:b/></w:rPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:pPr><w:jc w:val="center"/></w:pPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style>
+            </w:styles>"#,
+        );
+        let ctx = ExportContext {
+            styles,
+            ..ExportContext::default()
+        };
+        let strong = RunProps {
+            style_id: Some("Strong".into()),
+            ..RunProps::default()
+        };
+        let doc = Document {
+            body: vec![
+                para(
+                    ParProps {
+                        style_id: Some("Title".into()),
+                        ..ParProps::default()
+                    },
+                    vec![plain("Title")],
+                ),
+                para(
+                    ParProps::default(),
+                    vec![plain("a "), run("strong", strong)],
+                ),
+                para(crate::import::heading_props(1), vec![plain("Heading")]),
+            ],
+        };
+        let s = to_rtf(&doc, &ctx);
+        assert!(
+            s.contains("{\\s1\\outlinelevel0\\b\\fs32 heading 1;}"),
+            "{s}"
+        );
+        let back = import_rtf(s.as_bytes()).unwrap();
+        let p = paras(&back);
+        assert_eq!(p[0].props.align, Align::Center);
+        let bold: Vec<(String, bool)> = runs(p[1]).into_iter().map(|(t, r)| (t, r.bold)).collect();
+        assert_eq!(
+            bold,
+            [("a ".to_string(), false), ("strong".to_string(), true)]
+        );
+        assert!(runs(p[2]).iter().all(|(_, r)| r.bold), "{:?}", runs(p[2]));
+    }
+
+    /// A row's `w:gridBefore` columns are skipped (FIX r1 #5): the row
+    /// starts at their edge and its cells' edges follow the grid.
+    #[test]
+    fn grid_before_moves_the_row_and_its_cell_edges() {
+        let cell = |s: &str| Cell {
+            blocks: vec![para(ParProps::default(), vec![plain(s)])],
+            ..Cell::default()
+        };
+        let t = Table {
+            grid: vec![1000, 3000],
+            rows: vec![
+                crate::model::Row {
+                    cells: vec![cell("a"), cell("b")],
+                    ..Default::default()
+                },
+                crate::model::Row {
+                    cells: vec![cell("c")],
+                    raw_props: vec!["<w:trPr><w:gridBefore w:val=\"1\"/></w:trPr>".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Table::default()
+        };
+        let s = rtf(&Document {
+            body: vec![Block::Table(t)],
+        });
+        assert!(
+            s.contains("\\trowd\\trgaph108\\trleft0\\cellx1000\\cellx4000"),
+            "{s}"
+        );
+        assert!(
+            s.contains("\\trowd\\trgaph108\\trleft1000\\cellx4000"),
+            "{s}"
+        );
     }
 }

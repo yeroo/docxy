@@ -8,22 +8,31 @@
 //! line, at a paragraph's edge the paragraph break already does.
 //!
 //! The text is the final view of tracked changes (insertions kept, deletions
-//! dropped). Hidden text, pictures, objects and content the model keeps only
-//! as raw XML write nothing. The caller encodes the string (UTF-8, no BOM).
+//! dropped). Hidden text (a hidden field result included), pictures, objects
+//! and content the model keeps only as raw XML write nothing. The caller
+//! encodes the string (UTF-8, no BOM).
 
 use std::collections::HashMap;
 
-use crate::model::{Block, BreakKind, Cell, Document, Inline, Paragraph, RevisionKind, VMerge};
+use crate::export_context::ExportContext;
+use crate::model::{
+    Block, BreakKind, Cell, Document, Inline, Paragraph, RevisionKind, RunProps, VMerge,
+};
+use crate::styles::StyleSheet;
 
 const CRLF: &str = "\r\n";
 
-/// The plain text of `doc`. `markers` are its list paragraphs' markers by
-/// tree path ([`crate::numbering::compute_markers`]). An empty document is
-/// an empty string; otherwise every line, the last included, ends in CRLF.
-pub fn to_text(doc: &Document, markers: &HashMap<Vec<usize>, String>) -> String {
+/// The plain text of `doc`, its lists numbered and its styles resolved by
+/// `ctx`. An empty document is an empty string; otherwise every line, the
+/// last included, ends in CRLF.
+pub fn to_text(doc: &Document, ctx: &ExportContext) -> String {
+    let markers = ctx.markers(doc);
+    let w = Writer {
+        markers: &markers,
+        styles: &ctx.styles,
+    };
     let mut lines = Vec::new();
-    let mut path = Vec::new();
-    blocks_lines(&doc.body, &mut path, markers, &mut lines);
+    w.blocks_lines(&doc.body, &mut Vec::new(), &mut lines);
     let mut out = lines.join(CRLF);
     if !out.is_empty() {
         out.push_str(CRLF);
@@ -31,61 +40,121 @@ pub fn to_text(doc: &Document, markers: &HashMap<Vec<usize>, String>) -> String 
     out
 }
 
-fn blocks_lines(
-    blocks: &[Block],
-    path: &mut Vec<usize>,
-    markers: &HashMap<Vec<usize>, String>,
-    lines: &mut Vec<String>,
-) {
-    for (i, block) in blocks.iter().enumerate() {
-        path.push(i);
-        match block {
-            Block::Paragraph(p) => lines.push(paragraph_line(p, markers.get(path.as_slice()))),
-            Block::Table(t) => {
-                for (ri, row) in t.rows.iter().enumerate() {
-                    let cells: Vec<String> = row
-                        .cells
-                        .iter()
-                        .enumerate()
-                        .map(|(ci, cell)| {
-                            path.push(ri);
-                            path.push(ci);
-                            let text = cell_text(cell, path, markers);
-                            path.pop();
-                            path.pop();
-                            text
-                        })
-                        .collect();
-                    lines.push(cells.join("\t"));
+struct Writer<'a> {
+    markers: &'a HashMap<Vec<usize>, String>,
+    styles: &'a StyleSheet,
+}
+
+impl Writer<'_> {
+    fn blocks_lines(&self, blocks: &[Block], path: &mut Vec<usize>, lines: &mut Vec<String>) {
+        for (i, block) in blocks.iter().enumerate() {
+            path.push(i);
+            match block {
+                Block::Paragraph(p) => {
+                    lines.push(self.paragraph_line(p, self.markers.get(path.as_slice())))
                 }
+                Block::Table(t) => {
+                    for (ri, row) in t.rows.iter().enumerate() {
+                        let cells: Vec<String> = row
+                            .cells
+                            .iter()
+                            .enumerate()
+                            .map(|(ci, cell)| {
+                                path.push(ri);
+                                path.push(ci);
+                                let text = self.cell_text(cell, path);
+                                path.pop();
+                                path.pop();
+                                text
+                            })
+                            .collect();
+                        lines.push(cells.join("\t"));
+                    }
+                }
+                // Content controls and other block XML the model does not
+                // read, and the final section's properties: no text.
+                Block::Raw(_) | Block::SectionProperties(_) => {}
             }
-            // Content controls and other block XML the model does not read,
-            // and the final section's properties: no text.
-            Block::Raw(_) | Block::SectionProperties(_) => {}
+            path.pop();
         }
-        path.pop();
     }
-}
 
-/// A cell's text: its paragraphs by CRLF; a cell merged into the one above
-/// is empty.
-fn cell_text(cell: &Cell, path: &mut Vec<usize>, markers: &HashMap<Vec<usize>, String>) -> String {
-    if cell.v_merge == VMerge::Continue {
-        return String::new();
+    /// A cell's text: its paragraphs by CRLF; a cell merged into the one
+    /// above is empty.
+    fn cell_text(&self, cell: &Cell, path: &mut Vec<usize>) -> String {
+        if cell.v_merge == VMerge::Continue {
+            return String::new();
+        }
+        let mut lines = Vec::new();
+        self.blocks_lines(&cell.blocks, path, &mut lines);
+        lines.join(CRLF)
     }
-    let mut lines = Vec::new();
-    blocks_lines(&cell.blocks, path, markers, &mut lines);
-    lines.join(CRLF)
-}
 
-fn paragraph_line(p: &Paragraph, marker: Option<&String>) -> String {
-    let mut line = Line::default();
-    if let Some(m) = marker {
-        line.text(m);
-        line.text("\t");
+    fn paragraph_line(&self, p: &Paragraph, marker: Option<&String>) -> String {
+        let mut line = Line::default();
+        if let Some(m) = marker {
+            line.text(m);
+            line.text("\t");
+        }
+        self.inlines(&p.content, p.props.style_id.as_deref(), &mut line);
+        line.out
     }
-    inlines(&p.content, &mut line);
-    line.out
+
+    /// Whether text with direct properties `props` in a paragraph of style
+    /// `pstyle` is hidden, its styles resolved.
+    fn hidden(&self, pstyle: Option<&str>, props: &RunProps) -> bool {
+        self.styles
+            .effective_run(pstyle, props.style_id.as_deref(), props)
+            .vanish
+    }
+
+    fn inlines(&self, content: &[Inline], pstyle: Option<&str>, line: &mut Line) {
+        for inline in content {
+            match inline {
+                Inline::Run(r) if self.hidden(pstyle, &r.props) => {}
+                Inline::Run(r) => line.text(&r.text),
+                Inline::Hyperlink(h) => {
+                    for r in h.runs.iter().filter(|r| !self.hidden(pstyle, &r.props)) {
+                        line.text(&r.text);
+                    }
+                    self.inlines(&h.content, pstyle, line);
+                }
+                Inline::Break(BreakKind::Line | BreakKind::Clear(_), _) => line.text("\n"),
+                Inline::Break(BreakKind::Page | BreakKind::Column, _) => line.pending_break = true,
+                Inline::Tab(_) => line.text("\t"),
+                Inline::SmartArt { text, .. } => line.text(&text.join("\n")),
+                Inline::Chart { chart, .. } => line.text(chart.title.as_deref().unwrap_or("")),
+                Inline::Equation { text, .. } => line.text(text),
+                // A field shows its cached result, unless the result is hidden.
+                Inline::Field { raw, text } => {
+                    if !self.hidden(pstyle, &crate::load::field_result_props(raw)) {
+                        line.text(text)
+                    }
+                }
+                Inline::TextBox { blocks, .. } => {
+                    let mut lines = Vec::new();
+                    let inner = Writer {
+                        markers: &HashMap::new(),
+                        styles: self.styles,
+                    };
+                    inner.blocks_lines(blocks, &mut Vec::new(), &mut lines);
+                    line.text(&lines.join("\n"));
+                }
+                Inline::Revision {
+                    kind: RevisionKind::Insert,
+                    content,
+                    ..
+                } => self.inlines(content, pstyle, line),
+                Inline::Revision {
+                    kind: RevisionKind::Delete,
+                    ..
+                } => {}
+                Inline::UnsupportedRevision { .. } => {}
+                Inline::FootnoteRef { id, .. } => line.text(&id.to_string()),
+                Inline::Raw(_) => {}
+            }
+        }
+    }
 }
 
 /// A line being written, with a page or column break waiting to end it if
@@ -110,45 +179,6 @@ impl Line {
                 self.out.push_str(CRLF);
             }
             self.out.push_str(piece.strip_suffix('\r').unwrap_or(piece));
-        }
-    }
-}
-
-fn inlines(content: &[Inline], line: &mut Line) {
-    for inline in content {
-        match inline {
-            Inline::Run(r) if r.props.vanish => {}
-            Inline::Run(r) => line.text(&r.text),
-            Inline::Hyperlink(h) => {
-                for r in h.runs.iter().filter(|r| !r.props.vanish) {
-                    line.text(&r.text);
-                }
-                inlines(&h.content, line);
-            }
-            Inline::Break(BreakKind::Line | BreakKind::Clear(_), _) => line.text("\n"),
-            Inline::Break(BreakKind::Page | BreakKind::Column, _) => line.pending_break = true,
-            Inline::Tab(_) => line.text("\t"),
-            Inline::SmartArt { text, .. } => line.text(&text.join("\n")),
-            Inline::Chart { chart, .. } => line.text(chart.title.as_deref().unwrap_or("")),
-            Inline::Equation { text, .. } => line.text(text),
-            Inline::Field { text, .. } => line.text(text),
-            Inline::TextBox { blocks, .. } => {
-                let mut lines = Vec::new();
-                blocks_lines(blocks, &mut Vec::new(), &HashMap::new(), &mut lines);
-                line.text(&lines.join("\n"));
-            }
-            Inline::Revision {
-                kind: RevisionKind::Insert,
-                content,
-                ..
-            } => inlines(content, line),
-            Inline::Revision {
-                kind: RevisionKind::Delete,
-                ..
-            } => {}
-            Inline::UnsupportedRevision { .. } => {}
-            Inline::FootnoteRef { id, .. } => line.text(&id.to_string()),
-            Inline::Raw(_) => {}
         }
     }
 }
@@ -203,7 +233,7 @@ mod tests {
     }
 
     fn text(doc: &Document) -> String {
-        to_text(doc, &crate::numbering::package_markers(None, doc))
+        to_text(doc, &ExportContext::for_package(None))
     }
 
     #[test]
@@ -332,6 +362,25 @@ mod tests {
             ],
         };
         assert_eq!(text(&doc), "ab\r\n");
+    }
+
+    /// A field shows its cached result, unless that result is hidden
+    /// (FIX r1 #4), as the RTF writer marks it `\v`.
+    #[test]
+    fn a_hidden_field_result_writes_nothing() {
+        let field = |vanish: &str| Inline::Field {
+            raw: format!(
+                "<w:fldSimple w:instr=\" PAGE \"><w:r><w:rPr>{vanish}</w:rPr><w:t>7</w:t></w:r></w:fldSimple>"
+            ),
+            text: "7".into(),
+        };
+        let doc = Document {
+            body: vec![
+                para(vec![run("page "), field("")]),
+                para(vec![run("hidden "), field("<w:vanish/>")]),
+            ],
+        };
+        assert_eq!(text(&doc), "page 7\r\nhidden \r\n");
     }
 
     #[test]

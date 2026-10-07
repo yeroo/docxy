@@ -375,3 +375,43 @@ fn without_a_sidecar_the_file_reopens_and_is_not_written_over() {
         assert_eq!(std::fs::read(&target).unwrap(), on_disk, "{name}");
     }
 }
+
+/// Save As Rich Text resolves the tab's own styles (FIX r1 #3): a run in
+/// the document's bold character style comes back bold.
+#[test]
+fn rich_text_resolves_the_documents_styles() {
+    use docxcore::model::{Block, Inline, ParProps, Paragraph, Run, RunProps};
+    let dir = Scratch::new();
+    let mut pkg = load_package(&fixture("basic.docx")).unwrap();
+    let styles = pkg.part_text("word/styles.xml").unwrap();
+    let styles = styles.replacen(
+        "</w:styles>",
+        "<w:style w:type=\"character\" w:styleId=\"Strong\"><w:name w:val=\"Strong\"/><w:rPr><w:b/></w:rPr></w:style></w:styles>",
+        1,
+    );
+    assert!(pkg.set_part_text("word/styles.xml", &styles));
+    pkg.document.body = vec![Block::Paragraph(Paragraph {
+        props: ParProps::default(),
+        content: vec![Inline::Run(Run {
+            text: "strong".into(),
+            props: RunProps {
+                style_id: Some("Strong".into()),
+                ..RunProps::default()
+            },
+        })],
+    })];
+    let source = dir.path("styled.docx");
+    std::fs::write(&source, docxcore::package::save_package(&pkg)).unwrap();
+    let mut tab = tab_from_path(&source);
+    let rtf = dir.path("styled.rtf");
+    assert!(save_doc_tab(&mut tab, Some(rtf.clone())), "{}", tab.status);
+    let back = docxcore::import::rtf::import_rtf(&std::fs::read(&rtf).unwrap()).unwrap();
+    let Some(Block::Paragraph(p)) = back.body.first() else {
+        panic!("{:?}", back.body)
+    };
+    let Some(Inline::Run(r)) = p.content.first() else {
+        panic!("{:?}", p.content)
+    };
+    assert_eq!(r.text, "strong");
+    assert!(r.props.bold, "the Strong style's bold was dropped");
+}

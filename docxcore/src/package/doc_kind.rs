@@ -398,6 +398,38 @@ mod tests {
         }
     }
 
+    /// A single-quoted Override is retyped in place: one ContentType, the
+    /// new one (FIX r1 #2).
+    #[test]
+    fn a_single_quoted_override_keeps_one_content_type() {
+        let mut pkg = doc_pkg();
+        let types = pkg.part_text("[Content_Types].xml").unwrap();
+        let single = types.replace(
+            "<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>",
+            "<Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>",
+        );
+        assert_ne!(single, types);
+        pkg.set_part_text("[Content_Types].xml", &single);
+        assert!(pkg.set_main_kind(DocKind::Template).retyped);
+        let types = pkg.part_text("[Content_Types].xml").unwrap();
+        let (_, tag) = start_tags(&types, "Override")
+            .into_iter()
+            .find(|(_, t)| t.contains("/word/document.xml"))
+            .unwrap();
+        assert_eq!(tag.matches("ContentType=").count(), 1, "{tag}");
+        assert_eq!(
+            tag,
+            format!(
+                "<Override PartName='/word/document.xml' ContentType='{}'/>",
+                DocKind::Template.main_content_type()
+            )
+        );
+        assert_eq!(
+            pkg.main_content_type().as_deref(),
+            Some(DocKind::Template.main_content_type())
+        );
+    }
+
     #[test]
     fn a_missing_override_is_added() {
         let mut pkg = doc_pkg();

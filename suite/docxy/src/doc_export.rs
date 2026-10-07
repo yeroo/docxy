@@ -364,22 +364,22 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Err(e) = self.new_from_template(path) {
+        if let Err(e) = self.new_from_template(path, window, cx) {
             self.set_status(e);
             cx.notify();
-            return;
         }
-        self.backstage = false;
-        self.show_backstage_open_page();
-        self.persist();
-        self.refocus(window, cx);
     }
 
     /// A new, untitled document from the template at `path` (File > New's
-    /// Personal templates, and the harness's `new-from-template`). A file
-    /// that is no template, or one that cannot be read, opens nothing and
-    /// says why.
-    pub(crate) fn new_from_template(&mut self, path: &std::path::Path) -> Result<(), String> {
+    /// Personal templates, and the harness's `new-from-template`), shown with
+    /// the File screen closed. A file that is no template, or one that
+    /// cannot be read, opens nothing and says why.
+    pub(crate) fn new_from_template(
+        &mut self,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         if doc_templates::doc_template_title(path).is_none() {
             return Err(format!(
                 "\"{}\" is not a Word template (.dotx or .dotm)",
@@ -399,6 +399,10 @@ impl Docxy {
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.drop_grid_state();
+        self.backstage = false;
+        self.show_backstage_open_page();
+        self.persist();
+        self.refocus(window, cx);
         Ok(())
     }
 }

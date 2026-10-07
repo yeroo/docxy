@@ -4057,7 +4057,7 @@ struct Docxy {
     /// wherever `bs_new` is; New and Info clear each other.
     bs_info: bool,
     /// The backstage shows the Account page: the build line and About (#1023).
-    /// New, Info and Account clear one another.
+    /// New, Info, Export and Account clear one another.
     bs_account: bool,
     /// The backstage shows a document's Export page, Change File Type
     /// (#635). Cleared wherever `bs_new` is.
@@ -10779,7 +10779,6 @@ impl Docxy {
     /// item and the harness's `account` verb both come here.
     fn open_account(&mut self, cx: &mut Context<Self>) {
         self.bs_account = true;
-        self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
         self.bs_new = false;
@@ -10798,7 +10797,6 @@ impl Docxy {
             BackstageRailAction::Back => self.backstage_back(window, cx),
             BackstageRailAction::Info => {
                 self.bs_info = true;
-                self.bs_export = false;
                 self.bs_info_status = None;
                 self.bs_new = false;
                 self.bs_export = false;
@@ -17725,8 +17723,10 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
         },
     };
     // Markdown-backed tabs save as Markdown, editable-HTML pages rewrap the
-    // bundle the tab holds (or become a new one), everything else is lossless
-    // .docx.
+    // bundle the tab holds (or become a new one), `.txt` and `.rtf` names
+    // write Plain Text and Rich Text (lossy: the tab keeps the full
+    // document), everything else is a lossless Word package of the type its
+    // name says.
     let kind = html_bundle::doc_target(&path, markdown);
     // A converted tab has the package its conversion wrote (#633), so it
     // saves into it like any other Word document.
@@ -17735,8 +17735,9 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
         let base = save_base(tab, &editor.doc, &live);
         doc_to_docx_for(&editor.doc, &live, base.as_deref(), kind)
     };
-    // Plain Text and Rich Text number lists the way the package does.
-    let markers = |doc: &Document| docxcore::numbering::package_markers(tab.pkg.as_ref(), doc);
+    // Plain Text and Rich Text number lists and resolve styles the way the
+    // package defines them.
+    let context = || docxcore::export_context::ExportContext::for_package(tab.pkg.as_ref());
     // The Word package written, alone or inside a page.
     let mut package: Option<Vec<u8>> = None;
     let mut macros_dropped = false;
@@ -17746,12 +17747,10 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
             docxcore::markdown::to_markdown(&editor.export_doc()).into_bytes()
         }
         html_bundle::DocTarget::Text => {
-            let doc = editor.export_doc();
-            docxcore::export_text::to_text(&doc, &markers(&doc)).into_bytes()
+            docxcore::export_text::to_text(&editor.export_doc(), &context()).into_bytes()
         }
         html_bundle::DocTarget::Rtf => {
-            let doc = editor.export_doc();
-            docxcore::export_rtf::to_rtf(&doc, &markers(&doc)).into_bytes()
+            docxcore::export_rtf::to_rtf(&editor.export_doc(), &context()).into_bytes()
         }
         html_bundle::DocTarget::Docx(kind) => {
             let (bytes, change) = docx(kind);

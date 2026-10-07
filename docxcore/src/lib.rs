@@ -29,6 +29,7 @@ pub mod cover;
 pub mod editor;
 pub mod equation;
 pub mod export;
+pub mod export_context;
 pub mod export_rtf;
 pub mod export_text;
 pub mod field;

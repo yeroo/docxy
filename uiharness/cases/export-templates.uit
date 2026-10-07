@@ -39,6 +39,8 @@ test a template opens as a new untitled document that never saves over it
   key ctrl+s
   assert title is Letter1.docx
   assert dirty is true
+  # The new document has no folder, so a relative path names none.
+  call-error new-from-template {"path":"Letter.dotx"} => the active tab has never been saved, so a relative 'path' has no folder
 
 test new-from-template refuses what is not a template
   open copy:../fixtures/basic.docx

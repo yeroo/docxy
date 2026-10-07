@@ -11,8 +11,9 @@ use std::collections::HashMap;
 use crate::model::{Block, Document};
 use crate::xml::{Event, XmlParser};
 
+/// A list level's number format (`w:numFmt`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NumFmt {
+pub enum NumFmt {
     Decimal,
     LowerLetter,
     UpperLetter,
@@ -60,7 +61,30 @@ pub struct Numbering {
     num_to_abstract: HashMap<i32, i32>,
 }
 
+/// One list level as `numbering.xml` defines it: what an exporter that
+/// writes its own list definitions (RTF) needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LevelDef {
+    pub format: NumFmt,
+    /// `w:start`.
+    pub start: i32,
+    /// `w:lvlText`, `%1`…`%9` standing for the levels' numbers.
+    pub text: String,
+}
+
 impl Numbering {
+    /// Level `ilvl` of list `num_id`, or `None` when the list or level is
+    /// not defined.
+    pub fn level(&self, num_id: i32, ilvl: i32) -> Option<LevelDef> {
+        let abs = self.abstracts.get(self.num_to_abstract.get(&num_id)?)?;
+        let level = abs.levels.get(usize::try_from(ilvl).ok()?)?;
+        Some(LevelDef {
+            format: level.fmt,
+            start: level.start,
+            text: level.text.clone(),
+        })
+    }
+
     fn marker(
         &self,
         num_id: i32,
@@ -274,24 +298,6 @@ pub fn compute_markers(doc: &Document, num: &Numbering) -> HashMap<Vec<usize>, S
     let mut prefix = Vec::new();
     walk(&doc.body, &mut prefix, num, &mut counters, &mut out);
     out
-}
-
-/// The markers of `doc`'s list paragraphs as a save of it numbers them: by
-/// `pkg`'s `word/numbering.xml`, or, with no package or no numbering part in
-/// it, by the two lists a new Markdown package defines (`numId` 1 bullets, 2
-/// decimal), which is the package a save of such a document is written into.
-pub fn package_markers(
-    pkg: Option<&crate::package::Package>,
-    doc: &Document,
-) -> HashMap<Vec<usize>, String> {
-    let xml = pkg
-        .and_then(|p| p.part_text("word/numbering.xml"))
-        .or_else(|| {
-            crate::package::new_markdown_package(Document::default())
-                .part_text("word/numbering.xml")
-        })
-        .unwrap_or_default();
-    compute_markers(doc, &parse_numbering_xml(&xml))
 }
 
 fn walk(

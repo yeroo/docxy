@@ -3998,19 +3998,21 @@ fn dispatch_verb(
         "new-from-template" => {
             app.refuse_under_dialog()?;
             // A relative path resolves against the active file's folder, as
-            // `save-as`'s does.
-            let raw = PathBuf::from(arg_str(args, "path")?.trim());
-            let path = match app.tabs.get(app.active).and_then(|t| t.path.as_deref()) {
-                Some(own) if raw.is_relative() => own
-                    .parent()
-                    .map_or_else(|| raw.clone(), |dir| dir.join(&raw)),
-                _ => raw,
+            // `open`'s does; one with no folder is refused, never the CWD.
+            let raw = Path::new(arg_str(args, "path")?.trim());
+            let path = if raw.is_relative() {
+                app.tabs
+                    .get(app.active)
+                    .and_then(|t| t.path.as_deref())
+                    .and_then(Path::parent)
+                    .ok_or(
+                        "the active tab has never been saved, so a relative 'path' has no folder: give an absolute path",
+                    )?
+                    .join(raw)
+            } else {
+                raw.to_path_buf()
             };
-            app.new_from_template(&path)?;
-            app.backstage = false;
-            app.show_backstage_open_page();
-            app.persist();
-            app.refocus(window, cx);
+            app.new_from_template(&path, window, cx)?;
             let tab = &app.tabs[app.active];
             Done::ok(Json::obj(vec![
                 (
