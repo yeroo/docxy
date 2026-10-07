@@ -1,0 +1,69 @@
+# Multi-window support (#587): window-list / window-new / window-select /
+# window-arrange drive New Window and Arrange All through the same handlers
+# as View > Window. Run against a fresh harness instance, whose one tab is
+# the never-saved sample. The desktop restart check is the ignored test
+# uiharness/tests/windows_restart.rs.
+
+test window list and new window move the active tab
+  assert windows is 1
+  open ../fixtures/basic.docx
+  assert tabs is 2
+  call window-list {}
+  assert reply.count is 1
+  assert reply.windows.0.tabs is 2
+  call window-new {}
+  assert reply.window is 2
+  assert windows is 2
+  # The new window is selected and holds the moved tab; the source kept the sample.
+  assert tabs is 1
+  assert title is basic.docx
+  call window-select {"window":1}
+  assert window is 1
+  assert tabs is 1
+  assert title is sample.docx
+  call tab-list {}
+  assert reply.tabs.0.title is sample.docx
+
+test window new refuses the only tab an out of range tab and a tab under a dialog
+  call window-select {"window":2}
+  assert tabs is 1
+  call-error window-new {"tab":0} => the only tab cannot move to a new window; close the window instead
+  call-error window-new {"tab":5} => no tab 5: this window has 1
+  call-error window-new {"tab":-1} => 'tab' must be a whole number, not below zero
+  call-error window-new {"tab":"0"} => 'tab' must be a whole number, not below zero
+  # A dialog on the named tab refuses the move too, naming it.
+  open ../fixtures/gantt-summary.xml
+  assert tabs is 2
+  call tab-select {"tab":"basic.docx"}
+  type edited
+  call close-tab {}
+  assert dialog is save-on-close
+  call-error window-new {"tab":0} => a dialog is open: Save your changes to this file?
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  assert tabs is 2
+
+test window arrange resizes every window and replies the count
+  call window-arrange {}
+  assert reply.arranged is 2
+  assert status is Arranged 2 windows
+
+test closing a non last window with unsaved work asks whatever the setting
+  # Ask-on-close is off by default: the Force ask is what a non-last close
+  # does regardless.
+  assert ask_on_close is false
+  call close-window {}
+  assert dialog is save-on-close
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  assert windows is 2
+  # Answered: the window leaves, the app lives, the source window keeps working.
+  call close-window {}
+  call dialog-click {"button":"Don't Save"}
+  assert dialog is none
+  assert windows is 1
+  assert window is 1
+  assert tabs is 1
+  assert title is sample.docx
+  call tab-list {}
+  assert reply.tabs.0.title is sample.docx

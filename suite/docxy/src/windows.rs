@@ -14,7 +14,7 @@
 //! ⚠️ Never hold the global borrowed across `open_window` / `update_window`
 //! (re-entrancy): take a descriptor snapshot, drop the borrow, then act.
 
-use gpui::{px, AnyWindowHandle, App, Bounds, Entity, Global, Pixels, Point, Size, WeakEntity};
+use gpui::{AnyWindowHandle, App, Bounds, Entity, Global, Pixels, Point, Size, WeakEntity, px};
 
 use crate::{Docxy, PersistTab};
 
@@ -53,8 +53,10 @@ pub(crate) fn cascade(source: Bounds<Pixels>, display: Bounds<Pixels>) -> Bounds
     let origin = display.origin;
     let max_x = origin.x.as_f32() + display.size.width.as_f32() - source.size.width.as_f32();
     let max_y = origin.y.as_f32() + display.size.height.as_f32() - source.size.height.as_f32();
-    let x = (source.origin.x.as_f32() + STEP).clamp(origin.x.as_f32(), max_x.max(origin.x.as_f32()));
-    let y = (source.origin.y.as_f32() + STEP).clamp(origin.y.as_f32(), max_y.max(origin.y.as_f32()));
+    let x =
+        (source.origin.x.as_f32() + STEP).clamp(origin.x.as_f32(), max_x.max(origin.x.as_f32()));
+    let y =
+        (source.origin.y.as_f32() + STEP).clamp(origin.y.as_f32(), max_y.max(origin.y.as_f32()));
     Bounds::new(Point::new(px(x), px(y)), source.size)
 }
 
@@ -185,9 +187,7 @@ fn with<R>(cx: &App, f: impl FnOnce(&Registry) -> R) -> Option<R> {
 /// `global_mut` after `try_global` proved it there (there is no
 /// `try_global_mut` at the pinned gpui rev).
 fn update<R>(cx: &mut App, f: impl FnOnce(&mut Registry) -> R) -> Option<R> {
-    if cx.try_global::<Registry>().is_none() {
-        return None;
-    }
+    cx.try_global::<Registry>()?;
     Some(f(cx.global_mut::<Registry>()))
 }
 
@@ -200,8 +200,7 @@ pub(crate) fn unregister(cx: &mut App, id: u64) -> Option<u64> {
 }
 
 pub(crate) fn select(cx: &mut App, id: u64) -> Result<(), String> {
-    update(cx, |w| w.select(id))
-        .unwrap_or_else(|| Err("the app is gone".into()))
+    update(cx, |w| w.select(id)).unwrap_or_else(|| Err("the app is gone".into()))
 }
 
 pub(crate) fn selected(cx: &App) -> Option<u64> {
@@ -248,7 +247,6 @@ pub(crate) fn entries_snapshot(cx: &App) -> Vec<(u64, WeakEntity<Docxy>, AnyWind
 
 /// The selected window's dispatch target.
 pub(crate) struct Target {
-    pub(crate) id: u64,
     pub(crate) view: WeakEntity<Docxy>,
     pub(crate) handle: AnyWindowHandle,
 }
@@ -259,7 +257,6 @@ pub(crate) fn selected_target(cx: &App) -> Option<Target> {
     let sel = selected(cx)?;
     with(cx, |w| {
         w.get(sel).map(|e| Target {
-            id: e.id,
             view: e.view.clone(),
             handle: e.handle,
         })

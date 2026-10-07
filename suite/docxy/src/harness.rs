@@ -2804,10 +2804,7 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
         // harness targets now (window-new selects the new window,
         // window-select switches). A single-window run reports 1 and its
         // own id.
-        (
-            "windows",
-            Json::Num(windows::count(cx) as f64),
-        ),
+        ("windows", Json::Num(windows::count(cx) as f64)),
         (
             "window",
             Json::Num(windows::selected(cx).unwrap_or(0) as f64),
@@ -3305,7 +3302,10 @@ fn dispatch_verb(
                     }
                 };
                 let size = if id == app.win_id {
-                    (window.bounds().size.width.as_f32(), window.bounds().size.height.as_f32())
+                    (
+                        window.bounds().size.width.as_f32(),
+                        window.bounds().size.height.as_f32(),
+                    )
                 } else {
                     cx.update_window(handle, |_, window, _| {
                         (
@@ -3318,7 +3318,7 @@ fn dispatch_verb(
                 out.push(Json::obj(vec![
                     ("id", Json::Num(id as f64)),
                     ("tabs", Json::Num(tabs as f64)),
-                    ("title", Json::Str(title.into())),
+                    ("title", Json::Str(title)),
                     ("selected", Json::Bool(selected == Some(id))),
                     ("width", Json::Num(f64::from(size.0))),
                     ("height", Json::Num(f64::from(size.1))),
@@ -3341,8 +3341,8 @@ fn dispatch_verb(
         "window-select" => {
             let id = arg_usize(args, "window")?;
             windows::select(cx, id as u64)?;
-            // Reply from the window verbs now target, not the one this verb
-            // dispatched on.
+            // The reply comes from the window the verbs now target, not the
+            // one this verb dispatched on.
             let reply = match windows::selected_view(cx) {
                 Some(view) => view
                     .read_with(cx, |this: &crate::Docxy, cx| state(this, window, cx))
@@ -3355,10 +3355,7 @@ fn dispatch_verb(
             let arranged = app.arrange_all(window, cx);
             app.set_status(format!("Arranged {arranged} windows"));
             cx.notify();
-            Done::ok(Json::obj(vec![(
-                "arranged",
-                Json::Num(arranged as f64),
-            )]))
+            Done::ok(Json::obj(vec![("arranged", Json::Num(arranged as f64))]))
         }
         // The tab chip's click handler, by index or title/path substring.
         "tab-select" => {
@@ -3748,8 +3745,17 @@ fn dispatch_verb(
             } else {
                 crate::close::CloseAsk::Force
             };
-            if app.window_should_close(ask, window, cx) && last {
-                app.quit_ready = true;
+            if app.window_should_close(ask, window, cx) {
+                if last {
+                    app.quit_ready = true;
+                } else {
+                    // gpui's own close machinery is not in this loop — the
+                    // verb runs the handler directly — so a non-last window
+                    // removes itself, as finish_quit's prompt path does. The
+                    // handler already unregistered it and persisted the
+                    // survivor; the process keeps running.
+                    window.remove_window();
+                }
             }
             Done::ok(state(app, window, cx))
         }
@@ -6533,7 +6539,10 @@ mod tests {
     fn window_new_tab_arg_is_optional_and_refuses_bad_shapes() {
         assert_eq!(window_new_tab_arg(&obj(&[])), Ok(None));
         assert_eq!(window_new_tab_arg(&obj(&[("tab", Json::Null)])), Ok(None));
-        assert_eq!(window_new_tab_arg(&obj(&[("tab", Json::Num(0.0))])), Ok(Some(0)));
+        assert_eq!(
+            window_new_tab_arg(&obj(&[("tab", Json::Num(0.0))])),
+            Ok(Some(0))
+        );
         for bad in [Json::Num(-1.0), Json::Num(1.5), Json::Str("0".into())] {
             let err = window_new_tab_arg(&obj(&[("tab", bad)])).unwrap_err();
             assert_eq!(err, "'tab' must be a whole number, not below zero");

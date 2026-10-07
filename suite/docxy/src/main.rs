@@ -1019,7 +1019,10 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
 fn protected_view_allows_act(act: SheetAct) -> bool {
     matches!(
         act,
-        SheetAct::Copy | SheetAct::PrevComment | SheetAct::NextComment | SheetAct::Todo
+        SheetAct::Copy
+            | SheetAct::PrevComment
+            | SheetAct::NextComment
+            | SheetAct::Todo
             | SheetAct::NewWindow
             | SheetAct::ArrangeAll
     )
@@ -9749,11 +9752,7 @@ fn write_session_forgetting(
         })
         .collect();
     let session = Session {
-        tabs: own
-            .iter()
-            .cloned()
-            .chain(extra.iter().cloned())
-            .collect(),
+        tabs: own.iter().cloned().chain(extra.iter().cloned()).collect(),
         active,
         theme: prefs.theme,
         ask_on_close: prefs.ask_on_close,
@@ -9785,8 +9784,8 @@ fn write_session_forgetting(
 #[cfg(test)]
 mod session_union_tests {
     use super::{
-        sample_doc, session_path_in, write_session_forgetting, DocTab, EditOptions, Kind, Prefs,
-        Session, ThemePref,
+        DocTab, EditOptions, Kind, Prefs, Session, ThemePref, sample_doc, session_path_in,
+        write_session_forgetting,
     };
 
     fn prefs() -> Prefs {
@@ -9833,15 +9832,26 @@ mod session_union_tests {
         write_session_forgetting(&root, &win1, 0, prefs(), &[], &snap0, 1000);
 
         let session = session_json(&root);
-        assert_eq!(session.tabs.len(), 2, "both windows' tabs reach the one session");
+        assert_eq!(
+            session.tabs.len(),
+            2,
+            "both windows' tabs reach the one session"
+        );
         let hots: Vec<&str> = session
             .tabs
             .iter()
             .filter_map(|t| t.hot.as_deref())
             .collect();
-        assert_eq!(hots.len(), 2, "both dirty tabs keep a hot sidecar: {hots:?}");
+        assert_eq!(
+            hots.len(),
+            2,
+            "both dirty tabs keep a hot sidecar: {hots:?}"
+        );
         assert!(hots.iter().any(|h| h.ends_with("tab-0.docx")), "{hots:?}");
-        assert!(hots.iter().any(|h| h.ends_with("tab-1000.docx")), "{hots:?}");
+        assert!(
+            hots.iter().any(|h| h.ends_with("tab-1000.docx")),
+            "{hots:?}"
+        );
         for h in &hots {
             assert!(std::path::Path::new(h).exists(), "sidecar written: {h}");
         }
@@ -9881,8 +9891,14 @@ mod session_union_tests {
             .filter_map(|t| t.hot.as_deref())
             .collect();
         assert_eq!(hots.len(), 2, "every tab names its sidecar");
-        assert!(hots[0].ends_with("tab-0.docx"), "no offset in the names: {hots:?}");
-        assert!(hots[1].ends_with("tab-1.docx"), "no offset in the names: {hots:?}");
+        assert!(
+            hots[0].ends_with("tab-0.docx"),
+            "no offset in the names: {hots:?}"
+        );
+        assert!(
+            hots[1].ends_with("tab-1.docx"),
+            "no offset in the names: {hots:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
@@ -11540,8 +11556,7 @@ impl Docxy {
                 };
                 if self.tabs.len() == 1 {
                     return Err(
-                        "the only tab cannot move to a new window; close the window instead"
-                            .into(),
+                        "the only tab cannot move to a new window; close the window instead".into(),
                     );
                 }
                 if let Some(d) = t.dialogs.top() {
@@ -11626,13 +11641,23 @@ impl Docxy {
     /// an equal vertical strip of THIS window's display, in creation order.
     /// gpui cannot move windows at the pinned rev, so positions stay; the
     /// status says what happened. Returns how many windows answered.
-    pub(crate) fn arrange_all(&self, window: &Window, cx: &mut App) -> usize {
+    /// View › Window › Arrange All (#587): resize every window of the run to
+    /// an equal vertical strip of THIS window's display, in creation order.
+    /// gpui cannot move windows at the pinned rev, so positions stay; the
+    /// status says what happened. Returns how many windows answered. The
+    /// calling window is resized directly: it is mid-update here, and
+    /// `update_window` on it would find it gone from the app.
+    pub(crate) fn arrange_all(&self, window: &mut Window, cx: &mut App) -> usize {
         let display = display_of(window, cx);
         let entries = windows::entries_snapshot(cx);
         let tiles = windows::tile_bounds(display, entries.len());
         let mut arranged = 0;
-        for ((_, _, handle), tile) in entries.iter().zip(tiles) {
-            if cx.update_window(*handle, |_, window, _| window.resize(tile.size))
+        for ((id, _, handle), tile) in entries.iter().zip(tiles) {
+            if *id == self.win_id {
+                window.resize(tile.size);
+                arranged += 1;
+            } else if cx
+                .update_window(*handle, |_, window, _| window.resize(tile.size))
                 .is_ok()
             {
                 arranged += 1;
@@ -23263,10 +23288,10 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
         | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments
         | ResolveComment | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | NewWindow
-        | ArrangeAll | DarkMode
-        | AutoHideRibbon | InsertField | PageBreak | BlankPage | Cover(_) | ToggleNotes
-        | InsertTable | InsertSymbol | InsertEquation | LineSpacing | Hf(_) | Design(_)
-        | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler | UndoTo(_) => {}
+        | ArrangeAll | DarkMode | AutoHideRibbon | InsertField | PageBreak | BlankPage
+        | Cover(_) | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing
+        | Hf(_) | Design(_) | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler
+        | UndoTo(_) => {}
     }
 }
 
@@ -35735,10 +35760,7 @@ fn quit_mode() -> QuitMode {
 /// run — those belong to the first window alone.
 enum WindowInit {
     First {
-        ctl: Option<(
-            ctlcore::Server,
-            std::sync::mpsc::Receiver<ctlcore::Request>,
-        )>,
+        ctl: Option<(ctlcore::Server, std::sync::mpsc::Receiver<ctlcore::Request>)>,
         want_harness: bool,
         startup_files: Vec<std::path::PathBuf>,
         read_only: bool,
@@ -35796,6 +35818,12 @@ fn display_of(window: &Window, cx: &App) -> Bounds<Pixels> {
     on_display.map(|d| d.bounds()).unwrap_or(bounds)
 }
 
+/// What opening a window yields: its handle, its view and its registry id.
+/// On failure the view comes back with the reason, so New Window can put a
+/// moved tab back instead of losing it to a refused window.
+type OpenedWindow = (AnyWindowHandle, Entity<Docxy>, u64);
+type OpenWindowError = (String, Entity<Docxy>);
+
 /// Open a Docxy window and register it. The build closure runs
 /// synchronously at the pinned gpui rev, so the view exists by the time
 /// `open_window` returns and registration follows immediately. On failure
@@ -35805,7 +35833,7 @@ fn open_docxy_window(
     cx: &mut App,
     options: WindowOptions,
     init: WindowInit,
-) -> Result<(AnyWindowHandle, Entity<Docxy>, u64), (String, Entity<Docxy>)> {
+) -> Result<OpenedWindow, OpenWindowError> {
     let (view, ctl, want_harness, startup_files, read_only) = match init {
         WindowInit::First {
             ctl,
@@ -35813,7 +35841,7 @@ fn open_docxy_window(
             startup_files,
             read_only,
         } => (
-            cx.new(|cx| Docxy::new(cx)),
+            cx.new(Docxy::new),
             ctl,
             want_harness,
             startup_files,

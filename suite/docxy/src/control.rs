@@ -389,9 +389,7 @@ pub(crate) fn attach_with_dispatch(
             // hit-tests this one frame. `draw` marks the frame for presenting,
             // so the next tick puts it on screen.
             if hit_tests(&req.verb) {
-                let _ = cx.update_window(target.handle, |_, window, cx| {
-                    window.draw(cx).clear(cx)
-                });
+                let _ = cx.update_window(target.handle, |_, window, cx| window.draw(cx).clear(cx));
             }
             match cx.update_window(target.handle, |_, window, cx| {
                 target.view.update(cx, |this, cx| {
@@ -436,7 +434,7 @@ pub(crate) fn attach_with_dispatch(
                         // ctlcore's connection thread needs time to put the reply on the wire.
                         const QUIT_GRACE: Duration = Duration::from_millis(120);
                         cx.background_executor().timer(QUIT_GRACE).await;
-                        let _ = cx.update(|cx| cx.quit());
+                        cx.update(|cx| cx.quit());
                         break;
                     }
                 }

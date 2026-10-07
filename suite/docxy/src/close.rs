@@ -967,11 +967,7 @@ impl Docxy {
                     self.active = i;
                     self.drop_grid_state();
                 }
-                let prompt = close_prompt(
-                    &self.tabs[i],
-                    true,
-                    &known_locations(self.harness),
-                );
+                let prompt = close_prompt(&self.tabs[i], true, &known_locations(self.harness));
                 self.tabs[i].dialogs.push(prompt);
                 self.refocus(window, cx);
             }
