@@ -1095,26 +1095,25 @@ fn parse_active_tab(xml: &str) -> usize {
     }
 }
 
-/// Plain text of each `<si>` (rich-text runs concatenated).
+/// Plain text of each `<si>` (rich-text runs concatenated), each `<t>` read
+/// as Excel reads it ([`TextRun`]).
 fn parse_shared_strings(xml: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut p = XmlParser::new(xml);
     let mut cur: Option<String> = None;
-    let mut in_t = false;
+    let mut run: Option<TextRun> = None;
     let mut in_rph = false; // phonetic runs are annotations, not content
     loop {
         match p.next() {
             Event::Start => match local(p.name()) {
                 "si" => cur = Some(String::new()),
-                "t" if !in_rph => in_t = true,
+                "t" if !in_rph => run = Some(TextRun::start(&p)),
                 "rPh" => in_rph = true,
                 _ => {}
             },
             Event::Text => {
-                if in_t {
-                    if let Some(s) = &mut cur {
-                        XmlParser::append_decoded(p.text(), s);
-                    }
+                if let Some(run) = &mut run {
+                    run.push(&p);
                 }
             }
             Event::End => match local(p.name()) {
@@ -1123,7 +1122,11 @@ fn parse_shared_strings(xml: &str) -> Vec<String> {
                         out.push(s);
                     }
                 }
-                "t" => in_t = false,
+                "t" => {
+                    if let (Some(run), Some(s)) = (run.take(), &mut cur) {
+                        run.finish(s);
+                    }
+                }
                 "rPh" => in_rph = false,
                 _ => {}
             },
@@ -1131,6 +1134,39 @@ fn parse_shared_strings(xml: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The text of one `<t>` (a shared or inline string, or one of its runs) as
+/// Excel reads it: outside `xml:space="preserve"` the XML whitespace at its
+/// two ends is not significant (#1153, docx's #1084), so `<t> </t>` is empty.
+struct TextRun {
+    text: String,
+    preserve: bool,
+}
+
+impl TextRun {
+    /// At the `<t>` start tag, where its `xml:space` resolves.
+    fn start(p: &XmlParser) -> Self {
+        TextRun {
+            text: String::new(),
+            preserve: p.xml_space_preserve(),
+        }
+    }
+
+    /// One piece of its character data (entities and CDATA arrive apart; a
+    /// CDATA section is literal text, so `&amp;` in it stays as written).
+    fn push(&mut self, p: &XmlParser) {
+        push_text(p, &mut self.text);
+    }
+
+    /// At `</t>`: append the text as read to `out`.
+    fn finish(self, out: &mut String) {
+        if self.preserve {
+            out.push_str(&self.text);
+        } else {
+            out.push_str(opccore::xml::trim_xml_whitespace(&self.text));
+        }
+    }
 }
 
 /// The display subset of `xl/styles.xml`: cellXfs joined with fonts and
@@ -2483,7 +2519,7 @@ fn parse_cell_body(
     let mut depth = 1;
     let mut in_v = false;
     let mut in_f = false;
-    let mut in_is_t = false;
+    let mut is_run: Option<TextRun> = None;
     while depth > 0 {
         match p.next() {
             Event::Start => {
@@ -2525,7 +2561,7 @@ fn parse_cell_body(
                             }
                         }
                     }
-                    "t" => in_is_t = true,
+                    "t" => is_run = Some(TextRun::start(p)),
                     "rPh" => {
                         p.skip_element();
                         depth -= 1;
@@ -2542,9 +2578,8 @@ fn parse_cell_body(
                     if let Some(s) = &mut formula {
                         XmlParser::append_decoded(p.text(), s);
                     }
-                } else if in_is_t {
-                    let s = is_text.get_or_insert_with(String::new);
-                    XmlParser::append_decoded(p.text(), s);
+                } else if let Some(run) = &mut is_run {
+                    run.push(p);
                 }
             }
             Event::End => {
@@ -2564,7 +2599,11 @@ fn parse_cell_body(
                             }
                         }
                     }
-                    "t" => in_is_t = false,
+                    "t" => {
+                        if let Some(run) = is_run.take() {
+                            run.finish(is_text.get_or_insert_with(String::new));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2579,7 +2618,9 @@ fn parse_cell_body(
         other => other,
     };
 
-    let value = if let Some(t) = is_text {
+    // An inline string with no text as read (`<t> </t>`) is no value, as
+    // `<is><t/></is>` already was.
+    let value = if let Some(t) = is_text.filter(|t| !t.is_empty()) {
         CellValue::Text(t)
     } else {
         match (ctype, v_text) {
@@ -10933,6 +10974,139 @@ mod tests {
             ("xl/worksheets/sheet1.xml".into(), sheet1.into_bytes()),
             ("xl/worksheets/sheet2.xml".into(), sheet2.into_bytes()),
         ])
+    }
+
+    /// A one-sheet workbook with these `<sheetData>` rows and shared strings,
+    /// and a second cell style (`s="1"`).
+    fn whitespace_xlsx(rows: &str, sst: &str) -> Vec<u8> {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let sheet = format!(r#"<worksheet xmlns="{ns}"><sheetData>{rows}</sheetData></worksheet>"#);
+        let sst = format!(r#"<sst xmlns="{ns}">{sst}</sst>"#);
+        let styles = format!(
+            r#"<styleSheet xmlns="{ns}"><fonts count="1"><font><sz val="11"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0"/><xf numFmtId="0" fontId="0" fillId="1" applyFill="1"/></cellXfs></styleSheet>"#
+        );
+        let workbook = format!(
+            r#"<workbook xmlns="{ns}" xmlns:r="{rel}"><sheets><sheet name="Plan1" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+        );
+        let wb_rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{rel}/styles" Target="styles.xml"/><Relationship Id="rId3" Type="{rel}/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#
+        );
+        let root_rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#
+        );
+        let content_types = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+        write_zip(&[
+            ("[Content_Types].xml".into(), content_types.into()),
+            ("_rels/.rels".into(), root_rels.into_bytes()),
+            ("xl/workbook.xml".into(), workbook.into_bytes()),
+            ("xl/_rels/workbook.xml.rels".into(), wb_rels.into_bytes()),
+            ("xl/worksheets/sheet1.xml".into(), sheet.into_bytes()),
+            ("xl/styles.xml".into(), styles.into_bytes()),
+            ("xl/sharedStrings.xml".into(), sst.into_bytes()),
+        ])
+    }
+
+    /// #1153: an inline string's `<t>` reads as Excel reads it. Outside
+    /// `xml:space="preserve"` the XML whitespace at its ends is not text, so
+    /// a `<t>` holding only a space is an empty cell, not a one-space string.
+    #[test]
+    fn inline_t_edge_whitespace_is_read_as_excel_reads_it() {
+        let rows = "<row r=\"1\">\
+            <c r=\"A1\" t=\"inlineStr\" s=\"1\"><is><t> </t></is></c>\
+            <c r=\"B1\" t=\"inlineStr\" s=\"1\"><is><t><![CDATA[ ]]></t></is></c>\
+            <c r=\"C1\" t=\"inlineStr\"><is><t xml:space=\"preserve\"> </t></is></c>\
+            <c r=\"D1\" t=\"inlineStr\"><is><t> a  b\t</t></is></c>\
+            <c r=\"E1\" t=\"inlineStr\"><is><t>\u{a0}x\u{a0}</t></is></c>\
+            <c r=\"F1\" t=\"inlineStr\"><is><r><t>Hello</t></r><r><t xml:space=\"preserve\"> world</t></r></is></c>\
+            <c r=\"G1\" t=\"inlineStr\"><is><t>\r\n line &amp; <![CDATA[more]]> \r\n</t></is></c>\
+            <c r=\"H1\" t=\"inlineStr\"><is xml:space=\"preserve\"><t> in </t></is></c>\
+            <c r=\"I1\" t=\"inlineStr\" s=\"1\"><is><t/></is></c>\
+            <c r=\"J1\" t=\"inlineStr\"><is><t> <![CDATA[a&amp;b]]> &amp; </t></is></c>\
+            </row>";
+        let pkg = load_xlsx(&whitespace_xlsx(rows, "")).unwrap();
+        let s = &pkg.workbook.sheets[0];
+        let value = |col| s.cell(0, col).map(|c| c.value.clone());
+        assert_eq!(value(0), Some(CellValue::Empty));
+        assert_eq!(
+            s.cell(0, 0).unwrap().style,
+            1,
+            "the blank cell keeps its style"
+        );
+        assert_eq!(value(1), Some(CellValue::Empty));
+        assert_eq!(value(2), Some(CellValue::Text(" ".into())));
+        assert_eq!(value(3), Some(CellValue::Text("a  b".into())));
+        assert_eq!(value(4), Some(CellValue::Text("\u{a0}x\u{a0}".into())));
+        assert_eq!(value(5), Some(CellValue::Text("Hello world".into())));
+        assert_eq!(value(6), Some(CellValue::Text("line & more".into())));
+        assert_eq!(value(7), Some(CellValue::Text(" in ".into())));
+        assert_eq!(value(8), Some(CellValue::Empty));
+        assert_eq!(value(9), Some(CellValue::Text("a&amp;b &".into())));
+    }
+
+    /// #1153: a shared string's `<t>`s read the same way, each run on its
+    /// own and `xml:space` inherited from `<si>`. Whitespace-only text is the
+    /// empty string, as a literal `<si><t/></si>` is.
+    #[test]
+    fn shared_string_t_edge_whitespace_is_read_as_excel_reads_it() {
+        let sst = "<si><t> </t></si>\
+            <si><t xml:space=\"preserve\"> </t></si>\
+            <si xml:space=\"preserve\"><r><t> x </t></r></si>\
+            <si><t> a </t></si>\
+            <si><t/></si>\
+            <si><t>a</t><rPh><t> ph </t></rPh></si>\
+            <si><r><t>Hello </t></r><r><t xml:space=\"preserve\"> world</t></r></si>\
+            <si><t xml:space=\"preserve\"><![CDATA[ ]]></t></si>\
+            <si><t><![CDATA[a&amp;b ]]></t></si>";
+        assert_eq!(
+            parse_shared_strings(&format!("<sst>{sst}</sst>")),
+            ["", " ", " x ", "a", "", "a", "Hello world", " ", "a&amp;b"]
+        );
+        let rows = "<row r=\"1\">\
+            <c r=\"A1\" t=\"s\" s=\"1\"><v>0</v></c>\
+            <c r=\"B1\" t=\"s\"><v>1</v></c>\
+            <c r=\"C1\" t=\"s\"><v>3</v></c>\
+            </row>";
+        let pkg = load_xlsx(&whitespace_xlsx(rows, sst)).unwrap();
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cell(0, 0).unwrap().value, CellValue::Text(String::new()));
+        assert_eq!(s.cell(0, 1).unwrap().value, CellValue::Text(" ".into()));
+        assert_eq!(s.cell(0, 2).unwrap().value, CellValue::Text("a".into()));
+    }
+
+    /// #1153 (tdf76115.xlsx, 173 cells): styled inline `<t><![CDATA[ ]]></t>`
+    /// cells Excel reads as blank stay blank through an unedited save, while
+    /// a real one-space string keeps its space.
+    #[test]
+    fn blank_inline_strings_stay_blank_through_an_unedited_save() {
+        let rows = "<row r=\"5\">\
+            <c r=\"ES5\" t=\"inlineStr\" s=\"1\"><is><t><![CDATA[ ]]></t></is></c>\
+            <c r=\"ET5\" t=\"inlineStr\"><is><t><![CDATA[Plano]]></t></is></c>\
+            <c r=\"EU5\" t=\"inlineStr\"><is><t xml:space=\"preserve\"><![CDATA[ ]]></t></is></c>\
+            </row><row r=\"7\">\
+            <c r=\"EZ7\" t=\"inlineStr\" s=\"1\"><is><t><![CDATA[ ]]></t></is></c>\
+            </row>";
+        let pkg = load_xlsx(&whitespace_xlsx(rows, "")).unwrap();
+        let saved = save_xlsx(&pkg);
+        let re = load_xlsx(&saved).unwrap();
+        let s = &re.workbook.sheets[0];
+        let value = |name| {
+            let (row, col) = crate::sheet::parse_cell_name(name).unwrap();
+            s.cell(row, col).map(|c| (c.value.clone(), c.style))
+        };
+        for name in ["ES5", "EZ7"] {
+            assert_eq!(value(name), Some((CellValue::Empty, 1)), "{name}");
+        }
+        assert_eq!(value("ET5"), Some((CellValue::Text("Plano".into()), 0)));
+        assert_eq!(value("EU5"), Some((CellValue::Text(" ".into()), 0)));
+
+        let sheet = part_text(&re, "xl/worksheets/sheet1.xml");
+        assert!(sheet.contains(r#"<c r="ES5" s="1"/>"#), "{sheet}");
+        assert!(sheet.contains(r#"<c r="EZ7" s="1"/>"#), "{sheet}");
+        // The one shared one-space string is EU5's, written to be kept.
+        let sst = part_text(&re, "xl/sharedStrings.xml");
+        assert_eq!(sst.matches("> </t>").count(), 1, "{sst}");
+        assert!(sst.contains(r#"<t xml:space="preserve"> </t>"#), "{sst}");
     }
 
     fn part_text(pkg: &SheetPackage, name: &str) -> String {
