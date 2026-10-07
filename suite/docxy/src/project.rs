@@ -1281,7 +1281,9 @@ pub(super) fn project_el(
                             let ClickEvent::Mouse(click) = ev else {
                                 return;
                             };
-                            let entry = this.probes.borrow().current("project-cell:entry:0");
+                            // The frame on screen only: an entry row that just scrolled away
+                            // must not answer from the frame before it.
+                            let entry = this.probes.borrow().on_screen("project-cell:entry:0");
                             if !below_entry_row(
                                 click.down.position.y,
                                 click.up.position.y,
