@@ -1096,7 +1096,10 @@ fn print_usage() {
            Ctrl-PgUp/PgDn or click tabs to switch sheets\n  \
            Ctrl-D/Ctrl-R fill down/right   Ctrl-F find (F3 next)\n  \
            F5 insert rows  Shift-F5 delete rows  F6/Shift-F6 same for columns\n  \
-           Ctrl-T add sheet  Shift-F2 rename sheet  Shift-Del delete sheet\n  \
+           Shift-Space whole rows · Ctrl-Shift-= / Ctrl-- insert / delete the\n  \
+             whole rows or columns selected (when the terminal reports them)\n  \
+           Ctrl-T add sheet  Shift-F11 add a sheet unasked  Shift-F2 rename sheet\n  \
+           Shift-Del delete sheet\n  \
            F12 Save As   F7 / F8 shrink / widen the current column\n  \
            Ctrl-Shift-L filter buttons on/off   Alt-↓ on a header: its filter\n  \
            Alt-↓ elsewhere: pick from the column's entries (or a formula's names)\n  \
@@ -6801,10 +6804,26 @@ impl App {
     // --- editor sprint operations -------------------------------------------
 
     /// Insert `count` rows above the selection (or delete the selected rows).
+    /// Refused on a protected sheet, whose default protection allows
+    /// neither, as Excel's is, and an insert that would push data off the
+    /// sheet (#860). The same rows stay selected, as in
+    /// Excel, so Ctrl+- again deletes the next ones.
     fn row_op(&mut self, insert: bool) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         let (r1, _, r2, _) = self.selection();
         let count = r2 - r1 + 1;
         let sheet = self.sheet;
+        if insert
+            && gridcore::edit::insert_shifts_data_off(&self.pkg.workbook, sheet, true, r1, count)
+        {
+            self.status = Some(gridcore::edit::SHIFT_OFF_SHEET.into());
+            return;
+        }
+        let kept = (self.cur, self.anchor);
         self.structural(|wb| {
             if insert {
                 gridcore::edit::insert_rows(wb, sheet, r1, count);
@@ -6812,6 +6831,7 @@ impl App {
                 gridcore::edit::delete_rows(wb, sheet, r1, count);
             }
         });
+        (self.cur, self.anchor) = kept;
         self.status = Some(format!(
             "{} {count} row{}",
             if insert { "Inserted" } else { "Deleted" },
@@ -6819,10 +6839,23 @@ impl App {
         ));
     }
 
+    /// [`Self::row_op`] for columns.
     fn col_op(&mut self, insert: bool) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         let (_, c1, _, c2) = self.selection();
         let count = c2 - c1 + 1;
         let sheet = self.sheet;
+        if insert
+            && gridcore::edit::insert_shifts_data_off(&self.pkg.workbook, sheet, false, c1, count)
+        {
+            self.status = Some(gridcore::edit::SHIFT_OFF_SHEET.into());
+            return;
+        }
+        let kept = (self.cur, self.anchor);
         self.structural(|wb| {
             if insert {
                 gridcore::edit::insert_cols(wb, sheet, c1, count);
@@ -6830,6 +6863,7 @@ impl App {
                 gridcore::edit::delete_cols(wb, sheet, c1, count);
             }
         });
+        (self.cur, self.anchor) = kept;
         self.status = Some(format!(
             "{} {count} column{}",
             if insert { "Inserted" } else { "Deleted" },
@@ -7080,6 +7114,29 @@ impl App {
                 self.ensure_visible();
                 Ok(true)
             }
+        }
+    }
+
+    /// Shift+Space: every row the selection touches, whole (#860). The
+    /// cursor keeps its row and moves to column A: the selection is the
+    /// anchor and the cursor, and a whole row's corners are in column A and
+    /// the last column (Excel keeps the column).
+    fn select_rows(&mut self) {
+        let (ar, _) = self.anchor.unwrap_or(self.cur);
+        self.anchor = Some((ar, MAX_COLS - 1));
+        self.cur.1 = 0;
+        self.ensure_visible();
+    }
+
+    /// Ctrl+Shift+= (`insert`) and Ctrl+-: Insert or Delete Sheet Rows on
+    /// whole rows, Sheet Columns on whole columns (#860). Any other
+    /// selection does nothing: Excel's Insert and Delete Cells dialogs are
+    /// not here.
+    fn struct_chord(&mut self, insert: bool) {
+        match self.outline_target() {
+            Some((Axis::Rows, _, _)) => self.row_op(insert),
+            Some((Axis::Cols, _, _)) => self.col_op(insert),
+            None => {}
         }
     }
 
@@ -8468,10 +8525,7 @@ impl App {
                 "Rename sheet: ",
                 self.pkg.workbook.sheets[self.sheet].name.clone(),
             ),
-            PromptKind::AddSheet => (
-                "New sheet name: ",
-                format!("Sheet{}", self.pkg.workbook.sheets.len() + 1),
-            ),
+            PromptKind::AddSheet => ("New sheet name: ", self.pkg.workbook.next_sheet_name()),
             PromptKind::RenameTable => ("Table name: ", self.table_here().unwrap_or_default()),
             PromptKind::ResizeTable => {
                 let here = self
@@ -8687,18 +8741,7 @@ impl App {
                 if text.is_empty() || self.pkg.workbook.sheet_index(&text).is_some() {
                     self.status = Some("Sheet name empty or already taken".to_string());
                 } else {
-                    let new_idx = self.pkg.add_sheet(&text);
-                    self.sheet = new_idx;
-                    self.cur = (0, 0);
-                    self.top = 0;
-                    self.left = 0;
-                    self.anchor = None;
-                    // As in Excel, adding a sheet keeps the history: it is
-                    // appended, so the steps' sheet indices still hold, and a
-                    // snapshot put back keeps it (`put_back`).
-                    self.rebuild_engine();
-                    self.modified = true;
-                    self.status = Some(format!("Added sheet {text}"));
+                    self.add_sheet(&text);
                 }
             }
         }
@@ -8713,6 +8756,28 @@ impl App {
         if let Some(clip) = &mut self.clip {
             clip.cut = false;
         }
+    }
+
+    /// Add sheet `name` (free, not empty) and switch to it.
+    fn add_sheet(&mut self, name: &str) {
+        let new_idx = self.pkg.add_sheet(name);
+        self.sheet = new_idx;
+        self.cur = (0, 0);
+        self.top = 0;
+        self.left = 0;
+        self.anchor = None;
+        // As in Excel, adding a sheet keeps the history: it is appended, so
+        // the steps' sheet indices still hold, and a snapshot put back keeps
+        // it (`put_back`).
+        self.rebuild_engine();
+        self.modified = true;
+        self.status = Some(format!("Added sheet {name}"));
+    }
+
+    /// Shift+F11: a new sheet, named the next free SheetN, unasked (#860).
+    fn add_sheet_auto(&mut self) {
+        let name = self.pkg.workbook.next_sheet_name();
+        self.add_sheet(&name);
     }
 
     fn delete_current_sheet(&mut self) {
@@ -10833,6 +10898,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::F(2) if shift => app.open_prompt(PromptKind::RenameSheet),
         KeyCode::F(5) if shift => app.row_op(false),
         KeyCode::F(5) => app.row_op(true),
+        // Excel's Ctrl+Shift+= (or Ctrl++) and Ctrl+- on whole rows or
+        // columns, when the terminal reports them: most report Ctrl+- as
+        // Ctrl+7 and drop the Ctrl of Ctrl+Shift+= unless they speak the
+        // kitty keyboard protocol. F5 and Shift+F5 always arrive (#860).
+        KeyCode::Char('+') if ctrl && !alt => app.struct_chord(true),
+        KeyCode::Char('=') if ctrl && shift && !alt => app.struct_chord(true),
+        KeyCode::Char('-') if ctrl && !shift && !alt => app.struct_chord(false),
+        // Shift+F11: a new sheet, no name asked (Ctrl-T asks one).
+        KeyCode::F(11) if shift => app.add_sheet_auto(),
         KeyCode::F(6) if shift => app.col_op(false),
         KeyCode::F(6) => app.col_op(true),
         KeyCode::Delete if shift => {
@@ -10937,6 +11011,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Esc => {
             app.anchor = None;
         }
+        // Shift+Space selects the whole rows (#860), when the terminal
+        // reports the Shift: most send a plain space, which types.
+        KeyCode::Char(' ') if shift && !alt => app.select_rows(),
         KeyCode::Char(ch) if !ctrl => {
             app.start_edit(Some(ch));
             app.propose();
@@ -18940,6 +19017,229 @@ mod tests {
             .cell(r, c)
             .map(|c| c.value.clone())
             .unwrap_or_default()
+    }
+
+    // --- #860: Shift+Space, Ctrl+Shift+=, Ctrl+-, Shift+F11 -----------------
+
+    const CTRL_SHIFT: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::SHIFT);
+
+    #[test]
+    fn shift_space_selects_the_whole_rows_and_keeps_the_cursor_row() {
+        let mut app = app_with_numbers(&[]);
+        app.cur = (2, 3);
+        app.anchor = Some((1, 1));
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        assert!(app.edit.is_none());
+        assert_eq!(app.selection(), (1, 0, 2, MAX_COLS - 1));
+        assert_eq!(app.cur, (2, 0));
+        assert_eq!(app.outline_target(), Some((Axis::Rows, 1, 2)));
+    }
+
+    #[test]
+    fn a_plain_space_still_types() {
+        let mut app = app_with_numbers(&[]);
+        app.cur = (5, 1);
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.edit.as_ref().map(|e| e.text.as_str()), Some(" "));
+        assert_eq!(app.cur, (5, 1));
+    }
+
+    #[test]
+    fn shift_space_in_the_editor_types_a_space() {
+        let mut app = app_with_numbers(&[]);
+        app.cur = (5, 1);
+        press(&mut app, KeyCode::Char('a'));
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(app.edit.as_ref().map(|e| e.text.as_str()), Some("a b"));
+    }
+
+    #[test]
+    fn ctrl_shift_equals_inserts_the_selected_rows_as_one_undo_step() {
+        // The issue's repro: A1:A3 = 1, 2, 3; A2, Shift+Space, Ctrl+Shift+=.
+        let mut app = app_with_numbers(&[]);
+        app.cur = (1, 0);
+        app.anchor = None;
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        let steps = app.undo.len();
+        press_mod(&mut app, KeyCode::Char('='), CTRL_SHIFT);
+        assert_eq!(value_at(&app, 1, 0), CellValue::Empty);
+        assert_eq!(value_at(&app, 2, 0), CellValue::Number(2.0));
+        assert_eq!(value_at(&app, 3, 0), CellValue::Number(3.0));
+        assert_eq!(app.undo.len(), steps + 1);
+        app.undo();
+        assert_eq!(value_at(&app, 1, 0), CellValue::Number(2.0));
+        assert_eq!(value_at(&app, 2, 0), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn ctrl_plus_inserts_as_many_rows_as_are_selected() {
+        // Windows reports Ctrl+Shift+= as Ctrl+'+'.
+        let mut app = app_with_numbers(&[]);
+        app.cur = (2, 0);
+        app.anchor = Some((1, 0));
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        press_mod(&mut app, KeyCode::Char('+'), CTRL_SHIFT);
+        assert_eq!(value_at(&app, 0, 0), CellValue::Number(1.0));
+        assert_eq!(value_at(&app, 1, 0), CellValue::Empty);
+        assert_eq!(value_at(&app, 2, 0), CellValue::Empty);
+        assert_eq!(value_at(&app, 3, 0), CellValue::Number(2.0));
+        assert_eq!(value_at(&app, 4, 0), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn ctrl_minus_deletes_the_selected_rows() {
+        let mut app = app_with_numbers(&[]);
+        app.cur = (1, 0);
+        app.anchor = None;
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        let steps = app.undo.len();
+        press_mod(&mut app, KeyCode::Char('-'), KeyModifiers::CONTROL);
+        assert_eq!(value_at(&app, 1, 0), CellValue::Number(3.0));
+        assert_eq!(app.undo.len(), steps + 1);
+        // The row stays selected: Ctrl+- again deletes the next one.
+        assert_eq!(app.selection(), (1, 0, 1, MAX_COLS - 1));
+        press_mod(&mut app, KeyCode::Char('-'), KeyModifiers::CONTROL);
+        assert_eq!(value_at(&app, 1, 0), CellValue::Empty);
+        assert_eq!(value_at(&app, 0, 0), CellValue::Number(1.0));
+    }
+
+    #[test]
+    fn the_chords_insert_and_delete_whole_columns() {
+        let mut app = app_with_numbers(&[((0, 1), gridcore::sheet::Cell::number(9.0))]);
+        // Column B, whole.
+        app.anchor = Some((0, 1));
+        app.cur = (MAX_ROWS - 1, 1);
+        press_mod(&mut app, KeyCode::Char('='), CTRL_SHIFT);
+        assert_eq!(value_at(&app, 0, 1), CellValue::Empty);
+        assert_eq!(value_at(&app, 0, 2), CellValue::Number(9.0));
+        press_mod(&mut app, KeyCode::Char('-'), KeyModifiers::CONTROL);
+        assert_eq!(value_at(&app, 0, 1), CellValue::Number(9.0));
+    }
+
+    #[test]
+    fn the_chords_leave_a_cell_range_alone() {
+        let mut app = app_with_numbers(&[]);
+        app.cur = (2, 0);
+        app.anchor = Some((1, 0));
+        let steps = app.undo.len();
+        press_mod(&mut app, KeyCode::Char('-'), KeyModifiers::CONTROL);
+        press_mod(&mut app, KeyCode::Char('='), CTRL_SHIFT);
+        assert_eq!(value_at(&app, 1, 0), CellValue::Number(2.0));
+        assert_eq!(value_at(&app, 2, 0), CellValue::Number(3.0));
+        assert_eq!(app.undo.len(), steps);
+        assert!(app.edit.is_none());
+    }
+
+    #[test]
+    fn a_protected_sheet_refuses_inserting_and_deleting_rows_and_columns() {
+        let mut app = app_with_numbers(&[]);
+        app.toggle_protection();
+        let steps = app.undo.len();
+        app.cur = (1, 0);
+        app.anchor = None;
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        press_mod(&mut app, KeyCode::Char('-'), KeyModifiers::CONTROL);
+        press_mod(&mut app, KeyCode::Char('='), CTRL_SHIFT);
+        // F5, Shift+F5 and F6 too.
+        press(&mut app, KeyCode::F(5));
+        press_mod(&mut app, KeyCode::F(5), KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::F(6));
+        assert_eq!(value_at(&app, 1, 0), CellValue::Number(2.0));
+        assert_eq!(value_at(&app, 2, 0), CellValue::Number(3.0));
+        assert_eq!(app.undo.len(), steps);
+        assert!(app.status.as_deref().unwrap_or("").contains("protected"));
+    }
+
+    /// A1:C3 holding numbers.
+    fn app_with_block() -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        for r in 0..3 {
+            for c in 0..3 {
+                app.pkg.workbook.sheets[0].set_cell(r, c, gridcore::sheet::Cell::number(1.0));
+            }
+        }
+        app.rebuild_engine();
+        app
+    }
+
+    #[test]
+    fn inserting_columns_on_whole_rows_refuses_to_push_data_off_the_sheet() {
+        // Shift+Space, then F6 (or Ctrl+Shift+= on whole columns below).
+        let mut app = app_with_block();
+        app.cur = (1, 1);
+        app.anchor = None;
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        let (cells, steps) = (app.sheet().cells.clone(), app.undo.len());
+        press(&mut app, KeyCode::F(6));
+        assert_eq!(app.status.as_deref(), Some(gridcore::edit::SHIFT_OFF_SHEET));
+        assert_eq!(app.sheet().cells, cells);
+        assert_eq!(app.undo.len(), steps);
+    }
+
+    #[test]
+    fn inserting_rows_on_whole_columns_refuses_to_push_data_off_the_sheet() {
+        let mut app = app_with_block();
+        app.anchor = Some((0, 1));
+        app.cur = (MAX_ROWS - 1, 1);
+        let (cells, steps) = (app.sheet().cells.clone(), app.undo.len());
+        press(&mut app, KeyCode::F(5));
+        assert_eq!(app.status.as_deref(), Some(gridcore::edit::SHIFT_OFF_SHEET));
+        assert_eq!(app.sheet().cells, cells);
+        assert_eq!(app.undo.len(), steps);
+    }
+
+    #[test]
+    fn a_sheet_wide_insert_with_nothing_to_lose_still_runs() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.cur = (1, 1);
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        let steps = app.undo.len();
+        press(&mut app, KeyCode::F(6));
+        assert_eq!(app.undo.len(), steps + 1);
+    }
+
+    #[test]
+    fn deleting_columns_on_whole_rows_deletes_every_column() {
+        let mut app = app_with_block();
+        app.cur = (1, 1);
+        app.anchor = None;
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        press_mod(&mut app, KeyCode::F(6), KeyModifiers::SHIFT);
+        assert!(app.sheet().cells.values().all(|c| c.is_blank()));
+    }
+
+    #[test]
+    fn the_add_sheet_prompt_offers_a_free_name() {
+        // Sheet1 and Sheet2, then Sheet1 deleted: "Sheet2" is taken.
+        let mut app = app_with_numbers(&[]);
+        app.add_sheet("Sheet2");
+        app.goto_sheet(0);
+        app.delete_current_sheet();
+        assert_eq!(app.pkg.workbook.sheets.len(), 1);
+        app.open_prompt(PromptKind::AddSheet);
+        assert_eq!(app.prompt.as_ref().map(|p| p.text.as_str()), Some("Sheet3"));
+    }
+
+    #[test]
+    fn shift_f11_adds_the_next_sheet_unasked_and_keeps_the_history() {
+        let mut app = app_with_numbers(&[]);
+        app.apply(vec![(0, 3, gridcore::sheet::Cell::number(7.0))]);
+        let steps = app.undo.len();
+        press_mod(&mut app, KeyCode::F(11), KeyModifiers::SHIFT);
+        assert!(app.prompt.is_none());
+        assert_eq!(app.sheet().name, "Sheet2");
+        // A name taken in another case is skipped.
+        app.pkg.add_sheet("sheet3");
+        press_mod(&mut app, KeyCode::F(11), KeyModifiers::SHIFT);
+        assert_eq!(app.sheet().name, "Sheet4");
+        assert_eq!(app.pkg.workbook.sheets.len(), 4);
+        assert_eq!(app.undo.len(), steps);
+        app.goto_sheet(0);
+        app.undo();
+        assert_eq!(value_at(&app, 0, 3), CellValue::Empty);
     }
 
     fn put(app: &mut App, r: u32, c: u32, text: &str) {

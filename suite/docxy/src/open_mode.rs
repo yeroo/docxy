@@ -433,10 +433,13 @@ pub(crate) fn parse_zone_identifier(bytes: &[u8]) -> Option<u32> {
 }
 
 /// Whether a key may reach a workbook in Protected View: moving and
-/// extending the selection, scrolling, switching sheets, copying, finding,
-/// and the modifiers on their own. Everything else would edit.
-pub(crate) fn protected_allows_key(key: &str, ctrl: bool, alt: bool) -> bool {
+/// extending the selection (Shift+Space selects rows, #860), scrolling,
+/// switching sheets, copying, finding, and the modifiers on their own.
+/// Everything else would edit.
+pub(crate) fn protected_allows_key(key: &str, ctrl: bool, shift: bool, alt: bool) -> bool {
     match key {
+        // Plain Space would type one.
+        "space" => shift && !ctrl && !alt,
         "shift" | "control" | "alt" | "platform" | "function" => true,
         "left" | "right" | "up" | "down" | "pageup" | "pagedown" | "home" | "end" | "escape"
         | "tab" => true,
@@ -820,20 +823,22 @@ mod tests {
         for key in [
             "left", "right", "up", "down", "pageup", "pagedown", "home", "end", "tab", "escape",
         ] {
-            assert!(protected_allows_key(key, false, false), "{key}");
-            assert!(protected_allows_key(key, true, false), "ctrl+{key}");
+            assert!(protected_allows_key(key, false, false, false), "{key}");
+            assert!(protected_allows_key(key, true, false, false), "ctrl+{key}");
         }
-        assert!(protected_allows_key("enter", false, false));
-        assert!(protected_allows_key("shift", false, false));
+        assert!(protected_allows_key("enter", false, false, false));
+        assert!(protected_allows_key("shift", false, false, false));
+        // Shift+Space selects whole rows (#860).
+        assert!(protected_allows_key("space", false, true, false));
         for key in ["c", "a", "f"] {
-            assert!(protected_allows_key(key, true, false), "ctrl+{key}");
+            assert!(protected_allows_key(key, true, false, false), "ctrl+{key}");
         }
     }
 
     #[test]
     fn protected_refuses_keys_that_edit() {
         for key in ["x", "v", "z", "y", "b", "i", "d", "r", "s", ";", "enter"] {
-            assert!(!protected_allows_key(key, true, false), "ctrl+{key}");
+            assert!(!protected_allows_key(key, true, false, false), "ctrl+{key}");
         }
         for key in [
             "a",
@@ -847,8 +852,27 @@ mod tests {
             "insert",
             "space",
         ] {
-            assert!(!protected_allows_key(key, false, false), "{key}");
+            assert!(!protected_allows_key(key, false, false, false), "{key}");
         }
-        assert!(!protected_allows_key("enter", false, true), "alt+enter");
+        assert!(
+            !protected_allows_key("enter", false, false, true),
+            "alt+enter"
+        );
+        // Inserting and deleting rows, and Shift+F11's new sheet (#860).
+        for key in ["-", "=", "+"] {
+            assert!(
+                !protected_allows_key(key, true, true, false),
+                "ctrl+shift+{key}"
+            );
+            assert!(!protected_allows_key(key, true, false, false), "ctrl+{key}");
+        }
+        assert!(
+            !protected_allows_key("f11", false, true, false),
+            "shift+f11"
+        );
+        assert!(
+            !protected_allows_key("space", true, true, false),
+            "ctrl+shift+space"
+        );
     }
 }

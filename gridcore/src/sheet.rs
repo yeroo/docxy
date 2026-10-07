@@ -1964,6 +1964,16 @@ impl Workbook {
             .position(|s| s.name.eq_ignore_ascii_case(name))
     }
 
+    /// The lowest "SheetN" (counting from one past the sheet count) no sheet
+    /// has yet, case-insensitively: the name Excel gives a sheet added
+    /// without asking (Shift+F11, the + button).
+    pub fn next_sheet_name(&self) -> String {
+        (self.sheets.len() + 1..)
+            .map(|n| format!("Sheet{n}"))
+            .find(|name| self.sheet_index(name).is_none())
+            .expect("an unused sheet name")
+    }
+
     /// A table by displayName, case-insensitive.
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables
@@ -2671,6 +2681,23 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_sheet_name_skips_names_taken_in_any_case() {
+        let named = |n: &str| Sheet {
+            name: n.to_string(),
+            ..Sheet::default()
+        };
+        let mut wb = Workbook {
+            sheets: vec![named("Sheet1")],
+            ..Workbook::default()
+        };
+        assert_eq!(wb.next_sheet_name(), "Sheet2");
+        wb.sheets.push(named("sheet2"));
+        wb.sheets.push(named("SHEET4"));
+        // Three sheets: counting starts at Sheet4, which is taken.
+        assert_eq!(wb.next_sheet_name(), "Sheet5");
+    }
 
     #[test]
     fn snapshots_blank_the_spill_output_of_a_live_anchor() {

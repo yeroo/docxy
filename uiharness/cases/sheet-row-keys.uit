@@ -1,0 +1,174 @@
+# Excel's keys for whole rows and new sheets (#860): Shift+Space selects the
+# rows, Ctrl+Shift+= inserts as many rows as are selected, Ctrl+- deletes
+# them, and Shift+F11 adds a sheet. Home › Delete Row deletes every row the
+# selection touches. Run with:
+#
+#   cargo run -p uiharness -- run uiharness/cases/sheet-row-keys.uit
+#
+# The issue's repro types into A1:A3; here it is column J, clear of the
+# fixture's data (A1:C5) and its chart (B9:H21). The active cell moves to
+# column A with the rows: the selection is two corners, so a whole row's
+# corners are in column A and the last column.
+
+test shift space then ctrl shift equals inserts a row
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 1
+  key enter
+  type 2
+  key enter
+  type 3
+  key enter
+  click J2
+  key shift+space
+  assert editing is false
+  assert range is A2:XFD2
+  assert sel is A2
+  key ctrl+shift+=
+  assert cell J2 is nothing
+  assert cell J3 is 2
+  assert cell J4 is 3
+  assert range is A2:XFD2
+  click J9
+  key ctrl+z
+  assert cell J2 is 2
+  assert cell J3 is 3
+  assert range is A2:XFD2
+
+test ctrl minus deletes the selected row
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 1
+  key enter
+  type 2
+  key enter
+  type 3
+  key enter
+  click J2
+  key shift+space
+  key ctrl+-
+  assert cell J2 is 3
+  assert cell J3 is nothing
+  key ctrl+z
+  assert cell J2 is 2
+
+test shift space covers every row of the selection
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 1
+  key enter
+  type 2
+  key enter
+  type 3
+  key enter
+  click J2
+  key shift+down
+  key shift+space
+  assert range is A2:XFD3
+  key ctrl+shift+=
+  assert cell J2 is nothing
+  assert cell J3 is nothing
+  assert cell J4 is 2
+  assert cell J5 is 3
+
+test delete row deletes every row the selection touches
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 1
+  key enter
+  type 2
+  key enter
+  type 3
+  key enter
+  type 4
+  key enter
+  click J2
+  key shift+down
+  call ribbon-click {"tab":"Home","command":"Delete Row"}
+  assert cell J1 is 1
+  assert cell J2 is 4
+  assert cell J3 is nothing
+
+test the structural keys leave a plain cell selection alone
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 1
+  key enter
+  type 2
+  key enter
+  click J1
+  key ctrl+-
+  key ctrl+shift+=
+  assert editing is false
+  assert cell J1 is 1
+  assert cell J2 is 2
+
+test shift space types a space in the editor
+  open copy:../fixtures/basic.xlsx
+  click J5
+  type a
+  key shift+space
+  type b
+  assert editing is true
+  assert edit is a b
+  key escape
+
+test shift space takes the selection back from a chart
+  open copy:../fixtures/basic.xlsx
+  click J2
+  select chart 0
+  assert chart_sel is 0
+  key shift+space
+  assert chart_sel is nothing
+  assert editing is false
+  assert range is A2:XFD2
+
+test a protected sheet refuses inserting and deleting rows
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 1
+  key enter
+  type 2
+  key enter
+  call ribbon-click {"tab":"Review","command":"Protect Sheet"}
+  click J1
+  key shift+space
+  assert range is A1:XFD1
+  key ctrl+-
+  assert status is The sheet is protected: unprotect it (Review › Protect Sheet) to insert or delete rows or columns.
+  assert cell J1 is 1
+  key ctrl+shift+=
+  assert cell J1 is 1
+  assert cell J2 is 2
+
+test shift f11 adds a sheet and keeps the history
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 7
+  key enter
+  key shift+f11
+  assert sheet is Sheet2
+  assert editing is false
+  key shift+f11
+  assert sheet is Sheet3
+  key ctrl+z
+  assert sheet is Sheet2
+  key ctrl+z
+  assert sheet is Sheet1
+  # The entry typed before the sheets were added is still one step back.
+  assert cell J1 is 7
+  key ctrl+z
+  assert cell J1 is nothing
+
+test insert col on whole rows refuses to push data off the sheet
+  open copy:../fixtures/basic.xlsx
+  click J2
+  type 5
+  key enter
+  click J2
+  key shift+space
+  call ribbon-click {"tab":"Home","command":"Insert Col"}
+  assert status is To prevent possible loss of data, cells that aren't blank can't be shifted off the worksheet.
+  assert cell J2 is 5
+  key ctrl+z
+  assert cell J2 is nothing
