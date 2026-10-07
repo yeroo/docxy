@@ -1909,6 +1909,39 @@ fn cursor(t: &DocTab) -> (usize, usize, bool, bool, bool) {
 }
 
 #[test]
+fn in_cell_cut_empties_the_buffer_only_when_the_write_took() {
+    // #561 r1: a silent clipboard-write failure (another process holds the OS
+    // clipboard) must not lose the typed text. The host empties the buffer
+    // only when the read-back clipboard still holds what it wrote, compared
+    // CRLF-insensitively.
+    assert!(cell_cut_write_took("Task 2", "Task 2"));
+    assert!(cell_cut_write_took("a\r\nb", "a\nb"), "CRLF-insensitive");
+    assert!(
+        !cell_cut_write_took("older copy", "Task 2"),
+        "someone else's copy stayed on the clipboard"
+    );
+    assert!(
+        !cell_cut_write_took("", "Task 2"),
+        "a non-text item replaced the write"
+    );
+    // What the host records against the write: a foreign text is recorded as
+    // the foreign text (the failure the gate catches); an empty clipboard, or
+    // one already holding our text, records the write.
+    assert_eq!(
+        recorded_after_write("Task 2".into(), &ClipRead::Text("older".into())),
+        "older"
+    );
+    assert_eq!(
+        recorded_after_write("Task 2".into(), &ClipRead::Nothing),
+        "Task 2"
+    );
+    assert_eq!(
+        recorded_after_write("Task 2".into(), &ClipRead::Text("Task 2".into())),
+        "Task 2"
+    );
+}
+
+#[test]
 fn home_and_end_move_to_the_rows_first_and_last_field() {
     let mut t = tab();
     vm(&mut t).col = COL_NAME;
