@@ -1240,7 +1240,9 @@ fn a_summary_shows_the_estimate_of_its_subtasks() {
         false,
         "loaded".into(),
     );
-    assert_eq!(duration_text(&t, 10), "2 days?");
+    // Both children run in parallel, so the span is a day; task 30's
+    // estimate marks it.
+    assert_eq!(duration_text(&t, 10), "1 day?");
     assert_eq!(duration_text(&t, 20), "1 day");
 }
 

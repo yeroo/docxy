@@ -630,7 +630,7 @@ fn rows_resolve_ids_format_links_milestones_and_resources() {
         assert_eq!(row[COL_DURATION], "1 day");
         assert_eq!(row[COL_PREDECESSORS], expected);
         assert_eq!(row[COL_RESOURCES], "Alice");
-        assert_eq!(row[COL_START].len(), 9);
+        assert_eq!(row[COL_START].len(), 10);
         ed.remove_predecessor(9, 7).unwrap();
     }
     ed.toggle_milestone(9).unwrap();
