@@ -17,6 +17,7 @@
 //! through [`col`] and [`rows`], `const fn`s that assert `len <= 3`: a table
 //! with a fourth row does not compile (#1018).
 
+use crate::help_tab::HelpAct;
 use crate::sheet_menus::SheetMenu;
 use crate::{RibbonTab, SheetAct};
 
@@ -92,7 +93,11 @@ impl SheetCmd {
     /// `Shape::Menu` button is enabled although its act is `Todo`: pressing it
     /// opens its menu, and the items carry the acts.
     pub fn enabled(&self) -> bool {
-        !matches!(self.act, SheetAct::Todo) || matches!(self.shape, Shape::Menu(_))
+        match self.act {
+            SheetAct::Todo => matches!(self.shape, Shape::Menu(_)),
+            SheetAct::Help(act) => crate::help_tab::help_enabled(act),
+            _ => true,
+        }
     }
 }
 
@@ -943,6 +948,70 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
         }],
     },
+    // Help ends the row, as in Excel (#1021): the document ribbon's Help tab.
+    Tab {
+        tab: RibbonTab::Help,
+        titles: Titles::Plain,
+        groups: &[
+            Group {
+                title: "Help",
+                launcher: false,
+                launch: None,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        Item::One(large("help", "Help", None, SheetAct::Help(HelpAct::Help))),
+                        col(
+                            COL,
+                            &[
+                                row(
+                                    "contact-support",
+                                    "Contact Support",
+                                    None,
+                                    SheetAct::Help(HelpAct::ContactSupport),
+                                ),
+                                row(
+                                    "feedback",
+                                    "Feedback",
+                                    None,
+                                    SheetAct::Help(HelpAct::Feedback),
+                                ),
+                                row(
+                                    "show-training",
+                                    "Show Training",
+                                    None,
+                                    SheetAct::Help(HelpAct::ShowTraining),
+                                ),
+                            ],
+                        ),
+                        col(
+                            COL,
+                            &[row(
+                                "whats-new",
+                                "What's New",
+                                None,
+                                SheetAct::Help(HelpAct::WhatsNew),
+                            )],
+                        ),
+                    ],
+                },
+            },
+            Group {
+                title: "About",
+                launcher: false,
+                launch: None,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[Item::One(large(
+                        "about-docxy",
+                        "About docxy suite",
+                        None,
+                        SheetAct::Help(HelpAct::About),
+                    ))],
+                },
+            },
+        ],
+    },
 ];
 
 /// The tab definition drawn for `tab`: its own entry, or Home's.
@@ -1129,6 +1198,9 @@ mod tests {
                 "cell-styles",
                 "spelling",
                 "protect-workbook",
+                // Help (#1021): nothing to show yet.
+                "show-training",
+                "whats-new",
             ]
         );
     }

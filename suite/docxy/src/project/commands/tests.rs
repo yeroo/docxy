@@ -143,7 +143,7 @@ fn ribbon_inventory_keys_tips_and_assets_are_complete() {
     let r = project_ribbon();
     assert_eq!(
         r.tabs.iter().map(|t| t.name).collect::<Vec<_>>(),
-        ["Task", "Resource", "Report", "Project", "View"]
+        ["Task", "Resource", "Report", "Project", "View", "Help"]
     );
     // The Task tab leads with the Clipboard group (#561): a large Paste and a
     // Cut/Copy column, as in Project.
@@ -165,9 +165,10 @@ fn ribbon_inventory_keys_tips_and_assets_are_complete() {
     assert_eq!(col[1].tip.shortcut, "Ctrl+C");
     assert_eq!(col[1].key_tip, "Y");
     // The contextual Gantt Chart Format tab holds the rest of the inventory.
+    // The Help tab every ribbon shares is not Project's (help_tab's tests).
     let fmt = gantt_format_tab();
     let mut acts = vec![];
-    for t in r.tabs.iter().chain([&fmt]) {
+    for t in r.tabs.iter().filter(|t| t.name != "Help").chain([&fmt]) {
         let mut keys = vec![];
         for g in &t.groups {
             for control in &g.items {
@@ -243,14 +244,16 @@ fn ribbon_context_survives_valid_switches_only() {
             .iter()
             .map(|x| x.1)
             .collect::<Vec<_>>(),
-        ["File", "Task", "Resource", "Report", "Project", "View"]
+        [
+            "File", "Task", "Resource", "Report", "Project", "View", "Help"
+        ]
     );
     assert_eq!(
         ribbon_tab_set(Kind::Project)
             .iter()
             .map(|x| x.2)
             .collect::<Vec<_>>(),
-        ["F", "T", "U", "R", "P", "W"]
+        ["F", "T", "U", "R", "P", "W", "Y"]
     );
     assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::View, false, false, false) == RibbonTab::View);
     assert!(valid_ribbon_tab(Kind::Xlsx, RibbonTab::Task, false, false, false) == RibbonTab::Home);
@@ -311,7 +314,13 @@ fn project_instruction_paths_exist() {
     use ProjectAct::*;
     let r = project_ribbon();
     let fmt = gantt_format_tab();
-    let tabs: Vec<_> = r.tabs.iter().chain([&fmt]).collect();
+    // Help is every ribbon's, not a Project instruction path (help_tab's tests).
+    let tabs: Vec<_> = r
+        .tabs
+        .iter()
+        .filter(|t| t.name != "Help")
+        .chain([&fmt])
+        .collect();
     let mut paths = vec![];
     for t in &tabs {
         for g in &t.groups {

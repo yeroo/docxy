@@ -85,7 +85,7 @@ fn the_tab_has_words_groups_between_layout_and_review() {
     assert_eq!(
         names,
         [
-            "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View"
+            "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View", "Help"
         ]
     );
     assert_eq!(ribbon_tab_set(Kind::Docx)[5].1, "Mailings");

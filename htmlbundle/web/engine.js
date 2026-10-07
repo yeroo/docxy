@@ -723,6 +723,13 @@
     'Markup(Original)': NOT_YET,
     'Markup(Simple)': NOT_YET,
     ToggleNav: NOT_YET,
+    // The Help tab (#1021): help, feedback and About are the desktop app's.
+    'Help(Help)': NOT_YET,
+    'Help(ContactSupport)': NOT_YET,
+    'Help(Feedback)': NOT_YET,
+    'Help(ShowTraining)': NOT_YET,
+    'Help(WhatsNew)': NOT_YET,
+    'Help(About)': NOT_YET,
   };
 
   root.DocxyEngine = {

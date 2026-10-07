@@ -446,10 +446,12 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                 ),
             ],
         ),
+        // Help ends the row, as in Project (#1021).
+        crate::help_tab::help_tab(),
     ])
 }
 
-/// Project's contextual Gantt Chart Format tab, shown after View while a
+/// Project's contextual Gantt Chart Format tab, shown after Help while a
 /// Project document's Gantt pane is showing (see `RibbonTab::GanttFormat`).
 pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
     use ProjectAct::*;

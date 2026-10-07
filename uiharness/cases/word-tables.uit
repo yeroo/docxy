@@ -174,18 +174,18 @@ test design tab styles, options, shading and borders (648)
   call ribbon-click {"tab":"Table Design","command":"shade-none"}
   assert table.shading is null
   call ribbon-read {}
-  assert reply.tabs.8.name is Table Design
-  assert reply.tabs.8.groups.2.commands.6.id is border-all
-  assert reply.tabs.8.groups.2.commands.6.checked is true
-  assert reply.tabs.8.groups.2.commands.11.id is border-diag-down
-  assert reply.tabs.8.groups.2.commands.11.enabled is true
+  assert reply.tabs.9.name is Table Design
+  assert reply.tabs.9.groups.2.commands.6.id is border-all
+  assert reply.tabs.9.groups.2.commands.6.checked is true
+  assert reply.tabs.9.groups.2.commands.11.id is border-diag-down
+  assert reply.tabs.9.groups.2.commands.11.enabled is true
   call ribbon-click {"tab":"Table Design","command":"border-all"}
   call ribbon-read {}
-  assert reply.tabs.8.groups.2.commands.6.checked is false
+  assert reply.tabs.9.groups.2.commands.6.checked is false
   call ribbon-click {"tab":"Table Design","command":"border-diag-down"}
   call ribbon-read {}
-  assert reply.tabs.8.groups.2.commands.11.checked is true
+  assert reply.tabs.9.groups.2.commands.11.checked is true
   shot window
   key ctrl+z ctrl+z
   call ribbon-read {}
-  assert reply.tabs.8.groups.2.commands.6.checked is true
+  assert reply.tabs.9.groups.2.commands.6.checked is true

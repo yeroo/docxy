@@ -1,0 +1,113 @@
+# The Help tab every ribbon ends with (#1021): Help, Contact Support, Feedback,
+# Show Training, What's New, and About docxy suite. The runner has no negative
+# index, so `tab_count` names the last tab. Only contextual tabs come after Help
+# (a Project's Gantt Chart Format, as in Project).
+
+test every editor has a Help tab last
+  open ../fixtures/basic.xlsx
+  call ribbon-read {}
+  assert reply.tab_count is 7
+  assert reply.tabs.6.name is Help
+  assert reply.tabs.6.key_tip is Y
+  open copy:../fixtures/basic.docx
+  call ribbon-read {}
+  assert reply.tab_count is 9
+  assert reply.tabs.8.name is Help
+  assert reply.tabs.8.key_tip is Y
+  open ../fixtures/gantt-summary.xml
+  call ribbon-read {}
+  assert reply.tab_count is 8
+  assert reply.tabs.6.name is Help
+  assert reply.tabs.6.key_tip is Y
+  assert reply.tabs.7.name is Gantt Chart Format
+
+test About shows the build info and copies it
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Help","command":"About docxy suite"}
+  call dialog-read {}
+  assert reply.open is true
+  assert reply.id is about
+  assert reply.controls.0.text is Manual build
+  assert reply.controls.1.name is commit
+  shot window
+  call dialog-click {"button":"Copy"}
+  call clipboard {"action":"read"}
+  assert reply.text is not nothing
+  key escape
+  call dialog-read {}
+  assert reply.open is false
+  call app-info {}
+  assert reply.commit_len is 40
+  assert reply.kind is local
+  assert reply.manual is true
+
+test About opens from a document's Help tab too, with File closed
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Help","command":"About docxy suite"}
+  call dialog-read {}
+  assert reply.id is about
+  call dialog-click {"button":"Close"}
+  assert reply.dialog.open is false
+  # The Account page's button still needs the Account page.
+  call backstage {"action":"open"}
+  call-error account {"action":"about"} => the Account page is not open; use account open
+  call backstage {"action":"close"}
+
+test Feedback opens the new-issue page with the build, not the host
+  open ../fixtures/basic.xlsx
+  call last-url {}
+  assert reply.url is nothing
+  call ribbon-click {"tab":"Help","command":"Feedback"}
+  call last-url {}
+  assert reply.page is https://github.com/yeroo/docxy/issues/new
+  assert reply.has_commit is true
+  assert reply.has_host is false
+  call status-read {}
+  assert reply.items.0.text is Opened the feedback page in your browser
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Help","command":"Contact Support"}
+  call last-url {}
+  assert reply.page is https://github.com/yeroo/docxy/issues/new
+
+test Help and F1 say the documentation is coming; Training and What's New wait
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Help","command":"Help"}
+  call status-read {}
+  assert reply.items.0.text is Help: the documentation is coming soon
+  call ribbon-click {"tab":"Help","command":"Feedback"}
+  call status-read {}
+  assert reply.items.0.text is Opened the feedback page in your browser
+  key f1
+  call status-read {}
+  assert reply.items.0.text is Help: the documentation is coming soon
+  call ribbon-read {}
+  assert reply.tabs.8.groups.0.commands.3.label is Show Training
+  assert reply.tabs.8.groups.0.commands.3.enabled is false
+  assert reply.tabs.8.groups.0.commands.4.label is What's New
+  assert reply.tabs.8.groups.0.commands.4.enabled is false
+  open ../fixtures/basic.xlsx
+  call-error ribbon-click {"tab":"Help","command":"Show Training"} => 'Show Training' is not implemented
+  call ribbon-click {"tab":"Help","command":"Feedback"}
+  key f1
+  call status-read {}
+  assert reply.items.0.text is Help: the documentation is coming soon
+
+test the Help tab fits its ribbon on every kind
+  open copy:../fixtures/basic.docx
+  call ribbon-layout {"tab":"Help"}
+  shot window
+  call ribbon-layout {}
+  assert reply.any_clipped_v is false
+  assert reply.any_clipped_h is false
+  open ../fixtures/basic.xlsx
+  call ribbon-layout {"tab":"Help"}
+  shot window
+  call ribbon-layout {}
+  assert reply.any_clipped_v is false
+  assert reply.any_clipped_h is false
+  open ../fixtures/gantt-summary.xml
+  call ribbon-layout {"tab":"Help"}
+  shot window
+  call ribbon-layout {}
+  assert reply.any_clipped_v is false
+  assert reply.any_clipped_h is false
