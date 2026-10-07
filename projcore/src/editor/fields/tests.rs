@@ -1305,6 +1305,15 @@ fn custom_text_lookup_by_guid() {
         ),
         (s("Civil"), FieldValue::Text(s("Civil")))
     );
+    // A stored value wins over a guid pointing at a different entry.
+    assert_eq!(
+        tv(
+            &build(Some("Civil"), Some("7F2B5E61-7C21-4E0A-9B55-3C8D12A4E102")),
+            1,
+            "Text1"
+        ),
+        (s("Civil"), FieldValue::Text(s("Civil")))
+    );
     for guid in [Some("no-such-guid"), None] {
         assert_eq!(
             tv(&build(None, guid), 1, "Text1"),
@@ -1312,6 +1321,26 @@ fn custom_text_lookup_by_guid() {
             "{guid:?}"
         );
     }
+}
+
+#[test]
+fn custom_field_reads_past_shadowing_definitions() {
+    // The definitions block is shared with resource and assignment custom
+    // fields, whose definitions repeat the task field names (resource Text1
+    // is FieldID 205520904, corpus/mspdi/13-resource-fields.xml). One that
+    // names no task value — or has no FieldID child at all — must not
+    // shadow the task's definition.
+    let mut p = untitled_project();
+    p.extended_attribute_definitions = vec![
+        custom_def("205520904", "Text1"),
+        node("ExtendedAttribute", vec![leaf("FieldName", "Text1")]),
+        custom_def("188743731", "Text1"),
+    ];
+    let mut t = task(1, "Pour", 480);
+    t.extended_attributes = vec![custom_value("188743731", "M&E")];
+    p.tasks = vec![t];
+    let ed = Editor::new(p);
+    assert_eq!(tv(&ed, 1, "Text1"), (s("M&E"), FieldValue::Text(s("M&E"))));
 }
 
 #[test]
@@ -1432,6 +1461,40 @@ fn custom_unset_and_unparseable_read_leniently() {
         ("Text1", ""),
     ] {
         assert_eq!(tv(&ed, 1, name), (s(raw), FieldValue::Null), "{name}");
+    }
+
+    // `parse` accepts NaN and the inf spellings; they are not values and
+    // keep their raw text. Finite numbers keep their exact digits — no
+    // rounding to hundredths, no overflow to inf in the display text.
+    let mut p = untitled_project();
+    p.extended_attribute_definitions = vec![
+        custom_def("555000001", "Number1"),
+        custom_def("555000002", "Number2"),
+        custom_def("555000003", "Number3"),
+        custom_def("555000004", "Number4"),
+        custom_def("555000005", "Cost1"),
+        custom_def("555000006", "Cost2"),
+    ];
+    let mut t = task(1, "Bare", 480);
+    t.extended_attributes = vec![
+        custom_value("555000001", "NaN"),
+        custom_value("555000002", "inf"),
+        custom_value("555000003", "0.001"),
+        custom_value("555000004", "1e308"),
+        custom_value("555000005", "NaN"),
+        custom_value("555000006", "inf"),
+    ];
+    p.tasks = vec![t];
+    let ed = Editor::new(p);
+    for (name, text, value) in [
+        ("Number1", "NaN", FieldValue::Null),
+        ("Number2", "inf", FieldValue::Null),
+        ("Number3", "0.001", FieldValue::Number(0.001)),
+        ("Number4", &1e308.to_string(), FieldValue::Number(1e308)),
+        ("Cost1", "NaN", FieldValue::Null),
+        ("Cost2", "inf", FieldValue::Null),
+    ] {
+        assert_eq!(tv(&ed, 1, name), (s(text), value), "{name}");
     }
 }
 

@@ -1307,9 +1307,11 @@ fn file_20_custom_task_fields_read_through_their_definitions() {
         read(4, "Duration1"),
         ("0 days".to_string(), FieldValue::Null)
     );
-    // UID 2 ("Excavate") carries Text1 with a value that wins over its
-    // ValueGUID, and a Duration1 shown in the value's own unit (code 7 =
-    // days; PT32H0M0S = 1920 minutes on this calendar).
+    // UID 2 ("Excavate") carries Text1 with a value and a ValueGUID for the
+    // same lookup entry (Civil), and a Duration1 shown in the value's own
+    // unit (code 7 = days; PT32H0M0S = 1920 minutes on this calendar).
+    // Precedence of a stored value over a guid is pinned in
+    // custom_text_lookup_by_guid.
     assert_eq!(
         read(2, "Text1"),
         ("Civil".to_string(), FieldValue::Text("Civil".into()))

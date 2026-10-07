@@ -1,32 +1,37 @@
 //! Custom task fields (Text1-30, Number1-20, Cost1-10, Flag1-20 and
 //! Date/Start/Finish/Duration1-10, #577): each field resolves to a
-//! `FieldID` through the plan's own `<ExtendedAttribute>` definitions — the
-//! definition whose `FieldName` is the field's name says which `FieldID`
-//! holds the value — so no id is hard-coded. A field with no definition in
-//! the plan, or no task value with that id, reads as unset; a stored value
-//! that does not parse reads as its raw text and [`FieldValue::Null`], never
-//! an error.
+//! `FieldID` through the plan's own `<ExtendedAttribute>` definitions, so no
+//! id is hard-coded. The definitions block is shared with resource and
+//! assignment custom fields, whose `FieldName`s repeat the task fields', so
+//! the first definition whose `FieldName` matches and whose `FieldID` names
+//! one of the task's values wins. A field with no such definition, or no
+//! task value with that id, reads as unset; a stored value that does not
+//! parse reads as its raw text and [`FieldValue::Null`], never an error.
 use super::*;
 use crate::model::{ExtendedAttributeValue, XmlElement};
 
 /// Read one custom field of one task.
 pub(super) fn read(proj: &Project, task: &Task, kind: CustomKind, n: u8) -> FieldRead {
     let name = Field::Custom(kind, n).name();
-    let Some(definition) = proj
+    // The definitions block is shared: it also holds resource and assignment
+    // definitions, whose FieldName repeats the task fields' (resource Text1
+    // is FieldID 205520904, task Text1 188743731). Resolve across every
+    // definition with a matching FieldName: the first whose FieldID names a
+    // task value wins, so an earlier definition for another owner — or with
+    // no FieldID child — cannot shadow the task's.
+    let resolved = proj
         .extended_attribute_definitions
         .iter()
-        .find(|def| child(def, "FieldName").is_some_and(|f| f.eq_ignore_ascii_case(&name)))
-    else {
-        return unset(proj, kind);
-    };
-    let Some(id) = child(definition, "FieldID") else {
-        return unset(proj, kind);
-    };
-    let Some(value) = task
-        .extended_attributes
-        .iter()
-        .find(|value| value.field_id.trim() == id)
-    else {
+        .filter(|def| child(def, "FieldName").is_some_and(|f| f.eq_ignore_ascii_case(&name)))
+        .find_map(|def| {
+            let id = child(def, "FieldID")?;
+            let value = task
+                .extended_attributes
+                .iter()
+                .find(|value| value.field_id.trim() == id)?;
+            Some((def, value))
+        });
+    let Some((definition, value)) = resolved else {
         return unset(proj, kind);
     };
     value_read(proj, definition, value, kind)
@@ -71,17 +76,16 @@ fn value_read(
             },
             _ => text(raw),
         },
-        CustomKind::Number => match raw.trim().parse::<f64>() {
-            Ok(number) => {
-                let (shown, _) = two_decimals(number);
-                FieldRead::new(shown, FieldValue::Number(number))
-            }
-            Err(_) => FieldRead::new(raw, FieldValue::Null),
+        // `parse` accepts NaN and the inf spellings; only a finite number is
+        // a value, anything else keeps its raw text.
+        CustomKind::Number => match raw.trim().parse::<f64>().ok().filter(|n| n.is_finite()) {
+            Some(number) => FieldRead::new(number.to_string(), FieldValue::Number(number)),
+            None => FieldRead::new(raw, FieldValue::Null),
         },
         // MSPDI stores every cost in hundredths, like the built-in costs.
-        CustomKind::Cost => match raw.trim().parse::<f64>() {
-            Ok(hundredths) => money_value(Some(hundredths)),
-            Err(_) => FieldRead::new(raw, FieldValue::Null),
+        CustomKind::Cost => match raw.trim().parse::<f64>().ok().filter(|n| n.is_finite()) {
+            Some(hundredths) => money_value(Some(hundredths)),
+            None => FieldRead::new(raw, FieldValue::Null),
         },
         CustomKind::Flag => {
             let trimmed = raw.trim();
