@@ -1408,7 +1408,7 @@ impl Editor {
         let i = self.index(uid)?;
         // A blank row toggles from the duration it gets as a task.
         let min = if self.row_as_edited(i).duration_min == 0 {
-            480
+            self.project().days_to_minutes(1.0)
         } else {
             0
         };
