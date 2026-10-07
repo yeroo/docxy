@@ -23220,6 +23220,37 @@ mod repeat_tests {
         xml[start..at].to_string()
     }
 
+    /// #854: Ctrl+B with nothing selected bolds what is typed next, each
+    /// press an undo step named Bold, and Ctrl+Z after `ghi` takes back only
+    /// `ghi`.
+    #[test]
+    fn ctrl_b_at_the_caret_bolds_the_next_typing_854() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], 10));
+        type_keys(&mut ed, &mut rec, "Abc");
+        key(&mut ed, &mut rec, "b", true, false);
+        type_keys(&mut ed, &mut rec, "def");
+        key(&mut ed, &mut rec, "b", true, false);
+        type_keys(&mut ed, &mut rec, "ghi");
+        assert_eq!(text(&ed, 2), "Third one.Abcdefghi");
+        assert!(!saved_run_of(&ed, "Abc").contains("<w:b/>"));
+        assert!(saved_run_of(&ed, "def").contains("<w:b/>"));
+        assert!(!saved_run_of(&ed, "ghi").contains("<w:b/>"));
+        assert_eq!(
+            ed.undo_names(),
+            [
+                "Typing \"ghi\"",
+                "Bold",
+                "Typing \"def\"",
+                "Bold",
+                "Typing \"Abc\""
+            ]
+        );
+        assert!(ed.undo());
+        assert_eq!(text(&ed, 2), "Third one.Abcdef");
+    }
+
     /// #618 step 2: Bold on `quick`, then Ctrl+Y on `brown` with nothing
     /// to redo repeats it.
     #[test]

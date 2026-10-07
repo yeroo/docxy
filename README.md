@@ -173,7 +173,7 @@ in docxy for now: the browser shows those ribbon commands dimmed.
 | type · Enter · Backspace · Delete | edit text |
 | arrows · Home/End · PgUp/PgDn | move (Ctrl-←/→ by word) |
 | Shift + move | select (Esc clears) |
-| Ctrl-B / Ctrl-I / Ctrl-U | bold / italic / underline (over selection) |
+| Ctrl-B / Ctrl-I / Ctrl-U | bold / italic / underline (the selection, or what is typed next) |
 | Ctrl-L / Ctrl-E / Ctrl-R | align left / center / right |
 | Ctrl-A · Ctrl-C · Ctrl-X · Ctrl-V | select all · copy · cut · paste |
 | Ctrl-F | find / replace (Tab toggles replace, Ctrl-A replaces all) |

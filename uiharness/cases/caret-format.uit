@@ -1,0 +1,20 @@
+test Ctrl+B with nothing selected bolds what is typed next (#854)
+  open copy:../fixtures/basic.docx
+  type Abc
+  assert run.bold is false
+  key ctrl+b
+  assert run.bold is true
+  type def
+  key ctrl+b
+  assert run.bold is false
+  type ghi
+  assert text is Abcdefghi
+  call selection-set {"start":2,"end":2}
+  assert run.bold is false
+  call selection-set {"start":5,"end":5}
+  assert run.bold is true
+  call selection-set {"start":8,"end":8}
+  assert run.bold is false
+  key ctrl+end
+  key ctrl+z
+  assert text is Abcdef

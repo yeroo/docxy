@@ -676,7 +676,7 @@ fn print_usage() {
            type / Enter / Backspace / Delete    edit text\n  \
            arrows / Home / End / PgUp / PgDn     move   (Ctrl-←/→ by word)\n  \
            Shift + move                          select   (Esc clears)\n  \
-           Ctrl-B bold  Ctrl-I italic  Ctrl-U underline   (over selection)\n  \
+           Ctrl-B bold  Ctrl-I italic  Ctrl-U underline   (selection, or text typed next)\n  \
            Ctrl-L/E/R/J align left / center / right / justify\n  \
            Ctrl-A select all   Ctrl-C copy   Ctrl-X cut   Ctrl-V paste\n  \
            Ctrl-F find   Ctrl-H replace   Ctrl-Shift-8 show marks\n  \
@@ -13752,6 +13752,35 @@ mod tests {
             }
         }
         assert!(app.modified);
+    }
+
+    /// Ctrl+B with nothing selected switches bold for what is typed next,
+    /// and each press is an undo step of its own (#854).
+    #[test]
+    fn ctrl_b_at_the_caret_bolds_the_next_typing_854() {
+        let mut app = app_with(&[""]);
+        let type_str = |app: &mut App, s: &str| {
+            for c in s.chars() {
+                app.on_key(key(KeyCode::Char(c)));
+            }
+        };
+        type_str(&mut app, "Abc");
+        app.on_key(ctrl(KeyCode::Char('b')));
+        type_str(&mut app, "def");
+        app.on_key(ctrl(KeyCode::Char('b')));
+        type_str(&mut app, "ghi");
+        let path = save_to_temp(&mut app, "ctrl-b-caret-854");
+        let (doc, _) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(doc.matches("<w:b/>").count(), 1, "{doc}");
+        assert!(doc.contains(">def</w:t>"), "{doc}");
+        assert_eq!(
+            app.editor.undo_names().len(),
+            5,
+            "three typings, two toggles"
+        );
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(first_line(&app), "Abcdef", "Ctrl+Z takes back only ghi");
     }
 
     #[test]

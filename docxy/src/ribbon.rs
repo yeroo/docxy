@@ -277,7 +277,12 @@ fn home_groups(markdown: bool) -> Vec<Group> {
                     btn("⌧", 1, ClearFormatting, "Clear formatting (Ctrl+Space)"),
                 ],
                 vec![
-                    btn("B", 1, Bold, "Bold (Ctrl+B) — make the selection bold"),
+                    btn(
+                        "B",
+                        1,
+                        Bold,
+                        "Bold (Ctrl+B) — make the selection, or what you type next, bold",
+                    ),
                     Seg::Gap("  "),
                     btn("I", 1, Italic, "Italic (Ctrl+I)"),
                     Seg::Gap("  "),
