@@ -11,6 +11,8 @@
 
 use crate::model::*;
 use crate::review::{RevisionAction, RevisionOutcome};
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 mod cover;
 mod flat;
@@ -143,7 +145,11 @@ enum EditKind {
 
 #[derive(Clone)]
 struct Snapshot {
-    doc: Document,
+    /// The document's top-level blocks. A block equal to the one at the same
+    /// place in the step it was taken next to is that step's block, shared
+    /// (see [`share_body`]): a step costs what it changed, not a whole copy
+    /// of the document, so the history can be long (#853).
+    body: Vec<Arc<Block>>,
     caret: Caret,
     anchor: Option<Caret>,
     review_target: Option<RevisionTarget>,
@@ -168,15 +174,26 @@ enum StepName {
 /// The longest typed text an undo-list label shows before it is shortened.
 const TYPING_LABEL_CHARS: usize = 30;
 
+/// A manual line break (Shift+Enter, `<w:br/>`) as typed text: what
+/// [`Editor::insert_char`] turns into one and what a typing step records for
+/// one, so Repeat types it again as a line break, not a paragraph. The same
+/// character Word's own text uses for it.
+pub const LINE_BREAK: char = '\u{000b}';
+
 impl StepName {
     fn label(&self) -> String {
         match self {
             StepName::Typing(text) if text.is_empty() => "Typing".into(),
-            StepName::Typing(text) if text.chars().count() > TYPING_LABEL_CHARS => {
-                let short: String = text.chars().take(TYPING_LABEL_CHARS).collect();
-                format!("Typing \"{short}\u{2026}\"")
+            StepName::Typing(text) => {
+                // A line break shows as an arrow, not a control character.
+                let shown = |text: &str| text.replace(LINE_BREAK, "\u{21b5}");
+                if text.chars().count() > TYPING_LABEL_CHARS {
+                    let short: String = text.chars().take(TYPING_LABEL_CHARS).collect();
+                    format!("Typing \"{}\u{2026}\"", shown(&short))
+                } else {
+                    format!("Typing \"{}\"", shown(text))
+                }
             }
-            StepName::Typing(text) => format!("Typing \"{text}\""),
             StepName::Named(name) => name.clone(),
             StepName::Unnamed(EditKind::Insert) => "Typing".into(),
             StepName::Unnamed(EditKind::Delete) => "Delete".into(),
@@ -204,7 +221,51 @@ pub fn undo_serial_counter() -> u64 {
     LAST_SERIAL.with(|c| c.get())
 }
 
-const UNDO_CAP: usize = 500;
+/// How many undo steps an editor keeps. Word has no undo-levels option and
+/// keeps every step (#853); the cap only guards memory, which shared blocks
+/// (see [`Snapshot::body`]) keep small per step.
+const UNDO_CAP: usize = 20_000;
+
+/// The most characters one typing step holds, as in Word: typing on past
+/// them starts a new step (#853). A line break counts as one.
+const TYPING_STEP_CHARS: usize = 128;
+
+/// `body` as an undo step holds it, sharing every block equal to `like`'s
+/// block at the same place, counted from the start or from the end (an
+/// inserted or removed paragraph shifts the ones after it), so only the
+/// blocks in between are copied.
+fn share_body(body: &[Block], like: Option<&[Arc<Block>]>) -> Vec<Arc<Block>> {
+    let like = like.unwrap_or_default();
+    let prefix = body
+        .iter()
+        .zip(like)
+        .take_while(|(b, l)| *b == l.as_ref())
+        .count();
+    let room = body.len().min(like.len()) - prefix;
+    let suffix = body
+        .iter()
+        .rev()
+        .zip(like.iter().rev())
+        .take(room)
+        .take_while(|(b, l)| *b == l.as_ref())
+        .count();
+    let mut out = Vec::with_capacity(body.len());
+    out.extend(like[..prefix].iter().cloned());
+    out.extend(
+        body[prefix..body.len() - suffix]
+            .iter()
+            .map(|b| Arc::new(b.clone())),
+    );
+    out.extend(like[like.len() - suffix..].iter().cloned());
+    out
+}
+
+/// The document an undo step holds.
+fn unshare_body(body: Vec<Arc<Block>>) -> Document {
+    Document {
+        body: body.into_iter().map(Arc::unwrap_or_clone).collect(),
+    }
+}
 
 /// An editing session over a [`Document`].
 pub struct Editor {
@@ -212,7 +273,7 @@ pub struct Editor {
     pub caret: Caret,
     /// Selection anchor (the fixed end); the moving end is the caret.
     pub anchor: Option<Caret>,
-    undo: Vec<Snapshot>,
+    undo: VecDeque<Snapshot>,
     redo: Vec<Snapshot>,
     last: EditKind,
     review_target: Option<RevisionTarget>,
@@ -237,7 +298,7 @@ impl Editor {
             doc,
             caret: Caret { path, offset: 0 },
             anchor: None,
-            undo: Vec::new(),
+            undo: VecDeque::new(),
             redo: Vec::new(),
             last: EditKind::None,
             review_target: None,
@@ -288,9 +349,15 @@ impl Editor {
         std::borrow::Cow::Owned(doc)
     }
 
+    /// The current state as an undo step, sharing the blocks it has in
+    /// common with the newest step.
     fn snapshot(&self) -> Snapshot {
+        self.snapshot_like(self.undo.back())
+    }
+
+    fn snapshot_like(&self, like: Option<&Snapshot>) -> Snapshot {
         Snapshot {
-            doc: self.doc.clone(),
+            body: share_body(&self.doc.body, like.map(|s| s.body.as_slice())),
             caret: self.caret.clone(),
             anchor: self.anchor.clone(),
             review_target: self.review_target,
@@ -302,9 +369,9 @@ impl Editor {
     fn push_undo(&mut self, mut snapshot: Snapshot) {
         snapshot.serial = UNDO_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         LAST_SERIAL.with(|c| c.set(snapshot.serial));
-        self.undo.push(snapshot);
+        self.undo.push_back(snapshot);
         if self.undo.len() > UNDO_CAP {
-            self.undo.remove(0);
+            self.undo.pop_front();
         }
         self.redo.clear();
     }
@@ -315,8 +382,11 @@ impl Editor {
             .unwrap_or(0)
     }
 
+    /// Push an undo step for an edit of `kind`, unless it continues the
+    /// newest step: only typing coalesces. Each Backspace or Delete is a step
+    /// of its own, as in Word (#853).
     fn checkpoint(&mut self, kind: EditKind) {
-        if self.last != kind || kind == EditKind::Structural {
+        if self.last != kind || matches!(kind, EditKind::Structural | EditKind::Delete) {
             let mut snapshot = self.snapshot();
             snapshot.name = match kind {
                 EditKind::Insert => StepName::Typing(String::new()),
@@ -328,12 +398,13 @@ impl Editor {
     }
 
     /// The current state as the entry that undoing or redoing `step` leaves
-    /// on the other stack: the same step, so it keeps its name and serial.
+    /// on the other stack: the same step, so it keeps its name and serial,
+    /// and it shares the blocks the step did not change.
     fn snapshot_as(&self, step: &Snapshot) -> Snapshot {
         Snapshot {
             name: step.name.clone(),
             serial: step.serial,
-            ..self.snapshot()
+            ..self.snapshot_like(Some(step))
         }
     }
 
@@ -350,7 +421,7 @@ impl Editor {
     /// brings a step back with its serial, so a host can tell whether the
     /// step it recorded is still the newest one.
     pub fn undo_serial(&self) -> Option<u64> {
-        self.undo.last().map(|s| s.serial)
+        self.undo.back().map(|s| s.serial)
     }
 
     /// The undo steps pushed after `since` (a value of
@@ -376,7 +447,7 @@ impl Editor {
 
     /// The text of the newest undo step when it is typing.
     pub fn last_typed(&self) -> Option<&str> {
-        match self.undo.last().map(|s| &s.name) {
+        match self.undo.back().map(|s| &s.name) {
             Some(StepName::Typing(text)) => Some(text),
             _ => None,
         }
@@ -403,9 +474,9 @@ impl Editor {
     }
 
     pub fn undo(&mut self) -> bool {
-        if let Some(prev) = self.undo.pop() {
+        if let Some(prev) = self.undo.pop_back() {
             self.redo.push(self.snapshot_as(&prev));
-            self.doc = prev.doc;
+            self.doc = unshare_body(prev.body);
             self.caret = prev.caret;
             self.anchor = prev.anchor;
             self.review_target = prev.review_target;
@@ -419,8 +490,8 @@ impl Editor {
 
     pub fn redo(&mut self) -> bool {
         if let Some(next) = self.redo.pop() {
-            self.undo.push(self.snapshot_as(&next));
-            self.doc = next.doc;
+            self.undo.push_back(self.snapshot_as(&next));
+            self.doc = unshare_body(next.body);
             self.caret = next.caret;
             self.anchor = next.anchor;
             self.review_target = next.review_target;
@@ -634,7 +705,14 @@ impl Editor {
     }
 
     fn finish_review_transaction(&mut self, before: Snapshot) {
-        if self.doc == before.doc {
+        let same = self.doc.body.len() == before.body.len()
+            && self
+                .doc
+                .body
+                .iter()
+                .zip(&before.body)
+                .all(|(b, s)| b == s.as_ref());
+        if same {
             return;
         }
         self.push_undo(before);
@@ -660,22 +738,52 @@ impl Editor {
         // deletion pushed (its snapshot is the state before it) becomes the
         // typing step, and the characters coalesce into it.
         if undo_serial_counter() > pushed_before {
-            if let Some(step) = self.undo.last_mut() {
+            if let Some(step) = self.undo.back_mut() {
                 step.name = StepName::Typing(String::new());
                 self.last = EditKind::Insert;
             }
         }
+        // A full typing step is closed: the character starts the next (#853).
+        if self.last == EditKind::Insert
+            && self
+                .last_typed()
+                .is_some_and(|text| text.chars().count() >= TYPING_STEP_CHARS)
+        {
+            self.last = EditKind::None;
+        }
         self.checkpoint(EditKind::Insert);
         let off = self.caret.offset;
-        if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
+        if ch == LINE_BREAK {
+            // A break is an inline of its own, formatted as typing here
+            // would be (see `insert_break`), and part of the typing step.
+            let props = resolve_para(&self.doc.body, &self.caret.path)
+                .map(|p| tab_props_at(&p.content, off))
+                .unwrap_or_default();
+            self.paste_at_caret(&Clip {
+                paras: vec![vec![Inline::Break(BreakKind::Line, props)]],
+            });
+            self.settle_revisions();
+            if self.caret.offset == off {
+                return;
+            }
+        } else if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
             content_insert(&mut p.content, off, ch);
             self.caret.offset += 1;
             let path = self.caret.path.clone();
             self.settle_inserted(&path, off, 1);
-            if let Some(StepName::Typing(text)) = self.undo.last_mut().map(|s| &mut s.name) {
-                text.push(ch);
-            }
+        } else {
+            return;
         }
+        if let Some(StepName::Typing(text)) = self.undo.back_mut().map(|s| &mut s.name) {
+            text.push(ch);
+        }
+    }
+
+    /// Shift+Enter: a manual line break at the caret. Typed as Word types it,
+    /// inside the typing step around it (#853), so one Undo takes back the
+    /// text before and after it with it.
+    pub fn insert_line_break(&mut self) {
+        self.insert_char(LINE_BREAK);
     }
 
     pub fn insert_str(&mut self, s: &str) {
@@ -1200,10 +1308,12 @@ impl Editor {
         let Some((mut lo, hi)) = self.selection_range() else {
             return false;
         };
-        self.anchor = None;
+        // The anchor goes after the checkpoint, so that undoing the delete
+        // selects the text again, as in Word (#853).
 
         if lo.path == hi.path {
             self.checkpoint(EditKind::Structural);
+            self.anchor = None;
             for _ in lo.offset..hi.offset {
                 self.delete_char_at(&lo.path, lo.offset);
             }
@@ -1215,11 +1325,13 @@ impl Editor {
         let same_container = lo.path.len() == hi.path.len()
             && lo.path[..lo.path.len() - 1] == hi.path[..hi.path.len() - 1];
         if !same_container {
+            self.anchor = None;
             self.caret = lo; // cross-container: collapse (rare)
             return false;
         }
 
         self.checkpoint(EditKind::Structural);
+        self.anchor = None;
         // Tracked: the text of each paragraph is recorded as deleted and the
         // paragraph marks stay (see the `track` module).
         if self.delete_text_across_paragraphs(&lo, &hi) {
@@ -4959,12 +5071,233 @@ mod tests {
     fn undo_cap_drops_the_oldest_name_with_its_step() {
         let mut ed = Editor::new(doc(&[""]));
         ed.insert_str("first");
-        for _ in 0..UNDO_CAP {
-            ed.insert_newline();
+        ed.break_undo_group();
+        // Two steps a round in one short paragraph, so the cap is cheap to
+        // reach: a typed character and the Backspace that takes it away.
+        for _ in 0..UNDO_CAP / 2 {
+            ed.insert_char('x');
+            ed.backspace();
         }
         let names = ed.undo_names();
         assert_eq!(names.len(), UNDO_CAP);
-        assert!(names.iter().all(|n| n == "Edit"), "the typing step is gone");
+        assert_eq!(names.last().map(String::as_str), Some("Typing \"x\""));
+        assert!(
+            !names.iter().any(|n| n == "Typing \"first\""),
+            "the typing step is gone"
+        );
+    }
+
+    /// The text of the caret's paragraph after each of `n` undos.
+    fn texts_after_undos(ed: &mut Editor, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|_| {
+                assert!(ed.undo());
+                ed.cur_text()
+            })
+            .collect()
+    }
+
+    /// #853: a typing step holds at most 128 characters, as in Word: 300
+    /// typed characters are three steps, the newest holding the last 44.
+    #[test]
+    fn a_typing_step_holds_at_most_128_characters_853() {
+        let mut ed = Editor::new(doc(&[""]));
+        let typed: String = ('a'..='z').cycle().take(300).collect();
+        ed.insert_str(&typed);
+        let names = ed.undo_names();
+        assert_eq!(names.len(), 3);
+        assert!(names.iter().all(|n| n.starts_with("Typing")));
+        assert_eq!(ed.last_typed().map(|t| t.chars().count()), Some(44));
+        let lens: Vec<usize> = texts_after_undos(&mut ed, 3)
+            .iter()
+            .map(|t| t.chars().count())
+            .collect();
+        assert_eq!(lens, vec![256, 128, 0]);
+        assert_eq!(top_text(&ed), vec![""]);
+        assert!(!ed.undo());
+    }
+
+    /// #853: each Backspace is an undo step of its own.
+    #[test]
+    fn each_backspace_is_one_undo_step_853() {
+        let mut ed = Editor::new(doc(&["Hello world"]));
+        ed.caret.offset = 11;
+        for _ in 0..3 {
+            ed.backspace();
+        }
+        assert_eq!(top_text(&ed), vec!["Hello wo"]);
+        assert_eq!(ed.undo_names(), vec!["Delete"; 3]);
+        assert_eq!(
+            texts_after_undos(&mut ed, 3),
+            vec!["Hello wor", "Hello worl", "Hello world"]
+        );
+        assert!(!ed.undo());
+    }
+
+    /// #853: each Delete is an undo step of its own.
+    #[test]
+    fn each_delete_is_one_undo_step_853() {
+        let mut ed = Editor::new(doc(&["Hello world"]));
+        for _ in 0..3 {
+            ed.delete_forward();
+        }
+        assert_eq!(top_text(&ed), vec!["lo world"]);
+        assert_eq!(
+            texts_after_undos(&mut ed, 3),
+            vec!["llo world", "ello world", "Hello world"]
+        );
+        assert!(!ed.undo());
+    }
+
+    /// #853: Word's sequence: typing, two Backspaces, typing are four steps.
+    #[test]
+    fn backspaces_between_typing_are_steps_of_their_own_853() {
+        let mut ed = Editor::new(doc(&[""]));
+        ed.insert_str("Abcdef");
+        ed.backspace();
+        ed.backspace();
+        ed.insert_str("gh");
+        assert_eq!(top_text(&ed), vec!["Abcdgh"]);
+        assert_eq!(
+            texts_after_undos(&mut ed, 4),
+            vec!["Abcd", "Abcde", "Abcdef", ""]
+        );
+        assert!(!ed.undo());
+    }
+
+    /// #853: a line break typed with the text around it is part of its
+    /// typing step, so one Undo empties the paragraph.
+    #[test]
+    fn a_line_break_stays_inside_the_typing_step_853() {
+        let mut ed = Editor::new(doc(&[""]));
+        ed.insert_str("Six");
+        ed.insert_line_break();
+        ed.insert_str("Seven eight");
+        assert_eq!(ed.doc.body.len(), 1, "a line break, not a paragraph");
+        let Some(Block::Paragraph(p)) = ed.doc.body.first() else {
+            panic!("a paragraph");
+        };
+        assert!(matches!(p.content[1], Inline::Break(BreakKind::Line, _)));
+        assert_eq!(ed.undo_names(), vec!["Typing \"Six\u{21b5}Seven eight\""]);
+        assert_eq!(ed.last_typed(), Some("Six\u{000b}Seven eight"));
+        assert!(ed.undo());
+        assert_eq!(top_text(&ed), vec![""]);
+        assert!(!ed.undo());
+    }
+
+    /// #853: typing the recorded text again (Repeat) types the line break
+    /// as a line break, not a new paragraph.
+    #[test]
+    fn a_recorded_line_break_types_again_as_a_line_break_853() {
+        let mut ed = Editor::new(doc(&[""]));
+        ed.insert_line_break();
+        ed.insert_str("a");
+        let typed = ed.last_typed().unwrap().to_owned();
+        ed.break_undo_group();
+        ed.insert_str(&typed);
+        assert_eq!(ed.doc.body.len(), 1);
+        let Some(Block::Paragraph(p)) = ed.doc.body.first() else {
+            panic!("a paragraph");
+        };
+        let breaks = p
+            .content
+            .iter()
+            .filter(|i| matches!(i, Inline::Break(BreakKind::Line, _)))
+            .count();
+        assert_eq!(breaks, 2);
+    }
+
+    /// #853: undoing a deleted selection selects the text again.
+    #[test]
+    fn undoing_a_deleted_selection_selects_it_again_853() {
+        let mut ed = Editor::new(doc(&["Hello world"]));
+        ed.anchor = Some(Caret::at(vec![0], 6));
+        ed.caret = Caret::at(vec![0], 11);
+        ed.backspace();
+        assert_eq!(top_text(&ed), vec!["Hello "]);
+        assert_eq!(ed.anchor, None);
+        assert!(ed.undo());
+        assert_eq!(top_text(&ed), vec!["Hello world"]);
+        assert_eq!(ed.anchor, Some(Caret::at(vec![0], 6)));
+        assert_eq!(ed.caret, Caret::at(vec![0], 11));
+        // Redo deletes it again, leaving no selection.
+        assert!(ed.redo());
+        assert_eq!(top_text(&ed), vec!["Hello "]);
+        assert_eq!(ed.anchor, None);
+    }
+
+    /// #853: so does undoing typing over a selection, and across paragraphs.
+    #[test]
+    fn undoing_typing_over_a_selection_selects_it_again_853() {
+        let mut ed = Editor::new(doc(&["Hello world"]));
+        ed.anchor = Some(Caret::at(vec![0], 6));
+        ed.caret = Caret::at(vec![0], 11);
+        ed.insert_str("rust");
+        assert!(ed.undo());
+        assert_eq!(top_text(&ed), vec!["Hello world"]);
+        assert_eq!(ed.anchor, Some(Caret::at(vec![0], 6)));
+        assert_eq!(ed.caret, Caret::at(vec![0], 11));
+
+        let mut ed = Editor::new(doc(&["one", "two"]));
+        ed.anchor = Some(Caret::at(vec![0], 1));
+        ed.caret = Caret::at(vec![1], 2);
+        ed.delete_forward();
+        assert_eq!(top_text(&ed), vec!["oo"]);
+        assert!(ed.undo());
+        assert_eq!(top_text(&ed), vec!["one", "two"]);
+        assert_eq!(ed.anchor, Some(Caret::at(vec![0], 1)));
+        assert_eq!(ed.caret, Caret::at(vec![1], 2));
+    }
+
+    /// #853: the history reaches back past 500 steps: 2,000 Enters undo.
+    #[test]
+    fn two_thousand_enters_all_undo_853() {
+        let mut ed = Editor::new(doc(&[""]));
+        for _ in 0..2000 {
+            ed.insert_newline();
+        }
+        assert_eq!(ed.doc.body.len(), 2001);
+        assert_eq!(ed.undo_names().len(), 2000);
+        for _ in 0..2000 {
+            assert!(ed.undo());
+        }
+        assert_eq!(top_text(&ed), vec![""]);
+        assert!(!ed.undo());
+    }
+
+    /// #853: an undo step shares the blocks it did not change with its
+    /// neighbours, so a long history of small edits stays small.
+    #[test]
+    fn undo_steps_share_the_blocks_they_did_not_change_853() {
+        let texts: Vec<String> = (0..1000).map(|i| format!("paragraph {i}")).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut ed = Editor::new(doc(&refs));
+        for i in 0..3 {
+            ed.caret = Caret::at(vec![500], 0);
+            ed.insert_char('x');
+            ed.caret = Caret::at(vec![500 + i], 0);
+            ed.insert_newline();
+        }
+        assert_eq!(ed.undo.len(), 6);
+        // The first paragraph and the last are unchanged in every step:
+        // each step holds the same block.
+        for at in [0, 999] {
+            let first = &ed.undo[0].body;
+            let index = if at == 0 { 0 } else { first.len() - 1 };
+            let block = &first[index];
+            assert_eq!(Arc::strong_count(block), 6, "block {at}: one copy");
+            for step in &ed.undo {
+                let i = if at == 0 { 0 } else { step.body.len() - 1 };
+                assert!(Arc::ptr_eq(&step.body[i], block));
+            }
+        }
+        // Undo and redo keep sharing and restore the document exactly.
+        let full = ed.doc.clone();
+        while ed.undo() {}
+        assert_eq!(top_text(&ed), texts);
+        assert!(Arc::ptr_eq(&ed.redo[0].body[0], &ed.redo[5].body[0]));
+        while ed.redo() {}
+        assert_eq!(ed.doc, full);
     }
 
     #[test]
