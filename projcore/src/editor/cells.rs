@@ -359,15 +359,9 @@ impl Editor {
                 None => None,
             };
             if let Some(u) = units {
-                let span = match kind(a.resource_uid) {
-                    // A flat work resource works from its delay, as `rescale_work`;
-                    // a contoured one, and a material or cost, stage the duration.
-                    Some(ResourceType::Work) | None if matches!(a.work_contour, None | Some(0)) => {
-                        (duration - a.delay_min()).max(0)
-                    }
-                    _ => duration,
-                };
-                a.set_units(u, staged_work(kind(a.resource_uid), span, u, raw)?);
+                let kind = kind(a.resource_uid);
+                let work = staged_work(kind, units_span(kind, a, duration), u, raw)?;
+                a.set_units(u, work);
                 changed = true;
             }
         }

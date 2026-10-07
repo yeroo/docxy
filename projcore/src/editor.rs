@@ -1150,15 +1150,7 @@ impl Editor {
             };
             let u = checked_units(u, name)?;
             let mut assignments = self.proj.assignments.clone();
-            let span = match kind {
-                Some(ResourceType::Work) | None
-                    if matches!(assignments[k].work_contour, None | Some(0)) =>
-                {
-                    // A flat work resource works from its delay, as `rescale_work`.
-                    (duration - assignments[k].delay_min()).max(0)
-                }
-                _ => duration,
-            };
+            let span = units_span(kind, &assignments[k], duration);
             assignments[k].set_units(u, staged_work(kind, span, u, name)?);
             self.commit_assignments(i, resources, assignments)?;
             return Ok(AssignOutcome::Assigned);
@@ -1557,19 +1549,34 @@ fn checked_units(units: f64, token: &str) -> Result<f64, String> {
 /// `work / units + delay` and the stored tenths stay representable.
 pub(crate) const MAX_MINUTES: i64 = 2 * HORIZON_DAYS * 1440;
 
+/// The work `units` give over `span` minutes ([`assigned_work`]), or `None`
+/// when it would pass the scheduling range. The work saturates, so huge
+/// units give `None` too.
+fn bounded_work(kind: Option<ResourceType>, span: i64, units: f64) -> Option<i64> {
+    let work = assigned_work(kind, span.max(0), units);
+    (work <= MAX_MINUTES).then_some(work)
+}
+
 /// Staged work for `units` over `span` minutes, refused when it would pass
-/// the scheduling range. The work saturates, so huge units are refused too.
+/// the scheduling range.
 fn staged_work(
     kind: Option<ResourceType>,
     span: i64,
     units: f64,
     token: &str,
 ) -> Result<i64, String> {
-    let work = assigned_work(kind, span.max(0), units);
-    if work > MAX_MINUTES {
-        Err(format!("Invalid units in '{}'", token.trim()))
-    } else {
-        Ok(work)
+    bounded_work(kind, span, units).ok_or_else(|| format!("Invalid units in '{}'", token.trim()))
+}
+
+/// The minutes an assignment on a task of `duration` stages its units' work
+/// over: a flat work resource works from its delay, as `rescale_work`; a
+/// contoured one, and a material or cost, span the duration.
+fn units_span(kind: Option<ResourceType>, a: &Assignment, duration: i64) -> i64 {
+    match kind {
+        Some(ResourceType::Work) | None if matches!(a.work_contour, None | Some(0)) => {
+            (duration - a.delay_min()).max(0)
+        }
+        _ => duration,
     }
 }
 

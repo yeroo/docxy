@@ -67,12 +67,7 @@ fn checked_minutes(what: &str, min: i64) -> Result<i64, String> {
 /// when it would pass the scheduling horizon. The work saturates, so huge
 /// units are refused too.
 fn units_work(kind: Option<ResourceType>, span: i64, units: f64) -> Result<i64, String> {
-    let work = assigned_work(kind, span.max(0), units);
-    if work > MAX_MINUTES {
-        Err("units are beyond the scheduling range".into())
-    } else {
-        Ok(work)
-    }
+    bounded_work(kind, span, units).ok_or_else(|| "units are beyond the scheduling range".into())
 }
 
 /// Refuse units or work a resource of this kind does not take: a cost
