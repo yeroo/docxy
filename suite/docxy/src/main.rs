@@ -3280,9 +3280,13 @@ impl SheetView {
     /// Excel's one Redo/Repeat command, on F4 and Ctrl+Y alike (#859): a
     /// pending redo is redone (its snapshot selects what it redoes), and with
     /// nothing to redo the last format is repeated when `may_repeat` (not on
-    /// a protected sheet, not in the cell editor). False when nothing changed.
+    /// a protected sheet). In the cell editor it does nothing, as Excel greys
+    /// it there: a redo would restore over the typed entry and drop it. False
+    /// when nothing changed.
     fn redo_or_repeat(&mut self, may_repeat: bool) -> bool {
-        if !self.redo.is_empty() {
+        if self.editing.is_some() {
+            false
+        } else if !self.redo.is_empty() {
             self.redo_step()
         } else {
             may_repeat && self.repeat_format()
@@ -14217,16 +14221,24 @@ impl Docxy {
     }
 
     /// F4 and Ctrl+Y: redo, or repeat the last format with nothing to redo
-    /// ([`SheetView::redo_or_repeat`]). Only a redo moves the chart list, so
-    /// only a redo drops the chart selection.
+    /// ([`SheetView::redo_or_repeat`]). A redo moves the chart list, so it
+    /// drops the chart selection; a repeat writes to the cell selection, so
+    /// it takes the selection back from a chart first, as Ctrl+B does (see
+    /// `chart_hand_back`).
     fn sheet_redo_or_repeat(&mut self, cx: &mut Context<Self>) {
         let may_repeat = !self.sheet_protected();
-        let mut had_redo = false;
-        let changed = self.active_sheet_mut().is_some_and(|v| {
-            had_redo = !v.redo.is_empty();
-            let may_repeat = may_repeat && v.editing.is_none();
-            v.redo_or_repeat(may_repeat)
+        let (had_redo, repeats) = self.active_sheet().map_or((false, false), |v| {
+            let idle = v.editing.is_none();
+            let had_redo = idle && !v.redo.is_empty();
+            let repeats = idle && !had_redo && may_repeat && v.last_format.is_some();
+            (had_redo, repeats)
         });
+        if repeats {
+            self.chart_hand_back(cx);
+        }
+        let changed = self
+            .active_sheet_mut()
+            .is_some_and(|v| v.redo_or_repeat(may_repeat));
         if changed {
             if had_redo {
                 self.chart_drop_selection();
@@ -17127,9 +17139,11 @@ impl Docxy {
             }
             // The Ctrl keys that act on the CELLS take the selection back
             // first, for the same reason the arrows do — see `chart_hand_back`.
-            // Undo and redo are absent because they drop the chart selection
-            // themselves (the chart list moves under them); the rest of the
-            // block acts on the document or the window, not on the selection.
+            // Undo and Redo/Repeat are absent: an undo or a redo drops the
+            // chart selection itself (the chart list moves under it), and a
+            // repeat hands the selection back in `sheet_redo_or_repeat`. The
+            // rest of the block acts on the document or the window, not on
+            // the selection.
             if matches!(key, "c" | "x" | "v" | "a" | "b" | "i")
                 || (shift && matches!(key, "p" | "k"))
             {
@@ -17151,7 +17165,7 @@ impl Docxy {
                 "v" => return self.run_sheet_act(SheetAct::Paste, window, cx),
                 "z" => self.sheet_undo(cx),
                 // Redo, or Repeat with nothing to redo, as F4 (#859). In the
-                // editor a pending redo is still redone; nothing is repeated.
+                // editor it does nothing: the entry is never touched.
                 "y" => self.sheet_redo_or_repeat(cx),
                 "b" => return self.run_sheet_act(SheetAct::Bold, window, cx),
                 "i" => return self.run_sheet_act(SheetAct::Italic, window, cx),

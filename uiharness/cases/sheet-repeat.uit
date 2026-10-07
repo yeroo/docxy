@@ -81,6 +81,34 @@ test ctrl y while typing repeats nothing
   call ribbon-read {}
   assert reply.tabs.1.groups.1.commands.4.checked is false
 
+test ctrl y while typing keeps the entry over a pending redo
+  open copy:../fixtures/basic.xlsx
+  click A1
+  key ctrl+b
+  key ctrl+z
+  click E5
+  type hello
+  key ctrl+y
+  assert editing is true
+  assert edit is hello
+  key escape
+  click A1
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.4.checked is false
+
+test a repeat takes the selection back from a chart
+  open copy:../fixtures/basic.xlsx
+  click A1
+  key ctrl+b
+  click E5
+  select chart 0
+  assert chart_sel is 0
+  key ctrl+y
+  assert chart_sel is nothing
+  assert sel is E5
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.4.checked is true
+
 test a protected sheet repeats nothing
   open copy:../fixtures/basic.xlsx
   click A1

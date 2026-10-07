@@ -972,6 +972,21 @@ fn without_may_repeat_only_a_pending_redo_runs() {
 }
 
 #[test]
+fn redo_or_repeat_in_the_cell_editor_keeps_the_entry() {
+    // Excel greys Redo/Repeat while editing: a pending redo would restore
+    // over the typed entry and drop it.
+    let mut v = view();
+    bold_selection(&mut v);
+    assert!(v.undo_step());
+    select(&mut v, 4, 4);
+    type_fresh(&mut v, "hello");
+    assert!(!v.redo_or_repeat(true));
+    assert_eq!(v.editing.as_deref(), Some("hello"));
+    assert!(!xf(&v, 0, 0).bold);
+    assert_eq!(v.redo.len(), 1);
+}
+
+#[test]
 fn typing_leaves_the_last_format_to_repeat() {
     let mut v = view();
     bold_selection(&mut v);
