@@ -221,6 +221,32 @@ mod tests {
         std::fs::remove_dir(dir).unwrap();
     }
 
+    /// A save clears undo and redo, as in Project; a failed one keeps both
+    /// (#863).
+    #[test]
+    fn save_clears_undo_and_redo_only_on_success() {
+        let dir =
+            std::env::temp_dir().join(format!("yppxy-control-history-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let save = |a: &mut App, name: &str| {
+            let path = dir.join(name).to_string_lossy().into_owned();
+            dispatch(a, "proj.save", &Json::obj(vec![("path", Json::Str(path))]))
+        };
+        let mut a = app();
+        a.ed.rename(1, "A").unwrap();
+        a.ed.rename(1, "B").unwrap();
+        a.undo();
+        assert_eq!((a.ed.undo_depth(), a.ed.redo_depth()), (1, 1));
+        assert!(save(&mut a, "plan.mpp").is_err());
+        assert_eq!((a.ed.undo_depth(), a.ed.redo_depth()), (1, 1));
+        save(&mut a, "saved.xml").unwrap();
+        assert_eq!((a.ed.undo_depth(), a.ed.redo_depth()), (0, 0));
+        a.undo();
+        a.redo();
+        assert_eq!(a.ed.project().tasks[0].name, "A");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn path_reports_project_shape() {
         let a = app();
