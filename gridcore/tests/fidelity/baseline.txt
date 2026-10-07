@@ -3,12 +3,6 @@
 # fails on a loss not listed here AND on a listed loss that no longer
 # reproduces. Regenerate with FIDELITY_UPDATE_BASELINE=1 (docs/fidelity-gate.md).
 
-# ZIP64 container is refused (XlsxError::CorruptPart); nothing is saved (#1094)
-ext:libreoffice/sc/qa/unit/data/xlsx/tdf82984_zip64XLSXImport.xlsx		load-error	
-
-# part names with backslash separators (xl\workbook.xml) are not found (XlsxError::MissingWorkbook); nothing is saved (#1095)
-ext:libreoffice/sc/qa/unit/data/xlsx/tdf76115.xlsx		load-error	
-
 # corrupt input (fuzzed: bad CRCs, an invalid deflate stream) is refused (by design: XlsxError::CorruptPart)
 ext:libreoffice/sc/qa/unit/data/xlsx/forcepoint107.xlsx		load-error	
 
@@ -3294,6 +3288,7 @@ ext:libreoffice/sc/qa/unit/data/xlsx/tdf167019.xlsx	xl/worksheets/sheet1.xml	cha
 ext:libreoffice/sc/qa/unit/data/xlsx/tdf169326_ignore_line_breaks_in_referenced_cells.xlsx	xl/worksheets/sheet1.xml	changed-value	/worksheet/dimension/@ref
 ext:libreoffice/sc/qa/unit/data/xlsx/tdf170298.xlsx	xl/worksheets/sheet1.xml	changed-value	/worksheet/dimension/@ref
 ext:libreoffice/sc/qa/unit/data/xlsx/tdf58243.xlsx	xl/worksheets/sheet1.xml	changed-value	/worksheet/dimension/@ref
+ext:libreoffice/sc/qa/unit/data/xlsx/tdf82984_zip64XLSXImport.xlsx	xl/worksheets/sheet1.xml	changed-value	/worksheet/dimension/@ref
 ext:libreoffice/sc/qa/unit/data/xlsx/tdf83671_SmartArt_import.xlsx	xl/worksheets/sheet1.xml	changed-value	/worksheet/dimension/@ref
 ext:libreoffice/sc/qa/unit/data/xlsx/tdf91332.xlsx	xl/worksheets/sheet1.xml	changed-value	/worksheet/dimension/@ref
 ext:libreoffice/sc/qa/unit/data/xlsx/tdfSheetProts.xlsx	xl/worksheets/sheet2.xml	changed-value	/worksheet/dimension/@ref
@@ -3406,4 +3401,5 @@ ext:libreoffice/sc/qa/unit/data/xlsx/escape-unicode.xlsx	xl/sharedStrings.xml	pa
 ext:libreoffice/sc/qa/unit/data/xlsx/tdf121887.xlsx	xl/worksheets/sheet.xml	extra-attr	/worksheet/sheetData/row/@r
 ext:libreoffice/sc/qa/unit/data/xlsx/tdf122336.xlsx	xl/sharedStrings.xml	part-extra	
 ext:libreoffice/sc/qa/unit/data/xlsx/tdf167689_xmlMaps_and_xmlColumnPr.xlsx	xl/sharedStrings.xml	part-extra	
+ext:libreoffice/sc/qa/unit/data/xlsx/tdf76115.xlsx	xl/sharedStrings.xml	part-extra	
 repo:corpus/xlsx/oracle-basic.xlsx	xl/sharedStrings.xml	part-extra	

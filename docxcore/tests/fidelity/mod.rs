@@ -307,10 +307,15 @@ fn finish(mut b: Building) -> Elem {
 /// Line ends normalize to LF first, as an XML processor's do.
 pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let text = std::str::from_utf8(bytes)
-        .ok()?
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    // A document declaring ISO-8859-1 is read by its declaration, as the
+    // xlsx loaders read it (#1108).
+    let latin1 = opccore::xml::latin1_to_utf8(bytes);
+    let text = match &latin1 {
+        Some(text) => text.as_str(),
+        None => std::str::from_utf8(bytes).ok()?,
+    }
+    .replace("\r\n", "\n")
+    .replace('\r', "\n");
     let mut parser = XmlParser::new(&text);
     let mut stack: Vec<Building> = Vec::new();
     let mut root = None;

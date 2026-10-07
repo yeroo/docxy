@@ -313,7 +313,11 @@ cargo test -p gridcore --test fidelity -- --nocapture
   from a loss. Examples: `0.14000000000000001` written `0.14`; an inline string
   moved to the shared strings; a shared formula expanded per cell; a dropped
   `<c r="B2"/>`; `customWidth="true"` written `1`. So each worksheet is also
-  read the way a spreadsheet reads it.
+  read the way a spreadsheet reads it. A worksheet is any part under
+  `xl/worksheets/` or one the workbook's worksheet relationships name. Parts
+  are keyed by their OPC name (an entry written `xl\sheet1.xml` is
+  `xl/sheet1.xml`), and a part declaring ISO-8859-1 is read by its
+  declaration, as the loaders read it (#1108).
 
   **Per cell** either side lists, it compares three things:
   - the **value**. Shared strings are found through the workbook's
