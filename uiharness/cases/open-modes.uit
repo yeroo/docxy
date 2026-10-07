@@ -88,7 +88,7 @@ test open and repair of a sound workbook finds nothing to repair
 
 test open refuses an unknown mode and enable-editing outside Protected View
   open copy:../fixtures/basic.xlsx
-  call-error open {"path":"basic.xlsx","mode":"readonly"} => 'mode' must be normal, read-only, copy or repair
+  call-error open {"path":"basic.xlsx","mode":"readonly"} => 'mode' must be normal, read-only, copy, repair or recover-text
   call-error enable-editing {} => the active tab is not in Protected View
   assert protected is false
 
