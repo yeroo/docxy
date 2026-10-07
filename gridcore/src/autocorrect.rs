@@ -354,9 +354,11 @@ impl AutoCorrect {
         self.entries.values().cloned().collect()
     }
 
-    /// The With for a typed token, in the case it was typed in, while
-    /// Replace text as you type is on: what the Word editors' AutoCorrect
-    /// reads (#856), which applies its own word rules around it.
+    /// The With for a typed token, in the case it was typed in: the replace
+    /// list's while Replace text as you type is on, then Math AutoCorrect's
+    /// while Use Math AutoCorrect rules outside of math regions is on
+    /// (whatever Replace text is set to). What the Word editors'
+    /// AutoCorrect reads (#856), which applies its own word rules around it.
     pub fn replacement(&self, token: &str) -> Option<String> {
         self.replace_one(token)
     }

@@ -6,7 +6,7 @@ use super::{EditKind, Editor, editor_text, inline_len, para_mut, resolve_para};
 use crate::autocorrect::{
     AUTOFORMAT, AutoCorrectOptions, Fix, ListKind, WordFixes, auto_list, fixes_for,
 };
-use crate::model::Inline;
+use crate::model::{Inline, Run, RunProps};
 
 impl Editor {
     /// Type `ch` from the keyboard, then make the corrections it triggers
@@ -49,12 +49,24 @@ impl Editor {
             let Some(num_id) = list(kind) else {
                 return 0;
             };
+            // The item's text goes on in the typing's formatting (Bold on,
+            // `1. `: the item is bold), held by an empty run where the
+            // text was, which the next character typed joins.
+            let (at, props) = first_run(&p.content);
             self.one_step(AUTOFORMAT, |ed| {
                 ed.checkpoint(EditKind::Structural);
                 ed.replace_text_range(&path, 0, text.len(), "");
                 if let Some(p) = para_mut(&mut ed.doc.body, &path) {
                     p.props.num_id = Some(num_id);
                     p.props.ilvl = 0;
+                    let at = at.min(p.content.len());
+                    p.content.insert(
+                        at,
+                        Inline::Run(Run {
+                            text: String::new(),
+                            props,
+                        }),
+                    );
                 }
                 ed.caret.offset = 0;
             });
@@ -93,6 +105,18 @@ impl Editor {
     }
 }
 
+/// Where the first run of `content` is, and its formatting.
+fn first_run(content: &[Inline]) -> (usize, RunProps) {
+    content
+        .iter()
+        .enumerate()
+        .find_map(|(i, inline)| match inline {
+            Inline::Run(r) => Some((i, r.props.clone())),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// Whether editor offsets `start..end` of `content` are all text of plain,
 /// unrecorded runs, with nothing zero-width (a tracked deletion, a bookmark)
 /// between them.
@@ -122,7 +146,9 @@ mod tests {
     use super::super::{Caret, FIELD_CHAR, TrackAuthor};
     use super::*;
     use crate::autocorrect::{AUTOCORRECT, BuiltinFixes};
-    use crate::model::{Block, Document, Hyperlink, ParProps, Paragraph, Run, RunProps};
+    use crate::model::{
+        Block, Document, Hyperlink, ParProps, Paragraph, RevisionKind, RevisionMetadata,
+    };
 
     fn editor(content: Vec<Inline>) -> Editor {
         let len = content.iter().map(inline_len).sum();
@@ -256,6 +282,43 @@ mod tests {
     }
 
     #[test]
+    fn an_automatic_list_keeps_the_typing_formatting_856() {
+        let mut ed = empty();
+        ed.toggle_bold();
+        type_keys(&mut ed, "1. Item");
+        assert_eq!(para(&ed).props.num_id, Some(2));
+        assert_eq!(text(&ed), "Item");
+        let bold: Vec<_> = para(&ed)
+            .content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) if !r.text.is_empty() => Some((r.text.as_str(), r.props.bold)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bold, [("Item", true)]);
+    }
+
+    #[test]
+    fn a_with_holding_a_field_stand_in_keeps_the_caret_in_step_856() {
+        struct FieldWith;
+        impl WordFixes for FieldWith {
+            fn replacement(&self, token: &str) -> Option<String> {
+                (token == "xx").then(|| format!("{FIELD_CHAR}ab"))
+            }
+            fn first_letter_exception(&self, _: &str) -> bool {
+                false
+            }
+        }
+        let mut ed = empty();
+        for ch in "xx ".chars() {
+            ed.type_autocorrected(ch, &AutoCorrectOptions::default(), &FieldWith, &mut lists);
+        }
+        assert_eq!(text(&ed), "Ab ");
+        assert_eq!(ed.caret.offset, 3);
+    }
+
+    #[test]
     fn a_declined_list_leaves_the_typing_856() {
         let mut ed = empty();
         for ch in "1. ".chars() {
@@ -307,12 +370,13 @@ mod tests {
         // The space after it is plain typing again, and corrects.
         type_keys(&mut ed, " ");
         assert_eq!(text(&ed), "Then the ");
-        let mut ed = editor(vec![run("Then teh")]);
-        ed.anchor = Some(Caret::at(vec![0], 8));
-        ed.caret = Caret::at(vec![0], 4);
-        // A space over ` teh` corrects nothing.
+        // A space over the `x` of `tehx` would end `teh` where the caret
+        // lands, but typing over a selection corrects nothing.
+        let mut ed = editor(vec![run("tehx")]);
+        ed.anchor = Some(Caret::at(vec![0], 4));
+        ed.caret = Caret::at(vec![0], 3);
         type_keys(&mut ed, " ");
-        assert_eq!(text(&ed), "Then ");
+        assert_eq!(text(&ed), "teh ");
     }
 
     #[test]
@@ -324,6 +388,25 @@ mod tests {
         }));
         type_keys(&mut ed, "teh \"x\" 1. ");
         assert_eq!(text(&ed), "teh \"x\" 1. ");
+        // Text that was there before is not replaced as a tracked change
+        // either: only the typed space is recorded.
+        let mut ed = editor(vec![run("teh")]);
+        ed.set_track_changes(Some(TrackAuthor {
+            author: "A".into(),
+            clock: || "2026-10-07T00:00:00Z".into(),
+        }));
+        type_keys(&mut ed, " ");
+        assert_eq!(text(&ed), "teh ");
+        let recorded: Vec<_> = para(&ed)
+            .content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some((r.text.as_str(), r.props.tracked_insert.is_some())),
+                Inline::Revision { .. } => Some(("<revision>", true)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded, [("teh", false), (" ", true)]);
     }
 
     #[test]
@@ -389,14 +472,20 @@ mod tests {
     }
 
     #[test]
-    fn a_word_across_a_field_or_in_a_link_is_left_alone_856() {
-        let field = Inline::Field {
-            raw: "<w:fldSimple/>".into(),
-            text: "1".into(),
+    fn a_word_across_a_tracked_change_or_in_a_link_is_left_alone_856() {
+        // `te`, a tracked deletion (zero-width in the editor), `h`: the
+        // editor reads `teh`, which is not one plain word.
+        let deleted = Inline::Revision {
+            kind: RevisionKind::Delete,
+            metadata: RevisionMetadata::default(),
+            raw: String::new(),
+            content: vec![run("x")],
+            content_changed: false,
         };
-        let mut ed = editor(vec![run("So te"), field, run("h")]);
+        let mut ed = editor(vec![run("So te"), deleted, run("h")]);
         type_keys(&mut ed, " ");
-        assert_eq!(text(&ed), format!("So te{FIELD_CHAR}h "));
+        assert_eq!(text(&ed), "So teh ");
+        assert_eq!(ed.undo_names().len(), 1, "the typing only");
         let link = Inline::Hyperlink(Hyperlink {
             target: Some("https://example.com".into()),
             runs: vec![Run {

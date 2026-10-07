@@ -22957,8 +22957,10 @@ fn break_typing_unless_continuing(ed: &mut Editor, rec: &Option<RepeatRecord>) {
 
 /// A typed key's text, into the typing step it continues: what Repeat
 /// records for it. One character is typed with the app's AutoCorrect (#856),
-/// whose corrections are steps of their own after the typing; a longer
-/// commit (an IME's composed text) goes in as typed.
+/// whose corrections are steps of their own after the typing. An IME's
+/// composed text arrives one key per character (`text_input::char_stroke`),
+/// so it is corrected too; only a key event whose `key_char` holds several
+/// characters goes in as typed.
 fn type_key_text(
     ed: &mut Editor,
     rec: &Option<RepeatRecord>,

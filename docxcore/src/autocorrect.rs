@@ -195,8 +195,11 @@ pub fn fixes_for(
             return out;
         }
     }
-    // The word before the ender, which stays at `end` until a fix moves it.
+    // The word before the ender: it starts at `start` and ends at `end`
+    // until a fix moves its end (`alot` → `a lot` is still one word for the
+    // capital after it).
     let mut end = caret - 1;
+    let start = token_start(&text, end);
     if let Some(fix) = dash_fix(&text, end, opts) {
         end = end + fix.with.chars().count() - (fix.end - fix.start);
         push(fix, &mut text);
@@ -206,7 +209,7 @@ pub fn fixes_for(
         push(fix, &mut text);
     }
     if ch.is_whitespace() {
-        if let Some(fix) = capital_fix(&text, end, opts, list) {
+        if let Some(fix) = capital_fix(&text, start, end, opts, list) {
             push(fix, &mut text);
         }
     }
@@ -230,6 +233,13 @@ pub fn auto_list(
         ['*', ' '] => Some(ListKind::Bullet),
         _ => None,
     }
+}
+
+/// A With as it can go into the text: a field's stand-in
+/// ([`crate::editor::FIELD_CHAR`]) is never inserted, so it is left out here
+/// too, and the fixes after it count the chars that really go in.
+fn insertable(with: String) -> String {
+    with.replace(crate::editor::FIELD_CHAR, "")
 }
 
 /// The start of the whitespace-delimited token that ends at `end`.
@@ -264,7 +274,7 @@ fn symbol_fix(
                 name: AUTOCORRECT,
                 start: s,
                 end: caret,
-                with,
+                with: insertable(with),
             })
         })
 }
@@ -306,7 +316,11 @@ fn replace_fix(
         return None;
     }
     let token: String = text[start..end].iter().collect();
-    if let Some(with) = list.replacement(&token).filter(|w| *w != token) {
+    if let Some(with) = list
+        .replacement(&token)
+        .map(insertable)
+        .filter(|w| *w != token)
+    {
         return Some(Fix {
             name: AUTOCORRECT,
             start,
@@ -320,6 +334,7 @@ fn replace_fix(
     }
     let word: String = text[a..b].iter().collect();
     list.replacement(&word)
+        .map(insertable)
         .filter(|w| *w != word)
         .map(|with| Fix {
             name: AUTOCORRECT,
@@ -333,6 +348,7 @@ fn replace_fix(
 /// after `.`, `!` or `?` that does not end a First Letter exception.
 fn capital_fix(
     text: &[char],
+    start: usize,
     end: usize,
     opts: &AutoCorrectOptions,
     list: &dyn WordFixes,
@@ -340,7 +356,6 @@ fn capital_fix(
     if !opts.capitalize_sentences {
         return None;
     }
-    let start = token_start(text, end);
     let (a, _) = core(text, start, end)?;
     let token: String = text[start..end].iter().collect();
     // An address is not a word: `www.x.com` stays as typed.
@@ -475,6 +490,40 @@ mod tests {
             fix.apply(&mut text);
         }
         assert_eq!(text.iter().collect::<String>(), "The ");
+    }
+
+    #[test]
+    fn a_capital_follows_a_replacement_of_several_words() {
+        let mut text: Vec<char> = "alot ".chars().collect();
+        let fixes = fixes_for(&text, 5, ' ', &AutoCorrectOptions::default(), &BuiltinFixes);
+        let names: Vec<_> = fixes.iter().map(|f| (f.name, f.with.as_str())).collect();
+        assert_eq!(names, [(AUTOCORRECT, "a lot"), (AUTOCORRECT, "A")]);
+        for fix in fixes {
+            fix.apply(&mut text);
+        }
+        assert_eq!(text.iter().collect::<String>(), "A lot ");
+        assert_eq!(typed("Yes. alot "), "Yes. A lot ");
+    }
+
+    /// A list whose one entry's With holds a field's stand-in.
+    struct FieldWith;
+
+    impl WordFixes for FieldWith {
+        fn replacement(&self, token: &str) -> Option<String> {
+            (token == "xx").then(|| format!("{}ab", crate::editor::FIELD_CHAR))
+        }
+
+        fn first_letter_exception(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_with_never_carries_a_field_stand_in() {
+        let text: Vec<char> = "xx ".chars().collect();
+        let fixes = fixes_for(&text, 3, ' ', &AutoCorrectOptions::default(), &FieldWith);
+        let withs: Vec<_> = fixes.iter().map(|f| f.with.as_str()).collect();
+        assert_eq!(withs, ["ab", "A"]);
     }
 
     #[test]
