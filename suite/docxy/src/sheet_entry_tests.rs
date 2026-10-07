@@ -956,7 +956,7 @@ fn redo_or_repeat_with_nothing_to_do_changes_nothing() {
 
 #[test]
 fn without_may_repeat_only_a_pending_redo_runs() {
-    // A protected sheet, or Ctrl+Y in the cell editor: no repeat.
+    // A protected sheet: no repeat.
     let mut v = view();
     bold_selection(&mut v);
     select(&mut v, 1, 2);
