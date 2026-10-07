@@ -324,15 +324,17 @@ pub(crate) fn heading_props(level: u8) -> ParProps {
     }
 }
 
-/// Whether a list marker as Word writes it (`1.`, `a)`, `iv.`) is a
-/// numbered one; anything else (`·`, `o`, `§`, `•`, U+F0B7) is a bullet.
+/// Whether a list marker as Word writes it (`1.`, `a)`, `iv.`, and a
+/// multilevel list's `1.2.`) is a numbered one; anything else (`·`, `o`,
+/// `§`, `•`, U+F0B7) is a bullet.
 pub(crate) fn marker_is_numbered(marker: &str) -> bool {
     let m = marker.trim();
     let Some(body) = m.strip_suffix('.').or_else(|| m.strip_suffix(')')) else {
         return false;
     };
     let body = body.strip_prefix('(').unwrap_or(body);
-    !body.is_empty() && body.chars().all(|c| c.is_alphanumeric())
+    body.split('.')
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_alphanumeric()))
 }
 
 /// Builds a [`Document`] from a stream of text, breaks, paragraph ends and
@@ -656,10 +658,22 @@ mod tests {
 
     #[test]
     fn list_markers_say_numbered_or_bullet() {
-        for m in ["1.", "12.", "a)", "(iv)", "B."] {
+        // A multilevel list's compound markers too (#635 FIX r1).
+        for m in ["1.", "12.", "a)", "(iv)", "B.", "1.1.", "2.3.4.", "1.a)"] {
             assert!(marker_is_numbered(m), "{m}");
         }
-        for m in ["\u{b7}", "o", "\u{a7}", "\u{2022}", "\u{f0b7}", "-", "."] {
+        for m in [
+            "\u{b7}",
+            "o",
+            "\u{a7}",
+            "\u{2022}",
+            "\u{f0b7}",
+            "-",
+            ".",
+            "1..",
+            ".1.",
+            "1.\u{2022}.",
+        ] {
             assert!(!marker_is_numbered(m), "{m}");
         }
     }

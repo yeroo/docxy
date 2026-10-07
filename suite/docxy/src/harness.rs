@@ -416,12 +416,18 @@ pub fn drag_args(args: &Json) -> Result<DragEnds, String> {
 }
 
 /// What a document refuses to be saved as.
-const DOC_SAVE_FORMATS: &str = "Documents can be saved as .docx, .md or .html";
+const DOC_SAVE_FORMATS: &str =
+    "Documents can be saved as .docx, .docm, .dotx, .dotm, .rtf, .txt, .md or .html";
 
 /// The extension `save-as` gives a path that has none, for a `format`.
 fn format_extension(format: &str) -> Option<&'static str> {
     Some(match format {
         "docx" => ".docx",
+        "docm" => ".docm",
+        "dotx" => ".dotx",
+        "dotm" => ".dotm",
+        "rtf" => ".rtf",
+        "txt" => ".txt",
         "md" => ".md",
         "html" => ".docx.html",
         "xlsx" => ".xlsx",
@@ -434,25 +440,20 @@ fn format_extension(format: &str) -> Option<&'static str> {
     })
 }
 
-/// The format a document path saves as, by the app's own rules
-/// (`is_markdown_path`, `htmlbundle::is_html_path`), or the refusal. Any other
-/// extension is refused: `save_doc_tab` would write a Word package under it.
+/// The format a document path saves as, by the app's own rule
+/// ([`crate::html_bundle::doc_target`], which `save_doc_tab` writes by), or
+/// the refusal. A name naming no format is refused: `save_doc_tab` refuses
+/// it too.
 fn doc_save_format(path: &Path, html_ok: bool) -> Result<&'static str, String> {
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase());
-    if crate::is_markdown_path(path) {
-        Ok("md")
-    } else if htmlbundle::is_html_path(&path.to_string_lossy()) {
-        if html_ok {
-            Ok("html")
-        } else {
-            Err("this build cannot write editable HTML (.html)".into())
-        }
-    } else if ext.as_deref() == Some("docx") {
-        Ok("docx")
-    } else {
-        Err(DOC_SAVE_FORMATS.into())
+    use crate::html_bundle::DocTarget;
+    match crate::html_bundle::doc_target(path, crate::is_markdown_path(path)) {
+        DocTarget::Markdown => Ok("md"),
+        DocTarget::Html if html_ok => Ok("html"),
+        DocTarget::Html => Err("this build cannot write editable HTML (.html)".into()),
+        DocTarget::Text => Ok("txt"),
+        DocTarget::Rtf => Ok("rtf"),
+        DocTarget::Docx(Some(kind)) => Ok(kind.extension()),
+        DocTarget::Docx(None) => Err(DOC_SAVE_FORMATS.into()),
     }
 }
 
@@ -492,7 +493,7 @@ fn save_as_target(
         .join(given)
     };
     let kind_formats: &[&str] = match kind {
-        Kind::Docx => &["docx", "md", "html"],
+        Kind::Docx => &["docx", "docm", "dotx", "dotm", "rtf", "txt", "md", "html"],
         Kind::Xlsx => &crate::SHEET_EXTENSIONS,
         Kind::Project => &["yppx", "xml"],
         Kind::Look => return Err("this tab cannot be saved as a file".into()),
@@ -1044,6 +1045,8 @@ fn backstage_layout_json(app: &crate::Docxy) -> Json {
     let rail = crate::BackstageLayout::read(&app.bs_rail_scroll);
     let page = if app.bs_account {
         "account"
+    } else if app.bs_export {
+        "export"
     } else if app.bs_new {
         "new"
     } else if app.bs_info {
@@ -2569,6 +2572,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "border-drag"
             | "fill-drag"
             | "save-as"
+            | "new-from-template"
             | "convert"
             | "mail-attach"
             | "select-chart"
@@ -3903,8 +3907,8 @@ fn dispatch_verb(
             done.input = wheel_events(p, dy);
             Ok(done)
         }
-        // Switch the File screen's page (#1028): `new` and `info` (a document
-        // tab only) call the rail's handler; `open` is a setup shortcut for
+        // Switch the File screen's page (#1028): `new`, `info` and `export`
+        // (a document tab only) and `account` call the rail's handler; `open` is a setup shortcut for
         // the default page, which the user reaches by closing and reopening
         // File (the rail's Open… opens a file picker).
         "backstage-page" => {
@@ -3921,8 +3925,14 @@ fn dispatch_verb(
                     app.backstage_rail_action(crate::BackstageRailAction::Info, window, cx)
                 }
                 "account" => app.open_account(cx),
+                "export" => {
+                    if !app.active_is_doc() {
+                        return Err("the Export page is for a document tab".into());
+                    }
+                    app.backstage_rail_action(crate::BackstageRailAction::ExportDoc, window, cx)
+                }
                 "open" => app.show_backstage_open_page(),
-                _ => return Err("'page' must be new, info, account or open".into()),
+                _ => return Err("'page' must be new, info, account, export or open".into()),
             }
             Done::ok(backstage_layout_json(app))
         }
@@ -4013,6 +4023,37 @@ fn dispatch_verb(
             ]))
         }
 
+        // File > New's Personal templates (#636): a new, untitled document
+        // from the template at `path`, as clicking it does.
+        "new-from-template" => {
+            app.refuse_under_dialog()?;
+            // A relative path resolves against the active file's folder, as
+            // `open`'s does; one with no folder is refused, never the CWD.
+            let raw = Path::new(arg_str(args, "path")?.trim());
+            let path = if raw.is_relative() {
+                app.tabs
+                    .get(app.active)
+                    .and_then(|t| t.path.as_deref())
+                    .and_then(Path::parent)
+                    .ok_or(
+                        "the active tab has never been saved, so a relative 'path' has no folder: give an absolute path",
+                    )?
+                    .join(raw)
+            } else {
+                raw.to_path_buf()
+            };
+            app.new_from_template(&path, window, cx)?;
+            let tab = &app.tabs[app.active];
+            Done::ok(Json::obj(vec![
+                (
+                    "path",
+                    str_or_null(tab.path.as_ref().map(|p| p.display().to_string())),
+                ),
+                ("title", Json::Str(tab.title.to_string())),
+                ("dirty", Json::Bool(tab.dirty)),
+                ("status", Json::Str(tab.status.to_string())),
+            ]))
+        }
         // Save As without the native dialog (#699), which a harness instance
         // must never open (its modal loop stops the control pump). The target
         // the dialog would have answered with goes to the same save functions
@@ -6354,8 +6395,30 @@ mod tests {
             ok(Kind::Docx, "out", Some("html")),
             Ok((at("out.docx.html"), "html"))
         );
+        // #635, #636: Plain Text, Rich Text and every Word type.
+        for (name, format) in [
+            ("out.txt", "txt"),
+            ("out.rtf", "rtf"),
+            ("out.dotx", "dotx"),
+            ("out.dotm", "dotm"),
+            ("out.docm", "docm"),
+        ] {
+            assert_eq!(ok(Kind::Docx, name, None), Ok((at(name), format)), "{name}");
+        }
+        for format in ["txt", "rtf", "dotx", "dotm", "docm"] {
+            let name = format!("out.{format}");
+            assert_eq!(
+                ok(Kind::Docx, "out", Some(format)),
+                Ok((at(&name), format)),
+                "{format}"
+            );
+        }
         assert_eq!(
-            ok(Kind::Docx, "out.txt", None),
+            ok(Kind::Docx, "out.rtf", Some("txt")),
+            Err("'format' txt does not match out.rtf, which saves as rtf".into())
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out.odt", None),
             Err(DOC_SAVE_FORMATS.into())
         );
         assert_eq!(

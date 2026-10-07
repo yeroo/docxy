@@ -281,6 +281,7 @@ pub(crate) fn docx_snapshot() -> Result<String, String> {
                     crate::BackstageRailAction::Save => "save",
                     crate::BackstageRailAction::SaveAs => "saveAs",
                     crate::BackstageRailAction::Export => "export",
+                    crate::BackstageRailAction::ExportDoc => "exportDoc",
                     crate::BackstageRailAction::Account => "account",
                     crate::BackstageRailAction::Close => "close",
                 },

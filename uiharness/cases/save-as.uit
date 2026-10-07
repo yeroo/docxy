@@ -19,9 +19,42 @@ test save-as gives a path with no extension the format's
   assert reply.title is report.docx
   assert reply.format is docx
 
+test save-as writes Plain Text and Rich Text and keeps writing them (#635)
+  open copy:../fixtures/basic.docx
+  type Hello
+  call save-as {"path":"notes.txt"}
+  assert reply.format is txt
+  assert reply.title is notes.txt
+  assert reply.dirty is false
+  assert title is notes.txt
+  type x
+  key ctrl+s
+  assert title is notes.txt
+  assert dirty is false
+  call save-as {"path":"notes","format":"rtf"}
+  assert reply.format is rtf
+  assert reply.title is notes.rtf
+  type y
+  key ctrl+s
+  assert title is notes.rtf
+  assert dirty is false
+
+test save-as writes the Word template types (#636)
+  open copy:../fixtures/basic.docx
+  call save-as {"path":"Letter.dotx"}
+  assert reply.format is dotx
+  assert reply.title is Letter.dotx
+  call save-as {"path":"Macros","format":"dotm"}
+  assert reply.format is dotm
+  assert reply.title is Macros.dotm
+  call save-as {"path":"Back","format":"docm"}
+  assert reply.format is docm
+  call-error save-as {"path":"Letter.rtf","format":"dotx"} => 'format' dotx does not match Letter.rtf, which saves as rtf
+
 test save-as refuses what the dialog would not write and leaves the tab alone
   open copy:../fixtures/basic.docx
-  call-error save-as {"path":"notes.txt"} => Documents can be saved as .docx, .md or .html
+  call-error save-as {"path":"notes.odt"} => Documents can be saved as .docx, .docm, .dotx, .dotm, .rtf, .txt, .md or .html
+  call-error save-as {"path":"notes","format":"pdf"} => Documents can be saved as .docx, .docm, .dotx, .dotm, .rtf, .txt, .md or .html
   call-error save-as {"path":"notes.md","format":"docx"} => does not match notes.md
   call-error save-as {"path":""} => non-empty 'path'
   call-error save-as {"path":"basic.docx"} => already exists; pass "overwrite": true

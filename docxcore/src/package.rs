@@ -21,6 +21,9 @@ use crate::zip::ZipArchive;
 use crate::zipwrite::write_zip;
 use std::borrow::Cow;
 
+mod doc_kind;
+pub use doc_kind::{DocKind, KindChange};
+
 const OLE2: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
 fn decode_xml_entities(s: &str) -> String {
@@ -3360,23 +3363,26 @@ fn next_rid(rels: &str) -> String {
 /// An attribute's value out of a raw tag body (`w:val="false"`), either quote
 /// style. `None` when the attribute isn't there.
 pub(crate) fn tag_attr(attrs: &str, name: &str) -> Option<String> {
-    let pat = format!("{name}=");
     let mut from = 0usize;
-    while let Some(rel) = attrs[from..].find(&pat) {
+    while let Some(rel) = attrs[from..].find(name) {
         let at = from + rel;
+        from = at + name.len();
         // `w:val=` must not be the tail of `w:someOtherVal=`.
         let ok = attrs[..at]
             .chars()
             .next_back()
             .is_none_or(|c| c.is_whitespace());
-        let rest = attrs[at + pat.len()..].trim_start();
+        // `name`, then `=` and the opening quote, with any space between.
+        let Some(rest) = attrs[from..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
         let q = rest.chars().next();
         if ok && matches!(q, Some('"') | Some('\'')) {
             let q = q.unwrap();
             let body = &rest[q.len_utf8()..];
             return body.find(q).map(|e| body[..e].to_string());
         }
-        from = at + pat.len();
     }
     None
 }
@@ -4044,17 +4050,37 @@ fn remove_tags_matching(xml: &str, name: &str, drop: impl Fn(&str) -> bool) -> S
 }
 
 /// `tag` (a start tag) with attribute `name` set to `value`, added before
-/// the closing `>` or `/>` when it is absent.
+/// the closing `>` or `/>` when it is absent. The attribute is found in
+/// either quote style (and not as the tail of a longer name), and its value
+/// is replaced between its own quotes, so `tag` keeps exactly one.
 fn set_attr_value(tag: &str, name: &str, value: &str) -> String {
-    let key = format!("{name}=\"");
-    if let Some(i) = tag.find(&key) {
-        let v = i + key.len();
-        if let Some(e) = tag[v..].find('"') {
+    let mut from = 0usize;
+    while let Some(rel) = tag[from..].find(name) {
+        let at = from + rel;
+        from = at + name.len();
+        let whole_name = tag[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace());
+        // `name`, then `=` and the opening quote, with any space between.
+        let rest = tag[from..].trim_start();
+        let Some(rest) = rest.strip_prefix('=').map(str::trim_start) else {
+            continue;
+        };
+        let Some(quote) = rest.chars().next().filter(|q| matches!(q, '"' | '\'')) else {
+            continue;
+        };
+        let v = tag.len() - rest.len() + 1;
+        if let (true, Some(e)) = (whole_name, tag[v..].find(quote)) {
             return format!("{}{}{}", &tag[..v], value, &tag[v + e..]);
         }
     }
     let cut = tag.len() - if tag.ends_with("/>") { 2 } else { 1 };
-    format!("{} {key}{value}\"{}", tag[..cut].trim_end(), &tag[cut..])
+    format!(
+        "{} {name}=\"{value}\"{}",
+        tag[..cut].trim_end(),
+        &tag[cut..]
+    )
 }
 
 /// `comment` (one `<w:comment>` element) with `w14:paraId` on its last
@@ -4129,6 +4155,35 @@ fn comment_id_at(xml: &str, start: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An attribute is read with space around its `=` (FIX r2 #6), and
+    /// never as the tail of a longer name.
+    #[test]
+    fn tag_attr_reads_space_around_the_equals_sign() {
+        assert_eq!(
+            tag_attr("<O PartName = '/word/document.xml'/>", "PartName").as_deref(),
+            Some("/word/document.xml")
+        );
+        assert_eq!(tag_attr("<O A=\"x\"/>", "A").as_deref(), Some("x"));
+        assert_eq!(tag_attr("<O XA=\"x\"/>", "A"), None);
+        assert_eq!(tag_attr("<O A/>", "A"), None);
+    }
+
+    /// Either quote style is replaced in place, never doubled, and a longer
+    /// name ending in the same text is not the attribute (FIX r1 #2).
+    #[test]
+    fn set_attr_value_replaces_either_quote_once() {
+        assert_eq!(
+            set_attr_value("<O A='x' B=\"y\"/>", "A", "z"),
+            "<O A='z' B=\"y\"/>"
+        );
+        assert_eq!(set_attr_value("<O A = \"x\"/>", "A", "z"), "<O A = \"z\"/>");
+        assert_eq!(
+            set_attr_value("<O XA='x'/>", "A", "z"),
+            "<O XA='x' A=\"z\"/>"
+        );
+        assert_eq!(set_attr_value("<O B='y'>", "A", "z"), "<O B='y' A=\"z\">");
+    }
     use crate::model::{Block, Inline};
     use crate::zipwrite::write_zip;
 

@@ -2310,7 +2310,9 @@ fn a_quits_own_save_under_a_new_name_is_not_a_change_of_tabs() {
 #[test]
 fn an_in_place_tab_keeps_whatever_extension_it_has() {
     let dir = crate::open_mode_tests::Scratch::new();
-    for (name, stem, ext) in [("Letter.dotx", "Letter", ".dotx"), ("Letter", "Letter", "")] {
+    // `.docm` stands for any extension a tab saves in place under (a
+    // `.dotx` no longer would: it opens untitled, #636).
+    for (name, stem, ext) in [("Letter.docm", "Letter", ".docm"), ("Letter", "Letter", "")] {
         let path = dir.path(name);
         std::fs::copy(fixtures().join("basic.docx"), &path).unwrap();
         let t = tab_from_path(&path);
@@ -2331,6 +2333,26 @@ fn an_in_place_tab_keeps_whatever_extension_it_has() {
                 true
             ),
             Ok(PromptSave::InPlace),
+            "{name}"
+        );
+    }
+}
+
+/// #635: a tab rebound to a `.rtf` or `.txt` by Save As saves in place
+/// under it, and the close prompt keeps that extension.
+#[test]
+fn a_tab_saved_as_rich_or_plain_text_prompts_with_its_extension() {
+    let dir = crate::open_mode_tests::Scratch::new();
+    for (name, ext) in [("Letter.rtf", ".rtf"), ("Letter.txt", ".txt")] {
+        let source = dir.path("basic.docx");
+        std::fs::copy(fixtures().join("basic.docx"), &source).unwrap();
+        let mut t = tab_from_path(&source);
+        assert!(save_doc_tab(&mut t, Some(dir.path(name))), "{}", t.status);
+        assert!(saves_in_place(&t), "{name}");
+        let prompt = prompt_name(&t, &known());
+        assert_eq!(
+            (prompt.stem.as_str(), prompt.ext.as_str()),
+            ("Letter", ext),
             "{name}"
         );
     }

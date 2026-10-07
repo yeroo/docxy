@@ -11,8 +11,9 @@ use std::collections::HashMap;
 use crate::model::{Block, Document};
 use crate::xml::{Event, XmlParser};
 
+/// A list level's number format (`w:numFmt`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NumFmt {
+pub enum NumFmt {
     Decimal,
     LowerLetter,
     UpperLetter,
@@ -60,7 +61,32 @@ pub struct Numbering {
     num_to_abstract: HashMap<i32, i32>,
 }
 
+/// One list level as `numbering.xml` defines it: what an exporter that
+/// writes its own list definitions (RTF) needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LevelDef {
+    pub format: NumFmt,
+    /// `w:start`.
+    pub start: i32,
+    /// `w:lvlText`, `%1`…`%9` standing for the levels' numbers.
+    pub text: String,
+}
+
 impl Numbering {
+    /// Level `ilvl` of list `num_id`, or `None` when the list is not
+    /// defined or `ilvl` is past its highest defined level. A level skipped
+    /// below the highest one comes back as the default decimal `%1.` level,
+    /// as the markers number it.
+    pub fn level(&self, num_id: i32, ilvl: i32) -> Option<LevelDef> {
+        let abs = self.abstracts.get(self.num_to_abstract.get(&num_id)?)?;
+        let level = abs.levels.get(usize::try_from(ilvl).ok()?)?;
+        Some(LevelDef {
+            format: level.fmt,
+            start: level.start,
+            text: level.text.clone(),
+        })
+    }
+
     fn marker(
         &self,
         num_id: i32,
