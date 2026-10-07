@@ -145,11 +145,15 @@ enum EditKind {
 
 #[derive(Clone)]
 struct Snapshot {
-    /// The document's top-level blocks. A block equal to the one at the same
-    /// place in the step it was taken next to is that step's block, shared
-    /// (see [`share_body`]): a step costs what it changed, not a whole copy
-    /// of the document, so the history can be long (#853).
+    /// The document's top-level blocks. Those in the common prefix and suffix
+    /// with the step it was taken next to are that step's blocks, shared (see
+    /// [`share_body`]); the ones in between are copies. A step costs the
+    /// top-level blocks it changed, whole: an edit in a table cell copies
+    /// the table (#853).
     body: Vec<Arc<Block>>,
+    /// About how many bytes the step's own copies take ([`block_weight`]),
+    /// what the history's memory budget counts.
+    weight: usize,
     caret: Caret,
     anchor: Option<Caret>,
     review_target: Option<RevisionTarget>,
@@ -221,43 +225,67 @@ pub fn undo_serial_counter() -> u64 {
     LAST_SERIAL.with(|c| c.get())
 }
 
-/// How many undo steps an editor keeps. Word has no undo-levels option and
-/// keeps every step (#853); the cap only guards memory, which shared blocks
-/// (see [`Snapshot::body`]) keep small per step.
+/// The most undo steps an editor keeps. Word has no undo-levels option and
+/// keeps every step (#853); this and [`HISTORY_BUDGET`] only guard memory.
 const UNDO_CAP: usize = 20_000;
+
+/// About how many bytes of copied blocks the undo history may hold (see
+/// [`Snapshot::weight`]) before its oldest steps go, though never below
+/// [`UNDO_FLOOR`] steps: steps that each copy a large table reach it early.
+const HISTORY_BUDGET: usize = 256 << 20;
+
+/// The undo steps the history always keeps, budget or not: the 500 it kept
+/// before #853.
+const UNDO_FLOOR: usize = 500;
 
 /// The most characters one typing step holds, as in Word: typing on past
 /// them starts a new step (#853). A line break counts as one.
 const TYPING_STEP_CHARS: usize = 128;
 
-/// `body` as an undo step holds it, sharing every block equal to `like`'s
-/// block at the same place, counted from the start or from the end (an
-/// inserted or removed paragraph shifts the ones after it), so only the
-/// blocks in between are copied.
-fn share_body(body: &[Block], like: Option<&[Arc<Block>]>) -> Vec<Arc<Block>> {
+/// `body` as an undo step holds it, and about how many bytes it copied:
+/// the common prefix and suffix with `like` (an inserted or removed
+/// paragraph shifts the blocks after it) are `like`'s blocks, shared; only
+/// the top-level blocks in between are copied. Shared only when strictly
+/// equal, preserved element attributes too, so a step never swaps a
+/// look-alike paragraph's `w14:paraId` or rsids for another's.
+fn share_body(body: &[Block], like: Option<&[Arc<Block>]>) -> (Vec<Arc<Block>>, usize) {
     let like = like.unwrap_or_default();
-    let prefix = body
-        .iter()
-        .zip(like)
-        .take_while(|(b, l)| *b == l.as_ref())
-        .count();
+    let same = |(b, l): &(&Block, &Arc<Block>)| strictly_equal(*b, l.as_ref());
+    let prefix = body.iter().zip(like).take_while(same).count();
     let room = body.len().min(like.len()) - prefix;
     let suffix = body
         .iter()
         .rev()
         .zip(like.iter().rev())
         .take(room)
-        .take_while(|(b, l)| *b == l.as_ref())
+        .take_while(same)
         .count();
+    let copied = &body[prefix..body.len() - suffix];
     let mut out = Vec::with_capacity(body.len());
     out.extend(like[..prefix].iter().cloned());
-    out.extend(
-        body[prefix..body.len() - suffix]
-            .iter()
-            .map(|b| Arc::new(b.clone())),
-    );
+    out.extend(copied.iter().map(|b| Arc::new(b.clone())));
     out.extend(like[like.len() - suffix..].iter().cloned());
-    out
+    (out, copied.iter().map(block_weight).sum())
+}
+
+/// About how many bytes a copy of `block` takes: its inlines and text, and
+/// a table's cells' blocks. An estimate for the history's budget only.
+fn block_weight(block: &Block) -> usize {
+    std::mem::size_of::<Block>()
+        + match block {
+            Block::Paragraph(p) => {
+                p.content.len() * std::mem::size_of::<Inline>() + p.plain_text().len()
+            }
+            Block::Table(t) => t
+                .rows
+                .iter()
+                .flat_map(|r| &r.cells)
+                .flat_map(|c| &c.blocks)
+                .map(block_weight)
+                .sum(),
+            Block::Raw(raw) => raw.len(),
+            Block::SectionProperties(_) => 0,
+        }
 }
 
 /// The document an undo step holds.
@@ -275,6 +303,8 @@ pub struct Editor {
     pub anchor: Option<Caret>,
     undo: VecDeque<Snapshot>,
     redo: Vec<Snapshot>,
+    /// [`HISTORY_BUDGET`], smaller in tests.
+    history_budget: usize,
     last: EditKind,
     review_target: Option<RevisionTarget>,
     /// Mail merge's Preview Results record (#628), shown in merge fields'
@@ -300,6 +330,7 @@ impl Editor {
             anchor: None,
             undo: VecDeque::new(),
             redo: Vec::new(),
+            history_budget: HISTORY_BUDGET,
             last: EditKind::None,
             review_target: None,
             merge_preview: None,
@@ -356,8 +387,10 @@ impl Editor {
     }
 
     fn snapshot_like(&self, like: Option<&Snapshot>) -> Snapshot {
+        let (body, weight) = share_body(&self.doc.body, like.map(|s| s.body.as_slice()));
         Snapshot {
-            body: share_body(&self.doc.body, like.map(|s| s.body.as_slice())),
+            body,
+            weight,
             caret: self.caret.clone(),
             anchor: self.anchor.clone(),
             review_target: self.review_target,
@@ -370,10 +403,18 @@ impl Editor {
         snapshot.serial = UNDO_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         LAST_SERIAL.with(|c| c.set(snapshot.serial));
         self.undo.push_back(snapshot);
-        if self.undo.len() > UNDO_CAP {
-            self.undo.pop_front();
-        }
         self.redo.clear();
+        // The oldest steps go past the cap, or past the memory budget while
+        // more than the floor are left.
+        let mut weight: usize = self.undo.iter().map(|s| s.weight).sum();
+        while self.undo.len() > UNDO_CAP
+            || (weight > self.history_budget && self.undo.len() > UNDO_FLOOR)
+        {
+            let Some(oldest) = self.undo.pop_front() else {
+                break;
+            };
+            weight -= oldest.weight;
+        }
     }
 
     fn cur_len(&self) -> usize {
@@ -445,6 +486,18 @@ impl Editor {
         self.last = EditKind::None;
     }
 
+    /// Run `edit` as one command: the undo steps it pushes become one, named
+    /// `name` (see [`Editor::name_command`]), apart from any typing before
+    /// it. For a host command made of several edits, such as a counted
+    /// delete or text inserted as if typed, which would otherwise be a step
+    /// per Delete or per 128 characters (#853).
+    pub fn one_step(&mut self, name: &str, edit: impl FnOnce(&mut Self)) {
+        let since = undo_serial_counter();
+        self.break_undo_group();
+        edit(self);
+        self.name_command(since, name);
+    }
+
     /// The text of the newest undo step when it is typing.
     pub fn last_typed(&self) -> Option<&str> {
         match self.undo.back().map(|s| &s.name) {
@@ -453,8 +506,8 @@ impl Editor {
         }
     }
 
-    /// End the current typing (or deleting) run, so the next edit starts a
-    /// new undo step instead of coalescing into the newest one.
+    /// End the current typing run, so the next character typed starts a new
+    /// undo step instead of coalescing into the newest one.
     pub fn break_undo_group(&mut self) {
         self.last = EditKind::None;
     }
@@ -957,7 +1010,12 @@ impl Editor {
             self.caret.offset -= 1;
             return;
         }
-        // At the start of a paragraph: merge into the previous sibling paragraph.
+        // At the start of a paragraph: merge into the previous sibling
+        // paragraph, if there is one; with none it is no edit, and no step.
+        if !self.has_sibling_paragraph(false) {
+            self.last = EditKind::None;
+            return;
+        }
         self.checkpoint(EditKind::Structural);
         let merged = {
             let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
@@ -985,9 +1043,22 @@ impl Editor {
             }
             self.caret.offset = plen;
         } else {
-            // nothing to merge; drop the snapshot we may have pushed
             self.last = EditKind::None;
         }
+    }
+
+    /// Whether the caret's paragraph has a paragraph right after it (`after`)
+    /// or right before it in its container, for Delete or Backspace to merge.
+    fn has_sibling_paragraph(&mut self, after: bool) -> bool {
+        let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
+            return false;
+        };
+        let sibling = if after {
+            idx.checked_add(1)
+        } else {
+            idx.checked_sub(1)
+        };
+        matches!(sibling.and_then(|i| cont.get(i)), Some(Block::Paragraph(_)))
     }
 
     pub fn delete_forward(&mut self) {
@@ -1006,7 +1077,11 @@ impl Editor {
             self.delete_char_at(&path, off);
             return;
         }
-        // At the end: pull up the next sibling paragraph.
+        // At the end: pull up the next sibling paragraph, if there is one.
+        if !self.has_sibling_paragraph(true) {
+            self.last = EditKind::None;
+            return;
+        }
         self.checkpoint(EditKind::Structural);
         let did = {
             let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
@@ -5263,6 +5338,126 @@ mod tests {
         }
         assert_eq!(top_text(&ed), vec![""]);
         assert!(!ed.undo());
+    }
+
+    /// #853: the history's memory budget drops the oldest steps once their
+    /// copies pass it, but never below the 500 steps kept before: an edit in
+    /// a table cell copies the whole table.
+    #[test]
+    fn the_history_budget_keeps_at_least_500_steps_853() {
+        let cell = |s: &str| Cell {
+            grid_span: 1,
+            v_merge: VMerge::None,
+            blocks: vec![para(s)],
+            ..Default::default()
+        };
+        let row = |i: usize| Row {
+            cells: (0..4).map(|c| cell(&format!("cell {i} {c}"))).collect(),
+            ..Default::default()
+        };
+        let table = Document {
+            body: vec![Block::Table(Table {
+                grid: vec![100; 4],
+                rows: (0..20).map(row).collect(),
+                ..Default::default()
+            })],
+        };
+        let table_weight = block_weight(&table.body[0]);
+        let edits = |budget: usize| {
+            let mut ed = Editor::new(table.clone());
+            ed.history_budget = budget;
+            ed.caret = Caret::at(vec![0, 0, 0, 0], 0);
+            for _ in 0..600 {
+                ed.break_undo_group();
+                ed.insert_char('x');
+            }
+            let weight: usize = ed.undo.iter().map(|s| s.weight).sum();
+            (ed.undo.len(), weight)
+        };
+        // Each step copies the table, about `table_weight` bytes.
+        let (kept, _) = edits(usize::MAX);
+        assert_eq!(kept, 600, "no budget: every step");
+        let budget = table_weight * 550;
+        let (kept, weight) = edits(budget);
+        assert!(kept > UNDO_FLOOR && kept < 600, "{kept} steps");
+        assert!(weight <= budget);
+        let (kept, _) = edits(table_weight);
+        assert_eq!(kept, UNDO_FLOOR, "never fewer than the floor");
+    }
+
+    /// #853: blocks equal but for their preserved element attributes are not
+    /// shared, or undo could give one paragraph another's `w14:paraId`.
+    #[test]
+    fn undo_steps_never_share_look_alike_blocks_853() {
+        let empty = |id: &str| {
+            let mut props = ParProps::default();
+            props.element_attrs = ElementAttrs(vec![("w14:paraId".into(), id.into())]);
+            Block::Paragraph(Paragraph {
+                props,
+                content: Vec::new(),
+            })
+        };
+        let attrs = |ed: &Editor, i: usize| match &ed.doc.body[i] {
+            Block::Paragraph(p) => p.props.element_attrs.0.clone(),
+            _ => panic!("a paragraph"),
+        };
+        let mut ed = Editor::new(Document {
+            body: vec![para("x"), empty("A"), empty("B")],
+        });
+        ed.caret = Caret::at(vec![0], 1);
+        ed.insert_char('z');
+        // Backspace at the start of A merges it into `xz`; then B is
+        // second, where A was, and an edit there takes a step.
+        ed.caret = Caret::at(vec![1], 0);
+        ed.backspace();
+        assert_eq!(ed.doc.body.len(), 2);
+        ed.caret = Caret::at(vec![1], 0);
+        ed.insert_char('q');
+        assert!(ed.undo());
+        assert_eq!(attrs(&ed, 1), vec![("w14:paraId".into(), "B".into())]);
+        assert!(ed.undo());
+        assert_eq!(attrs(&ed, 1), vec![("w14:paraId".into(), "A".into())]);
+        assert_eq!(attrs(&ed, 2), vec![("w14:paraId".into(), "B".into())]);
+        assert!(ed.redo() && ed.redo());
+        assert_eq!(attrs(&ed, 1), vec![("w14:paraId".into(), "B".into())]);
+    }
+
+    /// Backspace at the start of the first paragraph and Delete at the end
+    /// of the last edit nothing, so they push no step and keep Redo.
+    #[test]
+    fn a_merge_with_nothing_to_merge_pushes_no_step_853() {
+        let mut ed = Editor::new(doc(&["ab"]));
+        ed.caret.offset = 2;
+        ed.insert_char('x');
+        assert!(ed.undo());
+        ed.caret.offset = 2;
+        ed.delete_forward();
+        ed.caret.offset = 0;
+        ed.backspace();
+        assert!(ed.undo_names().is_empty());
+        assert!(ed.can_redo());
+        assert!(ed.redo());
+        assert_eq!(top_text(&ed), vec!["abx"]);
+    }
+
+    /// #853: a host command made of many edits is one named step.
+    #[test]
+    fn one_step_makes_a_command_one_named_step_853() {
+        let mut ed = Editor::new(doc(&["abcdef"]));
+        ed.insert_str("t");
+        let long: String = "y".repeat(300);
+        ed.one_step("Paste", |ed| ed.insert_str(&long));
+        ed.caret.offset = 0;
+        ed.one_step("Delete", |ed| {
+            for _ in 0..3 {
+                ed.delete_forward();
+            }
+        });
+        assert_eq!(ed.undo_names(), vec!["Delete", "Paste", "Typing \"t\""]);
+        assert!(ed.undo());
+        assert!(top_text(&ed)[0].starts_with("ty"));
+        assert!(ed.undo());
+        assert_eq!(top_text(&ed), vec!["tabcdef"]);
     }
 
     /// #853: an undo step shares the blocks it did not change with its
