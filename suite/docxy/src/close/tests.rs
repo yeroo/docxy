@@ -673,7 +673,10 @@ fn structural_edit_commits_the_open_editor_before_shifting_cells() {
         let Surface::Sheet(v) = &mut t.surface else {
             panic!()
         };
-        v.sel = (1, 1); // B2, which holds the number 10 in basic.xlsx.
+        // B2 alone, which holds the number 10 in basic.xlsx: a structural
+        // edit acts on every row or column the selection touches (#860).
+        v.sel = (1, 1);
+        v.anchor = (1, 1);
         v.begin_cell_edit(None);
         v.editing = Some("42".into());
 
