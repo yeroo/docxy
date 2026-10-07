@@ -362,11 +362,25 @@ pub(crate) fn attach_with_dispatch(
     window: &mut Window,
     cx: &mut App,
     dispatch: Dispatch,
+    hit_tests: fn(&str) -> bool,
 ) -> ControlLink {
     let target = view.downgrade();
     let pending = async_requests(rx);
     let pump = window.spawn(cx, async move |cx: &mut AsyncWindowContext| {
         while let Ok(req) = pending.recv_async().await {
+            // A verb whose pointer input hit-tests the rendered frame gets a
+            // frame drawn from the current state first (#1121), as gpui gives
+            // a key-down: mouse dispatch hit-tests `rendered_frame` without
+            // drawing, so an earlier verb's change was otherwise visible only
+            // if the platform's tick happened to fire in between. The verb
+            // aims at the fresh probes and the events land on its hitboxes.
+            // No await separates this draw from the dispatch below, so no tick
+            // lands between them, and a whole gesture (press, moves, release)
+            // hit-tests this one frame. `draw` marks the frame for presenting,
+            // so the next tick puts it on screen.
+            if hit_tests(&req.verb) {
+                let _ = cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
             match target.update_in(cx, |this, window, cx| {
                 dispatch(this, &req.verb, &req.args, window, cx)
             }) {
@@ -491,6 +505,8 @@ pub(crate) fn attach(
                 .unwrap_or_else(|| Err(format!("unknown verb '{verb}'")))
                 .and_then(Done::ok)
         },
+        // No automation verb queues pointer input.
+        |_| false,
     );
     view.update(cx, |this, _| this.control = Some(link));
 }

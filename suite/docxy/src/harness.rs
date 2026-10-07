@@ -340,7 +340,15 @@ pub fn attach(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let link = crate::control::attach_with_dispatch(view, server, rx, window, cx, dispatch);
+    let link = crate::control::attach_with_dispatch(
+        view,
+        server,
+        rx,
+        window,
+        cx,
+        dispatch,
+        hit_tests_rendered_frame,
+    );
     view.update(cx, |this, _| this.harness = Some(link));
 }
 
@@ -2538,6 +2546,19 @@ fn account_json(app: &crate::Docxy) -> Json {
             Json::Bool(open && app.probes.borrow().get("account-manual-badge").is_some()),
         ),
     ])
+}
+
+/// Whether `verb` queues pointer input that gpui hit-tests against the
+/// rendered frame (#1121), so the pump draws the window before it runs: the
+/// point aimed at and the hitboxes it lands on then both come from the
+/// current state. gpui draws a dirty window before a key-down but never
+/// before a mouse event, so without this a pointer verb after a verb that
+/// changed the view hit-tested whichever frame the platform's tick last drew.
+fn hit_tests_rendered_frame(verb: &str) -> bool {
+    matches!(
+        verb,
+        "pointer-click" | "pointer-drag" | "pointer-move" | "pointer-wheel"
+    )
 }
 
 /// Whether `verb` stands for a press outside an open menu, which closes it
@@ -5786,6 +5807,32 @@ mod tests {
         assert!(!closes_menu("pointer-click", &no_args));
         assert!(!closes_menu("pointer-drag", &no_args));
         assert!(!closes_menu("pointer-wheel", &no_args));
+    }
+
+    /// #1121: the verbs that queue pointer input from region geometry draw
+    /// first; `click-cell` calls its handlers directly and reads, keys
+    /// (gpui draws before a key-down itself) and handler verbs do not.
+    #[test]
+    fn pointer_verbs_draw_before_they_hit_test() {
+        for verb in [
+            "pointer-click",
+            "pointer-drag",
+            "pointer-move",
+            "pointer-wheel",
+        ] {
+            assert!(hit_tests_rendered_frame(verb), "{verb}");
+        }
+        for verb in [
+            "click-cell",
+            "drag",
+            "key",
+            "real-key",
+            "real-type",
+            "rect",
+            "frame",
+        ] {
+            assert!(!hit_tests_rendered_frame(verb), "{verb}");
+        }
     }
 
     /// #397: no menu opens or runs while File or the more-tabs list covers

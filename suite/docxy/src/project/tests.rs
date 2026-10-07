@@ -941,3 +941,33 @@ fn save_runs_a_pending_level_pass_first() {
     assert!(view(&tab).ed.leveled());
     assert!(tab.status.starts_with("saved "), "{}", tab.status);
 }
+
+/// #1121: the body's click moves the cursor to the entry row only when the
+/// press and the release both stayed below it; a press on one row and a
+/// release on another reaches the body too, and must not.
+#[test]
+fn a_body_click_counts_only_when_it_stayed_below_the_entry_row() {
+    let bottom = Some(px(100.));
+    assert!(below_entry_row(px(120.), px(130.), bottom), "both below");
+    assert!(
+        below_entry_row(px(101.), px(101.), bottom),
+        "the border's edge"
+    );
+    assert!(
+        !below_entry_row(px(100.), px(120.), bottom),
+        "pressed on the border"
+    );
+    assert!(!below_entry_row(px(40.), px(80.), bottom), "row to row");
+    assert!(
+        !below_entry_row(px(40.), px(120.), bottom),
+        "row, released below"
+    );
+    assert!(
+        !below_entry_row(px(120.), px(40.), bottom),
+        "below, released on a row"
+    );
+    assert!(
+        !below_entry_row(px(500.), px(500.), None),
+        "entry row not drawn"
+    );
+}

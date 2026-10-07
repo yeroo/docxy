@@ -1125,6 +1125,19 @@ fn editable_row_cells(
         }))
 }
 
+/// Whether a click on the Project body, pressed at `down_y` and released at
+/// `up_y`, stayed in the empty area below the entry row: both ends at or
+/// below `entry_bottom`, the bottom of the entry row's cell probe (its padding
+/// box, so the cell's 1px bottom border still counts as the row). `None`:
+/// the entry row is not drawn, which in the scrolled list means it is below
+/// the viewport, so no empty area shows.
+fn below_entry_row(down_y: Pixels, up_y: Pixels, entry_bottom: Option<Pixels>) -> bool {
+    entry_bottom.is_some_and(|bottom| {
+        let edge = bottom + px(1.);
+        down_y >= edge && up_y >= edge
+    })
+}
+
 fn inactive_row(proj: &projcore::Project, index: usize) -> bool {
     proj.tasks
         .get(index)
@@ -1270,9 +1283,24 @@ pub(super) fn project_el(
                         .overflow_hidden()
                         .child(body_grid(view, pal))
                         .child(probe(probes, "project-body"))
-                        // Rows stop propagation, so only the ruled empty rows below the
-                        // entry row land here.
-                        .on_click(cx.listener(move |this, _, window, cx| {
+                        // Meant for the ruled empty rows below the entry row. Rows stop
+                        // propagation of their own clicks, but a press on one row and a
+                        // release on another is no row's click and still the body's
+                        // (#1121), so the gesture itself has to have stayed below.
+                        .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                            let ClickEvent::Mouse(click) = ev else {
+                                return;
+                            };
+                            // The frame on screen only: an entry row that just scrolled away
+                            // must not answer from the frame before it.
+                            let entry = this.probes.borrow().on_screen("project-cell:entry:0");
+                            if !below_entry_row(
+                                click.down.position.y,
+                                click.up.position.y,
+                                entry.map(|b| b.bottom()),
+                            ) {
+                                return;
+                            }
                             if let Some(tab) = this.tabs.get_mut(index) {
                                 project_below_click(tab);
                             }
