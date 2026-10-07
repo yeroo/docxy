@@ -1,0 +1,63 @@
+# In-cell clipboard (#561): with a Project cell editor open, Ctrl+C/X/V and the
+# Task tab's Clipboard group edit the open cell's buffer — nothing commits, the
+# edit stays open. The closed-editor table clipboard is pinned by
+# project-clipboard.uit.
+
+test the Task tab leads with a Clipboard group
+  open copy:../fixtures/project-clipboard.xml
+  call ribbon-read {}
+  assert reply.tabs.1.groups.0.title is Clipboard
+  assert reply.tabs.1.groups.0.commands.0.id is pr-paste
+  assert reply.tabs.1.groups.0.commands.1.id is pr-cut
+  assert reply.tabs.1.groups.0.commands.2.id is pr-copy
+
+test the Clipboard group buttons run the table clipboard acts
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  call ribbon-click {"tab":"Task","command":"pr-copy"}
+  key down
+  call ribbon-click {"tab":"Task","command":"pr-paste"}
+  assert selected_name is A
+  assert undo_depth is 1
+  assert dirty is true
+  key ctrl+z
+  assert undo_depth is 0
+  call click-cell {"cell":"C1"}
+  call ribbon-click {"tab":"Task","command":"pr-cut"}
+  assert selected_name is ""
+  assert undo_depth is 1
+
+test in-cell ctrl+c/x/v edit the open cell's buffer
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  # A range copy puts two lines on the clipboard.
+  key shift+down
+  key ctrl+c
+  assert selection is 2
+  # The entry row's editor starts empty: pasting turns the line break into a
+  # space, as a copied cell's text does, and nothing commits.
+  key down
+  key f2
+  assert cell_edit is ""
+  key ctrl+v
+  assert cell_edit is "A B"
+  assert undo_depth is 0
+  assert dirty is false
+  # Copy takes the whole buffer; cut empties it, leaving the edit open.
+  key ctrl+c
+  assert cell_edit is "A B"
+  key ctrl+x
+  assert cell_edit is ""
+  # The ribbon buttons do the same with the editor open; they do not commit.
+  call ribbon-click {"tab":"Task","command":"pr-paste"}
+  assert cell_edit is "A B"
+  assert undo_depth is 0
+  assert dirty is false
+  call ribbon-click {"tab":"Task","command":"pr-copy"}
+  assert cell_edit is "A B"
+  # Escape discards the whole edit: no task appears, nothing is written.
+  key escape
+  assert cell_edit is none
+  assert tasks is 2
+  assert undo_depth is 0
+  assert dirty is false

@@ -444,7 +444,14 @@ deletes a task). Paste overwrites from the cursor cell as Project does with
 cells selected: line i goes to the i-th shown row below, field j to the j-th
 column right, ID fields are ignored, and lines past the last task append
 tasks; no row is inserted. The whole paste is one undo step, and a field that
-cannot apply cancels it, naming the cell.
+cannot apply cancels it, naming the cell. The Task tab's Clipboard group
+(Paste, Cut, Copy; key tips Alt, T, W / X / Y) runs the same three acts, and
+while a cell editor is open they act on the buffer instead of the table:
+Ctrl+C and Ctrl+X take the whole buffer (cut leaves it empty), Ctrl+V inserts
+at the caret with a CRLF pair counting as one break, trailing line breaks
+dropped, tabs and remaining line breaks as spaces and control characters
+dropped; nothing commits until Enter (one undo step), and a cut whose
+clipboard write failed keeps the buffer and says so.
 
 The entry table also has Project's range selection (#560). Shift+arrows
 extend a rectangle from the anchor (where the cursor was) to the cursor; a

@@ -94,8 +94,10 @@ test Project ribbon: no tab is clipped vertically
   call ribbon-layout {"tab":"Task"}
   assert reply.tab is Task
   assert reply.settled is true
-  assert reply.groups.0.title is Schedule
-  # Not vacuous: Schedule has a column, so the model renderer's probe measured it.
+  # #561: the Task tab leads with the Clipboard group.
+  assert reply.groups.0.title is Clipboard
+  # Not vacuous: Clipboard has a column, so the model renderer's probe
+  # measured it.
   assert reply.groups.0.content_bounds is not null
   assert reply.any_clipped_v is false
   # Report has no groups: nothing to wait for, so it is settled at once.

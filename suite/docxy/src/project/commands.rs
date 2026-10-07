@@ -63,9 +63,11 @@ pub(crate) enum ProjectAct {
     DeleteTask,
     /// Ctrl+K and a task row's context menu › Hyperlink...: the selected
     /// task's hyperlink (display text, address, in-file location) in one
-    /// prompt. Keyboard and row-menu only, like Copy: no ribbon command.
+    /// prompt. Keyboard and row-menu only; no ribbon command.
     Hyperlink,
-    /// Ctrl+C / Ctrl+X / Ctrl+V on the cursor cell (see `clip.rs`).
+    /// Ctrl+C / Ctrl+X / Ctrl+V: the cursor cell (or range) on the table, the
+    /// whole buffer in an open cell edit (#561); also the Task tab's
+    /// Clipboard group. See `clip.rs`.
     Copy,
     Cut,
     Paste,
@@ -102,6 +104,9 @@ impl ProjectAct {
         Self::Timeline,
         Self::CriticalTasks,
         Self::BaselineBars,
+        Self::Paste,
+        Self::Cut,
+        Self::Copy,
     ];
 }
 
@@ -127,6 +132,19 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
             "Task",
             "T",
             vec![
+                // Clipboard leads the Task tab, as in Project: Paste large,
+                // Cut and Copy beside it (#561).
+                rs::group(
+                    "Clipboard",
+                    10,
+                    vec![
+                        Control::Large(cmd("pr-paste", "paste", "Paste", Paste, "Ctrl+V", "W")),
+                        rs::column(vec![
+                            cmd("pr-cut", "cut", "Cut", Cut, "Ctrl+X", "X"),
+                            cmd("pr-copy", "copy", "Copy", Copy, "Ctrl+C", "Y"),
+                        ]),
+                    ],
+                ),
                 rs::group(
                     "Schedule",
                     125,
@@ -474,6 +492,19 @@ pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
     !matches!(act, Copy | Cut | Paste | AddLink | UnlinkTasks)
 }
 
+/// Whether an in-cell cut may empty the buffer: the read-back clipboard
+/// `now` holds the buffer's text `wrote`, compared CRLF-insensitively. A
+/// write can fail without a word — another process holds the OS clipboard —
+/// and it then reads as `Nothing` or someone else's item, never as our text;
+/// the buffer must not be lost to a copy that never landed (#561 r1/r2).
+/// Cutting an empty buffer is harmless and the host skips the check.
+pub(crate) fn cell_cut_write_took(now: &ClipRead, wrote: &str) -> bool {
+    match now {
+        ClipRead::Text(held) => held.replace("\r\n", "\n") == wrote.replace("\r\n", "\n"),
+        _ => false,
+    }
+}
+
 /// A Project command's checked state on the ribbon.
 pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
     match act {
@@ -758,6 +789,13 @@ pub(crate) fn project_input(
         }
         if key_act(key, m) == Some(ProjectAct::NewProject) {
             return commit_project_cell(tab).then_some(ProjectAct::NewProject);
+        }
+        // #561: the host edits the open cell's buffer in place; the edit
+        // stays open, so the range anchor survives like it does for Copy.
+        if let Some(act @ (ProjectAct::Copy | ProjectAct::Cut | ProjectAct::Paste)) =
+            key_act(key, m)
+        {
+            return Some(act);
         }
         v.anchor = None;
         project_cell_input(tab, key, text, m);
@@ -1623,6 +1661,17 @@ impl Docxy {
         // A pass already asked for runs first, so this act, and a second
         // levelling command above all, sees the plan it left.
         self.flush_project_passes(cx);
+        // With a cell editor open, Copy/Cut/Paste edit its buffer instead of
+        // the table (#561); committing first would break the edit.
+        if matches!(act, ProjectAct::Copy | ProjectAct::Cut | ProjectAct::Paste)
+            && self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| matches!(&t.surface, Surface::Project(v) if v.cell.is_some()))
+        {
+            self.project_cell_clipboard(act, cx);
+            return self.refocus(window, cx);
+        }
         if !self.commit_active_project_cell() {
             self.refocus(window, cx);
             return;
@@ -1724,6 +1773,53 @@ impl Docxy {
         self.grid_clip = None;
         if act == ProjectAct::Cut {
             project_cut(&mut self.tabs[self.active]);
+        }
+    }
+    /// Copy/Cut/Paste with a cell editor open take the buffer, not the table
+    /// (#561). Copy and Cut put the whole buffer on the system clipboard (the
+    /// editor has no selection); Cut empties the buffer only when the read-
+    /// back clipboard holds the buffer's text — a silently failed write (a
+    /// busy OS clipboard) otherwise keeps the buffer and the status says so.
+    /// Paste inserts the clipboard's text at the caret. The edit stays open;
+    /// the project, its undo stack and its dirty flag are untouched.
+    fn project_cell_clipboard(&mut self, act: ProjectAct, cx: &mut Context<Self>) {
+        if act == ProjectAct::Paste {
+            let now = self.clipboard_read(cx);
+            if let (Some(tab), Some(text)) = (self.tabs.get_mut(self.active), now.text())
+                && let Surface::Project(v) = &mut tab.surface
+                && let Some(cell) = &mut v.cell
+            {
+                cell.paste(text);
+            }
+            return;
+        }
+        let text = self.tabs.get(self.active).and_then(|t| match &t.surface {
+            Surface::Project(v) => v.cell.as_ref().map(|c| c.buf.clone()),
+            _ => None,
+        });
+        let Some(text) = text else {
+            return;
+        };
+        self.clipboard_write(text.clone(), cx);
+        if act == ProjectAct::Copy {
+            // A sheet pastes its own clipboard first; this copy is newer.
+            self.grid_clip = None;
+            return;
+        }
+        // Cut: an empty buffer has nothing to lose; otherwise empty it only
+        // when the clipboard holds what the write put there.
+        if !text.is_empty() && !cell_cut_write_took(&self.clipboard_read(cx), &text) {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.status = "Cut failed: the clipboard is busy".into();
+            }
+            return;
+        }
+        // A sheet pastes its own clipboard first; this copy is newer.
+        self.grid_clip = None;
+        if let Some(Surface::Project(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface)
+            && let Some(cell) = &mut v.cell
+        {
+            cell.cut();
         }
     }
     pub(crate) fn project_key(

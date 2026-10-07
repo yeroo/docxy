@@ -556,6 +556,137 @@ fn caret_edits_utf8_and_long_buffer_window_tracks_it() {
 }
 
 #[test]
+fn cell_edit_paste_inserts_at_the_caret_and_moves_it() {
+    let mut c = CellEdit {
+        last_error: None,
+        uid: Some(1),
+        col: COL_NAME,
+        initial: "ac".into(),
+        buf: "ac".into(),
+        caret: 1,
+    };
+    c.paste("b");
+    assert_eq!(c.buf, "abc");
+    assert_eq!(c.caret, 2);
+    // The caret is a UTF-8 byte offset: it advances by the inserted bytes.
+    c.paste("é");
+    assert_eq!(c.buf, "abéc");
+    assert_eq!(c.caret, 4);
+}
+
+#[test]
+fn cell_edit_paste_spaces_tabs_and_line_breaks_and_drops_the_trailing_ones() {
+    let mut c = CellEdit {
+        last_error: None,
+        uid: Some(1),
+        col: COL_NAME,
+        initial: String::new(),
+        buf: String::new(),
+        caret: 0,
+    };
+    // As a copied cell's text: the trailing line break is dropped and every
+    // remaining tab or line break becomes a space.
+    c.paste("x\ny\tz\r\n");
+    assert_eq!(c.buf, "x y z");
+    assert_eq!(c.caret, 5);
+    // An empty clipboard pastes nothing.
+    c.paste("");
+    assert_eq!(c.buf, "x y z");
+    assert_eq!(c.caret, 5);
+}
+
+#[test]
+fn cell_edit_paste_counts_a_crlf_pair_as_one_break() {
+    let mut c = CellEdit {
+        last_error: None,
+        uid: Some(1),
+        col: COL_NAME,
+        initial: String::new(),
+        buf: String::new(),
+        caret: 0,
+    };
+    c.paste("Line 1\r\nLine 2");
+    assert_eq!(c.buf, "Line 1 Line 2");
+    assert_eq!(c.caret, 13);
+}
+
+#[test]
+fn cell_edit_paste_drops_control_characters_a_copy_can_carry() {
+    let mut c = CellEdit {
+        last_error: None,
+        uid: Some(1),
+        col: COL_NAME,
+        initial: String::new(),
+        buf: String::new(),
+        caret: 0,
+    };
+    // Word copies can carry \x0b, \x0c, \x1b or NUL; typed text drops controls
+    // in key(), and a paste must not land them in the project either — the
+    // mspdi writer would emit invalid XML (#561 r1).
+    c.paste("a\x0bb\x1bc\0d");
+    assert_eq!(c.buf, "abcd");
+    assert_eq!(c.caret, 4);
+}
+
+#[test]
+fn in_cell_paste_commits_no_control_characters() {
+    let mut t = tab();
+    vm(&mut t).open_cell(None).unwrap();
+    vm(&mut t).cell.as_mut().unwrap().cut();
+    vm(&mut t).cell.as_mut().unwrap().paste("a\x0bb\x1bc\0d");
+    key(&mut t, "enter");
+    let name = &v(&t).ed.project().task(10).unwrap().name;
+    assert_eq!(name, "abcd");
+    assert!(!name.chars().any(|c| c.is_control()));
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+}
+
+#[test]
+fn cell_edit_cut_takes_the_whole_buffer_and_empties_it() {
+    let mut c = CellEdit {
+        last_error: None,
+        uid: Some(1),
+        col: COL_NAME,
+        initial: "Task 2".into(),
+        buf: "Task 2".into(),
+        caret: 3,
+    };
+    assert_eq!(c.cut(), "Task 2");
+    assert!(c.buf.is_empty());
+    assert_eq!(c.caret, 0);
+    // The edit stays usable: cutting again is empty, pasting re-fills.
+    assert!(c.cut().is_empty());
+    c.paste("a");
+    assert_eq!(c.buf, "a");
+    assert_eq!(c.caret, 1);
+}
+
+#[test]
+fn in_cell_cut_and_paste_touch_the_project_only_on_commit() {
+    let mut t = tab();
+    vm(&mut t).open_cell(None).unwrap();
+    vm(&mut t).cell.as_mut().unwrap().cut();
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "enter commits the emptied buffer");
+    assert_eq!(v(&t).ed.project().task(10).unwrap().name, "");
+    assert_eq!(v(&t).ed.undo_depth(), 1, "the clear is one undo step");
+    assert!(v(&t).ed.dirty());
+    assert!(vm(&mut t).ed.undo());
+    assert_eq!(v(&t).ed.project().task(10).unwrap().name, "Task 1");
+    // A pasted buffer escapes away: the project never saw it.
+    let mut t = tab();
+    vm(&mut t).open_cell(None).unwrap();
+    vm(&mut t).cell.as_mut().unwrap().cut();
+    vm(&mut t).cell.as_mut().unwrap().paste("renamed\r\n");
+    assert_eq!(v(&t).cell.as_ref().unwrap().buf, "renamed");
+    key(&mut t, "escape");
+    assert!(v(&t).cell.is_none());
+    assert_eq!(v(&t).ed.project().task(10).unwrap().name, "Task 1");
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    assert!(!v(&t).ed.dirty());
+}
+
+#[test]
 fn resource_names_cell_shows_and_keeps_partial_units() {
     let mut t = tab();
     let mut p = v(&t).ed.project().clone();
