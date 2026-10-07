@@ -9,7 +9,7 @@ test issue 371 ctrl+delete resets a duration to the new-task default and keeps t
   assert tasks is 2
   assert cell D1 is 1 day?
   assert cell C1 is A
-  assert cell D2 is 2d
+  assert cell D2 is 2 days
   assert undo_depth is 1
   assert dirty is true
   key ctrl+z
