@@ -1,8 +1,11 @@
 //! Round-trip fidelity gate for xlsx (#1064, the xlsx half of #1060): open
 //! every corpus `.xlsx`, save it with no edits, and compare every package part
 //! with the original. Fails on any loss not covered by
-//! `fidelity/allowlist.txt` or `fidelity/baseline.txt`, and on a baseline
-//! entry that no longer reproduces. See `docs/fidelity-gate.md`.
+//! `fidelity/allowlist.txt` or `fidelity/baseline.txt`, on a baseline
+//! entry that no longer reproduces, and on any package or schema violation
+//! the save added (`fidelity/schema.rs`, #1156): those have no allowlist and
+//! no baseline, also under `FIDELITY_UPDATE_BASELINE`. See
+//! `docs/fidelity-gate.md`.
 //!
 //! - `FIDELITY_XLSX_CORPUS=<dir>`: the docxy-corpus `xlsx-ext/` checkout
 //!   (default `corpus/xlsx-ext`; relative paths resolve against the workspace
@@ -2085,6 +2088,22 @@ fn an_empty_entry_named_like_a_directory_is_no_part() {
         .map(|f| f.kind)
         .collect();
     assert_eq!(kinds, [Kind::PartMissing]);
+    // So is an empty extensionless part an Override names (#1156 r1).
+    let named = br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/XL/customData" ContentType="application/octet-stream"/></Types>"#;
+    let custom = package(&[
+        ("[Content_Types].xml", named.to_vec()),
+        ("xl/a.xml", b"<a/>".to_vec()),
+        ("xl/customData", Vec::new()),
+    ]);
+    let without = package(&[
+        ("[Content_Types].xml", named.to_vec()),
+        ("xl/a.xml", b"<a/>".to_vec()),
+    ]);
+    let kinds: Vec<Kind> = compare_packages(&custom, &without)
+        .into_iter()
+        .map(|f| f.kind)
+        .collect();
+    assert_eq!(kinds, [Kind::PartMissing]);
 }
 
 /// `zip` with the external attributes of the central directory entries
@@ -2173,8 +2192,18 @@ const TYPES_NS: &str = "http://schemas.openxmlformats.org/package/2006/content-t
 
 /// A package of a workbook and one worksheet, with `extra` entries.
 fn validated(workbook: &str, worksheet: &str, extra: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    validated_with_types(workbook, worksheet, extra, "")
+}
+
+/// [`validated`], with `types` added to `[Content_Types].xml`.
+fn validated_with_types(
+    workbook: &str,
+    worksheet: &str,
+    extra: &[(&str, Vec<u8>)],
+    types: &str,
+) -> Vec<u8> {
     let types = format!(
-        r#"<Types xmlns="{TYPES_NS}"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="XML" ContentType="application/xml"/><Override PartName="/XL/Workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#
+        r#"<Types xmlns="{TYPES_NS}"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="XML" ContentType="application/xml"/><Default Extension="bin" ContentType="application/octet-stream"/>{types}<Override PartName="/XL/Workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#
     );
     let wb_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet%201.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/x.xml" TargetMode="External"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="/xl/./styles.xml"/></Relationships>"#;
     let mut parts = vec![
@@ -2267,6 +2296,83 @@ fn the_validator_reports_what_excel_repairs() {
     ];
     want.sort();
     assert_eq!(found, want);
+}
+
+/// A worksheet relationships part with one relationship to `target`.
+fn sheet_rels(target: &str) -> (&'static str, Vec<u8>) {
+    let rels = format!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="t" Target="{target}"/></Relationships>"#
+    );
+    ("xl/worksheets/_rels/sheet 1.xml.rels", rels.into_bytes())
+}
+
+/// #1156 r1: entry names, Override names and targets are compared
+/// percent-decoded alike, so a part named with an escape is the target that
+/// names it, and losing it is a new dangling target, not one the original
+/// already (falsely) had.
+#[test]
+fn a_percent_named_part_is_the_target_that_names_it() {
+    let original = validated(
+        SHEETS,
+        "<sheetData/>",
+        &[
+            sheet_rels("../media/a%23.bin"),
+            ("xl/media/a%23.bin", b"1".to_vec()),
+        ],
+    );
+    assert_eq!(violations(&original), vec![]);
+    let dropped = validated(SHEETS, "<sheetData/>", &[sheet_rels("../media/a%23.bin")]);
+    let added: Vec<_> = new_violations(&validate_package(&original), &validate_package(&dropped))
+        .into_iter()
+        .map(|v| (v.rule.as_str(), v.child))
+        .collect();
+    assert_eq!(added, [("dangling-target", "xl/media/a#.bin".to_string())]);
+}
+
+/// #1156 r1: a cell reference too long for a column number is skipped, not
+/// an overflow.
+#[test]
+fn an_overlong_cell_reference_is_skipped() {
+    let ws = r#"<sheetData><row r="1"><c r="ZZZZZZZZZZZZZZZZ1"/><c r="A1"/></row></sheetData>"#;
+    assert_eq!(violations(&validated(SHEETS, ws, &[])), vec![]);
+}
+
+/// #1156 r1: a `_RELS` directory holds relationships too.
+#[test]
+fn relationships_in_an_upper_case_rels_directory_are_checked() {
+    let (_, rels) = sheet_rels("../gone.xml");
+    let pkg = validated(
+        SHEETS,
+        "<sheetData/>",
+        &[("xl/worksheets/_RELS/sheet 1.xml.rels", rels)],
+    );
+    assert_eq!(
+        violations(&pkg),
+        [(
+            "dangling-target",
+            "xl/worksheets/_rels/sheet 1.xml.rels".to_string(),
+            "xl/gone.xml".to_string()
+        )]
+    );
+}
+
+/// #1156 r1: a worksheet is found by its content type, not by a `.xml`
+/// name: `xl/sheet2` with an Override is checked.
+#[test]
+fn a_worksheet_without_an_xml_name_is_checked() {
+    let ws = format!(
+        r#"<worksheet xmlns="{MAIN}"><dimension ref="A1"/><sheetPr/><sheetData/></worksheet>"#
+    );
+    let pkg = validated_with_types(
+        SHEETS,
+        "<sheetData/>",
+        &[("xl/sheet2", ws.into_bytes())],
+        r#"<Override PartName="/xl/sheet2" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#,
+    );
+    assert_eq!(
+        violations(&pkg),
+        [("order", "xl/sheet2".to_string(), "sheetPr".to_string())]
+    );
 }
 
 /// #1156: Excel repaired the suite's unedited save of tdf124525.xlsx. Its

@@ -1,7 +1,7 @@
 //! Package and schema validation of saved SpreadsheetML (#1156): a
 //! dependency-free check that a save is a package Excel opens without its
-//! repair prompt, value loss or not. See "Schema validation" in
-//! `docs/fidelity-gate.md`.
+//! repair prompt, value loss or not. See "Package and schema validation" in
+//! the `xlsx` section of `docs/fidelity-gate.md`.
 //!
 //! The package (OPC, ECMA-376 Part 2):
 //!
@@ -9,18 +9,21 @@
 //! - `no-content-type`: a part with neither an `Override` nor a `Default` for
 //!   its extension;
 //! - `override-no-part`: an `Override` naming no part;
-//! - `duplicate-part`: two entries naming one part (names are ASCII
-//!   case-insensitive);
+//! - `duplicate-part`: two entries naming one part;
 //! - `dangling-target`: an internal relationship whose target is no part.
 //!
-//! Which entries are parts is read from the ZIP central directory as Excel
+//! Entry names, `Override` part names and relationship targets compare as
+//! one normalized name ([`opc_name`]: `/` separators, percent-decoded, ASCII
+//! case-insensitive). Which entries are parts is read from the ZIP central
+//! directory as Excel
 //! reads it: an entry is a directory when its name ends with `/` or its
 //! external attributes say so (tdf124525.xlsx marks `_rels`, `xl`, ... only
 //! there). The comparator's `read_parts` cannot decide this: it drops an empty
 //! extensionless entry as the loader does, which is exactly the part a save
 //! must not write.
 //!
-//! The content models (transitional `sml.xsd` of ECMA-376 Part 4), by child
+//! The content models (transitional `sml.xsd` of ECMA-376 Part 4) of every
+//! part whose content type is XML, whatever its name, by child
 //! name only, for `worksheet` (CT_Worksheet, `sheetData` required), its
 //! `sheetData` (`row`s) and their `row`s (`c`s, `extLst`), and `workbook`
 //! (CT_Workbook, `sheets` required): `not-allowed`, `order`, `duplicate` and
@@ -28,7 +31,7 @@
 //! is not after its previous sibling's (one without `r` is skipped). Children
 //! in another namespace (`mc:AlternateContent`, extensions) are not checked.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use super::comparator::{Elem, Node, parse_xml, read_parts, strip_indices};
 
@@ -161,22 +164,56 @@ fn zip_directory(name: &str, attrs: u32) -> bool {
         || (attrs >> 16) & 0o170_000 == 0o040_000
 }
 
-/// `[Content_Types].xml`: the `Default` extensions and the `Override` part
-/// names, both in lower case and without the leading `/`.
-fn content_types(types: &Elem) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut defaults = BTreeSet::new();
-    let mut overrides = BTreeSet::new();
-    for c in &types.children {
-        let Node::Elem(e) = c else { continue };
-        let get = |n: &str| e.attrs.iter().find(|a| a.local == n).map(|a| &a.value);
-        match e.local.as_str() {
-            "Default" => defaults.extend(get("Extension").map(|x| x.to_ascii_lowercase())),
-            "Override" => overrides
-                .extend(get("PartName").map(|p| p.trim_start_matches('/').to_ascii_lowercase())),
-            _ => {}
+/// A part name as OPC compares it: `/` separators, no leading `/`, `%XX`
+/// escapes decoded, ASCII lower case. ZIP entry names, `Override` part names
+/// and relationship targets all go through it, so a part written
+/// `xl/media/a%23.bin` is the one a target `media/a%23.bin` names.
+fn opc_name(name: &str) -> String {
+    percent_decode(&name.replace('\\', "/"))
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
+}
+
+/// `[Content_Types].xml`: the content type of each `Default` extension (in
+/// lower case) and of each `Override` part (by [`opc_name`]).
+struct ContentTypes {
+    defaults: BTreeMap<String, String>,
+    overrides: BTreeMap<String, String>,
+}
+
+impl ContentTypes {
+    fn read(types: &Elem) -> Self {
+        let mut defaults = BTreeMap::new();
+        let mut overrides = BTreeMap::new();
+        for c in &types.children {
+            let Node::Elem(e) = c else { continue };
+            let get = |n: &str| e.attrs.iter().find(|a| a.local == n).map(|a| &a.value);
+            let ct = get("ContentType").cloned().unwrap_or_default();
+            match (e.local.as_str(), get("Extension"), get("PartName")) {
+                ("Default", Some(x), _) => {
+                    defaults.insert(x.to_ascii_lowercase(), ct);
+                }
+                ("Override", _, Some(p)) => {
+                    overrides.insert(opc_name(p), ct);
+                }
+                _ => {}
+            }
+        }
+        ContentTypes {
+            defaults,
+            overrides,
         }
     }
-    (defaults, overrides)
+
+    /// The content type of the part `name` (by [`opc_name`]).
+    fn of(&self, name: &str) -> Option<&str> {
+        if let Some(ct) = self.overrides.get(name) {
+            return Some(ct);
+        }
+        let leaf = name.rsplit('/').next().unwrap_or(name);
+        let (_, ext) = leaf.rsplit_once('.')?;
+        self.defaults.get(ext).map(String::as_str)
+    }
 }
 
 /// `%XX` escapes decoded (a malformed one is kept as written).
@@ -203,11 +240,10 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The part a relationship `target` of the part in `dir` names: percent
-/// decoded, without a fragment, absolute or resolved against `dir`.
+/// The part (by [`opc_name`]) a relationship `target` of the part in `dir`
+/// names: without a fragment, absolute or resolved against `dir`.
 fn resolve(dir: &str, target: &str) -> String {
-    let target = percent_decode(target.split('#').next().unwrap_or(""));
-    let target = target.replace('\\', "/");
+    let target = target.split('#').next().unwrap_or("").replace('\\', "/");
     let mut steps: Vec<&str> = match target.strip_prefix('/') {
         Some(_) => Vec::new(),
         None => dir.split('/').filter(|s| !s.is_empty()).collect(),
@@ -221,23 +257,36 @@ fn resolve(dir: &str, target: &str) -> String {
             s => steps.push(s),
         }
     }
-    steps.join("/")
+    opc_name(&steps.join("/"))
 }
 
 /// The directory of the part whose relationships the part `rels` holds
 /// (`xl/_rels/workbook.xml.rels` -> `xl`, `_rels/.rels` -> the root), or
-/// `None` when `rels` is not in a `_rels` directory.
+/// `None` when `rels` is not in a `_rels` directory (in any case).
 fn source_dir(rels: &str) -> Option<&str> {
     let (dir, _) = rels.rsplit_once('/')?;
     match dir.rsplit_once('/') {
-        Some((parent, "_rels")) => Some(parent),
-        None if dir == "_rels" => Some(""),
+        Some((parent, rels_dir)) if rels_dir.eq_ignore_ascii_case("_rels") => Some(parent),
+        None if dir.eq_ignore_ascii_case("_rels") => Some(""),
         _ => None,
     }
 }
 
+/// The package's content types, if it has a readable `[Content_Types].xml`.
+fn read_content_types(parts: &BTreeMap<String, Vec<u8>>) -> Option<ContentTypes> {
+    parts
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(CONTENT_TYPES))
+        .and_then(|(_, b)| parse_xml(b))
+        .map(|types| ContentTypes::read(&types))
+}
+
 /// The package rules, over the parts the central directory names.
-fn validate_opc(zip: &[u8], parts: &BTreeMap<String, Vec<u8>>) -> Vec<Violation> {
+fn validate_opc(
+    zip: &[u8],
+    parts: &BTreeMap<String, Vec<u8>>,
+    types: Option<&ContentTypes>,
+) -> Vec<Violation> {
     let Some(entries) = central_entries(zip) else {
         return Vec::new();
     };
@@ -245,9 +294,7 @@ fn validate_opc(zip: &[u8], parts: &BTreeMap<String, Vec<u8>>) -> Vec<Violation>
     let mut names: BTreeMap<String, usize> = BTreeMap::new();
     for (name, attrs) in &entries {
         if !zip_directory(name, *attrs) {
-            *names
-                .entry(name.replace('\\', "/").to_ascii_lowercase())
-                .or_default() += 1;
+            *names.entry(opc_name(name)).or_default() += 1;
         }
     }
     for (name, n) in &names {
@@ -256,27 +303,17 @@ fn validate_opc(zip: &[u8], parts: &BTreeMap<String, Vec<u8>>) -> Vec<Violation>
         }
     }
     for required in [CONTENT_TYPES, "_rels/.rels"] {
-        if !names.contains_key(&required.to_ascii_lowercase()) {
+        if !names.contains_key(&opc_name(required)) {
             out.push(violation(required, Rule::MissingPart, required, ""));
         }
     }
-    let types = parts
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(CONTENT_TYPES))
-        .and_then(|(_, b)| parse_xml(b));
     if let Some(types) = types {
-        let (defaults, overrides) = content_types(&types);
         for name in names.keys() {
-            if name == &CONTENT_TYPES.to_ascii_lowercase() || overrides.contains(name) {
-                continue;
-            }
-            let leaf = name.rsplit('/').next().unwrap_or(name);
-            let ext = leaf.rsplit_once('.').map(|(_, x)| x);
-            if !ext.is_some_and(|x| defaults.contains(x)) {
+            if name != &opc_name(CONTENT_TYPES) && types.of(name).is_none() {
                 out.push(violation(name, Rule::NoContentType, name, ""));
             }
         }
-        for name in &overrides {
+        for name in types.overrides.keys() {
             if !names.contains_key(name) {
                 out.push(violation(CONTENT_TYPES, Rule::OverrideNoPart, name, ""));
             }
@@ -299,7 +336,7 @@ fn validate_opc(zip: &[u8], parts: &BTreeMap<String, Vec<u8>>) -> Vec<Violation>
             if r.local != "Relationship" || external {
                 continue;
             }
-            let part = resolve(dir, target).to_ascii_lowercase();
+            let part = resolve(dir, target);
             if !part.is_empty() && !names.contains_key(&part) {
                 out.push(violation(rels, Rule::DanglingTarget, &part, ""));
             }
@@ -448,9 +485,10 @@ fn position(e: &Elem) -> Option<u64> {
     if letters.is_empty() {
         return None;
     }
-    Some(letters.bytes().fold(0, |n, b| {
-        n * 26 + u64::from(b.to_ascii_uppercase() - b'A' + 1)
-    }))
+    letters.bytes().try_fold(0u64, |n, b| {
+        n.checked_mul(26)?
+            .checked_add(u64::from(b.to_ascii_uppercase() - b'A' + 1))
+    })
 }
 
 /// `r-order`: each `row` (or `c`) of `e` must come after the previous one
@@ -508,9 +546,18 @@ pub fn validate_package(pkg: &[u8]) -> Vec<Violation> {
     let Some(parts) = read_parts(pkg) else {
         return Vec::new();
     };
-    let mut out = validate_opc(pkg, &parts);
+    let types = read_content_types(&parts);
+    let mut out = validate_opc(pkg, &parts, types.as_ref());
     for (name, bytes) in &parts {
-        if !name.to_ascii_lowercase().ends_with(".xml") {
+        // An XML part by its content type, so a worksheet at `xl/sheet1`
+        // with an Override is checked; by its name without content types.
+        let xml = match &types {
+            Some(types) => types
+                .of(&opc_name(name))
+                .is_some_and(|ct| ct.ends_with("xml")),
+            None => name.to_ascii_lowercase().ends_with(".xml"),
+        };
+        if !xml {
             continue;
         }
         if let Some(root) = parse_xml(bytes) {

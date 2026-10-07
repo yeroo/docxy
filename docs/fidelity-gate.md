@@ -382,7 +382,8 @@ cargo test -p gridcore --test fidelity -- --nocapture
   The loader and the comparator both treat an entry as a directory, not a
   part, when its name ends with `/`, or when it is empty and either another
   entry lies under it or its name has no extension. An empty part with an
-  extension (`docProps/thumbnail.wmf`) is still a part. Before #1156 the
+  extension (`docProps/thumbnail.wmf`), or one without that an `Override` or
+  an internal relationship names, is still a part. Before #1156 the
   save wrote those entries back as empty parts with no content type, and
   Excel opened the file with its repair prompt.
 
@@ -393,9 +394,10 @@ cargo test -p gridcore --test fidelity -- --nocapture
   whether or not a value was lost. The checks live in
   `gridcore/tests/fidelity/schema.rs`.
 
-  The package rules follow OPC (ECMA-376 Part 2). Part names, `Override`
-  names and `Default` extensions compare ASCII case-insensitively.
-  Relationship targets are percent-decoded and resolved against their
+  The package rules follow OPC (ECMA-376 Part 2). Entry names, `Override`
+  names and relationship targets go through one normalization (`/`
+  separators, percent-decoded, ASCII case-insensitive), and `Default`
+  extensions compare case-insensitively. Targets are resolved against their
   source part, and `TargetMode="External"` targets are skipped. Which
   entries are parts is read from the ZIP central directory, as Excel reads
   it: an entry is a directory when its name ends with `/` or its attributes
@@ -411,7 +413,8 @@ cargo test -p gridcore --test fidelity -- --nocapture
   | `dangling-target` | An internal relationship targets no part. |
 
   The content models are a subset of the transitional `sml.xsd` of ECMA-376
-  Part 4. They check the children of `worksheet` (CT_Worksheet order,
+  Part 4. They apply to every part whose content type is XML, whatever its
+  name, and check the children of `worksheet` (CT_Worksheet order,
   `sheetData` required), `sheetData` (`row`), `row` (`c`, then `extLst`) and
   `workbook` (CT_Workbook order, `sheets` required), by name only. A
   violation uses docx's `not-allowed`, `order`, `duplicate` and `missing`
