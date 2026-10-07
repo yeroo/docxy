@@ -446,6 +446,19 @@ column right, ID fields are ignored, and lines past the last task append
 tasks; no row is inserted. The whole paste is one undo step, and a field that
 cannot apply cancels it, naming the cell.
 
+The entry table also has Project's range selection (#560). Shift+arrows
+extend a rectangle from the anchor (where the cursor was) to the cursor; a
+mouse drag over the cells, Shift+click, or a click on a task's ID cell (the
+whole row, like Project's row header) selects too, and any other key, click
+or command clears it. Ctrl+C copies the range as TSV — one line per shown
+row, each field a cell's edit text with tabs and line breaks inside a field
+turned to spaces — and Ctrl+X copies it, then clears whichever of Name,
+Predecessors and Resource Names the range covers, as one undo step; Ctrl+V
+pastes from the range's top-left. With 2+ rows selected, Ctrl+F2 links the tasks
+finish-to-start in row order and Ctrl+Shift+F2 unlinks them, each one undo
+step, the selection kept (#558). Pasting whole rows so that it inserts tasks
+is not done yet (its own issue).
+
 A summary's subtasks can be hidden and shown again, as in Project: View › Data
 › Show Subtasks / Hide Subtasks (Alt+Shift+Plus / Alt+Shift+Minus; yppxy `+` or
 `=` and `-`), or a click on the `▾`/`▸` beside the summary's name. Hide Subtasks

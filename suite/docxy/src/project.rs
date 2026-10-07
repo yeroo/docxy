@@ -76,6 +76,22 @@ pub(super) struct ProjectView {
     /// registered, so it registers once. A callback whose token no longer
     /// matches `busy` does nothing.
     pub scheduled: Option<u64>,
+    /// The selection's anchor (a task uid and column): the corner that stays
+    /// put while Shift+arrows, a drag or Shift+click move the cursor. The
+    /// selection is the bounding box of the anchor and the cursor, computed by
+    /// [`ProjectView::selection`]; `None` is no range.
+    pub anchor: Option<(i32, usize)>,
+    /// A press on a task's ID cell: the range stays whole rows (the anchor's
+    /// and the cursor's columns are pinned) while the drag moves over rows.
+    pub row_drag: bool,
+    /// A left press on a cell that has not seen its release yet; `drag_over`
+    /// extends the range only while this is set. The window-level mouse-up
+    /// clears it, like the sheet's `grid_release`.
+    pub dragging: bool,
+    /// A drag crossed onto another cell (or a Shift/ID press made a range):
+    /// the cell/row/body `on_click` that gpui delivers on release must not
+    /// clear what the gesture selected, so `cell_click` swallows that click.
+    pub drag_made_range: bool,
 }
 
 impl ProjectView {
@@ -106,6 +122,10 @@ impl ProjectView {
             split: None,
             busy: None,
             scheduled: None,
+            anchor: None,
+            row_drag: false,
+            dragging: false,
+            drag_made_range: false,
         }
     }
 
@@ -967,6 +987,16 @@ fn editable_row_cells(
     let (uid, summary) = (task.map(|t| t.uid), task.is_some_and(|t| t.summary));
     let probe_row = task.map_or_else(|| "entry".to_string(), |t| t.id.to_string());
     let cursor_row = v.cursor_row();
+    // Once per row: which cells, if any, the range selection covers.
+    let selection = v.selection();
+    let selected_bg = |u: Option<i32>, col: usize| {
+        if u.is_some_and(|u| selection.as_ref().is_some_and(|s| s.contains(u, col))) {
+            let c = hsla_u(BRAND);
+            hsla(c.h, c.s, c.l, 0.18)
+        } else {
+            hsla(0., 0., 0., 0.)
+        }
+    };
     h_flex()
         .h(px(ROW_H))
         .items_center()
@@ -989,6 +1019,8 @@ fn editable_row_cells(
             } else if let Some(uid) = uid.filter(|_| summary && col == COL_NAME) {
                 // A summary's outline glyph: a click shows or hides its
                 // subtasks without editing the cell or moving the cursor.
+                // The press is swallowed too, so the cell's own press
+                // listener cannot move the cursor before the click toggles.
                 let glyph = if v.ed.is_collapsed(uid) { "▸" } else { "▾" };
                 h_flex()
                     .child(
@@ -1000,6 +1032,9 @@ fn editable_row_cells(
                             .cursor_pointer()
                             .child(probe(probes, format!("project-toggle:{probe_row}")))
                             .child(glyph)
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 if let Some(tab) = this.tabs.get_mut(index) {
@@ -1024,6 +1059,7 @@ fn editable_row_cells(
                 .px_2()
                 .overflow_hidden()
                 .whitespace_nowrap()
+                .bg(selected_bg(uid, col))
                 .border_1()
                 .border_color(if row == cursor_row && col == v.col {
                     hsla_u(BRAND)
@@ -1033,6 +1069,32 @@ fn editable_row_cells(
                 .when(col == COL_NAME && edit.is_none(), |d| d.pl(px(8. + indent)))
                 .child(probe(probes, format!("project-cell:{probe_row}:{col}")))
                 .child(content)
+                // The press starts (and the move extends) a drag selection;
+                // the release is the window-level mouse-up, like the sheet.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        if this.active == index
+                            && let Some(tab) = this.tabs.get_mut(index)
+                        {
+                            project_cell_press(tab, row, col, ev.modifiers.shift);
+                        }
+                        this.refocus(window, cx);
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
+                    // A held left button is a drag's move; plain hover never
+                    // extends a range, however the press state stands.
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        return;
+                    }
+                    if this.active == index
+                        && let Some(tab) = this.tabs.get_mut(index)
+                        && project_cell_drag_over(tab, row, col)
+                    {
+                        cx.notify();
+                    }
+                }))
                 // Right-click selects the cell, then opens the row's menu.
                 .on_mouse_down(
                     MouseButton::Right,
@@ -1046,12 +1108,7 @@ fn editable_row_cells(
                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                     cx.stop_propagation();
                     if let Some(tab) = this.tabs.get_mut(index) {
-                        let double = ev.click_count() >= 2;
-                        if uid.is_some() {
-                            project_cell_click(tab, row, Some(col), double);
-                        } else {
-                            project_entry_click(tab, Some(col), double);
-                        }
+                        project_row_click(tab, row, Some(col), ev.click_count() >= 2);
                     }
                     this.refocus(window, cx);
                 }))
@@ -1234,7 +1291,6 @@ pub(super) fn project_el(
                                             .map(|r| {
                                                 let i = list_task(&rows, tasks.len(), r);
                                                 let task = tasks.get(i);
-                                                let is_task = task.is_some();
                                                 let indent = task
                                                     .map_or(0, |t| t.outline_level)
                                                     .saturating_sub(1)
@@ -1314,15 +1370,9 @@ pub(super) fn project_el(
                                                             if let Some(tab) =
                                                                 this.tabs.get_mut(index)
                                                             {
-                                                                if is_task {
-                                                                    project_cell_click(
-                                                                        tab, i, None, false,
-                                                                    );
-                                                                } else {
-                                                                    project_entry_click(
-                                                                        tab, None, false,
-                                                                    );
-                                                                }
+                                                                project_row_click(
+                                                                    tab, i, None, false,
+                                                                );
                                                             }
                                                             this.refocus(window, cx);
                                                         },

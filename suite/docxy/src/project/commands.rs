@@ -464,6 +464,16 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
     )
 }
 
+/// Whether a command act drops the entry-table range selection: every act
+/// clears it except the ones that keep or consume it — Copy keeps the
+/// highlight, Cut and Paste clear it when they run, Link and Unlink act on
+/// it. The rule lives here, one place, so keys, the ribbon, the QAT and
+/// Backstage cannot drift apart.
+pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
+    use ProjectAct::*;
+    !matches!(act, Copy | Cut | Paste | AddLink | UnlinkTasks)
+}
+
 /// A Project command's checked state on the ribbon.
 pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
     match act {
@@ -749,6 +759,7 @@ pub(crate) fn project_input(
         if key_act(key, m) == Some(ProjectAct::NewProject) {
             return commit_project_cell(tab).then_some(ProjectAct::NewProject);
         }
+        v.anchor = None;
         project_cell_input(tab, key, text, m);
         return None;
     }
@@ -757,6 +768,7 @@ pub(crate) fn project_input(
             v.prompt = Some(prompt);
             return None;
         }
+        v.anchor = None;
         match key {
             "escape" => {}
             "enter" => commit_prompt(tab, prompt),
@@ -779,6 +791,7 @@ pub(crate) fn project_input(
     }
     if m.control && !m.alt && !m.platform {
         // Shift is ignored, as it is for the plain arrows.
+        v.anchor = None;
         navigate(tab, |v| v.ctrl_key(key));
         return None;
     }
@@ -787,12 +800,20 @@ pub(crate) fn project_input(
             .map(|s| s.chars().filter(|c| !c.is_control()).collect::<String>())
             .filter(|s| !s.is_empty());
         if matches!(key, "enter" | "f2") || typed.is_some() {
+            v.anchor = None;
             if let Err(e) = v.open_cell(typed.as_deref()) {
                 tab.status = e.into();
             }
             return None;
         }
-        navigate(tab, |v| v.key(key, m.shift));
+        if m.shift && matches!(key, "up" | "down" | "left" | "right") {
+            navigate(tab, |v| v.extend_selection(key));
+        } else {
+            // A plain arrow, Tab, Home/End, PageUp/PageDown or Escape moves
+            // the cursor; the range a Shift+arrow made does not survive.
+            v.anchor = None;
+            navigate(tab, |v| v.key(key, m.shift));
+        }
     }
     None
 }
@@ -1187,6 +1208,13 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
         return;
     };
     v.cancel_prompt();
+    // A command acts on the cursor: the range does not survive it. (Copy,
+    // Cut and Paste are handled by the host before they reach here; Cut and
+    // Paste clear the range themselves, and Link/Unlink below are exempt in
+    // [`project_act_clears_range`], which the host-side dispatch also uses.)
+    if project_act_clears_range(act) {
+        v.anchor = None;
+    }
     let before = (v.cursor_row(), v.display_row());
     let mut status = None;
     let mut reveal_clear = false;
@@ -1249,9 +1277,64 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 status = Some(format!("New tasks: {}", task_mode_name(manual)));
             }
             Indent | Outdent => {} // shared no-op-at-limit policy below
-            AddLink => v.open_prompt(PromptKind::Predecessor),
+            AddLink => {
+                // Over a range: link the shown tasks finish-to-start in row
+                // order (blank rows are not linked, a pair already linked is
+                // left alone) as one undo step; a link that would cycle (or
+                // cross a summary's outline) cancels the whole batch, naming
+                // the pair. Otherwise the predecessor prompt opens, as for a
+                // single task. The selection survives both.
+                if let Some(sel) = v.selection().filter(|s| s.uids.len() >= 2) {
+                    let linked = v.ed.batch(|ed| {
+                        let tasks: Vec<i32> = sel
+                            .uids
+                            .iter()
+                            .copied()
+                            .filter(|&uid| ed.project().task(uid).is_some_and(|t| !t.is_null))
+                            .collect();
+                        let mut n = 0;
+                        for w in tasks.windows(2) {
+                            let (a, b) = (w[0], w[1]);
+                            let already = ed
+                                .project()
+                                .task(b)
+                                .is_some_and(|t| t.predecessors.iter().any(|p| p.uid == a));
+                            if !already {
+                                ed.add_link(b, projcore::Predecessor::fs(a))
+                                    .map_err(|e| cell_error(ed, Some(b), COL_PREDECESSORS, e))?;
+                                n += 1;
+                            }
+                        }
+                        Ok(n)
+                    });
+                    status = Some(match linked {
+                        Ok(0) => "No links to add".into(),
+                        Ok(1) => "Added 1 link".into(),
+                        Ok(n) => format!("Added {n} links"),
+                        Err(e) => e,
+                    });
+                } else {
+                    v.open_prompt(PromptKind::Predecessor);
+                }
+            }
             UnlinkTasks => {
-                if let Some(uid) = v.selected_uid() {
+                // Over a range: every selected task loses its links in one
+                // undo step; the single-task wording and depth are unchanged.
+                if let Some(sel) = v.selection().filter(|s| s.uids.len() >= 2) {
+                    let removed = v.ed.batch(|ed| {
+                        let mut n = 0;
+                        for uid in &sel.uids {
+                            n += ed.unlink_task(*uid)?;
+                        }
+                        Ok(n)
+                    });
+                    status = Some(match removed {
+                        Ok(0) => "No links to remove".into(),
+                        Ok(1) => "Removed 1 link".into(),
+                        Ok(n) => format!("Removed {n} links"),
+                        Err(e) => e,
+                    });
+                } else if let Some(uid) = v.selected_uid() {
                     status = Some(match v.ed.unlink_task(uid)? {
                         0 => "No links to remove".into(),
                         1 => "Removed 1 link".into(),
@@ -1390,6 +1473,9 @@ pub(crate) fn toggle_project_collapse(tab: &mut DocTab, uid: i32) {
     let Surface::Project(v) = &mut tab.surface else {
         return;
     };
+    // The glyph's click is a plain click: the range does not survive it, so
+    // collapsing cannot park an old anchor that expanding would revive.
+    v.anchor = None;
     let before = v.cursor_row();
     if let Err(e) = v.ed.toggle_collapsed(uid) {
         tab.status = e.into();
@@ -1542,6 +1628,16 @@ impl Docxy {
             return;
         }
         self.project_prompt_cancel();
+        // A command acts on the cursor, so the range does not survive it —
+        // here, one place, however the act reached the app (keys, the
+        // ribbon, the QAT, the row menus). Backstage Save and Save As go
+        // straight to save_project, which applies the same rule itself.
+        if project_act_clears_range(act)
+            && let Some(Surface::Project(v)) =
+                self.tabs.get_mut(self.active).map(|t| &mut t.surface)
+        {
+            v.anchor = None;
+        }
         match act {
             ProjectAct::Save => return self.save_project(false, window, cx),
             ProjectAct::NewProject => return self.add_tab(Kind::Project, window, cx),

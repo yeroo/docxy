@@ -367,3 +367,228 @@ fn an_empty_copied_cell_pastes_as_an_emptied_cell() {
         assert_eq!((tasks(&t).len(), v(&t).ed.undo_depth()), (2, depth + 1));
     }
 }
+
+// ---- Range copy/cut/paste (#560) --------------------------------------------
+
+fn shift_key(t: &mut DocTab, key_name: &str) {
+    let m = Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    };
+    assert_eq!(project_input(t, key_name, None, m), None);
+}
+
+/// Select the rectangle from (row 0, `col`) to (`rows`, `to_col`) with
+/// Shift+arrows, the cursor landing on the bottom-right cell. Resets the
+/// anchor first: `at` alone does not, and a stale one would move the box.
+fn select_range(t: &mut DocTab, col: usize, rows: usize, to_col: usize) {
+    at(t, 0, col);
+    vm(t).anchor = None;
+    for _ in 0..rows {
+        shift_key(t, "down");
+    }
+    for _ in col..to_col {
+        shift_key(t, "right");
+    }
+}
+
+#[test]
+fn ctrl_c_with_shift_arrows_maps_to_the_range_acts() {
+    // The clipboard chords are unchanged and Shift+arrows are not acts; they
+    // extend the selection (see ctrl_c_x_v_map_to_the_clipboard_acts for the
+    // chord mapping itself).
+    let m = Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    };
+    for key in ["up", "down", "left", "right"] {
+        assert_ne!(key_act(key, m), Some(ProjectAct::Copy), "{key}");
+        assert_ne!(key_act(key, m), Some(ProjectAct::Cut), "{key}");
+        assert_ne!(key_act(key, m), Some(ProjectAct::Paste), "{key}");
+    }
+    let mut t = tab();
+    at(&mut t, 0, COL_NAME);
+    shift_key(&mut t, "down");
+    shift_key(&mut t, "right");
+    assert_eq!(v(&t).selection().unwrap().count(), 4);
+}
+
+#[test]
+fn copy_a_range_is_tsv_of_edit_texts() {
+    let mut t = tab();
+    select_range(&mut t, COL_NAME, 1, COL_DURATION);
+    assert_eq!(project_copy_text(v(&t)), "A\t2d\nB\t2d\n");
+    // One row, several columns: tabs between fields, and the line still
+    // ends with \n.
+    select_range(&mut t, COL_MODE, 0, COL_DURATION);
+    assert_eq!(
+        project_copy_text(v(&t)),
+        "Auto Scheduled\tA\t2d\n",
+        "the cursor's row copies top to bottom, left to right"
+    );
+}
+
+#[test]
+fn copy_a_range_replaces_tabs_and_newlines_inside_a_field() {
+    let mut t = tab();
+    vm(&mut t).ed.rename(1, "a\tb\rc\nd").unwrap();
+    select_range(&mut t, COL_NAME, 0, COL_DURATION);
+    assert_eq!(project_copy_text(v(&t)), "a b c d\t2d\n");
+    // The single-cell path does not replace them (range-only rule).
+    at(&mut t, 0, COL_NAME);
+    assert_eq!(project_copy_text(v(&t)), "a\tb\rc\nd");
+}
+
+#[test]
+fn copy_then_paste_a_range_round_trips() {
+    let mut t = tab();
+    select_range(&mut t, COL_NAME, 1, COL_DURATION);
+    let text = project_copy_text(v(&t));
+    assert_eq!(text, "A\t2d\nB\t2d\n");
+    at(&mut t, 2, COL_NAME);
+    let depth = v(&t).ed.undo_depth();
+    paste_project_text(&mut t, &text);
+    assert_eq!(
+        tasks(&t),
+        [
+            (1, "A".into(), 960),
+            (2, "B".into(), 960),
+            (3, "A".into(), 960),
+            (4, "B".into(), 960),
+        ],
+        "the copied values land on the appended tasks"
+    );
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1, "one undo step");
+}
+
+#[test]
+fn cut_a_range_clears_only_name_predecessors_resources_in_one_undo_step() {
+    let mut t = tab();
+    apply_cell(&mut vm(&mut t).ed, 2, COL_PREDECESSORS, "1").unwrap();
+    vm(&mut t).ed.assign_resource(2, "Alice").unwrap();
+    select_range(&mut t, COL_NAME, 1, COL_RESOURCES);
+    let depth = v(&t).ed.undo_depth();
+    project_cut(&mut t);
+    assert_eq!(
+        v(&t).ed.undo_depth(),
+        depth + 1,
+        "the whole cut is one step"
+    );
+    let names: Vec<_> = tasks(&t).into_iter().map(|t| t.1).collect();
+    assert_eq!(names, ["", ""], "both names cleared");
+    for uid in [1, 2] {
+        let task = v(&t).ed.project().task(uid).unwrap();
+        assert!(task.predecessors.is_empty(), "{uid}: predecessors cleared");
+        assert!(
+            project_row(&v(&t).ed, task)[COL_RESOURCES].is_empty(),
+            "{uid}: resource names cleared"
+        );
+    }
+    // Durations in the range survived.
+    assert_eq!(tasks(&t)[0].2, 960);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    let names: Vec<_> = tasks(&t).into_iter().map(|t| t.1).collect();
+    assert_eq!(names, ["A", "B"], "one undo restores every cleared cell");
+    assert!(!v(&t).ed.project().task(2).unwrap().predecessors.is_empty());
+}
+
+#[test]
+fn cut_a_range_with_no_cutable_column_only_copies() {
+    let mut t = tab();
+    select_range(&mut t, COL_ID, 1, COL_ID);
+    let depth = v(&t).ed.undo_depth();
+    project_cut(&mut t);
+    assert_eq!(
+        t.status.as_ref(),
+        "Selection copied; its columns can't be cut"
+    );
+    assert_eq!(v(&t).ed.undo_depth(), depth, "nothing was cleared");
+    assert_eq!(tasks(&t)[0].1, "A");
+    assert_eq!(sel_count(&t), None, "the cut consumed the range");
+}
+
+#[test]
+fn cut_a_range_never_deletes_a_task_even_across_the_id_column() {
+    let mut t = tab();
+    // Whole rows: an ID-press drag over both tasks.
+    crate::project_cell_press(&mut t, 0, COL_ID, false);
+    crate::project_cell_drag_over(&mut t, 1, COL_ID);
+    crate::project_cell_release(&mut t);
+    let depth = v(&t).ed.undo_depth();
+    project_cut(&mut t);
+    assert_eq!(tasks(&t).len(), 2, "both tasks survive their ID cells");
+    assert_eq!(tasks(&t)[0].1, "", "Name cleared");
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+}
+
+#[test]
+fn cut_a_range_skips_a_blank_row_and_clears_the_rest() {
+    let mut t = tab();
+    let row = vm(&mut t).ed.insert_blank_row(None).unwrap();
+    assert_eq!(row, 2);
+    select_range(&mut t, COL_NAME, 2, COL_NAME);
+    project_cut(&mut t);
+    let task = &v(&t).ed.project().tasks[2];
+    assert!(task.is_null, "a blank row stays blank");
+    assert_eq!(tasks(&t)[0].1, "", "the named rows cleared");
+}
+
+#[test]
+fn paste_with_a_range_goes_to_its_top_left_and_clears_it() {
+    let mut t = tab();
+    // The cursor on the bottom-right: the range's top-left is (0, Name).
+    select_range(&mut t, COL_NAME, 1, COL_DURATION);
+    paste_project_text(&mut t, "X\t3d");
+    assert_eq!(
+        tasks(&t),
+        [(1, "X".into(), 1440), (2, "B".into(), 960)],
+        "one pasted line reached only the top-left cell's row"
+    );
+    assert_eq!(sel_count(&t), None);
+    assert_eq!((v(&t).ed.sel(), v(&t).col), (0, COL_NAME));
+}
+
+#[test]
+fn paste_with_a_range_pastes_down_and_right_from_its_top_left() {
+    let mut t = tab();
+    select_range(&mut t, COL_DURATION, 1, COL_DURATION);
+    paste_project_text(&mut t, "3d\n4d");
+    assert_eq!(tasks(&t), [(1, "A".into(), 1440), (2, "B".into(), 1920)]);
+}
+
+fn sel_count(t: &DocTab) -> Option<usize> {
+    v(t).selection().map(|s| s.count())
+}
+
+#[test]
+fn whole_rows_copy_and_paste_back_from_the_id_column() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../uiharness/fixtures/project-clipboard.xml");
+    let mut t = crate::project_tab_from_path(&path);
+    // Whole rows via an ID press + drag, as the uit does; the copy starts at
+    // the ID column, so the paste has to start there too (the ID field is
+    // ignored, as on any paste).
+    crate::project_cell_press(&mut t, 0, COL_ID, false);
+    crate::project_cell_drag_over(&mut t, 1, COL_ID);
+    crate::project_cell_release(&mut t);
+    let text = {
+        let Surface::Project(v) = &t.surface else {
+            panic!()
+        };
+        project_copy_text(v)
+    };
+    crate::project_cell_press(&mut t, 2, COL_ID, false);
+    crate::project_cell_release(&mut t);
+    paste_project_text(&mut t, &text);
+    assert_eq!(
+        tasks(&t),
+        [
+            (1, "A".into(), 960),
+            (2, "B".into(), 960),
+            (3, "A".into(), 960),
+            (4, "B".into(), 960),
+        ],
+        "{}",
+        t.status
+    );
+}

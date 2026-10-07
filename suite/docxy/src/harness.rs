@@ -935,8 +935,10 @@ pub fn region_name(region: Region) -> String {
 
 /// The 10 points a `pointer-drag` visits: the two ends plus 8 interpolated
 /// moves strictly between them, at k/9 of the distance. gpui arms the drag on
-/// the first pressed move more than 2px from the press, so a from→to distance
-/// of about 2.25px or less never arms and acts as a click.
+/// the first pressed move more than 2px from the press, and `drag_events`
+/// also sends a pressed move at the destination itself, so a from→to
+/// distance (including `offset`) of 2px or less never arms and acts as a
+/// click.
 fn pointer_drag_path(from: Point<Pixels>, to: Point<Pixels>) -> Vec<Point<Pixels>> {
     let mut path = Vec::with_capacity(10);
     path.push(from);
@@ -1017,10 +1019,12 @@ fn wheel_events(p: Point<Pixels>, dy: f32) -> Vec<PlatformInput> {
 }
 
 /// The press-moves-release a `pointer-drag` dispatches along `path`: an
-/// unpressed hover and the press at the start, pressed moves (which arm and
-/// carry the drag) along the middle, the release at the end.
+/// unpressed hover and the press at the start, then pressed moves (which arm
+/// and carry the drag) — eight between the ends and a ninth at the
+/// destination, so the drag's handlers see the final cell before the
+/// release at the end.
 fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
-    let mut events = Vec::with_capacity(path.len() + 1);
+    let mut events = Vec::with_capacity(path.len() + 2);
     events.push(mouse_move(path[0], None));
     events.push(mouse_down(path[0]));
     events.extend(
@@ -1028,6 +1032,7 @@ fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
             .iter()
             .map(|&p| mouse_move(p, Some(MouseButton::Left))),
     );
+    events.push(mouse_move(path[path.len() - 1], Some(MouseButton::Left)));
     events.push(mouse_up(path[path.len() - 1]));
     events
 }
@@ -3795,12 +3800,22 @@ fn dispatch_verb(
                             .into(),
                     );
                 }
+                let count = v.ed.project().tasks.len();
                 match target.at {
                     Some(crate::ShownRow::Task(i)) => {
-                        crate::project_cell_click(tab, i, Some(target.col), dbl)
+                        crate::project_cell_press(tab, i, target.col, shift);
+                        crate::project_cell_click(tab, i, Some(target.col), dbl);
+                        crate::project_cell_release(tab);
                     }
                     Some(crate::ShownRow::Entry) => {
-                        crate::project_entry_click(tab, Some(target.col), dbl)
+                        // The press commits an open entry-row edit, so an
+                        // append is visible before the click runs: the click
+                        // lands on the new task's row, as the pointer's click
+                        // does — its closure resolves the row against the
+                        // current task list (see project_row_click).
+                        crate::project_cell_press(tab, count, target.col, shift);
+                        crate::project_row_click(tab, count, Some(target.col), dbl);
+                        crate::project_cell_release(tab);
                     }
                     None => return Err("Project cell is outside the entry table".into()),
                 }
@@ -3945,6 +3960,21 @@ fn dispatch_verb(
                 ),
             ]))?;
             done.input = drag_events(&path);
+            Ok(done)
+        }
+
+        // A bare pointer move with no button held, as the hover between
+        // gestures: `to` names a region, as for pointer-drag. Drives the
+        // move handlers exactly like a real hover: it pins that they answer
+        // a held left button and never plain hover (a Project range extends
+        // on a drag's move, not on a hover).
+        "pointer-move" => {
+            let to = region_point(app, arg_str(args, "to")?, window)?;
+            let mut done = Done::ok(Json::obj(vec![(
+                "to",
+                Json::Arr(vec![Json::Num(f64::from(to.x)), Json::Num(f64::from(to.y))]),
+            )]))?;
+            done.input = vec![mouse_move(to, None)];
             Ok(done)
         }
 
@@ -4289,11 +4319,45 @@ fn dispatch_verb(
         }
 
         // A drag: the press plants the anchor, each cell crossed is a move, the
-        // release commits whatever the moves armed.
+        // release commits whatever the moves armed. On a Project tab the ends
+        // are entry-table cells, as for `click-cell`.
         "drag" => {
             app.refuse_under_dialog()?;
             let (from, to) = drag_args(args)?;
             let ctrl = arg_flag(args, "ctrl")?;
+            if app.active_is_project() {
+                let tab = &mut app.tabs[app.active];
+                let (from_i, path) = {
+                    let crate::Surface::Project(v) = &tab.surface else {
+                        return Err("Project is not loaded".into());
+                    };
+                    if from.1 as usize >= crate::COLUMN_COUNT
+                        || to.1 as usize >= crate::COLUMN_COUNT
+                    {
+                        return Err("Project cell is outside the entry table".into());
+                    }
+                    // Rows are drawn rows, as for `click-cell`; the entry row
+                    // and past it move nothing (the range stops on the last
+                    // task), so they map to the entry row's press/drag no-ops.
+                    let count = v.ed.project().tasks.len();
+                    let at = |r: u32| match crate::shown_task(&v.ed, r as usize) {
+                        Some(crate::ShownRow::Task(i)) => i,
+                        _ => count,
+                    };
+                    let path = drag_path(from, to)
+                        .into_iter()
+                        .map(|(r, c)| (at(r), c as usize))
+                        .collect::<Vec<_>>();
+                    (at(from.0), path)
+                };
+                crate::project_cell_press(tab, from_i, from.1 as usize, false);
+                for (i, c) in path {
+                    crate::project_cell_drag_over(tab, i, c);
+                }
+                crate::project_cell_release(tab);
+                app.refocus(window, cx);
+                return Done::ok(state(app, window));
+            }
             sheet(app)?;
             app.grid_press_cell(from, ctrl, cx);
             for (r, c) in drag_path(from, to) {
@@ -6985,15 +7049,33 @@ mod tests {
                 + (f32::from(p.y) - f32::from(press.y)).powi(2))
             .sqrt()
         };
+        // The pressed moves drag_events actually sends: the eight between
+        // the ends and the ninth at the destination.
+        let pressed_moves = |from: Point<Pixels>, to: Point<Pixels>| {
+            drag_events(&pointer_drag_path(from, to))
+                .into_iter()
+                .filter_map(|e| match e {
+                    PlatformInput::MouseMove(m) => {
+                        (m.pressed_button == Some(MouseButton::Left)).then_some(m.position)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
         let press = point(px(100.), px(100.));
-        let short = pointer_drag_path(press, point(px(106.), px(100.)));
+        let short = pressed_moves(press, point(px(106.), px(100.)));
         assert!(
-            short[1..9].iter().any(|p| dist_from_press(p, &press) > 2.0),
+            short.iter().any(|p| dist_from_press(p, &press) > 2.0),
             "a 6px drag must arm gpui's drag"
         );
-        let tiny = pointer_drag_path(press, point(px(102.), px(100.)));
+        assert_eq!(
+            short.last(),
+            Some(&point(px(106.), px(100.))),
+            "the destination gets a pressed move, so the drag sees the final cell"
+        );
+        let tiny = pressed_moves(press, point(px(102.), px(100.)));
         assert!(
-            tiny[1..9].iter().all(|p| dist_from_press(p, &press) <= 2.0),
+            tiny.iter().all(|p| dist_from_press(p, &press) <= 2.0),
             "a 2px drag must never arm — it acts as a click"
         );
     }

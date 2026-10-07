@@ -13794,6 +13794,16 @@ impl Docxy {
             self.refocus(window, cx);
             return;
         }
+        // A command acts on the cursor, so the range does not survive it.
+        // Backstage Save and Save As reach this method directly, not through
+        // project_act, so the rule is applied here too (one rule, see
+        // [`project_act_clears_range`]).
+        if project_act_clears_range(ProjectAct::Save)
+            && let Some(Surface::Project(v)) =
+                self.tabs.get_mut(self.active).map(|t| &mut t.surface)
+        {
+            v.anchor = None;
+        }
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -26569,14 +26579,13 @@ impl Docxy {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return Err("no tab is open".into());
         };
-        let Surface::Project(v) = &tab.surface else {
+        let Surface::Project(v) = &mut tab.surface else {
             return Err("the active tab is not a Project".into());
         };
-        if row < v.ed.project().tasks.len() {
-            project_cell_click(tab, row, col, false);
-        } else {
-            project_entry_click(tab, col, false);
-        }
+        // The menu acts on the row under the pointer: a stale drag flag must
+        // not swallow this click and leave the cursor on an older row.
+        v.drag_made_range = false;
+        crate::project_row_click(tab, row, col, false);
         let Surface::Project(v) = &tab.surface else {
             return Err("the active tab is not a Project".into());
         };
@@ -31184,11 +31193,48 @@ impl Render for Docxy {
             .flatten()
             .map(|at| self.mini_bar_el(at, pal, cx));
 
+        // A Project cell drag ends at the window level, not the element
+        // level: the suite root's hitbox is not hovered for releases over
+        // the split gutter (block_mouse_except_scroll), outside the window,
+        // or in keyboard modality, and element listeners run only when
+        // hovered. Window listeners run for every event of the next frame.
+        // They are registered from a canvas's paint callback: a view's
+        // render runs in Prepaint and window.on_mouse_event asserts it is
+        // called during paint. The swallow flag is not touched at release;
+        // the press listener disarms it before any click the press could
+        // produce is dispatched. Both apply to every Project tab: a gesture
+        // can outlive its tab's activation (a tab switch mid-drag, F11), and
+        // the release that ends it must reach it wherever it lives.
+        let released = cx.entity();
+        let pressed = cx.entity();
+        let gesture_listeners = canvas(
+            |_b, _w, _a| {},
+            move |_b, _s, window: &mut Window, _cx: &mut App| {
+                window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
+                    if phase == DispatchPhase::Capture && ev.button == MouseButton::Left {
+                        released.update(cx, |this, _cx| {
+                            crate::project_cell_release_all(&mut this.tabs);
+                        });
+                    }
+                });
+                window.on_mouse_event(move |_ev: &MouseDownEvent, phase, _window, cx| {
+                    if phase == DispatchPhase::Capture {
+                        pressed.update(cx, |this, _cx| {
+                            crate::project_cell_press_reset_all(&mut this.tabs);
+                        });
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full();
+
         v_flex()
             .size_full()
             .relative()
             .track_focus(&self.focus)
             .key_routing(&self.focus, cx)
+            .child(gesture_listeners)
             // Ruler drags are tracked at the window level so they keep working when
             // the pointer leaves the thin ruler strip (gpui move events are
             // hitbox-scoped, so a ruler-only handler would stop the moment the

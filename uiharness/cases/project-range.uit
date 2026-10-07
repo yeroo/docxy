@@ -1,0 +1,218 @@
+# Range selection in the Project entry table (#560) and range Link/Unlink
+# (#558). The fixture has two two-day tasks, A and B.
+
+test shift+arrows extend a range and a one-row copy pastes back exactly
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  key shift+down
+  key shift+right
+  assert selection is 4
+  # One row's copy: the edit texts, tab-separated, ending with the newline a
+  # spreadsheet's copy ends with. A uit value is one line, so the text is
+  # pinned through the round trip.
+  call click-cell {"cell":"C1"}
+  key shift+right
+  assert selection is 2
+  key ctrl+c
+  call click-cell {"cell":"C3"}
+  key ctrl+v
+  call task.list {}
+  assert reply.tasks.2.name is A
+  assert reply.tasks.2.duration_days is 2
+  assert selection is none
+  assert cell is Name
+  assert cell_row is 2
+  # A plain arrow moves the cursor and clears the range.
+  key shift+up
+  assert selection is 2
+  key down
+  assert selection is none
+
+test a range copy whose last row is empty still clears that row on paste
+  open copy:../fixtures/project-clipboard.xml
+  call clipboard {"action":"write","text":"X\t1d\nY\t2d\n"}
+  call click-cell {"cell":"C3"}
+  key ctrl+v
+  call task.list {}
+  assert reply.tasks.2.name is X
+  assert reply.tasks.3.name is Y
+  # Copy A's name and B's (now empty) name — "A\n\n" — and paste over X and
+  # Y: the empty second line must clear Y's name, not be dropped by the TSV
+  # parse.
+  call click-cell {"cell":"C2"}
+  key delete
+  call click-cell {"cell":"C1"}
+  key shift+down
+  key ctrl+c
+  call click-cell {"cell":"C3"}
+  key ctrl+v
+  call task.list {}
+  assert reply.tasks.2.name is A
+  assert reply.tasks.3.name is ""
+
+test the copied range pastes back for the same values
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  key shift+down
+  key shift+right
+  key ctrl+c
+  call click-cell {"cell":"C3"}
+  key ctrl+v
+  call task.list {}
+  assert reply.tasks.2.name is A
+  assert reply.tasks.3.name is B
+  assert reply.tasks.2.duration_days is 2
+  assert selection is none
+  assert cell is Name
+  key ctrl+z
+  call task.list {}
+  assert reply.tasks.0.name is A
+
+test ctrl+x over a range copies it and clears names in one undo step
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  key shift+down
+  key ctrl+x
+  call clipboard {"action":"read"}
+  assert reply.text is not nothing
+  call task.list {}
+  assert reply.tasks.0.name is ""
+  assert reply.tasks.1.name is ""
+  assert reply.tasks.0.duration_days is 2
+  assert selection is none
+  key ctrl+z
+  call task.list {}
+  assert reply.tasks.0.name is A
+  assert reply.tasks.1.name is B
+
+test a drag selects the rectangle and the release-click keeps it
+  open copy:../fixtures/project-clipboard.xml
+  drag C1 -> C2
+  assert selection is 2
+  # The same through real pointer events: press, moves, release hit-test the
+  # cells' own handlers.
+  call pointer-drag {"from":"cell:C1","to":"cell:D2"}
+  assert selection is 4
+  # The range is what Copy takes: paste it below and the values land.
+  key ctrl+c
+  call click-cell {"cell":"C3"}
+  key ctrl+v
+  call task.list {}
+  assert reply.tasks.2.name is A
+  assert reply.tasks.3.name is B
+
+test a click ends its drag: neither a hover nor a held move extends a range
+  open copy:../fixtures/project-clipboard.xml
+  call pointer-click {"region":"cell:C1"}
+  # A hover with no button held: the move gate alone pins that the cursor
+  # stays and no range forms.
+  call pointer-move {"to":"cell:C2"}
+  assert cell_row is 0
+  assert selection is none
+  # A held-button move starting on the chart side: this only stays put if
+  # the click's release ended the drag it armed — otherwise the swept cells
+  # would sweep the cursor onto row 1 and grow a range. The release lands on
+  # another row, so no click follows it and the cursor stays where the
+  # click put it.
+  call pointer-drag {"from":"bar:1","to":"cell:C2"}
+  assert selection is none
+  assert cell_row is 0
+  # A drag released on the split gutter, where the root's hitbox is not even
+  # hovered. cell_drag is the assertion that pins the window-level release:
+  # it must be false after the release even though no element listener ran.
+  # The gutter's centre is the split bar's middle, so the sweep leaves the
+  # table diagonally at C2 and keeps its range.
+  call pointer-drag {"from":"cell:C1","to":"project-split"}
+  assert cell_drag is false
+  assert selection is 2
+  # A plain click after it behaves exactly as always: the cursor moves to
+  # the clicked cell and the range does not survive.
+  call click-cell {"cell":"C2"}
+  assert cell_drag is false
+  assert selection is none
+  assert cell_row is 1
+
+test a command clears the range wherever it ran from
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  key shift+down
+  assert selection is 2
+  # Ctrl+S is handled by the host (save_project) and never reaches
+  # apply_project_act: the range still does not survive it.
+  key ctrl+s
+  assert selection is none
+  # Copy is the exception: the highlight survives it.
+  call click-cell {"cell":"C1"}
+  key shift+down
+  key ctrl+c
+  assert selection is 2
+
+test shift+click extends the range from the cursor
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  call click-cell {"cell":"D2","shift":true}
+  assert selection is 4
+  assert cell_row is 1
+
+test a click on the ID cell selects the whole row, and drags whole rows
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"A1"}
+  assert selection is 8
+  assert cell is ID
+  # Whole rows drag: two rows x all eight columns. Copy and paste below from
+  # the ID column, where a whole-row copy starts; the ID fields are ignored,
+  # so the new tasks take names and durations.
+  drag A1 -> A2
+  assert selection is 16
+  key ctrl+c
+  call click-cell {"cell":"A3"}
+  key ctrl+v
+  call task.list {}
+  assert reply.tasks.2.name is A
+  assert reply.tasks.3.name is B
+  assert reply.tasks.2.duration_days is 2
+
+test ctrl+f2 links the selected rows and ctrl+shift+f2 unlinks them
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"A1"}
+  key shift+down
+  # The ID click anchored the whole row, so Shift+Down extends by whole rows.
+  assert selection is 16
+  key ctrl+f2
+  call status-read {}
+  assert reply.items.2.text is Added 1 link
+  call task.list {}
+  assert reply.tasks.1.predecessors.0.uid is 1
+  assert selection is 16
+  key ctrl+shift+f2
+  call status-read {}
+  assert reply.items.2.text is Removed 1 link
+  key ctrl+z
+  call task.list {}
+  assert reply.tasks.1.predecessors.0.uid is 1
+
+test ctrl+f2 with one row opens the predecessor prompt
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"A1"}
+  key ctrl+f2
+  assert prompt is predecessor:
+
+test a press that commits the entry row keeps the click on the new task
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C3"}
+  type Design
+  # pointer-click dispatches press and release back to back, with no redraw
+  # in between: the release runs the entry row's stale click closure. The
+  # press committed the edit and made the row a task, so the click must
+  # resolve against the current task list and stay on the new task.
+  call pointer-click {"region":"cell:D3"}
+  assert tasks is 3
+  assert cell_row is 2
+  assert cell is Duration
+  # Typing now hits the new task's Duration; no second task appears.
+  type 3d
+  key enter
+  assert tasks is 3
+  call task.list {}
+  assert reply.tasks.2.name is Design
+  assert reply.tasks.2.duration_days is 3
