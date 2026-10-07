@@ -4673,6 +4673,7 @@ mod table_tests {
             data_on_rows: false,
             unsupported: false,
             edited: false,
+            refreshed: false,
             part: String::new(),
             cache_part: String::new(),
         }
