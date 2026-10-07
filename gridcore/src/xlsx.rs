@@ -897,6 +897,7 @@ fn parse_workbook_xml(
 ) {
     let mut sheets = Vec::new();
     let mut date1904 = false;
+    let mut seen_workbook_pr = false;
     let mut iterate = None;
     let mut names = Vec::new();
     let mut p = XmlParser::new(xml);
@@ -920,7 +921,11 @@ fn parse_workbook_xml(
                     let hidden = matches!(p.attr("state"), "hidden" | "veryHidden");
                     sheets.push((name, rid, hidden));
                 }
-                "workbookPr" => {
+                // The workbook's own comes first (CT_Workbook puts it ahead
+                // of extLst); `<x15:workbookPr>` in extLst shares the local
+                // name but has no date1904, and must not reset it.
+                "workbookPr" if !seen_workbook_pr => {
+                    seen_workbook_pr = true;
                     let v = p.attr("date1904");
                     date1904 = v == "1" || v == "true";
                 }
@@ -1751,9 +1756,9 @@ fn parse_worksheet(
     let mut sheet = Sheet::default();
     let mut p = XmlParser::new(xml);
 
-    // Shared-formula masters: si → (row, col, source).
-    let mut shared_masters: BTreeMap<u32, (u32, u32, String)> = BTreeMap::new();
-    // Followers to fill in after the pass: (row, col, si).
+    // Shared-formula masters: si → (row, col, source, the master's raw <f> attrs).
+    let mut shared_masters: BTreeMap<u32, (u32, u32, String, String)> = BTreeMap::new();
+    // Every shared <f>, masters included, to resolve after the pass: (row, col, si).
     let mut followers: Vec<(u32, u32, u32)> = Vec::new();
 
     let mut cur_row: u32 = 0;
@@ -1878,7 +1883,25 @@ fn parse_worksheet(
                     if meta != CellMeta::default() {
                         cell.meta = Some(Box::new(meta));
                     }
-                    if !(cell.is_blank() && cell.style == 0 && cell.f_attrs.is_none()) {
+                    // An empty cell with the default style carries nothing,
+                    // unless its row or column has a style: then the cell
+                    // pins the default, and without it the cell would show
+                    // the row's or column's format (#1064).
+                    let pins_default = || {
+                        let styled = |s: Option<&str>| s.is_some_and(|s| s.trim() != "0");
+                        sheet.row_attrs.get(&row).is_some_and(|a| {
+                            matches!(
+                                crate::sheet::xml_attr(a, "customFormat"),
+                                Some("1" | "true")
+                            ) && styled(crate::sheet::xml_attr(a, "s"))
+                        }) || sheet.col_defs.iter().any(|d| {
+                            (d.min..=d.max).contains(&col)
+                                && styled(crate::sheet::xml_attr(&d.attrs, "style"))
+                        })
+                    };
+                    if !(cell.is_blank() && cell.style == 0 && cell.f_attrs.is_none())
+                        || pins_default()
+                    {
                         sheet.cells.insert((row, col), cell);
                     }
                 }
@@ -2150,9 +2173,21 @@ fn parse_worksheet(
     // refs by the offset. If the master doesn't parse, preserve the group
     // verbatim (master keeps its text; followers keep the si marker).
     for (row, col, si) in followers {
-        let Some((mr, mc, src)) = shared_masters.get(&si) else {
+        let Some((mr, mc, src, master_attrs)) = shared_masters.get(&si) else {
             continue;
         };
+        if (row, col) == (*mr, *mc) {
+            // The master keeps its text; when it does not translate, it also
+            // keeps its original attrs (ref too), even for a one-cell group.
+            if translate_formula(src, 0, 0).is_none() {
+                if let Some(mcell) = sheet.cells.get_mut(&(*mr, *mc)) {
+                    if mcell.f_attrs.is_none() {
+                        mcell.f_attrs = Some(master_attrs.clone());
+                    }
+                }
+            }
+            continue;
+        }
         let dr = row as i64 - *mr as i64;
         let dc = col as i64 - *mc as i64;
         let translated = translate_formula(src, dr, dc);
@@ -2162,14 +2197,6 @@ fn parse_worksheet(
                 None => {
                     cell.formula = Some(String::new());
                     cell.f_attrs = Some(format!(" t=\"shared\" si=\"{si}\""));
-                }
-            }
-        }
-        if translated.is_none() {
-            // Master keeps its original shared attrs too.
-            if let Some(mcell) = sheet.cells.get_mut(&(*mr, *mc)) {
-                if mcell.f_attrs.is_none() {
-                    mcell.f_attrs = Some(format!(" t=\"shared\" si=\"{si}\""));
                 }
             }
         }
@@ -2246,7 +2273,7 @@ fn parse_cell_body(
     shared: &[String],
     row: u32,
     col: u32,
-    shared_masters: &mut BTreeMap<u32, (u32, u32, String)>,
+    shared_masters: &mut BTreeMap<u32, (u32, u32, String, String)>,
     followers: &mut Vec<(u32, u32, u32)>,
 ) -> Cell {
     let mut v_text: Option<String> = None;
@@ -2284,22 +2311,17 @@ fn parse_cell_body(
                                     // claim the slot (which would leave the
                                     // group's source empty), so key on `ref`.
                                     if !ref_attr.is_empty() {
-                                        shared_masters.insert(si, (row, col, String::new()));
+                                        // Keep the master's own `<f>` attrs
+                                        // (ref included) for the fallback.
+                                        shared_masters
+                                            .insert(si, (row, col, String::new(), raw_f_attrs(p)));
                                     }
                                 }
                             }
                             "" | "normal" => {}
                             _ => {
                                 // array / dataTable — preserve verbatim.
-                                let mut attrs = String::new();
-                                for a in p.attrs() {
-                                    attrs.push(' ');
-                                    attrs.push_str(a.name);
-                                    attrs.push_str("=\"");
-                                    attrs.push_str(&esc_raw_attr(a.value));
-                                    attrs.push('"');
-                                }
-                                f_attrs = Some(attrs);
+                                f_attrs = Some(raw_f_attrs(p));
                             }
                         }
                     }
@@ -2400,6 +2422,19 @@ fn parse_cell_body(
         spill,
         meta: None,
     }
+}
+
+/// The `<f>` the parser is on, its attributes re-serialised verbatim.
+fn raw_f_attrs(p: &XmlParser) -> String {
+    let mut attrs = String::new();
+    for a in p.attrs() {
+        attrs.push(' ');
+        attrs.push_str(a.name);
+        attrs.push_str("=\"");
+        attrs.push_str(&esc_raw_attr(a.value));
+        attrs.push('"');
+    }
+    attrs
 }
 
 /// The `<brk>` the parser is on; `None` when its `id` is unreadable.
@@ -3053,6 +3088,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
 
     // --- regenerate each worksheet's sheetData (and cols/dimension) -------
     let mut any_formulas = false;
+    let rel_types = pkg.sheet_rel_types();
     for (idx, sheet) in wb.sheets.iter().enumerate() {
         let Some(part_name) = pkg.sheet_parts.get(idx) else {
             continue;
@@ -3061,8 +3097,20 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             .part(part_name)
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
-        let sheet_data = sheet_data_xml(sheet, &mut index_of, &mut any_formulas, new_cm.as_deref());
-        let updated = splice_worksheet(&source, sheet, &sheet_data, &wb.styles.dxfs, &mut dxf_for);
+        // Chart and dialog sheets have no cells: CT_Chartsheet and
+        // CT_Dialogsheet have no <sheetData>, so one spliced in is invalid.
+        // Their page layout is edited like a worksheet's (its children keep
+        // CT_Worksheet's relative order).
+        let cellless = rel_types
+            .get(idx)
+            .is_some_and(|ty| ty.ends_with("/chartsheet") || ty.ends_with("/dialogsheet"));
+        let updated = if cellless {
+            page::set_page_setup(&source, &sheet.page_setup, &sheet.page_setup_loaded)
+        } else {
+            let sheet_data =
+                sheet_data_xml(sheet, &mut index_of, &mut any_formulas, new_cm.as_deref());
+            splice_worksheet(&source, sheet, &sheet_data, &wb.styles.dxfs, &mut dxf_for)
+        };
         let updated = if tabs_selected {
             set_tab_selected(&updated, idx == active_tab)
         } else {
@@ -3740,6 +3788,17 @@ fn cell_xml(
     }
 }
 
+/// The used range of `sheet`'s cells as (first row, first col, last row,
+/// last col), or `None` for a sheet with no cells.
+fn sheet_bounds(sheet: &Sheet) -> Option<(u32, u32, u32, u32)> {
+    sheet.cells.keys().fold(None, |acc, &(r, c)| {
+        Some(match acc {
+            None => (r, c, r, c),
+            Some((r0, c0, r1, c1)) => (r0.min(r), c0.min(c), r1.max(r), c1.max(c)),
+        })
+    })
+}
+
 /// Replace `<sheetData>…</sheetData>` (or `<sheetData/>`) in the original
 /// worksheet XML, refresh `<dimension>`, and regenerate `<cols>`.
 ///
@@ -3776,12 +3835,12 @@ fn splice_worksheet(
         }
     };
 
-    // <dimension ref="…"/> → recomputed used range.
-    let (rows, cols) = sheet.used_size();
-    let dim = if rows == 0 {
-        "A1".to_string()
-    } else {
-        format!("A1:{}", cell_name(rows - 1, cols.max(1) - 1))
+    // <dimension ref="…"/> → recomputed used range, from its first cell as
+    // Excel writes it: `C4:D8`, or `B2` for a single cell.
+    let dim = match sheet_bounds(sheet) {
+        None => "A1".to_string(),
+        Some((r0, c0, r1, c1)) if (r0, c0) == (r1, c1) => cell_name(r0, c0),
+        Some((r0, c0, r1, c1)) => format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1)),
     };
     if let Some((i, _)) = worksheet_child_span(&out, "dimension") {
         if attr_at(&out, i, "ref").is_some() {
@@ -5436,7 +5495,8 @@ fn set_dxfs(xml: &str, dxfs: &[crate::sheet::Dxf]) -> String {
 }
 
 /// Rewrite the frozen-pane state of the first `<sheetView>` from the model's
-/// `freeze` (rows, cols): inserts/updates `<pane … state="frozen"/>`, removes it
+/// `freeze` (rows, cols): a pane that already says the same is left exactly
+/// as written; otherwise inserts/updates `<pane … state="frozen"/>`, removes it
 /// when unfrozen, and creates a `<sheetViews>` block if the worksheet lacks one.
 /// Idempotent — a second save with the same freeze is byte-identical.
 fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
@@ -5451,8 +5511,15 @@ fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
         if fr > 0 {
             a.push_str(&format!(" ySplit=\"{fr}\""));
         }
+        // The pane holding the cursor is the one past both splits, as Excel
+        // writes it: rows only leave the bottom pane, columns the right one.
+        let active = match (fr > 0, fc > 0) {
+            (true, true) => "bottomRight",
+            (true, false) => "bottomLeft",
+            _ => "topRight",
+        };
         format!(
-            "<pane{a} topLeftCell=\"{}\" activePane=\"bottomRight\" state=\"frozen\"/>",
+            "<pane{a} topLeftCell=\"{}\" activePane=\"{active}\" state=\"frozen\"/>",
             cell_name(fr, fc)
         )
     };
@@ -5467,6 +5534,21 @@ fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
             put_worksheet_child(xml, "sheetViews", &new_views(), None, true)
         };
     };
+    // A pane that already says what the model says stays as it is: its
+    // scroll position (`topLeftCell`), active pane, and a split that is not
+    // frozen are view state the model does not keep (#1064).
+    if let Some((ps, _)) = view.pane {
+        let split = |a: &str| attr_at(xml, ps, a).and_then(|v| v.parse::<u32>().ok());
+        let frozen = matches!(attr_at(xml, ps, "state"), Some("frozen" | "frozenSplit"));
+        let has = if frozen {
+            (split("ySplit").unwrap_or(0), split("xSplit").unwrap_or(0))
+        } else {
+            (0, 0)
+        };
+        if has == freeze {
+            return xml.to_string();
+        }
+    }
     // Drop its existing <pane> first (idempotent; also handles unfreeze).
     let mut out = xml.to_string();
     if let Some((ps, pe)) = view.pane {
@@ -9525,6 +9607,41 @@ mod tests {
         );
     }
 
+    /// #1064: a loaded pane the model agrees with is kept as written (its
+    /// scroll position, active pane, a split that is not frozen); a new one
+    /// gets the active pane Excel would write.
+    #[test]
+    fn save_keeps_a_pane_the_model_agrees_with() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let ws = |pane: &str| {
+            format!(
+                "<worksheet xmlns=\"{ns}\"><sheetViews><sheetView workbookViewId=\"0\">{pane}</sheetView></sheetViews><sheetData/></worksheet>"
+            )
+        };
+        for pane in [
+            r#"<pane ySplit="10" topLeftCell="A590" activePane="bottomLeft" state="frozen"/>"#,
+            r#"<pane xSplit="0" ySplit="6" topLeftCell="A7" activePane="bottomLeft" state="frozen"/>"#,
+            r#"<pane xSplit="5220" topLeftCell="F1" activePane="topRight"/>"#,
+        ] {
+            let xml = ws(pane);
+            let freeze = parse_worksheet(&xml, &[], &Default::default()).freeze;
+            assert_eq!(set_freeze_pane(&xml, freeze), xml);
+        }
+        let new = |freeze| set_freeze_pane(&ws(""), freeze);
+        assert!(new((2, 0)).contains(r#"activePane="bottomLeft""#));
+        assert!(new((0, 2)).contains(r#"activePane="topRight""#));
+        assert!(new((2, 2)).contains(r#"activePane="bottomRight""#));
+        // A changed freeze still replaces the pane.
+        let moved = set_freeze_pane(
+            &ws(r#"<pane ySplit="10" topLeftCell="A11" activePane="bottomLeft" state="frozen"/>"#),
+            (3, 0),
+        );
+        assert!(
+            moved.contains(r#"<pane ySplit="3" topLeftCell="A4""#),
+            "{moved}"
+        );
+    }
+
     #[test]
     fn rename_sheet_updates_model_and_workbook_xml() {
         let mut pkg = new_xlsx();
@@ -10693,6 +10810,72 @@ mod tests {
         let mut pkg = back;
         pkg.workbook.date1904 = false;
         assert!(!load_xlsx(&save_xlsx(&pkg)).unwrap().workbook.date1904);
+    }
+
+    /// #1064: a chartsheet has no cells, and CT_Chartsheet has no
+    /// `<sheetData>`; save writes the part back as it was.
+    #[test]
+    fn save_leaves_a_chartsheet_without_sheet_data() {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Chart1");
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let part = pkg.sheet_parts[1].clone();
+        let name = part.rsplit('/').next().unwrap().to_string();
+        let rels =
+            String::from_utf8(pkg.part("xl/_rels/workbook.xml.rels").unwrap().to_vec()).unwrap();
+        let at = rels.find(&format!("{name}\"")).unwrap();
+        let open = rels[..at].rfind("<Relationship").unwrap();
+        let rels = format!(
+            "{}{}",
+            &rels[..open],
+            rels[open..].replacen("/worksheet\"", "/chartsheet\"", 1)
+        );
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        let chart = r#"<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"/></sheetViews><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></chartsheet>"#;
+        pkg.set_part(&part, chart.as_bytes().to_vec());
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let saved = save_xlsx(&pkg);
+        let back = load_xlsx(&saved).unwrap();
+        assert_eq!(back.part(&part).unwrap(), chart.as_bytes());
+
+        // Its page layout still saves.
+        pkg.workbook.sheets[1].page_setup.margins.left = 1.5;
+        let back = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let xml = String::from_utf8(back.part(&part).unwrap().to_vec()).unwrap();
+        assert!(
+            xml.contains(r#"<pageMargins left="1.5" right="0.7""#),
+            "{xml}"
+        );
+        assert!(!xml.contains("sheetData"), "{xml}");
+        assert_eq!(back.workbook.sheets[1].page_setup.margins.left, 1.5);
+    }
+
+    /// #1064: an empty cell with the default style under a row or column
+    /// style pins the default; dropping it would give it that style.
+    #[test]
+    fn an_empty_default_cell_under_a_row_or_column_style_is_kept() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let xml = format!(
+            r#"<worksheet xmlns="{ns}"><cols><col min="3" max="3" width="9" style="7"/></cols><sheetData><row r="1" s="5" customFormat="1"><c r="A1"/></row><row r="2"><c r="B2"/><c r="C2" s="0"/></row></sheetData></worksheet>"#
+        );
+        let sheet = parse_worksheet(&xml, &[], &Default::default());
+        assert!(sheet.cells.contains_key(&(0, 0)), "under the row style");
+        assert!(!sheet.cells.contains_key(&(1, 1)), "nothing to pin");
+        assert!(sheet.cells.contains_key(&(1, 2)), "under the column style");
+    }
+
+    /// #1064: Excel 2013+ writes `<x15:workbookPr chartTrackingRefBase>` in
+    /// extLst; it must not reset the date system the real workbookPr set.
+    #[test]
+    fn date1904_survives_an_x15_workbook_pr_in_ext_lst() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let x15 = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/main";
+        let xml = format!(
+            "<workbook xmlns=\"{ns}\" xmlns:x15=\"{x15}\"><workbookPr date1904=\"true\"/>\
+             <sheets/><extLst><ext uri=\"{{B58B0392-4F1F-4190-BB64-5DF3571DCE5F}}\">\
+             <x15:workbookPr chartTrackingRefBase=\"1\"/></ext></extLst></workbook>"
+        );
+        assert!(parse_workbook_xml(&xml).1);
     }
 
     #[test]
@@ -12004,6 +12187,27 @@ b",
         let ws =
             String::from_utf8_lossy(pkg2.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
         assert!(ws.contains("<dimension ref=\"A1:Z100\"/>"), "{ws}");
+    }
+
+    /// #1064: the dimension starts at the first used cell, as Excel writes
+    /// it, and a single cell is one reference.
+    #[test]
+    fn dimension_starts_at_the_first_used_cell() {
+        let dim = |cells: &[(u32, u32)]| {
+            let mut pkg = new_xlsx();
+            for &(r, c) in cells {
+                pkg.workbook.sheets[0].set_cell(r, c, Cell::number(1.0));
+            }
+            let pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+            let ws = String::from_utf8_lossy(pkg.part(&pkg.sheet_parts[0]).unwrap()).into_owned();
+            let at = ws.find("<dimension ref=\"").unwrap() + "<dimension ref=\"".len();
+            ws[at..at + ws[at..].find('"').unwrap()].to_string()
+        };
+        assert_eq!(dim(&[]), "A1");
+        assert_eq!(dim(&[(0, 0)]), "A1");
+        assert_eq!(dim(&[(1, 1)]), "B2");
+        assert_eq!(dim(&[(3, 2), (7, 3)]), "C4:D8");
+        assert_eq!(dim(&[(3, 3), (7, 2)]), "C4:D8");
     }
 
     #[test]
@@ -13593,6 +13797,38 @@ b",
         assert_eq!(resaved(&pkg).1, restyled);
         eng.set_styles(&mut pkg.workbook, 0, &[(0, 1, 0), (0, 6, 0)]);
         assert_eq!(resaved(&pkg).1, unedited);
+    }
+
+    #[test]
+    fn untranslatable_one_cell_shared_group_keeps_its_attrs() {
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="shared" ref="B1" si="0">[1]Sheet1!A1*2</f><v>2</v></c></row>"#;
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<f t="shared" ref="B1" si="0">[1]Sheet1!A1*2</f>"#),
+            "{ws}"
+        );
+    }
+
+    /// A shared group whose master does not translate is kept verbatim: the
+    /// master keeps its text and `ref`, the followers their `si` marker.
+    #[test]
+    fn untranslatable_shared_group_keeps_master_text_and_ref() {
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="shared" ref="B1:B3" si="0">[1]Sheet1!A1*2</f><v>2</v></c></row>"#,
+            r#"<row r="2"><c r="A2"><v>2</v></c><c r="B2"><f t="shared" si="0"/><v>4</v></c></row>"#,
+            r#"<row r="3"><c r="A3"><v>3</v></c><c r="B3"><f t="shared" si="0"/><v>6</v></c></row>"#,
+        );
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="B1"><f t="shared" ref="B1:B3" si="0">[1]Sheet1!A1*2</f>"#),
+            "{ws}"
+        );
+        assert!(ws.contains(r#"<c r="B2"><f t="shared" si="0"/>"#), "{ws}");
+        assert!(ws.contains(r#"<c r="B3"><f t="shared" si="0"/>"#), "{ws}");
+        let b1 = pkg.workbook.sheets[0].cell(0, 1).unwrap();
+        assert_eq!(b1.formula.as_deref(), Some("[1]Sheet1!A1*2"));
     }
 
     #[test]

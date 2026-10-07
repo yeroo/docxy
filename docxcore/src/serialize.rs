@@ -1415,13 +1415,12 @@ fn write_table(s: &mut String, t: &Table) {
     } else if let Some(change) = &t.property_change {
         s.push_str(&format!("<w:tblPr>{}</w:tblPr>", change.raw));
     }
-    if !t.grid.is_empty() {
-        s.push_str("<w:tblGrid>");
-        for w in &t.grid {
-            s.push_str(&format!("<w:gridCol w:w=\"{w}\"/>"));
-        }
-        s.push_str("</w:tblGrid>");
+    // CT_Tbl requires tblGrid, even with no columns (#1083).
+    s.push_str("<w:tblGrid>");
+    for w in &t.grid {
+        s.push_str(&format!("<w:gridCol w:w=\"{w}\"/>"));
     }
+    s.push_str("</w:tblGrid>");
     // A boundary-aware table is a mixed child sequence. tblPr/tblGrid remain
     // first as required by CT_Tbl; each gap's invisible children are then
     // emitted immediately before the visible row anchored at that gap.
@@ -2765,19 +2764,25 @@ mod tests {
         let partial_open = "<w:document><w:body><w:tbl><w:sdt><w:sdtPr";
         let parsed = parse_document_xml(partial_open, &Relationships::default());
         let saved = document_to_xml(&parsed);
-        assert!(saved.contains("<w:tbl><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"));
+        assert!(saved.contains(
+            "<w:tbl><w:tblGrid></w:tblGrid><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"
+        ));
         assert!(!saved.contains("<w:sdtPr<"));
 
         let mismatched_open = "<w:document><w:body><w:tbl><w:sdt><w:sdtPr></w:future>";
         let parsed = parse_document_xml(mismatched_open, &Relationships::default());
         let saved = document_to_xml(&parsed);
-        assert!(saved.contains("<w:tbl><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"));
+        assert!(saved.contains(
+            "<w:tbl><w:tblGrid></w:tblGrid><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"
+        ));
         assert!(!saved.contains("<w:sdtPr></w:future>"));
 
         let mismatched_closed = table_xml("<w:sdt><w:sdtPr></w:future></w:sdt>");
         let parsed = parse_document_xml(&mismatched_closed, &Relationships::default());
         let saved = document_to_xml(&parsed);
-        assert!(saved.contains("<w:tbl><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"));
+        assert!(saved.contains(
+            "<w:tbl><w:tblGrid></w:tblGrid><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"
+        ));
         assert!(!saved.contains("<w:sdtPr></w:future>"));
 
         let open = "<w:sdt><w:sdtPr><w:alias w:val=\"tail\"/></w:sdtPr><w:sdtContent>";
@@ -2799,6 +2804,25 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_table_grid_is_kept_1083() {
+        // CT_Tbl requires tblGrid even without gridCol: dropping it makes the
+        // table schema-invalid.
+        let source = table_xml(&format!(
+            "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/></w:tblPr><w:tblGrid/>{}",
+            row_xml("cell")
+        ));
+        let saved = document_to_xml(&parse_document_xml(&source, &Relationships::default()));
+        assert!(
+            saved.contains("</w:tblPr><w:tblGrid></w:tblGrid><w:tr"),
+            "{saved}"
+        );
+        assert_eq!(
+            parse_document_xml(&saved, &Relationships::default()).plain_text(),
+            "cell\n"
+        );
+    }
+
+    #[test]
     fn truncated_unknown_table_children_are_not_emitted_as_raw_xml() {
         let inside_control = format!(
             "<w:document><w:body><w:tbl><w:sdt><w:sdtContent>{}<w:customXml>",
@@ -2816,7 +2840,7 @@ mod tests {
         let table_child = "<w:document><w:body><w:tbl><w:customXml>";
         let saved = document_to_xml(&parse_document_xml(table_child, &Relationships::default()));
         assert!(!saved.contains("<w:customXml>"));
-        assert!(saved.contains("<w:tbl></w:tbl>"));
+        assert!(saved.contains("<w:tbl><w:tblGrid></w:tblGrid></w:tbl>"));
     }
 
     #[test]

@@ -1328,6 +1328,10 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
                     "w:del" => out.push(parse_revision(p, rels, RevisionKind::Delete)),
                     "w:fldSimple" => parse_fld_simple(p, rels, out),
                     "w:smartTag" => parse_inlines_into(p, rels, out),
+                    // The unwrapped smart tag's own metadata. CT_SmartTagPr is
+                    // valid only inside CT_SmartTagRun, so kept raw it would land
+                    // under `w:p`, which Word rejects as corrupt (#1083).
+                    "w:smartTagPr" => p.skip_element(),
                     "w:sdt" => parse_inline_sdt(p, rels, out),
                     _ => parse_raw_or_unsupported_revision(p, out),
                 }
@@ -3130,6 +3134,40 @@ mod tests {
             first_para(&d).plain_text(),
             "The University of Texas System"
         );
+    }
+
+    #[test]
+    fn smart_tag_properties_are_not_saved_outside_their_tag_1083() {
+        // An unwrapped smart tag drops its `w:smartTagPr`: under `w:p` (body or
+        // table cell) Word rejects the file. Nested tags and the text stay.
+        let tag = |el: &str, inner: &str| {
+            format!(
+                "<w:smartTag w:uri=\"urn:schemas-microsoft-com:office:smarttags\" \
+                 w:element=\"{el}\"><w:smartTagPr><w:attr w:name=\"n\" w:val=\"v\"/>\
+                 </w:smartTagPr>{inner}</w:smartTag>"
+            )
+        };
+        let run = |t: &str| format!("<w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r>");
+        let nested = tag(
+            "place",
+            &format!(
+                "{}{}",
+                tag("PlaceType", &run("University")),
+                run(" of Texas")
+            ),
+        );
+        let xml = format!(
+            "<w:document><w:body><w:p>{nested}</w:p>\
+             <w:tbl><w:tr><w:tc><w:p>{}</w:p></w:tc></w:tr></w:tbl>\
+             </w:body></w:document>",
+            tag("date", &run("2003"))
+        );
+        let d = doc(&xml);
+        assert_eq!(first_para(&d).plain_text(), "University of Texas");
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(!out.contains("smartTagPr"), "{out}");
+        assert!(!out.contains("w:attr"), "{out}");
+        assert!(out.contains(">2003</w:t>"), "{out}");
     }
 
     #[test]

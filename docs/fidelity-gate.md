@@ -1,11 +1,12 @@
-# The docx round-trip fidelity gate
+# The round-trip fidelity gate
 
 Saving must never silently destroy a user's document (#1060). The fidelity gate
 opens every corpus `.docx`, saves it with no edits, and compares every package
-part with the original. A loss nobody has accepted fails the build.
+part with the original. A loss nobody has accepted fails the build. The same
+gate runs over `.xlsx` (#1064); [xlsx](#xlsx) below covers what differs.
 
-It is a plain cargo test, `docxcore/tests/fidelity.rs`, and the `docx fidelity
-gate` job runs it in CI on every PR.
+It is a plain cargo test, `docxcore/tests/fidelity.rs`, and the `fidelity gate
+(docx, xlsx)` job runs it in CI on every PR.
 
 ## What it checks
 
@@ -14,12 +15,14 @@ The gate round-trips each file the way docxy saves an **edited** document:
 `word/document.xml` from the semantic model, so it is where untouched
 paragraphs of an edited document lose what the model does not understand.
 
-A user who saves **without** editing gets `save_package_preserving_document`,
-which writes the original parts back. The gate asserts that path is
-byte-identical part for part. That check has no baseline: any difference fails
-outright. "The gate reports a loss in X" therefore means "X is lost once the
-user edits anything in the document". It does not mean "X is lost by
-open+save".
+In docxy, a user who saves **without** editing gets
+`save_package_preserving_document`, which writes the original parts back. The
+gate asserts that path is byte-identical part for part. That check has no
+baseline: any difference fails outright. "The gate reports a loss in X"
+therefore means "X is lost once the user edits anything in the document". It
+does not mean "X is lost by open+save" in docxy. The suite has no preserving
+path: it saves every document through `save_package`, edited or not, so there
+a reported loss is lost by open+save too (#1083).
 
 Every part of the original is compared with its saved counterpart:
 
@@ -80,6 +83,64 @@ The kinds are:
 Files are named `repo:<path>` for repo-tracked `.docx` and `ext:<path>` for the
 external corpus, relative to the `FIDELITY_CORPUS` directory. So a local copy and
 CI's checkout produce the same keys.
+
+## Schema validation
+
+A save can lose nothing and still write a file Word refuses as corrupt (#1083:
+an unwrapped smart tag left its `w:smartTagPr` directly under `w:p`). So the
+gate also validates every saved package against a subset of the
+WordprocessingML schema (the transitional `wml.xsd` of ECMA-376 Part 4), in
+`docxcore/tests/fidelity/schema.rs`. It needs no Word, .NET or XSD, and checks
+a subset of what the Open XML SDK validator does.
+
+Every part whose root element is in the `w:` namespace is checked: the
+document, headers, footers, footnotes, endnotes, comments, numbering and
+styles. These containers have a content model, wherever they occur:
+
+- ordered sequences: `pPr`, `tblPr`, `tblPrEx`, `tcPr`, `sectPr`, `pBdr`,
+  `pgBorders`, `tblBorders`, `tcBorders`, `tblCellMar`, `tcMar` (each side
+  both physical and logical: `start` then `left`, `end` then `right`), `tbl`
+  (only range markup before `tblPr`), `tr`;
+- repeatable choices with an ordered head or tail: `rPr` (its properties come
+  in any order and may repeat; a paragraph mark's `rPr` leads with its
+  revision marks, and `rPrChange` is last) and `trPr` (row properties, then
+  `ins`, `del`, `trPrChange`);
+- allowed children: `body` (`sectPr` last), `p` (`pPr` first), `r` (`rPr`
+  first), `hyperlink`, `smartTag` (`smartTagPr` first), `tc` (`tcPr` first,
+  then at least one block), and the block containers `hdr`, `ftr`,
+  `footnote`, `endnote`, `comment`, `txbxContent` and `docPartBody`.
+
+A revision's snapshot of properties (`pPrChange/pPr`, `rPrChange/rPr`,
+`tblPrChange/tblPr`, ...) has the narrower model the schema gives it: no
+nested change, and a paragraph's snapshot ends at `cnfStyle`.
+
+A child breaks one of four rules:
+
+| Rule | Meaning |
+|---|---|
+| `not-allowed` | Its parent's model has no place for it. |
+| `order` | It comes after a sibling the schema puts after it. |
+| `duplicate` | It repeats where the schema allows one. |
+| `missing` | A required child is absent (`tblPr`, `tblGrid`, a cell's block). |
+
+Children in another namespace (extensions, DrawingML, math) are not checked,
+but `w:` containers inside them are, so text box paragraphs count. An
+`mc:AlternateContent` subtree is skipped.
+
+The original package is validated too. A violation is counted by part, parent
+path without indices, rule and child, and only the ones the save **added** fail:
+a count above the original's. A non-conforming original therefore does not
+fail the gate, and a violation the save fixed does not cover a new one. A
+failure is reported as:
+
+```
+SCHEMA ext:table/2007.docx | word/document.xml | not-allowed | /w:document/w:body/w:p[39]/w:smartTagPr
+```
+
+Schema violations have no allowlist and no baseline: Word rejects the file
+whether or not anything was lost, so any new one fails the gate, also under
+`FIDELITY_UPDATE_BASELINE`. When one appears, fix the writer, or fix the table
+in `schema.rs` if the schema allows the construct.
 
 ## Running it locally
 
@@ -196,11 +257,99 @@ becomes visible for the first time. Such an entry may be added under its own
 class, but only when an entry for the same file at that node or an ancestor goes
 away in the same diff. The PR lists each one (#1063 did this).
 
-## What it does not cover
+## xlsx
 
-- xlsx: #1064.
+`gridcore/tests/fidelity.rs` runs the same gate over `.xlsx`. It shares the
+comparator, the allowlist and baseline formats, and the NEW / STALE /
+UNCLASSIFIED rules: it includes `docxcore/tests/fidelity/mod.rs` by path, so
+there is one comparator. Its own files are `gridcore/tests/fidelity/allowlist.txt`
+and `gridcore/tests/fidelity/baseline.txt`, and its classes are `CLASSES` in
+`gridcore/tests/fidelity.rs`.
+
+```sh
+corpus/tools/fetch-corpus.sh          # also populates corpus/xlsx-ext
+cargo test -p gridcore --test fidelity -- --nocapture
+```
+
+- **The round trip** is `load_xlsx`, then `save_xlsx_for_path` with the file's
+  own path: what xlsxy writes on save. It leaves out `stamp_save`, which
+  rewrites `docProps` with the current time on purpose. xlsx has no separate
+  no-edit save like docx's `save_package_preserving_document`: every save
+  regenerates each worksheet's `<sheetData>`, `<cols>` and `<dimension>` from
+  the model, so the gate measures that.
+- **The files**: the repo-tracked `.xlsx` in `assets/`, `corpus/xlsx/`,
+  `corpus/legacy/addin/`, `corpus/legacy/extra/`, `offxy-vscode/mcp/templates/`
+  and `uiharness/fixtures/`, plus every `.xlsx` under `FIDELITY_XLSX_CORPUS`
+  (default `corpus/xlsx-ext`, the docxy-corpus `xlsx-ext/` directory), searched
+  recursively. `FIDELITY_REQUIRE_CORPUS` and `FIDELITY_UPDATE_BASELINE` work as
+  for docx. `FIDELITY_UPDATE_BASELINE=1 cargo test --workspace` rewrites both
+  baselines.
+- **The sheet check.** A regenerated worksheet differs from its source in ways
+  that change nothing a reader sees, and a structural finding cannot tell them
+  from a loss. Examples: `0.14000000000000001` written `0.14`; an inline string
+  moved to the shared strings; a shared formula expanded per cell; a dropped
+  `<c r="B2"/>`; `customWidth="true"` written `1`. So each worksheet is also
+  read the way a spreadsheet reads it.
+
+  **Per cell** either side lists, it compares three things:
+  - the **value**. Shared strings are found through the workbook's
+    relationship. Shared and inline strings are resolved, run formatting
+    included; phonetic runs are not read. Numbers compare as doubles, along
+    with booleans and errors.
+  - the **formula**: its text, plus kind and range for array and data-table
+    formulas. A shared formula's follower is resolved from its master by
+    shifting the master's relative references. The test does that with its
+    own shifter, not gridcore's. A follower that has no master covering it
+    does not resolve.
+  - the **effective style**: the cell's own `s`, else its row's (with
+    `customFormat`), else its column's.
+
+  **Per column**, it compares the `<col>` attributes: width (as a double),
+  `customWidth`, `style`, `hidden`, `bestFit`, `phonetic`, `outlineLevel` and
+  `collapsed`.
+
+  A difference is a `changed-value` finding at one of these paths:
+  - `/cells/<ref>/value`
+  - `/cells/<ref>/style`
+  - `/cells/<ref>/formula-text`: the same formula in other words, meaning
+    spaces, case or the `_xlfn.` prefix;
+  - `/cells/<ref>/formula`: any other formula change, including a lost,
+    added or unresolved formula;
+  - `/cols/<letters or range>/<attribute>`: one path covers a run of
+    adjacent columns that differ the same way.
+
+  Each baseline line covers that cell or column run only. A new loss in
+  another cell is NEW, and so is a changed formula filed where only
+  re-serialization is baselined.
+
+  The structural findings the check covers are dropped. Covered are:
+  - all of `<cols>`;
+  - a lost or extra `<c>` whose attributes are within `r`, `s` and `t` and
+    whose children are `<v>`, `<f>` (with `t`, `si`, `ref`) and `<is>`
+    (`<t>` and runs);
+  - the `<v>` and `<f>` text;
+  - the `<is>` text and runs;
+  - the cell attributes `r`, `s` and `t`;
+  - the formula attributes `t`, `si` and `ref`;
+  - rows carrying nothing but `r` and `spans`.
+
+  Everything else stays structural. That includes other row attributes,
+  other cell attributes (`vm`, `cm`, `ph`), other formula attributes (`ca`,
+  `aca`), phonetic runs, and a lost cell that carried any of them. Those
+  baseline lines are index-free like docx's, so one line covers every
+  occurrence in that sheet. The test prints how many findings the check
+  covered.
+
+## What it does not cover
 - Fixing the losses it found:
   - The unmodeled property children and attributes were fixed by #1063.
   - The other classes in `baseline.txt` each name their issue.
+- Whether Word opens the file. Schema validation catches the structural part
+  of that, by a subset of the schema. Attribute values, relationship targets
+  and the containers it has no model for are not checked.
 - Save paths other than `save_package` and `save_package_preserving_document`:
   the HTML bundle, Markdown, compare and merge.
+- For xlsx:
+  - other file types (`.xlsm`, `.xltx`, `.xlsb`), and Save As to another type;
+  - what xlsxy does around a save, such as recalculation on open and
+    `stamp_save`. Only the library's round trip is checked.

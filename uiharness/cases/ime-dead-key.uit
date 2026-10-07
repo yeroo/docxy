@@ -1,0 +1,70 @@
+# Dead keys and IME composition (#1072). macOS sends ⌥E on ABC as marked
+# text, setMarkedText "´", and the E that follows as insertText "é". The
+# `ime-*` verbs call the input handler's own methods with what AppKit sends,
+# so these run on every platform although only macOS registers the handler.
+# A real ⌥E needs a Mac: the keys a macOS root leaves to AppKit are in
+# text_input.rs's unit tests.
+
+test a dead key types nothing until the composed letter commits
+  open copy:../fixtures/basic.docx
+  type caf
+  call ime-mark {"text":"´"}
+  assert ime_marked is ´
+  assert text is caf
+  call ime-commit {"text":"é"}
+  assert ime_marked is null
+  assert text is café
+  key space
+  type naive
+  assert text is café naive
+
+test a commit of several characters types each one
+  open copy:../fixtures/basic.docx
+  call ime-mark {"text":"´"}
+  call ime-commit {"text":"´x"}
+  assert text is ´x
+  call ime-commit {"text":"か"}
+  assert text is ´xか
+
+test unmark accepts the marked text and an emptied mark types nothing
+  open copy:../fixtures/basic.docx
+  type a
+  call ime-mark {"text":"´"}
+  call ime-unmark {}
+  assert ime_marked is null
+  assert text is a´
+  call ime-mark {"text":"¨"}
+  call ime-mark {"text":""}
+  assert ime_marked is null
+  call ime-unmark {}
+  assert text is a´
+
+test the find bar's Replace field takes a composed letter
+  open copy:../fixtures/basic.docx
+  key ctrl+f
+  assert find_open is true
+  type caf
+  key down
+  type caf
+  call ime-mark {"text":"´"}
+  assert replace_text is caf
+  call ime-commit {"text":"é"}
+  assert replace_text is café
+  assert find_query is caf
+  key escape
+  assert find_open is false
+
+test a dialog field takes a composed letter
+  open copy:../fixtures/basic.docx
+  call user-name {}
+  assert dialog is user-name
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Jos"}
+  call ime-mark {"text":"´"}
+  call dialog-read {}
+  assert reply.controls.0.value is Jos
+  call ime-commit {"text":"é"}
+  call dialog-read {}
+  assert reply.controls.0.value is José
+  call real-key {"key":"escape"}
+  assert dialog is none

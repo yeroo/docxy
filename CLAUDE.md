@@ -15,6 +15,17 @@
   `docx_doc`, not as projected grid lines, so the browser does bidi itself;
   its selection maps to logical editor offsets through `data-o` segments.
 
+## Text input (dead keys, IME)
+
+- On macOS the window root (`KeyRouting`) leaves printable keys to AppKit and
+  registers `text_input`'s `EntityInputHandler`, which replays a commit of the
+  key's own text as that key and types composed text as keys into `on_key`;
+  marked text types nothing. While KeyTips or a menu is up (and no dialog is
+  open), letters stay with `on_key`. The handler is macOS-only (Windows and
+  Linux would hand it every character `on_key` already typed), and off macOS
+  the root never stops a key's propagation: a handled key-down on Windows is
+  never translated (#1072).
+
 ## Build info
 
 - `buildinfo` is the one place that stamps binaries (commit, last merged PR, kind,

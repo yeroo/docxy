@@ -48,13 +48,16 @@ jobs:
         run: cargo test --workspace --locked --features docxy/html-export
 
   fidelity-gate:
-    name: docx fidelity gate
-    # Open + save with no edits must not lose anything (#1060): every
-    # docxy-corpus .docx round-trips through save_package and is compared
-    # part by part with the original, against the allowlist and the
-    # shrink-only baseline in docxcore/tests/fidelity/. The `test` job runs
-    # the same test without the external corpus (repo-tracked .docx only);
-    # here FIDELITY_REQUIRE_CORPUS makes a missing checkout a failure.
+    name: fidelity gate (docx, xlsx)
+    # Open + save with no edits must not lose anything (#1060, #1064): every
+    # docxy-corpus .docx round-trips through save_package, and every .xlsx
+    # through save_xlsx_for_path, and is compared part by part with the
+    # original, against the allowlist and the shrink-only baseline in
+    # docxcore/tests/fidelity/ and gridcore/tests/fidelity/. Each saved .docx
+    # is also schema-validated: a violation the save added fails, with no
+    # baseline (#1083). The `test` job runs the same tests without the
+    # external corpus (repo-tracked files only); here FIDELITY_REQUIRE_CORPUS
+    # makes a missing checkout a failure.
     # See docs/fidelity-gate.md.
     runs-on: ubuntu-latest
     # What `--version` and File > Account report for this build (#1023).
@@ -70,11 +73,18 @@ jobs:
           fetch-depth: 1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Fidelity gate
+      - name: Fidelity gate (docx)
         env:
           FIDELITY_CORPUS: corpus-ext/files
           FIDELITY_REQUIRE_CORPUS: "1"
         run: cargo test -p docxcore --test fidelity --locked -- --nocapture
+      - name: Fidelity gate (xlsx)
+        # Reported even when the docx step failed.
+        if: ${{ !cancelled() }}
+        env:
+          FIDELITY_XLSX_CORPUS: corpus-ext/xlsx-ext
+          FIDELITY_REQUIRE_CORPUS: "1"
+        run: cargo test -p gridcore --test fidelity --locked -- --nocapture
 
   msrv:
     name: msrv (1.88)

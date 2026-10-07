@@ -32,9 +32,9 @@ use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
 use docxcore::model::{Align, VertAlign};
 use gpui::{
-    App, Context, Entity, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent,
-    TouchPhase, Window, point, px, size,
+    App, Context, Entity, EntityInputHandler as _, KeyDownEvent, Keystroke, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta,
+    ScrollWheelEvent, TouchPhase, Window, point, px, size,
 };
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
@@ -707,25 +707,14 @@ pub fn typed_keys(text: &str) -> Result<Vec<Keystroke>, String> {
                 key: "tab".into(),
                 key_char: None,
             },
-            ' ' => Keystroke {
-                modifiers: gpui::Modifiers::default(),
-                key: "space".into(),
-                key_char: Some(" ".into()),
-            },
-            c if c.is_control() => {
-                return Err(format!(
+            // Space and every other printable character type as the input
+            // handler types a composed commit (#1072).
+            c => crate::text_input::char_stroke(c).ok_or_else(|| {
+                format!(
                     "'text' contains the control character U+{:04X}; use the 'key' verb for those",
                     c as u32
-                ));
-            }
-            c => Keystroke {
-                modifiers: gpui::Modifiers {
-                    shift: c.is_uppercase(),
-                    ..Default::default()
-                },
-                key: c.to_lowercase().to_string(),
-                key_char: Some(c.to_string()),
-            },
+                )
+            })?,
         };
         out.push(stroke);
     }
@@ -2978,6 +2967,15 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
         ("picking", Json::Bool(ov.picking)),
         ("range_preview", str_or_null(ov.range_preview.map(a1_range))),
         ("sel_hidden", Json::Bool(ov.sel_hidden)),
+        // The find bar's two fields (Ctrl+F; Down moves to Replace).
+        ("find_open", Json::Bool(app.find_open)),
+        ("find_query", Json::Str(app.find_query.clone())),
+        ("replace_text", Json::Str(app.replace_text.clone())),
+        // The input handler's marked text (#1072), typed nowhere yet.
+        (
+            "ime_marked",
+            str_or_null(app.ime.marked().map(str::to_string)),
+        ),
     ]);
     let mut out: Vec<_> = out.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     if active_doc(app).is_ok() {
@@ -4387,6 +4385,26 @@ fn dispatch_verb(
             Ok(done)
         }
 
+        // What macOS's input context sends the input handler (#1072):
+        // `setMarkedText:` (`ime-mark`, a dead key's accent or an IME's
+        // provisional text, which types nothing), `insertText:` (`ime-commit`)
+        // and `unmarkText` (`ime-unmark`). The handler's own methods, so they
+        // drive it on every platform, though only macOS registers it.
+        "ime-mark" => {
+            let text = arg_str(args, "text")?;
+            app.replace_and_mark_text_in_range(None, text, None, window, cx);
+            Done::ok(state(app, window))
+        }
+        "ime-commit" => {
+            let text = arg_str(args, "text")?;
+            app.replace_text_in_range(None, text, window, cx);
+            Done::ok(state(app, window))
+        }
+        "ime-unmark" => {
+            app.unmark_text(window, cx);
+            Done::ok(state(app, window))
+        }
+
         // Type text, one key event per character.
         "type" => {
             for stroke in typed_keys(arg_str(args, "text")?)? {
@@ -5655,6 +5673,9 @@ mod tests {
             "menu-close",
             "key",
             "type",
+            "ime-mark",
+            "ime-commit",
+            "ime-unmark",
             "ribbon-read",
             "ribbon-layout",
             "clipboard",
