@@ -1080,7 +1080,7 @@ function xlsxyToolDefs() {
       'Create a REAL, persistent pivot table on a new sheet (first row of `range` = header ' +
         "names) — unlike `xlsxy_pivot`, this mutates the workbook: the pivot participates in " +
         "`xlsxy_pivots` and its output is refreshed by `xlsxy_recalc`. Clears undo history " +
-        'like adding a sheet (an agent-level undo must remove both the created sheet and the ' +
+        'like importing a CSV (an agent-level undo must remove both the created sheet and the ' +
         'pivot registration).',
       Object.fromEntries([
         ['range', prop('string', 'A1-style range, e.g. "A1:D100", first row = headers.')],

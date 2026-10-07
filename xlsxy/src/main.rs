@@ -1568,11 +1568,12 @@ fn group_cells<'a>(
 }
 
 /// The workbook state around a structural edit whose inverse is not
-/// expressible as per-cell changes (row/column insert-delete, sheet rename,
-/// the table commands — Table Name, Resize Table, Convert to Range): sheets,
+/// expressible as per-cell changes (row/column insert-delete, the table
+/// commands — Table Name, Resize Table, Convert to Range): sheets,
 /// defined names, the tables (live, and converted ones whose parts await the
 /// save), the PivotTables' sources, and a table rename to replay on the data
-/// model.
+/// model. A sheet rename is not such an edit: it rewrites the snapshots
+/// already taken ([`App::rename_sheet`]).
 #[derive(Clone)]
 struct WbSnapshot {
     sheets: Vec<gridcore::sheet::Sheet>,
@@ -1609,31 +1610,43 @@ fn wb_changed(before: &WbSnapshot, wb: &gridcore::sheet::Workbook) -> bool {
         })
 }
 
-/// [`App::rename_sheet`] on an undo snapshot: its sheet `idx`, when it has
-/// one, takes the new name and the snapshot's references follow, as the
-/// workbook's do.
-fn rename_sheet_in_snapshot(snap: &mut WbSnapshot, idx: usize, name: &str) {
-    let Some(old) = snap.sheets.get(idx).map(|s| s.name.clone()) else {
-        return;
-    };
+/// [`App::rename_sheet`] on an undo snapshot: the references in it to sheet
+/// `old` follow the rename, as the workbook's do, and its sheet `idx` takes
+/// the new name when it has one. A snapshot taken before that sheet was
+/// added has none, but its formulas may still name it.
+fn rename_sheet_in_snapshot(snap: &mut WbSnapshot, idx: usize, old: &str, name: &str) {
     let mut wb = gridcore::sheet::Workbook {
         sheets: std::mem::take(&mut snap.sheets),
         defined_names: std::mem::take(&mut snap.names),
         tables: std::mem::take(&mut snap.tables),
         ..Default::default()
     };
-    gridcore::edit::rename_sheet(&mut wb, idx, name);
+    if idx < wb.sheets.len() {
+        gridcore::edit::rename_sheet(&mut wb, idx, name);
+    } else {
+        // Renamed as a stand-in sheet of that name, which then goes again.
+        wb.sheets.push(gridcore::sheet::Sheet {
+            name: old.to_string(),
+            ..Default::default()
+        });
+        let stand_in = wb.sheets.len() - 1;
+        gridcore::edit::rename_sheet(&mut wb, stand_in, name);
+        wb.sheets.pop();
+    }
     snap.sheets = wb.sheets;
     snap.names = wb.defined_names;
     snap.tables = wb.tables;
     for source in &mut snap.pivot_sources {
         if let gridcore::pivot::PivotSource::Range { sheet, .. } = source {
-            if sheet.eq_ignore_ascii_case(&old) {
+            if sheet.eq_ignore_ascii_case(old) {
                 *sheet = name.to_string();
             }
         }
     }
 }
+
+/// A rename to a name another sheet already has.
+const SHEET_NAME_TAKEN: &str = "Sheet name already taken";
 
 /// How many steps the undo history keeps, as Excel does: the oldest goes.
 const UNDO_CAP: usize = 100;
@@ -3172,10 +3185,18 @@ impl App {
     /// an undo step and keeps the history, so the history follows it: the
     /// cells, rules and snapshots it holds name the sheet by its new name, or
     /// an undo or redo would bring back references to a sheet that is gone.
-    fn rename_sheet(&mut self, idx: usize, name: &str) {
-        let Some(old) = self.pkg.workbook.sheets.get(idx).map(|s| s.name.clone()) else {
-            return;
+    /// A name another sheet has (in any case) is refused, since there is no
+    /// step to undo it: `Err` with the reason, nothing changed.
+    fn rename_sheet(&mut self, idx: usize, name: &str) -> Result<(), String> {
+        let wb = &self.pkg.workbook;
+        let Some(old) = wb.sheets.get(idx).map(|s| s.name.clone()) else {
+            return Err("no such sheet".into());
         };
+        let taken = (wb.sheets.iter().enumerate())
+            .any(|(i, s)| i != idx && s.name.eq_ignore_ascii_case(name));
+        if taken {
+            return Err(SHEET_NAME_TAKEN.into());
+        }
         let circles_before = self.engine.circular_refs().len();
         gridcore::edit::rename_sheet(&mut self.pkg.workbook, idx, name);
         // A rename that only changes case leaves references as they are
@@ -3199,8 +3220,8 @@ impl App {
                 }
                 UndoAction::Cells(_) => {}
                 UndoAction::Structural { before, after } => {
-                    rename_sheet_in_snapshot(before, idx, name);
-                    rename_sheet_in_snapshot(after, idx, name);
+                    rename_sheet_in_snapshot(before, idx, &old, name);
+                    rename_sheet_in_snapshot(after, idx, &old, name);
                 }
             }
         }
@@ -3211,6 +3232,7 @@ impl App {
         }
         self.cancel_cut();
         self.modified = true;
+        Ok(())
     }
 
     /// The workbook state a structural undo step restores.
@@ -8558,8 +8580,10 @@ impl App {
             }
             PromptKind::RenameSheet => {
                 if !text.is_empty() && !text.contains(['[', ']', '*', '?', ':', '/', '\\']) {
-                    self.rename_sheet(self.sheet, &text);
-                    self.status = Some(format!("Renamed sheet to {text}"));
+                    self.status = Some(match self.rename_sheet(self.sheet, &text) {
+                        Ok(()) => format!("Renamed sheet to {text}"),
+                        Err(why) => why,
+                    });
                 } else {
                     self.status = Some("Invalid sheet name".to_string());
                 }
@@ -20353,6 +20377,17 @@ mod tests {
         assert_eq!(app.pkg.workbook.sheets[0].name, "Ren");
         press_mod(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
         assert_eq!(app.status.as_deref(), Some("Nothing to undo"));
+        // A name another sheet has, in any case, is refused and changes
+        // nothing: there is no step to undo it.
+        app.sheet = 1;
+        app.modified = false;
+        press_mod(&mut app, KeyCode::F(2), KeyModifiers::SHIFT);
+        app.prompt.as_mut().unwrap().text = "REN".to_string();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some(SHEET_NAME_TAKEN));
+        assert_eq!(app.pkg.workbook.sheets[1].name, "Sheet2");
+        assert!(!app.modified);
+        assert_eq!(app.redo.len(), 1);
     }
 
     #[test]
@@ -20398,7 +20433,7 @@ mod tests {
                 (vec![rule("Data!$A$1:$A$3")], Vec::new()),
             )),
         }]));
-        app.rename_sheet(1, "Lists");
+        app.rename_sheet(1, "Lists").unwrap();
         app.undo();
         app.redo();
         assert_eq!(

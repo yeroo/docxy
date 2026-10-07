@@ -30,7 +30,7 @@
 //! | `sheet.stats` | `{range,sheet?}` | `{sum,count,countNums,average,min,max}` |
 //! | `chart.list` | — | `{charts:[{kind,title?,categories,series:[{name?,values}]}]}` |
 //! | `pivot.list` | — | `{pivots:[{sheet,rows,cols,values}]}` |
-//! | `pivot.create` | `{range,rows,cols?,values,name?,sheet?}` | `{sheet,name}` — REAL persistent pivot on a NEW sheet; clears undo history like `sheet.add` |
+//! | `pivot.create` | `{range,rows,cols?,values,name?,sheet?}` | `{sheet,name}` — REAL persistent pivot on a NEW sheet; clears undo history like `sheet.import-csv` |
 //! | `comment.add` | `{ref,text,author?,sheet?}` | `{sheet,ref}` |
 //! | `comment.remove` | `{ref,sheet?}` | `{removed:bool}` |
 //! | `range.set` | `{start,rows:[[string]],sheet?}` | `{set}` — atomic, one undo group |
@@ -716,7 +716,7 @@ fn names_arg(args: &Json, key: &str) -> Vec<String> {
 /// instead of the interactive editor's one-field-at-a-time session) and
 /// lands the output on a NEW sheet, mirroring the TUI's Ctrl-P placement.
 ///
-/// Undo: clears history like `sheet.add`/`sheet.import-csv` — a new sheet +
+/// Undo: clears history like `sheet.import-csv` — a new sheet +
 /// pivot-part registration isn't a cell-level edit the undo stack can
 /// invert. An agent-level inverse (MCP/wasm) must remove BOTH the created
 /// sheet and the pivot registration; `SheetPackage::remove_sheet` already
@@ -1806,7 +1806,7 @@ fn sheet_rename(app: &mut App, args: &Json) -> Result<Json, String> {
         return Err("invalid sheet name".into());
     }
     let name = name.to_string();
-    app.rename_sheet(si, &name);
+    app.rename_sheet(si, &name)?;
     Ok(Json::obj(vec![("name", Json::Str(name))]))
 }
 
@@ -4526,6 +4526,83 @@ mod tests {
         assert_eq!(formula(&mut a, "A1").as_deref(), Some("=Renamed!A1"));
         assert_eq!(text_at(&a, 0, 0, 0).as_deref(), Some("7"));
         assert_eq!(a.pkg.workbook.sheets[1].name, "Renamed");
+    }
+
+    #[test]
+    fn sheet_rename_refuses_a_taken_name() {
+        // A rename is no step (#858), so a clash can't be undone: refused,
+        // in any case, with the workbook, history and `modified` untouched.
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Data".into()))]),
+        )
+        .unwrap();
+        set(&mut a, "A1", "=Data!A1");
+        a.modified = false;
+        let depth = a.undo.len();
+        let err = dispatch(
+            &mut a,
+            "sheet.rename",
+            &Json::obj(vec![
+                ("sheet", Json::Str("Sheet1".into())),
+                ("name", Json::Str("DATA".into())),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Sheet name already taken");
+        let names: Vec<&str> = a
+            .pkg
+            .workbook
+            .sheets
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, ["Sheet1", "Data"]);
+        assert_eq!(get(&mut a, "A1").get_str("formula"), Some("=Data!A1"));
+        assert_eq!(a.undo.len(), depth);
+        assert!(!a.modified);
+        a.undo();
+        a.redo();
+        assert_eq!(get(&mut a, "A1").get_str("formula"), Some("=Data!A1"));
+    }
+
+    #[test]
+    fn a_rename_rewrites_snapshots_taken_before_the_sheet_was_added() {
+        // The row insert's snapshots hold `=Data!A1+1` from before a sheet
+        // Data existed: once Data is added and renamed New, undoing the
+        // insert must put back a formula naming New.
+        let mut a = app();
+        set(&mut a, "A1", "=Data!A1+1");
+        dispatch(
+            &mut a,
+            "row.insert",
+            &Json::obj(vec![("at", Json::Num(0.0))]),
+        )
+        .unwrap();
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Data".into()))]),
+        )
+        .unwrap();
+        dispatch(
+            &mut a,
+            "sheet.rename",
+            &Json::obj(vec![
+                ("sheet", Json::Str("Data".into())),
+                ("name", Json::Str("New".into())),
+            ]),
+        )
+        .unwrap();
+        a.sheet = 0;
+        assert_eq!(get(&mut a, "A2").get_str("formula"), Some("=New!A1+1"));
+        a.undo(); // the row insert
+        assert_eq!(get(&mut a, "A1").get_str("formula"), Some("=New!A1+1"));
+        assert_eq!(a.pkg.workbook.sheets[1].name, "New");
+        a.redo();
+        assert_eq!(get(&mut a, "A2").get_str("formula"), Some("=New!A1+1"));
     }
 
     #[test]
