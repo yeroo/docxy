@@ -68,12 +68,22 @@ pub(crate) struct Entry<V, H> {
     persisted: Vec<PersistTab>,
 }
 
-#[derive(Default)]
 pub(crate) struct Windows<V, H> {
     entries: Vec<Entry<V, H>>,
     selected: u64,
     next_id: u64,
     next_seq: usize,
+}
+
+impl<V, H> Default for Windows<V, H> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            selected: 0,
+            next_id: 0,
+            next_seq: 0,
+        }
+    }
 }
 
 impl<V, H> Windows<V, H> {
@@ -196,6 +206,13 @@ pub(crate) fn select(cx: &mut App, id: u64) -> Result<(), String> {
 
 pub(crate) fn selected(cx: &App) -> Option<u64> {
     with(cx, |w| w.selected()).flatten()
+}
+
+/// The selected window's view, for asking it to persist after another
+/// window closed.
+pub(crate) fn selected_view(cx: &App) -> Option<WeakEntity<Docxy>> {
+    let sel = selected(cx)?;
+    with(cx, |w| w.get(sel).map(|e| e.view.clone())).flatten()
 }
 
 pub(crate) fn is_alone(cx: &App, id: u64) -> bool {

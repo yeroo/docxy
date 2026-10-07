@@ -312,6 +312,20 @@ const MORE_OPTIONS_HARNESS: &str =
 /// Word's close prompt's title.
 pub(crate) const SAVE_PROMPT_TITLE: &str = "Save your changes to this file?";
 
+/// How a window close asks about unsaved tabs (#587).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseAsk {
+    /// The window's X / Alt+F4: ask only when "ask before closing" is on.
+    Setting,
+    /// A harness instance's own close: never ask; its quit must end the run.
+    HarnessQuit,
+    /// A window of a multi-window run: ask whenever something is unsaved,
+    /// whatever the setting says. Hot-exit only covers a QUIT; a closed
+    /// secondary window is not restored, so silently dropping its unsaved
+    /// work is data loss.
+    Force,
+}
+
 /// Whether the tab's Save writes its own file, as it is (not Save As): what
 /// an unchanged File name and location mean in the close prompt.
 fn saves_in_place(tab: &DocTab) -> bool {
@@ -570,13 +584,14 @@ fn prompt_dialog_target(tab: &DocTab, d: &Dialog) -> Result<PromptSave, String> 
     )
 }
 
-fn remove_tab(tabs: &mut Vec<DocTab>, active: &mut usize, i: usize) {
-    tabs.remove(i);
+pub(crate) fn remove_tab(tabs: &mut Vec<DocTab>, active: &mut usize, i: usize) -> DocTab {
+    let removed = tabs.remove(i);
     if *active >= tabs.len() {
         *active = tabs.len().saturating_sub(1);
     } else if i < *active {
         *active -= 1;
     }
+    removed
 }
 
 impl Docxy {
@@ -678,7 +693,7 @@ impl Docxy {
         self.flush_project_passes(cx);
         self.project_prompt_cancel();
         let previous_active = self.active;
-        let harness = self.harness.is_some();
+        let harness = self.harness;
         if i == self.active {
             // The dialog buffers act on the active tab; committing them is
             // what the closed tab's own prompt must see as dirty.
@@ -751,7 +766,7 @@ impl Docxy {
                 DraftErrorTo::Reply => {}
             }
         }
-        self.persist();
+        self.persist(cx);
         self.refocus(window, cx);
         draft_error
     }
@@ -814,7 +829,7 @@ impl Docxy {
                 };
                 target.and_then(|t| self.close_prompt_save(i, t, quit, window, cx))
             }
-            _ if self.harness.is_some() => Err(MORE_OPTIONS_HARNESS.into()),
+            _ if self.harness => Err(MORE_OPTIONS_HARNESS.into()),
             _ => match self.pick_doc_save_target(None) {
                 Some(path) => self.close_prompt_save(i, PromptSave::To(path), quit, window, cx),
                 // Cancelled: back to the prompt.
@@ -882,14 +897,14 @@ impl Docxy {
     }
 
     /// The window's close (its X, Alt+F4, the harness `close-window`): fold
-    /// every pending edit into the session and persist it. With `ask` and
-    /// "Ask before closing the window" on and something unsaved, ask about
-    /// each unsaved tab in turn instead (#630): `false` now, and the window
-    /// goes when the last one is answered. Otherwise it is a clean exit
-    /// (hot exit keeps the unsaved work), and `true`.
+    /// every pending edit into the session and persist it. With `ask`
+    /// resolving to ask and something unsaved, ask about each unsaved tab in
+    /// turn instead (#630): `false` now, and the window goes when the last
+    /// one is answered. Otherwise it is a clean exit (hot exit keeps the
+    /// unsaved work), and `true`.
     pub(crate) fn window_should_close(
         &mut self,
-        ask: bool,
+        ask: CloseAsk,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -905,10 +920,22 @@ impl Docxy {
         }
         self.commit_dialog_buffers_for_exit(cx);
         commit_pending_for_exit(&mut self.tabs);
-        self.persist();
-        if !(ask && self.ask_on_close && self.tabs.iter().any(|t| t.dirty)) {
-            // The persist above is the final one, so only the marker is left.
-            self.mark_clean_exit();
+        self.persist(cx);
+        let ask = match ask {
+            CloseAsk::Setting => self.ask_on_close,
+            CloseAsk::HarnessQuit => false,
+            CloseAsk::Force => true,
+        };
+        if !(ask && self.tabs.iter().any(|t| t.dirty)) {
+            // The persist above is the final one, so only the marker is left —
+            // for the LAST window, whose close is the app's quit. A secondary
+            // window stays unmarked (the run goes on; its crash must still be
+            // reported) and leaves the registry instead.
+            if windows::is_alone(cx, self.win_id) {
+                self.mark_clean_exit();
+            } else {
+                self.leave_registry(cx);
+            }
             return true;
         }
         self.quitting = true;
@@ -930,7 +957,7 @@ impl Docxy {
         }
         let next = next_to_ask(&self.tabs, &self.quit_discards);
         match next {
-            None => self.finish_quit(window),
+            None => self.finish_quit(window, cx),
             Some(i) if self.tabs[i].dialogs.is_open() => {
                 self.quit_cancelled();
                 self.refuse_close_under_dialog(i, window, cx);
@@ -943,7 +970,7 @@ impl Docxy {
                 let prompt = close_prompt(
                     &self.tabs[i],
                     true,
-                    &known_locations(self.harness.is_some()),
+                    &known_locations(self.harness),
                 );
                 self.tabs[i].dialogs.push(prompt);
                 self.refocus(window, cx);
@@ -962,7 +989,7 @@ impl Docxy {
     /// Every unsaved tab is answered: keep the drafts of workbooks answered
     /// Don't Save (#613), drop never-saved tabs answered so, persist the
     /// others as their files alone, and go as a clean exit.
-    fn finish_quit(&mut self, window: &mut Window) {
+    fn finish_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let root = config_root();
         let now = std::time::SystemTime::now();
         for &i in &self.quit_discards {
@@ -982,15 +1009,50 @@ impl Docxy {
             &mut self.active,
             std::mem::take(&mut self.quit_discards),
         );
-        write_session_forgetting(&root, &self.tabs, self.active, self.prefs(), &forget);
+        write_session_forgetting(
+            &root,
+            &self.tabs,
+            self.active,
+            self.prefs(),
+            &forget,
+            &windows::others_persisted(cx, self.win_id),
+            windows::seq_of(cx, self.win_id) * 1000,
+        );
         self.last_persist.set(std::time::Instant::now());
-        self.mark_clean_exit();
+        let alone = windows::is_alone(cx, self.win_id);
+        if alone {
+            // The last window's close is the app's quit: the marker can go.
+            self.mark_clean_exit();
+        }
         self.quitting = false;
-        if self.harness.is_some() {
-            // The harness ends the process once its reply is out.
-            self.quit_ready = true;
+        if alone {
+            if self.harness {
+                // The harness ends the process once its reply is out.
+                self.quit_ready = true;
+            } else {
+                window.remove_window();
+            }
         } else {
+            // A secondary window: leave the registry, hand selection to the
+            // most recent survivor and persist it, then remove only this
+            // window. The app keeps running.
+            self.leave_registry(cx);
             window.remove_window();
+        }
+    }
+
+    /// A secondary window's accepted close: leave the registry; selection
+    /// falls back to the most recent survivor, which is persisted at once so
+    /// this window's tabs leave `session.json` — a closed secondary window
+    /// is not restored, and a kill before the survivor's next write would
+    /// otherwise bring its tabs back. Called from BOTH accepted-close paths
+    /// (nothing to ask, and the last prompt answered); the last window never
+    /// comes here — its close is the app's quit and keeps the single-window
+    /// behaviour exactly.
+    fn leave_registry(&mut self, cx: &mut Context<Self>) {
+        windows::unregister(cx, self.win_id);
+        if let Some(view) = windows::selected_view(cx) {
+            let _ = view.update(cx, |this: &mut crate::Docxy, cx| this.persist(cx));
         }
     }
 }
@@ -1020,7 +1082,7 @@ fn refresh_tab_id(ids: &mut [TabId], tabs: &[DocTab], i: usize) {
 
 /// Whether a window close's question is open on some tab: the quit is live
 /// only while one is, whatever the app last recorded.
-fn quit_prompt_live(tabs: &[DocTab]) -> bool {
+pub(crate) fn quit_prompt_live(tabs: &[DocTab]) -> bool {
     tabs.iter().any(|t| {
         t.dialogs
             .top()

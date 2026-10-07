@@ -27,6 +27,7 @@
 //! harness verbs and its UI dialog overrides remain disabled.
 
 use crate::control::Done;
+use crate::windows;
 use crate::{CONFIG_DIR_ENV, RefTarget, SheetView};
 use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
@@ -349,7 +350,10 @@ pub fn attach(
         dispatch,
         hit_tests_rendered_frame,
     );
-    view.update(cx, |this, _| this.harness = Some(link));
+    view.update(cx, |this, _| {
+        this.harness = true;
+        this.harness_link = Some(link);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -3613,13 +3617,22 @@ fn dispatch_verb(
             Done::ok(state(app, window))
         }
         // The window's close button, as `on_window_should_close` runs it
-        // outside the harness (#630): with "ask before closing" on and work
-        // unsaved, Word's question for each unsaved tab, driven with
-        // `dialog-click`; otherwise, or once the last one is answered, a clean
-        // exit, and the process ends after the reply.
+        // outside the harness (#630). The LAST window: with "ask before
+        // closing" on and work unsaved, Word's question for each unsaved tab,
+        // driven with `dialog-click`; otherwise, or once the last one is
+        // answered, a clean exit, and the process ends after the reply. A
+        // NON-last window (#587) always asks when something is unsaved —
+        // whatever the setting — and on accept leaves the registry: the
+        // process keeps running and `window-list` shrinks.
         "close-window" => {
             app.refuse_under_dialog()?;
-            if app.window_should_close(true, window, cx) {
+            let last = windows::is_alone(cx, app.win_id);
+            let ask = if last {
+                crate::close::CloseAsk::Setting
+            } else {
+                crate::close::CloseAsk::Force
+            };
+            if app.window_should_close(ask, window, cx) && last {
                 app.quit_ready = true;
             }
             Done::ok(state(app, window))
@@ -3705,7 +3718,7 @@ fn dispatch_verb(
         // whether anything was unsaved and so written. Runs even when the
         // setting is off: it is the tick, not the schedule.
         "autorecover-now" => {
-            let wrote = app.autorecover_tick();
+            let wrote = app.autorecover_tick(cx);
             cx.notify();
             Done::ok(Json::obj(vec![("wrote", Json::Bool(wrote))]))
         }
@@ -3761,7 +3774,7 @@ fn dispatch_verb(
             let loaded = app.open_path(&path, mode, reopen)?;
             app.backstage = false;
             app.drop_grid_state();
-            app.persist();
+            app.persist(cx);
             cx.notify();
             // An open tab was only focused, or asked about: nothing was
             // loaded, so its status says something else and is not judged.
@@ -4654,7 +4667,7 @@ fn dispatch_verb(
             crate::close::commit_pending_for_exit(&mut app.tabs);
             // Not through `on_window_should_close`: clear the run marker here
             // too, or every harness relaunch would look like a crash (#632).
-            app.clean_exit();
+            app.clean_exit(cx);
             Ok(Done {
                 result: Json::obj(vec![("quitting", Json::Bool(true))]),
                 quit: true,

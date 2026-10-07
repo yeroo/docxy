@@ -1375,7 +1375,7 @@ fn autorecover_writes_an_unsaved_edit_that_a_crash_restores_as_recovered() {
     let mut tabs = vec![t];
 
     assert!(autorecover_prepare(&mut tabs));
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     let session = root.session();
     assert!(session.tabs[0].dirty);
     let hot = PathBuf::from(session.tabs[0].hot.as_deref().unwrap());
@@ -1404,7 +1404,7 @@ fn a_crash_does_not_label_clean_tabs_recovered() {
     let root = Root::new("clean");
     let mut tabs = vec![tab(Kind::Docx), tab(Kind::Xlsx)];
     tabs[1].dirty = true;
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     let restored = restore_session(
         &root.session(),
         true,
@@ -1443,7 +1443,7 @@ fn autorecover_captures_an_open_header_and_stays_in_header_mode() {
     let part = open_hf(&mut tabs[0], true, "Recovered header");
     assert!(autorecover_prepare(&mut tabs));
     assert!(tabs[0].hf_edit.is_some(), "the header editor stays open");
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     let restored = restore_session(
         &root.session(),
         true,
@@ -1467,7 +1467,7 @@ fn autorecover_is_on_by_default_and_the_setting_round_trips() {
         autorecover_minutes: 0,
         ..prefs()
     };
-    write_session(&root.0, &[tab(Kind::Docx)], 0, prefs);
+    write_session(&root.0, &[tab(Kind::Docx)], 0, prefs, &[], 0);
     assert_eq!(root.session().autorecover_minutes, 0, "off is kept");
 }
 
@@ -1554,7 +1554,7 @@ fn a_crash_still_labels_sheet_and_project_sidecars_it_read() {
     for t in &mut tabs {
         t.dirty = true;
     }
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     let restored = restore_session(
         &root.session(),
         true,
@@ -1628,7 +1628,7 @@ fn keeping_drafts_is_on_by_default_and_the_setting_round_trips() {
         keep_drafts: false,
         ..prefs()
     };
-    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
+    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs, &[], 0);
     assert!(!root.session().keep_drafts, "off is kept");
 }
 
@@ -1662,7 +1662,7 @@ fn sheet_editing_options_round_trip_through_the_session() {
         edit_opts: opts,
         ..prefs()
     };
-    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
+    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs, &[], 0);
     assert_eq!(EditOptions::from_text(&root.session().sheet_editing), opts);
 }
 
@@ -1687,7 +1687,7 @@ fn autocorrect_persists_with_the_sheet_editing_options() {
         autocorrect: ac.to_lines(),
         ..prefs()
     };
-    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
+    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs, &[], 0);
     let saved = root.session().sheet_editing;
     assert_eq!(AutoCorrect::from_text(&saved), ac);
     assert_eq!(EditOptions::from_text(&saved), opts);
@@ -1782,19 +1782,19 @@ fn a_persist_records_the_sidecar_only_while_the_tab_is_unsaved() {
     let root = Root::new("last-hot");
     let mut tabs = vec![tab(Kind::Docx), tab(Kind::Xlsx)];
     tabs[1].dirty = true;
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     assert_eq!(*tabs[0].last_hot.borrow(), None, "clean");
     let hot = tabs[1].last_hot.borrow().clone().unwrap();
     assert_eq!(hot, hot_dir_in(&root.0).join("tab-1.xlsx"));
     assert!(hot.exists());
     // Saved since: the next persist forgets it.
     tabs[1].dirty = false;
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     assert_eq!(*tabs[1].last_hot.borrow(), None);
     // A sibling closed: the path follows the tab to its new index.
     tabs[1].dirty = true;
     tabs.remove(0);
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     assert_eq!(
         tabs[0].last_hot.borrow().as_deref(),
         Some(hot_dir_in(&root.0).join("tab-0.xlsx").as_path())
@@ -1822,7 +1822,7 @@ fn dont_save_keeps_the_last_autorecover_copy_as_a_read_only_draft() {
     let mut tabs = vec![tab(Kind::Xlsx)];
     commit_a1(&mut tabs[0], "Draft me");
     assert!(autorecover_prepare(&mut tabs));
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     commit_a1(&mut tabs[0], "After the tick");
     let step = close_step(&mut tabs[0], Some(CloseAnswer::Discard));
     assert_eq!(step, CloseStep::Discard);
@@ -1856,7 +1856,7 @@ fn no_draft_without_a_write_while_unsaved_or_without_discard() {
     assert_eq!(keep_closed_draft(&root.0, &t, &step, 1, true, now), None);
     // Written while unsaved, but the answer was Cancel.
     let tabs = vec![t];
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     let mut t = tabs.into_iter().next().unwrap();
     let step = close_step(&mut t, Some(CloseAnswer::Cancel));
     assert_eq!(keep_closed_draft(&root.0, &t, &step, 1, true, now), None);

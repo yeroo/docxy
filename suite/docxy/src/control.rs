@@ -476,11 +476,11 @@ impl Docxy {
             if effect.repaint {
                 cx.notify();
             }
-            if effect.signals_activity(self.harness.is_some()) {
+            if effect.signals_activity(self.harness) {
                 ctlcore::signal_activity();
             }
             if matches!(verb, "proj.save" | "proj.reload") {
-                self.persist();
+                self.persist(cx);
             }
             result
         }))

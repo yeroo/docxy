@@ -196,7 +196,7 @@ impl Docxy {
         if !self.active_is_doc() {
             return;
         }
-        if doc_save_as_target(self.harness.is_some()) == DocSaveTarget::RefuseHarness {
+        if doc_save_as_target(self.harness) == DocSaveTarget::RefuseHarness {
             self.set_status(DOC_SAVE_AS_HARNESS);
             return self.refocus(window, cx);
         }
@@ -388,7 +388,7 @@ impl Docxy {
         self.drop_grid_state();
         self.backstage = false;
         self.show_backstage_open_page();
-        self.persist();
+        self.persist(cx);
         self.refocus(window, cx);
         Ok(())
     }
