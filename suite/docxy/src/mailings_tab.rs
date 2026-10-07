@@ -987,7 +987,7 @@ impl Docxy {
     /// never in a harness instance (its modal loop stops the control pump):
     /// there the `mail-attach` verb hands the path in instead.
     fn pick_recipients(&mut self) {
-        if self.harness.is_some() {
+        if self.harness {
             self.set_status(MAIL_ATTACH_HARNESS);
             return;
         }
@@ -1006,7 +1006,7 @@ impl Docxy {
 
     /// Open what a mail-merge dialog left for the app: a merged or labels
     /// document in a new tab, then the command a confirmed attach was for.
-    pub(crate) fn take_mail_outputs(&mut self) {
+    pub(crate) fn take_mail_outputs(&mut self, cx: &mut App) {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -1018,7 +1018,7 @@ impl Docxy {
                 .push(loaded.into_tab(Kind::Docx, title.into(), None, true));
             self.active = self.tabs.len() - 1;
             self.drop_grid_state();
-            self.persist();
+            self.persist(cx);
         }
         // A drop-down's menu needs the pointer's place: the list is attached
         // now, and the button opens it on the next press.

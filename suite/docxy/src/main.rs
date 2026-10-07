@@ -115,6 +115,7 @@ mod track_tests;
 mod trusted;
 mod ttc_dialog;
 mod user_name;
+mod windows;
 use open_mode::{OpenMode, Reopen, ReopenStep, reopen_step};
 use project::*;
 
@@ -282,7 +283,7 @@ impl ThemePref {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PersistTab {
     kind: Kind,
     title: String,
@@ -1018,7 +1019,12 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
 fn protected_view_allows_act(act: SheetAct) -> bool {
     matches!(
         act,
-        SheetAct::Copy | SheetAct::PrevComment | SheetAct::NextComment | SheetAct::Todo
+        SheetAct::Copy
+            | SheetAct::PrevComment
+            | SheetAct::NextComment
+            | SheetAct::Todo
+            | SheetAct::NewWindow
+            | SheetAct::ArrangeAll
     )
 }
 
@@ -1038,6 +1044,8 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
             | Act::ShowHide
             | Act::ToggleComments
             | Act::ToggleNav
+            | Act::NewWindow
+            | Act::ArrangeAll
             | Act::ToggleNotes
             | Act::Markup(_)
             | Act::DarkMode
@@ -1081,6 +1089,8 @@ fn multi_area_ok(act: SheetAct) -> bool {
         // that pick a new selection.
         | SheetAct::Menu(_)
         | SheetAct::FreezePanes
+        | SheetAct::NewWindow
+        | SheetAct::ArrangeAll
         | SheetAct::PrevComment
         | SheetAct::NextComment
         | SheetAct::ProtectSheet
@@ -1187,6 +1197,8 @@ fn act_targets_cells(act: SheetAct) -> bool {
             | SheetAct::Menu(_)
             | SheetAct::OfficeClipboard
             | SheetAct::CustomLists
+            | SheetAct::NewWindow
+            | SheetAct::ArrangeAll
             | SheetAct::Todo
     )
 }
@@ -1809,15 +1821,28 @@ fn recorded_after_write(wrote: String, now: &ClipRead) -> String {
 /// neither read nor overwrite what the person at the machine copied, and
 /// starts from an empty clipboard whatever they have on theirs. The private one
 /// reads as the OS one does: an empty write is an item with no text.
-#[derive(Default)]
+///
+/// The private store is ONE for the whole run (#587 r3): every window's store
+/// clones the same `Rc`, so a copy in any window — document, grid, Project,
+/// cell editor, About, the harness `clipboard` verb — is what every other
+/// window pastes, with no per-site sync. The rich document clip, the grid
+/// clip and the Office Clipboard stay PER WINDOW: a paste into another
+/// window finds that clip not "ours" and falls back to this plain text,
+/// exactly like a paste from another application.
+#[derive(Clone, Default)]
 struct ClipboardStore {
-    private: Option<String>,
+    private: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
 impl ClipboardStore {
+    /// A store over the run-wide shared private text (see the type).
+    fn shared(private: std::rc::Rc<std::cell::RefCell<Option<String>>>) -> Self {
+        Self { private }
+    }
+
     fn write(&mut self, harness: bool, text: String, os: impl FnOnce(String)) {
         if harness {
-            self.private = Some(text);
+            *self.private.borrow_mut() = Some(text);
         } else {
             os(text);
         }
@@ -1827,7 +1852,7 @@ impl ClipboardStore {
     /// text (`None` when it has none).
     fn read(&self, harness: bool, os: impl FnOnce() -> Option<Option<String>>) -> ClipRead {
         ClipRead::from_item(if harness {
-            self.private.clone().map(Some)
+            self.private.borrow().clone().map(Some)
         } else {
             os()
         })
@@ -1861,6 +1886,12 @@ enum SheetAct {
     FontColor,
     ToggleBorder,
     FreezePanes,
+    /// View › Window › New Window (#587): move the active tab into a new
+    /// window; a one-tab window opens the new window on a blank document.
+    NewWindow,
+    /// View › Window › Arrange All (#587): resize every window to an equal
+    /// strip of this window's display.
+    ArrangeAll,
     NewComment,
     DeleteComment,
     PrevComment,
@@ -4130,9 +4161,6 @@ struct Docxy {
     /// tab in turn (#630). Off by default: work is hot-persisted and restored
     /// regardless, so closing is normally silent.
     ask_on_close: bool,
-    /// The number the next new document's `Document<n>` title takes (#631):
-    /// it only goes up, so a number is never reused in a session.
-    next_document: u32,
     /// The window is closing through its per-document questions (#630):
     /// a close prompt with `quit` is on the tab being asked about.
     quitting: bool,
@@ -4347,10 +4375,15 @@ struct Docxy {
     // While this is None the bar keeps following the selection, which is what
     // these bars did before they grew a range field.
     bar_range: Option<String>,
-    // The opt-in UI harness server and pump, kept alive with the window.
-    harness: Option<control::ControlLink>,
-    // The normal Project-only server and pump; absent in harness mode.
-    control: Option<control::ControlLink>,
+    // This window's id in the window registry (#587); 0 until registered
+    // (also the value tests and the first window's construction carry while
+    // no registry exists yet).
+    win_id: u64,
+    // Whether this RUN is a harness instance: every window of the run gets
+    // it (#587); it drives the close flow, prompt locations and save
+    // targets. The link that keeps the harness server alive is owned by the
+    // registry, for the whole run.
+    harness: bool,
     // Measured bounds of the regions the harness's `rect` verb can name, written
     // by `probe` elements during layout. Costs one out-of-flow zero-paint element
     // per probed region per frame, harness or not — the alternative, gating them
@@ -6183,6 +6216,36 @@ mod click_caret_tests {
 fn empty_doc() -> Document {
     Document {
         body: vec![Block::Paragraph(Default::default())],
+    }
+}
+
+/// A fresh blank document tab, the shape Backstage › New › Document makes
+/// (shared by New Window's blank-document window, #587).
+fn blank_docx_tab(title: &str) -> DocTab {
+    DocTab {
+        kind: Kind::Docx,
+        title: title.to_owned().into(),
+        path: None,
+        surface: Surface::Doc(Editor::new(empty_doc())),
+        dirty: false,
+        status: "new".into(),
+        comments: vec![],
+        tracked_comment_ids: Default::default(),
+        comments_removed_all: false,
+        used_comment_ids: Default::default(),
+        pkg: None,
+        notes: vec![],
+        markdown: false,
+        hf_edit: None,
+        bundle_html: None,
+        load_failed: false,
+        dialogs: crate::dialog::DialogStack::default(),
+        access: crate::open_mode::Access::default(),
+        last_hot: Default::default(),
+        converted_docx: None,
+        pending_conversion: false,
+        mail: Default::default(),
+        import: Default::default(),
     }
 }
 
@@ -9643,8 +9706,15 @@ fn hot_dir_in(root: &std::path::Path) -> PathBuf {
 /// ⚠️ The sidecars and the session are still two steps: killed between them
 /// after a tab close or reorder, the old session can pair `tab-N` with another
 /// tab's `path`. The AutoRecover tick never reorders, so it does not widen this.
-fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: Prefs) {
-    write_session_forgetting(root, tabs, active, prefs, &[]);
+fn write_session(
+    root: &std::path::Path,
+    tabs: &[DocTab],
+    active: usize,
+    prefs: Prefs,
+    extra: &[PersistTab],
+    hot_seq: usize,
+) -> Vec<PersistTab> {
+    write_session_forgetting(root, tabs, active, prefs, &[], extra, hot_seq)
 }
 
 /// [`write_session`], with the unsaved work of the tabs at `forget` left out
@@ -9656,10 +9726,18 @@ fn write_session_forgetting(
     active: usize,
     prefs: Prefs,
     forget: &[usize],
-) {
+    // The other windows' last-written tabs, appended after this window's:
+    // one session.json holds every window's tabs (#587). Never merged into
+    // `forget`, whose indices name THIS window's tabs only.
+    extra: &[PersistTab],
+    // The window's registry seq: its sidecars are named by [`hot_stem`], so
+    // two windows never share a sidecar name at any tab count. 0 keeps the
+    // single-window names (`tab-{i}`) exactly.
+    hot_seq: usize,
+) -> Vec<PersistTab> {
     let hd = hot_dir_in(root);
     let _ = std::fs::create_dir_all(&hd);
-    let tabs = tabs
+    let own: Vec<PersistTab> = tabs
         .iter()
         .enumerate()
         .map(|(i, t)| {
@@ -9667,7 +9745,7 @@ fn write_session_forgetting(
                 *t.last_hot.borrow_mut() = None;
                 return forgotten(persist_tab_meta(t));
             }
-            let persisted = persist_tab(&hd, i, t);
+            let persisted = persist_tab(&hd, hot_seq, i, t);
             // Every tab is rewritten in this one call, so the path names this
             // tab's content even after a later close shifts the indices.
             *t.last_hot.borrow_mut() = persisted
@@ -9679,7 +9757,7 @@ fn write_session_forgetting(
         })
         .collect();
     let session = Session {
-        tabs,
+        tabs: own.iter().cloned().chain(extra.iter().cloned()).collect(),
         active,
         theme: prefs.theme,
         ask_on_close: prefs.ask_on_close,
@@ -9700,6 +9778,137 @@ fn write_session_forgetting(
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = opccore::fsio::write_atomic(&p, json.as_bytes());
+    }
+    own
+}
+
+#[cfg(test)]
+mod session_union_tests {
+    use super::{
+        DocTab, EditOptions, Kind, Prefs, Session, ThemePref, sample_doc, session_path_in,
+        write_session_forgetting,
+    };
+
+    fn prefs() -> Prefs {
+        Prefs {
+            theme: ThemePref::Auto,
+            ask_on_close: false,
+            autorecover_minutes: 10,
+            keep_drafts: true,
+            edit_opts: EditOptions::default(),
+            custom_lists: vec![],
+            autocorrect: String::new(),
+            user_name: "Tester".into(),
+            user_initials: "T".into(),
+        }
+    }
+
+    fn doc_tab(title: &str, dirty: bool) -> DocTab {
+        sample_doc().into_tab(Kind::Docx, title.into(), None, dirty)
+    }
+
+    fn fresh_root(name: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("docxy-session-union-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn session_json(root: &std::path::Path) -> Session {
+        serde_json::from_slice(&std::fs::read(session_path_in(root)).unwrap()).unwrap()
+    }
+
+    /// #587 decision 6: one session.json holds every window's tabs. Each
+    /// window's write appends the others' last snapshots, and a secondary
+    /// window's sidecars take the `tab-w{seq}-` namespace so the files never
+    /// collide (the first window keeps `tab-{i}`).
+    #[test]
+    fn two_windows_union_reaches_session_with_distinct_sidecars() {
+        let root = fresh_root("two");
+        let win0 = vec![doc_tab("alpha.docx", true)];
+        write_session_forgetting(&root, &win0, 0, prefs(), &[], &[], 0);
+        // What window 0 wrote becomes the snapshot window 1 appends.
+        let snap0 = session_json(&root).tabs;
+        let win1 = vec![doc_tab("beta.docx", true)];
+        let own = write_session_forgetting(&root, &win1, 0, prefs(), &[], &snap0, 1);
+
+        let session = session_json(&root);
+        assert_eq!(
+            session.tabs.len(),
+            2,
+            "both windows' tabs reach the one session"
+        );
+        assert_eq!(
+            own.len(),
+            1,
+            "the returned snapshot is this window's own tabs, not the union it appended"
+        );
+        assert_eq!(own[0].title, "beta.docx");
+        let hots: Vec<&str> = session
+            .tabs
+            .iter()
+            .filter_map(|t| t.hot.as_deref())
+            .collect();
+        assert_eq!(
+            hots.len(),
+            2,
+            "both dirty tabs keep a hot sidecar: {hots:?}"
+        );
+        assert!(hots.iter().any(|h| h.ends_with("tab-0.docx")), "{hots:?}");
+        assert!(
+            hots.iter().any(|h| h.ends_with("tab-w1-0.docx")),
+            "{hots:?}"
+        );
+        for h in &hots {
+            assert!(std::path::Path::new(h).exists(), "sidecar written: {h}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A single-window run keeps the exact bytes and sidecar names it wrote
+    /// before #587: the union append is empty and seq 0 keeps the `tab-{i}`
+    /// sidecar names.
+    #[test]
+    fn single_window_write_is_byte_identical_to_before() {
+        let root = fresh_root("single");
+        write_session_forgetting(
+            &root,
+            &[doc_tab("one.docx", true), doc_tab("two.docx", false)],
+            0,
+            prefs(),
+            &[],
+            &[],
+            0,
+        );
+        let first = std::fs::read(session_path_in(&root)).unwrap();
+        write_session_forgetting(
+            &root,
+            &[doc_tab("one.docx", true), doc_tab("two.docx", false)],
+            0,
+            prefs(),
+            &[],
+            &[],
+            0,
+        );
+        let second = std::fs::read(session_path_in(&root)).unwrap();
+        assert_eq!(first, second, "the same input writes the same bytes");
+        let session: Session = serde_json::from_slice(&second).unwrap();
+        let hots: Vec<&str> = session
+            .tabs
+            .iter()
+            .filter_map(|t| t.hot.as_deref())
+            .collect();
+        assert_eq!(hots.len(), 2, "every tab names its sidecar");
+        assert!(
+            hots[0].ends_with("tab-0.docx"),
+            "no offset in the names: {hots:?}"
+        );
+        assert!(
+            hots[1].ends_with("tab-1.docx"),
+            "no offset in the names: {hots:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
@@ -10327,7 +10536,19 @@ fn restore_session(
         .collect()
 }
 
-fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
+/// The hot-sidecar file stem for tab `i` of the window with registry seq
+/// `s` (#587): the first window keeps the historic `tab-{i}` names
+/// byte-identical; a secondary window's namespace (`tab-w{s}-{i}`) cannot
+/// collide with the first window's at any tab count.
+fn hot_stem(seq: usize, i: usize) -> String {
+    if seq == 0 {
+        format!("tab-{i}")
+    } else {
+        format!("tab-w{seq}-{i}")
+    }
+}
+
+fn persist_tab(hd: &std::path::Path, seq: usize, i: usize, t: &DocTab) -> PersistTab {
     // Write the tab's live content to a sidecar so unsaved edits are
     // held across a restart (closing never loses work). Docs → .docx,
     // spreadsheets → .xlsx, projects → .yppx; restored in preference to `path`.
@@ -10337,7 +10558,7 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         // document: no sidecar, so the next start converts it again.
         Surface::Doc(_) if t.pending_conversion => None,
         Surface::Doc(ed) => {
-            let p = hd.join(format!("tab-{i}.docx"));
+            let p = hd.join(format!("{}.docx", hot_stem(seq, i)));
             let live = live_comments(t, &ed.doc);
             let base = save_base(t, &ed.doc, &live);
             let bytes = doc_to_docx(&ed.doc, &live, base.as_deref());
@@ -10346,13 +10567,13 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
                 .map(|_| p.display().to_string())
         }
         Surface::Sheet(v) => {
-            let p = hd.join(format!("tab-{i}.xlsx"));
+            let p = hd.join(format!("{}.xlsx", hot_stem(seq, i)));
             opccore::fsio::write_atomic(&p, &sheet_bytes(v, None).0)
                 .ok()
                 .map(|_| p.display().to_string())
         }
         Surface::Project(v) => {
-            let p = hd.join(format!("tab-{i}.yppx"));
+            let p = hd.join(format!("{}.yppx", hot_stem(seq, i)));
             let mut snapshot = v.ed.project().clone();
             snapshot.package.unreadable.clear();
             projcore::yppx::write_yppx(&snapshot)
@@ -10508,11 +10729,16 @@ impl Docxy {
         let active = session.active.min(tabs.len().saturating_sub(1));
         let mut this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
         // New documents continue past the restored ones (#631).
-        this.next_document = doc_name::next_after(
-            this.tabs
-                .iter()
-                .filter(|t| t.kind == Kind::Docx && t.path.is_none())
-                .map(|t| t.title.as_ref()),
+        // The untitled counter is the run's (#587 r2 m10): seed the shared
+        // one from the restored titles, then every window mints from it.
+        windows::seed_document_titles(
+            cx,
+            doc_name::next_after(
+                this.tabs
+                    .iter()
+                    .filter(|t| t.kind == Kind::Docx && t.path.is_none())
+                    .map(|t| t.title.as_ref()),
+            ),
         );
         this.autorecover_minutes = session.autorecover_minutes;
         this.keep_drafts = session.keep_drafts;
@@ -10525,7 +10751,9 @@ impl Docxy {
         sheet_autocorrect::stamp_autocorrect(&mut this.tabs, &this.autocorrect);
         this.user_name = session.user_name;
         this.user_initials = session.user_initials;
-        this.persist_to(&root);
+        // win_id is 0 until the window registers: the write below behaves
+        // exactly like the single-window write this was (no union, base 0).
+        this.persist_to(&root, cx);
         this
     }
 
@@ -10563,7 +10791,6 @@ impl Docxy {
             clip: None,
             theme_pref,
             ask_on_close,
-            next_document: 1,
             quitting: false,
             quit_discards: Vec::new(),
             quit_tabs: Vec::new(),
@@ -10634,7 +10861,7 @@ impl Docxy {
             zoom: 1.0,
             ruler_guide: None,
             grid_clip: None,
-            clipboard: ClipboardStore::default(),
+            clipboard: ClipboardStore::shared(windows::shared_clipboard_text(cx)),
             sheet_pick: None,
             sheet_rename: None,
             sheet_grid_w: 1000.0,
@@ -10647,21 +10874,70 @@ impl Docxy {
             sheet_rowh_edit: None,
             bar_field: None,
             bar_range: None,
-            harness: None,
-            control: None,
+            win_id: 0,
+            harness: false,
             probes: Default::default(),
             frame: 0,
         }
     }
 
-    fn persist(&self) {
-        self.persist_to(&config_root());
+    fn persist(&self, cx: &mut App) {
+        self.persist_to(&config_root(), cx);
     }
 
-    fn persist_to(&self, root: &std::path::Path) {
-        write_session(root, &self.tabs, self.active, self.prefs());
+    /// This window's tabs and the other windows' snapshots reach one
+    /// `session.json` (#587): the write appends the registry's snapshots and
+    /// names this window's sidecars by its registry seq, then stores this
+    /// window's own tabs (never the union) for the others to append.
+    fn persist_to(&self, root: &std::path::Path, cx: &mut App) {
+        let own = write_session(
+            root,
+            &self.tabs,
+            self.active,
+            self.prefs(),
+            &windows::others_persisted(cx, self.win_id),
+            windows::seq_of(cx, self.win_id),
+        );
+        windows::set_persisted(cx, self.win_id, own);
         // Any write restarts the AutoRecover clock: the copy is fresh.
         self.last_persist.set(std::time::Instant::now());
+    }
+
+    /// A shared setting changed: apply it to every registered window, so the
+    /// next union write from ANY window keeps it (#587 r1 M6). Skips this
+    /// view — the caller already applied the change, and updating the
+    /// entity the caller is being updated on would double-lease it. Each
+    /// other window is notified, so a checkbox or the theme repaints there
+    /// too (#587 r2 m4).
+    pub(crate) fn share_with_windows(&mut self, cx: &mut App, apply: impl Fn(&mut Docxy)) {
+        for (id, view, _) in windows::entries_snapshot(cx) {
+            if id == self.win_id {
+                continue;
+            }
+            let _ = view.update(cx, |this: &mut Docxy, cx| {
+                apply(this);
+                cx.notify();
+            });
+        }
+    }
+
+    /// The harness `quit` (#587 r1 M3): fold pending edits into every OTHER
+    /// registered window and persist it, so their newest state reaches the
+    /// session — the union write appends snapshots, and a stale one would
+    /// lose another window's edits. Skips this view: the caller persists it
+    /// through `clean_exit`, and updating the entity being updated would
+    /// double-lease it.
+    pub(crate) fn persist_other_windows(&mut self, cx: &mut App) {
+        for (id, view, _) in windows::entries_snapshot(cx) {
+            if id == self.win_id {
+                continue;
+            }
+            let _ = view.update(cx, |this: &mut Docxy, cx| {
+                this.commit_dialog_buffers_for_exit(cx);
+                close::commit_pending_for_exit(&mut this.tabs);
+                this.persist(cx);
+            });
+        }
     }
 
     fn prefs(&self) -> Prefs {
@@ -10681,10 +10957,10 @@ impl Docxy {
     /// One AutoRecover tick: write the hot-exit state if any tab is unsaved.
     /// Returns whether it wrote. The timer and the harness `autorecover-now`
     /// verb both come here.
-    fn autorecover_tick(&mut self) -> bool {
+    fn autorecover_tick(&mut self, cx: &mut App) -> bool {
         let wrote = autorecover_prepare(&mut self.tabs);
         if wrote {
-            self.persist();
+            self.persist(cx);
         } else {
             // A check that found nothing unsaved restarts the clock too, or a
             // clean session would be re-checked every second from now on. An
@@ -10703,8 +10979,8 @@ impl Docxy {
     /// The harness `quit`'s clean exit: persist, then [`Self::mark_clean_exit`].
     /// An accepted window close has already persisted before asking, so it
     /// calls `mark_clean_exit` alone.
-    fn clean_exit(&self) {
-        self.persist();
+    fn clean_exit(&self, cx: &mut App) {
+        self.persist(cx);
         self.mark_clean_exit();
     }
 
@@ -10718,7 +10994,8 @@ impl Docxy {
 
     fn set_autorecover_minutes(&mut self, minutes: u32, cx: &mut Context<Self>) {
         self.autorecover_minutes = minutes;
-        self.persist();
+        self.share_with_windows(cx, |d| d.autorecover_minutes = minutes);
+        self.persist(cx);
         cx.notify();
     }
 
@@ -10732,7 +11009,7 @@ impl Docxy {
         self.close_menu();
         self.backstage = true;
         self.show_backstage_open_page();
-        self.refresh_drafts();
+        self.refresh_drafts(cx);
         self.trusted_count = trusted::count(&config_root());
         self.trusted_error = None;
         cx.notify();
@@ -10939,19 +11216,25 @@ impl Docxy {
     fn set_theme_pref(&mut self, pref: ThemePref, window: &mut Window, cx: &mut Context<Self>) {
         self.theme_pref = pref;
         self.applied = None; // force re-apply on next render
-        self.persist();
+        self.share_with_windows(cx, |d| {
+            d.theme_pref = pref;
+            d.applied = None;
+        });
+        self.persist(cx);
         self.refocus(window, cx);
     }
 
     fn set_ask_on_close(&mut self, on: bool, cx: &mut Context<Self>) {
         self.ask_on_close = on;
-        self.persist();
+        self.share_with_windows(cx, |d| d.ask_on_close = on);
+        self.persist(cx);
         cx.notify();
     }
 
     fn set_keep_drafts(&mut self, on: bool, cx: &mut Context<Self>) {
         self.keep_drafts = on;
-        self.persist();
+        self.share_with_windows(cx, |d| d.keep_drafts = on);
+        self.persist(cx);
         cx.notify();
     }
 
@@ -11148,7 +11431,11 @@ impl Docxy {
     fn set_edit_opts(&mut self, opts: EditOptions, cx: &mut Context<Self>) {
         self.edit_opts = opts;
         stamp_edit_opts(&mut self.tabs, opts);
-        self.persist();
+        self.share_with_windows(cx, |d| {
+            d.edit_opts = opts;
+            stamp_edit_opts(&mut d.tabs, opts);
+        });
+        self.persist(cx);
         cx.notify();
     }
 
@@ -11175,9 +11462,23 @@ impl Docxy {
     }
 
     /// Re-read the drafts (pruning old ones, but never a draft open in a
-    /// tab) into the backstage's list, and return it.
-    fn refresh_drafts(&mut self) -> &[recover::Draft] {
-        let open: Vec<PathBuf> = self.tabs.iter().filter_map(|t| t.path.clone()).collect();
+    /// tab) into the backstage's list, and return it. A draft open in ANY
+    /// window's tab is protected, not just this one's (#587 r2 m8).
+    fn refresh_drafts(&mut self, cx: &mut App) -> &[recover::Draft] {
+        let mut open: Vec<PathBuf> = self.tabs.iter().filter_map(|t| t.path.clone()).collect();
+        for (id, view, _) in windows::entries_snapshot(cx) {
+            if id == self.win_id {
+                continue;
+            }
+            if let Ok(paths) = view.read_with(cx, |this: &Docxy, _| {
+                this.tabs
+                    .iter()
+                    .filter_map(|t| t.path.clone())
+                    .collect::<Vec<_>>()
+            }) {
+                open.extend(paths);
+            }
+        }
         self.drafts = recover::list_drafts(&config_root(), std::time::SystemTime::now(), &open);
         &self.drafts
     }
@@ -11202,7 +11503,7 @@ impl Docxy {
         }
         self.backstage = false;
         self.drop_grid_state();
-        self.persist();
+        self.persist(cx);
         self.refocus(window, cx);
     }
 
@@ -11271,7 +11572,7 @@ impl Docxy {
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
             Kind::Docx => new_tab(
-                &doc_name::next_document_title(&mut self.next_document),
+                &windows::next_document_title(cx),
                 Surface::Doc(Editor::new(empty_doc())),
             ),
             Kind::Xlsx => new_tab("Untitled.xlsx", new_sheet_surface()),
@@ -11284,8 +11585,174 @@ impl Docxy {
         self.bs_info = false;
         self.bs_info_status = None;
         self.drop_grid_state();
-        self.persist();
+        self.persist(cx);
         self.refocus(window, cx);
+    }
+
+    /// A New Window's view (#587): the moved tabs, the source's shared
+    /// settings, nothing read from disk — the session and the crash marker
+    /// belong to the first window alone.
+    fn moved(tabs: Vec<DocTab>, prefs: MovedPrefs, cx: &mut Context<Self>) -> Self {
+        let MovedPrefs {
+            theme_pref,
+            ask_on_close,
+            autorecover_minutes,
+            keep_drafts,
+            edit_opts,
+            custom_lists,
+            autocorrect,
+            user_name,
+            user_initials,
+        } = prefs;
+        let mut this = Self::build(tabs, 0, theme_pref, ask_on_close, cx);
+        this.autorecover_minutes = autorecover_minutes;
+        this.keep_drafts = keep_drafts;
+        this.edit_opts = edit_opts;
+        this.custom_lists = custom_lists;
+        this.autocorrect = autocorrect;
+        stamp_edit_opts(&mut this.tabs, this.edit_opts);
+        sheet_autocorrect::stamp_autocorrect(&mut this.tabs, &this.autocorrect);
+        this.user_name = user_name;
+        this.user_initials = user_initials;
+        this
+    }
+
+    /// View › Window › New Window (#587): open a new window and move a tab
+    /// to it. `tab = None` (the ribbon, Shift+F11) moves the ACTIVE tab when
+    /// this window has another to keep; with exactly one tab the new window
+    /// opens on a blank document and this window is untouched. `tab = Some(i)`
+    /// moves tab `i`. Returns the new window's registry id.
+    pub(crate) fn new_window(
+        &mut self,
+        tab: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<u64, String> {
+        if self.quitting || crate::close::quit_prompt_live(&self.tabs) {
+            return Err("a window close is asking about unsaved tabs; answer it first".into());
+        }
+        // Resolve the move and its refusals before anything changes.
+        let (i, blank) = match tab {
+            Some(i) => {
+                let Some(t) = self.tabs.get(i) else {
+                    return Err(format!("no tab {i}: this window has {}", self.tabs.len()));
+                };
+                if self.tabs.len() == 1 {
+                    return Err(
+                        "the only tab cannot move to a new window; close the window instead".into(),
+                    );
+                }
+                if let Some(d) = t.dialogs.top() {
+                    return Err(format!("a dialog is open: {}", d.title));
+                }
+                (i, false)
+            }
+            None if self.tabs.len() >= 2 => {
+                if let Some(d) = self.tabs[self.active].dialogs.top() {
+                    return Err(format!("a dialog is open: {}", d.title));
+                }
+                (self.active, false)
+            }
+            None => (0, true),
+        };
+        if !blank {
+            // The same folding a tab's own close does (minus its prompt):
+            // app-level buffers belong to the ACTIVE tab and would be
+            // stranded here, and a pending levelling pass must settle before
+            // the tab moves.
+            if i == self.active {
+                self.commit_dialog_buffers_for_exit(cx);
+            }
+            self.flush_project_passes(cx);
+            self.project_prompt_cancel();
+        }
+        let mut tabs = Vec::new();
+        // Where to put the tab back if the platform refuses the window.
+        let mut restore: Option<(usize, usize)> = None;
+        if blank {
+            let title = windows::next_document_title(cx);
+            tabs.push(blank_docx_tab(&title));
+        } else {
+            let previous_active = self.active;
+            self.cancel_highlight_mode();
+            let moved = crate::close::remove_tab(&mut self.tabs, &mut self.active, i);
+            // The grid clipboard's clip names the workbook it came from: if
+            // that workbook is the tab leaving, the clip's source is gone
+            // from this window, so copy mode ends with it (#587 r4).
+            if let crate::Surface::Sheet(v) = &moved.surface {
+                if self.grid_clip.as_ref().is_some_and(|c| c.view == v.id) {
+                    self.grid_clip_spend();
+                }
+            }
+            if i == previous_active {
+                self.drop_grid_state();
+            }
+            self.bs_info_status = None;
+            restore = Some((i.min(self.tabs.len()), previous_active));
+            tabs.push(moved);
+        }
+        let options = window_options(
+            windows::cascade(window.bounds(), display_of(window, cx)),
+            self.harness,
+        );
+        let init = WindowInit::Moved {
+            tabs,
+            prefs: MovedPrefs::from_docxy(self),
+            harness: self.harness,
+        };
+        match open_docxy_window(cx, options, init) {
+            Ok((_, new_view, id)) => {
+                // The new view persists first: until one of them writes, the
+                // moved tab is in NEITHER snapshot, so the sooner the new
+                // window's union write lands the smaller the window in which
+                // a kill loses it; then the source's write carries the new
+                // window's tabs too.
+                new_view.update(cx, |this, cx| this.persist(cx));
+                self.persist(cx);
+                self.refocus(window, cx);
+                Ok(id)
+            }
+            Err((e, view)) => {
+                if let Some((at, previous_active)) = restore {
+                    let mut back = Vec::new();
+                    view.update(cx, |this, _| back = std::mem::take(&mut this.tabs));
+                    for (k, t) in back.into_iter().enumerate() {
+                        self.tabs.insert((at + k).min(self.tabs.len()), t);
+                    }
+                    self.active = previous_active.min(self.tabs.len().saturating_sub(1));
+                    self.drop_grid_state();
+                    self.bs_info_status = None;
+                }
+                self.refocus(window, cx);
+                Err(format!("could not open the new window: {e}"))
+            }
+        }
+    }
+
+    /// View › Window › Arrange All (#587): resize every window of the run to
+    /// an equal vertical strip of THIS window's display, in creation order.
+    /// gpui cannot move windows at the pinned rev, so positions stay. Returns
+    /// how many windows answered; the caller (the ribbon or the harness verb)
+    /// says "Arranged N windows" in the status. The calling window is resized
+    /// directly: it is mid-update here, and `update_window` on it would find
+    /// it gone from the app.
+    pub(crate) fn arrange_all(&self, window: &mut Window, cx: &mut App) -> usize {
+        let display = display_of(window, cx);
+        let entries = windows::entries_snapshot(cx);
+        let tiles = windows::tile_bounds(display, entries.len());
+        let mut arranged = 0;
+        for ((id, _, handle), tile) in entries.iter().zip(tiles) {
+            if *id == self.win_id {
+                window.resize(tile.size);
+                arranged += 1;
+            } else if cx
+                .update_window(*handle, |_, window, _| window.resize(tile.size))
+                .is_ok()
+            {
+                arranged += 1;
+            }
+        }
+        arranged
     }
 
     /// Move the spreadsheet selection to a cell (from a grid click), collapsing
@@ -13929,7 +14396,7 @@ impl Docxy {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        let decision = save_decision(tab, self.harness.is_some(), explicit_save_as);
+        let decision = save_decision(tab, self.harness, explicit_save_as);
         match decision {
             SaveDecision::InPlace(path) => {
                 finish_project_save(&mut self.tabs[self.active], Some(&path))
@@ -13953,7 +14420,7 @@ impl Docxy {
         self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
-        self.persist();
+        self.persist(cx);
         self.refocus(window, cx);
     }
 
@@ -14138,7 +14605,7 @@ impl Docxy {
     /// it waits for Enable Editing, whose bar shows first.
     pub(crate) fn edit_anyway(&mut self, cx: &mut Context<Self>) {
         if self.tabs.get_mut(self.active).is_some_and(edit_anyway_tab) {
-            self.persist();
+            self.persist(cx);
             cx.notify();
         }
     }
@@ -14160,7 +14627,7 @@ impl Docxy {
             (Some(path), Some(stamp)) => trusted::remember(&config_root(), path, stamp).into(),
             _ => "editing enabled".into(),
         };
-        self.persist();
+        self.persist(cx);
         cx.notify();
     }
 
@@ -14456,7 +14923,7 @@ impl Docxy {
 
     /// Put `text` on the clipboard: the OS one, or the private one in a harness.
     fn clipboard_write(&mut self, text: String, cx: &mut App) {
-        let harness = self.harness.is_some();
+        let harness = self.harness;
         self.clipboard.write(harness, text, |text| {
             cx.write_to_clipboard(ClipboardItem::new_string(text))
         });
@@ -14471,7 +14938,7 @@ impl Docxy {
 
     /// What the clipboard holds: the OS one, or the private one in a harness.
     fn clipboard_read(&self, cx: &App) -> ClipRead {
-        self.clipboard.read(self.harness.is_some(), || {
+        self.clipboard.read(self.harness, || {
             cx.read_from_clipboard().map(|item| item.text())
         })
     }
@@ -16845,6 +17312,15 @@ impl Docxy {
             }
             SheetAct::ToggleBorder => self.sheet_toggle_border(cx),
             SheetAct::FreezePanes => self.sheet_freeze(cx),
+            // View › Window (#587): app-level commands, handled on the app.
+            SheetAct::NewWindow => match self.new_window(None, window, cx) {
+                Ok(_) => self.set_status("Opened a new window"),
+                Err(e) => self.set_status(e),
+            },
+            SheetAct::ArrangeAll => {
+                let n = self.arrange_all(window, cx);
+                self.set_status(format!("Arranged {n} windows"));
+            }
             SheetAct::NewComment => self.sheet_new_comment(cx),
             SheetAct::DeleteComment => self.sheet_delete_comment(cx),
             SheetAct::PrevComment => self.sheet_comment_nav(false, cx),
@@ -17521,7 +17997,7 @@ impl Docxy {
             // Same reason as `select_sheet`: these all index the document we
             // were just on.
             self.drop_grid_state();
-            self.persist();
+            self.persist(cx);
             self.refocus(window, cx);
         }
     }
@@ -18035,12 +18511,12 @@ impl Docxy {
             .filter(|_| !tab.access.save_needs_dialog());
         let target = match target {
             Some(target) => Some(target),
-            None if tab.path.is_some() && path.is_none() && self.harness.is_some() => {
+            None if tab.path.is_some() && path.is_none() && self.harness => {
                 self.tabs[self.active].status = DOC_CONVERTED_HARNESS.into();
                 self.refocus(window, cx);
                 return false;
             }
-            None => match doc_save_target(path, tab.import.binary_source, self.harness.is_some()) {
+            None => match doc_save_target(path, tab.import.binary_source, self.harness) {
                 DocSaveTarget::InPlace => None,
                 // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
                 // this thread and stops the control pump dead (see `save_sheet_tab`).
@@ -18065,7 +18541,7 @@ impl Docxy {
         self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
-        self.persist();
+        self.persist(cx);
         self.refocus(window, cx);
         saved
     }
@@ -18074,7 +18550,7 @@ impl Docxy {
     /// re-writes into the loaded package), preserving styles and formulas.
     /// `explicit_save_as` always asks where to go, even for a saved workbook.
     fn save_sheet(&mut self, explicit_save_as: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let harness = self.harness.is_some();
+        let harness = self.harness;
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -18102,7 +18578,7 @@ impl Docxy {
         self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
-        self.persist();
+        self.persist(cx);
         self.refocus(window, cx);
     }
 
@@ -18124,7 +18600,7 @@ impl Docxy {
         self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
-        self.persist();
+        self.persist(cx);
         self.refocus(window, cx);
         saved
     }
@@ -18148,7 +18624,7 @@ impl Docxy {
         self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
-        self.persist();
+        self.persist(cx);
         self.refocus(window, cx);
         result
     }
@@ -18166,7 +18642,7 @@ impl Docxy {
         // this thread and stops the control pump dead (see `save_sheet_tab`).
         // The Backstage's Save As… is pointer-only, but a dead pump is the
         // worst way a harness run can fail, so it refuses in words.
-        if doc_save_as_target(self.harness.is_some()) == DocSaveTarget::RefuseHarness {
+        if doc_save_as_target(self.harness) == DocSaveTarget::RefuseHarness {
             self.set_status(DOC_SAVE_AS_HARNESS);
             return self.refocus(window, cx);
         }
@@ -18232,7 +18708,7 @@ impl Docxy {
         self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
-        self.persist();
+        self.persist(cx);
         self.refocus(window, cx);
     }
 
@@ -18336,7 +18812,7 @@ impl Docxy {
         // both. Discarding is the point: it is the previous case's, and
         // nothing is meant to survive it. A case that wants the person's
         // question asks for it with `open`'s `reopen: "ask"`.
-        let reopen = if self.harness.is_some() {
+        let reopen = if self.harness {
             Reopen::Always
         } else {
             Reopen::Ask
@@ -18357,7 +18833,7 @@ impl Docxy {
             self.backstage = false;
             // The tab under the panel/bar state just changed (or was replaced).
             self.drop_grid_state();
-            self.persist();
+            self.persist(cx);
             cx.notify();
         }
     }
@@ -21477,6 +21953,21 @@ mod clipboard_tests {
         assert_ne!(anchor.value, CellValue::Error("#SPILL!".into()));
     }
 
+    /// #587 r3: the harness's private text store is ONE for the run: a copy
+    /// in any window is what every other window pastes, with no per-site
+    /// sync — the stores share the same `Rc`.
+    #[test]
+    fn the_private_text_store_is_one_per_run() {
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let mut a = ClipboardStore::shared(shared.clone());
+        let b = ClipboardStore::shared(shared);
+        a.write(true, "run-wide".into(), |_| panic!("an OS clipboard write"));
+        assert_eq!(
+            b.read(true, || panic!("an OS clipboard read")),
+            ClipRead::Text("run-wide".into())
+        );
+    }
+
     /// #699: a harness instance never reads or writes the OS clipboard, and
     /// starts from an empty private one.
     #[test]
@@ -22900,10 +23391,11 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         ClearFmt => e.clear_run_formatting(),
         Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
         | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments
-        | ResolveComment | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | DarkMode
-        | AutoHideRibbon | InsertField | PageBreak | BlankPage | Cover(_) | ToggleNotes
-        | InsertTable | InsertSymbol | InsertEquation | LineSpacing | Hf(_) | Design(_)
-        | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler | UndoTo(_) => {}
+        | ResolveComment | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | NewWindow
+        | ArrangeAll | DarkMode | AutoHideRibbon | InsertField | PageBreak | BlankPage
+        | Cover(_) | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing
+        | Hf(_) | Design(_) | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler
+        | UndoTo(_) => {}
     }
 }
 
@@ -24074,6 +24566,12 @@ enum Act {
     ShowHide,
     ToggleComments,
     ToggleNav,
+    /// View › Window › New Window (#587): move the active tab into a new
+    /// window; a one-tab window opens the new window on a blank document.
+    NewWindow,
+    /// View › Window › Arrange All (#587): resize every window to an equal
+    /// strip of this window's display.
+    ArrangeAll,
     DarkMode,
     AutoHideRibbon,
     InsertField,
@@ -24542,6 +25040,14 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                             "Ctrl+F1",
                         )
                         .key("A"),
+                    ])],
+                ),
+                rs::group(
+                    "Window",
+                    10,
+                    vec![rs::column(vec![
+                        cmdt("newwindow", "new", "New Window", NewWindow, "").key("W"),
+                        cmdt("arrangeall", "columns", "Arrange All", ArrangeAll, "").key("L"),
                     ])],
                 ),
             ],
@@ -27390,6 +27896,8 @@ impl Docxy {
             Act::Highlight
                 | Act::ShowHide
                 | Act::ToggleNav
+                | Act::NewWindow
+                | Act::ArrangeAll
                 | Act::DarkMode
                 | Act::AutoHideRibbon
                 | Act::ToggleRuler
@@ -27460,6 +27968,14 @@ impl Docxy {
             ToggleNav => {
                 self.show_nav = !self.show_nav;
                 self.refocus(window, cx);
+            }
+            NewWindow => match self.new_window(None, window, cx) {
+                Ok(_) => self.set_status("Opened a new window"),
+                Err(e) => self.set_status(e),
+            },
+            ArrangeAll => {
+                let n = self.arrange_all(window, cx);
+                self.set_status(format!("Arranged {n} windows"));
             }
             DarkMode => self.cycle_theme(window, cx),
             AutoHideRibbon => {
@@ -30270,7 +30786,7 @@ impl Docxy {
         if tabstrip::move_index(&mut self.tabs, &mut self.active, from, to) {
             // The Info page's result is keyed by tab index (#627).
             self.bs_info_status = None;
-            self.persist();
+            self.persist(cx);
             cx.notify();
         }
         self.refocus(window, cx);
@@ -35343,6 +35859,213 @@ fn quit_mode() -> QuitMode {
     QuitMode::LastWindowClosed
 }
 
+/// What the one window-opening path builds (#587): the run's FIRST window,
+/// or a New Window's. A `Moved` window never reads the session or marks the
+/// run — those belong to the first window alone.
+enum WindowInit {
+    First {
+        ctl: Option<(ctlcore::Server, std::sync::mpsc::Receiver<ctlcore::Request>)>,
+        want_harness: bool,
+        startup_files: Vec<std::path::PathBuf>,
+        read_only: bool,
+    },
+    Moved {
+        tabs: Vec<DocTab>,
+        prefs: MovedPrefs,
+        harness: bool,
+    },
+}
+
+/// What a New Window's view inherits from its source (#587 decision 2):
+/// the settings every window of the run shares. Per-tab state and window
+/// geometry deliberately are not here.
+struct MovedPrefs {
+    theme_pref: ThemePref,
+    ask_on_close: bool,
+    autorecover_minutes: u32,
+    keep_drafts: bool,
+    edit_opts: EditOptions,
+    custom_lists: Vec<Vec<String>>,
+    autocorrect: std::rc::Rc<gridcore::autocorrect::AutoCorrect>,
+    user_name: String,
+    user_initials: String,
+}
+
+impl MovedPrefs {
+    fn from_docxy(d: &Docxy) -> Self {
+        Self {
+            theme_pref: d.theme_pref,
+            ask_on_close: d.ask_on_close,
+            autorecover_minutes: d.autorecover_minutes,
+            keep_drafts: d.keep_drafts,
+            edit_opts: d.edit_opts,
+            custom_lists: d.custom_lists.clone(),
+            autocorrect: d.autocorrect.clone(),
+            user_name: d.user_name.clone(),
+            user_initials: d.user_initials.clone(),
+        }
+    }
+}
+
+/// The display a window sits on: what Arrange All tiles and what New
+/// Window's cascade clamps to, falling back to the primary display.
+fn display_of(window: &Window, cx: &App) -> Bounds<Pixels> {
+    let bounds = window.bounds();
+    let on_display = cx
+        .displays()
+        .iter()
+        .find(|d| d.bounds().contains(&bounds.origin))
+        .cloned()
+        .or_else(|| cx.primary_display());
+    on_display.map(|d| d.bounds()).unwrap_or(bounds)
+}
+
+/// What opening a window yields: its handle, its view and its registry id.
+/// On failure the view comes back with the reason, so New Window can put a
+/// moved tab back instead of losing it to a refused window.
+type OpenedWindow = (AnyWindowHandle, Entity<Docxy>, u64);
+type OpenWindowError = (String, Entity<Docxy>);
+
+/// Open a Docxy window and register it. The build closure runs
+/// synchronously at the pinned gpui rev, so the view exists by the time
+/// `open_window` returns and registration follows immediately. On failure
+/// the view is handed back with the error: New Window puts a moved tab back
+/// rather than lose it to a refused window.
+fn open_docxy_window(
+    cx: &mut App,
+    options: WindowOptions,
+    init: WindowInit,
+) -> Result<OpenedWindow, OpenWindowError> {
+    let (view, ctl, want_harness, startup_files, read_only) = match init {
+        WindowInit::First {
+            ctl,
+            want_harness,
+            startup_files,
+            read_only,
+        } => (
+            cx.new(Docxy::new),
+            ctl,
+            want_harness,
+            startup_files,
+            read_only,
+        ),
+        WindowInit::Moved {
+            tabs,
+            prefs,
+            harness,
+        } => (
+            cx.new(|cx| Docxy::moved(tabs, prefs, cx)),
+            None,
+            harness,
+            Vec::new(),
+            false,
+        ),
+    };
+    // Every window of the run carries the harness flag, whether or not a
+    // control link attaches to it (#587 r1 M5): it drives prompt locations,
+    // save targets and the close flow on a New Window's view too.
+    view.update(cx, |this, _| this.harness = want_harness);
+    let handle = cx.open_window(options, {
+        let view = view.clone();
+        move |window, cx| {
+            // Attach only the selected mode's server. Normal Project control
+            // never enables harness verbs or changes the UI's dialog policy.
+            // The link is owned by the registry, so it — and the discovery
+            // file — outlive every window.
+            if let Some((server, rx)) = ctl {
+                if want_harness {
+                    harness::attach(server, rx, window, cx);
+                } else {
+                    control::attach(server, rx, window, cx);
+                }
+            }
+            // Open any command-line files on top of the restored session.
+            if !startup_files.is_empty() {
+                view.update(cx, move |this, cx| {
+                    this.open_args(startup_files, read_only, cx)
+                });
+            }
+            // Hot-exit: capture the latest (possibly unsaved) content when
+            // the window is closed, so a restart restores exactly what was
+            // open. By default closing is silent; with "ask before closing"
+            // on, each unsaved document is asked about in turn (#630). A
+            // non-last window always asks (decision 5): a closed secondary
+            // window is not restored, so silently dropping unsaved work is
+            // data loss.
+            let on_close = view.clone();
+            window.on_window_should_close(cx, move |window, cx| {
+                on_close.update(cx, |this, cx| {
+                    let ask = if windows::count(cx) > 1 {
+                        close::CloseAsk::Force
+                    } else if this.harness {
+                        close::CloseAsk::HarnessQuit
+                    } else {
+                        close::CloseAsk::Setting
+                    };
+                    this.window_should_close(ask, window, cx)
+                })
+            });
+            // AutoRecover (#632): wake when the interval is up (and at least
+            // every `recover::POLL`), and write the hot-exit state when a
+            // whole interval has passed since the last write or check while
+            // something is unsaved. Re-reading the setting on each wake is
+            // what makes a change apply without a restart. Ends when the view
+            // is gone.
+            //
+            // ⚠️ Only `update_in`, never `read_with` / `update`. On Windows a
+            // foreground task runs from a window message, and rfd's dialogs
+            // (Open, Save As) pump those messages in
+            // a modal loop while a gpui listener holds the App borrowed. The
+            // plain entity calls `borrow()` the App and panic there, aborting
+            // the process with the unsaved work this exists to keep;
+            // `update_in` goes through `try_borrow_mut` and fails instead.
+            // That failure means "busy, try again", not "stop" — breaking on
+            // it would end AutoRecover at the first dialog — so only a view
+            // that is really gone stops the loop (`recover::reach`).
+            let ticker = view.downgrade();
+            window
+                .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                    loop {
+                        let wait = ticker.update_in(cx, |this, _, _| {
+                            recover::wake_after(
+                                this.autorecover_minutes,
+                                this.last_persist.get().elapsed(),
+                            )
+                        });
+                        let wait = match recover::reach(wait.ok(), || ticker.upgrade().is_some()) {
+                            recover::Reach::Done(wait) => wait,
+                            recover::Reach::Busy => recover::POLL,
+                            recover::Reach::Gone => break,
+                        };
+                        cx.background_executor().timer(wait).await;
+                        let ticked = ticker.update_in(cx, |this, _, cx| {
+                            if this.autorecover_due() && this.autorecover_tick(cx) {
+                                cx.notify();
+                            }
+                        });
+                        // Busy: the next wake retries, since nothing reset the clock.
+                        if recover::reach(ticked.ok(), || ticker.upgrade().is_some())
+                            == recover::Reach::Gone
+                        {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            cx.new(|cx| Root::new(view, window, cx))
+        }
+    });
+    match handle {
+        Ok(handle) => {
+            let any_handle: AnyWindowHandle = handle.into();
+            let id = windows::register(cx, &view, any_handle);
+            view.update(cx, |this, _| this.win_id = id);
+            Ok((any_handle, view, id))
+        }
+        Err(e) => Err((e.to_string(), view)),
+    }
+}
+
 fn main() {
     // A converting child (#633): the importer and nothing else, no window.
     if let Some(code) = convert_child::child_main(&std::env::args_os().collect::<Vec<_>>()) {
@@ -35418,88 +36141,20 @@ fn main() {
             KeyBinding::new("tab", InsertTabAction, None),
             KeyBinding::new("shift-tab", OutdentAction, None),
         ]);
+        cx.set_global(windows::Registry::default());
         let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
         let options = window_options(bounds, want_harness);
-        let startup_files = cli_files.clone();
-        cx.open_window(options, move |window, cx| {
-            let view = cx.new(Docxy::new);
-            // Attach only the selected mode's server. Normal Project control
-            // never enables harness verbs or changes the UI's dialog policy.
-            if let Some((server, rx)) = ctl {
-                if want_harness {
-                    harness::attach(&view, server, rx, window, cx);
-                } else {
-                    control::attach(&view, server, rx, window, cx);
-                }
-            }
-            // Open any command-line files on top of the restored session.
-            if !startup_files.is_empty() {
-                view.update(cx, move |this, cx| {
-                    this.open_args(startup_files, cli_read_only, cx)
-                });
-            }
-            // Hot-exit: capture the latest (possibly unsaved) content when the
-            // window is closed, so a restart restores exactly what was open. By
-            // default closing is silent; with "ask before closing" on, each
-            // unsaved document is asked about in turn (#630).
-            let on_close = view.clone();
-            window.on_window_should_close(cx, move |window, cx| {
-                on_close.update(cx, |this, cx| {
-                    // Not asked in a harness instance: its `quit` must end the
-                    // run it waits on. Its `close-window` verb asks instead.
-                    let ask = this.harness.is_none();
-                    this.window_should_close(ask, window, cx)
-                })
-            });
-            // AutoRecover (#632): wake when the interval is up (and at least
-            // every `recover::POLL`), and write the hot-exit state when a whole
-            // interval has passed since the last write or check while
-            // something is unsaved. Re-reading the setting on each wake is
-            // what makes a change apply without a restart. Ends when the view
-            // is gone.
-            //
-            // ⚠️ Only `update_in`, never `read_with` / `update`. On Windows a
-            // foreground task runs from a window message, and rfd's dialogs
-            // (Open, Save As) pump those messages in
-            // a modal loop while a gpui listener holds the App borrowed. The
-            // plain entity calls `borrow()` the App and panic there, aborting
-            // the process with the unsaved work this exists to keep;
-            // `update_in` goes through `try_borrow_mut` and fails instead.
-            // That failure means "busy, try again", not "stop" — breaking on
-            // it would end AutoRecover at the first dialog — so only a view
-            // that is really gone stops the loop (`recover::reach`).
-            let ticker = view.downgrade();
-            window
-                .spawn(cx, async move |cx: &mut AsyncWindowContext| {
-                    loop {
-                        let wait = ticker.update_in(cx, |this, _, _| {
-                            recover::wake_after(
-                                this.autorecover_minutes,
-                                this.last_persist.get().elapsed(),
-                            )
-                        });
-                        let wait = match recover::reach(wait.ok(), || ticker.upgrade().is_some()) {
-                            recover::Reach::Done(wait) => wait,
-                            recover::Reach::Busy => recover::POLL,
-                            recover::Reach::Gone => break,
-                        };
-                        cx.background_executor().timer(wait).await;
-                        let ticked = ticker.update_in(cx, |this, _, cx| {
-                            if this.autorecover_due() && this.autorecover_tick() {
-                                cx.notify();
-                            }
-                        });
-                        // Busy: the next wake retries, since nothing reset the clock.
-                        if recover::reach(ticked.ok(), || ticker.upgrade().is_some())
-                            == recover::Reach::Gone
-                        {
-                            break;
-                        }
-                    }
-                })
-                .detach();
-            cx.new(|cx| Root::new(view, window, cx))
-        })
+        open_docxy_window(
+            cx,
+            options,
+            WindowInit::First {
+                ctl,
+                want_harness,
+                startup_files: cli_files,
+                read_only: cli_read_only,
+            },
+        )
+        .map(|(_, _, _)| ())
         .expect("failed to open docxy window");
     });
 }

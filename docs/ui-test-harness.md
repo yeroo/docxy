@@ -343,6 +343,7 @@ State keys, as the app reports them after every driving verb:
 | `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor, prompt or dialog is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
 | `dialog` | the top dialog's id (the app's own, #1027, else the active tab's), or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
+| `windows`, `window` | how many windows the run has open, and the registry id the harness targets now (#587): every newly opened window becomes the selection (a ribbon New Window, Shift+F11 on a Project tab, or `window-new`), closing the selected window falls back to the most recently opened survivor, and `window-select` switches; a mouse click never moves it; a single-window run reads `1` and its own id |
 | `autorecover_minutes` | minutes between AutoRecover writes while a tab is unsaved; `0` is off |
 | `keep_drafts` | whether Don't Save keeps a workbook's last AutoRecover copy as a draft |
 | `user_name`, `user_initials` | Settings' User name and Initials for new comments (#620); empty falls back to the OS account name and initials derived from it |
@@ -468,6 +469,10 @@ footer editor; `selection-set` refuses while it is open.
 | `title-bar {}` | read the measured title content, active chip, tab strip, theme button and drag space; reports tab count, active/first/visible indices, layout mode, `overflow`, `controls_clear`, `active_visible`, `active_dirty_visible` (the active tab is dirty and its bullet lies inside the chip), `theme_visible`, `drag_w`, `drag_ok`, and logical-pixel right edges. `caption_left` comes from a separate probe of Root's inner box minus the pinned caption-control width (102 px on Windows/Linux, zero on macOS) |
 | `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
 | `tab-list {}` | read every open tab in strip order: `{active, tabs:[{index, title, kind, path, dirty, imported, caption, read_only, protected, final, repaired}]}`. `kind` is `docx`, `xlsx`, `project` or `mail`; `path` is `null` for a tab never saved; `imported` is true for a Project read from `.mpp` and for a document whose file is a Word 97-2003 binary it was imported from (#634; a `.doc`, or one renamed), until a save rebinds the tab to the file it wrote |
+| `window-list {}` | read the run's windows (#587): `{count, windows:[{id, tabs, title, selected, width, height}]}`, in creation order. `title` is the window's active tab's title; `selected` marks the window verbs target now |
+| `window-new {tab?}` | the View › Window › New Window command: open a new window and move the tab named by `tab` (absent: the active tab) to it; a one-tab source opens the new window on a blank document instead. Refused, naming the reason, for an out-of-range `tab`, the window's only tab, or a tab under a dialog. The new window becomes the selected one; the reply is the state with the new `window` id |
+| `window-select {window}` | switch the harness to the window with this registry id; every verb after this acts on that window, and reads like `tab-list` and `state` describe it. EVERY newly opened window becomes the selection — a ribbon New Window, Shift+F11 on a Project tab, or `window-new` — and closing the selected window falls back to the most recently opened survivor. Clicking a window with the mouse never moves the selection. The rich document clip, the grid clip and the Office Clipboard are per window: a paste into another window pastes the clipboard's plain text, like a paste from another application (a harness run shares the private text clipboard run-wide) |
+| `window-arrange {}` | the View › Window › Arrange All command: resize every window to an equal vertical strip of the calling window's display, left to right in creation order, and reply `{arranged:N}`. gpui at the suite's pinned revision has no cross-platform way to MOVE a window, so positions stay: Arrange All resizes, it does not tile |
 | `tab-select {"tab":"schedule"}` | make a tab active as clicking its chip does, and reply with the state. `tab` is an index or a case-insensitive title/path substring over **all** tabs, the rule the `proj.*` verbs use; a miss (`no tab matches 'x'`), an ambiguous match (`several tabs match 'x' (2, 3)`) and an index past the end (`no tab at index 9`) are refused. The Backstage stays as it was, as it does for a chip click |
 | `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point; or `{"at":"user-name-row"}`: Backstage's User name... row, #1027); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog, except the `{"dialog-field":"user-name","x":N}` form (#1027), which clicks the open dialog's text field `N` pixels in from its left edge (its middle without `x`) and replies `{x, y}`; a press reaches an open menu's own item or backdrop, so it does not pre-close menus |
 | `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 9 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The ninth pressed move lands at the destination, so the drag's handlers see the final cell before the release. gpui arms a drag once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of 2px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
@@ -559,6 +564,14 @@ session as its file alone (it reopens clean) and drops a never-saved one.
 Otherwise `close-window` exits at once (hot exit). The window's own close in a
 harness instance never asks: `quit` must end the run it waits on. `call ask-on-close {"on":true}` uses the same setting handler as
 Settings; closing a dirty single tab always asks regardless of this window setting.
+
+With more than one window open (#587), `close-window` on a NON-last window
+always asks about unsaved work, whatever `ask-on-close` says — a closed
+secondary window is not restored, so silently dropping its unsaved work is
+data loss. Answered or clean, the window leaves the registry: the process
+keeps running, `window-list` shrinks, and the selection falls back to the
+most recently opened survivor. `close-window` on the LAST window is the
+cases above: quit, hot exit, and the process ends.
 
 `call autorecover {"minutes":N}` sets the Settings AutoRecover interval (`0`
 turns it off). `call autorecover-now {}` runs one AutoRecover tick at once, as
@@ -1284,7 +1297,7 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `user-name`,
 `autocorrect`, `trusted-clear`,
 `open-draft`,
-`enable-editing`, `edit-anyway`, `close-window` and the
+`enable-editing`, `edit-anyway`, `close-window`, `window-new`, `window-select` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 
@@ -1754,9 +1767,6 @@ stale pixels is exactly the failure a pixel assertion cannot notice by itself.
 
 ## Not covered
 
-- **More than one window.** The suite has one window, so there is no
-  `window-list` or `window-new`, and no New Window or Arrange All to drive.
-  `tab-list` covers the tabs of that window.
 - **The drawn window title and a recent-files list.** The title bar draws the
   tab strip, not a `Project1 - <app>` title, and Backstage's Open lists the
   open tabs, not a recent-files list, so neither is there to report.
