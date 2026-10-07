@@ -115,12 +115,12 @@ fn work_cost_and_units_read_as_project_shows_them() {
     let start = DateTime::from_ymd_hm(2026, 1, 5, 8, 0);
     assert_eq!(
         read(&ed, uid, "Start"),
-        shows("2026-01-05", FieldValue::Date(start))
+        shows("Mon 1/5/26", FieldValue::Date(start))
     );
     let finish = ed.project().assignments[0].finish.unwrap();
     assert_eq!(
         read(&ed, uid, "Finish"),
-        shows("2026-01-09", FieldValue::Date(finish))
+        shows("Fri 1/9/26", FieldValue::Date(finish))
     );
 }
 

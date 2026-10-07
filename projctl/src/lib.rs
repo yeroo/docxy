@@ -1354,7 +1354,7 @@ mod tests {
             vec![("uid", Json::Num(3.0)), ("fields", asked.clone())],
         )
         .unwrap();
-        assert_eq!(field(&r, "Duration"), ("1d", &Json::Num(480.0)));
+        assert_eq!(field(&r, "Duration"), ("1 day", &Json::Num(480.0)));
         // Keyed by the name as asked; unset values are null, shown as Project shows them.
         assert_eq!(field(&r, " % complete"), ("0%", &Json::Null));
         assert_eq!(field(&r, "Actual Start"), ("NA", &Json::Null));
@@ -1365,7 +1365,7 @@ mod tests {
         let outline: Vec<_> = tasks.iter().map(|t| t.get_str("outline_number")).collect();
         assert_eq!(outline, [Some("1"), Some("1.1"), Some("1.2")]);
         assert!(tasks.iter().all(|t| t.get("fields").is_some()));
-        assert_eq!(field(&tasks[0], "Duration").0, "2d");
+        assert_eq!(field(&tasks[0], "Duration").0, "2 days");
 
         let found = call(
             &mut ed,
@@ -1379,7 +1379,7 @@ mod tests {
         let hit = &found.get("tasks").unwrap().as_array().unwrap()[0];
         assert_eq!(
             field(hit, "Start"),
-            ("2026-03-03", &Json::Str("2026-03-03 08:00".into()))
+            ("Tue 3/3/26", &Json::Str("2026-03-03 08:00".into()))
         );
     }
 
@@ -1596,14 +1596,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.get_str("outline_number"), Some("0"));
-        assert_eq!(field(&r, "Duration"), ("3d", &Json::Num(1440.0)));
+        assert_eq!(field(&r, "Duration"), ("3 days", &Json::Num(1440.0)));
         assert_eq!(
             field(&r, "Start"),
-            ("2026-03-02", &Json::Str("2026-03-02 08:00".into()))
+            ("Mon 3/2/26", &Json::Str("2026-03-02 08:00".into()))
         );
         assert_eq!(
             field(&r, "Finish"),
-            ("2026-03-04", &Json::Str("2026-03-04 17:00".into()))
+            ("Wed 3/4/26", &Json::Str("2026-03-04 17:00".into()))
         );
         assert_eq!(field(&r, "% Complete"), ("25%", &Json::Num(25.0)));
         assert_eq!(field(&r, "Cost"), ("$1,400.00", &Json::Num(1400.0)));

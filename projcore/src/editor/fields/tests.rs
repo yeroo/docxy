@@ -108,15 +108,15 @@ fn every_listed_field_reads_a_representative_value() {
             FieldValue::Text(s("Auto Scheduled")),
         ),
         ("Name", "Pour", FieldValue::Text(s("Pour"))),
-        ("Duration", "2d", m(960)),
-        ("Start", "2026-01-05", d(5)),
-        ("Finish", "2026-01-06", FieldValue::Date(at(6, 17))),
+        ("Duration", "2 days", m(960)),
+        ("Start", "Mon 1/5/26", d(5)),
+        ("Finish", "Tue 1/6/26", FieldValue::Date(at(6, 17))),
         ("Predecessors", "", FieldValue::Text(s(""))),
         ("Resource Names", "", FieldValue::Text(s(""))),
         ("% Complete", "50%", FieldValue::Int(50)),
         ("% Work Complete", "25%", FieldValue::Int(25)),
         ("Physical % Complete", "10%", FieldValue::Int(10)),
-        ("Actual Start", "2026-01-05", d(5)),
+        ("Actual Start", "Mon 1/5/26", d(5)),
         ("Actual Finish", "NA", FieldValue::Null),
         ("Actual Duration", "1 day", m(480)),
         ("Remaining Duration", "1 day", m(480)),
@@ -128,14 +128,14 @@ fn every_listed_field_reads_a_representative_value() {
         ("Remaining Cost", "$700.00", FieldValue::Money(700.0)),
         ("Fixed Cost", "$100.00", FieldValue::Money(100.0)),
         ("Fixed Cost Accrual", "Start", FieldValue::Text(s("Start"))),
-        ("Baseline Start", "2026-01-05", d(5)),
-        ("Baseline Finish", "2026-01-05", FieldValue::Date(at(5, 17))),
+        ("Baseline Start", "Mon 1/5/26", d(5)),
+        ("Baseline Finish", "Mon 1/5/26", FieldValue::Date(at(5, 17))),
         ("Baseline Duration", "1 day", m(480)),
         ("Baseline Work", "8 hrs", m(480)),
         ("Baseline Cost", "$40,000.00", FieldValue::Money(40000.0)),
         (
             "Baseline3 Finish",
-            "2026-01-08",
+            "Thu 1/8/26",
             FieldValue::Date(at(8, 17)),
         ),
         ("Baseline3 Start", "NA", FieldValue::Null),
@@ -151,18 +151,18 @@ fn every_listed_field_reads_a_representative_value() {
         ("Free Slack", "0 days", m(0)),
         ("Start Slack", "0 days", m(0)),
         ("Finish Slack", "0 days", m(0)),
-        ("Early Start", "2026-01-05", d(5)),
-        ("Early Finish", "2026-01-06", FieldValue::Date(at(6, 17))),
-        ("Late Start", "2026-01-05", d(5)),
-        ("Late Finish", "2026-01-06", FieldValue::Date(at(6, 17))),
+        ("Early Start", "Mon 1/5/26", d(5)),
+        ("Early Finish", "Tue 1/6/26", FieldValue::Date(at(6, 17))),
+        ("Late Start", "Mon 1/5/26", d(5)),
+        ("Late Finish", "Tue 1/6/26", FieldValue::Date(at(6, 17))),
         ("Critical", "Yes", FieldValue::Bool(true)),
         (
             "Constraint Type",
             "Start No Earlier Than",
             FieldValue::Text(s("Start No Earlier Than")),
         ),
-        ("Constraint Date", "2026-01-05", d(5)),
-        ("Deadline", "2026-01-09", FieldValue::Date(at(9, 17))),
+        ("Constraint Date", "Mon 1/5/26", d(5)),
+        ("Deadline", "Fri 1/9/26", FieldValue::Date(at(9, 17))),
         ("Active", "Yes", FieldValue::Bool(true)),
         ("Outline Number", "1", FieldValue::Text(s("1"))),
         ("Outline Level", "1", FieldValue::Int(1)),
@@ -351,9 +351,9 @@ fn every_name_reads_on_a_leaf_a_summary_a_milestone_and_a_blank_row() {
     assert_eq!(read(&ed, 10, "Summary").text, "Yes");
     // Its stored duration is 0, but a summary is not a milestone by length.
     assert_eq!(read(&ed, 10, "Milestone").text, "No");
-    assert_eq!(read(&ed, 10, "Duration").text, "2d");
+    assert_eq!(read(&ed, 10, "Duration").text, "2 days");
     assert_eq!(read(&ed, 2, "Milestone").text, "Yes");
-    assert_eq!(read(&ed, 2, "Duration").text, "0d");
+    assert_eq!(read(&ed, 2, "Duration").text, "0 days");
     assert_eq!(read(&ed, 10, "Outline Number").text, "1");
     assert_eq!(read(&ed, 1, "Outline Number").text, "1.1");
     assert_eq!(read(&ed, 2, "Outline Number").text, "1.2");
@@ -373,12 +373,12 @@ fn milestone_duration_reads_zero_in_its_unit_and_toggles_back_to_a_day() {
     let mut ed = editor(vec![weekly, task(2, "Daily", 480)]);
     ed.toggle_milestone(1).unwrap();
     assert_eq!(read(&ed, 1, "Milestone").text, "Yes");
-    assert_eq!(read(&ed, 1, "Duration").text, "0w");
+    assert_eq!(read(&ed, 1, "Duration").text, "0 wks");
     ed.toggle_milestone(2).unwrap();
-    assert_eq!(read(&ed, 2, "Duration").text, "0d");
+    assert_eq!(read(&ed, 2, "Duration").text, "0 days");
     ed.toggle_milestone(2).unwrap();
     assert_eq!(read(&ed, 2, "Milestone").text, "No");
-    assert_eq!(read(&ed, 2, "Duration").text, "1d");
+    assert_eq!(read(&ed, 2, "Duration").text, "1 day");
 }
 
 #[test]
@@ -386,11 +386,11 @@ fn an_estimated_milestone_shows_no_estimate_suffix() {
     let mut t = task(1, "Guess", 480);
     t.estimated = Some(true);
     let mut ed = editor(vec![t]);
-    assert_eq!(read(&ed, 1, "Duration").text, "1d?");
+    assert_eq!(read(&ed, 1, "Duration").text, "1 day?");
     ed.toggle_milestone(1).unwrap();
     assert_eq!(read(&ed, 1, "Milestone").text, "Yes");
     // `duration_suffix` shows no `?` for a milestone.
-    assert_eq!(read(&ed, 1, "Duration").text, "0d");
+    assert_eq!(read(&ed, 1, "Duration").text, "0 days");
 }
 
 #[test]
@@ -472,6 +472,105 @@ fn money_percent_and_dates_use_project_spellings() {
 }
 
 #[test]
+fn format_project_date_uses_projects_weekday_form() {
+    // #578: `Mon 3/2/26` — weekday name, unpadded month and day, two-digit
+    // year. The timeline pins the same spellings
+    // (suite/docxy/src/project/timeline/tests.rs).
+    assert_eq!(format_project_date(at(5, 8)), "Mon 1/5/26");
+    assert_eq!(
+        format_project_date(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+        "Mon 3/2/26"
+    );
+    assert_eq!(
+        format_project_date(DateTime::from_ymd_hm(2026, 3, 5, 8, 0)),
+        "Thu 3/5/26"
+    );
+    assert_eq!(
+        format_project_date(DateTime::from_ymd_hm(2030, 12, 31, 12, 0)),
+        "Tue 12/31/30"
+    );
+    assert_eq!(
+        format_project_date(DateTime::from_ymd_hm(2005, 1, 9, 12, 0)),
+        "Sun 1/9/05"
+    );
+}
+
+#[test]
+fn date_fields_read_project_spelling() {
+    // #578: every date field the registry reads shows Project's spelling,
+    // `Mon 1/5/26`; unset is still `NA` and the value is untouched.
+    let ed = editor(vec![rich()]);
+    let d = |day| FieldValue::Date(at(day, 8));
+    for (name, text, value) in [
+        ("Start", "Mon 1/5/26", d(5)),
+        ("Finish", "Tue 1/6/26", FieldValue::Date(at(6, 17))),
+        ("Actual Start", "Mon 1/5/26", d(5)),
+        ("Baseline Start", "Mon 1/5/26", d(5)),
+        (
+            "Baseline3 Finish",
+            "Thu 1/8/26",
+            FieldValue::Date(at(8, 17)),
+        ),
+        ("Early Start", "Mon 1/5/26", d(5)),
+        ("Late Finish", "Tue 1/6/26", FieldValue::Date(at(6, 17))),
+        ("Constraint Date", "Mon 1/5/26", d(5)),
+        ("Deadline", "Fri 1/9/26", FieldValue::Date(at(9, 17))),
+    ] {
+        assert_eq!(tv(&ed, 1, name), (s(text), value), "{name}");
+    }
+    assert_eq!(tv(&ed, 1, "Actual Finish"), (s("NA"), FieldValue::Null));
+    assert_eq!(tv(&ed, 1, "Baseline3 Start"), (s("NA"), FieldValue::Null));
+}
+
+#[test]
+fn entry_duration_reads_project_spelling() {
+    // #578: the Entry Duration reads as Project shows it — the task's own
+    // unit with the estimate's `?`, a summary rolled up in days — while the
+    // value stays the stored minutes.
+    let mut estimated = task(2, "Guess", 480);
+    estimated.estimated = Some(true);
+    // Format code 8 is elapsed days, as in `durations_use_project_spellings`.
+    let mut elapsed = task(3, "Cure", 4320);
+    elapsed.duration_format = Some(8);
+    let ed = editor(vec![
+        task(1, "Pour", 960),
+        estimated,
+        elapsed,
+        task(4, "Done", 0),
+    ]);
+    assert_eq!(
+        tv(&ed, 1, "Duration"),
+        (s("2 days"), FieldValue::Minutes(960))
+    );
+    assert_eq!(
+        tv(&ed, 2, "Duration"),
+        (s("1 day?"), FieldValue::Minutes(480))
+    );
+    assert_eq!(
+        tv(&ed, 3, "Duration"),
+        (s("3 edays"), FieldValue::Minutes(4320))
+    );
+    assert_eq!(
+        tv(&ed, 4, "Duration"),
+        (s("0 days"), FieldValue::Minutes(0))
+    );
+    // A summary rolls its shown span up in days.
+    let summary = Task {
+        summary: true,
+        ..task(1, "Phase", 0)
+    };
+    let leaf = Task {
+        outline_level: 2,
+        ..task(2, "Pour", 960)
+    };
+    let ed = editor(vec![summary, leaf]);
+    assert_eq!(
+        tv(&ed, 1, "Duration"),
+        (s("2 days"), FieldValue::Minutes(960))
+    );
+}
+
+#[test]
 fn a_task_shows_its_durations_and_slack_in_its_own_unit() {
     let hours = Task {
         duration_format: Some(5),
@@ -479,7 +578,7 @@ fn a_task_shows_its_durations_and_slack_in_its_own_unit() {
         ..task(1, "Short", 240)
     };
     let ed = editor(vec![hours]);
-    assert_eq!(read(&ed, 1, "Duration").text, "4h");
+    assert_eq!(read(&ed, 1, "Duration").text, "4 hrs");
     assert_eq!(read(&ed, 1, "Actual Duration").text, "2 hrs");
     assert_eq!(read(&ed, 1, "Total Slack").text, "0 hrs");
     let mut elapsed = Task {
@@ -598,7 +697,7 @@ fn the_progress_fixture_reads_its_tracking_fields() {
     assert_eq!(
         tv(&ed, pour, "Actual Start"),
         (
-            s("2026-03-04"),
+            s("Wed 3/4/26"),
             FieldValue::Date(DateTime::from_ymd_hm(2026, 3, 4, 8, 0))
         )
     );
@@ -629,9 +728,9 @@ fn the_project_summary_row_reads_its_rollup_and_stored_values() {
     summary.duration_min = 0;
     let ed = editor(vec![summary, task(1, "A", 960), task(2, "B", 480)]);
     for (name, text) in [
-        ("Duration", "2d"),
-        ("Start", "2026-01-05"),
-        ("Finish", "2026-01-06"),
+        ("Duration", "2 days"),
+        ("Start", "Mon 1/5/26"),
+        ("Finish", "Tue 1/6/26"),
         ("% Complete", "25%"),
         ("Cost", "$1,400.00"),
         ("Notes", "Kickoff"),
@@ -1385,9 +1484,9 @@ fn custom_number_cost_flag_date_duration() {
         ("Cost1", "$125.50", FieldValue::Money(125.5)),
         ("Flag1", "Yes", FieldValue::Bool(true)),
         ("Flag2", "No", FieldValue::Bool(false)),
-        ("Date1", "2026-03-04", date("2026-03-04T17:00:00")),
-        ("Start1", "2026-03-02", date("2026-03-02T08:00:00")),
-        ("Finish1", "2026-03-05", date("2026-03-05T17:00:00")),
+        ("Date1", "Wed 3/4/26", date("2026-03-04T17:00:00")),
+        ("Start1", "Mon 3/2/26", date("2026-03-02T08:00:00")),
+        ("Finish1", "Thu 3/5/26", date("2026-03-05T17:00:00")),
         // The unit is the value's own DurationFormat (5 = hours).
         ("Duration1", "16 hrs", FieldValue::Minutes(960)),
         // Without one it is days.
