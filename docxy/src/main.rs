@@ -676,7 +676,7 @@ fn print_usage() {
            type / Enter / Backspace / Delete    edit text\n  \
            arrows / Home / End / PgUp / PgDn     move   (Ctrl-←/→ by word)\n  \
            Shift + move                          select   (Esc clears)\n  \
-           Ctrl-B bold  Ctrl-I italic  Ctrl-U underline   (over selection)\n  \
+           Ctrl-B bold  Ctrl-I italic  Ctrl-U underline   (selection, or text typed next)\n  \
            Ctrl-L/E/R/J align left / center / right / justify\n  \
            Ctrl-A select all   Ctrl-C copy   Ctrl-X cut   Ctrl-V paste\n  \
            Ctrl-F find   Ctrl-H replace   Ctrl-Shift-8 show marks\n  \
