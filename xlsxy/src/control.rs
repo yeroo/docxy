@@ -773,7 +773,8 @@ fn pivot_create(app: &mut App, args: &Json) -> Result<Json, String> {
         .ok_or("pivot.create: could not create the pivot")?;
     let dest = app.pkg.workbook.pivots[idx].sheet;
 
-    // Same "can't be a cell-level undo" reasoning as sheet.add.
+    // A new pivot sheet's parts and cells aren't an undo step: the history
+    // is cleared (sheet.import-csv's reasoning).
     app.undo.clear();
     app.redo.clear();
     app.rebuild_engine();
@@ -1617,9 +1618,10 @@ fn import_new_sheet(
         date1904,
     );
     let (rows, cols) = app.pkg.workbook.sheets[idx].used_size();
-    // New package parts (worksheet/relationship/workbook.xml wiring) don't
-    // fit the cell-level undo model — same as the TUI's own AddSheet flow,
-    // which clears history rather than push an entry it couldn't invert.
+    // New package parts (worksheet/relationship/workbook.xml wiring) and
+    // the imported cells aren't an undo step, so the history is cleared
+    // rather than left with nothing to undo the import (unlike sheet.add,
+    // whose sheet starts blank and keeps the history).
     app.undo.clear();
     app.redo.clear();
     app.rebuild_engine();
@@ -1667,9 +1669,7 @@ fn sheet_add(app: &mut App, args: &Json) -> Result<Json, String> {
     let requested = args.get_str("name").unwrap_or("Sheet");
     let name = unique_sheet_name(&app.pkg.workbook, requested);
     let idx = app.pkg.add_sheet(&name);
-    // Same "can't be a cell-level undo" reasoning as sheet.import-csv.
-    app.undo.clear();
-    app.redo.clear();
+    // As the TUI's AddSheet: the history stays (see `App::put_back`).
     app.rebuild_engine();
     app.modified = true;
     Ok(Json::obj(vec![
@@ -1797,8 +1797,8 @@ fn table_convert(app: &mut App, args: &Json) -> Result<Json, String> {
 }
 
 /// Rename a sheet and rewrite every formula/defined-name reference to it —
-/// via [`App::structural`], so it's one undo group like the TUI's own
-/// RenameSheet prompt.
+/// via [`App::rename_sheet`], like the TUI's own RenameSheet prompt: not an
+/// undo step, and the history is kept (as in Excel).
 fn sheet_rename(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg_required(app, args)?;
     let name = args.get_str("name").ok_or("sheet.rename needs a 'name'")?;
@@ -1806,8 +1806,7 @@ fn sheet_rename(app: &mut App, args: &Json) -> Result<Json, String> {
         return Err("invalid sheet name".into());
     }
     let name = name.to_string();
-    let new_name = name.clone();
-    app.structural(move |wb| gridcore::edit::rename_sheet(wb, si, &new_name));
+    app.rename_sheet(si, &name);
     Ok(Json::obj(vec![("name", Json::Str(name))]))
 }
 
@@ -4209,13 +4208,133 @@ mod tests {
         assert_eq!(a.pkg.workbook.sheets.len(), 3);
     }
 
+    fn text_at(a: &App, sheet: usize, r: u32, c: u32) -> Option<String> {
+        cell_text(a.pkg.workbook.sheets[sheet].cell(r, c))
+    }
+
+    /// A cell's value as text, `None` when it has none.
+    fn cell_text(cell: Option<&Cell>) -> Option<String> {
+        match &cell?.value {
+            CellValue::Empty => None,
+            CellValue::Number(n) => Some(format!("{n}")),
+            CellValue::Text(t) => Some(t.clone()),
+            other => Some(format!("{other:?}")),
+        }
+    }
+
     #[test]
-    fn sheet_add_clears_the_undo_stack() {
+    fn sheet_add_keeps_the_undo_stack() {
+        // #858: as in Excel, adding a sheet is not a step and keeps the
+        // history; the undo goes back to the cell's sheet.
         let mut a = app();
-        set(&mut a, "A1", "1");
+        set(&mut a, "A1", "b");
         dispatch(&mut a, "sheet.add", &Json::Null).unwrap();
+        a.sheet = 1;
+        a.undo();
+        assert_eq!(a.status.as_deref(), Some("Undid"));
+        assert_eq!(text_at(&a, 0, 0, 0), None);
+        assert_eq!(a.sheet, 0);
+        assert_eq!(a.pkg.workbook.sheets.len(), 2);
+        a.redo();
+        assert_eq!(text_at(&a, 0, 0, 0).as_deref(), Some("b"));
+        a.undo();
         a.undo();
         assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn structural_undo_after_sheet_add_keeps_the_sheet() {
+        // A snapshot from before the add has one sheet: putting it back keeps
+        // the added one, and the workbook still saves and reloads with both.
+        let mut a = app();
+        set(&mut a, "A1", "top");
+        dispatch(
+            &mut a,
+            "row.insert",
+            &Json::obj(vec![("at", Json::Num(0.0))]),
+        )
+        .unwrap();
+        assert_eq!(text_at(&a, 0, 1, 0).as_deref(), Some("top"));
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Added".into()))]),
+        )
+        .unwrap();
+        a.sheet = 1;
+        set(&mut a, "B2", "kept");
+        a.sheet = 0;
+        a.undo(); // B2 on Added
+        assert_eq!(text_at(&a, 1, 1, 1), None);
+        a.undo(); // the row insert, recorded before the add
+        assert_eq!(text_at(&a, 0, 0, 0).as_deref(), Some("top"));
+        assert_eq!(a.pkg.workbook.sheets.len(), 2);
+        assert_eq!(a.pkg.workbook.sheets[1].name, "Added");
+        a.redo();
+        a.redo();
+        assert_eq!(text_at(&a, 0, 1, 0).as_deref(), Some("top"));
+        assert_eq!(text_at(&a, 1, 1, 1).as_deref(), Some("kept"));
+        let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&a.pkg)).unwrap();
+        let names: Vec<&str> = re.workbook.sheets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Sheet1", "Added"]);
+        assert_eq!(
+            cell_text(re.workbook.sheets[1].cell(1, 1)).as_deref(),
+            Some("kept")
+        );
+    }
+
+    #[test]
+    fn undo_history_keeps_100_steps() {
+        // #858: Excel keeps the last 100 steps; the oldest go.
+        let mut a = app();
+        for i in 1..=103 {
+            set(&mut a, &format!("A{i}"), &i.to_string());
+        }
+        assert_eq!(a.undo.len(), crate::UNDO_CAP);
+        for _ in 0..100 {
+            a.undo();
+            assert_eq!(a.status.as_deref(), Some("Undid"));
+        }
+        a.undo();
+        assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
+        for (r, v) in [(0, "1"), (1, "2"), (2, "3")] {
+            assert_eq!(text_at(&a, 0, r, 0).as_deref(), Some(v));
+        }
+        assert_eq!(text_at(&a, 0, 3, 0), None);
+        // Redo holds what was undone, all 100 of it.
+        assert_eq!(a.redo.len(), 100);
+        for _ in 0..100 {
+            a.redo();
+        }
+        assert_eq!(text_at(&a, 0, 102, 0).as_deref(), Some("103"));
+        assert_eq!(a.undo.len(), crate::UNDO_CAP);
+    }
+
+    #[test]
+    fn sheet_rename_is_not_an_undo_step() {
+        // #858: as in Excel, a rename keeps the history and is not a step.
+        let mut a = app();
+        a.undo();
+        set(&mut a, "A1", "b");
+        let depth = a.undo.len();
+        a.modified = false;
+        dispatch(
+            &mut a,
+            "sheet.rename",
+            &Json::obj(vec![
+                ("sheet", Json::Str("Sheet1".into())),
+                ("name", Json::Str("Ren".into())),
+            ]),
+        )
+        .unwrap();
+        assert!(a.modified);
+        assert_eq!(a.undo.len(), depth);
+        a.undo();
+        assert_eq!(text_at(&a, 0, 0, 0), None);
+        assert_eq!(a.pkg.workbook.sheets[0].name, "Ren");
+        a.undo();
+        assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
+        assert_eq!(a.pkg.workbook.sheets[0].name, "Ren");
     }
 
     #[test]
@@ -4369,7 +4488,7 @@ mod tests {
     }
 
     #[test]
-    fn sheet_rename_updates_name_rewrites_refs_one_undo_group() {
+    fn sheet_rename_updates_name_rewrites_refs_and_the_history() {
         let mut a = app();
         dispatch(
             &mut a,
@@ -4377,7 +4496,12 @@ mod tests {
             &Json::obj(vec![("name", Json::Str("Data".into()))]),
         )
         .unwrap();
+        a.sheet = 1;
+        set(&mut a, "A1", "7");
+        a.sheet = 0;
         set(&mut a, "A1", "=Data!A1"); // Sheet1!A1 references the other sheet
+        set(&mut a, "A2", "=Data!A1*2");
+        set(&mut a, "A2", "5"); // its `before` names Data too
         let r = dispatch(
             &mut a,
             "sheet.rename",
@@ -4389,13 +4513,61 @@ mod tests {
         .unwrap();
         assert_eq!(r.get_str("name"), Some("Renamed"));
         assert_eq!(a.pkg.workbook.sheets[1].name, "Renamed");
-        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        let formula = |a: &mut App, r: &str| get(a, r).get_str("formula").map(str::to_string);
+        assert_eq!(formula(&mut a, "A1").as_deref(), Some("=Renamed!A1"));
+        // #858: the rename is no step; the steps before it name the new sheet.
+        a.undo(); // A2 back to its formula
+        assert_eq!(formula(&mut a, "A2").as_deref(), Some("=Renamed!A1*2"));
+        assert_eq!(text_at(&a, 0, 1, 0).as_deref(), Some("14"));
+        a.undo(); // A2's formula typed
+        a.undo(); // A1's formula typed
+        assert_eq!(text_at(&a, 0, 0, 0), None);
+        a.redo();
+        assert_eq!(formula(&mut a, "A1").as_deref(), Some("=Renamed!A1"));
+        assert_eq!(text_at(&a, 0, 0, 0).as_deref(), Some("7"));
+        assert_eq!(a.pkg.workbook.sheets[1].name, "Renamed");
+    }
+
+    #[test]
+    fn structural_undo_before_a_rename_keeps_the_new_name() {
+        // A row insert's snapshots were taken while the sheet was Data: the
+        // rename rewrites them, so undoing it keeps Renamed and its refs.
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Data".into()))]),
+        )
+        .unwrap();
+        a.sheet = 1;
+        set(&mut a, "A1", "3");
+        a.sheet = 0;
+        set(&mut a, "B1", "=Data!A1");
+        dispatch(
+            &mut a,
+            "row.insert",
+            &Json::obj(vec![("at", Json::Num(0.0))]),
+        )
+        .unwrap();
+        for name in ["Renamed", "RENAMED"] {
+            dispatch(
+                &mut a,
+                "sheet.rename",
+                &Json::obj(vec![
+                    ("sheet", Json::Num(1.0)),
+                    ("name", Json::Str(name.into())),
+                ]),
+            )
+            .unwrap();
+        }
+        a.undo(); // the row insert
+        assert_eq!(a.pkg.workbook.sheets[1].name, "RENAMED");
+        let g = get(&mut a, "B1");
         assert_eq!(g.get_str("formula"), Some("=Renamed!A1"));
-        // One TUI-level undo reverts the whole rename (name + every formula).
-        a.undo();
-        assert_eq!(a.pkg.workbook.sheets[1].name, "Data");
-        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
-        assert_eq!(g.get_str("formula"), Some("=Data!A1"));
+        assert_eq!(text_at(&a, 0, 0, 1).as_deref(), Some("3"));
+        a.redo();
+        assert_eq!(a.pkg.workbook.sheets[1].name, "RENAMED");
+        assert_eq!(get(&mut a, "B2").get_str("formula"), Some("=Renamed!A1"));
     }
 
     #[test]
