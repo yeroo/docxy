@@ -1282,3 +1282,40 @@ fn baseline_fixture_records_different_plans_and_missing_duration() {
         ]
     );
 }
+
+/// #577: custom task fields (Text1, Duration1, ...) resolve through the
+/// plan's own `<ExtendedAttribute>` definitions — the definition whose
+/// `FieldName` matches says which `FieldID` holds the value — not through any
+/// built-in id table.
+#[test]
+fn file_20_custom_task_fields_read_through_their_definitions() {
+    use projcore::editor::{Editor, Field, FieldReader, FieldValue};
+    let xml = std::fs::read_to_string(corpus_dir().join("20-task-fields.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    let ed = Editor::new(proj);
+    let read = |uid: i32, name: &str| {
+        let task = ed.project().task(uid).unwrap();
+        let r = FieldReader::new(&ed).read(task, Field::parse(name).unwrap());
+        (r.text, r.value)
+    };
+    // UID 4 ("Pour") stores Text1 directly; its Duration1 is unset.
+    assert_eq!(
+        read(4, "Text1"),
+        ("M&E".to_string(), FieldValue::Text("M&E".into()))
+    );
+    assert_eq!(
+        read(4, "Duration1"),
+        ("0 days".to_string(), FieldValue::Null)
+    );
+    // UID 2 ("Excavate") carries Text1 with a value that wins over its
+    // ValueGUID, and a Duration1 shown in the value's own unit (code 7 =
+    // days; PT32H0M0S = 1920 minutes on this calendar).
+    assert_eq!(
+        read(2, "Text1"),
+        ("Civil".to_string(), FieldValue::Text("Civil".into()))
+    );
+    assert_eq!(
+        read(2, "Duration1"),
+        ("4 days".to_string(), FieldValue::Minutes(1920))
+    );
+}

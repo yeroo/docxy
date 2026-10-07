@@ -85,7 +85,11 @@ Active, Outline Number, Outline Level, WBS, Leveling Delay, Type, Effort Driven,
 Priority, Notes, Hyperlink, Hyperlink Address, Hyperlink SubAddress, Milestone,
 Summary, Estimated, Status and Unique ID. Status is
 measured at the plan's StatusDate, else its CurrentDate, and is empty when the
-plan has neither. Earned-value and custom fields are not readable yet.
+plan has neither. Earned-value fields are not readable yet. Custom task
+fields read too — Text1–Text30, Number1–Number20, Cost1–Cost10, Flag1–Flag20
+and Date, Start, Finish and Duration1–10 — each resolved by the plan's own
+`<ExtendedAttribute>` definition whose `FieldName` matches; a custom field
+with no definition in the plan reads as unset.
 
 - `text` is what the sheet shows. The Entry columns use the grid's own text,
   which the harness `cell` verb also returns (`2d`, `2026-03-02`); the other

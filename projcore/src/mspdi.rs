@@ -1468,7 +1468,7 @@ pub fn iso8601_to_minutes(s: &str) -> i64 {
 /// Optional durations (baselines, progress, stored work, resource work) need to
 /// distinguish a recorded zero from an unavailable one; only the required task
 /// `Duration` and assignment `Work` keep the permissive parser above.
-fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
+pub(crate) fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
     let body = s.trim().strip_prefix('P')?;
     let mut minutes = 0i64;
     let mut in_time = false;
