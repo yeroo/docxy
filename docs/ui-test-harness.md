@@ -297,7 +297,11 @@ unchanged` would stay green if someone put a second handler back on that handle.
 The exception is `pointer-click`/`pointer-drag` (#545) and `real-key`/`real-type`
 (#1027): they queue real `PlatformInput` mouse and key-down events on the control reply, and the pump dispatches them
 through `Window::dispatch_event` once the entity borrow ends — so hit testing
-runs against the last rendered frame exactly as an OS click would. They exist
+runs through gpui exactly as an OS click would. Before a pointer verb runs, the
+pump draws the window (#1121), as gpui itself does before a key-down: the point
+the verb aims at and the hitboxes its events land on then both come from the
+current state, never from whichever frame the platform's tick last drew. A
+whole gesture (press, moves, release) hit-tests that one frame. They exist
 precisely for what handler-calling verbs cannot express: hit order between
 overlapping elements, like the more-tabs list (deferred, priority 1) over the
 sheet's fill handle (deferred, priority 0).
