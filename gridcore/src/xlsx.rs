@@ -258,7 +258,7 @@ fn utf8_part(bytes: Vec<u8>) -> Vec<u8> {
 }
 
 /// The container entries that are parts, each with its part name, in entry
-/// order. Some writers separate segments with `\\` (`xl\\workbook.xml`), and
+/// order. Some writers separate segments with `\` (`xl\workbook.xml`), and
 /// Excel opens those packages, so it becomes the OPC `/` here and on save
 /// (#1095). Two entries that only differ in their separators would become one
 /// part: [`XlsxError::CorruptPart`]. A directory entry is no part (see
@@ -278,25 +278,85 @@ fn part_entries<'a>(zip: &'a ZipArchive<'_>) -> Result<Vec<(&'a ZipEntry, String
         .iter()
         .flat_map(|n| n.match_indices('/').map(|(i, _)| &n[..i]))
         .collect();
+    let named = named_parts(zip, &names);
     Ok(zip
         .entries()
         .iter()
         .zip(names.iter())
-        .filter(|(e, name)| !is_directory_entry(name, e.uncomp_size, &dirs))
+        .filter(|(e, name)| !is_directory_entry(name, e.uncomp_size, &dirs, &named))
         .map(|(e, name)| (e, name.clone()))
         .collect())
+}
+
+/// The part names, in lower case, that the package names: an `Override` in
+/// `[Content_Types].xml` or an internal relationship's target. `names` are
+/// the entries' names with `/` separators. A stream that cannot be read
+/// names nothing.
+fn named_parts(zip: &ZipArchive, names: &[String]) -> HashSet<String> {
+    let mut named = HashSet::new();
+    for (e, name) in zip.entries().iter().zip(names) {
+        let lower = name.to_ascii_lowercase();
+        let source = match lower.rsplit_once('/') {
+            Some((dir, _)) if lower.ends_with(".rels") => match dir.rsplit_once('/') {
+                Some((parent, "_rels")) => Some(&name[..parent.len()]),
+                None if dir == "_rels" => Some(""),
+                _ => None,
+            },
+            _ => None,
+        };
+        if source.is_none() && lower != "[content_types].xml" {
+            continue;
+        }
+        let Some(bytes) = zip.extract(e) else {
+            continue;
+        };
+        let xml = String::from_utf8_lossy(&bytes);
+        match source {
+            Some(dir) => named.extend(
+                parse_rels_mode(&xml)
+                    .into_iter()
+                    .filter(|(_, _, _, mode)| mode.is_none())
+                    .map(|(_, _, target, _)| {
+                        resolve_relative(dir, &target.replace('\\', "/")).to_ascii_lowercase()
+                    }),
+            ),
+            None => {
+                let mut p = XmlParser::new(&xml);
+                loop {
+                    match p.next() {
+                        Event::Start if local(p.name()) == "Override" => named.insert(
+                            decode(p.attr("PartName"))
+                                .trim_start_matches('/')
+                                .to_ascii_lowercase(),
+                        ),
+                        Event::Eof => break,
+                        _ => false,
+                    };
+                }
+            }
+        }
+    }
+    named
 }
 
 /// Whether the entry `name` (with `/` separators) of `size` bytes is a
 /// directory, not a part: its name ends with `/`, or it is empty and either
 /// some entry lies under it (`xl` beside `xl/workbook.xml`) or its name has
-/// no extension (an empty `xl/media`). tdf124525.xlsx marks `_rels`, `xl` and
-/// others as directories only in their ZIP attributes (#1156). An empty part
-/// with an extension (`docProps/thumbnail.wmf`) is still a part. `dirs` holds
-/// every directory an entry name lies in.
-fn is_directory_entry(name: &str, size: u64, dirs: &HashSet<&str>) -> bool {
+/// no extension (an empty `xl/media`) and nothing names it. tdf124525.xlsx
+/// marks `_rels`, `xl` and others as directories only in their ZIP
+/// attributes (#1156). An empty part with an extension
+/// (`docProps/thumbnail.wmf`), or one an `Override` or a relationship names
+/// (`named`, in lower case), is still a part. `dirs` holds every directory
+/// an entry name lies in.
+fn is_directory_entry(
+    name: &str,
+    size: u64,
+    dirs: &HashSet<&str>,
+    named: &HashSet<String>,
+) -> bool {
     let leaf = name.rsplit('/').next().unwrap_or(name);
-    name.ends_with('/') || (size == 0 && (dirs.contains(name) || !leaf.contains('.')))
+    let unnamed = || !leaf.contains('.') && !named.contains(&name.to_ascii_lowercase());
+    name.ends_with('/') || (size == 0 && (dirs.contains(name) || unnamed()))
 }
 
 /// The ZIP container of an `.xlsx`, or why `data` is not one.

@@ -147,8 +147,7 @@ fn with_directory_entries() -> Vec<u8> {
     for (i, dir) in dirs.into_iter().enumerate() {
         parts.insert(i * 2, (dir.into(), Vec::new()));
     }
-    dirs.into_iter()
-        .fold(write_zip(&parts), deflate_method)
+    dirs.into_iter().fold(write_zip(&parts), deflate_method)
 }
 
 /// #1156: a directory entry is no part, so a save does not write it back as
@@ -176,17 +175,60 @@ fn the_repair_loader_drops_directory_entries_too() {
     assert_eq!(pkg.part_names(), plain.part_names());
 }
 
+/// #1156: an empty extensionless part the package names, by an `Override`
+/// or by a relationship, is a part: it loads and saves, while the directory
+/// entries beside it are still dropped.
+#[test]
+fn an_empty_part_the_package_names_is_kept() {
+    let mut parts = package("/");
+    for (name, bytes) in parts.iter_mut() {
+        let xml = String::from_utf8(bytes.clone()).unwrap();
+        *bytes = match name.as_str() {
+            "[Content_Types].xml" => xml.replace(
+                "<Default ",
+                "<Override PartName=\"/XL/CustomData\" ContentType=\"application/octet-stream\"/><Default ",
+            ),
+            "xl/_rels/workbook.xml.rels" => xml.replace(
+                "</Relationships>",
+                "<Relationship Id=\"rId9\" Type=\"x\" Target=\"blob\"/><Relationship Id=\"rId10\" Type=\"x\" Target=\"media\" TargetMode=\"External\"/></Relationships>",
+            ),
+            _ => xml,
+        }
+        .into_bytes();
+    }
+    parts.push(("xl/customData".into(), Vec::new()));
+    parts.push(("xl/blob".into(), Vec::new()));
+    parts.push(("xl/media".into(), Vec::new()));
+    parts.push(("xl/theme".into(), Vec::new()));
+    let pkg = load_xlsx(&write_zip(&parts)).expect("loads");
+    assert_eq!(pkg.part("xl/customData"), Some(&[][..]));
+    assert_eq!(pkg.part("xl/blob"), Some(&[][..]));
+    assert_eq!(
+        pkg.part("xl/media"),
+        None,
+        "only an external target names it"
+    );
+    assert_eq!(pkg.part("xl/theme"), None);
+    let saved = entry_names(&save_xlsx(&pkg));
+    assert!(saved.contains(&"xl/customData".to_string()), "{saved:?}");
+    assert!(saved.contains(&"xl/blob".to_string()), "{saved:?}");
+    assert!(!saved.contains(&"xl/theme".to_string()), "{saved:?}");
+}
+
 /// #1156: only an empty entry is a directory, and only when an entry lies
 /// under it or it has no extension; `xl/a.b` is no directory of
 /// `xl/a.bc.xml`.
 #[test]
 fn which_empty_entries_are_directories() {
     let dirs: HashSet<&str> = ["xl", "xl/a.b", "_rels"].into_iter().collect();
-    let dir = |name: &str, size: u64| is_directory_entry(name, size, &dirs);
+    let named: HashSet<String> = ["xl/customdata".to_string()].into_iter().collect();
+    let dir = |name: &str, size: u64| is_directory_entry(name, size, &dirs, &named);
     assert!(dir("xl/media/", 0));
     assert!(dir("xl", 0));
     assert!(dir("xl/a.b", 0), "an entry lies under it");
     assert!(dir("xl/embeddings", 0), "no extension");
+    assert!(!dir("xl/customData", 0), "no extension, but named");
+    assert!(dir("xl/media/", 0) && dir("xl", 0), "named or not");
     assert!(!dir("xl/a.bc", 0), "an extension and nothing under it");
     assert!(!dir("docProps/thumbnail.wmf", 0));
     assert!(!dir("xl", 3), "not empty: a part, however odd");
