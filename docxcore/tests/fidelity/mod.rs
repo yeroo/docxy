@@ -621,6 +621,8 @@ fn lcs<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(usize, usize)> {
 // ---------------------------------------------------------------------------
 // Packages
 
+/// A package's parts by OPC name: an entry written `xl\\workbook.xml` is the
+/// part `xl/workbook.xml`, as the loaders read it (#1095).
 fn read_parts(bytes: &[u8]) -> Option<BTreeMap<String, Vec<u8>>> {
     let zip = ZipArchive::open(bytes)?;
     let mut parts = BTreeMap::new();
@@ -628,7 +630,7 @@ fn read_parts(bytes: &[u8]) -> Option<BTreeMap<String, Vec<u8>>> {
         if e.name.ends_with('/') {
             continue;
         }
-        parts.insert(e.name.clone(), zip.extract(e)?);
+        parts.insert(e.name.replace('\\', "/"), zip.extract(e)?);
     }
     Some(parts)
 }

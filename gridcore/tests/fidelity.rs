@@ -770,12 +770,14 @@ fn trees(bytes: &[u8]) -> BTreeMap<String, Elem> {
     let Some(zip) = opccore::zip::ZipArchive::open(bytes) else {
         return BTreeMap::new();
     };
-    let parse = |e: &opccore::zip::ZipEntry| Some((e.name.clone(), parse_xml(&zip.extract(e)?)?));
+    // By OPC name, as `read_parts` keys them (#1095).
+    let name = |e: &opccore::zip::ZipEntry| e.name.replace('\\', "/");
+    let parse = |e: &opccore::zip::ZipEntry| Some((name(e), parse_xml(&zip.extract(e)?)?));
     let mut trees: BTreeMap<String, Elem> = zip
         .entries()
         .iter()
         .filter(|e| {
-            let name = e.name.to_ascii_lowercase();
+            let name = name(e).to_ascii_lowercase();
             name.ends_with(".rels")
                 || (name.starts_with("xl/worksheets/") && name.ends_with(".xml"))
         })
@@ -785,7 +787,8 @@ fn trees(bytes: &[u8]) -> BTreeMap<String, Elem> {
         .iter()
         .flat_map(|wb| rel_targets(&trees, wb, "sharedStrings"))
         .next();
-    if let Some((_, tree)) = sst.and_then(|n| zip.find(&n)).and_then(parse) {
+    let entry = |n: String| zip.entries().iter().find(|e| name(e) == n);
+    if let Some((_, tree)) = sst.and_then(entry).and_then(parse) {
         trees.insert(SHARED_STRINGS.to_string(), tree);
     }
     trees
