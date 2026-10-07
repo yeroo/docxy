@@ -2749,6 +2749,28 @@ mod tests {
     }
 
     #[test]
+    fn milestone_toggle_uses_the_plans_day() {
+        let mut proj = editor().project().clone();
+        proj.hours_per_day = 7.0;
+        let mut ed = Editor::new(proj);
+        // Milestone -> task: one plan day is 7h.
+        ed.toggle_milestone(2).unwrap();
+        let task = &ed.project().tasks[1];
+        assert_eq!((task.duration_min, task.milestone), (0, true));
+        ed.toggle_milestone(2).unwrap();
+        let task = &ed.project().tasks[1];
+        assert_eq!((task.duration_min, task.milestone), (420, false));
+        // A blank row takes the zero-duration branch instead: the plan's day
+        // never enters, at 7h as at 8h.
+        let mut proj = blank_row_editor().project().clone();
+        proj.hours_per_day = 7.0;
+        let mut ed = Editor::new(proj);
+        ed.toggle_milestone(3).unwrap();
+        let row = &ed.project().tasks[1];
+        assert_eq!((row.duration_min, row.milestone), (0, true));
+    }
+
+    #[test]
     fn rejected_edits_preserve_everything_clean_and_dirty() {
         type Edit = fn(&mut Editor) -> Result<(), String>;
         let bad: &[Edit] = &[
