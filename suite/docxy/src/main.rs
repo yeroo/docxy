@@ -65,6 +65,8 @@ mod recover;
 mod ribbon_export;
 mod ribbon_layout;
 #[cfg(test)]
+mod save_preserve_tests;
+#[cfg(test)]
 mod sect_pr_tests;
 mod sheet_autocorrect;
 #[cfg(test)]
@@ -9856,13 +9858,21 @@ fn doc_to_docx_styled(
     converted: bool,
 ) -> Vec<u8> {
     use std::collections::HashSet;
+    // A body still equal to the one the base's document.xml encodes writes
+    // those bytes back, as the CLI does (#1107). Compared by content, not the
+    // tab's dirty flag: the base is not rebased after a save, so a clean tab
+    // can hold edits its document.xml lacks; nor with `p.document`, which
+    // section edits change while the part keeps its old sectPr.
+    let unmodified = !converted && base.is_some_and(|p| p.stored_document().as_ref() == Some(doc));
     // With the original package in hand, re-serialize just document.xml back into
     // it — every other part (footnotes, headers/footers, images, themes, …) is
     // preserved. Otherwise build a minimal package (new/empty documents).
     let mut pkg = match base {
         Some(p) => {
             let mut p = p.clone();
-            p.document = doc.clone();
+            if !unmodified {
+                p.document = doc.clone();
+            }
             p
         }
         None => {
@@ -9913,7 +9923,11 @@ fn doc_to_docx_styled(
     if comments.is_empty() {
         pkg.drop_empty_comment_parts();
     }
-    docxcore::package::save_package(&pkg)
+    if unmodified {
+        docxcore::package::save_package_preserving_document(&pkg)
+    } else {
+        docxcore::package::save_package(&pkg)
+    }
 }
 
 /// One tab as a relaunch restores it. The app goes through

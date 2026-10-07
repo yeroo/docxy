@@ -1042,20 +1042,22 @@ impl Package {
     /// trailing sectPr, else the captured one (an empty
     /// `<w:sectPr></w:sectPr>` when the package has none).
     pub fn final_section(&self) -> SectionProperties {
-        if let Some(section) = self.document.trailing_section_properties() {
-            return section.clone();
+        final_section_of(&self.document, &self.sect_pr)
+    }
+
+    /// The body the stored main document part encodes, parsed as
+    /// [`load_package`] parses it and ending in its [`Package::final_section`]:
+    /// what a fresh load of this package shows. Unlike [`Package::document`]
+    /// (which [`Package::set_sect_pr`] and others change), only rewriting the
+    /// part changes it, so a body equal to it can keep the part's bytes
+    /// (#1107). `None` when the part is not UTF-8.
+    pub fn stored_document(&self) -> Option<Document> {
+        let (mut document, sect_pr) = parse_main_document(&self.parts, self.doc_index).ok()?;
+        if document.trailing_section_properties().is_none() {
+            let section = final_section_of(&document, &sect_pr);
+            document.set_trailing_section_properties(section);
         }
-        let xml = if self.sect_pr.trim().is_empty() {
-            "<w:sectPr></w:sectPr>"
-        } else {
-            &self.sect_pr
-        };
-        let (raw, property_change) =
-            crate::load::split_property_change_container(xml, PropertyScope::Section);
-        SectionProperties {
-            raw,
-            property_change,
-        }
+        Some(document)
     }
 
     /// Replace the trailing section properties with an already-split section
@@ -3397,7 +3399,23 @@ pub fn load_package(data: &[u8]) -> Result<Package, LoadError> {
         parts.push((e.name.clone(), bytes));
     }
     let doc_index = doc_index.ok_or(LoadError::MissingDocument)?;
+    let (document, sect_pr) = parse_main_document(&parts, doc_index)?;
 
+    Ok(Package {
+        parts,
+        doc_index,
+        sect_pr,
+        document,
+    })
+}
+
+/// The document and final `w:sectPr` that `parts[doc_index]` encodes, with
+/// the relationships (and the diagram, equation and chart data they lead to)
+/// its parse needs.
+fn parse_main_document(
+    parts: &[(String, Vec<u8>)],
+    doc_index: usize,
+) -> Result<(Document, String), LoadError> {
     let doc_xml = std::str::from_utf8(&parts[doc_index].1).map_err(|_| LoadError::NotUtf8)?;
     let read_part = |name: &str| {
         parts
@@ -3427,13 +3445,7 @@ pub fn load_package(data: &[u8]) -> Result<Package, LoadError> {
     }
     let document = parse_document_xml(doc_xml, &rels);
     let sect_pr = extract_sectpr(doc_xml);
-
-    Ok(Package {
-        parts,
-        doc_index,
-        sect_pr,
-        document,
-    })
+    Ok((document, sect_pr))
 }
 
 /// Build a new package around a document, with a minimal valid OPC part set.
@@ -3560,6 +3572,24 @@ fn markdown_styles_xml() -> String {
          {code}\
          </w:styles>"
     )
+}
+
+/// [`Package::final_section`] of a document and its captured `w:sectPr`.
+fn final_section_of(document: &Document, sect_pr: &str) -> SectionProperties {
+    if let Some(section) = document.trailing_section_properties() {
+        return section.clone();
+    }
+    let xml = if sect_pr.trim().is_empty() {
+        "<w:sectPr></w:sectPr>"
+    } else {
+        sect_pr
+    };
+    let (raw, property_change) =
+        crate::load::split_property_change_container(xml, PropertyScope::Section);
+    SectionProperties {
+        raw,
+        property_change,
+    }
 }
 
 /// Serialize the package back to `.docx` bytes (STORED ZIP).
@@ -5814,6 +5844,31 @@ mod tests {
             "new relationship missing from freshly-created rels part: {rels_xml}"
         );
         assert!(pkg.part("word/media/image1.png").is_some());
+    }
+
+    #[test]
+    fn stored_document_follows_the_part_not_the_live_document_1107() {
+        let source = new_package(crate::markdown::from_markdown("Hello"));
+        let mut pkg = load_package(&save_package(&source)).unwrap();
+        // What a fresh load shows: the body with its final section.
+        let mut loaded = pkg.document.clone();
+        if loaded.trailing_section_properties().is_none() {
+            loaded.set_trailing_section_properties(pkg.final_section());
+        }
+        assert_eq!(pkg.stored_document().as_ref(), Some(&loaded));
+        // A section edit changes the live document, not the stored part.
+        pkg.set_sect_pr("<w:sectPr><w:cols w:num=\"2\"/></w:sectPr>".into());
+        assert_ne!(pkg.document, loaded);
+        assert_eq!(pkg.stored_document().as_ref(), Some(&loaded));
+        // Saving rewrites the part, and a fresh load of it agrees.
+        let saved = load_package(&save_package(&pkg)).unwrap();
+        let stored = saved.stored_document().unwrap();
+        assert!(stored.plain_text().starts_with("Hello"));
+        assert!(
+            stored
+                .trailing_section_properties()
+                .is_some_and(|s| s.raw.contains("w:num=\"2\""))
+        );
     }
 
     #[test]
