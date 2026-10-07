@@ -1568,11 +1568,12 @@ fn group_cells<'a>(
 }
 
 /// The workbook state around a structural edit whose inverse is not
-/// expressible as per-cell changes (row/column insert-delete, sheet rename,
-/// the table commands — Table Name, Resize Table, Convert to Range): sheets,
+/// expressible as per-cell changes (row/column insert-delete, the table
+/// commands — Table Name, Resize Table, Convert to Range): sheets,
 /// defined names, the tables (live, and converted ones whose parts await the
 /// save), the PivotTables' sources, and a table rename to replay on the data
-/// model.
+/// model. A sheet rename is not such an edit: it rewrites the snapshots
+/// already taken ([`App::rename_sheet`]).
 #[derive(Clone)]
 struct WbSnapshot {
     sheets: Vec<gridcore::sheet::Sheet>,
@@ -1608,6 +1609,47 @@ fn wb_changed(before: &WbSnapshot, wb: &gridcore::sheet::Workbook) -> bool {
                 || a.filter_mode.unwrap_or(false) != b.filter_mode.unwrap_or(false)
         })
 }
+
+/// [`App::rename_sheet`] on an undo snapshot: the references in it to sheet
+/// `old` follow the rename, as the workbook's do, and its sheet `idx` takes
+/// the new name when it has one. A snapshot taken before that sheet was
+/// added has none, but its formulas may still name it.
+fn rename_sheet_in_snapshot(snap: &mut WbSnapshot, idx: usize, old: &str, name: &str) {
+    let mut wb = gridcore::sheet::Workbook {
+        sheets: std::mem::take(&mut snap.sheets),
+        defined_names: std::mem::take(&mut snap.names),
+        tables: std::mem::take(&mut snap.tables),
+        ..Default::default()
+    };
+    if idx < wb.sheets.len() {
+        gridcore::edit::rename_sheet(&mut wb, idx, name);
+    } else {
+        // Renamed as a stand-in sheet of that name, which then goes again.
+        wb.sheets.push(gridcore::sheet::Sheet {
+            name: old.to_string(),
+            ..Default::default()
+        });
+        let stand_in = wb.sheets.len() - 1;
+        gridcore::edit::rename_sheet(&mut wb, stand_in, name);
+        wb.sheets.pop();
+    }
+    snap.sheets = wb.sheets;
+    snap.names = wb.defined_names;
+    snap.tables = wb.tables;
+    for source in &mut snap.pivot_sources {
+        if let gridcore::pivot::PivotSource::Range { sheet, .. } = source {
+            if sheet.eq_ignore_ascii_case(old) {
+                *sheet = name.to_string();
+            }
+        }
+    }
+}
+
+/// A rename to a name another sheet already has.
+const SHEET_NAME_TAKEN: &str = "Sheet name already taken";
+
+/// How many steps the undo history keeps, as Excel does: the oldest goes.
+const UNDO_CAP: usize = 100;
 
 enum UndoAction {
     /// One undo step; more than one group when it touched several sheets
@@ -1975,6 +2017,9 @@ struct App {
     status: Option<String>,
     undo: Vec<UndoAction>,
     redo: Vec<UndoAction>,
+    /// Steps ever pushed onto `undo`; unlike `undo.len()` it still moves at
+    /// [`UNDO_CAP`], so [`App::with_rules`] can tell a step was recorded.
+    undo_pushes: u64,
     clip: Option<ClipData>,
     os_clip: Option<arboard::Clipboard>,
     clip_text: Option<String>,
@@ -2141,6 +2186,7 @@ impl App {
             circle_warning_pending: false,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_pushes: 0,
             clip: None,
             os_clip: arboard::Clipboard::new().ok(),
             clip_text: None,
@@ -2820,7 +2866,7 @@ impl App {
             // cut's cells were captured before the formulas were rewritten.
             // When this step is the cut-paste itself, the cut is spent.
             self.cancel_cut();
-            self.undo.push(UndoAction::Structural { before, after });
+            self.push_undo(UndoAction::Structural { before, after });
             self.redo.clear();
             self.modified = true;
             self.warn_new_circles(&circles_before);
@@ -2846,7 +2892,7 @@ impl App {
                 rules: None,
             })
             .collect();
-        self.undo.push(UndoAction::Cells(undo));
+        self.push_undo(UndoAction::Cells(undo));
         self.redo.clear();
         self.modified = true;
         self.prune_circles();
@@ -2890,7 +2936,7 @@ impl App {
             .zip(before)
             .map(|(&(r, c, _), before)| (r, c, before, sheet.cell(r, c).cloned()))
             .collect();
-        self.undo.push(UndoAction::Cells(vec![UndoGroup {
+        self.push_undo(UndoAction::Cells(vec![UndoGroup {
             sheet: sheet_idx,
             changes,
             styles_only: true,
@@ -2975,7 +3021,7 @@ impl App {
             Ok(false) => Ok(false),
             Ok(true) => {
                 let after = self.wb_snapshot();
-                self.undo.push(UndoAction::Structural { before, after });
+                self.push_undo(UndoAction::Structural { before, after });
                 self.redo.clear();
                 self.modified = true;
                 Ok(true)
@@ -3074,7 +3120,7 @@ impl App {
         if self.circles_shown() && self.engine.circular_refs().len() > circles_before {
             self.circle_warning_pending = true;
         }
-        self.undo.push(UndoAction::Structural { before, after });
+        self.push_undo(UndoAction::Structural { before, after });
         self.redo.clear();
         self.modified = true;
         self.clamp_cursor();
@@ -3135,6 +3181,60 @@ impl App {
         }
     }
 
+    /// Rename sheet `idx` and every reference to it. As in Excel this is not
+    /// an undo step and keeps the history, so the history follows it: the
+    /// cells, rules and snapshots it holds name the sheet by its new name, or
+    /// an undo or redo would bring back references to a sheet that is gone.
+    /// A name another sheet has (in any case) is refused, since there is no
+    /// step to undo it: `Err` with the reason, nothing changed.
+    fn rename_sheet(&mut self, idx: usize, name: &str) -> Result<(), String> {
+        let wb = &self.pkg.workbook;
+        let Some(old) = wb.sheets.get(idx).map(|s| s.name.clone()) else {
+            return Err("no such sheet".into());
+        };
+        let taken = (wb.sheets.iter().enumerate())
+            .any(|(i, s)| i != idx && s.name.eq_ignore_ascii_case(name));
+        if taken {
+            return Err(SHEET_NAME_TAKEN.into());
+        }
+        let circles_before = self.engine.circular_refs().len();
+        gridcore::edit::rename_sheet(&mut self.pkg.workbook, idx, name);
+        // A rename that only changes case leaves references as they are
+        // (they match either way), as `rename_sheet` does in the workbook.
+        let refs = !old.eq_ignore_ascii_case(name);
+        for action in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            match action {
+                UndoAction::Cells(groups) if refs => {
+                    for g in groups {
+                        for (_, _, before, after) in &mut g.changes {
+                            for cell in [before, after].into_iter().flatten() {
+                                gridcore::edit::rename_sheet_in_cell(cell, &old, name);
+                            }
+                        }
+                        if let Some((before, after)) = &mut g.rules {
+                            for (rules, _) in [before, after] {
+                                gridcore::edit::rename_sheet_in_validations(rules, &old, name);
+                            }
+                        }
+                    }
+                }
+                UndoAction::Cells(_) => {}
+                UndoAction::Structural { before, after } => {
+                    rename_sheet_in_snapshot(before, idx, &old, name);
+                    rename_sheet_in_snapshot(after, idx, &old, name);
+                }
+            }
+        }
+        self.rebuild_engine();
+        // A rename can close a circle (#660): warn after its own status.
+        if self.circles_shown() && self.engine.circular_refs().len() > circles_before {
+            self.circle_warning_pending = true;
+        }
+        self.cancel_cut();
+        self.modified = true;
+        Ok(())
+    }
+
     /// The workbook state a structural undo step restores.
     fn wb_snapshot(&self) -> WbSnapshot {
         let wb = &self.pkg.workbook;
@@ -3152,7 +3252,12 @@ impl App {
     /// the data model (see [`Self::restore`]).
     fn put_back(&mut self, snap: &WbSnapshot) {
         let wb = &mut self.pkg.workbook;
+        // A sheet added since keeps the history (as in Excel) and is not in
+        // `snap`: it stays, after the snapshot's. The history never holds
+        // more sheets than the workbook, since deleting one clears it.
+        let added = wb.sheets.split_off(snap.sheets.len().min(wb.sheets.len()));
         wb.sheets = snap.sheets.clone();
+        wb.sheets.extend(added);
         wb.defined_names = snap.names.clone();
         wb.tables = snap.tables.clone();
         wb.removed_tables = snap.removed_tables.clone();
@@ -3626,7 +3731,7 @@ impl App {
     /// their own when it recorded none. A structural step already holds them.
     fn with_rules<R>(&mut self, sheets: &[usize], f: impl FnOnce(&mut Self) -> R) -> R {
         let before: Vec<RuleState> = sheets.iter().map(|&s| self.rule_state(s)).collect();
-        let depth = self.undo.len();
+        let pushes = self.undo_pushes;
         let out = f(self);
         // Rules changed: a circled cell may be valid now (or a clean one not).
         self.prune_circles();
@@ -3639,7 +3744,7 @@ impl App {
         if changed.is_empty() {
             return out;
         }
-        let recorded = self.undo.len() > depth;
+        let recorded = self.undo_pushes > pushes;
         let mut groups = match (recorded, self.undo.last_mut()) {
             (true, Some(UndoAction::Cells(groups))) => std::mem::take(groups),
             (true, _) => return out,
@@ -3662,10 +3767,20 @@ impl App {
         if recorded {
             self.undo.pop();
         }
-        self.undo.push(UndoAction::Cells(groups));
+        self.push_undo(UndoAction::Cells(groups));
         self.redo.clear();
         self.modified = true;
         out
+    }
+
+    /// Record an undo step, dropping the oldest past [`UNDO_CAP`]. The redo
+    /// stack is the caller's: a new edit clears it, a redo does not.
+    fn push_undo(&mut self, action: UndoAction) {
+        self.undo_pushes += 1;
+        self.undo.push(action);
+        if self.undo.len() > UNDO_CAP {
+            self.undo.remove(0);
+        }
     }
 
     fn undo(&mut self) {
@@ -3728,14 +3843,14 @@ impl App {
                         .restore_cells(&mut self.pkg.workbook, group.sheet, &cells);
                 }
                 self.show_undo_group(groups.last());
-                self.undo.push(UndoAction::Cells(groups));
+                self.push_undo(UndoAction::Cells(groups));
                 self.modified = true;
                 self.prune_circles();
                 self.status = Some("Redid".to_string());
             }
             Some(UndoAction::Structural { before, after }) => {
                 self.restore(&after);
-                self.undo.push(UndoAction::Structural { before, after });
+                self.push_undo(UndoAction::Structural { before, after });
                 self.status = Some("Redid".to_string());
             }
             None => self.status = Some("Nothing to redo".to_string()),
@@ -6958,7 +7073,7 @@ impl App {
                 }
                 self.rebuild_engine();
                 let after = self.wb_snapshot();
-                self.undo.push(UndoAction::Structural { before, after });
+                self.push_undo(UndoAction::Structural { before, after });
                 self.redo.clear();
                 self.modified = true;
                 self.cancel_cut();
@@ -8465,9 +8580,10 @@ impl App {
             }
             PromptKind::RenameSheet => {
                 if !text.is_empty() && !text.contains(['[', ']', '*', '?', ':', '/', '\\']) {
-                    let idx = self.sheet;
-                    self.structural(|wb| gridcore::edit::rename_sheet(wb, idx, &text));
-                    self.status = Some(format!("Renamed sheet to {text}"));
+                    self.status = Some(match self.rename_sheet(self.sheet, &text) {
+                        Ok(()) => format!("Renamed sheet to {text}"),
+                        Err(why) => why,
+                    });
                 } else {
                     self.status = Some("Invalid sheet name".to_string());
                 }
@@ -8577,9 +8693,9 @@ impl App {
                     self.top = 0;
                     self.left = 0;
                     self.anchor = None;
-                    // Package parts changed: old snapshots no longer line up.
-                    self.undo.clear();
-                    self.redo.clear();
+                    // As in Excel, adding a sheet keeps the history: it is
+                    // appended, so the steps' sheet indices still hold, and a
+                    // snapshot put back keeps it (`put_back`).
                     self.rebuild_engine();
                     self.modified = true;
                     self.status = Some(format!("Added sheet {text}"));
@@ -17487,7 +17603,7 @@ mod tests {
         app.commit_prompt();
         assert_eq!(app.pkg.workbook.sheets.len(), 2);
         assert_eq!(app.sheet, 1);
-        // Rename it (structural: formulas elsewhere would follow).
+        // Rename it (formulas elsewhere follow; not an undo step, #858).
         app.open_prompt(PromptKind::RenameSheet);
         if let Some(p) = &mut app.prompt {
             p.text = "Plan".to_string();
@@ -20221,6 +20337,111 @@ mod tests {
         assert_eq!(value_at(&app, 5, 1), CellValue::Number(1000.0));
         assert_eq!(ranges_of(&app), vec![vec![(1, 1, 9, 1)]]);
     }
+    // ---- #858: the history keeps 100 steps, and sheet adds and renames ----
+
+    #[test]
+    fn ctrl_t_and_shift_f2_keep_the_history() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        type_text(&mut app, "b");
+        press(&mut app, KeyCode::Enter);
+        press_mod(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(
+            app.prompt
+                .as_ref()
+                .is_some_and(|p| p.kind == PromptKind::AddSheet)
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pkg.workbook.sheets.len(), 2);
+        assert_eq!(app.sheet, 1);
+        // Ctrl+Z undoes the entry before the add, back on its sheet.
+        press_mod(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(app.sheet, 0);
+        assert_eq!(value_at(&app, 0, 0), CellValue::Empty);
+        press_mod(&mut app, KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert_eq!(value_at(&app, 0, 0), CellValue::Text("b".into()));
+        // A rename is no step either: Ctrl+Z empties A1, the name stays.
+        let depth = app.undo.len();
+        press_mod(&mut app, KeyCode::F(2), KeyModifiers::SHIFT);
+        assert!(
+            app.prompt
+                .as_ref()
+                .is_some_and(|p| p.kind == PromptKind::RenameSheet)
+        );
+        app.prompt.as_mut().unwrap().text = "Ren".to_string();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some("Renamed sheet to Ren"));
+        assert_eq!(app.undo.len(), depth);
+        press_mod(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(value_at(&app, 0, 0), CellValue::Empty);
+        assert_eq!(app.pkg.workbook.sheets[0].name, "Ren");
+        press_mod(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(app.status.as_deref(), Some("Nothing to undo"));
+        // A name another sheet has, in any case, is refused and changes
+        // nothing: there is no step to undo it.
+        app.sheet = 1;
+        app.modified = false;
+        press_mod(&mut app, KeyCode::F(2), KeyModifiers::SHIFT);
+        app.prompt.as_mut().unwrap().text = "REN".to_string();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some(SHEET_NAME_TAKEN));
+        assert_eq!(app.pkg.workbook.sheets[1].name, "Sheet2");
+        assert!(!app.modified);
+        assert_eq!(app.redo.len(), 1);
+    }
+
+    #[test]
+    fn a_paste_that_changes_rules_stays_one_step_at_the_cap() {
+        // `with_rules` folds the rules into the step the paste recorded; with
+        // the history full, that push drops the oldest step and the length
+        // stays put, so it must count pushes rather than compare lengths.
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        for r in 0..UNDO_CAP as u32 {
+            app.apply(vec![(r, 7, Cell::number(1000.0))]); // H1:H100
+        }
+        assert_eq!(app.undo.len(), UNDO_CAP);
+        app.cur = (1, 7);
+        app.copy(false);
+        app.cur = (5, 1); // B6, inside the rule
+        app.paste_from(None);
+        assert_eq!(ranges_of(&app), vec![vec![(1, 1, 4, 1), (6, 1, 9, 1)]]);
+        assert_eq!(app.undo.len(), UNDO_CAP);
+        // One undo puts back both the cell and the rule.
+        app.undo();
+        assert_eq!(value_at(&app, 5, 1), CellValue::Empty);
+        assert_eq!(ranges_of(&app), vec![vec![(1, 1, 9, 1)]]);
+    }
+
+    #[test]
+    fn a_rename_rewrites_rule_formulas_in_the_history() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.add_sheet("Data");
+        let rule = |f: &str| gridcore::sheet::DataValidation {
+            ranges: vec![(0, 0, 0, 0)],
+            kind: "list".into(),
+            formula1: f.into(),
+            ..Default::default()
+        };
+        app.push_undo(UndoAction::Cells(vec![UndoGroup {
+            sheet: 0,
+            changes: Vec::new(),
+            styles_only: false,
+            rules: Some((
+                (Vec::new(), Vec::new()),
+                (vec![rule("Data!$A$1:$A$3")], Vec::new()),
+            )),
+        }]));
+        app.rename_sheet(1, "Lists").unwrap();
+        app.undo();
+        app.redo();
+        assert_eq!(
+            app.pkg.workbook.sheets[0].validations[0].formula1,
+            "Lists!$A$1:$A$3"
+        );
+    }
+
     // ---- #689: the Data Validation dialog and Circle Invalid Data ----
 
     fn dialog_keys(app: &mut App, keys: &[KeyCode]) {

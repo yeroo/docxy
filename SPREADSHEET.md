@@ -349,7 +349,9 @@ is data entry plus semantics tests, not architecture.
   the file, frozen formula bar (`A1 ▸ =SUM(B1:B9)`), sheet tabs, status bar
   with Sum/Average/Count for the selection (like Excel's status bar).
 - **Editing:** type to replace, `F2` to edit in place, Enter/Tab commit and
-  move, Esc cancels; `=` starts a formula; Del clears; undo/redo.
+  move, Esc cancels; `=` starts a formula; Del clears; undo/redo, which keep
+  the last 100 steps as Excel does (adding or renaming a sheet keeps them and
+  is not a step; deleting a sheet clears them).
 - **Navigation:** arrows, PgUp/PgDn, Ctrl-arrows (data-edge jump), Ctrl-Home,
   mouse click/drag/wheel, click sheet tabs.
 - **Clipboard:** ranges copy as TSV to the OS clipboard (arboard, like docxy);

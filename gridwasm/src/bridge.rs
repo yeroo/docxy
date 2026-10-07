@@ -1956,13 +1956,13 @@ impl Session {
     //     (`UndoAction::SheetAdd`, whose inverse is the real
     //     `SheetPackage::remove_sheet` — proven by
     //     `sheet_add_undo_survives_save` above) -> `"undoSteps":1`. Unlike
-    //     xlsxy's terminal (which has no such stack entry and clears
-    //     history for `sheet.add`), gridwasm already has a true inverse, so
+    //     xlsxy's terminal (where, as in Excel, `sheet.add` is not an undo
+    //     step and keeps the history, #858), gridwasm has a true inverse, so
     //     it's used directly rather than falling back to a weaker bucket.
     //   - `sheet.remove`, `sheet.import-csv`: NEVER on the undo stack AND
-    //     ACTIVELY CLEAR existing history (same reasoning as `sheet.add`'s
-    //     package-parts churn, but there is no cheap true inverse for
-    //     *removing* or *importing* arbitrary content) -> reply carries
+    //     ACTIVELY CLEAR existing history (package-parts churn with no
+    //     cheap true inverse for *removing* or *importing* arbitrary
+    //     content) -> reply carries
     //     `"undoSteps":0` plus an `"inverse"`. `sheet.import-csv`'s inverse
     //     (`sheet.remove` of the very sheet it just created) is EXACT — the
     //     sheet never existed before, so deleting it is a full reversal.
@@ -2652,7 +2652,9 @@ impl Session {
     /// `"sheet\trename"` dispatch command (one `Structural` undo group), but
     /// validates the name FIRST — the dispatch command itself only checks
     /// non-empty, silently no-op'ing on an invalid one; mirrors xlsxy
-    /// control.rs's `sheet_rename` validation.
+    /// control.rs's `sheet_rename` validation. Terminal xlsxy also refuses a
+    /// name another sheet has (its rename is no undo step, #858); this one
+    /// does not yet.
     fn ctl_sheet_rename(&mut self, args: &json::Json) -> Result<String, String> {
         let si = self.ctl_sheet_arg_required(args)?;
         let name = args.get_str("name").ok_or("sheet.rename needs a 'name'")?;
