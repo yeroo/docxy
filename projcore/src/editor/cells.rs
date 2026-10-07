@@ -359,7 +359,9 @@ impl Editor {
                 None => None,
             };
             if let Some(u) = units {
-                a.set_units(u, assigned_work(kind(a.resource_uid), duration, u));
+                let kind = kind(a.resource_uid);
+                let work = staged_work(kind, units_span(kind, a, duration), u, raw)?;
+                a.set_units(u, work);
                 changed = true;
             }
         }
@@ -381,6 +383,7 @@ impl Editor {
                 rid,
                 kind(rid),
                 units,
+                raw,
                 duration,
             )?);
             changed = true;

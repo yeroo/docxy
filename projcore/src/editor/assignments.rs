@@ -12,7 +12,6 @@
 //! closure.
 use super::effort::work_edit_rescales_units;
 use super::*;
-use crate::schedule::HORIZON_DAYS;
 
 /// The resource an added assignment is for.
 #[derive(Clone, Copy, Debug)]
@@ -52,10 +51,6 @@ fn positive_units(units: f64) -> Result<f64, String> {
     }
 }
 
-/// The most work or delay an agent may give: the scheduling horizon, so
-/// `work / units + delay` and the stored tenths stay representable.
-const MAX_MINUTES: i64 = 2 * HORIZON_DAYS * 1440;
-
 /// Work or a delay must be a non-negative number of minutes within the
 /// scheduling horizon.
 fn checked_minutes(what: &str, min: i64) -> Result<i64, String> {
@@ -72,12 +67,7 @@ fn checked_minutes(what: &str, min: i64) -> Result<i64, String> {
 /// when it would pass the scheduling horizon. The work saturates, so huge
 /// units are refused too.
 fn units_work(kind: Option<ResourceType>, span: i64, units: f64) -> Result<i64, String> {
-    let work = assigned_work(kind, span.max(0), units);
-    if work > MAX_MINUTES {
-        Err("units are beyond the scheduling range".into())
-    } else {
-        Ok(work)
-    }
+    bounded_work(kind, span, units).ok_or_else(|| "units are beyond the scheduling range".into())
 }
 
 /// Refuse units or work a resource of this kind does not take: a cost
@@ -200,7 +190,7 @@ impl Editor {
             .max()
             .unwrap_or(0);
         let mut assignments = self.proj.assignments.clone();
-        let added = new_assignment(&mut next_aid, task_uid, rid, kind, units, duration)?;
+        let added = new_assignment(&mut next_aid, task_uid, rid, kind, units, "units", duration)?;
         let uid = added.uid;
         assignments.push(added);
         self.commit_assignments(i, resources, assignments)?;
