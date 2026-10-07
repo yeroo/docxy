@@ -3006,6 +3006,7 @@ impl App {
             KeyCode::Char('z' | 'y') if ctrl => Some(MutationKind::Content),
             KeyCode::F(3) if shift => Some(MutationKind::Content),
             KeyCode::Char(_) if !ctrl => Some(MutationKind::Content),
+            KeyCode::Enter if shift && !ctrl && !alt => Some(MutationKind::Content),
             KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete => Some(MutationKind::Structure),
             KeyCode::Tab => Some(MutationKind::Content),
             _ => None,
@@ -6459,6 +6460,12 @@ impl App {
                 self.editor.insert_char(c);
                 self.after_edit();
             }
+            // Shift+Enter: a manual line break inside the paragraph, typed
+            // into the typing step around it (#853, #855), as in Word.
+            KeyCode::Enter if shift && !ctrl && !alt => {
+                self.editor.insert_line_break();
+                self.after_edit();
+            }
             KeyCode::Enter => {
                 // "---" / "===" / "___" … on a line becomes a horizontal rule.
                 let formatting_allowed = self
@@ -6479,14 +6486,11 @@ impl App {
                 self.editor.delete_forward();
                 self.after_edit();
             }
-            // Ctrl+Tab types a tab inside a table cell (where the terminal
-            // reports it), as in Word.
-            KeyCode::Tab if ctrl && self.editor.in_table() => {
-                self.editor.insert_tab();
-                self.after_edit();
-            }
+            // Tab types a tab (`<w:tab/>`), as in Word, replacing a selection
+            // in one undo step. Inside a table plain Tab moves between cells,
+            // so only Ctrl+Tab or Alt+Tab reaches here.
             KeyCode::Tab => {
-                self.editor.insert_str("    ");
+                self.editor.one_step("Tab", |ed| ed.insert_tab());
                 self.after_edit();
             }
             KeyCode::Left => {
@@ -14655,6 +14659,133 @@ mod tests {
             panic!("paragraph")
         };
         assert!(matches!(p.content.as_slice(), [Inline::Tab(_)]));
+    }
+
+    fn body_paragraphs(app: &App) -> Vec<String> {
+        let doc = &app.editor.doc;
+        doc.body[..doc.content_block_count()]
+            .iter()
+            .map(Block::plain_text)
+            .collect()
+    }
+
+    #[test]
+    fn tab_outside_a_table_types_a_tab_not_spaces_855() {
+        let mut app = app_with(&[""]);
+        type_text(&mut app, "Five");
+        app.on_key(key(KeyCode::Tab));
+        type_text(&mut app, "Six");
+        assert_eq!(body_paragraphs(&app), ["Five\tSix"]);
+        let Block::Paragraph(p) = &app.editor.doc.body[0] else {
+            panic!("paragraph")
+        };
+        let tabs = p
+            .content
+            .iter()
+            .filter(|i| matches!(i, Inline::Tab(_)))
+            .count();
+        assert_eq!(tabs, 1);
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn tab_over_a_selection_is_one_undo_step_855() {
+        let mut app = app_with(&["hello world"]);
+        app.editor.move_end();
+        for _ in 0.."world".len() {
+            app.on_key(shift(KeyCode::Left));
+        }
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(body_paragraphs(&app), ["hello \t"]);
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(body_paragraphs(&app), ["hello world"]);
+    }
+
+    #[test]
+    fn shift_enter_types_a_line_break_in_the_paragraph_855() {
+        let mut app = app_with(&[""]);
+        type_text(&mut app, "Five");
+        app.on_key(key(KeyCode::Tab));
+        type_text(&mut app, "Six");
+        app.on_key(shift(KeyCode::Enter));
+        type_text(&mut app, "Seven");
+        assert_eq!(body_paragraphs(&app), ["Five\tSix\nSeven"]);
+        let Block::Paragraph(p) = &app.editor.doc.body[0] else {
+            panic!("paragraph")
+        };
+        assert!(
+            p.content
+                .iter()
+                .any(|i| matches!(i, Inline::Break(BreakKind::Line, _)))
+        );
+        // `Six`, the line break and `Seven` are one typing step (#853).
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(body_paragraphs(&app), ["Five\t"]);
+    }
+
+    #[test]
+    fn shift_enter_replaces_the_selection_855() {
+        let mut app = app_with(&["abcd"]);
+        app.editor.move_end();
+        app.on_key(shift(KeyCode::Left));
+        app.on_key(shift(KeyCode::Left));
+        app.on_key(shift(KeyCode::Enter));
+        assert_eq!(body_paragraphs(&app), ["ab\n"]);
+    }
+
+    #[test]
+    fn shift_enter_in_a_table_cell_stays_in_the_cell_855() {
+        let mut app = app_with(&["text"]);
+        app.run_act(ribbon::Act::InsertTable);
+        let table_path = app
+            .editor
+            .table_at_caret()
+            .expect("caret in the table")
+            .table;
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(shift(KeyCode::Enter));
+        app.on_key(key(KeyCode::Char('b')));
+        let cell = &app.editor.table(&table_path).unwrap().rows[0].cells[0];
+        assert_eq!(cell.blocks.len(), 1);
+        assert_eq!(cell.blocks[0].plain_text(), "a\nb");
+    }
+
+    #[test]
+    fn plain_and_ctrl_shift_enter_still_split_the_paragraph_855() {
+        let mut app = app_with(&["abcd"]);
+        app.editor.move_end();
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(body_paragraphs(&app), ["abc", "d"]);
+        app.on_key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(body_paragraphs(&app), ["abc", "", "d"]);
+    }
+
+    #[test]
+    fn shift_enter_is_content_and_enter_structure_855() {
+        use protection::MutationKind;
+        let kind = |m: KeyModifiers| App::body_key_mutation_kind(&KeyEvent::new(KeyCode::Enter, m));
+        assert_eq!(kind(KeyModifiers::SHIFT), Some(MutationKind::Content));
+        assert_eq!(kind(KeyModifiers::NONE), Some(MutationKind::Structure));
+        assert_eq!(
+            kind(KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            Some(MutationKind::Structure)
+        );
+        assert_eq!(
+            kind(KeyModifiers::ALT | KeyModifiers::SHIFT),
+            Some(MutationKind::Structure)
+        );
+
+        let mut app = app_with(&["abcd"]);
+        app.editor.move_end();
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+        app.on_key(shift(KeyCode::Enter));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(body_paragraphs(&app), ["abcd"]);
+        assert!(!app.modified);
     }
 
     #[test]
