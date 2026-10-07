@@ -111,3 +111,29 @@ test the Help tab fits its ribbon on every kind
   call ribbon-layout {}
   assert reply.any_clipped_v is false
   assert reply.any_clipped_h is false
+
+test F1 leaves an open entry alone, and a find bar elsewhere does not stop it
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Help","command":"Feedback"}
+  key f2
+  key f1
+  call status-read {}
+  assert reply.items.0.text is not Help: the documentation is coming soon
+  key escape
+  call ribbon-click {"tab":"Home","command":"Row Height"}
+  key f1
+  call status-read {}
+  assert reply.items.0.text is not Help: the documentation is coming soon
+  key escape
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Help","command":"Feedback"}
+  key ctrl+f
+  key f1
+  call status-read {}
+  assert reply.items.0.text is not Help: the documentation is coming soon
+  # The document's find bar stays open, but a Project draws none.
+  open ../fixtures/gantt-summary.xml
+  key f1
+  call status-read {}
+  assert reply.items.2.id is message
+  assert reply.items.2.text is Help: the documentation is coming soon

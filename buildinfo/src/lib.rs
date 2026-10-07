@@ -268,7 +268,8 @@ impl BuildInfo {
     /// rows without `host` (the machine's name has no place in a public issue),
     /// and the URL stays within [`FEEDBACK_URL_MAX`] bytes, the most the editors'
     /// `safe_url` opens: the last PR's title is shortened first, then rows are
-    /// dropped from the end.
+    /// dropped from the end, and when the title line alone is too long the
+    /// page comes with no body.
     pub fn feedback_url(&self, product: &str) -> String {
         let mut b = self.clone();
         let title: Vec<char> = b
@@ -296,8 +297,11 @@ impl BuildInfo {
             }
             if keep > 0 {
                 keep -= 1;
-            } else {
+            } else if drop < self.rows().len() {
                 drop += 1;
+            } else {
+                // Even the title line is too long: the page with no body.
+                return FEEDBACK_NEW_ISSUE.to_string();
             }
         }
     }
@@ -576,6 +580,12 @@ mod tests {
             text.ends_with("kind:        local\nmanual build\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn feedback_url_without_room_for_the_title_line_has_no_body() {
+        let b = BuildInfo::from_raw(&raw("local", false), "0.5.0");
+        assert_eq!(b.feedback_url(&"p".repeat(2048)), FEEDBACK_NEW_ISSUE);
     }
 
     #[test]

@@ -13972,6 +13972,25 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Whether a text entry the active surface draws takes the keyboard: the
+    /// find or comment bar where it is shown, a Project entry, or a sheet's
+    /// cell, rename, comment, range, rule or row-height entry. F1 leaves these
+    /// alone (#1021).
+    fn entry_owns_keys(&self) -> bool {
+        let doc = self.active_is_doc();
+        let sheet = self.active_is_sheet();
+        (self.find_open && (doc || sheet))
+            || (self.comment_open && doc)
+            || self.project_edit_open()
+            || (sheet
+                && (self.sheet_rename.is_some()
+                    || self.sheet_comment_edit.is_some()
+                    || self.range_edit.is_some()
+                    || self.sheet_cf_edit.is_some()
+                    || self.sheet_rowh_edit.is_some()
+                    || self.active_sheet().is_some_and(|v| v.editing.is_some())))
+    }
+
     fn active_is_doc(&self) -> bool {
         matches!(
             self.tabs.get(self.active).map(|t| &t.surface),
@@ -20613,14 +20632,9 @@ impl Docxy {
         if let Some(done) = self.document_key(ev, window, cx) {
             return done;
         }
-        // F1 is Help › Help on every surface (#1021), unless a find, comment,
-        // cell or Project entry owns the keyboard.
-        if help_tab::is_help_key(&ev.keystroke)
-            && !self.find_open
-            && !self.comment_open
-            && !self.project_edit_open()
-            && !self.active_sheet().is_some_and(|v| v.editing.is_some())
-        {
+        // F1 is Help › Help on every surface (#1021), unless an entry owns
+        // the keyboard.
+        if help_tab::is_help_key(&ev.keystroke) && !self.entry_owns_keys() {
             self.keytips = KeyTip::Off;
             return self.dispatch(Act::Help(help_tab::HelpAct::Help), window, cx);
         }
@@ -27661,6 +27675,10 @@ impl Docxy {
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Help's placeholders (#1021) draw dim and take no click, as the
+        // document ribbon draws a disabled command.
+        let enabled = !matches!(act, SheetAct::Help(a) if !help_tab::help_enabled(a));
+        let ink = if enabled { pal.fg } else { pal.dim };
         div()
             .id(ElementId::Name(format!("srb-{label}").into()))
             .flex()
@@ -27669,11 +27687,14 @@ impl Docxy {
             .px_1()
             .h(px(20.))
             .rounded(px(3.))
-            .cursor_pointer()
-            .hover(|d| d.bg(pal.hover))
-            .when_some(icon, |d, ic| d.child(icon_svg(ic, 14., pal.fg)))
-            .child(div().text_size(px(11.)).text_color(pal.fg).child(label))
-            .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)))
+            .when(enabled, |d| d.cursor_pointer().hover(|d| d.bg(pal.hover)))
+            .when_some(icon, |d, ic| d.child(icon_svg(ic, 14., ink)))
+            .child(div().text_size(px(11.)).text_color(ink).child(label))
+            .when(enabled, |d| {
+                d.on_click(
+                    cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)),
+                )
+            })
             .into_any_element()
     }
 

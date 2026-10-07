@@ -8909,14 +8909,22 @@ impl backstage::BackstageHost for App {
                 "  Build       {}",
                 buildinfo::get(env!("CARGO_PKG_VERSION")).short_line()
             )),
-            RLine::raw(String::new()),
-            RLine::raw(format!(
-                "  Sheets      {} ({})",
-                sheets.len(),
-                sheets.join(", ")
-            )),
-            RLine::raw(format!("  Comments    {}", self.comments.len())),
         ];
+        // Help › About lands here (#1021): every build field, before the
+        // workbook's own lines so it shows on an 80x24 terminal (the page does
+        // not scroll).
+        lines.push(RLine::raw(String::new()));
+        lines.push(RLine::raw("  About xlsxy".to_string()));
+        for l in buildinfo::get(env!("CARGO_PKG_VERSION")).about_lines() {
+            lines.push(RLine::raw(format!("    {l}")));
+        }
+        lines.push(RLine::raw(String::new()));
+        lines.push(RLine::raw(format!(
+            "  Sheets      {} ({})",
+            sheets.len(),
+            sheets.join(", ")
+        )));
+        lines.push(RLine::raw(format!("  Comments    {}", self.comments.len())));
         let p = self.pkg.doc_properties();
         let row = |label: &str, value: &Option<String>| {
             RLine::raw(format!("  {label:<18}{}", value.as_deref().unwrap_or("")))
@@ -8933,12 +8941,6 @@ impl backstage::BackstageHost for App {
                 c.name,
                 c.value.display()
             )));
-        }
-        // Help › About lands here (#1021): every build field.
-        lines.push(RLine::raw(String::new()));
-        lines.push(RLine::raw("  About xlsxy".to_string()));
-        for l in buildinfo::get(env!("CARGO_PKG_VERSION")).about_lines() {
-            lines.push(RLine::raw(format!("    {l}")));
         }
         lines
     }
@@ -11250,6 +11252,21 @@ fn safe_url(url: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
+/// Every line of an 80x24 frame drawn by `draw`, for the About checks (#1021).
+#[cfg(test)]
+fn screen_80x24(draw: impl FnOnce(&mut Frame)) -> Vec<String> {
+    let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(draw).unwrap();
+    let buf = term.backend().buffer();
+    (0..24)
+        .map(|y| {
+            (0..80)
+                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
+                .collect()
+        })
+        .collect()
+}
+
 /// What Help › Help says until the documentation lands (#1021).
 const HELP_COMING: &str = "Help: the documentation is coming soon";
 
@@ -11485,6 +11502,14 @@ mod tests {
         app.ribbon_act(ribbon::Act::About);
         let bs = app.backstage.as_ref().expect("About opens File");
         assert_eq!(bs.item, backstage::Item::Info);
+        // The last build row is on screen at 80x24, above the properties.
+        let screen = screen_80x24(|f| draw(&mut app, f));
+        assert!(
+            screen.iter().any(|l| l.contains("About xlsxy")),
+            "{screen:#?}"
+        );
+        let kind = format!("kind        {}", b.kind.as_str());
+        assert!(screen.iter().any(|l| l.contains(&kind)), "{screen:#?}");
         let url = feedback_url();
         assert!(safe_url(&url), "{url}");
         assert!(url.starts_with("https://github.com/yeroo/docxy/issues/new?body=xlsxy%20"));

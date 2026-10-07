@@ -712,8 +712,8 @@ Predecessors in cells use **displayed IDs** (a cross-project link shows its
 external reference). Ctrl+F
 opens Find; F3 repeats and reveals the selected row. Ctrl+Z/Y undo/redo, Ctrl+S
 saves, and Ctrl+E exports Markdown. Use `open copy:` before save/export. Project
-ribbon KeyTips are File/Task/Resource/Report/Project/View = F/T/U/R/P/W after
-Alt or F10.
+ribbon KeyTips are File/Task/Resource/Report/Project/View/Help = F/T/U/R/P/W/Y
+after Alt or F10.
 
 An open cell editor owns input before prompts and KeyTips. Enter commits and
 moves down, Shift+Enter commits and moves up, Up/Down commit and move one row

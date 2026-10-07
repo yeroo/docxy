@@ -7673,13 +7673,17 @@ impl backstage::BackstageHost for App {
                 "  Build       {}",
                 buildinfo::get(env!("CARGO_PKG_VERSION")).short_line()
             )),
+        ]
+        .into_iter()
+        // Before the document's own lines, so Help › About shows every build
+        // row on an 80x24 terminal (the page does not scroll).
+        .chain(about_lines())
+        .chain([
             RLine::raw(String::new()),
             RLine::raw(format!("  Paragraphs  {paras}")),
             RLine::raw(format!("  Words       {words}")),
             RLine::raw(format!("  Characters  {chars}")),
-        ]
-        .into_iter()
-        .chain(about_lines())
+        ])
         .collect()
     }
 
@@ -8016,6 +8020,21 @@ fn about_lines() -> Vec<RLine<'static>> {
                 .into_iter()
                 .map(|l| RLine::raw(format!("    {l}"))),
         )
+        .collect()
+}
+
+/// Every line of an 80x24 frame drawn by `draw`, for the About checks (#1021).
+#[cfg(test)]
+fn screen_80x24(draw: impl FnOnce(&mut Frame)) -> Vec<String> {
+    let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(draw).unwrap();
+    let buf = term.backend().buffer();
+    (0..24)
+        .map(|y| {
+            (0..80)
+                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
+                .collect()
+        })
         .collect()
 }
 
@@ -10049,6 +10068,16 @@ mod tests {
         app.run_act(ribbon::Act::About);
         let bs = app.backstage.as_ref().expect("About opens File");
         assert_eq!(bs.item, backstage::Item::Info);
+        // The last build row is on screen at 80x24, under a long document.
+        let mut app = app_with(&["para"; 40]);
+        app.run_act(ribbon::Act::About);
+        let screen = screen_80x24(|f| app.draw(f));
+        assert!(
+            screen.iter().any(|l| l.contains("About docxy")),
+            "{screen:#?}"
+        );
+        let kind = format!("kind        {}", b.kind.as_str());
+        assert!(screen.iter().any(|l| l.contains(&kind)), "{screen:#?}");
         let url = feedback_url();
         assert!(safe_url(&url), "{url}");
         assert!(url.starts_with("https://github.com/yeroo/docxy/issues/new?body=docxy%20"));

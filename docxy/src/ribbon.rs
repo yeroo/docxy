@@ -10,7 +10,7 @@ use ribboncore::{Ribbon as CoreRibbon, Seg};
 pub use ribboncore::{Dir, EXPANDED_H, Focus, Hit};
 
 /// A ribbon command. Most map to an existing editor op; `Todo` ones are drawn
-/// dimmed and only report "not implemented yet" until wired up.
+/// like the rest and only report "not implemented yet" until wired up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Act {
     Cut,
@@ -681,10 +681,8 @@ fn review_groups() -> Vec<Group> {
     ]
 }
 
-/// The View tab's groups (Views / Page / Show / Ribbon / Edit, plus a contextual
-/// Markdown group when a `.md` file is open).
 /// The Help tab every editor ends with (#1021): Show Training and What's New
-/// have nothing to show yet, so they are drawn dimmed.
+/// have nothing to show yet, so they are `Todo` and say so on the status line.
 fn help_groups() -> Vec<Group> {
     use Act::*;
     vec![
@@ -742,6 +740,8 @@ fn help_groups() -> Vec<Group> {
     ]
 }
 
+/// The View tab's groups (Views / Page / Show / Ribbon / Edit, plus a contextual
+/// Markdown group when a `.md` file is open).
 fn view_groups(markdown: bool) -> Vec<Group> {
     use Act::*;
     let mut groups = vec![

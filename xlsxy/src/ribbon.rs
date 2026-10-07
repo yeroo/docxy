@@ -9,8 +9,8 @@ use unicode_width::UnicodeWidthStr;
 
 pub use ribboncore::{Dir, EXPANDED_H, Focus, Hit};
 
-/// A ribbon command. `Todo` entries are drawn dimmed and only report
-/// "not implemented yet" until wired up.
+/// A ribbon command. `Todo` entries are drawn like the rest and only report
+/// "not implemented yet" on the status line until wired up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Act {
     Cut,
@@ -550,7 +550,7 @@ fn review_groups() -> Vec<Group> {
 }
 
 /// The Help tab every editor ends with (#1021): Show Training and What's New
-/// have nothing to show yet, so they are drawn dimmed.
+/// have nothing to show yet, so they are `Todo` and say so on the status line.
 fn help_groups() -> Vec<Group> {
     use Act::*;
     vec![
