@@ -734,7 +734,7 @@ cancels the prompt. The `project-cells`, `project-invalid`, `project-ribbon`, an
 `ribbon-kinds` cases exercise these routes, including Word/Sheet strip switching.
 
 `assert cell is Duration` checks the Project column state, while
-`assert cell D2 is 3d` reads the value displayed at that entry-table cell.
+`assert cell D2 is 3 days` reads the value displayed at that entry-table cell.
 Project A1 references use **drawn** row positions and columns A through H (ID,
 Task Mode, Name, Duration, Start, Finish, Predecessors, Resource Names), rather
 than task IDs. A collapsed summary's subtasks are not drawn, so they take no row:

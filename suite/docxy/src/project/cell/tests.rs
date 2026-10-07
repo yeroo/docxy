@@ -147,6 +147,48 @@ fn start_cell_edit_and_copy_stay_iso() {
 }
 
 #[test]
+fn an_unscheduled_tasks_date_copies_empty_and_pastes_without_cancelling() {
+    // #578 review: an external task with no dates shows `NA` but reopens and
+    // copies empty — `parse_cell_date` rejects `NA`, and a copied `NA` would
+    // cancel a whole range paste; an empty date field is skipped.
+    let mut p = v(&tab()).ed.project().clone();
+    p.tasks[2].external_task = Some(true);
+    let mut t = project_tab(
+        "test.yppx".into(),
+        None,
+        Surface::Project(ProjectView::new(p, false)),
+        false,
+        "loaded".into(),
+    );
+    let task = v(&t).ed.project().task(30).unwrap().clone();
+    assert_eq!(project_row(&v(&t).ed, &task)[COL_START], "NA");
+    assert_eq!(cell_edit_text(&v(&t).ed, &task, COL_START), "");
+    assert_eq!(cell_edit_text(&v(&t).ed, &task, COL_FINISH), "");
+    // A range copy carries the empty date; pasting applies the dates that
+    // exist and skips the empty one instead of cancelling.
+    vm(&mut t).ed.select(2);
+    vm(&mut t).col = COL_START;
+    vm(&mut t).anchor = None;
+    shift_key(&mut t, "up");
+    shift_key(&mut t, "up");
+    let copied = clip::project_copy_text(v(&t));
+    assert_eq!(copied, "2026-01-05\n2026-01-05\n\n");
+    apply_cell(&mut vm(&mut t).ed, 20, COL_START, "2026-01-08").unwrap();
+    clip::paste_project_text(&mut t, &copied);
+    assert_eq!(v(&t).ed.project().tasks.len(), 3, "no row was added");
+    assert!(
+        !t.status.contains("valid date"),
+        "the paste was not cancelled: {}",
+        t.status
+    );
+    assert_eq!(
+        v(&t).ed.disp_start(20).unwrap().day_number(),
+        DateTime::from_ymd_hm(2026, 1, 5, 0, 0).day_number(),
+        "the copied ISO date applied"
+    );
+}
+
+#[test]
 fn a_duration_shows_reopens_and_commits_in_its_own_unit() {
     let mut t = tab();
     let format = |t: &DocTab| v(t).ed.project().task(10).unwrap().duration_format;

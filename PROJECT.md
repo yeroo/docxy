@@ -313,8 +313,9 @@ the subtasks' rolled-up span as a thin bar above its own, the part past its
 finish in a warning colour (yppxy marks those days `╍`), else its own finish
 day (an overrun within that day, or a finish past its manual parent).
 
-Durations show Project's `?` for an estimated task (`1d?`, `2.5d?`), in the
-suite, yppxy and projctl's task JSON (`estimated`). Typing a duration with a
+Durations show Project's `?` for an estimated task (`1 day?`, `2.5 days?`,
+in the suite, yppxy and projctl's task JSON (`estimated`); the cell reopens
+and copies as typed, `1d?`). Typing a duration with a
 trailing `?` marks it estimated; typing it without `?` commits the estimate,
 even at the same duration (`1d` over `1d?`), as one undo step. A task never
 marked estimated stays unmarked. A summary shows `?` when any task below it is

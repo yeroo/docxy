@@ -36,8 +36,8 @@
 //! that reply with a task (`task.set`, `task.add`, `link.add`, `link.del`)
 //! take it too, and check it before they edit anything. Each task
 //! then carries `fields: {"<name as asked>": {text, value}}`: `text` as the
-//! sheet shows it (`1 day`, `4 hrs`, `$1,400.00`, `NA`; the Entry columns in
-//! the grid's own spellings, `2d`), `value` underneath: dates
+//! sheet shows it (`1 day`, `4 hrs`, `$1,400.00`, `Mon 3/2/26`, `NA`),
+//! `value` underneath: dates
 //! `YYYY-MM-DD HH:MM`, durations, work and slack signed minutes, money a
 //! number, percents integers, flags booleans, enums and text strings, and
 //! `null` for an absent stored value or a date that shows `NA`. An unknown

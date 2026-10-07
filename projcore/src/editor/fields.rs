@@ -852,7 +852,9 @@ fn format_money(units: f64) -> String {
     }
 }
 
-/// A date as the grid shows it, `YYYY-MM-DD`, or `NA` when unset.
+/// A date as strict ISO `YYYY-MM-DD`, or `NA` when unset: the edit and copy
+/// text of a date cell (`parse_cell_date` accepts nothing else) and the form
+/// status messages and the project range line spell a date in.
 pub fn format_date_field(dt: Option<DateTime>) -> String {
     dt.map_or_else(
         || "NA".into(),
