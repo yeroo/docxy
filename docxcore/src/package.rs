@@ -1038,24 +1038,56 @@ impl Package {
         self.sect_pr = xml;
     }
 
+    /// Keep the parts whose name `keep` accepts, and always the main document
+    /// part, still found at `doc_index` when a part listed before it goes
+    /// (#1107): the last entry of that name, as [`load_package`] picks it.
+    fn retain_parts(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        let doc_name = self.parts[self.doc_index].0.clone();
+        self.parts.retain(|(n, _)| *n == doc_name || keep(n));
+        self.doc_index = self
+            .parts
+            .iter()
+            .rposition(|(n, _)| *n == doc_name)
+            .expect("the main document part is kept");
+    }
+
     /// The final section as split section properties: the document's own
     /// trailing sectPr, else the captured one (an empty
     /// `<w:sectPr></w:sectPr>` when the package has none).
     pub fn final_section(&self) -> SectionProperties {
-        if let Some(section) = self.document.trailing_section_properties() {
-            return section.clone();
+        final_section_of(&self.document, &self.sect_pr)
+    }
+
+    /// The body the stored main document part encodes, parsed as
+    /// [`load_package`] parses it and ending in its [`Package::final_section`]:
+    /// what a fresh load of this package shows. Unlike [`Package::document`]
+    /// (which [`Package::set_sect_pr`] and others change), only rewriting the
+    /// part changes it, so a body equal to it can keep the part's bytes
+    /// (#1107). `None` when the part is not UTF-8.
+    pub fn stored_document(&self) -> Option<Document> {
+        let (mut document, sect_pr) = parse_main_document(&self.parts, self.doc_index).ok()?;
+        if document.trailing_section_properties().is_none() {
+            let section = final_section_of(&document, &sect_pr);
+            document.set_trailing_section_properties(section);
         }
-        let xml = if self.sect_pr.trim().is_empty() {
-            "<w:sectPr></w:sectPr>"
-        } else {
-            &self.sect_pr
+        Some(document)
+    }
+
+    /// Whether `doc` is the body the stored main document part encodes
+    /// ([`Package::stored_document`]), so a save may keep the part's bytes
+    /// ([`save_package_keeping_document`]). A merge preview's record in the
+    /// merge fields is display only, never written, so it is not a change.
+    pub fn stores_document(&self, doc: &Document) -> bool {
+        let Some(mut stored) = self.stored_document() else {
+            return false;
         };
-        let (raw, property_change) =
-            crate::load::split_property_change_container(xml, PropertyScope::Section);
-        SectionProperties {
-            raw,
-            property_change,
+        if stored == *doc {
+            return true;
         }
+        let mut doc = doc.clone();
+        crate::merge::preview::apply_preview(&mut doc, None);
+        crate::merge::preview::apply_preview(&mut stored, None);
+        stored == doc
     }
 
     /// Replace the trailing section properties with an already-split section
@@ -1711,7 +1743,7 @@ impl Package {
 
         self.parts.push((part_name.clone(), bytes));
         if let (Some(rels), Some(name)) = (own_rels, part_rels_name(&part_name)) {
-            self.parts.retain(|(n, _)| *n != name);
+            self.retain_parts(|n| n != name);
             self.parts.push((name, rels));
         }
 
@@ -2683,7 +2715,7 @@ impl Package {
         if self.part("word/comments.xml").is_none() || !self.comment_ids().is_empty() {
             return;
         }
-        self.parts.retain(|(n, _)| !PARTS.contains(&n.as_str()));
+        self.retain_parts(|n| !PARTS.contains(&n));
         if let Some(ct) = self.part_text("[Content_Types].xml") {
             let out = remove_tags_matching(&ct, "Override", |tag| {
                 PARTS
@@ -3397,7 +3429,23 @@ pub fn load_package(data: &[u8]) -> Result<Package, LoadError> {
         parts.push((e.name.clone(), bytes));
     }
     let doc_index = doc_index.ok_or(LoadError::MissingDocument)?;
+    let (document, sect_pr) = parse_main_document(&parts, doc_index)?;
 
+    Ok(Package {
+        parts,
+        doc_index,
+        sect_pr,
+        document,
+    })
+}
+
+/// The document and final `w:sectPr` that `parts[doc_index]` encodes, with
+/// the relationships (and the diagram, equation and chart data they lead to)
+/// its parse needs.
+fn parse_main_document(
+    parts: &[(String, Vec<u8>)],
+    doc_index: usize,
+) -> Result<(Document, String), LoadError> {
     let doc_xml = std::str::from_utf8(&parts[doc_index].1).map_err(|_| LoadError::NotUtf8)?;
     let read_part = |name: &str| {
         parts
@@ -3427,13 +3475,7 @@ pub fn load_package(data: &[u8]) -> Result<Package, LoadError> {
     }
     let document = parse_document_xml(doc_xml, &rels);
     let sect_pr = extract_sectpr(doc_xml);
-
-    Ok(Package {
-        parts,
-        doc_index,
-        sect_pr,
-        document,
-    })
+    Ok((document, sect_pr))
 }
 
 /// Build a new package around a document, with a minimal valid OPC part set.
@@ -3562,6 +3604,24 @@ fn markdown_styles_xml() -> String {
     )
 }
 
+/// [`Package::final_section`] of a document and its captured `w:sectPr`.
+fn final_section_of(document: &Document, sect_pr: &str) -> SectionProperties {
+    if let Some(section) = document.trailing_section_properties() {
+        return section.clone();
+    }
+    let xml = if sect_pr.trim().is_empty() {
+        "<w:sectPr></w:sectPr>"
+    } else {
+        sect_pr
+    };
+    let (raw, property_change) =
+        crate::load::split_property_change_container(xml, PropertyScope::Section);
+    SectionProperties {
+        raw,
+        property_change,
+    }
+}
+
 /// Serialize the package back to `.docx` bytes (STORED ZIP).
 pub fn save_package(pkg: &Package) -> Vec<u8> {
     // External hyperlinks need a relationship (`r:id` → `.rels` Target) or their
@@ -3656,6 +3716,17 @@ fn document_prolog(original: &str) -> Option<&str> {
 /// byte intact while the container itself may be rewritten.
 pub fn save_package_preserving_document(pkg: &Package) -> Vec<u8> {
     write_zip(&pkg.parts)
+}
+
+/// [`save_package_preserving_document`] for a package whose other parts may
+/// have been edited (a header or footer, say) while its body still is the
+/// stored one ([`Package::stores_document`]): the main document part keeps
+/// its bytes, and as in [`save_package`] the styles part gains the table
+/// styles the body and the other stories reference (#1107).
+pub fn save_package_keeping_document(pkg: &Package) -> Vec<u8> {
+    let mut parts = pkg.parts.clone();
+    add_referenced_table_styles(&mut parts, &pkg.document);
+    write_zip(&parts)
 }
 
 /// Merge the original `<w:document …>` attributes with every declaration the
@@ -5817,6 +5888,31 @@ mod tests {
     }
 
     #[test]
+    fn stored_document_follows_the_part_not_the_live_document_1107() {
+        let source = new_package(crate::markdown::from_markdown("Hello"));
+        let mut pkg = load_package(&save_package(&source)).unwrap();
+        // What a fresh load shows: the body with its final section.
+        let mut loaded = pkg.document.clone();
+        if loaded.trailing_section_properties().is_none() {
+            loaded.set_trailing_section_properties(pkg.final_section());
+        }
+        assert_eq!(pkg.stored_document().as_ref(), Some(&loaded));
+        // A section edit changes the live document, not the stored part.
+        pkg.set_sect_pr("<w:sectPr><w:cols w:num=\"2\"/></w:sectPr>".into());
+        assert_ne!(pkg.document, loaded);
+        assert_eq!(pkg.stored_document().as_ref(), Some(&loaded));
+        // Saving rewrites the part, and a fresh load of it agrees.
+        let saved = load_package(&save_package(&pkg)).unwrap();
+        let stored = saved.stored_document().unwrap();
+        assert!(stored.plain_text().starts_with("Hello"));
+        assert!(
+            stored
+                .trailing_section_properties()
+                .is_some_and(|s| s.raw.contains("w:num=\"2\""))
+        );
+    }
+
+    #[test]
     fn new_package_keeps_repeating_section_namespaces_on_save() {
         use crate::model::{Table, TableRowBoundary};
 
@@ -6977,6 +7073,80 @@ mod tests {
         let rels = p.part_text("word/_rels/document.xml.rels").unwrap();
         assert!(!rels.contains("comments"), "{rels}");
         assert!(crate::comments::parse_comments(&p).is_empty());
+    }
+
+    /// A comments part listed before the document part: dropping it must
+    /// not leave `doc_index` on the part after the document (#1107).
+    #[test]
+    fn dropping_comment_parts_listed_before_the_document_keeps_it_1107() {
+        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let parts = vec![
+            (
+                "[Content_Types].xml".to_string(),
+                br#"<?xml version="1.0"?><Types/>"#.to_vec(),
+            ),
+            (
+                "word/comments.xml".to_string(),
+                format!("<w:comments xmlns:w=\"{W_NS}\"></w:comments>").into_bytes(),
+            ),
+            (
+                "word/document.xml".to_string(),
+                format!(
+                    "<w:document xmlns:w=\"{W_NS}\"><w:body><w:p><w:r><w:t>Hi</w:t></w:r></w:p></w:body></w:document>"
+                )
+                .into_bytes(),
+            ),
+            (
+                "word/_rels/document.xml.rels".to_string(),
+                br#"<?xml version="1.0"?><Relationships/>"#.to_vec(),
+            ),
+        ];
+        let mut p = load_package(&write_zip(&parts)).unwrap();
+        p.drop_empty_comment_parts();
+        assert!(p.part("word/comments.xml").is_none());
+        p.document
+            .body
+            .push(Block::Paragraph(crate::model::Paragraph::default()));
+        let saved = load_package(&save_package(&p)).unwrap();
+        assert!(saved.document.plain_text().starts_with("Hi"));
+        assert_eq!(saved.document.body.len(), 2);
+        let rels = saved.part_text("word/_rels/document.xml.rels").unwrap();
+        assert!(rels.contains("Relationships"), "{rels}");
+    }
+
+    /// Two document entries (a malformed ZIP): the load and the save after
+    /// dropping parts both take the last one, so an edit is not written to
+    /// the entry a reload ignores (#1107).
+    #[test]
+    fn dropping_parts_keeps_the_last_of_two_document_entries_1107() {
+        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let document = |text: &str| {
+            format!(
+                "<w:document xmlns:w=\"{W_NS}\"><w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"
+            )
+            .into_bytes()
+        };
+        let parts = vec![
+            (
+                "[Content_Types].xml".to_string(),
+                br#"<?xml version="1.0"?><Types/>"#.to_vec(),
+            ),
+            ("word/document.xml".to_string(), document("Stale")),
+            (
+                "word/comments.xml".to_string(),
+                format!("<w:comments xmlns:w=\"{W_NS}\"></w:comments>").into_bytes(),
+            ),
+            ("word/document.xml".to_string(), document("Hi")),
+        ];
+        let mut p = load_package(&write_zip(&parts)).unwrap();
+        assert!(p.document.plain_text().starts_with("Hi"));
+        p.drop_empty_comment_parts();
+        p.document
+            .body
+            .push(Block::Paragraph(crate::model::Paragraph::default()));
+        let saved = load_package(&save_package(&p)).unwrap();
+        assert!(saved.document.plain_text().starts_with("Hi"));
+        assert_eq!(saved.document.body.len(), 2);
     }
 
     // ---- Track Changes setting (#624) --------------------------------------

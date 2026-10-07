@@ -263,6 +263,24 @@ mod tests {
         assert_eq!(plain, previewed);
     }
 
+    /// A previewed body is still the stored one: the record is display only
+    /// (#1107). An edit is not.
+    #[test]
+    fn a_previewed_body_is_still_the_stored_one_1107() {
+        use crate::package::{load_package, new_package, save_package};
+        let pkg = load_package(&save_package(&new_package(letter()))).unwrap();
+        let mut doc = pkg.stored_document().unwrap();
+        apply_preview(&mut doc, Some(&preview(0)));
+        assert_eq!(shown(&doc), "Hi Jane Acme!\n");
+        assert_ne!(pkg.stored_document().as_ref(), Some(&doc));
+        assert!(pkg.stores_document(&doc));
+        let Block::Paragraph(p) = &mut doc.body[0] else {
+            panic!()
+        };
+        p.content.push(run(" edited"));
+        assert!(!pkg.stores_document(&doc));
+    }
+
     #[test]
     fn next_moves_to_the_next_included_record() {
         let p = RunProps::default();

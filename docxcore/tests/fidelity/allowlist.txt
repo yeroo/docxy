@@ -25,3 +25,4 @@ extra-attr | word/document.xml | */@mc:Ignorable | * | Preserved raw subtrees (t
 part-extra | word/styles.xml | * | * | save_package adds a styles part defining the table styles the body references when the package has none (add_referenced_table_styles).
 extra-element | [Content_Types].xml | /Types/Override | ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml" PartName="/word/styles.xml" | once-with part-extra word/styles.xml | The content-type override for that added styles part: only in a file where the part was added, and only once.
 extra-element | word/document.xml | */w:tbl/w:tblGrid |  | CT_Tbl requires tblGrid, so the serializer writes one for a table that had none (#1083). The schema check rejects a second one.
+extra-element | word/document.xml | */w:tbl/w:tblPr |  | CT_Tbl requires tblPr, so the serializer writes an empty one for a table that had none (#1107). The schema check rejects a second one.

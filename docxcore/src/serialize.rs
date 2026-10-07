@@ -1435,7 +1435,8 @@ fn write_table(s: &mut String, t: &Table) {
         s.push('"');
     }
     s.push('>');
-    // tblPr is the first tbl child; preserved verbatim when present.
+    // tblPr is the first tbl child; preserved verbatim when present. CT_Tbl
+    // requires it, so a table without properties gets an empty one (#1107).
     if let Some(raw) = &t.raw_tblpr {
         s.push_str(&with_property_change(
             raw,
@@ -1444,6 +1445,8 @@ fn write_table(s: &mut String, t: &Table) {
         ));
     } else if let Some(change) = &t.property_change {
         s.push_str(&format!("<w:tblPr>{}</w:tblPr>", change.raw));
+    } else {
+        s.push_str("<w:tblPr></w:tblPr>");
     }
     // CT_Tbl requires tblGrid, even with no columns (#1083).
     s.push_str("<w:tblGrid>");
@@ -2795,7 +2798,7 @@ mod tests {
         let parsed = parse_document_xml(partial_open, &Relationships::default());
         let saved = document_to_xml(&parsed);
         assert!(saved.contains(
-            "<w:tbl><w:tblGrid></w:tblGrid><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"
+            "<w:tbl><w:tblPr></w:tblPr><w:tblGrid></w:tblGrid><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"
         ));
         assert!(!saved.contains("<w:sdtPr<"));
 
@@ -2803,7 +2806,7 @@ mod tests {
         let parsed = parse_document_xml(mismatched_open, &Relationships::default());
         let saved = document_to_xml(&parsed);
         assert!(saved.contains(
-            "<w:tbl><w:tblGrid></w:tblGrid><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"
+            "<w:tbl><w:tblPr></w:tblPr><w:tblGrid></w:tblGrid><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"
         ));
         assert!(!saved.contains("<w:sdtPr></w:future>"));
 
@@ -2811,7 +2814,7 @@ mod tests {
         let parsed = parse_document_xml(&mismatched_closed, &Relationships::default());
         let saved = document_to_xml(&parsed);
         assert!(saved.contains(
-            "<w:tbl><w:tblGrid></w:tblGrid><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"
+            "<w:tbl><w:tblPr></w:tblPr><w:tblGrid></w:tblGrid><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"
         ));
         assert!(!saved.contains("<w:sdtPr></w:future>"));
 
@@ -2853,6 +2856,49 @@ mod tests {
     }
 
     #[test]
+    fn a_table_without_properties_gets_an_empty_tblpr_1107() {
+        // CT_Tbl requires tblPr as the first child; a loaded table without
+        // one used to be written with tblGrid first.
+        let source = table_xml(&format!("<w:tblGrid/>{}", row_xml("cell")));
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        let Block::Table(table) = &parsed.body[0] else {
+            panic!("expected table");
+        };
+        assert!(table.raw_tblpr.is_none());
+        let saved = document_to_xml(&parsed);
+        assert!(
+            saved.contains("<w:tbl><w:tblPr></w:tblPr><w:tblGrid></w:tblGrid><w:tr>"),
+            "{saved}"
+        );
+        assert_eq!(
+            parse_document_xml(&saved, &Relationships::default()).plain_text(),
+            "cell\n"
+        );
+    }
+
+    #[test]
+    fn emptying_table_properties_keeps_the_tblpr_1107() {
+        // `edit_table_props` drops `raw_tblpr` once the property set is empty.
+        let source = table_xml(&format!(
+            "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/></w:tblPr><w:tblGrid/>{}",
+            row_xml("cell")
+        ));
+        let mut parsed = parse_document_xml(&source, &Relationships::default());
+        let Block::Table(table) = &mut parsed.body[0] else {
+            panic!("expected table");
+        };
+        crate::table::edit_table_props(table, |p| {
+            assert!(p.remove("w:tblW"));
+        });
+        assert!(table.raw_tblpr.is_none());
+        let saved = document_to_xml(&parsed);
+        assert!(
+            saved.contains("<w:tbl><w:tblPr></w:tblPr><w:tblGrid></w:tblGrid><w:tr>"),
+            "{saved}"
+        );
+    }
+
+    #[test]
     fn truncated_unknown_table_children_are_not_emitted_as_raw_xml() {
         let inside_control = format!(
             "<w:document><w:body><w:tbl><w:sdt><w:sdtContent>{}<w:customXml>",
@@ -2870,7 +2916,7 @@ mod tests {
         let table_child = "<w:document><w:body><w:tbl><w:customXml>";
         let saved = document_to_xml(&parse_document_xml(table_child, &Relationships::default()));
         assert!(!saved.contains("<w:customXml>"));
-        assert!(saved.contains("<w:tbl><w:tblGrid></w:tblGrid></w:tbl>"));
+        assert!(saved.contains("<w:tbl><w:tblPr></w:tblPr><w:tblGrid></w:tblGrid></w:tbl>"));
     }
 
     #[test]

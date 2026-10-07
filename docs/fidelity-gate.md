@@ -20,9 +20,11 @@ In docxy, a user who saves **without** editing gets
 gate asserts that path is byte-identical part for part. That check has no
 baseline: any difference fails outright. "The gate reports a loss in X"
 therefore means "X is lost once the user edits anything in the document". It
-does not mean "X is lost by open+save" in docxy. The suite has no preserving
-path: it saves every document through `save_package`, edited or not, so there
-a reported loss is lost by open+save too (#1083).
+does not mean "X is lost by open+save" in docxy. The suite also writes the
+original `word/document.xml` back while the body still equals the stored part
+(`Package::stores_document`, then `save_package_keeping_document`, #1107), so
+there too a reported loss means "lost once the user edits". That save is not
+itself gated (see below).
 
 Every part of the original is compared with its saved counterpart:
 
@@ -370,7 +372,10 @@ cargo test -p gridcore --test fidelity -- --nocapture
   of that, by a subset of the schema. Attribute values, relationship targets
   and the containers it has no model for are not checked.
 - Save paths other than `save_package` and `save_package_preserving_document`:
-  the HTML bundle, Markdown, compare and merge.
+  the HTML bundle, Markdown, compare and merge, and the suite's unedited save
+  `save_package_keeping_document` (#1107). That one is the preserving save
+  plus `save_package`'s table-style pass, so it can add table styles to
+  `styles.xml` and `[Content_Types].xml` where the preserving save does not.
 - For xlsx:
   - other file types (`.xlsm`, `.xltx`, `.xlsb`), and Save As to another type;
   - what xlsxy does around a save, such as recalculation on open and
