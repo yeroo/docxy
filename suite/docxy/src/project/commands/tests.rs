@@ -1521,7 +1521,7 @@ fn add_task_follows_the_plans_day() {
     let task = &v(&t).ed.project().tasks[1];
     assert_eq!(task.name, "New task");
     assert_eq!(task.duration_min, 420);
-    assert_eq!(duration_text(&t, 1), "1d?");
+    assert_eq!(duration_text(&t, 1), "1 day?");
 }
 
 #[test]
@@ -3107,12 +3107,12 @@ fn ctrl_delete_on_duration_resets_it_to_a_new_tasks_day_as_one_undo_step() {
     vm(&mut t).ed.mark_saved();
     vm(&mut t).col = COL_DURATION;
     let before = v(&t).ed.project().clone();
-    assert_eq!(duration_text(&t, 1), "2d");
+    assert_eq!(duration_text(&t, 1), "2 days");
     chord(&mut t, "delete", ctrl());
     let after = v(&t).ed.project().clone();
     assert_eq!(after.tasks.len(), 2);
     assert_eq!(after.tasks[1].duration_min, 480);
-    assert_eq!(duration_text(&t, 1), "1d?");
+    assert_eq!(duration_text(&t, 1), "1 day?");
     assert_eq!(after.tasks[1].name, before.tasks[1].name);
     assert_eq!(after.tasks[0], before.tasks[0]);
     assert_eq!(v(&t).ed.undo_depth(), 1);
@@ -3123,7 +3123,7 @@ fn ctrl_delete_on_duration_resets_it_to_a_new_tasks_day_as_one_undo_step() {
     assert_eq!(v(&t).ed.undo_depth(), 1);
     chord(&mut t, "z", ctrl());
     assert_eq!(v(&t).ed.project(), &before);
-    assert_eq!(duration_text(&t, 1), "2d");
+    assert_eq!(duration_text(&t, 1), "2 days");
 }
 
 #[test]
@@ -3136,10 +3136,10 @@ fn ctrl_delete_on_duration_follows_the_plans_day_and_estimate() {
     vm(&mut t).ed.set_duration(2, "2d?").unwrap();
     vm(&mut t).ed.select(1);
     vm(&mut t).col = COL_DURATION;
-    assert_eq!(duration_text(&t, 1), "2d?");
+    assert_eq!(duration_text(&t, 1), "2 days?");
     chord(&mut t, "delete", ctrl());
     assert_eq!(v(&t).ed.project().tasks[1].duration_min, 420);
-    assert_eq!(duration_text(&t, 1), "1d");
+    assert_eq!(duration_text(&t, 1), "1 day");
 }
 
 #[test]
@@ -3152,7 +3152,7 @@ fn ctrl_delete_on_a_milestones_duration_makes_it_a_one_day_task() {
     let task = &v(&t).ed.project().tasks[1];
     assert_eq!(task.duration_min, 480);
     assert!(!task.milestone);
-    assert_eq!(duration_text(&t, 1), "1d?");
+    assert_eq!(duration_text(&t, 1), "1 day?");
 }
 
 #[test]
@@ -3168,7 +3168,7 @@ fn milestone_toggle_follows_the_plans_day() {
     apply_project_act(&mut t, ProjectAct::Milestone);
     let task = &v(&t).ed.project().tasks[1];
     assert_eq!((task.duration_min, task.milestone), (420, false));
-    assert_eq!(duration_text(&t, 1), "1d");
+    assert_eq!(duration_text(&t, 1), "1 day");
     // A blank row takes the zero-duration branch instead: it becomes a
     // milestone and the plan's day never enters, at 7h as at 8h.
     vm(&mut t).ed.select(1);
@@ -3200,7 +3200,7 @@ fn ctrl_delete_on_a_summarys_duration_refuses_unless_it_is_manual() {
     chord(&mut t, "delete", ctrl());
     assert_eq!(v(&t).ed.disp_duration_min(1), Some(480));
     // A summary takes no estimate.
-    assert_eq!(duration_text(&t, 0), "1d");
+    assert_eq!(duration_text(&t, 0), "1 day");
     assert_eq!(v(&t).ed.undo_depth(), depth + 1);
 }
 

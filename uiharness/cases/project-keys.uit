@@ -32,7 +32,7 @@ test project editing keys and prompts
   assert cell is Duration
   type 3d
   key tab
-  assert cell D2 is 3d
+  assert cell D2 is 3 days
   assert bar_2 is on-track 0-2
   key alt t p
   type 3

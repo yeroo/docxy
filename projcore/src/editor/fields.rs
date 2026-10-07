@@ -3,8 +3,9 @@
 //! same registry, so a column and a field read of it cannot disagree.
 //!
 //! `text` uses Project's US spellings (`1 day`, `4 hrs`, `$1,400.00`,
-//! `($40,000.00)`, `50%`, `Yes`), except for the Entry columns, which keep
-//! the grid's (`2d`, `2026-03-02`). Dates show `YYYY-MM-DD`, `NA` when unset.
+//! `($40,000.00)`, `50%`, `Yes`). Dates show `Mon 3/2/26`, `NA` when unset;
+//! a date cell's edit and copy keep the strict ISO `YYYY-MM-DD` so a pasted
+//! value still parses.
 //!
 //! `value` is [`FieldValue::Null`] only for a date that shows `NA`, for a
 //! custom value that does not parse (its text is the stored text), for a
@@ -650,7 +651,7 @@ fn minutes(min: Option<i64>) -> FieldValue {
 
 fn date(dt: Option<DateTime>) -> FieldRead {
     FieldRead::new(
-        format_date_field(dt),
+        dt.map_or_else(|| "NA".into(), format_project_date),
         dt.map_or(FieldValue::Null, FieldValue::Date),
     )
 }
@@ -694,28 +695,16 @@ fn entry_duration(ed: &Editor, task: &Task) -> FieldRead {
     if task.summary {
         return match ed.disp_duration_min(task.uid) {
             Some(min) => FieldRead::new(
-                grid_days(proj, min) + duration_suffix(proj, task.uid),
+                format_duration_field(proj, min, DurationUnit::DAYS, false)
+                    + duration_suffix(proj, task.uid),
                 FieldValue::Minutes(min),
             ),
             None => FieldRead::new("?", FieldValue::Null),
         };
     }
     let min = FieldValue::Minutes(task.duration_min);
-    let shown = task
-        .duration_unit()
-        .and_then(|unit| proj.format_in_unit(task.duration_min, unit, 1))
-        .unwrap_or_else(|| grid_days(proj, task.duration_min));
+    let shown = format_duration_field(proj, task.duration_min, DurationUnit::of_task(task), false);
     FieldRead::new(shown + duration_suffix(proj, task.uid), min)
-}
-
-/// Days as the grid's Duration column shows them: `2d`, `1.5d`.
-fn grid_days(proj: &Project, min: i64) -> String {
-    let d = proj.minutes_to_days(min);
-    if (d.round() - d).abs() < 1e-9 {
-        format!("{d:.0}d")
-    } else {
-        format!("{d:.1}d")
-    }
 }
 
 /// Start or Finish Variance: working minutes from the Baseline date to the
@@ -866,7 +855,9 @@ fn format_money(units: f64) -> String {
     }
 }
 
-/// A date as the grid shows it, `YYYY-MM-DD`, or `NA` when unset.
+/// A date as strict ISO `YYYY-MM-DD`, or `NA` when unset: the edit and copy
+/// text of a date cell (`parse_cell_date` accepts nothing else) and the form
+/// status messages and the project range line spell a date in.
 pub fn format_date_field(dt: Option<DateTime>) -> String {
     dt.map_or_else(
         || "NA".into(),
@@ -874,6 +865,22 @@ pub fn format_date_field(dt: Option<DateTime>) -> String {
             let p = d.parts();
             format!("{:04}-{:02}-{:02}", p.year, p.month, p.day)
         },
+    )
+}
+
+/// Weekday names, Sunday first, as `DateTime::weekday` numbers them.
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// A date as Project's Entry table shows it: `Mon 3/2/26` — weekday name,
+/// unpadded month and day, two-digit year.
+pub fn format_project_date(dt: DateTime) -> String {
+    let p = dt.parts();
+    format!(
+        "{} {}/{}/{:02}",
+        WEEKDAYS[dt.weekday() as usize],
+        p.month,
+        p.day,
+        p.year.rem_euclid(100)
     )
 }
 

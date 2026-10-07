@@ -2,7 +2,7 @@
 use super::*;
 use projcore::LagUnit;
 use projcore::editor::{
-    DURATION_HINT, duration_suffix, format_duration_exact, parse_cell_date,
+    DURATION_HINT, duration_suffix, format_date_field, format_duration_exact, parse_cell_date,
     parse_task_duration_unit, parse_task_predecessors,
 };
 
@@ -288,9 +288,24 @@ impl ProjectView {
 /// The text a cell edit opens with, which [`apply_cell`] reads back as the
 /// same value: a duration exactly (`2d`, not the rounded `2 days`), in the
 /// task's own unit where that is exact (`1.5w`, `0.5d`) so re-entering it
-/// keeps the unit. Copy writes it too, so a copied cell pastes as it was.
+/// keeps the unit; a Start or Finish date as strict ISO (`2026-01-05`),
+/// which is what the cell shows in `Mon 3/2/26` form but neither
+/// `parse_cell_date` nor a paste accepts — empty when the task has no
+/// scheduled date (`NA` would cancel a pasted range). Copy writes it too,
+/// so a copied cell pastes as it was.
 pub(crate) fn cell_edit_text(ed: &ProjectEditor, task: &Task, col: usize) -> String {
     if col != COL_DURATION {
+        if !task.is_null && matches!(col, COL_START | COL_FINISH) {
+            let shown = if col == COL_START {
+                ed.disp_start(task.uid)
+            } else {
+                ed.disp_finish(task.uid)
+            };
+            // No schedule: seed empty, not `NA` — `parse_cell_date` rejects
+            // `NA`, and a copied `NA` cancels a whole range paste, while an
+            // empty date field is skipped.
+            return shown.map_or_else(String::new, |dt| format_date_field(Some(dt)));
+        }
         return project_row(ed, task)[col].clone();
     }
     // A manual summary's duration is the span it shows.
@@ -307,7 +322,7 @@ pub(crate) fn cell_edit_text(ed: &ProjectEditor, task: &Task, col: usize) -> Str
         // duration shows in days, whatever its format.
         format_duration_exact(min, ed.project(), None)
     } else {
-        // An estimated duration reopens as it shows, `1d?`.
+        // An estimated duration reopens with its `?`, `1d?`.
         format_duration_exact(min, ed.project(), task.duration_unit())
             + duration_suffix(ed.project(), task.uid)
     }

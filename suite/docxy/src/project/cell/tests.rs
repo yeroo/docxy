@@ -120,6 +120,75 @@ fn all_columns_commit_as_one_step_and_undo_restores_schedule() {
 }
 
 #[test]
+fn start_cell_edit_and_copy_stay_iso() {
+    // #578: a Start cell shows Project's `Mon 1/5/26`, but the edit seed and
+    // the copy stay strict ISO (`parse_cell_date` accepts nothing else), and
+    // a pasted copy sets the same date.
+    let mut t = tab();
+    let task = v(&t).ed.project().task(10).unwrap().clone();
+    assert_eq!(project_row(&v(&t).ed, &task)[COL_START], "Mon 1/5/26");
+    assert_eq!(project_row(&v(&t).ed, &task)[COL_FINISH], "Mon 1/5/26");
+    assert_eq!(cell_edit_text(&v(&t).ed, &task, COL_START), "2026-01-05");
+    assert_eq!(cell_edit_text(&v(&t).ed, &task, COL_FINISH), "2026-01-05");
+    vm(&mut t).col = COL_START;
+    let copied = clip::project_copy_text(v(&t));
+    assert_eq!(copied, "2026-01-05");
+    // The ISO copy pastes onto another task's Start as the same date.
+    apply_cell(&mut vm(&mut t).ed, 20, COL_START, "2026-01-08").unwrap();
+    key(&mut t, "down");
+    vm(&mut t).col = COL_START;
+    clip::paste_project_text(&mut t, &copied);
+    assert_eq!(
+        v(&t).ed.disp_start(20).unwrap().day_number(),
+        DateTime::from_ymd_hm(2026, 1, 5, 0, 0).day_number()
+    );
+    let task = v(&t).ed.project().task(20).unwrap().clone();
+    assert_eq!(project_row(&v(&t).ed, &task)[COL_START], "Mon 1/5/26");
+}
+
+#[test]
+fn an_unscheduled_tasks_date_copies_empty_and_pastes_without_cancelling() {
+    // #578 review: an external task with no dates shows `NA` but reopens and
+    // copies empty — `parse_cell_date` rejects `NA`, and a copied `NA` would
+    // cancel a whole range paste; an empty date field is skipped.
+    let mut p = v(&tab()).ed.project().clone();
+    p.tasks[2].external_task = Some(true);
+    let mut t = project_tab(
+        "test.yppx".into(),
+        None,
+        Surface::Project(ProjectView::new(p, false)),
+        false,
+        "loaded".into(),
+    );
+    let task = v(&t).ed.project().task(30).unwrap().clone();
+    assert_eq!(project_row(&v(&t).ed, &task)[COL_START], "NA");
+    assert_eq!(cell_edit_text(&v(&t).ed, &task, COL_START), "");
+    assert_eq!(cell_edit_text(&v(&t).ed, &task, COL_FINISH), "");
+    // A range copy carries the empty date; pasting applies the dates that
+    // exist and skips the empty one instead of cancelling.
+    vm(&mut t).ed.select(2);
+    vm(&mut t).col = COL_START;
+    vm(&mut t).anchor = None;
+    shift_key(&mut t, "up");
+    shift_key(&mut t, "up");
+    let copied = clip::project_copy_text(v(&t));
+    assert_eq!(copied, "2026-01-05\n2026-01-05\n\n");
+    apply_cell(&mut vm(&mut t).ed, 20, COL_START, "2026-01-08").unwrap();
+    clip::paste_project_text(&mut t, &copied);
+    assert_eq!(v(&t).ed.project().tasks.len(), 3, "no row was added");
+    assert!(
+        !t.status.contains("valid date"),
+        "the paste was not cancelled: {}",
+        t.status
+    );
+    assert_eq!(
+        v(&t).ed.disp_start(20).unwrap().day_number(),
+        DateTime::from_ymd_hm(2026, 1, 5, 0, 0).day_number(),
+        "the copied ISO date applied"
+    );
+}
+
+#[test]
 fn a_duration_shows_reopens_and_commits_in_its_own_unit() {
     let mut t = tab();
     let format = |t: &DocTab| v(t).ed.project().task(10).unwrap().duration_format;
@@ -135,14 +204,14 @@ fn a_duration_shows_reopens_and_commits_in_its_own_unit() {
     edit(&mut t, COL_DURATION, "1.5w");
     key(&mut t, "enter");
     assert_eq!(format(&t), Some(9));
-    assert_eq!(shown(&t), ("1.5w".into(), "1.5w".into()));
+    assert_eq!(shown(&t), ("1.5 wks".into(), "1.5w".into()));
     // Reopening and committing keeps the unit, and is no edit.
     let depth = v(&t).ed.undo_depth();
     for (duration, format_before, row) in [
-        ("1.5w", Some(9), "1.5w"),
-        ("4h", Some(5), "4h"),
-        ("0.5d", None, "0.5d"),
-        ("1w?", Some(9), "1w?"),
+        ("1.5w", Some(9), "1.5 wks"),
+        ("4h", Some(5), "4 hrs"),
+        ("0.5d", None, "0.5 days"),
+        ("1w?", Some(9), "1 wk?"),
     ] {
         vm(&mut t).ed.select(0);
         edit(&mut t, COL_DURATION, duration);
@@ -160,7 +229,7 @@ fn a_duration_shows_reopens_and_commits_in_its_own_unit() {
     // Ctrl+Delete gives a new task's day, in days.
     reset_cell(&mut vm(&mut t).ed, 10, COL_DURATION).unwrap();
     assert_eq!(format(&t), None);
-    assert_eq!(shown(&t), ("1d?".into(), "1d?".into()));
+    assert_eq!(shown(&t), ("1 day?".into(), "1d?".into()));
 }
 
 #[test]
@@ -224,7 +293,7 @@ fn typed_dates_move_a_manual_task_without_constraints() {
     let row = project_row(ed, task);
     assert_eq!(
         (row[COL_START].as_str(), row[COL_FINISH].as_str()),
-        ("2026-01-08", "2026-01-09")
+        ("Thu 1/8/26", "Fri 1/9/26")
     );
     assert_eq!(ed.undo_depth(), depth + 2);
 }
@@ -246,7 +315,10 @@ fn a_date_typed_into_a_blank_row_of_a_manual_plan_pins_it() {
         false,
         "loaded".into(),
     );
-    for (col, text) in [(COL_START, "2026-01-08"), (COL_FINISH, "2026-01-09")] {
+    for (col, text, shown) in [
+        (COL_START, "2026-01-08", "Thu 1/8/26"),
+        (COL_FINISH, "2026-01-09", "Fri 1/9/26"),
+    ] {
         vm(&mut t).ed.select(1);
         edit(&mut t, col, text);
         key(&mut t, "enter");
@@ -257,7 +329,7 @@ fn a_date_typed_into_a_blank_row_of_a_manual_plan_pins_it() {
         let task = ed.project().task(20).unwrap();
         assert!(task.manual && !task.is_null);
         assert_eq!(task.constraint, ConstraintType::AsSoonAsPossible);
-        assert_eq!(project_row(ed, task)[col], text);
+        assert_eq!(project_row(ed, task)[col], shown);
     }
 }
 
@@ -272,7 +344,7 @@ fn reentering_an_existing_constraint_does_not_claim_a_change() {
     vm(&mut t).ed.set_constraint(10, "SNET 2026-03-05").unwrap();
     assert_eq!(
         project_row(&v(&t).ed, v(&t).ed.project().task(10).unwrap())[COL_START],
-        "2026-03-09"
+        "Mon 3/9/26"
     );
     let before = v(&t).ed.project().clone();
     let depth = v(&t).ed.undo_depth();
@@ -862,12 +934,12 @@ fn tab_after_an_entry_row_commit_stays_on_the_new_task() {
 
 #[test]
 fn every_column_of_the_entry_row_appends_a_task() {
-    for (col, text, check) in [
-        (COL_DURATION, "3d", "duration"),
-        (COL_START, "2026-01-07", "start"),
-        (COL_FINISH, "2026-01-09", "finish"),
-        (COL_PREDECESSORS, "1", "predecessors"),
-        (COL_RESOURCES, "Bob", "resources"),
+    for (col, text, shown, check) in [
+        (COL_DURATION, "3d", "3 days", "duration"),
+        (COL_START, "2026-01-07", "Wed 1/7/26", "start"),
+        (COL_FINISH, "2026-01-09", "Fri 1/9/26", "finish"),
+        (COL_PREDECESSORS, "1", "1", "predecessors"),
+        (COL_RESOURCES, "Bob", "Bob", "resources"),
     ] {
         let mut t = tab();
         project_entry_click(&mut t, Some(col), false);
@@ -876,7 +948,7 @@ fn every_column_of_the_entry_row_appends_a_task() {
         let ed = &v(&t).ed;
         assert_eq!(ed.project().tasks.len(), 4, "{check}");
         let new = &ed.project().tasks[3];
-        assert_eq!(project_row(ed, new)[col], text, "{check}");
+        assert_eq!(project_row(ed, new)[col], shown, "{check}");
         assert_eq!(ed.undo_depth(), 1, "{check}");
         assert!(v(&t).on_entry_row(), "{check}");
         if col == COL_START {
@@ -1156,9 +1228,9 @@ fn an_estimated_duration_shows_and_reopens_with_a_question_mark() {
         false,
         "loaded".into(),
     );
-    assert_eq!(duration_text(&t, 10), "1d?");
-    assert_eq!(duration_text(&t, 20), "2.5d?");
-    assert_eq!(duration_text(&t, 30), "1d");
+    assert_eq!(duration_text(&t, 10), "1 day?");
+    assert_eq!(duration_text(&t, 20), "2.5 days?");
+    assert_eq!(duration_text(&t, 30), "1 day");
     // The cell opens as it shows; committing it unchanged is no edit.
     vm(&mut t).ed.select(0);
     vm(&mut t).col = COL_DURATION;
@@ -1173,14 +1245,14 @@ fn an_estimated_duration_shows_and_reopens_with_a_question_mark() {
     key(&mut t, "enter");
     assert!(v(&t).cell.is_none(), "{}", t.status);
     assert_eq!(v(&t).ed.project().task(10).unwrap().estimated, Some(false));
-    assert_eq!(duration_text(&t, 10), "1d");
+    assert_eq!(duration_text(&t, 10), "1 day");
     assert_eq!(v(&t).ed.undo_depth(), 1);
     // And `?` marks one.
     vm(&mut t).ed.select(2);
     edit(&mut t, COL_DURATION, "3 days?");
     key(&mut t, "enter");
     assert!(v(&t).cell.is_none(), "{}", t.status);
-    assert_eq!(duration_text(&t, 30), "3d?");
+    assert_eq!(duration_text(&t, 30), "3 days?");
 }
 
 #[test]
@@ -1192,7 +1264,7 @@ fn the_entry_row_takes_an_estimated_duration() {
     let ed = &v(&t).ed;
     let new = &ed.project().tasks[3];
     assert_eq!((new.duration_min, new.estimated), (960, Some(true)));
-    assert_eq!(project_row(ed, new)[COL_DURATION], "2d?");
+    assert_eq!(project_row(ed, new)[COL_DURATION], "2 days?");
     assert_eq!(ed.undo_depth(), 1);
 }
 
@@ -1210,12 +1282,10 @@ fn a_summary_shows_the_estimate_of_its_subtasks() {
         false,
         "loaded".into(),
     );
-    assert!(
-        duration_text(&t, 10).ends_with("d?"),
-        "{}",
-        duration_text(&t, 10)
-    );
-    assert_eq!(duration_text(&t, 20), "1d");
+    // Both children run in parallel, so the span is a day; task 30's
+    // estimate marks it.
+    assert_eq!(duration_text(&t, 10), "1 day?");
+    assert_eq!(duration_text(&t, 20), "1 day");
 }
 
 fn shift_key(t: &mut DocTab, key: &str) {

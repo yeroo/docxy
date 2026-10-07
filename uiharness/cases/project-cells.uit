@@ -15,15 +15,15 @@ test project cell commits cover every editable column and undo
   click D2
   type 2d
   key tab
-  assert cell D2 is 2d
+  assert cell D2 is 2 days
   assert cell is Start
   type 2026-01-08
   key tab
-  assert cell E2 is 2026-01-08
+  assert cell E2 is Thu 1/8/26
   assert cell is Finish
   type 2026-01-13
   key tab
-  assert cell F2 is 2026-01-13
+  assert cell F2 is Tue 1/13/26
   assert cell is Predecessors
   type 3SS+2h
   key tab
@@ -157,7 +157,7 @@ test hidden document find does not intercept project Tab
   assert cell is Duration
   type 2d
   key shift+tab
-  assert cell D2 is 2d
+  assert cell D2 is 2 days
   assert cell_edit is none
   assert cell is Name
 
@@ -171,5 +171,5 @@ test corrected duration clears its validation error
   type 2d
   key enter
   assert cell_edit is none
-  assert cell D2 is 2d
+  assert cell D2 is 2 days
   assert status is Ready

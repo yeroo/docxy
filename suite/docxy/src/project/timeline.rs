@@ -16,16 +16,10 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-/// Project's default date form: `Mon 3/2/26`.
+/// Project's default date form: `Mon 3/2/26`. Defined in projcore so the
+/// field registry and the timeline cannot drift.
 pub(crate) fn project_date(dt: DateTime) -> String {
-    let p = dt.parts();
-    format!(
-        "{} {}/{}/{:02}",
-        WEEKDAYS[dt.weekday() as usize],
-        p.month,
-        p.day,
-        p.year.rem_euclid(100)
-    )
+    projcore::editor::format_project_date(dt)
 }
 
 /// A ruler unit: which days start one, how a tick is labelled, and the pixels a
