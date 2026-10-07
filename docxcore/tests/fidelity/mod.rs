@@ -300,17 +300,23 @@ fn finish(mut b: Building) -> Elem {
     e
 }
 
-/// Parse an XML part into its canonical DOM. `None` when the part is not
-/// UTF-8 or is malformed: mismatched or unclosed tags, a duplicate attribute,
+/// Parse an XML part into its canonical DOM. `None` when the part is neither
+/// UTF-8 nor declared ISO-8859-1 (read by its declaration, #1108), or is
+/// malformed: mismatched or unclosed tags, a duplicate attribute,
 /// an ill-formed reference or a `<` in an attribute value, or content other
 /// than whitespace outside the root. The caller then compares bytes instead.
 /// Line ends normalize to LF first, as an XML processor's do.
 pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let text = std::str::from_utf8(bytes)
-        .ok()?
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    // A document declaring ISO-8859-1 is read by its declaration, as the
+    // xlsx loaders read it (#1108).
+    let latin1 = opccore::xml::latin1_to_utf8(bytes);
+    let text = match &latin1 {
+        Some(text) => text.as_str(),
+        None => std::str::from_utf8(bytes).ok()?,
+    }
+    .replace("\r\n", "\n")
+    .replace('\r', "\n");
     let mut parser = XmlParser::new(&text);
     let mut stack: Vec<Building> = Vec::new();
     let mut root = None;
@@ -621,14 +627,22 @@ fn lcs<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(usize, usize)> {
 // ---------------------------------------------------------------------------
 // Packages
 
+/// A package's parts by OPC name: an entry written `xl\\workbook.xml` is the
+/// part `xl/workbook.xml`, as the loaders read it (#1095). `None` when two
+/// entries differ only in their separators: which one is the part?
 fn read_parts(bytes: &[u8]) -> Option<BTreeMap<String, Vec<u8>>> {
     let zip = ZipArchive::open(bytes)?;
     let mut parts = BTreeMap::new();
+    let mut raw: BTreeMap<String, &str> = BTreeMap::new();
     for e in zip.entries() {
-        if e.name.ends_with('/') {
+        let name = e.name.replace('\\', "/");
+        if name.ends_with('/') {
             continue;
         }
-        parts.insert(e.name.clone(), zip.extract(e)?);
+        if *raw.entry(name.clone()).or_insert(&e.name) != e.name {
+            return None;
+        }
+        parts.insert(name, zip.extract(e)?);
     }
     Some(parts)
 }

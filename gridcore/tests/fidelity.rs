@@ -38,17 +38,6 @@ const TRACKED: &[&str] = &[
 /// wins. A baseline entry no class claims fails the gate.
 const CLASSES: &[LossClass] = &[
     LossClass {
-        name: "ZIP64 container is refused (XlsxError::CorruptPart); nothing is saved",
-        issue: "#1094",
-        matches: |e| e.kind == Kind::LoadError && e.file.contains("zip64"),
-    },
-    LossClass {
-        name: "part names with backslash separators (xl\\workbook.xml) are not found \
-               (XlsxError::MissingWorkbook); nothing is saved",
-        issue: "#1095",
-        matches: |e| e.kind == Kind::LoadError && e.file.ends_with("/tdf76115.xlsx"),
-    },
-    LossClass {
         name: "corrupt input (fuzzed: bad CRCs, an invalid deflate stream) is refused",
         issue: "by design: XlsxError::CorruptPart",
         matches: |e| e.kind == Kind::LoadError && e.file.ends_with("/forcepoint107.xlsx"),
@@ -764,28 +753,45 @@ fn rel_targets(trees: &BTreeMap<String, Elem>, part: &str, kind: &str) -> Vec<St
 }
 
 /// The parts the sheet check reads, parsed, by name: the relationships,
-/// the worksheets and the workbook's shared strings (found through the
-/// package and workbook relationships, whatever their name).
+/// the worksheets (in xl/worksheets/ or wherever the workbook's
+/// relationships put them) and the workbook's shared strings (found
+/// through the package and workbook relationships, whatever their name).
 fn trees(bytes: &[u8]) -> BTreeMap<String, Elem> {
     let Some(zip) = opccore::zip::ZipArchive::open(bytes) else {
         return BTreeMap::new();
     };
-    let parse = |e: &opccore::zip::ZipEntry| Some((e.name.clone(), parse_xml(&zip.extract(e)?)?));
+    // By OPC name, as `read_parts` keys them (#1095).
+    let name = |e: &opccore::zip::ZipEntry| e.name.replace('\\', "/");
+    let parse = |e: &opccore::zip::ZipEntry| Some((name(e), parse_xml(&zip.extract(e)?)?));
     let mut trees: BTreeMap<String, Elem> = zip
         .entries()
         .iter()
         .filter(|e| {
-            let name = e.name.to_ascii_lowercase();
+            let name = name(e).to_ascii_lowercase();
             name.ends_with(".rels")
                 || (name.starts_with("xl/worksheets/") && name.ends_with(".xml"))
         })
         .filter_map(parse)
         .collect();
-    let sst = rel_targets(&trees, "", "officeDocument")
+    let entry = |n: &str| zip.entries().iter().find(|e| name(e) == n);
+    let workbooks = rel_targets(&trees, "", "officeDocument");
+    // A worksheet outside xl/worksheets/ (tdf76115.xlsx keeps it at
+    // xl/sheet1.xml) is found through the workbook's relationships.
+    let sheets: Vec<String> = workbooks
+        .iter()
+        .flat_map(|wb| rel_targets(&trees, wb, "worksheet"))
+        .filter(|n| !trees.contains_key(n))
+        .collect();
+    for sheet in sheets {
+        if let Some((n, tree)) = entry(&sheet).and_then(parse) {
+            trees.insert(n, tree);
+        }
+    }
+    let sst = workbooks
         .iter()
         .flat_map(|wb| rel_targets(&trees, wb, "sharedStrings"))
         .next();
-    if let Some((_, tree)) = sst.and_then(|n| zip.find(&n)).and_then(parse) {
+    if let Some((_, tree)) = sst.as_deref().and_then(entry).and_then(parse) {
         trees.insert(SHARED_STRINGS.to_string(), tree);
     }
     trees
@@ -1024,9 +1030,7 @@ fn check_sheets(
     let sheets: BTreeSet<&String> = a
         .iter()
         .filter(|(name, t)| {
-            name.starts_with("xl/worksheets/")
-                && t.local == "worksheet"
-                && b.get(*name).is_some_and(|s| s.local == "worksheet")
+            t.local == "worksheet" && b.get(*name).is_some_and(|s| s.local == "worksheet")
         })
         .map(|(name, _)| name)
         .collect();
@@ -1775,6 +1779,87 @@ fn a_workbook_gridcore_wrote_round_trips_clean() {
     let mut covered = 0;
     let found = round_trip(&bytes, Path::new("book.xlsx"), &mut covered);
     assert_eq!(not_allowed(found), vec![]);
+}
+
+/// #1108: a package shaped like tdf76115.xlsx (entries named with `\`, the
+/// worksheet at xl/sheet1.xml and declared ISO-8859-1, with Latin-1 inline
+/// strings) is compared part by part with its save: parts by OPC name, the
+/// sheet read by its declaration and checked cell by cell. All that is left
+/// is the shared-strings part the inline strings move to (#1091's class).
+#[test]
+fn a_backslash_latin1_package_is_compared_by_part_and_cell() {
+    const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const RELS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+    let types = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#;
+    let root = format!(
+        r#"<Relationships xmlns="{RELS}"><Relationship Id="rId1" Type="{R}/officeDocument" Target="/xl/workbook.xml"/></Relationships>"#
+    );
+    let wb = format!(
+        r#"<workbook xmlns="{MAIN}" xmlns:r="{R}"><sheets><sheet name="Plan1" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+    );
+    let wb_rels = format!(
+        r#"<Relationships xmlns="{RELS}"><Relationship Id="rId1" Type="{R}/worksheet" Target="/xl/sheet1.xml"/></Relationships>"#
+    );
+    let mut ws = format!(
+        r#"<?xml version="1.0" encoding="ISO-8859-1"?><worksheet xmlns="{MAIN}"><sheetData><row r="1" spans="1:2"><c r="A1" t="inlineStr"><is><t>S"#
+    )
+    .into_bytes();
+    ws.extend_from_slice(
+        b"\xe9rie</t></is></c><c r=\"B1\"><v>7</v></c></row></sheetData></worksheet>",
+    );
+    let bytes = package(&[
+        ("[Content_Types].xml", types.as_bytes().to_vec()),
+        ("_rels\\.rels", root.into_bytes()),
+        ("xl\\workbook.xml", wb.into_bytes()),
+        ("xl\\_rels\\workbook.xml.rels", wb_rels.into_bytes()),
+        ("xl\\sheet1.xml", ws),
+    ]);
+    let mut covered = 0;
+    let found = round_trip(&bytes, Path::new("tdf76115.xlsx"), &mut covered);
+    assert!(covered > 0, "the sheet check reads xl/sheet1.xml");
+    assert_eq!(
+        not_allowed(found),
+        vec![(Kind::PartExtra, "xl/sharedStrings.xml".to_string())]
+    );
+}
+
+/// #1108 r1: a directory entry written with `\` is a directory too, not a
+/// part the save (which writes it with `/`) lost.
+#[test]
+fn a_backslash_directory_entry_is_no_part() {
+    let types = br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#;
+    let original = package(&[
+        ("[Content_Types].xml", types.to_vec()),
+        ("xl\\media\\", Vec::new()),
+    ]);
+    let saved = package(&[
+        ("[Content_Types].xml", types.to_vec()),
+        ("xl/media/", Vec::new()),
+    ]);
+    assert_eq!(compare_packages(&original, &saved).len(), 0);
+    assert_eq!(parts_identical(&original, &saved), Ok(()));
+}
+
+/// #1108 r1: two entries that differ only in their separators would be one
+/// part; the comparator cannot tell which one a loader read.
+#[test]
+fn entries_that_name_one_part_are_unreadable() {
+    let two = package(&[
+        ("xl/a.xml", b"<a/>".to_vec()),
+        ("xl\\a.xml", b"<b/>".to_vec()),
+    ]);
+    let one = package(&[("xl/a.xml", b"<a/>".to_vec())]);
+    let kinds = |found: Vec<Finding>| found.into_iter().map(|f| f.kind).collect::<Vec<_>>();
+    assert_eq!(kinds(compare_packages(&two, &one)), [Kind::LoadError]);
+    assert_eq!(kinds(compare_packages(&one, &two)), [Kind::PartBytes]);
+    assert!(parts_identical(&two, &one).is_err());
+    // The same name twice is no separator question: as before, the last
+    // entry is the part.
+    let twice = package(&[
+        ("xl/a.xml", b"<b/>".to_vec()),
+        ("xl/a.xml", b"<a/>".to_vec()),
+    ]);
+    assert_eq!(compare_packages(&twice, &one).len(), 0);
 }
 
 #[test]

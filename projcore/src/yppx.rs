@@ -14,7 +14,7 @@
 use crate::model::{PackageParts, Project};
 use crate::mspdi::{read_mspdi, write_mspdi};
 use opccore::xml::{Event, XmlParser};
-use opccore::zip::ZipArchive;
+use opccore::zip::{ZipArchive, ZipEntry};
 use opccore::zipwrite::write_zip;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -265,6 +265,12 @@ pub fn read_yppx(bytes: &[u8]) -> Result<Project, String> {
     read_yppx_within(bytes, MAX_PACKAGE_UNCOMPRESSED)
 }
 
+/// The uncompressed bytes `entries` declare, in total. ZIP64 sizes are 64-bit,
+/// so the sum saturates rather than overflow.
+fn declared_bytes<'a>(entries: impl Iterator<Item = &'a ZipEntry>) -> u64 {
+    entries.fold(0, |total, entry| total.saturating_add(entry.uncomp_size))
+}
+
 fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
     let zip = ZipArchive::open(bytes).ok_or("not a valid .yppx (ZIP) container")?;
     let missing = || format!(".yppx package is missing its {MAIN_PART} part");
@@ -289,11 +295,11 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
         .entries()
         .iter()
         .find(|entry| entry.name.eq_ignore_ascii_case(CONTENT_TYPES_PART));
-    let total: u64 = std::iter::once(main)
-        .chain(extras.iter().copied())
-        .chain(content_types)
-        .map(|entry| u64::from(entry.uncomp_size))
-        .sum();
+    let total = declared_bytes(
+        std::iter::once(main)
+            .chain(extras.iter().copied())
+            .chain(content_types),
+    );
     if total > budget {
         return Err(format!(
             ".yppx package too large: its parts unpack to {total} bytes, over the {budget}-byte budget"
@@ -457,13 +463,29 @@ mod tests {
             .unwrap()
             .entries()
             .iter()
-            .map(|entry| u64::from(entry.uncomp_size))
+            .map(|entry| entry.uncomp_size)
             .sum()
     }
 
     fn assert_too_large(result: Result<Project, String>) {
         let error = result.unwrap_err();
         assert!(error.contains("too large"), "{error}");
+    }
+
+    /// #1094: ZIP64 entries declare 64-bit sizes; their total saturates
+    /// instead of overflowing past the budget check.
+    #[test]
+    fn zip64_declared_sizes_saturate() {
+        let entry = |uncomp_size| ZipEntry {
+            name: String::new(),
+            method: 0,
+            comp_size: 0,
+            uncomp_size,
+            local_offset: 0,
+        };
+        let entries = [entry(u64::MAX), entry(1), entry(5)];
+        assert_eq!(declared_bytes(entries.iter()), u64::MAX);
+        assert_eq!(declared_bytes(entries[1..].iter()), 6);
     }
 
     /// #451: a part declaring a huge size is refused before extraction; it

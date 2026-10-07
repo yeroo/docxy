@@ -16,13 +16,15 @@
 //! - Shared formulas are expanded to per-cell formulas at load (via reference
 //!   translation); groups whose master doesn't parse are preserved verbatim.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 use opccore::zipwrite::write_zip;
 
 mod consolidate;
+#[cfg(test)]
+mod container_tests;
 #[cfg(test)]
 mod filter_tests;
 mod page;
@@ -238,11 +240,39 @@ fn is_strict_workbook(wb_xml: &str) -> bool {
 pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     let zip = open_container(data)?;
     let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
-    for e in zip.entries() {
+    for (e, name) in zip.entries().iter().zip(entry_part_names(&zip)?) {
         let bytes = zip.extract(e).ok_or(XlsxError::CorruptPart)?;
-        parts.push((e.name.clone(), bytes));
+        parts.push((name, utf8_part(bytes)));
     }
     load_parts(parts)
+}
+
+/// A part as the loader reads it: UTF-8. A part declaring ISO-8859-1 is
+/// transcoded and then declares UTF-8, so its text survives and a save
+/// writes what it declares (#1108); any other part is kept as it is.
+fn utf8_part(bytes: Vec<u8>) -> Vec<u8> {
+    match opccore::xml::latin1_to_utf8(&bytes) {
+        Some(text) => text.into_bytes(),
+        None => bytes,
+    }
+}
+
+/// The part name of each container entry, in entry order. Some writers
+/// separate segments with `\` (`xl\workbook.xml`), and Excel opens those
+/// packages, so it becomes the OPC `/` here and on save (#1095). Two entries
+/// that only differ in their separators would become one part:
+/// [`XlsxError::CorruptPart`].
+fn entry_part_names(zip: &ZipArchive) -> Result<Vec<String>, XlsxError> {
+    let names: Vec<String> = zip
+        .entries()
+        .iter()
+        .map(|e| e.name.replace('\\', "/"))
+        .collect();
+    let raw: HashSet<&str> = zip.entries().iter().map(|e| e.name.as_str()).collect();
+    if names.iter().collect::<HashSet<_>>().len() != raw.len() {
+        return Err(XlsxError::CorruptPart);
+    }
+    Ok(names)
 }
 
 /// The ZIP container of an `.xlsx`, or why `data` is not one.
