@@ -1776,6 +1776,56 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
     xml
 }
 
+/// The `<col>`s a save writes for `defs`: ascending and never overlapping,
+/// as Excel requires (#1152). Where definitions overlap, the earlier one
+/// wins, as [`crate::sheet::Sheet::col_width`] reads them, and a later one
+/// keeps only the columns no earlier one covers (in up to two pieces). A
+/// definition with no width and nothing else to say still claims its
+/// columns, at the default width, but writes no `<col>`.
+fn written_col_defs(defs: &[ColDef]) -> Vec<ColDef> {
+    let mut covered: Vec<(u32, u32)> = Vec::new();
+    let mut out: Vec<ColDef> = Vec::new();
+    for d in defs {
+        let mut pieces = vec![(d.min, d.max)];
+        for &(lo, hi) in &covered {
+            pieces = pieces
+                .into_iter()
+                .flat_map(|(a, b)| {
+                    if hi < a || lo > b {
+                        return vec![(a, b)];
+                    }
+                    let mut left = Vec::new();
+                    if a < lo {
+                        left.push((a, lo - 1));
+                    }
+                    if hi < b {
+                        left.push((hi + 1, b));
+                    }
+                    left
+                })
+                .collect();
+        }
+        if d.min <= d.max {
+            covered.push((d.min, d.max));
+        }
+        if d.width.is_none() && !d.default_width && d.attrs.trim().is_empty() {
+            continue;
+        }
+        out.extend(
+            pieces
+                .into_iter()
+                .filter(|(a, b)| a <= b)
+                .map(|(min, max)| ColDef {
+                    min,
+                    max,
+                    ..d.clone()
+                }),
+        );
+    }
+    out.sort_by_key(|d| d.min);
+    out
+}
+
 /// One worksheet: `<sheetData>`, `<cols>`, `<mergeCells>`; everything else is
 /// preserved through the source-splice on save.
 fn parse_worksheet(
@@ -1827,14 +1877,24 @@ fn parse_worksheet(
     // workbook window) or a custom view keeps a pane of its own.
     let mut sheet_views_seen = 0u32;
     let mut in_first_view = false;
+    // Inside the sheet's own `<cols>` / `<sheetData>`. A control's or a
+    // drawing's anchor (`<xdr:from><xdr:col>1</xdr:col><xdr:row>…`) has
+    // elements of the same local names; those are not columns or rows
+    // (#1152).
+    let mut in_cols = false;
+    let mut in_sheet_data = false;
 
     loop {
         match p.next() {
             Event::Start => match local(p.name()) {
-                "col" => {
+                "cols" => in_cols = true,
+                "sheetData" => in_sheet_data = true,
+                "col" if in_cols => {
                     let min: u32 = p.attr("min").parse().unwrap_or(1);
                     let max: u32 = p.attr("max").parse().unwrap_or(min);
-                    let width = p.attr("width").parse::<f64>().ok();
+                    // Excel reads a `<col>` with no width as zero wide: the
+                    // model says so, and the save writes the 0 out.
+                    let width = Some(p.attr("width").trim().parse::<f64>().unwrap_or(0.0));
                     // A width that is just the sheet's default, not marked
                     // custom, is the default: it shows like its neighbours
                     // and is written back as it was.
@@ -1859,7 +1919,7 @@ fn parse_worksheet(
                         default_width,
                     });
                 }
-                "row" => {
+                "row" if in_sheet_data => {
                     // `r` is 1-based; a crafted `r="0"` must not underflow.
                     cur_row = p
                         .attr("r")
@@ -2124,7 +2184,9 @@ fn parse_worksheet(
                 }
             }
             Event::End => match local(p.name()) {
-                "row" => cur_row += 1,
+                "cols" => in_cols = false,
+                "sheetData" => in_sheet_data = false,
+                "row" if in_sheet_data => cur_row += 1,
                 "rowBreaks" | "colBreaks" => in_breaks = None,
                 "customSheetViews" => in_custom_views = false,
                 "sheetView" => in_first_view = false,
@@ -3880,22 +3942,20 @@ fn splice_worksheet(
 
     // <cols> — regenerate from the model when we have definitions, and drop
     // the element when the last one went (an ungrouped column's).
-    if sheet.col_defs.is_empty() {
+    let col_defs = written_col_defs(&sheet.col_defs);
+    if col_defs.is_empty() {
         if worksheet_child_span(&out, "cols").is_some() {
             out = remove_worksheet_child(&out, "cols");
         }
     } else {
         let mut cols_xml = String::from("<cols>");
-        for d in &sheet.col_defs {
-            // Excel reads a `<col>` with no width as zero wide: one created
-            // for an outline or a hide gets the sheet's default. One loaded
-            // without a width keeps its spelling.
+        for d in &col_defs {
+            // Excel reads a `<col>` with no width as zero wide: one without
+            // a width (made for an outline or a hide) gets the sheet's
+            // default. A loaded one without a width is 0 wide in the model.
             let width = match d.width {
                 Some(w) => format!(" width=\"{w}\" customWidth=\"1\""),
-                None if d.default_width => {
-                    format!(" width=\"{}\"", sheet.default_col_file_width())
-                }
-                None => String::new(),
+                None => format!(" width=\"{}\"", sheet.default_col_file_width()),
             };
             cols_xml.push_str(&format!(
                 "<col min=\"{}\" max=\"{}\"{width}{}/>",
@@ -18854,15 +18914,26 @@ mod ct_worksheet_order_tests {
         let ws = saved_sheet(&pkg);
         assert!(ws.contains(r#"<row r="1" hidden="1">"#), "{ws}");
         assert!(ws.contains(r#"<row r="4" outlineLevel="1"/>"#), "{ws}");
-        assert!(ws.contains(r#"<col min="3" max="3" hidden="1"/>"#), "{ws}");
+        // Excel reads a `<col>` with no width as zero wide: a hide made in
+        // code is written at the sheet's default (#1152).
+        assert!(
+            ws.contains(r#"<col min="3" max="3" width="9.140625" hidden="1"/>"#),
+            "{ws}"
+        );
     }
 
     #[test]
-    fn a_loaded_col_without_a_width_keeps_its_spelling() {
+    fn a_loaded_col_without_a_width_keeps_excels_zero_width() {
+        // Excel shows a `<col>` with no width zero wide; the model says so
+        // and the save writes the 0 out, so no `<col>` goes without a width
+        // (#1152).
         let pkg = loaded(&format!(
             r#"<cols><col min="2" max="2" style="5"/></cols>{ROWS}{MARGINS}"#
         ));
-        assert!(saved_sheet(&pkg).contains(r#"<cols><col min="2" max="2" style="5"/></cols>"#));
+        assert_eq!(pkg.workbook.sheets[0].col_width(1), 0.0);
+        assert!(saved_sheet(&pkg).contains(
+            r#"<cols><col min="2" max="2" width="0" customWidth="1" style="5"/></cols>"#
+        ));
         // Grouping elsewhere doesn't touch it either.
         let mut pkg = pkg;
         crate::outline::group(
@@ -18874,9 +18945,113 @@ mod ct_worksheet_order_tests {
         .unwrap();
         let ws = saved_sheet(&pkg);
         assert!(
-            ws.contains(r#"<col min="2" max="2" style="5"/><col min="5" max="5" width="9.140625" outlineLevel="1"/>"#),
+            ws.contains(r#"<col min="2" max="2" width="0" customWidth="1" style="5"/><col min="5" max="5" width="9.140625" outlineLevel="1"/>"#),
             "{ws}"
         );
+    }
+
+    /// A form control as Excel writes one: its anchor's `<xdr:col>` and
+    /// `<xdr:row>` share local names with the sheet's columns and rows.
+    const CONTROLS: &str = r#"<controls><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="x14"><control shapeId="1025" r:id="rId3" name="CheckBox1343"><controlPr defaultSize="0" autoLine="0" r:id="rId4"><anchor moveWithCells="1"><from><xdr:col>1</xdr:col><xdr:colOff>438150</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>38100</xdr:rowOff></from><to><xdr:col>4</xdr:col><xdr:colOff>161925</xdr:colOff><xdr:row>6</xdr:row><xdr:rowOff>114300</xdr:rowOff></to></anchor></controlPr></control></mc:Choice><mc:Fallback><control shapeId="1025" r:id="rId3" name="CheckBox1343"/></mc:Fallback></mc:AlternateContent></controls>"#;
+
+    /// `loaded`, with the namespaces a sheet with controls declares.
+    fn loaded_with_controls(body: &str) -> SheetPackage {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="{NS}" xmlns:r="{R}" xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">{body}</worksheet>"#
+            )
+            .into_bytes(),
+        );
+        load_xlsx(&write_zip(&pkg.parts)).expect("load")
+    }
+
+    #[test]
+    fn a_controls_anchor_defines_no_columns() {
+        // No `<cols>`: the unedited save writes none, rather than a
+        // width-less `<col min="1" max="1"/>` per anchor cell that Excel
+        // opens zero wide (#1152).
+        let pkg = loaded_with_controls(&format!("{ROWS}{MARGINS}{CONTROLS}"));
+        assert!(pkg.workbook.sheets[0].col_defs.is_empty());
+        let ws = saved_sheet(&pkg);
+        assert!(!ws.contains("<cols"), "{ws}");
+        assert!(ws.contains("<xdr:col>1</xdr:col>"), "{ws}");
+        // With `<cols>`, only its own `<col>`s are the sheet's.
+        let pkg = loaded_with_controls(&format!(
+            r#"<cols><col min="3" max="4" width="20" customWidth="1"/></cols>{ROWS}{MARGINS}{CONTROLS}"#
+        ));
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.col_defs.len(), 1, "{:?}", s.col_defs);
+        assert_eq!((s.col_defs[0].min, s.col_defs[0].max), (2, 3));
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r#"<cols><col min="3" max="4" width="20" customWidth="1"/></cols>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_controls_anchor_moves_no_rows() {
+        // Rows and cells without `r` take their place from the rows before
+        // them; an anchor's `<xdr:row>` is not one of those.
+        let body = r#"<sheetData><row><c><v>1</v></c><c><v>2</v></c></row><row><c><v>3</v></c></row></sheetData>"#;
+        for xml in [
+            format!("{CONTROLS}{body}{MARGINS}"),
+            format!("{body}{MARGINS}{CONTROLS}"),
+        ] {
+            let pkg = loaded_with_controls(&xml);
+            let s = &pkg.workbook.sheets[0];
+            let mut at: Vec<(u32, u32)> = s.cells.keys().copied().collect();
+            at.sort();
+            assert_eq!(at, vec![(0, 0), (0, 1), (1, 0)], "{xml}");
+        }
+    }
+
+    #[test]
+    fn overlapping_columns_are_written_once_in_order() {
+        use crate::sheet::ColDef;
+        let def = |min, max, width: Option<f64>, attrs: &str| ColDef {
+            min,
+            max,
+            width,
+            attrs: attrs.into(),
+            default_width: false,
+        };
+        let mut pkg = new_xlsx();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(0, 0, Cell::number(1.0));
+        s.col_defs = vec![
+            // Written after the later, lower ranges: sorted on save.
+            def(4, 6, Some(20.0), ""),
+            // Covers 4..=6 again around it: only 2..=3 and 7..=8 are its own.
+            def(2, 8, Some(12.0), r#" style="3""#),
+            // The same column twice: the first one wins, as `col_width` reads.
+            def(0, 0, Some(5.0), ""),
+            def(0, 0, Some(30.0), ""),
+            // Width-less with nothing else to say: claims column J at the
+            // default width, writes nothing, and hides the next one there.
+            def(9, 9, None, ""),
+            def(9, 10, Some(7.0), ""),
+        ];
+        assert_eq!(s.col_width(5), 20.0);
+        assert_eq!(s.col_width(0), 5.0);
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(concat!(
+                r#"<cols><col min="1" max="1" width="5" customWidth="1"/>"#,
+                r#"<col min="3" max="4" width="12" customWidth="1" style="3"/>"#,
+                r#"<col min="5" max="7" width="20" customWidth="1"/>"#,
+                r#"<col min="8" max="9" width="12" customWidth="1" style="3"/>"#,
+                r#"<col min="11" max="11" width="7" customWidth="1"/></cols>"#,
+            )),
+            "{ws}"
+        );
+        // Nothing left to write: no `<cols>` at all.
+        let s = &mut pkg.workbook.sheets[0];
+        s.col_defs = vec![def(0, 0, None, ""), def(0, 0, None, "")];
+        let ws = saved_sheet(&pkg);
+        assert!(!ws.contains("<cols"), "{ws}");
     }
 
     #[test]
