@@ -81,6 +81,23 @@ impl CellEdit {
         }
     }
 
+    /// Paste at the caret: one trailing line break (a copied cell's) is
+    /// dropped and every remaining tab or line break becomes a space, as
+    /// [`project_copy_text`] sanitises a field. The caret follows the insert.
+    pub fn paste(&mut self, text: &str) {
+        let text = text.trim_end_matches(['\r', '\n']);
+        let text = text.replace(['\t', '\r', '\n'], " ");
+        self.buf.insert_str(self.caret, &text);
+        self.caret += text.len();
+    }
+
+    /// Cut: the whole buffer leaves with the caller (the editor has no
+    /// selection); the edit continues empty, the caret at the start.
+    pub fn cut(&mut self) -> String {
+        self.caret = 0;
+        std::mem::take(&mut self.buf)
+    }
+
     /// Scroll the buffer by its measured width, leaving room for the caret.
     pub fn scroll_x(&self, available: f32, measure: impl FnOnce(&str) -> f32) -> f32 {
         (measure(&self.buf[..self.caret]) - available.max(0.)).max(0.)

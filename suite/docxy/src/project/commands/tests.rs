@@ -145,6 +145,25 @@ fn ribbon_inventory_keys_tips_and_assets_are_complete() {
         r.tabs.iter().map(|t| t.name).collect::<Vec<_>>(),
         ["Task", "Resource", "Report", "Project", "View"]
     );
+    // The Task tab leads with the Clipboard group (#561): a large Paste and a
+    // Cut/Copy column, as in Project.
+    let clipboard = &r.tabs[0].groups[0];
+    assert_eq!(clipboard.title, "Clipboard");
+    let Control::Large(paste) = &clipboard.items[0] else {
+        panic!("Paste is the large button")
+    };
+    assert_eq!(paste.id, "pr-paste");
+    assert_eq!(paste.tip.shortcut, "Ctrl+V");
+    assert_eq!(paste.key_tip, "W");
+    let Control::Column(col) = &clipboard.items[1] else {
+        panic!("Cut and Copy are the column")
+    };
+    assert_eq!(col[0].id, "pr-cut");
+    assert_eq!(col[0].tip.shortcut, "Ctrl+X");
+    assert_eq!(col[0].key_tip, "X");
+    assert_eq!(col[1].id, "pr-copy");
+    assert_eq!(col[1].tip.shortcut, "Ctrl+C");
+    assert_eq!(col[1].key_tip, "Y");
     // The contextual Gantt Chart Format tab holds the rest of the inventory.
     let fmt = gantt_format_tab();
     let mut acts = vec![];
@@ -312,6 +331,9 @@ fn project_instruction_paths_exist() {
     }
     // (tab, group, Project's label, Project's screentip, act) — Project 2024.
     let want = [
+        ("Task", "Clipboard", "Paste", "Paste", Paste),
+        ("Task", "Clipboard", "Cut", "Cut", Cut),
+        ("Task", "Clipboard", "Copy", "Copy", Copy),
         ("Task", "Schedule", "Indent", "Indent Task", Indent),
         ("Task", "Schedule", "Outdent", "Outdent Task", Outdent),
         (
@@ -1914,6 +1936,30 @@ fn home_and_end_move_to_the_rows_first_and_last_field() {
     assert_eq!(cursor(&t), (2, COLUMN_COUNT - 1, true, false, false));
     press(&mut t, "home");
     assert_eq!(cursor(&t), (2, 0, true, false, false));
+}
+
+#[test]
+fn ctrl_clipboard_keys_dispatch_while_a_cell_editor_is_open() {
+    // #561: with a cell editor open, Ctrl+C/X/V are Copy/Cut/Paste for the
+    // buffer, not swallowed chords: they bubble to the host, which edits the
+    // open cell and leaves it open. Nothing commits, and the range an anchor
+    // made survives, as it does for Copy on the table.
+    for (key, want) in [
+        ("c", ProjectAct::Copy),
+        ("x", ProjectAct::Cut),
+        ("v", ProjectAct::Paste),
+    ] {
+        let mut t = tab();
+        vm(&mut t).open_cell(None).unwrap();
+        let uid = v(&t).ed.selected_uid().unwrap();
+        vm(&mut t).anchor = Some((uid, COL_NAME));
+        assert_eq!(project_input(&mut t, key, None, ctrl()), Some(want));
+        let cell = v(&t).cell.as_ref().expect("the editor stays open");
+        assert_eq!(cell.buf, "Second", "{key}: the buffer is untouched");
+        assert_eq!(v(&t).anchor, Some((uid, COL_NAME)), "{key}: range kept");
+        assert_eq!(v(&t).ed.undo_depth(), 0, "{key}: nothing committed");
+        assert!(!v(&t).ed.dirty(), "{key}: not dirty");
+    }
 }
 
 #[test]
