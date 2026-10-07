@@ -761,6 +761,21 @@ impl App {
             }
             Act::ShowSubtasks => self.show_subtasks(),
             Act::HideSubtasks => self.hide_subtasks(),
+            Act::Help => self.status = HELP_COMING.into(),
+            Act::ContactSupport | Act::Feedback => {
+                // A test never starts a browser.
+                #[cfg(not(test))]
+                open_url(&feedback_url());
+                self.status = FEEDBACK_OPENED.into();
+            }
+            Act::About => {
+                // File › Info, where every build field is.
+                self.open_backstage();
+                if let Some(bs) = self.backstage.as_mut() {
+                    bs.item = backstage::Item::Info;
+                }
+            }
+            Act::Todo(name) => self.status = format!("{name}: not implemented yet"),
         }
     }
 
@@ -1206,6 +1221,12 @@ impl backstage::BackstageHost for App {
             "  Build       {}",
             buildinfo::get(env!("CARGO_PKG_VERSION")).short_line()
         )));
+        // Help › About lands here (#1021): every build field.
+        lines.push(Line::raw(String::new()));
+        lines.push(Line::raw("  About yppxy".to_string()));
+        for l in buildinfo::get(env!("CARGO_PKG_VERSION")).about_lines() {
+            lines.push(Line::raw(format!("    {l}")));
+        }
         lines
     }
 
@@ -2272,6 +2293,45 @@ fn truncate(s: &str, width: usize) -> String {
     out
 }
 
+/// What Help › Help says until the documentation lands (#1021).
+const HELP_COMING: &str = "Help: the documentation is coming soon";
+
+/// The status line after Help › Feedback or Contact Support.
+const FEEDBACK_OPENED: &str = "Opened the feedback page in your browser";
+
+/// Help › Feedback's page: the GitHub new-issue form with this build filled in.
+fn feedback_url() -> String {
+    buildinfo::get(env!("CARGO_PKG_VERSION")).feedback_url("yppxy")
+}
+
+/// Whether `url` is a web link fit to hand the OS: http(s), no control
+/// characters, at most 2048 bytes (docxy's and xlsxy's rule).
+fn safe_url(url: &str) -> bool {
+    if url.is_empty() || url.len() > 2048 || url.chars().any(char::is_control) {
+        return false;
+    }
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Open a URL with the OS default handler, without a shell (the URL is one
+/// argument), and only after [`safe_url`] approves it.
+#[cfg_attr(test, allow(dead_code))]
+fn open_url(url: &str) {
+    use std::process::Command;
+    if !safe_url(url) {
+        return;
+    }
+    #[cfg(windows)]
+    let _ = Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = Command::new("xdg-open").arg(url).spawn();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2994,6 +3054,35 @@ mod tests {
         let uid = app.ed.selected_uid().unwrap();
         assert_eq!(app.ed.project().task(uid).unwrap().estimated, None);
         assert_eq!(duration_suffix(app.ed.project(), uid), "");
+    }
+
+    /// #1021: Help › About opens File › Info, whose About section lists
+    /// every build field; Help and Feedback answer on the status line.
+    #[test]
+    fn help_tab_commands() {
+        let mut app = App::new(new_project(), None, false);
+        let info: Vec<String> = app.info_lines().iter().map(|l| l.to_string()).collect();
+        let b = buildinfo::get(env!("CARGO_PKG_VERSION"));
+        assert!(info.iter().any(|l| l.trim() == "About yppxy"), "{info:?}");
+        assert!(
+            info.iter()
+                .any(|l| l.trim() == format!("commit      {}", b.commit)),
+            "{info:?}"
+        );
+        assert_eq!(info.iter().any(|l| l.trim() == "Manual build"), b.manual());
+        app.apply_act(Act::Help);
+        assert_eq!(app.status, HELP_COMING);
+        app.apply_act(Act::Feedback);
+        assert_eq!(app.status, FEEDBACK_OPENED);
+        app.apply_act(Act::Todo("What's New"));
+        assert_eq!(app.status, "What's New: not implemented yet");
+        app.apply_act(Act::About);
+        let bs = app.backstage.as_ref().expect("About opens File");
+        assert_eq!(bs.item, backstage::Item::Info);
+        let url = feedback_url();
+        assert!(safe_url(&url), "{url}");
+        assert!(url.starts_with("https://github.com/yeroo/docxy/issues/new?body=yppxy%20"));
+        assert!(!safe_url("file:///etc/passwd") && !safe_url("https://a\nb"));
     }
 
     #[test]
@@ -3983,12 +4072,14 @@ mod tests {
     #[test]
     fn theme_button_hidden_when_narrow() {
         let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
-        // Six tabs end at column 50: the button needs 60 columns.
-        assert!(theme_btn_cols(60, app.ribbon.width()).is_some());
-        assert_eq!(theme_btn_cols(59, app.ribbon.width()), None);
+        // Seven tabs (Help is last, #1021) end at column 57: the button
+        // needs 67 columns.
+        assert_eq!(app.ribbon.width(), 57);
+        assert!(theme_btn_cols(67, app.ribbon.width()).is_some());
+        assert_eq!(theme_btn_cols(66, app.ribbon.width()), None);
         let light = app.light;
-        assert!(!frame_row(&mut app, 59, 0).contains("Theme"));
-        for x in 51..59 {
+        assert!(!frame_row(&mut app, 66, 0).contains("Theme"));
+        for x in 58..66 {
             click(&mut app, x, 0);
         }
         assert_eq!(app.light, light);

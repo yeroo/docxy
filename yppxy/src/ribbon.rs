@@ -33,6 +33,16 @@ pub enum Act {
     // View
     ShowSubtasks,
     HideSubtasks,
+    // Help (#1021)
+    /// Help: the documentation is coming.
+    Help,
+    /// Contact Support / Feedback: the GitHub new-issue page with this build.
+    ContactSupport,
+    Feedback,
+    /// About yppxy: File › Info, with every build field.
+    About,
+    /// Show Training / What's New: nothing to show yet; the name is said.
+    Todo(&'static str),
 }
 
 type Group = ribboncore::Group<Act>;
@@ -100,6 +110,8 @@ fn tabs() -> Vec<(&'static str, Vec<Group>)> {
         ("Report", Vec::new()),
         ("Project", project_groups()),
         ("View", view_groups()),
+        // Help ends the row, as in Project (#1021).
+        ("Help", help_groups()),
     ]
 }
 
@@ -267,6 +279,60 @@ fn view_groups() -> Vec<Group> {
     }]
 }
 
+/// The Help tab every editor ends with (#1021). Show Training and What's New
+/// have nothing to show yet and say so.
+fn help_groups() -> Vec<Group> {
+    use Act::*;
+    vec![
+        Group {
+            title: "Help",
+            width: 35,
+            rows: [
+                vec![
+                    btn("? Help", Help, "Help — the documentation is coming"),
+                    Seg::Gap("  "),
+                    btn(
+                        "✉ Feedback",
+                        Feedback,
+                        "Feedback — a GitHub issue with this build filled in",
+                    ),
+                    Seg::Gap("  "),
+                    btn(
+                        "▷ Show Training",
+                        Todo("Show Training"),
+                        "Show Training — coming later",
+                    ),
+                ],
+                vec![
+                    btn(
+                        "☎ Contact Support",
+                        ContactSupport,
+                        "Contact Support — a GitHub issue with this build filled in",
+                    ),
+                    Seg::Gap("  "),
+                    btn(
+                        "✦ What's New",
+                        Todo("What's New"),
+                        "What's New — coming later",
+                    ),
+                ],
+            ],
+        },
+        Group {
+            title: "About",
+            width: 13,
+            rows: [
+                vec![btn(
+                    "ⓘ About yppxy",
+                    About,
+                    "About yppxy — this build's details",
+                )],
+                vec![],
+            ],
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,7 +362,9 @@ mod tests {
         let labels: Vec<_> = (0..).map_while(|i| r.tab_label(i)).collect();
         assert_eq!(
             labels,
-            ["File", "Task", "Resource", "Report", "Project", "View"]
+            [
+                "File", "Task", "Resource", "Report", "Project", "View", "Help"
+            ]
         );
     }
 
@@ -390,6 +458,31 @@ mod tests {
                 "Hide Subtasks",
                 HideSubtasks,
             ),
+            // The Help tab every editor ends with (#1021).
+            ("Help", "Help", "Help", "Help", Help),
+            ("Help", "Help", "Feedback", "Feedback", Feedback),
+            (
+                "Help",
+                "Help",
+                "Show Training",
+                "Show Training",
+                Todo("Show Training"),
+            ),
+            (
+                "Help",
+                "Help",
+                "Contact Support",
+                "Contact Support",
+                ContactSupport,
+            ),
+            (
+                "Help",
+                "Help",
+                "What's New",
+                "What's New",
+                Todo("What's New"),
+            ),
+            ("Help", "About", "About yppxy", "About yppxy", About),
         ];
         let tabs = tabs();
         for (tab, group, name, tip, act) in paths {

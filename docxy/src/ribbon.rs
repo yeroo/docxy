@@ -135,6 +135,14 @@ pub enum Act {
     Watermark,
     /// Open the Page Borders picker (a box around every page).
     PageBorders,
+    // Help tab (#1021)
+    /// Help (F1 in the suite): the documentation is coming.
+    Help,
+    /// Contact Support / Feedback: the GitHub new-issue page with this build.
+    ContactSupport,
+    Feedback,
+    /// About docxy: File › Info, with every build field.
+    About,
     /// Not yet implemented; the `&str` is the feature name for the hint.
     Todo(&'static str),
 }
@@ -175,7 +183,7 @@ pub struct Ribbon {
 impl Ribbon {
     pub fn home() -> Ribbon {
         let tabs = vec![
-            "File", "Home", "Styles", "Insert", "Design", "Review", "View",
+            "File", "Home", "Styles", "Insert", "Design", "Review", "View", "Help",
         ];
         let tab_groups = vec![
             Vec::new(), // File → backstage
@@ -185,6 +193,7 @@ impl Ribbon {
             design_groups(),
             review_groups(),
             view_groups(false),
+            help_groups(),
         ];
         Ribbon {
             inner: CoreRibbon::new(tabs, tab_groups, HOME_TAB, ACCENT),
@@ -674,6 +683,65 @@ fn review_groups() -> Vec<Group> {
 
 /// The View tab's groups (Views / Page / Show / Ribbon / Edit, plus a contextual
 /// Markdown group when a `.md` file is open).
+/// The Help tab every editor ends with (#1021): Show Training and What's New
+/// have nothing to show yet, so they are drawn dimmed.
+fn help_groups() -> Vec<Group> {
+    use Act::*;
+    vec![
+        Group {
+            title: "Help",
+            width: 29,
+            rows: [
+                vec![
+                    btn("Help", 4, Help, "Help — the documentation is coming"),
+                    Seg::Gap("  "),
+                    btn(
+                        "Feedback",
+                        8,
+                        Feedback,
+                        "Feedback — a GitHub issue with this build filled in",
+                    ),
+                    Seg::Gap("  "),
+                    btn(
+                        "Show Training",
+                        13,
+                        Todo("Show Training"),
+                        "Show Training — coming later",
+                    ),
+                ],
+                vec![
+                    btn(
+                        "Contact Support",
+                        15,
+                        ContactSupport,
+                        "Contact Support — a GitHub issue with this build filled in",
+                    ),
+                    Seg::Gap("  "),
+                    btn(
+                        "What's New",
+                        10,
+                        Todo("What's New"),
+                        "What's New — coming later",
+                    ),
+                ],
+            ],
+        },
+        Group {
+            title: "About",
+            width: 11,
+            rows: [
+                vec![btn(
+                    "About docxy",
+                    11,
+                    About,
+                    "About docxy — this build's details",
+                )],
+                vec![],
+            ],
+        },
+    ]
+}
+
 fn view_groups(markdown: bool) -> Vec<Group> {
     use Act::*;
     let mut groups = vec![
@@ -823,6 +891,7 @@ mod tests {
                 design_groups(),
                 review_groups(),
                 view_groups(md),
+                help_groups(),
             ];
             for groups in tabs {
                 for g in &groups {
@@ -887,6 +956,21 @@ mod tests {
         assert!(r.has_act(Act::PageColor));
         assert!(r.has_act(Act::Watermark));
         assert!(r.has_act(Act::PageBorders));
+    }
+
+    const HELP_TAB: usize = 7;
+
+    #[test]
+    fn help_is_the_last_tab() {
+        let mut r = Ribbon::home();
+        assert_eq!(r.tab_label(HELP_TAB), Some("Help"));
+        assert_eq!(r.tab_label(HELP_TAB + 1), None);
+        r.set_active(HELP_TAB);
+        for act in [Act::Help, Act::ContactSupport, Act::Feedback, Act::About] {
+            assert!(r.has_act(act), "{act:?}");
+        }
+        assert!(r.has_act(Act::Todo("Show Training")));
+        assert!(r.has_act(Act::Todo("What's New")));
     }
 
     #[test]

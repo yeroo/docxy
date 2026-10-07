@@ -5876,6 +5876,20 @@ impl App {
                     .to_string(),
                 );
             }
+            Help => self.status = Some(HELP_COMING.to_string()),
+            ContactSupport | Feedback => {
+                // A test never starts a browser.
+                #[cfg(not(test))]
+                open_url(&feedback_url());
+                self.status = Some(FEEDBACK_OPENED.to_string());
+            }
+            About => {
+                // File › Info, where every build field is.
+                self.open_backstage();
+                if let Some(bs) = self.backstage.as_mut() {
+                    bs.item = backstage::Item::Info;
+                }
+            }
             Todo(name) => self.status = Some(format!("{name}: not implemented yet")),
         }
     }
@@ -8920,6 +8934,12 @@ impl backstage::BackstageHost for App {
                 c.value.display()
             )));
         }
+        // Help › About lands here (#1021): every build field.
+        lines.push(RLine::raw(String::new()));
+        lines.push(RLine::raw("  About xlsxy".to_string()));
+        for l in buildinfo::get(env!("CARGO_PKG_VERSION")).about_lines() {
+            lines.push(RLine::raw(format!("    {l}")));
+        }
         lines
     }
 
@@ -11230,6 +11250,17 @@ fn safe_url(url: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
+/// What Help › Help says until the documentation lands (#1021).
+const HELP_COMING: &str = "Help: the documentation is coming soon";
+
+/// The status line after Help › Feedback or Contact Support.
+const FEEDBACK_OPENED: &str = "Opened the feedback page in your browser";
+
+/// Help › Feedback's page: the GitHub new-issue form with this build filled in.
+fn feedback_url() -> String {
+    buildinfo::get(env!("CARGO_PKG_VERSION")).feedback_url("xlsxy")
+}
+
 fn open_url(url: &str) {
     if !safe_url(url) {
         return;
@@ -11431,6 +11462,32 @@ mod tests {
                 .any(|l| l.contains("Build") && l.contains(&line)),
             "{info:?}"
         );
+    }
+
+    /// #1021: Help › About opens File › Info, whose About section lists
+    /// every build field; Help and Feedback answer on the status line.
+    #[test]
+    fn help_tab_commands() {
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        let info: Vec<String> = app.info_lines().iter().map(|l| l.to_string()).collect();
+        let b = buildinfo::get(env!("CARGO_PKG_VERSION"));
+        assert!(info.iter().any(|l| l.trim() == "About xlsxy"), "{info:?}");
+        assert!(
+            info.iter()
+                .any(|l| l.trim() == format!("commit      {}", b.commit)),
+            "{info:?}"
+        );
+        assert_eq!(info.iter().any(|l| l.trim() == "Manual build"), b.manual());
+        app.ribbon_act(ribbon::Act::Help);
+        assert_eq!(app.status.as_deref(), Some(HELP_COMING));
+        app.ribbon_act(ribbon::Act::ContactSupport);
+        assert_eq!(app.status.as_deref(), Some(FEEDBACK_OPENED));
+        app.ribbon_act(ribbon::Act::About);
+        let bs = app.backstage.as_ref().expect("About opens File");
+        assert_eq!(bs.item, backstage::Item::Info);
+        let url = feedback_url();
+        assert!(safe_url(&url), "{url}");
+        assert!(url.starts_with("https://github.com/yeroo/docxy/issues/new?body=xlsxy%20"));
     }
 
     /// `Backup of <stem>.xlk` lives beside the file; the stem keeps any

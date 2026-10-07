@@ -2356,10 +2356,30 @@ impl App {
                 self.status = Some(format!("Applied style: {id}"));
             }
             StylesDialog => self.open_styles_dialog(),
+            Help => {
+                self.status = Some(HELP_COMING.to_string());
+                self.dirty = true;
+            }
+            ContactSupport | Feedback => {
+                // A test never starts a browser.
+                #[cfg(not(test))]
+                open_url(&feedback_url());
+                self.status = Some(FEEDBACK_OPENED.to_string());
+                self.dirty = true;
+            }
+            About => self.open_about(),
             Todo(name) => {
                 self.status = Some(format!("{name} — not implemented yet"));
                 self.dirty = true;
             }
+        }
+    }
+
+    /// Help › About docxy (#1021): File › Info, where every build field is.
+    fn open_about(&mut self) {
+        self.open_backstage();
+        if let Some(bs) = self.backstage.as_mut() {
+            bs.item = backstage::Item::Info;
         }
     }
 
@@ -7658,6 +7678,9 @@ impl backstage::BackstageHost for App {
             RLine::raw(format!("  Words       {words}")),
             RLine::raw(format!("  Characters  {chars}")),
         ]
+        .into_iter()
+        .chain(about_lines())
+        .collect()
     }
 
     fn accent(&self) -> Color {
@@ -7969,6 +7992,31 @@ fn clip_has_formatting(clip: &Clip) -> bool {
     }
 
     clip.paras.iter().flatten().any(inline_has_formatting)
+}
+
+/// What Help › Help says until the documentation lands (#1021).
+const HELP_COMING: &str = "Help: the documentation is coming soon";
+
+/// The status line after Help › Feedback or Contact Support.
+const FEEDBACK_OPENED: &str = "Opened the feedback page in your browser";
+
+/// Help › Feedback's page: the GitHub new-issue form with this build filled in.
+fn feedback_url() -> String {
+    buildinfo::get(env!("CARGO_PKG_VERSION")).feedback_url("docxy")
+}
+
+/// The Info page's About section (#1021): a blank line, then every build
+/// field, headed by "Manual build" on a manual one.
+fn about_lines() -> Vec<RLine<'static>> {
+    std::iter::once(RLine::raw(String::new()))
+        .chain(std::iter::once(RLine::raw("  About docxy".to_string())))
+        .chain(
+            buildinfo::get(env!("CARGO_PKG_VERSION"))
+                .about_lines()
+                .into_iter()
+                .map(|l| RLine::raw(format!("    {l}"))),
+        )
+        .collect()
 }
 
 /// Open a URL with the OS default handler — **without a shell** (the URL is
@@ -9978,6 +10026,32 @@ mod tests {
                 .any(|l| l.contains("Build") && l.contains(&line)),
             "{info:?}"
         );
+    }
+
+    /// #1021: Help › About opens File › Info, whose About section lists
+    /// every build field; Help and Feedback answer on the status line.
+    #[test]
+    fn help_tab_commands() {
+        let mut app = app_with(&["A"]);
+        let info: Vec<String> = app.info_lines().iter().map(|l| l.to_string()).collect();
+        let b = buildinfo::get(env!("CARGO_PKG_VERSION"));
+        assert!(info.iter().any(|l| l.trim() == "About docxy"), "{info:?}");
+        assert!(
+            info.iter()
+                .any(|l| l.trim() == format!("commit      {}", b.commit)),
+            "{info:?}"
+        );
+        assert_eq!(info.iter().any(|l| l.trim() == "Manual build"), b.manual());
+        app.run_act(ribbon::Act::Help);
+        assert_eq!(app.status.as_deref(), Some(HELP_COMING));
+        app.run_act(ribbon::Act::Feedback);
+        assert_eq!(app.status.as_deref(), Some(FEEDBACK_OPENED));
+        app.run_act(ribbon::Act::About);
+        let bs = app.backstage.as_ref().expect("About opens File");
+        assert_eq!(bs.item, backstage::Item::Info);
+        let url = feedback_url();
+        assert!(safe_url(&url), "{url}");
+        assert!(url.starts_with("https://github.com/yeroo/docxy/issues/new?body=docxy%20"));
     }
 
     fn app_with(paras: &[&str]) -> App {

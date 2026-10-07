@@ -17,9 +17,9 @@ most three small-button rows to a column.
 1. Open a workbook. Widen the window to at least 1400 px so nothing collapses.
 2. On Home, look at each group from Clipboard to Editing: no button is cut off
    at the top or bottom, and every group title is visible under its buttons.
-3. Visit Insert, Data, Review and View and look again.
+3. Visit Insert, Data, Review, View and Help and look again.
 4. Do the same in a Word document (Home, Insert, Design, Layout, Mailings,
-   Review, View) and a Project (Task, Resource, Project, View).
+   Review, View, Help) and a Project (Task, Resource, Project, View, Help).
 
 **Expect:** every button is whole and every group title shows. Editing is an
 AutoSum / Fill / Clear column, a large Sort & Filter drop-down and Find & Select.

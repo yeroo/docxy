@@ -99,6 +99,13 @@ pub enum Act {
     ShowObjects,
     ThemeToggle,
     AutoHideRibbon,
+    /// Help tab (#1021): Help says the documentation is coming; Contact
+    /// Support and Feedback open the GitHub new-issue page with this build;
+    /// About shows File › Info, where every build field is.
+    Help,
+    ContactSupport,
+    Feedback,
+    About,
     Todo(&'static str),
 }
 
@@ -119,7 +126,7 @@ pub struct Ribbon(CoreRibbon<Act>);
 
 impl Ribbon {
     pub fn new() -> Ribbon {
-        let tabs = vec!["File", "Home", "Insert", "Data", "Review", "View"];
+        let tabs = vec!["File", "Home", "Insert", "Data", "Review", "View", "Help"];
         let tab_groups = vec![
             Vec::new(), // File → backstage
             home_groups(),
@@ -127,6 +134,7 @@ impl Ribbon {
             data_groups(),
             review_groups(),
             view_groups(),
+            help_groups(),
         ];
         Ribbon(CoreRibbon::new(tabs, tab_groups, 1, ACCENT))
     }
@@ -541,6 +549,60 @@ fn review_groups() -> Vec<Group> {
     ]
 }
 
+/// The Help tab every editor ends with (#1021): Show Training and What's New
+/// have nothing to show yet, so they are drawn dimmed.
+fn help_groups() -> Vec<Group> {
+    use Act::*;
+    vec![
+        Group {
+            title: "Help",
+            width: 27,
+            rows: [
+                vec![
+                    btn("Help", Help, "Help — the documentation is coming"),
+                    Seg::Gap(" "),
+                    btn(
+                        "Feedback",
+                        Feedback,
+                        "Feedback — a GitHub issue with this build filled in",
+                    ),
+                    Seg::Gap(" "),
+                    btn(
+                        "Show Training",
+                        Todo("Show Training"),
+                        "Show Training — coming later",
+                    ),
+                ],
+                vec![
+                    btn(
+                        "Contact Support",
+                        ContactSupport,
+                        "Contact Support — a GitHub issue with this build filled in",
+                    ),
+                    Seg::Gap(" "),
+                    btn(
+                        "What's New",
+                        Todo("What's New"),
+                        "What's New — coming later",
+                    ),
+                ],
+            ],
+        },
+        Group {
+            title: "About",
+            width: 11,
+            rows: [
+                vec![btn(
+                    "About xlsxy",
+                    About,
+                    "About xlsxy — this build's details",
+                )],
+                vec![],
+            ],
+        },
+    ]
+}
+
 fn view_groups() -> Vec<Group> {
     use Act::*;
     vec![
@@ -623,6 +685,7 @@ mod tests {
             data_groups(),
             review_groups(),
             view_groups(),
+            help_groups(),
         ] {
             for g in &groups {
                 for row in &g.rows {
@@ -636,6 +699,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn help_is_the_last_tab() {
+        let mut r = Ribbon::new();
+        assert_eq!(r.tab_label(6), Some("Help"));
+        assert_eq!(r.tab_label(7), None);
+        r.set_active(6);
+        for act in [Act::Help, Act::ContactSupport, Act::Feedback, Act::About] {
+            assert!(r.has_act(act), "{act:?}");
+        }
+        assert!(r.has_act(Act::Todo("Show Training")));
+        assert!(r.has_act(Act::Todo("What's New")));
     }
 
     #[test]

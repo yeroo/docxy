@@ -249,6 +249,20 @@ impl BuildInfo {
         s
     }
 
+    /// The terminal editors' About screen (File › Info, which Help › About
+    /// opens, #1021): "Manual build" first when it is one, then every row as
+    /// `label       value`.
+    pub fn about_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.manual() {
+            lines.push("Manual build".to_string());
+        }
+        for (label, value) in self.rows() {
+            lines.push(format!("{label:<12}{value}"));
+        }
+        lines
+    }
+
     /// Help › Feedback and Contact Support: the docxy GitHub new-issue page with
     /// the build pre-filled in the body. The body is the [`BuildInfo::version_block`]
     /// rows without `host` (the machine's name has no place in a public issue),
@@ -460,6 +474,21 @@ mod tests {
         assert_eq!(b.short_commit(), "unknown");
         assert!(b.short_line().contains("no merged PR"));
         assert!(b.fields().contains(&("commit_hex", Value::Bool(false))));
+    }
+
+    #[test]
+    fn about_lines_mark_a_manual_build_and_list_every_row() {
+        let local = BuildInfo::from_raw(&raw("local", false), "0.5.0");
+        let lines = local.about_lines();
+        assert_eq!(lines[0], "Manual build");
+        assert_eq!(lines.len(), 1 + local.rows().len());
+        assert!(lines.contains(&format!("commit      {}", local.commit)));
+        assert!(lines.contains(&"kind        local".to_string()));
+        let release = BuildInfo::from_raw(&raw("release", false), "0.5.0");
+        assert_eq!(
+            release.about_lines()[0],
+            format!("commit      {}", release.commit)
+        );
     }
 
     /// Undo [`percent_encode`], for checking the body a URL carries.
