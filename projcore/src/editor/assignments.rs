@@ -12,7 +12,6 @@
 //! closure.
 use super::effort::work_edit_rescales_units;
 use super::*;
-use crate::schedule::HORIZON_DAYS;
 
 /// The resource an added assignment is for.
 #[derive(Clone, Copy, Debug)]
@@ -51,10 +50,6 @@ fn positive_units(units: f64) -> Result<f64, String> {
         Err(format!("units must be a positive number, not {units}"))
     }
 }
-
-/// The most work or delay an agent may give: the scheduling horizon, so
-/// `work / units + delay` and the stored tenths stay representable.
-const MAX_MINUTES: i64 = 2 * HORIZON_DAYS * 1440;
 
 /// Work or a delay must be a non-negative number of minutes within the
 /// scheduling horizon.
@@ -200,7 +195,7 @@ impl Editor {
             .max()
             .unwrap_or(0);
         let mut assignments = self.proj.assignments.clone();
-        let added = new_assignment(&mut next_aid, task_uid, rid, kind, units, duration)?;
+        let added = new_assignment(&mut next_aid, task_uid, rid, kind, units, "units", duration)?;
         let uid = added.uid;
         assignments.push(added);
         self.commit_assignments(i, resources, assignments)?;

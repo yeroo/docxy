@@ -10,7 +10,7 @@ use crate::model::{
     LinkType, Predecessor, Project, Resource, ResourceBaseline, ResourceType, Task, TaskType,
     TimephasedValue, outline_numbers,
 };
-use crate::schedule::{Leveled, Schedule, level, schedule};
+use crate::schedule::{HORIZON_DAYS, Leveled, Schedule, level, schedule};
 
 const UNDO_CAP: usize = 100;
 const EXTERNAL_TASK_DATES: &str = "External task: its dates come from its own project";
@@ -1150,7 +1150,16 @@ impl Editor {
             };
             let u = checked_units(u, name)?;
             let mut assignments = self.proj.assignments.clone();
-            assignments[k].set_units(u, assigned_work(kind, duration, u));
+            let span = match kind {
+                Some(ResourceType::Work) | None
+                    if matches!(assignments[k].work_contour, None | Some(0)) =>
+                {
+                    // A flat work resource works from its delay, as `rescale_work`.
+                    (duration - assignments[k].delay_min()).max(0)
+                }
+                _ => duration,
+            };
+            assignments[k].set_units(u, staged_work(kind, span, u, name)?);
             self.commit_assignments(i, resources, assignments)?;
             return Ok(AssignOutcome::Assigned);
         }
@@ -1173,6 +1182,7 @@ impl Editor {
             rid,
             kind,
             units,
+            name,
             duration,
         )?);
         self.commit_assignments(i, resources, assignments)?;
@@ -1543,14 +1553,36 @@ fn checked_units(units: f64, token: &str) -> Result<f64, String> {
     }
 }
 
+/// The most work or delay an edit may stage: the scheduling horizon, so
+/// `work / units + delay` and the stored tenths stay representable.
+pub(crate) const MAX_MINUTES: i64 = 2 * HORIZON_DAYS * 1440;
+
+/// Staged work for `units` over `span` minutes, refused when it would pass
+/// the scheduling range. The work saturates, so huge units are refused too.
+fn staged_work(
+    kind: Option<ResourceType>,
+    span: i64,
+    units: f64,
+    token: &str,
+) -> Result<i64, String> {
+    let work = assigned_work(kind, span.max(0), units);
+    if work > MAX_MINUTES {
+        Err(format!("Invalid units in '{}'", token.trim()))
+    } else {
+        Ok(work)
+    }
+}
+
 fn new_assignment(
     next_uid: &mut i32,
     task_uid: i32,
     resource_uid: i32,
     kind: Option<ResourceType>,
     units: f64,
+    token: &str,
     duration_min: i64,
 ) -> Result<Assignment, String> {
+    let work_min = staged_work(kind, duration_min, units, token)?;
     *next_uid = next_uid
         .checked_add(1)
         .ok_or("No assignment IDs available")?;
@@ -1559,7 +1591,7 @@ fn new_assignment(
         task_uid,
         resource_uid,
         units,
-        work_min: assigned_work(kind, duration_min, units),
+        work_min,
         ..Assignment::default()
     })
 }

@@ -1779,6 +1779,117 @@ fn malformed_units_are_rejected_atomically_unless_a_resource_has_that_name() {
 }
 
 #[test]
+fn a_huge_units_cell_entry_is_refused() {
+    let mut ed = with_bob(ResourceType::Work, 0.5);
+    ed.set_resources(10, &["Bob".into()]).unwrap();
+    ed.mark_saved();
+    let before = ed.project().clone();
+    let err = "Invalid units in 'Bob[1e300%]'".to_string();
+    // A new assignment (task 20) and the existing one (task 10), through the
+    // cell and through the prompt: all refused before anything is staged, so
+    // the saturating work never reaches `assign::refresh`.
+    assert_eq!(
+        ed.set_resources(20, &["Bob[1e300%]".into()]),
+        Err(err.clone())
+    );
+    unchanged(&ed, &before, (1, 0, false));
+    assert_eq!(
+        ed.set_resources(10, &["Bob[1e300%]".into()]),
+        Err(err.clone())
+    );
+    unchanged(&ed, &before, (1, 0, false));
+    assert_eq!(ed.assign_resource(20, "Bob[1e300%]"), Err(err.clone()));
+    unchanged(&ed, &before, (1, 0, false));
+    assert_eq!(ed.assign_resource(10, "Bob[1e300%]"), Err(err));
+    unchanged(&ed, &before, (1, 0, false));
+}
+
+#[test]
+fn a_huge_material_quantity_is_refused() {
+    let mut ed = with_bob(ResourceType::Material, 1.0);
+    ed.set_resources(10, &["Bob".into()]).unwrap();
+    ed.mark_saved();
+    let before = ed.project().clone();
+    // A material's work is its quantity in hours, so a huge quantity is a
+    // huge work and is refused the same way.
+    let err = "Invalid units in 'Bob[1e300]'".to_string();
+    assert_eq!(
+        ed.set_resources(20, &["Bob[1e300]".into()]),
+        Err(err.clone())
+    );
+    unchanged(&ed, &before, (1, 0, false));
+    assert_eq!(
+        ed.set_resources(10, &["Bob[1e300]".into()]),
+        Err(err.clone())
+    );
+    unchanged(&ed, &before, (1, 0, false));
+    assert_eq!(ed.assign_resource(20, "Bob[1e300]"), Err(err.clone()));
+    unchanged(&ed, &before, (1, 0, false));
+    assert_eq!(ed.assign_resource(10, "Bob[1e300]"), Err(err));
+    unchanged(&ed, &before, (1, 0, false));
+}
+
+/// Task 10, Fixed Duration, Bob at 100% with a 240-minute delay.
+fn delayed_fixed_plan() -> Editor {
+    let mut ed = with_bob(ResourceType::Work, 1.0);
+    ed.proj.tasks[0].task_type = Some(TaskType::FixedDuration);
+    ed.set_resources(10, &["Bob".into()]).unwrap();
+    ed.proj.assignments[0].delay = Some(2400); // tenths of a minute
+    ed
+}
+
+#[test]
+fn a_units_cell_edit_of_a_delayed_assignment_works_from_the_delay() {
+    // What assign.set stages for the same units is the oracle (its test
+    // `a_units_edit_works_from_the_delay_on_a_fixed_duration_task`).
+    let mut oracle = delayed_fixed_plan();
+    let aid = oracle.proj.assignments[0].uid;
+    oracle
+        .set_assignment(
+            aid,
+            AssignmentPatch {
+                units: Some(0.5),
+                ..AssignmentPatch::default()
+            },
+        )
+        .unwrap();
+    let expected = oracle.proj.assignments[0].work_min;
+    // Fixed Duration: the staged work survives the commit, (D - d) x units.
+    assert_eq!(expected, (960 - 240) / 2);
+    for prompt in [false, true] {
+        let mut ed = delayed_fixed_plan();
+        if prompt {
+            assert_eq!(
+                ed.assign_resource(10, "Bob[50%]"),
+                Ok(AssignOutcome::Assigned)
+            );
+        } else {
+            ed.set_resources(10, &["Bob[50%]".into()]).unwrap();
+        }
+        assert_eq!(allocation(&ed, 10, 1), (0.5, expected), "prompt: {prompt}");
+    }
+}
+
+#[test]
+fn a_refused_huge_units_leaves_other_assignments_and_undo_untouched() {
+    let mut ed = with_bob(ResourceType::Work, 1.0);
+    ed.set_resources(10, &["Bob".into()]).unwrap();
+    ed.set_resources(20, &["Bob[200%]".into()]).unwrap();
+    ed.mark_saved();
+    let before = ed.project().clone();
+    // The huge units are refused before anything lands: not the restaged
+    // task-10 assignment, not the Carol staged after it, not an undo step.
+    assert_eq!(
+        ed.set_resources(10, &["Bob[1e300%]".into(), "Carol".into()]),
+        Err("Invalid units in 'Bob[1e300%]'".to_string())
+    );
+    unchanged(&ed, &before, (2, 0, false));
+    assert_eq!(allocation(&ed, 10, 1), (1.0, 960));
+    assert_eq!(allocation(&ed, 20, 1), (2.0, 960));
+    assert!(ed.proj.resources.iter().all(|r| r.name != "Carol"));
+}
+
+#[test]
 fn assign_prompt_takes_units_and_changes_only_different_ones() {
     let mut ed = with_bob(ResourceType::Work, 0.5);
     // Fixed Duration: a units edit rescales the work from the duration (#159).
