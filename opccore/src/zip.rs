@@ -49,21 +49,35 @@ fn deflate_cap(uncomp_size: u64) -> Option<usize> {
 
 /// The entry count and central directory offset of a ZIP64 archive, read
 /// from the ZIP64 end record its locator (just before the end record at
-/// `eocd`) points to. `Some(None)` when there is no locator; `None` when
-/// there is one but the record it points to is missing.
+/// `eocd`) points to. `Some(None)` when there is no locator. An ordinary
+/// archive can hold the locator's bytes by chance (an entry comment ending
+/// the central directory), so when the end record's own fields are not
+/// ZIP64 sentinels, a locator inside the central directory or one that
+/// points at no ZIP64 end record is not one either: `Some(None)` too. With
+/// sentinel fields, a locator that leads nowhere is `None`.
 fn zip64_end(data: &[u8], eocd: usize) -> Option<Option<(u64, u64)>> {
-    let Some(locator) = eocd.checked_sub(20).and_then(|at| span(data, at, 20)) else {
+    let end = &data[eocd..];
+    let (count, cd_size, cd_offset) = (rd16(&end[10..]), rd32(&end[12..]), rd32(&end[16..]));
+    let sentinels = count == 0xFFFF || cd_size == ZIP64_SENTINEL || cd_offset == ZIP64_SENTINEL;
+    let Some(at) = eocd.checked_sub(20) else {
         return Some(None);
     };
+    let locator = &data[at..eocd];
     if rd32(locator) != EOCD64_LOCATOR_SIG {
         return Some(None);
     }
-    let at = usize::try_from(rd64(&locator[8..])).ok()?;
-    let rec = span(data, at, 56)?;
-    if rd32(rec) != EOCD64_SIG {
-        return None;
+    if !sentinels && cd_offset as u64 + cd_size as u64 > at as u64 {
+        return Some(None);
     }
-    Some(Some((rd64(&rec[32..]), rd64(&rec[48..]))))
+    let record = usize::try_from(rd64(&locator[8..]))
+        .ok()
+        .and_then(|rec| span(data, rec, 56))
+        .filter(|rec| rd32(rec) == EOCD64_SIG);
+    match record {
+        Some(rec) => Some(Some((rd64(&rec[32..]), rd64(&rec[48..])))),
+        None if sentinels => None,
+        None => Some(None),
+    }
 }
 
 /// The 64-bit values of the fields a central directory entry marked with
@@ -555,6 +569,45 @@ mod tests {
             zip[record + field..record + field + 8].copy_from_slice(&value.to_le_bytes());
             assert!(ZipArchive::open(&zip).is_none(), "+{field} = {value}");
         }
+    }
+
+    /// An ordinary archive whose last entry comment is 20 bytes that look
+    /// like a ZIP64 locator pointing at `target`.
+    fn locator_lookalike(content: &[u8], target: u64) -> Vec<u8> {
+        let mut zip = make_stored_zip(&[("a", content)]);
+        let eocd = zip.len() - 22;
+        let central = rd32(&zip[eocd + 16..]) as usize;
+        zip[central + 32..central + 34].copy_from_slice(&20u16.to_le_bytes());
+        let mut comment = EOCD64_LOCATOR_SIG.to_le_bytes().to_vec();
+        comment.extend_from_slice(&0u32.to_le_bytes());
+        comment.extend_from_slice(&target.to_le_bytes());
+        comment.extend_from_slice(&1u32.to_le_bytes());
+        zip.splice(eocd..eocd, comment);
+        let cd_size = rd32(&zip[zip.len() - 22 + 12..]) + 20;
+        let at = zip.len() - 22 + 12;
+        zip[at..at + 4].copy_from_slice(&cd_size.to_le_bytes());
+        zip
+    }
+
+    /// An ordinary archive opens as before when the 20 bytes before its end
+    /// record happen to read as a ZIP64 locator: one pointing at no ZIP64
+    /// end record, and one pointing at bytes that look like one.
+    #[test]
+    fn locator_lookalike_in_an_ordinary_archive_is_ignored() {
+        let zip = locator_lookalike(b"hello", 0);
+        let arc = ZipArchive::open(&zip).expect("open");
+        assert_eq!(arc.read("a").unwrap(), b"hello");
+        // The entry's data is a ZIP64 end record claiming 5 entries at 0.
+        let mut record = EOCD64_SIG.to_le_bytes().to_vec();
+        record.extend_from_slice(&[0; 28]);
+        record.extend_from_slice(&5u64.to_le_bytes());
+        record.extend_from_slice(&[0; 8]);
+        record.extend_from_slice(&0u64.to_le_bytes());
+        let data_at = 30 + 1; // local header + name "a"
+        let zip = locator_lookalike(&record, data_at);
+        let arc = ZipArchive::open(&zip).expect("open");
+        assert_eq!(arc.entries().len(), 1);
+        assert_eq!(arc.read("a").unwrap(), record);
     }
 
     /// A ZIP64 archive truncated anywhere opens to `None` or to entries
