@@ -1046,6 +1046,56 @@ fn check_sheets(
         let (x, y) = (read_sheet(&a[name], &sst_a), read_sheet(&b[name], &sst_b));
         out.extend(compare_sheets(name, &x, &y));
     }
+    for (name, t) in &b {
+        if t.local == "worksheet" {
+            out.extend(bad_cols(name, t));
+        }
+    }
+    out
+}
+
+/// What no save may write, whatever the original said (#1152): a `<col>`
+/// without a width, which Excel opens zero wide, at
+/// `/cols/<span>/no-width`; and a `<col>` starting at or before the end of
+/// the one before it (overlapping, duplicated or out of order), at
+/// `/cols/<span>/overlap`. No loss class claims either.
+fn bad_cols(part: &str, root: &Elem) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut previous: Option<(u32, u32)> = None;
+    for cols in elems(root, "cols") {
+        for col in elems(cols, "col") {
+            let n = |a| attr(col, a).and_then(|v| v.trim().parse::<u32>().ok());
+            let (Some(lo), Some(hi)) = (n("min"), n("max")) else {
+                continue;
+            };
+            let span = if lo == hi {
+                col_letters(lo)
+            } else {
+                format!("{}:{}", col_letters(lo), col_letters(hi))
+            };
+            let mut finding = |what: &str, detail: String| {
+                out.push(Finding {
+                    part: part.to_string(),
+                    kind: Kind::ChangedValue,
+                    path: format!("/cols/{span}/{what}"),
+                    detail,
+                })
+            };
+            if attr(col, "width").is_none() {
+                finding(
+                    "no-width",
+                    format!("<col min=\"{lo}\" max=\"{hi}\"> has no width"),
+                );
+            }
+            if let Some((p_lo, p_hi)) = previous.filter(|(_, p_hi)| lo <= *p_hi) {
+                finding(
+                    "overlap",
+                    format!("starts at or before the end of the <col> before it ({p_lo}..={p_hi})"),
+                );
+            }
+            previous = Some((lo, hi));
+        }
+    }
     out
 }
 
@@ -1264,6 +1314,62 @@ fn round_trip_fidelity_gate() {
         verdict.stale.len(),
         unclassified.len()
     );
+}
+
+/// The files whose unedited save Excel opened with a column zero wide
+/// (#1152, found by the real-Excel oracle), and three more the same
+/// control anchors hit. Paths under the external corpus.
+const ZERO_WIDE_COLUMN_FILES: &[&str] = &[
+    "libreoffice/sc/qa/unit/data/xlsx/activex_checkbox.xlsx",
+    "libreoffice/chart2/qa/extras/data/xlsx/tdf111173.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/button-form-control.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/checkbox-form-control.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/singlecontrol.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/pivot_dark1.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/pivottable_date_field_filter.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/tdf120301_xmlSpaceParsing.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/tdf134769.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/tdf161365.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/tdf60673.xlsx",
+    "openoffice/test/testgui/data/pvt/complex_29s.xlsx",
+];
+
+#[test]
+fn the_zero_wide_column_files_save_their_columns_as_they_were() {
+    let (_, ext) = corpus(&workspace_root());
+    let Some(dir) = ext else {
+        assert!(
+            !flag("FIDELITY_REQUIRE_CORPUS"),
+            "fidelity: FIDELITY_REQUIRE_CORPUS=1 but no external corpus"
+        );
+        eprintln!("fidelity: SKIP the #1152 files: no external corpus");
+        return;
+    };
+    for file in ZERO_WIDE_COLUMN_FILES {
+        let path = dir.join(file);
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let pkg = load_xlsx(&bytes).unwrap_or_else(|e| panic!("{file}: {e:?}"));
+        let saved = save_xlsx_for_path(&pkg, &path);
+        let (a, b) = (trees(&bytes), trees(&saved));
+        let (sst_a, sst_b) = (shared_strings(&a), shared_strings(&b));
+        for (name, t) in &b {
+            if t.local != "worksheet" {
+                continue;
+            }
+            // No `<col>` without a width, none overlapping another.
+            assert_eq!(bad_cols(name, t), vec![], "{file} {name}");
+            // Every column as wide as it was.
+            let original = a
+                .get(name)
+                .unwrap_or_else(|| panic!("{file}: {name} is new"));
+            let widths: Vec<Finding> =
+                compare_sheets(name, &read_sheet(original, &sst_a), &read_sheet(t, &sst_b))
+                    .into_iter()
+                    .filter(|f| f.path.starts_with("/cols/") && f.path.ends_with("/width"))
+                    .collect();
+            assert_eq!(widths, vec![], "{file} {name}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1676,6 +1782,59 @@ fn columns_are_compared_one_by_one() {
         ),
         vec![col("A", "hidden"), col("A", "style"), col("A", "width")]
     );
+}
+
+#[test]
+fn a_saved_col_without_a_width_or_overlapping_another_fails() {
+    let cols = |c: &str| format!("<cols>{c}</cols><sheetData/>");
+    let check = |a: &str, b: &str| after_check((&cols(a), ""), (&cols(b), ""));
+    let col = |c: &str, what: &str| (Kind::ChangedValue, format!("/cols/{c}/{what}"));
+    // What the suite wrote for a control's anchor (#1152): no width, twice.
+    // The column read compares them as no `<col>` at all, so only this
+    // check finds them.
+    assert_eq!(
+        check("", r#"<col min="1" max="1"/><col min="1" max="1"/>"#),
+        vec![
+            col("A", "no-width"),
+            col("A", "no-width"),
+            col("A", "overlap")
+        ]
+    );
+    // Overlapping and out of order, each where it starts.
+    let ok = r#"<col min="1" max="2" width="9"/><col min="4" max="4" width="9"/>"#;
+    assert_eq!(check(ok, ok), vec![]);
+    assert_eq!(
+        check(
+            ok,
+            r#"<col min="1" max="2" width="9"/><col min="2" max="3" width="9"/><col min="1" max="1" width="9"/>"#
+        )
+        .into_iter()
+        .filter(|(_, p)| p.ends_with("/overlap"))
+        .collect::<Vec<_>>(),
+        vec![col("B:C", "overlap"), col("A", "overlap")]
+    );
+    // Judged on the saved side only: an original's bad `<col>` is not the
+    // save's, and a save that fixes it is clean of these.
+    assert_eq!(
+        check(
+            r#"<col min="2" max="2"/>"#,
+            r#"<col min="2" max="2" width="0" customWidth="1"/>"#
+        )
+        .into_iter()
+        .filter(|(_, p)| p.ends_with("/no-width") || p.ends_with("/overlap"))
+        .collect::<Vec<_>>(),
+        vec![]
+    );
+    // No loss class claims them: they always fail the gate.
+    for (kind, path) in check("", r#"<col min="1" max="1"/><col min="1" max="1"/>"#) {
+        let e = Entry {
+            file: "ext:libreoffice/sc/qa/unit/data/xlsx/activex_checkbox.xlsx".into(),
+            part: "xl/worksheets/sheet1.xml".into(),
+            kind,
+            path: path.clone(),
+        };
+        assert!(!CLASSES.iter().any(|c| (c.matches)(&e)), "{path}");
+    }
 }
 
 #[test]
