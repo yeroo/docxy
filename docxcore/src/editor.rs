@@ -232,6 +232,11 @@ const UNDO_CAP: usize = 20_000;
 /// About how many bytes of copied blocks the undo history may hold (see
 /// [`Snapshot::weight`]) before its oldest steps go, though never below
 /// [`UNDO_FLOOR`] steps: steps that each copy a large table reach it early.
+///
+/// A step's weight estimates what that step copied when it was taken, not
+/// what dropping it frees: a block an old step copied may still be shared by
+/// newer ones, so the memory the history keeps can exceed the budget. The
+/// floor and [`UNDO_CAP`] bound how far.
 const HISTORY_BUDGET: usize = 256 << 20;
 
 /// The undo steps the history always keeps, budget or not: the 500 it kept
@@ -265,27 +270,27 @@ fn share_body(body: &[Block], like: Option<&[Arc<Block>]>) -> (Vec<Arc<Block>>, 
     out.extend(like[..prefix].iter().cloned());
     out.extend(copied.iter().map(|b| Arc::new(b.clone())));
     out.extend(like[like.len() - suffix..].iter().cloned());
-    (out, copied.iter().map(block_weight).sum())
+    // The step's own list of blocks is a copy too, one pointer a block.
+    let list = out.capacity() * std::mem::size_of::<Arc<Block>>();
+    (out, list + copied.iter().map(block_weight).sum::<usize>())
 }
 
-/// About how many bytes a copy of `block` takes: its inlines and text, and
-/// a table's cells' blocks. An estimate for the history's budget only.
+/// About how many bytes a copy of `block` takes, erring high: the length of
+/// its debug form, which spells out every field, string and child (raw XML,
+/// text boxes, hyperlinks, revisions, cells), and never less than the
+/// block's own size. Counted, not built. An estimate for the history's
+/// budget only.
 fn block_weight(block: &Block) -> usize {
-    std::mem::size_of::<Block>()
-        + match block {
-            Block::Paragraph(p) => {
-                p.content.len() * std::mem::size_of::<Inline>() + p.plain_text().len()
-            }
-            Block::Table(t) => t
-                .rows
-                .iter()
-                .flat_map(|r| &r.cells)
-                .flat_map(|c| &c.blocks)
-                .map(block_weight)
-                .sum(),
-            Block::Raw(raw) => raw.len(),
-            Block::SectionProperties(_) => 0,
+    struct Count(usize);
+    impl std::fmt::Write for Count {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 += s.len();
+            Ok(())
         }
+    }
+    let mut count = Count(0);
+    let _ = std::fmt::Write::write_fmt(&mut count, format_args!("{block:?}"));
+    count.0.max(std::mem::size_of::<Block>())
 }
 
 /// The document an undo step holds.
@@ -305,6 +310,9 @@ pub struct Editor {
     redo: Vec<Snapshot>,
     /// [`HISTORY_BUDGET`], smaller in tests.
     history_budget: usize,
+    /// While [`Editor::one_step`] runs: `Some(pushed)`, whether its one step
+    /// is pushed yet. Every edit's step after the first is not taken at all.
+    grouping: Option<bool>,
     last: EditKind,
     review_target: Option<RevisionTarget>,
     /// Mail merge's Preview Results record (#628), shown in merge fields'
@@ -331,6 +339,7 @@ impl Editor {
             undo: VecDeque::new(),
             redo: Vec::new(),
             history_budget: HISTORY_BUDGET,
+            grouping: None,
             last: EditKind::None,
             review_target: None,
             merge_preview: None,
@@ -400,6 +409,11 @@ impl Editor {
     }
 
     fn push_undo(&mut self, mut snapshot: Snapshot) {
+        match self.grouping {
+            Some(true) => return,
+            Some(false) => self.grouping = Some(true),
+            None => {}
+        }
         snapshot.serial = UNDO_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         LAST_SERIAL.with(|c| c.set(snapshot.serial));
         self.undo.push_back(snapshot);
@@ -491,10 +505,20 @@ impl Editor {
     /// it. For a host command made of several edits, such as a counted
     /// delete or text inserted as if typed, which would otherwise be a step
     /// per Delete or per 128 characters (#853).
+    ///
+    /// Only the first edit takes a step (the state before the command); the
+    /// rest take none, so a long command can never push its own first step
+    /// out of the history.
     pub fn one_step(&mut self, name: &str, edit: impl FnOnce(&mut Self)) {
+        if self.grouping.is_some() {
+            edit(self);
+            return;
+        }
         let since = undo_serial_counter();
         self.break_undo_group();
+        self.grouping = Some(false);
         edit(self);
+        self.grouping = None;
         self.name_command(since, name);
     }
 
@@ -1017,40 +1041,29 @@ impl Editor {
             return;
         }
         self.checkpoint(EditKind::Structural);
-        let merged = {
-            let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
-                return;
-            };
-            if idx == 0 || !matches!(cont.get(idx - 1), Some(Block::Paragraph(_))) {
-                None
-            } else {
-                let prev_len = match &cont[idx - 1] {
-                    Block::Paragraph(p) => para_text_len(p),
-                    _ => 0,
-                };
-                let gone = cont.remove(idx);
-                if let (Block::Paragraph(prev), Block::Paragraph(gone)) = (&mut cont[idx - 1], gone)
-                {
-                    join_paragraph_content(&mut prev.content, gone.content);
-                    keep_section_mark(&mut prev.props, gone.props);
-                }
-                Some((idx - 1, prev_len))
-            }
+        let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
+            return;
         };
-        if let Some((nidx, plen)) = merged {
-            if let Some(last) = self.caret.path.last_mut() {
-                *last = nidx;
+        let gone = cont.remove(idx);
+        let prev_len = match (&mut cont[idx - 1], gone) {
+            (Block::Paragraph(prev), Block::Paragraph(gone)) => {
+                let len = para_text_len(prev);
+                join_paragraph_content(&mut prev.content, gone.content);
+                keep_section_mark(&mut prev.props, gone.props);
+                len
             }
-            self.caret.offset = plen;
-        } else {
-            self.last = EditKind::None;
+            _ => 0,
+        };
+        if let Some(last) = self.caret.path.last_mut() {
+            *last = idx - 1;
         }
+        self.caret.offset = prev_len;
     }
 
     /// Whether the caret's paragraph has a paragraph right after it (`after`)
     /// or right before it in its container, for Delete or Backspace to merge.
-    fn has_sibling_paragraph(&mut self, after: bool) -> bool {
-        let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
+    fn has_sibling_paragraph(&self, after: bool) -> bool {
+        let Some((cont, idx)) = container(&self.doc.body, &self.caret.path) else {
             return false;
         };
         let sibling = if after {
@@ -1083,23 +1096,13 @@ impl Editor {
             return;
         }
         self.checkpoint(EditKind::Structural);
-        let did = {
-            let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
-                return;
-            };
-            if idx + 1 >= cont.len() || !matches!(cont.get(idx + 1), Some(Block::Paragraph(_))) {
-                false
-            } else {
-                let gone = cont.remove(idx + 1);
-                if let (Block::Paragraph(p), Block::Paragraph(gone)) = (&mut cont[idx], gone) {
-                    join_paragraph_content(&mut p.content, gone.content);
-                    keep_section_mark(&mut p.props, gone.props);
-                }
-                true
-            }
+        let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
+            return;
         };
-        if !did {
-            self.last = EditKind::None;
+        let gone = cont.remove(idx + 1);
+        if let (Block::Paragraph(p), Block::Paragraph(gone)) = (&mut cont[idx], gone) {
+            join_paragraph_content(&mut p.content, gone.content);
+            keep_section_mark(&mut p.props, gone.props);
         }
     }
 
@@ -2558,6 +2561,25 @@ pub fn resolve_para<'a>(body: &'a [Block], path: &[usize]) -> Option<&'a Paragra
             let cell = t.rows.get(rest[0])?.cells.get(rest[1])?;
             resolve_para(&cell.blocks, &rest[2..])
         }
+        _ => None,
+    }
+}
+
+/// [`container_mut`], read-only.
+fn container<'a>(body: &'a [Block], path: &[usize]) -> Option<(&'a [Block], usize)> {
+    if path.len() <= 1 {
+        let i = *path.first()?;
+        return Some((body, i));
+    }
+    match body.get(path[0])? {
+        Block::Table(t) => {
+            let cell = t.rows.get(path[1])?.cells.get(path[2])?;
+            container(&cell.blocks, &path[3..])
+        }
+        Block::Paragraph(p) => match p.content.get(path[1])? {
+            Inline::TextBox { blocks, .. } => container(blocks, &path[2..]),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -5383,6 +5405,76 @@ mod tests {
         assert!(weight <= budget);
         let (kept, _) = edits(table_weight);
         assert_eq!(kept, UNDO_FLOOR, "never fewer than the floor");
+    }
+
+    /// #853: a command run through `one_step` takes one step however many
+    /// edits it makes, so even past the floor and the budget one undo puts
+    /// back the state before it (`600x` in a heavy table cell).
+    #[test]
+    fn one_step_never_pushes_out_its_own_first_step_853() {
+        let long = "z".repeat(700);
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Table(Table {
+                grid: vec![100],
+                rows: vec![Row {
+                    cells: vec![Cell {
+                        grid_span: 1,
+                        v_merge: VMerge::None,
+                        blocks: vec![para(&long)],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        });
+        let before = ed.doc.clone();
+        ed.history_budget = 1;
+        ed.caret = Caret::at(vec![0, 0, 0, 0], 0);
+        ed.one_step("Delete", |ed| {
+            for _ in 0..600 {
+                ed.delete_forward();
+            }
+        });
+        assert_eq!(ed.undo_names(), vec!["Delete"]);
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert!(!ed.undo());
+    }
+
+    /// #853: the weight counts everything a copy holds, raw XML too, so a
+    /// paragraph carrying a large preserved payload trips the budget.
+    #[test]
+    fn the_history_budget_counts_raw_payloads_853() {
+        let mut heavy = para("");
+        if let Block::Paragraph(p) = &mut heavy {
+            p.content
+                .push(Inline::Raw(format!("<w:x>{}</w:x>", "r".repeat(64 << 10))));
+        }
+        let mut ed = Editor::new(Document { body: vec![heavy] });
+        ed.history_budget = 10 << 20;
+        for _ in 0..600 {
+            ed.break_undo_group();
+            ed.insert_char('x');
+        }
+        assert_eq!(ed.undo.len(), UNDO_FLOOR);
+    }
+
+    /// #853: each step's own list of block pointers counts: in a document of
+    /// 10,000 paragraphs a one-character step still copies 10,000 pointers.
+    #[test]
+    fn the_history_budget_counts_each_steps_block_list_853() {
+        let texts = vec![""; 10_000];
+        let mut ed = Editor::new(doc(&texts));
+        ed.caret = Caret::at(vec![5_000], 0);
+        ed.insert_char('x');
+        let list = 10_000 * std::mem::size_of::<Arc<Block>>();
+        ed.history_budget = ed.undo[0].weight + 100 * list;
+        for _ in 0..300 {
+            ed.backspace();
+            ed.insert_char('x');
+        }
+        assert_eq!(ed.undo.len(), UNDO_FLOOR);
     }
 
     /// #853: blocks equal but for their preserved element attributes are not
