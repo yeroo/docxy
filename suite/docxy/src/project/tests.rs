@@ -636,7 +636,12 @@ fn rows_resolve_ids_format_links_milestones_and_resources() {
     ed.toggle_milestone(9).unwrap();
     assert_eq!(
         project_row(&ed, ed.project().task(9).unwrap())[COL_DURATION],
-        "—"
+        "0d"
+    );
+    ed.toggle_milestone(9).unwrap();
+    assert_eq!(
+        project_row(&ed, ed.project().task(9).unwrap())[COL_DURATION],
+        "1d"
     );
     let mut p = ed.project().clone();
     p.tasks[1].predecessors.push(projcore::Predecessor::fs(999));
