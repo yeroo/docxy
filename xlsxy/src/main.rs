@@ -8525,10 +8525,7 @@ impl App {
                 "Rename sheet: ",
                 self.pkg.workbook.sheets[self.sheet].name.clone(),
             ),
-            PromptKind::AddSheet => (
-                "New sheet name: ",
-                format!("Sheet{}", self.pkg.workbook.sheets.len() + 1),
-            ),
+            PromptKind::AddSheet => ("New sheet name: ", self.pkg.workbook.next_sheet_name()),
             PromptKind::RenameTable => ("Table name: ", self.table_here().unwrap_or_default()),
             PromptKind::ResizeTable => {
                 let here = self
@@ -19212,6 +19209,18 @@ mod tests {
         press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
         press_mod(&mut app, KeyCode::F(6), KeyModifiers::SHIFT);
         assert!(app.sheet().cells.values().all(|c| c.is_blank()));
+    }
+
+    #[test]
+    fn the_add_sheet_prompt_offers_a_free_name() {
+        // Sheet1 and Sheet2, then Sheet1 deleted: "Sheet2" is taken.
+        let mut app = app_with_numbers(&[]);
+        app.add_sheet("Sheet2");
+        app.goto_sheet(0);
+        app.delete_current_sheet();
+        assert_eq!(app.pkg.workbook.sheets.len(), 1);
+        app.open_prompt(PromptKind::AddSheet);
+        assert_eq!(app.prompt.as_ref().map(|p| p.text.as_str()), Some("Sheet3"));
     }
 
     #[test]

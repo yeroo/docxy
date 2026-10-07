@@ -310,7 +310,9 @@ pub fn insert_shifts_data_off(wb: &Workbook, idx: usize, rows: bool, at: u32, co
         || sheet
             .merges
             .iter()
-            .any(|&(r0, c0, r1, c1)| pick(r0, c0) >= at && pick(r1, c1) >= edge)
+            // Its far edge is what moves off, wherever it starts: one that
+            // spans `at` grows by the insert.
+            .any(|&(_, _, r1, c1)| pick(r1, c1) >= edge)
 }
 
 /// Insert `count` blank rows before 0-based row `at` on sheet `idx`.
@@ -2760,6 +2762,17 @@ mod tests {
         wb.sheets[0].merges.push((MAX_ROWS - 2, 0, MAX_ROWS - 1, 1));
         assert!(insert_shifts_data_off(&wb, 0, true, 5, 1));
         assert!(!insert_shifts_data_off(&wb, 0, false, 5, 1));
+        // One that starts before the insert and spans it grows past the
+        // edge too: A1048574:A1048575, two rows inserted at row 1048575.
+        wb.sheets[0].merges.clear();
+        wb.sheets[0].merges.push((MAX_ROWS - 3, 0, MAX_ROWS - 2, 0));
+        assert!(insert_shifts_data_off(&wb, 0, true, MAX_ROWS - 2, 2));
+        // Columns alike: XFB:XFC, two columns inserted at XFC.
+        wb.sheets[0].merges.clear();
+        wb.sheets[0].merges.push((0, MAX_COLS - 3, 0, MAX_COLS - 2));
+        assert!(insert_shifts_data_off(&wb, 0, false, MAX_COLS - 2, 2));
+        // A merge wholly before the insert stays put.
+        assert!(!insert_shifts_data_off(&wb, 0, false, MAX_COLS - 1, 1));
     }
 
     fn wb(cells: &[(&str, Cell)]) -> Workbook {
