@@ -631,7 +631,11 @@ Exceptions... opens `autocorrect-exceptions` (tabs First Letter and INitial
 CAps, fields `first-word`/`caps-word`, lists `first-list`/`caps-list`, Add,
 Delete, OK). Add, Delete and the exceptions take effect at once, as Office's
 do; the checkboxes apply with OK, and Cancel keeps them. All of it persists
-with the Sheet editing options. A typed URL, `www.` address, e-mail address
+with the Sheet editing options. The Word tab types with the same list,
+exceptions and Replace text / Capitalize first letter switches (#856), each
+correction an undo step of its own (`AutoCorrect`, or `AutoFormat` for smart
+quotes, em dashes and automatic lists); the cases are in
+`uiharness/cases/word-autocorrect.uit`. A typed URL, `www.` address, e-mail address
 or UNC path becomes a hyperlink while `ac_hyperlinks` is on; such a
 hyperlink lives in the workbook model (clickable, undoable) but is not yet
 written to the file, since the xlsx writer keeps only the hyperlinks a file

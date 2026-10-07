@@ -1,0 +1,85 @@
+# AutoCorrect and AutoFormat as you type in the Word tab (#856): Word 2024's
+# defaults, each correction an undo step of its own after the typing, so the
+# first Ctrl+Z takes back the correction and keeps what was typed.
+# (`type` trims its line, so a trailing space is typed with `key space`.
+# Text assertions ignore case, so the Undo drop-down's step names show
+# that the capital is a correction of its own.)
+
+test teh and a space at the start correct twice, one undo step each
+  open copy:../fixtures/basic.docx
+  type teh
+  key space
+  assert text is "The "
+  call menu-open {"target":{"qat":"qat-undo"}}
+  assert reply.items.0.label is AutoCorrect
+  assert reply.items.1.label is AutoCorrect
+  assert reply.items.2.label is Typing "teh "
+  key escape
+  # Ctrl+Y straight after a correction does nothing.
+  key ctrl+y
+  assert text is "The "
+  key ctrl+z
+  assert text is "the "
+  key ctrl+z
+  assert text is "teh "
+
+test a replacement after the first word is one step, and typing goes on as a new one
+  open copy:../fixtures/basic.docx
+  type Then teh
+  key space
+  assert text is "Then the "
+  key ctrl+z
+  assert text is "Then teh "
+  type x
+  key ctrl+z
+  assert text is "Then teh "
+
+test a symbol corrects on its last key and quotes one at a time
+  open copy:../fixtures/basic.docx
+  type Mark (c)
+  key space
+  assert text is "Mark © "
+  key ctrl+z
+  assert text is "Mark ©"
+  key ctrl+z
+  assert text is "Mark (c)"
+
+test quotes, dashes and an automatic list
+  open copy:../fixtures/basic.docx
+  type He said "hi" ok
+  assert text is He said “hi” ok
+  call menu-open {"target":{"qat":"qat-undo"}}
+  assert reply.items.0.label is Typing " ok"
+  assert reply.items.1.label is AutoFormat
+  assert reply.items.3.label is AutoFormat
+  key escape
+  key ctrl+z
+  assert text is He said “hi”
+  key ctrl+z
+  assert text is He said “hi"
+  key ctrl+a
+  key backspace
+  type One--two
+  key space
+  assert text is "One—two "
+  key ctrl+z
+  assert text is "One--two "
+  key ctrl+a
+  key backspace
+  type 1.
+  key space
+  assert para.list is not null
+  key ctrl+z
+  assert text is "1. "
+  assert para.list is null
+
+test the Word tab shares the app's AutoCorrect switches
+  open copy:../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-set {"control":"ac_replace_text","value":false}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  type then teh
+  key space
+  assert text is "Then teh "
