@@ -1511,6 +1511,20 @@ fn insert_task_follows_the_plans_new_tasks_estimated() {
 }
 
 #[test]
+fn add_task_follows_the_plans_day() {
+    let mut t = tab();
+    let mut p = v(&t).ed.project().clone();
+    p.hours_per_day = 7.0;
+    t.surface = Surface::Project(ProjectView::new(p, false));
+    vm(&mut t).ed.select(0);
+    apply_project_act(&mut t, ProjectAct::AddTask);
+    let task = &v(&t).ed.project().tasks[1];
+    assert_eq!(task.name, "New task");
+    assert_eq!(task.duration_min, 420);
+    assert_eq!(duration_text(&t, 1), "1d?");
+}
+
+#[test]
 fn blank_row_goes_above_the_selected_row_or_the_entry_row_and_is_selected() {
     let mut t = tab();
     t.dirty = false;
@@ -3139,6 +3153,31 @@ fn ctrl_delete_on_a_milestones_duration_makes_it_a_one_day_task() {
     assert_eq!(task.duration_min, 480);
     assert!(!task.milestone);
     assert_eq!(duration_text(&t, 1), "1d?");
+}
+
+#[test]
+fn milestone_toggle_follows_the_plans_day() {
+    let mut t = tab();
+    let mut p = v(&t).ed.project().clone();
+    p.hours_per_day = 7.0;
+    t.surface = Surface::Project(ProjectView::new(p, false));
+    // Milestone -> task: one plan day is 7h.
+    vm(&mut t).ed.toggle_milestone(2).unwrap();
+    assert!(v(&t).ed.project().tasks[1].milestone);
+    project_cell_click(&mut t, 1, None, false);
+    apply_project_act(&mut t, ProjectAct::Milestone);
+    let task = &v(&t).ed.project().tasks[1];
+    assert_eq!((task.duration_min, task.milestone), (420, false));
+    assert_eq!(duration_text(&t, 1), "1d");
+    // A blank row takes the zero-duration branch instead: it becomes a
+    // milestone and the plan's day never enters, at 7h as at 8h.
+    vm(&mut t).ed.select(1);
+    apply_project_act(&mut t, ProjectAct::InsertBlankRow);
+    assert!(v(&t).ed.project().tasks[1].is_null);
+    project_cell_click(&mut t, 1, None, false);
+    apply_project_act(&mut t, ProjectAct::Milestone);
+    let row = &v(&t).ed.project().tasks[1];
+    assert_eq!((row.duration_min, row.milestone), (0, true));
 }
 
 #[test]

@@ -1408,7 +1408,7 @@ impl Editor {
         let i = self.index(uid)?;
         // A blank row toggles from the duration it gets as a task.
         let min = if self.row_as_edited(i).duration_min == 0 {
-            480
+            self.project().days_to_minutes(1.0)
         } else {
             0
         };
@@ -2746,6 +2746,28 @@ mod tests {
             e.delete_task(3).unwrap();
         });
         assert_eq!(ed.project().tasks.len(), 2);
+    }
+
+    #[test]
+    fn milestone_toggle_uses_the_plans_day() {
+        let mut proj = editor().project().clone();
+        proj.hours_per_day = 7.0;
+        let mut ed = Editor::new(proj);
+        // Milestone -> task: one plan day is 7h.
+        ed.toggle_milestone(2).unwrap();
+        let task = &ed.project().tasks[1];
+        assert_eq!((task.duration_min, task.milestone), (0, true));
+        ed.toggle_milestone(2).unwrap();
+        let task = &ed.project().tasks[1];
+        assert_eq!((task.duration_min, task.milestone), (420, false));
+        // A blank row takes the zero-duration branch instead: the plan's day
+        // never enters, at 7h as at 8h.
+        let mut proj = blank_row_editor().project().clone();
+        proj.hours_per_day = 7.0;
+        let mut ed = Editor::new(proj);
+        ed.toggle_milestone(3).unwrap();
+        let row = &ed.project().tasks[1];
+        assert_eq!((row.duration_min, row.milestone), (0, true));
     }
 
     #[test]
