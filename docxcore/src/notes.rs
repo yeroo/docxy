@@ -61,26 +61,24 @@ pub fn parse_notes_xml(xml: &str, endnote: bool, elem: &str) -> Vec<Note> {
 fn collect_text(p: &mut XmlParser, elem: &str) -> String {
     let mut s = String::new();
     let mut depth = 1; // inside the note element
-    let mut in_t = false;
     loop {
         match p.next() {
             Event::Start => {
                 match p.name() {
-                    "w:t" | "w:delText" => in_t = true,
+                    "w:t" | "w:delText" => {
+                        // Consumes through the element's End.
+                        s.push_str(&crate::load::read_text(p));
+                        continue;
+                    }
                     "w:tab" => s.push('\t'),
                     "w:br" | "w:cr" => s.push('\n'),
                     _ => {}
                 }
                 depth += 1;
             }
-            Event::Text => {
-                if in_t {
-                    XmlParser::append_decoded(p.text(), &mut s);
-                }
-            }
+            Event::Text => {}
             Event::End => {
                 match p.name() {
-                    "w:t" | "w:delText" => in_t = false,
                     // a paragraph closing inside the note → a line break
                     "w:p" if depth >= 2 => s.push('\n'),
                     _ => {}
@@ -108,7 +106,7 @@ mod tests {
             <w:footnote w:type=\"continuationSeparator\" w:id=\"0\"><w:p/></w:footnote>\
             <w:footnote w:id=\"1\"><w:p><w:r><w:footnoteRef/></w:r>\
               <w:r><w:t xml:space=\"preserve\">First note.</w:t></w:r></w:p></w:footnote>\
-            <w:footnote w:id=\"2\"><w:p><w:r><w:t>Second </w:t></w:r>\
+            <w:footnote w:id=\"2\"><w:p><w:r><w:t xml:space=\"preserve\">Second </w:t></w:r>\
               <w:r><w:t>note.</w:t></w:r></w:p></w:footnote>\
             </w:footnotes>";
         let notes = parse_notes_xml(xml, false, "w:footnote");
@@ -118,6 +116,19 @@ mod tests {
         assert_eq!(notes[1].id, 2);
         assert_eq!(notes[1].text, "Second note.");
         assert!(!notes[0].endnote);
+    }
+
+    /// A `w:t` / `w:delText` without `xml:space="preserve"` (on it or an
+    /// ancestor) loses its edge whitespace, as in Word (#1084).
+    #[test]
+    fn note_text_drops_unpreserved_edge_whitespace() {
+        let xml = "<w:footnotes><w:footnote w:id=\"1\"><w:p>\
+            <w:r><w:t>SDT </w:t></w:r><w:r><w:t> Run</w:t></w:r>\
+            <w:r><w:delText> gone </w:delText></w:r>\
+            <w:r xml:space=\"preserve\"><w:t> kept</w:t></w:r>\
+            </w:p></w:footnote></w:footnotes>";
+        let notes = parse_notes_xml(xml, false, "w:footnote");
+        assert_eq!(notes[0].text, "SDTRungone kept");
     }
 
     /// Full [`parse_notes`] pipeline (footnotes part, then endnotes part)
