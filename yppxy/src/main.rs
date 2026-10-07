@@ -947,7 +947,7 @@ impl App {
         let path = save_to(self.ed.project(), path)?
             .to_string_lossy()
             .into_owned();
-        self.ed.mark_saved();
+        self.ed.commit_save();
         self.status = format!("Saved {path}");
         self.path = Some(path);
         Ok(())

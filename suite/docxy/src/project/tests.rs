@@ -978,3 +978,22 @@ fn a_body_click_counts_only_when_it_stayed_below_the_entry_row() {
         "entry row not drawn"
     );
 }
+
+/// A save clears undo and redo, as in Project, and a failed one keeps both
+/// (#863).
+#[test]
+fn save_clears_undo_and_redo_only_on_success() {
+    let dir = Scratch::new();
+    let mut tab = edited_tab();
+    view_mut(&mut tab).ed.rename(1, "B").unwrap();
+    assert!(view_mut(&mut tab).ed.undo());
+    let depths = |tab: &DocTab| (view(tab).ed.undo_depth(), view(tab).ed.redo_depth());
+    assert_eq!(depths(&tab), (1, 1));
+    assert!(apply_save(&mut tab, &dir.path("plan.mpp")).is_err());
+    assert_eq!(depths(&tab), (1, 1));
+    apply_save(&mut tab, &dir.path("saved.xml")).unwrap();
+    assert_eq!(depths(&tab), (0, 0));
+    assert!(!view_mut(&mut tab).ed.undo());
+    assert!(!view_mut(&mut tab).ed.redo());
+    assert_eq!(view(&tab).ed.project().tasks[0].name, "Unsaved rename");
+}

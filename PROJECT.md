@@ -90,12 +90,15 @@ default duration, a task added between two others autolinks, and the critical
 flag follows the slack limit and multiple critical paths (Project's defaults
 apply when absent).
 
-`projcore::editor::Editor` owns the editable project, its 100-entry undo history,
+`projcore::editor::Editor` owns the editable project, its 20-entry undo history,
 selection, dirty flag, computed schedule and optional leveling overlay. Validated
 edits snapshot once and reschedule; rejected edits preserve the whole session.
 `yppxy` supplies the keys, status messages and file I/O, and its project control
 verbs use the same Editor through `dispatch_editor`. Opening or creating a project
-clears history while retaining the find query and leveling preference.
+clears history while retaining the find query and leveling preference. As in
+Project (default *Undo levels* 20), a successful save clears both undo and redo
+(`Editor::commit_save`, used by `yppxy` and the suite's Project tab); a failed
+save keeps them (#863).
 
 ## The scheduling model
 

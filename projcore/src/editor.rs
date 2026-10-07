@@ -2,7 +2,7 @@
 //!
 //! Edits address stable task UIDs. Validation precedes the undo snapshot, so a
 //! rejected edit leaves all editor state untouched. Hosts own file I/O and UI
-//! messages; [`Editor::mark_saved`] acknowledges a successful save.
+//! messages; [`Editor::commit_save`] acknowledges a successful save.
 
 use crate::datetime::DateTime;
 use crate::model::{
@@ -12,7 +12,8 @@ use crate::model::{
 };
 use crate::schedule::{Leveled, Schedule, level, schedule};
 
-const UNDO_CAP: usize = 100;
+/// Undo steps kept, as Project's default *Undo levels* (#863).
+const UNDO_CAP: usize = 20;
 const EXTERNAL_TASK_DATES: &str = "External task: its dates come from its own project";
 pub const DURATION_HINT: &str = "try 3d, 4h, 2w, 1mo";
 
@@ -195,8 +196,19 @@ impl Editor {
     pub fn dirty(&self) -> bool {
         self.dirty
     }
+    /// Clear the dirty flag only, keeping undo and redo; hosts acknowledge a
+    /// save with [`Self::commit_save`].
     pub fn mark_saved(&mut self) {
         self.dirty = false;
+    }
+    /// Acknowledge a successful save: as in Project, a save clears both undo
+    /// and redo (#863). The open edit's refresh goes too, since the state it
+    /// pairs with (the top of the undo stack) is gone.
+    pub fn commit_save(&mut self) {
+        self.mark_saved();
+        self.undo.clear();
+        self.redo.clear();
+        self.pending = None;
     }
     pub fn schedule(&self) -> &Schedule {
         &self.sched
@@ -3617,21 +3629,89 @@ mod tests {
         ed.rename(1, "Fresh edit").unwrap();
         assert_eq!(ed.redo_depth(), 0);
         ed.replace_project(editor().proj);
-        for i in 0..101 {
+        for i in 0..21 {
             ed.rename(1, &format!("Edit {i}")).unwrap();
         }
-        assert_eq!(ed.undo_depth(), 100);
-        for _ in 0..100 {
+        assert_eq!(ed.undo_depth(), 20);
+        for _ in 0..20 {
             assert!(ed.undo());
         }
         assert!(!ed.undo());
         assert_eq!(ed.project().tasks[0].name, "Edit 0");
-        for _ in 0..100 {
+        for _ in 0..20 {
             assert!(ed.redo());
         }
         assert!(!ed.redo());
-        assert_eq!(ed.undo_depth(), 100);
-        assert_eq!(ed.project().tasks[0].name, "Edit 100");
+        assert_eq!(ed.undo_depth(), 20);
+        assert_eq!(ed.project().tasks[0].name, "Edit 20");
+    }
+
+    /// Project keeps 20 undo steps by default: of 25 added tasks, undoing
+    /// everything leaves the first five (#863).
+    #[test]
+    fn undo_keeps_twenty_steps_as_project_does() {
+        let mut ed = editor();
+        let base = ed.project().tasks.len();
+        for i in 1..=25 {
+            ed.add_task(None, &format!("T{i}"), 480, false).unwrap();
+        }
+        assert_eq!(ed.undo_depth(), 20);
+        for _ in 0..20 {
+            assert!(ed.undo());
+        }
+        assert!(!ed.undo());
+        let names: Vec<_> = ed.project().tasks[base..]
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names, ["T1", "T2", "T3", "T4", "T5"]);
+    }
+
+    /// A save clears undo and redo, as in Project: a redoable step does not
+    /// come back and an edit before the save cannot be undone (#863).
+    #[test]
+    fn commit_save_clears_undo_and_redo() {
+        let mut ed = editor();
+        ed.add_task(None, "A", 480, false).unwrap();
+        ed.add_task(None, "B", 480, false).unwrap();
+        assert!(ed.undo());
+        assert_eq!((ed.undo_depth(), ed.redo_depth()), (1, 1));
+        let saved = ed.project().clone();
+        ed.commit_save();
+        assert!(!ed.dirty());
+        assert_eq!((ed.undo_depth(), ed.redo_depth()), (0, 0));
+        assert!(!ed.undo());
+        assert!(!ed.redo());
+        assert_eq!(ed.project(), &saved);
+        // The next edit starts a fresh history.
+        ed.rename(1, "After").unwrap();
+        assert_eq!((ed.undo_depth(), ed.redo_depth()), (1, 0));
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &saved);
+    }
+
+    /// Plain re-save: type X, save, undo, and X stays (#863).
+    #[test]
+    fn commit_save_after_resave_keeps_no_history() {
+        let mut ed = editor();
+        ed.commit_save();
+        ed.rename(1, "X").unwrap();
+        ed.commit_save();
+        assert!(!ed.undo());
+        assert_eq!(ed.project().tasks[0].name, "X");
+        assert!(!ed.dirty());
+    }
+
+    /// `mark_saved` stays a dirty-flag reset that keeps history.
+    #[test]
+    fn mark_saved_keeps_history() {
+        let mut ed = editor();
+        ed.rename(1, "A").unwrap();
+        ed.rename(1, "B").unwrap();
+        assert!(ed.undo());
+        ed.mark_saved();
+        assert!(!ed.dirty());
+        assert_eq!((ed.undo_depth(), ed.redo_depth()), (1, 1));
     }
 
     #[test]
