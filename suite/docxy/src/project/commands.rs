@@ -492,12 +492,17 @@ pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
     !matches!(act, Copy | Cut | Paste | AddLink | UnlinkTasks)
 }
 
-/// Whether an in-cell cut may empty the buffer: the clipboard holds what the
-/// write recorded, compared CRLF-insensitively ([`clip_still_ours`]). A write
-/// can fail without a word — another process holds the OS clipboard — and the
-/// buffer must not be lost to a copy that never landed (#561 r1).
-pub(crate) fn cell_cut_write_took(recorded: &str, wrote: &str) -> bool {
-    clip_still_ours(recorded, &ClipRead::Text(wrote.into()))
+/// Whether an in-cell cut may empty the buffer: the read-back clipboard
+/// `now` holds the buffer's text `wrote`, compared CRLF-insensitively. A
+/// write can fail without a word — another process holds the OS clipboard —
+/// and it then reads as `Nothing` or someone else's item, never as our text;
+/// the buffer must not be lost to a copy that never landed (#561 r1/r2).
+/// Cutting an empty buffer is harmless and the host skips the check.
+pub(crate) fn cell_cut_write_took(now: &ClipRead, wrote: &str) -> bool {
+    match now {
+        ClipRead::Text(held) => held.replace("\r\n", "\n") == wrote.replace("\r\n", "\n"),
+        _ => false,
+    }
 }
 
 /// A Project command's checked state on the ribbon.
@@ -1772,11 +1777,11 @@ impl Docxy {
     }
     /// Copy/Cut/Paste with a cell editor open take the buffer, not the table
     /// (#561). Copy and Cut put the whole buffer on the system clipboard (the
-    /// editor has no selection); Cut leaves the buffer empty, unless the
-    /// write failed silently — a busy OS clipboard — in which case the buffer
-    /// stays and the status says so. Paste inserts the clipboard's text at
-    /// the caret. The edit stays open; the project, its undo stack and its
-    /// dirty flag are untouched.
+    /// editor has no selection); Cut empties the buffer only when the read-
+    /// back clipboard holds the buffer's text — a silently failed write (a
+    /// busy OS clipboard) otherwise keeps the buffer and the status says so.
+    /// Paste inserts the clipboard's text at the caret. The edit stays open;
+    /// the project, its undo stack and its dirty flag are untouched.
     fn project_cell_clipboard(&mut self, act: ProjectAct, cx: &mut Context<Self>) {
         if act == ProjectAct::Paste {
             let now = self.clipboard_read(cx);
@@ -1795,20 +1800,23 @@ impl Docxy {
         let Some(text) = text else {
             return;
         };
-        let recorded = self.clipboard_write_recorded(text.clone(), cx);
-        if !cell_cut_write_took(&recorded, &text) {
-            if act == ProjectAct::Cut {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.status = "Cut failed: the clipboard is busy".into();
-                }
+        self.clipboard_write(text.clone(), cx);
+        if act == ProjectAct::Copy {
+            // A sheet pastes its own clipboard first; this copy is newer.
+            self.grid_clip = None;
+            return;
+        }
+        // Cut: an empty buffer has nothing to lose; otherwise empty it only
+        // when the clipboard holds what the write put there.
+        if !text.is_empty() && !cell_cut_write_took(&self.clipboard_read(cx), &text) {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.status = "Cut failed: the clipboard is busy".into();
             }
             return;
         }
         // A sheet pastes its own clipboard first; this copy is newer.
         self.grid_clip = None;
-        if act == ProjectAct::Cut
-            && let Some(Surface::Project(v)) =
-                self.tabs.get_mut(self.active).map(|t| &mut t.surface)
+        if let Some(Surface::Project(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface)
             && let Some(cell) = &mut v.cell
         {
             cell.cut();
