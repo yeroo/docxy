@@ -7,6 +7,7 @@
 //! the grid's (`2d`, `2026-03-02`). Dates show `YYYY-MM-DD`, `NA` when unset.
 //!
 //! `value` is [`FieldValue::Null`] only for a date that shows `NA`, for a
+//! custom value that does not parse (its text is the stored text), for a
 //! stored value the plan does not have (percents, actuals, remaining
 //! values, work, cost, fixed cost, baseline values, notes, hyperlink parts),
 //! and for Status

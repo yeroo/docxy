@@ -1474,6 +1474,8 @@ fn custom_unset_and_unparseable_read_leniently() {
         custom_def("555000004", "Number4"),
         custom_def("555000005", "Cost1"),
         custom_def("555000006", "Cost2"),
+        custom_def("555000007", "Cost3"),
+        custom_def("555000008", "Cost4"),
     ];
     let mut t = task(1, "Bare", 480);
     t.extended_attributes = vec![
@@ -1483,6 +1485,10 @@ fn custom_unset_and_unparseable_read_leniently() {
         custom_value("555000004", "1e308"),
         custom_value("555000005", "NaN"),
         custom_value("555000006", "inf"),
+        // A finite but huge cost saturates the money text; a normal large
+        // one still reads.
+        custom_value("555000007", "1e40"),
+        custom_value("555000008", "123456789012"),
     ];
     p.tasks = vec![t];
     let ed = Editor::new(p);
@@ -1493,6 +1499,12 @@ fn custom_unset_and_unparseable_read_leniently() {
         ("Number4", &1e308.to_string(), FieldValue::Number(1e308)),
         ("Cost1", "NaN", FieldValue::Null),
         ("Cost2", "inf", FieldValue::Null),
+        ("Cost3", "1e40", FieldValue::Null),
+        (
+            "Cost4",
+            "$1,234,567,890.12",
+            FieldValue::Money(1234567890.12),
+        ),
     ] {
         assert_eq!(tv(&ed, 1, name), (s(text), value), "{name}");
     }

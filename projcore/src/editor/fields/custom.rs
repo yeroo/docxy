@@ -82,8 +82,16 @@ fn value_read(
             Some(number) => FieldRead::new(number.to_string(), FieldValue::Number(number)),
             None => FieldRead::new(raw, FieldValue::Null),
         },
-        // MSPDI stores every cost in hundredths, like the built-in costs.
-        CustomKind::Cost => match raw.trim().parse::<f64>().ok().filter(|n| n.is_finite()) {
+        // MSPDI stores every cost in hundredths, like the built-in costs. A
+        // finite but huge value would saturate `format_money`'s i128 cents,
+        // so the text could disagree with the value; past $10 trillion
+        // (1e15 hundredths) read it as unparseable.
+        CustomKind::Cost => match raw
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite() && n.abs() <= 1e15)
+        {
             Some(hundredths) => money_value(Some(hundredths)),
             None => FieldRead::new(raw, FieldValue::Null),
         },

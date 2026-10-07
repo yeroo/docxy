@@ -89,7 +89,8 @@ plan has neither. Earned-value fields are not readable yet. Custom task
 fields read too — Text1–Text30, Number1–Number20, Cost1–Cost10, Flag1–Flag20
 and Date, Start, Finish and Duration1–10 — each resolved by the plan's own
 `<ExtendedAttribute>` definition whose `FieldName` matches; a custom field
-with no definition in the plan reads as unset.
+with no definition in the plan reads as unset; a stored value that does not
+parse reads as its raw text and `null`.
 
 - `text` is what the sheet shows. The Entry columns use the grid's own text,
   which the harness `cell` verb also returns (`2d`, `2026-03-02`); the other
@@ -101,7 +102,8 @@ with no definition in the plan reads as unset.
   and slack signed minutes; money a number of currency units; percents
   integers; flags booleans; enums (Task Mode, Constraint Type, Type, Fixed
   Cost Accrual, Status) their display names; text strings. It is `null` only
-  for a date that shows `NA`, for a stored value the plan does not have
+  for a date that shows `NA`, for a custom value that does not parse (which
+  then reads its raw text and `null`), for a stored value the plan does not have
   (unset % Complete reads `"0%"` and `null`; a stored 0 reads `"0%"` and `0`;
   unset hyperlink parts read `""` and `null`),
   and for Status when the plan has no StatusDate or CurrentDate (or the task
