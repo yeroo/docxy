@@ -629,8 +629,8 @@ fn money_value(hundredths: Option<f64>) -> FieldRead {
 }
 
 /// The Entry table's Duration: a summary's rolled-up span in days (`?` when
-/// it has no schedule), `—` for a milestone, else a leaf's own duration in
-/// the unit it was entered in; each with the estimate's `?`.
+/// it has no schedule), else the task's own duration in the unit it was
+/// entered in, a milestone's zero included; each with the estimate's `?`.
 fn entry_duration(ed: &Editor, task: &Task) -> FieldRead {
     let proj = ed.project();
     // Summaries first: their stored duration is stale (and may be 0, which
@@ -645,9 +645,6 @@ fn entry_duration(ed: &Editor, task: &Task) -> FieldRead {
         };
     }
     let min = FieldValue::Minutes(task.duration_min);
-    if task.is_milestone() {
-        return FieldRead::new("—", min);
-    }
     let shown = task
         .duration_unit()
         .and_then(|unit| proj.format_in_unit(task.duration_min, unit, 1))

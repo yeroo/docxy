@@ -353,7 +353,7 @@ fn every_name_reads_on_a_leaf_a_summary_a_milestone_and_a_blank_row() {
     assert_eq!(read(&ed, 10, "Milestone").text, "No");
     assert_eq!(read(&ed, 10, "Duration").text, "2d");
     assert_eq!(read(&ed, 2, "Milestone").text, "Yes");
-    assert_eq!(read(&ed, 2, "Duration").text, "—");
+    assert_eq!(read(&ed, 2, "Duration").text, "0d");
     assert_eq!(read(&ed, 10, "Outline Number").text, "1");
     assert_eq!(read(&ed, 1, "Outline Number").text, "1.1");
     assert_eq!(read(&ed, 2, "Outline Number").text, "1.2");
@@ -364,6 +364,21 @@ fn every_name_reads_on_a_leaf_a_summary_a_milestone_and_a_blank_row() {
             _ => assert_eq!((r.text, r.value), (s(""), FieldValue::Null), "{name}"),
         }
     }
+}
+
+#[test]
+fn milestone_duration_reads_zero_in_its_unit_and_toggles_back_to_a_day() {
+    let mut weekly = task(1, "Weekly", 2400);
+    weekly.duration_format = Some(9);
+    let mut ed = editor(vec![weekly, task(2, "Daily", 480)]);
+    ed.toggle_milestone(1).unwrap();
+    assert_eq!(read(&ed, 1, "Milestone").text, "Yes");
+    assert_eq!(read(&ed, 1, "Duration").text, "0w");
+    ed.toggle_milestone(2).unwrap();
+    assert_eq!(read(&ed, 2, "Duration").text, "0d");
+    ed.toggle_milestone(2).unwrap();
+    assert_eq!(read(&ed, 2, "Milestone").text, "No");
+    assert_eq!(read(&ed, 2, "Duration").text, "1d");
 }
 
 #[test]

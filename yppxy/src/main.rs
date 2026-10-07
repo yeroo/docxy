@@ -1920,8 +1920,6 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
                         + duration_suffix(app.ed.project(), t.uid)
                 },
             )
-        } else if t.is_milestone() {
-            "—".to_string()
         } else {
             in_task_unit(app.ed.project(), t, t.duration_min)
                 + duration_suffix(app.ed.project(), t.uid)
@@ -2677,13 +2675,13 @@ mod tests {
                 .rev()
                 .collect()
         };
-        // A summary keeps days; a milestone keeps its dash, slack in its unit.
+        // A summary keeps days; a milestone shows zero in the task's unit.
         assert_eq!(row(0), ["7.5d", "0d"]);
         assert_eq!(row(1), ["1.5w", "0w"]);
         assert_eq!(row(2), ["0.5w", "1w"]);
         assert_eq!(row(3), ["4h", "56h"]);
         assert_eq!(row(4), ["0.5d", "7d"]);
-        assert_eq!(row(5), ["—", "1.5w"]);
+        assert_eq!(row(5), ["0w", "1.5w"]);
         assert_eq!(row(6), ["1.5w", "0.1d"]);
     }
 
