@@ -31,7 +31,7 @@ fn two_scripts_in_one_run_do_not_share_tabs() {
     std::fs::write(
         dir.join("first.uit"),
         format!(
-            "test first file opens fresh\n  open copy:{}/gantt-empty.xml\n  assert tabs is 2\n  assert tasks is 0\n",
+            "test first file opens fresh\n  open copy:\"{}/gantt-empty.xml\"\n  assert tabs is 2\n  assert tasks is 0\n",
             fixtures.display()
         ),
     )
@@ -39,7 +39,7 @@ fn two_scripts_in_one_run_do_not_share_tabs() {
     std::fs::write(
         dir.join("second.uit"),
         format!(
-            "test second file starts clean\n  open copy:{}/project-clipboard.xml\n  assert tabs is 2\n  assert tasks is 2\n",
+            "test second file starts clean\n  open copy:\"{}/project-clipboard.xml\"\n  assert tabs is 2\n  assert tasks is 2\n",
             fixtures.display()
         ),
     )
