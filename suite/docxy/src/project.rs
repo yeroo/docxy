@@ -809,7 +809,7 @@ pub(super) fn apply_save(tab: &mut DocTab, target: &Path) -> Result<usize, Strin
     match result {
         Ok((path, n)) => {
             if let Surface::Project(v) = &mut tab.surface {
-                v.ed.mark_saved();
+                v.ed.commit_save();
             }
             tab.dirty = false;
             tab.title = file_name(&path).into();

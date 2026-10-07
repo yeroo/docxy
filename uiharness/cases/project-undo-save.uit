@@ -1,0 +1,22 @@
+test project save clears undo and redo as Project does
+  open copy:../fixtures/gantt-summary.xml
+  click C4
+  type A
+  key enter
+  type B
+  key enter
+  assert tasks is 5
+  key ctrl+z
+  assert tasks is 4
+  assert undo_depth is 1
+  assert redo_depth is 1
+  call proj.save {}
+  assert dirty is false
+  assert undo_depth is 0
+  assert redo_depth is 0
+  key ctrl+z
+  assert tasks is 4
+  assert cell C4 is A
+  key ctrl+y
+  assert tasks is 4
+  shot window
