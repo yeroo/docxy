@@ -1411,6 +1411,54 @@ fn the_zero_wide_column_files_save_their_columns_as_they_were() {
     }
 }
 
+/// The files whose unedited save Excel opened with a different pivot table
+/// (#1154, found by the real-Excel oracle): other captions, values and a
+/// lost page-field selection. Paths under the external corpus.
+const PIVOT_FILES: &[&str] = &[
+    "libreoffice/sc/qa/unit/data/xlsx/pivot-table/groupwithcalcfields.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/pivot-table/onlycalcfields.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/pivot-table/calcfields.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/pivot_table_first_header_row.xlsx",
+    "libreoffice/sc/qa/unit/data/xlsx/pivottable_duplicated_member_filter.xlsx",
+];
+
+#[test]
+fn the_pivot_files_save_their_pivot_parts_as_they_were() {
+    let (_, ext) = corpus(&workspace_root());
+    let Some(dir) = ext else {
+        assert!(
+            !flag("FIDELITY_REQUIRE_CORPUS"),
+            "fidelity: FIDELITY_REQUIRE_CORPUS=1 but no external corpus"
+        );
+        eprintln!("fidelity: SKIP the #1154 files: no external corpus");
+        return;
+    };
+    let is_pivot = |name: &str| {
+        let name = name.to_ascii_lowercase();
+        name.starts_with("xl/pivottables/") || name.starts_with("xl/pivotcache/")
+    };
+    for file in PIVOT_FILES {
+        let path = dir.join(file);
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let pkg = load_xlsx(&bytes).unwrap_or_else(|e| panic!("{file}: {e:?}"));
+        let saved = save_xlsx_for_path(&pkg, &path);
+        let (a, b) = (read_parts(&bytes).unwrap(), read_parts(&saved).unwrap());
+        let originals: Vec<_> = a.iter().filter(|(n, _)| is_pivot(n)).collect();
+        assert!(!originals.is_empty(), "{file}: no pivot parts");
+        for (name, original) in originals {
+            let saved = b
+                .get(name)
+                .unwrap_or_else(|| panic!("{file}: {name} was dropped"));
+            if original == saved {
+                continue;
+            }
+            let parse = |x: &[u8]| parse_xml(x).unwrap_or_else(|| panic!("{file} {name}: XML"));
+            let findings = compare_xml(name, &parse(original), &parse(saved));
+            assert_eq!(findings, vec![], "{file} {name}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests: the xlsx side of the shared comparator, the sheet check and
 // the real allowlist.

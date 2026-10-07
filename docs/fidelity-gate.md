@@ -393,6 +393,14 @@ cargo test -p gridcore --test fidelity -- --nocapture
   occurrence in that sheet. The test prints how many findings the check
   covered.
 
+- **Pivot parts round-trip unchanged** (#1154). Save no longer adds
+  `refreshOnLoad` to an untouched pivot's cache, so the allowlist has no
+  entry for it: Excel rebuilt such a pivot with its own captions and lost
+  its page-field selection. `the_pivot_files_save_their_pivot_parts_as_they_were`
+  checks the five files the oracle found: every part under `xl/pivotTables/`
+  and `xl/pivotCache/` is kept and compares equal, with no allowlist or
+  baseline.
+
 - **Directory entries are no parts** (#1156). Some writers put directories
   in the ZIP as empty entries without a trailing `/` and mark them only in
   their ZIP attributes (tdf124525.xlsx has `_rels`, `docProps`, `xl`, ...).
