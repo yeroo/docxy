@@ -823,8 +823,10 @@ pub(crate) fn project_input(
         if m.control && !m.alt && !m.platform && key == "s" {
             return commit_project_cell(tab).then_some(ProjectAct::Save);
         }
-        if key_act(key, m) == Some(ProjectAct::NewProject) {
-            return commit_project_cell(tab).then_some(ProjectAct::NewProject);
+        // F11's new project and Shift+F11's New Window (#587) commit the
+        // open cell first, as every command act does (#561).
+        if let Some(act @ (ProjectAct::NewProject | ProjectAct::NewWindow)) = key_act(key, m) {
+            return commit_project_cell(tab).then_some(act);
         }
         // #561: the host edits the open cell's buffer in place; the edit
         // stays open, so the range anchor survives like it does for Copy.

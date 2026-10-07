@@ -3046,6 +3046,17 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
     Json::Obj(out)
 }
 
+/// The selected window's state, falling back to this window's: the shared
+/// tail of `state_for_selection`, `state_for_reply` and `window-select`.
+fn selected_state(app: &crate::Docxy, window: &Window, cx: &mut App) -> Json {
+    match windows::selected_view(cx) {
+        Some(view) => view
+            .read_with(cx, |this: &crate::Docxy, cx| state(this, window, cx))
+            .unwrap_or_else(|_| state(app, window, cx)),
+        None => state(app, window, cx),
+    }
+}
+
 /// The state for a verb whose act may MOVE THE SELECTION (New Window from
 /// the ribbon or Shift+F11, window-new): the reply describes the selected
 /// window — the new one — whenever the selection left the dispatch window.
@@ -3053,12 +3064,7 @@ fn state_for_selection(app: &crate::Docxy, window: &Window, cx: &mut App) -> Jso
     if windows::selected(cx) == Some(app.win_id) {
         return state(app, window, cx);
     }
-    match windows::selected_view(cx) {
-        Some(view) => view
-            .read_with(cx, |this: &crate::Docxy, cx| state(this, window, cx))
-            .unwrap_or_else(|_| state(app, window, cx)),
-        None => state(app, window, cx),
-    }
+    selected_state(app, window, cx)
 }
 
 /// The state a verb's reply describes: this window's while it is still
@@ -3069,12 +3075,7 @@ fn state_for_reply(app: &crate::Docxy, window: &Window, cx: &mut App) -> Json {
     if windows::is_registered(cx, app.win_id) {
         return state(app, window, cx);
     }
-    match windows::selected_view(cx) {
-        Some(view) => view
-            .read_with(cx, |this: &crate::Docxy, cx| state(this, window, cx))
-            .unwrap_or_else(|_| state(app, window, cx)),
-        None => state(app, window, cx),
-    }
+    selected_state(app, window, cx)
 }
 
 /// The kind a tab is, as `tab-list` names it: the Backstage › New cards'.
@@ -3377,13 +3378,7 @@ fn dispatch_verb(
             windows::select(cx, id as u64)?;
             // The reply comes from the window the verbs now target, not the
             // one this verb dispatched on.
-            let reply = match windows::selected_view(cx) {
-                Some(view) => view
-                    .read_with(cx, |this: &crate::Docxy, cx| state(this, window, cx))
-                    .unwrap_or_else(|_| state(app, window, cx)),
-                None => state(app, window, cx),
-            };
-            Done::ok(reply)
+            Done::ok(selected_state(app, window, cx))
         }
         "window-arrange" => {
             let arranged = app.arrange_all(window, cx);
@@ -3482,12 +3477,25 @@ fn dispatch_verb(
             app.dialog_press(&button, window, cx)?;
             app.refocus(window, cx);
             // A close prompt's answer may have closed the WINDOW (a non-last
-            // close removes it) — then the reply describes the survivor.
+            // close removes it) — then the reply describes the survivor,
+            // its open dialog included.
             let Json::Obj(mut out) = state_for_reply(app, window, cx) else {
                 unreachable!("state is an object")
             };
-            // A close prompt's Save or Don't Save may have closed the last tab.
-            let dialog = app.active_dialogs_mut().to_json();
+            let dialog = if windows::is_registered(cx, app.win_id) {
+                // A close prompt's Save or Don't Save may have closed the last tab.
+                app.active_dialogs_mut().to_json()
+            } else {
+                windows::selected_view(cx)
+                    .and_then(|view| {
+                        view.read_with(cx, |this: &crate::Docxy, _| {
+                            this.active_dialogs().map(|d| d.to_json())
+                        })
+                        .ok()
+                        .flatten()
+                    })
+                    .unwrap_or_else(|| app.active_dialogs_mut().to_json())
+            };
             match out.iter_mut().find(|(k, _)| k == "dialog") {
                 Some((_, v)) => *v = dialog,
                 None => out.push(("dialog".into(), dialog)),
@@ -4656,7 +4664,9 @@ fn dispatch_verb(
             for stroke in strokes {
                 press(app, stroke, window, cx);
             }
-            Done::ok(state(app, window, cx))
+            // Shift+F11 on a Project tab is New Window: the reply describes
+            // the window it selects.
+            Done::ok(state_for_selection(app, window, cx))
         }
 
         // Select a chart, as pressing its card does (press then release, with

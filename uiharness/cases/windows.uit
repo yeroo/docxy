@@ -134,3 +134,32 @@ test closing a non last window with unsaved work asks whatever the setting
   assert title is Document5
   call tab-list {}
   assert reply.tabs.0.title is Document5
+
+test shift f11 on a project tab opens a window and the key reply describes it
+  call window-select {"window":2}
+  call tab-select {"tab":"gantt-summary.xml"}
+  call key {"key":"shift+f11"}
+  assert reply.window is 7
+  assert reply.title is gantt-summary.xml
+  assert reply.tabs is 1
+
+test a grid cut pastes as text in another window and still moves once at home
+  # The grid clip is per window: a cut pasted into ANOTHER window lands the
+  # clipboard's plain text (like a paste from another application); back
+  # home, the same cut still moves its cells exactly once.
+  call window-select {"window":2}
+  open copy:../fixtures/basic.xlsx
+  assert title is basic.xlsx
+  click A1
+  click B1 shift
+  key ctrl+x
+  call window-select {"window":4}
+  key ctrl+v
+  assert dirty is true
+  call window-select {"window":2}
+  click C1
+  key ctrl+v
+  call cell {"cell":"A1"}
+  assert reply.value is nothing
+  call cell {"cell":"C1"}
+  assert reply.value is not nothing

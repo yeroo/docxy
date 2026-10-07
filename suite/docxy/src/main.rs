@@ -11676,6 +11676,14 @@ impl Docxy {
             let previous_active = self.active;
             self.cancel_highlight_mode();
             let moved = crate::close::remove_tab(&mut self.tabs, &mut self.active, i);
+            // The grid clipboard's clip names the workbook it came from: if
+            // that workbook is the tab leaving, the clip's source is gone
+            // from this window, so copy mode ends with it (#587 r4).
+            if let crate::Surface::Sheet(v) = &moved.surface {
+                if self.grid_clip.as_ref().is_some_and(|c| c.view == v.id) {
+                    self.grid_clip_spend();
+                }
+            }
             if i == previous_active {
                 self.drop_grid_state();
             }
@@ -11721,7 +11729,6 @@ impl Docxy {
         }
     }
 
-    /// View › Window › Arrange All (#587): resize every window of the run to
     /// View › Window › Arrange All (#587): resize every window of the run to
     /// an equal vertical strip of THIS window's display, in creation order.
     /// gpui cannot move windows at the pinned rev, so positions stay. Returns
