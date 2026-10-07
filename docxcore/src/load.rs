@@ -2505,7 +2505,10 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
                     let raw = &declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
                     let (current, change) =
                         split_property_change_container(raw, PropertyScope::Table);
-                    table.raw_tblpr = Some(current);
+                    // An empty tblPr is what the writer emits for a table
+                    // without properties (#1107): it loads back as none.
+                    let empty = matches!(current.as_str(), "<w:tblPr/>" | "<w:tblPr></w:tblPr>");
+                    table.raw_tblpr = (!empty).then_some(current);
                     table.property_change = change;
                 }
                 // Preserve unmodeled table children at the row gap where they
