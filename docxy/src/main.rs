@@ -6127,6 +6127,9 @@ impl App {
                 for _ in 0..n {
                     changed |= self.editor.undo();
                 }
+                // Undoing a deleted selection selects it again (#853), which
+                // Vim's `u` in Normal mode never does.
+                self.editor.clear_selection();
                 if changed {
                     self.after_edit();
                 } else {
@@ -14109,6 +14112,26 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["two", "three"]);
+    }
+
+    #[test]
+    fn vim_undo_leaves_no_selection_853() {
+        let mut app = vim_app(&["one two"]);
+        app.editor.move_home();
+        app.on_key(key(KeyCode::Char('D'))); // cut to the line end
+        assert_eq!(first_line(&app), "");
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(first_line(&app), "one two");
+        assert!(!app.editor.has_selection(), "u selects nothing");
+        // Ctrl+Z outside Vim selects the text again, as Word does.
+        app.vim = None;
+        app.editor.move_home();
+        app.editor.anchor = Some(app.editor.caret.clone());
+        app.editor.move_end();
+        app.editor.backspace();
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(first_line(&app), "one two");
+        assert!(app.editor.has_selection());
     }
 
     #[test]
