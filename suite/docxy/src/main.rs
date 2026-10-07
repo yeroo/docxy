@@ -18379,10 +18379,8 @@ impl Docxy {
             if !cut {
                 return ed.copy();
             }
-            let since = docxcore::editor::undo_serial_counter();
-            ed.break_undo_group();
-            let clip = ed.cut();
-            ed.name_command(since, "Cut");
+            let mut clip = None;
+            ed.one_step("Cut", |ed| clip = ed.cut());
             clip
         });
         if let Some(clip) = clip {
@@ -18410,12 +18408,7 @@ impl Docxy {
             _ => now.text().map(Clip::from_text),
         };
         if let Some(clip) = clip {
-            self.with_editor(window, cx, |e| {
-                let since = docxcore::editor::undo_serial_counter();
-                e.break_undo_group();
-                e.paste(&clip);
-                e.name_command(since, "Paste");
-            });
+            self.with_editor(window, cx, |e| e.one_step("Paste", |e| e.paste(&clip)));
         } else {
             self.refocus(window, cx);
         }
@@ -23052,10 +23045,7 @@ fn note_edit(ed: &mut Editor, rec: &mut Option<RepeatRecord>, since: u64, what: 
 /// drop-down (#619). Never part of the typing before it, so a Repeat record
 /// of that typing goes stale rather than replaying the symbol (#618).
 fn insert_symbol_into(e: &mut Editor, s: &str) {
-    let since = docxcore::editor::undo_serial_counter();
-    e.break_undo_group();
-    e.insert_str(s);
-    e.name_command(since, "Insert Symbol");
+    e.one_step("Insert Symbol", |e| e.insert_str(s));
 }
 
 /// What a document key does that Repeat can do again (#618): the formatting
