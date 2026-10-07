@@ -20,7 +20,7 @@
 # review. Losses that are real but not fixed yet belong in baseline.txt, not
 # here.
 
-extra-attr | word/document.xml | */w:t/@xml:space | preserve | The serializer writes xml:space="preserve" on every w:t. It changes nothing for text without leading or trailing whitespace and keeps such whitespace when there is some.
+extra-attr | word/document.xml | */w:t/@xml:space | preserve | The serializer writes xml:space="preserve" on every w:t. The loader drops the edge whitespace Word ignores outside preserve (#1084), so the model holds the text Word reads, and preserve writes exactly that text back.
 extra-attr | word/document.xml | */@mc:Ignorable | * | Preserved raw subtrees (tables, drawings) get the effective mc:Ignorable of their ancestors redeclared, so the ignorable prefixes they use stay declared. The tokens repeat the root's.
 part-extra | word/styles.xml | * | * | save_package adds a styles part defining the table styles the body references when the package has none (add_referenced_table_styles).
 extra-element | [Content_Types].xml | /Types/Override | ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml" PartName="/word/styles.xml" | once-with part-extra word/styles.xml | The content-type override for that added styles part: only in a file where the part was added, and only once.
