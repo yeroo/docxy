@@ -256,11 +256,32 @@ fn marker_raw_mut(inline: &mut Inline) -> Option<&mut String> {
     }
 }
 
+/// [`marker_raw`] for comment markers, which can also sit in a footnote
+/// reference's run (`w:footnoteReference` then `w:commentReference`), kept
+/// whole as its raw (#1107).
+fn comment_marker_raw(inline: &Inline) -> Option<&str> {
+    match inline {
+        Inline::FootnoteRef { raw, .. } => Some(raw),
+        _ => marker_raw(inline),
+    }
+}
+
+fn comment_marker_raw_mut(inline: &mut Inline) -> Option<&mut String> {
+    match inline {
+        Inline::FootnoteRef { raw, .. } => Some(raw),
+        _ => marker_raw_mut(inline),
+    }
+}
+
 fn count_inlines(content: &[Inline], target: Target) -> usize {
     content
         .iter()
         .map(|inline| {
-            let own = match marker_raw(inline) {
+            let raw = match target {
+                Target::CommentMarkers(_) => comment_marker_raw(inline),
+                _ => marker_raw(inline),
+            };
+            let own = match raw {
                 Some(raw) => count_in_raw(raw, target),
                 None => usize::from(target.matches(inline)),
             };
@@ -323,7 +344,7 @@ fn remove_inlines(content: &mut Vec<Inline>, target: Target) -> usize {
             return true;
         };
         let plain_raw = matches!(inline, Inline::Raw(_));
-        let Some(raw) = marker_raw_mut(inline) else {
+        let Some(raw) = comment_marker_raw_mut(inline) else {
             return true;
         };
         let (out, n) = strip_markers(raw, id);
@@ -558,7 +579,7 @@ fn marker_ids_in_blocks(blocks: &[Block], ids: &mut std::collections::BTreeSet<S
 
 fn marker_ids_in_inlines(content: &[Inline], ids: &mut std::collections::BTreeSet<String>) {
     for inline in content {
-        if let Some(raw) = marker_raw(inline) {
+        if let Some(raw) = comment_marker_raw(inline) {
             marker_ids_in_xml(raw, ids);
         }
         match inline {
@@ -1128,6 +1149,27 @@ mod tests {
         let xml = document_to_xml(&reopened);
         assert!(!xml.contains("gone"), "{xml}");
         assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+    }
+
+    /// A footnote reference's run is kept whole as its raw, so a comment
+    /// reference sharing that run must be found and removed there too.
+    #[test]
+    fn a_comment_reference_in_a_footnote_run_is_found_and_removed_1107() {
+        let body = "<w:p><w:r><w:t>text</w:t></w:r>\
+            <w:r><w:footnoteReference w:id=\"1\"/><w:commentReference w:id=\"2\"/></w:r></w:p>";
+        let mut doc = parse(body);
+        let Block::Paragraph(p) = &doc.body[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(p.content[1], Inline::FootnoteRef { .. }));
+        let ids: Vec<String> = comment_marker_ids(&doc).into_iter().collect();
+        assert_eq!(ids, ["2"]);
+        assert_eq!(count_blocks(&doc.body, Target::CommentMarkers(None)), 1);
+        assert_eq!(remove_comment_markers(&mut doc, "2"), 1);
+        let xml = document_to_xml(&doc);
+        assert_eq!(count_markers(&xml, None), 0, "{xml}");
+        assert!(xml.contains("<w:footnoteReference w:id=\"1\"/>"), "{xml}");
+        assert!(comment_marker_ids(&doc).is_empty());
     }
 
     /// #917: deleting one comment strips only its markers. Text in the same
