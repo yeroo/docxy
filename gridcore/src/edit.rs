@@ -287,6 +287,32 @@ pub fn fill_changes(
     changes
 }
 
+/// Excel's refusal of an insert that would push data off the sheet (#860).
+pub const SHIFT_OFF_SHEET: &str =
+    "To prevent possible loss of data, cells that aren't blank can't be shifted off the worksheet.";
+
+/// Whether inserting `count` rows (`rows`) or columns before `at` on sheet
+/// `idx` would push a cell that isn't blank, or a merged range, past the
+/// sheet's last row or column, where the insert drops it (#860). Excel
+/// refuses such an insert; a delete never shifts anything off.
+pub fn insert_shifts_data_off(wb: &Workbook, idx: usize, rows: bool, at: u32, count: u32) -> bool {
+    let Some(sheet) = wb.sheets.get(idx) else {
+        return false;
+    };
+    let max = if rows { MAX_ROWS } else { MAX_COLS };
+    // A coordinate at or past this moves off the sheet.
+    let edge = at.max(max.saturating_sub(count));
+    let pick = |r: u32, c: u32| if rows { r } else { c };
+    sheet
+        .cells
+        .iter()
+        .any(|(&(r, c), cell)| pick(r, c) >= edge && !cell.is_blank())
+        || sheet
+            .merges
+            .iter()
+            .any(|&(r0, c0, r1, c1)| pick(r0, c0) >= at && pick(r1, c1) >= edge)
+}
+
 /// Insert `count` blank rows before 0-based row `at` on sheet `idx`.
 pub fn insert_rows(wb: &mut Workbook, idx: usize, at: u32, count: u32) {
     structural_edit(
@@ -2708,6 +2734,33 @@ mod tests {
     use super::*;
     use crate::engine::Engine;
     use crate::sheet::{Cell, CellValue, Xf, parse_cell_name};
+
+    #[test]
+    fn an_insert_that_would_push_data_off_the_sheet_is_spotted() {
+        let mut wb = Workbook {
+            sheets: vec![Sheet::default()],
+            ..Workbook::default()
+        };
+        wb.sheets[0].set_cell(2, 2, Cell::number(1.0)); // C3
+        // Whole rows selected (every column) push C3 off; whole columns
+        // (every row) push row 3 off.
+        assert!(insert_shifts_data_off(&wb, 0, false, 0, MAX_COLS));
+        assert!(insert_shifts_data_off(&wb, 0, true, 0, MAX_ROWS));
+        // Inserting past the data, or few enough to keep it, is fine.
+        assert!(!insert_shifts_data_off(&wb, 0, false, 3, MAX_COLS - 3));
+        assert!(!insert_shifts_data_off(&wb, 0, true, 0, MAX_ROWS - 3));
+        assert!(insert_shifts_data_off(&wb, 0, true, 0, MAX_ROWS - 2));
+        assert!(!insert_shifts_data_off(&wb, 0, true, 1, 1));
+        // A blank (style-only) cell at the edge goes without a word.
+        let mut styled = Cell::default();
+        styled.style = 3;
+        wb.sheets[0].set_cell(MAX_ROWS - 1, 0, styled);
+        assert!(!insert_shifts_data_off(&wb, 0, true, 5, 1));
+        // A merge whose far edge would fall off counts.
+        wb.sheets[0].merges.push((MAX_ROWS - 2, 0, MAX_ROWS - 1, 1));
+        assert!(insert_shifts_data_off(&wb, 0, true, 5, 1));
+        assert!(!insert_shifts_data_off(&wb, 0, false, 5, 1));
+    }
 
     fn wb(cells: &[(&str, Cell)]) -> Workbook {
         let mut sheet = Sheet {

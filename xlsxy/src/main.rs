@@ -6805,7 +6805,8 @@ impl App {
 
     /// Insert `count` rows above the selection (or delete the selected rows).
     /// Refused on a protected sheet, whose default protection allows
-    /// neither, as Excel's is (#860). The same rows stay selected, as in
+    /// neither, as Excel's is, and an insert that would push data off the
+    /// sheet (#860). The same rows stay selected, as in
     /// Excel, so Ctrl+- again deletes the next ones.
     fn row_op(&mut self, insert: bool) {
         if self.protected() {
@@ -6816,6 +6817,12 @@ impl App {
         let (r1, _, r2, _) = self.selection();
         let count = r2 - r1 + 1;
         let sheet = self.sheet;
+        if insert
+            && gridcore::edit::insert_shifts_data_off(&self.pkg.workbook, sheet, true, r1, count)
+        {
+            self.status = Some(gridcore::edit::SHIFT_OFF_SHEET.into());
+            return;
+        }
         let kept = (self.cur, self.anchor);
         self.structural(|wb| {
             if insert {
@@ -6842,6 +6849,12 @@ impl App {
         let (_, c1, _, c2) = self.selection();
         let count = c2 - c1 + 1;
         let sheet = self.sheet;
+        if insert
+            && gridcore::edit::insert_shifts_data_off(&self.pkg.workbook, sheet, false, c1, count)
+        {
+            self.status = Some(gridcore::edit::SHIFT_OFF_SHEET.into());
+            return;
+        }
         let kept = (self.cur, self.anchor);
         self.structural(|wb| {
             if insert {
@@ -19139,6 +19152,66 @@ mod tests {
         assert_eq!(value_at(&app, 2, 0), CellValue::Number(3.0));
         assert_eq!(app.undo.len(), steps);
         assert!(app.status.as_deref().unwrap_or("").contains("protected"));
+    }
+
+    /// A1:C3 holding numbers.
+    fn app_with_block() -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        for r in 0..3 {
+            for c in 0..3 {
+                app.pkg.workbook.sheets[0].set_cell(r, c, gridcore::sheet::Cell::number(1.0));
+            }
+        }
+        app.rebuild_engine();
+        app
+    }
+
+    #[test]
+    fn inserting_columns_on_whole_rows_refuses_to_push_data_off_the_sheet() {
+        // Shift+Space, then F6 (or Ctrl+Shift+= on whole columns below).
+        let mut app = app_with_block();
+        app.cur = (1, 1);
+        app.anchor = None;
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        let (cells, steps) = (app.sheet().cells.clone(), app.undo.len());
+        press(&mut app, KeyCode::F(6));
+        assert_eq!(app.status.as_deref(), Some(gridcore::edit::SHIFT_OFF_SHEET));
+        assert_eq!(app.sheet().cells, cells);
+        assert_eq!(app.undo.len(), steps);
+    }
+
+    #[test]
+    fn inserting_rows_on_whole_columns_refuses_to_push_data_off_the_sheet() {
+        let mut app = app_with_block();
+        app.anchor = Some((0, 1));
+        app.cur = (MAX_ROWS - 1, 1);
+        let (cells, steps) = (app.sheet().cells.clone(), app.undo.len());
+        press(&mut app, KeyCode::F(5));
+        assert_eq!(app.status.as_deref(), Some(gridcore::edit::SHIFT_OFF_SHEET));
+        assert_eq!(app.sheet().cells, cells);
+        assert_eq!(app.undo.len(), steps);
+    }
+
+    #[test]
+    fn a_sheet_wide_insert_with_nothing_to_lose_still_runs() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.cur = (1, 1);
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        let steps = app.undo.len();
+        press(&mut app, KeyCode::F(6));
+        assert_eq!(app.undo.len(), steps + 1);
+    }
+
+    #[test]
+    fn deleting_columns_on_whole_rows_deletes_every_column() {
+        let mut app = app_with_block();
+        app.cur = (1, 1);
+        app.anchor = None;
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        press_mod(&mut app, KeyCode::F(6), KeyModifiers::SHIFT);
+        assert!(app.sheet().cells.values().all(|c| c.is_blank()));
     }
 
     #[test]

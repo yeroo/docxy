@@ -237,3 +237,70 @@ fn a_new_sheet_takes_the_next_free_sheet_name() {
     assert_eq!(v.active, idx);
     assert_ne!(v.pkg.workbook.next_sheet_name(), first);
 }
+
+/// A1:C3 holding numbers, as the review's case has it.
+fn block() -> SheetView {
+    let mut v = view();
+    for r in 1..=3 {
+        for c in ["A", "B", "C"] {
+            put(&mut v, &format!("{c}{r}"), Cell::number(f64::from(r)));
+        }
+    }
+    v
+}
+
+#[test]
+fn insert_col_on_whole_rows_refuses_to_push_data_off_the_sheet() {
+    // Shift+Space, then Home › Insert Col: 16,384 columns before A.
+    let mut v = block();
+    select(&mut v, "B2", "B2");
+    v.select_rows();
+    let (cells, steps) = (v.sheet().cells.clone(), v.undo.len());
+    assert!(!v.structural_edit(StructOp::InsertCol));
+    assert_eq!(
+        v.entry_error.take().as_deref(),
+        Some(gridcore::edit::SHIFT_OFF_SHEET)
+    );
+    assert_eq!(v.sheet().cells, cells);
+    assert_eq!(v.undo.len(), steps);
+}
+
+#[test]
+fn insert_row_on_whole_columns_refuses_to_push_data_off_the_sheet() {
+    let mut v = block();
+    // Column B, whole.
+    v.anchor = (0, 1);
+    v.sel = (gridcore::sheet::MAX_ROWS - 1, 1);
+    v.clear_areas();
+    let (cells, steps) = (v.sheet().cells.clone(), v.undo.len());
+    assert!(!v.structural_edit(StructOp::InsertRow));
+    assert_eq!(
+        v.entry_error.take().as_deref(),
+        Some(gridcore::edit::SHIFT_OFF_SHEET)
+    );
+    assert_eq!(v.sheet().cells, cells);
+    assert_eq!(v.undo.len(), steps);
+}
+
+#[test]
+fn a_sheet_wide_insert_with_nothing_to_lose_still_runs() {
+    let mut v = view();
+    select(&mut v, "A2", "A2");
+    v.select_rows();
+    let steps = v.undo.len();
+    assert!(v.structural_edit(StructOp::InsertCol));
+    assert!(v.entry_error.is_none());
+    assert_eq!(v.undo.len(), steps + 1);
+}
+
+#[test]
+fn delete_col_on_whole_rows_deletes_every_column() {
+    // Excel's Delete Sheet Columns on a whole row empties the sheet.
+    let mut v = block();
+    select(&mut v, "B2", "B2");
+    v.select_rows();
+    assert!(v.structural_edit(StructOp::DeleteCol));
+    assert!(v.sheet().cells.values().all(Cell::is_blank));
+    assert!(v.undo_step());
+    assert_eq!(value(&v, "C3"), num(3));
+}

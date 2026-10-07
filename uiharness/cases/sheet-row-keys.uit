@@ -159,3 +159,16 @@ test shift f11 adds a sheet and keeps the history
   assert cell J1 is 7
   key ctrl+z
   assert cell J1 is nothing
+
+test insert col on whole rows refuses to push data off the sheet
+  open copy:../fixtures/basic.xlsx
+  click J2
+  type 5
+  key enter
+  click J2
+  key shift+space
+  call ribbon-click {"tab":"Home","command":"Insert Col"}
+  assert status is To prevent possible loss of data, cells that aren't blank can't be shifted off the worksheet.
+  assert cell J2 is 5
+  key ctrl+z
+  assert cell J2 is nothing

@@ -3294,7 +3294,8 @@ impl SheetView {
     /// open editor before moving rows or columns under its origin. False
     /// when a refused commit left the editor open (its absolute origin
     /// would point at a shifted cell, so nothing moves), or when the sheet
-    /// is protected (`entry_error` says so).
+    /// is protected or an insert would push data off it (`entry_error` says
+    /// which).
     fn structural_edit(&mut self, op: StructOp) -> bool {
         use gridcore::edit;
 
@@ -3308,12 +3309,25 @@ impl SheetView {
             self.dv_pending = None;
             return false;
         }
-        // Rows or columns are about to move: circles name cells, not rules.
-        self.circles.clear();
-        self.push_undo();
         let s = self.active;
         let (r0, c0, r1, c1) = self.range();
         let (rows, cols) = (r1 - r0 + 1, c1 - c0 + 1);
+        // An insert as wide as the sheet (Insert Col on whole rows) would
+        // push the data off its far edge: Excel refuses it.
+        let over = match op {
+            StructOp::InsertRow => Some((true, r0, rows)),
+            StructOp::InsertCol => Some((false, c0, cols)),
+            StructOp::DeleteRow | StructOp::DeleteCol => None,
+        };
+        if let Some((axis_rows, at, count)) = over
+            && edit::insert_shifts_data_off(&self.pkg.workbook, s, axis_rows, at, count)
+        {
+            self.entry_error = Some(edit::SHIFT_OFF_SHEET.into());
+            return false;
+        }
+        // Rows or columns are about to move: circles name cells, not rules.
+        self.circles.clear();
+        self.push_undo();
         let wb = &mut self.pkg.workbook;
         let shift = match op {
             StructOp::InsertRow => {
