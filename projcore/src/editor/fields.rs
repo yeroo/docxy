@@ -7,6 +7,7 @@
 //! the grid's (`2d`, `2026-03-02`). Dates show `YYYY-MM-DD`, `NA` when unset.
 //!
 //! `value` is [`FieldValue::Null`] only for a date that shows `NA`, for a
+//! custom value that does not parse (its text is the stored text), for a
 //! stored value the plan does not have (percents, actuals, remaining
 //! values, work, cost, fixed cost, baseline values, notes, hyperlink parts),
 //! and for Status
@@ -22,6 +23,14 @@
 //! grid shows (a summary is estimated when a leaf below it is; a zero-length
 //! leaf is a milestone). A blank row reads only its ID and Unique ID; every
 //! other field is empty text and null.
+//!
+//! Custom fields (Text1-30, Number1-20, Cost1-10, Flag1-20 and
+//! Date/Start/Finish/Duration1-10) resolve through the plan's own
+//! `<ExtendedAttribute>` definitions: the definition whose `FieldName` is the
+//! field's name says which `FieldID` holds the value, so no id is hard-coded.
+//! A field with no definition in the plan, or no task value with that id,
+//! reads unset (`""`, `0`, `$0.00`, `No`/`false`, `NA`, `0 days` by kind);
+//! a stored value that does not parse reads as its raw text and Null.
 //!
 //! Units: a task's own durations (Actual and Remaining Duration, Duration
 //! Variance) show in the unit its Duration was entered in, elapsed included;
@@ -81,6 +90,10 @@ pub enum Field {
     FixedCostAccrual,
     /// A Baseline slot: 0 is Baseline, 1..=10 are Baseline1..Baseline10.
     Baseline(u8, BaselinePart),
+    /// A custom field slot: Text1-30, Number1-20, Cost1-10, Flag1-20 and
+    /// Date/Start/Finish/Duration1-10 (`n` is 1-based), resolved through the
+    /// plan's own `<ExtendedAttribute>` definitions.
+    Custom(CustomKind, u8),
     StartVariance,
     FinishVariance,
     DurationVariance,
@@ -126,6 +139,33 @@ pub enum BaselinePart {
     Work,
     Cost,
 }
+
+/// The family of a custom (user-defined) task field (`#577`). Project
+/// numbers each family separately: Text1-30, Number1-20, Cost1-10, Flag1-20
+/// and Date/Start/Finish/Duration1-10.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CustomKind {
+    Text,
+    Number,
+    Cost,
+    Flag,
+    Date,
+    Start,
+    Finish,
+    Duration,
+}
+
+/// Every custom family: its kind, name prefix and highest number.
+const CUSTOM_KINDS: [(CustomKind, &str, u8); 8] = [
+    (CustomKind::Text, "Text", 30),
+    (CustomKind::Number, "Number", 20),
+    (CustomKind::Cost, "Cost", 10),
+    (CustomKind::Flag, "Flag", 20),
+    (CustomKind::Date, "Date", 10),
+    (CustomKind::Start, "Start", 10),
+    (CustomKind::Finish, "Finish", 10),
+    (CustomKind::Duration, "Duration", 10),
+];
 
 const BASELINE_PARTS: [(BaselinePart, &str); 5] = [
     (BaselinePart::Start, "Start"),
@@ -220,10 +260,14 @@ impl Field {
                 .iter()
                 .map(move |&(part, _)| Field::Baseline(n, part))
         });
+        let customs = CUSTOM_KINDS
+            .iter()
+            .flat_map(|&(kind, _, max)| (1..=max).map(move |n| Field::Custom(kind, n)));
         HEAD.iter()
             .map(|&(f, _)| f)
             .chain(baselines)
             .chain(TAIL.iter().map(|&(f, _)| f))
+            .chain(customs)
             .collect()
     }
 
@@ -239,6 +283,13 @@ impl Field {
             } else {
                 format!("Baseline{n} {part}")
             };
+        }
+        if let Field::Custom(kind, n) = self {
+            let prefix = CUSTOM_KINDS
+                .iter()
+                .find(|(k, _, _)| *k == kind)
+                .map_or("", |&(_, prefix, _)| prefix);
+            return format!("{prefix}{n}");
         }
         HEAD.iter()
             .chain(TAIL)
@@ -475,6 +526,7 @@ impl<'a> FieldReader<'a> {
             Field::Estimated => flag(!duration_suffix(proj, task.uid).is_empty()),
             Field::Status => status(ed, task),
             Field::UniqueId => int(i64::from(task.uid)),
+            Field::Custom(kind, n) => custom::read(proj, task, kind, n),
         }
     }
 }
@@ -823,6 +875,7 @@ pub fn format_date_field(dt: Option<DateTime>) -> String {
 }
 
 pub(super) mod assignment;
+mod custom;
 
 #[cfg(test)]
 mod tests;

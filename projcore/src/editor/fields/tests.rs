@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::Baseline;
+use crate::model::{Baseline, ExtendedAttributeValue, XmlElement};
 
 fn at(day: u32, hour: u32) -> DateTime {
     DateTime::from_ymd_hm(2026, 1, day, hour, 0)
@@ -396,7 +396,7 @@ fn an_estimated_milestone_shows_no_estimate_suffix() {
 #[test]
 fn names_list_the_families_and_match_loosely() {
     let names = field_names();
-    assert_eq!(names.len(), 23 + 11 * 5 + 34);
+    assert_eq!(names.len(), 23 + 11 * 5 + 34 + 120);
     assert_eq!(names[..3], [s("ID"), s("Task Mode"), s("Name")]);
     for name in [
         "Baseline Start",
@@ -1131,4 +1131,409 @@ fn status_matches_project_over_the_x_status_sweep() {
             );
         }
     }
+}
+
+// ---- custom fields (#577) ----
+
+/// An `<ExtendedAttribute>` definition element the way `read_mspdi` keeps it.
+fn custom_def(field_id: &str, field_name: &str) -> XmlElement {
+    node(
+        "ExtendedAttribute",
+        vec![leaf("FieldID", field_id), leaf("FieldName", field_name)],
+    )
+}
+
+fn leaf(name: &str, text: &str) -> XmlElement {
+    XmlElement {
+        name: name.into(),
+        text: text.into(),
+        children: Vec::new(),
+    }
+}
+
+fn node(name: &str, children: Vec<XmlElement>) -> XmlElement {
+    XmlElement {
+        name: name.into(),
+        text: String::new(),
+        children,
+    }
+}
+
+fn custom_value(field_id: &str, value: &str) -> ExtendedAttributeValue {
+    ExtendedAttributeValue {
+        field_id: field_id.into(),
+        value: Some(value.into()),
+        ..ExtendedAttributeValue::default()
+    }
+}
+
+#[test]
+fn custom_field_names_parse_and_list() {
+    for (given, canonical) in [
+        ("Text1", "Text1"),
+        ("text30", "Text30"),
+        ("Number20", "Number20"),
+        ("Cost10", "Cost10"),
+        ("Flag20", "Flag20"),
+        ("Date10", "Date10"),
+        ("Start10", "Start10"),
+        ("Finish10", "Finish10"),
+        ("Duration10", "Duration10"),
+        ("  flag1 ", "Flag1"),
+    ] {
+        let field = Field::parse(given).unwrap_or_else(|e| panic!("{given}: {e}"));
+        assert_eq!(field.name(), canonical, "{given}");
+    }
+    for bad in [
+        "Text31",
+        "Text0",
+        "Text01",
+        "Number21",
+        "Cost11",
+        "Flag21",
+        "Date11",
+        "Start11",
+        "Finish11",
+        "Duration11",
+    ] {
+        assert_eq!(
+            Field::parse(bad),
+            Err(format!("unknown task field '{bad}'"))
+        );
+    }
+    // The families append after "Unique ID", Text through Duration, and
+    // `Field::all` agrees with the listing.
+    let names = field_names();
+    let tail: Vec<String> = [
+        ("Text", 30),
+        ("Number", 20),
+        ("Cost", 10),
+        ("Flag", 20),
+        ("Date", 10),
+        ("Start", 10),
+        ("Finish", 10),
+        ("Duration", 10),
+    ]
+    .iter()
+    .flat_map(|&(prefix, max)| (1..=max).map(move |n| format!("{prefix}{n}")))
+    .collect();
+    let unique_id = names.iter().position(|n| n == "Unique ID").unwrap();
+    assert_eq!(names[unique_id + 1..], tail[..]);
+    assert_eq!(names.len(), 23 + 11 * 5 + 34 + 120);
+    assert_eq!(Field::all().len(), names.len());
+    for name in &names[unique_id + 1..] {
+        assert_eq!(Field::parse(name).unwrap().name(), *name);
+    }
+}
+
+#[test]
+fn custom_text_reads_through_the_definition() {
+    let mut p = untitled_project();
+    p.extended_attribute_definitions = vec![custom_def("188743731", "Text1")];
+    let mut t = task(1, "Pour", 480);
+    t.extended_attributes = vec![custom_value("188743731", "M&E")];
+    p.tasks = vec![t];
+    let ed = Editor::new(p);
+    assert_eq!(tv(&ed, 1, "Text1"), (s("M&E"), FieldValue::Text(s("M&E"))));
+
+    // The lookup follows the definition's FieldName, not a fixed id: renaming
+    // the definition moves the value to Text2 and leaves Text1 unset.
+    let mut p = untitled_project();
+    p.extended_attribute_definitions = vec![custom_def("188743731", "Text2")];
+    let mut t = task(1, "Pour", 480);
+    t.extended_attributes = vec![custom_value("188743731", "M&E")];
+    p.tasks = vec![t];
+    let ed = Editor::new(p);
+    assert_eq!(tv(&ed, 1, "Text1"), (s(""), FieldValue::Null));
+    assert_eq!(tv(&ed, 1, "Text2"), (s("M&E"), FieldValue::Text(s("M&E"))));
+}
+
+#[test]
+fn custom_text_lookup_by_guid() {
+    let list = node(
+        "ValueList",
+        vec![
+            node(
+                "Value",
+                vec![
+                    leaf("ID", "1"),
+                    leaf("Value", "Civil"),
+                    leaf("FieldGUID", "7F2B5E61-7C21-4E0A-9B55-3C8D12A4E101"),
+                ],
+            ),
+            node(
+                "Value",
+                vec![
+                    leaf("ID", "2"),
+                    leaf("Value", "M&E"),
+                    leaf("FieldGUID", "7F2B5E61-7C21-4E0A-9B55-3C8D12A4E102"),
+                ],
+            ),
+        ],
+    );
+    let mut def = custom_def("188743731", "Text1");
+    def.children.push(list);
+    // No value: the guid names the ValueList entry, case-insensitively; an
+    // empty value falls back to the guid as well. A guid no entry matches,
+    // or no guid at all, reads unset.
+    let build = |value: Option<&str>, guid: Option<&str>| {
+        let mut p = untitled_project();
+        p.extended_attribute_definitions = vec![def.clone()];
+        let mut t = task(1, "Pour", 480);
+        t.extended_attributes = vec![ExtendedAttributeValue {
+            field_id: "188743731".into(),
+            value: value.map(String::from),
+            value_guid: guid.map(String::from),
+            duration_format: None,
+        }];
+        p.tasks = vec![t];
+        Editor::new(p)
+    };
+    assert_eq!(
+        tv(
+            &build(None, Some("7f2b5e61-7c21-4e0a-9b55-3c8d12a4e102")),
+            1,
+            "Text1"
+        ),
+        (s("M&E"), FieldValue::Text(s("M&E")))
+    );
+    assert_eq!(
+        tv(
+            &build(Some(""), Some("7F2B5E61-7C21-4E0A-9B55-3C8D12A4E101")),
+            1,
+            "Text1"
+        ),
+        (s("Civil"), FieldValue::Text(s("Civil")))
+    );
+    // A stored value wins over a guid pointing at a different entry.
+    assert_eq!(
+        tv(
+            &build(Some("Civil"), Some("7F2B5E61-7C21-4E0A-9B55-3C8D12A4E102")),
+            1,
+            "Text1"
+        ),
+        (s("Civil"), FieldValue::Text(s("Civil")))
+    );
+    for guid in [Some("no-such-guid"), None] {
+        assert_eq!(
+            tv(&build(None, guid), 1, "Text1"),
+            (s(""), FieldValue::Null),
+            "{guid:?}"
+        );
+    }
+}
+
+#[test]
+fn custom_field_reads_past_shadowing_definitions() {
+    // The definitions block is shared with resource and assignment custom
+    // fields, whose definitions repeat the task field names (resource Text1
+    // is FieldID 205520904, corpus/mspdi/13-resource-fields.xml). One that
+    // names no task value — or has no FieldID child at all — must not
+    // shadow the task's definition.
+    let mut p = untitled_project();
+    p.extended_attribute_definitions = vec![
+        custom_def("205520904", "Text1"),
+        node("ExtendedAttribute", vec![leaf("FieldName", "Text1")]),
+        custom_def("188743731", "Text1"),
+    ];
+    let mut t = task(1, "Pour", 480);
+    t.extended_attributes = vec![custom_value("188743731", "M&E")];
+    p.tasks = vec![t];
+    let ed = Editor::new(p);
+    assert_eq!(tv(&ed, 1, "Text1"), (s("M&E"), FieldValue::Text(s("M&E"))));
+}
+
+#[test]
+fn custom_number_cost_flag_date_duration() {
+    let mut p = untitled_project();
+    p.extended_attribute_definitions = vec![
+        custom_def("555000001", "Number1"),
+        custom_def("555000002", "Number2"),
+        custom_def("555000003", "Cost1"),
+        custom_def("555000004", "Flag1"),
+        custom_def("555000005", "Flag2"),
+        custom_def("555000006", "Date1"),
+        custom_def("555000007", "Start1"),
+        custom_def("555000008", "Finish1"),
+        custom_def("555000009", "Duration1"),
+        custom_def("555000010", "Duration2"),
+    ];
+    let mut t = task(1, "Pour", 480);
+    t.extended_attributes = vec![
+        custom_value("555000001", "12.50"),
+        custom_value("555000002", "-0.25"),
+        custom_value("555000003", "12550"),
+        custom_value("555000004", "1"),
+        custom_value("555000005", "FALSE"),
+        custom_value("555000006", "2026-03-04T17:00:00"),
+        custom_value("555000007", "2026-03-02T08:00:00"),
+        custom_value("555000008", "2026-03-05T17:00:00"),
+        ExtendedAttributeValue {
+            field_id: "555000009".into(),
+            value: Some("PT16H0M0S".into()),
+            value_guid: None,
+            duration_format: Some(5),
+        },
+        custom_value("555000010", "PT16H0M0S"),
+    ];
+    p.tasks = vec![t];
+    let ed = Editor::new(p);
+    let date = |text: &str| FieldValue::Date(DateTime::parse_mspdi(text).unwrap());
+    for (name, text, value) in [
+        ("Number1", "12.5", FieldValue::Number(12.5)),
+        ("Number2", "-0.25", FieldValue::Number(-0.25)),
+        ("Cost1", "$125.50", FieldValue::Money(125.5)),
+        ("Flag1", "Yes", FieldValue::Bool(true)),
+        ("Flag2", "No", FieldValue::Bool(false)),
+        ("Date1", "2026-03-04", date("2026-03-04T17:00:00")),
+        ("Start1", "2026-03-02", date("2026-03-02T08:00:00")),
+        ("Finish1", "2026-03-05", date("2026-03-05T17:00:00")),
+        // The unit is the value's own DurationFormat (5 = hours).
+        ("Duration1", "16 hrs", FieldValue::Minutes(960)),
+        // Without one it is days.
+        ("Duration2", "2 days", FieldValue::Minutes(960)),
+    ] {
+        assert_eq!(tv(&ed, 1, name), (s(text), value), "{name}");
+    }
+}
+
+#[test]
+fn custom_unset_and_unparseable_read_leniently() {
+    // No definitions at all: every kind reads its unset shape.
+    let ed = editor(vec![task(1, "Bare", 480)]);
+    for (name, text, value) in [
+        ("Text1", "", FieldValue::Null),
+        ("Number1", "0", FieldValue::Null),
+        ("Cost1", "$0.00", FieldValue::Null),
+        ("Flag1", "No", FieldValue::Bool(false)),
+        ("Date1", "NA", FieldValue::Null),
+        ("Start1", "NA", FieldValue::Null),
+        ("Finish1", "NA", FieldValue::Null),
+        ("Duration1", "0 days", FieldValue::Null),
+    ] {
+        assert_eq!(tv(&ed, 1, name), (s(text), value), "{name}");
+    }
+
+    // A definition with no FieldName never matches, and a task value whose id
+    // no definition names reads unset too.
+    let mut p = untitled_project();
+    p.extended_attribute_definitions = vec![node(
+        "ExtendedAttribute",
+        vec![leaf("FieldID", "555000099")],
+    )];
+    let mut t = task(1, "Bare", 480);
+    t.extended_attributes = vec![
+        custom_value("555000099", "M&E"),
+        custom_value("555000777", "orphan"),
+    ];
+    p.tasks = vec![t];
+    let ed = Editor::new(p);
+    assert_eq!(tv(&ed, 1, "Text1"), (s(""), FieldValue::Null));
+
+    // A stored value that does not parse reads as its raw text and Null,
+    // never an error.
+    let mut p = untitled_project();
+    p.extended_attribute_definitions = vec![
+        custom_def("555000001", "Number1"),
+        custom_def("555000002", "Cost1"),
+        custom_def("555000003", "Flag1"),
+        custom_def("555000004", "Date1"),
+        custom_def("555000005", "Duration1"),
+        custom_def("555000006", "Text1"),
+    ];
+    let mut t = task(1, "Bare", 480);
+    t.extended_attributes = vec![
+        custom_value("555000001", "abc"),
+        custom_value("555000002", "12x"),
+        custom_value("555000003", "maybe"),
+        custom_value("555000004", "not-a-date"),
+        custom_value("555000005", "XYZ"),
+        custom_value("555000006", ""),
+    ];
+    p.tasks = vec![t];
+    let ed = Editor::new(p);
+    for (name, raw) in [
+        ("Number1", "abc"),
+        ("Cost1", "12x"),
+        ("Flag1", "maybe"),
+        ("Date1", "not-a-date"),
+        ("Duration1", "XYZ"),
+        ("Text1", ""),
+    ] {
+        assert_eq!(tv(&ed, 1, name), (s(raw), FieldValue::Null), "{name}");
+    }
+
+    // `parse` accepts NaN and the inf spellings; they are not values and
+    // keep their raw text. Finite numbers keep their exact digits — no
+    // rounding to hundredths, no overflow to inf in the display text.
+    let mut p = untitled_project();
+    p.extended_attribute_definitions = vec![
+        custom_def("555000001", "Number1"),
+        custom_def("555000002", "Number2"),
+        custom_def("555000003", "Number3"),
+        custom_def("555000004", "Number4"),
+        custom_def("555000005", "Cost1"),
+        custom_def("555000006", "Cost2"),
+        custom_def("555000007", "Cost3"),
+        custom_def("555000008", "Cost4"),
+    ];
+    let mut t = task(1, "Bare", 480);
+    t.extended_attributes = vec![
+        custom_value("555000001", "NaN"),
+        custom_value("555000002", "inf"),
+        custom_value("555000003", "0.001"),
+        custom_value("555000004", "1e308"),
+        custom_value("555000005", "NaN"),
+        custom_value("555000006", "inf"),
+        // A finite but huge cost saturates the money text; a normal large
+        // one still reads.
+        custom_value("555000007", "1e40"),
+        custom_value("555000008", "123456789012"),
+    ];
+    p.tasks = vec![t];
+    let ed = Editor::new(p);
+    for (name, text, value) in [
+        ("Number1", "NaN", FieldValue::Null),
+        ("Number2", "inf", FieldValue::Null),
+        ("Number3", "0.001", FieldValue::Number(0.001)),
+        ("Number4", &1e308.to_string(), FieldValue::Number(1e308)),
+        ("Cost1", "NaN", FieldValue::Null),
+        ("Cost2", "inf", FieldValue::Null),
+        ("Cost3", "1e40", FieldValue::Null),
+        (
+            "Cost4",
+            "$1,234,567,890.12",
+            FieldValue::Money(1234567890.12),
+        ),
+    ] {
+        assert_eq!(tv(&ed, 1, name), (s(text), value), "{name}");
+    }
+}
+
+#[test]
+fn custom_field_first_value_wins_and_blank_row_is_empty() {
+    let mut p = untitled_project();
+    p.extended_attribute_definitions = vec![custom_def("188743731", "Text1")];
+    let mut t = task(1, "Pour", 480);
+    t.extended_attributes = vec![
+        custom_value("188743731", "first"),
+        custom_value("188743731", "second"),
+    ];
+    p.tasks = vec![t];
+    let ed = Editor::new(p);
+    assert_eq!(
+        tv(&ed, 1, "Text1"),
+        (s("first"), FieldValue::Text(s("first")))
+    );
+
+    // The blank-row guard covers custom fields: empty text and Null even
+    // with a stored value and a matching definition.
+    let mut p = untitled_project();
+    p.extended_attribute_definitions = vec![custom_def("188743731", "Text1")];
+    let mut blank = task(2, "", 0);
+    blank.is_null = true;
+    blank.extended_attributes = vec![custom_value("188743731", "M&E")];
+    p.tasks = vec![blank];
+    let ed = Editor::new(p);
+    assert_eq!(tv(&ed, 2, "Text1"), (s(""), FieldValue::Null));
 }
