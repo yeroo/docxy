@@ -2895,8 +2895,13 @@ fn parse_tcpr(p: &mut XmlParser, cell: &mut Cell) -> bool {
     has_extra
 }
 
-/// Reads character data up to the matching End (used for `w:t`).
-fn read_text(p: &mut XmlParser) -> String {
+/// Reads character data up to the matching End: call right after the Start of
+/// a `w:t` or `w:delText`. Its text is the text Word shows: without
+/// `xml:space="preserve"` on the element or an ancestor, the XML whitespace at
+/// either end is not significant and is dropped (#1084). Diagram text
+/// (`a:t`, [`extract_diagram_text`]) reads through it too and trims anyway.
+pub(crate) fn read_text(p: &mut XmlParser) -> String {
+    let preserve = p.xml_space_preserve();
     let mut s = String::new();
     loop {
         match p.next() {
@@ -2905,7 +2910,15 @@ fn read_text(p: &mut XmlParser) -> String {
             Event::End | Event::Eof => break,
         }
     }
-    s
+    if preserve {
+        return s;
+    }
+    let trimmed = crate::xml::trim_xml_whitespace(&s);
+    if trimmed.len() == s.len() {
+        s
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[cfg(test)]

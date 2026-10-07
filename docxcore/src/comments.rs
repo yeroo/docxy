@@ -127,12 +127,15 @@ fn collect_text(p: &mut XmlParser) -> (String, Option<String>) {
     let mut s = String::new();
     let mut para_id = None;
     let mut depth = 1; // inside <w:comment>
-    let mut in_t = false;
     loop {
         match p.next() {
             Event::Start => {
                 match p.name() {
-                    "w:t" => in_t = true,
+                    "w:t" | "w:delText" => {
+                        // Consumes through the element's End.
+                        s.push_str(&crate::load::read_text(p));
+                        continue;
+                    }
                     "w:tab" => s.push('\t'),
                     "w:br" | "w:cr" => s.push('\n'),
                     "w:p" => {
@@ -144,14 +147,9 @@ fn collect_text(p: &mut XmlParser) -> (String, Option<String>) {
                 }
                 depth += 1;
             }
-            Event::Text => {
-                if in_t {
-                    XmlParser::append_decoded(p.text(), &mut s);
-                }
-            }
+            Event::Text => {}
             Event::End => {
                 match p.name() {
-                    "w:t" => in_t = false,
                     // a paragraph closing inside the comment → a line break
                     "w:p" if depth >= 2 => s.push('\n'),
                     _ => {}
@@ -175,7 +173,6 @@ fn anchors(doc: &str) -> (HashMap<String, usize>, HashMap<String, String>) {
     let mut quotes: HashMap<String, String> = HashMap::new();
     let mut active: Vec<String> = Vec::new();
     let mut seq = 0usize;
-    let mut in_t = false;
     let mut p = XmlParser::new(doc);
     loop {
         match p.next() {
@@ -204,25 +201,17 @@ fn anchors(doc: &str) -> (HashMap<String, usize>, HashMap<String, String>) {
                         s
                     });
                 }
-                "w:t" => in_t = true,
-                _ => {}
-            },
-            Event::Text => {
-                if in_t && !active.is_empty() {
-                    let mut piece = String::new();
-                    XmlParser::append_decoded(p.text(), &mut piece);
+                "w:t" => {
+                    let piece = crate::load::read_text(&mut p);
                     for id in &active {
                         if let Some(q) = quotes.get_mut(id) {
                             q.push_str(&piece);
                         }
                     }
                 }
-            }
-            Event::End => {
-                if p.name() == "w:t" {
-                    in_t = false;
-                }
-            }
+                _ => {}
+            },
+            Event::Text | Event::End => {}
             Event::Eof => break,
         }
     }
@@ -297,6 +286,41 @@ mod tests {
         assert_eq!(quotes.get("1").map(String::as_str), Some("first"));
         // id 2 is anchored before id 1
         assert!(order["2"] < order["1"]);
+    }
+
+    /// Comment text and the quoted span use Word's reading of `w:t`: edge
+    /// whitespace counts only under `xml:space="preserve"` (#1084).
+    #[test]
+    fn comment_and_quote_text_drop_unpreserved_edge_whitespace() {
+        let xml = r#"<w:comments xmlns:w="x"><w:comment w:id="1" w:author="A">
+            <w:p><w:r><w:t>SDT </w:t></w:r><w:r><w:t> Run</w:t></w:r>
+            <w:r><w:t xml:space="preserve"> kept</w:t></w:r></w:p>
+        </w:comment></w:comments>"#;
+        assert_eq!(parse_comments_xml(xml)[0].text, "SDTRun kept");
+        let doc = r#"<w:document xmlns:w="x"><w:body><w:p xml:space="preserve">
+            <w:commentRangeStart w:id="1"/><w:r><w:t>SDT </w:t></w:r>
+            <w:r><w:t xml:space="default"> Run</w:t></w:r><w:commentRangeEnd w:id="1"/>
+        </w:p></w:body></w:document>"#;
+        let (_, quotes) = anchors(doc);
+        assert_eq!(quotes.get("1").map(String::as_str), Some("SDT Run"));
+    }
+
+    /// Deleted text in a comment reads like note text: `w:delText` under the
+    /// same whitespace rule.
+    #[test]
+    fn comment_deleted_text_follows_the_whitespace_rule() {
+        let comment = |attrs: &str| {
+            format!(
+                r#"<w:comments xmlns:w="x"><w:comment w:id="1" w:author="A"><w:p>
+                <w:del w:id="2" w:author="A"><w:r><w:delText{attrs}> gone </w:delText></w:r></w:del>
+                </w:p></w:comment></w:comments>"#
+            )
+        };
+        assert_eq!(parse_comments_xml(&comment(""))[0].text, "gone");
+        assert_eq!(
+            parse_comments_xml(&comment(r#" xml:space="preserve""#))[0].text,
+            " gone "
+        );
     }
 
     #[test]

@@ -15,6 +15,11 @@ use opccore::zip::ZipArchive;
 pub mod schema;
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+/// WordprocessingML, transitional and strict.
+const W_NS: [&str; 2] = [
+    "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    "http://purl.oclc.org/ooxml/wordprocessingml/main",
+];
 
 /// Above this many LCS cells, child alignment falls back to pairing in order.
 const LCS_CELL_LIMIT: usize = 4_000_000;
@@ -265,6 +270,27 @@ fn decode_attr(raw: &str) -> Option<String> {
 struct Building {
     elem: Elem,
     text: String,
+    /// A `w:t` / `w:delText` outside `xml:space="preserve"`: the XML
+    /// whitespace at either end of its text is not significant (#1084).
+    trim_edges: bool,
+}
+
+/// Whether the element just started is WordprocessingML run text whose edge
+/// whitespace Word ignores: `w:t` or `w:delText` where `xml:space`, on the
+/// element or its nearest ancestor that has one, is not `preserve`.
+fn insignificant_edges(parser: &XmlParser<'_>, uri: &str, local: &str) -> bool {
+    W_NS.contains(&uri) && matches!(local, "t" | "delText") && !parser.xml_space_preserve()
+}
+
+/// Drop the XML whitespace at the two ends of an element's text content.
+fn trim_text_edges(children: &mut Vec<Node>) {
+    if let Some(Node::Text(t)) = children.first_mut() {
+        *t = t.trim_start_matches(is_xml_ws).to_string();
+    }
+    if let Some(Node::Text(t)) = children.last_mut() {
+        *t = t.trim_end_matches(is_xml_ws).to_string();
+    }
+    children.retain(|c| !matches!(c, Node::Text(t) if t.is_empty()));
 }
 
 fn flush_text(b: &mut Building) {
@@ -278,8 +304,14 @@ fn flush_text(b: &mut Building) {
 fn finish(mut b: Building) -> Elem {
     flush_text(&mut b);
     let mut e = b.elem;
+    // Compare the text Word reads, so a save that writes `preserve` with the
+    // trimmed text equals the original's untrimmed, unpreserved one.
+    if b.trim_edges {
+        trim_text_edges(&mut e.children);
+    }
     // Whitespace-only text between elements is indentation, not content. An
-    // element whose only content is whitespace (`<w:t> </w:t>`) keeps it.
+    // element whose only content is whitespace keeps it
+    // (`<w:t xml:space="preserve"> </w:t>`; trimmed above without preserve).
     if e.children.iter().any(|c| matches!(c, Node::Elem(_))) {
         e.children
             .retain(|c| !matches!(c, Node::Text(t) if t.chars().all(is_xml_ws)));
@@ -352,6 +384,7 @@ pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
                     });
                 }
                 let (uri, local) = resolve(&parser, qname, false);
+                let trim_edges = insignificant_edges(&parser, &uri, &local);
                 attrs.sort_by(|a, b| (&a.uri, &a.local).cmp(&(&b.uri, &b.local)));
                 if attrs
                     .windows(2)
@@ -369,6 +402,7 @@ pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
                         hash: 0,
                     },
                     text: String::new(),
+                    trim_edges,
                 });
             }
             Event::End => {

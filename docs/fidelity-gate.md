@@ -39,7 +39,16 @@ Every part of the original is compared with its saved counterpart:
   - References are decoded first (`&#38;` equals `&amp;`), and CDATA is text.
   - "Whitespace" means space, tab, CR and LF; a non-breaking space is text.
   - Element and attribute content and text are compared exactly, and so is a
-    whitespace-only text that is an element's whole content (`<w:t> </w:t>`).
+    whitespace-only text that is an element's whole content
+    (`<w:t xml:space="preserve"> </w:t>`).
+  - The exception is run text as Word reads it (#1084). In a `w:t` or
+    `w:delText` (matched by namespace, not prefix) whose `xml:space` does not
+    resolve to `preserve`, the whitespace at the two ends of the text is
+    dropped before the compare. The element's own `xml:space` decides, else
+    its nearest ancestor's, so `default` cancels an outer `preserve`. So
+    `<w:t>SDT </w:t>` equals `<w:t xml:space="preserve">SDT</w:t>`, and both
+    differ from `<w:t xml:space="preserve">SDT </w:t>`. An unpreserved
+    `<w:t> </w:t>` therefore holds no text at all.
 - **Every other part** must be byte-equal. So must any XML part that is not UTF-8
   or is malformed. Malformed covers:
   - mismatched or unclosed tags;
@@ -90,7 +99,8 @@ CI's checkout produce the same keys.
 
 The gate also compares the effective text of `word/document.xml` before and
 after the save (#1101). This is the text Word shows, with its `Range.Text`
-characters for run content that is not `w:t`:
+characters for run content that is not `w:t`. `w:t` and `w:delText` text
+counts without its insignificant edge whitespace, as above:
 
 | Content | Character |
 |---|---|
@@ -195,7 +205,7 @@ normalizations the gate tolerates in every file:
 
 ```
 kind | part glob | index-free path glob | detail glob | [once-with <kind> <part> |] reason
-extra-attr | word/document.xml | */w:t/@xml:space | preserve | The serializer writes xml:space="preserve" on every w:t. ...
+extra-attr | word/document.xml | */w:t/@xml:space | preserve | The serializer writes xml:space="preserve" on every w:t. The loader drops ...
 ```
 
 In the globs, `*` matches any run of characters, including `/`. The detail is

@@ -458,6 +458,58 @@ fn whitespace_only_text_content_is_kept() {
     );
 }
 
+/// `w:t` / `w:delText` text compares as Word reads it: outside
+/// `xml:space="preserve"` its edge whitespace is not text (#1084).
+#[test]
+fn unpreserved_run_text_compares_without_edge_whitespace() {
+    let t =
+        |attrs: &str, text: &str| format!(r#"<w:r xmlns:w="{W}"><w:t{attrs}>{text}</w:t></w:r>"#);
+    let preserve = r#" xml:space="preserve""#;
+    // The serializer's save of Word's "SDT": the same text, plus the attr.
+    assert_eq!(
+        kinds(&diff(&t("", "SDT "), &t(preserve, "SDT"))),
+        vec![(Kind::ExtraAttr, "/w:r/w:t/@xml:space".into())]
+    );
+    // Keeping the space under preserve changes what Word shows.
+    assert_eq!(
+        kinds(&diff(&t("", "SDT "), &t(preserve, "SDT "))),
+        vec![
+            (Kind::ExtraAttr, "/w:r/w:t/@xml:space".into()),
+            (Kind::ChangedValue, "/w:r/w:t/text()".into()),
+        ]
+    );
+    // Only XML whitespace at the ends: interior spaces and NBSP are text.
+    assert_eq!(
+        kinds(&diff(&t("", " \t\nA  B\r\n"), &t("", "A  B"))),
+        vec![]
+    );
+    assert_eq!(kinds(&diff(&t("", "A\u{a0}"), &t("", "A"))).len(), 1);
+    // All whitespace is no text at all.
+    assert_eq!(kinds(&diff(&t("", " \t "), &t(preserve, ""))).len(), 1);
+    // An ancestor's preserve applies; a nearer `default` cancels it.
+    let a = format!(r#"<w:p xmlns:w="{W}" xml:space="preserve"><w:r><w:t> x</w:t></w:r></w:p>"#);
+    let b = format!(r#"<w:p xmlns:w="{W}" xml:space="preserve"><w:r><w:t>x</w:t></w:r></w:p>"#);
+    assert_eq!(
+        kinds(&diff(&a, &b)).len(),
+        1,
+        "inherited preserve keeps the space"
+    );
+    let a = format!(
+        r#"<w:p xmlns:w="{W}" xml:space="preserve"><w:r xml:space="default"><w:t> x</w:t></w:r></w:p>"#
+    );
+    let b = format!(
+        r#"<w:p xmlns:w="{W}" xml:space="preserve"><w:r xml:space="default"><w:t>x</w:t></w:r></w:p>"#
+    );
+    assert_eq!(kinds(&diff(&a, &b)), vec![]);
+    // By namespace, not prefix; delText too; other vocabularies' `t` are exact.
+    let a = format!(r#"<x:delText xmlns:x="{W}"> gone </x:delText>"#);
+    let b = format!(r#"<w:delText xmlns:w="{W}">gone</w:delText>"#);
+    assert_eq!(kinds(&diff(&a, &b)), vec![]);
+    let a = r#"<t xmlns="urn:other"> x</t>"#;
+    let b = r#"<t xmlns="urn:other">x</t>"#;
+    assert_eq!(kinds(&diff(a, b)).len(), 1);
+}
+
 #[test]
 fn entities_compare_decoded() {
     let a = format!(r#"<w:t xmlns:w="{W}" w:x="a&#38;b">1 &lt; 2 &amp; 3</w:t>"#);
@@ -723,6 +775,55 @@ fn the_round_trip_keeps_the_effective_text_of_hyphens() {
         .filter(|f| f.part == "word/document.xml" && f.path.contains("Hyphen"))
         .collect();
     assert!(lost.is_empty(), "{lost:?}");
+}
+
+/// The issue's runs (#1084): Word reads `<w:t>SDT </w:t><w:t> Run</w:t>`
+/// as "SDTRun", and so must the save that rewrites them with `preserve`.
+#[test]
+fn the_round_trip_keeps_words_reading_of_unpreserved_whitespace() {
+    let original = document_package(
+        "<w:p><w:r><w:t>SDT </w:t></w:r><w:r><w:t> Run</w:t></w:r></w:p>\
+         <w:p><w:r><w:t xml:space=\"preserve\">kept </w:t></w:r><w:r><w:t>x</w:t></w:r></w:p>",
+    );
+    let text = |bytes: &[u8]| {
+        effective_text(&parse_xml(&read_parts(bytes).unwrap()["word/document.xml"]).unwrap())
+    };
+    assert_eq!(text(&original), "SDTRun\rkept x\r");
+    let rt = round_trip(&original);
+    assert_eq!(rt.text_change, None);
+    let text_findings: Vec<_> = rt
+        .findings
+        .iter()
+        .filter(|f| f.part == "word/document.xml" && f.path.ends_with("/text()"))
+        .collect();
+    assert!(text_findings.is_empty(), "{text_findings:?}");
+}
+
+/// The corpus files the Windows oracle found (#1084) read as Word reads them,
+/// and their round trip keeps that text. Skips when the docxy-corpus checkout
+/// is absent, like the gate itself.
+#[test]
+fn corpus_sdt_files_read_sdtrun_as_word_does_1084() {
+    let (_, Some(dir)) = corpus(&workspace_root()) else {
+        eprintln!("fidelity: SKIP corpus_sdt_files_read_sdtrun_as_word_does_1084: no corpus");
+        return;
+    };
+    for name in [
+        "SDT/SDT.docx",
+        "SDT/Sdt/SDT Run.docx",
+        "SDT/SdtRun/SDT Run.docx",
+    ] {
+        let path = dir.join(name);
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("fidelity: SKIP {name}: not in the corpus");
+            continue;
+        };
+        let doc = load_package(&bytes).expect(name).document;
+        let text = doc.plain_text();
+        assert!(text.contains("SDTRun"), "{name}: {text:?}");
+        assert!(!text.contains("SDT  Run"), "{name}: {text:?}");
+        assert_eq!(round_trip(&bytes).text_change, None, "{name}");
+    }
 }
 
 #[test]
