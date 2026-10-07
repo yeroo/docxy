@@ -630,7 +630,8 @@ fn money_value(hundredths: Option<f64>) -> FieldRead {
 
 /// The Entry table's Duration: a summary's rolled-up span in days (`?` when
 /// it has no schedule), else the task's own duration in the unit it was
-/// entered in, a milestone's zero included; each with the estimate's `?`.
+/// entered in, a milestone's zero included. The estimate's `?` comes from
+/// `duration_suffix`, which shows none for a milestone.
 fn entry_duration(ed: &Editor, task: &Task) -> FieldRead {
     let proj = ed.project();
     // Summaries first: their stored duration is stale (and may be 0, which

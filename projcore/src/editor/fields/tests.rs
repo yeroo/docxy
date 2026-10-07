@@ -382,6 +382,18 @@ fn milestone_duration_reads_zero_in_its_unit_and_toggles_back_to_a_day() {
 }
 
 #[test]
+fn an_estimated_milestone_shows_no_estimate_suffix() {
+    let mut t = task(1, "Guess", 480);
+    t.estimated = Some(true);
+    let mut ed = editor(vec![t]);
+    assert_eq!(read(&ed, 1, "Duration").text, "1d?");
+    ed.toggle_milestone(1).unwrap();
+    assert_eq!(read(&ed, 1, "Milestone").text, "Yes");
+    // `duration_suffix` shows no `?` for a milestone.
+    assert_eq!(read(&ed, 1, "Duration").text, "0d");
+}
+
+#[test]
 fn names_list_the_families_and_match_loosely() {
     let names = field_names();
     assert_eq!(names.len(), 23 + 11 * 5 + 34);
