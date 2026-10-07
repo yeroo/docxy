@@ -3,17 +3,17 @@ test issue 371 ctrl+delete resets a duration to the new-task default and keeps t
   call click-cell {"cell":"C1"}
   key tab
   assert cell is Duration
-  assert cell D1 is 2d
+  assert cell D1 is 2 days
   key ctrl+delete
   call task.list {}
   assert tasks is 2
-  assert cell D1 is 1d?
+  assert cell D1 is 1 day?
   assert cell C1 is A
   assert cell D2 is 2d
   assert undo_depth is 1
   assert dirty is true
   key ctrl+z
-  assert cell D1 is 2d
+  assert cell D1 is 2 days
   assert undo_depth is 0
 
 test issue 371 ctrl+delete on the ID column keeps the task

@@ -438,7 +438,7 @@ same escaped form is what a typed buffer decodes, leniently — an unknown
 
 Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste cells through the system clipboard
 as tab-separated text (#369). Copy takes the cursor cell's edit text (a
-duration as `2d`, so it pastes back exactly); Cut clears it as Delete does on
+duration as `2d`, a date as `2026-03-02`, so both paste back exactly); Cut clears it as Delete does on
 Name, Predecessors and Resource Names, and elsewhere only copies (it never
 deletes a task). Paste overwrites from the cursor cell as Project does with
 cells selected: line i goes to the i-th shown row below, field j to the j-th

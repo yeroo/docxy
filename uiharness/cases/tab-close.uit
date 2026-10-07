@@ -91,7 +91,7 @@ test inactive invalid Project edit refuses and correction clears the error
   key enter
   assert cell_edit is none
   assert status is Ready
-  assert cell D2 is 2d
+  assert cell D2 is 2 days
   call close-tab {"answer":"discard"}
   call close-tab {}
   assert tabs is 0

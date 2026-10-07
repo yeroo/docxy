@@ -627,21 +627,21 @@ fn rows_resolve_ids_format_links_milestones_and_resources() {
         let row = project_row(&ed, ed.project().task(9).unwrap());
         assert_eq!(row[COL_ID], "4");
         assert_eq!(row[COL_NAME], "Child");
-        assert_eq!(row[COL_DURATION], "1d");
+        assert_eq!(row[COL_DURATION], "1 day");
         assert_eq!(row[COL_PREDECESSORS], expected);
         assert_eq!(row[COL_RESOURCES], "Alice");
-        assert_eq!(row[COL_START].len(), 10);
+        assert_eq!(row[COL_START].len(), 9);
         ed.remove_predecessor(9, 7).unwrap();
     }
     ed.toggle_milestone(9).unwrap();
     assert_eq!(
         project_row(&ed, ed.project().task(9).unwrap())[COL_DURATION],
-        "0d"
+        "0 days"
     );
     ed.toggle_milestone(9).unwrap();
     assert_eq!(
         project_row(&ed, ed.project().task(9).unwrap())[COL_DURATION],
-        "1d"
+        "1 day"
     );
     let mut p = ed.project().clone();
     p.tasks[1].predecessors.push(projcore::Predecessor::fs(999));
@@ -690,7 +690,7 @@ fn a_blank_row_shows_only_its_id() {
         (pour[COL_NAME].as_str(), pour[COL_PREDECESSORS].as_str()),
         ("Pour", "2, 3")
     );
-    assert_eq!(pour[COL_START], "2026-03-04");
+    assert_eq!(pour[COL_START], "Wed 3/4/26");
 }
 
 fn summary_fixture(stored_summary_min: Option<i64>) -> ProjectEditor {
@@ -704,18 +704,18 @@ fn summary_fixture(stored_summary_min: Option<i64>) -> ProjectEditor {
 }
 
 #[test]
-fn summary_duration_follows_child_edits_and_matches_the_gantt_export() {
+fn summary_duration_follows_child_edits_while_the_export_keeps_mermaid_tokens() {
     let mut ed = summary_fixture(None);
     let phase = ed.project().tasks[0].uid;
     let b = ed.project().tasks[2].uid;
     assert_eq!(ed.project().tasks[2].name, "B");
     assert_eq!(
         project_row(&ed, ed.project().task(phase).unwrap())[COL_DURATION],
-        "2d"
+        "2 days"
     );
     ed.set_duration_min(b, 1440, false).unwrap();
     let row = project_row(&ed, ed.project().task(phase).unwrap());
-    assert_eq!(row[COL_DURATION], "4d");
+    assert_eq!(row[COL_DURATION], "4 days");
     let md = projcore::gantt::to_markdown(ed.project(), ed.schedule());
     let cells = |prefix: &str| -> Vec<&str> {
         md.lines()
@@ -730,7 +730,9 @@ fn summary_duration_follows_child_edits_and_matches_the_gantt_export() {
         .position(|&c| c == "Duration")
         .unwrap();
     let exported = cells("| **Phase** |")[duration];
-    assert_eq!(row[COL_DURATION], exported);
+    // The grid speaks Project's spelling (#578); the Markdown export keeps
+    // its Mermaid duration tokens.
+    assert_eq!(exported, "4d");
 }
 
 #[test]
@@ -738,7 +740,7 @@ fn summary_with_zero_stored_duration_is_not_shown_as_a_milestone() {
     let ed = summary_fixture(Some(0));
     let phase = ed.project().task(ed.project().tasks[0].uid).unwrap();
     assert!(phase.is_milestone());
-    assert_eq!(project_row(&ed, phase)[COL_DURATION], "2d");
+    assert_eq!(project_row(&ed, phase)[COL_DURATION], "2 days");
 }
 
 #[test]
