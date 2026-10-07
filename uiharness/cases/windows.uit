@@ -32,7 +32,7 @@ test window new refuses the only tab an out of range tab and a tab under a dialo
   call-error window-new {"tab":-1} => 'tab' must be a whole number, not below zero
   call-error window-new {"tab":"0"} => 'tab' must be a whole number, not below zero
   # A dialog on the named tab refuses the move too, naming it.
-  open ../fixtures/gantt-summary.xml
+  open copy:../fixtures/gantt-summary.xml
   assert tabs is 2
   call tab-select {"tab":"basic.docx"}
   type edited
@@ -81,6 +81,10 @@ test closing the first window keeps the control server alive
   # harness verb.
   call window-select {"window":1}
   call ribbon-click {"tab":"View","command":"New Window"}
+  # The reply describes the NEW window, like window-new's: the ribbon's
+  # New Window selects it.
+  assert reply.title is Document5
+  assert reply.tabs is 1
   assert windows is 5
   call window-select {"window":1}
   call close-window {}
@@ -111,7 +115,7 @@ test a moved window carries the harness policies
 
 test closing a non last window with unsaved work asks whatever the setting
   # Ask-on-close is off by default: the Force ask is what a non-last close
-  # does regardless. Document5 (window 6's active tab) is dirty from the
+  # does regardless. Document6 (window 6's active tab) is dirty from the
   # case above.
   call window-select {"window":6}
   assert ask_on_close is false

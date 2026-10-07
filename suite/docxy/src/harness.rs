@@ -2795,22 +2795,6 @@ fn load_failure(app: &crate::Docxy) -> Option<String> {
 /// One shape for every driving verb, so a test reads the same keys whichever
 /// one it just sent. The sheet half is absent when the active tab is not a
 /// spreadsheet (`type` and `key` reach the document surface too).
-/// The state a verb's reply describes: this window's while it is still
-/// registered; once a close removed it (a non-last `close-window`, or the
-/// last answer to its close prompts), the surviving selected window's
-/// (#587 r2 m7) — the closed view has no tabs left to describe.
-fn state_for_reply(app: &crate::Docxy, window: &Window, cx: &mut App) -> Json {
-    if windows::is_registered(cx, app.win_id) {
-        return state(app, window, cx);
-    }
-    match windows::selected_view(cx) {
-        Some(view) => view
-            .read_with(cx, |this: &crate::Docxy, cx| state(this, window, cx))
-            .unwrap_or_else(|_| state(app, window, cx)),
-        None => state(app, window, cx),
-    }
-}
-
 fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
     let mut out = vec![
         ("tab", Json::Num(app.active as f64)),
@@ -3060,6 +3044,37 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
         out.extend(crate::project_state(v, body_h));
     }
     Json::Obj(out)
+}
+
+/// The state for a verb whose act may MOVE THE SELECTION (New Window from
+/// the ribbon or Shift+F11, window-new): the reply describes the selected
+/// window — the new one — whenever the selection left the dispatch window.
+fn state_for_selection(app: &crate::Docxy, window: &Window, cx: &mut App) -> Json {
+    if windows::selected(cx) == Some(app.win_id) {
+        return state(app, window, cx);
+    }
+    match windows::selected_view(cx) {
+        Some(view) => view
+            .read_with(cx, |this: &crate::Docxy, cx| state(this, window, cx))
+            .unwrap_or_else(|_| state(app, window, cx)),
+        None => state(app, window, cx),
+    }
+}
+
+/// The state a verb's reply describes: this window's while it is still
+/// registered; once a close removed it (a non-last `close-window`, or the
+/// last answer to its close prompts), the surviving selected window's
+/// (#587 r2 m7) — the closed view has no tabs left to describe.
+fn state_for_reply(app: &crate::Docxy, window: &Window, cx: &mut App) -> Json {
+    if windows::is_registered(cx, app.win_id) {
+        return state(app, window, cx);
+    }
+    match windows::selected_view(cx) {
+        Some(view) => view
+            .read_with(cx, |this: &crate::Docxy, cx| state(this, window, cx))
+            .unwrap_or_else(|_| state(app, window, cx)),
+        None => state(app, window, cx),
+    }
 }
 
 /// The kind a tab is, as `tab-list` names it: the Backstage › New cards'.
@@ -3349,12 +3364,7 @@ fn dispatch_verb(
             app.new_window(tab, window, cx)?;
             // The reply describes the NEW window (selected now), with one
             // `window` field — not the source's state with a second id.
-            Done::ok(match windows::selected_view(cx) {
-                Some(view) => view
-                    .read_with(cx, |this: &crate::Docxy, cx| state(this, window, cx))
-                    .unwrap_or_else(|_| state(app, window, cx)),
-                None => state(app, window, cx),
-            })
+            Done::ok(state_for_selection(app, window, cx))
         }
         "window-select" => {
             let id = arg_usize(args, "window")?;
@@ -3662,12 +3672,16 @@ fn dispatch_verb(
                 let (ribbon_tab, cmd) = resolve_sheet_command(app, &tab, &command)?;
                 app.select_ribbon_tab(ribbon_tab, window, cx);
                 click_sheet_command(app, ribbon_tab, cmd, window, cx)?;
-                return Done::ok(state(app, window, cx));
+                // A New Window button selects the new window: the reply
+                // describes it, like window-new.
+                return Done::ok(state_for_selection(app, window, cx));
             }
             let act = resolve_ribbon_command(app, &tab, &command)?;
             app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), &tab)?, window, cx);
             app.dispatch(act, window, cx);
-            Done::ok(state(app, window, cx))
+            // A New Window button selects the new window: the reply
+            // describes it, like window-new.
+            Done::ok(state_for_selection(app, window, cx))
         }
         // Menus (#397): opened through the opener the right-click or the
         // split button's arrow calls, clicked through the item's own handler.

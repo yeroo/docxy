@@ -89,6 +89,11 @@ pub(crate) struct Windows<V, H> {
     // The run-wide untitled-document counter (#587 r2 m10): "DocumentN" is
     // minted once for the whole run, however many windows create one.
     next_title: u32,
+    // The harness's private text clipboard, ONE for the whole run (#587 r3):
+    // every window's ClipboardStore clones this Rc, so a copy in any window
+    // — document, grid, Project, cell editor, About, the clipboard verb —
+    // is what every other window pastes, with no per-site sync.
+    clipboard_text: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
 impl<V, H> Default for Windows<V, H> {
@@ -101,6 +106,7 @@ impl<V, H> Default for Windows<V, H> {
             links: Vec::new(),
             handles: Default::default(),
             next_title: 1,
+            clipboard_text: Default::default(),
         }
     }
 }
@@ -298,13 +304,17 @@ pub(crate) fn is_registered(cx: &App, id: u64) -> bool {
 /// one counter, so two windows cannot mint the same "DocumentN". Without a
 /// registry (tests) a throwaway counter answers.
 pub(crate) fn next_document_title(cx: &mut App) -> String {
-    let mut next = 1;
     update(cx, |w| {
-        let title = crate::doc_name::next_document_title(&mut w.next_title);
-        next = w.next_title;
-        title
+        crate::doc_name::next_document_title(&mut w.next_title)
     })
-    .unwrap_or_else(|| crate::doc_name::next_document_title(&mut next))
+    .unwrap_or_else(|| crate::doc_name::next_document_title(&mut 1))
+}
+
+/// The run-wide private text clipboard: each window's store clones this Rc
+/// (#587 r3).
+pub(crate) fn shared_clipboard_text(cx: &App) -> std::rc::Rc<std::cell::RefCell<Option<String>>> {
+    with(cx, |w| w.clipboard_text.clone())
+        .unwrap_or_else(|| std::rc::Rc::new(std::cell::RefCell::new(None)))
 }
 
 /// Raise the run-wide title counter to at least `at_least`: the first

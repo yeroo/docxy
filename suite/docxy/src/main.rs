@@ -1821,15 +1821,28 @@ fn recorded_after_write(wrote: String, now: &ClipRead) -> String {
 /// neither read nor overwrite what the person at the machine copied, and
 /// starts from an empty clipboard whatever they have on theirs. The private one
 /// reads as the OS one does: an empty write is an item with no text.
+///
+/// The private store is ONE for the whole run (#587 r3): every window's store
+/// clones the same `Rc`, so a copy in any window — document, grid, Project,
+/// cell editor, About, the harness `clipboard` verb — is what every other
+/// window pastes, with no per-site sync. The rich document clip, the grid
+/// clip and the Office Clipboard stay PER WINDOW: a paste into another
+/// window finds that clip not "ours" and falls back to this plain text,
+/// exactly like a paste from another application.
 #[derive(Clone, Default)]
 struct ClipboardStore {
-    private: Option<String>,
+    private: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
 impl ClipboardStore {
+    /// A store over the run-wide shared private text (see the type).
+    fn shared(private: std::rc::Rc<std::cell::RefCell<Option<String>>>) -> Self {
+        Self { private }
+    }
+
     fn write(&mut self, harness: bool, text: String, os: impl FnOnce(String)) {
         if harness {
-            self.private = Some(text);
+            *self.private.borrow_mut() = Some(text);
         } else {
             os(text);
         }
@@ -1839,7 +1852,7 @@ impl ClipboardStore {
     /// text (`None` when it has none).
     fn read(&self, harness: bool, os: impl FnOnce() -> Option<Option<String>>) -> ClipRead {
         ClipRead::from_item(if harness {
-            self.private.clone().map(Some)
+            self.private.borrow().clone().map(Some)
         } else {
             os()
         })
@@ -4148,8 +4161,6 @@ struct Docxy {
     /// tab in turn (#630). Off by default: work is hot-persisted and restored
     /// regardless, so closing is normally silent.
     ask_on_close: bool,
-    /// The number the next new document's `Document<n>` title takes (#631):
-    /// it only goes up, so a number is never reused in a session.
     /// The window is closing through its per-document questions (#630):
     /// a close prompt with `quit` is on the tab being asked about.
     quitting: bool,
@@ -9856,7 +9867,8 @@ mod session_union_tests {
     }
 
     /// A single-window run keeps the exact bytes and sidecar names it wrote
-    /// before #587: the union append is empty and the offset base is 0.
+    /// before #587: the union append is empty and seq 0 keeps the `tab-{i}`
+    /// sidecar names.
     #[test]
     fn single_window_write_is_byte_identical_to_before() {
         let root = fresh_root("single");
@@ -10849,7 +10861,7 @@ impl Docxy {
             zoom: 1.0,
             ruler_guide: None,
             grid_clip: None,
-            clipboard: ClipboardStore::default(),
+            clipboard: ClipboardStore::shared(windows::shared_clipboard_text(cx)),
             sheet_pick: None,
             sheet_rename: None,
             sheet_grid_w: 1000.0,
@@ -11591,10 +11603,6 @@ impl Docxy {
             autocorrect,
             user_name,
             user_initials,
-            clipboard,
-            doc_clip,
-            grid_clip,
-            office_clip,
         } = prefs;
         let mut this = Self::build(tabs, 0, theme_pref, ask_on_close, cx);
         this.autorecover_minutes = autorecover_minutes;
@@ -11606,28 +11614,7 @@ impl Docxy {
         sheet_autocorrect::stamp_autocorrect(&mut this.tabs, &this.autocorrect);
         this.user_name = user_name;
         this.user_initials = user_initials;
-        this.clipboard = clipboard;
-        this.clip = doc_clip;
-        this.grid_clip = grid_clip;
-        this.office_clip = office_clip;
         this
-    }
-
-    /// The clipboard is the run's, not a window's (#587 r2 M2): after a
-    /// copy or cut, every other window holds the same text, rich document
-    /// clip, grid clip and Office Clipboard, so a paste lands what the user
-    /// copied in whichever window they paste into.
-    fn sync_clipboards(&mut self, cx: &mut App) {
-        let clipboard = self.clipboard.clone();
-        let doc_clip = self.clip.clone();
-        let grid_clip = self.grid_clip.clone();
-        let office_clip = self.office_clip.clone();
-        self.share_with_windows(cx, |d| {
-            d.clipboard = clipboard.clone();
-            d.clip = doc_clip.clone();
-            d.grid_clip = grid_clip.clone();
-            d.office_clip = office_clip.clone();
-        });
     }
 
     /// View › Window › New Window (#587): open a new window and move a tab
@@ -14975,7 +14962,6 @@ impl Docxy {
         // Every copy and cut goes on the Office Clipboard too (#669).
         self.office_clip.push(&clip.text);
         self.grid_clip = Some(clip);
-        self.sync_clipboards(cx);
         cx.notify();
     }
 
@@ -18986,7 +18972,6 @@ impl Docxy {
         if let Some(clip) = clip {
             let text = self.clipboard_write_recorded(clip.to_text(), cx);
             self.clip = Some(DocClip { clip, text });
-            self.sync_clipboards(cx);
             if cut {
                 if let Some(t) = self.tabs.get_mut(self.active) {
                     t.mark_dirty();
@@ -21959,6 +21944,21 @@ mod clipboard_tests {
         let anchor = wb.sheets[0].cell(0, 3).unwrap();
         assert_eq!(anchor.spill, Some((3, 1)));
         assert_ne!(anchor.value, CellValue::Error("#SPILL!".into()));
+    }
+
+    /// #587 r3: the harness's private text store is ONE for the run: a copy
+    /// in any window is what every other window pastes, with no per-site
+    /// sync — the stores share the same `Rc`.
+    #[test]
+    fn the_private_text_store_is_one_per_run() {
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let mut a = ClipboardStore::shared(shared.clone());
+        let b = ClipboardStore::shared(shared);
+        a.write(true, "run-wide".into(), |_| panic!("an OS clipboard write"));
+        assert_eq!(
+            b.read(true, || panic!("an OS clipboard read")),
+            ClipRead::Text("run-wide".into())
+        );
     }
 
     /// #699: a harness instance never reads or writes the OS clipboard, and
@@ -35882,13 +35882,6 @@ struct MovedPrefs {
     autocorrect: std::rc::Rc<gridcore::autocorrect::AutoCorrect>,
     user_name: String,
     user_initials: String,
-    // The clipboard is the run's, not a window's (#587 r2 M2): a new window
-    // starts with what the source held, and every copy re-syncs all
-    // windows, so a paste after New Window finds the same content.
-    clipboard: ClipboardStore,
-    doc_clip: Option<DocClip>,
-    grid_clip: Option<GridClip>,
-    office_clip: sheet_paste::OfficeClipboard,
 }
 
 impl MovedPrefs {
@@ -35903,10 +35896,6 @@ impl MovedPrefs {
             autocorrect: d.autocorrect.clone(),
             user_name: d.user_name.clone(),
             user_initials: d.user_initials.clone(),
-            clipboard: d.clipboard.clone(),
-            doc_clip: d.clip.clone(),
-            grid_clip: d.grid_clip.clone(),
-            office_clip: d.office_clip.clone(),
         }
     }
 }
