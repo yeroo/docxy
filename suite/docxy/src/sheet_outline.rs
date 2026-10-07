@@ -52,7 +52,7 @@ pub(crate) fn group_key(key: &str, ctrl: bool, shift: bool, alt: bool) -> Option
 
 /// The axis and span a selection names on its own: whole rows or whole
 /// columns. `None` for an ordinary block, which makes Group ask.
-fn selected_axis(v: &SheetView) -> Option<(Axis, u32, u32)> {
+pub(crate) fn selected_axis(v: &SheetView) -> Option<(Axis, u32, u32)> {
     let (r0, c0, r1, c1) = v.range();
     let whole_rows = c0 == 0 && c1 >= MAX_COLS - 1;
     let whole_cols = r0 == 0 && r1 >= MAX_ROWS - 1;

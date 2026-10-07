@@ -1701,7 +1701,7 @@ fn ctrl_shift_u_is_the_formula_bar_key_even_in_protected_view() {
     assert!(fx_toggle_key(true, true, "u"));
     assert!(fx_toggle_key(true, true, "U"));
     assert!(!fx_toggle_key(true, false, "u"), "Ctrl+U alone is not it");
-    assert!(!open_mode::protected_allows_key("u", true, false));
+    assert!(!open_mode::protected_allows_key("u", true, true, false));
 }
 
 /// One A to Z level on column `col`.

@@ -101,6 +101,8 @@ mod sheet_ribbon;
 #[cfg(test)]
 mod sheet_select_tests;
 mod sheet_sort;
+#[cfg(test)]
+mod sheet_struct_tests;
 mod sheet_validation;
 mod style_gallery;
 mod table_dialogs;
@@ -2008,6 +2010,10 @@ enum SheetPick {
     Font,
 }
 
+/// Excel's refusal of Insert/Delete Sheet Rows and Columns on a protected
+/// sheet, whose default protection allows neither (#860).
+const STRUCT_PROTECTED: &str = "The sheet is protected: unprotect it (Review › Protect Sheet) to insert or delete rows or columns.";
+
 /// A whole-row / whole-column structural edit at the selection.
 #[derive(Clone, Copy)]
 enum StructOp {
@@ -2306,16 +2312,6 @@ impl SheetView {
         }
         self.push_undo_snapshot(self.snapshot_package());
         self.pkg.remove_comment(s, r, c);
-    }
-
-    /// The lowest "SheetN" (counting from one past the sheet count) no sheet
-    /// has yet, case-insensitively.
-    fn next_sheet_name(&self) -> String {
-        let sheets = &self.pkg.workbook.sheets;
-        (sheets.len() + 1..)
-            .map(|n| format!("Sheet{n}"))
-            .find(|name| !sheets.iter().any(|s| s.name.eq_ignore_ascii_case(name)))
-            .expect("an unused sheet name")
     }
 
     /// Add sheet `name` (its part, relationship and `<sheet>` element, as
@@ -3293,12 +3289,19 @@ impl SheetView {
         }
     }
 
-    /// Commit an open editor before moving rows or columns under its origin.
-    /// False when a refused commit left the editor open: its absolute origin
-    /// would point at a shifted cell, so nothing moves.
+    /// Insert or delete every row (or column) the selection touches, as
+    /// Excel's Insert/Delete Sheet Rows do (#860): one undo step. Commit an
+    /// open editor before moving rows or columns under its origin. False
+    /// when a refused commit left the editor open (its absolute origin
+    /// would point at a shifted cell, so nothing moves), or when the sheet
+    /// is protected (`entry_error` says so).
     fn structural_edit(&mut self, op: StructOp) -> bool {
         use gridcore::edit;
 
+        if self.sheet().is_protected() {
+            self.entry_error = Some(STRUCT_PROTECTED.into());
+            return false;
+        }
         self.commit_edit();
         if self.editing.is_some() {
             // No alert is shown on this path: the entry waits for nothing.
@@ -3309,24 +3312,25 @@ impl SheetView {
         self.circles.clear();
         self.push_undo();
         let s = self.active;
-        let (r, c) = self.sel;
+        let (r0, c0, r1, c1) = self.range();
+        let (rows, cols) = (r1 - r0 + 1, c1 - c0 + 1);
         let wb = &mut self.pkg.workbook;
         let shift = match op {
             StructOp::InsertRow => {
-                edit::insert_rows(wb, s, r, 1);
-                (true, r, 1i64)
+                edit::insert_rows(wb, s, r0, rows);
+                (true, r0, i64::from(rows))
             }
             StructOp::DeleteRow => {
-                edit::delete_rows(wb, s, r, 1);
-                (true, r, -1)
+                edit::delete_rows(wb, s, r0, rows);
+                (true, r0, -i64::from(rows))
             }
             StructOp::InsertCol => {
-                edit::insert_cols(wb, s, c, 1);
-                (false, c, 1)
+                edit::insert_cols(wb, s, c0, cols);
+                (false, c0, i64::from(cols))
             }
             StructOp::DeleteCol => {
-                edit::delete_cols(wb, s, c, 1);
-                (false, c, -1)
+                edit::delete_cols(wb, s, c0, cols);
+                (false, c0, -i64::from(cols))
             }
         };
         // Charts the UI authored live outside the workbook until they're
@@ -3570,6 +3574,25 @@ impl SheetView {
     fn clear_areas(&mut self) {
         self.areas.clear();
         self.areas_dead.set(false);
+    }
+
+    /// Shift+Space: every row the selection touches, whole (#860), each
+    /// area of a multi-area one. The active cell keeps its row and moves to
+    /// column A: the selection is two corners, and a whole row's corners
+    /// sit in column A and the last column (Excel keeps the column).
+    fn select_rows(&mut self) {
+        let last = gridcore::sheet::MAX_COLS - 1;
+        let live = self.areas_live();
+        if live {
+            for a in &mut self.areas {
+                (a.1, a.3) = (0, last);
+            }
+        }
+        self.sel.1 = 0;
+        self.anchor.1 = last;
+        if live {
+            self.stamp_areas();
+        }
     }
 
     /// The selection as a grid clip (Ctrl+C, Ctrl+X): its cells, and as TSV
@@ -13705,7 +13728,7 @@ impl Docxy {
             return;
         }
         if let Some(v) = self.active_sheet_mut() {
-            let name = v.next_sheet_name();
+            let name = v.pkg.workbook.next_sheet_name();
             v.add_sheet(&name);
         }
         // We just switched sheets, same as `select_sheet`.
@@ -15140,8 +15163,38 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Insert/delete a whole row or column at the selection (Home ▸ Cells), then
-    /// rebuild the recalc engine so shifted formulas re-evaluate.
+    /// Ctrl+Shift+= (`insert`) and Ctrl+-: Insert or Delete Sheet Rows when
+    /// whole rows are selected, Sheet Columns when whole columns are (#860),
+    /// through the ribbon commands' acts and their checks. Any other
+    /// selection, or an open editor, does nothing: Excel's Insert and
+    /// Delete dialogs for cells are not here.
+    fn sheet_struct_chord(
+        &mut self,
+        insert: bool,
+        editing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gridcore::outline::Axis;
+        if editing {
+            return;
+        }
+        let axis = self
+            .active_sheet()
+            .and_then(sheet_outline::selected_axis)
+            .map(|(axis, _, _)| axis);
+        let act = match (axis, insert) {
+            (Some(Axis::Rows), true) => SheetAct::InsertRow,
+            (Some(Axis::Rows), false) => SheetAct::DeleteRow,
+            (Some(Axis::Cols), true) => SheetAct::InsertCol,
+            (Some(Axis::Cols), false) => SheetAct::DeleteCol,
+            (None, _) => return,
+        };
+        self.run_sheet_act(act, window, cx)
+    }
+
+    /// Insert/delete every row or column the selection touches (Home ▸
+    /// Cells), then rebuild the recalc engine so shifted formulas re-evaluate.
     fn sheet_structural(&mut self, op: StructOp, cx: &mut Context<Self>) {
         if self
             .active_sheet_mut()
@@ -16961,7 +17014,7 @@ impl Docxy {
         // where it would write.
         if self.active_locked()
             && !self.find_open
-            && !open_mode::protected_allows_key(key, ctrl, alt)
+            && !open_mode::protected_allows_key(key, ctrl, shift, alt)
         {
             self.protected_refused(cx);
             return;
@@ -17177,6 +17230,12 @@ impl Docxy {
                 }
                 // Data › Filter (#690).
                 "l" if shift => return self.run_sheet_act(SheetAct::Filter, window, cx),
+                // Insert (Ctrl+Shift+=, or Ctrl++ on the numpad) and Delete
+                // (Ctrl+-) the selected whole rows or columns (#860). The
+                // harness spells Ctrl+Shift+= by its key, `=` with Shift.
+                "=" if shift => return self.sheet_struct_chord(true, editing, window, cx),
+                "+" => return self.sheet_struct_chord(true, editing, window, cx),
+                "-" if !shift => return self.sheet_struct_chord(false, editing, window, cx),
                 "a" => {
                     // Select the whole used range.
                     if let Some(v) = self.active_sheet_mut() {
@@ -17330,6 +17389,17 @@ impl Docxy {
             // F4 outside the editor is Redo/Repeat, as Ctrl+Y (#859): it
             // redoes a pending redo, else repeats the last formatting change.
             "f4" if !editing => self.sheet_redo_or_repeat(cx),
+            // Shift+Space selects the whole rows (#860); in the editor it is
+            // a space like any other.
+            "space" if shift && !alt && !editing => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.select_rows();
+                }
+                cx.notify();
+            }
+            // Shift+F11: a new sheet, named and selected as the + button's
+            // (#860). Not from the editor, which it would close unasked.
+            "f11" if shift && !editing => self.sheet_add(cx),
             // Insert toggles overtype for this editor session.
             "insert" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
@@ -22563,7 +22633,7 @@ mod sheet_save_tests {
         let Surface::Sheet(v) = &mut tab.surface else {
             unreachable!()
         };
-        let name = v.next_sheet_name();
+        let name = v.pkg.workbook.next_sheet_name();
         assert_eq!(name, "Sheet4");
         assert_eq!(v.add_sheet(&name), 3);
         assert_eq!(v.active, 3);
