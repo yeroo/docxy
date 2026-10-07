@@ -64,7 +64,8 @@ options for run:
                                 sandbox; default <run>/sandbox-<pid>-<timestamp>-<n>,
                                 retained)
   --keep                        leave the last file's instance running after the
-                                run, to poke at the window a case failed on
+                                run (earlier files' instances always shut down;
+                                run a failing file alone with --keep to inspect it)
   --desktop NAME                start the suite on a separate Win32 desktop (never shown)
 
 regions:
@@ -402,40 +403,26 @@ fn run_scripts(a: &Args) -> Result<String, String> {
                 .dir()
                 .join(format!("sandbox-{}-{stamp}-{i}", std::process::id())),
         };
-        let mut app = match &desk {
-            Some(d) => uiharness::launch::launch_on_desktop(&exe, &sandbox, d)?,
-            None => uiharness::launch::launch(&exe, &sandbox)?,
-        };
-        let ctl = app.ctl_dir();
-
-        let driver = match Driver::connect(&ctl, a.instance.as_deref()) {
-            Ok(d) => d,
-            // A refusal from the isolation gate exits before it ever publishes a
-            // socket, so the connect timing out is the symptom and the exit is the
-            // cause. Say both.
+        out.push_str(&format!("{}\n", path.display()));
+        // A launch or connect failure stops the run rather than skipping to
+        // the next file: the harness or the app is broken, not a case, and
+        // the remaining files would hit the same wall. The error lands under
+        // this file's path and the transcripts collected so far — the driven
+        // binary, earlier files' reports — are still reported below.
+        let (app, driver) = match launch_one(&exe, &sandbox, desk.as_ref(), a.instance.as_deref()) {
+            Ok(launched) => launched,
             Err(e) => {
-                return Err(match app.exited() {
-                    Some(why) => format!("{e}\n{why}"),
-                    None => e,
-                });
+                all_passed = false;
+                let mut lines = e.lines();
+                if let Some(first) = lines.next() {
+                    out.push_str(&format!("  ERROR {first}\n"));
+                }
+                for l in lines {
+                    out.push_str(&format!("        {l}\n"));
+                }
+                break;
             }
         };
-
-        // The instance that answered must be the one this process started. It is
-        // the same check the unique sandbox above makes unnecessary — and exactly
-        // the reason to keep it: if the two ever disagree, a run would be driving
-        // somebody else's window and reporting on it as if it were its own.
-        if driver.pid() != app.pid() {
-            let (found, ours) = (driver.pid(), app.pid());
-            app.shutdown(None);
-            return Err(format!(
-                "the instance publishing itself in {} is pid {found}, but the one this run \
-                 started is pid {ours}; another harness instance is using this sandbox",
-                ctl.display()
-            ));
-        }
-
-        out.push_str(&format!("{}\n", path.display()));
         let outcome = uiharness::Runner::new(&driver, &run, base, &sandbox).run_script(script);
         all_passed &= outcome.passed();
         out.push_str(&outcome.report());
@@ -463,6 +450,52 @@ fn run_scripts(a: &Args) -> Result<String, String> {
     out.push_str(&format!("evidence: {}\n", run.dir().display()));
 
     if all_passed { Ok(out) } else { Err(out) }
+}
+
+/// Launch one per-file instance and verify that the instance answering is the
+/// one this process started: the launch itself, the control connect (quoting
+/// the exit reason when the app died first) and the pid match, as one
+/// `Result` so a mid-run failure can be reported under its file's path
+/// instead of discarding the transcripts collected so far.
+fn launch_one(
+    exe: &Path,
+    sandbox: &Path,
+    desk: Option<&uiharness::desktop::Desktop>,
+    instance: Option<&str>,
+) -> Result<(uiharness::launch::Launched, Driver), String> {
+    let mut app = match desk {
+        Some(d) => uiharness::launch::launch_on_desktop(exe, sandbox, d)?,
+        None => uiharness::launch::launch(exe, sandbox)?,
+    };
+    let ctl = app.ctl_dir();
+
+    let driver = match Driver::connect(&ctl, instance) {
+        Ok(d) => d,
+        // A refusal from the isolation gate exits before it ever publishes a
+        // socket, so the connect timing out is the symptom and the exit is the
+        // cause. Say both.
+        Err(e) => {
+            return Err(match app.exited() {
+                Some(why) => format!("{e}\n{why}"),
+                None => e,
+            });
+        }
+    };
+
+    // The instance that answered must be the one this process started. It is
+    // the same check the unique sandbox makes unnecessary — and exactly
+    // the reason to keep it: if the two ever disagree, a run would be driving
+    // somebody else's window and reporting on it as if it were its own.
+    if driver.pid() != app.pid() {
+        let (found, ours) = (driver.pid(), app.pid());
+        app.shutdown(None);
+        return Err(format!(
+            "the instance publishing itself in {} is pid {found}, but the one this run \
+             started is pid {ours}; another harness instance is using this sandbox",
+            ctl.display()
+        ));
+    }
+    Ok((app, driver))
 }
 
 /// File a capture: `--out` if the caller named a file, otherwise under the

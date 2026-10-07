@@ -117,9 +117,11 @@ fn a_relative_suite_path_is_launched_from_outside_the_sandbox() {
 /// #583: `run` gives every script file its own sandbox — the model
 /// scripts/ui-linux-sweep.py runs every script under — so no file inherits
 /// another file's session. The fake suite cannot serve the control protocol,
-/// so the run dies on a connect timeout either way; the sandboxes created on
-/// the way out carry the per-file index either way, and on current code they
-/// do not. The behavioural half (the second file starts without the first
+/// so the run dies on a connect timeout either way, leaving the first file's
+/// sandbox on disk; the directory name must be the per-file form
+/// `sandbox-<pid>-<stamp>-<index>`, which a run on current code does not
+/// produce (its name has three parts and no index — that is what this test
+/// catches). The behavioural half (the second file starts without the first
 /// file's tabs) needs a live suite: tests/multi_file.rs, run with
 /// `-- --ignored` like tab_close.
 #[test]
@@ -152,11 +154,44 @@ fn run_gives_each_script_file_its_own_sandbox() {
         String::from_utf8_lossy(&out.stderr)
     );
     for name in &sandboxes {
-        let indexed = name
-            .rsplit('-')
-            .next()
-            .is_some_and(|tail| tail.parse::<usize>().is_ok());
-        assert!(indexed, "sandbox {name} carries no per-file index");
+        let parts: Vec<&str> = name.split('-').collect();
+        assert_eq!(
+            parts.len(),
+            4,
+            "sandbox {name} is not sandbox-<pid>-<stamp>-<index> (the pre-#583 form)"
+        );
+        assert_eq!(parts[3], "0", "the first file's index, in {name}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// FIX r1 (#583): a launch or connect failure lands under the file's path and
+/// the run still reports the driven binary, the path and the evidence
+/// directory — the transcripts collected so far are not dropped. Before the
+/// per-file loop these errors returned the bare message and nothing else.
+#[test]
+fn a_failed_launch_still_reports_the_transcript() {
+    let (dir, name) = fake_suite_dir("583b");
+    let run_dir = dir.join("runs-583b");
+    std::fs::write(dir.join("only.uit"), "test only file\n  assert tabs is 1\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_uiharness"))
+        .current_dir(&dir)
+        .env_remove("UIHARNESS_SUITE")
+        .arg("run")
+        .arg(dir.join("only.uit"))
+        .arg("--suite")
+        .arg(&name)
+        .arg("--run")
+        .arg(&run_dir)
+        .output()
+        .expect("run uiharness run against a dead fake suite");
+    assert!(!out.status.success(), "status: {:?}", out.status.code());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for expected in ["suite:", "only.uit", "ERROR", "evidence:"] {
+        assert!(
+            stderr.contains(expected),
+            "the transcript must name '{expected}':\n{stderr}"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

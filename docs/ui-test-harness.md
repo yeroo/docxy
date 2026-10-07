@@ -63,7 +63,7 @@ Useful flags on `run`:
 | `--suite EXE` | drive this binary. Otherwise `$UIHARNESS_SUITE` if it is set (an error if it does not name a file), otherwise the first build found — release before debug, under `suite/target/` then `target/`, relative to the repository this crate was built from and then the working directory. Release wins over debug whatever their dates, so every run prints the binary it drove as its first line — that is what makes a stale release build answering for a fresh debug one visible |
 | `--run DIR` | where evidence is filed (default `./uiharness-runs`, which is git-ignored). The path a capture lands on is `<case>/<line>-<region>.png`, so two runs sharing this directory *at the same time* would file over each other's pictures — give them different `--run` directories if you run them in parallel. The instances themselves never share anything: each gets its own sandbox |
 | `--sandbox DIR` | the throwaway config root, for one script file only (a multi-file run starts an instance per file and refuses a named sandbox — each needs its own, or the second file reopens the first file's session). Default `<run>/sandbox-<pid>-<timestamp>-<n>`, one per file. Every default is unique and retained for diagnosis; the harness performs no recursive cleanup. A directory you name yourself is also yours to manage and is kept |
-| `--keep` | leave the last file's instance up after the run, to poke at the window a case failed on |
+| `--keep` | leave the last file's instance running after the run (earlier files' instances are always shut down; run a failing file alone with `--keep` to inspect it) |
 | `--desktop NAME` | run the suite on a separate Win32 desktop, never shown — see below |
 
 ### On a separate desktop
