@@ -293,6 +293,12 @@ fn block_weight(block: &Block) -> usize {
     count.0.max(std::mem::size_of::<Block>())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many undo snapshots this thread has built, for tests to count.
+    static SNAPSHOTS_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The document an undo step holds.
 fn unshare_body(body: Vec<Arc<Block>>) -> Document {
     Document {
@@ -311,7 +317,7 @@ pub struct Editor {
     /// [`HISTORY_BUDGET`], smaller in tests.
     history_budget: usize,
     /// While [`Editor::one_step`] runs: `Some(pushed)`, whether its one step
-    /// is pushed yet. Every edit's step after the first is not taken at all.
+    /// is pushed yet. Once it is, edits take no snapshot ([`Editor::grouped`]).
     grouping: Option<bool>,
     last: EditKind,
     review_target: Option<RevisionTarget>,
@@ -396,6 +402,8 @@ impl Editor {
     }
 
     fn snapshot_like(&self, like: Option<&Snapshot>) -> Snapshot {
+        #[cfg(test)]
+        SNAPSHOTS_TAKEN.with(|n| n.set(n.get() + 1));
         let (body, weight) = share_body(&self.doc.body, like.map(|s| s.body.as_slice()));
         Snapshot {
             body,
@@ -441,6 +449,10 @@ impl Editor {
     /// newest step: only typing coalesces. Each Backspace or Delete is a step
     /// of its own, as in Word (#853).
     fn checkpoint(&mut self, kind: EditKind) {
+        if self.grouped() {
+            self.last = kind;
+            return;
+        }
         if self.last != kind || matches!(kind, EditKind::Structural | EditKind::Delete) {
             let mut snapshot = self.snapshot();
             snapshot.name = match kind {
@@ -506,20 +518,45 @@ impl Editor {
     /// delete or text inserted as if typed, which would otherwise be a step
     /// per Delete or per 128 characters (#853).
     ///
-    /// Only the first edit takes a step (the state before the command); the
-    /// rest take none, so a long command can never push its own first step
-    /// out of the history.
+    /// Only the first edit that takes a step does (the state before the
+    /// command); the edits after it build no snapshot at all, so a long
+    /// command costs one copy of the document and can never push its own
+    /// first step out of the history. Typing inside it is not split at 128
+    /// characters.
     pub fn one_step(&mut self, name: &str, edit: impl FnOnce(&mut Self)) {
         if self.grouping.is_some() {
             edit(self);
             return;
         }
+        /// Ends the grouping however `edit` exits, a panic too, and with it
+        /// the typing run, so the editor goes on taking steps.
+        struct Ungroup<'a>(&'a mut Editor);
+        impl Drop for Ungroup<'_> {
+            fn drop(&mut self) {
+                self.0.grouping = None;
+                self.0.last = EditKind::None;
+            }
+        }
         let since = undo_serial_counter();
         self.break_undo_group();
         self.grouping = Some(false);
-        edit(self);
-        self.grouping = None;
+        let group = Ungroup(self);
+        edit(&mut *group.0);
+        drop(group);
         self.name_command(since, name);
+    }
+
+    /// Inside [`Editor::one_step`] with its step taken: an edit takes no
+    /// snapshot at all.
+    fn grouped(&self) -> bool {
+        self.grouping == Some(true)
+    }
+
+    /// The state before a transaction that pushes its step only if it
+    /// changed something ([`Editor::finish_review_transaction`]); none when
+    /// grouped, whose step is taken already.
+    fn transaction_start(&self) -> Option<Snapshot> {
+        (!self.grouped()).then(|| self.snapshot())
     }
 
     /// The text of the newest undo step when it is typing.
@@ -744,7 +781,7 @@ impl Editor {
     /// ([`crate::inspect::remove_hidden_text`]) as one undo step, none when
     /// nothing was hidden. Returns how many were removed.
     pub fn remove_hidden_text(&mut self) -> usize {
-        let before = self.snapshot();
+        let before = self.transaction_start();
         let removed = crate::inspect::remove_hidden_text(&mut self.doc);
         self.finish_review_transaction(before);
         removed
@@ -754,7 +791,7 @@ impl Editor {
     /// ([`crate::inspect::remove_all_comment_markers`]) as one undo step, none
     /// when there were none. Returns how many were removed.
     pub fn remove_all_comment_markers(&mut self) -> usize {
-        let before = self.snapshot();
+        let before = self.transaction_start();
         let removed = crate::inspect::remove_all_comment_markers(&mut self.doc);
         self.finish_review_transaction(before);
         removed
@@ -765,14 +802,14 @@ impl Editor {
         target: RevisionTarget,
         action: RevisionAction,
     ) -> RevisionOutcome {
-        let before = self.snapshot();
+        let before = self.transaction_start();
         let outcome = self.doc.apply_revision_action(target, action);
         self.finish_review_transaction(before);
         outcome
     }
 
     fn apply_all_revision_actions(&mut self, action: RevisionAction) -> Vec<RevisionOutcome> {
-        let before = self.snapshot();
+        let before = self.transaction_start();
         let outcomes = match action {
             RevisionAction::Accept => self.doc.accept_all_revisions(),
             RevisionAction::Reject => self.doc.reject_all_revisions(),
@@ -781,7 +818,12 @@ impl Editor {
         outcomes
     }
 
-    fn finish_review_transaction(&mut self, before: Snapshot) {
+    fn finish_review_transaction(&mut self, before: Option<Snapshot>) {
+        let Some(before) = before else {
+            self.last = EditKind::None;
+            self.clamp();
+            return;
+        };
         let same = self.doc.body.len() == before.body.len()
             && self
                 .doc
@@ -821,7 +863,9 @@ impl Editor {
             }
         }
         // A full typing step is closed: the character starts the next (#853).
-        if self.last == EditKind::Insert
+        // Not inside one_step, whose one step holds all its text.
+        if self.grouping.is_none()
+            && self.last == EditKind::Insert
             && self
                 .last_typed()
                 .is_some_and(|text| text.chars().count() >= TYPING_STEP_CHARS)
@@ -1993,7 +2037,7 @@ impl Editor {
     /// any text or wrapper that shares raw XML with them, as one undo step,
     /// none when there were none. Returns how many were removed.
     pub fn remove_comment_markers(&mut self, id: &str) -> usize {
-        let before = self.snapshot();
+        let before = self.transaction_start();
         let removed = crate::inspect::remove_comment_markers(&mut self.doc, id);
         self.finish_review_transaction(before);
         removed
@@ -5440,6 +5484,62 @@ mod tests {
         assert!(ed.undo());
         assert_eq!(ed.doc, before);
         assert!(!ed.undo());
+    }
+
+    /// #853: inside `one_step` only the first edit builds a snapshot: a
+    /// 500-line paste as if typed, or 500 Deletes, copy the document once.
+    #[test]
+    fn one_step_builds_one_snapshot_853() {
+        let taken = || SNAPSHOTS_TAKEN.with(std::cell::Cell::get);
+        let mut ed = Editor::new(doc(&["abc"]));
+        let lines = "line of text\n".repeat(500);
+        let start = taken();
+        ed.one_step("Paste", |ed| ed.insert_str(&lines));
+        assert_eq!(taken() - start, 1);
+        assert_eq!(ed.doc.body.len(), 501);
+        assert_eq!(ed.undo_names(), vec!["Paste"]);
+
+        let mut ed = Editor::new(doc(&[&"d".repeat(600)]));
+        let start = taken();
+        ed.one_step("Delete", |ed| {
+            for _ in 0..500 {
+                ed.delete_forward();
+            }
+        });
+        assert_eq!(taken() - start, 1);
+        assert_eq!(top_text(&ed), vec!["d".repeat(100)]);
+        // A review transaction inside a group builds none either.
+        let mut ed = Editor::new(doc(&["a"]));
+        let start = taken();
+        ed.one_step("Clean", |ed| {
+            ed.insert_char('x');
+            ed.remove_hidden_text();
+            ed.remove_all_comment_markers();
+        });
+        assert_eq!(taken() - start, 1);
+        assert!(ed.undo());
+        assert_eq!(top_text(&ed), vec!["a"]);
+    }
+
+    /// #853: a command that panics leaves no grouping behind: the editor
+    /// keeps the step it took and goes on taking steps.
+    #[test]
+    fn one_step_ends_its_grouping_on_a_panic_853() {
+        let mut ed = Editor::new(doc(&["abc"]));
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ed.one_step("Broken", |ed| {
+                ed.insert_char('x');
+                panic!("the command fails");
+            })
+        }));
+        assert!(run.is_err());
+        assert_eq!(ed.grouping, None);
+        assert_eq!(ed.undo.len(), 1, "the step before the command stays");
+        ed.caret.offset = 0;
+        ed.insert_char('y');
+        assert_eq!(ed.undo.len(), 2, "a new step");
+        assert!(ed.undo() && ed.undo());
+        assert_eq!(top_text(&ed), vec!["abc"]);
     }
 
     /// #853: the weight counts everything a copy holds, raw XML too, so a
