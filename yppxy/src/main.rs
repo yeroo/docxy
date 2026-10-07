@@ -1509,12 +1509,17 @@ fn on_key(app: &mut App, k: KeyEvent) {
     }
     // Project's Alt+End: the timescale to the project finish, the mirror of
     // Alt+Home — the finish day becomes the last visible gantt column.
-    // Before the plain End arm, which selects the last task. With no drawn
-    // gantt there is no column geometry to align, so the scroll is skipped.
-    if alt && k.code == KeyCode::End && app.gantt_cols > 0 {
-        let origin = gantt_origin_day(app);
-        let finish = app.ed.disp_project_finish().day_number();
-        app.hscroll = finish - origin - app.gantt_cols as i64 + 1;
+    // Always consumed, before the plain End arm (which selects the last
+    // task): with no drawn gantt there is no column geometry to align, so
+    // the scroll is skipped rather than guessing an offset that would
+    // scroll the finish day out of view. A plan narrower than the viewport
+    // clamps at the left edge, as the suite's clamp_offsets does.
+    if alt && k.code == KeyCode::End {
+        if app.gantt_cols > 0 {
+            let origin = gantt_origin_day(app);
+            let finish = app.ed.disp_project_finish().day_number();
+            app.hscroll = (finish - origin - app.gantt_cols as i64 + 1).max(0);
+        }
         return;
     }
 
@@ -3289,14 +3294,29 @@ mod tests {
 
     /// With no drawn gantt there is no column geometry to align, so Alt+End
     /// before the first draw leaves the timescale alone rather than guessing
-    /// an offset that would scroll the finish day out of view.
+    /// an offset that would scroll the finish day out of view. The chord is
+    /// still consumed: it must not fall through to plain End, which would
+    /// move the selection.
     #[test]
     fn alt_end_before_the_first_draw_leaves_the_timescale() {
         let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
         app.add_task();
+        on_key(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         app.hscroll = 5;
         on_key(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::ALT));
         assert_eq!(app.hscroll, 5);
+        assert_eq!(app.ed.sel(), 0, "Alt+End is consumed, not plain End");
+    }
+
+    /// A plan narrower than the viewport has nothing to scroll: Alt+End
+    /// clamps at the left edge, as the suite's `clamp_offsets` does.
+    #[test]
+    fn alt_end_on_a_narrow_plan_clamps_to_zero() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        app.gantt_cols = 200;
+        on_key(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::ALT));
+        assert_eq!(app.hscroll, 0);
     }
 
     /// Report has no groups (#370) but is still a tab you can select: Enter

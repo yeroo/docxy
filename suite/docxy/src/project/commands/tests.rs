@@ -1175,8 +1175,8 @@ fn alt_end_goes_to_finish() {
     assert!(x > 0., "the timescale moved");
     let (scale, finish) = (v(&t).scale, v(&t).ed.disp_project_finish().day_number());
     assert!(
-        scale.x(finish) >= x - 1e-3 && scale.x(finish + 1) <= x + w + 1e-3,
-        "the finish day column is the last fully visible one"
+        (x + w - scale.x(finish + 1)).abs() < 1e-3,
+        "the finish day column ends at the chart's right edge"
     );
     assert_eq!((v(&t).ed.sel(), v(&t).col), (sel, col), "the cursor stays");
     assert_eq!(
@@ -1186,6 +1186,10 @@ fn alt_end_goes_to_finish() {
     );
     apply_project_act(&mut t, ProjectAct::GoToStart);
     assert_eq!(v(&t).gantt_x.get(), 0.);
+    vm(&mut t).pan_gantt(true);
+    let x = v(&t).gantt_x.get();
+    press(&mut t, "end");
+    assert!(v(&t).gantt_x.get() == x, "plain End leaves the timescale");
 }
 
 /// Project's Alt keys get past the KeyTips overlay (pressing Alt starts it),
@@ -1224,9 +1228,14 @@ fn project_alt_keys_bypass_keytips_but_letters_do_not() {
         "plain End keeps its meaning"
     );
     assert_ne!(
-        key_act("end", ctrl_alt),
+        key_act("end", ctrl()),
         Some(ProjectAct::GoToFinish),
         "Ctrl+End keeps its meaning"
+    );
+    assert_ne!(
+        key_act("end", ctrl_alt),
+        Some(ProjectAct::GoToFinish),
+        "Ctrl+Alt+End keeps its meaning"
     );
     assert!(!project_alt_key("alt", alt));
     for c in ('a'..='z').chain('0'..='9') {
