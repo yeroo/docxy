@@ -815,7 +815,7 @@ impl Docxy {
                 target.and_then(|t| self.close_prompt_save(i, t, quit, window, cx))
             }
             _ if self.harness.is_some() => Err(MORE_OPTIONS_HARNESS.into()),
-            _ => match self.pick_doc_save_target() {
+            _ => match self.pick_doc_save_target(None) {
                 Some(path) => self.close_prompt_save(i, PromptSave::To(path), quit, window, cx),
                 // Cancelled: back to the prompt.
                 None => Ok(()),

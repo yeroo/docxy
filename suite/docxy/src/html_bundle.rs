@@ -21,21 +21,35 @@ pub(crate) fn can_export() -> bool {
 /// How a document tab is written, from the path it saves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DocTarget {
-    Docx,
+    /// A Word package, of the file type the extension names (#636); `None`
+    /// for a name that names none (an in-place tab called `Letter`), which
+    /// keeps the type it was loaded with.
+    Docx(Option<docxcore::package::DocKind>),
     Markdown,
     Html,
+    /// Plain Text (#635).
+    Text,
+    /// Rich Text Format (#635).
+    Rtf,
 }
 
 /// The format a document path saves as: any `.html`/`.htm` is a bundle (never
-/// OOXML or Markdown written over an HTML name), Markdown by flag, Word
-/// otherwise.
+/// OOXML or Markdown written over an HTML name), `.txt` plain text and
+/// `.rtf` Rich Text, Markdown by flag, Word otherwise.
 pub(crate) fn doc_target(path: &Path, markdown: bool) -> DocTarget {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
     if htmlbundle::is_html_path(&path.to_string_lossy()) {
         DocTarget::Html
+    } else if ext.as_deref() == Some("txt") {
+        DocTarget::Text
+    } else if ext.as_deref() == Some("rtf") {
+        DocTarget::Rtf
     } else if markdown {
         DocTarget::Markdown
     } else {
-        DocTarget::Docx
+        DocTarget::Docx(docxcore::package::DocKind::from_path(path))
     }
 }
 
@@ -157,7 +171,36 @@ mod tests {
         );
         assert_eq!(
             doc_target(Path::new("a/sample.docx"), false),
-            DocTarget::Docx
+            DocTarget::Docx(Some(docxcore::package::DocKind::Document))
+        );
+    }
+
+    /// #635, #636: the extension names the format, whatever the Markdown
+    /// flag says, and a name naming no Word type keeps the loaded one.
+    #[test]
+    fn text_rtf_and_every_word_type_follow_the_extension() {
+        use docxcore::package::DocKind;
+        for markdown in [false, true] {
+            for (name, want) in [
+                ("a/notes.TXT", DocTarget::Text),
+                ("a/notes.rtf", DocTarget::Rtf),
+            ] {
+                assert_eq!(doc_target(Path::new(name), markdown), want, "{name}");
+            }
+        }
+        for (name, kind) in [
+            ("a/t.dotx", DocKind::Template),
+            ("a/t.DOTM", DocKind::MacroTemplate),
+            ("a/t.docm", DocKind::MacroDocument),
+        ] {
+            assert_eq!(
+                doc_target(Path::new(name), false),
+                DocTarget::Docx(Some(kind))
+            );
+        }
+        assert_eq!(
+            doc_target(Path::new("a/Letter"), false),
+            DocTarget::Docx(None)
         );
     }
 

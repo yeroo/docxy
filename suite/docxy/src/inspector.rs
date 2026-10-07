@@ -474,6 +474,7 @@ mod tests {
                 "bs-open",
                 "bs-save",
                 "bs-saveas",
+                "bs-export-doc",
                 "bs-account",
                 "bs-close"
             ]
@@ -487,6 +488,11 @@ mod tests {
         let project = ids(true, false);
         assert!(!project.contains(&"bs-info"));
         assert!(project.contains(&"bs-export"));
+        // A document's Export page is its own (#635); a project's Export…
+        // exports the Gantt chart.
+        assert!(!project.contains(&"bs-export-doc"));
+        assert!(!ids(false, true).contains(&"bs-export"));
+        assert!(!ids(false, false).contains(&"bs-export-doc"));
     }
 
     /// Review r1 m3: the Info page shows the last Remove All's result, an

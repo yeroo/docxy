@@ -36,6 +36,9 @@ mod design_dialogs;
 mod design_tab;
 mod dialog;
 mod dialog_host;
+mod doc_export;
+#[cfg(test)]
+mod doc_export_tests;
 #[cfg(test)]
 mod doc_final_tests;
 mod doc_import;
@@ -44,6 +47,9 @@ mod doc_import_tests;
 mod doc_name;
 #[cfg(test)]
 mod doc_protected_tests;
+mod doc_templates;
+#[cfg(test)]
+mod doc_templates_tests;
 mod harness;
 mod hf;
 mod hf_tab;
@@ -487,7 +493,10 @@ enum BackstageRailAction {
     Open,
     Save,
     SaveAs,
+    /// A project's Export… (the Gantt chart).
     Export,
+    /// A document's Export page, Change File Type (#635).
+    ExportDoc,
     /// Build info and the About dialog (#1023); on every tab kind.
     Account,
     Close,
@@ -551,6 +560,13 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Export,
         project_only: true,
         doc_only: false,
+    },
+    BackstageRailItem {
+        id: "bs-export-doc",
+        display: "Export",
+        action: BackstageRailAction::ExportDoc,
+        project_only: false,
+        doc_only: true,
     },
     BackstageRailItem {
         id: "bs-account",
@@ -4043,6 +4059,12 @@ struct Docxy {
     /// The backstage shows the Account page: the build line and About (#1023).
     /// New, Info and Account clear one another.
     bs_account: bool,
+    /// The backstage shows a document's Export page, Change File Type
+    /// (#635). Cleared wherever `bs_new` is.
+    bs_export: bool,
+    /// The personal templates File > New lists (#636), read when the page
+    /// opens rather than on every frame.
+    bs_templates: Vec<PathBuf>,
     /// The last Remove All on the Info page and the tab index it ran on:
     /// the backstage draws no status bar, so the page shows it under the
     /// rows. Cleared with `bs_info`, on a tab switch, and when a tab is
@@ -6548,10 +6570,11 @@ fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> (Vec<u8>, usi
 
 /// What the Open dialog's "All supported" filter lists: documents
 /// (Word 97-2003 `.doc` imports, #634; RTF, web pages and PDFs opened
-/// converted, #633), workbooks and project schedules.
-const OPEN_EXTENSIONS: [&str; 15] = [
-    "docx", "doc", "md", "markdown", "html", "htm", "rtf", "pdf", "xlsx", "xlsm", "xltx", "xltm",
-    "yppx", "xml", "mpp",
+/// converted, #633; Word templates, opened as new documents, #636),
+/// workbooks and project schedules.
+const OPEN_EXTENSIONS: [&str; 18] = [
+    "docx", "docm", "dotx", "dotm", "doc", "md", "markdown", "html", "htm", "rtf", "pdf", "xlsx",
+    "xlsm", "xltx", "xltm", "yppx", "xml", "mpp",
 ];
 
 /// The extensions a workbook opens from and saves to.
@@ -6581,10 +6604,11 @@ fn template_title(path: &std::path::Path) -> Option<String> {
 
 /// Build a tab by loading `path` from disk — an .xlsx/.xlsm workbook, a
 /// Word/Markdown document, or a .yppx/.xml/.mpp project schedule, dispatched on
-/// the extension (.xml opens as Project). A template (.xltx/.xltm) opens as a
-/// new, never-saved workbook from it, as Excel starts one, so a save asks
-/// for a name and never writes the template. Shared by the Open dialog and
-/// command-line file arguments.
+/// the extension (.xml opens as Project). A template (.xltx/.xltm, or a Word
+/// .dotx/.dotm, #636) opens as a new, never-saved workbook or document from
+/// it, as Excel and Word start one, so a save asks for a name and never
+/// writes the template. Shared by the Open dialog and command-line file
+/// arguments.
 fn tab_from_path(path: &PathBuf) -> DocTab {
     if is_project_path(path) {
         return project_tab_from_path(path);
@@ -6593,7 +6617,9 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
         sheet_tab_from_path(path, false)
     } else {
         let title: SharedString = file_name(path).into();
-        doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false)
+        let mut tab = doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false);
+        doc_templates::untitle_template_tab(&mut tab, path);
+        tab
     }
 }
 
@@ -6673,6 +6699,11 @@ fn doc_tab_from_path_mode(
     );
     tab.access.protected = protected;
     tab.access.stamp = stamp;
+    // A template opens untitled, as from `tab_from_path` (#636); Recover
+    // Text keeps its file.
+    if mode != OpenMode::RecoverText {
+        doc_templates::untitle_template_tab(&mut tab, path);
+    }
     tab
 }
 
@@ -9857,6 +9888,29 @@ fn doc_to_docx_styled(
     base: Option<&Package>,
     converted: bool,
 ) -> Vec<u8> {
+    doc_to_docx_kind(doc, comments, base, converted, None).0
+}
+
+/// [`doc_to_docx`] for a save to a file of type `kind` (#636): the main
+/// part's content type says so, and a macro-free type leaves the VBA project
+/// out (see [`Package::set_main_kind`]). `None` (hot-exit, a page's
+/// payload, a name naming no Word type) keeps the type the package has.
+fn doc_to_docx_for(
+    doc: &Document,
+    comments: &[Comment],
+    base: Option<&Package>,
+    kind: Option<docxcore::package::DocKind>,
+) -> (Vec<u8>, docxcore::package::KindChange) {
+    doc_to_docx_kind(doc, comments, base, false, kind)
+}
+
+fn doc_to_docx_kind(
+    doc: &Document,
+    comments: &[Comment],
+    base: Option<&Package>,
+    converted: bool,
+    kind: Option<docxcore::package::DocKind>,
+) -> (Vec<u8>, docxcore::package::KindChange) {
     use std::collections::HashSet;
     // A body still equal to the one the base's document.xml encodes writes
     // those bytes back, as the CLI writes an unedited document's (#1107).
@@ -9922,12 +9976,16 @@ fn doc_to_docx_styled(
     if comments.is_empty() {
         pkg.drop_empty_comment_parts();
     }
-    if unmodified {
+    // Only a type that disagrees is rewritten, so an unmodified save of a
+    // file already of its type is still its own bytes.
+    let change = kind.map(|k| pkg.set_main_kind(k)).unwrap_or_default();
+    let bytes = if unmodified {
         // Header and footer edits still add the table styles they use.
         docxcore::package::save_package_keeping_document(&pkg)
     } else {
         docxcore::package::save_package(&pkg)
-    }
+    };
+    (bytes, change)
 }
 
 /// One tab as a relaunch restores it. The app goes through
@@ -10441,6 +10499,8 @@ impl Docxy {
             backstage: false,
             app_dialogs: dialog::DialogStack::default(),
             bs_new: false,
+            bs_export: false,
+            bs_templates: Vec::new(),
             bs_scroll: ScrollHandle::new(),
             bs_rail_scroll: ScrollHandle::new(),
             bs_info: false,
@@ -10676,6 +10736,7 @@ impl Docxy {
     /// The default (Open) page, as `open_backstage` leaves it.
     fn show_backstage_open_page(&mut self) {
         self.bs_new = false;
+        self.bs_export = false;
         self.bs_info = false;
         self.bs_account = false;
         self.bs_info_status = None;
@@ -10718,9 +10779,11 @@ impl Docxy {
     /// item and the harness's `account` verb both come here.
     fn open_account(&mut self, cx: &mut Context<Self>) {
         self.bs_account = true;
+        self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
         self.bs_new = false;
+        self.bs_export = false;
         self.reset_backstage_scroll();
         cx.notify();
     }
@@ -10735,8 +10798,10 @@ impl Docxy {
             BackstageRailAction::Back => self.backstage_back(window, cx),
             BackstageRailAction::Info => {
                 self.bs_info = true;
+                self.bs_export = false;
                 self.bs_info_status = None;
                 self.bs_new = false;
+                self.bs_export = false;
                 self.reset_backstage_scroll();
                 self.bs_account = false;
                 cx.notify();
@@ -10744,6 +10809,9 @@ impl Docxy {
             BackstageRailAction::Account => self.open_account(cx),
             BackstageRailAction::New => {
                 self.bs_new = true;
+                self.bs_export = false;
+                self.bs_templates =
+                    doc_templates::personal_templates(&doc_templates::templates_dir());
                 self.bs_account = false;
                 self.bs_info = false;
                 self.bs_info_status = None;
@@ -10754,6 +10822,7 @@ impl Docxy {
             BackstageRailAction::Save => self.save_active(window, cx),
             BackstageRailAction::SaveAs => self.save_as(window, cx),
             BackstageRailAction::Export => self.project_act(ProjectAct::ExportGantt, window, cx),
+            BackstageRailAction::ExportDoc => self.open_export(cx),
             BackstageRailAction::Close => self.backstage_close(window, cx),
         }
     }
@@ -11159,6 +11228,7 @@ impl Docxy {
         self.active = self.tabs.len() - 1;
         self.backstage = false;
         self.bs_new = false;
+        self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
         self.drop_grid_state();
@@ -13818,6 +13888,7 @@ impl Docxy {
         }
         self.backstage = false;
         self.bs_new = false;
+        self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
         self.persist();
@@ -17521,7 +17592,14 @@ fn doc_save_as_name(tab: &DocTab) -> String {
         && !tab.import.binary_source
         && let Surface::Doc(ed) = &tab.surface
     {
-        return format!("{}.docx", doc_name::untitled_stem(&ed.doc, &tab.title));
+        // A document from a macro-enabled template keeps its macros' type
+        // (#636): `Letter1.docm` suggests a `.docm`.
+        let ext = if tab.title.to_ascii_lowercase().ends_with(".docm") {
+            "docm"
+        } else {
+            "docx"
+        };
+        return format!("{}.{ext}", doc_name::untitled_stem(&ed.doc, &tab.title));
     }
     if tab.access.converted.is_none() {
         return doc_import::save_name(tab);
@@ -17535,17 +17613,18 @@ fn doc_save_as_name(tab: &DocTab) -> String {
 }
 
 /// Whether a document may be saved as `path` (#633): the bytes written are
-/// Word, Markdown or an editable-HTML page, so only those names.
+/// Word (of the type the name says, #636), Markdown, an editable-HTML page,
+/// Plain Text or Rich Text (#635), so only those names. The one decision is
+/// [`html_bundle::doc_target`]'s.
 fn doc_target_allowed(path: &std::path::Path) -> bool {
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    matches!(
-        ext.as_str(),
-        "docx" | "docm" | "md" | "markdown" | "mdown" | "htm" | "html"
+    !matches!(
+        html_bundle::doc_target(path, is_markdown_path(path)),
+        html_bundle::DocTarget::Docx(None)
     )
 }
+
+/// What a Save As to a name no format is written under says.
+const DOC_TARGET_REFUSED: &str = "save it as .docx, .docm, .dotx, .dotm, .rtf, .txt, .md or .html";
 
 /// What a Save onto the file a tab could not load says (#209).
 const DOC_LOAD_FAILED_SAVE: &str = "this file could not be opened; use Save As to save a new copy";
@@ -17575,8 +17654,10 @@ fn refuses_load_failed_save(
 /// Write a document tab to `target` (Save As, or the first save of a
 /// never-saved document to a picked path) or, with `None`, to its own file
 /// (refused when it has none). The format
-/// follows the destination: Markdown for a `.md` target (or a Markdown tab
-/// saved in place), an editable-HTML page for any `.html`, Word otherwise.
+/// follows the destination ([`html_bundle::doc_target`]): Markdown for a
+/// `.md` target (or a Markdown tab saved in place), an editable-HTML page for
+/// any `.html`, Plain Text for `.txt` and Rich Text for `.rtf` (#635), Word
+/// otherwise, of the file type its extension names (#636).
 ///
 /// The tab is rebound (path, Markdown flag, title, held bundle) only after a
 /// successful write, so a refused or failed Save As leaves it saving where it
@@ -17588,8 +17669,7 @@ fn refuses_load_failed_save(
 /// Every document save ends here, so this is the last word (#633): a tab in
 /// Protected View writes nothing; a converted tab (RTF, Web Page, PDF,
 /// recovered text) never writes over its source, in place or by Save As;
-/// and Save As writes only to a Word, Markdown or HTML name, since the bytes
-/// are one of those.
+/// and Save As writes only to a name one of those formats is written under.
 fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     let Surface::Doc(editor) = &tab.surface else {
         return false;
@@ -17623,7 +17703,7 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     }
     if let Some(t) = target.as_deref().filter(|t| !doc_target_allowed(t)) {
         tab.status = format!(
-            "cannot save a document as \"{}\": save it as .docx, .docm, .md or .html",
+            "cannot save a document as \"{}\": {DOC_TARGET_REFUSED}",
             file_name(t)
         )
         .into();
@@ -17650,21 +17730,37 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     let kind = html_bundle::doc_target(&path, markdown);
     // A converted tab has the package its conversion wrote (#633), so it
     // saves into it like any other Word document.
-    let docx = || {
+    let docx = |kind| {
         let live = live_comments(tab, &editor.doc);
         let base = save_base(tab, &editor.doc, &live);
-        doc_to_docx(&editor.doc, &live, base.as_deref())
+        doc_to_docx_for(&editor.doc, &live, base.as_deref(), kind)
     };
+    // Plain Text and Rich Text number lists the way the package does.
+    let markers = |doc: &Document| docxcore::numbering::package_markers(tab.pkg.as_ref(), doc);
     // The Word package written, alone or inside a page.
     let mut package: Option<Vec<u8>> = None;
+    let mut macros_dropped = false;
     let bytes = match kind {
         // Without a mail-merge preview: the record is display only.
         html_bundle::DocTarget::Markdown => {
             docxcore::markdown::to_markdown(&editor.export_doc()).into_bytes()
         }
-        html_bundle::DocTarget::Docx => package.insert(docx()).clone(),
+        html_bundle::DocTarget::Text => {
+            let doc = editor.export_doc();
+            docxcore::export_text::to_text(&doc, &markers(&doc)).into_bytes()
+        }
+        html_bundle::DocTarget::Rtf => {
+            let doc = editor.export_doc();
+            docxcore::export_rtf::to_rtf(&doc, &markers(&doc)).into_bytes()
+        }
+        html_bundle::DocTarget::Docx(kind) => {
+            let (bytes, change) = docx(kind);
+            macros_dropped = change.macros_dropped;
+            package.insert(bytes).clone()
+        }
+        // The page's payload is a plain document, as before.
         html_bundle::DocTarget::Html => {
-            let docx = package.insert(docx()).clone();
+            let docx = package.insert(docx(None).0).clone();
             match html_bundle::bundle_bytes(&path, tab.bundle_html.as_deref(), &docx) {
                 Ok(page) => page.into_bytes(),
                 Err(e) => {
@@ -17676,7 +17772,17 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     };
     match opccore::fsio::write_atomic(&path, &bytes) {
         Ok(()) => {
-            tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
+            tab.status = format!(
+                "saved {} bytes → {}{}",
+                bytes.len(),
+                path.display(),
+                if macros_dropped {
+                    " (macros were not saved: this file type cannot hold them)"
+                } else {
+                    ""
+                }
+            )
+            .into();
             tab.title = file_name(&path).into();
             tab.markdown = markdown;
             tab.path = Some(path);
@@ -17685,8 +17791,12 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
             // A converted tab is now that Word document (#633): the package
             // just written, with the styles it defines, is what later saves
             // keep, and Save writes in place again.
+            // A Text or Rich Text save wrote no package: the one the
+            // conversion made stays the base of later Word saves.
             if tab.access.converted.take().is_some() {
-                tab.pkg = package.and_then(|p| docxcore::package::load_package(&p).ok());
+                if let Some(pkg) = package.and_then(|p| docxcore::package::load_package(&p).ok()) {
+                    tab.pkg = Some(pkg);
+                }
             }
             // The tab's file is now the one just written, not the binary
             // original; Compatibility Mode stays until Convert (#634).
@@ -17813,7 +17923,7 @@ impl Docxy {
                     self.refocus(window, cx);
                     return false;
                 }
-                DocSaveTarget::NeedsDialog => match self.pick_doc_save_target() {
+                DocSaveTarget::NeedsDialog => match self.pick_doc_save_target(None) {
                     Some(picked) => Some(picked),
                     None => {
                         self.tabs[self.active].status = "save cancelled".into();
@@ -17826,6 +17936,7 @@ impl Docxy {
         let saved = save_doc_tab(&mut self.tabs[self.active], target);
         self.backstage = false;
         self.bs_new = false;
+        self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
         self.persist();
@@ -17862,6 +17973,7 @@ impl Docxy {
         }
         self.backstage = false;
         self.bs_new = false;
+        self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
         self.persist();
@@ -17883,6 +17995,7 @@ impl Docxy {
         let saved = save_sheet_to(tab, target);
         self.backstage = false;
         self.bs_new = false;
+        self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
         self.persist();
@@ -17906,6 +18019,7 @@ impl Docxy {
         let result = apply_save(&mut self.tabs[self.active], target);
         self.backstage = false;
         self.bs_new = false;
+        self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
         self.persist();
@@ -17930,49 +18044,19 @@ impl Docxy {
             self.set_status(DOC_SAVE_AS_HARNESS);
             return self.refocus(window, cx);
         }
-        match self.pick_doc_save_target() {
+        match self.pick_doc_save_target(None) {
             Some(target) => self.save_doc(Some(target), window, cx),
             None => self.refocus(window, cx),
         }
-    }
-
-    /// Ask for a document Save As destination. The caller saves to it (the tab
-    /// is rebound only once that save succeeds) and owns the cancellation
-    /// status and any harness guard against native dialogs.
-    fn pick_doc_save_target(&self) -> Option<PathBuf> {
-        let start = self
-            .tabs
-            .get(self.active)
-            .map(doc_save_as_name)
-            .unwrap_or_else(|| "Document1.docx".into());
-        let mut dialog = rfd::FileDialog::new()
-            .add_filter("Word document", &["docx"])
-            .add_filter("Markdown", &["md", "markdown"]);
-        // An open bundle can always be saved as one (it rewraps itself); a new
-        // one needs the engine this build may not carry.
-        if self
-            .tabs
-            .get(self.active)
-            .is_some_and(doc_html_save_allowed)
-        {
-            dialog = dialog.add_filter("Editable HTML (*.docx.html)", &["html"]);
-        }
-        // An imported document's .docx goes beside its Word 97-2003 original
-        // (#634); the save refuses the original itself, whatever its name.
-        if let Some(dir) = self.tabs.get(self.active).and_then(doc_import::save_dir) {
-            dialog = dialog.set_directory(dir);
-        }
-        // The name is written as picked (the dialog already asked about
-        // overwriting it): any .html name saves a bundle, found by its content
-        // when opened again.
-        dialog.set_file_name(start).save_file()
     }
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dialog = rfd::FileDialog::new()
             .add_filter("All supported", &OPEN_EXTENSIONS)
             .add_filter("Project schedule", &["yppx", "xml", "mpp"])
-            .add_filter("Word or Markdown", &["docx", "md", "markdown"])
+            .add_filter("Word or Markdown", &["docx", "docm", "md", "markdown"])
+            // Opened as a new document from the template (#636).
+            .add_filter("Word Template", &["dotx", "dotm"])
             // Opened converted (#633); Save writes a Word document.
             .add_filter("Rich Text, Web Page or PDF", &["rtf", "htm", "html", "pdf"])
             .add_filter("Word 97-2003 Document", &["doc"])
@@ -18019,6 +18103,7 @@ impl Docxy {
         }
         self.backstage = false;
         self.bs_new = false;
+        self.bs_export = false;
         self.bs_info = false;
         self.bs_info_status = None;
         self.persist();
@@ -29410,8 +29495,11 @@ impl Docxy {
                             Kind::Look,
                         )),
                 )
+                .child(self.personal_templates_section(fg, dim, cx))
                 .into_any_element()
         } else if let Some(page) = self.account_page(bg, fg, dim, cx) {
+            page
+        } else if let Some(page) = self.export_page(bg, fg, dim, cx) {
             page
         } else if let Some(page) = self.info_page(bg, fg, dim, cx) {
             page

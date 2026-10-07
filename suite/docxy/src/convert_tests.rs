@@ -137,14 +137,14 @@ fn a_converted_tab_never_writes_its_source() {
         assert_eq!(tab.status.as_ref(), converted_refusal("letter.rtf"));
     }
     assert_eq!(std::fs::read(&src).unwrap(), RTF);
-    // Nor any name that is not Word, Markdown or HTML.
-    assert!(!save_doc_tab(&mut tab, Some(dir.path("other.rtf"))));
+    // Nor any name no format is written under.
+    assert!(!save_doc_tab(&mut tab, Some(dir.path("other.pdf"))));
     assert!(
         tab.status.contains("cannot save a document as"),
         "{}",
         tab.status
     );
-    assert!(!dir.path("other.rtf").exists());
+    assert!(!dir.path("other.pdf").exists());
     // Save As suggests the same name as a Word document.
     assert_eq!(doc_save_as_name(&tab), "letter.docx");
     // Saved as .docx, it is that document from then on.
@@ -175,20 +175,25 @@ fn a_converted_heading_keeps_its_style_through_save() {
 }
 
 #[test]
-fn only_word_markdown_and_html_names_are_save_targets() {
+fn only_names_a_format_is_written_under_are_save_targets() {
     for ok in [
         "a.docx",
         "a.DOCX",
         "a.docm",
+        "a.dotx",
+        "a.dotm",
         "a.md",
         "a.markdown",
         "a.mdown",
         "a.htm",
         "a.html",
+        // Plain Text and Rich Text (#635).
+        "a.rtf",
+        "a.TXT",
     ] {
         assert!(doc_target_allowed(Path::new(ok)), "{ok}");
     }
-    for bad in ["a.rtf", "a.pdf", "a.txt", "a.doc", "noext"] {
+    for bad in ["a.pdf", "a.doc", "a.dot", "a.odt", "noext"] {
         assert!(!doc_target_allowed(Path::new(bad)), "{bad}");
     }
 }
