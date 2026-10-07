@@ -642,10 +642,11 @@ pub fn read_parts(bytes: &[u8]) -> Option<BTreeMap<String, Vec<u8>>> {
         .iter()
         .flat_map(|n| n.match_indices('/').map(|(i, _)| &n[..i]))
         .collect();
+    let named = named_parts(&zip, &names);
     let mut parts = BTreeMap::new();
     let mut raw: BTreeMap<String, &str> = BTreeMap::new();
     for (e, name) in zip.entries().iter().zip(names.iter()) {
-        if is_directory_entry(name, e.uncomp_size, &dirs) {
+        if is_directory_entry(name, e.uncomp_size, &dirs, &named) {
             continue;
         }
         if *raw.entry(name.clone()).or_insert(&e.name) != e.name {
@@ -656,15 +657,80 @@ pub fn read_parts(bytes: &[u8]) -> Option<BTreeMap<String, Vec<u8>>> {
     Some(parts)
 }
 
+/// The part names, in lower case, that the package names: an `Override` in
+/// `[Content_Types].xml` or an internal relationship's target, as gridcore's
+/// xlsx loader reads them. `names` are the entries' names with `/`
+/// separators.
+fn named_parts(zip: &ZipArchive, names: &[String]) -> BTreeSet<String> {
+    let mut named = BTreeSet::new();
+    for (e, name) in zip.entries().iter().zip(names) {
+        let lower = name.to_ascii_lowercase();
+        let source = match lower.rsplit_once('/') {
+            Some((dir, _)) if lower.ends_with(".rels") => match dir.rsplit_once('/') {
+                Some((parent, "_rels")) => Some(&name[..parent.len()]),
+                None if dir == "_rels" => Some(""),
+                _ => None,
+            },
+            _ => None,
+        };
+        if source.is_none() && lower != "[content_types].xml" {
+            continue;
+        }
+        let Some(root) = zip.extract(e).and_then(|b| parse_xml(&b)) else {
+            continue;
+        };
+        for c in &root.children {
+            let Node::Elem(c) = c else { continue };
+            let get = |n: &str| {
+                c.attrs
+                    .iter()
+                    .find(|a| a.local == n)
+                    .map(|a| a.value.as_str())
+            };
+            match (source, c.local.as_str()) {
+                (Some(dir), "Relationship") if get("TargetMode").is_none() => {
+                    let target = get("Target").unwrap_or("").replace('\\', "/");
+                    let mut steps: Vec<&str> = match target.strip_prefix('/') {
+                        Some(_) => Vec::new(),
+                        None => dir.split('/').filter(|s| !s.is_empty()).collect(),
+                    };
+                    for step in target.split('/') {
+                        match step {
+                            "" | "." => {}
+                            ".." => {
+                                steps.pop();
+                            }
+                            s => steps.push(s),
+                        }
+                    }
+                    named.insert(steps.join("/").to_ascii_lowercase());
+                }
+                (None, "Override") => {
+                    let part = get("PartName").unwrap_or("").trim_start_matches('/');
+                    named.insert(part.to_ascii_lowercase());
+                }
+                _ => {}
+            }
+        }
+    }
+    named
+}
+
 /// Whether the entry `name` (with `/` separators) of `size` bytes is a
 /// directory, as gridcore's xlsx loader decides it (#1156): its name ends
 /// with `/`, or it is empty and either an entry lies under it (`dirs` holds
-/// every directory an entry name lies in) or it has no extension.
-/// tdf124525.xlsx marks `_rels`, `xl` and others as directories only in
-/// their ZIP attributes.
-pub fn is_directory_entry(name: &str, size: u64, dirs: &BTreeSet<&str>) -> bool {
+/// every directory an entry name lies in) or it has no extension and
+/// nothing names it (`named`, from [`named_parts`]). tdf124525.xlsx marks
+/// `_rels`, `xl` and others as directories only in their ZIP attributes.
+pub fn is_directory_entry(
+    name: &str,
+    size: u64,
+    dirs: &BTreeSet<&str>,
+    named: &BTreeSet<String>,
+) -> bool {
     let leaf = name.rsplit('/').next().unwrap_or(name);
-    name.ends_with('/') || (size == 0 && (dirs.contains(name) || !leaf.contains('.')))
+    let unnamed = || !leaf.contains('.') && !named.contains(&name.to_ascii_lowercase());
+    name.ends_with('/') || (size == 0 && (dirs.contains(name) || unnamed()))
 }
 
 /// Part names whose `[Content_Types].xml` type is XML (`...xml` or `...+xml`).
