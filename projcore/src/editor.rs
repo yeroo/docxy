@@ -8,7 +8,7 @@ use crate::datetime::DateTime;
 use crate::model::{
     Assignment, AssignmentBaseline, Baseline, ConstraintType, LagFormat, LagKind, LagUnit,
     LinkType, Predecessor, Project, Resource, ResourceBaseline, ResourceType, Task, TaskType,
-    TimephasedValue,
+    TimephasedValue, outline_numbers,
 };
 use crate::schedule::{Leveled, Schedule, level, schedule};
 
@@ -388,6 +388,7 @@ impl Editor {
         let mut next = self.proj.clone();
         edit(&mut next);
         links::follow_outline(&self.proj.tasks, &mut next.tasks)?;
+        renumber_wbs(&self.proj.tasks, &mut next.tasks);
         recompute_summaries(&mut next);
         if let Some(error) = crate::schedule::calendar_error(&next) {
             return Err(error);
@@ -1892,6 +1893,42 @@ fn format_after(stored: Option<u8>, code: u8, estimated: bool) -> Option<u8> {
 fn recompute_summaries(proj: &mut Project) {
     for i in 0..proj.tasks.len() {
         proj.tasks[i].summary = proj.is_outline_summary(i);
+    }
+}
+
+/// Renumber the stored WBS codes a structural edit moved. A stored code that
+/// equals the task's outline number before the edit is treated as generated
+/// (whatever the plan's mask) and follows the task's new outline number, so
+/// the WBS field and a save show it and a task the edit added cannot collide
+/// with it. A stored code that differs from the old outline number — an
+/// explicit override, or a masked code like `PRJ-01.02` — stays as the plan
+/// holds it. A numeric override that equals its outline number is
+/// indistinguishable from a generated code and is renumbered too; telling
+/// the two apart would need per-task tracking we do not keep. Undo needs
+/// nothing here: it swaps whole-project snapshots. `wbs_level` is not
+/// touched.
+fn renumber_wbs(old: &[Task], new: &mut [Task]) {
+    // With no row's uid, blank state or level changed, no outline number
+    // did (the rows `follow_outline` already judged by).
+    if links::same_outline(old, new) {
+        return;
+    }
+    // Key the old outline numbers by uid: a uid the edit added has no old
+    // number, and a blank row has none, so neither is renumbered.
+    let old_numbers = outline_numbers(old);
+    let new_numbers = outline_numbers(new);
+    let old_number_of: std::collections::HashMap<i32, Option<&str>> = old
+        .iter()
+        .zip(old_numbers.iter())
+        .map(|(t, n)| (t.uid, n.as_deref()))
+        .collect();
+    for (t, n) in new.iter_mut().zip(new_numbers.iter()) {
+        let Some(code) = &t.wbs else { continue };
+        if old_number_of.get(&t.uid) == Some(&Some(code.as_str())) {
+            if let Some(number) = n {
+                t.wbs = Some(number.clone());
+            }
+        }
     }
 }
 

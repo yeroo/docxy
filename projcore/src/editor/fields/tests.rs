@@ -645,6 +645,96 @@ fn the_project_summary_row_reads_its_rollup_and_stored_values() {
 #[test]
 fn wbs_is_the_stored_code_else_the_live_outline_number() {
     let tasks = vec![
+        task(1, "A", 480),
+        Task {
+            wbs: Some("2".into()),
+            ..task(2, "B", 480)
+        },
+        task(3, "C", 480),
+        Task {
+            wbs: Some("ABC.42".into()),
+            ..task(4, "D", 480)
+        },
+    ];
+    let mut ed = editor(tasks);
+    assert_eq!(read(&ed, 1, "WBS").text, "1");
+    assert_eq!(read(&ed, 2, "WBS").text, "2");
+    assert_eq!(read(&ed, 3, "WBS").text, "3");
+    assert_eq!(read(&ed, 4, "WBS").text, "ABC.42");
+    // Indents move the outline numbers. A stored code that is the task's
+    // outline number renumbers with it; a task without one reads its live
+    // number; an explicit override stays as the plan holds it (a save
+    // writes it unchanged).
+    ed.indent(2, 1).unwrap();
+    ed.indent(3, 1).unwrap();
+    assert_eq!(read(&ed, 1, "WBS").text, "1");
+    assert_eq!(read(&ed, 2, "WBS").text, "1.1");
+    assert_eq!(read(&ed, 3, "WBS").text, "1.2");
+    assert_eq!(read(&ed, 4, "WBS").text, "ABC.42");
+}
+
+#[test]
+fn delete_renumbers_generated_wbs_and_undo_restores_it() {
+    let tasks = vec![
+        task(1, "A", 480),
+        task(2, "B", 480),
+        Task {
+            wbs: Some("3".into()),
+            ..task(3, "C", 480)
+        },
+        task(4, "D", 480),
+    ];
+    let mut ed = editor(tasks);
+    ed.delete_task(2).unwrap();
+    // The delete moved C from outline 3 to outline 2, and its stored
+    // generated code followed it.
+    assert_eq!(read(&ed, 3, "WBS").text, "2");
+    assert_eq!(read(&ed, 4, "WBS").text, "3");
+    // Undo is a whole-project snapshot: every stored code comes back exactly.
+    assert!(ed.undo());
+    assert_eq!(read(&ed, 2, "WBS").text, "2");
+    assert_eq!(read(&ed, 3, "WBS").text, "3");
+    assert_eq!(read(&ed, 4, "WBS").text, "4");
+}
+
+#[test]
+fn added_and_inserted_tasks_never_collide_with_a_generated_wbs() {
+    let tasks = vec![
+        task(1, "A", 480),
+        Task {
+            wbs: Some("2".into()),
+            ..task(2, "B", 480)
+        },
+    ];
+    let mut ed = editor(tasks);
+    // A task added above a stored-code row takes its outline number; the
+    // stored code renumbers after it.
+    let at = ed.add_task(Some(1), "Added", 480, false).unwrap();
+    let added = ed.project().tasks[at].uid;
+    ed.insert_blank_row(Some(2)).unwrap();
+    // Typing into the blank row gives it the level of the row above and a
+    // fresh outline number.
+    let blank = ed.project().tasks[2].uid;
+    ed.rename(blank, "Typed").unwrap();
+    assert_eq!(read(&ed, added, "WBS").text, "2");
+    assert_eq!(read(&ed, blank, "WBS").text, "3");
+    assert_eq!(read(&ed, 2, "WBS").text, "4");
+    let wbs: Vec<String> = ed
+        .project()
+        .tasks
+        .iter()
+        .filter(|t| !t.is_null)
+        .map(|t| read(&ed, t.uid, "WBS").text)
+        .collect();
+    let mut distinct = wbs.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct, wbs, "a WBS collides with another row's");
+}
+
+#[test]
+fn a_rename_leaves_stored_wbs_alone() {
+    let tasks = vec![
         Task {
             wbs: Some("ABC.42".into()),
             ..task(1, "A", 480)
@@ -653,19 +743,56 @@ fn wbs_is_the_stored_code_else_the_live_outline_number() {
             wbs: Some("2".into()),
             ..task(2, "B", 480)
         },
+    ];
+    let mut ed = editor(tasks);
+    // A non-structural edit renumbers nothing: the override and the stored
+    // generated code read exactly as before.
+    ed.rename(1, "Renamed").unwrap();
+    ed.set_duration(2, "2d").unwrap();
+    assert_eq!(read(&ed, 1, "WBS").text, "ABC.42");
+    assert_eq!(read(&ed, 2, "WBS").text, "2");
+}
+
+#[test]
+fn a_code_that_differs_from_the_outline_number_is_never_renumbered() {
+    // A stored code that differs from the task's outline number — an
+    // explicit override, or a masked code like PRJ-01.02 — is kept by a
+    // structural edit; the plan's mask is not parsed.
+    let tasks = vec![
+        task(1, "A", 480),
+        Task {
+            wbs: Some("PRJ-01.02".into()),
+            ..task(2, "B", 480)
+        },
         task(3, "C", 480),
     ];
     let mut ed = editor(tasks);
-    assert_eq!(read(&ed, 1, "WBS").text, "ABC.42");
-    assert_eq!(read(&ed, 3, "WBS").text, "3");
-    // Indents move the outline numbers. A stored code stays as the plan
-    // holds it (a save writes it unchanged); a task without one reads its
-    // live number.
     ed.indent(2, 1).unwrap();
     ed.indent(3, 1).unwrap();
-    assert_eq!(read(&ed, 2, "WBS").text, "2");
-    assert_eq!(read(&ed, 3, "WBS").text, "1.2");
-    assert_eq!(read(&ed, 1, "WBS").text, "ABC.42");
+    assert_eq!(read(&ed, 2, "WBS").text, "PRJ-01.02");
+    assert!(ed.undo());
+    assert_eq!(read(&ed, 2, "WBS").text, "PRJ-01.02");
+}
+
+#[test]
+fn a_save_holds_the_renumbered_wbs() {
+    let tasks = vec![
+        task(1, "A", 480),
+        Task {
+            wbs: Some("2".into()),
+            ..task(2, "B", 480)
+        },
+    ];
+    let mut ed = editor(tasks);
+    ed.indent(2, 1).unwrap();
+    let xml = crate::mspdi::write_mspdi(ed.project());
+    assert!(
+        xml.contains("<WBS>1.1</WBS>"),
+        "the save holds the renumbered code: {xml}"
+    );
+    // Reopened, the renumbered code is the stored one and reads as itself.
+    let reopened = Editor::new(crate::mspdi::read_mspdi(&xml).unwrap());
+    assert_eq!(read(&reopened, 2, "WBS").text, "1.1");
 }
 
 #[test]

@@ -32,8 +32,9 @@ pub(super) fn follow_outline(prev: &[Task], next: &mut [Task]) -> Result<(), Str
 }
 
 /// Whether the rows, their blank state and levels are the same. Only a fast
-/// path: links are judged one by one when the outline changed.
-fn same_outline(a: &[Task], b: &[Task]) -> bool {
+/// path: links are judged one by one when the outline changed. `renumber_wbs`
+/// answers with it too.
+pub(super) fn same_outline(a: &[Task], b: &[Task]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
             (x.uid, x.is_null, x.outline_level) == (y.uid, y.is_null, y.outline_level)

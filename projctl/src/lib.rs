@@ -262,7 +262,12 @@ fn task_json(
         ("name", Json::Str(t.name.clone())),
         ("level", Json::Num(t.outline_level as f64)),
         ("summary", Json::Bool(t.summary)),
-        ("milestone", Json::Bool(t.is_milestone())),
+        // The Milestone field, not Task::is_milestone: a summary whose stored
+        // duration is 0 is no milestone, as the field and the grid read it.
+        (
+            "milestone",
+            Json::Bool(reader.read(t, Field::Milestone).value == FieldValue::Bool(true)),
+        ),
         ("manual", Json::Bool(t.manual)),
         (
             "duration_days",
@@ -1381,6 +1386,57 @@ mod tests {
             field(hit, "Start"),
             ("2026-03-03", &Json::Str("2026-03-03 08:00".into()))
         );
+    }
+
+    #[test]
+    fn milestone_key_agrees_with_the_milestone_field() {
+        let mut p = new_project();
+        // A summary whose stored duration is 0: the Milestone field reads No.
+        p.tasks.push(Task {
+            uid: 2,
+            id: 2,
+            name: "Phase".into(),
+            outline_level: 1,
+            duration_min: 0,
+            summary: true,
+            ..Task::default()
+        });
+        p.tasks.push(Task {
+            uid: 3,
+            id: 3,
+            name: "Work".into(),
+            outline_level: 2,
+            duration_min: 480,
+            ..Task::default()
+        });
+        // A zero-length leaf: the field reads Yes.
+        p.tasks.push(Task {
+            uid: 4,
+            id: 4,
+            name: "Flag".into(),
+            outline_level: 1,
+            duration_min: 0,
+            ..Task::default()
+        });
+        let mut ed = Editor::new(p);
+        for (uid, milestone) in [(2, false), (4, true)] {
+            let r = call(
+                &mut ed,
+                "task.get",
+                vec![
+                    ("uid", Json::Num(uid as f64)),
+                    ("fields", names(&["Milestone"])),
+                ],
+            )
+            .unwrap();
+            let shown = if milestone { "Yes" } else { "No" };
+            assert_eq!(
+                r.get("milestone"),
+                Some(&Json::Bool(milestone)),
+                "uid {uid}"
+            );
+            assert_eq!(field(&r, "Milestone"), (shown, &Json::Bool(milestone)));
+        }
     }
 
     #[test]
