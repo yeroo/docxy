@@ -350,6 +350,14 @@ cargo test -p gridcore --test fidelity -- --nocapture
   another cell is NEW, and so is a changed formula filed where only
   re-serialization is baselined.
 
+  Two more findings judge the saved worksheet alone, whatever the original
+  said (#1152), and no loss class claims them, so they always fail:
+  - `/cols/<letters or range>/no-width`: a `<col>` with no `width`, which
+    Excel opens zero wide. The column comparison above reads it as no
+    `<col>` at all, so it would miss one;
+  - `/cols/<letters or range>/overlap`: a `<col>` starting at or before the
+    end of the one before it (a duplicate, an overlap, or one out of order).
+
   The structural findings the check covers are dropped. Covered are:
   - all of `<cols>`;
   - a lost or extra `<c>` whose attributes are within `r`, `s` and `t` and

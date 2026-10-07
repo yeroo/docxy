@@ -429,10 +429,13 @@ pub struct ColDef {
     pub width: Option<f64>,
     /// Raw leftover attributes (everything but min/max/width/customWidth).
     pub attrs: String,
-    /// Made in this session for a column no definition covered (to hold an
-    /// outline level or a hide), not loaded: saved with the sheet's default
-    /// width, since Excel reads a `<col>` with no width as zero wide. A
-    /// loaded definition without a width is written back without one.
+    /// At the sheet's default width (`width` is `None`): a loaded `<col>`
+    /// whose width is the default and not marked custom, or one made in
+    /// this session for a column no definition covered (to hold an outline
+    /// level or a hide). Saved with the default width and no `customWidth`,
+    /// like every definition without a width, since Excel reads a `<col>`
+    /// with no width as zero wide. A loaded `<col>` without a width loads
+    /// as `Some(0.0)`, as Excel shows it (#1152).
     pub default_width: bool,
 }
 
