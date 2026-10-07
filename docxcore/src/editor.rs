@@ -170,24 +170,62 @@ struct Snapshot {
 
 /// Formatting toggled at an insertion point (Ctrl+B with nothing
 /// selected, #854): what the next character typed there takes, as Word
-/// does. Each toggle is a setter and the value it sets, applied in order
-/// over the props the character would get anyway.
+/// does, set over the props the character would get anyway.
 #[derive(Clone)]
 struct PendingFormat {
     caret: Caret,
     /// The toggle's own undo step. Any later step, from whatever edit,
     /// leaves the toggles behind.
     serial: Option<u64>,
-    toggles: Vec<Toggle>,
+    /// The value each property is toggled to, by [`ToggleProp`]: one slot
+    /// each, however often it is toggled.
+    toggles: [Option<bool>; ToggleProp::ALL.len()],
 }
-
-/// A run property's setter and the value a toggle sets it to.
-type Toggle = (fn(&mut RunProps, bool), bool);
 
 impl PendingFormat {
     fn apply(&self, props: &mut RunProps) {
-        for (set, value) in &self.toggles {
-            set(props, *value);
+        for prop in ToggleProp::ALL {
+            if let Some(value) = self.toggles[prop as usize] {
+                prop.set()(props, value);
+            }
+        }
+    }
+}
+
+/// A run property Bold, Italic, Underline or Strike toggles.
+#[derive(Clone, Copy)]
+enum ToggleProp {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+}
+
+impl ToggleProp {
+    const ALL: [ToggleProp; 4] = [
+        ToggleProp::Bold,
+        ToggleProp::Italic,
+        ToggleProp::Underline,
+        ToggleProp::Strike,
+    ];
+
+    fn get(self) -> fn(&RunProps) -> bool {
+        match self {
+            ToggleProp::Bold => |p| p.bold,
+            ToggleProp::Italic => |p| p.italic,
+            // Not the cue a tracked change is drawn with (see
+            // `Editor::toggle_underline`).
+            ToggleProp::Underline => RunProps::user_underline,
+            ToggleProp::Strike => RunProps::user_strike,
+        }
+    }
+
+    fn set(self) -> fn(&mut RunProps, bool) {
+        match self {
+            ToggleProp::Bold => |p, v| p.bold = v,
+            ToggleProp::Italic => |p, v| p.italic = v,
+            ToggleProp::Underline => RunProps::set_user_underline,
+            ToggleProp::Strike => RunProps::set_user_strike,
         }
     }
 }
@@ -1729,21 +1767,21 @@ impl Editor {
     // ---- formatting ----
 
     pub fn toggle_bold(&mut self) {
-        self.toggle_run_prop(|p| p.bold, |p, v| p.bold = v);
+        self.toggle_run_prop(ToggleProp::Bold);
     }
     pub fn toggle_italic(&mut self) {
-        self.toggle_run_prop(|p| p.italic, |p, v| p.italic = v);
+        self.toggle_run_prop(ToggleProp::Italic);
     }
     /// Underline over the selection. The underline a tracked insertion is drawn
     /// with is a display cue, not the user's: it does not count as "already
     /// underlined", and an explicit underline replaces it (so it is saved).
     pub fn toggle_underline(&mut self) {
-        self.toggle_run_prop(RunProps::user_underline, RunProps::set_user_underline);
+        self.toggle_run_prop(ToggleProp::Underline);
     }
     /// Strike over the selection, as [`Editor::toggle_underline`] treats the
     /// cue of a tracked deletion.
     pub fn toggle_strike(&mut self) {
-        self.toggle_run_prop(RunProps::user_strike, RunProps::set_user_strike);
+        self.toggle_run_prop(ToggleProp::Strike);
     }
 
     /// Run properties at the caret (used for toggles and the ribbon's
@@ -2157,11 +2195,12 @@ impl Editor {
     ///
     /// With nothing selected it switches the property for the next character
     /// typed at the caret instead, as an undo step of its own (#854).
-    fn toggle_run_prop(&mut self, get: fn(&RunProps) -> bool, set: fn(&mut RunProps, bool)) {
+    fn toggle_run_prop(&mut self, prop: ToggleProp) {
+        let (get, set) = (prop.get(), prop.set());
         let spans = self.selection_spans();
         if spans.is_empty() {
             if !self.has_selection() {
-                self.toggle_at_caret(get, set);
+                self.toggle_at_caret(prop);
             }
             return;
         }
@@ -2184,13 +2223,10 @@ impl Editor {
         self.doc.initialize_revision_targets();
     }
 
-    fn toggle_at_caret(&mut self, get: fn(&RunProps) -> bool, set: fn(&mut RunProps, bool)) {
-        let value = !get(&self.caret_props());
-        let mut toggles = self
-            .pending_format()
-            .map(|p| p.toggles.clone())
-            .unwrap_or_default();
-        toggles.push((set, value));
+    fn toggle_at_caret(&mut self, prop: ToggleProp) {
+        let value = !prop.get()(&self.caret_props());
+        let mut toggles = self.pending_format().map(|p| p.toggles).unwrap_or_default();
+        toggles[prop as usize] = Some(value);
         // The step holds the state before the toggle, pending format and all.
         self.checkpoint(EditKind::Structural);
         let pending = PendingFormat {
@@ -4579,6 +4615,34 @@ mod tests {
                 .expect("x is in a plain run outside the link");
             assert_eq!(x, want, "text typed after the tab");
         }
+    }
+
+    /// Toggling at the caret over and over keeps one slot per property, so
+    /// the pending format (which every undo step copies) stays the same
+    /// size, and still types what the last toggles say (#854 r1).
+    #[test]
+    fn repeated_toggles_at_the_caret_stay_one_slot_each_854() {
+        let mut ed = selected(vec![run("Abc", RunProps::default())], 3, 3);
+        ed.anchor = None;
+        ed.toggle_italic();
+        for _ in 0..1000 {
+            ed.toggle_bold();
+        }
+        let pending = ed.pending_format().expect("italic is still toggled on");
+        assert_eq!(pending.toggles, [Some(false), Some(true), None, None]);
+        ed.insert_char('x');
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!("a paragraph");
+        };
+        let x = p
+            .content
+            .iter()
+            .find_map(|i| match i {
+                Inline::Run(r) if r.text == "x" => Some(&r.props),
+                _ => None,
+            })
+            .expect("x is a run of its own");
+        assert!(x.italic && !x.bold, "{x:?}");
     }
 
     /// An editor over one paragraph holding `content`, with `[start, end)`
