@@ -367,8 +367,8 @@ blank row and the entry row alone. A task added with Task › Insert
 day, estimated unless the plan's `NewTasksEstimated` is off, and with the plan's
 `Autolink` on (the default) it is linked into the finish-to-start chain it
 splits: A→B becomes A→N→B, N→B keeping the lag. Alt+Shift+Right/Left
-indent/outdent; Alt+Right/Left pan the Gantt and Alt+Home moves it back to
-the project start, as in Project;
+indent/outdent; Alt+Right/Left pan the Gantt and Alt+Home / Alt+End move it
+to the project start / finish, as in Project;
 Ctrl+Shift+L toggles leveling. Ctrl+F2 links the selected task (it opens
 the Predecessor prompt, as Task › Schedule › Link Tasks does) and
 Ctrl+Shift+F2 removes its links, as Project does. Ctrl+F, F3, Ctrl+Z/Y/S/E
@@ -403,8 +403,8 @@ on a Project. docxy's extras have no ribbon
 button: rename and set durations in the cells (yppxy: Enter/F2 and `d`),
 delete a task with Delete on its ID or the row menu's Delete Task (yppxy `x`), clear resources with Delete
 on Resource Names (yppxy: Assign with an empty name), export with Ctrl+E or
-File › Export, and scroll the Gantt with Alt+Left/Right and Alt+Home (yppxy
-h/l and Alt+Home). The Report tab stays, with no groups yet.
+File › Export, and scroll the Gantt with Alt+Left/Right and Alt+Home / Alt+End (yppxy
+h/l and Alt+Home / Alt+End). The Report tab stays, with no groups yet.
 
 Ctrl+K (and a task row's menu › Hyperlink..., enabled like Information...)
 opens one prompt on the selected task: prefilled from its stored link as

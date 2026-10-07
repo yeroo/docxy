@@ -377,11 +377,12 @@ struct App {
     // vim mode
     vim: bool,
     // geometry recorded during draw for mouse hit-testing
-    list_y0: u16,     // absolute y of the first task row
-    list_x0: u16,     // absolute x of the task pane's inner area
-    list_left_w: u16, // width of the task pane (left of the gantt)
-    gantt_x0: u16,    // absolute x where the gantt inner area begins
-    screen_w: u16,    // terminal width, for the tab-strip Theme button
+    list_y0: u16,      // absolute y of the first task row
+    list_x0: u16,      // absolute x of the task pane's inner area
+    list_left_w: u16,  // width of the task pane (left of the gantt)
+    gantt_x0: u16,     // absolute x where the gantt inner area begins
+    gantt_cols: usize, // inner width of the gantt in columns; 0 before the first draw
+    screen_w: u16,     // terminal width, for the tab-strip Theme button
     /// The status line's `New Tasks: …` segment: its row and end column.
     new_tasks_hit: Option<(u16, u16)>,
 }
@@ -442,6 +443,7 @@ impl App {
             list_x0: 0,
             list_left_w: 0,
             gantt_x0: 0,
+            gantt_cols: 0,
             screen_w: 0,
             new_tasks_hit: None,
             vim,
@@ -1505,6 +1507,21 @@ fn on_key(app: &mut App, k: KeyEvent) {
         app.hscroll = 0;
         return;
     }
+    // Project's Alt+End: the timescale to the project finish, the mirror of
+    // Alt+Home — the finish day becomes the last visible gantt column.
+    // Always consumed, before the plain End arm (which selects the last
+    // task): with no drawn gantt there is no column geometry to align, so
+    // the scroll is skipped rather than guessing an offset that would
+    // scroll the finish day out of view. A plan narrower than the viewport
+    // clamps at the left edge, as the suite's clamp_offsets does.
+    if alt && k.code == KeyCode::End {
+        if app.gantt_cols > 0 {
+            let origin = gantt_origin_day(app);
+            let finish = app.ed.disp_project_finish().day_number();
+            app.hscroll = (finish - origin - app.gantt_cols as i64 + 1).max(0);
+        }
+        return;
+    }
 
     // Ctrl combinations first, so plain-letter shortcuts don't shadow them.
     if ctrl {
@@ -1840,6 +1857,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
     app.list_y0 = left.y + 2; // border + column-header row
     app.list_x0 = left.x + 1; // border
     app.gantt_x0 = right.x + 1;
+    app.gantt_cols = right.width.saturating_sub(2) as usize; // the `gw` the scale and bars draw at
 
     // visible task rows (inner height minus borders and the column-header row)
     let inner_h = left.height.saturating_sub(3) as usize; // 2 border + 1 header
@@ -3239,6 +3257,66 @@ mod tests {
         on_key(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         assert_eq!(app.ed.sel(), 0);
         assert_eq!(app.hscroll, 5, "plain Home leaves the timescale");
+    }
+
+    /// Project's Alt+End: the timescale to the project finish, the mirror of
+    /// Alt+Home — the finish day becomes the last visible gantt column and the
+    /// selection stays. Plain End still selects the last task and leaves the
+    /// timescale.
+    #[test]
+    fn alt_end_goes_to_finish() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        // A plan wider than the 40-column viewport, so the scroll has room.
+        app.set_duration("60d");
+        app.gantt_cols = 40;
+        on_key(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        let (origin, finish) = (
+            gantt_origin_day(&app),
+            app.ed.disp_project_finish().day_number(),
+        );
+        on_key(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::ALT));
+        assert_eq!(
+            app.hscroll,
+            finish - origin - 40 + 1,
+            "the finish day is the last visible column"
+        );
+        assert!(app.hscroll > 0);
+        assert_eq!(app.ed.sel(), 0, "the selection stays");
+        on_key(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.ed.sel(), app.ed.visible_rows().len() - 1);
+        assert_eq!(
+            app.hscroll,
+            finish - origin - 40 + 1,
+            "plain End leaves the timescale"
+        );
+    }
+
+    /// With no drawn gantt there is no column geometry to align, so Alt+End
+    /// before the first draw leaves the timescale alone rather than guessing
+    /// an offset that would scroll the finish day out of view. The chord is
+    /// still consumed: it must not fall through to plain End, which would
+    /// move the selection.
+    #[test]
+    fn alt_end_before_the_first_draw_leaves_the_timescale() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        on_key(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        app.hscroll = 5;
+        on_key(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::ALT));
+        assert_eq!(app.hscroll, 5);
+        assert_eq!(app.ed.sel(), 0, "Alt+End is consumed, not plain End");
+    }
+
+    /// A plan narrower than the viewport has nothing to scroll: Alt+End
+    /// clamps at the left edge, as the suite's `clamp_offsets` does.
+    #[test]
+    fn alt_end_on_a_narrow_plan_clamps_to_zero() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        app.gantt_cols = 200;
+        on_key(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::ALT));
+        assert_eq!(app.hscroll, 0);
     }
 
     /// Report has no groups (#370) but is still a tab you can select: Enter

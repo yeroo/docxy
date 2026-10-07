@@ -47,6 +47,8 @@ pub(crate) enum ProjectAct {
     ScrollRight,
     /// Alt+Home: the timescale back to the project start.
     GoToStart,
+    /// Alt+End: the timescale to the project finish.
+    GoToFinish,
     /// The status bar's `New Tasks: …` item: the plan's mode for new tasks.
     NewTasksMode,
     Save,
@@ -710,7 +712,7 @@ impl ProjectView {
 }
 
 /// Whether an Alt chord is one of Project's own keys (Alt+Left/Right,
-/// Alt+Home, Alt+Shift+arrows and ±). Those reach the Project surface even
+/// Alt+Home/End, Alt+Shift+arrows and ±). Those reach the Project surface even
 /// while KeyTips are up: pressing Alt starts KeyTips, and none of these keys
 /// is a KeyTip letter, so the overlay would otherwise swallow them.
 pub(crate) fn project_alt_key(key: &str, m: Modifiers) -> bool {
@@ -737,6 +739,8 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
             ("left", false) => Some(ScrollLeft),
             // Project: move the timescale to the project start.
             ("home", false) => Some(GoToStart),
+            // Project: move the timescale to the project finish.
+            ("end", false) => Some(GoToFinish),
             _ => None,
         };
     }
@@ -1452,6 +1456,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 v.pan_gantt(true);
             }
             GoToStart => v.gantt_x.set(0.),
+            GoToFinish => v.scroll_to_finish(),
             ShowSubtasks => {
                 if let Some(uid) = v.selected_uid() {
                     v.ed.set_collapsed(uid, false)?;

@@ -16,3 +16,7 @@ test project timeline highlights the chart's visible range and follows its scrol
   key alt+home
   assert timeline_view_start is Mon 1/5/26
   shot window
+  # Project's Alt+End: the timescale to the project finish.
+  key alt+end
+  assert timeline_view_finish is Fri 3/27/26
+  shot window

@@ -661,7 +661,7 @@ the chart shows (a day partly in view counts), clamped to that span; they are
 what the Timeline's view box covers. Dragging the box scrolls the chart.
 `pointer-drag` drives drags by region endpoints, not the box's own
 coordinates, so cases move the chart with keys (Task › Editing › Scroll to
-Task, and Alt+Home for the project start) instead.
+Task, and Alt+Home / Alt+End for the project start / finish) instead.
 
 Project cells use Enter/F2 or a double-click to edit the current value; typing
 any printable character replaces it. Left/Right move between columns, and
@@ -687,7 +687,7 @@ refused), and Task Mode becomes the plan's mode for new tasks. On ID, Start and
 Finish it reports `<column> can't be cleared` and never deletes the task; on a
 blank row or the entry row it does nothing. Alt+Shift+Right/Left
 indent/outdent, Alt+Right/Left pan the Gantt,
-Alt+Home moves it back to the project start, and Ctrl+Shift+L toggles leveling.
+Alt+Home / Alt+End move it to the project start / finish, and Ctrl+Shift+L toggles leveling.
 Ctrl+F2 opens the Predecessor prompt (Task › Schedule › Link Tasks, screentip
 Link the Selected Tasks) and Ctrl+Shift+F2 removes the selected task's links
 (Unlink Tasks) as one undo step. Former bare-letter commands
@@ -695,7 +695,7 @@ Link the Selected Tasks) and Ctrl+Shift+F2 removes the selected task's links
 baseline commands are on the ribbon under Project's names; renaming and
 durations are cell edits, and there is no ribbon Delete Task, Clear Resources,
 Export Gantt, Scroll Left/Right or Go to Start (Project has none): use Delete on
-the ID or Resource Names cell, Ctrl+E, Alt+Left/Right and Alt+Home.
+the ID or Resource Names cell, Ctrl+E, Alt+Left/Right and Alt+Home / Alt+End.
 Predecessors in cells use **displayed IDs** (a cross-project link shows its
 external reference). Ctrl+F
 opens Find; F3 repeats and reveals the selected row. Ctrl+Z/Y undo/redo, Ctrl+S
