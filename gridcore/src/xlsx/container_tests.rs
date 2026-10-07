@@ -148,7 +148,7 @@ fn with_directory_entries() -> Vec<u8> {
         parts.insert(i * 2, (dir.into(), Vec::new()));
     }
     dirs.into_iter()
-        .fold(write_zip(&parts), |zip, dir| deflate_method(zip, dir))
+        .fold(write_zip(&parts), deflate_method)
 }
 
 /// #1156: a directory entry is no part, so a save does not write it back as
