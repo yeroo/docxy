@@ -11,9 +11,3 @@
 
 # vbottom_inset at 200% is 323, the case expects 241.
 doc-rulers.uit | ruler positions follow the document geometry at 100 and 200 percent | #808
-
-# The refusal now also lists recover-text.
-open-modes.uit | open refuses an unknown mode and enable-editing outside Protected View | #976
-
-# Table Design moved from tab 7, so a path under it no longer exists (an ERROR step).
-word-tables.uit | design tab styles, options, shading and borders (648) | #976 | error
