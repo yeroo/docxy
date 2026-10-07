@@ -37,6 +37,7 @@ use std::process::ExitCode;
 // for the `impl backstage::BackstageHost for App` call sites below.
 use backstage::BackstageHost as _;
 
+use docxcore::autocorrect::{AutoCorrectOptions, BuiltinFixes, ListKind};
 use docxcore::compare::{CompareOptions, CompareResult, CompareSkip, compare_packages};
 use docxcore::editor::{Caret, Clip, Editor, FoundMatch, TrackAuthor};
 use docxcore::export::{PdfOptions, to_pdf};
@@ -6456,8 +6457,27 @@ impl App {
                     self.after_edit();
                 }
             }
+            // Typed with AutoCorrect and AutoFormat as Word's defaults, each
+            // correction its own undo step (#856). An automatic list changes
+            // formatting, so it needs that allowed too.
             KeyCode::Char(c) if !ctrl => {
-                self.editor.insert_char(c);
+                let lists = self
+                    .authorize_mutation(protection::MutationKind::Formatting)
+                    .is_ok();
+                let pkg = &mut self.pkg;
+                let mut listed = false;
+                self.editor.type_autocorrected(
+                    c,
+                    &AutoCorrectOptions::default(),
+                    &BuiltinFixes,
+                    &mut |kind| {
+                        listed = lists;
+                        lists.then(|| pkg.ensure_list(kind == ListKind::Bullet))
+                    },
+                );
+                if listed {
+                    self.reparse_numbering();
+                }
                 self.after_edit();
             }
             // Shift+Enter: a manual line break inside the paragraph, typed
@@ -14699,6 +14719,50 @@ mod tests {
         assert_eq!(body_paragraphs(&app), ["hello \t"]);
         app.on_key(ctrl(KeyCode::Char('z')));
         assert_eq!(body_paragraphs(&app), ["hello world"]);
+    }
+
+    #[test]
+    fn typing_autocorrects_each_fix_its_own_undo_step_856() {
+        let mut app = app_with(&[""]);
+        type_text(&mut app, "teh ");
+        assert_eq!(body_paragraphs(&app), ["The "]);
+        // Nothing to redo straight after a correction.
+        app.on_key(ctrl(KeyCode::Char('y')));
+        assert_eq!(body_paragraphs(&app), ["The "]);
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(body_paragraphs(&app), ["the "]);
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(body_paragraphs(&app), ["teh "]);
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(body_paragraphs(&app), [""]);
+    }
+
+    #[test]
+    fn one_space_starts_a_numbered_list_856() {
+        let mut app = app_with(&[""]);
+        type_text(&mut app, "1. ");
+        assert_eq!(body_paragraphs(&app), [""]);
+        let Block::Paragraph(p) = &app.editor.doc.body[0] else {
+            panic!("paragraph")
+        };
+        let num_id = p.props.num_id.expect("a list");
+        assert!(app.editor.all_in_list(num_id));
+        assert!(app.pkg.part("word/numbering.xml").is_some());
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(body_paragraphs(&app), ["1. "]);
+        assert!(!app.editor.all_in_list(num_id));
+    }
+
+    #[test]
+    fn locked_formatting_types_no_automatic_list_856() {
+        let mut app = app_with(&[""]);
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+        type_text(&mut app, "1. ");
+        let Block::Paragraph(p) = &app.editor.doc.body[0] else {
+            panic!("paragraph")
+        };
+        assert_eq!(body_paragraphs(&app), ["1. "]);
+        assert_eq!(p.props.num_id, None);
     }
 
     #[test]
