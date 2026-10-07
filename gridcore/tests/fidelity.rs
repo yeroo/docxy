@@ -1823,6 +1823,45 @@ fn a_backslash_latin1_package_is_compared_by_part_and_cell() {
     );
 }
 
+/// #1108 r1: a directory entry written with `\` is a directory too, not a
+/// part the save (which writes it with `/`) lost.
+#[test]
+fn a_backslash_directory_entry_is_no_part() {
+    let types = br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#;
+    let original = package(&[
+        ("[Content_Types].xml", types.to_vec()),
+        ("xl\\media\\", Vec::new()),
+    ]);
+    let saved = package(&[
+        ("[Content_Types].xml", types.to_vec()),
+        ("xl/media/", Vec::new()),
+    ]);
+    assert_eq!(compare_packages(&original, &saved).len(), 0);
+    assert_eq!(parts_identical(&original, &saved), Ok(()));
+}
+
+/// #1108 r1: two entries that differ only in their separators would be one
+/// part; the comparator cannot tell which one a loader read.
+#[test]
+fn entries_that_name_one_part_are_unreadable() {
+    let two = package(&[
+        ("xl/a.xml", b"<a/>".to_vec()),
+        ("xl\\a.xml", b"<b/>".to_vec()),
+    ]);
+    let one = package(&[("xl/a.xml", b"<a/>".to_vec())]);
+    let kinds = |found: Vec<Finding>| found.into_iter().map(|f| f.kind).collect::<Vec<_>>();
+    assert_eq!(kinds(compare_packages(&two, &one)), [Kind::LoadError]);
+    assert_eq!(kinds(compare_packages(&one, &two)), [Kind::PartBytes]);
+    assert!(parts_identical(&two, &one).is_err());
+    // The same name twice is no separator question: as before, the last
+    // entry is the part.
+    let twice = package(&[
+        ("xl/a.xml", b"<b/>".to_vec()),
+        ("xl/a.xml", b"<a/>".to_vec()),
+    ]);
+    assert_eq!(compare_packages(&twice, &one).len(), 0);
+}
+
 #[test]
 fn every_baseline_entry_is_classified() {
     // The gate checks this on every run; here it also runs without the
