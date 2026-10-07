@@ -2,11 +2,16 @@
 //! refresh pivot output regions from current source data through the
 //! columnar query core in [`crate::frame`].
 //!
-//! **Graceful degradation:** pivots using features we don't model — page
-//! filters, hidden items, calculated fields, measures-on-rows — are marked
-//! unsupported and never refreshed; their cached cells stay untouched. On
-//! save every pivot cache gets `refreshOnLoad="1"`, so real Excel rebuilds
-//! the layout from the same definition we computed from.
+//! Refresh applies page filters and hidden items and evaluates calculated
+//! fields. **Graceful degradation:** a pivot we can't model — no location or
+//! data fields, a data field with an unknown aggregation, a non-worksheet
+//! cache source, or several measures on rows next to column fields — is
+//! marked unsupported and never refreshed, and so is one whose source or
+//! fields can't be resolved or whose calculated field doesn't parse; their
+//! cached cells stay untouched. On
+//! save a pivot that was created, edited or refreshed gets
+//! `refreshOnLoad="1"`, so real Excel rebuilds the layout from the same
+//! definition we computed from; an untouched pivot keeps its parts as loaded.
 
 use opccore::xml::{Event, XmlParser};
 
@@ -76,6 +81,10 @@ pub struct Pivot {
     /// Field layout changed in the editor — save must rewrite the
     /// definition part (not just patch the location).
     pub edited: bool,
+    /// Output region recomputed by [`refresh_pivots`] this session — save
+    /// asks Excel to rebuild it (`refreshOnLoad`), since the definition's
+    /// row/column items and the cache still describe the loaded layout.
+    pub refreshed: bool,
     /// Part names, for save-time patching.
     pub part: String,
     pub cache_part: String,
@@ -105,6 +114,7 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
         data_on_rows: false,
         unsupported: false,
         edited: false,
+        refreshed: false,
         part: part.to_string(),
         cache_part: String::new(),
     };
@@ -571,6 +581,7 @@ pub fn refresh_pivots(wb: &mut Workbook) -> RefreshOutcome {
             }
         }
         wb.pivots[i].location = (r1, c1, new_r2, new_c2);
+        wb.pivots[i].refreshed = true;
         out.refreshed += 1;
     }
     out
@@ -887,6 +898,7 @@ mod tests {
                 data_on_rows: false,
                 unsupported: false,
                 edited: false,
+                refreshed: false,
                 part: String::new(),
                 cache_part: String::new(),
             };
@@ -1014,6 +1026,7 @@ mod tests {
             data_on_rows: false,
             unsupported: false,
             edited: false,
+            refreshed: false,
             part: String::new(),
             cache_part: String::new(),
         }

@@ -3476,10 +3476,12 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     // --- tables: geometry, names, columns and conversions reach the parts --
     sync_table_parts(&mut parts, wb);
 
-    // --- pivots: patch the refreshed location, ask Excel to rebuild --------
+    // --- pivots: patch a moved location, ask Excel to rebuild what we laid out
     // Refresh may have grown/shrunk the output region; the location ref must
-    // match what we wrote. refreshOnLoad makes real Excel re-derive its own
-    // layout from the same definition on open.
+    // match what we wrote. A pivot we created, edited or refreshed gets
+    // refreshOnLoad so real Excel re-derives its own layout from the same
+    // definition on open; an untouched one keeps its parts as loaded (#1154),
+    // or Excel would rebuild it with its own captions and lose its state.
     for piv in &wb.pivots {
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == &piv.part) {
             let mut xml = String::from_utf8_lossy(&p.1).into_owned();
@@ -3487,9 +3489,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             if piv.edited {
                 xml = crate::pivot::rewrite_pivot_definition(&xml, piv);
             }
-            let (r1, c1, r2, c2) = piv.location;
-            let full = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
-            p.1 = patch_ref_attr(&xml, "<location", &full).into_bytes();
+            p.1 = patch_pivot_location(&xml, piv.location).into_bytes();
         }
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == &piv.cache_part) {
             let mut xml = String::from_utf8_lossy(&p.1).into_owned();
@@ -3508,7 +3508,10 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
                     xml = patch_worksheet_source_name(&xml, name);
                 }
             }
-            p.1 = set_refresh_on_load(&xml).into_bytes();
+            if piv.edited || piv.refreshed {
+                xml = set_refresh_on_load(&xml);
+            }
+            p.1 = xml.into_bytes();
         }
     }
 
@@ -6577,7 +6580,6 @@ fn chart_space_xml_in(data: &crate::sheet::ChartData, ns: &OoxmlNs) -> String {
     )
 }
 
-/// Replace the `ref="…"` attribute value of the first `prefix` element.
 /// Ensure `refreshOnLoad="1"` on the pivotCacheDefinition root element.
 /// Idempotent, so a second save stays byte-identical.
 fn set_refresh_on_load(xml: &str) -> String {
@@ -7232,6 +7234,22 @@ fn drop_query_table_fields(parts: &mut [(String, Vec<u8>)], part: &str, dropped:
     }
 }
 
+/// Point a pivot definition's `<location ref>` at `rect`; a no-op when it
+/// already names that rect, so a single-cell `ref="A3"` keeps its spelling.
+fn patch_pivot_location(xml: &str, rect: (u32, u32, u32, u32)) -> String {
+    let current = xml
+        .find("<location")
+        .and_then(|el| attr_at(xml, el, "ref"))
+        .and_then(crate::sheet::parse_range_name);
+    if current == Some(rect) {
+        return xml.to_string();
+    }
+    let (r1, c1, r2, c2) = rect;
+    let full = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+    patch_ref_attr(xml, "<location", &full)
+}
+
+/// Replace the `ref="…"` attribute value of the first `prefix` element.
 fn patch_ref_attr(xml: &str, prefix: &str, new_ref: &str) -> String {
     let Some(el) = xml.find(prefix) else {
         return xml.to_string();
@@ -7254,7 +7272,8 @@ fn patch_ref_attr(xml: &str, prefix: &str, new_ref: &str) -> String {
 /// model (namely a `rename_sheet` of the pivot's source sheet, which doesn't
 /// set `edited` and so wouldn't otherwise touch this part). A no-op when the
 /// element or attribute is missing — e.g. a `PivotSource::Table` cache's
-/// `<worksheetSource name="…"/>` has no `sheet` attribute at all.
+/// `<worksheetSource name="…"/>` has no `sheet` attribute at all — or when
+/// it already names `new_sheet`, keeping the original's escaping.
 fn patch_worksheet_source_sheet(xml: &str, new_sheet: &str) -> String {
     let Some(el) = xml.find("<worksheetSource") else {
         return xml.to_string();
@@ -7269,6 +7288,10 @@ fn patch_worksheet_source_sheet(xml: &str, new_sheet: &str) -> String {
     let Some(ve) = xml[vs..].find('"') else {
         return xml.to_string();
     };
+    // Unchanged: keep the original's own escaping of the name.
+    if decode(&xml[vs..vs + ve]) == new_sheet {
+        return xml.to_string();
+    }
     let mut out = xml.to_string();
     out.replace_range(vs..vs + ve, &esc_attr(new_sheet));
     out
@@ -8831,6 +8854,7 @@ impl SheetPackage {
             data_on_rows: false,
             unsupported: false,
             edited: true,
+            refreshed: false,
             part: table_part,
             cache_part,
         });
@@ -15354,20 +15378,28 @@ b",
     /// A minimal two-sheet workbook with a real pivot: Data!A1:C5 sourcing a
     /// row-field/data-field pivot on the second sheet (stale cached output).
     fn pivot_fixture() -> Vec<u8> {
+        let pivot_table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="1" dataCaption="Values"><location ref="A3:B5" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField name="Sum of Sales" fld="2" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>"#;
+        let cache = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource ref="A1:C5" sheet="Data"/></cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"/><cacheField name="Product" numFmtId="0"/><cacheField name="Sales" numFmtId="0"/></cacheFields></pivotCacheDefinition>"#;
+        pivot_fixture_with("Data", pivot_table, cache)
+    }
+
+    /// [`pivot_fixture`]'s workbook with its own pivot table and cache parts
+    /// and source sheet name (as `workbook.xml` spells it).
+    fn pivot_fixture_with(data_sheet: &str, pivot_table: &str, cache: &str) -> Vec<u8> {
         let sheet1 = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="str"><v>Region</v></c><c r="B1" t="str"><v>Product</v></c><c r="C1" t="str"><v>Sales</v></c></row><row r="2"><c r="A2" t="str"><v>East</v></c><c r="B2" t="str"><v>Pen</v></c><c r="C2"><v>10</v></c></row><row r="3"><c r="A3" t="str"><v>West</v></c><c r="B3" t="str"><v>Pad</v></c><c r="C3"><v>20</v></c></row><row r="4"><c r="A4" t="str"><v>East</v></c><c r="B4" t="str"><v>Ink</v></c><c r="C4"><v>30</v></c></row><row r="5"><c r="A5" t="str"><v>West</v></c><c r="B5" t="str"><v>Pen</v></c><c r="C5"><v>40</v></c></row></sheetData></worksheet>"#;
         let sheet2 = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="3"><c r="A3" t="str"><v>Region</v></c><c r="B3" t="str"><v>Sum of Sales</v></c></row><row r="4"><c r="A4" t="str"><v>East</v></c><c r="B4"><v>999</v></c></row><row r="5"><c r="A5" t="str"><v>Grand Total</v></c><c r="B5"><v>999</v></c></row></sheetData></worksheet>"#;
         let sheet2_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>"#;
-        let pivot_table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="1" dataCaption="Values"><location ref="A3:B5" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField name="Sum of Sales" fld="2" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>"#;
-        let cache = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource ref="A1:C5" sheet="Data"/></cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"/><cacheField name="Product" numFmtId="0"/><cacheField name="Sales" numFmtId="0"/></cacheFields></pivotCacheDefinition>"#;
         let styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0"/></cellXfs></styleSheet>"#;
-        let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Report" sheetId="2" r:id="rId2"/></sheets><pivotCaches><pivotCache cacheId="1" r:id="rId5"/></pivotCaches></workbook>"#;
+        let workbook = &format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="{data_sheet}" sheetId="1" r:id="rId1"/><sheet name="Report" sheetId="2" r:id="rId2"/></sheets><pivotCaches><pivotCache cacheId="1" r:id="rId5"/></pivotCaches></workbook>"#
+        );
         let wb_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#;
         let root_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -15378,7 +15410,7 @@ b",
         write_zip(&[
             ("[Content_Types].xml".into(), content_types.into()),
             ("_rels/.rels".into(), root_rels.into()),
-            ("xl/workbook.xml".into(), workbook.into()),
+            ("xl/workbook.xml".into(), workbook.as_str().into()),
             ("xl/_rels/workbook.xml.rels".into(), wb_rels.into()),
             ("xl/worksheets/sheet1.xml".into(), sheet1.into()),
             ("xl/worksheets/sheet2.xml".into(), sheet2.into()),
@@ -15393,6 +15425,77 @@ b",
             ),
             ("xl/styles.xml".into(), styles.into()),
         ])
+    }
+
+    /// The saved part `name` of a reloaded `bytes`, as text.
+    fn saved_part(bytes: &[u8], name: &str) -> String {
+        let pkg = load_xlsx(bytes).unwrap();
+        let b = &pkg.parts.iter().find(|(n, _)| n == name).unwrap().1;
+        String::from_utf8_lossy(b).into_owned()
+    }
+
+    /// An unedited save keeps a pivot's parts byte for byte (#1154): no
+    /// `refreshOnLoad` (Excel would rebuild it with its own captions and drop
+    /// the page-field selection), a single-cell `<location ref>` keeps its
+    /// spelling, and the cache's entity-spelled source sheet stays as written.
+    #[test]
+    fn an_unedited_pivot_saves_its_parts_byte_identical() {
+        let pivot_table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="1" dataCaption="Data" grandTotalCaption="Total Result" rowHeaderCaption="a2"><location ref="A3" firstHeaderRow="1" firstDataRow="1" firstDataCol="1" rowPageCount="1" colPageCount="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField axis="axisPage" showAll="0"><items count="4"><item x="0"/><item x="1"/><item x="2"/><item t="default"/></items></pivotField><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><pageFields count="1"><pageField fld="1" item="2" hier="-1"/></pageFields><dataFields count="1"><dataField name="Sum of Sales" fld="2" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>"#;
+        let cache = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource ref="A1:C5" sheet="Bob&apos;s Data"/></cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"/><cacheField name="Product" numFmtId="0"/><cacheField name="Sales" numFmtId="0"/></cacheFields></pivotCacheDefinition>"#;
+        let bytes = pivot_fixture_with("Bob's Data", pivot_table, cache);
+        let pkg = load_xlsx(&bytes).unwrap();
+        assert_eq!(pkg.workbook.pivots.len(), 1, "the pivot loads");
+        assert_eq!(pkg.workbook.pivots[0].location, (2, 0, 2, 0));
+        let saved = save_xlsx(&pkg);
+        assert_eq!(
+            saved_part(&saved, "xl/pivotTables/pivotTable1.xml"),
+            pivot_table
+        );
+        assert_eq!(
+            saved_part(&saved, "xl/pivotCache/pivotCacheDefinition1.xml"),
+            cache
+        );
+    }
+
+    /// A refreshed pivot asks Excel to rebuild it, but a refresh that keeps
+    /// the region leaves `<location ref>` as loaded.
+    #[test]
+    fn a_refreshed_pivot_keeps_an_unmoved_location_and_sets_refresh_on_load() {
+        // The fixture's data refreshes to A3:B6 (East, West, Grand Total).
+        let pivot_table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="1"><location ref="$A$3:$B$6" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField name="Sum of Sales" fld="2" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>"#;
+        let cache = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource ref="A1:C5" sheet="Data"/></cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"/><cacheField name="Product" numFmtId="0"/><cacheField name="Sales" numFmtId="0"/></cacheFields></pivotCacheDefinition>"#;
+        let mut pkg = load_xlsx(&pivot_fixture_with("Data", pivot_table, cache)).unwrap();
+        let outcome = crate::pivot::refresh_pivots(&mut pkg.workbook);
+        assert_eq!(outcome.refreshed, 1);
+        assert_eq!(pkg.workbook.pivots[0].location, (2, 0, 5, 1));
+        let saved = save_xlsx(&pkg);
+        assert_eq!(
+            saved_part(&saved, "xl/pivotTables/pivotTable1.xml"),
+            pivot_table
+        );
+        let saved_cache = saved_part(&saved, "xl/pivotCache/pivotCacheDefinition1.xml");
+        assert!(
+            saved_cache.contains(r#"refreshOnLoad="1""#),
+            "{saved_cache}"
+        );
+    }
+
+    /// An editor layout edit asks Excel to rebuild the pivot even before
+    /// anything refreshed it.
+    #[test]
+    fn an_edited_pivot_saves_with_refresh_on_load() {
+        let mut pkg = load_xlsx(&pivot_fixture()).unwrap();
+        pkg.workbook.pivots[0].edited = true;
+        let saved = save_xlsx(&pkg);
+        let saved_cache = saved_part(&saved, "xl/pivotCache/pivotCacheDefinition1.xml");
+        assert!(
+            saved_cache.contains(r#"refreshOnLoad="1""#),
+            "{saved_cache}"
+        );
     }
 
     #[test]
@@ -15660,6 +15763,9 @@ b",
         // Save → reload: the created parts parse back into a supported,
         // fully-wired pivot that refreshes to the same values.
         let bytes = save_xlsx(&pkg);
+        // A created pivot asks Excel to lay it out on open.
+        let cache = saved_part(&bytes, &pkg.workbook.pivots[idx].cache_part);
+        assert!(cache.contains(r#"refreshOnLoad="1""#), "{cache}");
         let mut pkg2 = load_xlsx(&bytes).unwrap();
         assert_eq!(pkg2.workbook.pivots.len(), 1);
         let piv = &pkg2.workbook.pivots[0];

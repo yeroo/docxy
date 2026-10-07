@@ -437,11 +437,14 @@ The strategic piece: **conformance is measured, not claimed.**
   sort. Pivot parts (`pivotTableDefinition` + `pivotCacheDefinition`, wired
   through workbook `pivotCaches`) parse read-only into the model, and
   **refresh** recomputes the output region from current source data:
-  `xlsxy --recalc` refreshes headlessly, `F9` refreshes in the TUI, save
-  patches the location ref and sets `refreshOnLoad="1"` so real Excel
-  rebuilds its own layout from the same definition. Pivots using features
-  we don't model — page filters, hidden items, calculated fields,
-  measures-on-rows — are never refreshed (stale-not-wrong). Pivot *editing*
+  `xlsxy --recalc` refreshes headlessly, `F9` refreshes in the TUI; saving
+  a refreshed, edited or created pivot patches a moved location ref and sets
+  `refreshOnLoad="1"` so real Excel rebuilds its own layout from the same
+  definition, while an untouched pivot's parts are saved as loaded. Refresh
+  applies page filters and hidden items and evaluates calculated fields;
+  pivots we don't model — a non-worksheet cache source, several measures on
+  rows next to column fields, a data field or calculated field we can't
+  read, a source we can't resolve — are never refreshed (stale-not-wrong). Pivot *editing*
   shipped too: `Ctrl-P` opens a field editor in the TUI (add fields to
   rows/columns/values, remove them, cycle aggregations) with live refresh
   after every change; save rewrites the edited definition part
