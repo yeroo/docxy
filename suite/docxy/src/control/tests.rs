@@ -516,7 +516,11 @@ fn save_policy_preserves_binding_history_and_source_on_refusal() {
     let (_, effect) = call(&mut tabs, 0, "proj.save", Json::Null).unwrap();
     assert!(effect.repaint && !effect.activity && effect.focus.is_none());
     assert!(!tabs[0].dirty && !view(&tabs[0]).ed.dirty());
-    assert_eq!(view(&tabs[0]).ed.undo_depth(), before.history.0);
+    // A refused save keeps history (above); a successful one clears undo and
+    // redo, as in Project (#863).
+    assert_eq!(before.history, (1, 0));
+    let v = view(&tabs[0]);
+    assert_eq!((v.ed.undo_depth(), v.ed.redo_depth()), (0, 0));
     assert!(view(&tabs[0]).prompt.is_none());
     assert!(!project_tab_from_path(&source).dirty);
     let target = dir.join("converted");
