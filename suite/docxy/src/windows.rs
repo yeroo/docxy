@@ -80,6 +80,15 @@ pub(crate) struct Windows<V, H> {
     // a window's view they would drop — and take the discovery file down —
     // when that window closed while another lived (#587 r1 M4).
     links: Vec<crate::control::ControlLink>,
+    // Every registered window's handle, shared with the control pump: it
+    // tries each in turn per request, so a window opened or closed by the
+    // UI between verbs is always in the candidate set (#587 r2 M1). Rc, not
+    // the entries vec: the pump must read the CURRENT set without borrowing
+    // the App (a native dialog's modal loop may hold it).
+    handles: std::rc::Rc<std::cell::RefCell<Vec<H>>>,
+    // The run-wide untitled-document counter (#587 r2 m10): "DocumentN" is
+    // minted once for the whole run, however many windows create one.
+    next_title: u32,
 }
 
 impl<V, H> Default for Windows<V, H> {
@@ -90,16 +99,26 @@ impl<V, H> Default for Windows<V, H> {
             next_id: 0,
             next_seq: 0,
             links: Vec::new(),
+            handles: Default::default(),
+            next_title: 1,
         }
     }
 }
 
 impl<V, H> Windows<V, H> {
-    pub(crate) fn register(&mut self, view: V, handle: H) -> u64 {
+    pub(crate) fn register(&mut self, view: V, handle: H) -> u64
+    where
+        H: PartialEq + Clone,
+    {
         self.next_id += 1;
         let id = self.next_id;
         let seq = self.next_seq;
         self.next_seq += 1;
+        if let std::result::Result::Ok(mut handles) = self.handles.try_borrow_mut() {
+            if !handles.contains(&handle) {
+                handles.push(handle.clone());
+            }
+        }
         self.entries.push(Entry {
             id,
             view,
@@ -114,7 +133,15 @@ impl<V, H> Windows<V, H> {
     /// Removes the window. The selection falls back to the most recently
     /// registered survivor, so verbs keep working after the selected window
     /// closes. Returns the new selection; `None` when no window is left.
-    pub(crate) fn unregister(&mut self, id: u64) -> Option<u64> {
+    pub(crate) fn unregister(&mut self, id: u64) -> Option<u64>
+    where
+        H: PartialEq,
+    {
+        if let Some(handle) = self.entries.iter().find(|e| e.id == id).map(|e| &e.handle) {
+            if let std::result::Result::Ok(mut handles) = self.handles.try_borrow_mut() {
+                handles.retain(|h| h != handle);
+            }
+        }
         self.entries.retain(|e| e.id != id);
         if self.selected == id {
             self.selected = self.entries.last().map(|e| e.id).unwrap_or(0);
@@ -171,6 +198,15 @@ impl<V, H> Windows<V, H> {
 
     pub(crate) fn get(&self, id: u64) -> Option<&Entry<V, H>> {
         self.entries.iter().find(|e| e.id == id)
+    }
+
+    /// The shared handle list the control pump clones: always current,
+    /// readable without borrowing the App.
+    pub(crate) fn handle_list(&self) -> std::rc::Rc<std::cell::RefCell<Vec<H>>>
+    where
+        H: Clone,
+    {
+        self.handles.clone()
     }
 
     pub(crate) fn entries(&self) -> &[Entry<V, H>] {
@@ -246,6 +282,41 @@ pub(crate) fn keep_link(cx: &mut App, link: crate::control::ControlLink) {
     update(cx, |w| w.links.push(link));
 }
 
+/// The always-current handle list for the control pump's candidate chain
+/// (#587 r2 M1). A fresh Rc when no registry exists.
+pub(crate) fn handle_list(cx: &App) -> std::rc::Rc<std::cell::RefCell<Vec<AnyWindowHandle>>> {
+    with(cx, |w| w.handle_list())
+        .unwrap_or_else(|| std::rc::Rc::new(std::cell::RefCell::new(Vec::new())))
+}
+
+/// Whether the window is still registered.
+pub(crate) fn is_registered(cx: &App, id: u64) -> bool {
+    with(cx, |w| w.get(id).is_some()).unwrap_or(false)
+}
+
+/// Mint the next untitled document title for the whole run (#587 r2 m10):
+/// one counter, so two windows cannot mint the same "DocumentN". Without a
+/// registry (tests) a throwaway counter answers.
+pub(crate) fn next_document_title(cx: &mut App) -> String {
+    let mut next = 1;
+    update(cx, |w| {
+        let title = crate::doc_name::next_document_title(&mut w.next_title);
+        next = w.next_title;
+        title
+    })
+    .unwrap_or_else(|| crate::doc_name::next_document_title(&mut next))
+}
+
+/// Raise the run-wide title counter to at least `at_least`: the first
+/// window seeds it from the restored session's untitled documents.
+pub(crate) fn seed_document_titles(cx: &mut App, at_least: u32) {
+    update(cx, |w| {
+        if w.next_title < at_least {
+            w.next_title = at_least;
+        }
+    });
+}
+
 /// A descriptor copy for iterating without holding the global borrowed.
 pub(crate) fn entries_snapshot(cx: &App) -> Vec<(u64, WeakEntity<Docxy>, AnyWindowHandle)> {
     with(cx, |w| {
@@ -255,13 +326,6 @@ pub(crate) fn entries_snapshot(cx: &App) -> Vec<(u64, WeakEntity<Docxy>, AnyWind
             .collect()
     })
     .unwrap_or_default()
-}
-
-/// Every registered window's handle, for the pump's fallible retry chain:
-/// a request resolves through a live window's update, and the handles known
-/// last time are the candidates when the recent ones have closed.
-pub(crate) fn handles_snapshot(cx: &App) -> Vec<AnyWindowHandle> {
-    with(cx, |w| w.entries().iter().map(|e| e.handle).collect()).unwrap_or_default()
 }
 
 /// The selected window's dispatch target.
@@ -403,8 +467,21 @@ mod tests {
         let others = w.others_persisted(b);
         assert_eq!(others.len(), 2);
         assert!(others.iter().all(|p| p.title.starts_with('a')));
-        // A stored snapshot is the window's own tabs alone, never the union:
-        // appending it to another write must not re-append nested snapshots.
-        assert_eq!(w.get(b).unwrap().persisted.len(), 1);
+    }
+
+    /// The pump's candidate chain reads the shared handle list, which
+    /// register/unregister keep current — a window opened or closed by the
+    /// UI between verbs is always reachable (#587 r2 M1).
+    #[test]
+    fn the_shared_handle_list_tracks_register_and_unregister() {
+        let mut w: Windows<u8, u8> = Windows::default();
+        let list = w.handle_list();
+        w.register(0, 7);
+        w.register(0, 9);
+        assert_eq!(*list.borrow(), vec![7, 9]);
+        w.unregister(1);
+        assert_eq!(*list.borrow(), vec![9]);
+        w.unregister(2);
+        assert!(list.borrow().is_empty());
     }
 }

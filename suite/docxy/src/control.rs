@@ -374,33 +374,26 @@ pub(crate) fn attach_with_dispatch(
     // gpui listener holds the App borrowed, and an infallible borrow there
     // panics (see main's startup comment). `update_window` goes through
     // `try_borrow_mut`, so a busy app gets "busy, try again" — never a
-    // panic. The window this attached on bootstraps the first resolution;
-    // after that the last used handle leads.
+    // panic. The candidates come from the registry's shared handle list, so
+    // a window opened or closed by the UI between verbs is always tried
+    // (#587 r2 M1) — no success-dependent cache.
     let bootstrap = window.window_handle();
+    let handles = windows::handle_list(cx);
     let pump = cx.spawn(async move |cx: &mut AsyncApp| {
-        let mut last: Option<gpui::AnyWindowHandle> = None;
-        // Handles seen at the last successful resolution: the retry chain
-        // when the recent windows have closed.
-        let mut known: Vec<gpui::AnyWindowHandle> = vec![bootstrap];
         while let Ok(req) = pending.recv_async().await {
             let mut resolved = None;
             let mut gone = false;
-            let mut candidates: Vec<gpui::AnyWindowHandle> = Vec::new();
-            for h in last.into_iter().chain(known.iter().copied()) {
-                if !candidates.contains(&h) {
-                    candidates.push(h);
+            let candidates: Vec<gpui::AnyWindowHandle> = {
+                let mut v: Vec<gpui::AnyWindowHandle> = handles.borrow().clone();
+                if !v.contains(&bootstrap) {
+                    v.push(bootstrap);
                 }
-            }
-            if !candidates.contains(&bootstrap) {
-                candidates.push(bootstrap);
-            }
+                v
+            };
             for candidate in candidates {
-                match cx.update_window(candidate, |_, _, cx| {
-                    windows::selected_target(cx).map(|t| (t, windows::handles_snapshot(cx)))
-                }) {
-                    Ok(Some((target, handles))) => {
+                match cx.update_window(candidate, |_, _, cx| windows::selected_target(cx)) {
+                    Ok(Some(target)) => {
                         resolved = Some(target);
-                        known = handles;
                         break;
                     }
                     // The registry is empty: the app is gone.
@@ -414,14 +407,13 @@ pub(crate) fn attach_with_dispatch(
                 }
             }
             let Some(target) = resolved else {
-                req.reply_err(if gone {
+                req.reply_err(if gone || handles.borrow().is_empty() {
                     "the app is gone".to_string()
                 } else {
                     "busy, try again".to_string()
                 });
                 continue;
             };
-            last = Some(target.handle);
             // A verb whose pointer input hit-tests the rendered frame gets a
             // frame drawn from the current state first (#1121), as gpui gives
             // a key-down: mouse dispatch hit-tests `rendered_frame` without

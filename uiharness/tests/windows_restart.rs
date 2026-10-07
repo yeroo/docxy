@@ -54,8 +54,9 @@ fn two_windows_restore_into_one_on_relaunch() {
     let wrote = call(&driver, "autorecover-now", &[]);
     assert_eq!(wrote.get("wrote"), Some(&Json::Bool(true)), "{wrote}");
 
-    // The one session holds BOTH windows' tabs, under distinct sidecar names
-    // (the second window's registry seq offsets its hot index base).
+    // The one session holds BOTH windows' tabs, under distinct sidecar names:
+    // the first window keeps `tab-{i}`, a secondary window namespaces its own
+    // by registry seq (`tab-w{seq}-{i}`), so the files never collide.
     let session =
         Json::parse(&std::fs::read_to_string(sandbox.join("docxy/session.json")).unwrap()).unwrap();
     let tabs = session.get("tabs").and_then(Json::as_array).unwrap();
@@ -184,11 +185,17 @@ fn a_pref_changed_in_one_window_survives_anothers_persist() {
         &[("path", Json::Str(doc.display().to_string()))],
     );
     call(&driver, "window-new", &[]);
+    // A real edit in window 1, so its own persist writes: without the
+    // sharing fix that write carries window 1's stale copy of the setting,
+    // and the session reverts it.
+    call(&driver, "window-select", &[("window", Json::Num(1.))]);
+    call(&driver, "type", &[("text", Json::Str("one".into()))]);
     // The setting changes on window 2; the persist comes from window 1.
     call(&driver, "window-select", &[("window", Json::Num(2.))]);
     call(&driver, "ask-on-close", &[("on", Json::Bool(true))]);
     call(&driver, "window-select", &[("window", Json::Num(1.))]);
-    call(&driver, "autorecover-now", &[]);
+    let wrote = call(&driver, "autorecover-now", &[]);
+    assert_eq!(wrote.get("wrote"), Some(&Json::Bool(true)), "{wrote}");
     let session =
         Json::parse(&std::fs::read_to_string(sandbox.join("docxy/session.json")).unwrap()).unwrap();
     assert_eq!(

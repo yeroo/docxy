@@ -48,50 +48,85 @@ test window arrange resizes every window and replies the count
   assert reply.arranged is 2
   assert status is Arranged 2 windows
 
-test closing the first window keeps the control server alive
-  call window-select {"window":1}
-  call close-window {}
-  assert windows is 1
-  assert window is 2
-  # The server and pump outlived window 1: these verbs still answer.
-  call window-list {}
-  assert reply.count is 1
-  assert tabs is 2
-  # Selecting the window that is already selected is a plain read of its
-  # state, not a second borrow of its view.
-  call window-select {"window":2}
-  assert window is 2
-
-test a moved window carries the harness policies
-  # Window 2 is a New Window view: its Save As refusal must be the harness
-  # one. A native dialog here would open on the test display and hang.
+test the untitled counter is run wide
+  # Ctrl+N in window 2, then again in the window the tab moved to: before
+  # the fix both minted "Document2" (each window carried its own counter).
+  key ctrl+n
+  assert title is Document1
   call window-new {}
   assert reply.window is 3
   key ctrl+n
-  assert title is Document1
+  assert title is Document2
+  call window-select {"window":2}
+  call tab-select {"tab":"basic.docx"}
+  key ctrl+n
+  assert title is Document3
+
+test a copy in one window pastes in a new window
+  # The clipboard is the run's: a private one under the harness, so a new
+  # window must paste what window 2 copied, not nothing. The paste target is
+  # a fresh blank document: only a real paste dirties it.
+  call window-select {"window":2}
+  call tab-select {"tab":"basic.docx"}
+  call selection-set {"start":0,"end":6}
+  key ctrl+c
+  call window-select {"window":1}
+  call window-new {}
+  assert reply.window is 4
+  key ctrl+v
+  assert dirty is true
+
+test closing the first window keeps the control server alive
+  # The new window opens through the RIBBON handler — the UI path, not a
+  # harness verb.
+  call window-select {"window":1}
+  call ribbon-click {"tab":"View","command":"New Window"}
+  assert windows is 5
+  call window-select {"window":1}
+  call close-window {}
+  assert windows is 4
+  assert window is 5
+  # The server and pump outlived window 1: these verbs still answer.
+  call window-list {}
+  assert reply.count is 4
+  # Selecting the window that is already selected is a plain read of its
+  # state, not a second borrow of its view.
+  call window-select {"window":5}
+  assert window is 5
+  assert tabs is 1
+
+test a moved window carries the harness policies
+  # Window 6 is a New Window view: its Save As refusal must be the harness
+  # one. A native dialog here would open on the test display and hang. The
+  # moved tab is named explicitly so the case does not depend on which tab
+  # was active.
+  call window-select {"window":2}
+  call window-new {"tab":2}
+  assert reply.window is 6
+  key ctrl+n
+  assert title is Document6
   type edited
   key ctrl+s
   assert status is this document has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb
-  call close-tab {"answer":"discard"}
-  assert tabs is 1
 
 test closing a non last window with unsaved work asks whatever the setting
   # Ask-on-close is off by default: the Force ask is what a non-last close
-  # does regardless.
-  call window-select {"window":3}
+  # does regardless. Document5 (window 6's active tab) is dirty from the
+  # case above.
+  call window-select {"window":6}
   assert ask_on_close is false
   call close-window {}
   assert dialog is save-on-close
   call dialog-click {"button":"Cancel"}
   assert dialog is none
-  assert windows is 2
-  # Answered: the window leaves, the app lives, the other window keeps working.
+  assert windows is 5
+  # Answered: the window leaves, the app lives, another window keeps working.
   call close-window {}
   call dialog-click {"button":"Don't Save"}
   assert dialog is none
-  assert windows is 1
-  assert window is 2
+  assert windows is 4
+  assert window is 5
   assert tabs is 1
-  assert title is gantt-summary.xml
+  assert title is Document5
   call tab-list {}
-  assert reply.tabs.0.title is gantt-summary.xml
+  assert reply.tabs.0.title is Document5

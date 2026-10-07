@@ -717,7 +717,7 @@ impl Docxy {
         ) {
             match kept {
                 Ok(_) => {
-                    self.refresh_drafts();
+                    self.refresh_drafts(cx);
                 }
                 // Never blocks the close: the user chose to discard.
                 Err(e) => draft_error = Some(e),

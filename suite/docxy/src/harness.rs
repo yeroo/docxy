@@ -2795,6 +2795,22 @@ fn load_failure(app: &crate::Docxy) -> Option<String> {
 /// One shape for every driving verb, so a test reads the same keys whichever
 /// one it just sent. The sheet half is absent when the active tab is not a
 /// spreadsheet (`type` and `key` reach the document surface too).
+/// The state a verb's reply describes: this window's while it is still
+/// registered; once a close removed it (a non-last `close-window`, or the
+/// last answer to its close prompts), the surviving selected window's
+/// (#587 r2 m7) — the closed view has no tabs left to describe.
+fn state_for_reply(app: &crate::Docxy, window: &Window, cx: &mut App) -> Json {
+    if windows::is_registered(cx, app.win_id) {
+        return state(app, window, cx);
+    }
+    match windows::selected_view(cx) {
+        Some(view) => view
+            .read_with(cx, |this: &crate::Docxy, cx| state(this, window, cx))
+            .unwrap_or_else(|_| state(app, window, cx)),
+        None => state(app, window, cx),
+    }
+}
+
 fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
     let mut out = vec![
         ("tab", Json::Num(app.active as f64)),
@@ -3455,7 +3471,9 @@ fn dispatch_verb(
             open_dialogs(app)?;
             app.dialog_press(&button, window, cx)?;
             app.refocus(window, cx);
-            let Json::Obj(mut out) = state(app, window, cx) else {
+            // A close prompt's answer may have closed the WINDOW (a non-last
+            // close removes it) — then the reply describes the survivor.
+            let Json::Obj(mut out) = state_for_reply(app, window, cx) else {
                 unreachable!("state is an object")
             };
             // A close prompt's Save or Don't Save may have closed the last tab.
@@ -3765,7 +3783,7 @@ fn dispatch_verb(
                     window.remove_window();
                 }
             }
-            Done::ok(state(app, window, cx))
+            Done::ok(state_for_reply(app, window, cx))
         }
         "ask-on-close" => {
             let Some(Json::Bool(on)) = args.get("on") else {
@@ -3816,7 +3834,7 @@ fn dispatch_verb(
         "drafts" => {
             let now = std::time::SystemTime::now();
             let drafts = app
-                .refresh_drafts()
+                .refresh_drafts(cx)
                 .iter()
                 .map(|d| {
                     let age = now.duration_since(d.saved).unwrap_or_default();
@@ -3836,7 +3854,7 @@ fn dispatch_verb(
             app.refuse_under_dialog()?;
             let index = arg_usize(args, "index")?;
             let path = app
-                .refresh_drafts()
+                .refresh_drafts(cx)
                 .get(index)
                 .map(|d| d.path.clone())
                 .ok_or_else(|| format!("no draft {index}"))?;

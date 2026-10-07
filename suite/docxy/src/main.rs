@@ -1821,7 +1821,7 @@ fn recorded_after_write(wrote: String, now: &ClipRead) -> String {
 /// neither read nor overwrite what the person at the machine copied, and
 /// starts from an empty clipboard whatever they have on theirs. The private one
 /// reads as the OS one does: an empty write is an item with no text.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ClipboardStore {
     private: Option<String>,
 }
@@ -4150,7 +4150,6 @@ struct Docxy {
     ask_on_close: bool,
     /// The number the next new document's `Document<n>` title takes (#631):
     /// it only goes up, so a number is never reused in a session.
-    next_document: u32,
     /// The window is closing through its per-document questions (#630):
     /// a close prompt with `quit` is on the tab being asked about.
     quitting: bool,
@@ -9810,8 +9809,9 @@ mod session_union_tests {
     }
 
     /// #587 decision 6: one session.json holds every window's tabs. Each
-    /// window's write appends the others' last snapshots, and the second
-    /// window's sidecar names take its seq offset so the files never collide.
+    /// window's write appends the others' last snapshots, and a secondary
+    /// window's sidecars take the `tab-w{seq}-` namespace so the files never
+    /// collide (the first window keeps `tab-{i}`).
     #[test]
     fn two_windows_union_reaches_session_with_distinct_sidecars() {
         let root = fresh_root("two");
@@ -10717,11 +10717,16 @@ impl Docxy {
         let active = session.active.min(tabs.len().saturating_sub(1));
         let mut this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
         // New documents continue past the restored ones (#631).
-        this.next_document = doc_name::next_after(
-            this.tabs
-                .iter()
-                .filter(|t| t.kind == Kind::Docx && t.path.is_none())
-                .map(|t| t.title.as_ref()),
+        // The untitled counter is the run's (#587 r2 m10): seed the shared
+        // one from the restored titles, then every window mints from it.
+        windows::seed_document_titles(
+            cx,
+            doc_name::next_after(
+                this.tabs
+                    .iter()
+                    .filter(|t| t.kind == Kind::Docx && t.path.is_none())
+                    .map(|t| t.title.as_ref()),
+            ),
         );
         this.autorecover_minutes = session.autorecover_minutes;
         this.keep_drafts = session.keep_drafts;
@@ -10774,7 +10779,6 @@ impl Docxy {
             clip: None,
             theme_pref,
             ask_on_close,
-            next_document: 1,
             quitting: false,
             quit_discards: Vec::new(),
             quit_tabs: Vec::new(),
@@ -10890,13 +10894,18 @@ impl Docxy {
     /// A shared setting changed: apply it to every registered window, so the
     /// next union write from ANY window keeps it (#587 r1 M6). Skips this
     /// view — the caller already applied the change, and updating the
-    /// entity the caller is being updated on would double-lease it.
+    /// entity the caller is being updated on would double-lease it. Each
+    /// other window is notified, so a checkbox or the theme repaints there
+    /// too (#587 r2 m4).
     pub(crate) fn share_with_windows(&mut self, cx: &mut App, apply: impl Fn(&mut Docxy)) {
         for (id, view, _) in windows::entries_snapshot(cx) {
             if id == self.win_id {
                 continue;
             }
-            let _ = view.update(cx, |this: &mut Docxy, _| apply(this));
+            let _ = view.update(cx, |this: &mut Docxy, cx| {
+                apply(this);
+                cx.notify();
+            });
         }
     }
 
@@ -10988,7 +10997,7 @@ impl Docxy {
         self.close_menu();
         self.backstage = true;
         self.show_backstage_open_page();
-        self.refresh_drafts();
+        self.refresh_drafts(cx);
         self.trusted_count = trusted::count(&config_root());
         self.trusted_error = None;
         cx.notify();
@@ -11441,9 +11450,23 @@ impl Docxy {
     }
 
     /// Re-read the drafts (pruning old ones, but never a draft open in a
-    /// tab) into the backstage's list, and return it.
-    fn refresh_drafts(&mut self) -> &[recover::Draft] {
-        let open: Vec<PathBuf> = self.tabs.iter().filter_map(|t| t.path.clone()).collect();
+    /// tab) into the backstage's list, and return it. A draft open in ANY
+    /// window's tab is protected, not just this one's (#587 r2 m8).
+    fn refresh_drafts(&mut self, cx: &mut App) -> &[recover::Draft] {
+        let mut open: Vec<PathBuf> = self.tabs.iter().filter_map(|t| t.path.clone()).collect();
+        for (id, view, _) in windows::entries_snapshot(cx) {
+            if id == self.win_id {
+                continue;
+            }
+            if let Ok(paths) = view.read_with(cx, |this: &Docxy, _| {
+                this.tabs
+                    .iter()
+                    .filter_map(|t| t.path.clone())
+                    .collect::<Vec<_>>()
+            }) {
+                open.extend(paths);
+            }
+        }
         self.drafts = recover::list_drafts(&config_root(), std::time::SystemTime::now(), &open);
         &self.drafts
     }
@@ -11537,7 +11560,7 @@ impl Docxy {
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
             Kind::Docx => new_tab(
-                &doc_name::next_document_title(&mut self.next_document),
+                &windows::next_document_title(cx),
                 Surface::Doc(Editor::new(empty_doc())),
             ),
             Kind::Xlsx => new_tab("Untitled.xlsx", new_sheet_surface()),
@@ -11568,10 +11591,12 @@ impl Docxy {
             autocorrect,
             user_name,
             user_initials,
-            next_document,
+            clipboard,
+            doc_clip,
+            grid_clip,
+            office_clip,
         } = prefs;
         let mut this = Self::build(tabs, 0, theme_pref, ask_on_close, cx);
-        this.next_document = next_document;
         this.autorecover_minutes = autorecover_minutes;
         this.keep_drafts = keep_drafts;
         this.edit_opts = edit_opts;
@@ -11581,7 +11606,28 @@ impl Docxy {
         sheet_autocorrect::stamp_autocorrect(&mut this.tabs, &this.autocorrect);
         this.user_name = user_name;
         this.user_initials = user_initials;
+        this.clipboard = clipboard;
+        this.clip = doc_clip;
+        this.grid_clip = grid_clip;
+        this.office_clip = office_clip;
         this
+    }
+
+    /// The clipboard is the run's, not a window's (#587 r2 M2): after a
+    /// copy or cut, every other window holds the same text, rich document
+    /// clip, grid clip and Office Clipboard, so a paste lands what the user
+    /// copied in whichever window they paste into.
+    fn sync_clipboards(&mut self, cx: &mut App) {
+        let clipboard = self.clipboard.clone();
+        let doc_clip = self.clip.clone();
+        let grid_clip = self.grid_clip.clone();
+        let office_clip = self.office_clip.clone();
+        self.share_with_windows(cx, |d| {
+            d.clipboard = clipboard.clone();
+            d.clip = doc_clip.clone();
+            d.grid_clip = grid_clip.clone();
+            d.office_clip = office_clip.clone();
+        });
     }
 
     /// View › Window › New Window (#587): open a new window and move a tab
@@ -11637,7 +11683,7 @@ impl Docxy {
         // Where to put the tab back if the platform refuses the window.
         let mut restore: Option<(usize, usize)> = None;
         if blank {
-            let title = doc_name::next_document_title(&mut self.next_document);
+            let title = windows::next_document_title(cx);
             tabs.push(blank_docx_tab(&title));
         } else {
             let previous_active = self.active;
@@ -11661,12 +11707,13 @@ impl Docxy {
         };
         match open_docxy_window(cx, options, init) {
             Ok((_, new_view, id)) => {
-                // Both windows persist now: the source's union write must
-                // already know the new window's tabs, or a kill before the
-                // new window's first AutoRecover tick would lose the moved
-                // tab from the session.
-                self.persist(cx);
+                // The new view persists first: until one of them writes, the
+                // moved tab is in NEITHER snapshot, so the sooner the new
+                // window's union write lands the smaller the window in which
+                // a kill loses it; then the source's write carries the new
+                // window's tabs too.
                 new_view.update(cx, |this, cx| this.persist(cx));
+                self.persist(cx);
                 self.refocus(window, cx);
                 Ok(id)
             }
@@ -11688,9 +11735,6 @@ impl Docxy {
     }
 
     /// View › Window › Arrange All (#587): resize every window of the run to
-    /// an equal vertical strip of THIS window's display, in creation order.
-    /// gpui cannot move windows at the pinned rev, so positions stay; the
-    /// status says what happened. Returns how many windows answered.
     /// View › Window › Arrange All (#587): resize every window of the run to
     /// an equal vertical strip of THIS window's display, in creation order.
     /// gpui cannot move windows at the pinned rev, so positions stay. Returns
@@ -14931,6 +14975,7 @@ impl Docxy {
         // Every copy and cut goes on the Office Clipboard too (#669).
         self.office_clip.push(&clip.text);
         self.grid_clip = Some(clip);
+        self.sync_clipboards(cx);
         cx.notify();
     }
 
@@ -18941,6 +18986,7 @@ impl Docxy {
         if let Some(clip) = clip {
             let text = self.clipboard_write_recorded(clip.to_text(), cx);
             self.clip = Some(DocClip { clip, text });
+            self.sync_clipboards(cx);
             if cut {
                 if let Some(t) = self.tabs.get_mut(self.active) {
                     t.mark_dirty();
@@ -35836,7 +35882,13 @@ struct MovedPrefs {
     autocorrect: std::rc::Rc<gridcore::autocorrect::AutoCorrect>,
     user_name: String,
     user_initials: String,
-    next_document: u32,
+    // The clipboard is the run's, not a window's (#587 r2 M2): a new window
+    // starts with what the source held, and every copy re-syncs all
+    // windows, so a paste after New Window finds the same content.
+    clipboard: ClipboardStore,
+    doc_clip: Option<DocClip>,
+    grid_clip: Option<GridClip>,
+    office_clip: sheet_paste::OfficeClipboard,
 }
 
 impl MovedPrefs {
@@ -35851,7 +35903,10 @@ impl MovedPrefs {
             autocorrect: d.autocorrect.clone(),
             user_name: d.user_name.clone(),
             user_initials: d.user_initials.clone(),
-            next_document: d.next_document,
+            clipboard: d.clipboard.clone(),
+            doc_clip: d.clip.clone(),
+            grid_clip: d.grid_clip.clone(),
+            office_clip: d.office_clip.clone(),
         }
     }
 }
