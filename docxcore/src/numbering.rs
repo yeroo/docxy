@@ -73,8 +73,10 @@ pub struct LevelDef {
 }
 
 impl Numbering {
-    /// Level `ilvl` of list `num_id`, or `None` when the list or level is
-    /// not defined.
+    /// Level `ilvl` of list `num_id`, or `None` when the list is not
+    /// defined or `ilvl` is past its highest defined level. A level skipped
+    /// below the highest one comes back as the default decimal `%1.` level,
+    /// as the markers number it.
     pub fn level(&self, num_id: i32, ilvl: i32) -> Option<LevelDef> {
         let abs = self.abstracts.get(self.num_to_abstract.get(&num_id)?)?;
         let level = abs.levels.get(usize::try_from(ilvl).ok()?)?;

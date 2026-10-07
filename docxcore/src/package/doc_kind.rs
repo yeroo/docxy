@@ -430,6 +430,27 @@ mod tests {
         );
     }
 
+    /// An Override written with space around its `=` is the main part's
+    /// (FIX r2 #6): retyped in place, not joined by a second Override.
+    #[test]
+    fn an_override_with_spaced_attributes_is_retyped_not_duplicated() {
+        let mut pkg = doc_pkg();
+        let types = pkg.part_text("[Content_Types].xml").unwrap();
+        let spaced = types.replace(
+            "<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>",
+            "<Override PartName = '/word/document.xml' ContentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>",
+        );
+        assert_ne!(spaced, types);
+        pkg.set_part_text("[Content_Types].xml", &spaced);
+        assert!(pkg.set_main_kind(DocKind::Template).retyped);
+        let types = pkg.part_text("[Content_Types].xml").unwrap();
+        assert_eq!(types.matches("/word/document.xml").count(), 1, "{types}");
+        assert_eq!(
+            pkg.main_content_type().as_deref(),
+            Some(DocKind::Template.main_content_type())
+        );
+    }
+
     #[test]
     fn a_missing_override_is_added() {
         let mut pkg = doc_pkg();

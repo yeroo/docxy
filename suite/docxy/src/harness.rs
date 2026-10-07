@@ -3892,8 +3892,8 @@ fn dispatch_verb(
             done.input = wheel_events(p, dy);
             Ok(done)
         }
-        // Switch the File screen's page (#1028): `new` and `info` (a document
-        // tab only) call the rail's handler; `open` is a setup shortcut for
+        // Switch the File screen's page (#1028): `new`, `info` and `export`
+        // (a document tab only) and `account` call the rail's handler; `open` is a setup shortcut for
         // the default page, which the user reaches by closing and reopening
         // File (the rail's Open… opens a file picker).
         "backstage-page" => {

@@ -8,29 +8,26 @@
 //! line, at a paragraph's edge the paragraph break already does.
 //!
 //! The text is the final view of tracked changes (insertions kept, deletions
-//! dropped). Hidden text (a hidden field result included), pictures, objects
-//! and content the model keeps only as raw XML write nothing. The caller
-//! encodes the string (UTF-8, no BOM).
+//! dropped, a deleted paragraph mark joining its paragraph to the next; see
+//! [`final_view`]). Hidden text (a hidden field result, tab or break
+//! included), pictures, objects and content the model keeps only as raw XML
+//! write nothing. Hidden is direct formatting only: styles do not model
+//! `w:vanish` yet. The caller encodes the string (UTF-8, no BOM).
 
 use std::collections::HashMap;
 
-use crate::export_context::ExportContext;
-use crate::model::{
-    Block, BreakKind, Cell, Document, Inline, Paragraph, RevisionKind, RunProps, VMerge,
-};
-use crate::styles::StyleSheet;
+use crate::export_context::{ExportContext, final_view};
+use crate::model::{Block, BreakKind, Cell, Document, Inline, Paragraph, RevisionKind, VMerge};
 
 const CRLF: &str = "\r\n";
 
-/// The plain text of `doc`, its lists numbered and its styles resolved by
-/// `ctx`. An empty document is an empty string; otherwise every line, the
-/// last included, ends in CRLF.
+/// The plain text of `doc`'s final view, its lists numbered as `ctx`
+/// defines them. An empty document is an empty string; otherwise every line,
+/// the last included, ends in CRLF.
 pub fn to_text(doc: &Document, ctx: &ExportContext) -> String {
+    let doc = &final_view(doc);
     let markers = ctx.markers(doc);
-    let w = Writer {
-        markers: &markers,
-        styles: &ctx.styles,
-    };
+    let w = Writer { markers: &markers };
     let mut lines = Vec::new();
     w.blocks_lines(&doc.body, &mut Vec::new(), &mut lines);
     let mut out = lines.join(CRLF);
@@ -42,7 +39,6 @@ pub fn to_text(doc: &Document, ctx: &ExportContext) -> String {
 
 struct Writer<'a> {
     markers: &'a HashMap<Vec<usize>, String>,
-    styles: &'a StyleSheet,
 }
 
 impl Writer<'_> {
@@ -96,29 +92,23 @@ impl Writer<'_> {
             line.text(m);
             line.text("\t");
         }
-        self.inlines(&p.content, p.props.style_id.as_deref(), &mut line);
+        self.inlines(&p.content, &mut line);
         line.out
     }
 
-    /// Whether text with direct properties `props` in a paragraph of style
-    /// `pstyle` is hidden, its styles resolved.
-    fn hidden(&self, pstyle: Option<&str>, props: &RunProps) -> bool {
-        self.styles
-            .effective_run(pstyle, props.style_id.as_deref(), props)
-            .vanish
-    }
-
-    fn inlines(&self, content: &[Inline], pstyle: Option<&str>, line: &mut Line) {
+    fn inlines(&self, content: &[Inline], line: &mut Line) {
         for inline in content {
             match inline {
-                Inline::Run(r) if self.hidden(pstyle, &r.props) => {}
+                Inline::Run(r) if r.props.vanish => {}
                 Inline::Run(r) => line.text(&r.text),
                 Inline::Hyperlink(h) => {
-                    for r in h.runs.iter().filter(|r| !self.hidden(pstyle, &r.props)) {
+                    for r in h.runs.iter().filter(|r| !r.props.vanish) {
                         line.text(&r.text);
                     }
-                    self.inlines(&h.content, pstyle, line);
+                    self.inlines(&h.content, line);
                 }
+                // Hidden tabs and breaks are hidden text too.
+                Inline::Break(_, props) | Inline::Tab(props) if props.vanish => {}
                 Inline::Break(BreakKind::Line | BreakKind::Clear(_), _) => line.text("\n"),
                 Inline::Break(BreakKind::Page | BreakKind::Column, _) => line.pending_break = true,
                 Inline::Tab(_) => line.text("\t"),
@@ -127,7 +117,7 @@ impl Writer<'_> {
                 Inline::Equation { text, .. } => line.text(text),
                 // A field shows its cached result, unless the result is hidden.
                 Inline::Field { raw, text } => {
-                    if !self.hidden(pstyle, &crate::load::field_result_props(raw)) {
+                    if !crate::load::field_result_props(raw).vanish {
                         line.text(text)
                     }
                 }
@@ -135,7 +125,6 @@ impl Writer<'_> {
                     let mut lines = Vec::new();
                     let inner = Writer {
                         markers: &HashMap::new(),
-                        styles: self.styles,
                     };
                     inner.blocks_lines(blocks, &mut Vec::new(), &mut lines);
                     line.text(&lines.join("\n"));
@@ -144,7 +133,7 @@ impl Writer<'_> {
                     kind: RevisionKind::Insert,
                     content,
                     ..
-                } => self.inlines(content, pstyle, line),
+                } => self.inlines(content, line),
                 Inline::Revision {
                     kind: RevisionKind::Delete,
                     ..
@@ -381,6 +370,51 @@ mod tests {
             ],
         };
         assert_eq!(text(&doc), "page 7\r\nhidden \r\n");
+    }
+
+    /// A deleted paragraph mark joins its paragraph to the next (FIX r2
+    /// #1); the document itself is unchanged.
+    #[test]
+    fn a_deleted_paragraph_mark_joins_the_paragraphs() {
+        let doc = crate::export_rtf::tests::deleted_mark_doc();
+        let before = doc.clone();
+        assert_eq!(text(&doc), "Hello world\r\n");
+        assert_eq!(doc, before);
+    }
+
+    /// Hidden tabs and breaks write nothing, and a hidden page break does
+    /// not end the line (FIX r2 #5).
+    #[test]
+    fn hidden_tabs_and_breaks_write_nothing() {
+        let hidden = RunProps {
+            vanish: true,
+            ..RunProps::default()
+        };
+        let doc = Document {
+            body: vec![para(vec![
+                run("a"),
+                Inline::Tab(hidden.clone()),
+                Inline::Break(BreakKind::Line, hidden.clone()),
+                Inline::Break(BreakKind::Page, hidden.clone()),
+                Inline::Break(BreakKind::Column, hidden),
+                run("b"),
+            ])],
+        };
+        assert_eq!(text(&doc), "ab\r\n");
+    }
+
+    /// A heading in a list writes its marker (FIX r2 #3, as the RTF writer).
+    #[test]
+    fn a_numbered_heading_writes_its_marker() {
+        let mut heading = crate::import::heading_props(1);
+        heading.num_id = Some(2);
+        let doc = Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: heading,
+                content: vec![run("Intro")],
+            })],
+        };
+        assert_eq!(text(&doc), "1.\tIntro\r\n");
     }
 
     #[test]

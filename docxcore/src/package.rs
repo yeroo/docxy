@@ -3363,23 +3363,26 @@ fn next_rid(rels: &str) -> String {
 /// An attribute's value out of a raw tag body (`w:val="false"`), either quote
 /// style. `None` when the attribute isn't there.
 pub(crate) fn tag_attr(attrs: &str, name: &str) -> Option<String> {
-    let pat = format!("{name}=");
     let mut from = 0usize;
-    while let Some(rel) = attrs[from..].find(&pat) {
+    while let Some(rel) = attrs[from..].find(name) {
         let at = from + rel;
+        from = at + name.len();
         // `w:val=` must not be the tail of `w:someOtherVal=`.
         let ok = attrs[..at]
             .chars()
             .next_back()
             .is_none_or(|c| c.is_whitespace());
-        let rest = attrs[at + pat.len()..].trim_start();
+        // `name`, then `=` and the opening quote, with any space between.
+        let Some(rest) = attrs[from..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
         let q = rest.chars().next();
         if ok && matches!(q, Some('"') | Some('\'')) {
             let q = q.unwrap();
             let body = &rest[q.len_utf8()..];
             return body.find(q).map(|e| body[..e].to_string());
         }
-        from = at + pat.len();
     }
     None
 }
@@ -4152,6 +4155,19 @@ fn comment_id_at(xml: &str, start: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An attribute is read with space around its `=` (FIX r2 #6), and
+    /// never as the tail of a longer name.
+    #[test]
+    fn tag_attr_reads_space_around_the_equals_sign() {
+        assert_eq!(
+            tag_attr("<O PartName = '/word/document.xml'/>", "PartName").as_deref(),
+            Some("/word/document.xml")
+        );
+        assert_eq!(tag_attr("<O A=\"x\"/>", "A").as_deref(), Some("x"));
+        assert_eq!(tag_attr("<O XA=\"x\"/>", "A"), None);
+        assert_eq!(tag_attr("<O A/>", "A"), None);
+    }
 
     /// Either quote style is replaced in place, never doubled, and a longer
     /// name ending in the same text is not the attribute (FIX r1 #2).

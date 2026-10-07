@@ -415,3 +415,43 @@ fn rich_text_resolves_the_documents_styles() {
     assert_eq!(r.text, "strong");
     assert!(r.props.bold, "the Strong style's bold was dropped");
 }
+
+/// Plain Text and Rich Text write the final view, a deleted paragraph mark
+/// joining two paragraphs, while the tab's document keeps the tracked
+/// change (FIX r2 #1).
+#[test]
+fn text_and_rtf_write_the_final_view_and_leave_the_tab_alone() {
+    let dir = Scratch::new();
+    let mut pkg = load_package(&fixture("basic.docx")).unwrap();
+    let xml = pkg.part_text("word/document.xml").unwrap();
+    let body_start = xml.find("<w:body>").unwrap() + "<w:body>".len();
+    let body_end = xml.find("</w:body>").unwrap();
+    let body = "<w:p><w:pPr><w:rPr><w:del w:id=\"1\" w:author=\"A\" w:date=\"2026-10-07T00:00:00Z\"/></w:rPr></w:pPr><w:r><w:t>Hello</w:t></w:r></w:p><w:p><w:r><w:t xml:space=\"preserve\"> world</w:t></w:r></w:p>";
+    let xml = format!("{}{body}{}", &xml[..body_start], &xml[body_end..]);
+    assert!(pkg.set_part_text("word/document.xml", &xml));
+    let source = dir.path("tracked.docx");
+    std::fs::write(
+        &source,
+        docxcore::package::save_package_preserving_document(&pkg),
+    )
+    .unwrap();
+    let mut tab = tab_from_path(&source);
+    let before = body_text(&tab);
+    assert_eq!(
+        before,
+        ["Hello", " world"],
+        "the mark is tracked, not applied"
+    );
+    let txt = dir.path("tracked.txt");
+    assert!(save_doc_tab(&mut tab, Some(txt.clone())), "{}", tab.status);
+    assert_eq!(std::fs::read(&txt).unwrap(), b"Hello world\r\n");
+    let rtf = dir.path("tracked.rtf");
+    assert!(save_doc_tab(&mut tab, Some(rtf.clone())), "{}", tab.status);
+    let back = docxcore::import::rtf::import_rtf(&std::fs::read(&rtf).unwrap()).unwrap();
+    assert_eq!(docxcore::import::paragraph_texts(&back), ["Hello world"]);
+    assert_eq!(
+        body_text(&tab),
+        before,
+        "the editor's document is unchanged"
+    );
+}

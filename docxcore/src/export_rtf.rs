@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use crate::export_context::ExportContext;
+use crate::export_context::{ExportContext, final_view};
 use crate::model::{
     Align, Block, BreakKind, Cell, Document, Inline, Paragraph, RevisionKind, RunProps, Table,
     VMerge, VertAlign,
@@ -37,6 +37,7 @@ const DEFAULT_COLUMN: u32 = 2160;
 
 /// The RTF for `doc`, its lists and styles as `ctx` defines them.
 pub fn to_rtf(doc: &Document, ctx: &ExportContext) -> String {
+    let doc = &final_view(doc);
     let markers = ctx.markers(doc);
     let mut w = Writer {
         markers: &markers,
@@ -200,7 +201,7 @@ impl Writer<'_> {
             self.body.push_str("\\intbl");
         }
         let marker = self.markers.get(path).cloned();
-        let listed = p.props.num_id.filter(|_| p.props.heading_level.is_none());
+        let listed = p.props.num_id;
         if let Some(num_id) = listed {
             let ilvl = p.props.ilvl.clamp(0, 8) as usize;
             let ls = self.list(num_id, ilvl, marker.as_deref());
@@ -392,9 +393,16 @@ impl Writer<'_> {
 
     /// The formatting text with direct properties `props` has in a paragraph
     /// of style `pstyle`: its styles resolved, as the PDF exporter does.
+    /// The underline and strike are the user's: a tracked change's display
+    /// cue is not formatting (the OOXML serializer drops it too).
     fn effective(&self, props: &RunProps, pstyle: Option<&str>) -> RunProps {
+        let direct = RunProps {
+            underline: props.user_underline(),
+            strike: props.user_strike(),
+            ..props.clone()
+        };
         self.styles
-            .effective_run(pstyle, props.style_id.as_deref(), props)
+            .effective_run(pstyle, direct.style_id.as_deref(), &direct)
     }
 
     fn run(&mut self, text: &str, props: &RunProps, pstyle: Option<&str>) {
@@ -634,7 +642,7 @@ fn escape(s: &str, out: &mut String) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::import::rtf::import_rtf;
     use crate::model::{Hyperlink, ParProps, Run};
@@ -652,6 +660,23 @@ mod tests {
 
     fn para(props: ParProps, content: Vec<Inline>) -> Block {
         Block::Paragraph(Paragraph { props, content })
+    }
+
+    /// "Hello" with its paragraph mark deleted, then " world".
+    pub(crate) fn deleted_mark_doc() -> Document {
+        let mut first = ParProps::default();
+        first
+            .mark_revisions
+            .push(crate::model::ParagraphMarkRevision {
+                kind: RevisionKind::Delete,
+                metadata: Default::default(),
+            });
+        Document {
+            body: vec![
+                para(first, vec![plain("Hello")]),
+                para(ParProps::default(), vec![plain(" world")]),
+            ],
+        }
     }
 
     fn rtf(doc: &Document) -> String {
@@ -1052,6 +1077,114 @@ mod tests {
             .map(|p| (p.props.num_id, p.props.ilvl))
             .collect();
         assert_eq!(ordered, [(Some(2), 0), (Some(2), 1), (Some(2), 0)]);
+    }
+
+    /// A numbered list whose number text has no `.` or `)` after it (`%1`,
+    /// `%1.%2`, `Article %1:`) reads back numbered (FIX r2 #2): the reader
+    /// takes the list table's format, not the marker's look. A bullet list
+    /// stays bulleted.
+    #[test]
+    fn numbered_lists_of_any_number_text_read_back_numbered() {
+        for (text, numbered) in [
+            ("%1", true),
+            ("%1.%2", true),
+            ("Article %1:", true),
+            ("\u{2022}", false),
+        ] {
+            let fmt = if numbered { "decimal" } else { "bullet" };
+            let numbering = crate::numbering::parse_numbering_xml(&format!(
+                r#"<w:numbering><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="{fmt}"/><w:lvlText w:val="{text}"/></w:lvl></w:abstractNum><w:num w:numId="3"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+            ));
+            let ctx = ExportContext {
+                numbering,
+                ..ExportContext::default()
+            };
+            let doc = Document {
+                body: vec![para(
+                    ParProps {
+                        num_id: Some(3),
+                        ..ParProps::default()
+                    },
+                    vec![plain("item")],
+                )],
+            };
+            let s = to_rtf(&doc, &ctx);
+            let back = import_rtf(s.as_bytes()).unwrap();
+            let want = Some(if numbered { 2 } else { 1 });
+            assert_eq!(paras(&back)[0].props.num_id, want, "{text}: {s}");
+        }
+    }
+
+    /// A deleted paragraph mark joins its paragraph to the next (FIX r2 #1).
+    #[test]
+    fn a_deleted_paragraph_mark_joins_the_paragraphs() {
+        let doc = deleted_mark_doc();
+        let before = doc.clone();
+        let got = back(&doc);
+        assert_eq!(crate::import::paragraph_texts(&got), ["Hello world"]);
+        assert_eq!(doc, before, "the document itself is unchanged");
+    }
+
+    /// A heading in a list keeps its list and marker (FIX r2 #3).
+    #[test]
+    fn a_numbered_heading_keeps_its_list() {
+        let mut heading = crate::import::heading_props(1);
+        heading.num_id = Some(2);
+        let doc = Document {
+            body: vec![para(heading, vec![plain("Intro")])],
+        };
+        let s = rtf(&doc);
+        assert!(s.contains("\\s1\\outlinelevel0\\ql\\ls1\\ilvl0"), "{s}");
+        assert!(s.contains("{\\listtext 1.\\tab}"), "{s}");
+    }
+
+    /// A tracked change's underline or strike cue is not formatting (FIX r2
+    /// #4); the user's own underline still is.
+    #[test]
+    fn revision_cues_are_not_written_as_formatting() {
+        let cued = |underline_added, strike_added| RunProps {
+            underline: true,
+            strike: true,
+            revision_cues: crate::model::RevisionDisplayCues {
+                insertions: 1,
+                deletions: 0,
+                underline_added,
+                strike_added,
+            },
+            ..RunProps::default()
+        };
+        let doc = Document {
+            body: vec![para(
+                ParProps::default(),
+                vec![
+                    run("cue", cued(true, true)),
+                    run("real", cued(false, false)),
+                ],
+            )],
+        };
+        let s = rtf(&doc);
+        // The control words of the group a text is in.
+        let words = |text: &str| {
+            let end = s
+                .find(&format!(" {text}}}"))
+                .unwrap_or_else(|| panic!("{s}"));
+            s[..end].rsplit('{').next().unwrap().to_string()
+        };
+        assert!(!words("cue").contains("\\ul"), "{s}");
+        assert!(!words("cue").contains("\\strike"), "{s}");
+        assert!(words("real").starts_with("\\ul\\strike"), "{s}");
+        let back = import_rtf(s.as_bytes()).unwrap();
+        let got: Vec<(String, bool, bool)> = runs(paras(&back)[0])
+            .into_iter()
+            .map(|(t, r)| (t, r.underline, r.strike))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("cue".to_string(), false, false),
+                ("real".to_string(), true, true)
+            ]
+        );
     }
 
     #[test]

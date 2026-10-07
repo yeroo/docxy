@@ -173,7 +173,7 @@ pub(crate) fn preset_name(name: &str, format: SaveFormat) -> String {
 
 impl Docxy {
     /// File > Export for a document: the Change File Type page. The rail item
-    /// and the harness's `backstage` `export` action both come here.
+    /// and the harness's `backstage-page {"page":"export"}` both come here.
     pub(crate) fn open_export(&mut self, cx: &mut Context<Self>) {
         self.bs_export = true;
         self.bs_new = false;

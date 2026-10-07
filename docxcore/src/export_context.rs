@@ -1,6 +1,6 @@
 //! What the Plain Text and Rich Text writers (#635) need beside the
 //! document: its lists' definitions and its styles, as the package that a
-//! save of it is written into defines them.
+//! save of it is written into defines them, and the document's final view.
 
 use std::collections::HashMap;
 
@@ -40,4 +40,15 @@ impl ExportContext {
     pub fn markers(&self, doc: &Document) -> HashMap<Vec<usize>, String> {
         compute_markers(doc, &self.numbering)
     }
+}
+
+/// `doc` as it reads with its tracked changes accepted: what Plain Text and
+/// Rich Text write, a deleted paragraph mark joining its paragraph to the
+/// next included. A copy: `doc` itself is left as it is. A revision the
+/// review module cannot accept stays, and the writers still drop what it
+/// deletes.
+pub fn final_view(doc: &Document) -> Document {
+    let mut copy = doc.clone();
+    copy.accept_all_revisions();
+    copy
 }

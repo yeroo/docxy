@@ -4,8 +4,8 @@
 //! Kept: paragraphs, tabs, line and page breaks, bold / italic / underline /
 //! strikethrough / superscript / subscript / small caps / all caps,
 //! paragraph alignment, `heading N` paragraph styles (named in the
-//! stylesheet), list membership (`\ls`, `\ilvl`, the marker in `\listtext`
-//! saying bullet or number), tables (`\trowd … \cell … \row`), field results
+//! stylesheet), list membership (`\ls`, `\ilvl`; bullet or number as the
+//! list table's `\levelnfc` says, else as the marker in `\listtext` does), tables (`\trowd … \cell … \row`), field results
 //! (hyperlink text), `\uN` with its `\ucN` fallback skipped, and `\'hh`
 //! decoded in the code page the font's `\fcharset` (or `\ansicpg`) names.
 //!
@@ -64,6 +64,23 @@ enum Dest {
     StyleSheet,
     /// The list marker Word writes before a list paragraph.
     ListText,
+    /// `\listtable`: each list's levels' number formats.
+    ListTable,
+    /// `\listoverridetable`: which list each `\lsN` is.
+    ListOverrides,
+}
+
+/// A list read from `\listtable`: its `\listid` and each level's
+/// `\levelnfc` (`None` until the level says).
+#[derive(Default)]
+struct ListFormats {
+    id: Option<i32>,
+    levels: Vec<Option<i32>>,
+}
+
+/// `\levelnfc` values that are no number: a bullet (23) and none (255).
+fn nfc_is_numbered(nfc: i32) -> bool {
+    !matches!(nfc, 23 | 255)
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +134,10 @@ struct Reader<'a> {
     /// A double-byte lead byte waiting for its trail byte.
     lead: bool,
     list_text: String,
+    /// The list table's lists, and the override table's `\lsN` → `\listid`
+    /// (`(ls, listid)`, either still unread while its entry is open).
+    lists: Vec<ListFormats>,
+    overrides: Vec<(Option<i32>, Option<i32>)>,
 }
 
 impl<'a> Reader<'a> {
@@ -152,6 +173,8 @@ impl<'a> Reader<'a> {
             high: None,
             lead: false,
             list_text: String::new(),
+            lists: Vec::new(),
+            overrides: Vec::new(),
         }
     }
 
@@ -292,7 +315,10 @@ impl<'a> Reader<'a> {
             .iter()
             .position(|b| !b.is_ascii_alphabetic())
             .unwrap_or(rest.len());
-        matches!(&rest[..end], b"ud" | b"fldinst" | b"listtext")
+        matches!(
+            &rest[..end],
+            b"ud" | b"fldinst" | b"listtext" | b"listtable" | b"listoverridetable"
+        )
     }
 
     fn word(&mut self, w: &[u8], num: Option<i32>) {
@@ -312,6 +338,14 @@ impl<'a> Reader<'a> {
             b"listtext" | b"pntext" => {
                 self.st.dest = Dest::ListText;
                 self.list_text.clear();
+                return;
+            }
+            b"listtable" => {
+                self.st.dest = Dest::ListTable;
+                return;
+            }
+            b"listoverridetable" => {
+                self.st.dest = Dest::ListOverrides;
                 return;
             }
             b"ud" => {
@@ -341,8 +375,6 @@ impl<'a> Reader<'a> {
             | b"rxe"
             | b"bkmkstart"
             | b"bkmkend"
-            | b"listtable"
-            | b"listoverridetable"
             | b"revtbl"
             | b"rsidtbl"
             | b"generator"
@@ -395,6 +427,8 @@ impl<'a> Reader<'a> {
                 }
                 return;
             }
+            Dest::ListTable => return self.list_table_word(w, n),
+            Dest::ListOverrides => return self.list_override_word(w, n),
             Dest::Skip => return,
             Dest::Body | Dest::ListText => {}
         }
@@ -476,6 +510,69 @@ impl<'a> Reader<'a> {
             b"pnlvlbody" | b"pnlvlcont" => self.st.pn = Some(true),
             _ => {}
         }
+    }
+
+    /// A control word in `\listtable`. Only what says whether a level is
+    /// numbered is kept: each `\list`, its levels' first `\levelnfc`
+    /// (`\levelnfcn` too) and its `\listid`, each charged as kept memory.
+    fn list_table_word(&mut self, w: &[u8], n: i32) {
+        match w {
+            b"list" => {
+                if self.budget.keep::<ListFormats>(0) {
+                    self.lists.push(ListFormats::default());
+                }
+            }
+            b"listlevel" => {
+                if self.budget.keep::<Option<i32>>(0) {
+                    if let Some(list) = self.lists.last_mut() {
+                        list.levels.push(None);
+                    }
+                }
+            }
+            b"levelnfc" | b"levelnfcn" => {
+                if let Some(level) = self.lists.last_mut().and_then(|l| l.levels.last_mut()) {
+                    level.get_or_insert(n);
+                }
+            }
+            b"listid" => {
+                if let Some(list) = self.lists.last_mut() {
+                    list.id = Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A control word in `\listoverridetable`: each `\listoverride`'s
+    /// `\listid` and `\ls`.
+    fn list_override_word(&mut self, w: &[u8], n: i32) {
+        match w {
+            b"listoverride" => {
+                if self.budget.keep::<(Option<i32>, Option<i32>)>(0) {
+                    self.overrides.push((None, None));
+                }
+            }
+            b"ls" => {
+                if let Some(o) = self.overrides.last_mut() {
+                    o.0 = Some(n);
+                }
+            }
+            b"listid" => {
+                if let Some(o) = self.overrides.last_mut() {
+                    o.1 = Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether level `ilvl` of list `\ls{ls}` is numbered, as the list
+    /// table says; `None` when the tables do not define it.
+    fn defined_numbered(&self, ls: i32, ilvl: i32) -> Option<bool> {
+        let id = self.overrides.iter().find(|o| o.0 == Some(ls))?.1?;
+        let list = self.lists.iter().find(|l| l.id == Some(id))?;
+        let nfc = (*list.levels.get(usize::try_from(ilvl).ok()?)?)?;
+        Some(nfc_is_numbered(nfc))
     }
 
     fn font_word(&mut self, w: &[u8], num: Option<i32>) {
@@ -643,8 +740,15 @@ impl<'a> Reader<'a> {
         p.align = self.st.align;
         let listed = self.st.list.is_some_and(|l| l > 0) || self.st.pn.is_some();
         if listed && p.heading_level.is_none() {
-            let numbered = match self.st.pn {
-                Some(n) if self.list_text.is_empty() => n,
+            // The list table first; a list it does not define is what its
+            // Word 95 kind or its marker says.
+            let defined = self
+                .st
+                .list
+                .and_then(|ls| self.defined_numbered(ls, self.st.ilvl));
+            let numbered = match (defined, self.st.pn) {
+                (Some(n), _) => n,
+                (None, Some(n)) if self.list_text.is_empty() => n,
                 _ => marker_is_numbered(&self.list_text),
             };
             p.num_id = Some(if numbered { 2 } else { 1 });
@@ -786,6 +890,21 @@ mod tests {
         assert_eq!(p[1].props.num_id, Some(1));
         assert_eq!(p[2].props.num_id, Some(2));
         assert_eq!(p[3].props.num_id, None);
+    }
+
+    /// The list table says numbered or bullet (FIX r2 #2), whatever the
+    /// marker looks like; a list the tables do not define falls back to
+    /// its marker.
+    #[test]
+    fn the_list_table_says_numbered_or_bullet() {
+        let rtf = r"{\rtf1{\*\listtable{\list\listtemplateid1{\listlevel\levelnfc0\levelnfcn0{\leveltext\'01\'00;}{\levelnumbers\'01;}}{\listlevel\levelnfc23{\leveltext\'01\u8226 ?;}{\levelnumbers;}}{\listname ;}\listid10}{\list{\listlevel\levelnfc23}\listid20}}{\*\listoverridetable{\listoverride\listid10\listoverridecount0\ls1}{\listoverride\listid20\ls2}}\pard\ls1\ilvl0{\listtext Article 1:\tab}Numbered\par\pard\ls1\ilvl1{\listtext 1.\tab}Bullet level\par\pard\ls2{\listtext 1.\tab}Bullet list\par\pard\ls3{\listtext 2)\tab}Undefined\par}";
+        let doc = import_rtf(rtf.as_bytes()).unwrap();
+        assert_eq!(
+            paragraph_texts(&doc),
+            ["Numbered", "Bullet level", "Bullet list", "Undefined"]
+        );
+        let kinds: Vec<Option<i32>> = paras(&doc).iter().map(|p| p.props.num_id).collect();
+        assert_eq!(kinds, [Some(2), Some(1), Some(1), Some(2)]);
     }
 
     #[test]
