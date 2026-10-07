@@ -628,23 +628,43 @@ fn lcs<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(usize, usize)> {
 // Packages
 
 /// A package's parts by OPC name: an entry written `xl\\workbook.xml` is the
-/// part `xl/workbook.xml`, as the loaders read it (#1095). `None` when two
-/// entries differ only in their separators: which one is the part?
-fn read_parts(bytes: &[u8]) -> Option<BTreeMap<String, Vec<u8>>> {
+/// part `xl/workbook.xml`, as the loaders read it (#1095). A directory entry
+/// is no part (#1156, [`is_directory_entry`]). `None` when two entries differ
+/// only in their separators: which one is the part?
+pub fn read_parts(bytes: &[u8]) -> Option<BTreeMap<String, Vec<u8>>> {
     let zip = ZipArchive::open(bytes)?;
+    let names: Vec<String> = zip
+        .entries()
+        .iter()
+        .map(|e| e.name.replace('\\', "/"))
+        .collect();
+    let dirs: BTreeSet<&str> = names
+        .iter()
+        .flat_map(|n| n.match_indices('/').map(|(i, _)| &n[..i]))
+        .collect();
     let mut parts = BTreeMap::new();
     let mut raw: BTreeMap<String, &str> = BTreeMap::new();
-    for e in zip.entries() {
-        let name = e.name.replace('\\', "/");
-        if name.ends_with('/') {
+    for (e, name) in zip.entries().iter().zip(names.iter()) {
+        if is_directory_entry(name, e.uncomp_size, &dirs) {
             continue;
         }
         if *raw.entry(name.clone()).or_insert(&e.name) != e.name {
             return None;
         }
-        parts.insert(name, zip.extract(e)?);
+        parts.insert(name.clone(), zip.extract(e)?);
     }
     Some(parts)
+}
+
+/// Whether the entry `name` (with `/` separators) of `size` bytes is a
+/// directory, as gridcore's xlsx loader decides it (#1156): its name ends
+/// with `/`, or it is empty and either an entry lies under it (`dirs` holds
+/// every directory an entry name lies in) or it has no extension.
+/// tdf124525.xlsx marks `_rels`, `xl` and others as directories only in
+/// their ZIP attributes.
+pub fn is_directory_entry(name: &str, size: u64, dirs: &BTreeSet<&str>) -> bool {
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    name.ends_with('/') || (size == 0 && (dirs.contains(name) || !leaf.contains('.')))
 }
 
 /// Part names whose `[Content_Types].xml` type is XML (`...xml` or `...+xml`).
