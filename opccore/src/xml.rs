@@ -36,6 +36,9 @@ pub struct XmlParser<'a> {
     namespace_changes: Vec<Vec<NamespaceScopeChange<'a>>>,
     m_markup_compatibility_attrs: Vec<XmlScopedAttr<'a>>,
     markup_compatibility_scope_counts: Vec<usize>,
+    /// Per open element: whether `xml:space` resolves to `preserve` there
+    /// (its own attribute, else the nearest ancestor's).
+    space_preserve: Vec<bool>,
     pending_end: bool,
     /// Byte index of the `<` of the most recent start tag (for raw capture).
     m_start: usize,
@@ -48,6 +51,13 @@ pub struct XmlParser<'a> {
 fn is_ws(c: u8) -> bool {
     c == b' ' || c == b'\t' || c == b'\r' || c == b'\n'
 }
+/// `text` without the XML whitespace (space, tab, CR, LF) at either end:
+/// character data whose whitespace is not significant, such as a `w:t`
+/// outside `xml:space="preserve"`. Other spaces (NBSP) are kept.
+pub fn trim_xml_whitespace(text: &str) -> &str {
+    text.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
+}
+
 fn is_name_end(c: u8) -> bool {
     is_ws(c) || c == b'>' || c == b'/' || c == b'='
 }
@@ -71,6 +81,7 @@ impl<'a> XmlParser<'a> {
             namespace_changes: Vec::new(),
             m_markup_compatibility_attrs: Vec::new(),
             markup_compatibility_scope_counts: Vec::new(),
+            space_preserve: Vec::new(),
             pending_end: false,
             m_start: 0,
             malformed: false,
@@ -270,9 +281,29 @@ impl<'a> XmlParser<'a> {
             .truncate(self.m_markup_compatibility_attrs.len() - count);
     }
 
+    fn push_scopes(&mut self) {
+        self.push_namespace_scope();
+        self.push_markup_compatibility_scope();
+        let inherited = self.xml_space_preserve();
+        let preserve = match self.attr("xml:space") {
+            "preserve" => true,
+            "default" => false,
+            _ => inherited,
+        };
+        self.space_preserve.push(preserve);
+    }
+
     fn pop_scopes(&mut self) {
+        self.space_preserve.pop();
         self.pop_markup_compatibility_scope();
         self.pop_namespace_scope();
+    }
+
+    /// Whether `xml:space` resolves to `preserve` for the current element:
+    /// right after a Start, its own attribute or else the nearest ancestor's
+    /// (`default` cancels an outer `preserve`); after an End, the parent's.
+    pub fn xml_space_preserve(&self) -> bool {
+        self.space_preserve.last().copied().unwrap_or(false)
     }
 
     pub fn next(&mut self) -> Event {
@@ -402,8 +433,7 @@ impl<'a> XmlParser<'a> {
                 let d = self.xml[self.pos];
                 if d == b'>' {
                     self.pos += 1;
-                    self.push_namespace_scope();
-                    self.push_markup_compatibility_scope();
+                    self.push_scopes();
                     return Event::Start;
                 }
                 if d == b'/' {
@@ -414,8 +444,7 @@ impl<'a> XmlParser<'a> {
                         self.malformed = true;
                     }
                     self.pending_end = true;
-                    self.push_namespace_scope();
-                    self.push_markup_compatibility_scope();
+                    self.push_scopes();
                     return Event::Start;
                 }
                 // attribute
@@ -639,6 +668,48 @@ mod tests {
             [("urn:root", "r"), ("urn:inner", "c"), ("urn:root", "e")]
         );
         assert!(p.namespace_declaration_chain("xmlns:b").is_empty());
+    }
+
+    #[test]
+    fn xml_space_resolves_from_the_element_or_its_nearest_ancestor() {
+        let mut p = XmlParser::new(concat!(
+            r#"<p xml:space="preserve"><r><t/><u xml:space="default"><t/>"#,
+            r#"<v xml:space="bogus"><t/></v></u><t xml:space="default"/></r>"#,
+            r#"<s/></p><q><t xml:space="preserve"/><t/></q>"#,
+        ));
+        let mut seen = Vec::new();
+        loop {
+            match p.next() {
+                Event::Start => seen.push((p.name(), p.xml_space_preserve())),
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                ("p", true),
+                ("r", true),
+                ("t", true),
+                ("u", false),
+                ("t", false),
+                ("v", false),
+                ("t", false),
+                ("t", false),
+                ("s", true),
+                ("q", false),
+                ("t", true),
+                ("t", false),
+            ]
+        );
+        assert!(!p.xml_space_preserve(), "every scope is popped at Eof");
+    }
+
+    #[test]
+    fn trim_xml_whitespace_keeps_interior_and_non_xml_spaces() {
+        assert_eq!(trim_xml_whitespace(" \t\r\nSDT  Run\n "), "SDT  Run");
+        assert_eq!(trim_xml_whitespace("\u{a0}x\u{a0}"), "\u{a0}x\u{a0}");
+        assert_eq!(trim_xml_whitespace(" \t "), "");
     }
 
     #[test]
