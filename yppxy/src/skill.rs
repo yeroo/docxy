@@ -98,7 +98,9 @@ Ctrl+D and run yppxy there). Now you sit beside the schedule and edit it live.
 ## Notes
 - Read `yppxy_tasks` before editing; scheduled dates come from the CPM engine,
   so changing a duration or link moves every dependent task.
-- Each edit is one undo step — the user can undo it in yppxy (Ctrl+Z).
+- Each edit is one undo step — the user can undo it in yppxy (Ctrl+Z) until
+  the next save: as in Project, a successful save clears undo and redo. Save
+  only when asked, and say first that the edits can no longer be undone.
 - While you edit, the yppxy pane's status dot flashes active, so the user sees
   the plan being worked on.
 "#;
