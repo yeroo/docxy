@@ -376,6 +376,57 @@ cargo test -p gridcore --test fidelity -- --nocapture
   occurrence in that sheet. The test prints how many findings the check
   covered.
 
+- **Directory entries are no parts** (#1156). Some writers put directories
+  in the ZIP as empty entries without a trailing `/` and mark them only in
+  their ZIP attributes (tdf124525.xlsx has `_rels`, `docProps`, `xl`, ...).
+  The loader and the comparator both treat an entry as a directory, not a
+  part, when its name ends with `/`, or when it is empty and either another
+  entry lies under it or its name has no extension. An empty part with an
+  extension (`docProps/thumbnail.wmf`), or one without that an `Override` or
+  an internal relationship names, is still a part. Before #1156 the
+  save wrote those entries back as empty parts with no content type, and
+  Excel opened the file with its repair prompt.
+
+- **Package and schema validation** (#1156). Like docx's schema validation,
+  every original and every save is validated, and a violation the save
+  **added** fails the gate. Violations have no allowlist and no baseline,
+  also under `FIDELITY_UPDATE_BASELINE`, because Excel repairs the file
+  whether or not a value was lost. The checks live in
+  `gridcore/tests/fidelity/schema.rs`.
+
+  The package rules follow OPC (ECMA-376 Part 2). Entry names, `Override`
+  names and relationship targets go through one normalization (`/`
+  separators, percent-decoded, ASCII case-insensitive), and `Default`
+  extensions compare case-insensitively. Targets are resolved against their
+  source part, and `TargetMode="External"` targets are skipped. Which
+  entries are parts is read from the ZIP central directory, as Excel reads
+  it: an entry is a directory when its name ends with `/` or its attributes
+  say so. The size rule above does not apply here, because an empty
+  extensionless entry is exactly the part a save must not write.
+
+  | Rule | Meaning |
+  |---|---|
+  | `missing-part` | No `[Content_Types].xml` or no `_rels/.rels`. |
+  | `no-content-type` | A part with neither an `Override` nor a `Default` for its extension. |
+  | `override-no-part` | An `Override` names no part. |
+  | `duplicate-part` | Two entries name one part. |
+  | `dangling-target` | An internal relationship targets no part. |
+
+  The content models are a subset of the transitional `sml.xsd` of ECMA-376
+  Part 4. They apply to every part whose content type is XML, whatever its
+  name, and check the children of `worksheet` (CT_Worksheet order,
+  `sheetData` required), `sheetData` (`row`), `row` (`c`, then `extLst`) and
+  `workbook` (CT_Workbook order, `sheets` required), by name only. A
+  violation uses docx's `not-allowed`, `order`, `duplicate` and `missing`
+  rules, or `r-order`: a `row` or `c` whose `r` does not come after its
+  previous sibling's. A row or cell without `r` is skipped. Children in
+  another namespace (`mc:AlternateContent`, extensions) are not checked. A
+  failure reads:
+
+  ```
+  SCHEMA ext:libreoffice/sc/qa/unit/data/xlsx/tdf124525.xlsx | xl | no-content-type | /xl
+  ```
+
 ## What it does not cover
 - Fixing the losses it found:
   - The unmodeled property children and attributes were fixed by #1063.
@@ -389,6 +440,9 @@ cargo test -p gridcore --test fidelity -- --nocapture
   plus `save_package`'s table-style pass, so it can add table styles to
   `styles.xml` and `[Content_Types].xml` where the preserving save does not.
 - For xlsx:
+  - attribute values, cell contents (`f`, `v`, `is`), and every part but the
+    workbook and its worksheets; package and schema validation cover the
+    package and those containers only;
   - other file types (`.xlsm`, `.xltx`, `.xlsb`), and Save As to another type;
   - what xlsxy does around a save, such as recalculation on open and
     `stamp_save`. Only the library's round trip is checked.
