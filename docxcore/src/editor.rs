@@ -14,6 +14,7 @@ use crate::review::{RevisionAction, RevisionOutcome};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+mod autocorrect;
 mod cover;
 mod flat;
 mod sections;
