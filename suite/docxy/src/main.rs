@@ -36,6 +36,7 @@ mod design_dialogs;
 mod design_tab;
 mod dialog;
 mod dialog_host;
+mod doc_autocorrect;
 mod doc_export;
 #[cfg(test)]
 mod doc_export_tests;
@@ -20598,6 +20599,7 @@ impl Docxy {
         // record current (#618).
         let untouched = repeat_untouched(&self.repeat);
         let history = (ctrl && matches!(key.as_str(), "z" | "y")) || (!ctrl && key == "f4");
+        let autocorrect = self.autocorrect.clone();
         let (Some(ed), repeat) = self.edit_target_and_repeat() else {
             return;
         };
@@ -20676,7 +20678,7 @@ impl Docxy {
                 "down" => no(|| move_vert(ed, true)),
                 _ => match ev.keystroke.key_char.as_deref() {
                     Some(c) if !c.is_empty() && !c.chars().next().unwrap().is_control() => {
-                        noted = Some(type_key_text(ed, repeat, c));
+                        noted = Some(type_key_text(ed, repeat, c, &autocorrect));
                         true
                     }
                     _ => false,
@@ -22954,10 +22956,23 @@ fn break_typing_unless_continuing(ed: &mut Editor, rec: &Option<RepeatRecord>) {
 }
 
 /// A typed key's text, into the typing step it continues: what Repeat
-/// records for it.
-fn type_key_text(ed: &mut Editor, rec: &Option<RepeatRecord>, text: &str) -> Repeat {
+/// records for it. One character is typed with the app's AutoCorrect (#856),
+/// whose corrections are steps of their own after the typing. An IME's
+/// composed text arrives one key per character (`text_input::char_stroke`),
+/// so it is corrected too; only a key event whose `key_char` holds several
+/// characters goes in as typed.
+fn type_key_text(
+    ed: &mut Editor,
+    rec: &Option<RepeatRecord>,
+    text: &str,
+    ac: &gridcore::autocorrect::AutoCorrect,
+) -> Repeat {
     break_typing_unless_continuing(ed, rec);
-    ed.insert_str(text);
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => doc_autocorrect::type_key(ed, ac, ch),
+        _ => ed.insert_str(text),
+    }
     Repeat::Typing
 }
 
@@ -23182,7 +23197,7 @@ mod repeat_tests {
     fn type_keys(ed: &mut Editor, rec: &mut Option<RepeatRecord>, s: &str) {
         for ch in s.chars() {
             let since = docxcore::editor::undo_serial_counter();
-            let what = type_key_text(ed, rec, &ch.to_string());
+            let what = type_key_text(ed, rec, &ch.to_string(), &Default::default());
             note_edit(ed, rec, since, what);
         }
     }
@@ -23208,6 +23223,42 @@ mod repeat_tests {
         assert!(redo_or_repeat(&mut ed, &mut rec), "F4 repeats the typing");
         assert_eq!(ed.doc.body.len(), 3, "still no new paragraph");
         assert!(text(&ed, 2).starts_with("Six"));
+    }
+
+    /// #856: a typed key corrects as Word does, each correction a step of
+    /// its own after the typing; Ctrl+Y straight after it does nothing (no
+    /// redo, and the typing record is no longer the newest step).
+    #[test]
+    fn typed_keys_autocorrect_and_ctrl_y_after_it_does_nothing_856() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], 10));
+        type_keys(&mut ed, &mut rec, " Then teh ");
+        assert_eq!(text(&ed, 2), "Third one. Then the ");
+        assert_eq!(ed.undo_names()[0], "AutoCorrect");
+        assert!(!repeat_ready(&ed, &rec));
+        assert!(!redo_or_repeat(&mut ed, &mut rec), "Ctrl+Y does nothing");
+        assert_eq!(text(&ed, 2), "Third one. Then the ");
+        assert!(ed.undo());
+        assert_eq!(text(&ed, 2), "Third one. Then teh ");
+        // Typing goes on as a step of its own.
+        assert!(ed.redo());
+        type_keys(&mut ed, &mut rec, "x");
+        assert!(ed.undo());
+        assert_eq!(text(&ed, 2), "Third one. Then the ");
+    }
+
+    /// #856: a key that corrects nothing leaves the typing record ready, so
+    /// Repeat (#618) still repeats the typing.
+    #[test]
+    fn a_key_with_no_correction_keeps_repeat_ready_856() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], 10));
+        type_keys(&mut ed, &mut rec, " Then");
+        assert!(repeat_ready(&ed, &rec));
+        assert!(redo_or_repeat(&mut ed, &mut rec), "F4 repeats the typing");
+        assert_eq!(text(&ed, 2), "Third one. Then Then");
     }
 
     /// The saved `w:r` that holds `word`, up to the word.

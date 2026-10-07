@@ -354,6 +354,20 @@ impl AutoCorrect {
         self.entries.values().cloned().collect()
     }
 
+    /// The With for a typed token, in the case it was typed in: the replace
+    /// list's while Replace text as you type is on, then Math AutoCorrect's
+    /// while Use Math AutoCorrect rules outside of math regions is on
+    /// (whatever Replace text is set to). What the Word editors'
+    /// AutoCorrect reads (#856), which applies its own word rules around it.
+    pub fn replacement(&self, token: &str) -> Option<String> {
+        self.replace_one(token)
+    }
+
+    /// Whether `word` (with its period, `e.g.`) is a First Letter exception.
+    pub fn is_first_letter_exception(&self, word: &str) -> bool {
+        self.first_letter.contains(&word.to_lowercase())
+    }
+
     /// The With an entry for `replace` holds, any case.
     pub fn lookup(&self, replace: &str) -> Option<&str> {
         self.entries
