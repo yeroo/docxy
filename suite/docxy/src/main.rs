@@ -20666,6 +20666,10 @@ impl Docxy {
             match key.as_str() {
                 "backspace" => yes(|| ed.backspace()),
                 "delete" => yes(|| ed.delete_forward()),
+                "enter" if shift => {
+                    noted = Some(type_line_break(ed, repeat));
+                    true
+                }
                 "enter" => yes(|| ed.insert_newline()),
                 // Plain Tab and Shift+Tab are action-bound (`tab_key`,
                 // `shift_tab_key`) and never arrive here.
@@ -20679,9 +20683,7 @@ impl Docxy {
                 "down" => no(|| move_vert(ed, true)),
                 _ => match ev.keystroke.key_char.as_deref() {
                     Some(c) if !c.is_empty() && !c.chars().next().unwrap().is_control() => {
-                        break_typing_unless_continuing(ed, repeat);
-                        ed.insert_str(c);
-                        noted = Some(Repeat::Typing);
+                        noted = Some(type_key_text(ed, repeat, c));
                         true
                     }
                     _ => false,
@@ -22958,6 +22960,23 @@ fn break_typing_unless_continuing(ed: &mut Editor, rec: &Option<RepeatRecord>) {
     }
 }
 
+/// A typed key's text, into the typing step it continues: what Repeat
+/// records for it.
+fn type_key_text(ed: &mut Editor, rec: &Option<RepeatRecord>, text: &str) -> Repeat {
+    break_typing_unless_continuing(ed, rec);
+    ed.insert_str(text);
+    Repeat::Typing
+}
+
+/// Shift+Enter: a manual line break, typed as Word types it, inside the
+/// typing step (#853), and recorded as typing, so the record follows the
+/// caret past the break and the text typed next continues the step.
+fn type_line_break(ed: &mut Editor, rec: &Option<RepeatRecord>) -> Repeat {
+    break_typing_unless_continuing(ed, rec);
+    ed.insert_line_break();
+    Repeat::Typing
+}
+
 /// Whether Ctrl+Y / F4 would repeat on `ed` now (nothing to redo).
 fn repeat_ready(ed: &Editor, rec: &Option<RepeatRecord>) -> bool {
     rec.as_ref().is_some_and(|r| {
@@ -23049,7 +23068,8 @@ fn key_repeat(key: &str, ctrl: bool, shift: bool) -> Option<Repeat> {
         (true, "m") if shift => Repeat::Act(Act::IndentDec),
         (true, "m") => Repeat::Act(Act::IndentInc),
         (_, "tab") if !shift => Repeat::Tab,
-        (false, "enter") => Repeat::Enter,
+        // Shift+Enter is a line break typed into the typing step (#853).
+        (false, "enter") if !shift => Repeat::Enter,
         (true, "enter") if shift => Repeat::Break(docxcore::model::BreakKind::Column),
         (true, "enter") => Repeat::Break(docxcore::model::BreakKind::Page),
         _ => return None,
@@ -23139,13 +23159,14 @@ mod repeat_tests {
     /// `note_edit` with what the key records.
     fn key(ed: &mut Editor, rec: &mut Option<RepeatRecord>, key: &str, ctrl: bool, shift: bool) {
         let since = docxcore::editor::undo_serial_counter();
-        let noted = key_repeat(key, ctrl, shift);
+        let mut noted = key_repeat(key, ctrl, shift);
         if noted.is_some() {
             ed.break_undo_group();
         }
         match (ctrl, key) {
             (true, "b") => ed.toggle_bold(),
             (true, "a") => ed.select_all(),
+            (false, "enter") if shift => noted = Some(type_line_break(ed, rec)),
             (false, "enter") => ed.insert_newline(),
             (true, "enter") if shift => ed.insert_break(docxcore::model::BreakKind::Column),
             (true, "enter") => ed.insert_break(docxcore::model::BreakKind::Page),
@@ -23163,6 +23184,40 @@ mod repeat_tests {
             ed.insert_str(&ch.to_string());
             note_edit(ed, rec, since, Repeat::Typing);
         }
+    }
+
+    /// Typed text as the key handler types it, one key at a time: each key
+    /// continues the typing step only while the Repeat record says nothing
+    /// happened since the last one.
+    fn type_keys(ed: &mut Editor, rec: &mut Option<RepeatRecord>, s: &str) {
+        for ch in s.chars() {
+            let since = docxcore::editor::undo_serial_counter();
+            let what = type_key_text(ed, rec, &ch.to_string());
+            note_edit(ed, rec, since, what);
+        }
+    }
+
+    /// #853: `Six`, Shift+Enter, `Seven eight` is one typing step, the line
+    /// break inside it, as in Word: one Ctrl+Z takes it all back.
+    #[test]
+    fn shift_enter_types_a_line_break_inside_the_typing_step_853() {
+        let mut ed = three();
+        let mut rec = None;
+        ed.set_caret(Caret::at(vec![2], 10));
+        type_keys(&mut ed, &mut rec, "Six");
+        key(&mut ed, &mut rec, "enter", false, true);
+        type_keys(&mut ed, &mut rec, "Seven eight");
+        assert_eq!(ed.doc.body.len(), 3, "a line break, not a paragraph");
+        assert_eq!(ed.undo_names(), ["Typing \"Six\u{21b5}Seven eight\""]);
+        assert!(ed.undo());
+        assert_eq!(text(&ed, 2), "Third one.");
+        assert!(!ed.undo());
+        // Repeat types the line break again as a line break.
+        assert!(ed.redo());
+        ed.set_caret(Caret::at(vec![2], 0));
+        assert!(redo_or_repeat(&mut ed, &mut rec), "F4 repeats the typing");
+        assert_eq!(ed.doc.body.len(), 3, "still no new paragraph");
+        assert!(text(&ed, 2).starts_with("Six"));
     }
 
     /// The saved `w:r` that holds `word`, up to the word.
@@ -23638,6 +23693,10 @@ mod repeat_tests {
             key_repeat("enter", true, true),
             Some(Repeat::Break(docxcore::model::BreakKind::Column))
         ));
+        assert!(
+            key_repeat("enter", false, true).is_none(),
+            "Shift+Enter types"
+        );
         assert!(key_repeat("y", true, false).is_none());
         assert!(key_repeat("f4", false, false).is_none());
         assert!(key_repeat("left", false, false).is_none());
