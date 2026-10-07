@@ -577,14 +577,16 @@ fn utf8_len(b: u8) -> usize {
     }
 }
 
-/// A document that is not UTF-8 but whose XML declaration names ISO-8859-1
-/// (or `latin1`), as UTF-8 text: each byte is the character of that code
-/// point, and the declaration then says `UTF-8`, so the text matches what it
-/// declares. `None` for UTF-8 input and for any other declared encoding.
+/// A document whose XML declaration names ISO-8859-1 (or `latin1`), as
+/// UTF-8 text: each byte is the character of that code point, and the
+/// declaration then says `UTF-8`, so the text matches what it declares, also
+/// after a save adds non-ASCII text to it. `None` for any other declared
+/// encoding, and for non-ASCII input that is valid UTF-8 (UTF-8 under a
+/// wrong declaration, kept as it is); pure ASCII reads the same either way.
 /// Some writers emit such parts (LibreOffice's tdf76115.xlsx), and Excel
 /// reads them by their declaration (#1108).
 pub fn latin1_to_utf8(bytes: &[u8]) -> Option<String> {
-    if std::str::from_utf8(bytes).is_ok() || !bytes.starts_with(b"<?xml") {
+    if !bytes.starts_with(b"<?xml") || (!bytes.is_ascii() && std::str::from_utf8(bytes).is_ok()) {
         return None;
     }
     let decl = &bytes[..bytes.windows(2).position(|w| w == b"?>")?];
@@ -948,14 +950,27 @@ mod tests {
             ),
             None
         );
+        // Pure ASCII under a Latin-1 declaration: the declaration says UTF-8,
+        // so text a save adds to the part is what it declares.
+        assert_eq!(
+            latin1_to_utf8(b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><t>a</t>").as_deref(),
+            Some("<?xml version=\"1.0\" encoding=\"UTF-8\"?><t>a</t>")
+        );
         // Another encoding, no encoding, no declaration: not ours to decode.
+        // A declaration that never ends, or whose encoding's quote never
+        // closes, is not read (and does not panic).
         for doc in [
             &b"<?xml version=\"1.0\" encoding=\"windows-1252\"?><t>\x80</t>"[..],
             b"<?xml version=\"1.0\"?><t>\xe9</t>",
+            b"<?xml version=\"1.0\"?><t>a</t>",
             b"<t>\xe9</t>",
-            b"<?xml encoding=\"ISO-8859-1\"",
+            b"<?xml encoding=\"ISO-8859-1\" \xe9",
+            b"<?xml encoding=\"ISO-8859-1?>\xe9",
+            b"<?xml encoding?>\xe9",
+            b"<?xml encoding=?>\xe9",
+            b"<?xml encoding=\"?>\xe9",
         ] {
-            assert_eq!(latin1_to_utf8(doc), None);
+            assert_eq!(latin1_to_utf8(doc), None, "{doc:?}");
         }
     }
 }

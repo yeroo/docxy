@@ -179,3 +179,34 @@ fn latin1_sheet_text_survives_a_repair() {
     assert_eq!(repairs.dropped, ["xl/theme/theme1.xml"]);
     latin1_round_trip(&pkg);
 }
+
+/// #1108 r1: a shared-strings part declaring ISO-8859-1 but holding only
+/// ASCII is read as declaring UTF-8, so the non-ASCII text a save appends
+/// to it is what the part declares.
+#[test]
+fn ascii_latin1_part_declares_utf8_after_an_addition() {
+    let mut parts = package("/");
+    let sst = format!(
+        "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><sst xmlns=\"{SML}\" count=\"1\" uniqueCount=\"1\"><si><t>plain</t></si></sst>"
+    );
+    parts.push(("xl/sharedStrings.xml".into(), sst.into_bytes()));
+    for (name, bytes) in &mut parts {
+        if name == "xl/_rels/workbook.xml.rels" {
+            let rels = String::from_utf8(bytes.clone()).unwrap().replace(
+                "</Relationships>",
+                &format!("<Relationship Id=\"rId9\" Type=\"{R}/sharedStrings\" Target=\"sharedStrings.xml\"/></Relationships>"),
+            );
+            *bytes = rels.into_bytes();
+        }
+    }
+    let mut pkg = load_xlsx(&write_zip(&parts)).expect("loads");
+    pkg.workbook.sheets[0].set_cell(0, 1, crate::sheet::Cell::text("caf\u{e9}"));
+    let saved = save_xlsx(&pkg);
+    let zip = ZipArchive::open(&saved).unwrap();
+    let sst = String::from_utf8(zip.read("xl/sharedStrings.xml").unwrap()).expect("UTF-8");
+    assert!(sst.contains("caf\u{e9}"), "{sst}");
+    assert!(
+        !sst.contains("8859"),
+        "UTF-8 text under a Latin-1 declaration: {sst}"
+    );
+}
