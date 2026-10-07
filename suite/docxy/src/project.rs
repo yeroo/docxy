@@ -913,9 +913,19 @@ pub(super) fn restore_project_tab(t: &PersistTab) -> DocTab {
     project_tab(t.title.clone().into(), path, surface, false, status)
 }
 
-/// The status bar's `New Tasks: …` item.
+/// The status bar's `New Tasks: …` item, with the glyph Microsoft Project
+/// draws beside it: a pushpin when new tasks are manually scheduled, a gear
+/// when they are auto-scheduled.
 pub(crate) fn new_tasks_label(manual: bool) -> String {
-    format!("New Tasks: {}", task_mode_name(manual))
+    format!(
+        "{} New Tasks: {}",
+        new_tasks_glyph(manual),
+        task_mode_name(manual)
+    )
+}
+
+fn new_tasks_glyph(manual: bool) -> &'static str {
+    if manual { "📌" } else { "⚙" }
 }
 
 /// The status bar's items as `status-read` reports them, left to right, each

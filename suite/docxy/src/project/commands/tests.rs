@@ -3469,7 +3469,18 @@ fn status_items_are_the_state_the_mode_and_the_message_in_order() {
         items(&t),
         [
             ("state", "Ready".to_string()),
-            ("new-tasks", "New Tasks: Auto Scheduled".to_string()),
+            ("new-tasks", "⚙ New Tasks: Auto Scheduled".to_string()),
+            ("message", "loaded — 2 tasks".to_string()),
+        ]
+    );
+    // The mode item's glyph flips with the plan's mode; the state and
+    // message items stay put.
+    vm(&mut t).ed.set_new_tasks_manual(true);
+    assert_eq!(
+        items(&t),
+        [
+            ("state", "Ready".to_string()),
+            ("new-tasks", "📌 New Tasks: Manually Scheduled".to_string()),
             ("message", "loaded — 2 tasks".to_string()),
         ]
     );
