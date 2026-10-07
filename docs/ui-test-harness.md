@@ -464,7 +464,7 @@ footer editor; `selection-set` refuses while it is open.
 | `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 8 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The drag arms once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of about 2.25px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
 | `pointer-wheel {"region":"backstage-content","dy":-600}` | dispatch a real mouse move and wheel notch at the region's centre through gpui's hit testing (#1028); a negative `dy` (logical pixels) scrolls the content down. Replies `{x, y, dy}`. Refuses under a dialog; does not pre-close menus |
 | `backstage-layout {}` | read the File screen's scroll state (refused while it is closed): `page` (`open`, `new`, `info`, `account`), the content pane's `viewport_h`, `content_h`, `scroll_y`, `scrollable`, `at_top`, `scrolled`, `last_item_visible` (true when the page fits or has been scrolled to its end), and the rail's `rail_viewport_h`, `rail_content_h`, `rail_scrollable`, `rail_last_item_visible`. Settle with `shot window` first; regions `backstage-content` and `backstage-rail` name the two columns |
-| `backstage-page {"page":"new"}` | switch the File screen's page: `new`, `info` (a document tab only) and `account` call the rail's handler; `open` (the default page) is a setup shortcut with no rail counterpart (the user closes and reopens File; the rail's Open… opens a file picker). Every page starts scrolled to the top. Replies like `backstage-layout`, whose sizes come from the last drawn frame: `shot window` before reading them |
+| `backstage-page {"page":"new"}` | switch the File screen's page: `new`, `info` and `export` (a document tab only; Export is Change File Type, #635) and `account` call the rail's handler; `open` (the default page) is a setup shortcut with no rail counterpart (the user closes and reopens File; the rail's Open… opens a file picker). Every page starts scrolled to the top. Replies like `backstage-layout`, whose sizes come from the last drawn frame: `shot window` before reading them |
 | `proj.new {}` | make a blank Project and activate it, as Backstage › New › Project does; replies with `proj.path` for it (`tab`, `path: null`, `name: Project1`, 0 `tasks`, `imported`, the cell state). It takes no `tab` and no `name`: the plan is the app's, so name it by saving it (`proj.save {"path":…}`). The Project control server accepts it too |
 | `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
 | `window-zoom {}` | call GPUI's zoom action; on Windows it maximizes, while the native caption Max button uses the OS control area. Use a fresh harness window for restored geometry on Windows |
@@ -770,6 +770,7 @@ pointer on a few pixels, each driven through the app's own handlers (#699).
 |---|---|
 | `mail-attach {"path":"list.csv"}` | Mailings › Select Recipients › Use an Existing List… without the native dialog (#628): the path goes to the same attach the dialog's answer feeds, on the active Word document. A relative path resolves against the tab's folder. The reply is `{rows, columns, status}`; a file that is not a `.csv`/`.txt` list, cannot be read or has no header row is refused |
 | `save-as {"path":"out.md"}` | Save As the active tab to `path` without the native dialog: the path goes to the same save function the dialog's answer feeds (`save_doc_to`, `save_sheet_as`, `save_project_to`), and the tab is rebound (title, path, clean, a document's Markdown flag) exactly as after a dialog Save As. Optional `format` and `overwrite` |
+| `new-from-template {"path":"Letter.dotx"}` | File › New › Personal templates without the click (#636): a new, untitled document from the `.dotx`/`.dotm` at `path` (relative to the active tab's folder), the way opening a template makes one. Replies `{path: null, title, dirty, status}`; a file that is not a Word template, or one that will not load, opens nothing and is refused |
 | `clipboard {"action":"read"}` | the clipboard's text and what the active tab's paste would use |
 | `clipboard {"action":"write","text":"a\tb\n"}` | put text on the clipboard, as another app's copy would |
 | `fill-drag {"from":"B4:B5","to":"B8"}` | press the fill handle, cross each cell to `to`, release. Optional `from`, `option`, `ctrl`, `right`, `double` (#668) |
@@ -780,19 +781,23 @@ pointer on a few pixels, each driven through the app's own handlers (#699).
 of the tab's own file, where the dialog would open, so after `open copy:` it
 lands in the case's sandbox folder. A tab that was never saved needs an
 absolute path. The format follows the extension by the app's own rules:
-documents save as `.docx`, `.md` (`.markdown`) or an editable-HTML bundle
-(`.html`/`.htm`, only in a build that can make one or from a tab that is one);
+documents save as `.docx`, `.docm`, `.dotx` or `.dotm` (each written as that
+file type, a macro-free one without the document's macros, #636), Rich Text
+`.rtf` or Plain Text `.txt` (#635), `.md` (`.markdown`) or an editable-HTML
+bundle (`.html`/`.htm`, only in a build that can make one or from a tab that
+is one);
 workbooks as `.xlsx`, `.xlsm`, `.xltx` or `.xltm`, each written as that file
 type (a macro-free one without the workbook's macros); Projects as `.yppx` or
-MSPDI `.xml`. A path with no extension takes `format`'s (`docx`, `md`, `html`
-→ `.docx.html`, `xlsx`, `xlsm`, `xltx`, `xltm`, `yppx`, `xml`) or the kind's
+MSPDI `.xml`. A path with no extension takes `format`'s (`docx`, `docm`,
+`dotx`, `dotm`, `rtf`, `txt`, `md`, `html` → `.docx.html`, `xlsx`, `xlsm`,
+`xltx`, `xltm`, `yppx`, `xml`) or the kind's
 first (`.docx`, `.xlsx`, `.yppx`). The reply is
 `{path, format, title, dirty, status}`. Refused in words, with nothing written
 and the tab unchanged:
 
 - a missing or empty `path`; a relative `path` on a never-saved tab;
-- a format the tab kind cannot save (`Documents can be saved as .docx, .md or
-  .html`, `Workbooks can only be saved as .xlsx, .xlsm, .xltx or .xltm`,
+- a format the tab kind cannot save (`Documents can be saved as .docx, .docm,
+  .dotx, .dotm, .rtf, .txt, .md or .html`, `Workbooks can only be saved as .xlsx, .xlsm, .xltx or .xltm`,
   `Project schedules can only be saved as .yppx or .xml (MSPDI)`), including
   any other document extension, which the save would otherwise write as a
   Word package under that name;
@@ -801,10 +806,11 @@ and the tab unchanged:
 - a write that fails: the reply is the tab's status (`save failed: …`), and
   the tab stays bound where it was.
 
-`key ctrl+s` on a never-saved tab and the Backstage's Save As… (a
-pointer-only control no verb reaches) still refuse in a harness instance, now
-ending with `use the harness save-as verb`. `save-as.uit` covers each kind and
-refusal.
+`key ctrl+s` on a never-saved tab, the Backstage's Save As… and the Export
+page's types (pointer-only controls no verb reaches) still refuse in a harness
+instance, now ending with `use the harness save-as verb`. `save-as.uit` covers
+each kind and refusal; `export-templates.uit` the Export page and new
+documents from templates.
 
 **`clipboard`.** A harness instance never touches the OS clipboard: the app's
 clipboard reads and writes (document, sheet and Project copy and paste) go
