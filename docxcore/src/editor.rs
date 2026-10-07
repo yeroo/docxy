@@ -163,6 +163,33 @@ struct Snapshot {
     /// The step's identity, unique across every editor in the process
     /// (0 until the step is pushed); travels with the step too.
     serial: u64,
+    /// The formatting toggled at the caret, so undoing or redoing a Bold
+    /// at an insertion point switches it back off or on (#854).
+    pending: Option<PendingFormat>,
+}
+
+/// Formatting toggled at an insertion point (Ctrl+B with nothing
+/// selected, #854): what the next character typed there takes, as Word
+/// does. Each toggle is a setter and the value it sets, applied in order
+/// over the props the character would get anyway.
+#[derive(Clone)]
+struct PendingFormat {
+    caret: Caret,
+    /// The toggle's own undo step. Any later step, from whatever edit,
+    /// leaves the toggles behind.
+    serial: Option<u64>,
+    toggles: Vec<Toggle>,
+}
+
+/// A run property's setter and the value a toggle sets it to.
+type Toggle = (fn(&mut RunProps, bool), bool);
+
+impl PendingFormat {
+    fn apply(&self, props: &mut RunProps) {
+        for (set, value) in &self.toggles {
+            set(props, *value);
+        }
+    }
 }
 
 /// An undo step's name. Typing is named by its text as it coalesces; a host
@@ -332,6 +359,9 @@ pub struct Editor {
     /// reviewer while `Some`. Not saved with the document: the host sets it
     /// from the settings and its own identity.
     track: Option<TrackAuthor>,
+    /// Formatting toggled at the caret, for the next character typed (#854);
+    /// see [`Editor::pending_format`] for while it holds.
+    pending: Option<PendingFormat>,
 }
 
 impl Editor {
@@ -351,6 +381,7 @@ impl Editor {
             merge_preview: None,
             merge_previewed: false,
             track: None,
+            pending: None,
         }
     }
 
@@ -413,6 +444,7 @@ impl Editor {
             review_target: self.review_target,
             name: StepName::Unnamed(EditKind::Structural),
             serial: 0,
+            pending: self.pending.clone(),
         }
     }
 
@@ -594,6 +626,7 @@ impl Editor {
             self.caret = prev.caret;
             self.anchor = prev.anchor;
             self.review_target = prev.review_target;
+            self.pending = prev.pending;
             self.last = EditKind::None;
             self.refresh_merge_preview();
             true
@@ -609,6 +642,7 @@ impl Editor {
             self.caret = next.caret;
             self.anchor = next.anchor;
             self.review_target = next.review_target;
+            self.pending = next.pending;
             self.last = EditKind::None;
             self.refresh_merge_preview();
             true
@@ -845,6 +879,10 @@ impl Editor {
             return;
         }
         self.drop_collapsed_anchor();
+        // Read before the typing step is pushed, which leaves it behind (that
+        // step keeps it, so undoing the typing brings it back); text typed
+        // after this character takes the character's own props.
+        let pending = self.pending_format().cloned();
         let pushed_before = undo_serial_counter();
         if self.has_selection() {
             self.delete_selection();
@@ -877,9 +915,12 @@ impl Editor {
         if ch == LINE_BREAK {
             // A break is an inline of its own, formatted as typing here
             // would be (see `insert_break`), and part of the typing step.
-            let props = resolve_para(&self.doc.body, &self.caret.path)
+            let mut props = resolve_para(&self.doc.body, &self.caret.path)
                 .map(|p| tab_props_at(&p.content, off))
                 .unwrap_or_default();
+            if let Some(pending) = &pending {
+                pending.apply(&mut props);
+            }
             self.paste_at_caret(&Clip {
                 paras: vec![vec![Inline::Break(BreakKind::Line, props)]],
             });
@@ -889,6 +930,11 @@ impl Editor {
             }
         } else if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
             content_insert(&mut p.content, off, ch);
+            // The toggles go on before the change is recorded, which may
+            // set the props of a tracked insertion over them.
+            if let Some(pending) = &pending {
+                map_prop_range(&mut p.content, off, off + 1, &|props| pending.apply(props));
+            }
             self.caret.offset += 1;
             let path = self.caret.path.clone();
             self.settle_inserted(&path, off, 1);
@@ -923,12 +969,16 @@ impl Editor {
     /// takes the formatting before the link, not the link's style (see
     /// `tab_props_at`).
     pub fn insert_tab(&mut self) {
+        let pending = self.pending_format().cloned();
         if self.has_selection() {
             self.delete_selection();
         }
-        let props = resolve_para(&self.doc.body, &self.caret.path)
+        let mut props = resolve_para(&self.doc.body, &self.caret.path)
             .map(|p| tab_props_at(&p.content, self.caret.offset))
             .unwrap_or_default();
+        if let Some(pending) = &pending {
+            pending.apply(&mut props);
+        }
         self.paste(&Clip {
             paras: vec![vec![Inline::Tab(props)]],
         });
@@ -1696,11 +1746,31 @@ impl Editor {
         self.toggle_run_prop(RunProps::user_strike, RunProps::set_user_strike);
     }
 
-    /// Run properties at the caret (used for toggles and the ribbon's on-states).
+    /// Run properties at the caret (used for toggles and the ribbon's
+    /// on-states): what a character typed there takes, formatting toggled at
+    /// the caret included (#854).
     pub fn caret_props(&self) -> RunProps {
+        let mut props = self.text_props_at_caret();
+        if let Some(pending) = self.pending_format() {
+            pending.apply(&mut props);
+        }
+        props
+    }
+
+    /// The props the text around the caret gives a character typed there.
+    fn text_props_at_caret(&self) -> RunProps {
         resolve_para(&self.doc.body, &self.caret.path)
             .map(|p| run_props_at(&p.content, self.caret.offset))
             .unwrap_or_default()
+    }
+
+    /// The formatting toggled at the caret, while it still holds: the caret
+    /// has not moved, nothing is selected, and no undo step has been pushed
+    /// since the toggle's own (#854).
+    fn pending_format(&self) -> Option<&PendingFormat> {
+        self.pending.as_ref().filter(|p| {
+            p.caret == self.caret && p.serial == self.undo_serial() && !self.has_selection()
+        })
     }
 
     /// Paragraph properties of the paragraph at the caret.
@@ -2084,9 +2154,15 @@ impl Editor {
 
     /// Toggle a run property over the selection. The new value is "off" only if
     /// every selected character already has it (so it works like Word).
+    ///
+    /// With nothing selected it switches the property for the next character
+    /// typed at the caret instead, as an undo step of its own (#854).
     fn toggle_run_prop(&mut self, get: fn(&RunProps) -> bool, set: fn(&mut RunProps, bool)) {
         let spans = self.selection_spans();
         if spans.is_empty() {
+            if !self.has_selection() {
+                self.toggle_at_caret(get, set);
+            }
             return;
         }
         self.checkpoint(EditKind::Structural);
@@ -2106,6 +2182,28 @@ impl Editor {
             }
         }
         self.doc.initialize_revision_targets();
+    }
+
+    fn toggle_at_caret(&mut self, get: fn(&RunProps) -> bool, set: fn(&mut RunProps, bool)) {
+        let value = !get(&self.caret_props());
+        let mut toggles = self
+            .pending_format()
+            .map(|p| p.toggles.clone())
+            .unwrap_or_default();
+        toggles.push((set, value));
+        // The step holds the state before the toggle, pending format and all.
+        self.checkpoint(EditKind::Structural);
+        let pending = PendingFormat {
+            caret: self.caret.clone(),
+            serial: self.undo_serial(),
+            toggles,
+        };
+        // Toggles that cancel out (Bold twice) leave nothing to apply, so
+        // the text typed next joins the run it is typed in.
+        let base = self.text_props_at_caret();
+        let mut toggled = base.clone();
+        pending.apply(&mut toggled);
+        self.pending = (toggled != base).then_some(pending);
     }
 
     // ---- find / replace ----
