@@ -131,7 +131,7 @@ fn collect_text(p: &mut XmlParser) -> (String, Option<String>) {
         match p.next() {
             Event::Start => {
                 match p.name() {
-                    "w:t" => {
+                    "w:t" | "w:delText" => {
                         // Consumes through the element's End.
                         s.push_str(&crate::load::read_text(p));
                         continue;
@@ -303,6 +303,24 @@ mod tests {
         </w:p></w:body></w:document>"#;
         let (_, quotes) = anchors(doc);
         assert_eq!(quotes.get("1").map(String::as_str), Some("SDT Run"));
+    }
+
+    /// Deleted text in a comment reads like note text: `w:delText` under the
+    /// same whitespace rule.
+    #[test]
+    fn comment_deleted_text_follows_the_whitespace_rule() {
+        let comment = |attrs: &str| {
+            format!(
+                r#"<w:comments xmlns:w="x"><w:comment w:id="1" w:author="A"><w:p>
+                <w:del w:id="2" w:author="A"><w:r><w:delText{attrs}> gone </w:delText></w:r></w:del>
+                </w:p></w:comment></w:comments>"#
+            )
+        };
+        assert_eq!(parse_comments_xml(&comment(""))[0].text, "gone");
+        assert_eq!(
+            parse_comments_xml(&comment(r#" xml:space="preserve""#))[0].text,
+            " gone "
+        );
     }
 
     #[test]

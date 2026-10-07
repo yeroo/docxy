@@ -310,7 +310,8 @@ fn finish(mut b: Building) -> Elem {
         trim_text_edges(&mut e.children);
     }
     // Whitespace-only text between elements is indentation, not content. An
-    // element whose only content is whitespace (`<w:t> </w:t>`) keeps it.
+    // element whose only content is whitespace keeps it
+    // (`<w:t xml:space="preserve"> </w:t>`; trimmed above without preserve).
     if e.children.iter().any(|c| matches!(c, Node::Elem(_))) {
         e.children
             .retain(|c| !matches!(c, Node::Text(t) if t.chars().all(is_xml_ws)));

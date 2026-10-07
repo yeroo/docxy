@@ -285,7 +285,15 @@ impl<'a> XmlParser<'a> {
         self.push_namespace_scope();
         self.push_markup_compatibility_scope();
         let inherited = self.xml_space_preserve();
-        let preserve = match self.attr("xml:space") {
+        let raw = self.attr("xml:space");
+        let mut decoded = String::new();
+        let value = if raw.contains('&') {
+            Self::append_decoded(raw, &mut decoded);
+            decoded.as_str()
+        } else {
+            raw
+        };
+        let preserve = match value {
             "preserve" => true,
             "default" => false,
             _ => inherited,
@@ -703,6 +711,22 @@ mod tests {
             ]
         );
         assert!(!p.xml_space_preserve(), "every scope is popped at Eof");
+    }
+
+    #[test]
+    fn xml_space_values_compare_after_references_decode() {
+        let mut p = XmlParser::new(
+            r#"<p xml:space="pre&#x73;erve"><t/><r xml:space="&#100;efault"><t/></r></p>"#,
+        );
+        let mut seen = Vec::new();
+        loop {
+            match p.next() {
+                Event::Start => seen.push((p.name(), p.xml_space_preserve())),
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert_eq!(seen, [("p", true), ("t", true), ("r", false), ("t", false)]);
     }
 
     #[test]
