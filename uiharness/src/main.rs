@@ -37,7 +37,7 @@ usage:
   uiharness [--config DIR | --ctl DIR] [--instance NAME] [--desktop NAME] <command>
 
 commands:
-  run SCRIPT...                 launch a sandboxed instance and run a test script
+  run SCRIPT...                 launch a sandboxed instance per script file and run it
   ping                          check the connection and print the instance
   call VERB [JSON]              send any verb, print its reply
   rect REGION                   print a region's desktop rectangle
@@ -59,9 +59,12 @@ options for shot/window:
 options for run:
   --suite EXE                   the built suite to drive (default: $UIHARNESS_SUITE,
                                 else target/release then target/debug)
-  --sandbox DIR                 the throwaway config root
-                                (default: <run>/sandbox-<pid>-<timestamp>, retained)
-  --keep                        leave the instance running after the script ends
+  --sandbox DIR                 the throwaway config root, one script file only
+                                (a multi-file run gives every file its own
+                                sandbox; default <run>/sandbox-<pid>-<timestamp>-<n>,
+                                retained)
+  --keep                        leave the last file's instance running after the
+                                run, to poke at the window a case failed on
   --desktop NAME                start the suite on a separate Win32 desktop (never shown)
 
 regions:
@@ -297,12 +300,17 @@ fn run(a: Args) -> Result<String, String> {
     }
 }
 
-/// Run one or more script files against an instance this process starts and
-/// stops.
+/// Run one or more script files, one instance per script file.
 ///
-/// The script is parsed — all of them, in fact — before the app is launched, so
-/// a typo costs milliseconds rather than a cold start. That ordering is the
-/// point of [`uiharness::script`] being pure.
+/// Every file gets the fresh instance scripts/ui-linux-sweep.py runs each
+/// script under, so no file inherits another file's tabs or view state —
+/// cases within one file still share an instance on purpose (runner.rs
+/// `run_script`), and a case that needs exact tab counts relies on its file
+/// starting clean (see user-name-no-document.uit).
+///
+/// The scripts are parsed — all of them, in fact — before the first app is
+/// launched, so a typo costs milliseconds rather than a cold start. That
+/// ordering is the point of [`uiharness::script`] being pure.
 fn run_scripts(a: &Args) -> Result<String, String> {
     let paths = &a.rest[1..];
     if paths.is_empty() {
@@ -332,6 +340,20 @@ fn run_scripts(a: &Args) -> Result<String, String> {
         return Err(clash);
     }
 
+    // A caller-named sandbox is ONE config root, and the app restores the
+    // session persisted in it at launch — with several files, the second
+    // instance would reopen the first file's tabs and their unsaved edits.
+    // Refuse before anything launches; chaining separate runs with one
+    // --sandbox is still how to carry state on purpose.
+    if a.sandbox.is_some() && scripts.len() > 1 {
+        return Err(format!(
+            "--sandbox names a single throwaway config root, and this run has {} script files — \
+             a multi-file run starts one instance per file, each with its own sandbox. \
+             Drop --sandbox, or run the files separately",
+            scripts.len()
+        ));
+    }
+
     let exe = uiharness::launch::find_suite(a.suite.as_deref())?;
     let run = Run::create(&a.run_dir).map_err(|e| format!("{}: {e}", a.run_dir.display()))?;
     // ⚠️ The default sandbox must be one no other run can name, because the app
@@ -339,7 +361,8 @@ fn run_scripts(a: &Args) -> Result<String, String> {
     // each tab's live content, and the next launch restores those in preference
     // to the file on disk — a shared path would start run N+1 with run N's tabs
     // and their unsaved edits, exactly the "testing that instance's history"
-    // the harness starts its own instance to avoid.
+    // the harness starts its own instance to avoid. Every file gets its own;
+    // the per-file index keeps them apart inside one run.
     //
     // The process id is not enough on its own. `--keep` detaches the suite and
     // lets THIS process exit, which frees the id while that instance is still
@@ -349,20 +372,13 @@ fn run_scripts(a: &Args) -> Result<String, String> {
     // a recursive delete on a path someone else might hold is how a live
     // instance loses its discovery file and two runs end up driving one window.
     // A sandbox the caller named is theirs to manage (that is what `--sandbox`
-    // is for: keeping one across runs).
-    let sandbox = match &a.sandbox {
-        Some(p) => p.clone(),
-        None => {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos());
-            run.dir()
-                .join(format!("sandbox-{}-{stamp}", std::process::id()))
-        }
-    };
+    // is for: keeping one across runs — of one file).
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     // The suite starts on the named desktop (or the user's own, as today).
     // The `Desktop` outlives the run: its handle must stay open while this
-    // thread is attached to it and the suite is running on it.
+    // thread is attached to it and every per-file instance is running on it.
     let desk = match &a.desktop {
         Some(name) => {
             let d = uiharness::desktop::Desktop::create(name)?;
@@ -371,38 +387,6 @@ fn run_scripts(a: &Args) -> Result<String, String> {
         }
         None => None,
     };
-    let mut app = match &desk {
-        Some(d) => uiharness::launch::launch_on_desktop(&exe, &sandbox, d)?,
-        None => uiharness::launch::launch(&exe, &sandbox)?,
-    };
-    let ctl = app.ctl_dir();
-
-    let driver = match Driver::connect(&ctl, a.instance.as_deref()) {
-        Ok(d) => d,
-        // A refusal from the isolation gate exits before it ever publishes a
-        // socket, so the connect timing out is the symptom and the exit is the
-        // cause. Say both.
-        Err(e) => {
-            return Err(match app.exited() {
-                Some(why) => format!("{e}\n{why}"),
-                None => e,
-            });
-        }
-    };
-
-    // The instance that answered must be the one this process started. It is
-    // the same check the unique sandbox above makes unnecessary — and exactly
-    // the reason to keep it: if the two ever disagree, a run would be driving
-    // somebody else's window and reporting on it as if it were its own.
-    if driver.pid() != app.pid() {
-        let (found, ours) = (driver.pid(), app.pid());
-        app.shutdown(None);
-        return Err(format!(
-            "the instance publishing itself in {} is pid {found}, but the one this run \
-             started is pid {ours}; another harness instance is using this sandbox",
-            ctl.display()
-        ));
-    }
 
     // ⚠️ Which binary was driven, first line of every run. `find_suite` prefers
     // release over debug and does not compare dates, so a stale
@@ -411,31 +395,72 @@ fn run_scripts(a: &Args) -> Result<String, String> {
     // is what makes that visible instead of mystifying.
     let mut out = format!("suite:    {}\n", exe.display());
     let mut all_passed = true;
-    for (path, base, script) in &scripts {
+    for (i, (path, base, script)) in scripts.iter().enumerate() {
+        let sandbox = match &a.sandbox {
+            Some(p) => p.clone(),
+            None => run
+                .dir()
+                .join(format!("sandbox-{}-{stamp}-{i}", std::process::id())),
+        };
+        let mut app = match &desk {
+            Some(d) => uiharness::launch::launch_on_desktop(&exe, &sandbox, d)?,
+            None => uiharness::launch::launch(&exe, &sandbox)?,
+        };
+        let ctl = app.ctl_dir();
+
+        let driver = match Driver::connect(&ctl, a.instance.as_deref()) {
+            Ok(d) => d,
+            // A refusal from the isolation gate exits before it ever publishes a
+            // socket, so the connect timing out is the symptom and the exit is the
+            // cause. Say both.
+            Err(e) => {
+                return Err(match app.exited() {
+                    Some(why) => format!("{e}\n{why}"),
+                    None => e,
+                });
+            }
+        };
+
+        // The instance that answered must be the one this process started. It is
+        // the same check the unique sandbox above makes unnecessary — and exactly
+        // the reason to keep it: if the two ever disagree, a run would be driving
+        // somebody else's window and reporting on it as if it were its own.
+        if driver.pid() != app.pid() {
+            let (found, ours) = (driver.pid(), app.pid());
+            app.shutdown(None);
+            return Err(format!(
+                "the instance publishing itself in {} is pid {found}, but the one this run \
+                 started is pid {ours}; another harness instance is using this sandbox",
+                ctl.display()
+            ));
+        }
+
         out.push_str(&format!("{}\n", path.display()));
         let outcome = uiharness::Runner::new(&driver, &run, base, &sandbox).run_script(script);
         all_passed &= outcome.passed();
         out.push_str(&outcome.report());
+        out.push_str(&format!("sandbox:  {}\n", sandbox.display()));
+
+        // --keep leaves the LAST instance up for poking at; earlier files shut
+        // down however their cases went, so a later file never sees them.
+        if i + 1 == scripts.len() && a.keep {
+            match &a.desktop {
+                Some(name) => out.push_str(&format!(
+                    "the instance is still running (pid {}) on desktop {name}; --keep was \
+                     given — later shot/window/assert commands need --desktop {name}\n",
+                    driver.pid()
+                )),
+                None => out.push_str(&format!(
+                    "the instance is still running (pid {}); --keep was given\n",
+                    driver.pid()
+                )),
+            }
+            app.detach();
+        } else {
+            app.shutdown(Some(&driver));
+        }
     }
     out.push_str(&format!("evidence: {}\n", run.dir().display()));
-    out.push_str(&format!("sandbox:  {}\n", sandbox.display()));
-
-    if a.keep {
-        match &a.desktop {
-            Some(name) => out.push_str(&format!(
-                "the instance is still running (pid {}) on desktop {name}; --keep was \
-                 given — later shot/window/assert commands need --desktop {name}\n",
-                driver.pid()
-            )),
-            None => out.push_str(&format!(
-                "the instance is still running (pid {}); --keep was given\n",
-                driver.pid()
-            )),
-        }
-        app.detach();
-    } else {
-        app.shutdown(Some(&driver));
-    }
 
     if all_passed { Ok(out) } else { Err(out) }
 }
