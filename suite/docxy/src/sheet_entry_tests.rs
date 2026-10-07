@@ -898,6 +898,109 @@ fn f4_repeats_the_ribbons_last_toggle_as_a_setter() {
     assert!(!v.repeat_format());
 }
 
+/// Ctrl+B on the selection as the ribbon runs it: one undo step, then the
+/// resolved toggle, recorded for Repeat.
+fn bold_selection(v: &mut SheetView) {
+    let bold = v.toggle_setter(|x| x.bold, |x, on| x.bold = on);
+    v.push_undo();
+    v.apply_format(bold);
+}
+
+#[test]
+fn redo_or_repeat_repeats_the_last_format_with_nothing_to_redo() {
+    let mut v = view();
+    // #859 step 1: A1 bold, then Ctrl+Y (or F4) on C2 bolds C2.
+    bold_selection(&mut v);
+    select(&mut v, 1, 2);
+    let undo = v.undo.len();
+    assert!(v.redo_or_repeat(true));
+    assert!(xf(&v, 1, 2).bold);
+    // One undo step, and nothing left to redo.
+    assert_eq!(v.undo.len(), undo + 1);
+    assert!(v.redo.is_empty());
+    assert!(v.undo_step());
+    assert!(!xf(&v, 1, 2).bold);
+    assert!(xf(&v, 0, 0).bold);
+}
+
+#[test]
+fn a_pending_redo_wins_over_repeat_and_selects_what_it_redoes() {
+    let mut v = view();
+    bold_selection(&mut v);
+    // #859 step 2: F4 on C3, Ctrl+Z, click C4, F4.
+    select(&mut v, 2, 2);
+    assert!(v.redo_or_repeat(true));
+    assert!(xf(&v, 2, 2).bold);
+    assert!(v.undo_step());
+    assert!(!xf(&v, 2, 2).bold);
+    select(&mut v, 3, 2);
+    assert!(v.redo_or_repeat(true));
+    assert!(xf(&v, 2, 2).bold, "C3 is bold again");
+    assert!(!xf(&v, 3, 2).bold, "C4 stays plain");
+    assert_eq!(v.sel, (2, 2), "the redo selects C3");
+    assert!(v.redo.is_empty());
+    // With the redo spent, the next press repeats again.
+    select(&mut v, 3, 2);
+    assert!(v.redo_or_repeat(true));
+    assert!(xf(&v, 3, 2).bold);
+}
+
+#[test]
+fn redo_or_repeat_with_nothing_to_do_changes_nothing() {
+    let mut v = view();
+    select(&mut v, 1, 1);
+    assert!(!v.redo_or_repeat(true));
+    assert!(v.undo.is_empty());
+    assert!(!xf(&v, 1, 1).bold);
+}
+
+#[test]
+fn without_may_repeat_only_a_pending_redo_runs() {
+    // A protected sheet: no repeat.
+    let mut v = view();
+    bold_selection(&mut v);
+    select(&mut v, 1, 2);
+    let undo = v.undo.len();
+    assert!(!v.redo_or_repeat(false));
+    assert!(!xf(&v, 1, 2).bold);
+    assert_eq!(v.undo.len(), undo);
+    // A pending redo still redoes.
+    assert!(v.undo_step());
+    assert!(!xf(&v, 0, 0).bold);
+    assert!(v.redo_or_repeat(false));
+    assert!(xf(&v, 0, 0).bold);
+}
+
+#[test]
+fn redo_or_repeat_in_the_cell_editor_keeps_the_entry() {
+    // Excel greys Redo/Repeat while editing: a pending redo would restore
+    // over the typed entry and drop it.
+    let mut v = view();
+    bold_selection(&mut v);
+    assert!(v.undo_step());
+    select(&mut v, 4, 4);
+    type_fresh(&mut v, "hello");
+    assert!(!v.redo_or_repeat(true));
+    assert_eq!(v.editing.as_deref(), Some("hello"));
+    assert!(!xf(&v, 0, 0).bold);
+    assert_eq!(v.redo.len(), 1);
+}
+
+#[test]
+fn typing_leaves_the_last_format_to_repeat() {
+    let mut v = view();
+    bold_selection(&mut v);
+    // Typing in E2 records nothing to repeat.
+    select(&mut v, 1, 4);
+    type_fresh(&mut v, "text");
+    assert!(v.commit_edit());
+    assert!(!xf(&v, 1, 4).bold);
+    // F4 on E3 still repeats the bold.
+    select(&mut v, 2, 4);
+    assert!(v.redo_or_repeat(true));
+    assert!(xf(&v, 2, 4).bold);
+}
+
 #[test]
 fn a_refused_entry_stays_open_and_nothing_moves() {
     let mut v = view();
