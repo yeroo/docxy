@@ -72,7 +72,9 @@ or summary switched back to auto is restamped where it is now scheduled. Likewis
 refreshes the stored assignment dates, costs and remaining work, and the
 resource, task and summary totals, that an edit made stale
 (`assign::refresh`, run from `Editor::reschedule` during an edit); values no
-edit touched are saved exactly as read. Project-level options the model does not hold (`ScheduleFromStart`,
+edit touched are saved exactly as read. A structural edit likewise renumbers
+a stored WBS code that equals the task's outline number (a generated one, as
+Project writes without a custom mask) and keeps an explicit override. Project-level options the model does not hold (`ScheduleFromStart`,
 currency, file identity, ...) are kept verbatim in
 `Project::options` and written back on save. docxy still schedules forward
 when `ScheduleFromStart` is 0, and a save then keeps every task's stored
