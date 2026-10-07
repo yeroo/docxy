@@ -2,9 +2,13 @@
 //! refresh pivot output regions from current source data through the
 //! columnar query core in [`crate::frame`].
 //!
-//! **Graceful degradation:** pivots using features we don't model — page
-//! filters, hidden items, calculated fields, measures-on-rows — are marked
-//! unsupported and never refreshed; their cached cells stay untouched. On
+//! Refresh applies page filters and hidden items and evaluates calculated
+//! fields. **Graceful degradation:** a pivot we can't model — no location or
+//! data fields, a data field with an unknown aggregation, a non-worksheet
+//! cache source, or several measures on rows next to column fields — is
+//! marked unsupported and never refreshed, and so is one whose source or
+//! fields can't be resolved or whose calculated field doesn't parse; their
+//! cached cells stay untouched. On
 //! save a pivot that was created, edited or refreshed gets
 //! `refreshOnLoad="1"`, so real Excel rebuilds the layout from the same
 //! definition we computed from; an untouched pivot keeps its parts as loaded.
