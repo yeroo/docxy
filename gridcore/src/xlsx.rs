@@ -1153,9 +1153,10 @@ impl TextRun {
         }
     }
 
-    /// One piece of its character data (entities and CDATA arrive apart).
+    /// One piece of its character data (entities and CDATA arrive apart; a
+    /// CDATA section is literal text, so `&amp;` in it stays as written).
     fn push(&mut self, p: &XmlParser) {
-        XmlParser::append_decoded(p.text(), &mut self.text);
+        push_text(p, &mut self.text);
     }
 
     /// At `</t>`: append the text as read to `out`.
@@ -11021,6 +11022,7 @@ mod tests {
             <c r=\"G1\" t=\"inlineStr\"><is><t>\r\n line &amp; <![CDATA[more]]> \r\n</t></is></c>\
             <c r=\"H1\" t=\"inlineStr\"><is xml:space=\"preserve\"><t> in </t></is></c>\
             <c r=\"I1\" t=\"inlineStr\" s=\"1\"><is><t/></is></c>\
+            <c r=\"J1\" t=\"inlineStr\"><is><t> <![CDATA[a&amp;b]]> &amp; </t></is></c>\
             </row>";
         let pkg = load_xlsx(&whitespace_xlsx(rows, "")).unwrap();
         let s = &pkg.workbook.sheets[0];
@@ -11039,6 +11041,7 @@ mod tests {
         assert_eq!(value(6), Some(CellValue::Text("line & more".into())));
         assert_eq!(value(7), Some(CellValue::Text(" in ".into())));
         assert_eq!(value(8), Some(CellValue::Empty));
+        assert_eq!(value(9), Some(CellValue::Text("a&amp;b &".into())));
     }
 
     /// #1153: a shared string's `<t>`s read the same way, each run on its
@@ -11053,10 +11056,11 @@ mod tests {
             <si><t/></si>\
             <si><t>a</t><rPh><t> ph </t></rPh></si>\
             <si><r><t>Hello </t></r><r><t xml:space=\"preserve\"> world</t></r></si>\
-            <si><t xml:space=\"preserve\"><![CDATA[ ]]></t></si>";
+            <si><t xml:space=\"preserve\"><![CDATA[ ]]></t></si>\
+            <si><t><![CDATA[a&amp;b ]]></t></si>";
         assert_eq!(
             parse_shared_strings(&format!("<sst>{sst}</sst>")),
-            ["", " ", " x ", "a", "", "a", "Hello world", " "]
+            ["", " ", " x ", "a", "", "a", "Hello world", " ", "a&amp;b"]
         );
         let rows = "<row r=\"1\">\
             <c r=\"A1\" t=\"s\" s=\"1\"><v>0</v></c>\
