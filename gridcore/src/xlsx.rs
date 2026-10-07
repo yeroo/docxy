@@ -1779,9 +1779,11 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
 /// The `<col>`s a save writes for `defs`: ascending and never overlapping,
 /// as Excel requires (#1152). Where definitions overlap, the earlier one
 /// wins, as [`crate::sheet::Sheet::col_width`] reads them, and a later one
-/// keeps only the columns no earlier one covers (in up to two pieces). A
-/// definition with no width and nothing else to say still claims its
-/// columns, at the default width, but writes no `<col>`.
+/// keeps only the columns no earlier one covers (one piece per gap the
+/// earlier ones leave in it). A definition with no width and nothing else
+/// to say still claims its columns, at the default width, but writes no
+/// `<col>`: only a model built in code has one, since the loader gives
+/// every `<col>` a width and the edits drop or default theirs.
 fn written_col_defs(defs: &[ColDef]) -> Vec<ColDef> {
     let mut covered: Vec<(u32, u32)> = Vec::new();
     let mut out: Vec<ColDef> = Vec::new();
@@ -1877,17 +1879,40 @@ fn parse_worksheet(
     // workbook window) or a custom view keeps a pane of its own.
     let mut sheet_views_seen = 0u32;
     let mut in_first_view = false;
-    // Inside the sheet's own `<cols>` / `<sheetData>`. A control's or a
-    // drawing's anchor (`<xdr:from><xdr:col>1</xdr:col><xdr:row>…`) has
-    // elements of the same local names; those are not columns or rows
-    // (#1152).
-    let mut in_cols = false;
+    // The sheet's columns are the `<col>`s directly in its own top-level
+    // `<cols>`, its rows those in `<sheetData>`. A control's or a drawing's
+    // anchor (`<xdr:from><xdr:col>1</xdr:col><xdr:row>…`), or an extension
+    // payload's `<cols>`, has elements of the same local names; those are
+    // not columns or rows (#1152). `cols_depth` is how deep the parser is
+    // below a top-level `<cols>`, `None` outside one.
+    let cols_starts: Vec<usize> = if xml.contains("cols") {
+        worksheet_children(xml)
+            .children
+            .iter()
+            .filter(|c| c.local == "cols")
+            .map(|c| c.start)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut cols_depth: Option<u32> = None;
     let mut in_sheet_data = false;
 
     loop {
-        match p.next() {
+        let event = p.next();
+        // A `<col>` starting right in the sheet's `<cols>`.
+        let in_cols = event == Event::Start && cols_depth == Some(0);
+        match (event, cols_depth) {
+            (Event::Start, Some(d)) => cols_depth = Some(d + 1),
+            (Event::End, Some(0)) => cols_depth = None,
+            (Event::End, Some(d)) => cols_depth = Some(d - 1),
+            _ => {}
+        }
+        match event {
             Event::Start => match local(p.name()) {
-                "cols" => in_cols = true,
+                "cols" if cols_depth.is_none() && cols_starts.contains(&p.start_pos()) => {
+                    cols_depth = Some(0);
+                }
                 "sheetData" => in_sheet_data = true,
                 "col" if in_cols => {
                     let min: u32 = p.attr("min").parse().unwrap_or(1);
@@ -2184,7 +2209,6 @@ fn parse_worksheet(
                 }
             }
             Event::End => match local(p.name()) {
-                "cols" => in_cols = false,
                 "sheetData" => in_sheet_data = false,
                 "row" if in_sheet_data => cur_row += 1,
                 "rowBreaks" | "colBreaks" => in_breaks = None,
@@ -3942,6 +3966,17 @@ fn splice_worksheet(
 
     // <cols> — regenerate from the model when we have definitions, and drop
     // the element when the last one went (an ungrouped column's).
+    // A source with more than one top-level `<cols>` keeps one: the model
+    // holds all their `<col>`s, and a second block would repeat them.
+    while worksheet_children(&out)
+        .children
+        .iter()
+        .filter(|c| c.local == "cols")
+        .count()
+        > 1
+    {
+        out = remove_worksheet_child(&out, "cols");
+    }
     let col_defs = written_col_defs(&sheet.col_defs);
     if col_defs.is_empty() {
         if worksheet_child_span(&out, "cols").is_some() {
@@ -3951,8 +3986,9 @@ fn splice_worksheet(
         let mut cols_xml = String::from("<cols>");
         for d in &col_defs {
             // Excel reads a `<col>` with no width as zero wide: one without
-            // a width (made for an outline or a hide) gets the sheet's
-            // default. A loaded one without a width is 0 wide in the model.
+            // a width (the sheet's default, or one made for an outline or a
+            // hide) is written at the sheet's default. A loaded one without
+            // a width is 0 wide in the model.
             let width = match d.width {
                 Some(w) => format!(" width=\"{w}\" customWidth=\"1\""),
                 None => format!(" width=\"{}\"", sheet.default_col_file_width()),
@@ -18989,6 +19025,47 @@ mod ct_worksheet_order_tests {
             ws.contains(r#"<cols><col min="3" max="4" width="20" customWidth="1"/></cols>"#),
             "{ws}"
         );
+    }
+
+    #[test]
+    fn an_extensions_cols_defines_no_columns() {
+        // Only a `<col>` right in the sheet's own top-level `<cols>` is a
+        // column: one in an extension payload's `<cols>` would otherwise
+        // load as column A, 0 wide.
+        let ext = r#"<extLst><ext uri="{00000000-0000-0000-0000-000000000000}" xmlns:v="urn:example"><v:cols><v:col/></v:cols></ext></extLst>"#;
+        let pkg = loaded(&format!("{ROWS}{MARGINS}{ext}"));
+        assert!(pkg.workbook.sheets[0].col_defs.is_empty());
+        let ws = saved_sheet(&pkg);
+        assert!(!ws.contains("<cols"), "{ws}");
+        assert!(ws.contains("<v:cols><v:col/></v:cols>"), "{ws}");
+        // Nor one nested deeper inside the sheet's `<cols>`.
+        let pkg = loaded(&format!(
+            r#"<cols><col min="2" max="2" width="20" customWidth="1"/><x:wrap xmlns:x="urn:example"><col min="1" max="1"/></x:wrap></cols>{ROWS}{MARGINS}{ext}"#
+        ));
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.col_defs.len(), 1, "{:?}", s.col_defs);
+        assert_eq!(s.col_width(1), 20.0);
+        assert_eq!(s.col_width(0), crate::sheet::DEFAULT_COL_WIDTH);
+    }
+
+    #[test]
+    fn two_cols_blocks_save_as_one() {
+        let pkg = loaded(&format!(
+            r#"<cols><col min="1" max="1" width="5" customWidth="1"/></cols><cols><col min="2" max="2" width="6" customWidth="1"/></cols>{ROWS}{MARGINS}"#
+        ));
+        assert_eq!(pkg.workbook.sheets[0].col_defs.len(), 2);
+        let ws = saved_sheet(&pkg);
+        assert_eq!(ws.matches("<cols>").count(), 1, "{ws}");
+        assert!(
+            ws.contains(r#"<cols><col min="1" max="1" width="5" customWidth="1"/><col min="2" max="2" width="6" customWidth="1"/></cols>"#),
+            "{ws}"
+        );
+        assert_ct_worksheet_order(&ws);
+        // With nothing left to say, neither block stays.
+        let mut pkg = pkg;
+        pkg.workbook.sheets[0].col_defs.clear();
+        let ws = saved_sheet(&pkg);
+        assert!(!ws.contains("<cols"), "{ws}");
     }
 
     #[test]
