@@ -24,7 +24,7 @@ part, and adding a comment is Comment even though it also adds body anchors.
 
 | Surface | Routes | Class |
 |---|---|---|
-| Body keys | printable characters, non-breaking space, Tab outside a table, Ctrl+Tab in a table cell, Shift+Enter (line break) | Content |
+| Body keys | printable characters, non-breaking space, Tab outside a table, Ctrl+Tab or Alt+Tab in a table cell, Shift+Enter (line break) | Content |
 | Body keys | Enter, Backspace, Delete, Tab in a table's last cell (adds a row) | Structure |
 | Clipboard | Cut | Structure |
 | Clipboard | Plain/merge paste | Content |

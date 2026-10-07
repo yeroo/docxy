@@ -6486,10 +6486,11 @@ impl App {
                 self.editor.delete_forward();
                 self.after_edit();
             }
-            // Tab types a tab (`<w:tab/>`), as in Word; inside a table only
-            // Ctrl+Tab reaches here, since Tab moves between cells.
+            // Tab types a tab (`<w:tab/>`), as in Word, replacing a selection
+            // in one undo step. Inside a table plain Tab moves between cells,
+            // so only Ctrl+Tab or Alt+Tab reaches here.
             KeyCode::Tab => {
-                self.editor.insert_tab();
+                self.editor.one_step("Tab", |ed| ed.insert_tab());
                 self.after_edit();
             }
             KeyCode::Left => {
@@ -14685,6 +14686,19 @@ mod tests {
             .count();
         assert_eq!(tabs, 1);
         assert!(app.modified);
+    }
+
+    #[test]
+    fn tab_over_a_selection_is_one_undo_step_855() {
+        let mut app = app_with(&["hello world"]);
+        app.editor.move_end();
+        for _ in 0.."world".len() {
+            app.on_key(shift(KeyCode::Left));
+        }
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(body_paragraphs(&app), ["hello \t"]);
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(body_paragraphs(&app), ["hello world"]);
     }
 
     #[test]

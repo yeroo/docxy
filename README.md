@@ -171,7 +171,7 @@ in docxy for now: the browser shows those ribbon commands dimmed.
 | Keys | Action |
 |------|--------|
 | type · Enter · Backspace · Delete | edit text |
-| Tab · Shift-Enter | tab character · line break in the paragraph (in a table, Tab moves between cells and Ctrl-Tab types a tab) |
+| Tab · Shift-Enter | tab character · line break in the paragraph (in a table, Tab moves between cells and Ctrl-Tab or Alt-Tab types a tab) |
 | arrows · Home/End · PgUp/PgDn | move (Ctrl-←/→ by word) |
 | Shift + move | select (Esc clears) |
 | Ctrl-B / Ctrl-I / Ctrl-U | bold / italic / underline (the selection, or what is typed next) |
