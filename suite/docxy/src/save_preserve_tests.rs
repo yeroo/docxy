@@ -3,7 +3,10 @@
 
 use crate::open_mode_tests::Scratch;
 use crate::{DocTab, Surface, save_doc_tab, tab_from_path, track_author};
-use docxcore::package::{load_package, new_package, save_package_preserving_document};
+use docxcore::package::{
+    HeaderVariant, load_package, new_package, save_package_preserving_document,
+};
+use docxcore::table::AutoFit;
 use std::path::{Path, PathBuf};
 
 /// Valid, but not what the serializer writes: single-quoted attributes,
@@ -98,4 +101,29 @@ fn a_settings_only_change_keeps_the_document_bytes() {
     assert_eq!(part(&path, "word/document.xml"), ODD_DOCUMENT);
     let settings = part(&path, "word/settings.xml");
     assert!(settings.contains("<w:trackRevisions/>"), "{settings}");
+}
+
+/// A table inserted in an existing header, the body unchanged: the header
+/// part is saved, the styles part gains the TableGrid style the table uses,
+/// and document.xml keeps its bytes.
+#[test]
+fn a_header_table_on_an_unchanged_body_still_gets_its_style() {
+    let dir = Scratch::new();
+    let (mut tab, path) = odd_tab(&dir);
+    // Creating the header changes the body's sectPr: saved, then reopened.
+    assert!(crate::open_hf_tab(&mut tab, true, HeaderVariant::Default));
+    crate::exit_hf_tab(&mut tab);
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let mut tab = tab_from_path(&path);
+    let stored = part(&path, "word/document.xml");
+    assert!(stored.contains("w:headerReference"), "{stored}");
+    assert!(!part(&path, "word/styles.xml").contains("TableGrid"));
+    assert!(crate::open_hf_tab(&mut tab, true, HeaderVariant::Default));
+    let hf = tab.hf_edit.as_mut().expect("header editor open");
+    hf.editor.insert_table(1, 2, AutoFit::Fixed(None)).unwrap();
+    crate::exit_hf_tab(&mut tab);
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    assert_eq!(part(&path, "word/document.xml"), stored);
+    let styles = part(&path, "word/styles.xml");
+    assert!(styles.contains("w:styleId=\"TableGrid\""), "{styles}");
 }

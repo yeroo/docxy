@@ -20,9 +20,10 @@ In docxy, a user who saves **without** editing gets
 gate asserts that path is byte-identical part for part. That check has no
 baseline: any difference fails outright. "The gate reports a loss in X"
 therefore means "X is lost once the user edits anything in the document". It
-does not mean "X is lost by open+save" in docxy. The suite has no preserving
-path: it saves every document through `save_package`, edited or not, so there
-a reported loss is lost by open+save too (#1083).
+does not mean "X is lost by open+save" in docxy. The suite also writes the
+original `word/document.xml` back while the body still equals the stored part
+(`Package::stores_document`, then `save_package_keeping_document`, #1107), so
+there too a reported loss means "lost once the user edits".
 
 Every part of the original is compared with its saved counterpart:
 

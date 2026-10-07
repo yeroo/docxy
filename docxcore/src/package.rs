@@ -1038,6 +1038,19 @@ impl Package {
         self.sect_pr = xml;
     }
 
+    /// Keep the parts whose name `keep` accepts, and always the main document
+    /// part, still found at `doc_index` when a part listed before it goes
+    /// (#1107).
+    fn retain_parts(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        let doc_name = self.parts[self.doc_index].0.clone();
+        self.parts.retain(|(n, _)| *n == doc_name || keep(n));
+        self.doc_index = self
+            .parts
+            .iter()
+            .position(|(n, _)| *n == doc_name)
+            .expect("the main document part is kept");
+    }
+
     /// The final section as split section properties: the document's own
     /// trailing sectPr, else the captured one (an empty
     /// `<w:sectPr></w:sectPr>` when the package has none).
@@ -1058,6 +1071,23 @@ impl Package {
             document.set_trailing_section_properties(section);
         }
         Some(document)
+    }
+
+    /// Whether `doc` is the body the stored main document part encodes
+    /// ([`Package::stored_document`]), so a save may keep the part's bytes
+    /// ([`save_package_keeping_document`]). A merge preview's record in the
+    /// merge fields is display only, never written, so it is not a change.
+    pub fn stores_document(&self, doc: &Document) -> bool {
+        let Some(mut stored) = self.stored_document() else {
+            return false;
+        };
+        if stored == *doc {
+            return true;
+        }
+        let mut doc = doc.clone();
+        crate::merge::preview::apply_preview(&mut doc, None);
+        crate::merge::preview::apply_preview(&mut stored, None);
+        stored == doc
     }
 
     /// Replace the trailing section properties with an already-split section
@@ -1713,7 +1743,7 @@ impl Package {
 
         self.parts.push((part_name.clone(), bytes));
         if let (Some(rels), Some(name)) = (own_rels, part_rels_name(&part_name)) {
-            self.parts.retain(|(n, _)| *n != name);
+            self.retain_parts(|n| n != name);
             self.parts.push((name, rels));
         }
 
@@ -2685,7 +2715,7 @@ impl Package {
         if self.part("word/comments.xml").is_none() || !self.comment_ids().is_empty() {
             return;
         }
-        self.parts.retain(|(n, _)| !PARTS.contains(&n.as_str()));
+        self.retain_parts(|n| !PARTS.contains(&n));
         if let Some(ct) = self.part_text("[Content_Types].xml") {
             let out = remove_tags_matching(&ct, "Override", |tag| {
                 PARTS
@@ -3686,6 +3716,17 @@ fn document_prolog(original: &str) -> Option<&str> {
 /// byte intact while the container itself may be rewritten.
 pub fn save_package_preserving_document(pkg: &Package) -> Vec<u8> {
     write_zip(&pkg.parts)
+}
+
+/// [`save_package_preserving_document`] for a package whose other parts may
+/// have been edited (a header or footer, say) while its body still is the
+/// stored one ([`Package::stores_document`]): the main document part keeps
+/// its bytes, and as in [`save_package`] the styles part gains the table
+/// styles the body and the other stories reference (#1107).
+pub fn save_package_keeping_document(pkg: &Package) -> Vec<u8> {
+    let mut parts = pkg.parts.clone();
+    add_referenced_table_styles(&mut parts, &pkg.document);
+    write_zip(&parts)
 }
 
 /// Merge the original `<w:document …>` attributes with every declaration the
@@ -7032,6 +7073,45 @@ mod tests {
         let rels = p.part_text("word/_rels/document.xml.rels").unwrap();
         assert!(!rels.contains("comments"), "{rels}");
         assert!(crate::comments::parse_comments(&p).is_empty());
+    }
+
+    /// A comments part listed before the document part: dropping it must
+    /// not leave `doc_index` on the part after the document (#1107).
+    #[test]
+    fn dropping_comment_parts_listed_before_the_document_keeps_it_1107() {
+        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let parts = vec![
+            (
+                "[Content_Types].xml".to_string(),
+                br#"<?xml version="1.0"?><Types/>"#.to_vec(),
+            ),
+            (
+                "word/comments.xml".to_string(),
+                format!("<w:comments xmlns:w=\"{W_NS}\"></w:comments>").into_bytes(),
+            ),
+            (
+                "word/document.xml".to_string(),
+                format!(
+                    "<w:document xmlns:w=\"{W_NS}\"><w:body><w:p><w:r><w:t>Hi</w:t></w:r></w:p></w:body></w:document>"
+                )
+                .into_bytes(),
+            ),
+            (
+                "word/_rels/document.xml.rels".to_string(),
+                br#"<?xml version="1.0"?><Relationships/>"#.to_vec(),
+            ),
+        ];
+        let mut p = load_package(&write_zip(&parts)).unwrap();
+        p.drop_empty_comment_parts();
+        assert!(p.part("word/comments.xml").is_none());
+        p.document
+            .body
+            .push(Block::Paragraph(crate::model::Paragraph::default()));
+        let saved = load_package(&save_package(&p)).unwrap();
+        assert!(saved.document.plain_text().starts_with("Hi"));
+        assert_eq!(saved.document.body.len(), 2);
+        let rels = saved.part_text("word/_rels/document.xml.rels").unwrap();
+        assert!(rels.contains("Relationships"), "{rels}");
     }
 
     // ---- Track Changes setting (#624) --------------------------------------
