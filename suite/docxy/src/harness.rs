@@ -7,7 +7,8 @@
 //! shapes — so there is one style of control surface in the repo rather than
 //! two. What differs is the pump: the terminal editor owns its event loop and
 //! can select over requests, while here the app's thread belongs to gpui, so
-//! requests are drained on the window's own foreground task (see [`attach`]).
+//! requests are drained on an app task (see [`attach`]) and dispatched to the
+//! registry's selected window.
 //!
 //! ## Two things this module refuses to do
 //!
@@ -33,9 +34,9 @@ use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
 use docxcore::model::{Align, VertAlign};
 use gpui::{
-    App, AppContext as _, Context, Entity, EntityInputHandler as _, KeyDownEvent, Keystroke,
-    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput,
-    Point, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px, size,
+    App, AppContext as _, Context, EntityInputHandler as _, KeyDownEvent, Keystroke, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point,
+    ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px, size,
 };
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
@@ -332,17 +333,15 @@ pub fn start(
     ctlcore::serve(&control_dir(root), &instance_name(harness))
 }
 
-/// Bring the harness up on `view`: drain requests on the window's foreground
-/// task, apply each one to the app, and answer it.
+/// Bring the harness up: drain requests on an app task, apply each one to
+/// the app, and answer it. The link is owned by the registry for the run.
 pub fn attach(
-    view: &Entity<crate::Docxy>,
     server: ctlcore::Server,
     rx: Receiver<ctlcore::Request>,
     window: &mut Window,
     cx: &mut App,
 ) {
     let link = crate::control::attach_with_dispatch(
-        view,
         server,
         rx,
         window,
@@ -350,10 +349,10 @@ pub fn attach(
         dispatch,
         hit_tests_rendered_frame,
     );
-    view.update(cx, |this, _| {
-        this.harness = true;
-        this.harness_link = Some(link);
-    });
+    // The registry owns the link for the run: the harness surface must not
+    // die with the window that attached it (#587 r1 M4). The harness flag
+    // itself is set on every built view by the window-opening path.
+    windows::keep_link(cx, link);
 }
 
 // ---------------------------------------------------------------------------
@@ -3331,15 +3330,24 @@ fn dispatch_verb(
         }
         "window-new" => {
             let tab = window_new_tab_arg(args)?;
-            let id = app.new_window(tab, window, cx)?;
-            let mut reply = state(app, window, cx);
-            if let Json::Obj(fields) = &mut reply {
-                fields.push(("window".to_string(), Json::Num(id as f64)));
-            }
-            Done::ok(reply)
+            app.new_window(tab, window, cx)?;
+            // The reply describes the NEW window (selected now), with one
+            // `window` field — not the source's state with a second id.
+            Done::ok(match windows::selected_view(cx) {
+                Some(view) => view
+                    .read_with(cx, |this: &crate::Docxy, cx| state(this, window, cx))
+                    .unwrap_or_else(|_| state(app, window, cx)),
+                None => state(app, window, cx),
+            })
         }
         "window-select" => {
             let id = arg_usize(args, "window")?;
+            // Selecting the window that is already selected is a plain read
+            // of this state: reading the view the pump is updating would
+            // double-lease it (#587 r1 M1).
+            if id as u64 == app.win_id {
+                return Done::ok(state(app, window, cx));
+            }
             windows::select(cx, id as u64)?;
             // The reply comes from the window the verbs now target, not the
             // one this verb dispatched on.
@@ -4783,8 +4791,12 @@ fn dispatch_verb(
             Done::ok(crate::rows_json(&v.ed))
         }
 
-        // Persist and go. The reply is written first (see the pump).
+        // Persist and go. Every OTHER window folds its pending edits and
+        // persists first: the union write appends snapshots, and quitting on
+        // a stale one would lose another window's edits (#587 r1 M3). The
+        // reply is written first (see the pump).
         "quit" => {
+            app.persist_other_windows(cx);
             app.commit_dialog_buffers_for_exit(cx);
             crate::close::commit_pending_for_exit(&mut app.tabs);
             // Not through `on_window_should_close`: clear the run marker here

@@ -318,7 +318,7 @@ fn a_leak_without_a_snapshot_is_undone_from_the_file() {
 
     let hd = dir.path("hot");
     std::fs::create_dir_all(&hd).unwrap();
-    let persisted = persist_tab(&hd, 0, &tab);
+    let persisted = persist_tab(&hd, 0, 0, &tab);
     let hot = std::fs::read(persisted.hot.as_deref().expect("a sidecar")).unwrap();
     let pkg = gridcore::xlsx::load_xlsx(&hot).unwrap();
     assert_eq!(pkg.workbook.sheets[0].name, "Sheet1");
@@ -675,7 +675,7 @@ fn reopen_no_keeps_the_edit_and_yes_reloads_in_the_mode() {
 // ---- the session --------------------------------------------------------
 
 fn round_trip(tab: &DocTab, hd: &Path) -> DocTab {
-    let persisted = persist_tab(hd, 0, tab);
+    let persisted = persist_tab(hd, 0, 0, tab);
     let json = serde_json::to_string(&persisted).unwrap();
     let back: PersistTab = serde_json::from_str(&json).unwrap();
     restore_tab(&back)

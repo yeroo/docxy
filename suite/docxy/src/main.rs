@@ -4371,14 +4371,9 @@ struct Docxy {
     win_id: u64,
     // Whether this RUN is a harness instance: every window of the run gets
     // it (#587); it drives the close flow, prompt locations and save
-    // targets. The link that keeps the harness server alive stays on the
-    // first window only.
+    // targets. The link that keeps the harness server alive is owned by the
+    // registry, for the whole run.
     harness: bool,
-    // The opt-in UI harness server and pump, kept alive with the first
-    // window; None on a New Window's view, which the registry selects.
-    harness_link: Option<control::ControlLink>,
-    // The normal Project-only server and pump; absent in harness mode.
-    control: Option<control::ControlLink>,
     // Measured bounds of the regions the harness's `rect` verb can name, written
     // by `probe` elements during layout. Costs one out-of-flow zero-paint element
     // per probed region per frame, harness or not — the alternative, gating them
@@ -9707,9 +9702,9 @@ fn write_session(
     active: usize,
     prefs: Prefs,
     extra: &[PersistTab],
-    hot_base: usize,
+    hot_seq: usize,
 ) -> Vec<PersistTab> {
-    write_session_forgetting(root, tabs, active, prefs, &[], extra, hot_base)
+    write_session_forgetting(root, tabs, active, prefs, &[], extra, hot_seq)
 }
 
 /// [`write_session`], with the unsaved work of the tabs at `forget` left out
@@ -9725,10 +9720,10 @@ fn write_session_forgetting(
     // one session.json holds every window's tabs (#587). Never merged into
     // `forget`, whose indices name THIS window's tabs only.
     extra: &[PersistTab],
-    // The hot-sidecar index base: window with registry seq `s` writes
-    // `tab-{s * 1000 + i}` so two windows never share a sidecar name. 0
-    // keeps the single-window names (`tab-{i}`) exactly.
-    hot_base: usize,
+    // The window's registry seq: its sidecars are named by [`hot_stem`], so
+    // two windows never share a sidecar name at any tab count. 0 keeps the
+    // single-window names (`tab-{i}`) exactly.
+    hot_seq: usize,
 ) -> Vec<PersistTab> {
     let hd = hot_dir_in(root);
     let _ = std::fs::create_dir_all(&hd);
@@ -9740,7 +9735,7 @@ fn write_session_forgetting(
                 *t.last_hot.borrow_mut() = None;
                 return forgotten(persist_tab_meta(t));
             }
-            let persisted = persist_tab(&hd, hot_base + i, t);
+            let persisted = persist_tab(&hd, hot_seq, i, t);
             // Every tab is rewritten in this one call, so the path names this
             // tab's content even after a later close shifts the indices.
             *t.last_hot.borrow_mut() = persisted
@@ -9777,10 +9772,6 @@ fn write_session_forgetting(
     own
 }
 
-/// Nothing else from `close::commit_pending_for_exit` runs here: committing
-/// a sheet or Project cell editor would close the user's in-progress edit under
-/// them, and a level pass rewrites the status. So text still in an open cell
-/// editor is not in the recovery copy until it is committed.
 #[cfg(test)]
 mod session_union_tests {
     use super::{
@@ -9829,7 +9820,7 @@ mod session_union_tests {
         // What window 0 wrote becomes the snapshot window 1 appends.
         let snap0 = session_json(&root).tabs;
         let win1 = vec![doc_tab("beta.docx", true)];
-        write_session_forgetting(&root, &win1, 0, prefs(), &[], &snap0, 1000);
+        let own = write_session_forgetting(&root, &win1, 0, prefs(), &[], &snap0, 1);
 
         let session = session_json(&root);
         assert_eq!(
@@ -9837,6 +9828,12 @@ mod session_union_tests {
             2,
             "both windows' tabs reach the one session"
         );
+        assert_eq!(
+            own.len(),
+            1,
+            "the returned snapshot is this window's own tabs, not the union it appended"
+        );
+        assert_eq!(own[0].title, "beta.docx");
         let hots: Vec<&str> = session
             .tabs
             .iter()
@@ -9849,7 +9846,7 @@ mod session_union_tests {
         );
         assert!(hots.iter().any(|h| h.ends_with("tab-0.docx")), "{hots:?}");
         assert!(
-            hots.iter().any(|h| h.ends_with("tab-1000.docx")),
+            hots.iter().any(|h| h.ends_with("tab-w1-0.docx")),
             "{hots:?}"
         );
         for h in &hots {
@@ -10527,7 +10524,19 @@ fn restore_session(
         .collect()
 }
 
-fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
+/// The hot-sidecar file stem for tab `i` of the window with registry seq
+/// `s` (#587): the first window keeps the historic `tab-{i}` names
+/// byte-identical; a secondary window's namespace (`tab-w{s}-{i}`) cannot
+/// collide with the first window's at any tab count.
+fn hot_stem(seq: usize, i: usize) -> String {
+    if seq == 0 {
+        format!("tab-{i}")
+    } else {
+        format!("tab-w{seq}-{i}")
+    }
+}
+
+fn persist_tab(hd: &std::path::Path, seq: usize, i: usize, t: &DocTab) -> PersistTab {
     // Write the tab's live content to a sidecar so unsaved edits are
     // held across a restart (closing never loses work). Docs → .docx,
     // spreadsheets → .xlsx, projects → .yppx; restored in preference to `path`.
@@ -10537,7 +10546,7 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         // document: no sidecar, so the next start converts it again.
         Surface::Doc(_) if t.pending_conversion => None,
         Surface::Doc(ed) => {
-            let p = hd.join(format!("tab-{i}.docx"));
+            let p = hd.join(format!("{}.docx", hot_stem(seq, i)));
             let live = live_comments(t, &ed.doc);
             let base = save_base(t, &ed.doc, &live);
             let bytes = doc_to_docx(&ed.doc, &live, base.as_deref());
@@ -10546,13 +10555,13 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
                 .map(|_| p.display().to_string())
         }
         Surface::Sheet(v) => {
-            let p = hd.join(format!("tab-{i}.xlsx"));
+            let p = hd.join(format!("{}.xlsx", hot_stem(seq, i)));
             opccore::fsio::write_atomic(&p, &sheet_bytes(v, None).0)
                 .ok()
                 .map(|_| p.display().to_string())
         }
         Surface::Project(v) => {
-            let p = hd.join(format!("tab-{i}.yppx"));
+            let p = hd.join(format!("{}.yppx", hot_stem(seq, i)));
             let mut snapshot = v.ed.project().clone();
             snapshot.package.unreadable.clear();
             projcore::yppx::write_yppx(&snapshot)
@@ -10851,8 +10860,6 @@ impl Docxy {
             bar_range: None,
             win_id: 0,
             harness: false,
-            harness_link: None,
-            control: None,
             probes: Default::default(),
             frame: 0,
         }
@@ -10873,11 +10880,43 @@ impl Docxy {
             self.active,
             self.prefs(),
             &windows::others_persisted(cx, self.win_id),
-            windows::seq_of(cx, self.win_id) * 1000,
+            windows::seq_of(cx, self.win_id),
         );
         windows::set_persisted(cx, self.win_id, own);
         // Any write restarts the AutoRecover clock: the copy is fresh.
         self.last_persist.set(std::time::Instant::now());
+    }
+
+    /// A shared setting changed: apply it to every registered window, so the
+    /// next union write from ANY window keeps it (#587 r1 M6). Skips this
+    /// view — the caller already applied the change, and updating the
+    /// entity the caller is being updated on would double-lease it.
+    pub(crate) fn share_with_windows(&mut self, cx: &mut App, apply: impl Fn(&mut Docxy)) {
+        for (id, view, _) in windows::entries_snapshot(cx) {
+            if id == self.win_id {
+                continue;
+            }
+            let _ = view.update(cx, |this: &mut Docxy, _| apply(this));
+        }
+    }
+
+    /// The harness `quit` (#587 r1 M3): fold pending edits into every OTHER
+    /// registered window and persist it, so their newest state reaches the
+    /// session — the union write appends snapshots, and a stale one would
+    /// lose another window's edits. Skips this view: the caller persists it
+    /// through `clean_exit`, and updating the entity being updated would
+    /// double-lease it.
+    pub(crate) fn persist_other_windows(&mut self, cx: &mut App) {
+        for (id, view, _) in windows::entries_snapshot(cx) {
+            if id == self.win_id {
+                continue;
+            }
+            let _ = view.update(cx, |this: &mut Docxy, cx| {
+                this.commit_dialog_buffers_for_exit(cx);
+                close::commit_pending_for_exit(&mut this.tabs);
+                this.persist(cx);
+            });
+        }
     }
 
     fn prefs(&self) -> Prefs {
@@ -10934,6 +10973,7 @@ impl Docxy {
 
     fn set_autorecover_minutes(&mut self, minutes: u32, cx: &mut Context<Self>) {
         self.autorecover_minutes = minutes;
+        self.share_with_windows(cx, |d| d.autorecover_minutes = minutes);
         self.persist(cx);
         cx.notify();
     }
@@ -11155,18 +11195,24 @@ impl Docxy {
     fn set_theme_pref(&mut self, pref: ThemePref, window: &mut Window, cx: &mut Context<Self>) {
         self.theme_pref = pref;
         self.applied = None; // force re-apply on next render
+        self.share_with_windows(cx, |d| {
+            d.theme_pref = pref;
+            d.applied = None;
+        });
         self.persist(cx);
         self.refocus(window, cx);
     }
 
     fn set_ask_on_close(&mut self, on: bool, cx: &mut Context<Self>) {
         self.ask_on_close = on;
+        self.share_with_windows(cx, |d| d.ask_on_close = on);
         self.persist(cx);
         cx.notify();
     }
 
     fn set_keep_drafts(&mut self, on: bool, cx: &mut Context<Self>) {
         self.keep_drafts = on;
+        self.share_with_windows(cx, |d| d.keep_drafts = on);
         self.persist(cx);
         cx.notify();
     }
@@ -11364,6 +11410,10 @@ impl Docxy {
     fn set_edit_opts(&mut self, opts: EditOptions, cx: &mut Context<Self>) {
         self.edit_opts = opts;
         stamp_edit_opts(&mut self.tabs, opts);
+        self.share_with_windows(cx, |d| {
+            d.edit_opts = opts;
+            stamp_edit_opts(&mut d.tabs, opts);
+        });
         self.persist(cx);
         cx.notify();
     }
@@ -11643,10 +11693,11 @@ impl Docxy {
     /// status says what happened. Returns how many windows answered.
     /// View › Window › Arrange All (#587): resize every window of the run to
     /// an equal vertical strip of THIS window's display, in creation order.
-    /// gpui cannot move windows at the pinned rev, so positions stay; the
-    /// status says what happened. Returns how many windows answered. The
-    /// calling window is resized directly: it is mid-update here, and
-    /// `update_window` on it would find it gone from the app.
+    /// gpui cannot move windows at the pinned rev, so positions stay. Returns
+    /// how many windows answered; the caller (the ribbon or the harness verb)
+    /// says "Arranged N windows" in the status. The calling window is resized
+    /// directly: it is mid-update here, and `update_window` on it would find
+    /// it gone from the app.
     pub(crate) fn arrange_all(&self, window: &mut Window, cx: &mut App) -> usize {
         let display = display_of(window, cx);
         let entries = windows::entries_snapshot(cx);
@@ -35859,18 +35910,22 @@ fn open_docxy_window(
             false,
         ),
     };
+    // Every window of the run carries the harness flag, whether or not a
+    // control link attaches to it (#587 r1 M5): it drives prompt locations,
+    // save targets and the close flow on a New Window's view too.
+    view.update(cx, |this, _| this.harness = want_harness);
     let handle = cx.open_window(options, {
         let view = view.clone();
         move |window, cx| {
             // Attach only the selected mode's server. Normal Project control
             // never enables harness verbs or changes the UI's dialog policy.
-            // The link stays on this, the first window; the registry routes
-            // every verb to the selected window.
+            // The link is owned by the registry, so it — and the discovery
+            // file — outlive every window.
             if let Some((server, rx)) = ctl {
                 if want_harness {
-                    harness::attach(&view, server, rx, window, cx);
+                    harness::attach(server, rx, window, cx);
                 } else {
-                    control::attach(&view, server, rx, window, cx);
+                    control::attach(server, rx, window, cx);
                 }
             }
             // Open any command-line files on top of the restored session.

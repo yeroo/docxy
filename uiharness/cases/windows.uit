@@ -48,22 +48,50 @@ test window arrange resizes every window and replies the count
   assert reply.arranged is 2
   assert status is Arranged 2 windows
 
+test closing the first window keeps the control server alive
+  call window-select {"window":1}
+  call close-window {}
+  assert windows is 1
+  assert window is 2
+  # The server and pump outlived window 1: these verbs still answer.
+  call window-list {}
+  assert reply.count is 1
+  assert tabs is 2
+  # Selecting the window that is already selected is a plain read of its
+  # state, not a second borrow of its view.
+  call window-select {"window":2}
+  assert window is 2
+
+test a moved window carries the harness policies
+  # Window 2 is a New Window view: its Save As refusal must be the harness
+  # one. A native dialog here would open on the test display and hang.
+  call window-new {}
+  assert reply.window is 3
+  key ctrl+n
+  assert title is Document1
+  type edited
+  key ctrl+s
+  assert status is this document has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb
+  call close-tab {"answer":"discard"}
+  assert tabs is 1
+
 test closing a non last window with unsaved work asks whatever the setting
   # Ask-on-close is off by default: the Force ask is what a non-last close
   # does regardless.
+  call window-select {"window":3}
   assert ask_on_close is false
   call close-window {}
   assert dialog is save-on-close
   call dialog-click {"button":"Cancel"}
   assert dialog is none
   assert windows is 2
-  # Answered: the window leaves, the app lives, the source window keeps working.
+  # Answered: the window leaves, the app lives, the other window keeps working.
   call close-window {}
   call dialog-click {"button":"Don't Save"}
   assert dialog is none
   assert windows is 1
-  assert window is 1
+  assert window is 2
   assert tabs is 1
-  assert title is sample.docx
+  assert title is gantt-summary.xml
   call tab-list {}
-  assert reply.tabs.0.title is sample.docx
+  assert reply.tabs.0.title is gantt-summary.xml

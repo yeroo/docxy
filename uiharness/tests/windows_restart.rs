@@ -70,7 +70,7 @@ fn two_windows_restore_into_one_on_relaunch() {
     let hot1 = hot("sample.docx");
     let hot2 = hot("basic.docx");
     assert!(hot1.ends_with("tab-0.docx"), "{hot1}");
-    assert!(hot2.ends_with("tab-1000.docx"), "{hot2}");
+    assert!(hot2.ends_with("tab-w1-0.docx"), "{hot2}");
     assert!(PathBuf::from(&hot1).exists(), "{hot1}");
     assert!(PathBuf::from(&hot2).exists(), "{hot2}");
 
@@ -95,5 +95,106 @@ fn two_windows_restore_into_one_on_relaunch() {
         .filter_map(|t| t.get_str("title"))
         .collect();
     assert_eq!(titles, ["basic.docx", "sample.docx"], "{tabs}");
+    app.shutdown(Some(&driver));
+}
+
+/// #587 r1 M3: `quit` must persist EVERY registered window, not only the
+/// selected one — otherwise the others' newer edits are lost to the stale
+/// snapshots the union write appends.
+#[test]
+#[ignore = "requires a built suite and an interactive desktop"]
+fn quit_persists_every_windows_edits() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let run = Run::create(
+        root.join("../target/windows-restart-tests")
+            .join(format!("{}-{stamp}", std::process::id())),
+    )
+    .unwrap();
+    let sandbox = run.dir().join("sandbox");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    let doc = sandbox.join("basic.docx");
+    std::fs::copy(root.join("fixtures/basic.docx"), &doc).unwrap();
+    let exe = launch::find_suite(None).unwrap();
+
+    let app = launch::launch(&exe, &sandbox).unwrap();
+    let driver = Driver::connect(&app.ctl_dir(), None).unwrap();
+    call(
+        &driver,
+        "open",
+        &[("path", Json::Str(doc.display().to_string()))],
+    );
+    call(&driver, "window-new", &[]);
+    // Window 1's edit, persisted by nothing before the quit: the only good
+    // copy is window 1's own hot sidecar, which `quit` must flush.
+    call(&driver, "window-select", &[("window", Json::Num(1.))]);
+    call(&driver, "type", &[("text", Json::Str("one".into()))]);
+    call(&driver, "window-select", &[("window", Json::Num(2.))]);
+    // `shutdown` sends `quit` and waits for the process to exit.
+    app.shutdown(Some(&driver));
+    drop(driver);
+
+    let app = launch::launch(&exe, &sandbox).unwrap();
+    let driver = Driver::connect(&app.ctl_dir(), None).unwrap();
+    let tabs = call(&driver, "tab-list", &[]);
+    let sample = tabs
+        .get("tabs")
+        .and_then(Json::as_array)
+        .unwrap()
+        .iter()
+        .find(|t| t.get_str("title") == Some("sample.docx"))
+        .unwrap_or_else(|| panic!("sample.docx restored: {tabs}"));
+    assert_eq!(
+        sample.get("dirty"),
+        Some(&Json::Bool(true)),
+        "window 1's edit survived the quit: {tabs}"
+    );
+    app.shutdown(Some(&driver));
+}
+
+/// #587 r1 M6: a shared setting changed in one window must not revert when
+/// another window persists — the union write takes the writer's prefs.
+#[test]
+#[ignore = "requires a built suite and an interactive desktop"]
+fn a_pref_changed_in_one_window_survives_anothers_persist() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let run = Run::create(
+        root.join("../target/windows-restart-tests")
+            .join(format!("{}-{stamp}", std::process::id())),
+    )
+    .unwrap();
+    let sandbox = run.dir().join("sandbox");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    let doc = sandbox.join("basic.docx");
+    std::fs::copy(root.join("fixtures/basic.docx"), &doc).unwrap();
+    let exe = launch::find_suite(None).unwrap();
+
+    let app = launch::launch(&exe, &sandbox).unwrap();
+    let driver = Driver::connect(&app.ctl_dir(), None).unwrap();
+    call(
+        &driver,
+        "open",
+        &[("path", Json::Str(doc.display().to_string()))],
+    );
+    call(&driver, "window-new", &[]);
+    // The setting changes on window 2; the persist comes from window 1.
+    call(&driver, "window-select", &[("window", Json::Num(2.))]);
+    call(&driver, "ask-on-close", &[("on", Json::Bool(true))]);
+    call(&driver, "window-select", &[("window", Json::Num(1.))]);
+    call(&driver, "autorecover-now", &[]);
+    let session =
+        Json::parse(&std::fs::read_to_string(sandbox.join("docxy/session.json")).unwrap()).unwrap();
+    assert_eq!(
+        session.get("ask_on_close"),
+        Some(&Json::Bool(true)),
+        "window 1's union write keeps window 2's setting: {session}"
+    );
     app.shutdown(Some(&driver));
 }

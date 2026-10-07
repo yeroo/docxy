@@ -257,7 +257,7 @@ fn exit_and_restore(tabs: &mut [DocTab], name: &str) -> Vec<DocTab> {
     let restored = tabs
         .iter()
         .enumerate()
-        .map(|(i, t)| restore_tab(&persist_tab(&dir, i, t)))
+        .map(|(i, t)| restore_tab(&persist_tab(&dir, 0, i, t)))
         .collect();
     let _ = std::fs::remove_dir_all(&dir);
     restored
@@ -1103,7 +1103,7 @@ fn a_session_from_before_the_mark_asks_the_file_whether_it_loads() {
         let mut t = tab_from_path(path);
         t.dirty = true;
         // Written as a session from before #209: sidecar present, no mark.
-        let mut p = persist_tab(&dir, i, &t);
+        let mut p = persist_tab(&dir, 0, i, &t);
         assert!(p.hot.is_some());
         p.load_failed = None;
         let mut r = restore_tab(&p);
@@ -1119,7 +1119,7 @@ fn a_session_from_before_the_mark_asks_the_file_whether_it_loads() {
     let mut t = tab_from_path(&gone);
     t.dirty = true;
     let text = doc_text(&t);
-    let mut p = persist_tab(&dir, 5, &t);
+    let mut p = persist_tab(&dir, 0, 5, &t);
     p.load_failed = None;
     std::fs::remove_file(&gone).unwrap();
     let mut r = restore_tab(&p);
@@ -1140,7 +1140,7 @@ fn a_session_from_before_strict_markdown_decoding_cannot_overwrite_its_source() 
     let mut tab = tab_from_path(&path);
     assert!(!tab.load_failed);
     tab.dirty = true;
-    let persisted = persist_tab(&dir, 0, &tab);
+    let persisted = persist_tab(&dir, 0, 0, &tab);
     assert!(persisted.hot.is_some());
     assert_eq!(persisted.load_failed, Some(false));
 
@@ -1198,7 +1198,7 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
     ] {
         let mut t = tab_from_path(&good);
         t.dirty = dirty;
-        let p = persist_tab(&dir, 0, &t);
+        let p = persist_tab(&dir, 0, 0, &t);
         std::fs::write(p.hot.as_ref().unwrap(), corrupt).unwrap();
         let mut r = restore_tab(&p);
         assert!(!r.load_failed, "dirty={dirty}: {}", r.status);
@@ -1207,7 +1207,7 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
         assert!(r.status.contains("restored copy"), "{}", r.status);
         assert_eq!(doc_text(&r), on_disk);
         // The next exit and restart is an ordinary one.
-        let again = restore_tab(&persist_tab(&dir, 1, &r));
+        let again = restore_tab(&persist_tab(&dir, 0, 1, &r));
         assert!(!again.load_failed && again.status.starts_with("loaded"));
         r.dirty = true;
         assert!(save_doc_tab(&mut r, None), "{}", r.status);
@@ -1241,7 +1241,7 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
     .unwrap();
     let long_text = doc_text(&tab_from_path(&long));
     let t = tab_from_path(&long);
-    let p = persist_tab(&dir, 3, &t);
+    let p = persist_tab(&dir, 0, 3, &t);
     let hot = std::fs::read(p.hot.as_ref().unwrap()).unwrap();
     // Cut inside word/document.xml's own data, past its local header.
     let name = b"word/document.xml";
@@ -1267,7 +1267,7 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
     // A file that is itself broken stays marked, by the fresh load.
     let broken = dir.join("broken.docx");
     std::fs::write(&broken, b"not a zip").unwrap();
-    let p = persist_tab(&dir, 2, &tab_from_path(&broken));
+    let p = persist_tab(&dir, 0, 2, &tab_from_path(&broken));
     std::fs::write(p.hot.as_ref().unwrap(), b"garbage").unwrap();
     let mut r = restore_tab(&p);
     assert!(r.load_failed);
@@ -1278,7 +1278,7 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
     // A never-saved document has no file to protect: unmarked, Save asks.
     let mut t = tab_from_path(&good);
     t.path = None;
-    let p = persist_tab(&dir, 3, &t);
+    let p = persist_tab(&dir, 0, 3, &t);
     std::fs::write(p.hot.as_ref().unwrap(), b"garbage").unwrap();
     let r = restore_tab(&p);
     assert!(!r.load_failed && r.path.is_none());
@@ -1292,7 +1292,7 @@ fn the_persisted_mark_holds_over_a_file_that_loads_at_restart() {
     let path = dir.join("x.docx");
     let t = tab_from_path(&path);
     assert!(t.load_failed, "{}", t.status);
-    let json = serde_json::to_string(&persist_tab(&dir, 0, &t)).unwrap();
+    let json = serde_json::to_string(&persist_tab(&dir, 0, 0, &t)).unwrap();
     let p: PersistTab = serde_json::from_str(&json).unwrap();
     assert_eq!(p.load_failed, Some(true));
     // The file appears (or is repaired) before the restart; the sidecar

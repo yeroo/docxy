@@ -373,7 +373,7 @@ fn hot_exit_round_trips_dirty_clean_untitled_and_imported_sessions() {
             view_mut(&mut tab).ed.mark_saved();
             tab.dirty = false;
         }
-        let pt = persist_tab(&dir.0, i, &tab);
+        let pt = persist_tab(&dir.0, 0, i, &tab);
         assert!(pt.hot.as_deref().unwrap().ends_with(".yppx"));
         let json = serde_json::to_vec(&Session {
             tabs: vec![pt],
@@ -436,7 +436,7 @@ fn hot_exit_preserves_unreadable_guard_without_original() {
     );
     view_mut(&mut tab).ed.rename(1, "Unsaved rename").unwrap();
     tab.dirty = true;
-    let persisted = persist_tab(&dir.0, 0, &tab);
+    let persisted = persist_tab(&dir.0, 0, 0, &tab);
     assert_eq!(persisted.unreadable, ["media/mystery.bin"]);
     assert!(persisted.hot.is_some());
     std::fs::remove_file(&original).unwrap();
@@ -470,7 +470,7 @@ fn hot_exit_commits_all_valid_buffers_and_preserves_models_on_invalid_input() {
     let invalid_model = view(&tabs[2]).ed.project().clone();
     crate::close::commit_pending_for_exit(&mut tabs);
     for (i, tab) in tabs.iter().enumerate() {
-        let saved = persist_tab(&dir.0, i, tab);
+        let saved = persist_tab(&dir.0, 0, i, tab);
         let restored = restore_project_tab(&saved);
         assert_eq!(view(&restored).ed.project(), view(tab).ed.project());
         if i < 2 {
@@ -556,7 +556,7 @@ fn failed_sidecar_write_enters_recovery_instead_of_claiming_dirty_content() {
     for path in [Some(orig), Some(dir.path("missing.xml")), None] {
         let mut t = edited_tab();
         t.path = path;
-        let saved = persist_tab(&blocker.join("hot"), 0, &t);
+        let saved = persist_tab(&blocker.join("hot"), 0, 0, &t);
         assert!(saved.hot.is_none() && saved.dirty);
         let restored = restore_tab(&saved);
         assert!(!restored.dirty);

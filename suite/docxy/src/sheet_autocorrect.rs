@@ -524,6 +524,12 @@ impl Docxy {
             if changed {
                 self.autocorrect = Rc::new(ac);
                 stamp_autocorrect(&mut self.tabs, &self.autocorrect);
+                // The setting is the run's, not this window's (#587 r1 M6).
+                let ac = self.autocorrect.clone();
+                self.share_with_windows(cx, |d| {
+                    d.autocorrect = ac.clone();
+                    stamp_autocorrect(&mut d.tabs, &d.autocorrect);
+                });
                 self.persist(cx);
             }
         }))

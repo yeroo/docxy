@@ -723,6 +723,10 @@
     'Markup(Original)': NOT_YET,
     'Markup(Simple)': NOT_YET,
     ToggleNav: NOT_YET,
+    // View › Window (#587): the browser shell has one window; New Window
+    // and Arrange All are the desktop run's multi-window commands.
+    NewWindow: 'Not available in the browser — the browser shell has one window',
+    ArrangeAll: 'Not available in the browser — the browser shell has one window',
   };
 
   root.DocxyEngine = {

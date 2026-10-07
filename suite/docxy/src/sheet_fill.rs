@@ -548,6 +548,9 @@ impl Docxy {
             return Some(done.map(|stored| {
                 if let Some(lists) = stored {
                     self.custom_lists = lists;
+                    // The setting is the run's, not this window's (#587 r1 M6).
+                    let lists = self.custom_lists.clone();
+                    self.share_with_windows(cx, |d| d.custom_lists = lists.clone());
                     self.persist(cx);
                 }
             }));

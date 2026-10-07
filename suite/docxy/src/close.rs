@@ -1012,7 +1012,7 @@ impl Docxy {
             self.prefs(),
             &forget,
             &windows::others_persisted(cx, self.win_id),
-            windows::seq_of(cx, self.win_id) * 1000,
+            windows::seq_of(cx, self.win_id),
         );
         self.last_persist.set(std::time::Instant::now());
         let alone = windows::is_alone(cx, self.win_id);

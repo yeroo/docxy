@@ -2,8 +2,9 @@
 //! (#587). A window owns its tabs; documents are never shared between windows.
 //! New Window moves a tab into a new window, Arrange All resizes every window
 //! to its strip of the calling window's display, and the harness routes every
-//! verb to the registry's SELECTED window, so closing a window never takes
-//! the control server down with it.
+//! verb to the registry's SELECTED window. The registry also owns the control
+//! servers' links, so closing any window — the first included — leaves the
+//! control surface up for the run.
 //!
 //! The registry is a gpui `Global` set once in `main`, before the first
 //! window. Window ids start at 1 and are never reused; `selected == 0` means
@@ -75,6 +76,10 @@ pub(crate) struct Windows<V, H> {
     selected: u64,
     next_id: u64,
     next_seq: usize,
+    // The control servers and their pumps, owned for the whole run: kept in
+    // a window's view they would drop — and take the discovery file down —
+    // when that window closed while another lived (#587 r1 M4).
+    links: Vec<crate::control::ControlLink>,
 }
 
 impl<V, H> Default for Windows<V, H> {
@@ -84,6 +89,7 @@ impl<V, H> Default for Windows<V, H> {
             selected: 0,
             next_id: 0,
             next_seq: 0,
+            links: Vec::new(),
         }
     }
 }
@@ -234,6 +240,12 @@ pub(crate) fn set_persisted(cx: &mut App, id: u64, tabs: Vec<PersistTab>) {
     update(cx, |w| w.set_persisted(id, tabs));
 }
 
+/// Take ownership of a control server link for the whole run (see the
+/// field): attach stores it here, not in a window's view.
+pub(crate) fn keep_link(cx: &mut App, link: crate::control::ControlLink) {
+    update(cx, |w| w.links.push(link));
+}
+
 /// A descriptor copy for iterating without holding the global borrowed.
 pub(crate) fn entries_snapshot(cx: &App) -> Vec<(u64, WeakEntity<Docxy>, AnyWindowHandle)> {
     with(cx, |w| {
@@ -243,6 +255,13 @@ pub(crate) fn entries_snapshot(cx: &App) -> Vec<(u64, WeakEntity<Docxy>, AnyWind
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// Every registered window's handle, for the pump's fallible retry chain:
+/// a request resolves through a live window's update, and the handles known
+/// last time are the candidates when the recent ones have closed.
+pub(crate) fn handles_snapshot(cx: &App) -> Vec<AnyWindowHandle> {
+    with(cx, |w| w.entries().iter().map(|e| e.handle).collect()).unwrap_or_default()
 }
 
 /// The selected window's dispatch target.

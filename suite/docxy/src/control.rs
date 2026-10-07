@@ -356,7 +356,6 @@ type Dispatch =
     fn(&mut Docxy, &str, &Json, &mut Window, &mut Context<Docxy>) -> Result<Done, String>;
 
 pub(crate) fn attach_with_dispatch(
-    view: &Entity<Docxy>,
     server: ctlcore::Server,
     rx: Receiver<ctlcore::Request>,
     window: &mut Window,
@@ -368,16 +367,61 @@ pub(crate) fn attach_with_dispatch(
     // The pump lives on the app, not a window: closing a window — even the
     // first — must not take the control server down (#587). Each request
     // resolves the registry's SELECTED window, so window-new/window-select
-    // retarget every verb. The entity the caller attached is kept as the
-    // first window's view; the registry supersedes it once registered.
-    let _ = (view, window);
+    // retarget every verb.
+    //
+    // ⚠️ The resolution borrows fallibly, like the AutoRecover loop's
+    // `update_in`: on Windows a native rfd dialog pumps a modal loop while a
+    // gpui listener holds the App borrowed, and an infallible borrow there
+    // panics (see main's startup comment). `update_window` goes through
+    // `try_borrow_mut`, so a busy app gets "busy, try again" — never a
+    // panic. The window this attached on bootstraps the first resolution;
+    // after that the last used handle leads.
+    let bootstrap = window.window_handle();
     let pump = cx.spawn(async move |cx: &mut AsyncApp| {
+        let mut last: Option<gpui::AnyWindowHandle> = None;
+        // Handles seen at the last successful resolution: the retry chain
+        // when the recent windows have closed.
+        let mut known: Vec<gpui::AnyWindowHandle> = vec![bootstrap];
         while let Ok(req) = pending.recv_async().await {
-            let target = cx.update(|app| crate::windows::selected_target(app));
-            let Some(target) = target else {
-                req.reply_err("the app is gone".to_string());
+            let mut resolved = None;
+            let mut gone = false;
+            let mut candidates: Vec<gpui::AnyWindowHandle> = Vec::new();
+            for h in last.into_iter().chain(known.iter().copied()) {
+                if !candidates.contains(&h) {
+                    candidates.push(h);
+                }
+            }
+            if !candidates.contains(&bootstrap) {
+                candidates.push(bootstrap);
+            }
+            for candidate in candidates {
+                match cx.update_window(candidate, |_, _, cx| {
+                    windows::selected_target(cx).map(|t| (t, windows::handles_snapshot(cx)))
+                }) {
+                    Ok(Some((target, handles))) => {
+                        resolved = Some(target);
+                        known = handles;
+                        break;
+                    }
+                    // The registry is empty: the app is gone.
+                    Ok(None) => {
+                        gone = true;
+                        break;
+                    }
+                    // The window is gone or the app is busy: try the next
+                    // candidate.
+                    Err(_) => continue,
+                }
+            }
+            let Some(target) = resolved else {
+                req.reply_err(if gone {
+                    "the app is gone".to_string()
+                } else {
+                    "busy, try again".to_string()
+                });
                 continue;
             };
+            last = Some(target.handle);
             // A verb whose pointer input hit-tests the rendered frame gets a
             // frame drawn from the current state first (#1121), as gpui gives
             // a key-down: mouse dispatch hit-tests `rendered_frame` without
@@ -513,14 +557,12 @@ impl Docxy {
 }
 
 pub(crate) fn attach(
-    view: &Entity<Docxy>,
     server: ctlcore::Server,
     rx: Receiver<ctlcore::Request>,
     window: &mut Window,
     cx: &mut App,
 ) {
     let link = attach_with_dispatch(
-        view,
         server,
         rx,
         window,
@@ -533,7 +575,9 @@ pub(crate) fn attach(
         // No automation verb queues pointer input.
         |_| false,
     );
-    view.update(cx, |this, _| this.control = Some(link));
+    // The registry owns the link for the run: a control surface must not
+    // die with the window that attached it (#587 r1 M4).
+    windows::keep_link(cx, link);
 }
 
 #[cfg(test)]

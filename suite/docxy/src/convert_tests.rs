@@ -273,7 +273,7 @@ fn a_converted_tab_comes_back_converted_from_the_session() {
     // Dirty: restored from its .docx sidecar, still converted.
     let mut tab = tab_from_path(&src);
     tab.dirty = true;
-    let persisted = persist_tab(&hot, 0, &tab);
+    let persisted = persist_tab(&hot, 0, 0, &tab);
     assert_eq!(persisted.converted, Some(Converted::Rtf));
     let mut back = restore_tab(&persisted);
     assert_eq!(back.access.converted, Some(Converted::Rtf));
@@ -282,7 +282,7 @@ fn a_converted_tab_comes_back_converted_from_the_session() {
     assert_eq!(std::fs::read(&src).unwrap(), RTF);
     // Clean, with no sidecar: converted again from the file, when its tab
     // is first in front (FIX r4 M2), not at restore.
-    let mut clean = persist_tab(&hot, 1, &tab_from_path(&src));
+    let mut clean = persist_tab(&hot, 0, 1, &tab_from_path(&src));
     clean.hot = None;
     clean.dirty = false;
     let mut back = restore_tab(&clean);
@@ -294,7 +294,7 @@ fn a_converted_tab_comes_back_converted_from_the_session() {
     // A Recover Text tab restores as recovered text.
     let blob = write(&dir, "blob.bin", b"\x00\x01Some readable text\x00");
     let rt = tab_from_path_mode(&blob, OpenMode::RecoverText, &TrustStore::default()).unwrap();
-    let mut p = persist_tab(&hot, 2, &rt);
+    let mut p = persist_tab(&hot, 0, 2, &rt);
     p.hot = None;
     let mut back = restore_tab(&p);
     assert_eq!(back.access.converted, Some(Converted::RecoveredText));
@@ -315,7 +315,7 @@ fn an_old_session_of_a_damaged_file_still_refuses_save_over_it() {
     std::fs::create_dir_all(&hot).unwrap();
     let mut tab = tab_from_path(&cut);
     tab.dirty = true;
-    let mut p = persist_tab(&hot, 0, &tab);
+    let mut p = persist_tab(&hot, 0, 0, &tab);
     p.load_failed = None;
     p.converted = None;
     let mut back = restore_tab(&p);
@@ -448,14 +448,14 @@ fn a_restored_converted_tab_waits_and_saves_nothing() {
     let src = write(&dir, "letter.rtf", RTF);
     let hot = dir.path("hot");
     std::fs::create_dir_all(&hot).unwrap();
-    let mut p = persist_tab(&hot, 0, &tab_from_path(&src));
+    let mut p = persist_tab(&hot, 0, 0, &tab_from_path(&src));
     p.hot = None;
     p.dirty = false;
     // The file is unreadable at restore: restore does not even look at it.
     std::fs::remove_file(&src).unwrap();
     let mut back = restore_tab(&p);
     assert!(back.pending_conversion);
-    assert!(persist_tab(&hot, 1, &back).hot.is_none());
+    assert!(persist_tab(&hot, 0, 1, &back).hot.is_none());
     assert!(!save_doc_tab(&mut back, Some(dir.path("copy.docx"))));
     assert!(
         back.status.contains("not been converted yet"),
@@ -477,7 +477,7 @@ fn finishing_a_pending_conversion_replaces_the_placeholder_cleanly() {
     let src = write(&dir, "letter.rtf", RTF);
     let hot = dir.path("hot");
     std::fs::create_dir_all(&hot).unwrap();
-    let mut p = persist_tab(&hot, 0, &tab_from_path(&src));
+    let mut p = persist_tab(&hot, 0, 0, &tab_from_path(&src));
     p.hot = None;
     let mut back = restore_tab(&p);
     assert!(back.pending_conversion);
@@ -501,7 +501,7 @@ fn a_converted_tab_without_kept_bytes_rolls_back_from_its_file() {
     let src = write(&dir, "letter.rtf", RTF);
     let hot = dir.path("hot");
     std::fs::create_dir_all(&hot).unwrap();
-    let mut p = persist_tab(&hot, 0, &tab_from_path(&src));
+    let mut p = persist_tab(&hot, 0, 0, &tab_from_path(&src));
     p.hot = None;
     let mut back = restore_tab(&p);
     // The file was replaced by a Word document meanwhile.

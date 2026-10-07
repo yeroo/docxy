@@ -142,7 +142,7 @@ fn a_protected_document_comes_back_protected_from_the_session() {
     let hot = dir.path("hot");
     std::fs::create_dir_all(&hot).unwrap();
     let tab = protected(&src);
-    let persisted = persist_tab(&hot, 0, &tab);
+    let persisted = persist_tab(&hot, 0, 0, &tab);
     assert!(persisted.protected);
     let back = restore_tab(&persisted);
     assert!(back.access.protected);
