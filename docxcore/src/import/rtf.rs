@@ -70,10 +70,15 @@ enum Dest {
     ListOverrides,
 }
 
-/// A list read from `\listtable`: its `\listid` and each level's
-/// `\levelnfc` (`None` until the level says).
+/// The levels a list keeps: Word's nine. Past them a `\listlevel` is
+/// read and not kept.
+const MAX_LIST_LEVELS: usize = 9;
+
+/// The `\listtable` entry being read: its levels' `\levelnfc` (`None`
+/// until the level says), and its `\listid` once read, after which its
+/// levels are those in [`Reader::list_levels`].
 #[derive(Default)]
-struct ListFormats {
+struct OpenList {
     id: Option<i32>,
     levels: Vec<Option<i32>>,
 }
@@ -134,10 +139,14 @@ struct Reader<'a> {
     /// A double-byte lead byte waiting for its trail byte.
     lead: bool,
     list_text: String,
-    /// The list table's lists, and the override table's `\lsN` → `\listid`
-    /// (`(ls, listid)`, either still unread while its entry is open).
-    lists: Vec<ListFormats>,
-    overrides: Vec<(Option<i32>, Option<i32>)>,
+    /// The list table's lists by `\listid`, each level's `\levelnfc`, and
+    /// the override table's `\lsN` → `\listid`: looked up per list
+    /// paragraph, so indexed, and charged to the budget as kept.
+    list_levels: HashMap<i32, Vec<Option<i32>>>,
+    ls_lists: HashMap<i32, i32>,
+    /// The list and the override being read (`(ls, listid)`).
+    open_list: Option<OpenList>,
+    open_override: (Option<i32>, Option<i32>),
 }
 
 impl<'a> Reader<'a> {
@@ -173,8 +182,10 @@ impl<'a> Reader<'a> {
             high: None,
             lead: false,
             list_text: String::new(),
-            lists: Vec::new(),
-            overrides: Vec::new(),
+            list_levels: HashMap::new(),
+            ls_lists: HashMap::new(),
+            open_list: None,
+            open_override: (None, None),
         }
     }
 
@@ -513,65 +524,74 @@ impl<'a> Reader<'a> {
     }
 
     /// A control word in `\listtable`. Only what says whether a level is
-    /// numbered is kept: each `\list`, its levels' first `\levelnfc`
-    /// (`\levelnfcn` too) and its `\listid`, each charged as kept memory.
+    /// numbered is kept: each `\list`'s levels' first `\levelnfc`
+    /// (`\levelnfcn` too), by its `\listid`, each charged as kept memory.
     fn list_table_word(&mut self, w: &[u8], n: i32) {
         match w {
-            b"list" => {
-                if self.budget.keep::<ListFormats>(0) {
-                    self.lists.push(ListFormats::default());
-                }
-            }
+            b"list" => self.open_list = Some(OpenList::default()),
             b"listlevel" => {
-                if self.budget.keep::<Option<i32>>(0) {
-                    if let Some(list) = self.lists.last_mut() {
-                        list.levels.push(None);
+                if self
+                    .open_levels()
+                    .is_some_and(|l| l.len() < MAX_LIST_LEVELS)
+                    && self.budget.keep::<Option<i32>>(0)
+                {
+                    if let Some(levels) = self.open_levels() {
+                        levels.push(None);
                     }
                 }
             }
             b"levelnfc" | b"levelnfcn" => {
-                if let Some(level) = self.lists.last_mut().and_then(|l| l.levels.last_mut()) {
+                if let Some(level) = self.open_levels().and_then(|l| l.last_mut()) {
                     level.get_or_insert(n);
                 }
             }
             b"listid" => {
-                if let Some(list) = self.lists.last_mut() {
-                    list.id = Some(n);
+                let Some(open) = self.open_list.as_mut().filter(|o| o.id.is_none()) else {
+                    return;
+                };
+                let levels = std::mem::take(&mut open.levels);
+                open.id = Some(n);
+                if self.list_levels.contains_key(&n)
+                    || self.budget.keep::<(i32, Vec<Option<i32>>)>(0)
+                {
+                    self.list_levels.insert(n, levels);
                 }
             }
             _ => {}
         }
     }
 
+    /// The levels of the list being read: its own until its `\listid`,
+    /// then the kept entry's.
+    fn open_levels(&mut self) -> Option<&mut Vec<Option<i32>>> {
+        let open = self.open_list.as_mut()?;
+        match open.id {
+            None => Some(&mut open.levels),
+            Some(id) => self.list_levels.get_mut(&id),
+        }
+    }
+
     /// A control word in `\listoverridetable`: each `\listoverride`'s
-    /// `\listid` and `\ls`.
+    /// `\listid` and `\ls`, kept once both are read.
     fn list_override_word(&mut self, w: &[u8], n: i32) {
         match w {
-            b"listoverride" => {
-                if self.budget.keep::<(Option<i32>, Option<i32>)>(0) {
-                    self.overrides.push((None, None));
-                }
+            b"listoverride" => self.open_override = (None, None),
+            b"ls" => self.open_override.0 = Some(n),
+            b"listid" => self.open_override.1 = Some(n),
+            _ => return,
+        }
+        if let (Some(ls), Some(id)) = self.open_override {
+            if self.ls_lists.contains_key(&ls) || self.budget.keep::<(i32, i32)>(0) {
+                self.ls_lists.insert(ls, id);
             }
-            b"ls" => {
-                if let Some(o) = self.overrides.last_mut() {
-                    o.0 = Some(n);
-                }
-            }
-            b"listid" => {
-                if let Some(o) = self.overrides.last_mut() {
-                    o.1 = Some(n);
-                }
-            }
-            _ => {}
         }
     }
 
     /// Whether level `ilvl` of list `\ls{ls}` is numbered, as the list
     /// table says; `None` when the tables do not define it.
     fn defined_numbered(&self, ls: i32, ilvl: i32) -> Option<bool> {
-        let id = self.overrides.iter().find(|o| o.0 == Some(ls))?.1?;
-        let list = self.lists.iter().find(|l| l.id == Some(id))?;
-        let nfc = (*list.levels.get(usize::try_from(ilvl).ok()?)?)?;
+        let levels = self.list_levels.get(self.ls_lists.get(&ls)?)?;
+        let nfc = (*levels.get(usize::try_from(ilvl).ok()?)?)?;
         Some(nfc_is_numbered(nfc))
     }
 
@@ -739,7 +759,8 @@ impl<'a> Reader<'a> {
         };
         p.align = self.st.align;
         let listed = self.st.list.is_some_and(|l| l > 0) || self.st.pn.is_some();
-        if listed && p.heading_level.is_none() {
+        // A heading in a list (an outline-numbered heading) is both.
+        if listed {
             // The list table first; a list it does not define is what its
             // Word 95 kind or its marker says.
             let defined = self
@@ -905,6 +926,33 @@ mod tests {
         );
         let kinds: Vec<Option<i32>> = paras(&doc).iter().map(|p| p.props.num_id).collect();
         assert_eq!(kinds, [Some(2), Some(1), Some(1), Some(2)]);
+    }
+
+    /// Lists are found by their `\\ls` and `\\listid` however many there
+    /// are; each kept entry is charged, so a list table too big for the
+    /// budget fails the import (FIX r3 #5).
+    #[test]
+    fn many_lists_are_indexed_and_charged() {
+        let lists: String = (1..=2000)
+            .map(|i| {
+                let nfc = if i % 2 == 0 { 0 } else { 23 };
+                format!(r"{{\list{{\listlevel\levelnfc{nfc}}}\listid{i}}}")
+            })
+            .collect();
+        let overrides: String = (1..=2000)
+            .map(|i| format!(r"{{\listoverride\listid{i}\ls{i}}}"))
+            .collect();
+        let rtf = format!(
+            r"{{\rtf1{{\*\listtable{lists}}}{{\*\listoverridetable{overrides}}}\pard\ls1999 Odd\par\pard\ls2000 Even\par}}"
+        );
+        let doc = import_rtf(rtf.as_bytes()).unwrap();
+        let kinds: Vec<Option<i32>> = paras(&doc).iter().map(|p| p.props.num_id).collect();
+        assert_eq!(kinds, [Some(1), Some(2)]);
+        let small = Budget::with_built(1 << 20, crate::import::MAX_WORK, 4096);
+        assert_eq!(
+            import_rtf_within(rtf.as_bytes(), &small).unwrap_err(),
+            TOO_BIG
+        );
     }
 
     #[test]

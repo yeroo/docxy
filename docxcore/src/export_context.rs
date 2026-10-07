@@ -2,6 +2,7 @@
 //! document: its lists' definitions and its styles, as the package that a
 //! save of it is written into defines them, and the document's final view.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::model::Document;
@@ -44,11 +45,30 @@ impl ExportContext {
 
 /// `doc` as it reads with its tracked changes accepted: what Plain Text and
 /// Rich Text write, a deleted paragraph mark joining its paragraph to the
-/// next included. A copy: `doc` itself is left as it is. A revision the
-/// review module cannot accept stays, and the writers still drop what it
-/// deletes.
-pub fn final_view(doc: &Document) -> Document {
+/// next included. A copy, made only when `doc` has a tracked change: `doc`
+/// itself is left as it is. A revision the review module cannot accept (a
+/// tracked move, a custom-XML or conflict range) stays in the copy, and both
+/// writers then drop it whole, what it inserts included.
+pub fn final_view(doc: &Document) -> Cow<'_, Document> {
+    if doc.revisions().is_empty() {
+        return Cow::Borrowed(doc);
+    }
     let mut copy = doc.clone();
     copy.accept_all_revisions();
-    copy
+    Cow::Owned(copy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A document with no tracked change is its own final view: no copy,
+    /// no accept pass (FIX r3 #1).
+    #[test]
+    fn a_document_without_revisions_is_not_copied() {
+        let doc = crate::markdown::from_markdown("# Title\n\nBody\n\n- item\n");
+        assert!(matches!(final_view(&doc), Cow::Borrowed(d) if std::ptr::eq(d, &doc)));
+        let tracked = crate::export_rtf::tests::deleted_mark_doc();
+        assert!(matches!(final_view(&tracked), Cow::Owned(_)));
+    }
 }

@@ -2,7 +2,8 @@
 //! what File > New lists, and the untitled document a template opens as.
 
 use crate::doc_templates::{
-    Platform, doc_template_title, personal_templates, template_label, templates_dir_from,
+    Platform, doc_template_title, personal_templates, template_label, template_tab,
+    templates_dir_from,
 };
 use crate::open_mode::OpenMode;
 use crate::open_mode_tests::Scratch;
@@ -214,4 +215,34 @@ fn a_broken_template_or_recovered_text_keeps_its_file() {
     let path = template(&dir, "Letter.dotx", DocKind::Template);
     let tab = tab_from_path_mode(&path, OpenMode::RecoverText, &TrustStore::default()).unwrap();
     assert_eq!(tab.path.as_deref(), Some(path.as_path()));
+}
+
+/// An empty `.dotx` holds no Word package: it never becomes an untitled
+/// document, and File > New refuses it in words (FIX r3 #6). Nor does a
+/// file that is not a template, or one that will not load.
+#[test]
+fn file_new_refuses_what_is_no_loadable_template() {
+    let dir = Scratch::new();
+    let empty = dir.path("Empty.dotx");
+    std::fs::write(&empty, b"").unwrap();
+    let tab = tab_from_path(&empty);
+    assert_eq!(tab.path.as_deref(), Some(empty.as_path()), "{}", tab.status);
+    let trusted = TrustStore::default();
+    let refusal = |path: &Path| match template_tab(path, &trusted) {
+        Err(e) => e,
+        Ok(tab) => panic!("{} opened: {}", path.display(), tab.status),
+    };
+    let err = refusal(&empty);
+    assert_eq!(
+        err,
+        "cannot open the template \"Empty.dotx\": it holds no Word document"
+    );
+    let broken = dir.path("Broken.dotx");
+    std::fs::write(&broken, b"not a zip").unwrap();
+    assert!(refusal(&broken).starts_with("cannot open the template \"Broken.dotx\": "),);
+    let plain = template(&dir, "Plain.docx", DocKind::Document);
+    assert!(refusal(&plain).contains("is not a Word template"));
+    let good = template(&dir, "Good.dotx", DocKind::Template);
+    let tab = template_tab(&good, &trusted).unwrap();
+    assert_eq!((tab.path, tab.title.as_ref()), (None, "Good1.docx"));
 }

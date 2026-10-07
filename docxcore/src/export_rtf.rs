@@ -48,6 +48,7 @@ pub fn to_rtf(doc: &Document, ctx: &ExportContext) -> String {
         colors: Vec::new(),
         lists: Vec::new(),
         heading_styles: Default::default(),
+        para_base: RunProps::default(),
     };
     let mut path = Vec::new();
     w.blocks(&doc.body, &mut path, false);
@@ -104,6 +105,10 @@ struct Writer<'a> {
     /// The paragraph style of the first heading of each level, whose
     /// character formatting the stylesheet's `heading N` carries.
     heading_styles: [Option<String>; 9],
+    /// What the stylesheet entry of the paragraph being written turns on, so
+    /// a run that turns it off says so (`\b0`): a reader applying the
+    /// paragraph's style would otherwise show it.
+    para_base: RunProps,
 }
 
 impl Writer<'_> {
@@ -119,7 +124,7 @@ impl Writer<'_> {
             let props = self
                 .styles
                 .effective_run(Some(&style), None, &RunProps::default());
-            let formatting = self.props_words(&props);
+            let formatting = self.props_words(&props, &RunProps::default());
             sheet.push_str(&formatting);
             let _ = write!(sheet, " heading {level};}}");
         }
@@ -180,12 +185,18 @@ impl Writer<'_> {
     fn paragraph(&mut self, p: &Paragraph, path: &[usize], in_table: bool, end: &str) {
         let pstyle = p.props.style_id.as_deref();
         self.body.push_str("\\pard\\plain");
+        self.para_base = RunProps::default();
         if let Some(level) = p.props.heading_level.filter(|l| (1..=9).contains(l)) {
             let _ = write!(self.body, "\\s{level}\\outlinelevel{}", level - 1);
             let slot = &mut self.heading_styles[usize::from(level) - 1];
             if slot.is_none() {
                 *slot = p.props.style_id.clone();
             }
+            // The stylesheet's `heading N` is the first such heading's style.
+            let style = slot.clone().unwrap_or_else(|| format!("Heading{level}"));
+            self.para_base = self
+                .styles
+                .effective_run(Some(&style), None, &RunProps::default());
         }
         self.body
             .push_str(match self.styles.effective_align(pstyle, p.props.align) {
@@ -410,7 +421,9 @@ impl Writer<'_> {
             return;
         }
         let eff = self.effective(props, pstyle);
-        let words = self.props_words(&eff);
+        let base = std::mem::take(&mut self.para_base);
+        let words = self.props_words(&eff, &base);
+        self.para_base = base;
         self.body.push('{');
         if !words.is_empty() {
             self.body.push_str(&words);
@@ -423,7 +436,9 @@ impl Writer<'_> {
     /// A tab or break, in its run's formatting.
     fn control_run(&mut self, word: &str, props: &RunProps, pstyle: Option<&str>) {
         let eff = self.effective(props, pstyle);
-        let words = self.props_words(&eff);
+        let base = std::mem::take(&mut self.para_base);
+        let words = self.props_words(&eff, &base);
+        self.para_base = base;
         self.body.push('{');
         self.body.push_str(&words);
         self.body.push_str(word);
@@ -431,24 +446,30 @@ impl Writer<'_> {
     }
 
     /// The control words for run properties `p`, adding its font and colour
-    /// to their tables.
-    fn props_words(&mut self, p: &RunProps) -> String {
+    /// to their tables. What `base` (the paragraph style's formatting) turns
+    /// on and `p` does not is turned off explicitly (`\\b0`).
+    fn props_words(&mut self, p: &RunProps, base: &RunProps) -> String {
         let mut out = String::new();
         let flags = [
-            (p.bold, "\\b"),
-            (p.italic, "\\i"),
-            (p.underline, "\\ul"),
-            (p.strike, "\\strike"),
-            (p.caps, "\\caps"),
-            (p.small_caps, "\\scaps"),
-            (p.vanish, "\\v"),
-            (p.vert_align == VertAlign::Superscript, "\\super"),
-            (p.vert_align == VertAlign::Subscript, "\\sub"),
+            (p.bold, base.bold, "\\b", "\\b0"),
+            (p.italic, base.italic, "\\i", "\\i0"),
+            (p.underline, base.underline, "\\ul", "\\ulnone"),
+            (p.strike, base.strike, "\\strike", "\\strike0"),
+            (p.caps, base.caps, "\\caps", "\\caps0"),
+            (p.small_caps, base.small_caps, "\\scaps", "\\scaps0"),
+            (p.vanish, base.vanish, "\\v", "\\v0"),
         ];
-        for (on, word) in flags {
+        for (on, inherited, word, off) in flags {
             if on {
                 out.push_str(word);
+            } else if inherited {
+                out.push_str(off);
             }
+        }
+        match p.vert_align {
+            VertAlign::Superscript => out.push_str("\\super"),
+            VertAlign::Subscript => out.push_str("\\sub"),
+            VertAlign::Baseline => {}
         }
         let font = p
             .font
@@ -1136,6 +1157,10 @@ pub(crate) mod tests {
         let s = rtf(&doc);
         assert!(s.contains("\\s1\\outlinelevel0\\ql\\ls1\\ilvl0"), "{s}");
         assert!(s.contains("{\\listtext 1.\\tab}"), "{s}");
+        // Read back, it is a heading and a numbered list item (FIX r3 #4).
+        let back = import_rtf(s.as_bytes()).unwrap();
+        let p = paras(&back)[0].props.clone();
+        assert_eq!((p.heading_level, p.num_id, p.ilvl), (Some(1), Some(2), 0));
     }
 
     /// A tracked change's underline or strike cue is not formatting (FIX r2
@@ -1261,6 +1286,46 @@ pub(crate) mod tests {
             [("a ".to_string(), false), ("strong".to_string(), true)]
         );
         assert!(runs(p[2]).iter().all(|(_, r)| r.bold), "{:?}", runs(p[2]));
+    }
+
+    /// A run that turns off what its heading's style turns on says so
+    /// (FIX r3 #2): `\\b0` in the run and its tab, nothing for a run that
+    /// keeps it.
+    #[test]
+    fn a_run_turning_off_its_headings_bold_says_so() {
+        let styles = crate::styles::parse_styles_xml(
+            r#"<w:styles>
+            <w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:rPr><w:b/><w:i/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Plain"><w:name w:val="Plain"/><w:rPr><w:b w:val="0"/></w:rPr></w:style>
+            </w:styles>"#,
+        );
+        let ctx = ExportContext {
+            styles,
+            ..ExportContext::default()
+        };
+        let plain_style = RunProps {
+            style_id: Some("Plain".into()),
+            ..RunProps::default()
+        };
+        let doc = Document {
+            body: vec![
+                para(
+                    crate::import::heading_props(1),
+                    vec![
+                        plain("Bold"),
+                        run("Not", plain_style.clone()),
+                        Inline::Tab(plain_style),
+                    ],
+                ),
+                para(ParProps::default(), vec![plain("Body")]),
+            ],
+        };
+        let s = to_rtf(&doc, &ctx);
+        assert!(s.contains("{\\b\\i Bold}"), "{s}");
+        assert!(s.contains("{\\b0\\i Not}"), "{s}");
+        assert!(s.contains("{\\b0\\i\\tab}"), "{s}");
+        // A body paragraph's style turns nothing on: no resets.
+        assert!(s.contains("\\ql {Body}"), "{s}");
     }
 
     /// A row's `w:gridBefore` columns are skipped (FIX r1 #5): the row

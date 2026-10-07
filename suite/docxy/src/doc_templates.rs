@@ -115,14 +115,18 @@ pub(crate) fn doc_template_title(path: &Path) -> Option<String> {
 }
 
 /// Make `tab`, just loaded from `path`, the untitled document a template
-/// opens as, when `path` is a template and loaded as one. A template that
-/// failed to load, or was converted from another format, stays bound to its
-/// file, whose own guards then keep Save off it. Whether it became untitled.
+/// opens as, when `path` is a template and loaded as a Word package. One
+/// that failed to load, was converted from another format, or holds no
+/// package at all (an empty file) stays bound to its file, whose own guards
+/// then keep Save off it. Whether it became untitled.
 pub(crate) fn untitle_template_tab(tab: &mut DocTab, path: &Path) -> bool {
     let Some(title) = doc_template_title(path) else {
         return false;
     };
-    if !matches!(tab.surface, Surface::Doc(_)) || tab.load_failed || tab.access.converted.is_some()
+    if !matches!(tab.surface, Surface::Doc(_))
+        || tab.load_failed
+        || tab.access.converted.is_some()
+        || tab.pkg.is_none()
     {
         return false;
     }
@@ -131,4 +135,32 @@ pub(crate) fn untitle_template_tab(tab: &mut DocTab, path: &Path) -> bool {
     tab.dirty = false;
     tab.status = format!("new document from template {}", file_name(path)).into();
     true
+}
+
+/// The new, untitled document File > New makes from the template at `path`,
+/// or why it makes none: `path` is no Word template, or it does not load
+/// as one (unreadable, damaged, empty, or another format under the name).
+pub(crate) fn template_tab(
+    path: &Path,
+    trusted: &crate::trusted::TrustStore,
+) -> Result<DocTab, String> {
+    if doc_template_title(path).is_none() {
+        return Err(format!(
+            "\"{}\" is not a Word template (.dotx or .dotm)",
+            file_name(path)
+        ));
+    }
+    let tab = crate::tab_from_path_mode(&path.to_path_buf(), crate::OpenMode::Normal, trusted)?;
+    if tab.path.is_some() {
+        let why = if tab.load_failed {
+            tab.status.to_string()
+        } else {
+            "it holds no Word document".into()
+        };
+        return Err(format!(
+            "cannot open the template \"{}\": {why}",
+            file_name(path)
+        ));
+    }
+    Ok(tab)
 }

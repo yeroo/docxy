@@ -380,21 +380,8 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        if doc_templates::doc_template_title(path).is_none() {
-            return Err(format!(
-                "\"{}\" is not a Word template (.dotx or .dotm)",
-                file_name(path)
-            ));
-        }
         let trusted = trusted::TrustStore::load(&config_root());
-        let tab = tab_from_path_mode(&path.to_path_buf(), OpenMode::Normal, &trusted)?;
-        if tab.path.is_some() {
-            return Err(format!(
-                "cannot open the template \"{}\": {}",
-                file_name(path),
-                tab.status
-            ));
-        }
+        let tab = doc_templates::template_tab(path, &trusted)?;
         self.cancel_highlight_mode();
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
