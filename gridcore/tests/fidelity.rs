@@ -16,12 +16,15 @@
 #[path = "../../docxcore/tests/fidelity/mod.rs"]
 #[allow(dead_code)]
 mod comparator;
+#[path = "fidelity/schema.rs"]
+mod sml_schema;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use comparator::*;
 use gridcore::xlsx::{load_xlsx, save_xlsx_for_path};
+use sml_schema::{Violation, new_violations, validate_package};
 
 /// Repo-tracked `.xlsx` that always run, so the gate is never vacuous.
 /// `offxy-jetbrains` test resources are copies of files listed here.
@@ -1199,17 +1202,32 @@ fn corpus(root: &Path) -> (Vec<(String, PathBuf)>, Option<PathBuf>) {
 /// xlsx has no separate no-edit save: every save regenerates the worksheets.
 /// `covered` counts the structural findings the cell check replaced.
 fn round_trip(bytes: &[u8], path: &Path, covered: &mut usize) -> Vec<Finding> {
+    round_trip_validated(bytes, path, covered).0
+}
+
+/// [`round_trip`], with the package and schema violations the save added
+/// (#1156): Excel repairs those, value loss or not.
+fn round_trip_validated(
+    bytes: &[u8],
+    path: &Path,
+    covered: &mut usize,
+) -> (Vec<Finding>, Vec<Violation>) {
     match load_xlsx(bytes) {
         Ok(pkg) => {
             let saved = save_xlsx_for_path(&pkg, path);
-            check_sheets(bytes, &saved, compare_packages(bytes, &saved), covered)
+            let schema = new_violations(&validate_package(bytes), &validate_package(&saved));
+            let found = check_sheets(bytes, &saved, compare_packages(bytes, &saved), covered);
+            (found, schema)
         }
-        Err(e) => vec![Finding {
-            part: String::new(),
-            kind: Kind::LoadError,
-            path: String::new(),
-            detail: format!("{e:?}"),
-        }],
+        Err(e) => {
+            let f = Finding {
+                part: String::new(),
+                kind: Kind::LoadError,
+                path: String::new(),
+                detail: format!("{e:?}"),
+            };
+            (vec![f], Vec::new())
+        }
     }
 }
 
@@ -1241,10 +1259,17 @@ fn round_trip_fidelity_gate() {
     let mut present = BTreeSet::new();
     let mut allowed = vec![0usize; allow.len()];
     let mut covered = 0usize;
+    let mut invalid = Vec::new();
     for (file, path) in &files {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         present.insert(file.clone());
-        let found = guarded(|| round_trip(&bytes, path, &mut covered));
+        let mut schema = Vec::new();
+        let found = guarded(|| {
+            let (found, violations) = round_trip_validated(&bytes, path, &mut covered);
+            schema = violations;
+            found
+        });
+        invalid.extend(schema.iter().map(|v| v.line(file)));
         for f in apply_allowlist(found, &allow, &mut allowed) {
             findings.push((file.clone(), f));
         }
@@ -1262,6 +1287,15 @@ fn round_trip_fidelity_gate() {
             rule.part, rule.path, rule.reason
         );
     }
+
+    // Excel repairs these, lost or not: never baselined (#1156).
+    assert!(
+        invalid.is_empty(),
+        "fidelity gate: save introduced {} package or schema violations \
+         (docs/fidelity-gate.md)\n{}",
+        invalid.len(),
+        invalid.join("\n")
+    );
 
     if flag("FIDELITY_UPDATE_BASELINE") {
         let next = updated_baseline(&findings, &present, &baseline);
@@ -2019,6 +2053,248 @@ fn entries_that_name_one_part_are_unreadable() {
         ("xl/a.xml", b"<a/>".to_vec()),
     ]);
     assert_eq!(compare_packages(&twice, &one).len(), 0);
+}
+
+/// #1156: an empty entry with no extension, or with entries under it, is a
+/// directory too: tdf124525.xlsx marks `_rels`, `xl`, ... as directories
+/// only in their ZIP attributes, and the save no longer writes them.
+#[test]
+fn an_empty_entry_named_like_a_directory_is_no_part() {
+    let types = br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#;
+    let original = package(&[
+        ("_rels", Vec::new()),
+        ("xl", Vec::new()),
+        ("xl/media", Vec::new()),
+        ("[Content_Types].xml", types.to_vec()),
+        ("xl/a.xml", b"<a/>".to_vec()),
+    ]);
+    let saved = package(&[
+        ("[Content_Types].xml", types.to_vec()),
+        ("xl/a.xml", b"<a/>".to_vec()),
+    ]);
+    assert_eq!(compare_packages(&original, &saved).len(), 0);
+    assert_eq!(parts_identical(&original, &saved), Ok(()));
+    // An empty part with an extension is still a part.
+    let thumb = package(&[
+        ("[Content_Types].xml", types.to_vec()),
+        ("xl/a.xml", b"<a/>".to_vec()),
+        ("docProps/thumbnail.wmf", Vec::new()),
+    ]);
+    let kinds: Vec<Kind> = compare_packages(&thumb, &saved)
+        .into_iter()
+        .map(|f| f.kind)
+        .collect();
+    assert_eq!(kinds, [Kind::PartMissing]);
+}
+
+/// `zip` with the external attributes of the central directory entries
+/// named in `dirs` set to the MS-DOS directory bit, as tdf124525.xlsx has
+/// them.
+fn mark_directories(mut zip: Vec<u8>, dirs: &[&str]) -> Vec<u8> {
+    let eocd = zip.len() - 22;
+    let len = |zip: &[u8], at: usize| u16::from_le_bytes([zip[at], zip[at + 1]]) as usize;
+    let count = len(&zip, eocd + 10);
+    let mut p = u32::from_le_bytes(zip[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    for _ in 0..count {
+        let name_len = len(&zip, p + 28);
+        let name = std::str::from_utf8(&zip[p + 46..p + 46 + name_len]).unwrap();
+        if dirs.contains(&name) {
+            zip[p + 38..p + 42].copy_from_slice(&0x10u32.to_le_bytes());
+        }
+        p += 46 + name_len + len(&zip, p + 30) + len(&zip, p + 32);
+    }
+    zip
+}
+
+/// The directory entries tdf124525.xlsx has.
+const TDF124525_DIRS: &[&str] = &[
+    "_rels",
+    "docProps",
+    "xl",
+    "xl/_rels",
+    "xl/theme",
+    "xl/worksheets",
+];
+
+/// A workbook gridcore wrote, with tdf124525.xlsx's directory entries: empty,
+/// no trailing `/`, directories only by their ZIP attributes.
+fn with_tdf124525_directories() -> (Vec<u8>, Vec<String>) {
+    let mut pkg = gridcore::xlsx::new_xlsx();
+    pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::number(42.0));
+    let parts = read_parts(&gridcore::xlsx::save_xlsx(&pkg)).unwrap();
+    let names: Vec<String> = parts.keys().cloned().collect();
+    let mut entries: Vec<(String, Vec<u8>)> = TDF124525_DIRS
+        .iter()
+        .map(|d| (d.to_string(), Vec::new()))
+        .collect();
+    entries.extend(parts);
+    (
+        mark_directories(opccore::zipwrite::write_zip(&entries), TDF124525_DIRS),
+        names,
+    )
+}
+
+/// The entry names of `zip`, sorted.
+fn entry_names(zip: &[u8]) -> Vec<String> {
+    let arc = opccore::zip::ZipArchive::open(zip).unwrap();
+    let mut names: Vec<String> = arc.entries().iter().map(|e| e.name.clone()).collect();
+    names.sort();
+    names
+}
+
+/// #1156: the save of a package with tdf124525.xlsx's directory entries
+/// writes exactly its parts, and none without a content type. Before the
+/// fix it wrote `_rels`, `xl`, ... back as empty parts, and Excel repaired
+/// the file.
+#[test]
+fn a_package_with_directory_entries_saves_only_its_parts() {
+    let (original, names) = with_tdf124525_directories();
+    assert_eq!(validate_package(&original), vec![]);
+    let pkg = load_xlsx(&original).unwrap();
+    let saved = save_xlsx_for_path(&pkg, Path::new("tdf124525.xlsx"));
+    assert_eq!(validate_package(&saved), vec![]);
+    assert_eq!(entry_names(&saved), names);
+    let mut covered = 0;
+    let (found, schema) =
+        round_trip_validated(&original, Path::new("tdf124525.xlsx"), &mut covered);
+    assert_eq!(not_allowed(found), vec![]);
+    assert_eq!(schema, vec![]);
+}
+
+/// The (rule, part, child) of each violation in `pkg`.
+fn violations(pkg: &[u8]) -> Vec<(&'static str, String, String)> {
+    validate_package(pkg)
+        .into_iter()
+        .map(|v| (v.rule.as_str(), v.part, v.child))
+        .collect()
+}
+
+const TYPES_NS: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
+
+/// A package of a workbook and one worksheet, with `extra` entries.
+fn validated(workbook: &str, worksheet: &str, extra: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let types = format!(
+        r#"<Types xmlns="{TYPES_NS}"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="XML" ContentType="application/xml"/><Override PartName="/XL/Workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#
+    );
+    let wb_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet%201.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/x.xml" TargetMode="External"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="/xl/./styles.xml"/></Relationships>"#;
+    let mut parts = vec![
+        ("[Content_Types].xml", types.into_bytes()),
+        ("_rels/.rels", PACKAGE_RELS.as_bytes().to_vec()),
+        (
+            "xl/workbook.xml",
+            format!(r#"<workbook xmlns="{MAIN}">{workbook}</workbook>"#).into_bytes(),
+        ),
+        ("xl/_rels/workbook.xml.rels", wb_rels.as_bytes().to_vec()),
+        (
+            "xl/worksheets/sheet 1.xml",
+            format!(r#"<worksheet xmlns="{MAIN}">{worksheet}</worksheet>"#).into_bytes(),
+        ),
+        (
+            "xl/styles.xml",
+            format!(r#"<styleSheet xmlns="{MAIN}"/>"#).into_bytes(),
+        ),
+    ];
+    parts.extend(extra.iter().cloned());
+    package(&parts)
+}
+
+const SHEETS: &str = r#"<sheets><sheet name="A" sheetId="1"/></sheets>"#;
+
+/// #1156: a valid package has no violations: names match case-insensitively,
+/// targets are percent-decoded and resolved, external ones are skipped.
+#[test]
+fn the_validator_accepts_a_valid_package() {
+    let ws = r#"<dimension ref="A1"/><sheetData><row r="1"><c r="A1"/><c r="B1"/></row><row><c/></row><row r="3"><c/><c r="C3"/></row></sheetData><pageMargins left="1" right="1" top="1" bottom="1" header="0" footer="0"/>"#;
+    assert_eq!(violations(&validated(SHEETS, ws, &[])), vec![]);
+    let mut covered = 0;
+    let book = gridcore::xlsx::save_xlsx(&gridcore::xlsx::new_xlsx());
+    assert_eq!(validate_package(&book), vec![]);
+    let (_, schema) = round_trip_validated(&book, Path::new("book.xlsx"), &mut covered);
+    assert_eq!(schema, vec![]);
+}
+
+/// #1156: what Excel repairs is reported: an empty part with no content type
+/// (the saved directory entry), a worksheet out of schema order, rows and
+/// cells out of order, a workbook with no `sheets`, an Override and a
+/// relationship naming no part.
+#[test]
+fn the_validator_reports_what_excel_repairs() {
+    let ws = r#"<sheetData><row r="2"><c r="B2"/><c r="A2"/></row><row r="1"/><foo/></sheetData><dimension ref="A1"/><sheetData/>"#;
+    let wb = r#"<bookViews/><bookViews/>"#;
+    let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="t" Target="../nowhere.xml"/></Relationships>"#;
+    let types = format!(
+        r#"<Types xmlns="{TYPES_NS}"><Default Extension="rels" ContentType="r"/><Default Extension="xml" ContentType="x"/><Override PartName="/xl/gone.xml" ContentType="x"/></Types>"#
+    );
+    let pkg = validated(
+        wb,
+        ws,
+        &[
+            ("xl", Vec::new()),
+            (
+                "xl/worksheets/_rels/sheet 1.xml.rels",
+                rels.as_bytes().to_vec(),
+            ),
+        ],
+    );
+    let mut found = violations(&pkg);
+    found.sort();
+    let s = |r: &'static str, p: &str, c: &str| (r, p.to_string(), c.to_string());
+    let ws = "xl/worksheets/sheet 1.xml";
+    let mut want = vec![
+        s("no-content-type", "xl", "xl"),
+        s(
+            "dangling-target",
+            "xl/worksheets/_rels/sheet 1.xml.rels",
+            "xl/nowhere.xml",
+        ),
+        s("order", ws, "dimension"),
+        s("duplicate", ws, "sheetData"),
+        s("not-allowed", ws, "foo"),
+        s("r-order", ws, "row"),
+        s("r-order", ws, "c"),
+        s("duplicate", "xl/workbook.xml", "bookViews"),
+        s("missing", "xl/workbook.xml", "sheets"),
+    ];
+    want.sort();
+    assert_eq!(found, want);
+    // An Override naming no part, and a missing package relationships part.
+    let pkg = package(&[("[Content_Types].xml", types.into_bytes())]);
+    let mut found = violations(&pkg);
+    found.sort();
+    let mut want = vec![
+        s("missing-part", "_rels/.rels", "_rels/.rels"),
+        s("override-no-part", "[content_types].xml", "xl/gone.xml"),
+    ];
+    want.sort();
+    assert_eq!(found, want);
+}
+
+/// #1156: Excel repaired the suite's unedited save of tdf124525.xlsx. Its
+/// save has exactly its parts, and no package or schema violation the
+/// original does not have.
+#[test]
+fn tdf124525_saves_without_its_directory_entries() {
+    let (_, ext) = corpus(&workspace_root());
+    let Some(dir) = ext else {
+        assert!(
+            !flag("FIDELITY_REQUIRE_CORPUS"),
+            "fidelity: FIDELITY_REQUIRE_CORPUS=1 but no external corpus"
+        );
+        eprintln!("fidelity: SKIP tdf124525.xlsx: no external corpus");
+        return;
+    };
+    let path = dir.join("libreoffice/sc/qa/unit/data/xlsx/tdf124525.xlsx");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let pkg = load_xlsx(&bytes).expect("tdf124525.xlsx loads");
+    let saved = save_xlsx_for_path(&pkg, &path);
+    let mut parts: Vec<String> = read_parts(&bytes).unwrap().into_keys().collect();
+    parts.sort();
+    assert_eq!(entry_names(&saved), parts);
+    assert_eq!(validate_package(&saved), vec![]);
+    assert_eq!(
+        new_violations(&validate_package(&bytes), &validate_package(&saved)),
+        vec![]
+    );
 }
 
 #[test]
