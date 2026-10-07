@@ -19,7 +19,7 @@
 use super::{
     OoxmlNs, STRICT, SheetPackage, TRANSITIONAL, XlsxError, decode, entry_part_names,
     is_strict_workbook, load_parts, local, minimal_styles_xml, open_container, parse_rels,
-    rels_part_name, resolve_relative, workbook_part_name,
+    rels_part_name, resolve_relative, utf8_part, workbook_part_name,
 };
 use crate::sheet::Workbook;
 use opccore::xml::{Event, XmlParser};
@@ -66,7 +66,7 @@ pub fn load_xlsx_repair(data: &[u8]) -> Result<(SheetPackage, Repairs), XlsxErro
     let mut damaged: Vec<String> = Vec::new();
     for (e, name) in zip.entries().iter().zip(entry_part_names(&zip)?) {
         match zip.extract(e) {
-            Some(bytes) => parts.push((name, bytes)),
+            Some(bytes) => parts.push((name, utf8_part(bytes))),
             None => damaged.push(name),
         }
     }

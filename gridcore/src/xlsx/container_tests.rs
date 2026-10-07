@@ -7,11 +7,13 @@ use opccore::zipwrite::write_zip;
 
 const SML: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const THEME: &str = "<?xml version=\"1.0\"?><a:theme xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" name=\"Office\"/>";
 const PKG_RELS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
 /// A one-sheet workbook laid out as LibreOffice's tdf76115.xlsx is: the
 /// sheet at `xl/sheet1.xml`, every relationship target absolute, and each
-/// entry name written with `sep` between its segments.
+/// entry name written with `sep` between its segments. It also has a theme,
+/// a part repair can drop.
 fn package(sep: &str) -> Vec<(String, Vec<u8>)> {
     let ct = "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/></Types>";
     let root = format!(
@@ -21,7 +23,7 @@ fn package(sep: &str) -> Vec<(String, Vec<u8>)> {
         "<?xml version=\"1.0\"?><workbook xmlns=\"{SML}\" xmlns:r=\"{R}\"><sheets><sheet name=\"Plan1\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"
     );
     let wb_rels = format!(
-        "<?xml version=\"1.0\"?><Relationships xmlns=\"{PKG_RELS}\"><Relationship Id=\"rId1\" Type=\"{R}/worksheet\" Target=\"/xl/sheet1.xml\"/></Relationships>"
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"{PKG_RELS}\"><Relationship Id=\"rId1\" Type=\"{R}/worksheet\" Target=\"/xl/sheet1.xml\"/><Relationship Id=\"rId2\" Type=\"{R}/theme\" Target=\"/xl/theme/theme1.xml\"/></Relationships>"
     );
     let sheet = format!(
         "<?xml version=\"1.0\"?><worksheet xmlns=\"{SML}\"><sheetData><row r=\"1\"><c r=\"A1\"><v>42</v></c></row></sheetData></worksheet>"
@@ -32,6 +34,7 @@ fn package(sep: &str) -> Vec<(String, Vec<u8>)> {
         ("xl/_rels/workbook.xml.rels", wb_rels),
         ("xl/workbook.xml", wb),
         ("xl/sheet1.xml", sheet),
+        ("xl/theme/theme1.xml", THEME.to_string()),
     ]
     .into_iter()
     .map(|(name, xml)| (name.replace('/', sep), xml.into_bytes()))
@@ -118,4 +121,61 @@ fn empty_deflate_and_directory_entries_load() {
     assert_eq!(a1(&pkg), &CellValue::Number(42.0));
     assert_eq!(pkg.part("docProps/thumbnail.wmf"), Some(&[][..]));
     assert!(load_xlsx(&save_xlsx(&pkg)).is_ok());
+}
+
+/// [`package`] with its sheet written as tdf76115.xlsx writes it: in
+/// ISO-8859-1, with Latin-1 inline strings.
+fn latin1_package() -> Vec<(String, Vec<u8>)> {
+    let mut sheet = format!(
+        "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" standalone=\"yes\"?><worksheet xmlns=\"{SML}\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t><![CDATA[S"
+    )
+    .into_bytes();
+    sheet.extend_from_slice(b"\xe9rie N\xba]]></t></is></c></row></sheetData></worksheet>");
+    let mut parts = package("\\");
+    for (name, bytes) in &mut parts {
+        if name == "xl\\sheet1.xml" {
+            *bytes = sheet.clone();
+        }
+    }
+    parts
+}
+
+/// The sheet's A1 text, and the saved sheet part's text (which must be
+/// UTF-8 and say so), after a save and reload of `pkg`.
+fn latin1_round_trip(pkg: &SheetPackage) {
+    let text = CellValue::Text("S\u{e9}rie N\u{ba}".into());
+    assert_eq!(a1(pkg), &text);
+    let saved = save_xlsx(pkg);
+    let zip = ZipArchive::open(&saved).unwrap();
+    let sheet = String::from_utf8(zip.read("xl/sheet1.xml").unwrap()).expect("UTF-8");
+    assert!(!sheet.contains("8859"), "{sheet}");
+    let back = load_xlsx(&saved).expect("the save reloads");
+    assert_eq!(a1(&back), &text);
+}
+
+/// #1108: a part declaring ISO-8859-1 is read by its declaration, not as
+/// UTF-8 with every accented letter replaced, and is saved as UTF-8.
+#[test]
+fn latin1_sheet_text_survives_a_save() {
+    let zip = write_zip(&latin1_package());
+    latin1_round_trip(&load_xlsx(&zip).expect("loads"));
+    let (pkg, repairs) = load_xlsx_repair(&zip).expect("repair loads");
+    assert!(repairs.is_empty());
+    latin1_round_trip(&pkg);
+}
+
+/// The same through repair's own path: one entry damaged.
+#[test]
+fn latin1_sheet_text_survives_a_repair() {
+    let zip = write_zip(&latin1_package());
+    let theme = ZipArchive::open(&zip)
+        .unwrap()
+        .find("xl\\theme\\theme1.xml")
+        .unwrap()
+        .local_offset as usize;
+    let mut damaged = zip.clone();
+    damaged[theme..theme + 4].copy_from_slice(&[0; 4]);
+    let (pkg, repairs) = load_xlsx_repair(&damaged).expect("repairs");
+    assert_eq!(repairs.dropped, ["xl/theme/theme1.xml"]);
+    latin1_round_trip(&pkg);
 }

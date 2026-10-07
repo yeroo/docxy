@@ -577,6 +577,40 @@ fn utf8_len(b: u8) -> usize {
     }
 }
 
+/// A document that is not UTF-8 but whose XML declaration names ISO-8859-1
+/// (or `latin1`), as UTF-8 text: each byte is the character of that code
+/// point, and the declaration then says `UTF-8`, so the text matches what it
+/// declares. `None` for UTF-8 input and for any other declared encoding.
+/// Some writers emit such parts (LibreOffice's tdf76115.xlsx), and Excel
+/// reads them by their declaration (#1108).
+pub fn latin1_to_utf8(bytes: &[u8]) -> Option<String> {
+    if std::str::from_utf8(bytes).is_ok() || !bytes.starts_with(b"<?xml") {
+        return None;
+    }
+    let decl = &bytes[..bytes.windows(2).position(|w| w == b"?>")?];
+    let key = decl.windows(8).position(|w| w == b"encoding")? + 8;
+    let skip_ws = |mut i: usize| {
+        while decl.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        i
+    };
+    let eq = skip_ws(key);
+    if decl.get(eq) != Some(&b'=') {
+        return None;
+    }
+    let open = skip_ws(eq + 1);
+    let quote = *decl.get(open).filter(|q| matches!(q, b'"' | b'\''))?;
+    let start = open + 1;
+    let end = start + decl[start..].iter().position(|&b| b == quote)?;
+    let name = &decl[start..end];
+    if !(name.eq_ignore_ascii_case(b"ISO-8859-1") || name.eq_ignore_ascii_case(b"latin1")) {
+        return None;
+    }
+    let latin1 = |b: &[u8]| b.iter().map(|&b| b as char).collect::<String>();
+    Some(latin1(&bytes[..start]) + "UTF-8" + &latin1(&bytes[end..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,5 +925,37 @@ mod tests {
                 (Event::Eof, "a".to_string()),
             ]
         );
+    }
+
+    /// #1108: a declared ISO-8859-1 document becomes UTF-8 text declaring
+    /// UTF-8; anything else is left alone.
+    #[test]
+    fn latin1_documents_become_utf8() {
+        let doc = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><t>S\xe9rie \xba</t>";
+        assert_eq!(
+            latin1_to_utf8(doc).as_deref(),
+            Some("<?xml version=\"1.0\" encoding=\"UTF-8\"?><t>S\u{e9}rie \u{ba}</t>")
+        );
+        let spaced = b"<?xml version='1.0' encoding = 'latin1' ?><t>\xe3</t>";
+        assert_eq!(
+            latin1_to_utf8(spaced).as_deref(),
+            Some("<?xml version='1.0' encoding = 'UTF-8' ?><t>\u{e3}</t>")
+        );
+        // UTF-8 as declared, or a declaration that says so wrongly: kept.
+        assert_eq!(
+            latin1_to_utf8(
+                "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><t>\u{e9}</t>".as_bytes()
+            ),
+            None
+        );
+        // Another encoding, no encoding, no declaration: not ours to decode.
+        for doc in [
+            &b"<?xml version=\"1.0\" encoding=\"windows-1252\"?><t>\x80</t>"[..],
+            b"<?xml version=\"1.0\"?><t>\xe9</t>",
+            b"<t>\xe9</t>",
+            b"<?xml encoding=\"ISO-8859-1\"",
+        ] {
+            assert_eq!(latin1_to_utf8(doc), None);
+        }
     }
 }
