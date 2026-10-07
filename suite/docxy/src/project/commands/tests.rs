@@ -1150,6 +1150,44 @@ fn alt_home_goes_to_start() {
     assert!(v(&t).gantt_x.get() > 0., "plain Home leaves the timescale");
 }
 
+/// Project's Alt+End moves the timescale to the project finish: the finish
+/// day's column is the last fully visible one, right-aligned at the chart's
+/// right edge. The mirror of Alt+Home; the cursor, the column and the plan's
+/// dirtied state stay as they were.
+#[test]
+fn alt_end_goes_to_finish() {
+    let mut t = tab();
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    };
+    // A plan many days wider than the viewport, so the scroll has room.
+    vm(&mut t)
+        .ed
+        .add_task(None, "Long", 480 * 45, false)
+        .unwrap();
+    let (sel, col) = (v(&t).ed.sel(), v(&t).col);
+    let dirty = t.dirty || v(&t).ed.dirty();
+    let act = project_input(&mut t, "end", None, alt);
+    assert_eq!(act, Some(ProjectAct::GoToFinish));
+    apply_project_act(&mut t, act.unwrap());
+    let (x, w) = (v(&t).gantt_x.get(), v(&t).gantt_w);
+    assert!(x > 0., "the timescale moved");
+    let (scale, finish) = (v(&t).scale, v(&t).ed.disp_project_finish().day_number());
+    assert!(
+        scale.x(finish) >= x - 1e-3 && scale.x(finish + 1) <= x + w + 1e-3,
+        "the finish day column is the last fully visible one"
+    );
+    assert_eq!((v(&t).ed.sel(), v(&t).col), (sel, col), "the cursor stays");
+    assert_eq!(
+        t.dirty || v(&t).ed.dirty(),
+        dirty,
+        "scrolling is view state"
+    );
+    apply_project_act(&mut t, ProjectAct::GoToStart);
+    assert_eq!(v(&t).gantt_x.get(), 0.);
+}
+
 /// Project's Alt keys get past the KeyTips overlay (pressing Alt starts it),
 /// so Alt+Home works after F10 as Alt+Left/Right do; KeyTip letters and
 /// digits never do.
@@ -1164,6 +1202,7 @@ fn project_alt_keys_bypass_keytips_but_letters_do_not() {
         ("left", alt),
         ("right", alt),
         ("home", alt),
+        ("end", alt),
         ("right", alt_shift),
         ("left", alt_shift),
         ("-", alt_shift),
@@ -1176,7 +1215,19 @@ fn project_alt_keys_bypass_keytips_but_letters_do_not() {
         ..alt
     };
     assert!(!project_alt_key("home", ctrl_alt));
+    assert!(!project_alt_key("end", ctrl_alt));
     assert!(!project_alt_key("home", Modifiers::default()));
+    assert!(!project_alt_key("end", Modifiers::default()));
+    assert_ne!(
+        key_act("end", Modifiers::default()),
+        Some(ProjectAct::GoToFinish),
+        "plain End keeps its meaning"
+    );
+    assert_ne!(
+        key_act("end", ctrl_alt),
+        Some(ProjectAct::GoToFinish),
+        "Ctrl+End keeps its meaning"
+    );
     assert!(!project_alt_key("alt", alt));
     for c in ('a'..='z').chain('0'..='9') {
         let key = c.to_string();

@@ -362,6 +362,16 @@ impl ProjectView {
         }
     }
 
+    /// Alt+End: pan the chart so the project's displayed finish day is the
+    /// last fully visible day column, right-aligned at the chart's right
+    /// edge. The scale is refreshed first, as in `scroll_to_task`.
+    pub fn scroll_to_finish(&mut self) {
+        self.refresh_schedule_layout();
+        let finish = self.ed.disp_project_finish().day_number();
+        self.gantt_x.set(self.scale.x(finish + 1) - self.gantt_w);
+        self.clamp_offsets();
+    }
+
     /// The pane at `x`, relative to the split area's left edge. The boundary is
     /// the middle of the split bar, where `SplitDrag` puts it.
     pub fn pane_at(&self, x: f32) -> ProjectPane {
