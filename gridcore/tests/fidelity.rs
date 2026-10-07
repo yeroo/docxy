@@ -603,9 +603,11 @@ fn read_value(c: &Elem, sst: &[Vec<(Option<u64>, String)>]) -> Value {
     let t = attr(c, "t").unwrap_or("n");
     let v = elems(c, "v").next().map(text_of);
     match (t, v) {
-        ("inlineStr", _) => match elems(c, "is").next() {
-            Some(is) => Value::Text(runs(is)),
-            None => Value::Empty,
+        // An inline string with no text as read (`<t/>`, or `<t> </t>`
+        // outside preserve) is a blank cell to Excel.
+        ("inlineStr", _) => match elems(c, "is").next().map(runs) {
+            Some(runs) if runs.iter().any(|(_, t)| !t.is_empty()) => Value::Text(runs),
+            _ => Value::Empty,
         },
         (_, None) => Value::Empty,
         ("s", Some(v)) => match v.trim().parse::<usize>().ok().and_then(|i| sst.get(i)) {
@@ -1535,6 +1537,49 @@ fn a_boolean_reads_the_same_spelled_one_or_true() {
     assert_eq!(cells(&row("true"), &row("1")), vec![]);
     assert_eq!(cells(&row("false"), &row("0")), vec![]);
     assert_eq!(cells(&row("true"), &row("0")), at_cell("A1", "value"));
+}
+
+/// #1153: a string's `<t>` is read as Excel reads it, so the whitespace at
+/// its ends outside `xml:space="preserve"` is no text. tdf76115.xlsx's
+/// `<is><t><![CDATA[ ]]></t></is>` is a blank cell, saved without a value;
+/// a preserved one-space string is still one space.
+#[test]
+fn string_text_edges_outside_preserve_are_not_compared() {
+    let data = |rows: &str| format!("<sheetData>{rows}</sheetData>");
+    let row = |c: &str| data(&format!(r#"<row r="1"><c r="A1" s="1"{c}</c></row>"#));
+    let blank = data(r#"<row r="1"><c r="A1" s="1"/></row>"#);
+    let s = |i: &str| row(&format!(r#" t="s"><v>{i}</v>"#));
+    let strings = r#"<si><t xml:space="preserve"> </t></si><si><t>a</t></si><si><t></t></si>"#;
+    let inline = |is: &str| row(&format!(r#" t="inlineStr"><is>{is}</is>"#));
+
+    let space = inline("<t><![CDATA[ ]]></t>");
+    assert_eq!(after_check((&space, strings), (&blank, strings)), vec![]);
+    assert_eq!(
+        after_check((&inline("<t/>"), strings), (&blank, strings)),
+        vec![]
+    );
+    let edges = inline("<t> a\r\n</t>");
+    assert_eq!(after_check((&edges, strings), (&s("1"), strings)), vec![]);
+    let runs = inline(r#"<r><t>a </t></r><r><t xml:space="preserve"></t></r>"#);
+    assert_eq!(after_check((&runs, strings), (&s("1"), strings)), vec![]);
+    // A shared string of only unpreserved whitespace is the empty string.
+    let ws_strings = "<si><t> </t></si>";
+    assert_eq!(
+        after_check((&s("0"), ws_strings), (&s("2"), strings)),
+        vec![]
+    );
+    // Preserved, the space is text: blank is a loss, so is a trimmed save.
+    let kept = inline(r#"<t xml:space="preserve"> </t>"#);
+    assert_eq!(after_check((&kept, strings), (&s("0"), strings)), vec![]);
+    assert_eq!(
+        after_check((&kept, strings), (&blank, strings)),
+        at_cell("A1", "value")
+    );
+    let inherited = inline(r#"<r><t> a</t></r>"#).replace("<is>", r#"<is xml:space="preserve">"#);
+    assert_eq!(
+        after_check((&inherited, strings), (&s("1"), strings)),
+        at_cell("A1", "value")
+    );
 }
 
 #[test]

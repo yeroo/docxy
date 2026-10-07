@@ -49,6 +49,11 @@ Every part of the original is compared with its saved counterpart:
     `<w:t>SDT </w:t>` equals `<w:t xml:space="preserve">SDT</w:t>`, and both
     differ from `<w:t xml:space="preserve">SDT </w:t>`. An unpreserved
     `<w:t> </w:t>` therefore holds no text at all.
+  - The same rule applies to a SpreadsheetML string's `t`, the text of a
+    shared or inline string and of each of its runs, as Excel reads it
+    (#1153). So the xlsx sheet check reads an unpreserved `<is><t> </t></is>`
+    as a blank cell, and an unpreserved `<si><t> </t></si>` as the empty
+    string.
 - **Every other part** must be byte-equal. So must any XML part that is not UTF-8
   or is malformed. Malformed covers:
   - mismatched or unclosed tags;
@@ -332,7 +337,9 @@ cargo test -p gridcore --test fidelity -- --nocapture
   **Per cell** either side lists, it compares three things:
   - the **value**. Shared strings are found through the workbook's
     relationship. Shared and inline strings are resolved, run formatting
-    included; phonetic runs are not read. Numbers compare as doubles, along
+    included; phonetic runs are not read. Each `t` is read as Excel reads it
+    (see the whitespace rule above). An inline string with no text is a
+    blank cell. Numbers compare as doubles, along
     with booleans and errors.
   - the **formula**: its text, plus kind and range for array and data-table
     formulas. A shared formula's follower is resolved from its master by

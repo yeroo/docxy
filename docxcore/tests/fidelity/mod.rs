@@ -20,6 +20,11 @@ const W_NS: [&str; 2] = [
     "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
     "http://purl.oclc.org/ooxml/wordprocessingml/main",
 ];
+/// SpreadsheetML, transitional and strict.
+const SML_NS: [&str; 2] = [
+    "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "http://purl.oclc.org/ooxml/spreadsheetml/main",
+];
 
 /// Above this many LCS cells, child alignment falls back to pairing in order.
 const LCS_CELL_LIMIT: usize = 4_000_000;
@@ -270,16 +275,20 @@ fn decode_attr(raw: &str) -> Option<String> {
 struct Building {
     elem: Elem,
     text: String,
-    /// A `w:t` / `w:delText` outside `xml:space="preserve"`: the XML
-    /// whitespace at either end of its text is not significant (#1084).
+    /// A `w:t` / `w:delText` (#1084) or a SpreadsheetML `t` (#1153) outside
+    /// `xml:space="preserve"`: the XML whitespace at either end of its text
+    /// is not significant.
     trim_edges: bool,
 }
 
-/// Whether the element just started is WordprocessingML run text whose edge
-/// whitespace Word ignores: `w:t` or `w:delText` where `xml:space`, on the
-/// element or its nearest ancestor that has one, is not `preserve`.
+/// Whether the element just started is text whose edge whitespace its
+/// reader ignores: WordprocessingML `w:t` or `w:delText` (Word), or a
+/// SpreadsheetML string's `t` (Excel), where `xml:space`, on the element or
+/// its nearest ancestor that has one, is not `preserve`.
 fn insignificant_edges(parser: &XmlParser<'_>, uri: &str, local: &str) -> bool {
-    W_NS.contains(&uri) && matches!(local, "t" | "delText") && !parser.xml_space_preserve()
+    let run_text = (W_NS.contains(&uri) && matches!(local, "t" | "delText"))
+        || (SML_NS.contains(&uri) && local == "t");
+    run_text && !parser.xml_space_preserve()
 }
 
 /// Drop the XML whitespace at the two ends of an element's text content.
@@ -304,7 +313,7 @@ fn flush_text(b: &mut Building) {
 fn finish(mut b: Building) -> Elem {
     flush_text(&mut b);
     let mut e = b.elem;
-    // Compare the text Word reads, so a save that writes `preserve` with the
+    // Compare the text Word (or Excel) reads, so a save that writes `preserve` with the
     // trimmed text equals the original's untrimmed, unpreserved one.
     if b.trim_edges {
         trim_text_edges(&mut e.children);
