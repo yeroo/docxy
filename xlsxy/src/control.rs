@@ -4606,6 +4606,61 @@ mod tests {
     }
 
     #[test]
+    fn a_rename_rewrites_the_redo_stack() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Data".into()))]),
+        )
+        .unwrap();
+        set(&mut a, "A1", "=Data!A1");
+        a.undo();
+        dispatch(
+            &mut a,
+            "sheet.rename",
+            &Json::obj(vec![
+                ("sheet", Json::Str("Data".into())),
+                ("name", Json::Str("New".into())),
+            ]),
+        )
+        .unwrap();
+        a.redo();
+        assert_eq!(get(&mut a, "A1").get_str("formula"), Some("=New!A1"));
+    }
+
+    #[test]
+    fn a_rename_rewrites_a_pivot_source_in_the_history() {
+        let mut a = app();
+        pivot_fixture(&mut a);
+        dispatch(&mut a, "pivot.create", &pivot_create_args(None)).unwrap();
+        a.sheet = 0;
+        dispatch(
+            &mut a,
+            "row.insert",
+            &Json::obj(vec![("at", Json::Num(20.0))]),
+        )
+        .unwrap();
+        dispatch(
+            &mut a,
+            "sheet.rename",
+            &Json::obj(vec![
+                ("sheet", Json::Num(0.0)),
+                ("name", Json::Str("Src".into())),
+            ]),
+        )
+        .unwrap();
+        a.undo(); // the row insert, whose snapshot named Sheet1
+        let source_sheet = |a: &App| match &a.pkg.workbook.pivots[0].source {
+            gridcore::pivot::PivotSource::Range { sheet, .. } => sheet.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(source_sheet(&a), "Src");
+        a.redo();
+        assert_eq!(source_sheet(&a), "Src");
+    }
+
+    #[test]
     fn structural_undo_before_a_rename_keeps_the_new_name() {
         // A row insert's snapshots were taken while the sheet was Data: the
         // rename rewrites them, so undoing it keeps Renamed and its refs.
@@ -5524,10 +5579,10 @@ mod tests {
 
     #[test]
     fn pivot_create_clears_the_undo_stack() {
-        // Empirical fact (Wave-3 Task 3): mirrors sheet.add/sheet.import-csv
-        // — the new sheet + pivot-part registration isn't a cell-level edit
-        // the undo stack can invert, so like those verbs it clears history
-        // rather than push an entry.
+        // Empirical fact (Wave-3 Task 3): mirrors sheet.import-csv — the new
+        // sheet + pivot-part registration isn't a cell-level edit the undo
+        // stack can invert, so like that verb it clears history rather than
+        // push an entry.
         let mut a = app();
         pivot_fixture(&mut a);
         set(&mut a, "D1", "1"); // an undoable edit exists beforehand
