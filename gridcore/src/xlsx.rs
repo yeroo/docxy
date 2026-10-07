@@ -16,13 +16,15 @@
 //! - Shared formulas are expanded to per-cell formulas at load (via reference
 //!   translation); groups whose master doesn't parse are preserved verbatim.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 use opccore::zipwrite::write_zip;
 
 mod consolidate;
+#[cfg(test)]
+mod container_tests;
 #[cfg(test)]
 mod filter_tests;
 mod page;
@@ -238,11 +240,29 @@ fn is_strict_workbook(wb_xml: &str) -> bool {
 pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     let zip = open_container(data)?;
     let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
-    for e in zip.entries() {
+    for (e, name) in zip.entries().iter().zip(entry_part_names(&zip)?) {
         let bytes = zip.extract(e).ok_or(XlsxError::CorruptPart)?;
-        parts.push((e.name.clone(), bytes));
+        parts.push((name, bytes));
     }
     load_parts(parts)
+}
+
+/// The part name of each container entry, in entry order. Some writers
+/// separate segments with `\` (`xl\workbook.xml`), and Excel opens those
+/// packages, so it becomes the OPC `/` here and on save (#1095). Two entries
+/// that only differ in their separators would become one part:
+/// [`XlsxError::CorruptPart`].
+fn entry_part_names(zip: &ZipArchive) -> Result<Vec<String>, XlsxError> {
+    let names: Vec<String> = zip
+        .entries()
+        .iter()
+        .map(|e| e.name.replace('\\', "/"))
+        .collect();
+    let raw: HashSet<&str> = zip.entries().iter().map(|e| e.name.as_str()).collect();
+    if names.iter().collect::<HashSet<_>>().len() != raw.len() {
+        return Err(XlsxError::CorruptPart);
+    }
+    Ok(names)
 }
 
 /// The ZIP container of an `.xlsx`, or why `data` is not one.

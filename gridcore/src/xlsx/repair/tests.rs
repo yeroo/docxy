@@ -586,6 +586,28 @@ fn repair_theme_drops_and_prunes() {
     assert!(!text("[Content_Types].xml").contains("theme1"));
 }
 
+/// #1095: in a package whose entry names use `\`, a damaged entry is
+/// matched to its relationship by its OPC name like any other.
+#[test]
+fn repair_with_backslash_part_names() {
+    let parts: Vec<(String, Vec<u8>)> = parts_of(&fixture())
+        .into_iter()
+        .map(|(n, b)| (n.replace('/', "\\"), b))
+        .collect();
+    let data = damage(&write_zip(&parts), "xl\\theme\\theme1.xml");
+    let (pkg, repairs, saved) = repair_and_resave(&data);
+    assert_eq!(repairs.dropped, ["xl/theme/theme1.xml"]);
+    assert!(repairs.emptied.is_empty());
+    assert_eq!(pkg.workbook.sheets.len(), 2);
+    assert_eq!(
+        pkg.workbook.sheets[0].cells[&(0, 0)].value,
+        CellValue::Text("hello".into())
+    );
+    let names: Vec<String> = parts_of(&saved).into_iter().map(|(n, _)| n).collect();
+    assert!(names.iter().all(|n| !n.contains('\\')), "{names:?}");
+    assert!(names.iter().any(|n| n == "xl/worksheets/sheet1.xml"));
+}
+
 #[test]
 fn repair_damaged_chart_fails_naming_part() {
     let data = damage(&fixture(), "xl/charts/chart1.xml");
