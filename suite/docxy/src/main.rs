@@ -1020,6 +1020,8 @@ fn protected_view_allows_act(act: SheetAct) -> bool {
     matches!(
         act,
         SheetAct::Copy | SheetAct::PrevComment | SheetAct::NextComment | SheetAct::Todo
+            | SheetAct::NewWindow
+            | SheetAct::ArrangeAll
     )
 }
 
@@ -1039,6 +1041,8 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
             | Act::ShowHide
             | Act::ToggleComments
             | Act::ToggleNav
+            | Act::NewWindow
+            | Act::ArrangeAll
             | Act::ToggleNotes
             | Act::Markup(_)
             | Act::DarkMode
@@ -1082,6 +1086,8 @@ fn multi_area_ok(act: SheetAct) -> bool {
         // that pick a new selection.
         | SheetAct::Menu(_)
         | SheetAct::FreezePanes
+        | SheetAct::NewWindow
+        | SheetAct::ArrangeAll
         | SheetAct::PrevComment
         | SheetAct::NextComment
         | SheetAct::ProtectSheet
@@ -1188,6 +1194,8 @@ fn act_targets_cells(act: SheetAct) -> bool {
             | SheetAct::Menu(_)
             | SheetAct::OfficeClipboard
             | SheetAct::CustomLists
+            | SheetAct::NewWindow
+            | SheetAct::ArrangeAll
             | SheetAct::Todo
     )
 }
@@ -1862,6 +1870,12 @@ enum SheetAct {
     FontColor,
     ToggleBorder,
     FreezePanes,
+    /// View › Window › New Window (#587): move the active tab into a new
+    /// window; a one-tab window opens the new window on a blank document.
+    NewWindow,
+    /// View › Window › Arrange All (#587): resize every window to an equal
+    /// strip of this window's display.
+    ArrangeAll,
     NewComment,
     DeleteComment,
     PrevComment,
@@ -17184,6 +17198,15 @@ impl Docxy {
             }
             SheetAct::ToggleBorder => self.sheet_toggle_border(cx),
             SheetAct::FreezePanes => self.sheet_freeze(cx),
+            // View › Window (#587): app-level commands, handled on the app.
+            SheetAct::NewWindow => match self.new_window(None, window, cx) {
+                Ok(_) => self.set_status("Opened a new window"),
+                Err(e) => self.set_status(e),
+            },
+            SheetAct::ArrangeAll => {
+                let n = self.arrange_all(window, cx);
+                self.set_status(format!("Arranged {n} windows"));
+            }
             SheetAct::NewComment => self.sheet_new_comment(cx),
             SheetAct::DeleteComment => self.sheet_delete_comment(cx),
             SheetAct::PrevComment => self.sheet_comment_nav(false, cx),
@@ -23239,7 +23262,8 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         ClearFmt => e.clear_run_formatting(),
         Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
         | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments
-        | ResolveComment | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | DarkMode
+        | ResolveComment | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | NewWindow
+        | ArrangeAll | DarkMode
         | AutoHideRibbon | InsertField | PageBreak | BlankPage | Cover(_) | ToggleNotes
         | InsertTable | InsertSymbol | InsertEquation | LineSpacing | Hf(_) | Design(_)
         | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler | UndoTo(_) => {}
@@ -24413,6 +24437,12 @@ enum Act {
     ShowHide,
     ToggleComments,
     ToggleNav,
+    /// View › Window › New Window (#587): move the active tab into a new
+    /// window; a one-tab window opens the new window on a blank document.
+    NewWindow,
+    /// View › Window › Arrange All (#587): resize every window to an equal
+    /// strip of this window's display.
+    ArrangeAll,
     DarkMode,
     AutoHideRibbon,
     InsertField,
@@ -24881,6 +24911,14 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                             "Ctrl+F1",
                         )
                         .key("A"),
+                    ])],
+                ),
+                rs::group(
+                    "Window",
+                    10,
+                    vec![rs::column(vec![
+                        cmdt("newwindow", "new", "New Window", NewWindow, "").key("W"),
+                        cmdt("arrangeall", "columns", "Arrange All", ArrangeAll, "").key("L"),
                     ])],
                 ),
             ],
@@ -27729,6 +27767,8 @@ impl Docxy {
             Act::Highlight
                 | Act::ShowHide
                 | Act::ToggleNav
+                | Act::NewWindow
+                | Act::ArrangeAll
                 | Act::DarkMode
                 | Act::AutoHideRibbon
                 | Act::ToggleRuler
@@ -27799,6 +27839,14 @@ impl Docxy {
             ToggleNav => {
                 self.show_nav = !self.show_nav;
                 self.refocus(window, cx);
+            }
+            NewWindow => match self.new_window(None, window, cx) {
+                Ok(_) => self.set_status("Opened a new window"),
+                Err(e) => self.set_status(e),
+            },
+            ArrangeAll => {
+                let n = self.arrange_all(window, cx);
+                self.set_status(format!("Arranged {n} windows"));
             }
             DarkMode => self.cycle_theme(window, cx),
             AutoHideRibbon => {

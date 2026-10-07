@@ -364,10 +364,20 @@ pub(crate) fn attach_with_dispatch(
     dispatch: Dispatch,
     hit_tests: fn(&str) -> bool,
 ) -> ControlLink {
-    let target = view.downgrade();
     let pending = async_requests(rx);
-    let pump = window.spawn(cx, async move |cx: &mut AsyncWindowContext| {
+    // The pump lives on the app, not a window: closing a window — even the
+    // first — must not take the control server down (#587). Each request
+    // resolves the registry's SELECTED window, so window-new/window-select
+    // retarget every verb. The entity the caller attached is kept as the
+    // first window's view; the registry supersedes it once registered.
+    let _ = (view, window);
+    let pump = cx.spawn(async move |cx: &mut AsyncApp| {
         while let Ok(req) = pending.recv_async().await {
+            let target = cx.update(|app| crate::windows::selected_target(app));
+            let Some(target) = target else {
+                req.reply_err("the app is gone".to_string());
+                continue;
+            };
             // A verb whose pointer input hit-tests the rendered frame gets a
             // frame drawn from the current state first (#1121), as gpui gives
             // a key-down: mouse dispatch hit-tests `rendered_frame` without
@@ -379,19 +389,25 @@ pub(crate) fn attach_with_dispatch(
             // hit-tests this one frame. `draw` marks the frame for presenting,
             // so the next tick puts it on screen.
             if hit_tests(&req.verb) {
-                let _ = cx.update(|window, cx| window.draw(cx).clear(cx));
+                let _ = cx.update_window(target.handle, |_, window, cx| {
+                    window.draw(cx).clear(cx)
+                });
             }
-            match target.update_in(cx, |this, window, cx| {
-                dispatch(this, &req.verb, &req.args, window, cx)
+            match cx.update_window(target.handle, |_, window, cx| {
+                target.view.update(cx, |this, cx| {
+                    dispatch(this, &req.verb, &req.args, window, cx)
+                })
             }) {
-                Ok(Ok(mut done)) => {
+                // update_window's Result around the weak entity's upgrade
+                // Result around the verb's own Result.
+                Ok(Ok(Ok(mut done))) => {
                     // Pointer and key verbs queue real input: dispatch it
                     // through gpui's own hit testing and focus now, outside
                     // the entity borrow, so the listeners it triggers may
                     // update the app.
                     if !done.input.is_empty() {
                         let events = std::mem::take(&mut done.input);
-                        let _ = cx.update(|window, cx| {
+                        let _ = cx.update_window(target.handle, |_, window, cx| {
                             for event in events {
                                 let deferred = text_input::deferred_text(&event);
                                 // A key the root left to the input context
@@ -401,7 +417,7 @@ pub(crate) fn attach_with_dispatch(
                                 if window.dispatch_event(event, cx).propagate
                                     && let Some(text) = deferred
                                 {
-                                    let _ = target.update(cx, |this, cx| {
+                                    let _ = target.view.update(cx, |this, cx| {
                                         this.replace_text_in_range(None, &text, window, cx)
                                     });
                                 }
@@ -411,21 +427,32 @@ pub(crate) fn attach_with_dispatch(
                     // Before the reply, so a driver that reads the frame
                     // counter and then polls it sees it actually move.
                     if done.draw {
-                        let _ = cx.update(|window, cx| window.draw(cx).clear(cx));
+                        let _ = cx.update_window(target.handle, |_, window, cx| {
+                            window.draw(cx).clear(cx)
+                        });
                     }
                     req.reply_ok(done.result);
                     if done.quit {
                         // ctlcore's connection thread needs time to put the reply on the wire.
                         const QUIT_GRACE: Duration = Duration::from_millis(120);
                         cx.background_executor().timer(QUIT_GRACE).await;
-                        let _ = cx.update(|_, cx| cx.quit());
+                        let _ = cx.update(|cx| cx.quit());
                         break;
                     }
                 }
-                Ok(Err(e)) => req.reply_err(e),
-                Err(e) => {
+                Ok(Ok(Err(e))) => req.reply_err(e),
+                Ok(Err(e)) => {
+                    // The entity was released between resolution and update:
+                    // this request answers with the error; the pump keeps
+                    // serving the next one.
                     req.reply_err(format!("the app is gone: {e}"));
-                    break;
+                }
+                Err(e) => {
+                    // The window is gone or mid-update: this request answers
+                    // with the error and the pump keeps serving the next one
+                    // (#587). An empty registry above is the "app is gone"
+                    // case; here the selection was lost mid-flight.
+                    req.reply_err(format!("the app is gone: {e}"));
                 }
             }
         }

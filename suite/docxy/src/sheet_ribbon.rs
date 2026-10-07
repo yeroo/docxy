@@ -933,13 +933,27 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             launch: None,
             body: Body::Strip {
                 gap: GAP_1,
-                items: &[Item::One(toggle(
-                    "freeze-panes",
-                    "Freeze Panes",
-                    "Unfreeze Panes",
-                    None,
-                    SheetAct::FreezePanes,
-                ))],
+                items: &[
+                    Item::One(toggle(
+                        "freeze-panes",
+                        "Freeze Panes",
+                        "Unfreeze Panes",
+                        None,
+                        SheetAct::FreezePanes,
+                    )),
+                    Item::One(large(
+                        "newwindow",
+                        "New Window",
+                        Some("new"),
+                        SheetAct::NewWindow,
+                    )),
+                    Item::One(large(
+                        "arrangeall",
+                        "Arrange All",
+                        Some("columns"),
+                        SheetAct::ArrangeAll,
+                    )),
+                ],
             },
         }],
     },

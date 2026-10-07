@@ -33,9 +33,9 @@ use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
 use docxcore::model::{Align, VertAlign};
 use gpui::{
-    App, Context, Entity, EntityInputHandler as _, KeyDownEvent, Keystroke, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, Window, point, px, size,
+    App, AppContext as _, Context, Entity, EntityInputHandler as _, KeyDownEvent, Keystroke,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput,
+    Point, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px, size,
 };
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
@@ -385,6 +385,19 @@ pub fn arg_usize(args: &Json, key: &str) -> Result<usize, String> {
             .as_usize()
             .ok_or_else(|| format!("'{key}' must be a whole number, not below zero")),
         None => Err(format!("missing argument '{key}'")),
+    }
+}
+
+/// `window-new`'s optional `tab` argument (#587): absent (or null) means
+/// the active tab moves; a present one names the tab and must be a whole
+/// number, not below zero.
+fn window_new_tab_arg(args: &Json) -> Result<Option<usize>, String> {
+    match args.get("tab") {
+        None | Some(Json::Null) => Ok(None),
+        Some(v) => v
+            .as_usize()
+            .map(Some)
+            .ok_or_else(|| "'tab' must be a whole number, not below zero".to_string()),
     }
 }
 
@@ -2606,6 +2619,8 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "title-tab"
             | "close-tab"
             | "close-window"
+            | "window-new"
+            | "window-select"
             | "selection-set"
             | "open"
             | "backstage-close"
@@ -2781,10 +2796,22 @@ fn load_failure(app: &crate::Docxy) -> Option<String> {
 /// One shape for every driving verb, so a test reads the same keys whichever
 /// one it just sent. The sheet half is absent when the active tab is not a
 /// spreadsheet (`type` and `key` reach the document surface too).
-fn state(app: &crate::Docxy, window: &Window) -> Json {
+fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
     let mut out = vec![
         ("tab", Json::Num(app.active as f64)),
         ("tabs", Json::Num(app.tabs.len() as f64)),
+        // The run's windows (#587): how many are open, and which one the
+        // harness targets now (window-new selects the new window,
+        // window-select switches). A single-window run reports 1 and its
+        // own id.
+        (
+            "windows",
+            Json::Num(windows::count(cx) as f64),
+        ),
+        (
+            "window",
+            Json::Num(windows::selected(cx).unwrap_or(0) as f64),
+        ),
         ("ask_on_close", Json::Bool(app.ask_on_close)),
         (
             "autorecover_minutes",
@@ -3241,16 +3268,105 @@ fn dispatch_verb(
                 }
                 _ => return Err("'action' must be prev, next, more or pick".into()),
             }
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         "tab-list" => Done::ok(tab_list(&app.tabs, app.active)),
+        // The run's windows (#587). These go through the same handlers as
+        // View › Window: `window-new` is the New Window command (it moves
+        // the tab named by `tab`, or the active one, and selects the new
+        // window), `window-arrange` is Arrange All, and every other verb
+        // after `window-select` acts on the selected window.
+        "window-list" => {
+            let selected = windows::selected(cx);
+            let mut out = Vec::new();
+            for (id, view, handle) in windows::entries_snapshot(cx) {
+                let (tabs, title) = if id == app.win_id {
+                    (
+                        app.tabs.len(),
+                        app.tabs
+                            .get(app.active)
+                            .map(|t| t.title.to_string())
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    match view.read_with(cx, |this: &crate::Docxy, _| {
+                        (
+                            this.tabs.len(),
+                            this.tabs
+                                .get(this.active)
+                                .map(|t| t.title.to_string())
+                                .unwrap_or_default(),
+                        )
+                    }) {
+                        Ok(found) => found,
+                        // A window the registry still names but whose view is
+                        // gone: it is leaving; it has no state to list.
+                        Err(_) => continue,
+                    }
+                };
+                let size = if id == app.win_id {
+                    (window.bounds().size.width.as_f32(), window.bounds().size.height.as_f32())
+                } else {
+                    cx.update_window(handle, |_, window, _| {
+                        (
+                            window.bounds().size.width.as_f32(),
+                            window.bounds().size.height.as_f32(),
+                        )
+                    })
+                    .unwrap_or((0., 0.))
+                };
+                out.push(Json::obj(vec![
+                    ("id", Json::Num(id as f64)),
+                    ("tabs", Json::Num(tabs as f64)),
+                    ("title", Json::Str(title.into())),
+                    ("selected", Json::Bool(selected == Some(id))),
+                    ("width", Json::Num(f64::from(size.0))),
+                    ("height", Json::Num(f64::from(size.1))),
+                ]));
+            }
+            Done::ok(Json::obj(vec![
+                ("windows", Json::Arr(out)),
+                ("count", Json::Num(windows::count(cx) as f64)),
+            ]))
+        }
+        "window-new" => {
+            let tab = window_new_tab_arg(args)?;
+            let id = app.new_window(tab, window, cx)?;
+            let mut reply = state(app, window, cx);
+            if let Json::Obj(fields) = &mut reply {
+                fields.push(("window".to_string(), Json::Num(id as f64)));
+            }
+            Done::ok(reply)
+        }
+        "window-select" => {
+            let id = arg_usize(args, "window")?;
+            windows::select(cx, id as u64)?;
+            // Reply from the window verbs now target, not the one this verb
+            // dispatched on.
+            let reply = match windows::selected_view(cx) {
+                Some(view) => view
+                    .read_with(cx, |this: &crate::Docxy, cx| state(this, window, cx))
+                    .unwrap_or_else(|_| state(app, window, cx)),
+                None => state(app, window, cx),
+            };
+            Done::ok(reply)
+        }
+        "window-arrange" => {
+            let arranged = app.arrange_all(window, cx);
+            app.set_status(format!("Arranged {arranged} windows"));
+            cx.notify();
+            Done::ok(Json::obj(vec![(
+                "arranged",
+                Json::Num(arranged as f64),
+            )]))
+        }
         // The tab chip's click handler, by index or title/path substring.
         "tab-select" => {
             let tab = args.get("tab").ok_or("tab-select needs 'tab'")?;
             app.refuse_under_dialog()?;
             let i = crate::control::match_tab(&app.tabs, tab, false)?;
             app.select_tab(i, window, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         "doc" => Done::ok(live_doc_state(app, window)?),
         // The active document's comments, as a save would write them (#1027):
@@ -3303,7 +3419,7 @@ fn dispatch_verb(
                 .ok_or("the active tab is not a document")?;
             select_offsets(ed, start, end)?;
             app.refocus(window, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         // Dialogs (#393). There is no `dialog-open`: a dialog opens through
         // the verb a person would use (`key`, `ribbon-click`, `click-cell`).
@@ -3334,7 +3450,7 @@ fn dispatch_verb(
             open_dialogs(app)?;
             app.dialog_press(&button, window, cx)?;
             app.refocus(window, cx);
-            let Json::Obj(mut out) = state(app, window) else {
+            let Json::Obj(mut out) = state(app, window, cx) else {
                 unreachable!("state is an object")
             };
             // A close prompt's Save or Don't Save may have closed the last tab.
@@ -3523,12 +3639,12 @@ fn dispatch_verb(
                 let (ribbon_tab, cmd) = resolve_sheet_command(app, &tab, &command)?;
                 app.select_ribbon_tab(ribbon_tab, window, cx);
                 click_sheet_command(app, ribbon_tab, cmd, window, cx)?;
-                return Done::ok(state(app, window));
+                return Done::ok(state(app, window, cx));
             }
             let act = resolve_ribbon_command(app, &tab, &command)?;
             app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), &tab)?, window, cx);
             app.dispatch(act, window, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         // Menus (#397): opened through the opener the right-click or the
         // split button's arrow calls, clicked through the item's own handler.
@@ -3558,7 +3674,7 @@ fn dispatch_verb(
             }
             Done::ok(Json::obj(vec![
                 ("header", Json::Str(header)),
-                ("state", state(app, window)),
+                ("state", state(app, window, cx)),
             ]))
         }
         "menu-click" => {
@@ -3574,7 +3690,7 @@ fn dispatch_verb(
                 None => crate::menu::resolve(&menu.items, &menu_path(args)?)?,
             };
             app.menu_activate(&path, window, cx)?;
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         "menu-close" => {
             app.refuse_under_dialog()?;
@@ -3582,7 +3698,7 @@ fn dispatch_verb(
                 return Err("no menu is open".into());
             }
             cx.notify();
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         "close-tab" => {
             app.refuse_under_dialog()?;
@@ -3604,7 +3720,7 @@ fn dispatch_verb(
                 Some(_) => return Err("'answer' must be save, discard or cancel".into()),
             };
             let draft_error = app.close_tab_with(index, answer, window, cx);
-            let mut reply = state(app, window);
+            let mut reply = state(app, window, cx);
             if let (Json::Obj(fields), Some(e)) = (&mut reply, draft_error) {
                 fields.push(("draft_error".into(), Json::Str(e)));
             }
@@ -3614,7 +3730,7 @@ fn dispatch_verb(
         "backstage-close" => {
             app.refuse_under_dialog()?;
             app.backstage_close(window, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         // The window's close button, as `on_window_should_close` runs it
         // outside the harness (#630). The LAST window: with "ask before
@@ -3635,21 +3751,21 @@ fn dispatch_verb(
             if app.window_should_close(ask, window, cx) && last {
                 app.quit_ready = true;
             }
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         "ask-on-close" => {
             let Some(Json::Bool(on)) = args.get("on") else {
                 return Err("'on' must be a boolean".into());
             };
             app.set_ask_on_close(*on, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         // The Settings AutoRecover interval, in minutes; 0 turns it off.
         "autorecover" => {
             let minutes = u32::try_from(arg_usize(args, "minutes")?)
                 .map_err(|_| "'minutes' is too large".to_string())?;
             app.set_autorecover_minutes(minutes, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         // Settings' "Keep the last AutoRecovered version if I close without
         // saving" (#613).
@@ -3658,7 +3774,7 @@ fn dispatch_verb(
                 return Err("'on' must be a boolean".into());
             };
             app.set_keep_drafts(*on, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         // Settings' User name... row (#620): opens its dialog on the active
         // tab's stack, or the app's own with no document open (#1027), which
@@ -3666,14 +3782,14 @@ fn dispatch_verb(
         "user-name" => {
             app.open_user_name_dialog()?;
             cx.notify();
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         // Settings' AutoCorrect Options... (#667): the same opener as the
         // backstage row.
         "autocorrect" => {
             app.open_autocorrect_dialog()?;
             cx.notify();
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         // Settings' Trusted Documents Clear (#895): the same handler as the
         // backstage button.
@@ -3711,7 +3827,7 @@ fn dispatch_verb(
                 .map(|d| d.path.clone())
                 .ok_or_else(|| format!("no draft {index}"))?;
             app.open_draft_path(&path, window, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         // One AutoRecover tick now, as the timer would run it once the
         // interval is up, so a test need not wait minutes. `wrote` says
@@ -3779,7 +3895,7 @@ fn dispatch_verb(
             // An open tab was only focused, or asked about: nothing was
             // loaded, so its status says something else and is not judged.
             if !loaded {
-                return Done::ok(state(app, window));
+                return Done::ok(state(app, window, cx));
             }
             // ⚠️ A load that failed still produces a tab. `doc_from_path`
             // substitutes an empty document and records the reason in the
@@ -3790,7 +3906,7 @@ fn dispatch_verb(
             // the load went, so it is what decides.
             match load_failure(app) {
                 Some(why) => Err(format!("{raw}: {why}")),
-                None => Done::ok(state(app, window)),
+                None => Done::ok(state(app, window, cx)),
             }
         }
 
@@ -3802,7 +3918,7 @@ fn dispatch_verb(
                 return Err("the active tab is not in Protected View".into());
             }
             app.enable_editing(cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         // The MARKED AS FINAL bar's Edit Anyway (#617).
         "edit-anyway" => {
@@ -3814,7 +3930,7 @@ fn dispatch_verb(
                 return Err(crate::open_mode::PROTECTED_STATUS.into());
             }
             app.edit_anyway(cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
 
         // A click on a cell: press, click, release — the three events the
@@ -3858,13 +3974,13 @@ fn dispatch_verb(
                     None => return Err("Project cell is outside the entry table".into()),
                 }
                 app.refocus(window, cx);
-                return Done::ok(state(app, window));
+                return Done::ok(state(app, window, cx));
             }
             let cell = cell_arg(args, "cell")?;
             let ctrl = arg_flag(args, "ctrl")?;
             sheet(app)?;
             click_cell(app, cell, shift, ctrl, dbl, window, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
 
         // Real pointer input (#545): the events queue on the reply and the
@@ -4212,7 +4328,7 @@ fn dispatch_verb(
                     }
                     app.sheet_fill_as(kind, cx);
                 }
-                let mut reply = state(app, window);
+                let mut reply = state(app, window, cx);
                 if let Json::Obj(fields) = &mut reply {
                     let filled = (after != src).then(|| a1_range(after));
                     fields.push(("filled".into(), str_or_null(filled)));
@@ -4257,7 +4373,7 @@ fn dispatch_verb(
                 app.sheet_fill_as(kind, cx);
             }
             let after = sheet(app)?.range();
-            let mut reply = state(app, window);
+            let mut reply = state(app, window, cx);
             if let Json::Obj(fields) = &mut reply {
                 let filled = (after != src).then(|| a1_range(after));
                 fields.push(("filled".into(), str_or_null(filled)));
@@ -4330,7 +4446,7 @@ fn dispatch_verb(
                 Some(_) => return Err("'replace' must be true or false".into()),
                 None => {}
             }
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
 
         // The Office Clipboard pane (#669): `read` (the default), `open`,
@@ -4359,7 +4475,7 @@ fn dispatch_verb(
                             .collect(),
                     ),
                 ),
-                ("state", state(app, window)),
+                ("state", state(app, window, cx)),
             ]))
         }
         // The clipboard (#699). A harness instance has a private one (it starts
@@ -4431,7 +4547,7 @@ fn dispatch_verb(
                 }
                 crate::project_cell_release(tab);
                 app.refocus(window, cx);
-                return Done::ok(state(app, window));
+                return Done::ok(state(app, window, cx));
             }
             sheet(app)?;
             app.grid_press_cell(from, ctrl, cx);
@@ -4439,7 +4555,7 @@ fn dispatch_verb(
                 app.grid_drag_over(r, c, cx);
             }
             app.grid_release(cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
 
         // `key` and `type` through the window's own input path, as the OS
@@ -4468,16 +4584,16 @@ fn dispatch_verb(
         "ime-mark" => {
             let text = arg_str(args, "text")?;
             app.replace_and_mark_text_in_range(None, text, None, window, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         "ime-commit" => {
             let text = arg_str(args, "text")?;
             app.replace_text_in_range(None, text, window, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
         "ime-unmark" => {
             app.unmark_text(window, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
 
         // Type text, one key event per character.
@@ -4485,7 +4601,7 @@ fn dispatch_verb(
             for stroke in typed_keys(arg_str(args, "text")?)? {
                 press(app, stroke, window, cx);
             }
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
 
         // One key, or a list of them ("keys": ["ctrl+c", "down", "ctrl+v"]).
@@ -4494,7 +4610,7 @@ fn dispatch_verb(
             for stroke in strokes {
                 press(app, stroke, window, cx);
             }
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
 
         // Select a chart, as pressing its card does (press then release, with
@@ -4512,7 +4628,7 @@ fn dispatch_verb(
             }
             app.chart_press(idx, (0, 0), (0.0, 0.0), cx);
             app.grid_release(cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
 
         // Give a reference field the keyboard, as clicking it does.
@@ -4533,7 +4649,7 @@ fn dispatch_verb(
                 )
             })?;
             app.ref_field_focus(target, seed, cx);
-            Done::ok(state(app, window))
+            Done::ok(state(app, window, cx))
         }
 
         // Read one cell: what it shows, and what re-editing it would put in the
@@ -4649,7 +4765,7 @@ fn dispatch_verb(
 
         // State assertions include tab metadata for every surface; spreadsheet
         // selection fields are added by state() only when a sheet is active.
-        "selection" => Done::ok(state(app, window)),
+        "selection" => Done::ok(state(app, window, cx)),
 
         // The rows a Project's entry table draws, top to bottom, without the
         // entry row. Reads only: a `tab` other than the active one stays behind.
@@ -5734,6 +5850,8 @@ mod tests {
             "title-tab",
             "close-tab",
             "close-window",
+            "window-new",
+            "window-select",
             "selection-set",
             "open",
             "select-chart",
@@ -6407,6 +6525,31 @@ mod tests {
         assert_eq!(arg_flag(&args, "shift"), Ok(true));
         assert_eq!(arg_flag(&args, "absent"), Ok(false)); // an omitted flag is off
         assert!(arg_flag(&obj(&[("shift", s("yes"))]), "shift").is_err());
+    }
+
+    /// #587: `window-new` takes its tab optionally; a present one must be a
+    /// whole number, not below zero — the refusal names the reason.
+    #[test]
+    fn window_new_tab_arg_is_optional_and_refuses_bad_shapes() {
+        assert_eq!(window_new_tab_arg(&obj(&[])), Ok(None));
+        assert_eq!(window_new_tab_arg(&obj(&[("tab", Json::Null)])), Ok(None));
+        assert_eq!(window_new_tab_arg(&obj(&[("tab", Json::Num(0.0))])), Ok(Some(0)));
+        for bad in [Json::Num(-1.0), Json::Num(1.5), Json::Str("0".into())] {
+            let err = window_new_tab_arg(&obj(&[("tab", bad)])).unwrap_err();
+            assert_eq!(err, "'tab' must be a whole number, not below zero");
+        }
+    }
+
+    /// #587: the window verbs that stand for a press close an open menu.
+    #[test]
+    fn window_verbs_close_an_open_menu() {
+        let no_args = Json::obj(vec![]);
+        for verb in ["window-new", "window-select"] {
+            assert!(closes_menu(verb, &no_args), "{verb}");
+        }
+        // Reads do not press: listing and arranging leave a menu alone.
+        assert!(!closes_menu("window-list", &no_args));
+        assert!(!closes_menu("window-arrange", &no_args));
     }
 
     /// Both spellings of a drag reach the same pair of cells.

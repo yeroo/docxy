@@ -246,6 +246,27 @@ pub(crate) fn entries_snapshot(cx: &App) -> Vec<(u64, WeakEntity<Docxy>, AnyWind
     .unwrap_or_default()
 }
 
+/// The selected window's dispatch target.
+pub(crate) struct Target {
+    pub(crate) id: u64,
+    pub(crate) view: WeakEntity<Docxy>,
+    pub(crate) handle: AnyWindowHandle,
+}
+
+/// Resolve the selected window for one control request. `None` when no
+/// window is registered — the app is gone.
+pub(crate) fn selected_target(cx: &App) -> Option<Target> {
+    let sel = selected(cx)?;
+    with(cx, |w| {
+        w.get(sel).map(|e| Target {
+            id: e.id,
+            view: e.view.clone(),
+            handle: e.handle,
+        })
+    })
+    .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
