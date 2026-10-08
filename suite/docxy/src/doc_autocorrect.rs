@@ -111,5 +111,21 @@ mod tests {
             type_key(&mut ed, &ac, ch);
         }
         assert!(ed.all_in_list(crate::NUM_DECIMAL));
+        // Word also starts a list on a hyphen and on `1)` (#1080).
+        let mut ed = empty();
+        for ch in "- foo".chars() {
+            type_key(&mut ed, &ac, ch);
+        }
+        assert!(ed.all_in_list(crate::NUM_BULLET));
+        let mut ed = empty();
+        for ch in "1) ".chars() {
+            type_key(&mut ed, &ac, ch);
+        }
+        assert!(ed.all_in_list(crate::NUM_DECIMAL));
+        let mut ed = empty();
+        for ch in "x- ".chars() {
+            type_key(&mut ed, &ac, ch);
+        }
+        assert!(!ed.all_in_list(crate::NUM_BULLET));
     }
 }

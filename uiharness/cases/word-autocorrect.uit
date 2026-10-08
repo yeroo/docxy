@@ -72,6 +72,22 @@ test quotes, dashes and an automatic list
   key ctrl+z
   assert text is "1. "
   assert para.list is null
+  key ctrl+a
+  key backspace
+  type -
+  key space
+  assert para.list is not null
+  key ctrl+z
+  assert text is "- "
+  assert para.list is null
+  key ctrl+a
+  key backspace
+  type 1)
+  key space
+  assert para.list is not null
+  key ctrl+z
+  assert text is "1) "
+  assert para.list is null
 
 test the Word tab shares the app's AutoCorrect switches
   open copy:../fixtures/basic.docx

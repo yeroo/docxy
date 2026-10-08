@@ -1838,15 +1838,27 @@ impl Docxy {
         if act == ProjectAct::Paste {
             let now = self.clipboard_read(cx);
             if let (Some(tab), Some(text)) = (self.tabs.get_mut(self.active), now.text()) {
-                paste_project_text(tab, text);
+                // Whole rows copied here insert as tasks while the clipboard
+                // still holds that copy's text (#1100); anything else
+                // overwrites cells from the cursor.
+                match self.project_rows_clip.clone().filter(|c| c.live(text)) {
+                    Some(clip) => paste_project_rows(tab, &clip),
+                    None => paste_project_text(tab, text),
+                }
             }
             return;
         }
+        // `clipboard_write` ends the previous whole-rows copy.
         let Some(Surface::Project(v)) = self.tabs.get(self.active).map(|t| &t.surface) else {
             return;
         };
         let text = project_copy_text(v);
+        let clip = (act == ProjectAct::Copy)
+            .then(|| project_rows_clip(v, &text))
+            .flatten();
+        // The write ends any earlier clip; this copy's is installed after it.
         self.clipboard_write(text, cx);
+        self.project_rows_clip = clip;
         // A sheet pastes its own clipboard first; this copy is newer.
         self.grid_clip = None;
         if act == ProjectAct::Cut {

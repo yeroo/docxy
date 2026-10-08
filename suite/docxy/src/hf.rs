@@ -8,7 +8,6 @@
 
 use crate::{DocTab, HfEdit, Surface, parse_hf_part};
 use docxcore::editor::Editor;
-use docxcore::model::Block;
 use docxcore::package::{HeaderVariant, Package, SectionParts, section_header_parts};
 use docxcore::sect::{SectionSetup, has_flag, hf_reference, set_hf_reference};
 
@@ -73,6 +72,27 @@ pub(crate) fn edit_page(slots: &[PageSlot], section: usize, variant: HeaderVaria
         .position(|s| s.section == section && s.variant == variant)
         .or_else(|| slots.iter().position(|s| s.section == section))
         .unwrap_or(0)
+}
+
+/// The blank sheet an oddPage/evenPage section start inserts must not take a
+/// section's First variant (`w:titlePg`): demote any a filler was given to
+/// Default, or to Even under Different Odd & Even when its physical page is
+/// even. Called on the slots both page-slot consumers build.
+pub(crate) fn demote_filler_firsts(slots: &mut [PageSlot], fillers: &[bool], even_odd: bool) {
+    for (pi, is_filler) in fillers.iter().copied().enumerate() {
+        if !is_filler {
+            continue;
+        }
+        if let Some(slot) = slots.get_mut(pi) {
+            if slot.variant == HeaderVariant::First {
+                slot.variant = if even_odd && (pi + 1).is_multiple_of(2) {
+                    HeaderVariant::Even
+                } else {
+                    HeaderVariant::Default
+                };
+            }
+        }
+    }
 }
 
 /// The paragraph style new header (`Header`) or footer (`Footer`) content uses.
@@ -177,38 +197,6 @@ pub(crate) fn open(
         tab.status = format!("Editing {label} \u{2014} press Esc to return to the document").into();
     }
     true
-}
-
-/// For each body block, whether a new page starts after it because it closes
-/// a section and the next section starts on a new page: its `w:type` is
-/// anything but `continuous` (absent means next page). A section's `w:type`
-/// says how that section starts, so the break after section k's closing
-/// paragraph is read from section k + 1's sectPr.
-pub(crate) fn section_page_ends(blocks: &[Block]) -> Vec<bool> {
-    use docxcore::sect::SectionStart;
-    let mut out = vec![false; blocks.len()];
-    let mut pending: Option<usize> = None;
-    for (i, b) in blocks.iter().enumerate() {
-        let (raw, closes) = match b {
-            Block::Paragraph(p) => match p.props.section_break.as_deref() {
-                Some(raw) => (raw, true),
-                None => continue,
-            },
-            Block::SectionProperties(s) => (s.raw.as_str(), false),
-            _ => continue,
-        };
-        if let Some(prev) = pending.take() {
-            out[prev] = SectionSetup::parse(raw).start != SectionStart::Continuous;
-        }
-        if closes {
-            pending = Some(i);
-        }
-    }
-    // No trailing sectPr: the final section has Word's defaults (next page).
-    if let Some(prev) = pending {
-        out[prev] = true;
-    }
-    out
 }
 
 /// The header (`is_header`) or footer distance of a section, in twips

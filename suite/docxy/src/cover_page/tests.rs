@@ -2,7 +2,7 @@
 //! menu, what each command does to the body, and when they are disabled.
 
 use super::*;
-use crate::hf::tests::{ed, ed_mut, saved, three_sections};
+use crate::hf::tests::{ed, ed_mut, saved, three_sections, trailing_sect};
 use core::prelude::v1::test;
 use docxcore::cover::is_cover_open;
 
@@ -168,8 +168,13 @@ fn blank_page_puts_an_empty_page_at_the_caret() {
     assert_eq!(breaks, 2);
     // The page view pages them as Word does: the break paragraph is a page
     // of its own between the caret's page and the text after the caret.
-    let pages = paginate(body, 1.0e6, 600.0);
-    assert_eq!(&pages[..2], &[(0, 1), (1, 2)], "{pages:?}");
+    let pf = page_flow::flow(body, &trailing_sect(&t), false);
+    let ranges = pf.ranges();
+    assert_eq!(
+        &ranges[..2],
+        &vec![vec![(0, 1)], vec![(1, 2)]],
+        "{ranges:?}"
+    );
     assert_eq!(
         body[1].plain_text(),
         "

@@ -216,8 +216,8 @@ pub fn fixes_for(
     out
 }
 
-/// The list typing `ch` starts: a space after `1.` or `*` that make the whole
-/// paragraph. `in_list` is whether the paragraph is in a list already.
+/// The list typing `ch` starts: a space after `1.`, `1)`, `*` or `-` that make
+/// the whole paragraph. `in_list` is whether the paragraph is in a list already.
 pub fn auto_list(
     text: &[char],
     caret: usize,
@@ -229,8 +229,8 @@ pub fn auto_list(
         return None;
     }
     match text {
-        ['1', '.', ' '] => Some(ListKind::Decimal),
-        ['*', ' '] => Some(ListKind::Bullet),
+        ['1', '.' | ')', ' '] => Some(ListKind::Decimal),
+        ['*' | '-', ' '] => Some(ListKind::Bullet),
         _ => None,
     }
 }
@@ -585,7 +585,27 @@ mod tests {
             auto_list(&t("* "), 2, ' ', false, &o),
             Some(ListKind::Bullet)
         );
+        assert_eq!(
+            auto_list(&t("- "), 2, ' ', false, &o),
+            Some(ListKind::Bullet)
+        );
+        assert_eq!(
+            auto_list(&t("1) "), 3, ' ', false, &o),
+            Some(ListKind::Decimal)
+        );
         assert_eq!(auto_list(&t("1. "), 3, ' ', true, &o), None);
+        assert_eq!(auto_list(&t("- "), 2, ' ', true, &o), None);
+        assert_eq!(auto_list(&t("1) "), 3, ' ', true, &o), None);
+        for s in ["-- ", "x- ", "a 1) ", "1)5 ", "1) x", "- x", "-x "] {
+            assert_eq!(auto_list(&t(s), t(s).len(), ' ', false, &o), None, "{s}");
+        }
+        assert_eq!(auto_list(&t("- "), 1, ' ', false, &o), None);
+        let off = AutoCorrectOptions {
+            auto_lists: false,
+            ..AutoCorrectOptions::default()
+        };
+        assert_eq!(auto_list(&t("- "), 2, ' ', false, &off), None);
+        assert_eq!(auto_list(&t("1) "), 3, ' ', false, &off), None);
         assert_eq!(auto_list(&t("1.5 "), 4, ' ', false, &o), None);
         assert_eq!(auto_list(&t("1. x"), 3, ' ', false, &o), None);
     }

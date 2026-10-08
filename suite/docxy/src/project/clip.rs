@@ -8,6 +8,12 @@
 //! overwritten, blank rows and the entry row become tasks, no row is
 //! inserted, and the whole paste is one undo step. The host moves the text
 //! to and from the system clipboard.
+//!
+//! Whole rows (#1100): a copy of a range covering every column, as a click
+//! on an ID cell selects (#560), also records the rows as tasks
+//! ([`ProjectRowsClip`]). While the system clipboard still holds the text
+//! that copy wrote, Paste inserts those tasks above the cursor row instead
+//! of overwriting cells, as Project does, as one undo step.
 use super::*;
 
 /// The clipboard's text: the range's TSV when one is selected, else the
@@ -49,6 +55,187 @@ pub(crate) fn project_copy_text(v: &ProjectView) -> String {
         project_row(&v.ed, task)[v.col].clone()
     } else {
         cell_edit_text(&v.ed, task, v.col)
+    }
+}
+
+/// The resource UID of an assignment to nobody (MS Project's placeholder).
+const UNASSIGNED_RESOURCE: i32 = -65535;
+
+/// Tasks copied as whole rows: the rows' tasks (a collapsed summary's hidden
+/// subtree with it), their assignments, and the names of the resources those
+/// name, since another plan's resource UIDs mean other resources. They are
+/// snapshots taken at copy time, so an edit to the source plan does not touch
+/// them. `text` is what the copy wrote to the system clipboard: the clip is
+/// live only while the clipboard still holds it (see [`Self::live`]).
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectRowsClip {
+    text: String,
+    tasks: Vec<Task>,
+    assignments: Vec<projcore::Assignment>,
+    resources: Vec<(i32, String)>,
+    /// The task calendars the tasks name, with their names, for the same
+    /// reason as `resources`.
+    calendars: Vec<(i32, String)>,
+}
+
+impl ProjectRowsClip {
+    /// Whether the clipboard's `text` is still the copy this clip recorded
+    /// (a clipboard round trip may turn `\n` into `\r\n`).
+    pub fn live(&self, text: &str) -> bool {
+        text.replace("\r\n", "\n") == self.text
+    }
+}
+
+/// The whole-rows clip of the selected range, when it spans every column.
+/// Blank rows are skipped. `text` is the clipboard text the copy writes.
+pub(crate) fn project_rows_clip(v: &ProjectView, text: &str) -> Option<ProjectRowsClip> {
+    let sel = v.selection()?;
+    if *sel.cols.start() != COL_ID || *sel.cols.end() != COLUMN_COUNT - 1 {
+        return None;
+    }
+    let proj = v.ed.project();
+    let mut picked: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    for &uid in &sel.uids {
+        let Some(i) = proj.tasks.iter().position(|t| t.uid == uid) else {
+            continue;
+        };
+        picked.insert(uid);
+        if v.ed.is_collapsed(uid) {
+            // The rows a collapsed summary hides are part of the row.
+            let level = proj.tasks[i].outline_level;
+            picked.extend(
+                proj.tasks[i + 1..]
+                    .iter()
+                    .filter(|t| !t.is_null)
+                    .take_while(|t| t.outline_level > level)
+                    .map(|t| t.uid),
+            );
+        }
+    }
+    let tasks: Vec<Task> = proj
+        .tasks
+        .iter()
+        .filter(|t| !t.is_null && picked.contains(&t.uid))
+        .cloned()
+        .collect();
+    if tasks.is_empty() {
+        return None;
+    }
+    let assignments: Vec<projcore::Assignment> = proj
+        .assignments
+        .iter()
+        .filter(|a| tasks.iter().any(|t| t.uid == a.task_uid))
+        .cloned()
+        .collect();
+    let resources = proj
+        .resources
+        .iter()
+        .filter(|r| assignments.iter().any(|a| a.resource_uid == r.uid))
+        .map(|r| (r.uid, r.name.clone()))
+        .collect();
+    let calendars = proj
+        .calendars
+        .iter()
+        .filter(|c| tasks.iter().any(|t| t.calendar_uid == Some(c.uid)))
+        .map(|c| (c.uid, c.name.clone()))
+        .collect();
+    Some(ProjectRowsClip {
+        text: text.replace("\r\n", "\n"),
+        tasks,
+        assignments,
+        resources,
+        calendars,
+    })
+}
+
+/// Paste whole rows as new tasks above the cursor row (above the range's top
+/// row when one is selected; appended from the entry row), as one undo step.
+/// An assignment follows its resource into another plan by name; one whose
+/// resource that plan lacks is dropped, and the status says how many. The
+/// cursor goes to the first new task. A paste that cannot apply changes
+/// nothing and says why.
+pub(crate) fn paste_project_rows(tab: &mut DocTab, clip: &ProjectRowsClip) {
+    let Surface::Project(v) = &mut tab.surface else {
+        return;
+    };
+    let before = if v.on_entry_row() {
+        None
+    } else if let Some(sel) = v.selection() {
+        sel.uids.first().copied()
+    } else {
+        v.selected_uid()
+    };
+    let resources = v.ed.project().resources.clone();
+    let mut dropped = 0;
+    let mut assignments = Vec::new();
+    for a in &clip.assignments {
+        // The unassigned placeholder is no resource of any plan: it goes
+        // as it is. A resource the copy has no record of is dropped.
+        let Some((_, name)) = clip
+            .resources
+            .iter()
+            .find(|(uid, _)| *uid == a.resource_uid)
+        else {
+            if a.resource_uid == UNASSIGNED_RESOURCE {
+                assignments.push(a.clone());
+            } else {
+                dropped += 1;
+            }
+            continue;
+        };
+        // The same resource in the same plan, else one of that name (an
+        // empty name says nothing, so it never matches across resources).
+        let named = |r: &&projcore::Resource| r.name.eq_ignore_ascii_case(name);
+        let target = resources
+            .iter()
+            .find(|r| r.uid == a.resource_uid && named(r))
+            .or_else(|| resources.iter().find(|r| !name.is_empty() && named(r)));
+        match target {
+            Some(r) => assignments.push(projcore::Assignment {
+                resource_uid: r.uid,
+                ..a.clone()
+            }),
+            None => dropped += 1,
+        }
+    }
+    // A task calendar is the plan's own: the one of the same name here (the
+    // same UID alone could be another calendar), else the plan's default.
+    let calendars = &v.ed.project().calendars;
+    let mut tasks = clip.tasks.clone();
+    for t in &mut tasks {
+        t.calendar_uid = t.calendar_uid.and_then(|uid| {
+            let (_, name) = clip.calendars.iter().find(|(c, _)| *c == uid)?;
+            let same = |c: &&projcore::Calendar| c.name.eq_ignore_ascii_case(name);
+            calendars
+                .iter()
+                .find(|c| c.uid == uid && same(c))
+                .or_else(|| calendars.iter().find(same))
+                .map(|c| c.uid)
+        });
+    }
+    match v.ed.insert_tasks(before, &tasks, &assignments) {
+        Ok(new) => {
+            let n = new.len();
+            let mut status = format!("Pasted {n} row{}", if n == 1 { "" } else { "s" });
+            if dropped > 0 {
+                status += &format!(
+                    "; {dropped} resource assignment{} dropped",
+                    if dropped == 1 { "" } else { "s" }
+                );
+            }
+            tab.status = status.into();
+            v.anchor = None;
+            if let Some(index) = new
+                .first()
+                .and_then(|&uid| v.ed.project().tasks.iter().position(|t| t.uid == uid))
+            {
+                // As typing into the entry row does: the cursor goes to the task.
+                v.entry = false;
+                v.ed.select(index);
+            }
+            complete_project(tab, true);
+        }
+        Err(e) => tab.status = e.into(),
     }
 }
 
