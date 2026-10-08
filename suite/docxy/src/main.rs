@@ -52,6 +52,7 @@ mod doc_templates;
 #[cfg(test)]
 mod doc_templates_tests;
 mod harness;
+mod file_keys;
 mod help_tab;
 mod hf;
 mod hf_tab;
@@ -12181,6 +12182,11 @@ impl Docxy {
         if macos_menu::is_save_as(&ev.keystroke, text_input::MACOS) {
             self.keytips = KeyTip::Off;
             self.save_as(window, cx);
+            return Some(());
+        }
+        // F12 / Shift+F12 / Ctrl+F12 are Save As / Save / Open (#1141).
+        if let Some(fk) = file_keys::file_key(&ev.keystroke) {
+            self.file_key_act(fk, window, cx);
             return Some(());
         }
         let m = &ev.keystroke.modifiers;

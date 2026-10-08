@@ -1,0 +1,53 @@
+# F12 is Save As, Shift+F12 Save and Ctrl+F12 Open on every tab kind (#1141).
+# A harness instance has no native dialog, so Save As and Open refuse in words.
+
+test f12 reaches Save As on a document
+  open copy:../fixtures/basic.docx
+  key f12
+  assert status is This document needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb
+
+test f12 reaches Save As on a workbook
+  open copy:../fixtures/basic.xlsx
+  key f12
+  assert status is This workbook needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb
+
+test ctrl+f12 refuses Open in a harness and the app stays responsive
+  open copy:../fixtures/basic.docx
+  key ctrl+f12
+  assert status is A harness instance cannot open the Open dialog; use the harness open verb
+  type x
+  assert dirty is true
+
+test shift+f12 saves like ctrl+s
+  open copy:../fixtures/basic.docx
+  type x
+  assert dirty is true
+  key shift+f12
+  assert dirty is false
+
+test f12 reaches Save As on a project
+  open copy:../fixtures/schedule.xml
+  key f12
+  assert status is This project needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb
+
+test shift+f12 saves a workbook like ctrl+s
+  open copy:../fixtures/basic.xlsx
+  type x
+  key enter
+  assert dirty is true
+  key shift+f12
+  assert dirty is false
+
+test shift+f12 is refused on a document marked as final like ctrl+s
+  open copy:../fixtures/final.docx
+  key shift+f12
+  assert dirty is false
+  assert status is Marked as Final — select Edit Anyway to edit
+
+test ctrl+f12 refuses Open on a workbook and a project
+  open copy:../fixtures/basic.xlsx
+  key ctrl+f12
+  assert status is A harness instance cannot open the Open dialog; use the harness open verb
+  open copy:../fixtures/schedule.xml
+  key ctrl+f12
+  assert status is A harness instance cannot open the Open dialog; use the harness open verb
