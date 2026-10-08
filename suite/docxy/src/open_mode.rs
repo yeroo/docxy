@@ -199,6 +199,12 @@ pub(crate) fn reopen_step(
     }
 }
 
+/// Whether a native Open pick leaves the backstage (#1078): a picked file
+/// does, a cancelled dialog keeps the page the person was on.
+pub(crate) fn pick_leaves_backstage(picked: Option<&Path>) -> bool {
+    picked.is_some()
+}
+
 /// The caption a tab shows: its file name, then the access suffix.
 pub(crate) fn caption(title: &str, access: Access) -> String {
     match access.caption_suffix() {

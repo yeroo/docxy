@@ -19225,14 +19225,19 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A cancelled pick leaves the backstage on its page (#1078), as Word
+        // and Excel do; only a picked file leaves it.
+        let leaves = open_mode::pick_leaves_backstage(path.as_deref());
         if let Some(path) = path {
             self.open_picked(&path, mode);
         }
-        self.backstage = false;
-        self.bs_new = false;
-        self.bs_export = false;
-        self.bs_info = false;
-        self.bs_info_status = None;
+        if leaves {
+            self.backstage = false;
+            self.bs_new = false;
+            self.bs_export = false;
+            self.bs_info = false;
+            self.bs_info_status = None;
+        }
         self.persist(cx);
         self.refocus(window, cx);
     }
