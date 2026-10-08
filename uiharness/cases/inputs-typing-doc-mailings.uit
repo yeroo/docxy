@@ -30,6 +30,9 @@ test doc mail-envelopes/delivery: focus by Tab
   call ribbon-click {"tab":"Mailings","command":"Envelopes"}
   assert dialog is mail-envelopes
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"return"}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"delivery"}
   call field-read {"dialog-field":"delivery"}
   assert reply.focused is true
@@ -166,6 +169,9 @@ test doc mail-envelopes/return: focus by Tab
   call ribbon-click {"tab":"Mailings","command":"Envelopes"}
   assert dialog is mail-envelopes
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"delivery"}
+  call field-read {"dialog-field":"return"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"return"}
   call field-read {"dialog-field":"return"}
   assert reply.focused is true
@@ -551,6 +557,9 @@ test doc mail-labels/width: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"product"}
   call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"width"}
   call field-read {"dialog-field":"width"}
   assert reply.focused is true
@@ -707,6 +716,9 @@ test doc mail-labels/height: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"product"}
   call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"height"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"height"}
   call field-read {"dialog-field":"height"}
   assert reply.focused is true
@@ -863,6 +875,9 @@ test doc mail-labels/across: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"product"}
   call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"across"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"across"}
   call field-read {"dialog-field":"across"}
   assert reply.focused is true
@@ -1033,6 +1048,9 @@ test doc mail-labels/down: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"product"}
   call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"down"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"down"}
   call field-read {"dialog-field":"down"}
   assert reply.focused is true
@@ -1246,6 +1264,9 @@ test doc mail-label-options/width: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"product"}
   call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"width"}
   call field-read {"dialog-field":"width"}
   assert reply.focused is true
@@ -1412,6 +1433,9 @@ test doc mail-label-options/height: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"product"}
   call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"height"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"height"}
   call field-read {"dialog-field":"height"}
   assert reply.focused is true
@@ -1578,6 +1602,9 @@ test doc mail-label-options/across: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"product"}
   call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"across"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"across"}
   call field-read {"dialog-field":"across"}
   assert reply.focused is true
@@ -1760,6 +1787,9 @@ test doc mail-label-options/down: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"product"}
   call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"down"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"down"}
   call field-read {"dialog-field":"down"}
   assert reply.focused is true
@@ -3047,6 +3077,9 @@ test doc mail-merge-new/from: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"records"}
   call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"to"}
+  call field-read {"dialog-field":"from"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"from"}
   call field-read {"dialog-field":"from"}
   assert reply.focused is true
@@ -3272,6 +3305,9 @@ test doc mail-merge-new/to: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"records"}
   call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"from"}
+  call field-read {"dialog-field":"to"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"to"}
   call field-read {"dialog-field":"to"}
   assert reply.focused is true

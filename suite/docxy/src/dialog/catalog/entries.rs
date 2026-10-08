@@ -245,7 +245,8 @@ dialogs! {
             r#"call ribbon-click {"tab":"Table Layout","command":"split-cells"}"#,
         ],
         fields: &[
-            Field::number("cols", "2").applied(&["assert table.columns is 3"]),
+            // Cell A of the 1x2 table, split into 3 (the dialog opens on 2).
+            Field::number("cols", "3").applied(&["assert table.columns is 4"]),
             Field::number("rows", "2").applied(&["assert table.rows is 2"]),
             checkbox("merge"),
         ],
@@ -307,20 +308,23 @@ dialogs! {
         file: "doc-tables",
         fixture: DOCX,
         open: &[
-            "type one\ttwo",
+            "type one/two\tthree",
             "key home shift+end",
             r#"call ribbon-click {"tab":"Insert","command":"table"}"#,
             r#"call menu-click {"label":"Convert Text to Table..."}"#,
         ],
+        // The text is "one/two<Tab>three": the dialog opens on 2 columns,
+        // split at the Tab.
         fields: &[
-            Field::number("cols", "2")
-                .applied(&["assert table.columns is 2", "assert table.cells.0.1.0 is two"]),
+            Field::number("cols", "3").applied(&[
+                "assert table.columns is 3",
+                "assert table.cells.0.1.0 is three",
+            ]),
             radio("sep"),
-            // The text is "one<Tab>two", so a "/" leaves it in one cell.
             Field::text("other")
                 .sample("/")
                 .prep(SEPARATE_WITH_OTHER)
-                .applied(&["assert table.cells.0.0.0 is one⇥two"]),
+                .applied(&["assert table.cells.0.1.0 is two⇥three"]),
         ],
         reopen: &[],
         accept_closes: true,
@@ -1245,10 +1249,11 @@ dialogs! {
         ],
         fields: &[
             radio("action"),
+            // North and South only: no East record for the criteria.
             Field::text("list")
-                .sample("A1:C5")
+                .sample("A1:C3")
                 .prep(CRITERIA)
-                .applied(&["assert status is 1 of 4 records found"]),
+                .applied(&["assert status is 0 of 2 records found"]),
             Field::text("criteria")
                 .sample("E1:E2")
                 .applied(&["assert status is 1 of 4 records found"]),

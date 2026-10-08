@@ -33,6 +33,9 @@ test doc insert-table/cols: focus by Tab
   call menu-click {"label":"Insert Table..."}
   assert dialog is insert-table
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"cols"}
   call field-read {"dialog-field":"cols"}
   assert reply.focused is true
@@ -192,6 +195,9 @@ test doc insert-table/rows: focus by Tab
   call menu-click {"label":"Insert Table..."}
   assert dialog is insert-table
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"rows"}
   call field-read {"dialog-field":"rows"}
   assert reply.focused is true
@@ -351,6 +357,9 @@ test doc insert-table/width: focus by Tab
   call menu-click {"label":"Insert Table..."}
   assert dialog is insert-table
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"width"}
   call field-read {"dialog-field":"width"}
   assert reply.focused is true
@@ -499,6 +508,9 @@ test doc split-cells/cols: focus by Tab
   call ribbon-click {"tab":"Table Layout","command":"split-cells"}
   assert dialog is split-cells
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"cols"}
   call field-read {"dialog-field":"cols"}
   assert reply.focused is true
@@ -512,9 +524,9 @@ test doc split-cells/cols: types
   call dialog-catalog-check {}
   call pointer-click {"dialog-field":"cols"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"2"}
+  call real-type {"text":"3"}
   call field-read {"dialog-field":"cols"}
-  assert reply.value is 2
+  assert reply.value is 3
   assert reply.caret is 1
   call real-key {"key":"escape"}
 
@@ -603,10 +615,10 @@ test doc split-cells/cols: OK applies
   call dialog-catalog-check {}
   call pointer-click {"dialog-field":"cols"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"2"}
+  call real-type {"text":"3"}
   call real-key {"key":"enter"}
   assert dialog is not split-cells
-  assert table.columns is 3
+  assert table.columns is 4
 
 test doc split-cells/cols: Escape cancels
   open ../fixtures/doc-table.docx
@@ -635,10 +647,10 @@ test doc split-cells/cols: refuses invalid
   call dialog-catalog-check {}
   call pointer-click {"dialog-field":"cols"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"2"}
+  call real-type {"text":"3"}
   call real-type {"text":"x"}
   call field-read {"dialog-field":"cols"}
-  assert reply.value is 2
+  assert reply.value is 3
   call real-key {"key":"escape"}
 
 test doc split-cells/rows: focus by click
@@ -658,6 +670,9 @@ test doc split-cells/rows: focus by Tab
   call ribbon-click {"tab":"Table Layout","command":"split-cells"}
   assert dialog is split-cells
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"rows"}
   call field-read {"dialog-field":"rows"}
   assert reply.focused is true
@@ -1185,7 +1200,7 @@ test doc convert-to-text/other: Escape cancels
 
 test doc convert-text-to-table: matches the catalogue
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1195,7 +1210,7 @@ test doc convert-text-to-table: matches the catalogue
 
 test doc convert-text-to-table/cols: focus by click
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1208,7 +1223,7 @@ test doc convert-text-to-table/cols: focus by click
 
 test doc convert-text-to-table/cols: focus by Tab
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1221,7 +1236,7 @@ test doc convert-text-to-table/cols: focus by Tab
 
 test doc convert-text-to-table/cols: types
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1229,15 +1244,15 @@ test doc convert-text-to-table/cols: types
   call dialog-catalog-check {}
   call pointer-click {"dialog-field":"cols"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"2"}
+  call real-type {"text":"3"}
   call field-read {"dialog-field":"cols"}
-  assert reply.value is 2
+  assert reply.value is 3
   assert reply.caret is 1
   call real-key {"key":"escape"}
 
 test doc convert-text-to-table/cols: edits
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1268,7 +1283,7 @@ test doc convert-text-to-table/cols: edits
 
 test doc convert-text-to-table/cols: select-all replaces
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1288,7 +1303,7 @@ test doc convert-text-to-table/cols: select-all replaces
 
 test doc convert-text-to-table/cols: pastes
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1304,7 +1319,7 @@ test doc convert-text-to-table/cols: pastes
 
 test doc convert-text-to-table/cols: copies
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1322,7 +1337,7 @@ test doc convert-text-to-table/cols: copies
 
 test doc convert-text-to-table/cols: OK applies
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1330,15 +1345,15 @@ test doc convert-text-to-table/cols: OK applies
   call dialog-catalog-check {}
   call pointer-click {"dialog-field":"cols"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"2"}
+  call real-type {"text":"3"}
   call real-key {"key":"enter"}
   assert dialog is not convert-text-to-table
-  assert table.columns is 2
-  assert table.cells.0.1.0 is two
+  assert table.columns is 3
+  assert table.cells.0.1.0 is three
 
 test doc convert-text-to-table/cols: Escape cancels
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1349,7 +1364,7 @@ test doc convert-text-to-table/cols: Escape cancels
   call real-type {"text":"77"}
   call real-key {"key":"escape"}
   assert dialog is not convert-text-to-table
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1361,7 +1376,7 @@ test doc convert-text-to-table/cols: Escape cancels
 
 test doc convert-text-to-table/cols: refuses invalid
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1369,15 +1384,15 @@ test doc convert-text-to-table/cols: refuses invalid
   call dialog-catalog-check {}
   call pointer-click {"dialog-field":"cols"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"2"}
+  call real-type {"text":"3"}
   call real-type {"text":"x"}
   call field-read {"dialog-field":"cols"}
-  assert reply.value is 2
+  assert reply.value is 3
   call real-key {"key":"escape"}
 
 test doc convert-text-to-table/other: focus by click
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1392,7 +1407,7 @@ test doc convert-text-to-table/other: focus by click
 
 test doc convert-text-to-table/other: focus by Tab
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1407,7 +1422,7 @@ test doc convert-text-to-table/other: focus by Tab
 
 test doc convert-text-to-table/other: types
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1425,7 +1440,7 @@ test doc convert-text-to-table/other: types
 
 test doc convert-text-to-table/other: edits
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1458,7 +1473,7 @@ test doc convert-text-to-table/other: edits
 
 test doc convert-text-to-table/other: select-all replaces
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1480,7 +1495,7 @@ test doc convert-text-to-table/other: select-all replaces
 
 test doc convert-text-to-table/other: pastes
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1498,7 +1513,7 @@ test doc convert-text-to-table/other: pastes
 
 test doc convert-text-to-table/other: copies
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1518,7 +1533,7 @@ test doc convert-text-to-table/other: copies
 
 test doc convert-text-to-table/other: OK applies
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1531,11 +1546,11 @@ test doc convert-text-to-table/other: OK applies
   call real-type {"text":"/"}
   call real-key {"key":"enter"}
   assert dialog is not convert-text-to-table
-  assert table.cells.0.0.0 is one⇥two
+  assert table.cells.0.1.0 is two⇥three
 
 test doc convert-text-to-table/other: Escape cancels
   open ../fixtures/basic.docx
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}
@@ -1548,7 +1563,7 @@ test doc convert-text-to-table/other: Escape cancels
   call real-type {"text":"Esc9"}
   call real-key {"key":"escape"}
   assert dialog is not convert-text-to-table
-  type one	two
+  type one/two	three
   key home shift+end
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Convert Text to Table..."}

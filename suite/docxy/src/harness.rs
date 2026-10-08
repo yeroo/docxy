@@ -4467,10 +4467,8 @@ fn dispatch_verb(
                     }
                     None => return Err("'at' must be a string".into()),
                 },
-                (Some(_), Some(_)) => {
-                    return Err("pointer-click takes exactly one of 'region' or 'at'".into());
-                }
-                (None, None) => return Err("pointer-click needs 'region' or 'at'".into()),
+                // Both at once is refused by `one_pointer_target` above.
+                _ => return Err("pointer-click needs 'region' or 'at'".into()),
             };
             let mut done = Done::ok(Json::obj(vec![
                 ("x", Json::Num(f64::from(p.x))),
@@ -7660,7 +7658,8 @@ mod tests {
         assert!(key_args(&Json::obj(vec![])).is_err());
     }
 
-    /// `pointer-click`'s `x` is optional, and a present one must be a number.
+    /// #1029: `real-key`'s `to-field` presses Tab only, so it refuses any
+    /// other key, `keys` and `times`.
     #[test]
     fn to_field_presses_tab_only() {
         let j = |s: &str| Json::parse(s).unwrap();
@@ -7680,6 +7679,7 @@ mod tests {
         }
     }
 
+    /// #1029: `pointer-click` names one target, whichever kind it is.
     #[test]
     fn pointer_click_names_one_target() {
         let j = |s: &str| Json::parse(s).unwrap();
@@ -7698,6 +7698,7 @@ mod tests {
         assert!(one_pointer_target(&j(r#"{"region":"grid","input":"formula-bar"}"#)).is_err());
     }
 
+    /// `pointer-click`'s `x` is optional, and a present one must be a number.
     #[test]
     fn field_x_is_an_optional_number() {
         assert_eq!(field_x(&Json::obj(vec![])), Ok(None));

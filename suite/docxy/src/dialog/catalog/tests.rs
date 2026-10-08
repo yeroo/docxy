@@ -24,60 +24,127 @@ fn sources(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
     }
 }
 
-/// Production code: `.rs` files outside the catalogue, minus test files and
-/// inline `#[cfg(test)]` modules.
+/// Production code: `.rs` files outside the catalogue, minus the modules
+/// compiled only for tests: the files a `#[cfg(test)] mod name;` declares
+/// (and everything under them), and the bodies of inline
+/// `#[cfg(test)] mod name { .. }` modules.
 fn production(files: &[(PathBuf, String)]) -> Vec<(&PathBuf, String)> {
+    let test_dirs: Vec<PathBuf> = files
+        .iter()
+        .flat_map(|(p, text)| {
+            let dir = module_dir(p);
+            test_modules(text)
+                .into_iter()
+                .filter(|m| !m.inline)
+                .map(move |m| dir.join(m.name))
+        })
+        .collect();
     files
         .iter()
         .filter(|(p, _)| {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let declared_for_tests = test_dirs
+                .iter()
+                .any(|d| p.starts_with(d) || *p == d.with_extension("rs"));
             !p.starts_with(src().join("dialog/catalog"))
                 && !p.ends_with("dialog/catalog.rs")
-                && name != "tests.rs"
-                && !name.ends_with("_tests.rs")
+                && !declared_for_tests
         })
         .map(|(p, text)| (p, without_test_modules(text)))
         .collect()
 }
 
-/// `text` without the bodies of its inline `#[cfg(test)] mod name { .. }`
-/// modules (braces counted; a module declared `mod name;` is its own file).
-fn without_test_modules(text: &str) -> String {
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(at) = rest.find("#[cfg(test)]") {
-        let after = &rest[at..];
-        let line_end = after.find('\n').map_or(after.len(), |i| i + 1);
-        let next = after[line_end..].trim_start();
-        let is_inline_mod = next.starts_with("mod ")
-            && next
-                .find('{')
-                .is_some_and(|b| next.find(';').is_none_or(|s| b < s));
-        if !is_inline_mod {
-            out.push_str(&rest[..at + line_end]);
-            rest = &after[line_end..];
+/// Where the modules `file` declares live: beside it for `main.rs`,
+/// `lib.rs` and `mod.rs`, else in the directory named after it.
+fn module_dir(file: &Path) -> PathBuf {
+    let parent = file.parent().unwrap_or(Path::new(""));
+    match file.file_stem().and_then(|s| s.to_str()) {
+        Some("main" | "lib" | "mod") | None => parent.to_path_buf(),
+        Some(stem) => parent.join(stem),
+    }
+}
+
+/// A `#[cfg(test)]` module in a file's text.
+struct TestModule<'a> {
+    name: &'a str,
+    /// Declared with a body (`{`), not `;`.
+    inline: bool,
+    /// Where `#[cfg(test)]` starts, and where the body's `{` is.
+    at: usize,
+    body: usize,
+}
+
+/// The `#[cfg(test)]` modules of `text`: the attribute, then any other
+/// attributes, then `mod name` with an optional visibility (`pub`,
+/// `pub(crate)`, `pub(super)`, `pub(in ..)`).
+fn test_modules(text: &str) -> Vec<TestModule<'_>> {
+    let mut found = Vec::new();
+    for (at, _) in text.match_indices("#[cfg(test)]") {
+        let mut rest = &text[at + "#[cfg(test)]".len()..];
+        loop {
+            rest = rest.trim_start();
+            match rest.strip_prefix("#[") {
+                Some(attr) => rest = attr.find(']').map_or("", |e| &attr[e + 1..]),
+                None => break,
+            }
+        }
+        if let Some(vis) = rest.strip_prefix("pub") {
+            let vis = vis.trim_start();
+            rest = match vis.strip_prefix('(') {
+                Some(inner) => inner.find(')').map_or("", |e| &inner[e + 1..]),
+                None => vis,
+            }
+            .trim_start();
+        }
+        let Some(decl) = rest.strip_prefix("mod ") else {
+            continue;
+        };
+        let decl = decl.trim_start();
+        let end = decl
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(decl.len());
+        let after = decl[end..].trim_start();
+        let inline = after.starts_with('{');
+        if !inline && !after.starts_with(';') {
             continue;
         }
-        out.push_str(&rest[..at]);
-        let body = &after[after.find('{').expect("an inline module has a body")..];
+        let body = text.len() - after.len();
+        found.push(TestModule {
+            name: &decl[..end],
+            inline,
+            at,
+            body,
+        });
+    }
+    found
+}
+
+/// `text` without its inline `#[cfg(test)]` modules (braces counted).
+fn without_test_modules(text: &str) -> String {
+    let mut out = String::new();
+    let mut from = 0;
+    for m in test_modules(text).into_iter().filter(|m| m.inline) {
+        if m.at < from {
+            continue;
+        }
+        out.push_str(&text[from..m.at]);
         let mut depth = 0usize;
-        let mut end = body.len();
-        for (i, c) in body.char_indices() {
+        let mut end = text.len();
+        for (i, c) in text[m.body..].char_indices() {
             match c {
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
                     if depth == 0 {
-                        end = i + 1;
+                        end = m.body + i + 1;
                         break;
                     }
                 }
                 _ => {}
             }
         }
-        rest = &body[end..];
+        from = end;
     }
-    out.push_str(rest);
+    out.push_str(&text[from..]);
     out
 }
 
@@ -105,9 +172,17 @@ fn every_dialog_is_in_the_catalogue() {
     let live = production(&files);
     assert!(names("x catalog::GOTO;", "GOTO") && !names("catalog::GOTO_SPECIAL", "GOTO"));
     let cut = without_test_modules(
-        "a\n#[cfg(test)]\nmod t {\n fn f() { catalog::X }\n}\nb\n#[cfg(test)]\nmod u;\n",
+        "a\n#[cfg(test)]\n#[allow(dead_code)]\npub(crate) mod t {\n fn f() { catalog::X }\n}\nb\n#[cfg(test)]\nmod u;\n",
     );
     assert_eq!(cut, "a\n\nb\n#[cfg(test)]\nmod u;\n");
+    let declared: Vec<(&str, bool)> =
+        test_modules("#[cfg(test)]\npub mod u;\n#[cfg(test)] fn g() {}")
+            .iter()
+            .map(|m| (m.name, m.inline))
+            .collect();
+    assert_eq!(declared, [("u", false)]);
+    let file = |p: &str| live.iter().any(|(f, _)| f.ends_with(p));
+    assert!(file("close.rs") && !file("ribbon_export.rs") && !file("dialog/tests.rs"));
     for e in catalog() {
         let key = e.dialog.key();
         let used = live.iter().any(|(_, text)| names(text, key));
@@ -220,7 +295,7 @@ fn inputs_typing_case_is_current() {
 
 /// #1029: while the dialog under test is open, the generated cases drive it
 /// with real input only: no `dialog-set`, `dialog-click`, `dialog-tab`, `key`
-/// or `type` between `assert dialog is <id>` and the dialog closing. The
+/// or `type` (as steps or as `call` verbs) between `assert dialog is <id>` and the dialog closing. The
 /// steps that open it (and set the document up) come before.
 #[test]
 fn the_cases_drive_an_open_dialog_with_real_input_only() {

@@ -308,15 +308,21 @@ fn text_tests(e: &Entry, f: &Field) -> Vec<Test> {
         .close();
     tests.push(t);
 
+    // From another field a click focuses, when the field has a neighbour
+    // shown with it, so the Tabs have to move the focus: a field that
+    // already has it at open would pass on a whole round of ignored Tabs.
     let mut t = Test::new(e, f, "focus by Tab");
-    t.open(e, f)
-        .call(
-            "real-key",
-            &format!("{{\"key\":\"tab\",\"to-field\":{}}}", js(f.name)),
-        )
-        .read(f)
-        .assert("reply.focused is true")
-        .close();
+    t.open(e, f);
+    if let Some(other) = tab_start(e, f) {
+        t.click(other).read(f).assert("reply.focused is false");
+    }
+    t.call(
+        "real-key",
+        &format!("{{\"key\":\"tab\",\"to-field\":{}}}", js(f.name)),
+    )
+    .read(f)
+    .assert("reply.focused is true")
+    .close();
     tests.push(t);
 
     let mut t = Test::new(e, f, "types");
@@ -452,6 +458,14 @@ fn text_tests(e: &Entry, f: &Field) -> Vec<Test> {
         tests.push(t);
     }
     tests
+}
+
+/// Another typed field of `e` on `f`'s tab, shown by the same prep, to start
+/// the Tab case from.
+fn tab_start<'e>(e: &'e Entry, f: &Field) -> Option<&'e Field> {
+    e.fields
+        .iter()
+        .find(|o| o.name != f.name && o.typed() && o.tab == f.tab && o.prep == f.prep)
 }
 
 fn dropdown_tests(e: &Entry, f: &Field) -> Vec<Test> {

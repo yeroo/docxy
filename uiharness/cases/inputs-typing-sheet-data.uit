@@ -242,6 +242,9 @@ test sheet series/step: focus by Tab
   call menu-click {"label":"Series…"}
   assert dialog is series
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"stop"}
+  call field-read {"dialog-field":"step"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"step"}
   call field-read {"dialog-field":"step"}
   assert reply.focused is true
@@ -438,6 +441,9 @@ test sheet series/stop: focus by Tab
   call menu-click {"label":"Series…"}
   assert dialog is series
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"step"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"stop"}
   call field-read {"dialog-field":"stop"}
   assert reply.focused is true
@@ -1564,6 +1570,9 @@ test sheet data-validation/input-title: focus by Tab
   assert dialog is data-validation
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-message"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"input-title"}
   call field-read {"dialog-field":"input-title"}
   assert reply.focused is true
@@ -1727,6 +1736,9 @@ test sheet data-validation/input-message: focus by Tab
   assert dialog is data-validation
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-title"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"input-message"}
   call field-read {"dialog-field":"input-message"}
   assert reply.focused is true
@@ -1925,6 +1937,9 @@ test sheet data-validation/error-title: focus by Tab
   assert dialog is data-validation
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-message"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"error-title"}
   call field-read {"dialog-field":"error-title"}
   assert reply.focused is true
@@ -2088,6 +2103,9 @@ test sheet data-validation/error-message: focus by Tab
   assert dialog is data-validation
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-title"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"error-message"}
   call field-read {"dialog-field":"error-message"}
   assert reply.focused is true
@@ -2990,6 +3008,9 @@ test sheet text-to-columns/destination: focus by Tab
   assert dialog is text-to-columns
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"decimal"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"destination"}
   call field-read {"dialog-field":"destination"}
   assert reply.focused is true
@@ -3175,6 +3196,9 @@ test sheet text-to-columns/decimal: focus by Tab
   assert dialog is text-to-columns
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"decimal"}
   call field-read {"dialog-field":"decimal"}
   assert reply.focused is true
@@ -3343,6 +3367,9 @@ test sheet text-to-columns/thousands: focus by Tab
   assert dialog is text-to-columns
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"thousands"}
   call field-read {"dialog-field":"thousands"}
   assert reply.focused is true
