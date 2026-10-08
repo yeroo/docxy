@@ -1310,6 +1310,26 @@ impl Editor {
         self.caret.offset = o;
     }
 
+    /// Move the caret to just after the current/next word (macOS Option-Right),
+    /// crossing to the next paragraph at the end of one.
+    pub fn move_word_end_caret(&mut self) {
+        self.last = EditKind::None;
+        let text: Vec<char> = self.cur_text().chars().collect();
+        let len = text.len();
+        if self.caret.offset >= len {
+            self.move_right();
+            return;
+        }
+        let mut o = self.caret.offset;
+        while o < len && text[o].is_whitespace() {
+            o += 1;
+        }
+        while o < len && !text[o].is_whitespace() {
+            o += 1;
+        }
+        self.caret.offset = o;
+    }
+
     /// Move to the end of the current/next word (vim `e`).
     pub fn move_word_end(&mut self) {
         self.last = EditKind::None;
@@ -5893,6 +5913,21 @@ mod tests {
         ed.move_word_left(); // -> start of "brown"
         assert_eq!(ed.caret.offset, 11);
         ed.move_word_left(); // -> start of "quick"
+        assert_eq!(ed.caret.offset, 4);
+    }
+
+    #[test]
+    fn word_end_caret_lands_after_the_word_1073() {
+        let mut ed = Editor::new(doc(&["hello brave  world", "next"]));
+        ed.caret.offset = 8; // hello br|ave
+        ed.move_word_end_caret();
+        assert_eq!(ed.caret.offset, 11);
+        ed.move_word_end_caret(); // skips the double space
+        assert_eq!(ed.caret.offset, 18);
+        ed.move_word_end_caret(); // paragraph end: into the next paragraph
+        assert_eq!(ed.caret, Caret::top(1, 0));
+        ed.caret.offset = 0;
+        ed.move_word_end_caret();
         assert_eq!(ed.caret.offset, 4);
     }
 

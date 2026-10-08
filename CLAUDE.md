@@ -50,6 +50,15 @@
   through `macos_menu::end_process` (a unit test scans for a bare
   `cx.quit()`), or `resume_quit`'s apply phase, so its terminate goes ahead.
 
+## Mac text navigation (#1073)
+
+- `suite/docxy/src/mac_nav.rs` maps ⌘←/→/↑/↓ (line start/end, document start/end),
+  ⌥←/→ (word start / just after the word, `Editor::move_word_end_caret`) and ⌥⌫
+  to editor moves on macOS only; `on_key` tries it before the Ctrl split, and
+  lowers the KeyTips the ⌥ key-down raised. Home/End are paragraph offsets, so
+  ⌘←/→ are too, not visual lines. Protected View and final documents take the
+  ⌥←/→ word moves (caret only); ⌥⌫ stays refused.
+
 ## Build info
 
 - `buildinfo` is the one place that stamps binaries (commit, last merged PR, kind,
