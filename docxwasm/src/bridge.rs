@@ -1443,8 +1443,36 @@ impl Session {
         let mut out = richdoc::doc_json(&self.editor.doc, &self.page_geom(), &ctx);
         out.pop(); // the closing brace
         out.push(',');
+        out.push_str(&self.background_json());
         out.push_str(&self.selection_fields());
         out.push('}');
+        out
+    }
+
+    /// `"bg":{…},` — the page colour (see [`docxcore::page_bg`]), if the
+    /// package has one: `color` (RRGGBB), and for a Fill Effects gradient
+    /// `color2` and the shading `style`. Carries its own trailing comma;
+    /// empty text without a page colour.
+    fn background_json(&self) -> String {
+        use docxcore::page_bg::GradientStyle;
+        let Some(bg) = self.pkg.page_background() else {
+            return String::new();
+        };
+        let mut out = format!("\"bg\":{{\"color\":\"{:06X}\"", bg.color & 0xFF_FFFF);
+        if let Some(g) = bg.gradient {
+            let style = match g.style {
+                GradientStyle::Horizontal => "horizontal",
+                GradientStyle::Vertical => "vertical",
+                GradientStyle::DiagonalUp => "diagonalUp",
+                GradientStyle::DiagonalDown => "diagonalDown",
+                GradientStyle::FromCenter => "fromCenter",
+            };
+            out.push_str(&format!(
+                ",\"color2\":\"{:06X}\",\"style\":\"{style}\"",
+                g.color2 & 0xFF_FFFF,
+            ));
+        }
+        out.push_str("},");
         out
     }
 

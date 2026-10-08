@@ -4,6 +4,7 @@
 use super::*;
 use crate::json::Json;
 use docxcore::package::{new_package, save_package};
+use docxcore::page_bg::{Gradient, GradientStyle, PageBackground};
 
 fn docx_from_body(body: &str) -> Vec<u8> {
     let xml = format!(
@@ -606,4 +607,81 @@ fn a_complex_links_text_is_linked_editable_segments_212() {
         .expect("the tracked change inside the link");
     assert_eq!((rev.get_usize("o"), rev.get_usize("w")), (Some(9), Some(0)));
     assert_eq!(para_text(p), "abContosocd");
+}
+
+/// A one-paragraph docx whose package carries the page colour `bg`.
+fn docx_with_page_background(bg: &PageBackground) -> Vec<u8> {
+    let mut pkg = docxcore::package::load_package(&docx_from_body(&para("text"))).unwrap();
+    assert!(pkg.set_page_background(Some(bg)));
+    save_package(&pkg)
+}
+
+#[test]
+fn doc_json_reports_solid_page_colour() {
+    let s = open(&docx_with_page_background(&PageBackground {
+        color: 0xFFF2CC,
+        gradient: None,
+    }));
+    let bg = parse(&s.doc_json())
+        .get("bg")
+        .expect("bg in doc_json")
+        .clone();
+    assert_eq!(bg.get_str("color"), Some("FFF2CC"));
+    assert!(bg.get("color2").is_none());
+    assert!(bg.get("style").is_none());
+}
+
+#[test]
+fn doc_json_reports_gradient_page_colour() {
+    for style in GradientStyle::ALL {
+        let name = match style {
+            GradientStyle::Horizontal => "horizontal",
+            GradientStyle::Vertical => "vertical",
+            GradientStyle::DiagonalUp => "diagonalUp",
+            GradientStyle::DiagonalDown => "diagonalDown",
+            GradientStyle::FromCenter => "fromCenter",
+        };
+        let s = open(&docx_with_page_background(&PageBackground {
+            color: 0xFFF2CC,
+            gradient: Some(Gradient {
+                color2: 0x9DC3E6,
+                style,
+            }),
+        }));
+        let bg = parse(&s.doc_json())
+            .get("bg")
+            .expect("bg in doc_json")
+            .clone();
+        assert_eq!(bg.get_str("color"), Some("FFF2CC"), "{name}");
+        assert_eq!(bg.get_str("color2"), Some("9DC3E6"), "{name}");
+        assert_eq!(bg.get_str("style"), Some(name));
+    }
+}
+
+/// Regression guard (passes before the change too): a document without a
+/// page colour reports no `bg` key, and the rest of the model is untouched.
+#[test]
+fn doc_json_has_no_bg_without_page_colour() {
+    let s = open(&docx_from_body(&para("plain")));
+    let doc = parse(&s.doc_json());
+    assert!(doc.get("bg").is_none());
+    assert!(doc.get("page").unwrap().get_usize("w").unwrap() > 0);
+    assert_eq!(arr(doc.get("blocks").unwrap()).len(), 1);
+}
+
+#[test]
+fn page_colour_survives_a_body_edit_in_doc_json() {
+    let mut s = open(&docx_with_page_background(&PageBackground {
+        color: 0xFFF2CC,
+        gradient: None,
+    }));
+    s.exec_json("select\t0\t1\t0\t1");
+    let r = parse(&s.exec_json("insert\tX"));
+    assert_eq!(r.get("applied"), Some(&Json::Bool(true)));
+    assert_eq!(para_text(&all_paragraphs(&s)[0]), "tXext");
+    let bg = parse(&s.doc_json())
+        .get("bg")
+        .expect("bg survives the edit")
+        .clone();
+    assert_eq!(bg.get_str("color"), Some("FFF2CC"));
 }

@@ -1139,6 +1139,44 @@
     return S.media[rid];
   }
 
+  // The page colour (`bg` from doc_json): solid, or a Fill Effects gradient
+  // as a CSS gradient with Word's direction (VML angle + 90°: horizontal
+  // blends bottom to top). Ink follows the page colour's luminance, as the
+  // terminal's page_ink; without a colour both clear to the theme default.
+  function paintPage(bg) {
+    if (!bg) {
+      el.page.style.background = '';
+      el.page.style.removeProperty('--ink');
+      return;
+    }
+    var c1 = '#' + bg.color;
+    if (bg.color2) {
+      var c2 = '#' + bg.color2;
+      var dir = {
+        horizontal: 'to top',
+        vertical: 'to right',
+        diagonalUp: 'to top right',
+        diagonalDown: 'to bottom right'
+      }[bg.style];
+      el.page.style.background = bg.style === 'fromCenter'
+        ? 'radial-gradient(circle at center, ' + c1 + ', ' + c2 + ')'
+        : 'linear-gradient(' + dir + ', ' + c1 + ', ' + c2 + ')';
+    } else {
+      el.page.style.background = c1;
+    }
+    el.page.style.setProperty('--ink', pageInk(bg.color));
+  }
+
+  // Light or dark text on a sheet of colour `rgb` (RRGGBB), by relative
+  // luminance — a copy of page_ink in docxy/src/main.rs.
+  function pageInk(rgb) {
+    var n = parseInt(rgb, 16);
+    var r = ((n >> 16) & 255) / 255;
+    var g = ((n >> 8) & 255) / 255;
+    var b = (n & 255) / 255;
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.45 ? '#f2f2f2' : '#202020';
+  }
+
   function renderDoc() {
     S.model = S.engine.doc();
     var pg = S.model.page;
@@ -1147,6 +1185,7 @@
     el.page.style.padding = [pg.top, pg.right, pg.bottom, pg.left].map(function (v) {
       return Math.round(v / TW) + 'px';
     }).join(' ');
+    paintPage(S.model.bg);
     el.doc.innerHTML = blocksHtml(S.model.blocks);
     Array.prototype.forEach.call(el.doc.querySelectorAll('img[data-rid]'), function (img) {
       var url = mediaUrl(img.dataset.rid);
