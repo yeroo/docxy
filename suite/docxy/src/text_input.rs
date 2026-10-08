@@ -52,21 +52,33 @@ pub(crate) enum Route {
     /// `on_key` takes it and the platform hears it was handled, so it never
     /// also reaches the input handler as text.
     AppStop,
-    /// `on_key` sees it and it still propagates: a Cmd chord, which AppKit
-    /// offers to the menu bar and the system (Cmd+Q, Cmd+H, Cmd+`) when the
+    /// `on_key` sees it and it still propagates: a Cmd chord that is not on
+    /// the menu bar, which AppKit offers to the system (Cmd+`) when the
     /// window leaves it unhandled, and every key off macOS.
     AppPropagate,
+    /// Only the menu bar handles it (#1071): `on_key` never sees it and
+    /// AppKit hands it to its menu item (Cmd+Q, Cmd+H, Ctrl+Cmd+F).
+    MenuBar,
 }
 
 /// The route for one key-down. On macOS, printable text with no Ctrl, Cmd or
 /// Fn goes to AppKit (the keys gpui itself would let an input method see)
 /// while the app `takes_text` (see [`takes_text`]); a held key's repeats stay
-/// with `on_key`, as they always have. Off macOS every key goes to `on_key`
-/// and propagates, exactly as before #1072.
+/// with `on_key`, as they always have. A Cmd chord on the menu bar goes to
+/// whichever of `on_key` and the menu bar owns it, never to both (#1071).
+/// Off macOS every key goes to `on_key` and propagates, exactly as before
+/// #1072.
 pub(crate) fn route(keystroke: &Keystroke, is_held: bool, macos: bool, takes_text: bool) -> Route {
     let m = &keystroke.modifiers;
-    if !macos || m.platform {
+    if !macos {
         return Route::AppPropagate;
+    }
+    if m.platform {
+        return match crate::macos_menu::chord_role(keystroke) {
+            Some(crate::macos_menu::Role::Window) => Route::AppStop,
+            Some(crate::macos_menu::Role::Menu) => Route::MenuBar,
+            None => Route::AppPropagate,
+        };
     }
     let printable = keystroke
         .key_char
@@ -227,13 +239,14 @@ impl Docxy {
             Route::Defer => self.ime.defer(ev),
             Route::AppStop => {
                 self.ime.forget_key();
-                self.on_key(ev, window, cx);
+                self.window_chord(ev, window, cx);
                 cx.stop_propagation();
             }
             Route::AppPropagate => {
                 self.ime.forget_key();
                 self.on_key(ev, window, cx);
             }
+            Route::MenuBar => self.ime.forget_key(),
         }
     }
 
@@ -434,21 +447,50 @@ mod tests {
         assert_eq!(route(&plain("a", "a"), true, true, true), Route::AppStop);
     }
 
+    /// On macOS a Cmd chord on the menu bar reaches one path (#1071): one
+    /// `on_key` handles stops, so its menu item does not run it again, and a
+    /// menu-only one skips `on_key` for the menu bar. Off macOS every Cmd
+    /// chord still goes to `on_key` and propagates.
     #[test]
-    fn cmd_chords_keep_propagating_for_the_menu_bar() {
+    fn cmd_chords_reach_either_on_key_or_the_menu_bar() {
         let cmd = Modifiers {
             platform: true,
             ..Default::default()
         };
-        for macos in [true, false] {
-            assert_eq!(
-                route(&stroke("c", Some("c"), cmd), false, macos, true),
-                Route::AppPropagate
-            );
-            assert_eq!(
-                route(&stroke("q", None, cmd), false, macos, true),
-                Route::AppPropagate
-            );
+        let cmd_shift = Modifiers { shift: true, ..cmd };
+        let ctrl_cmd = Modifiers {
+            control: true,
+            ..cmd
+        };
+        let window = [
+            stroke("c", Some("c"), cmd),
+            stroke("v", Some("v"), cmd),
+            stroke("z", Some("z"), cmd),
+            stroke("z", Some("Z"), cmd_shift),
+            stroke("s", Some("S"), cmd_shift),
+            stroke("f", Some("f"), cmd),
+            stroke("n", Some("n"), cmd),
+        ];
+        let menu = [
+            stroke("q", Some("q"), cmd),
+            stroke("h", Some("h"), cmd),
+            stroke("m", Some("m"), cmd),
+            stroke("o", Some("o"), cmd),
+            stroke("f", Some("f"), ctrl_cmd),
+        ];
+        for k in &window {
+            assert_eq!(route(k, false, true, true), Route::AppStop, "{k}");
+        }
+        for k in &menu {
+            assert_eq!(route(k, false, true, true), Route::MenuBar, "{k}");
+        }
+        // Not on the menu bar: on_key's own, still offered to the system.
+        assert_eq!(
+            route(&stroke("b", Some("b"), cmd), false, true, true),
+            Route::AppPropagate
+        );
+        for k in window.iter().chain(&menu) {
+            assert_eq!(route(k, false, false, true), Route::AppPropagate, "{k}");
         }
     }
 

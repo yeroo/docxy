@@ -46,6 +46,21 @@ dirs = "5"
 rfd = { version = "0.15", features = ["common-controls-v6"] }
 rust-embed = "8"
 
+# The plain AppKit menu bar a native dialog runs under (#1071, macos_menu.rs).
+# Already in the lock through rfd.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSEvent",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSWindow",
+] }
+
 [build-dependencies]
 htmlbundle = { path = "../../htmlbundle" }
 

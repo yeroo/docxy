@@ -60,6 +60,7 @@ mod html_bundle;
 mod inputs;
 mod inspector;
 mod layout_tab;
+mod macos_menu;
 mod mailings_dialogs;
 mod mailings_tab;
 mod menu;
@@ -4292,6 +4293,15 @@ struct Docxy {
     /// The window is closing through its per-document questions (#630):
     /// a close prompt with `quit` is on the tab being asked about.
     quitting: bool,
+    /// The key `on_key` is handling is macOS's ⌘⇧Z (#1071): Redo, never
+    /// Repeat. Set only for that one call.
+    redo_only: bool,
+    /// The questions `quitting` asks are for the app's Quit (#1071), not
+    /// this window's close: the last answer hands the quit on.
+    app_quit: bool,
+    /// This window's agreement to the app's Quit (#1071), applied only once
+    /// every window has agreed. Cleared when a quit starts or stops.
+    quit_agreed: Option<close::QuitAgreed>,
     /// The tabs answered Don't Save while quitting, by index: their unsaved
     /// work is forgotten, but only once the quit goes ahead.
     quit_discards: Vec<usize>,
@@ -10765,39 +10775,41 @@ fn persist_tab(hd: &std::path::Path, seq: usize, i: usize, t: &DocTab) -> Persis
     // held across a restart (closing never loses work). Docs → .docx,
     // spreadsheets → .xlsx, projects → .yppx; restored in preference to `path`.
     // Missing or unreadable project sidecars use restore_project_tab's recovery policy.
-    let hot = match &t.surface {
-        // A converted tab not converted yet shows a placeholder, not its
-        // document: no sidecar, so the next start converts it again.
+    let hot = hot_bytes(t).and_then(|(ext, bytes)| {
+        let p = hd.join(format!("{}.{ext}", hot_stem(seq, i)));
+        opccore::fsio::write_atomic(&p, &bytes)
+            .ok()
+            .map(|_| p.display().to_string())
+    });
+    PersistTab {
+        hot,
+        ..persist_tab_meta(t)
+    }
+}
+
+/// What hot exit writes for tab `t`, with its sidecar's extension: the
+/// whole file a save would write, so everything a save keeps (a document's
+/// body, headers and footers, comments with their resolved state, Track
+/// Changes; a workbook with its charts; a project). `None` for a tab with
+/// no content of its own: a placeholder, or a converted tab not converted
+/// yet, which shows a placeholder and is converted again at the next start.
+fn hot_bytes(t: &DocTab) -> Option<(&'static str, Vec<u8>)> {
+    match &t.surface {
         Surface::Doc(_) if t.pending_conversion => None,
         Surface::Doc(ed) => {
-            let p = hd.join(format!("{}.docx", hot_stem(seq, i)));
             let live = live_comments(t, &ed.doc);
             let base = save_base(t, &ed.doc, &live);
-            let bytes = doc_to_docx(&ed.doc, &live, base.as_deref());
-            opccore::fsio::write_atomic(&p, &bytes)
-                .ok()
-                .map(|_| p.display().to_string())
+            Some(("docx", doc_to_docx(&ed.doc, &live, base.as_deref())))
         }
-        Surface::Sheet(v) => {
-            let p = hd.join(format!("{}.xlsx", hot_stem(seq, i)));
-            opccore::fsio::write_atomic(&p, &sheet_bytes(v, None).0)
-                .ok()
-                .map(|_| p.display().to_string())
-        }
+        Surface::Sheet(v) => Some(("xlsx", sheet_bytes(v, None).0)),
         Surface::Project(v) => {
-            let p = hd.join(format!("{}.yppx", hot_stem(seq, i)));
             let mut snapshot = v.ed.project().clone();
             snapshot.package.unreadable.clear();
             projcore::yppx::write_yppx(&snapshot)
                 .ok()
-                .and_then(|bytes| opccore::fsio::write_atomic(&p, &bytes).ok())
-                .map(|_| p.display().to_string())
+                .map(|bytes| ("yppx", bytes))
         }
         Surface::Placeholder => None,
-    };
-    PersistTab {
-        hot,
-        ..persist_tab_meta(t)
     }
 }
 
@@ -11126,6 +11138,9 @@ impl Docxy {
             theme_pref,
             ask_on_close,
             quitting: false,
+            redo_only: false,
+            app_quit: false,
+            quit_agreed: None,
             quit_discards: Vec::new(),
             quit_tabs: Vec::new(),
             quit_ready: false,
@@ -11852,14 +11867,20 @@ impl Docxy {
 
     /// Ctrl+N (#631): a new blank document on a document tab, a new workbook
     /// on a workbook tab; on any other tab it does nothing. Ctrl+W (#629):
-    /// close the active tab, as File > Close and its X do. `None` for a key
-    /// that is not one of these.
+    /// close the active tab, as File > Close and its X do. On macOS, ⌘⇧S is
+    /// Save As (#1071). `None` for a key that is not one of these.
     fn document_key(
         &mut self,
         ev: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<()> {
+        // ⌘⇧S is the Mac's Save As (#1071), on every tab kind.
+        if macos_menu::is_save_as(&ev.keystroke, text_input::MACOS) {
+            self.keytips = KeyTip::Off;
+            self.save_as(window, cx);
+            return Some(());
+        }
         let m = &ev.keystroke.modifiers;
         if !(m.control || m.platform) || m.alt || m.shift {
             return None;
@@ -14758,11 +14779,13 @@ impl Docxy {
                 finish_project_save(&mut self.tabs[self.active], Some(&path))
             }
             SaveDecision::Dialog { suggested } => {
-                let target = rfd::FileDialog::new()
-                    .add_filter("Project schedule", &["yppx"])
-                    .add_filter("MSPDI", &["xml"])
-                    .set_file_name(suggested)
-                    .save_file();
+                let target = macos_menu::native_modal(|| {
+                    rfd::FileDialog::new()
+                        .add_filter("Project schedule", &["yppx"])
+                        .add_filter("MSPDI", &["xml"])
+                        .set_file_name(suggested)
+                        .save_file()
+                });
                 finish_project_save(&mut self.tabs[self.active], target.as_deref());
             }
             SaveDecision::RefuseHarness(message) => self.tabs[self.active].status = message.into(),
@@ -15105,7 +15128,8 @@ impl Docxy {
     /// it takes the selection back from a chart first, as Ctrl+B does (see
     /// `chart_hand_back`).
     fn sheet_redo_or_repeat(&mut self, cx: &mut Context<Self>) {
-        let may_repeat = !self.sheet_protected();
+        // macOS's ⌘⇧Z only redoes (#1071).
+        let may_repeat = !self.sheet_protected() && !self.redo_only;
         let (had_redo, repeats) = self.active_sheet().map_or((false, false), |v| {
             let idle = v.editing.is_none();
             let had_redo = idle && !v.redo.is_empty();
@@ -18940,19 +18964,21 @@ impl Docxy {
             return;
         };
         let pick = |suggested| {
-            rfd::FileDialog::new()
-                .add_filter("Excel workbook", &SHEET_EXTENSIONS)
-                .set_file_name(suggested)
-                .save_file()
+            macos_menu::native_modal(|| {
+                rfd::FileDialog::new()
+                    .add_filter("Excel workbook", &SHEET_EXTENSIONS)
+                    .set_file_name(suggested)
+                    .save_file()
+            })
         };
         if !save_sheet_tab(tab, harness, explicit_save_as, pick, |features| {
             matches!(
-                rfd::MessageDialog::new()
+                macos_menu::native_modal(|| rfd::MessageDialog::new()
                     .set_title("docxy")
                     .set_level(rfd::MessageLevel::Warning)
                     .set_description(macro_free_question(features))
                     .set_buttons(rfd::MessageButtons::YesNo)
-                    .show(),
+                    .show()),
                 rfd::MessageDialogResult::Yes
             )
         }) {
@@ -19065,7 +19091,7 @@ impl Docxy {
         {
             let picked = cx
                 .background_executor()
-                .spawn(async move { dialog.pick_file() });
+                .spawn(async move { macos_menu::native_modal(|| dialog.pick_file()) });
             cx.spawn_in(window, async move |this, cx| {
                 let path = picked.await;
                 let _ = this.update_in(cx, |this, window, cx| {
@@ -19075,7 +19101,12 @@ impl Docxy {
             .detach();
         }
         #[cfg(not(target_os = "linux"))]
-        self.finish_open_file(dialog.pick_file(), mode, window, cx);
+        self.finish_open_file(
+            macos_menu::native_modal(|| dialog.pick_file()),
+            mode,
+            window,
+            cx,
+        );
     }
 
     fn finish_open_file(
@@ -21590,6 +21621,7 @@ impl Docxy {
         // Undo, Redo and Repeat change the document but keep a current Repeat
         // record current (#618).
         let untouched = repeat_untouched(&self.repeat);
+        let redo_only = self.redo_only;
         let history = (ctrl && matches!(key.as_str(), "z" | "y")) || (!ctrl && key == "f4");
         let autocorrect = self.autocorrect.clone();
         let (Some(ed), repeat) = self.edit_target_and_repeat() else {
@@ -21624,7 +21656,9 @@ impl Docxy {
                     ed.undo();
                     true
                 }
-                // Redo, or Repeat with nothing to redo (#618).
+                // Redo, or Repeat with nothing to redo (#618); macOS's ⌘⇧Z
+                // only redoes (#1071).
+                "y" if redo_only => ed.can_redo() && ed.redo(),
                 "y" => redo_or_repeat(ed, repeat),
                 "enter" if shift => yes(|| ed.insert_break(docxcore::model::BreakKind::Column)),
                 "enter" => yes(|| ed.insert_break(docxcore::model::BreakKind::Page)),
@@ -33387,6 +33421,7 @@ impl KeyRouting for Div {
             .on_action(
                 cx.listener(|this, _: &OutdentAction, window, cx| this.shift_tab_key(window, cx)),
             )
+            .map(|root| macos_menu::window_actions(root, cx))
     }
 }
 
@@ -37184,13 +37219,7 @@ fn open_docxy_window(
             let on_close = view.clone();
             window.on_window_should_close(cx, move |window, cx| {
                 on_close.update(cx, |this, cx| {
-                    let ask = if windows::count(cx) > 1 {
-                        close::CloseAsk::Force
-                    } else if this.harness {
-                        close::CloseAsk::HarnessQuit
-                    } else {
-                        close::CloseAsk::Setting
-                    };
+                    let ask = close::close_ask(windows::count(cx), this.harness);
                     this.window_should_close(ask, window, cx)
                 })
             });
@@ -37330,6 +37359,9 @@ fn main() {
             KeyBinding::new("tab", InsertTabAction, None),
             KeyBinding::new("shift-tab", OutdentAction, None),
         ]);
+        // The menu bar (#1071): ⌘Q, ⌃⌘F and the Edit menu native panels need.
+        #[cfg(target_os = "macos")]
+        macos_menu::install(cx);
         cx.set_global(windows::Registry::default());
         let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
         let options = window_options(bounds, want_harness);
