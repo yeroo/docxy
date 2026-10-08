@@ -15418,10 +15418,17 @@ impl Docxy {
         self.clipboard_write(text.clone(), cx);
         let now = self.clipboard_read(cx);
         if let Some(rtf) = rtf.filter(|_| rtf_follows(&text, &now)) {
-            let harness = self.harness;
-            self.clipboard.write_rtf(harness, rtf, rich_clip::write_rtf);
+            self.clipboard_write_rtf(rtf, &text);
         }
         recorded_after_write(text, &now)
+    }
+
+    /// Add `rtf` to the copy of `text` on the clipboard (#1074): the
+    /// private one's, or the OS one's while it still holds `text`.
+    fn clipboard_write_rtf(&mut self, rtf: String, text: &str) {
+        let harness = self.harness;
+        self.clipboard
+            .write_rtf(harness, rtf, |rtf| rich_clip::write_rtf(rtf, text));
     }
 
     /// The clipboard's RTF (#1074): the OS one's, or the private one's.

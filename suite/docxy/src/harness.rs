@@ -4981,11 +4981,9 @@ fn dispatch_verb(
                         Some(Json::Str(rtf)) => Some(rtf.clone()),
                         Some(_) => return Err("'rtf' must be a string".into()),
                     };
-                    app.clipboard_write(text, cx);
+                    app.clipboard_write(text.clone(), cx);
                     if let Some(rtf) = rtf {
-                        let harness = app.harness;
-                        app.clipboard
-                            .write_rtf(harness, rtf, crate::rich_clip::write_rtf);
+                        app.clipboard_write_rtf(rtf, &text);
                     }
                 }
                 "paste-special" => {

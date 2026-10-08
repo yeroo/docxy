@@ -7,6 +7,11 @@
 //! of anything clears both. Elsewhere (Linux: gpui has no multi-format
 //! clipboard) both calls do nothing and copy and paste stay plain text.
 //!
+//! The RTF goes on only while the clipboard still holds the copy's own
+//! text, checked again just before the write: another app may have copied
+//! since gpui wrote it, and our RTF beside their text would paste our
+//! formatting over their words.
+//!
 //! A failed write leaves the copy as plain text; a failed read pastes the
 //! plain text, and so does an RTF past [`MAX_RTF`], read no further.
 
@@ -28,9 +33,16 @@ fn bounded_copy(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Add `rtf` to the copy on the clipboard.
-pub(crate) fn write_rtf(rtf: String) {
-    imp::write_rtf(&rtf);
+/// Add `rtf` to the copy on the clipboard, if it still holds `text`.
+pub(crate) fn write_rtf(rtf: String, text: &str) {
+    imp::write_rtf(&rtf, text);
+}
+
+/// Whether the clipboard's text `held` is the copy's `text`, line endings
+/// compared loosely (the OS may hand CRLF back).
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+fn same_text(held: &str, text: &str) -> bool {
+    held.replace("\r\n", "\n") == text.replace("\r\n", "\n")
 }
 
 /// The RTF on the clipboard, if any.
@@ -46,8 +58,12 @@ mod imp {
     /// `NSPasteboardTypeRTF`.
     const RTF: &str = "public.rtf";
 
-    pub(super) fn write_rtf(rtf: &str) {
+    pub(super) fn write_rtf(rtf: &str, text: &str) {
         let board = NSPasteboard::generalPasteboard();
+        let held = board.stringForType(&NSString::from_str("public.utf8-plain-text"));
+        if !held.is_some_and(|held| super::same_text(&held.to_string(), text)) {
+            return;
+        }
         let kind = NSString::from_str(RTF);
         // SAFETY: no owner object; the type is a plain NSString.
         unsafe { board.addTypes_owner(&NSArray::from_slice(&[&*kind]), None) };
@@ -86,6 +102,7 @@ mod imp {
     }
 
     const GMEM_MOVEABLE: u32 = 0x0002;
+    const CF_UNICODETEXT: u32 = 13;
 
     /// The registered "Rich Text Format" clipboard format, `None` if
     /// registering failed.
@@ -122,13 +139,37 @@ mod imp {
         }
     }
 
-    pub(super) fn write_rtf(rtf: &str) {
+    /// The clipboard's Unicode text; the clipboard must be open.
+    fn held_text() -> Option<String> {
+        // SAFETY: the handle belongs to the open clipboard; it is read only
+        // while locked, within the size the allocation reports.
+        unsafe {
+            let mem = GetClipboardData(CF_UNICODETEXT);
+            if mem.is_null() {
+                return None;
+            }
+            let ptr = GlobalLock(mem).cast::<u16>();
+            if ptr.is_null() {
+                return None;
+            }
+            let units = std::slice::from_raw_parts(ptr, GlobalSize(mem) / 2);
+            let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+            let text = String::from_utf16_lossy(&units[..end]);
+            GlobalUnlock(mem);
+            Some(text)
+        }
+    }
+
+    pub(super) fn write_rtf(rtf: &str, text: &str) {
         let Some(format) = format() else {
             return;
         };
         let Some(_open) = Open::new() else {
             return;
         };
+        if !held_text().is_some_and(|held| super::same_text(&held, text)) {
+            return;
+        }
         let bytes = rtf.as_bytes();
         // SAFETY: a moveable block one byte longer than the RTF, filled and
         // NUL-terminated while locked; the clipboard owns it once
@@ -183,7 +224,14 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_RTF, bounded_copy};
+    use super::{MAX_RTF, bounded_copy, same_text};
+
+    #[test]
+    fn the_rtf_goes_only_beside_its_own_text() {
+        assert!(same_text("a\r\nb", "a\nb"));
+        assert!(same_text("bold", "bold"));
+        assert!(!same_text("theirs", "bold"));
+    }
 
     #[test]
     fn a_read_is_bounded() {
@@ -198,7 +246,7 @@ mod tests {
 
 #[cfg(not(any(target_os = "macos", windows)))]
 mod imp {
-    pub(super) fn write_rtf(_rtf: &str) {}
+    pub(super) fn write_rtf(_rtf: &str, _text: &str) {}
 
     pub(super) fn read_rtf() -> Option<Vec<u8>> {
         None
