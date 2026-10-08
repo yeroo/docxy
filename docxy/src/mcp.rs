@@ -194,9 +194,10 @@ fn tool_defs() -> Json {
         tool(
             "docxy_find",
             "Find all occurrences of a query in the live document; returns match positions and the containing paragraph. \
-             Only text the editor can edit is searched (not tracked changes, fields, footnote refs, equations, \
-             SmartArt, chart titles, or links holding such markup, bookmarks or proofing marks); \
-             start/end count only that text, so they need not index the returned text.",
+             Only text the editor can edit is searched (not tracked changes, field results, footnote refs, \
+             equations, SmartArt, chart titles, or links holding such markup, bookmarks or proofing marks); \
+             start/end count only that text plus one position per field that shows a result, so they \
+             need not index the returned text.",
             vec![
                 ("query", prop("string", "Text to search for.")),
                 (
