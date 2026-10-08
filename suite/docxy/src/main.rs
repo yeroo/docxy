@@ -19255,14 +19255,23 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A cancelled pick keeps the backstage on its page (#1078).
+        let page = open_mode::BackstagePage {
+            backstage: self.backstage,
+            new: self.bs_new,
+            export: self.bs_export,
+            info: self.bs_info,
+            info_status: self.bs_info_status.take(),
+        }
+        .after_open_pick(path.as_deref());
         if let Some(path) = path {
             self.open_picked(&path, mode);
         }
-        self.backstage = false;
-        self.bs_new = false;
-        self.bs_export = false;
-        self.bs_info = false;
-        self.bs_info_status = None;
+        self.backstage = page.backstage;
+        self.bs_new = page.new;
+        self.bs_export = page.export;
+        self.bs_info = page.info;
+        self.bs_info_status = page.info_status;
         self.persist(cx);
         self.refocus(window, cx);
     }
