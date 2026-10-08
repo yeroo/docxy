@@ -4030,6 +4030,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #729: wb.open of a missing file answers Err and keeps the open
+    /// workbook (path and cells) untouched.
+    #[test]
+    fn wb_open_of_a_missing_file_is_an_error_and_keeps_the_workbook() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-open-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app();
+        set(&mut a, "A1", "a");
+        set(&mut a, "B1", "1");
+        let missing = dir.join("missing.xlsx");
+
+        let err = dispatch(
+            &mut a,
+            "wb.open",
+            &Json::obj(vec![(
+                "path",
+                Json::Str(missing.to_string_lossy().into_owned()),
+            )]),
+        )
+        .unwrap_err();
+        assert!(err.contains("(os error"), "{err}");
+        assert_eq!(
+            std::path::Path::new(&a.path),
+            std::path::Path::new("ctl-test.xlsx")
+        );
+        assert_eq!(get_value(&a, "A1"), CellValue::Text("a".into()));
+        assert_eq!(get_value(&a, "B1"), CellValue::Number(1.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A CSV-bound workbook reloads with the delimiter it was saved with:
     /// a first row with as many `;` as `,` is not re-split, and saving again
     /// writes the same bytes.
