@@ -6300,8 +6300,10 @@ mod tests {
         assert!(err.contains("three, four"), "{err}");
     }
 
+    /// The Report tab's View Reports menus and their reports (#1123), each
+    /// report naming the menu it sits in.
     #[test]
-    fn project_report_tab_is_listed_with_no_groups() {
+    fn project_report_tab_lists_view_reports() {
         let json = ribbon_json_for(crate::Kind::Project, false, false, false, |_| false);
         let report = json
             .get("tabs")
@@ -6313,7 +6315,26 @@ mod tests {
             .unwrap();
         assert_eq!(report.get_str("kind"), Some("ribbon"));
         assert_eq!(report.get_str("key_tip"), Some("R"));
-        assert_eq!(report.get("groups"), Some(&Json::Arr(Vec::new())));
+        let groups = report.get("groups").unwrap().as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].get_str("title"), Some("View Reports"));
+        let commands = groups[0].get("commands").unwrap().as_array().unwrap();
+        let labels: Vec<_> = commands.iter().filter_map(|c| c.get_str("label")).collect();
+        for label in ["Dashboards", "Resources", "Costs", "In Progress"] {
+            assert!(labels.contains(&label), "{label}: {labels:?}");
+        }
+        for kind in projcore::report::ReportKind::ALL {
+            let c = commands
+                .iter()
+                .find(|c| c.get_str("label") == Some(kind.title()))
+                .unwrap_or_else(|| panic!("{kind:?}: {labels:?}"));
+            let menu = commands
+                .iter()
+                .find(|m| m.get_str("label") == Some(kind.menu()))
+                .and_then(|m| m.get_str("id"));
+            assert_eq!(c.get_str("menu"), menu, "{kind:?}");
+        }
+        assert_eq!(commands.len(), 4 + projcore::report::ReportKind::ALL.len());
         assert!(ribbon_tab_by_name(crate::Kind::Project, "Report").is_ok());
     }
 

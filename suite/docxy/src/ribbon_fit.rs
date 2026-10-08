@@ -741,7 +741,7 @@ mod tests {
         assert_eq!(tiny.overflow, vec![1, 2], "the highest stays drawn");
     }
 
-    /// Project's Report tab has no groups yet (#370): nothing to fit.
+    /// A tab with no groups has nothing to fit.
     #[test]
     fn an_empty_tab_fits_with_nothing_shown() {
         for width in [0., 400., 1600.] {
