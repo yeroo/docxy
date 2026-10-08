@@ -34,9 +34,23 @@
 //! and `selectAll:` to the panel's responder chain through a target of its
 //! own, and nothing in it reaches gpui (a nil target would fall back to
 //! gpui's app delegate, which deadlocks on an item it did not make).
+//!
+//! Dock > Quit, the Quit Apple Event and logout send AppKit's `terminate:`
+//! straight to gpui, which ends the process without asking about unsaved
+//! work (#1229). [`install`] gives gpui's app delegate an
+//! `applicationShouldTerminate:` that cancels such a terminate and runs
+//! [`quit`] instead, as ⌘Q does. Every quit docxy starts itself goes through
+//! [`end_process`] (or [`resume_quit`]'s last step), which lets its
+//! terminate go ahead.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use gpui::{
-    Action, App, Context, Div, InteractiveElement as _, KeyDownEvent, Keystroke, Window, actions,
+    Action, AnyWindowHandle, App, AppContext as _, AsyncApp, Context, Div, InteractiveElement as _,
+    KeyDownEvent, Keystroke, Window, actions,
 };
 
 use crate::Docxy;
@@ -512,6 +526,9 @@ pub(crate) fn resume_quit(cx: &mut App) {
             return;
         }
     }
+    // The last window going ends the process through AppKit's terminate:,
+    // which must not ask again.
+    allow_terminate();
     let views: Vec<_> = entries.iter().filter_map(|(_, v, _)| v.upgrade()).collect();
     for view in &views {
         view.update(cx, |this, cx| this.apply_quit(cx));
@@ -524,11 +541,156 @@ pub(crate) fn resume_quit(cx: &mut App) {
     }
 }
 
+/// Set once docxy itself ends the process (#1229): AppKit's terminate:
+/// then goes ahead. Never cleared, since the process is ending.
+static TERMINATE_OK: AtomicBool = AtomicBool::new(false);
+
+/// How long a terminate: answered while the app is busy (a native dialog
+/// up) waits before it looks again.
+const TERMINATE_BUSY_RETRY: Duration = Duration::from_millis(100);
+
+/// AppKit's answer to `applicationShouldTerminate:` (#1229).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminateReply {
+    /// NSTerminateNow: docxy is ending the process itself.
+    Now,
+    /// NSTerminateCancel: someone else asked (Dock > Quit, the Quit Apple
+    /// Event, logout); docxy asks its own Quit instead.
+    Cancel,
+}
+
+impl TerminateReply {
+    /// NSApplicationTerminateReply's value.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn ns(self) -> usize {
+        match self {
+            TerminateReply::Cancel => 0,
+            TerminateReply::Now => 1,
+        }
+    }
+}
+
+/// Whether a terminate: goes ahead: only once docxy ended the process.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn terminate_reply(terminate_ok: bool) -> TerminateReply {
+    if terminate_ok {
+        TerminateReply::Now
+    } else {
+        TerminateReply::Cancel
+    }
+}
+
+/// What a cancelled terminate: does once the app is free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AfterCancel {
+    /// No window is left (the last one just closed, which is how gpui
+    /// quits): end the process.
+    EndNow,
+    /// Ask docxy's own Quit, as ⌘Q does.
+    AskQuit,
+}
+
+/// Decided from gpui's live windows, not the registry: the last window's
+/// close removes the window and keeps its registry entry.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn after_cancel(live_windows: usize) -> AfterCancel {
+    if live_windows == 0 {
+        AfterCancel::EndNow
+    } else {
+        AfterCancel::AskQuit
+    }
+}
+
+/// Let the next terminate: go ahead.
+fn allow_terminate() {
+    TERMINATE_OK.store(true, Ordering::SeqCst);
+}
+
+/// End the process. Every quit docxy starts goes through here (a test
+/// scans the sources for one that does not), so on macOS the terminate:
+/// it causes is not cancelled and asked again.
+pub(crate) fn end_process(cx: &mut App) {
+    allow_terminate();
+    cx.quit();
+}
+
+/// Act on a cancelled terminate: with the app free.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn answer_terminate(cx: &mut App) {
+    match after_cancel(cx.windows().len()) {
+        AfterCancel::EndNow => end_process(cx),
+        AfterCancel::AskQuit => quit(cx),
+    }
+}
+
+/// What the app answers terminate: with, kept on the main thread by
+/// [`install`]: a handle to schedule on, and the registry's window handles
+/// to find out whether the app is free.
+type TerminateCx = (AsyncApp, Rc<RefCell<Vec<AnyWindowHandle>>>);
+
+thread_local! {
+    static TERMINATE_CX: RefCell<Option<TerminateCx>> = const { RefCell::new(None) };
+}
+
+/// AppKit asks whether the app may terminate (#1229). Reads only
+/// [`TERMINATE_OK`] and never borrows the app: AppKit can ask while a
+/// native dialog runs inside a gpui update, and a panic here aborts. A
+/// cancel schedules [`answer_terminate`]; with nothing to schedule on,
+/// the terminate goes ahead rather than never.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn should_terminate() -> TerminateReply {
+    let reply = terminate_reply(TERMINATE_OK.load(Ordering::SeqCst));
+    if reply == TerminateReply::Now {
+        return reply;
+    }
+    let scheduled = TERMINATE_CX.with(|c| {
+        let c = c.borrow();
+        let (cx, handles) = c.as_ref()?;
+        let handles = handles.clone();
+        cx.spawn(async move |cx: &mut AsyncApp| {
+            while terminate_busy(cx, &handles) {
+                cx.background_executor().timer(TERMINATE_BUSY_RETRY).await;
+            }
+        })
+        .detach();
+        Some(())
+    });
+    if scheduled.is_some() {
+        TerminateReply::Cancel
+    } else {
+        TerminateReply::Now
+    }
+}
+
+/// Try to run [`answer_terminate`] without panicking on a borrowed app;
+/// `true` when the app is busy and the caller should try again. A live
+/// window's update proves the app free and defers the answer; a handle
+/// that is gone or quitting proves it too (only a borrow is busy), and
+/// with no handle at all no window can be running a dialog.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn terminate_busy(cx: &mut AsyncApp, handles: &Rc<RefCell<Vec<AnyWindowHandle>>>) -> bool {
+    let handles = handles.borrow().clone();
+    for handle in handles {
+        match cx.update_window(handle, |_, _, cx| cx.defer(answer_terminate)) {
+            Ok(()) => return false,
+            Err(e) if e.downcast_ref::<std::cell::BorrowMutError>().is_some() => return true,
+            Err(_) => {}
+        }
+    }
+    cx.update(answer_terminate);
+    false
+}
+
 /// Install the menu bar: the app-wide handlers, the menu bindings and the
-/// bar itself. Built everywhere, so every CI leg type-checks it; only
-/// macOS calls it.
+/// bar itself, and the answer to AppKit's terminate: (#1229). Built
+/// everywhere, so every CI leg type-checks it; only macOS calls it, after
+/// the window registry exists.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn install(cx: &mut App) {
+    let handles = crate::windows::handle_list(cx);
+    TERMINATE_CX.with(|c| *c.borrow_mut() = Some((cx.to_async(), handles)));
+    #[cfg(target_os = "macos")]
+    native::hook_terminate();
     cx.on_action(|_: &MenuQuit, cx| cx.defer(quit));
     cx.on_action(|_: &MenuHide, cx| cx.hide());
     cx.on_action(|_: &MenuHideOthers, cx| cx.hide_other_apps());
@@ -565,11 +727,12 @@ pub(crate) fn install(cx: &mut App) {
 
 /// The menu bar a native dialog runs under: plain AppKit items, no
 /// delegate, and Edit items aimed at [`native::EditTarget`], so neither
-/// AppKit's validation nor an action ever reaches gpui's app delegate.
+/// AppKit's validation nor an action ever reaches gpui's app delegate. And
+/// the `applicationShouldTerminate:` added to that delegate (#1229).
 #[cfg(target_os = "macos")]
 mod native {
     use objc2::rc::Retained;
-    use objc2::runtime::{AnyObject, Bool, NSObject, NSObjectProtocol, Sel};
+    use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, NSObject, NSObjectProtocol, Sel};
     use objc2::{ClassType as _, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem, NSResponder};
     use objc2_foundation::NSString;
@@ -748,6 +911,52 @@ mod native {
         let item = NSMenuItem::new(mtm);
         item.setSubmenu(Some(menu));
         item
+    }
+
+    /// Give gpui's app delegate an `applicationShouldTerminate:` (#1229).
+    /// Its delegate answers only `applicationWillTerminate:`, so Dock >
+    /// Quit and the Quit Apple Event end the process without asking.
+    pub(super) fn hook_terminate() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        // SAFETY: a plain getter.
+        let delegate: Option<Retained<AnyObject>> = unsafe { msg_send![&app, delegate] };
+        let Some(delegate) = delegate else {
+            eprintln!("docxy: no app delegate: Dock Quit will not ask about unsaved work");
+            return;
+        };
+        if !add_should_terminate(delegate.class()) {
+            eprintln!(
+                "docxy: the app delegate already answers applicationShouldTerminate:; \
+                 Dock Quit may not ask about unsaved work"
+            );
+        }
+    }
+
+    /// Add `applicationShouldTerminate:` to `cls`; `false` when the class
+    /// already has one of its own (that one stays).
+    pub(super) fn add_should_terminate(cls: &AnyClass) -> bool {
+        unsafe extern "C-unwind" fn imp(_: *mut AnyObject, _: Sel, _: *mut AnyObject) -> usize {
+            super::should_terminate().ns()
+        }
+        // SAFETY: AppKit calls the method as `(id, SEL, NSApplication *)
+        // -> NSApplicationTerminateReply` (an NSUInteger), which is what the
+        // type string says and what `imp` takes; an IMP is called through
+        // its real signature, never the placeholder one.
+        unsafe {
+            let imp: Imp = std::mem::transmute(
+                imp as unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
+            );
+            objc2::ffi::class_addMethod(
+                cls as *const AnyClass as *mut AnyClass,
+                sel!(applicationShouldTerminate:),
+                imp,
+                c"Q@:@".as_ptr(),
+            )
+            .as_bool()
+        }
     }
 }
 
@@ -1020,5 +1229,131 @@ mod tests {
             checked >= 9,
             "found only {checked} dialogs: is the scan looking?"
         );
+    }
+
+    /// Dock > Quit (#1229): a terminate: docxy did not start is cancelled
+    /// and asked; one docxy started goes ahead.
+    #[test]
+    fn a_terminate_goes_ahead_only_once_docxy_ends_the_process() {
+        assert_eq!(terminate_reply(false), TerminateReply::Cancel);
+        assert_eq!(terminate_reply(true), TerminateReply::Now);
+        assert_eq!(TerminateReply::Cancel.ns(), 0, "NSTerminateCancel");
+        assert_eq!(TerminateReply::Now.ns(), 1, "NSTerminateNow");
+    }
+
+    /// The last window's close removes it and keeps its registry entry,
+    /// then gpui quits: with no live window the cancelled terminate ends
+    /// the process instead of asking nobody and leaving it running.
+    #[test]
+    fn a_cancelled_terminate_with_no_window_ends_the_process() {
+        assert_eq!(after_cancel(0), AfterCancel::EndNow);
+        assert_eq!(after_cancel(1), AfterCancel::AskQuit);
+        assert_eq!(after_cancel(3), AfterCancel::AskQuit);
+    }
+
+    /// The lines of `text` that quit gpui directly: a method call
+    /// (`cx.quit()`) or the function as a value (`App::quit`,
+    /// `cx.update(gpui::App::quit)`). This module's own Quit,
+    /// `macos_menu::quit`, is not one.
+    fn quit_calls(text: &str) -> Vec<usize> {
+        let mut found = Vec::new();
+        for pattern in [".quit()", "App::quit", "::quit)"] {
+            for (at, _) in text.match_indices(pattern) {
+                if pattern == "::quit)" && text[..at].ends_with("macos_menu") {
+                    continue;
+                }
+                found.push(text[..at].matches('\n').count() + 1);
+            }
+        }
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    #[test]
+    fn the_quit_scan_finds_every_form_of_a_gpui_quit() {
+        assert_eq!(quit_calls("cx.update(|cx| cx.quit());"), [1]);
+        assert_eq!(quit_calls("x;\ncx.update(App::quit);"), [2]);
+        assert_eq!(quit_calls("cx.defer(gpui::App::quit)"), [1]);
+        assert_eq!(quit_calls("App::quit(cx);"), [1]);
+        assert_eq!(quit_calls("cx.defer(crate::macos_menu::quit)"), [0usize; 0]);
+        assert_eq!(
+            quit_calls("cx.defer(quit);\nfn quit(cx: &mut App) {}"),
+            [0usize; 0]
+        );
+        assert_eq!(quit_calls("cx.update(end_process)"), [0usize; 0]);
+    }
+
+    /// Every quit docxy starts goes through [`end_process`]: a bare gpui
+    /// quit would have its terminate cancelled and asked on macOS (#1229).
+    /// This module's own code has exactly one, in `end_process`.
+    #[test]
+    fn every_quit_goes_through_end_process() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = vec![src];
+        let mut scanned = 0;
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") || path.ends_with("macos_menu.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            if let Some(line) = quit_calls(&text).first() {
+                panic!(
+                    "{}:{line}: a quit outside macos_menu::end_process",
+                    path.display()
+                );
+            }
+            scanned += 1;
+        }
+        assert!(
+            scanned > 50,
+            "scanned only {scanned} files: is the scan looking?"
+        );
+        let own = include_str!("macos_menu.rs");
+        let own = &own[..own.find("#[cfg(test)]\nmod tests").unwrap()];
+        let start = own.find("pub(crate) fn end_process").unwrap();
+        let end = start + own[start..].find("\n}\n").unwrap();
+        let body_line = |at: usize| own[..at].matches('\n').count() + 1;
+        let calls = quit_calls(own);
+        assert_eq!(calls.len(), 1, "macos_menu.rs quits at lines {calls:?}");
+        assert!(
+            (body_line(start)..=body_line(end)).contains(&calls[0]),
+            "macos_menu.rs:{}: a quit outside end_process",
+            calls[0]
+        );
+        assert!(own[start..end].contains("allow_terminate();\n    cx.quit();"));
+    }
+
+    /// The hook on a class of its own (#1229): it is added once and
+    /// answers the selector AppKit sends. With no app to schedule on (this
+    /// thread never ran `install`), it lets the terminate go ahead rather
+    /// than cancel it with nothing to ask. The real delegate gets the same
+    /// method from `install`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_terminate_hook_answers_should_terminate() {
+        use objc2::rc::Retained;
+        use objc2::runtime::{AnyObject, ClassBuilder, NSObject};
+        use objc2::{ClassType as _, msg_send, sel};
+
+        let cls = ClassBuilder::new(c"DocxyTerminateProbe", NSObject::class())
+            .unwrap()
+            .register();
+        assert!(native::add_should_terminate(cls));
+        assert!(!native::add_should_terminate(cls), "added twice");
+        // SAFETY: NSObject's `new`; the probe has no ivars.
+        let probe: Retained<AnyObject> = unsafe { msg_send![cls, new] };
+        // SAFETY: NSObject's respondsToSelector:.
+        let responds: bool =
+            unsafe { msg_send![&probe, respondsToSelector: sel!(applicationShouldTerminate:)] };
+        assert!(responds);
+        let sender: *const AnyObject = std::ptr::null();
+        // SAFETY: the method just added, with its own signature.
+        let reply: usize = unsafe { msg_send![&probe, applicationShouldTerminate: sender] };
+        assert_eq!(reply, 1, "NSTerminateNow with nothing to schedule on");
     }
 }

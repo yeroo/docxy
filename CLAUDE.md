@@ -41,6 +41,14 @@
   AppKit menu bar meanwhile whose Edit items target an object of its own:
   a nil target falls back to gpui's app delegate, which deadlocks on an
   item gpui did not make. A unit test fails on a bare dialog.
+- Dock > Quit, the Quit Apple Event and logout call `terminate:` directly
+  (#1229). `install` adds `applicationShouldTerminate:` to gpui's app
+  delegate: it reads only an atomic (never the app, which a native dialog
+  may hold) and cancels, and a task then runs `quit` once the app is free
+  (or ends the process when gpui has no live window: the last window's
+  close keeps its registry entry). Every exit docxy starts itself goes
+  through `macos_menu::end_process` (a unit test scans for a bare
+  `cx.quit()`), or `resume_quit`'s apply phase, so its terminate goes ahead.
 
 ## Build info
 

@@ -37359,10 +37359,11 @@ fn main() {
             KeyBinding::new("tab", InsertTabAction, None),
             KeyBinding::new("shift-tab", OutdentAction, None),
         ]);
+        cx.set_global(windows::Registry::default());
         // The menu bar (#1071): ⌘Q, ⌃⌘F and the Edit menu native panels need.
+        // After the registry: Dock Quit's answer reads its handles (#1229).
         #[cfg(target_os = "macos")]
         macos_menu::install(cx);
-        cx.set_global(windows::Registry::default());
         let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
         let options = window_options(bounds, want_harness);
         open_docxy_window(
