@@ -31,12 +31,16 @@
 - `suite/docxy/src/macos_menu.rs` holds the bar as data (`MENUS`). A chord
   reaches one path: `text_input::route` stops the chords `on_key` owns
   (`Role::Window`) and leaves menu-only ones (`Role::Menu`: ⌘Q, ⌘H, ⌘M, ⌘O,
-  ⌘, and ⌃⌘F) to AppKit without `on_key`. Menu bindings live in a key context
+  ⌘, and ⌃⌘F) to AppKit without `on_key`, so on macOS ⌘M minimizes instead
+  of indenting (⌃M still indents). Menu bindings live in a key context
   nothing sets, so gpui never matches them in the window; a click on a
-  window-owned item types its chord into `on_key`.
+  window-owned item types its chord into `on_key`. ⌘⇧Z redoes and never
+  repeats.
 - gpui's menu callbacks `borrow_mut` the app, so a synchronous native dialog
   (rfd) must run through `macos_menu::native_modal`, which swaps in a plain
-  AppKit menu bar meanwhile. A unit test fails on a bare one.
+  AppKit menu bar meanwhile whose Edit items target an object of its own:
+  a nil target falls back to gpui's app delegate, which deadlocks on an
+  item gpui did not make. A unit test fails on a bare dialog.
 
 ## Build info
 

@@ -326,6 +326,23 @@ pub(crate) enum CloseAsk {
     /// secondary window is not restored, so silently dropping its unsaved
     /// work is data loss.
     Force,
+    /// The app's Quit (⌘Q, #1071), for every window: ask only when "ask
+    /// before closing" is on, as the last window's X does, and leave the
+    /// window registered, so the session keeps every window's tabs. The
+    /// quit itself ([`crate::macos_menu::quit`]) closes the windows once
+    /// each has agreed.
+    Quit,
+}
+
+/// Whether a close of this kind asks about unsaved tabs: the app's Quit
+/// asks as the last window's X does, never in a harness.
+pub(crate) fn asks(ask: CloseAsk, ask_on_close: bool, harness: bool) -> bool {
+    match ask {
+        CloseAsk::Setting => ask_on_close,
+        CloseAsk::HarnessQuit => false,
+        CloseAsk::Force => true,
+        CloseAsk::Quit => ask_on_close && !harness,
+    }
 }
 
 /// How a window's close asks, with `windows` open (#587): a non-last
@@ -940,12 +957,15 @@ impl Docxy {
         self.commit_dialog_buffers_for_exit(cx);
         commit_pending_for_exit(&mut self.tabs);
         self.persist(cx);
-        let ask = match ask {
-            CloseAsk::Setting => self.ask_on_close,
-            CloseAsk::HarnessQuit => false,
-            CloseAsk::Force => true,
-        };
+        let app_quit = ask == CloseAsk::Quit;
+        let ask = asks(ask, self.ask_on_close, self.harness);
         if !(ask && self.tabs.iter().any(|t| t.dirty)) {
+            if app_quit {
+                // Persisted above; the quit marks the exit clean once every
+                // window has agreed. Asking again is harmless here (it only
+                // persists), so the quit asks again rather than remember it.
+                return true;
+            }
             // The persist above is the final one, so only the marker is left —
             // for the LAST window, whose close is the app's quit. A secondary
             // window stays unmarked (the run goes on; its crash must still be
@@ -958,6 +978,7 @@ impl Docxy {
             return true;
         }
         self.quitting = true;
+        self.app_quit = app_quit;
         self.quit_discards.clear();
         self.quit_tabs = tab_ids(&self.tabs);
         self.next_quit_prompt(window, cx);
@@ -997,6 +1018,7 @@ impl Docxy {
     /// saved; those answered Don't Save keep their unsaved work.
     fn quit_cancelled(&mut self) {
         self.quitting = false;
+        self.app_quit = false;
         self.quit_discards.clear();
         self.quit_tabs.clear();
     }
@@ -1034,6 +1056,14 @@ impl Docxy {
             windows::seq_of(cx, self.win_id),
         );
         self.last_persist.set(std::time::Instant::now());
+        if std::mem::take(&mut self.app_quit) {
+            // The app's Quit (#1071): this window has agreed; the quit goes
+            // on to the other windows once this update is done.
+            self.quitting = false;
+            self.quit_accepted = true;
+            App::defer(cx, crate::macos_menu::resume_quit);
+            return;
+        }
         let alone = windows::is_alone(cx, self.win_id);
         if alone {
             // The last window's close is the app's quit: the marker can go.

@@ -5,7 +5,10 @@
 //! Undo through the app's menu bar. The suite had none, so all of them did
 //! nothing. [`MENUS`] is the bar, as data, and [`install`] hands it to gpui.
 //!
-//! Three rules keep the bar from changing what the window already does:
+//! Three rules keep the bar from changing what the window already does,
+//! with one exception: on macOS ⌘M is Minimize, as in every Mac app, where
+//! `on_key` took it for Word's Ctrl+M indent. ⌃M still indents, and ⌘⇧M
+//! still outdents.
 //!
 //! * **A chord reaches one path.** AppKit offers a key to the window first
 //!   and to the menu bar only when the window leaves it unhandled. The root's
@@ -13,11 +16,11 @@
 //!   ([`Role::Window`]: ⌘N, ⌘S, ⌘C…, which `on_key` already handles), so the
 //!   menu item never fires a second time. A chord only the menu bar handles
 //!   ([`Role::Menu`]: ⌘Q, ⌘H, ⌘M, ⌘O, ⌘, and ⌃⌘F) skips `on_key` and goes
-//!   on to the menu bar.
+//!   on to the menu bar; of these, only ⌘M did anything in `on_key`.
 //! * **No live binding.** gpui shows an item's shortcut, and AppKit matches
 //!   it, from the keymap. Every binding here is in [`MENU_CONTEXT`], which
-//!   no element sets, so gpui never matches one in the window and `on_key`
-//!   keeps every key it had.
+//!   no element sets, so gpui never matches one in the window: the bindings
+//!   take no key from `on_key`.
 //! * **A click runs the key.** Clicking a window-owned item types its chord
 //!   into `on_key`, so every guard there (an open dialog, a menu, the find
 //!   bar, a cell being edited) applies to the click as it does to the key.
@@ -28,7 +31,9 @@
 //! when the panel validates or opens a menu. Every such dialog runs through
 //! [`native_modal`], which swaps in a plain AppKit menu bar for the
 //! dialog's lifetime: its Edit items send `undo:`, `cut:`, `copy:`, `paste:`
-//! and `selectAll:` to the panel's text field, and nothing in it calls gpui.
+//! and `selectAll:` to the panel's responder chain through a target of its
+//! own, and nothing in it reaches gpui (a nil target would fall back to
+//! gpui's app delegate, which deadlocks on an item it did not make).
 
 use gpui::{
     Action, App, Context, Div, InteractiveElement as _, KeyDownEvent, Keystroke, Window, actions,
@@ -207,7 +212,9 @@ impl Cmd {
 
     /// Who takes the chord while a suite window has the key. Window-owned
     /// commands are the ones `on_key` handles on every platform (⌘ is its
-    /// Ctrl); a click on one types its chord into `on_key`.
+    /// Ctrl); a click on one types its chord into `on_key`. Menu-only
+    /// chords never reach `on_key` on macOS: ⌘M, its Ctrl+M indent, is
+    /// Minimize there (⌃M still indents).
     pub(crate) fn role(self) -> Role {
         match self {
             Cmd::New
@@ -303,18 +310,21 @@ pub(crate) fn chord_role(k: &Keystroke) -> Option<Role> {
     })
 }
 
-/// The keystroke `on_key` gets for `k` on macOS: ⌘⇧Z is the Mac's Redo,
-/// which `on_key` knows as ⌘Y (its Ctrl+Y); every other key is itself.
-pub(crate) fn mac_alias(k: &Keystroke) -> Keystroke {
+/// The keystroke `on_key` gets for `k` on macOS, and whether it is a
+/// Redo that must not Repeat. ⌘⇧Z is the Mac's Redo, which `on_key` knows
+/// as ⌘Y (its Ctrl+Y), but ⌘Y also repeats the last action when there is
+/// nothing to redo (Word's and Excel's Repeat, #618) and a Mac's Redo does
+/// not. Every other key is itself.
+pub(crate) fn mac_alias(k: &Keystroke) -> (Keystroke, bool) {
     let m = &k.modifiers;
     if k.key == "z" && m.platform && m.shift && !m.control && !m.alt && !m.function {
         let mut y = k.clone();
         y.key = "y".into();
         y.key_char = None;
         y.modifiers.shift = false;
-        return y;
+        return (y, true);
     }
-    k.clone()
+    (k.clone(), false)
 }
 
 /// Whether `k` is Save As: ⌘⇧S, on macOS only. Elsewhere Ctrl+Shift+S
@@ -399,12 +409,33 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         let ev = KeyDownEvent {
-            keystroke: mac_alias(&keystroke),
+            keystroke,
             is_held: false,
             prefer_character_input: false,
         };
         self.ime.forget_key();
-        self.on_key(&ev, window, cx);
+        self.window_chord(&ev, window, cx);
+    }
+
+    /// A window-owned chord, pressed or clicked, into `on_key` through
+    /// [`mac_alias`]; ⌘⇧Z's Redo sets `redo_only` for that one key.
+    pub(crate) fn window_chord(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (keystroke, redo_only) = mac_alias(&ev.keystroke);
+        self.redo_only = redo_only;
+        self.on_key(
+            &KeyDownEvent {
+                keystroke,
+                ..ev.clone()
+            },
+            window,
+            cx,
+        );
+        self.redo_only = false;
     }
 
     /// Whether a menu-only item may run: not under an open dialog, which
@@ -414,28 +445,47 @@ impl Docxy {
     }
 }
 
-/// Quit (⌘Q): close every window through its own close, newest first, as
-/// its close button does: the unsaved-work questions, then the hot-exit
-/// write. A window that asks stays, and the quit stops there; the last
-/// window's close ends the process (`QuitMode::LastWindowClosed`).
+/// Quit (⌘Q): every window agrees through its own close, newest first, as
+/// the last window's X would: the unsaved-work questions when "ask before
+/// closing" is on, then the hot-exit write. No window leaves the registry,
+/// so the session keeps every window's tabs. A window that asks stops the
+/// quit until its last answer, which resumes it ([`resume_quit`]); Cancel
+/// ends it. Once all have agreed, the run is marked clean and the windows
+/// go, the last one ending the process (`QuitMode::LastWindowClosed`).
+///
+/// Deferred by its action handler: a menu action runs inside the active
+/// window's update, where that window cannot be updated again.
 pub(crate) fn quit(cx: &mut App) {
-    for (_, view, handle) in crate::windows::entries_snapshot(cx).into_iter().rev() {
+    for (_, view, _) in crate::windows::entries_snapshot(cx) {
+        if let Some(view) = view.upgrade() {
+            view.update(cx, |this, _| this.quit_accepted = false);
+        }
+    }
+    resume_quit(cx);
+}
+
+/// Go on with a Quit: ask each window that has not answered yet.
+pub(crate) fn resume_quit(cx: &mut App) {
+    let entries = crate::windows::entries_snapshot(cx);
+    for (_, view, handle) in entries.iter().rev() {
         let Some(view) = view.upgrade() else {
             continue;
         };
-        let closed = handle.update(cx, |_, window, cx| {
-            let closed = view.update(cx, |this, cx| {
-                let ask = crate::close::close_ask(crate::windows::count(cx), this.harness);
-                this.window_should_close(ask, window, cx)
-            });
-            if closed {
-                window.remove_window();
-            }
-            closed
+        let agreed = handle.update(cx, |_, window, cx| {
+            view.update(cx, |this, cx| {
+                this.quit_accepted
+                    || this.window_should_close(crate::close::CloseAsk::Quit, window, cx)
+            })
         });
-        if !matches!(closed, Ok(true)) {
+        if matches!(agreed, Ok(false)) {
             return;
         }
+    }
+    if let Some(view) = entries.first().and_then(|(_, view, _)| view.upgrade()) {
+        view.read(cx).mark_clean_exit();
+    }
+    for (_, _, handle) in entries {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
     }
 }
 
@@ -444,7 +494,7 @@ pub(crate) fn quit(cx: &mut App) {
 /// macOS calls it.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn install(cx: &mut App) {
-    cx.on_action(|_: &MenuQuit, cx| quit(cx));
+    cx.on_action(|_: &MenuQuit, cx| cx.defer(quit));
     cx.on_action(|_: &MenuHide, cx| cx.hide());
     cx.on_action(|_: &MenuHideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &MenuShowAll, cx| cx.unhide_other_apps());
@@ -478,21 +528,22 @@ pub(crate) fn install(cx: &mut App) {
     }));
 }
 
-/// The menu bar a native dialog runs under: plain AppKit items with
-/// standard selectors and no delegate, each tagged -1 so gpui's app
-/// delegate (the end of the responder chain) finds no action for it and
-/// never calls back into the app.
+/// The menu bar a native dialog runs under: plain AppKit items, no
+/// delegate, and Edit items aimed at [`native::EditTarget`], so neither
+/// AppKit's validation nor an action ever reaches gpui's app delegate.
 #[cfg(target_os = "macos")]
 mod native {
     use objc2::rc::Retained;
-    use objc2::runtime::Sel;
-    use objc2::{MainThreadMarker, MainThreadOnly as _, sel};
-    use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
+    use objc2::runtime::{AnyObject, Bool, NSObject, NSObjectProtocol, Sel};
+    use objc2::{ClassType as _, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+    use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem, NSResponder};
     use objc2_foundation::NSString;
 
-    /// The menu bar that was up, put back on drop.
+    /// The menu bar that was up, put back on drop, and the target of the
+    /// bar put up meanwhile (a menu item does not retain its target).
     pub(super) struct Swap {
         saved: Option<Retained<NSMenu>>,
+        _target: Retained<EditTarget>,
     }
 
     impl Swap {
@@ -501,11 +552,13 @@ mod native {
             let mtm = MainThreadMarker::new()?;
             let app = NSApplication::sharedApplication(mtm);
             let saved = app.mainMenu();
+            let target = EditTarget::new(mtm);
             let cmd = NSEventModifierFlags::Command;
             let cmd_shift = cmd | NSEventModifierFlags::Shift;
             let bar = NSMenu::new(mtm);
             let app_menu = NSMenu::new(mtm);
-            app_menu.addItem(&item(mtm, "Hide docxy", sel!(hide:), "h", cmd));
+            // NSApplication answers hide: itself, before its delegate.
+            app_menu.addItem(&item(mtm, "Hide docxy", sel!(hide:), "h", cmd, None));
             bar.addItem(&holder(mtm, &app_menu));
             let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Edit"));
             for (title, action, key, mask) in [
@@ -516,11 +569,14 @@ mod native {
                 ("Paste", sel!(paste:), "v", cmd),
                 ("Select All", sel!(selectAll:), "a", cmd),
             ] {
-                edit.addItem(&item(mtm, title, action, key, mask));
+                edit.addItem(&item(mtm, title, action, key, mask, Some(&target)));
             }
             bar.addItem(&holder(mtm, &edit));
             app.setMainMenu(Some(&bar));
-            Some(Swap { saved })
+            Some(Swap {
+                saved,
+                _target: target,
+            })
         }
     }
 
@@ -532,12 +588,110 @@ mod native {
         }
     }
 
+    define_class!(
+        /// The Edit items' target. A nil target would let AppKit fall back
+        /// to gpui's app delegate, which answers these selectors and, for an
+        /// item it never made, deadlocks on its own lock. This one sends
+        /// each action to the key window's responder chain, stopping short
+        /// of the application and its delegate, and is the only object
+        /// AppKit asks to validate the items.
+        // SAFETY: NSObject has no subclassing requirements, and the class
+        // has no ivars and no Drop.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        struct EditTarget;
+
+        unsafe impl NSObjectProtocol for EditTarget {}
+
+        impl EditTarget {
+            #[unsafe(method(undo:))]
+            fn undo(&self, sender: Option<&AnyObject>) {
+                self.forward(sel!(undo:), sender);
+            }
+
+            #[unsafe(method(redo:))]
+            fn redo(&self, sender: Option<&AnyObject>) {
+                self.forward(sel!(redo:), sender);
+            }
+
+            #[unsafe(method(cut:))]
+            fn cut(&self, sender: Option<&AnyObject>) {
+                self.forward(sel!(cut:), sender);
+            }
+
+            #[unsafe(method(copy:))]
+            fn copy(&self, sender: Option<&AnyObject>) {
+                self.forward(sel!(copy:), sender);
+            }
+
+            #[unsafe(method(paste:))]
+            fn paste(&self, sender: Option<&AnyObject>) {
+                self.forward(sel!(paste:), sender);
+            }
+
+            #[unsafe(method(selectAll:))]
+            fn select_all(&self, sender: Option<&AnyObject>) {
+                self.forward(sel!(selectAll:), sender);
+            }
+
+            #[unsafe(method(validateMenuItem:))]
+            fn validate_menu_item(&self, item: &NSMenuItem) -> Bool {
+                let Some(responder) = item.action().and_then(|a| responder_for(self.mtm(), a))
+                else {
+                    return Bool::NO;
+                };
+                if responder.respondsToSelector(sel!(validateMenuItem:)) {
+                    // SAFETY: it answers validateMenuItem:, which takes the
+                    // item and returns BOOL.
+                    unsafe { msg_send![&*responder, validateMenuItem: item] }
+                } else {
+                    Bool::YES
+                }
+            }
+        }
+    );
+
+    impl EditTarget {
+        fn new(mtm: MainThreadMarker) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(());
+            // SAFETY: NSObject's designated initialiser.
+            unsafe { msg_send![super(this), init] }
+        }
+
+        fn forward(&self, action: Sel, sender: Option<&AnyObject>) {
+            if let Some(responder) = responder_for(self.mtm(), action) {
+                // SAFETY: the responder answers `action`, a standard action
+                // taking its sender.
+                unsafe { responder.tryToPerform_with(action, sender) };
+            }
+        }
+    }
+
+    /// The first responder in the key window's chain that answers `action`,
+    /// up to (not including) the application, whose delegate is gpui's.
+    fn responder_for(mtm: MainThreadMarker, action: Sel) -> Option<Retained<NSResponder>> {
+        let window = NSApplication::sharedApplication(mtm).keyWindow()?;
+        let mut next = window.firstResponder();
+        while let Some(responder) = next {
+            if responder.isKindOfClass(NSApplication::class()) {
+                return None;
+            }
+            if responder.respondsToSelector(action) {
+                return Some(responder);
+            }
+            // SAFETY: a plain getter.
+            next = unsafe { responder.nextResponder() };
+        }
+        None
+    }
+
     fn item(
         mtm: MainThreadMarker,
         title: &str,
         action: Sel,
         key: &str,
         mask: NSEventModifierFlags,
+        target: Option<&EditTarget>,
     ) -> Retained<NSMenuItem> {
         // SAFETY: each selector is a standard responder action, which AppKit
         // sends with the item as its sender.
@@ -550,7 +704,8 @@ mod native {
             )
         };
         item.setKeyEquivalentModifierMask(mask);
-        item.setTag(-1);
+        // SAFETY: the target outlives the bar (`Swap` holds it).
+        unsafe { item.setTarget(target.map(|t| &***t)) };
         item
     }
 
@@ -704,7 +859,8 @@ mod tests {
 
     #[test]
     fn cmd_shift_z_reaches_on_key_as_redo() {
-        let y = mac_alias(&key("cmd-shift-z"));
+        let (y, redo_only) = mac_alias(&key("cmd-shift-z"));
+        assert!(redo_only, "a Mac's Redo does not fall back to Repeat");
         assert_eq!(y.key, "y");
         assert_eq!(
             y.modifiers,
@@ -720,7 +876,7 @@ mod tests {
             "alt-cmd-shift-z",
             "cmd-shift-s",
         ] {
-            assert_eq!(mac_alias(&key(chord)), key(chord), "{chord}");
+            assert_eq!(mac_alias(&key(chord)), (key(chord), false), "{chord}");
         }
     }
 
@@ -732,9 +888,24 @@ mod tests {
         assert!(!is_save_as(&key("ctrl-shift-s"), true));
     }
 
+    /// Whether the text ending at `at` is inside the open parentheses of a
+    /// `native_modal(` call: walking back, every `(` that is not closed
+    /// again before `at` encloses it.
+    fn inside_native_modal(text: &str, at: usize) -> bool {
+        let mut depth = 0usize;
+        for (i, c) in text[..at].char_indices().rev() {
+            match c {
+                ')' => depth += 1,
+                '(' if depth > 0 => depth -= 1,
+                '(' if text[..i].ends_with("native_modal") => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// The synchronous rfd dialog calls in `text`, as (line, call, whether
-    /// it runs under [`native_modal`]): wrapped when the nearest
-    /// `native_modal(` before it has no `;` in between.
+    /// it runs inside [`native_modal`]'s parentheses).
     fn dialog_calls(text: &str) -> Vec<(usize, &'static str, bool)> {
         let mut calls = vec![
             ".save_file()",
@@ -749,13 +920,11 @@ mod tests {
         let mut found = Vec::new();
         for call in calls {
             for (at, _) in text.match_indices(call) {
-                let before = &text[..at];
-                let wrapped = before
-                    .rfind("native_modal(")
-                    .is_some_and(|start| !before[start..].contains(';'));
-                found.push((before.matches('\n').count() + 1, call, wrapped));
+                let line = text[..at].matches('\n').count() + 1;
+                found.push((line, call, inside_native_modal(text, at)));
             }
         }
+        found.sort();
         found
     }
 
@@ -763,8 +932,23 @@ mod tests {
     fn the_scan_tells_a_wrapped_dialog_from_a_bare_one() {
         let wrapped = "let p = native_modal(|| rfd::FileDialog::new()\n    .save_file());";
         assert_eq!(dialog_calls(wrapped), [(2, ".save_file()", true)]);
+        let with_lets = "native_modal(|| {\n    let d = rfd::FileDialog::new();\n    let d = d.add_filter(\"A (*.a)\", &[\"a\"]);\n    d.pick_file()\n})";
+        assert_eq!(dialog_calls(with_lets), [(4, ".pick_file()", true)]);
         let bare = "native_modal(|| x);\nlet p = rfd::FileDialog::new().pick_file();";
         assert_eq!(dialog_calls(bare), [(2, ".pick_file()", false)]);
+        let tail = "fn a() -> X {\n    native_modal(|| x)\n}\nfn b() {\n    d.save_file()\n}";
+        assert_eq!(dialog_calls(tail), [(5, ".save_file()", false)]);
+        let arms =
+            "match m {\n    A => native_modal(|| d.save_file()),\n    B => d.pick_file(),\n}";
+        assert_eq!(
+            dialog_calls(arms),
+            [(2, ".save_file()", true), (3, ".pick_file()", false)]
+        );
+        let branches = "if c {\n    native_modal(|| d.save_file())\n} else {\n    d.save_file()\n}";
+        assert_eq!(
+            dialog_calls(branches),
+            [(2, ".save_file()", true), (4, ".save_file()", false)]
+        );
         let message = "rfd::MessageDialog::new().show();";
         assert_eq!(dialog_calls(message), [(1, ".show()", false)]);
         assert!(dialog_calls("menu.show();").is_empty());

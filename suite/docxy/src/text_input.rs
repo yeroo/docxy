@@ -239,11 +239,7 @@ impl Docxy {
             Route::Defer => self.ime.defer(ev),
             Route::AppStop => {
                 self.ime.forget_key();
-                let ev = KeyDownEvent {
-                    keystroke: crate::macos_menu::mac_alias(&ev.keystroke),
-                    ..ev.clone()
-                };
-                self.on_key(&ev, window, cx);
+                self.window_chord(ev, window, cx);
                 cx.stop_propagation();
             }
             Route::AppPropagate => {

@@ -2885,3 +2885,17 @@ fn a_close_asks_by_window_count_then_harness_then_setting() {
     assert!(close_ask(1, true) == CloseAsk::HarnessQuit);
     assert!(close_ask(1, false) == CloseAsk::Setting);
 }
+
+/// The app's Quit (#1071) asks as the last window's X does, in every
+/// window: only when "ask before closing" is on, so a quit with the
+/// setting off is the silent hot exit even with several windows open,
+/// where a secondary window's own close always asks.
+#[test]
+fn quit_asks_by_the_setting_in_every_window() {
+    assert!(asks(CloseAsk::Quit, true, false));
+    assert!(!asks(CloseAsk::Quit, false, false));
+    assert!(!asks(CloseAsk::Quit, true, true));
+    assert!(asks(CloseAsk::Force, false, false));
+    assert!(asks(CloseAsk::Setting, true, false));
+    assert!(!asks(CloseAsk::HarnessQuit, true, true));
+}

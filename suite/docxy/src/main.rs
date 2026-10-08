@@ -4293,6 +4293,16 @@ struct Docxy {
     /// The window is closing through its per-document questions (#630):
     /// a close prompt with `quit` is on the tab being asked about.
     quitting: bool,
+    /// The key `on_key` is handling is macOS's ⌘⇧Z (#1071): Redo, never
+    /// Repeat. Set only for that one call.
+    redo_only: bool,
+    /// The questions `quitting` asks are for the app's Quit (#1071), not
+    /// this window's close: the last answer hands the quit on.
+    app_quit: bool,
+    /// This window answered the app's Quit's questions (#1071): its last
+    /// write forgot what was answered Don't Save, so the quit does not ask
+    /// again. Cleared when a new Quit starts.
+    quit_accepted: bool,
     /// The tabs answered Don't Save while quitting, by index: their unsaved
     /// work is forgotten, but only once the quit goes ahead.
     quit_discards: Vec<usize>,
@@ -11122,6 +11132,9 @@ impl Docxy {
             theme_pref,
             ask_on_close,
             quitting: false,
+            redo_only: false,
+            app_quit: false,
+            quit_accepted: false,
             quit_discards: Vec::new(),
             quit_tabs: Vec::new(),
             quit_ready: false,
@@ -15109,7 +15122,8 @@ impl Docxy {
     /// it takes the selection back from a chart first, as Ctrl+B does (see
     /// `chart_hand_back`).
     fn sheet_redo_or_repeat(&mut self, cx: &mut Context<Self>) {
-        let may_repeat = !self.sheet_protected();
+        // macOS's ⌘⇧Z only redoes (#1071).
+        let may_repeat = !self.sheet_protected() && !self.redo_only;
         let (had_redo, repeats) = self.active_sheet().map_or((false, false), |v| {
             let idle = v.editing.is_none();
             let had_redo = idle && !v.redo.is_empty();
@@ -21601,6 +21615,7 @@ impl Docxy {
         // Undo, Redo and Repeat change the document but keep a current Repeat
         // record current (#618).
         let untouched = repeat_untouched(&self.repeat);
+        let redo_only = self.redo_only;
         let history = (ctrl && matches!(key.as_str(), "z" | "y")) || (!ctrl && key == "f4");
         let autocorrect = self.autocorrect.clone();
         let (Some(ed), repeat) = self.edit_target_and_repeat() else {
@@ -21635,7 +21650,9 @@ impl Docxy {
                     ed.undo();
                     true
                 }
-                // Redo, or Repeat with nothing to redo (#618).
+                // Redo, or Repeat with nothing to redo (#618); macOS's ⌘⇧Z
+                // only redoes (#1071).
+                "y" if redo_only => ed.can_redo() && ed.redo(),
                 "y" => redo_or_repeat(ed, repeat),
                 "enter" if shift => yes(|| ed.insert_break(docxcore::model::BreakKind::Column)),
                 "enter" => yes(|| ed.insert_break(docxcore::model::BreakKind::Page)),
