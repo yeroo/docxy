@@ -199,10 +199,32 @@ pub(crate) fn reopen_step(
     }
 }
 
-/// Whether a native Open pick leaves the backstage (#1078): a picked file
-/// does, a cancelled dialog keeps the page the person was on.
-pub(crate) fn pick_leaves_backstage(picked: Option<&Path>) -> bool {
-    picked.is_some()
+/// The backstage's page flags, as a native Open pick sees them (#1078).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BackstagePage {
+    pub(crate) backstage: bool,
+    pub(crate) new: bool,
+    pub(crate) export: bool,
+    pub(crate) info: bool,
+    pub(crate) info_status: Option<(usize, Result<String, String>)>,
+}
+
+impl BackstagePage {
+    /// The flags once a native Open pick ends: a picked file leaves the
+    /// backstage, a cancelled dialog keeps the page the person was on, as
+    /// Word and Excel do.
+    pub(crate) fn after_open_pick(self, picked: Option<&Path>) -> Self {
+        if picked.is_none() {
+            return self;
+        }
+        Self {
+            backstage: false,
+            new: false,
+            export: false,
+            info: false,
+            info_status: None,
+        }
+    }
 }
 
 /// The caption a tab shows: its file name, then the access suffix.

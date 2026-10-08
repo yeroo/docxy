@@ -3,9 +3,7 @@
 //! the backstop and the session.
 
 use crate::dialog_host::dialog_click;
-use crate::open_mode::{
-    Access, OpenMode, PROTECTED_STATUS, pick_leaves_backstage, read_only_refusal,
-};
+use crate::open_mode::{Access, BackstagePage, OpenMode, PROTECTED_STATUS, read_only_refusal};
 // `Stamp` is used only by the Windows-only Protected View tests.
 #[cfg(windows)]
 use crate::trusted::Stamp;
@@ -741,6 +739,23 @@ fn old_session_loads_unprotected() {
 
 #[test]
 fn a_cancelled_open_pick_keeps_the_backstage() {
-    assert!(!pick_leaves_backstage(None));
-    assert!(pick_leaves_backstage(Some(Path::new("book.xlsx"))));
+    let page = BackstagePage {
+        backstage: true,
+        new: false,
+        export: true,
+        info: true,
+        info_status: Some((2, Ok("done".into()))),
+    };
+    assert_eq!(page.clone().after_open_pick(None), page);
+    let left = page.after_open_pick(Some(Path::new("book.xlsx")));
+    assert_eq!(
+        left,
+        BackstagePage {
+            backstage: false,
+            new: false,
+            export: false,
+            info: false,
+            info_status: None,
+        }
+    );
 }
