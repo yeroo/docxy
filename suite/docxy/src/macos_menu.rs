@@ -1251,8 +1251,42 @@ mod tests {
         assert_eq!(after_cancel(3), AfterCancel::AskQuit);
     }
 
+    /// The lines of `text` that quit gpui directly: a method call
+    /// (`cx.quit()`) or the function as a value (`App::quit`,
+    /// `cx.update(gpui::App::quit)`). This module's own Quit,
+    /// `macos_menu::quit`, is not one.
+    fn quit_calls(text: &str) -> Vec<usize> {
+        let mut found = Vec::new();
+        for pattern in [".quit()", "App::quit", "::quit)"] {
+            for (at, _) in text.match_indices(pattern) {
+                if pattern == "::quit)" && text[..at].ends_with("macos_menu") {
+                    continue;
+                }
+                found.push(text[..at].matches('\n').count() + 1);
+            }
+        }
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    #[test]
+    fn the_quit_scan_finds_every_form_of_a_gpui_quit() {
+        assert_eq!(quit_calls("cx.update(|cx| cx.quit());"), [1]);
+        assert_eq!(quit_calls("x;\ncx.update(App::quit);"), [2]);
+        assert_eq!(quit_calls("cx.defer(gpui::App::quit)"), [1]);
+        assert_eq!(quit_calls("App::quit(cx);"), [1]);
+        assert_eq!(quit_calls("cx.defer(crate::macos_menu::quit)"), [0usize; 0]);
+        assert_eq!(
+            quit_calls("cx.defer(quit);\nfn quit(cx: &mut App) {}"),
+            [0usize; 0]
+        );
+        assert_eq!(quit_calls("cx.update(end_process)"), [0usize; 0]);
+    }
+
     /// Every quit docxy starts goes through [`end_process`]: a bare gpui
     /// quit would have its terminate cancelled and asked on macOS (#1229).
+    /// This module's own code has exactly one, in `end_process`.
     #[test]
     fn every_quit_goes_through_end_process() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1267,8 +1301,7 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            if let Some(at) = text.find(".quit()") {
-                let line = text[..at].matches('\n').count() + 1;
+            if let Some(line) = quit_calls(&text).first() {
                 panic!(
                     "{}:{line}: a quit outside macos_menu::end_process",
                     path.display()
@@ -1281,14 +1314,25 @@ mod tests {
             "scanned only {scanned} files: is the scan looking?"
         );
         let own = include_str!("macos_menu.rs");
-        let body = &own[own.find("pub(crate) fn end_process").unwrap()..];
-        let body = &body[..body.find("\n}\n").unwrap()];
-        assert!(body.contains("allow_terminate();\n    cx.quit();"));
+        let own = &own[..own.find("#[cfg(test)]\nmod tests").unwrap()];
+        let start = own.find("pub(crate) fn end_process").unwrap();
+        let end = start + own[start..].find("\n}\n").unwrap();
+        let body_line = |at: usize| own[..at].matches('\n').count() + 1;
+        let calls = quit_calls(own);
+        assert_eq!(calls.len(), 1, "macos_menu.rs quits at lines {calls:?}");
+        assert!(
+            (body_line(start)..=body_line(end)).contains(&calls[0]),
+            "macos_menu.rs:{}: a quit outside end_process",
+            calls[0]
+        );
+        assert!(own[start..end].contains("allow_terminate();\n    cx.quit();"));
     }
 
-    /// The hook on a class of its own (#1229): it is added once, answers
-    /// the selector AppKit sends, and lets a terminate docxy started go
-    /// ahead. The real delegate gets the same method from `install`.
+    /// The hook on a class of its own (#1229): it is added once and
+    /// answers the selector AppKit sends. With no app to schedule on (this
+    /// thread never ran `install`), it lets the terminate go ahead rather
+    /// than cancel it with nothing to ask. The real delegate gets the same
+    /// method from `install`.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_terminate_hook_answers_should_terminate() {
@@ -1307,10 +1351,9 @@ mod tests {
         let responds: bool =
             unsafe { msg_send![&probe, respondsToSelector: sel!(applicationShouldTerminate:)] };
         assert!(responds);
-        allow_terminate();
         let sender: *const AnyObject = std::ptr::null();
         // SAFETY: the method just added, with its own signature.
         let reply: usize = unsafe { msg_send![&probe, applicationShouldTerminate: sender] };
-        assert_eq!(reply, 1, "NSTerminateNow once docxy ends the process");
+        assert_eq!(reply, 1, "NSTerminateNow with nothing to schedule on");
     }
 }
