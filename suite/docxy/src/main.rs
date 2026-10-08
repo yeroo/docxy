@@ -731,6 +731,9 @@ struct SheetView {
     /// move, a click's selection change), which a data-validation alert holds
     /// for Yes or OK; `Move(0, 0)`, nothing, when no commit runs.
     dv_then: DvThen,
+    /// The run of Tab / Shift+Tab entries the selection last made, which Enter
+    /// ends by returning to the run's first column (#1079).
+    tab_run: Option<TabRun>,
     /// Circle Invalid Data's circles: (sheet, row, col). View state, never
     /// saved, and a circle goes when its cell is valid (#689).
     circles: Vec<(usize, u32, u32)>,
@@ -1288,6 +1291,16 @@ fn act_restamps_clip(act: SheetAct) -> bool {
         act,
         SheetAct::Paste | SheetAct::PasteAs(_) | SheetAct::PasteSpecial
     )
+}
+
+/// A run of Tab / Shift+Tab entries: the column it began in, and the cell the
+/// last of them left the selection on. The run is over once the selection is
+/// anywhere else (#1079).
+#[derive(Clone, Copy)]
+struct TabRun {
+    sheet: usize,
+    start_col: u32,
+    at: (u32, u32),
 }
 
 /// What a commit does once its entry is in: the move a key makes, or the
@@ -3215,6 +3228,45 @@ impl SheetView {
         self.move_sel(dr, dc);
         self.prune_circles();
         Some(committed)
+    }
+
+    /// Tab (`dc` = 1) or Shift+Tab (-1): commit and step sideways, noting the
+    /// column the run of them began in so a later Enter can return to it
+    /// (#1079). A refused entry neither moves nor changes the run; one held
+    /// on a data-validation alert extends it, for Yes or OK makes the move.
+    fn tab_commit(&mut self, dc: i32) -> Option<bool> {
+        let (r, c) = self.sel;
+        let start = self
+            .tab_run
+            .filter(|t| t.sheet == self.active && t.at == self.sel)
+            .map_or(c, |t| t.start_col);
+        let res = self.commit_and_move(0, dc);
+        if res.is_some() || self.dv_pending.is_some() {
+            self.tab_run = Some(TabRun {
+                sheet: self.active,
+                start_col: start,
+                at: (r, (c as i32 + dc).max(0) as u32),
+            });
+        }
+        res
+    }
+
+    /// Enter (Shift+Enter: `back`): commit and move as the Editing options
+    /// say; a plain downward Enter ending a run of Tabs goes down in the
+    /// run's first column instead (#1079). A refused entry changes nothing.
+    fn enter_commit(&mut self, back: bool) -> Option<bool> {
+        let (dr, mut dc) = self.enter_delta(back);
+        if !back && dr == 1 && dc == 0 {
+            if let Some(t) = self
+                .tab_run
+                .filter(|t| t.sheet == self.active && t.at == self.sel)
+            {
+                dc = t.start_col as i32 - self.sel.1 as i32;
+            }
+        }
+        let res = self.commit_and_move(dr, dc)?;
+        self.tab_run = None;
+        Some(res)
     }
 
     /// Commit the editor, leaving the follow-up (`then`) to the caller; a
@@ -9721,6 +9773,7 @@ fn new_sheet_surface() -> Surface {
         entry_error: None,
         dv_pending: None,
         dv_then: DvThen::Move(0, 0),
+        tab_run: None,
         circles: Vec::new(),
         engine,
         undo: vec![],
@@ -9803,6 +9856,7 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     entry_error: None,
                     dv_pending: None,
                     dv_then: DvThen::Move(0, 0),
+                    tab_run: None,
                     circles: Vec::new(),
                     engine,
                     undo: vec![],
@@ -15260,19 +15314,23 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Commit the in-progress edit (if any) into the workbook, recalc, and move
-    /// the selection by (dr, dc).
-    fn sheet_commit(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) {
-        self.sheet_commit_move(dr, dc, cx);
-    }
-
     /// Commit and move; false (the editor left open, the status saying why)
     /// when the entry was refused.
     fn sheet_commit_move(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) -> bool {
+        self.sheet_commit_with(|v| v.commit_and_move(dr, dc), cx)
+    }
+
+    /// [`Self::sheet_commit_move`] with the sheet's own commit-and-move: Tab
+    /// and Enter keep the run of Tabs (#1079).
+    fn sheet_commit_with(
+        &mut self,
+        f: impl FnOnce(&mut SheetView) -> Option<bool>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let origin = self
             .active_sheet()
             .and_then(|v| v.editing.as_ref().and(v.edit_origin));
-        let res = self.active_sheet_mut().map(|v| v.commit_and_move(dr, dc));
+        let res = self.active_sheet_mut().map(f);
         self.finish_commit(res, origin, cx)
     }
 
@@ -18393,10 +18451,7 @@ impl Docxy {
             // Enter in copy mode pastes and ends it (#664).
             "enter" if !editing && self.sheet_enter_paste(cx) => {}
             "enter" => {
-                let (dr, dc) = self
-                    .active_sheet_mut()
-                    .map_or((0, 0), |v| v.enter_delta(shift));
-                self.sheet_commit(dr, dc, cx)
+                self.sheet_commit_with(|v| v.enter_commit(shift), cx);
             }
             // F2 while editing switches Enter/Edit mode and keeps the text.
             "f2" if editing => {
@@ -21512,7 +21567,8 @@ impl Docxy {
             // selection exactly as the arrows do, and a selection the chart is
             // hiding is one you cannot watch move.
             self.chart_hand_back(cx);
-            return self.sheet_commit(0, 1, cx);
+            self.sheet_commit_with(|v| v.tab_commit(1), cx);
+            return;
         }
         if self.table_tab(false, window, cx) {
             return;
@@ -21605,7 +21661,8 @@ impl Docxy {
                 return;
             }
             self.chart_hand_back(cx);
-            return self.sheet_commit(0, -1, cx);
+            self.sheet_commit_with(|v| v.tab_commit(-1), cx);
+            return;
         }
         if self.table_tab(true, window, cx) {
             return;

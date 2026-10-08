@@ -1970,3 +1970,89 @@ fn autosum_on_a_protected_sheet_is_refused_and_writes_nothing() {
         assert_eq!(v.undo.len(), 0);
     }
 }
+
+// ---- #1079: Enter after a run of Tabs returns to the run's first column -----
+
+fn enter_text(v: &mut SheetView, text: &str) {
+    type_fresh(v, text);
+    v.enter_commit(false).expect("entry accepted");
+}
+
+fn tab_text(v: &mut SheetView, text: &str, dc: i32) {
+    type_fresh(v, text);
+    v.tab_commit(dc).expect("entry accepted");
+}
+
+#[test]
+fn tab_run_then_enter_returns_to_start_column() {
+    let mut v = view();
+    select(&mut v, 0, 0);
+    tab_text(&mut v, "1", 1);
+    tab_text(&mut v, "2", 1);
+    enter_text(&mut v, "3");
+    assert_eq!(v.sel, (1, 0));
+    assert_eq!(value(&v, 0, 2), CellValue::Number(3.0));
+    // The next row continues the habit.
+    tab_text(&mut v, "4", 1);
+    tab_text(&mut v, "5", 1);
+    enter_text(&mut v, "6");
+    assert_eq!(v.sel, (2, 0));
+}
+
+#[test]
+fn shift_tab_run_then_enter_returns_to_start_column() {
+    let mut v = view();
+    select(&mut v, 0, 3);
+    tab_text(&mut v, "1", -1);
+    tab_text(&mut v, "2", -1);
+    enter_text(&mut v, "3");
+    assert_eq!(v.sel, (1, 3));
+}
+
+#[test]
+fn enter_after_arrow_move_does_not_return_to_run_start() {
+    let mut v = view();
+    select(&mut v, 0, 0);
+    tab_text(&mut v, "1", 1);
+    tab_text(&mut v, "2", 1);
+    v.move_sel(0, 3);
+    enter_text(&mut v, "3");
+    assert_eq!(v.sel, (1, 5));
+}
+
+#[test]
+fn enter_without_tab_run_unchanged() {
+    let mut v = view();
+    select(&mut v, 0, 2);
+    enter_text(&mut v, "1");
+    assert_eq!(v.sel, (1, 2));
+    // Shift+Enter ends no run either.
+    select(&mut v, 5, 0);
+    tab_text(&mut v, "1", 1);
+    type_fresh(&mut v, "2");
+    v.enter_commit(true).expect("entry accepted");
+    assert_eq!(v.sel, (4, 1));
+}
+
+#[test]
+fn a_refused_entry_keeps_the_run() {
+    let mut v = view();
+    select(&mut v, 0, 0);
+    tab_text(&mut v, "1", 1);
+    type_fresh(&mut v, "=1+");
+    assert!(v.enter_commit(false).is_none());
+    assert_eq!(v.sel, (0, 1));
+    v.edit_type("2");
+    v.enter_commit(false).expect("entry accepted");
+    assert_eq!(v.sel, (1, 0));
+}
+
+#[test]
+fn tab_run_does_not_cross_sheets() {
+    let mut v = view();
+    select(&mut v, 0, 0);
+    tab_text(&mut v, "1", 1);
+    v.tab_run.as_mut().unwrap().sheet = v.active + 1;
+    enter_text(&mut v, "2");
+    assert_eq!(v.sel, (1, 1));
+}
