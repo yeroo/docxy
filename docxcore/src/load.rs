@@ -1373,6 +1373,9 @@ fn parse_inlines_with_smart_tag_pr(
 /// its `w:smartTagPr` and the close (#1069). Save keeps the boundaries
 /// balanced after edits (see `serialize`).
 fn parse_smart_tag(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    // The prefixes declared below the part root, which the boundary must
+    // declare itself wherever a save writes it (#1063).
+    let bindings = rebuilt_bindings(p);
     let opener = p.raw_slice(p.start_pos(), p.pos());
     let mut open = match opener.strip_suffix("/>") {
         Some(head) => format!("{}>", head.trim_end()),
@@ -1382,7 +1385,7 @@ fn parse_smart_tag(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline
     let mut pr = String::new();
     parse_inlines_with_smart_tag_pr(p, rels, out, Some(&mut pr));
     open.push_str(&pr);
-    out.insert(at, Inline::Raw(open));
+    out.insert(at, Inline::Raw(declare_rebuilt(&open, &bindings)));
     out.push(Inline::Raw(crate::hf::SMART_TAG_CLOSE.to_string()));
 }
 
@@ -3244,7 +3247,7 @@ mod tests {
     }
 
     #[test]
-    fn smart_tag_runs_are_unwrapped() {
+    fn smart_tag_runs_are_visible() {
         // <w:smartTag> wrappers (deprecated MS metadata) must not hide their runs.
         let xml = "<w:document><w:body><w:p>\
                    <w:r><w:t xml:space=\"preserve\">The </w:t></w:r>\
@@ -3423,6 +3426,29 @@ mod tests {
         let out = crate::serialize::document_to_xml(&d);
         check_smart_tags(&out);
         assert_eq!(smart_tag_outline(&out), ["<x>", "</>"]);
+    }
+
+    /// A smart tag (or its properties) using a prefix declared below the
+    /// part root declares it itself on save, as other preserved XML does.
+    #[test]
+    fn a_smart_tag_keeps_the_prefixes_it_uses_bound_1069() {
+        let xml = "<w:document><w:body xmlns:b=\"urn:b\"><w:p xmlns:x=\"urn:x\">\
+                   <w:smartTag x:a=\"1\" w:element=\"e\"><w:smartTagPr><b:y/></w:smartTagPr>\
+                   <w:r><w:t>T</w:t></w:r></w:smartTag>\
+                   <w:smartTag w:element=\"f\" b:z=\"2\"/></w:p></w:body></w:document>";
+        let out = crate::serialize::document_to_xml(&doc(xml));
+        check_smart_tags(&out);
+        assert!(
+            out.contains(
+                "<w:smartTag xmlns:b=\"urn:b\" xmlns:x=\"urn:x\" x:a=\"1\" w:element=\"e\">\
+                 <w:smartTagPr><b:y/></w:smartTagPr>"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("<w:smartTag xmlns:b=\"urn:b\" w:element=\"f\" b:z=\"2\"></w:smartTag>"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -3820,7 +3846,7 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, Inline::Field { .. }))
         );
-        // Begin at paragraph level, end inside an (unwrapped) smart tag: not
+        // Begin at paragraph level, end inside a smart tag: not
         // collapsed, and the saved XML still closes every element it opens.
         let d = para_doc(&format!(
             "{begin}<w:r><w:t>x</w:t></w:r><w:smartTag w:element=\"place\">{end}</w:smartTag>\
