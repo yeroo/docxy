@@ -10,7 +10,7 @@ ext:unable to normalized/document with password.docx		load-error
 # a w14:paraId the source repeats is dropped on save (paragraph ids must be unique) (by design: #1063)
 ext:Normalize/conflicting IDs.docx	word/document.xml	lost-attr	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/@w14:paraId
 
-# run and paragraph content restructured on save (runs merged or split, lastRenderedPageBreak, smartTag, row-level sdt, special characters) (#1069)
+# run and paragraph content restructured on save (runs merged or split, lastRenderedPageBreak, row-level sdt, special characters) (#1069)
 ext:Normalize/complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:Normalize/complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:Normalize/complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr

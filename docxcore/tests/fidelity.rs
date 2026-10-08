@@ -55,7 +55,7 @@ const CLASSES: &[LossClass] = &[
     },
     LossClass {
         name: "run and paragraph content restructured on save (runs merged or split, \
-               lastRenderedPageBreak, smartTag, row-level sdt, special characters)",
+               lastRenderedPageBreak, row-level sdt, special characters)",
         issue: "#1069",
         matches: |e| e.part == "word/document.xml" && e.path.starts_with("/w:document/w:body/"),
     },
