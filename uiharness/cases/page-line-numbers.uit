@@ -1,0 +1,60 @@
+test line numbers draw in print layout, continue across pages and columns, and follow the ribbon toggle
+  open copy:../fixtures/basic.docx
+  type One
+  shot window
+  key enter
+  type Two
+  # 40 more one-line paragraphs: page 1's column fills and the rest pours
+  # onto page 2, below the fold — its canvases paint while scrolled off.
+  key enter enter enter enter enter enter enter enter enter enter
+  key enter enter enter enter enter enter enter enter enter enter
+  key enter enter enter enter enter enter enter enter enter enter
+  key enter enter enter enter enter enter enter enter enter enter
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Continuous"}
+  shot window
+  call doc {}
+  assert reply.view.layout is print
+  assert reply.line_numbers.0.n is 1
+  assert reply.line_numbers.1.n is 2
+  assert reply.line_numbers.41.n is 42
+  # 35 rows fill page 1; Continuous keeps counting onto page 2.
+  assert reply.line_numbers.34.n is 35
+  assert reply.line_numbers.34.page is 1
+  assert reply.line_numbers.35.page is 2
+  assert reply.line_numbers.35.n is 36
+  # Two columns: column 1 keeps its 35 rows and the sequence continues at
+  # column 2's own left edge on the same page (x at 100% zoom).
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Columns"]}}
+  call menu-click {"label":"Two"}
+  shot window
+  call doc {}
+  assert reply.line_numbers.0.n is 1
+  assert reply.line_numbers.34.page is 1
+  assert reply.line_numbers.34.n is 35
+  assert reply.line_numbers.34.x is 255
+  assert reply.line_numbers.35.page is 1
+  assert reply.line_numbers.35.n is 36
+  assert reply.line_numbers.35.x is 591
+  assert reply.line_numbers.41.page is 1
+  assert reply.line_numbers.41.n is 42
+  assert reply.line_numbers.41.x is 591
+  # Zoom out: the caret is a fixed 19px but shrinks with the line, so with
+  # the caret in an EMPTY paragraph (offset 8, the first of the trailing
+  # empties) it must not add a row — a phantom row would push every later
+  # number's y down a row. Wheel to the top first so the y below reads at
+  # a settled scroll position.
+  key ctrl+- ctrl+- ctrl+- ctrl+- ctrl+- ctrl+- ctrl+- ctrl+-
+  call selection-set {"start":8,"end":8}
+  call pointer-wheel {"region":"window","dy":-6000}
+  shot window
+  call doc {}
+  assert reply.line_numbers.0.n is 1
+  assert reply.line_numbers.5.y is 77
+  # None removes them again.
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"None"}
+  shot window
+  call doc {}
+  assert reply.line_numbers is []

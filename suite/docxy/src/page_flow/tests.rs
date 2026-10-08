@@ -728,3 +728,22 @@ fn huge_margins_do_not_overflow() {
     let pf = flow(&body, neg, false);
     assert_eq!(pf.pages.len(), 1, "{:?}", pf.ranges());
 }
+
+#[test]
+fn section_box_carries_line_numbering() {
+    // `w:lnNumType` rides on the section so the page view can number its
+    // paragraphs (export.rs `LineNumbers` is the oracle); a section without
+    // it numbers nothing (#746).
+    let sect = letter(r#"<w:lnNumType w:countBy="5"/>"#);
+    let body = body_blocks(&para("One", Some(&sect)));
+    let pf = flow(&body, &sect, false);
+    let ln = pf.sections[0]
+        .line_numbers
+        .expect("lnNumType is carried on the section");
+    assert_eq!(ln.count_by, 5);
+
+    let plain = letter("");
+    let body = body_blocks(&para("One", Some(&plain)));
+    let pf = flow(&body, &plain, false);
+    assert!(pf.sections[0].line_numbers.is_none());
+}
