@@ -66,6 +66,14 @@ const WHOLE_NUMBER_MIN: &[&str] = &[
     r#"call pointer-click {"dialog-field":"first"}"#,
     r#"call real-type {"text":"10"}"#,
 ];
+/// Line Numbers opens with Add line numbering off (basic.docx has no
+/// `w:lnNumType`) and the fields under it disabled: the box turns them on.
+const NUMBERING_ON: &[&str] = &[r#"call pointer-click {"dialog-control":"add"}"#];
+/// From text is also gated by its Auto box, on at open: both clicks free it.
+const FROM_TEXT: &[&str] = &[
+    r#"call pointer-click {"dialog-control":"add"}"#,
+    r#"call pointer-click {"dialog-control":"auto"}"#,
+];
 const FIXED_WIDTH: &[&str] = pick!("kind", 1);
 const TWO_COLUMNS: &[&str] = &[
     r#"call pointer-click {"dialog-tab":"Step 2: Delimiters"}"#,
@@ -160,6 +168,27 @@ dialogs! {
             Field::number("space12", "0.1").skip("never shown: no gap follows the twelfth column"),
             checkbox("equal"),
             checkbox("sep"),
+            dropdown("apply"),
+        ],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    LINE_NUMBERS = "line-numbers" {
+        surface: Surface::Doc,
+        file: "doc-layout",
+        fixture: DOCX,
+        open: &[
+            r#"call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}"#,
+            r#"call menu-click {"label":"Line Numbering Options..."}"#,
+        ],
+        fields: &[
+            checkbox("add"),
+            Field::number("start", "1").prep(NUMBERING_ON).kept("1"),
+            Field::number("from", "0.25").prep(FROM_TEXT).kept("0.25"),
+            checkbox("auto"),
+            Field::number("by", "1").prep(NUMBERING_ON).kept("1"),
+            radio("restart"),
             dropdown("apply"),
         ],
         reopen: &[],

@@ -1,0 +1,50 @@
+test the Line Numbering Options dialog writes w:lnNumType and the drawing follows
+  open copy:../fixtures/basic.docx
+  type One
+  shot window
+  key enter
+  type Two
+  shot window
+  key enter
+  type Three
+  shot window
+  key enter
+  type Four
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  # The menu item is enabled now (#747) and opens the catalogued dialog.
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-set {"control":"add","value":true}
+  call dialog-set {"control":"by","value":"2"}
+  call dialog-click {"button":"OK"}
+  assert dialog is not line-numbers
+  shot window
+  call doc {}
+  # Count by 2: only the even lines draw, 2 and 4 across the paragraphs.
+  assert reply.line_numbers.0.n is 2
+  assert reply.line_numbers.1.n is 4
+  # The dialog reopens on what OK wrote.
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call field-read {"dialog-field":"by"}
+  assert reply.value is 2
+  call field-read {"dialog-field":"start"}
+  assert reply.value is 1
+  # Start at 5, still Count by 2: the lines number 5-8 and 6 and 8 draw.
+  call dialog-set {"control":"start","value":"5"}
+  call dialog-click {"button":"OK"}
+  shot window
+  call doc {}
+  assert reply.line_numbers.0.n is 6
+  assert reply.line_numbers.1.n is 8
+  # The box off removes the numbering: nothing draws.
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-set {"control":"add","value":false}
+  call dialog-click {"button":"OK"}
+  shot window
+  call doc {}
+  assert reply.line_numbers is []

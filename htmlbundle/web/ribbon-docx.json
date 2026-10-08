@@ -2229,7 +2229,7 @@
                   "id": "ln-options",
                   "label": "Line Numbering Options...",
                   "icon": "list-numbered",
-                  "act": "Layout(Unavailable)",
+                  "act": "Layout(LineNumbersOptions)",
                   "keyTip": "",
                   "tip": {
                     "title": "",

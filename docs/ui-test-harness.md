@@ -492,8 +492,8 @@ footer editor; `selection-set` refuses while it is open.
 `ribbon-read` and `ribbon-click` work on document, Project and sheet tabs. Each
 command's `enabled` is the predicate its button draws with (every document and
 Project ribbon command is enabled today except the document Layout tab's
-placeholders, `LayoutAct::Unavailable`: Line Numbering Options..., Manual and
-Hyphenation Options..., and the Design tab's Page Borders on a Markdown tab,
+placeholders, `LayoutAct::Unavailable`: Manual and Hyphenation Options..., and
+the Design tab's Page Borders on a Markdown tab,
 which keeps no section properties; sheet placeholders, drawn but doing nothing
 yet, report `enabled: false`, see below), and a command inside a split button's or a
 drop-down's menu carries `menu`, its button's id (Set Baseline's `Set Baseline...` and `Clear
@@ -1225,10 +1225,10 @@ Menus open today:
   opens one. The items follow Word, with its separators and the Breaks menu's
   `Page Breaks` / `Section Breaks` headings; the current choice is `checked`
   (the caret section's margins, orientation, size, columns and line numbers,
-  and the document's hyphenation). Line Numbering Options..., Manual and
-  Hyphenation Options... read `enabled: false`. Custom Margins... and More
-  Paper Sizes... open the `page-setup` dialog, and More Columns... the
-  `columns` one;
+  and the document's hyphenation). Manual and Hyphenation Options... read
+  `enabled: false`. Custom Margins... and More Paper Sizes... open the
+  `page-setup` dialog, More Columns... the `columns` one, and Line Numbering
+  Options... the `line-numbers` one;
 - **the Design tab's Page Color and Watermark** (#651): drop-downs whose press,
   or KeyTip (Alt, G, P, C and Alt, G, P, W), opens the menu;
   `menu-open {"ribbon": ["Design", "Page Background", "Page Color"]}` opens
