@@ -248,6 +248,14 @@ enum Kind {
     Look,
 }
 
+/// Whether the Open-page backstage offers Recover Unsaved Workbooks (#1077).
+/// Drafts are kept for workbooks only (`close::should_keep_draft`), so a
+/// Word tab, or none, shows nothing unless a kept draft is waiting: closing
+/// the last workbook with Don't Save keeps one, and the list is app-wide.
+fn recover_section_shown(kind: Option<Kind>, has_drafts: bool) -> bool {
+    kind == Some(Kind::Xlsx) || has_drafts
+}
+
 impl Kind {
     fn glyph(self) -> &'static str {
         match self {
@@ -31746,8 +31754,11 @@ impl Docxy {
                 })
                 .collect();
             let now = std::time::SystemTime::now();
-            // Recover Unsaved Workbooks (#613). The row keeps the draft's
+            // Recover Unsaved Workbooks (#613), shown on a workbook tab or while a
+            // draft waits (#1077, recover_section_shown). The row keeps the draft's
             // path, not its index: the list can change before the click.
+            let show_recover =
+                recover_section_shown(active.map(|t| t.kind), !self.drafts.is_empty());
             let drafts: Vec<AnyElement> = self
                 .drafts
                 .iter()
@@ -31869,24 +31880,26 @@ impl Docxy {
                     }),
                 ))
                 .child(v_flex().gap_0p5().children(recents))
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(rgb(BRAND))
-                        .mt_4()
-                        .child("Recover Unsaved Workbooks"),
-                )
-                .map(|d| {
-                    if drafts.is_empty() {
-                        d.child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(dim)
-                                .child("No unsaved workbooks"),
-                        )
-                    } else {
-                        d.child(v_flex().gap_0p5().children(drafts))
-                    }
+                .when(show_recover, |d| {
+                    d.child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(BRAND))
+                            .mt_4()
+                            .child("Recover Unsaved Workbooks"),
+                    )
+                    .map(|d| {
+                        if drafts.is_empty() {
+                            d.child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(dim)
+                                    .child("No unsaved workbooks"),
+                            )
+                        } else {
+                            d.child(v_flex().gap_0p5().children(drafts))
+                        }
+                    })
                 })
                 .child(
                     div()
@@ -43013,5 +43026,22 @@ mod flat_inlines_tests {
         let before_cd = offsets(&items[..items.len() - 1]);
         // The field is one offset (#642).
         assert_eq!(before_cd, 12, "`cd` starts at the engine's offset 12");
+    }
+}
+
+#[cfg(test)]
+mod recover_section_tests {
+    use super::{Kind, recover_section_shown};
+
+    #[test]
+    fn recover_section_follows_the_tab_or_a_waiting_draft() {
+        assert!(recover_section_shown(Some(Kind::Xlsx), false));
+        assert!(recover_section_shown(Some(Kind::Xlsx), true));
+        assert!(!recover_section_shown(Some(Kind::Docx), false));
+        assert!(!recover_section_shown(Some(Kind::Project), false));
+        assert!(!recover_section_shown(Some(Kind::Look), false));
+        assert!(!recover_section_shown(None, false));
+        assert!(recover_section_shown(Some(Kind::Docx), true));
+        assert!(recover_section_shown(None, true));
     }
 }
