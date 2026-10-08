@@ -4036,7 +4036,7 @@ fn dispatch_verb(
             // the view dirty), or a resize: then it is not this layout.
             let probes = app.probes.borrow();
             let measured = crate::ribbon_layout::measure(&probes.last);
-            // A tab with no groups (Project's Report) has nothing to wait for.
+            // A tab with no groups has nothing to wait for.
             let drawn = crate::ribbon_layout::shown_tab(&probes.last) == Some(name.as_str());
             if !titles.is_empty()
                 && !(drawn
