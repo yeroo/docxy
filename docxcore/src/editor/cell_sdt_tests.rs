@@ -292,3 +292,120 @@ fn split_insert_column_and_insert_row_never_copy_a_control() {
         assert_sound(&ed);
     }
 }
+
+#[test]
+fn replace_into_a_cell_placeholder_clears_only_its_flag() {
+    let mut ed = cover_row();
+    let matches = ed.find_all("abstract", false);
+    assert_eq!(matches.len(), 1);
+    assert_eq!(ed.replace_matches(matches, "summary"), 1);
+    assert_eq!(text(&ed, 0), "[Type the summary]");
+    assert!(!flagged(&ed, 0));
+    assert!(flagged(&ed, 2));
+    // Replace on a selection too.
+    let mut ed = cover_row();
+    ed.set_caret(at(2, 1));
+    assert!(ed.select_placeholder_at_caret());
+    ed.replace_current_with("2027");
+    assert_eq!(text(&ed, 2), "2027");
+    assert!(flagged(&ed, 0) && !flagged(&ed, 2));
+}
+
+#[test]
+fn delete_over_a_two_cell_placeholder_clears_its_flag() {
+    let mut ed = pair_row(true);
+    ed.set_caret(at(0, 0));
+    assert!(ed.select_placeholder_at_caret());
+    assert_eq!(
+        (ed.anchor.clone(), ed.caret.clone()),
+        (Some(at(0, 0)), at(1, 1))
+    );
+    ed.delete_forward();
+    assert_eq!((text(&ed, 0), text(&ed, 1)), (String::new(), String::new()));
+    assert!(!flagged(&ed, 0));
+    assert_sound(&ed);
+}
+
+#[test]
+fn enter_in_a_cell_placeholder_clears_its_flag() {
+    let mut ed = cover_row();
+    ed.set_caret(at(0, 3));
+    ed.insert_char('\n');
+    assert_eq!(row(&ed).cells[0].blocks.len(), 2);
+    assert!(!flagged(&ed, 0) && flagged(&ed, 2));
+    assert_sound(&ed);
+}
+
+#[test]
+fn a_selection_over_paragraphs_in_a_placeholder_clears_its_flag_when_deleted() {
+    let mut ed = cover_row();
+    ed.set_caret(at(0, 3));
+    ed.insert_char('\n');
+    // Put the flag back, as a document saved like this would have it.
+    let Some(Block::Table(t)) = ed.doc.body.get_mut(0) else {
+        unreachable!()
+    };
+    t.rows[0].cells[0].sdt_open[0] = open("Abstract", 1, true);
+    ed.anchor = Some(at(0, 1));
+    ed.caret = Caret::at(vec![0, 0, 0, 1], 2);
+    assert!(ed.delete_selection());
+    assert!(!flagged(&ed, 0) && flagged(&ed, 2));
+}
+
+#[test]
+fn shift_up_refuses_to_move_text_through_a_cell_level_control() {
+    let mut ed = editor(&format!(
+        "<w:tr>{}{}{}</w:tr><w:tr>{}{}{CLOSE}{}</w:tr>",
+        cell("a"),
+        cell("b"),
+        cell("c"),
+        open("Abstract", 1, true),
+        cell("[Abstract]"),
+        cell("x"),
+    ));
+    let before = document_to_xml(&ed.doc);
+    ed.set_caret(Caret::at(vec![0, 0, 0, 0], 0));
+    let err = ed.delete_cells(DeleteShift::ShiftUp).unwrap_err();
+    assert!(err.contains("content control"), "{err}");
+    assert_eq!(document_to_xml(&ed.doc), before);
+    // A column with no control still shifts.
+    ed.set_caret(Caret::at(vec![0, 0, 1, 0], 0));
+    ed.delete_cells(DeleteShift::ShiftUp).unwrap();
+    assert_sound(&ed);
+}
+
+#[test]
+fn a_showing_placeholder_flag_turned_off_is_not_a_placeholder() {
+    for (flag, shows) in [
+        ("<w:showingPlcHdr w:val=\"false\"/>", false),
+        ("<w:showingPlcHdr w:val=\"0\"/>", false),
+        ("<w:showingPlcHdr w:val=\"off\"/>", false),
+        ("<w:showingPlcHdr w:val=\"true\"/>", true),
+        ("<w:showingPlcHdr w:val=\"1\"/>", true),
+        ("<w:showingPlcHdr/>", true),
+    ] {
+        let ed = editor(&format!(
+            "<w:tr><w:sdt><w:sdtPr><w:alias w:val=\"A\"/>{flag}</w:sdtPr><w:sdtContent>{}{CLOSE}</w:tr>",
+            cell("[A]")
+        ));
+        assert_eq!(
+            ed.placeholder_range_at(&at(0, 1)).is_some(),
+            shows,
+            "{flag}"
+        );
+    }
+}
+
+#[test]
+fn a_placeholder_starting_in_a_nested_table_selects_nothing() {
+    let inner = "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"1000\"/></w:tblGrid>\
+        <w:tr><w:tc><w:p><w:r><w:t>in</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
+    let ed = editor(&format!(
+        "<w:tr>{}<w:tc>{inner}<w:p><w:r><w:t>[A]</w:t></w:r></w:p></w:tc>{CLOSE}</w:tr>",
+        open("A", 1, true)
+    ));
+    assert_eq!(
+        ed.placeholder_range_at(&Caret::at(vec![0, 0, 0, 1], 1)),
+        None
+    );
+}

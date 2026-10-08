@@ -394,6 +394,12 @@ impl Editor {
                                     "cells cannot shift up through merged or missing cells".into(),
                                 );
                             }
+                            // A cell-level content control stays with its
+                            // cell, so shifted text would land in another
+                            // control, or out of its own (#1102).
+                            if !cell.sdt_open.is_empty() || !cell.sdt_close.is_empty() {
+                                return Err("cells cannot shift up through content controls".into());
+                            }
                             cells.push((ri, ci));
                         }
                         columns.push(cells);

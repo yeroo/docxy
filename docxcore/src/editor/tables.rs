@@ -326,8 +326,16 @@ impl Editor {
         let Some(t) = table_at_mut(&mut self.doc.body, &range.table) else {
             return false;
         };
-        let map = GridMap::of(t);
-        let cells = range.cells(&map);
+        let cells = range.cells(&GridMap::of(t));
+        // An emptied cell no longer shows a placeholder (#1102).
+        for &(r, c) in &cells {
+            let mut path = range.table.clone();
+            path.extend([r, c, 0]);
+            self.clear_placeholders_around(&path);
+        }
+        let Some(t) = table_at_mut(&mut self.doc.body, &range.table) else {
+            return false;
+        };
         for &(r, c) in &cells {
             let cell = &mut t.rows[r].cells[c];
             let first = match cell.blocks.first() {

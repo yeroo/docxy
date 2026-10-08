@@ -10,6 +10,25 @@ use crate::model::{Block, Inline, Row};
 
 const FLAG: &str = "<w:showingPlcHdr";
 
+/// Whether a content control's opening boundary says it shows its
+/// placeholder: a `w:showingPlcHdr` that is on (no `w:val`, or a true one;
+/// `false`, `0` and `off` turn it off, as for any `ST_OnOff`).
+fn shows_placeholder(open: &str) -> bool {
+    let Some((a, b)) = crate::sect::find_element(open, "w:showingPlcHdr") else {
+        return false;
+    };
+    let element = &open[a..b];
+    let Some(at) = element.find("w:val=") else {
+        return true;
+    };
+    let value = element[at + 6..]
+        .trim_start_matches(['"', '\''])
+        .split(['"', '\''])
+        .next()
+        .unwrap_or("");
+    !matches!(value, "false" | "0" | "off")
+}
+
 /// One step down a caret path: into a table cell, or into a text box.
 enum Step {
     Cell {
@@ -28,7 +47,7 @@ impl Editor {
     /// innermost content control around it still showing its placeholder.
     /// A cell-level control's range runs from its first cell's start to its
     /// last cell's end. `None` when no such control holds the caret.
-    pub fn placeholder_range_at(&self, caret: &Caret) -> Option<(Caret, Caret)> {
+    pub(crate) fn placeholder_range_at(&self, caret: &Caret) -> Option<(Caret, Caret)> {
         let path = &caret.path;
         let para = resolve_para(&self.doc.body, path)?;
         // Outermost first: the last found is the innermost.
@@ -189,7 +208,7 @@ fn cell_placeholder(row: &Row, cell: usize, row_path: &[usize]) -> Option<(Caret
     let (c, k) = covering(row, cell)
         .into_iter()
         .rev()
-        .find(|&(c, k)| row.cells[c].sdt_open[k].contains(FLAG))?;
+        .find(|&(c, k)| shows_placeholder(&row.cells[c].sdt_open[k]))?;
     let last = closing_cell(row, c, k);
     let mut first_prefix = row_path.to_vec();
     first_prefix.push(c);
@@ -197,6 +216,12 @@ fn cell_placeholder(row: &Row, cell: usize, row_path: &[usize]) -> Option<(Caret
     last_prefix.push(last);
     let start = edge_paragraph(&row.cells[c].blocks, &mut first_prefix, false)?;
     let end = edge_paragraph(&row.cells[last].blocks, &mut last_prefix, true)?;
+    // Each end in its own cell's paragraphs, not a nested table's: a selection
+    // across containers is not one the editor can type over.
+    let top = row_path.len() + 2;
+    if start.0.len() != top || end.0.len() != top {
+        return None;
+    }
     Some((Caret::at(start.0, 0), Caret::at(end.0, end.1)))
 }
 
@@ -206,11 +231,16 @@ fn block_placeholder(blocks: &[Block], idx: usize, prefix: &[usize]) -> Option<(
     let open = enclosing_block_opens(blocks, idx)
         .into_iter()
         .rev()
-        .find(|&i| matches!(&blocks[i], Block::Raw(r) if r.contains(FLAG)))?;
-    let close = matching_block_close(blocks, open);
+        .find(|&i| matches!(&blocks[i], Block::Raw(r) if shows_placeholder(r)))?;
+    let close = crate::hf::matching_close(blocks, open).unwrap_or(blocks.len());
     let mut path = prefix.to_vec();
     let start = edge_paragraph_in(blocks, open + 1..close, &mut path, false)?;
     let end = edge_paragraph_in(blocks, open + 1..close, &mut path, true)?;
+    // Both ends in this container, not in a nested table: a selection across
+    // containers is not one the editor can type over.
+    if start.0.len() != prefix.len() + 1 || end.0.len() != prefix.len() + 1 {
+        return None;
+    }
     Some((Caret::at(start.0, 0), Caret::at(end.0, end.1)))
 }
 
@@ -240,25 +270,6 @@ fn enclosing_block_opens(blocks: &[Block], idx: usize) -> Vec<usize> {
     open
 }
 
-/// The index of the close matching the block-level open at `open`, or the
-/// end of `blocks` when it has none.
-fn matching_block_close(blocks: &[Block], open: usize) -> usize {
-    let mut depth = 0usize;
-    for (i, block) in blocks.iter().enumerate().skip(open) {
-        if let Block::Raw(raw) = block {
-            if crate::hf::is_sdt_open(raw) {
-                depth += 1;
-            } else if crate::hf::is_sdt_close(raw) {
-                depth -= 1;
-                if depth == 0 {
-                    return i;
-                }
-            }
-        }
-    }
-    blocks.len()
-}
-
 /// The innermost inline control around offset `at` showing its placeholder,
 /// as the offsets its content starts and ends at.
 fn inline_placeholder(content: &[Inline], at: usize) -> Option<(usize, usize)> {
@@ -266,7 +277,7 @@ fn inline_placeholder(content: &[Inline], at: usize) -> Option<(usize, usize)> {
     let mut offset = 0;
     let mut found = None;
     let consider = |i: usize, start: usize, end: usize, found: &mut Option<(usize, usize)>| {
-        let flagged = matches!(&content[i], Inline::Raw(r) if r.contains(FLAG));
+        let flagged = matches!(&content[i], Inline::Raw(r) if shows_placeholder(r));
         // Inner controls close first: the first found is the innermost.
         if flagged && found.is_none() && start <= at && at <= end {
             *found = Some((start, end));

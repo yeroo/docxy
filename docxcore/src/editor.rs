@@ -1034,6 +1034,8 @@ impl Editor {
         // here would delete from the anchor to the paragraph end.
         self.drop_collapsed_anchor();
         self.checkpoint(EditKind::Structural);
+        let path = self.caret.path.clone();
+        self.clear_placeholders_around(&path);
         let off = self.caret.offset;
         let in_cover = self.caret_in_cover();
         let new_idx = {
@@ -1568,6 +1570,8 @@ impl Editor {
 
         self.checkpoint(EditKind::Structural);
         self.anchor = None;
+        self.clear_placeholders_around(&lo.path);
+        self.clear_placeholders_around(&hi.path);
         // Tracked: the text of each paragraph is recorded as deleted and the
         // paragraph marks stay (see the `track` module).
         if self.delete_text_across_paragraphs(&lo, &hi) {

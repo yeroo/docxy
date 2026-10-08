@@ -1007,7 +1007,8 @@ impl Row {
 
     /// Whether every cell-level content control opened in the row closes in
     /// it, and none closes before it opens.
-    pub fn cell_sdt_balanced(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn cell_sdt_balanced(&self) -> bool {
         let mut depth = 0usize;
         for cell in &self.cells {
             depth += cell.sdt_open.len();

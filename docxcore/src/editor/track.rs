@@ -284,6 +284,7 @@ impl Editor {
         end: usize,
         with: &str,
     ) {
+        self.clear_placeholders_around(path);
         if self.track.is_none() {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
                 super::replace_range_in_content(&mut p.content, start, end, with);
