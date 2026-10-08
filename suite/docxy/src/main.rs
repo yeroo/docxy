@@ -76,6 +76,7 @@ mod recover;
 mod ribbon_export;
 mod ribbon_fit;
 mod ribbon_layout;
+mod rich_clip;
 #[cfg(test)]
 mod save_preserve_tests;
 #[cfg(test)]
@@ -1769,7 +1770,8 @@ const CUT_CANCELLED_STATUS: &str =
 /// The document clipboard: the rich clip copied from a document and the plain
 /// text that copy put on the clipboard (#755). While the clipboard still holds
 /// `text`, a paste uses `clip` (run formatting intact); once something else
-/// has been copied, the clipboard's text wins.
+/// has been copied, the clipboard's RTF wins, else its text
+/// ([`doc_paste_clip`], #1074).
 #[derive(Clone)]
 struct DocClip {
     clip: Clip,
@@ -1843,6 +1845,51 @@ fn recorded_after_write(wrote: String, now: &ClipRead) -> String {
     }
 }
 
+/// Whether a copy that wrote `wrote`, reading the clipboard back as `now`,
+/// adds its RTF to the clipboard (#1074). Only when the read-back shows our
+/// text: after a silent failure the clipboard holds another app's copy (or
+/// cannot be read, which cannot say the write took), and our RTF beside it
+/// would paste our formatting over their words everywhere. A copy with no
+/// text (only an image) has none. Line endings compare loosely, as in
+/// [`clip_still_ours`].
+fn rtf_follows(wrote: &str, now: &ClipRead) -> bool {
+    !wrote.is_empty()
+        && matches!(now, ClipRead::Text(held) if held.replace("\r\n", "\n") == wrote.replace("\r\n", "\n"))
+}
+
+/// Whether a document paste takes the window's own clip `ours` (#755,
+/// #1074): while the clipboard still holds its text ([`clip_still_ours`]),
+/// unless the clipboard holds an RTF (`rich`) with no text beside it. That
+/// is another app's copy, never ours: ours always comes with its text.
+fn doc_clip_ours(ours: &DocClip, now: &ClipRead, rich: bool) -> bool {
+    let rich_only = rich && now.text().is_none();
+    !rich_only && clip_still_ours(&ours.text, now)
+}
+
+/// What a document paste inserts (#755, #1074): the document clip while it
+/// is ours ([`doc_clip_ours`]), else the clipboard's RTF (another app's
+/// rich copy, or ours from another window), else its text. An RTF the
+/// importer cannot read pastes the text.
+fn doc_paste_clip(ours: Option<&DocClip>, now: &ClipRead, rtf: Option<&[u8]>) -> Option<Clip> {
+    match ours {
+        Some(ours) if doc_clip_ours(ours, now, rtf.is_some()) => Some(ours.clip.clone()),
+        _ => rtf
+            .and_then(|rtf| Clip::from_rtf(rtf, now.text()))
+            .or_else(|| now.text().map(Clip::from_text)),
+    }
+}
+
+/// What the harness's private clipboard holds: a copy's text and, from a
+/// document copy or another app's rich copy, its RTF (#1074).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PrivateClip {
+    text: String,
+    rtf: Option<String>,
+}
+
+/// The harness's run-wide private clipboard (see [`ClipboardStore`]).
+pub(crate) type SharedClip = std::rc::Rc<std::cell::RefCell<Option<PrivateClip>>>;
+
 /// The text clipboard the app reads and writes (#699). A normal instance uses
 /// the OS clipboard; a harness instance keeps a private one, so a UI test can
 /// neither read nor overwrite what the person at the machine copied, and
@@ -1854,24 +1901,51 @@ fn recorded_after_write(wrote: String, now: &ClipRead) -> String {
 /// cell editor, About, the harness `clipboard` verb — is what every other
 /// window pastes, with no per-site sync. The rich document clip, the grid
 /// clip and the Office Clipboard stay PER WINDOW: a paste into another
-/// window finds that clip not "ours" and falls back to this plain text,
-/// exactly like a paste from another application.
+/// window finds that clip not "ours" and falls back to this store (a
+/// document paste to its RTF, else its text), exactly like a paste from
+/// another application.
+///
+/// A copy's RTF (#1074) sits beside its text, in the private store as on
+/// the OS clipboard: a write of text alone drops the RTF, so an RTF never
+/// outlives the text it came with.
 #[derive(Clone, Default)]
 struct ClipboardStore {
-    private: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    private: SharedClip,
 }
 
 impl ClipboardStore {
     /// A store over the run-wide shared private text (see the type).
-    fn shared(private: std::rc::Rc<std::cell::RefCell<Option<String>>>) -> Self {
+    fn shared(private: SharedClip) -> Self {
         Self { private }
     }
 
     fn write(&mut self, harness: bool, text: String, os: impl FnOnce(String)) {
         if harness {
-            *self.private.borrow_mut() = Some(text);
+            *self.private.borrow_mut() = Some(PrivateClip { text, rtf: None });
         } else {
             os(text);
+        }
+    }
+
+    /// Add `rtf` to the copy [`Self::write`] just made: never on its own.
+    /// `os` adds it to the OS clipboard's item.
+    fn write_rtf(&mut self, harness: bool, rtf: String, os: impl FnOnce(String)) {
+        if harness {
+            if let Some(clip) = self.private.borrow_mut().as_mut() {
+                clip.rtf = Some(rtf);
+            }
+        } else {
+            os(rtf);
+        }
+    }
+
+    /// The clipboard's RTF, if it has one. `os` reads the OS clipboard's.
+    fn read_rtf(&self, harness: bool, os: impl FnOnce() -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+        if harness {
+            let private = self.private.borrow();
+            private.as_ref()?.rtf.clone().map(String::into_bytes)
+        } else {
+            os()
         }
     }
 
@@ -1879,7 +1953,7 @@ impl ClipboardStore {
     /// text (`None` when it has none).
     fn read(&self, harness: bool, os: impl FnOnce() -> Option<Option<String>>) -> ClipRead {
         ClipRead::from_item(if harness {
-            self.private.borrow().clone().map(Some)
+            self.private.borrow().as_ref().map(|c| Some(c.text.clone()))
         } else {
             os()
         })
@@ -15336,6 +15410,32 @@ impl Docxy {
         recorded_after_write(text, &self.clipboard_read(cx))
     }
 
+    /// Write `text` and, when the read-back shows that write took
+    /// ([`rtf_follows`]), `rtf` beside it (#1074). The RTF is made before
+    /// the text is written, so as little as possible runs between the two
+    /// writes. The text to record, as [`Self::clipboard_write_recorded`].
+    fn clipboard_write_rich(&mut self, text: String, rtf: Option<String>, cx: &mut App) -> String {
+        self.clipboard_write(text.clone(), cx);
+        let now = self.clipboard_read(cx);
+        if let Some(rtf) = rtf.filter(|_| rtf_follows(&text, &now)) {
+            self.clipboard_write_rtf(rtf, &text);
+        }
+        recorded_after_write(text, &now)
+    }
+
+    /// Add `rtf` to the copy of `text` on the clipboard (#1074): the
+    /// private one's, or the OS one's while it still holds `text`.
+    fn clipboard_write_rtf(&mut self, rtf: String, text: &str) {
+        let harness = self.harness;
+        self.clipboard
+            .write_rtf(harness, rtf, |rtf| rich_clip::write_rtf(rtf, text));
+    }
+
+    /// The clipboard's RTF (#1074): the OS one's, or the private one's.
+    fn clipboard_read_rtf(&self) -> Option<Vec<u8>> {
+        self.clipboard.read_rtf(self.harness, rich_clip::read_rtf)
+    }
+
     /// What the clipboard holds: the OS one, or the private one in a harness.
     fn clipboard_read(&self, cx: &App) -> ClipRead {
         self.clipboard.read(self.harness, || {
@@ -19380,8 +19480,9 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
-    /// Copy (or cut) the selection into the document clip and, as plain text,
-    /// the system clipboard (#755).
+    /// Copy (or cut) the selection into the document clip and, as plain text
+    /// and RTF, the system clipboard (#755, #1074). The RTF resolves the
+    /// runs' styles as the document's package defines them.
     fn do_copy(&mut self, cut: bool, window: &mut Window, cx: &mut Context<Self>) {
         // Copy only looks; cut would edit (#633).
         if cut && self.protected_refused(cx) {
@@ -19396,7 +19497,11 @@ impl Docxy {
             clip
         });
         if let Some(clip) = clip {
-            let text = self.clipboard_write_recorded(clip.to_text(), cx);
+            let pkg = self.tabs.get(self.active).and_then(|t| t.pkg.as_ref());
+            let text = clip.to_text();
+            let rtf = (!text.is_empty())
+                .then(|| clip.to_rtf(&docxcore::export_context::ExportContext::for_package(pkg)));
+            let text = self.clipboard_write_rich(text, rtf, cx);
             self.clip = Some(DocClip { clip, text });
             if cut {
                 if let Some(t) = self.tabs.get_mut(self.active) {
@@ -19408,17 +19513,16 @@ impl Docxy {
     }
 
     /// Paste at the caret: the document clip while it is still what the
-    /// clipboard holds (formatting intact), else the clipboard's text.
+    /// clipboard holds (formatting intact), else the clipboard's RTF, else
+    /// its text ([`doc_paste_clip`]).
     fn do_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_highlight_mode();
         if self.protected_refused(cx) {
             return self.refocus(window, cx);
         }
         let now = self.clipboard_read(cx);
-        let clip = match self.clip.as_ref() {
-            Some(ours) if clip_still_ours(&ours.text, &now) => Some(ours.clip.clone()),
-            _ => now.text().map(Clip::from_text),
-        };
+        let rtf = self.clipboard_read_rtf();
+        let clip = doc_paste_clip(self.clip.as_ref(), &now, rtf.as_deref());
         if let Some(clip) = clip {
             self.with_editor(window, cx, |e| e.one_step("Paste", |e| e.paste(&clip)));
         } else {
@@ -22067,7 +22171,10 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
 
 #[cfg(test)]
 mod clipboard_tests {
-    use super::{ClipRead, ClipboardStore, clip_still_ours, recorded_after_write};
+    use super::{
+        ClipRead, ClipboardStore, DocClip, clip_still_ours, doc_paste_clip, recorded_after_write,
+        rtf_follows,
+    };
     use gridcore::engine::Engine;
     use gridcore::sheet::{Cell, CellValue, Sheet, Workbook};
 
@@ -22441,6 +22548,112 @@ mod clipboard_tests {
             panic!("a harness wrote the OS clipboard")
         });
         assert_eq!(store.read(true, os_read), ClipRead::NotText);
+    }
+
+    /// #1074: a document copy's RTF sits beside its text in the private
+    /// store, shared by every window as the text is; a write of text alone
+    /// drops it, and an RTF is never written without a copy to add it to.
+    #[test]
+    fn the_private_rtf_goes_with_its_text() {
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let mut a = ClipboardStore::shared(shared.clone());
+        let mut b = ClipboardStore::shared(shared);
+        let os_read = || -> Option<Vec<u8>> { panic!("a harness read the OS clipboard") };
+        let os_write = |_: String| panic!("a harness wrote the OS clipboard");
+        a.write_rtf(true, "{\\rtf1 alone}".into(), os_write);
+        assert_eq!(b.read_rtf(true, os_read), None);
+        a.write(true, "bold".into(), os_write);
+        a.write_rtf(true, "{\\rtf1 {\\b bold}}".into(), os_write);
+        assert_eq!(
+            b.read_rtf(true, os_read).as_deref(),
+            Some(&b"{\\rtf1 {\\b bold}}"[..])
+        );
+        assert_eq!(b.read(true, || panic!()), ClipRead::Text("bold".into()));
+        // A sheet copy, the clipboard verb, any plain write: the RTF goes.
+        b.write(true, "plain".into(), os_write);
+        assert_eq!(a.read_rtf(true, os_read), None);
+    }
+
+    #[test]
+    fn a_normal_instance_puts_its_rtf_on_the_os_clipboard() {
+        let mut store = ClipboardStore::default();
+        let mut written = None;
+        store.write_rtf(false, "{\\rtf1 x}".into(), |r| written = Some(r));
+        assert_eq!(written.as_deref(), Some("{\\rtf1 x}"));
+        assert_eq!(
+            store.read_rtf(false, || Some(b"os".to_vec())).as_deref(),
+            Some(&b"os"[..])
+        );
+    }
+
+    /// #1074: the RTF follows only a text write the read-back shows took,
+    /// and only a copy with text.
+    #[test]
+    fn the_rtf_follows_only_a_text_write_that_took() {
+        let text = |t: &str| ClipRead::Text(t.into());
+        assert!(rtf_follows("bold", &text("bold")));
+        assert!(rtf_follows("a\nb", &text("a\r\nb")));
+        // The write failed: the clipboard holds another app's copy.
+        assert!(!rtf_follows("bold", &text("theirs")));
+        assert!(!rtf_follows("bold", &ClipRead::NotText));
+        // An unreadable clipboard cannot say the write took.
+        assert!(!rtf_follows("bold", &ClipRead::Nothing));
+        // An image-only copy has no text and no RTF.
+        assert!(!rtf_follows("", &ClipRead::NotText));
+    }
+
+    /// #1074: a document paste takes our clip while it is ours, else the
+    /// clipboard's RTF, else its text; an RTF with no text is another
+    /// app's copy; an unreadable RTF pastes the text.
+    #[test]
+    fn a_document_paste_prefers_ours_then_rtf_then_text() {
+        use docxcore::editor::Clip;
+        let bold_rtf: &[u8] = b"{\\rtf1\\ansi Plain {\\b BOLD}}";
+        let bold_of = |clip: &Clip| -> Vec<String> {
+            clip.paras
+                .iter()
+                .flatten()
+                .filter_map(|i| match i {
+                    docxcore::model::Inline::Run(r) if r.props.bold => Some(r.text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let ours = DocClip {
+            clip: Clip::from_text("mine"),
+            text: "mine".into(),
+        };
+        let text = |t: &str| ClipRead::Text(t.into());
+        // Ours, while the clipboard holds its text (the RTF there is ours).
+        let got = doc_paste_clip(Some(&ours), &text("mine"), Some(bold_rtf)).unwrap();
+        assert_eq!(got.to_text(), "mine");
+        // Another app's rich copy.
+        let got = doc_paste_clip(Some(&ours), &text("Plain BOLD"), Some(bold_rtf)).unwrap();
+        assert_eq!(got.to_text(), "Plain BOLD");
+        assert_eq!(bold_of(&got), vec!["BOLD".to_string()]);
+        let got = doc_paste_clip(None, &text("Plain BOLD"), Some(bold_rtf)).unwrap();
+        assert_eq!(bold_of(&got), vec!["BOLD".to_string()]);
+        // An RTF with no text beside it is not ours, whatever we hold.
+        let got = doc_paste_clip(Some(&ours), &ClipRead::Nothing, Some(bold_rtf)).unwrap();
+        assert_eq!(got.to_text(), "Plain BOLD");
+        let image_only = DocClip {
+            clip: Clip::default(),
+            text: String::new(),
+        };
+        let got = doc_paste_clip(Some(&image_only), &ClipRead::NotText, Some(bold_rtf));
+        assert_eq!(got.map(|c| c.to_text()).as_deref(), Some("Plain BOLD"));
+        // Garbage or empty RTF: the text, never a lost paste.
+        let got = doc_paste_clip(None, &text("words"), Some(b"\xff not rtf")).unwrap();
+        assert_eq!(got.to_text(), "words");
+        assert!(bold_of(&got).is_empty());
+        let got = doc_paste_clip(None, &text("words"), Some(b"{\\rtf1 }")).unwrap();
+        assert_eq!(got.to_text(), "words");
+        // Plain text alone, and nothing at all.
+        assert_eq!(
+            doc_paste_clip(None, &text("plain"), None).map(|c| c.to_text()),
+            Some("plain".into())
+        );
+        assert_eq!(doc_paste_clip(None, &ClipRead::Nothing, None), None);
     }
 
     #[test]

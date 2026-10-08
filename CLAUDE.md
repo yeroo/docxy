@@ -59,6 +59,20 @@
   ⌘←/→ are too, not visual lines. Protected View and final documents take the
   ⌥←/→ word moves (caret only); ⌥⌫ stays refused.
 
+## Rich copy and paste with other apps (#1074)
+
+- A document copy puts RTF beside its plain text (`Clip::to_rtf` in
+  `docxcore/src/clip_rtf.rs`, the Save As writer with the tab's styles), added
+  after gpui's text write by `suite/docxy/src/rich_clip.rs`: macOS
+  `public.rtf`, Windows "Rich Text Format", nothing on Linux. It is written
+  only when the text write took (`rtf_follows`). A document paste takes the
+  window's own clip while the clipboard still holds its text, else the
+  clipboard's RTF, else its text (`doc_paste_clip`). A partial copy's RTF ends
+  without `\par`; the paste takes the trailing mark from the plain text.
+- The harness's private clipboard holds the RTF beside the text, and any
+  plain write drops it. `clipboard {"action":"write","rtf":…}` plays another
+  app's rich copy; `read` reports `rtf` and `rtf_bold`.
+
 ## Build info
 
 - `buildinfo` is the one place that stamps binaries (commit, last merged PR, kind,

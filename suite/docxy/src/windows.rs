@@ -93,11 +93,12 @@ pub(crate) struct Windows<V, H> {
     // the whole run beside the document counter, with the same never-reused
     // rule.
     next_project: u32,
-    // The harness's private text clipboard, ONE for the whole run (#587 r3):
-    // every window's ClipboardStore clones this Rc, so a copy in any window
-    // — document, grid, Project, cell editor, About, the clipboard verb —
-    // is what every other window pastes, with no per-site sync.
-    clipboard_text: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    // The harness's private clipboard (text and RTF, #1074), ONE for the
+    // whole run (#587 r3): every window's ClipboardStore clones this Rc, so
+    // a copy in any window — document, grid, Project, cell editor, About,
+    // the clipboard verb — is what every other window pastes, with no
+    // per-site sync.
+    clipboard_text: crate::SharedClip,
 }
 
 impl<V, H> Default for Windows<V, H> {
@@ -315,9 +316,9 @@ pub(crate) fn next_document_title(cx: &mut App) -> String {
     .unwrap_or_else(|| crate::doc_name::next_document_title(&mut 1))
 }
 
-/// The run-wide private text clipboard: each window's store clones this Rc
-/// (#587 r3).
-pub(crate) fn shared_clipboard_text(cx: &App) -> std::rc::Rc<std::cell::RefCell<Option<String>>> {
+/// The run-wide private clipboard (text and RTF, #1074): each window's
+/// store clones this Rc (#587 r3).
+pub(crate) fn shared_clipboard_text(cx: &App) -> crate::SharedClip {
     with(cx, |w| w.clipboard_text.clone())
         .unwrap_or_else(|| std::rc::Rc::new(std::cell::RefCell::new(None)))
 }

@@ -2944,20 +2944,24 @@ fn resolve_commands(
     }
 }
 
-/// What the active tab's paste would take besides the clipboard's text: the
-/// document's rich clip or the sheet's grid clip, while the clipboard still
-/// holds what that copy put there (`clip_still_ours`) and, for a grid clip,
-/// copy mode is on (`GridClip::live`); otherwise `none`, and a paste takes
-/// `text` (or, over a spent grid clip's own text, nothing).
+/// What the active tab's paste would take besides the clipboard's text and
+/// RTF: the document's rich clip while a document paste would take it
+/// (`doc_clip_ours`: the clipboard still holds its text, and is not an RTF
+/// with no text, #1074), or the sheet's grid clip while the clipboard still
+/// holds its text (`clip_still_ours`) and copy mode is on
+/// (`GridClip::live`); otherwise `none`, and a paste takes the RTF (a
+/// document's) or `text` (or, over a spent grid clip's own text, nothing).
+/// `rich` is whether the clipboard holds an RTF.
 fn clipboard_app_json(
     surface: Option<&crate::Surface>,
     doc: Option<&crate::DocClip>,
     grid: Option<&crate::GridClip>,
     now: &crate::ClipRead,
+    rich: bool,
 ) -> Json {
     match surface {
         Some(crate::Surface::Doc(_)) => {
-            if let Some(clip) = doc.filter(|c| crate::clip_still_ours(&c.text, now)) {
+            if let Some(clip) = doc.filter(|c| crate::doc_clip_ours(c, now, rich)) {
                 return Json::obj(vec![
                     ("kind", Json::Str("doc".into())),
                     ("text", Json::Str(clip.text.clone())),
@@ -2982,17 +2986,51 @@ fn clipboard_app_json(
     Json::obj(vec![("kind", Json::Str("none".into()))])
 }
 
-/// The `clipboard` reply: the clipboard's text (the harness's private one)
-/// and what the active tab's paste would use.
+/// The `clipboard` reply: the clipboard's text (the harness's private one),
+/// its RTF and the text of the RTF's bold runs (#1074), and what the active
+/// tab's paste would use.
 fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
     let now = app.clipboard_read(cx);
+    let rtf = app.clipboard_read_rtf();
     let surface = app.tabs.get(app.active).map(|t| &t.surface);
     // A grid clip whose workbook was edited since is over (#664).
-    let used = clipboard_app_json(surface, app.clip.as_ref(), app.grid_clip_current(), &now);
+    let used = clipboard_app_json(
+        surface,
+        app.clip.as_ref(),
+        app.grid_clip_current(),
+        &now,
+        rtf.is_some(),
+    );
+    let bold = rtf
+        .as_deref()
+        .and_then(|rtf| docxcore::editor::Clip::from_rtf(rtf, now.text()))
+        .map(|clip| rtf_bold_text(&clip));
     Json::obj(vec![
         ("text", str_or_null(now.text().map(str::to_string))),
+        (
+            "rtf",
+            str_or_null(rtf.map(|r| String::from_utf8_lossy(&r).into_owned())),
+        ),
+        ("rtf_bold", str_or_null(bold)),
         ("app", used),
     ])
+}
+
+/// The text of `clip`'s bold runs, in order, each paragraph's on a line of
+/// its own: what an RTF on the clipboard pastes as bold.
+fn rtf_bold_text(clip: &docxcore::editor::Clip) -> String {
+    clip.paras
+        .iter()
+        .map(|p| {
+            p.iter()
+                .filter_map(|i| match i {
+                    docxcore::model::Inline::Run(r) if r.props.bold => Some(r.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The active spreadsheet, or the refusal every cell verb needs.
@@ -4930,14 +4968,23 @@ fn dispatch_verb(
         }
         // The clipboard (#699). A harness instance has a private one (it starts
         // empty and never touches the OS clipboard); `write` puts text on it
-        // as another app's copy would. Copy, cut and paste are the app's own
-        // keys and buttons (`key ctrl+c`, `ribbon-click`), not a second route.
+        // as another app's copy would, with an optional `rtf` beside it as a
+        // rich copy has (#1074). Copy, cut and paste are the app's own keys
+        // and buttons (`key ctrl+c`, `ribbon-click`), not a second route.
         "clipboard" => {
             match arg_str(args, "action")? {
                 "read" => {}
                 "write" => {
                     let text = arg_str(args, "text")?.to_string();
-                    app.clipboard_write(text, cx);
+                    let rtf = match args.get("rtf") {
+                        None | Some(Json::Null) => None,
+                        Some(Json::Str(rtf)) => Some(rtf.clone()),
+                        Some(_) => return Err("'rtf' must be a string".into()),
+                    };
+                    app.clipboard_write(text.clone(), cx);
+                    if let Some(rtf) = rtf {
+                        app.clipboard_write_rtf(rtf, &text);
+                    }
                 }
                 "paste-special" => {
                     return Err(
@@ -5484,39 +5531,54 @@ mod tests {
         let nothing = ClipRead::Nothing;
         let text = |t: &str| ClipRead::Text(t.into());
 
-        let on_doc = clipboard_app_json(Some(&doc), Some(&clip), Some(&grid), &nothing);
+        let on_doc = clipboard_app_json(Some(&doc), Some(&clip), Some(&grid), &nothing, false);
         assert_eq!(kind(on_doc.clone()), "doc");
         assert_eq!(on_doc.get_str("text"), Some("one\ntwo"));
-        let bare = clipboard_app_json(Some(&doc), None, Some(&grid), &nothing);
+        let bare = clipboard_app_json(Some(&doc), None, Some(&grid), &nothing, false);
         assert_eq!(kind(bare), "none");
-        let doc_echoed = clipboard_app_json(Some(&doc), Some(&clip), None, &text("one\r\ntwo"));
+        let doc_echoed =
+            clipboard_app_json(Some(&doc), Some(&clip), None, &text("one\r\ntwo"), false);
         assert_eq!(kind(doc_echoed), "doc");
         // Another app's copy, text or image, is newer than the document clip.
-        let doc_replaced = clipboard_app_json(Some(&doc), Some(&clip), None, &text("other"));
+        let doc_replaced = clipboard_app_json(Some(&doc), Some(&clip), None, &text("other"), false);
         assert_eq!(kind(doc_replaced), "none");
-        let doc_image = clipboard_app_json(Some(&doc), Some(&clip), None, &ClipRead::NotText);
+        let doc_image =
+            clipboard_app_json(Some(&doc), Some(&clip), None, &ClipRead::NotText, false);
         assert_eq!(kind(doc_image), "none");
+        // #1074: an RTF with no text is another app's rich copy, newer than
+        // the document clip; beside our own text it is ours.
+        let doc_rich_only = clipboard_app_json(Some(&doc), Some(&clip), None, &nothing, true);
+        assert_eq!(kind(doc_rich_only), "none");
+        let doc_with_rtf =
+            clipboard_app_json(Some(&doc), Some(&clip), None, &text("one\ntwo"), true);
+        assert_eq!(kind(doc_with_rtf), "doc");
 
-        let ours = clipboard_app_json(Some(&sheet), Some(&clip), Some(&grid), &text(&grid.text));
+        let ours = clipboard_app_json(
+            Some(&sheet),
+            Some(&clip),
+            Some(&grid),
+            &text(&grid.text),
+            false,
+        );
         assert_eq!(kind(ours.clone()), "grid");
         assert_eq!(ours.get("rows"), Some(&Json::Num(2.)));
         assert_eq!(ours.get("cols"), Some(&Json::Num(3.)));
         let crlf = text(&grid.text.replace('\n', "\r\n"));
-        let echoed = clipboard_app_json(Some(&sheet), None, Some(&grid), &crlf);
+        let echoed = clipboard_app_json(Some(&sheet), None, Some(&grid), &crlf, false);
         assert_eq!(kind(echoed), "grid");
-        let replaced = clipboard_app_json(Some(&sheet), None, Some(&grid), &text("x\ty"));
+        let replaced = clipboard_app_json(Some(&sheet), None, Some(&grid), &text("x\ty"), false);
         assert_eq!(kind(replaced), "none");
         // An image copied since is newer than the grid clip; a clipboard with
         // no item at all cannot say it changed.
-        let image = clipboard_app_json(Some(&sheet), None, Some(&grid), &ClipRead::NotText);
+        let image = clipboard_app_json(Some(&sheet), None, Some(&grid), &ClipRead::NotText, false);
         assert_eq!(kind(image), "none");
-        let unread = clipboard_app_json(Some(&sheet), None, Some(&grid), &nothing);
+        let unread = clipboard_app_json(Some(&sheet), None, Some(&grid), &nothing, false);
         assert_eq!(kind(unread), "grid");
         // #664: once copy mode is over (an Enter paste, a pasted cut, Esc),
         // the next paste pastes nothing though the text is still ours.
         let mut spent = grid.clone();
         spent.spend();
-        let over = clipboard_app_json(Some(&sheet), None, Some(&spent), &text(&grid.text));
+        let over = clipboard_app_json(Some(&sheet), None, Some(&spent), &text(&grid.text), false);
         assert_eq!(kind(over), "none");
 
         let placeholder = crate::Surface::Placeholder;
@@ -5525,11 +5587,15 @@ mod tests {
                 Some(&placeholder),
                 Some(&clip),
                 Some(&grid),
-                &nothing
+                &nothing,
+                false
             )),
             "none"
         );
-        assert_eq!(kind(clipboard_app_json(None, None, None, &nothing)), "none");
+        assert_eq!(
+            kind(clipboard_app_json(None, None, None, &nothing, false)),
+            "none"
+        );
     }
 
     /// #697: a harness instance ignores the pane it was launched from and is

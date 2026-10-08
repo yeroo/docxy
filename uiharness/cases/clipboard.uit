@@ -83,6 +83,41 @@ test a document copy pastes back with its formatting
   call selection-set {"start":7,"end":7}
   assert run.bold is true
 
+# #1074: a document copy puts RTF beside its text, so other apps keep its
+# formatting; a paste takes another app's RTF when it has one.
+test a document copy puts its formatting on the clipboard as RTF
+  open copy:../fixtures/basic.docx
+  type hello world
+  call selection-set {"start":0,"end":5}
+  call ribbon-click {"tab":"Home","command":"Bold"}
+  call selection-set {"start":0,"end":11}
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.text is hello world
+  assert reply.rtf_bold is hello
+
+test another app's rich copy pastes with its formatting
+  open copy:../fixtures/basic.docx
+  call clipboard {"action":"write","text":"Plain BOLD","rtf":"{\\rtf1\\ansi Plain {\\b BOLD}}"}
+  assert reply.app.kind is none
+  key ctrl+v
+  assert text is Plain BOLD
+  call selection-set {"start":2,"end":2}
+  assert run.bold is false
+  call selection-set {"start":8,"end":8}
+  assert run.bold is true
+
+test text copied after a rich copy leaves no RTF behind
+  open copy:../fixtures/basic.docx
+  call clipboard {"action":"write","text":"x","rtf":"{\\rtf1 {\\b x}}"}
+  assert reply.rtf_bold is x
+  call clipboard {"action":"write","text":"plain"}
+  assert reply.rtf is nothing
+  key ctrl+v
+  assert text is plain
+  call selection-set {"start":2,"end":2}
+  assert run.bold is false
+
 test text another app copied wins over the older document clip
   open copy:../fixtures/basic.docx
   type hello
@@ -118,6 +153,7 @@ test the clipboard verb refuses what it does not do
   call-error clipboard {"action":"paste-special"} => press the app's own key (key ctrl+alt+v)
   call-error clipboard {"action":"copy"} => press the app's own key
   call-error clipboard {"action":"write"} => text
+  call-error clipboard {"action":"write","text":"x","rtf":1} => 'rtf' must be a string
   call-error clipboard {"action":"shuffle"} => unknown clipboard action
 
 # #664: Excel's sheet clipboard. Each case builds the issue's book in an
@@ -419,3 +455,18 @@ test the Office Clipboard keeps copies and pastes them as values
   assert cell M40 is North
   call office-clipboard {"action":"clear-all"}
   assert office_clipboard is 0
+
+# Keep this case last: it opens a second window. The document clip is the
+# window's own, so the new window pastes the clipboard's RTF (#1074), which
+# keeps the bold the plain text would lose.
+test a document copy pastes with its formatting in another window
+  open copy:../fixtures/basic.docx
+  type hello
+  call selection-set {"start":0,"end":5}
+  call ribbon-click {"tab":"Home","command":"Bold"}
+  key ctrl+c
+  call window-new {}
+  key ctrl+v
+  assert text is hello
+  call selection-set {"start":2,"end":2}
+  assert run.bold is true
