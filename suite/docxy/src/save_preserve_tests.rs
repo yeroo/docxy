@@ -127,3 +127,45 @@ fn a_header_table_on_an_unchanged_body_still_gets_its_style() {
     let styles = part(&path, "word/styles.xml");
     assert!(styles.contains("w:styleId=\"TableGrid\""), "{styles}");
 }
+
+/// A cover page's cell-level content controls (`w:sdt` around `w:tc`) and
+/// the Abstract's placeholder flag survive a save after an edit elsewhere
+/// (#1102). An unedited save writes the original bytes back, which is why
+/// the real-Word check passed while any edit still dropped them.
+#[test]
+fn an_edit_elsewhere_keeps_cell_level_content_controls_1102() {
+    const COVER: &str = "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n\
+<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body>\
+<w:p><w:r><w:t>Hello</w:t></w:r></w:p>\
+<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w='4000'/><w:gridCol w:w='2000'/></w:tblGrid><w:tr>\
+<w:sdt><w:sdtPr><w:alias w:val='Abstract'/><w:id w:val='11'/><w:showingPlcHdr/>\
+<w:dataBinding w:xpath='/ns0:CoverPageProperties[1]/ns0:Abstract[1]' w:storeItemID='{55AF091B-3C7A-41E3-B477-F2FDAA23CFDA}'/>\
+</w:sdtPr><w:sdtContent><w:tc><w:p><w:r><w:t>[Type the abstract]</w:t></w:r></w:p></w:tc></w:sdtContent></w:sdt>\
+<w:sdt><w:sdtPr><w:alias w:val='Year'/><w:id w:val='12'/><w:date/></w:sdtPr>\
+<w:sdtContent><w:tc><w:p><w:r><w:t>2026</w:t></w:r></w:p></w:tc></w:sdtContent></w:sdt>\
+</w:tr></w:tbl><w:p/></w:body></w:document>\n";
+    let dir = Scratch::new();
+    let mut pkg = new_package(docxcore::markdown::from_markdown("placeholder"));
+    assert!(pkg.set_part_text("word/document.xml", COVER));
+    let path = dir.path("cover.docx");
+    std::fs::write(&path, save_package_preserving_document(&pkg)).unwrap();
+    let mut tab = tab_from_path(&path);
+    let ed = editor(&mut tab);
+    ed.caret.offset = 5;
+    ed.anchor = None;
+    ed.insert_str("!");
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let doc = part(&path, "word/document.xml");
+    assert!(doc.contains("Hello!"), "{doc}");
+    // Kept verbatim, single quotes and all.
+    for kept in [
+        "<w:alias w:val='Abstract'/>",
+        "<w:alias w:val='Year'/>",
+        "<w:showingPlcHdr/>",
+        "<w:dataBinding ",
+        "<w:date/>",
+    ] {
+        assert!(doc.contains(kept), "lost {kept}: {doc}");
+    }
+    assert_eq!(doc.matches("<w:sdt>").count(), 2, "{doc}");
+}

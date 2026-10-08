@@ -2876,6 +2876,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "window-new"
             | "window-select"
             | "selection-set"
+            | "doc-click"
             | "open"
             | "backstage-close"
             | "theme-set"
@@ -3744,6 +3745,48 @@ fn dispatch_verb(
                 .ok_or("the active tab is not a document")?;
             select_offsets(ed, start, end)?;
             app.refocus(window, cx);
+            Done::ok(state(app, window, cx))
+        }
+        // A press and release on the main story's text (#1102): the handler a
+        // word's mouse-down calls (`begin_select`), at a main-story offset as
+        // `selection-set` takes them, a drag to `drag-to` if given
+        // (`extend_select`), then the release (`end_select`), which ends the
+        // drag state; it pops no mini toolbar and ends no highlighter drag.
+        // A plain click inside a content control showing its placeholder
+        // selects the placeholder.
+        "doc-click" => {
+            app.refuse_under_dialog()?;
+            let offset = arg_usize(args, "offset")?;
+            let shift = matches!(args.get("shift"), Some(Json::Bool(true)));
+            if app.hf_active() {
+                return Err(
+                    "doc-click cannot address the body while a header or footer is being edited"
+                        .into(),
+                );
+            }
+            let drag_to = match args.get("drag-to") {
+                None => None,
+                Some(_) => Some(arg_usize(args, "drag-to")?),
+            };
+            let ed = app
+                .active_editor()
+                .ok_or("the active tab is not a document")?;
+            let flat = FlatDocument::new(&ed.doc);
+            let at = |n: usize| {
+                flat.main().caret(n).ok_or_else(|| {
+                    format!(
+                        "offset {n} is not addressable in the main story (valid: 0..{})",
+                        flat.main().len().saturating_sub(1)
+                    )
+                })
+            };
+            let caret = at(offset)?;
+            let drag = drag_to.map(at).transpose()?;
+            app.begin_select(caret.path, caret.offset, shift, window, cx);
+            if let Some(to) = drag {
+                app.extend_select(to.path, to.offset, cx);
+            }
+            app.end_select(None, cx);
             Done::ok(state(app, window, cx))
         }
         // Dialogs (#393). There is no `dialog-open`: a dialog opens through
@@ -6403,6 +6446,7 @@ mod tests {
             "window-new",
             "window-select",
             "selection-set",
+            "doc-click",
             "open",
             "select-chart",
             "focus-field",

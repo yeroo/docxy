@@ -286,6 +286,8 @@ pub fn template_cell(cell: &Cell) -> Cell {
         raw_tcpr: None,
         property_change: None,
         unsupported_revisions: Vec::new(),
+        sdt_open: Vec::new(),
+        sdt_close: Vec::new(),
     };
     set_cell_props(&mut out, &props);
     out

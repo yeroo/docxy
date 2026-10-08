@@ -4535,6 +4535,9 @@ struct Docxy {
     ruler_probe: std::rc::Rc<std::cell::RefCell<RulerProbe>>,
     // A text drag-selection is in progress (mouse down in the doc, not yet up).
     selecting: bool,
+    // That press was a plain one and has not dragged: its release selects a
+    // placeholder under it (#1102).
+    placeholder_click: bool,
     /// Word's highlighting mode (#623): a drag highlights what it crosses.
     hl_mode: Option<hl_mode::HlMode>,
     /// The last highlight colour chosen; the mode starts with it.
@@ -6550,6 +6553,14 @@ fn place_click_caret(ed: &mut Editor, caret: Caret, extend: bool, plant: bool) {
     }
 }
 
+/// A completed plain click (no Shift, no drag) left a collapsed caret inside
+/// a content control still showing its placeholder: select the whole
+/// placeholder, so typing replaces it, as in Word (#1102). Whether it did.
+fn click_selects_placeholder(ed: &mut Editor) -> bool {
+    let collapsed = ed.anchor.as_ref().is_none_or(|a| *a == ed.caret);
+    collapsed && ed.select_placeholder_at_caret()
+}
+
 #[cfg(test)]
 mod click_caret_tests {
     use super::*;
@@ -6586,6 +6597,49 @@ mod click_caret_tests {
         assert_eq!(ed.caret, Caret::at(vec![0], 4));
         place_click_caret(&mut ed, Caret::at(vec![0], 1), false, false);
         assert_eq!(ed.anchor, None);
+    }
+
+    /// A cover page's Abstract: a cell-level control showing its placeholder.
+    fn abstract_cell() -> Editor {
+        let xml = "<w:document><w:body><w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"4000\"/>\
+            </w:tblGrid><w:tr><w:sdt><w:sdtPr><w:alias w:val=\"Abstract\"/><w:showingPlcHdr/>\
+            </w:sdtPr><w:sdtContent><w:tc><w:p><w:r><w:t>[Abstract]</w:t></w:r></w:p></w:tc>\
+            </w:sdtContent></w:sdt></w:tr></w:tbl><w:p/></w:body></w:document>";
+        Editor::new(docxcore::load::parse_document_xml(
+            xml,
+            &docxcore::load::Relationships::default(),
+        ))
+    }
+
+    #[test]
+    fn a_click_in_a_placeholder_selects_it_and_a_drag_does_not_1102() {
+        let at = |o| Caret::at(vec![0, 0, 0, 0], o);
+        // A press and a release with no drag between them: the placeholder.
+        for plant in [false, true] {
+            let mut ed = abstract_cell();
+            place_click_caret(&mut ed, at(4), false, plant);
+            assert!(click_selects_placeholder(&mut ed));
+            assert_eq!((ed.anchor.clone(), ed.caret.clone()), (Some(at(0)), at(10)));
+            ed.insert_str("Mine");
+            let xml = docxcore::serialize::document_to_xml(&ed.doc);
+            assert!(
+                xml.contains(">Mine<") && !xml.contains("[Abstract]"),
+                "{xml}"
+            );
+            assert!(!xml.contains("showingPlcHdr"), "{xml}");
+        }
+        // A drag from inside the placeholder selects what it swept.
+        let mut ed = abstract_cell();
+        place_click_caret(&mut ed, at(4), false, true);
+        ed.caret = at(7);
+        assert!(!click_selects_placeholder(&mut ed));
+        assert_eq!((ed.anchor.clone(), ed.caret.clone()), (Some(at(4)), at(7)));
+        // Shift+click extends; the release is not asked to select.
+        let mut ed = abstract_cell();
+        place_click_caret(&mut ed, Caret::at(vec![1], 0), false, false);
+        place_click_caret(&mut ed, at(4), true, true);
+        assert_eq!(ed.caret, at(4));
+        assert_eq!(ed.anchor, Some(Caret::at(vec![1], 0)));
     }
 }
 
@@ -11343,6 +11397,7 @@ impl Docxy {
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
             selecting: false,
+            placeholder_click: false,
             hl_mode: None,
             hl_last: hl_mode::DEFAULT_COLOUR.to_string(),
             sheet_dragging: false,
@@ -19490,9 +19545,12 @@ impl Docxy {
         }
     }
 
-    /// Place the caret at an explicit paragraph path + char offset (used by
-    /// click-to-caret). With `extend` (Shift-click) it keeps/starts an anchor so
-    /// the click extends the selection; otherwise it collapses any selection.
+    /// Click-to-caret on an element that starts no drag (a tab, a field, past
+    /// a paragraph's end): place the caret at an explicit paragraph path +
+    /// char offset. With `extend` (Shift-click) it keeps/starts an anchor so
+    /// the click extends the selection; otherwise it collapses any selection,
+    /// and a click inside a content control still showing its placeholder
+    /// selects the placeholder (#1102): with no drag, the press is the click.
     fn set_caret(
         &mut self,
         path: Vec<usize>,
@@ -19503,6 +19561,9 @@ impl Docxy {
     ) {
         if let Some(ed) = self.edit_target() {
             place_click_caret(ed, Caret::at(path, offset), extend, false);
+            if !extend {
+                click_selects_placeholder(ed);
+            }
         }
         self.focus.focus(window, cx);
         self.focused = true;
@@ -19510,7 +19571,9 @@ impl Docxy {
     }
 
     /// Start a mouse drag-selection at a click. Without Shift it plants a fresh
-    /// anchor at the click; with Shift it extends the existing selection.
+    /// anchor at the click; with Shift it extends the existing selection. A
+    /// plain press that is released without dragging selects a placeholder
+    /// under it ([`Self::end_select`]).
     fn begin_select(
         &mut self,
         path: Vec<usize>,
@@ -19525,16 +19588,40 @@ impl Docxy {
             place_click_caret(ed, Caret::at(path, offset), extend, true);
         }
         self.selecting = true;
+        self.placeholder_click = !extend;
         self.focus.focus(window, cx);
         self.focused = true;
         cx.notify();
     }
 
+    /// The release that ends a drag-selection. A plain press that never moved
+    /// the caret is a click: inside a content control still showing its
+    /// placeholder, it selects the placeholder (#1102). A non-empty selection
+    /// pops the mini formatting toolbar at `at`, when given.
+    fn end_select(&mut self, at: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        self.selecting = false;
+        if std::mem::take(&mut self.placeholder_click) {
+            if let Some(ed) = self.edit_target() {
+                click_selects_placeholder(ed);
+            }
+        }
+        let has_sel = matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Doc(ed)) if ed.has_selection());
+        self.mini_bar = at.filter(|_| has_sel);
+        cx.notify();
+    }
+
     /// Extend the drag-selection to the character under the cursor (anchor stays).
     fn extend_select(&mut self, path: Vec<usize>, offset: usize, cx: &mut Context<Self>) {
+        let mut moved = false;
         if let Some(ed) = self.edit_target() {
-            ed.caret = Caret::at(path, offset);
+            let caret = Caret::at(path, offset);
+            moved = ed.caret != caret;
+            ed.caret = caret;
             ed.clamp();
+        }
+        // A press that drags is not a click.
+        if moved {
+            self.placeholder_click = false;
         }
         cx.notify();
     }
@@ -21140,8 +21227,14 @@ impl Docxy {
     }
 
     /// Navigate the caret to the start of a top-level block and scroll to it.
+    /// A caret jump, not a click: it selects no placeholder.
     fn goto_block(&mut self, block: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_caret(vec![block], 0, false, window, cx);
+        if let Some(ed) = self.edit_target() {
+            place_click_caret(ed, Caret::at(vec![block], 0), false, false);
+        }
+        self.focus.focus(window, cx);
+        self.focused = true;
+        cx.notify();
         self.scroll_to_caret();
     }
 
@@ -33673,41 +33766,53 @@ impl Render for Docxy {
                 }
                 let point = (f32::from(ev.position.x), f32::from(ev.position.y));
                 let mut probe = this.ruler_probe.borrow_mut();
-                let pointer = probe.viewport.filter(|r| r.contains(point.0, point.1)).map(|_| point);
+                let pointer = probe
+                    .viewport
+                    .filter(|r| r.contains(point.0, point.1))
+                    .map(|_| point);
                 if probe.pointer != pointer {
                     let old_page = tracked_page(&probe);
                     probe.pointer = pointer;
                     let new_page = tracked_page(&probe);
                     drop(probe);
-                    if old_page != new_page { cx.notify(); }
+                    if old_page != new_page {
+                        cx.notify();
+                    }
                 }
             }))
             // A right-drag of the grid released off it is cancelled (#707 r2).
-            .on_mouse_up(MouseButton::Right, cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
-                this.right_release_off_grid(cx);
-            }))
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                    this.right_release_off_grid(cx);
+                }),
+            )
             // End a text drag-selection or a ruler drag wherever the button is
             // released; a non-empty text selection pops the mini formatting toolbar.
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, w, cx| {
-                if this.selecting && this.hl_mode.is_some() {
-                    this.highlight_drag_end(w, cx);
-                }
-                if this.ruler_drag.is_some() {
-                    this.ruler_drag_end(cx);
-                }
-                // A grid drag released off the grid (over the ribbon, the sheet
-                // tabs, outside the window) ends here; idempotent, so the grid's
-                // own handler having run first costs nothing.
-                this.grid_release(cx);
-                if this.selecting {
-                    this.selecting = false;
-                    let has_sel = matches!(this.tabs.get(this.active).map(|t| &t.surface), Some(Surface::Doc(ed)) if ed.has_selection());
-                    this.mini_bar = has_sel.then_some(ev.position);
-                    cx.notify();
-                }
-            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseUpEvent, w, cx| {
+                    if this.selecting && this.hl_mode.is_some() {
+                        this.highlight_drag_end(w, cx);
+                    }
+                    if this.ruler_drag.is_some() {
+                        this.ruler_drag_end(cx);
+                    }
+                    // A grid drag released off the grid (over the ribbon, the sheet
+                    // tabs, outside the window) ends here; idempotent, so the grid's
+                    // own handler having run first costs nothing.
+                    this.grid_release(cx);
+                    if this.selecting {
+                        this.end_select(Some(ev.position), cx);
+                    }
+                }),
+            )
             .bg(bg)
-            .child(probe_tracked(&self.probes, "suite-root", self.tab_more_open))
+            .child(probe_tracked(
+                &self.probes,
+                "suite-root",
+                self.tab_more_open,
+            ))
             .child(title_bar)
             .child(ribbon_tabs)
             .when_some(ribbon_body, |d, r| d.child(r))
@@ -33734,7 +33839,18 @@ impl Render for Docxy {
             .when_some(dialog, |d, dialog| d.child(dialog))
             // A vertical guide line down the page while a ruler marker is dragged.
             .when_some(self.ruler_guide, |d, gx| {
-                d.child(div().absolute().top_0().bottom_0().left(px(gx)).w(px(1.)).bg(Hsla { a: 0.6, ..hsla_u(BRAND) }))
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(gx))
+                        .w(px(1.))
+                        .bg(Hsla {
+                            a: 0.6,
+                            ..hsla_u(BRAND)
+                        }),
+                )
             })
             .into_any_element()
     }

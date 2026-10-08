@@ -1,0 +1,60 @@
+# Word's cover page binds its Abstract and Year to whole table cells: a
+# content control around the w:tc (#1102). A click in the Abstract while it
+# shows its placeholder selects the whole placeholder, and typing replaces
+# it and clears the flag; the Year, holding a value, takes a plain caret.
+# A drag from inside the placeholder selects what it sweeps. The controls
+# survive a save after an edit elsewhere: the reopened Abstract still
+# selects as a placeholder.
+
+test a click selects a cell-level placeholder and typing replaces it
+  open copy:../fixtures/cover-abstract.docx
+  assert mail.text is ¶2026¶[Type the abstract]¶¶¶Body
+  call doc-click {"offset":12}
+  assert sel.start is 5
+  assert sel.end is 24
+  assert anchor.offset is 5
+  type Our year in review
+  assert mail.text is ¶2026¶Our year in review¶¶¶Body
+  assert caret.offset is 23
+  # The Year shows a value, not a placeholder: a click is a caret.
+  call doc-click {"offset":2}
+  assert sel.start is 2
+  assert sel.end is 2
+  # Shift+click extends from the caret, as anywhere else.
+  call doc-click {"offset":0,"shift":true}
+  assert sel.start is 0
+  assert sel.end is 2
+  key ctrl+s
+  assert dirty is false
+  call open {"path":"cover-abstract.docx","reopen":"always"}
+  assert mail.text is ¶2026¶Our year in review¶¶¶Body
+
+test undo brings the placeholder back and a click selects it again
+  open copy:../fixtures/cover-abstract.docx
+  call doc-click {"offset":10}
+  type Mine
+  assert mail.text is ¶2026¶Mine¶¶¶Body
+  key ctrl+z
+  assert mail.text is ¶2026¶[Type the abstract]¶¶¶Body
+  call doc-click {"offset":20}
+  assert sel.start is 5
+  assert sel.end is 24
+
+test a drag from inside a placeholder selects what it sweeps
+  open copy:../fixtures/cover-abstract.docx
+  call doc-click {"offset":8,"drag-to":12}
+  assert sel.start is 8
+  assert sel.end is 12
+
+test the placeholder survives a save after an edit elsewhere
+  open copy:../fixtures/cover-abstract.docx
+  call doc-click {"offset":30}
+  type !
+  assert mail.text is ¶2026¶[Type the abstract]¶¶¶Body!
+  key ctrl+s
+  assert dirty is false
+  call open {"path":"cover-abstract.docx","reopen":"always"}
+  assert mail.text is ¶2026¶[Type the abstract]¶¶¶Body!
+  call doc-click {"offset":10}
+  assert sel.start is 5
+  assert sel.end is 24

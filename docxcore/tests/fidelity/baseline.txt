@@ -23,18 +23,6 @@ ext:Normalize/lastRenderedPageBreak+run.docx	word/document.xml	lost-element	/w:d
 ext:Normalize/pict+pict.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:Normalize/t+t.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
 ext:Normalize/t+t.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-ext:SDT/Sdt/sdtCell.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:sdt
-ext:SDT/Sdt/sdtCell.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc
-ext:SDT/Sdt/sdtContent.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:sdt
-ext:SDT/Sdt/sdtContent.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc
-ext:SDT/SdtBlock/sdtContent.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:sdt
-ext:SDT/SdtBlock/sdtContent.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc
-ext:SDT/SdtCell/sdtCell.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:sdt
-ext:SDT/SdtCell/sdtCell.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc
-ext:SDT/SdtCell/sdtContent.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:sdt
-ext:SDT/SdtCell/sdtContent.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc
-ext:SDT/SdtRun/sdtContent.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:sdt
-ext:SDT/SdtRun/sdtContent.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc
 ext:TextRun/lastRenderedPageBreak.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:bookmark/bookmark.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:bookmark/bookmark.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:br
@@ -85,10 +73,6 @@ ext:complexDocx/complex0.docx	word/document.xml	extra-element	/w:document/w:body
 ext:complexDocx/complexity - part 1.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:complexDocx/complexity - part 2.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:complexDocx/complexity.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
-ext:cover page/coverpage1.docx	word/document.xml	lost-element	/w:document/w:body/w:sdt/w:sdtContent/w:tbl/w:tr/w:sdt
-ext:cover page/coverpage1.docx	word/document.xml	extra-element	/w:document/w:body/w:sdt/w:sdtContent/w:tbl/w:tr/w:tc
-ext:cover page/coverpage2.docx	word/document.xml	lost-element	/w:document/w:body/w:sdt/w:sdtContent/w:tbl/w:tr/w:sdt
-ext:cover page/coverpage2.docx	word/document.xml	extra-element	/w:document/w:body/w:sdt/w:sdtContent/w:tbl/w:tr/w:tc
 ext:cover page/coverpage3.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:cover page/covwepage4.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:equation/equation-1.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r/w:lastRenderedPageBreak

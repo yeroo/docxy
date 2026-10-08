@@ -15,8 +15,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 mod autocorrect;
+#[cfg(test)]
+mod cell_sdt_tests;
 mod cover;
 mod flat;
+mod placeholder;
 mod sections;
 mod table_design;
 mod table_layout;
@@ -950,6 +953,9 @@ impl Editor {
             self.last = EditKind::None;
         }
         self.checkpoint(EditKind::Insert);
+        let path = self.caret.path.clone();
+        self.clear_placeholders_around(&path);
+        self.clear_inline_placeholders_inside(&path, self.caret.offset);
         let off = self.caret.offset;
         if ch == LINE_BREAK {
             // A break is an inline of its own, formatted as typing here
@@ -1029,6 +1035,8 @@ impl Editor {
         // here would delete from the anchor to the paragraph end.
         self.drop_collapsed_anchor();
         self.checkpoint(EditKind::Structural);
+        let path = self.caret.path.clone();
+        self.clear_placeholders_around(&path);
         let off = self.caret.offset;
         let in_cover = self.caret_in_cover();
         let new_idx = {
@@ -1174,6 +1182,8 @@ impl Editor {
             return;
         }
         self.checkpoint(EditKind::Structural);
+        let path = self.caret.path.clone();
+        self.clear_placeholders_around(&path);
         let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
             return;
         };
@@ -1229,6 +1239,8 @@ impl Editor {
             return;
         }
         self.checkpoint(EditKind::Structural);
+        let path = self.caret.path.clone();
+        self.clear_placeholders_around(&path);
         let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
             return;
         };
@@ -1563,11 +1575,21 @@ impl Editor {
 
         self.checkpoint(EditKind::Structural);
         self.anchor = None;
+        self.clear_placeholders_around(&lo.path);
+        self.clear_placeholders_around(&hi.path);
         // Tracked: the text of each paragraph is recorded as deleted and the
         // paragraph marks stay (see the `track` module).
         if self.delete_text_across_paragraphs(&lo, &hi) {
             self.caret = lo;
             return true;
+        }
+        // The text deleted from the first and last paragraphs.
+        let lo_len = resolve_para(&self.doc.body, &lo.path).map_or(0, para_text_len);
+        if lo.offset < lo_len {
+            self.clear_inline_placeholders(&lo.path, lo.offset, lo_len);
+        }
+        if hi.offset > 0 {
+            self.clear_inline_placeholders(&hi.path, 0, hi.offset);
         }
         let li = *lo.path.last().unwrap();
         let hii = *hi.path.last().unwrap();
@@ -1707,6 +1729,9 @@ impl Editor {
         if clip.paras.is_empty() {
             return;
         }
+        let path = self.caret.path.clone();
+        self.clear_placeholders_around(&path);
+        self.clear_inline_placeholders_inside(&path, self.caret.offset);
         // Recorded as one tracked insertion when tracking; a copy of recorded
         // text is not itself a record when not.
         let recorded = self.clip_for_insertion(clip);
@@ -1932,6 +1957,8 @@ impl Editor {
             Box::new(|s: &str| s.to_uppercase()) // mixed → ALL CAPS
         };
         for (path, s, e) in &spans {
+            self.clear_placeholders_around(path);
+            self.clear_inline_placeholders(path, *s, *e);
             if let Some(p) = para_mut(&mut self.doc.body, path) {
                 map_text_range(&mut p.content, *s, *e, &*f);
             }

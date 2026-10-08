@@ -2854,19 +2854,63 @@ fn parse_cells_into(
                     *property_change = change;
                 }
                 "w:tblPrEx" => capture_element(p, raw),
-                "w:sdt" => loop {
-                    match p.next() {
-                        Event::Start if p.name() == "w:sdtContent" => {
-                            parse_cells_into(p, rels, cells, raw, property_change)
-                        }
-                        Event::Start => p.skip_element(),
-                        Event::End | Event::Eof => break,
-                        Event::Text => {}
-                    }
-                },
+                "w:sdt" => parse_sdt_cells(p, rels, cells, raw, property_change),
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+}
+
+/// Parse a cell-level content control (`<w:sdt>` wrapping `<w:tc>` cells,
+/// such as the cover page's Abstract, #1102): its cells join the row, and the
+/// first of them takes the control's exact opening source (`<w:sdt` through
+/// the `<w:sdtContent>` start tag) in front of any it opens itself, the last
+/// its exact closing source (`</w:sdtContent>` through `</w:sdt>`) after any
+/// it closes itself. A control holding no cell is dropped, as before; one cut
+/// short is closed after its last cell.
+fn parse_sdt_cells(
+    p: &mut XmlParser,
+    rels: &Relationships,
+    cells: &mut Vec<Cell>,
+    raw: &mut Vec<String>,
+    property_change: &mut Option<PropertyChange>,
+) {
+    let (sdt_start, bindings) = (p.start_pos(), rebuilt_bindings(p));
+    let first = cells.len();
+    let mut open = None;
+    let mut close = None;
+    loop {
+        match p.next() {
+            Event::Start if open.is_none() && p.name() == "w:sdtContent" => {
+                open = Some(declare_rebuilt(p.raw_slice(sdt_start, p.pos()), &bindings));
+                // A self-closing `<w:sdtContent/>` ends at once, holding no cell.
+                let content = p.pos();
+                parse_cells_into(p, rels, cells, raw, property_change);
+                // The suffix starts at this content's own end tag.
+                let tail = p.raw_slice(content, p.pos());
+                close = tail.rfind("</").map(|at| content + at);
+            }
+            Event::Start => p.skip_element(),
+            Event::End => {
+                if let (Some(open), Some(at)) = (open.take(), close) {
+                    if cells.len() > first {
+                        cells[first].sdt_open.insert(0, open);
+                        let suffix = p.raw_slice(at, p.pos()).to_string();
+                        cells.last_mut().unwrap().sdt_close.push(suffix);
+                    }
+                }
+                return;
+            }
+            Event::Eof => {
+                if let Some(open) = open.filter(|_| cells.len() > first) {
+                    cells[first].sdt_open.insert(0, open);
+                    let suffix = SDT_BLOCK_CLOSE.to_string();
+                    cells.last_mut().unwrap().sdt_close.push(suffix);
+                }
+                return;
+            }
             Event::Text => {}
         }
     }

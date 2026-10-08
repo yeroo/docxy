@@ -367,7 +367,7 @@ impl Editor {
                         let removed: usize = hit.iter().map(|&i| rm.cells[i].1).sum();
                         let row = &mut t.rows[ri];
                         for &i in hit.iter().rev() {
-                            row.cells.remove(i);
+                            row.remove_cell(i);
                         }
                         set_row_skips(row, rm.before, rm.after + removed);
                     }
@@ -393,6 +393,12 @@ impl Editor {
                                 return Err(
                                     "cells cannot shift up through merged or missing cells".into(),
                                 );
+                            }
+                            // A cell-level content control stays with its
+                            // cell, so shifted text would land in another
+                            // control, or out of its own (#1102).
+                            if !t.rows[ri].cell_controls(ci).is_empty() {
+                                return Err("cells cannot shift up through content controls".into());
                             }
                             cells.push((ri, ci));
                         }
@@ -990,7 +996,7 @@ fn remove_grid_columns(t: &mut Table, left: usize, right: usize) {
         for (ci, &(s, n)) in rm.cells.iter().enumerate().rev() {
             let o = overlap(s, n);
             if o == n {
-                row.cells.remove(ci);
+                row.remove_cell(ci);
             } else if o > 0 {
                 row.cells[ci].grid_span -= o as u32;
             }
@@ -1046,6 +1052,14 @@ fn merge_range(t: &mut Table, r: &CellRange) -> Result<(), String> {
         }
         per_row.push((ri, hit));
     }
+    // A merged cell would carry a cell-level content control over its
+    // neighbours' text, or lose it (#1102).
+    if per_row.iter().any(|(ri, hit)| {
+        hit.iter()
+            .any(|&ci| !t.rows[*ri].cell_controls(ci).is_empty())
+    }) {
+        return Err("cells in a content control cannot be merged".into());
+    }
     // The contents, in reading order; empty cells add nothing.
     let mut blocks = Vec::new();
     for (ri, hit) in &per_row {
@@ -1067,7 +1081,7 @@ fn merge_range(t: &mut Table, r: &CellRange) -> Result<(), String> {
         let row = &mut t.rows[ri];
         let keep = hit[0];
         for &ci in hit[1..].iter().rev() {
-            row.cells.remove(ci);
+            row.remove_cell(ci);
         }
         let cell = &mut row.cells[keep];
         cell.grid_span = w as u32;
