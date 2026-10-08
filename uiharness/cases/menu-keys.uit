@@ -1,0 +1,64 @@
+# #591: keyboard inside an open menu. Right enters a highlighted item's
+# submenu with its first item highlighted, Left and Esc back out one level
+# (Esc closes at the top), and a one-character key tip runs its item like
+# Enter; a letter that matches nothing is swallowed and the menu stays.
+
+test right enters a submenu and left and escape back out of it
+  open ../fixtures/basic.xlsx
+  call menu-open {"target":{"cell":"C3"}}
+  assert reply.open is true
+  assert reply.depth is 0
+  assert reply.highlight is nothing
+  # With nothing highlighted Right has nowhere to go: the menu stays open.
+  key right
+  call menu-read {}
+  assert reply.open is true
+  assert reply.depth is 0
+  assert reply.highlight is nothing
+  # Cut(0), Copy(1), Paste(2), Filter(4): Down steps over the separator.
+  key down down down down
+  call menu-read {}
+  assert reply.highlight is 4
+  key right
+  call menu-read {}
+  assert reply.depth is 1
+  assert reply.highlight is 0
+  assert reply.items.0.label is Reapply
+  # Left puts the parent level back with its submenu item highlighted again.
+  key left
+  call menu-read {}
+  assert reply.depth is 0
+  assert reply.highlight is 4
+  # Esc in a submenu backs out one level; at the top level it closes.
+  key right
+  call menu-read {}
+  assert reply.depth is 1
+  key escape
+  call menu-read {}
+  assert reply.depth is 0
+  assert reply.open is true
+  key escape
+  assert menu is nothing
+
+test a key tip's letter runs its item like Enter
+  open ../fixtures/gantt-summary.xml
+  call menu-open {"target":{"ribbon":["Project","Schedule","Set Baseline"]}}
+  assert reply.depth is 0
+  assert reply.items.0.key_tip is B
+  # The menu takes the letter and runs Set Baseline, as Enter would.
+  key b
+  assert menu is nothing
+  assert status is Baseline set — baseline bars now show under the current bars
+
+test a letter that matches no key tip is swallowed and the menu stays
+  open ../fixtures/basic.xlsx
+  call menu-open {"target":{"cell":"C3"}}
+  # The cell menu's items carry no key tips: x matches nothing, runs nothing
+  # and leaves the menu open (#591).
+  key x
+  call menu-read {}
+  assert reply.open is true
+  assert reply.depth is 0
+  # A non-character key is not single-character: it still closes the menu.
+  key tab
+  assert menu is nothing

@@ -190,6 +190,9 @@ pub(crate) struct Menu {
     /// The item Up and Down have highlighted (an index into `items`), for
     /// Enter to run; `None` until the first arrow.
     pub hi: Option<usize>,
+    /// The levels above (`items` with the highlight each had), one entry per
+    /// submenu Right or Enter has opened in the menu's place (#591).
+    parents: Vec<(Vec<MenuItem>, Option<usize>)>,
 }
 
 impl Menu {
@@ -200,6 +203,7 @@ impl Menu {
             at,
             items,
             hi: None,
+            parents: Vec::new(),
         }
     }
 
@@ -213,7 +217,71 @@ impl Menu {
                 "highlight",
                 self.hi.map_or(Json::Null, |i| Json::Num(i as f64)),
             ),
+            ("depth", Json::Num(self.depth() as f64)),
         ])
+    }
+
+    /// How deep the open menu sits: 0 at the level it opened on, +1 per
+    /// submenu entered in its place.
+    pub fn depth(&self) -> usize {
+        self.parents.len()
+    }
+
+    /// Open the submenu of the enabled item `i` in the menu's place, Office's
+    /// Right (and Enter) in a menu: the current level is remembered with the
+    /// highlight the item had, so [`Menu::leave`] can put it back. With
+    /// `highlight_first` (the keyboard's way in) the first enabled item of
+    /// the submenu is highlighted; without it (a pointer click's way in)
+    /// nothing is. `false`, changing nothing, when `i` is not an enabled item
+    /// with a submenu.
+    pub fn enter(&mut self, i: usize, highlight_first: bool) -> bool {
+        let Some(MenuItem::Item(e)) = self.items.get(i) else {
+            return false;
+        };
+        if !e.enabled || e.submenu.is_empty() {
+            return false;
+        }
+        let submenu = e.submenu.clone();
+        self.parents
+            .push((std::mem::take(&mut self.items), Some(i)));
+        self.items = submenu;
+        self.hi = None;
+        if highlight_first {
+            self.step(true);
+        }
+        true
+    }
+
+    /// Back out one submenu level (Left or Esc): the parent's items return
+    /// with the item that opened the submenu highlighted again. `false` at
+    /// the level the menu opened on, where Esc closes the menu instead.
+    pub fn leave(&mut self) -> bool {
+        let Some((items, hi)) = self.parents.pop() else {
+            return false;
+        };
+        self.items = items;
+        self.hi = hi;
+        true
+    }
+
+    /// The index of the first enabled item whose single-character key tip
+    /// equals `key` (ASCII case-insensitively). Multi-character key tips and
+    /// disabled items never match; the caller has checked `key` is one
+    /// character.
+    pub fn by_key_tip(&self, key: &str) -> Option<usize> {
+        self.items
+            .iter()
+            .enumerate()
+            .find_map(|(i, item)| match item {
+                MenuItem::Item(e)
+                    if e.enabled
+                        && e.key_tip.chars().count() == 1
+                        && e.key_tip.eq_ignore_ascii_case(key) =>
+                {
+                    Some(i)
+                }
+                _ => None,
+            })
     }
 
     /// Down (`down`) or Up: the highlight moves to the next enabled item,
@@ -878,6 +946,94 @@ mod tests {
         );
         none.step(true);
         assert_eq!(none.hi, None);
+    }
+
+    #[test]
+    fn enter_opens_the_submenu_and_leave_restores_the_parent_and_its_highlight() {
+        // sample(): Cut, separator, Insert (submenu), Font... (disabled), ...
+        let mut m = Menu::new(MenuTarget::Document, (0., 0.), sample());
+        m.step(true); // Cut
+        m.step(true); // Insert
+        assert_eq!(m.hi, Some(2));
+        assert_eq!(m.depth(), 0);
+        assert!(m.enter(2, true), "Insert opens its submenu");
+        assert_eq!(m.depth(), 1);
+        assert_eq!(
+            labels(&m.items),
+            ["[Built-In]", "Insert Task", "Insert Milestone"]
+        );
+        assert_eq!(m.hi, Some(1), "the first enabled item, past the heading");
+        assert!(m.leave(), "a level back");
+        assert_eq!(m.depth(), 0);
+        assert_eq!(labels(&m.items)[0], "Cut", "the parent's items");
+        assert_eq!(m.hi, Some(2), "the parent item highlighted again");
+    }
+
+    #[test]
+    fn enter_highlights_the_first_enabled_item_only_when_asked() {
+        let mut m = Menu::new(MenuTarget::Document, (0., 0.), sample());
+        assert!(m.enter(2, true));
+        assert_eq!(
+            m.hi,
+            Some(1),
+            "the heading is skipped, the disabled item would be too"
+        );
+        let mut plain = Menu::new(MenuTarget::Document, (0., 0.), sample());
+        assert!(plain.enter(2, false));
+        assert_eq!(plain.hi, None, "the pointer's way in: nothing highlighted");
+    }
+
+    #[test]
+    fn enter_refuses_a_disabled_or_plain_item() {
+        let mut m = Menu::new(MenuTarget::Document, (0., 0.), sample());
+        assert!(!m.enter(3, true), "Font... is disabled");
+        assert!(!m.enter(0, true), "Cut has no submenu");
+        assert!(!m.enter(1, true), "a separator is not an item");
+        assert_eq!(m.depth(), 0, "nothing was entered");
+        assert_eq!(labels(&m.items)[0], "Cut", "the items are unchanged");
+        assert_eq!(m.hi, None, "the highlight is unchanged");
+    }
+
+    #[test]
+    fn leave_at_top_level_is_false() {
+        let mut m = Menu::new(MenuTarget::Document, (0., 0.), sample());
+        assert!(!m.leave());
+        assert_eq!(m.depth(), 0);
+        assert!(m.enter(2, true));
+        assert!(m.leave());
+        assert!(!m.leave(), "the stack is empty again");
+    }
+
+    #[test]
+    fn by_key_tip_matches_one_char_enabled_items_case_insensitively() {
+        let items = vec![
+            MenuItem::Item(Entry::new("a", "Alpha", "", Act::Bold, true).key("a")),
+            MenuItem::Item(Entry::new("b", "Beta", "", Act::Italic, true).key("b")),
+            MenuItem::Item(Entry::new("g", "Gamma", "", Act::Copy, false).key("g")),
+            MenuItem::Item(Entry::new("np", "NP", "", Act::Paste, true).key("NP")),
+        ];
+        let m = Menu::new(MenuTarget::Document, (0., 0.), items);
+        assert_eq!(m.by_key_tip("b"), Some(1));
+        assert_eq!(m.by_key_tip("B"), Some(1), "case-insensitive");
+        assert_eq!(m.by_key_tip("g"), None, "a disabled item does not match");
+        assert_eq!(
+            m.by_key_tip("n"),
+            None,
+            "a multi-character key_tip does not"
+        );
+        assert_eq!(m.by_key_tip("x"), None, "no match");
+        let no_tips = Menu::new(MenuTarget::Document, (0., 0.), sample());
+        assert_eq!(no_tips.by_key_tip("c"), None, "no key tips at all");
+    }
+
+    #[test]
+    fn menu_json_reports_depth() {
+        let mut m = Menu::new(MenuTarget::Document, (0., 0.), sample());
+        assert_eq!(m.to_json().get("depth"), Some(&Json::Num(0.0)));
+        assert!(m.enter(2, true));
+        assert_eq!(m.to_json().get("depth"), Some(&Json::Num(1.0)));
+        assert!(m.leave());
+        assert_eq!(m.to_json().get("depth"), Some(&Json::Num(0.0)));
     }
 
     #[test]
