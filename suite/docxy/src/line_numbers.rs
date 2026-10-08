@@ -39,38 +39,55 @@ pub(crate) struct Entry {
     pub rule: Rule,
 }
 
-/// The counter value before each entry's first line, accumulated exactly as
-/// export.rs `count_line` does. An entry with `rows[k] == 0` neither
-/// restarts nor records a "last" page/section — page-view-only behaviour,
-/// a hedge for a canvas that has not painted yet (not an export.rs
-/// scenario: export counts every placed line, and an empty paragraph is one
-/// line). NOTE: a row whose painted height reads as several `line_h`s (a
-/// mixed larger inline font) is counted as that many rows, so later numbers
-/// can run ahead of the PDF until the next restart (known limitation).
-pub(crate) fn first_counts(entries: &[Entry], rows: &[u32]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(entries.len());
-    let mut count = 0u32;
-    let mut last: Option<(usize, usize)> = None;
-    for (k, e) in entries.iter().enumerate() {
-        let r = rows.get(k).copied().unwrap_or(0);
-        if r == 0 {
-            out.push(count);
-            continue;
-        }
-        let restart = match (last, e.rule.restart) {
-            (None, _) => true,
-            (Some((p, _)), LnRestart::NewPage) => p != e.page,
-            (Some((_, s)), LnRestart::NewSection) => s != e.section,
-            (Some(_), LnRestart::Continuous) => false,
-        };
-        if restart {
-            count = e.rule.start;
-        }
-        out.push(count);
-        count += r;
-        last = Some((e.page, e.section));
+/// The running line counter the row canvases share, applied in paint
+/// order (document order): mirrors export.rs `Region::count_line`'s
+/// `line_count`. `count` is the counter value before the next entry's
+/// first line; `last` is the (page, section) the counter last counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CountState {
+    pub count: u32,
+    pub last: Option<(usize, usize)>,
+}
+
+/// One numbered paragraph's step of the running counter, exactly export.rs
+/// `count_line`'s restart rule. An entry with `rows == 0` neither restarts
+/// nor updates `last` — page-view-only behaviour, a hedge for a canvas that
+/// has not painted yet (not an export.rs scenario: export counts every
+/// placed line, and an empty paragraph is one line). NOTE: a row whose
+/// painted height reads as several `line_h`s (a mixed larger inline font)
+/// is counted as that many rows, so later numbers can run ahead of the PDF
+/// until the next restart (known limitation). Returns the counter value
+/// before this entry's first line.
+pub(crate) fn advance(state: &mut CountState, e: &Entry, rows: u32) -> u32 {
+    if rows == 0 {
+        return state.count;
     }
-    out
+    let restart = match (state.last, e.rule.restart) {
+        (None, _) => true,
+        (Some((p, _)), LnRestart::NewPage) => p != e.page,
+        (Some((_, s)), LnRestart::NewSection) => s != e.section,
+        (Some(_), LnRestart::Continuous) => false,
+    };
+    if restart {
+        state.count = e.rule.start;
+    }
+    let first = state.count;
+    state.count += rows;
+    state.last = Some((e.page, e.section));
+    first
+}
+
+/// The counter value before each entry's first line, as export.rs
+/// accumulates it — the pure reference the unit tests pin; the paint
+/// closure runs the same `advance` one entry at a time.
+#[cfg(test)]
+pub(crate) fn first_counts(entries: &[Entry], rows: &[u32]) -> Vec<u32> {
+    let mut state = CountState::default();
+    entries
+        .iter()
+        .enumerate()
+        .map(|(k, e)| advance(&mut state, e, rows.get(k).copied().unwrap_or(0)))
+        .collect()
 }
 
 /// The pitch one wrapped line actually draws at. gpui snaps a text line's
@@ -98,10 +115,11 @@ fn round_half_toward_zero(x: f32) -> f32 {
 }
 
 /// The caret bar's layout height in a document row: the brand bar is a
-/// fixed 19px, but never taller than the paragraph's own line height, so
-/// below 100% zoom it cannot inflate a one-line row past `min_h` and make
-/// the row count a line that is not there (#746). The chrome caret sites
-/// (comment editor, label input) pass an explicit 19.
+/// fixed 19px, but never taller than the paragraph's own line height, so a
+/// small enough `line_h` — below ~97% zoom, or an auto line-spacing
+/// multiple under ~0.97 — cannot have the bar inflate a one-line row past
+/// `min_h` and make the row count a line that is not there (#746). The
+/// chrome caret sites (comment editor, label input) pass an explicit 19.
 pub(crate) fn caret_height(line_h: f32) -> f32 {
     19.0_f32.min(line_h)
 }
@@ -116,7 +134,11 @@ pub(crate) fn caret_height(line_h: f32) -> f32 {
 /// one line at `min_h` and read as one row — numbering after such a
 /// paragraph can run one short until the next restart. Laying the row out
 /// without `min_h` would change pagination, and gpui reports no wrapped
-/// line count, so there is nothing safe to count instead.
+/// line count, so there is nothing safe to count instead. A wrapped line
+/// that holds only a tab measures shorter than a text line (emit_tab's
+/// spacer is `base` tall), so tab-built rows can also read short; changing
+/// the spacer alters every tabbed paragraph's layout, so it is recorded as
+/// a follow-up rather than fixed here.
 pub(crate) fn row_count(height: f32, line_h: f32, min_h: f32) -> u32 {
     if height <= min_h + 0.5 || line_h <= 0.0 {
         return 1;
@@ -144,14 +166,15 @@ pub(crate) fn numbered_rule(
 
 /// The frame's line-number state, shared by the numbered rows' canvases in
 /// paint order — numbering depends on it, so the render rebuilds `entries`
-/// and `rows` (document order) before the canvases paint and each canvas
-/// records its own row count before reading earlier ones. `painted` is
-/// only the harness's record of what was drawn (`doc {}`). `page` is the
-/// 0-based sheet index.
+/// (document order) and resets `counting` before the canvases paint, each
+/// canvas records its own row count, and `advance`s the shared counter one
+/// entry at a time. `painted` is only the harness's record of what was
+/// drawn (`doc {}`). `page` is the 0-based sheet index.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LineProbe {
     pub entries: Vec<Entry>,
     pub rows: Vec<u32>,
+    pub counting: CountState,
     pub painted: Vec<Painted>,
 }
 

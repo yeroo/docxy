@@ -26607,8 +26607,9 @@ fn caret_bar() -> AnyElement {
 /// The caret bar as a layout box: `height` tall and 2px wide with negative
 /// side margins that cancel the width, so it sits between glyphs without
 /// nudging them apart. Document paragraphs pass
-/// `line_numbers::caret_height(line_h)` so a small-zoom line can never
-/// inflate a row (#746); the chrome sites pass 19.
+/// `line_numbers::caret_height(line_h)` so a small line height (low zoom
+/// or a small line-spacing multiple) can never inflate a row (#746); the
+/// chrome sites pass 19.
 fn caret_bar_h(height: f32) -> AnyElement {
     div()
         .w(px(2.))
@@ -27279,13 +27280,20 @@ fn line_number_canvas(
             let line_h = line_numbers::row_pitch(line_h, window.scale_factor());
             let rows = line_numbers::row_count(b.size.height.into(), line_h, min_h);
             if slot.ord < probe.rows.len() {
+                // A canvas paints once per frame (gpui walks the tree in
+                // order); this fires if that ever changes.
+                debug_assert_eq!(
+                    probe.rows[slot.ord], 0,
+                    "line-number canvas painted twice in one frame"
+                );
                 probe.rows[slot.ord] = rows;
             }
-            let Some(&first) =
-                line_numbers::first_counts(&probe.entries, &probe.rows).get(slot.ord)
-            else {
+            // Earlier canvases advanced the shared counter in tree order;
+            // this entry's step gives the number before its first line.
+            let Some(&entry) = probe.entries.get(slot.ord) else {
                 return;
             };
+            let first = line_numbers::advance(&mut probe.counting, &entry, rows);
             // The row sits `pad` in from its column's left edge, so the
             // column's left is `b.origin.x - pad`; the number's right edge
             // is `distance` further left (export.rs numbers the same way).
@@ -33052,6 +33060,7 @@ impl Render for Docxy {
                             let mut probe = self.line_probe.borrow_mut();
                             probe.entries.clear();
                             probe.painted.clear();
+                            probe.counting = Default::default();
                         }
                         // Per-page header/footer: each page shows the parts its own
                         // section applies (Link to Previous resolved by docxcore) for
@@ -33504,6 +33513,7 @@ impl Render for Docxy {
                             let mut probe = self.line_probe.borrow_mut();
                             probe.entries.clear();
                             probe.rows.clear();
+                            probe.counting = Default::default();
                             probe.painted.clear();
                         }
                         let blocks: Vec<AnyElement> = body
