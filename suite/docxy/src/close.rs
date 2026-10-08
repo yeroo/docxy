@@ -328,6 +328,19 @@ pub(crate) enum CloseAsk {
     Force,
 }
 
+/// How a window's close asks, with `windows` open (#587): a non-last
+/// window always asks, a harness's own close never does, and otherwise
+/// the setting decides. The close button and Quit (#1071) both ask this.
+pub(crate) fn close_ask(windows: usize, harness: bool) -> CloseAsk {
+    if windows > 1 {
+        CloseAsk::Force
+    } else if harness {
+        CloseAsk::HarnessQuit
+    } else {
+        CloseAsk::Setting
+    }
+}
+
 /// Whether the tab's Save writes its own file, as it is (not Save As): what
 /// an unchanged File name and location mean in the close prompt.
 fn saves_in_place(tab: &DocTab) -> bool {
@@ -760,12 +773,14 @@ impl Docxy {
             match draft_error_to(!self.tabs.is_empty(), harness) {
                 DraftErrorTo::Status => self.set_status(e.clone()),
                 DraftErrorTo::Dialog => {
-                    rfd::MessageDialog::new()
-                        .set_title("docxy")
-                        .set_level(rfd::MessageLevel::Warning)
-                        .set_description(e)
-                        .set_buttons(rfd::MessageButtons::Ok)
-                        .show();
+                    crate::macos_menu::native_modal(|| {
+                        rfd::MessageDialog::new()
+                            .set_title("docxy")
+                            .set_level(rfd::MessageLevel::Warning)
+                            .set_description(e)
+                            .set_buttons(rfd::MessageButtons::Ok)
+                            .show()
+                    });
                 }
                 DraftErrorTo::Reply => {}
             }

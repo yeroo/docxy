@@ -2875,3 +2875,13 @@ fn exit_comment_edge_whitespace_commit_lands_on_the_selection() {
     );
     assert_eq!(at(0, 0), 1, "A1 keeps its own note, untouched");
 }
+
+/// The close button and Quit (#1071) ask the same way: a non-last window
+/// always, a harness's own close never, otherwise as the setting says.
+#[test]
+fn a_close_asks_by_window_count_then_harness_then_setting() {
+    assert!(close_ask(2, false) == CloseAsk::Force);
+    assert!(close_ask(2, true) == CloseAsk::Force);
+    assert!(close_ask(1, true) == CloseAsk::HarnessQuit);
+    assert!(close_ask(1, false) == CloseAsk::Setting);
+}

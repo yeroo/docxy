@@ -991,10 +991,11 @@ impl Docxy {
             self.set_status(MAIL_ATTACH_HARNESS);
             return;
         }
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Recipient list (*.csv, *.txt)", &["csv", "txt"])
-            .pick_file()
-        else {
+        let Some(path) = crate::macos_menu::native_modal(|| {
+            rfd::FileDialog::new()
+                .add_filter("Recipient list (*.csv, *.txt)", &["csv", "txt"])
+                .pick_file()
+        }) else {
             return;
         };
         if let Some(tab) = self.tabs.get_mut(self.active) {

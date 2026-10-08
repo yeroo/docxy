@@ -241,7 +241,7 @@ impl Docxy {
         // The name is written as picked (the dialog already asked about
         // overwriting it): any .html name saves a bundle, found by its content
         // when opened again.
-        dialog.set_file_name(name).save_file()
+        crate::macos_menu::native_modal(|| dialog.set_file_name(name).save_file())
     }
 
     /// The Export page. `None` unless it is selected and the active tab is a

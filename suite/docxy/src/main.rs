@@ -60,6 +60,7 @@ mod html_bundle;
 mod inputs;
 mod inspector;
 mod layout_tab;
+mod macos_menu;
 mod mailings_dialogs;
 mod mailings_tab;
 mod menu;
@@ -11847,14 +11848,20 @@ impl Docxy {
 
     /// Ctrl+N (#631): a new blank document on a document tab, a new workbook
     /// on a workbook tab; on any other tab it does nothing. Ctrl+W (#629):
-    /// close the active tab, as File > Close and its X do. `None` for a key
-    /// that is not one of these.
+    /// close the active tab, as File > Close and its X do. On macOS, ⌘⇧S is
+    /// Save As (#1071). `None` for a key that is not one of these.
     fn document_key(
         &mut self,
         ev: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<()> {
+        // ⌘⇧S is the Mac's Save As (#1071), on every tab kind.
+        if macos_menu::is_save_as(&ev.keystroke, text_input::MACOS) {
+            self.keytips = KeyTip::Off;
+            self.save_as(window, cx);
+            return Some(());
+        }
         let m = &ev.keystroke.modifiers;
         if !(m.control || m.platform) || m.alt || m.shift {
             return None;
@@ -14753,11 +14760,13 @@ impl Docxy {
                 finish_project_save(&mut self.tabs[self.active], Some(&path))
             }
             SaveDecision::Dialog { suggested } => {
-                let target = rfd::FileDialog::new()
-                    .add_filter("Project schedule", &["yppx"])
-                    .add_filter("MSPDI", &["xml"])
-                    .set_file_name(suggested)
-                    .save_file();
+                let target = macos_menu::native_modal(|| {
+                    rfd::FileDialog::new()
+                        .add_filter("Project schedule", &["yppx"])
+                        .add_filter("MSPDI", &["xml"])
+                        .set_file_name(suggested)
+                        .save_file()
+                });
                 finish_project_save(&mut self.tabs[self.active], target.as_deref());
             }
             SaveDecision::RefuseHarness(message) => self.tabs[self.active].status = message.into(),
@@ -18935,19 +18944,21 @@ impl Docxy {
             return;
         };
         let pick = |suggested| {
-            rfd::FileDialog::new()
-                .add_filter("Excel workbook", &SHEET_EXTENSIONS)
-                .set_file_name(suggested)
-                .save_file()
+            macos_menu::native_modal(|| {
+                rfd::FileDialog::new()
+                    .add_filter("Excel workbook", &SHEET_EXTENSIONS)
+                    .set_file_name(suggested)
+                    .save_file()
+            })
         };
         if !save_sheet_tab(tab, harness, explicit_save_as, pick, |features| {
             matches!(
-                rfd::MessageDialog::new()
+                macos_menu::native_modal(|| rfd::MessageDialog::new()
                     .set_title("docxy")
                     .set_level(rfd::MessageLevel::Warning)
                     .set_description(macro_free_question(features))
                     .set_buttons(rfd::MessageButtons::YesNo)
-                    .show(),
+                    .show()),
                 rfd::MessageDialogResult::Yes
             )
         }) {
@@ -19060,7 +19071,7 @@ impl Docxy {
         {
             let picked = cx
                 .background_executor()
-                .spawn(async move { dialog.pick_file() });
+                .spawn(async move { macos_menu::native_modal(|| dialog.pick_file()) });
             cx.spawn_in(window, async move |this, cx| {
                 let path = picked.await;
                 let _ = this.update_in(cx, |this, window, cx| {
@@ -19070,7 +19081,12 @@ impl Docxy {
             .detach();
         }
         #[cfg(not(target_os = "linux"))]
-        self.finish_open_file(dialog.pick_file(), mode, window, cx);
+        self.finish_open_file(
+            macos_menu::native_modal(|| dialog.pick_file()),
+            mode,
+            window,
+            cx,
+        );
     }
 
     fn finish_open_file(
@@ -33382,6 +33398,7 @@ impl KeyRouting for Div {
             .on_action(
                 cx.listener(|this, _: &OutdentAction, window, cx| this.shift_tab_key(window, cx)),
             )
+            .map(|root| macos_menu::window_actions(root, cx))
     }
 }
 
@@ -37179,13 +37196,7 @@ fn open_docxy_window(
             let on_close = view.clone();
             window.on_window_should_close(cx, move |window, cx| {
                 on_close.update(cx, |this, cx| {
-                    let ask = if windows::count(cx) > 1 {
-                        close::CloseAsk::Force
-                    } else if this.harness {
-                        close::CloseAsk::HarnessQuit
-                    } else {
-                        close::CloseAsk::Setting
-                    };
+                    let ask = close::close_ask(windows::count(cx), this.harness);
                     this.window_should_close(ask, window, cx)
                 })
             });
@@ -37325,6 +37336,9 @@ fn main() {
             KeyBinding::new("tab", InsertTabAction, None),
             KeyBinding::new("shift-tab", OutdentAction, None),
         ]);
+        // The menu bar (#1071): ⌘Q, ⌃⌘F and the Edit menu native panels need.
+        #[cfg(target_os = "macos")]
+        macos_menu::install(cx);
         cx.set_global(windows::Registry::default());
         let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
         let options = window_options(bounds, want_harness);

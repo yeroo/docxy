@@ -1763,7 +1763,7 @@ impl Docxy {
                 match export_decision(tab, self.harness) {
                     ExportDecision::InPlace(p) => finish_project_export(&mut self.tabs[self.active], Some(&p)),
                     ExportDecision::Dialog { suggested } => {
-                        let target = rfd::FileDialog::new().add_filter("Markdown", &["md"]).set_file_name(suggested).save_file();
+                        let target = crate::macos_menu::native_modal(|| rfd::FileDialog::new().add_filter("Markdown", &["md"]).set_file_name(suggested).save_file());
                         finish_project_export(&mut self.tabs[self.active], target.as_deref());
                     },
                     ExportDecision::RefuseHarness => self.tabs[self.active].status = "This project needs an export filename, and a harness instance cannot open the export dialog".into(),
