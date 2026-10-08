@@ -240,13 +240,16 @@ impl Report<'_> {
 
     /// The earliest start or latest finish shown for the tasks a report
     /// covers (leveled while leveling is on), so a dormant task's span is
-    /// not the project's.
+    /// not the project's; nor is an active summary's that rolls up only
+    /// dormant tasks, which the scheduler treats as dormant too.
     fn bound(
         &self,
         pick: fn(DateTime, DateTime) -> DateTime,
         date: impl Fn(i32) -> Option<DateTime>,
     ) -> String {
+        let dormant = crate::schedule::dormant_uids(self.proj);
         self.tasks()
+            .filter(|t| !dormant.contains(&t.uid))
             .filter_map(|t| date(t.uid))
             .reduce(pick)
             .map_or_else(|| "NA".into(), format_project_date)
@@ -258,14 +261,14 @@ impl Report<'_> {
         if let Some(sum) = self.project_summary() {
             return self.fields.read(sum, Field::PercentComplete).text;
         }
-        let (mut done, mut all) = (0.0, 0.0);
+        // In whole numbers, so a leaf at 29% reads 29%, not a float's 28.99.
+        let (mut done, mut all) = (0i128, 0i128);
         for t in self.leaves() {
-            let min = t.duration_min.max(0) as f64;
-            done += min * f64::from(t.percent_complete.unwrap_or(0)) / 100.0;
+            let min = i128::from(t.duration_min.max(0));
+            done += min * i128::from(t.percent_complete.unwrap_or(0));
             all += min;
         }
-        let pct = if all > 0.0 { done / all * 100.0 } else { 0.0 };
-        format!("{}%", pct.floor() as i64)
+        format!("{}%", if all > 0 { done / all } else { 0 })
     }
 
     /// The plan's status date line, or why lateness is not computed.

@@ -3040,7 +3040,7 @@ fn dormant_pass(
 
 /// Inactive tasks and summaries with no active descendants have no effect on
 /// the active schedule. The latter still retain their own dates in pass B.
-fn dormant_uids(proj: &Project) -> std::collections::HashSet<i32> {
+pub(crate) fn dormant_uids(proj: &Project) -> std::collections::HashSet<i32> {
     let activity = proj.effective_activity();
     let mut dormant = std::collections::HashSet::new();
     for (task, active) in proj.tasks.iter().zip(activity) {
@@ -3308,7 +3308,9 @@ pub fn level(proj: &Project) -> Leveled {
 /// capacity are the leveler's, in its working-time index: only active,
 /// scheduled leaves book; an assignment books its resource over its own
 /// window from its `Delay` (a manual or tracked task's through its finish);
-/// capacity is Max. Units or the availability periods. Unlike the leveler,
+/// capacity is Max. Units or the availability periods (indexed on the
+/// leaves' calendars when the default one has no working time, where the
+/// leveler does not run). Unlike the leveler,
 /// which lets a free resource take one assignment above its capacity, any
 /// booking above capacity counts.
 pub fn overbooked(
@@ -3652,12 +3654,27 @@ impl Scheduler<'_> {
 
     /// See [`overbooked`].
     fn overbooked(&self, shown: impl Fn(i32) -> Option<(DateTime, DateTime)>) -> HashMap<i32, f64> {
-        let tl = self
+        let mut tl = self
             .timelines
             .get(&self.default_cal)
             .expect("default timeline present");
+        // A default calendar with no working time leaves each leaf on its
+        // own: index the shown span on their union instead, as a summary's
+        // duration is measured. The leveler leaves such a plan unleveled.
+        let union;
         if tl.total == 0 {
-            return HashMap::new();
+            let spans = self.proj.tasks.iter().filter_map(|t| shown(t.uid));
+            let Some((first, last)) = spans.fold(None, |acc: Option<(i64, i64)>, (s, f)| {
+                let (s, f) = (s.minutes(), f.minutes());
+                Some(acc.map_or((s, f), |(a, b)| (a.min(s), b.max(f))))
+            }) else {
+                return HashMap::new();
+            };
+            union = Timeline::build(&self.summary_cal, first, first, 0, last + 1440);
+            tl = &union;
+            if tl.total == 0 {
+                return HashMap::new();
+            }
         }
         let graph = self.leaf_graph();
         let caps: HashMap<i32, Capacity> = self
@@ -9559,6 +9576,25 @@ mod tests {
         assert_eq!(span_and_slack(&s, 2), fixed_span(at(4, 8), at(5, 17)));
         assert_eq!(leveled_span(&proj, 1), (Some(at(3, 8)), Some(at(3, 8))));
         assert_eq!(leveled_span(&proj, 2), (Some(at(4, 8)), Some(at(5, 17))));
+    }
+
+    /// With no working time on the default calendar, bookings are indexed
+    /// on the leaves' calendars, so two parallel tasks still overbook.
+    #[test]
+    fn overbooked_reads_leaf_calendars_when_default_has_no_work() {
+        let mut proj = closed_default(
+            vec![phase(1), child(2, "A", 960, 3), child(3, "B", 960, 3)],
+            vec![Calendar::standard(3)],
+        );
+        proj.resources = vec![worker(1, "Alice", 1.0)];
+        proj.assignments = vec![assign(1, 2, 1, 1.0), assign(2, 3, 1, 1.0)];
+        let s = schedule(&proj);
+        let shown = |uid| s.get(uid).map(|r| (r.early_start, r.early_finish));
+        assert_eq!(overbooked(&proj, shown), HashMap::from([(1, 2.0)]));
+        proj.tasks[2].predecessors.push(fs(2));
+        let s = schedule(&proj);
+        let shown = |uid| s.get(uid).map(|r| (r.early_start, r.early_finish));
+        assert!(overbooked(&proj, shown).is_empty());
     }
 
     #[test]

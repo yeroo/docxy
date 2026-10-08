@@ -455,3 +455,32 @@ fn the_overview_spans_only_active_tasks() {
     assert_eq!(rows(&md, "")[0][1], finish, "{md}");
     assert_eq!(finish, "Fri 3/13/26");
 }
+
+#[test]
+fn percent_complete_is_whole_number_arithmetic() {
+    // 0.29 is not exact in floating point: a float floor read 28%.
+    let mut one = task(1, "One", 480);
+    one.percent_complete = Some(29);
+    let md = render_of(project(vec![one]), ReportKind::ProjectOverview);
+    assert_eq!(rows(&md, "")[0][2], "29%", "{md}");
+}
+
+#[test]
+fn an_active_summary_of_dormant_tasks_does_not_stretch_the_overview() {
+    // Phase is active, but its only task is not; the plan is one day long.
+    let mut phase = task(1, "Phase", 0);
+    phase.summary = true;
+    let mut idle = task(2, "Idle", 3 * 480);
+    idle.outline_level = 2;
+    idle.active = Some(false);
+    let md = render_of(
+        project(vec![phase, idle, task(3, "Go", 480)]),
+        ReportKind::ProjectOverview,
+    );
+    let head = &rows(&md, "")[0];
+    assert_eq!(
+        (head[0].as_str(), head[1].as_str()),
+        ("Mon 3/2/26", "Mon 3/2/26"),
+        "{md}"
+    );
+}
