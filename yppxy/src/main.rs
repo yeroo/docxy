@@ -439,8 +439,8 @@ struct App {
     gantt_x0: u16,     // absolute x where the gantt inner area begins
     gantt_cols: usize, // inner width of the gantt in columns; 0 before the first draw
     screen_w: u16,     // terminal width, for the tab-strip Theme button
-    /// The status line's `New Tasks: …` segment: its row and end column.
-    new_tasks_hit: Option<(u16, u16)>,
+    /// The status line's `New Tasks: …` segment: its row, start and end column.
+    new_tasks_hit: Option<(u16, u16, u16)>,
 }
 
 const RIBBON_H: u16 = 7; // tab strip (1) + body (6: border, 2 rows, separator, titles, border)
@@ -1495,7 +1495,7 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
             }
             if app
                 .new_tasks_hit
-                .is_some_and(|(row, end)| y == row && x < end)
+                .is_some_and(|(row, start, end)| y == row && (start..end).contains(&x))
             {
                 app.toggle_new_tasks_manual();
                 return;
@@ -1857,7 +1857,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(app.ribbon.render_body(app.rfocus)), rows[1]);
     draw_header(f, rows[2], app);
     draw_body(f, rows[3], app);
-    app.new_tasks_hit = Some((rows[4].y, rows[4].x + new_tasks_label(app).width() as u16));
+    let start = rows[4].x + state_label(app_state(app)).width() as u16;
+    app.new_tasks_hit = Some((
+        rows[4].y,
+        start,
+        start + new_tasks_label(app).width() as u16,
+    ));
     draw_status(f, rows[4], app);
     if app.prompt.is_some() {
         draw_prompt(f, area, app);
@@ -2246,7 +2251,41 @@ fn mode_marker(t: &Task) -> &'static str {
     if t.manual { "📌" } else { "  " }
 }
 
-/// The status line's first segment, as Project's status bar shows it; a
+/// The application state the status line's first item shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AppState {
+    Ready,
+    Edit,
+}
+
+impl AppState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "Ready",
+            Self::Edit => "Edit",
+        }
+    }
+}
+
+/// `Edit` while a text prompt has the keyboard, else `Ready`. There is no
+/// `Busy`: leveling is synchronous (`set_level`), so no deferred pass is ever
+/// pending to show. The confirm modal, the welcome screen and the File
+/// backstage take the whole frame and draw no status line, so they have no
+/// state to show.
+fn app_state(app: &App) -> AppState {
+    if app.prompt.is_some() {
+        AppState::Edit
+    } else {
+        AppState::Ready
+    }
+}
+
+/// The state item, padded to a fixed width so the rest of the line stays put.
+fn state_label(state: AppState) -> String {
+    format!(" {:<5} │", state.label())
+}
+
+/// The status line's second segment, as Project's status bar shows it; a
 /// click on it (or `M`) switches the mode for new tasks.
 fn new_tasks_label(app: &App) -> String {
     format!(
@@ -2262,10 +2301,13 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     } else {
         app.status.clone()
     };
-    let mut spans = vec![Span::styled(
-        new_tasks_label(app),
-        Style::default().fg(Color::Yellow),
-    )];
+    let mut spans = vec![
+        Span::styled(
+            state_label(app_state(app)),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(new_tasks_label(app), Style::default().fg(Color::Yellow)),
+    ];
     if app.vim {
         spans.push(Span::styled(
             " -- VIM -- ",
@@ -4344,15 +4386,21 @@ mod tests {
     fn the_status_line_shows_and_switches_the_new_task_mode() {
         let mut app = two_tasks();
         let (w, h) = (110u16, 22u16);
-        assert!(frame_row(&mut app, w, h - 1).starts_with(" New Tasks: Auto Scheduled"));
+        assert!(frame_row(&mut app, w, h - 1).starts_with(" Ready │ New Tasks: Auto Scheduled"));
         press(&mut app, 'M');
         assert!(app.ed.project().new_tasks_are_manual);
         assert_eq!(app.ed.undo_depth(), 1);
-        assert!(frame_row(&mut app, w, h - 1).starts_with(" New Tasks: Manually Scheduled"));
+        assert!(
+            frame_row(&mut app, w, h - 1).starts_with(" Ready │ New Tasks: Manually Scheduled")
+        );
         // A new task follows the plan's mode.
         app.add_task();
         assert!(app.ed.project().tasks[app.ed.sel()].manual);
         // A click on the segment switches it back.
+        frame_row(&mut app, w, h - 1);
+        click(&mut app, 12, h - 1);
+        assert!(!app.ed.project().new_tasks_are_manual);
+        // A click on the state item does not.
         frame_row(&mut app, w, h - 1);
         click(&mut app, 3, h - 1);
         assert!(!app.ed.project().new_tasks_are_manual);
@@ -4360,6 +4408,23 @@ mod tests {
         frame_row(&mut app, w, h - 1);
         click(&mut app, w - 2, h - 1);
         assert!(!app.ed.project().new_tasks_are_manual);
+    }
+
+    #[test]
+    fn the_status_line_state_item_follows_the_text_prompt() {
+        let mut app = two_tasks();
+        let (w, h) = (110u16, 22u16);
+        let col = |r: &str| r.find("New Tasks:").unwrap();
+        let ready = frame_row(&mut app, w, h - 1);
+        assert!(ready.starts_with(" Ready │ New Tasks:"));
+        press_key(&mut app, KeyCode::Enter); // rename prompt
+        assert!(app.prompt.is_some());
+        let edit = frame_row(&mut app, w, h - 1);
+        assert!(edit.starts_with(" Edit  │ New Tasks:"));
+        assert_eq!(col(&ready), col(&edit));
+        press_key(&mut app, KeyCode::Esc);
+        assert!(app.prompt.is_none());
+        assert!(frame_row(&mut app, w, h - 1).starts_with(" Ready │ New Tasks:"));
     }
 
     /// Phase { A, B }, then C, all a day long.
