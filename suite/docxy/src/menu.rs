@@ -487,8 +487,14 @@ pub(crate) fn document_menu() -> Vec<MenuItem> {
 /// is collapsed; the same toggle as Ctrl+F1 and the chevron.
 pub(crate) fn ribbon_bar_menu(collapsed: bool) -> Vec<MenuItem> {
     vec![MenuItem::Item(
-        Entry::new("rb-collapse", "Collapse the Ribbon", "", Act::AutoHideRibbon, true)
-            .checked(collapsed),
+        Entry::new(
+            "rb-collapse",
+            "Collapse the Ribbon",
+            "",
+            Act::AutoHideRibbon,
+            true,
+        )
+        .checked(collapsed),
     )]
 }
 
