@@ -6537,17 +6537,24 @@ const FILE_FG: u32 = 0xffffff;
 /// selection, and `plant` (a press that may start a drag) leaves the anchor on
 /// the new caret so the drag extends from it. Goes through
 /// `Editor::set_caret`, so typing after the click is its own undo step instead
-/// of coalescing with the typing before it.
-fn place_click_caret(ed: &mut Editor, caret: Caret, extend: bool, plant: bool) {
+/// of coalescing with the typing before it. A plain click inside a content
+/// control still showing its placeholder selects the whole placeholder, so
+/// typing replaces it, as in Word (#1102); then it plants nothing and returns
+/// true, and the press starts no drag.
+fn place_click_caret(ed: &mut Editor, caret: Caret, extend: bool, plant: bool) -> bool {
     if extend {
         ed.extend_selection(true);
     } else {
         ed.clear_selection();
     }
     ed.set_caret(caret);
+    if !extend && ed.select_placeholder_at_caret() {
+        return true;
+    }
     if plant && !extend {
         ed.extend_selection(true);
     }
+    false
 }
 
 #[cfg(test)]
@@ -6586,6 +6593,41 @@ mod click_caret_tests {
         assert_eq!(ed.caret, Caret::at(vec![0], 4));
         place_click_caret(&mut ed, Caret::at(vec![0], 1), false, false);
         assert_eq!(ed.anchor, None);
+    }
+
+    /// A cover page's Abstract: a cell-level control showing its placeholder.
+    fn abstract_cell() -> Editor {
+        let xml = "<w:document><w:body><w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"4000\"/>\
+            </w:tblGrid><w:tr><w:sdt><w:sdtPr><w:alias w:val=\"Abstract\"/><w:showingPlcHdr/>\
+            </w:sdtPr><w:sdtContent><w:tc><w:p><w:r><w:t>[Abstract]</w:t></w:r></w:p></w:tc>\
+            </w:sdtContent></w:sdt></w:tr></w:tbl><w:p/></w:body></w:document>";
+        Editor::new(docxcore::load::parse_document_xml(
+            xml,
+            &docxcore::load::Relationships::default(),
+        ))
+    }
+
+    #[test]
+    fn a_click_in_a_placeholder_selects_it_and_shift_click_does_not_1102() {
+        let inside = Caret::at(vec![0, 0, 0, 0], 4);
+        for plant in [false, true] {
+            let mut ed = abstract_cell();
+            assert!(place_click_caret(&mut ed, inside.clone(), false, plant));
+            assert_eq!(ed.anchor, Some(Caret::at(vec![0, 0, 0, 0], 0)));
+            assert_eq!(ed.caret, Caret::at(vec![0, 0, 0, 0], 10));
+            ed.insert_str("Mine");
+            let xml = docxcore::serialize::document_to_xml(&ed.doc);
+            assert!(
+                xml.contains(">Mine<") && !xml.contains("[Abstract]"),
+                "{xml}"
+            );
+            assert!(!xml.contains("showingPlcHdr"), "{xml}");
+        }
+        let mut ed = abstract_cell();
+        place_click_caret(&mut ed, Caret::at(vec![1], 0), false, false);
+        assert!(!place_click_caret(&mut ed, inside.clone(), true, true));
+        assert_eq!(ed.caret, inside);
+        assert_eq!(ed.anchor, Some(Caret::at(vec![1], 0)));
     }
 }
 
@@ -19521,10 +19563,10 @@ impl Docxy {
     ) {
         self.mini_bar = None;
         self.close_menu();
-        if let Some(ed) = self.edit_target() {
-            place_click_caret(ed, Caret::at(path, offset), extend, true);
-        }
-        self.selecting = true;
+        let placeholder = self
+            .edit_target()
+            .is_some_and(|ed| place_click_caret(ed, Caret::at(path, offset), extend, true));
+        self.selecting = !placeholder;
         self.focus.focus(window, cx);
         self.focused = true;
         cx.notify();
