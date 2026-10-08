@@ -2733,6 +2733,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1223: doc.save with a header edit that cannot be committed answers
+    /// the commit's error, not ok:true, and writes nothing.
+    #[test]
+    fn doc_save_reports_a_failed_header_commit() {
+        let dir = scratch("save-hf-fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.docx");
+        let mut app = crate::tests::app_in_failing_header_edit();
+        app.path = path.to_string_lossy().into_owned();
+
+        let err = dispatch(&mut app, "doc.save", &Json::Null).unwrap_err();
+        assert!(err.contains("Couldn't write the header edit"), "{err}");
+        assert_eq!(app.status.as_deref(), Some(err.as_str()));
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #729: an html document whose bundle HTML is gone answers Err instead
     /// of ok:true, and stays modified.
     #[test]
