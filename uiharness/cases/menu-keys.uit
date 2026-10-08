@@ -63,6 +63,33 @@ test a letter that matches no key tip is swallowed and the menu stays
   key tab
   assert menu is nothing
 
+test the space bar closes the menu like any other non-character key
+  open ../fixtures/basic.xlsx
+  call menu-open {"target":{"cell":"C3"}}
+  # Space types a character (key_char " ") but whitespace is no key tip:
+  # the menu closes and the key is spent (#591).
+  key space
+  assert menu is nothing
+
+test a modifier chord is no menu key and closes it
+  open ../fixtures/basic.xlsx
+  call menu-open {"target":{"cell":"C3"}}
+  # Cut(0), Copy(1), Paste(2), Filter(4): Down steps over the separator.
+  key down down down down
+  # Ctrl+Right would enter Filter's submenu if chords were menu keys.
+  key ctrl+right
+  assert menu is nothing
+  open ../fixtures/gantt-summary.xml
+  call menu-open {"target":{"ribbon":["Project","Schedule","Set Baseline"]}}
+  key down
+  # Ctrl+Enter would run the highlighted Set Baseline... if chords were menu
+  # keys; it is not, so the menu closes and nothing runs.
+  key ctrl+enter
+  assert menu is nothing
+  assert status is not Baseline set — baseline bars now show under the current bars
+  call ribbon-click {"tab":"Project","command":"Clear Baseline"}
+  assert status is No baseline to clear
+
 test a modified chord closes the menu without running a key tip
   open ../fixtures/gantt-summary.xml
   call menu-open {"target":{"ribbon":["Project","Schedule","Set Baseline"]}}

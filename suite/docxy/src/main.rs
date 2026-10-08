@@ -4816,9 +4816,15 @@ mod menu_key_tests {
         ] {
             assert_eq!(Docxy::tip_char(&stroke(mods, "b", None)), None, "{mods:?}");
         }
-        // Named keys deliver no character.
+        // Named keys deliver no character — and the ones that type one (space
+        // everywhere, tab on macOS) type whitespace, which is no key tip:
+        // they close the menu.
         assert_eq!(
-            Docxy::tip_char(&stroke(Modifiers::none(), "space", None)),
+            Docxy::tip_char(&stroke(Modifiers::none(), "space", Some(" "))),
+            None
+        );
+        assert_eq!(
+            Docxy::tip_char(&stroke(Modifiers::none(), "tab", Some("\t"))),
             None
         );
         assert_eq!(
@@ -28058,16 +28064,25 @@ impl Docxy {
         cx.notify();
     }
 
-    /// A key while a menu is open (#591): Up and Down move the highlight,
-    /// Enter runs the highlighted item (an item with a submenu opens it in
-    /// the menu's place, its first item highlighted; Enter with nothing
-    /// highlighted closes the menu). Right opens the highlighted item's
-    /// submenu the same way; Left and Esc back out one level, and Esc at the
-    /// level the menu opened on closes it. A bare character equal to an
-    /// enabled item's one-character key tip runs that item like Enter, and
-    /// any other character is swallowed; a modifier chord or a named key
-    /// closes the menu and is spent.
+    /// A key while a menu is open (#591): a chord is no menu key — it closes
+    /// the menu and is spent (shift alone is not a chord). Up and Down move
+    /// the highlight, Enter runs the highlighted item (an item with a submenu
+    /// opens it in the menu's place, its first item highlighted; Enter with
+    /// nothing highlighted closes the menu). Right opens the highlighted
+    /// item's submenu the same way; Left and Esc back out one level, and Esc
+    /// at the level the menu opened on closes it. A bare character equal to
+    /// an enabled item's one-character key tip runs that item like Enter,
+    /// and any other character is swallowed; every other key closes the
+    /// menu and is spent.
     fn menu_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+        // A chord is no menu key (shift alone is not a chord): it closes the
+        // menu and is spent.
+        let m = &keystroke.modifiers;
+        if m.control || m.alt || m.platform || m.function {
+            self.close_menu();
+            cx.notify();
+            return;
+        }
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
@@ -28164,6 +28179,9 @@ impl Docxy {
     /// for named keys and modifier chords). Matching what would be typed —
     /// not `key`, the character printed on the key — keeps a Cyrillic и from
     /// reading as a "b" on a non-Latin layout (gpui's `Keystroke::key_char`).
+    /// Whitespace and control characters do not count: Space and (on macOS)
+    /// Tab type one, and they close the menu as the non-character keys they
+    /// are.
     fn tip_char(keystroke: &Keystroke) -> Option<char> {
         let m = &keystroke.modifiers;
         if m.control || m.alt || m.platform || m.function {
@@ -28171,7 +28189,10 @@ impl Docxy {
         }
         let mut chars = keystroke.key_char.as_deref()?.chars();
         let c = chars.next()?;
-        chars.next().is_none().then_some(c)
+        if chars.next().is_some() || c.is_whitespace() || c.is_control() {
+            return None;
+        }
+        Some(c)
     }
 
     /// Click the open menu's item at `path` (indices through submenus): the
