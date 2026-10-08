@@ -121,10 +121,12 @@ fn section_box(sect: &str, gutter_at_top: bool) -> SectionBox {
     let n = cols.count().clamp(1, MAX_COLS) as usize;
     let (col_w, col_gap) = if cols.equal_width() {
         // `left` already holds the side gutter, matching export.rs's
-        // `content_w = w - left - right - gutter`.
+        // `content_w = w - left - right - gutter`. i64 math: imported
+        // w:space values can be near i32::MAX and must not overflow.
         let space = cols.space.max(0);
-        let text_w = setup.page.w - left - m.right.abs();
-        let w = ((text_w - (n as i32 - 1) * space) / n as i32).max(1);
+        let text_w = setup.page.w as i64 - left as i64 - m.right.abs() as i64;
+        let w =
+            ((text_w - (n as i64 - 1) * space as i64) / n as i64).clamp(1, i32::MAX as i64) as i32;
         ((0..n).map(|_| w).collect(), (0..n).map(|_| space).collect())
     } else {
         (
@@ -404,31 +406,26 @@ impl<'a> Flow<'a> {
                     self.open_page(i, idx, false);
                     col = 0;
                 }
-                let (acc, col_start, first_of_band, has_bands) = {
+                let (acc, col_start, has_bands) = {
                     let page = self.cur.as_ref().unwrap();
                     let b = &page.open;
-                    (
-                        b.acc,
-                        b.col_start,
-                        b.cols.is_empty() && idx == b.col_start,
-                        !page.bands.is_empty(),
-                    )
+                    (b.acc, b.col_start, !page.bands.is_empty())
                 };
                 let bh = crate::block_height_est(&self.body[idx], col_w[col]);
-                if acc + bh > self.capacity() && (idx > col_start || (first_of_band && has_bands)) {
-                    if idx > col_start {
-                        self.cur.as_mut().unwrap().open.close_column(idx);
-                        col += 1;
-                        if col >= ncols {
-                            // The band's last column closed: the page is full.
-                            self.finish_page();
-                        }
-                    } else {
-                        // The first block of a later band does not fit under
-                        // the closed bands: drop the empty band and move to a
-                        // new page (never leave an empty band or a page that
-                        // holds only such a band).
-                        self.cur.as_mut().unwrap().open = BandB::new(usize::MAX, 0);
+                // A block that adds no height never needs a new column. Any
+                // other block overflows when it does not fit the band's
+                // remaining height — except the first block of a fresh
+                // sheet's first column (a block taller than the page still
+                // gets its own page). Under closed bands, an empty column
+                // overflows too: closing it advances the column index until
+                // the page finishes, so the block continues on a new page
+                // and can never spin.
+                let empty_column = idx == col_start;
+                if bh > 0.0 && acc + bh > self.capacity() && (!empty_column || has_bands) {
+                    self.cur.as_mut().unwrap().open.close_column(idx);
+                    col += 1;
+                    if col >= ncols {
+                        // The band's last column closed: the page is full.
                         self.finish_page();
                     }
                     continue;

@@ -5881,7 +5881,6 @@ mod ruler_geom_tests {
                 page: PageGeom::default(),
                 content_x: 300.0,
                 content_right: 900.0,
-                page_x: 100.0,
                 page_right: 100.0 + tw_px(PageGeom::default().w, zoom),
                 sect_checkpointed: false,
             };
@@ -5928,7 +5927,7 @@ mod ruler_geom_tests {
                     right: 1440
                 }
             );
-            near(ml.guide, 101.0 + tw_px(1800, zoom));
+            near(ml.guide, 300.0 + tw_px(1800 - 1440, zoom));
 
             d.handle = RulerHandle::MarginRight;
             let mr = ruler_drag_result(d, pointer);
@@ -6155,7 +6154,6 @@ struct RulerDrag {
     page: docxcore::model::PageGeom,
     content_x: f32,
     content_right: f32,
-    page_x: f32,
     page_right: f32,
     /// A margin drag already took its undo checkpoint on the body editor, so
     /// later moves of the same drag ride on it.
@@ -6214,7 +6212,9 @@ fn ruler_drag_result(d: RulerDrag, x: f32) -> RulerDragResult {
                     left,
                     right: d.page.mr,
                 },
-                d.page_x + 1.0 + tw(left),
+                // The dragged margin is the raw `w:left` (no gutter), but the
+                // guide tracks the drawn content edge, which includes it.
+                d.content_x + tw(left.saturating_sub(d.page.ml)),
             )
         }
         RulerHandle::MarginRight => {
@@ -20158,7 +20158,6 @@ impl Docxy {
             page: geom,
             content_x: g.content_x,
             content_right: g.content_right,
-            page_x: g.page_x,
             page_right: g.page_right,
             sect_checkpointed: false,
         });
@@ -32707,11 +32706,16 @@ impl Render for Docxy {
                                         block_el(&body[i], vec![i], markers[i].as_deref(), ctx)
                                     })
                                     .collect();
-                                return v_flex()
-                                    .w_full()
-                                    .gap_1()
-                                    .children(blocks)
-                                    .into_any_element();
+                                // One column still draws at the section's
+                                // column width (an explicit single `w:col`),
+                                // which is the full text width for an
+                                // ordinary equal-width section.
+                                let mut col = v_flex().gap_1().children(blocks);
+                                col = match sect.col_w.first() {
+                                    Some(&w) => col.w(tw(w)).flex_none(),
+                                    None => col.w_full(),
+                                };
+                                return col.into_any_element();
                             }
                             let mut els: Vec<AnyElement> = Vec::new();
                             for ci in 0..sect.col_w.len() {

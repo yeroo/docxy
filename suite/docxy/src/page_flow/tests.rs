@@ -328,27 +328,39 @@ fn balance_band_pours_at_most_ncols_columns() {
 
 #[test]
 fn bands_never_have_more_ranges_than_the_section_has_columns() {
-    let mut xml = String::new();
-    for i in 0..40 {
-        let sect = match i {
-            39 => Some(letter(r#"<w:cols w:num="2"/>"#)),
-            _ => None,
-        };
-        xml.push_str(&para(&format!("p{i}"), sect.as_deref()));
-    }
-    let body = body_blocks(&xml);
-    let sect = letter(r#"<w:cols w:num="2"/>"#);
-    let pf = flow(&body, &sect, false);
-    for (pi, page) in pf.pages.iter().enumerate() {
-        for band in &page.bands {
+    // The 2-col section ends with a continuous follower, so its band is
+    // balanced: the equal case balances 3 paragraphs 2+1, the uneven case
+    // keeps the filled columns. The invariant holds for every band, and the
+    // following band starts right after the balanced one.
+    let two_col_cont = letter(r#"<w:cols w:num="2"/><w:type w:val="continuous"/>"#);
+    let cont = letter(r#"<w:type w:val="continuous"/>"#);
+    for third in ["p2", &"x".repeat(160)] {
+        let body = body_blocks(&format!(
+            "{}{}{}{}{}",
+            para("p0", None),
+            para("p1", None),
+            para(third, Some(&two_col_cont)),
+            para("after", None),
+            cont
+        ));
+        let pf = flow(&body, &cont, false);
+        assert_eq!(pf.pages.len(), 1, "{:?}", pf.ranges());
+        for band in &pf.pages[0].bands {
             let ncols = pf.sections[band.section].col_w.len();
             assert!(
                 band.cols.len() <= ncols,
-                "page {pi} band of section {} has {} ranges for {ncols} columns",
+                "band of section {} has {} ranges for {ncols} columns",
                 band.section,
                 band.cols.len()
             );
         }
+        assert_eq!(
+            pf.pages[0].bands[0].cols.len(),
+            2,
+            "the two-column band balances: {:?}",
+            pf.pages[0].bands[0].cols
+        );
+        assert_eq!(pf.pages[0].bands[1].cols[0].0, 3, "next band follows");
     }
 }
 
@@ -439,16 +451,17 @@ fn drag_geom_keeps_the_gutter_out_of_the_margins() {
     assert_eq!(geom.ml, 1440, "the drag starts from the raw w:left");
     assert_eq!((geom.w, geom.h), (12240, 15840));
     // A left-margin drag then only adds its delta to w:left (360 twips = 24px
-    // at zoom 1).
+    // at zoom 1), and the guide tracks the drawn content edge: the content
+    // starts after the gutter-inclusive margin, so the guide sits at
+    // content_x + the drag delta, not at the raw margin width.
     let drag = crate::RulerDrag {
         handle: crate::RulerHandle::MarginLeft,
         start_x: 0.0,
         zoom: 1.0,
         indent: Default::default(),
         page: geom,
-        content_x: 0.0,
+        content_x: 144.0, // 2160 gutter-inclusive twips at zoom 1
         content_right: 0.0,
-        page_x: 0.0,
         page_right: 0.0,
         sect_checkpointed: false,
     };
@@ -457,6 +470,7 @@ fn drag_geom_keeps_the_gutter_out_of_the_margins() {
         crate::RulerChange::Margins { left, .. } => assert_eq!(left, 1440 + 360),
         other => panic!("expected a margins change, got {other:?}"),
     }
+    assert_eq!(moved.guide, 144.0 + 24.0);
     // gutterAtTop: the top margin the drag writes is the raw w:top.
     let pf = flow(&body, &sect, true);
     let (_, geom) = pf.drag_geom(Some(0), &sect).unwrap();
@@ -472,4 +486,74 @@ fn two_column_section_with_few_blocks_keeps_its_column_count() {
     let pf = flow(&body, &two_col, false);
     assert_eq!(pf.sections[0].col_w.len(), 2);
     assert_eq!(pf.pages[0].bands[0].cols, vec![(0, 1)]);
+}
+
+#[test]
+fn later_column_first_block_overruns_move_to_a_new_page() {
+    // 32 one-line paragraphs fill ~778px of the 864px sheet; the continuous
+    // two-column section's A fits column 0, and B (180 chars ~ 105.5px) must
+    // not start an empty column 1 that overruns the sheet: the band keeps
+    // its filled columns and B continues on a new page, with no page holding
+    // only the trailing sectPr block.
+    let big = "B".repeat(180);
+    let two_col_cont = letter(r#"<w:cols w:num="2"/><w:type w:val="continuous"/>"#);
+    let mut xml = String::new();
+    for i in 0..32 {
+        let sect = (i == 31).then(|| letter(""));
+        xml.push_str(&para(&format!("p{i}"), sect.as_deref()));
+    }
+    xml.push_str(&para("A", None));
+    xml.push_str(&para(&big, None));
+    xml.push_str(&two_col_cont);
+    let body = body_blocks(&xml);
+    let pf = flow(&body, &two_col_cont, false);
+    assert_eq!(
+        pf.ranges(),
+        vec![vec![(0, 32), (32, 33)], vec![(33, 35)]],
+        "{:?}",
+        pf.ranges()
+    );
+    assert_eq!(pf.pages[1].bands[0].cols, vec![(33, 35)]);
+}
+
+#[test]
+fn oversize_block_after_closed_bands_gets_its_own_page() {
+    // A block taller than a whole sheet after closed bands: no infinite
+    // loop; it lands alone on a fresh sheet (the oversize exception holds
+    // only for the page's first band).
+    let huge = "H".repeat(20_000);
+    let cont = letter(r#"<w:type w:val="continuous"/>"#);
+    let body = body_blocks(&format!(
+        "{}{}{}{}",
+        para("One", Some(&letter(""))),
+        para("Two", None),
+        para(&huge, None),
+        cont
+    ));
+    let pf = flow(&body, &cont, false);
+    assert_eq!(pf.pages.len(), 2, "{:?}", pf.ranges());
+    // The huge paragraph owns the fresh sheet; the zero-height trailing
+    // sectPr block rides in its column (no metadata-only page).
+    assert_eq!(pf.ranges()[1], vec![(2, 4)]);
+}
+
+#[test]
+fn single_explicit_column_keeps_its_width() {
+    // One explicit w:col: pagination and rendering use col_w[0], not the
+    // full text width.
+    let sect = letter(r#"<w:cols w:num="1" w:equalWidth="0"><w:col w:w="4320"/></w:cols>"#);
+    let body = body_blocks(&para("One", Some(&sect)));
+    let pf = flow(&body, &sect, false);
+    assert_eq!(pf.sections[0].col_w, vec![4320]);
+}
+
+#[test]
+fn huge_column_space_does_not_overflow() {
+    // An imported w:space near i32::MAX must not overflow the equal-width
+    // math; widths clamp to >= 1.
+    let sect = letter(r#"<w:cols w:num="3" w:space="2147483647"/>"#);
+    let body = body_blocks(&para("One", Some(&sect)));
+    let pf = flow(&body, &sect, false);
+    assert_eq!(pf.sections[0].col_w, vec![1, 1, 1]);
+    assert_eq!(pf.pages.len(), 1, "{:?}", pf.ranges());
 }
