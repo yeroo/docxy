@@ -1,0 +1,76 @@
+# #590: the ribbon's right-click menu. `menu-open "ribbon-bar"` calls the
+# opener a right-click on the tab strip or the ribbon body calls; the one
+# item toggles collapse exactly as Ctrl+F1 and the chevron do.
+
+test the ribbon's right-click menu collapses and expands it
+  open copy:../fixtures/basic.docx
+  call menu-open {"target":"ribbon-bar"}
+  assert reply.open is true
+  assert reply.target is ribbon-bar
+  assert reply.items.0.label is Collapse the Ribbon
+  assert reply.items.0.checked is false
+  assert reply.items.0.enabled is true
+  assert menu.target is ribbon-bar
+  shot window
+  call menu-click {"label":"Collapse the Ribbon"}
+  assert menu is nothing
+  call-error ribbon-read {} => the ribbon is collapsed
+  call menu-open {"target":"ribbon-bar"}
+  assert reply.items.0.checked is true
+  call menu-click {"label":"Collapse the Ribbon"}
+  call ribbon-read {}
+  assert reply.tabs.1.kind is ribbon
+  # Ctrl+F1 collapses first: the menu shows the tick, the item expands.
+  key ctrl+f1
+  call-error ribbon-read {} => the ribbon is collapsed
+  call menu-open {"target":"ribbon-bar"}
+  assert reply.items.0.checked is true
+  call menu-click {"label":"Collapse the Ribbon"}
+  call ribbon-read {}
+  assert reply.tabs.1.kind is ribbon
+  # Esc closes it like any other menu.
+  call menu-open {"target":"ribbon-bar"}
+  key escape
+  assert menu is nothing
+
+test the ribbon menu opens on a sheet tab and a Project tab too
+  open ../fixtures/basic.xlsx
+  call menu-open {"target":"ribbon-bar"}
+  assert reply.target is ribbon-bar
+  assert reply.items.0.label is Collapse the Ribbon
+  assert reply.items.0.checked is false
+  call menu-click {"label":"Collapse the Ribbon"}
+  call-error ribbon-read {} => the ribbon is collapsed
+  open copy:../fixtures/gantt-summary.xml
+  # Collapse is app-wide: the Project tab's menu opens already ticked, and
+  # its item expands the ribbon back.
+  call menu-open {"target":"ribbon-bar"}
+  assert reply.target is ribbon-bar
+  assert reply.items.0.label is Collapse the Ribbon
+  assert reply.items.0.checked is true
+  call menu-click {"label":"Collapse the Ribbon"}
+  call ribbon-read {}
+  assert reply.tab_count is 8
+
+test no ribbon menu opens while File covers the tab
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call-error menu-open {"target":"ribbon-bar"} => File (backstage) is open; no menu shows
+  call backstage {"action":"close"}
+  call menu-open {"target":"ribbon-bar"}
+  assert reply.open is true
+
+test an open group flyout closes when the ribbon's menu opens
+  open ../fixtures/basic.xlsx
+  call window-size {"w":640,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  # Draw a frame so the fit collapses Font, then a press like a person's
+  # (as ribbon-fit.uit does), before the flyout opens.
+  shot window
+  click A1
+  call ribbon-flyout {"action":"open","group":"Font"}
+  assert reply.open is true
+  assert reply.group is Font
+  call menu-open {"target":"ribbon-bar"}
+  call ribbon-flyout {}
+  assert reply.open is false

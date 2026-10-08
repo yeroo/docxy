@@ -29,7 +29,9 @@ when set and non-empty, otherwise the OS config directory (normally
 state. In `--harness` mode only the isolated harness server runs; it also
 accepts the Project verbs. A harness instance ignores `AGWINTERM_SESSION_ID`
 and is always `suite-<pid>` (#697). Normal control does not expose harness operations
-such as `open`, `key`, `type`, or `quit`.
+such as `open`, `key`, `type`, or `quit`. The harness menu verbs are documented
+in [ui-test-harness.md](ui-test-harness.md); `menu-open {"target":"ribbon-bar"}`
+opens the ribbon's right-click menu (Collapse the Ribbon, #590).
 
 Every verb except `proj.open`, `proj.new` and `app-info` (the build of the whole
 suite process, which ignores `tab`) accepts optional `tab`: an absolute zero-based

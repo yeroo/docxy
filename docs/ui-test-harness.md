@@ -1193,6 +1193,10 @@ Menus open today:
 - **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New
   Comment): right-click a document body. It never opens on a sheet or a
   Project, and `menu-open {"target":"document"}` refuses on both;
+- **the ribbon menu** (#590): right-click the ribbon's tab strip or body, or
+  `menu-open "ribbon-bar"`. One item, Collapse the Ribbon, ticked while the
+  ribbon is collapsed; it toggles exactly as Ctrl+F1 and the chevron do, on
+  document, sheet and Project tabs;
 - **the cell menu** on a sheet (#690, #691): right-click a cell. A cell outside
   the selection is selected first (no link followed; while a formula or a range
   field is pointing, nothing moves). It lists Cut, Copy, Paste, the Filter and
@@ -1238,7 +1242,7 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select, Sort & Filter), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619) | the menu, as `menu-read` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select, Sort & Filter), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619), `"ribbon-bar"` (the ribbon's right-click menu: Collapse the Ribbon, ticked while collapsed; #590) | the menu, as `menu-read` |
 | `menu-read` | `{}` | `{open: true, target, items, highlight}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null |
 | `menu-click` | `{label}` among the top-level items, `{path: [labels]}` through submenus, or `{index}`: the top-level item at that 0-based index, separators and headings not counted, for labels that repeat | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
@@ -1289,7 +1293,7 @@ Refusals change nothing, and each names what it refuses: `menu-open` under a
 dialog, a `row` off a Project tab, an unknown uid, a task hidden under a
 collapsed summary (there is no row to right-click), a ribbon command that has
 no menu, `"document"` on a Project, `"cell"` off a sheet, and the targets
-without a menu yet (`bar`, `column`, the ribbon's own right-click); `menu-click` with no
+without a menu yet (`bar`, `column`); `menu-click` with no
 menu open, on a disabled item, an unknown or ambiguous label, a heading, or an
 item that opens a submenu; `menu-click` and `menu-close` under a dialog;
 `menu-open` and `menu-click` while File (the backstage) or the more-tabs list

@@ -27575,7 +27575,16 @@ impl Docxy {
             .gap_1()
             .px_2()
             .pt_1()
-            .bg(panel);
+            .bg(panel)
+            // A right-click on the tab strip opens the ribbon's own menu
+            // (#590), not the document's behind it.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                    cx.stop_propagation();
+                    this.open_ribbon_bar_menu(ev.position, cx);
+                }),
+            );
         for (i, (this_tab, name, tab_key)) in names.iter().copied().enumerate() {
             let is_file = this_tab.is_none();
             let active = !self.backstage && this_tab == Some(self.ribbon_tab);
@@ -27798,6 +27807,20 @@ impl Docxy {
     /// The document body's right-click, and `menu-open "document"`.
     pub(crate) fn open_document_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
         self.open_menu(menu::MenuTarget::Document, at, menu::document_menu(), cx);
+    }
+
+    /// A right-click on the ribbon's tab strip or body, and `menu-open
+    /// "ribbon-bar"`: Collapse the Ribbon (#590), ticked while collapsed.
+    pub(crate) fn open_ribbon_bar_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        // A group flyout up from a narrow window closes: the menu replaces
+        // it, as a command dispatch clears it (see `dispatch`).
+        self.ribbon_flyout = None;
+        self.open_menu(
+            menu::MenuTarget::RibbonBar,
+            at,
+            menu::ribbon_bar_menu(self.ribbon_min),
+            cx,
+        );
     }
 
     /// A right-click on a sheet, and `menu-open "cell"`: the cell menu
@@ -28645,6 +28668,15 @@ impl Docxy {
             .border_color(pal.border)
             .relative()
             .overflow_hidden()
+            // A right-click on the ribbon body opens the ribbon's own menu
+            // (#590); it bubbles up from whatever control it lands on.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                    cx.stop_propagation();
+                    this.open_ribbon_bar_menu(ev.position, cx);
+                }),
+            )
             .children(groups)
             .when(!now.fit.overflow.is_empty(), |d| {
                 d.child(self.ribbon_chevron(pal, cx))

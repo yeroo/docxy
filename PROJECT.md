@@ -404,8 +404,8 @@ on; a summary asks first), Inactivate Task, Manually / Auto Schedule, Assign
 Resources... and Information... run their commands, and Hyperlink... opens the
 hyperlink prompt (below); Notes... opens the notes prompt (below); Paste Special..., Text
 Styles..., Font..., Fill Down, Clear Contents and Add to Timeline
-are drawn greyed until they exist. A bar, a column header and
-the ribbon have no menu yet, and the document's Bold / Italic menu never opens
+are drawn greyed until they exist. A bar and a column header have no menu yet
+(the ribbon's right-click opens Collapse the Ribbon, #590), and the document's Bold / Italic menu never opens
 on a Project. docxy's extras have no ribbon
 button: rename and set durations in the cells (yppxy: Enter/F2 and `d`),
 delete a task with Delete on its ID or the row menu's Delete Task (yppxy `x`), clear resources with Delete
