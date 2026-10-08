@@ -188,6 +188,23 @@ fn ribbon_inventory_keys_tips_and_assets_are_complete() {
                             (c, again)
                         }))
                         .collect(),
+                    // A View Reports menu (#1123): the button, then its items,
+                    // whose letters are their own menu's.
+                    Control::Dropdown { cmd, items } => {
+                        let mut menu_keys = vec![];
+                        for c in items {
+                            let Act::Project(act) = c.act else {
+                                panic!("wrong action")
+                            };
+                            acts.push(act);
+                            assert!(!c.key_tip.is_empty() && !menu_keys.contains(&c.key_tip));
+                            menu_keys.push(c.key_tip);
+                        }
+                        [(cmd, false)]
+                            .into_iter()
+                            .chain(items.iter().map(|c| (c, true)))
+                            .collect()
+                    }
                     _ => panic!("unexpected control"),
                 };
                 for (c, again) in cmds {
@@ -330,15 +347,28 @@ fn project_instruction_paths_exist() {
     for t in &tabs {
         for g in &t.groups {
             for control in &g.items {
-                let cmds: Vec<_> = match control {
-                    Control::Large(c) | Control::Toggle(c) => vec![c],
-                    Control::Column(c) => c.iter().collect(),
-                    Control::Split { primary, menu } => [primary].into_iter().chain(menu).collect(),
+                // A dropdown item's KeyTip is its menu's letter, then its own.
+                let cmds: Vec<(_, Option<&str>)> = match control {
+                    Control::Large(c) | Control::Toggle(c) => vec![(c, None)],
+                    Control::Column(c) => c.iter().map(|c| (c, None)).collect(),
+                    Control::Split { primary, menu } => [primary]
+                        .into_iter()
+                        .chain(menu)
+                        .map(|c| (c, None))
+                        .collect(),
+                    Control::Dropdown { cmd, items } => [(cmd, None)]
+                        .into_iter()
+                        .chain(items.iter().map(|c| (c, Some(cmd.key_tip))))
+                        .collect(),
                     _ => panic!("unexpected control"),
                 };
-                for c in cmds {
+                for (c, menu_key) in cmds {
                     assert_eq!(c.tip.body, "", "{}: the screentip has a title only", c.id);
-                    paths.push((t.name, g.title, c.label, c.tip.title, c.act, c.key_tip));
+                    let key = match menu_key {
+                        Some(m) => format!("{m} {}", c.key_tip),
+                        None => c.key_tip.to_string(),
+                    };
+                    paths.push((t.name, g.title, c.label, c.tip.title, c.act, key));
                 }
             }
         }
@@ -483,7 +513,31 @@ fn project_instruction_paths_exist() {
             BaselineBars,
         ),
     ];
-    for (tab, group, label, tip, act) in want {
+    // Report › View Reports (#1123): each menu, then the reports on it.
+    let mut want = want.to_vec();
+    for menu in ReportMenu::ALL {
+        let label = match menu {
+            ReportMenu::Dashboards => "Dashboards",
+            ReportMenu::Resources => "Resources",
+            ReportMenu::Costs => "Costs",
+            ReportMenu::InProgress => "In Progress",
+        };
+        want.push(("Report", "View Reports", label, label, OpenReportMenu(menu)));
+        for kind in menu.reports() {
+            want.push((
+                "Report",
+                "View Reports",
+                kind.title(),
+                kind.title(),
+                Report(kind),
+            ));
+        }
+    }
+    assert_eq!(
+        want.iter().filter(|w| matches!(w.4, Report(_))).count(),
+        ReportKind::ALL.len()
+    );
+    for (tab, group, label, tip, act) in want.iter().copied() {
         let path = format!("{tab} > {group} > {label}");
         let Some((_, _, _, found_tip, found, key)) = paths
             .iter()
@@ -495,15 +549,53 @@ fn project_instruction_paths_exist() {
         assert!(matches!(found, Act::Project(a) if *a == act), "{path}");
         let t = tabs.iter().find(|t| t.name == tab).unwrap();
         assert!(
-            matches!(tab_keytip_cmd(t, key), Some(Act::Project(a)) if a == act),
+            matches!(keytip_path(t, key), Some(Act::Project(a)) if a == act),
             "{path} KeyTip {key}"
         );
     }
     // Only Project's commands: nothing on the ribbon beyond the list above.
     assert_eq!(paths.len(), want.len(), "commands on the Project ribbon");
-    // Project's Report groups are not implemented; the tab stays (#72).
+    // The Report tab is View Reports' four menus; Custom, Export › Visual
+    // Reports and Compare Projects are not there (#1123).
     let report = r.tabs.iter().find(|t| t.name == "Report").unwrap();
-    assert!(report.groups.is_empty());
+    assert_eq!(report.groups.len(), 1);
+    assert_eq!(report.groups[0].title, "View Reports");
+    let menus: Vec<_> = report.groups[0]
+        .items
+        .iter()
+        .map(|c| match c {
+            Control::Dropdown { cmd, .. } => (cmd.label, cmd.key_tip, cmd.tip.shortcut),
+            _ => panic!("View Reports holds menus only"),
+        })
+        .collect();
+    assert_eq!(
+        menus,
+        [
+            ("Dashboards", "D", "Alt, R, D"),
+            ("Resources", "R", "Alt, R, R"),
+            ("Costs", "C", "Alt, R, C"),
+            ("In Progress", "I", "Alt, R, I"),
+        ]
+    );
+}
+
+/// The command a KeyTip path on `t` reaches: one letter, or a menu's letter
+/// and then its item's (`D P`).
+fn keytip_path(t: &rs::Tab<Act>, key: &str) -> Option<Act> {
+    let Some((menu, item)) = key.split_once(' ') else {
+        return tab_keytip_cmd(t, key);
+    };
+    let opener = tab_keytip_cmd(t, menu)?;
+    t.groups
+        .iter()
+        .flat_map(|g| &g.items)
+        .find_map(|c| match c {
+            Control::Dropdown { cmd, items } if cmd.act == opener => items
+                .iter()
+                .find(|i| i.key_tip.eq_ignore_ascii_case(item))
+                .map(|i| i.act),
+            _ => None,
+        })
 }
 
 /// docxy's own commands are off Project's ribbon (#370); each keeps its
@@ -523,6 +615,7 @@ fn docxy_only_commands_are_off_the_ribbon() {
             Control::Large(c) | Control::Toggle(c) => vec![c],
             Control::Column(commands) => commands.iter().collect(),
             Control::Split { primary, menu } => [primary].into_iter().chain(menu).collect(),
+            Control::Dropdown { cmd, items } => [cmd].into_iter().chain(items).collect(),
             _ => vec![],
         })
         .collect();
@@ -1270,39 +1363,42 @@ fn export_decisions_and_io_preserve_the_project_binding_and_history() {
     let mut t = tab();
     std::fs::write(&source, mspdi::write_mspdi(v(&t).ed.project())).unwrap();
     let source_bytes = std::fs::read(&source).unwrap();
-    assert_eq!(export_decision(&t, true), ExportDecision::RefuseHarness);
+    assert_eq!(
+        export_decision(&t, true, ExportKind::Gantt),
+        ExportDecision::RefuseHarness
+    );
     assert!(matches!(
-        export_decision(&t, false),
+        export_decision(&t, false, ExportKind::Gantt),
         ExportDecision::Dialog { .. }
     ));
     t.path = Some(source.clone());
     t.title = "source.xml".into();
     assert_eq!(
-        export_decision(&t, true),
+        export_decision(&t, true, ExportKind::Gantt),
         ExportDecision::InPlace(source.with_extension("md"))
     );
     apply_project_act(&mut t, ProjectAct::Baseline);
     let before = v(&t).ed.project().clone();
     let depth = v(&t).ed.undo_depth();
-    apply_export(&mut t, &dir.join("source.md")).unwrap();
+    apply_export(&mut t, &dir.join("source.md"), ExportKind::Gantt).unwrap();
     assert!(
         std::fs::read_to_string(dir.join("source.md"))
             .unwrap()
             .contains("First")
     );
     assert_eq!(v(&t).exported.as_deref(), Some("source.md"));
-    assert!(apply_export(&mut t, &source).is_err());
-    assert!(apply_export(&mut t, &dir.join("./source.xml")).is_err());
+    assert!(apply_export(&mut t, &source, ExportKind::Gantt).is_err());
+    assert!(apply_export(&mut t, &dir.join("./source.xml"), ExportKind::Gantt).is_err());
     let alias = dir.join("source-alias.md");
     std::fs::hard_link(&source, &alias).unwrap();
-    assert!(apply_export(&mut t, &alias).is_err());
+    assert!(apply_export(&mut t, &alias, ExportKind::Gantt).is_err());
     assert_eq!(std::fs::read(&alias).unwrap(), source_bytes);
     std::fs::remove_file(alias).unwrap();
-    assert!(apply_export(&mut t, &dir).is_err());
+    assert!(apply_export(&mut t, &dir, ExportKind::Gantt).is_err());
     assert!(t.status.contains("Export failed"));
 
-    assert!(apply_export(&mut t, &source.join("bad.md")).is_err());
-    finish_project_export(&mut t, None);
+    assert!(apply_export(&mut t, &source.join("bad.md"), ExportKind::Gantt).is_err());
+    finish_project_export(&mut t, None, ExportKind::Gantt);
     assert_eq!(v(&t).ed.project(), &before);
     assert_eq!(v(&t).ed.undo_depth(), depth);
     assert!(t.dirty && v(&t).ed.dirty());
@@ -1311,8 +1407,95 @@ fn export_decisions_and_io_preserve_the_project_binding_and_history() {
     assert_eq!(v(&t).exported.as_deref(), Some("source.md"));
     assert_eq!(std::fs::read(source).unwrap(), source_bytes);
     t.surface = Surface::Placeholder;
-    assert_eq!(export_decision(&t, false), ExportDecision::Unsaveable);
-    assert!(apply_export(&mut t, &dir.join("bad.md")).is_err());
+    assert_eq!(
+        export_decision(&t, false, ExportKind::Gantt),
+        ExportDecision::Unsaveable
+    );
+    assert!(apply_export(&mut t, &dir.join("bad.md"), ExportKind::Gantt).is_err());
+}
+
+/// A View Report goes beside the plan as `<stem>-<slug>.md` by Export's
+/// rules (#1123): the Gantt's own name is unchanged, a pathless plan asks for
+/// a name (a harness instance cannot), the source is never the target, and
+/// writing it leaves the plan, its dirty flag and its history alone.
+#[test]
+fn a_view_report_exports_beside_the_plan() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/project-report-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("plan.v2.xml");
+    let mut t = tab();
+    std::fs::write(&source, mspdi::write_mspdi(v(&t).ed.project())).unwrap();
+    let late = ExportKind::Report(ReportKind::LateTasks);
+    assert_eq!(
+        export_decision(&t, true, late),
+        ExportDecision::RefuseHarness
+    );
+    assert_eq!(
+        export_decision(&t, false, late),
+        ExportDecision::Dialog {
+            suggested: "schedule-late-tasks.md".into()
+        }
+    );
+    assert_eq!(
+        export_decision(&t, false, ExportKind::Gantt),
+        ExportDecision::Dialog {
+            suggested: "schedule.md".into()
+        }
+    );
+    t.path = Some(source.clone());
+    t.title = "plan.v2.xml".into();
+    assert_eq!(
+        export_decision(&t, true, ExportKind::Gantt),
+        ExportDecision::InPlace(dir.join("plan.v2.md"))
+    );
+    let target = dir.join("plan.v2-late-tasks.md");
+    assert_eq!(
+        export_decision(&t, true, late),
+        ExportDecision::InPlace(target.clone())
+    );
+    let before = v(&t).ed.project().clone();
+    let (dirty, depth) = (t.dirty, v(&t).ed.undo_depth());
+    apply_export(&mut t, &target, late).unwrap();
+    let md = std::fs::read_to_string(&target).unwrap();
+    assert!(md.contains(": Late Tasks\n"), "{md}");
+    assert_eq!(
+        md,
+        projcore::report::render(&v(&t).ed, ReportKind::LateTasks)
+    );
+    assert_eq!(
+        t.status.as_ref(),
+        format!("Exported Late Tasks to {}", target.display())
+    );
+    assert_eq!(v(&t).exported.as_deref(), Some("plan.v2-late-tasks.md"));
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!((t.dirty, v(&t).ed.undo_depth()), (dirty, depth));
+    // Never over the plan itself.
+    assert!(apply_export(&mut t, &source, late).is_err());
+    assert!(t.status.contains("Export failed"));
+    // Every report renders and writes.
+    for kind in ReportKind::ALL {
+        let ExportDecision::InPlace(p) = export_decision(&t, true, ExportKind::Report(kind)) else {
+            panic!("{kind:?}")
+        };
+        assert_eq!(p, dir.join(format!("plan.v2-{}.md", kind.slug())));
+        apply_export(&mut t, &p, ExportKind::Report(kind)).unwrap();
+        assert!(std::fs::read_to_string(&p).unwrap().contains(kind.title()));
+    }
+}
+
+/// An export's name keeps the plan's stem as bytes: a name that is not UTF-8
+/// is not rewritten with replacement characters (#1123 r1).
+#[cfg(unix)]
+#[test]
+fn export_names_keep_a_non_utf8_stem() {
+    use std::os::unix::ffi::OsStrExt;
+    let plan = Path::new("/plans").join(std::ffi::OsStr::from_bytes(b"pl\xffan.xml"));
+    let name = |kind: ExportKind| kind.target(&plan).file_name().unwrap().as_bytes().to_vec();
+    assert_eq!(name(ExportKind::Gantt), b"pl\xffan.md");
+    assert_eq!(
+        name(ExportKind::Report(ReportKind::LateTasks)),
+        b"pl\xffan-late-tasks.md"
+    );
 }
 
 #[test]
@@ -3876,6 +4059,7 @@ fn the_range_clearing_rule_is_one_place_and_covers_host_handled_acts() {
     for act in [
         Save,
         ExportGantt,
+        Report(ReportKind::LateTasks),
         Level,
         LevelAll,
         ClearLeveling,

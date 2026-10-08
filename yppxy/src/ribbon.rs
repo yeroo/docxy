@@ -2,6 +2,7 @@
 //! dispatch — all rendered/navigated by the shared [`ribboncore`] crate. The
 //! wrapper `Ribbon` derefs to `ribboncore::Ribbon<Act>`.
 
+use projcore::report::ReportKind;
 use ratatui::style::Color;
 use ribboncore::{Ribbon as CoreRibbon, Seg};
 use unicode_width::UnicodeWidthStr;
@@ -27,6 +28,9 @@ pub enum Act {
     Assign,
     LevelAll,
     ClearLeveling,
+    // Report (#1123)
+    /// A View Reports item: the report, written beside the plan.
+    Report(ReportKind),
     // Project
     CalculateProject,
     Baseline,
@@ -105,9 +109,7 @@ fn tabs() -> Vec<(&'static str, Vec<Group>)> {
         ("File", Vec::new()), // File → backstage
         ("Task", task_groups()),
         ("Resource", resource_groups()),
-        // Project's Report groups are not implemented; the tab stays so the
-        // tab set is Project's, and shows an empty body.
-        ("Report", Vec::new()),
+        ("Report", report_groups()),
         ("Project", project_groups()),
         ("View", view_groups()),
         // Help ends the row, as in Project (#1021).
@@ -233,6 +235,86 @@ fn resource_groups() -> Vec<Group> {
                     "✗ Clear Leveling",
                     ClearLeveling,
                     "Clear Leveling — turn resource leveling off (L toggles)",
+                )],
+            ],
+        },
+    ]
+}
+
+/// Report › View Reports (#1123). Project draws each of Dashboards,
+/// Resources, Costs and In Progress as a menu; a terminal ribbon has no
+/// menus, so each is a group of its reports' buttons, and an instruction
+/// reads "Report › Costs › Task Cost Overview" as in Project. Only the
+/// reports projcore backs are here (see `projcore::report`).
+fn report_groups() -> Vec<Group> {
+    use ReportKind::*;
+    let report = |glyph, kind: ReportKind, what| btn(glyph, Act::Report(kind), what);
+    vec![
+        Group {
+            title: "Dashboards",
+            width: 18,
+            rows: [
+                vec![report(
+                    "▦ Project Overview",
+                    ProjectOverview,
+                    "Project Overview — dates, progress, milestones due and late tasks, as Markdown beside the plan",
+                )],
+                Vec::new(),
+            ],
+        },
+        Group {
+            title: "Resources",
+            width: 25,
+            rows: [
+                vec![report(
+                    "◉ Resource Overview",
+                    ResourceOverview,
+                    "Resource Overview — each resource's work, as Markdown beside the plan",
+                )],
+                vec![report(
+                    "▲ Overallocated Resources",
+                    OverallocatedResources,
+                    "Overallocated Resources — resources booked past their units, as Markdown beside the plan",
+                )],
+            ],
+        },
+        Group {
+            title: "Costs",
+            width: 24,
+            rows: [
+                vec![report(
+                    "$ Task Cost Overview",
+                    TaskCostOverview,
+                    "Task Cost Overview — each task's costs and the total, as Markdown beside the plan",
+                )],
+                vec![report(
+                    "$ Resource Cost Overview",
+                    ResourceCostOverview,
+                    "Resource Cost Overview — each resource's costs and the total, as Markdown beside the plan",
+                )],
+            ],
+        },
+        Group {
+            title: "In Progress",
+            width: 30,
+            rows: [
+                vec![
+                    report(
+                        "★ Critical Tasks",
+                        CriticalTasks,
+                        "Critical Tasks — critical tasks not yet complete, as Markdown beside the plan",
+                    ),
+                    Seg::Gap("  "),
+                    report(
+                        "◷ Late Tasks",
+                        LateTasks,
+                        "Late Tasks — tasks late at the status date, as Markdown beside the plan",
+                    ),
+                ],
+                vec![report(
+                    "◆ Milestone Report",
+                    MilestoneReport,
+                    "Milestone Report — milestones with their status, as Markdown beside the plan",
                 )],
             ],
         },
@@ -483,6 +565,63 @@ mod tests {
                 Todo("What's New"),
             ),
             ("Help", "About", "About yppxy", "About yppxy", About),
+            // Report › View Reports' menus as groups (#1123).
+            (
+                "Report",
+                "Dashboards",
+                "Project Overview",
+                "Project Overview",
+                Report(ReportKind::ProjectOverview),
+            ),
+            (
+                "Report",
+                "Resources",
+                "Resource Overview",
+                "Resource Overview",
+                Report(ReportKind::ResourceOverview),
+            ),
+            (
+                "Report",
+                "Resources",
+                "Overallocated Resources",
+                "Overallocated Resources",
+                Report(ReportKind::OverallocatedResources),
+            ),
+            (
+                "Report",
+                "Costs",
+                "Task Cost Overview",
+                "Task Cost Overview",
+                Report(ReportKind::TaskCostOverview),
+            ),
+            (
+                "Report",
+                "Costs",
+                "Resource Cost Overview",
+                "Resource Cost Overview",
+                Report(ReportKind::ResourceCostOverview),
+            ),
+            (
+                "Report",
+                "In Progress",
+                "Critical Tasks",
+                "Critical Tasks",
+                Report(ReportKind::CriticalTasks),
+            ),
+            (
+                "Report",
+                "In Progress",
+                "Late Tasks",
+                "Late Tasks",
+                Report(ReportKind::LateTasks),
+            ),
+            (
+                "Report",
+                "In Progress",
+                "Milestone Report",
+                "Milestone Report",
+                Report(ReportKind::MilestoneReport),
+            ),
         ];
         let tabs = tabs();
         for (tab, group, name, tip, act) in paths {
@@ -525,8 +664,17 @@ mod tests {
             let rows = paths.iter().filter(|p| p.0 == *tab).count();
             assert_eq!(buttons, rows, "buttons on {tab}");
         }
-        // Project's Report groups are not implemented; the tab stays, empty.
-        assert!(tabs.iter().any(|(t, g)| *t == "Report" && g.is_empty()));
+        // Every View Report is on the Report tab, once (#1123).
+        let reports: Vec<_> = tabs
+            .iter()
+            .filter(|(t, _)| *t == "Report")
+            .flat_map(|(_, g)| g.iter().flat_map(|g| g.rows.iter().flatten()))
+            .filter_map(|s| match s {
+                Seg::Btn(b) => Some(b.act),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports, ReportKind::ALL.map(Act::Report));
     }
 
     #[test]

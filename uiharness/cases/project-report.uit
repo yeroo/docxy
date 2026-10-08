@@ -1,0 +1,54 @@
+# #1123: Report › View Reports. Each menu lists the reports projcore backs,
+# and a report goes beside the plan as <stem>-<slug>.md, as Export's Gantt
+# chart does, leaving the plan, its title and its dirty flag alone.
+
+test a View Report runs by its KeyTips and writes beside the plan
+  open copy:../fixtures/gantt-summary.xml
+  assert title is gantt-summary.xml
+  assert exported is none
+  key alt r i
+  assert menu.target.ribbon.0 is Report
+  assert menu.target.ribbon.1 is View Reports
+  assert menu.target.ribbon.2 is In Progress
+  call menu-read {}
+  assert reply.items.0.label is Critical Tasks
+  assert reply.items.0.key_tip is C
+  assert reply.items.1.label is Late Tasks
+  assert reply.items.1.key_tip is L
+  assert reply.items.2.label is Milestone Report
+  assert reply.items.2.key_tip is M
+  shot window
+  key l
+  assert menu is nothing
+  assert exported is gantt-summary-late-tasks.md
+  assert title is gantt-summary.xml
+  assert dirty is false
+  key alt r d p
+  assert exported is gantt-summary-project-overview.md
+  assert dirty is false
+
+test every View Reports menu lists its reports
+  open copy:../fixtures/gantt-summary.xml
+  call menu-open {"target":{"ribbon":["Report","View Reports","Dashboards"]}}
+  assert reply.items.0.label is Project Overview
+  call menu-open {"target":{"ribbon":["Report","View Reports","Resources"]}}
+  assert reply.items.0.label is Resource Overview
+  assert reply.items.1.label is Overallocated Resources
+  call menu-open {"target":{"ribbon":["Report","View Reports","Costs"]}}
+  assert reply.items.0.label is Task Cost Overview
+  assert reply.items.1.label is Resource Cost Overview
+  call menu-click {"label":"Task Cost Overview"}
+  assert menu is nothing
+  assert exported is gantt-summary-task-cost-overview.md
+  assert title is gantt-summary.xml
+  assert dirty is false
+
+test a dirty plan's report leaves it dirty with its history
+  open copy:../fixtures/gantt-summary.xml
+  key alt p b
+  assert dirty is true
+  key alt r c r
+  assert exported is gantt-summary-resource-cost-overview.md
+  assert dirty is true
+  key ctrl+z
+  assert status is Undo

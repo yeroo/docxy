@@ -806,7 +806,7 @@ impl DurationUnit {
 
 /// A number with up to two decimals, trailing zeros dropped, and whether it
 /// is exactly one either way (`1 day`, `-1 day`).
-fn two_decimals(value: f64) -> (String, bool) {
+pub(crate) fn two_decimals(value: f64) -> (String, bool) {
     let rounded = (value * 100.0).round() / 100.0 + 0.0;
     let mut s = format!("{rounded:.2}");
     while s.ends_with('0') {
@@ -829,14 +829,14 @@ fn format_duration_field(proj: &Project, min: i64, unit: DurationUnit, estimated
 }
 
 /// Work in hours, as Project shows it: `0 hrs`, `1 hr`, `1.5 hrs`.
-fn format_work(min: i64) -> String {
+pub(crate) fn format_work(min: i64) -> String {
     let (number, one) = two_decimals(min as f64 / 60.0);
     format!("{number} {}", if one { "hr" } else { "hrs" })
 }
 
 /// Money as Project shows it in US currency: `$1,400.00`, `($40,000.00)`,
 /// `$0.00`.
-fn format_money(units: f64) -> String {
+pub(crate) fn format_money(units: f64) -> String {
     let cents = (units * 100.0).round() as i128;
     let abs = cents.unsigned_abs();
     let whole = (abs / 100).to_string();

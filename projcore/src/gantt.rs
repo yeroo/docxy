@@ -274,7 +274,7 @@ fn sanitize(s: &str) -> Option<String> {
 /// (`\`, `|`, `*`, `_`, `` ` ``, `~`, `<`, `[`, `]`, `&`) backslash-escaped
 /// so a renderer shows the stored name and the row keeps its cells.
 /// Everything else is kept as stored. Returns `None` for an empty result.
-fn table_cell(s: &str) -> Option<String> {
+pub(crate) fn table_cell(s: &str) -> Option<String> {
     let flat = s.replace("\r\n", " ").replace(['\r', '\n', '\t'], " ");
     let mut out = String::new();
     for c in flat.trim().chars() {
@@ -293,7 +293,7 @@ fn table_cell(s: &str) -> Option<String> {
 /// table cell, with `#` also escaped so a title ending in ` #` is not read
 /// as an ATX closing sequence. `#` is not in the table-cell set, so the
 /// second pass never double-escapes.
-fn heading_text(s: &str) -> Option<String> {
+pub(crate) fn heading_text(s: &str) -> Option<String> {
     table_cell(s).map(|t| t.replace('#', "\\#"))
 }
 

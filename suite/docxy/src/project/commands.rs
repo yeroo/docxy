@@ -3,6 +3,7 @@ use super::*;
 use crate::dialog::catalog;
 use crate::dialog::{ButtonRole, Dialog, DialogOwner, DialogStack};
 use projcore::editor::{AssignOutcome, FindOutcome, constraint_hint};
+use projcore::report::ReportKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectAct {
@@ -43,6 +44,12 @@ pub(crate) enum ProjectAct {
     Level,
     /// Ctrl+E and File › Export.
     ExportGantt,
+    /// Report › View Reports: a menu button (Dashboards, Resources, Costs,
+    /// In Progress) opens its menu of reports (#1123).
+    OpenReportMenu(ReportMenu),
+    /// A View Reports menu item: the report, written beside the plan as
+    /// `<stem>-<slug>.md` the way Export writes the Gantt chart.
+    Report(ReportKind),
     /// Alt+Left / Alt+Right: pan the timescale.
     ScrollLeft,
     ScrollRight,
@@ -119,7 +126,136 @@ impl ProjectAct {
         Self::Copy,
         Self::NewWindow,
         Self::ArrangeAll,
+        Self::OpenReportMenu(ReportMenu::Dashboards),
+        Self::OpenReportMenu(ReportMenu::Resources),
+        Self::OpenReportMenu(ReportMenu::Costs),
+        Self::OpenReportMenu(ReportMenu::InProgress),
+        Self::Report(ReportKind::ProjectOverview),
+        Self::Report(ReportKind::ResourceOverview),
+        Self::Report(ReportKind::OverallocatedResources),
+        Self::Report(ReportKind::TaskCostOverview),
+        Self::Report(ReportKind::ResourceCostOverview),
+        Self::Report(ReportKind::CriticalTasks),
+        Self::Report(ReportKind::LateTasks),
+        Self::Report(ReportKind::MilestoneReport),
     ];
+}
+
+/// One of Project's Report › View Reports menus. Only the reports projcore
+/// backs with the plan's own data are on them (see `projcore::report`):
+/// Custom, Burndown, Cash Flow, Cost Overview, Work Overview, Earned Value,
+/// Cost Overruns, Slipping Tasks and Upcoming Tasks are not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportMenu {
+    Dashboards,
+    Resources,
+    Costs,
+    InProgress,
+}
+
+impl ReportMenu {
+    pub(crate) const ALL: [ReportMenu; 4] = [
+        ReportMenu::Dashboards,
+        ReportMenu::Resources,
+        ReportMenu::Costs,
+        ReportMenu::InProgress,
+    ];
+
+    /// (id, icon, label, KeyTip, shortcut).
+    fn spec(
+        self,
+    ) -> (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    ) {
+        match self {
+            ReportMenu::Dashboards => (
+                "pr-report-dashboards",
+                "print-layout",
+                "Dashboards",
+                "D",
+                "Alt, R, D",
+            ),
+            ReportMenu::Resources => (
+                "pr-report-resources",
+                "mail-recipients",
+                "Resources",
+                "R",
+                "Alt, R, R",
+            ),
+            ReportMenu::Costs => ("pr-report-costs", "table", "Costs", "C", "Alt, R, C"),
+            ReportMenu::InProgress => (
+                "pr-report-in-progress",
+                "align-left",
+                "In Progress",
+                "I",
+                "Alt, R, I",
+            ),
+        }
+    }
+
+    pub(crate) fn id(self) -> &'static str {
+        self.spec().0
+    }
+
+    /// The reports on this menu, in Project's order.
+    pub(crate) fn reports(self) -> impl Iterator<Item = ReportKind> {
+        ReportKind::ALL
+            .into_iter()
+            .filter(move |k| k.menu() == self.spec().2)
+    }
+}
+
+/// A View Reports item's (id, KeyTip in its menu, shortcut).
+fn report_item(kind: ReportKind) -> (&'static str, &'static str, &'static str) {
+    match kind {
+        ReportKind::ProjectOverview => ("pr-report-project-overview", "P", "Alt, R, D, P"),
+        ReportKind::ResourceOverview => ("pr-report-resource-overview", "O", "Alt, R, R, O"),
+        ReportKind::OverallocatedResources => {
+            ("pr-report-overallocated-resources", "A", "Alt, R, R, A")
+        }
+        ReportKind::TaskCostOverview => ("pr-report-task-cost-overview", "T", "Alt, R, C, T"),
+        ReportKind::ResourceCostOverview => {
+            ("pr-report-resource-cost-overview", "R", "Alt, R, C, R")
+        }
+        ReportKind::CriticalTasks => ("pr-report-critical-tasks", "C", "Alt, R, I, C"),
+        ReportKind::LateTasks => ("pr-report-late-tasks", "L", "Alt, R, I, L"),
+        ReportKind::MilestoneReport => ("pr-report-milestone-report", "M", "Alt, R, I, M"),
+    }
+}
+
+/// A View Reports menu button: its KeyTip (Alt, R, then its letter) opens
+/// the menu, whose items take their own letters. The items are the
+/// dropdown's `items`, so `ribbon-read` and the harness see them.
+fn report_dropdown(menu: ReportMenu) -> Control<Act> {
+    let (id, icon, label, key, shortcut) = menu.spec();
+    Control::Dropdown {
+        cmd: cmdt(
+            id,
+            icon,
+            label,
+            Act::Project(ProjectAct::OpenReportMenu(menu)),
+            shortcut,
+        )
+        .key(key),
+        items: menu
+            .reports()
+            .map(|kind| {
+                let (id, key, shortcut) = report_item(kind);
+                cmdt(
+                    id,
+                    icon,
+                    kind.title(),
+                    Act::Project(ProjectAct::Report(kind)),
+                    shortcut,
+                )
+                .key(key)
+            })
+            .collect(),
+    }
 }
 
 /// The Project document ribbon. Tabs, groups, command labels and screentips
@@ -360,9 +496,18 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                 ),
             ],
         ),
-        // Project's Report groups (View Reports, Export › Visual Reports) are
-        // not implemented; the tab stays so the tab set is Project's (#72).
-        rs::tab("Report", "R", Vec::new()),
+        // View Reports, with the reports projcore can back (#1123). Project's
+        // Custom reports, Export › Visual Reports and Project › Compare
+        // Projects are not here.
+        rs::tab(
+            "Report",
+            "R",
+            vec![rs::group(
+                "View Reports",
+                70,
+                ReportMenu::ALL.into_iter().map(report_dropdown).collect(),
+            )],
+        ),
         rs::tab(
             "Project",
             "P",
@@ -1534,7 +1679,8 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             BaselineBars => v.show_baseline = !v.show_baseline,
             // Window-dependent host actions: the file dialog, the clipboard,
             // a new tab.
-            Save | ExportGantt | Copy | Cut | Paste | NewProject => {}
+            Save | ExportGantt | Report(_) | OpenReportMenu(_) | Copy | Cut | Paste
+            | NewProject => {}
             // App-level View › Window commands (#587): the host dispatches
             // them on the app before a tab ever sees them.
             NewWindow | ArrangeAll => {}
@@ -1590,6 +1736,53 @@ pub(crate) fn toggle_project_collapse(tab: &mut DocTab, uid: i32) {
     complete_project(tab, moved);
 }
 
+/// What an export writes beside the plan: the Gantt chart (`<stem>.md`,
+/// Ctrl+E and File › Export) or a View Report (`<stem>-<slug>.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExportKind {
+    Gantt,
+    Report(ReportKind),
+}
+
+impl ExportKind {
+    /// Where the export of the plan at `plan` goes: the Gantt chart
+    /// beside it as `<stem>.md`, a report as `<stem>-<slug>.md`. The stem
+    /// keeps its bytes, even when they are not UTF-8.
+    fn target(self, plan: &Path) -> PathBuf {
+        match self {
+            ExportKind::Gantt => plan.with_extension("md"),
+            ExportKind::Report(kind) => {
+                let mut name = plan.file_stem().unwrap_or_default().to_os_string();
+                name.push(format!("-{}.md", kind.slug()));
+                plan.with_file_name(name)
+            }
+        }
+    }
+
+    /// The name an unsaved plan's export dialog suggests.
+    fn suggested(self) -> String {
+        match self {
+            ExportKind::Gantt => "schedule.md".into(),
+            ExportKind::Report(kind) => kind.file_name("schedule"),
+        }
+    }
+
+    fn render(self, ed: &ProjectEditor) -> String {
+        match self {
+            ExportKind::Gantt => projcore::gantt::to_markdown(ed.project(), ed.schedule()),
+            ExportKind::Report(kind) => projcore::report::render(ed, kind),
+        }
+    }
+
+    /// What the status line says was exported.
+    fn label(self) -> &'static str {
+        match self {
+            ExportKind::Gantt => "Gantt",
+            ExportKind::Report(kind) => kind.title(),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum ExportDecision {
     InPlace(PathBuf),
@@ -1597,27 +1790,31 @@ pub(crate) enum ExportDecision {
     RefuseHarness,
     Unsaveable,
 }
-pub(crate) fn export_decision(tab: &DocTab, harness: bool) -> ExportDecision {
+pub(crate) fn export_decision(tab: &DocTab, harness: bool, kind: ExportKind) -> ExportDecision {
     if !matches!(tab.surface, Surface::Project(_)) {
         return ExportDecision::Unsaveable;
     }
     if let Some(p) = &tab.path {
-        return ExportDecision::InPlace(p.with_extension("md"));
+        return ExportDecision::InPlace(kind.target(p));
     }
     if harness {
         ExportDecision::RefuseHarness
     } else {
         ExportDecision::Dialog {
-            suggested: "schedule.md".into(),
+            suggested: kind.suggested(),
         }
     }
 }
-pub(crate) fn apply_export(tab: &mut DocTab, target: &Path) -> Result<usize, String> {
+pub(crate) fn apply_export(
+    tab: &mut DocTab,
+    target: &Path,
+    kind: ExportKind,
+) -> Result<usize, String> {
     let result: Result<usize, String> = (|| {
         let Surface::Project(v) = &tab.surface else {
             return Err("This project could not be loaded and cannot be exported".into());
         };
-        let bytes = projcore::gantt::to_markdown(v.ed.project(), v.ed.schedule());
+        let bytes = kind.render(&v.ed);
         opccore::fsio::export_atomic(tab.path.as_deref(), target, bytes.as_bytes())
             .map_err(|e| format!("Export failed: {e}"))?;
         Ok(bytes.len())
@@ -1627,15 +1824,15 @@ pub(crate) fn apply_export(tab: &mut DocTab, target: &Path) -> Result<usize, Str
             if let Surface::Project(v) = &mut tab.surface {
                 v.exported = Some(file_name(target));
             }
-            tab.status = format!("Exported Gantt to {}", target.display()).into();
+            tab.status = format!("Exported {} to {}", kind.label(), target.display()).into();
         }
         Err(e) => tab.status = SharedString::from(e.clone()),
     }
     result
 }
-pub(crate) fn finish_project_export(tab: &mut DocTab, target: Option<&Path>) {
+pub(crate) fn finish_project_export(tab: &mut DocTab, target: Option<&Path>, kind: ExportKind) {
     if let Some(p) = target {
-        let _ = apply_export(tab, p);
+        let _ = apply_export(tab, p, kind);
     } else {
         tab.status = "export cancelled".into();
     }
@@ -1726,6 +1923,19 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A View Reports button only opens its menu, as the Design tab's
+        // do: the cell edit and prompt wait for the item that runs.
+        if let ProjectAct::OpenReportMenu(menu) = act {
+            let id = menu.id();
+            let at = split_menu_anchor(&self.probes.borrow(), id).unwrap_or_else(|| {
+                let n = ReportMenu::ALL.iter().position(|m| *m == menu).unwrap_or(0);
+                point(px(12. + 72. * n as f32), px(140.))
+            });
+            if let Err(e) = self.open_split_menu(id, at, cx) {
+                self.set_status(e);
+            }
+            return;
+        }
         // A pass already asked for runs first, so this act, and a second
         // levelling command above all, sees the plan it left.
         self.flush_project_passes(cx);
@@ -1777,21 +1987,8 @@ impl Docxy {
             ProjectAct::Copy | ProjectAct::Cut | ProjectAct::Paste => {
                 self.project_clipboard(act, cx)
             }
-            ProjectAct::ExportGantt => {
-                let Some(tab) = self.tabs.get(self.active) else {
-                    return;
-                };
-                match export_decision(tab, self.harness) {
-                    ExportDecision::InPlace(p) => finish_project_export(&mut self.tabs[self.active], Some(&p)),
-                    ExportDecision::Dialog { suggested } => {
-                        let target = crate::macos_menu::native_modal(|| rfd::FileDialog::new().add_filter("Markdown", &["md"]).set_file_name(suggested).save_file());
-                        finish_project_export(&mut self.tabs[self.active], target.as_deref());
-                    },
-                    ExportDecision::RefuseHarness => self.tabs[self.active].status = "This project needs an export filename, and a harness instance cannot open the export dialog".into(),
-                    ExportDecision::Unsaveable => self.tabs[self.active].status = "This project could not be loaded and cannot be exported".into(),
-                }
-                self.backstage = false;
-            }
+            ProjectAct::ExportGantt => self.project_export(ExportKind::Gantt),
+            ProjectAct::Report(kind) => self.project_export(ExportKind::Report(kind)),
             _ => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     apply_project_act(tab, act);
@@ -1799,6 +1996,30 @@ impl Docxy {
             }
         }
         self.refocus(window, cx);
+    }
+    /// Export the plan beside its file (Export's Gantt chart or a View
+    /// Report); an unsaved plan asks for a name, which a harness cannot.
+    fn project_export(&mut self, kind: ExportKind) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        match export_decision(tab, self.harness, kind) {
+            ExportDecision::InPlace(p) => {
+                finish_project_export(&mut self.tabs[self.active], Some(&p), kind)
+            }
+            ExportDecision::Dialog { suggested } => {
+                let target = crate::macos_menu::native_modal(|| {
+                    rfd::FileDialog::new()
+                        .add_filter("Markdown", &["md"])
+                        .set_file_name(suggested)
+                        .save_file()
+                });
+                finish_project_export(&mut self.tabs[self.active], target.as_deref(), kind);
+            }
+            ExportDecision::RefuseHarness => self.tabs[self.active].status = "This project needs an export filename, and a harness instance cannot open the export dialog".into(),
+            ExportDecision::Unsaveable => self.tabs[self.active].status = "This project could not be loaded and cannot be exported".into(),
+        }
+        self.backstage = false;
     }
     /// Run every tab's pending levelling pass now, for a reader or writer of
     /// the plan that must not see it half-asked-for.
