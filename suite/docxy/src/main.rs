@@ -60,6 +60,7 @@ mod html_bundle;
 mod inputs;
 mod inspector;
 mod layout_tab;
+mod mac_nav;
 mod macos_menu;
 mod mailings_dialogs;
 mod mailings_tab;
@@ -21507,6 +21508,7 @@ impl Docxy {
         let ctrl = m.control || m.platform;
         let shift = m.shift;
         let key = ev.keystroke.key.clone();
+        let mac_nav = mac_nav::mac_nav(text_input::MACOS, &key, *m);
         if self.active_is_project() && project_alt_key(&key, *m) {
             self.keytips = KeyTip::Off;
             return self.project_key(ev, window, cx);
@@ -21521,6 +21523,10 @@ impl Docxy {
         if self.active_is_sheet() && sheet_complete::alt_down_key(&key, *m) {
             self.keytips = KeyTip::Off;
             return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
+        }
+        // Mac ⌥←/→/⌫: the ⌥ key-down has raised the KeyTips by now (#1073).
+        if self.active_is_doc() && mac_nav::lowers_keytips(mac_nav, self.keytips == KeyTip::Tabs) {
+            self.keytips = KeyTip::Off;
         }
         // KeyTips (Alt / F10 access keys): toggle the overlay; while it's showing,
         // letters pick a tab / run a command instead of typing.
@@ -21647,7 +21653,9 @@ impl Docxy {
         if noted.is_some() {
             ed.break_undo_group();
         }
-        let changed = if ctrl {
+        let changed = if let Some(nav) = mac_nav {
+            mac_nav::run(ed, shift, nav)
+        } else if ctrl {
             match key.as_str() {
                 "b" => yes(|| ed.toggle_bold()),
                 "i" => yes(|| ed.toggle_italic()),
@@ -21720,6 +21728,15 @@ impl Docxy {
         self.keep_repeat_current(recorded || (history && untouched));
         self.scroll_to_caret();
         cx.notify();
+    }
+}
+
+/// The status bar's hint on a document tab: the Mac's chords on macOS (#1073).
+fn doc_status_hint(macos: bool) -> &'static str {
+    if macos {
+        "type · ⌘B/I/U · ⌘F find · ⌘C/X/V · ⌘Z/⇧⌘Z · ⌘S"
+    } else {
+        "type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S"
     }
 }
 
@@ -24701,6 +24718,15 @@ mod repeat_tests {
     /// Any caret move ends the typing run, by whatever path: a direct caret
     /// assignment, as `move_vert` makes, does not reset docxcore's `last`,
     /// so the record's caret is what ends it.
+    /// A document's status hint names the Mac's keys on macOS only (#1073).
+    #[test]
+    fn the_status_hint_names_the_platform_keys_1073() {
+        assert!(doc_status_hint(true).contains("⌘B/I/U"));
+        assert!(!doc_status_hint(true).contains("Ctrl"));
+        assert!(doc_status_hint(false).contains("Ctrl+B/I/U"));
+        assert!(!doc_status_hint(false).contains('⌘'));
+    }
+
     #[test]
     fn a_caret_move_ends_the_typing_run_618() {
         let mut ed = three();
@@ -33187,7 +33213,7 @@ impl Render for Docxy {
             } else if self.active_is_project() {
                 "Enter/F2 edit · Tab next cell · Insert blank row · Delete clear cell (ID: task) · Alt+Shift+←/→ outline · Ctrl+F find · Ctrl+Z/Y · Ctrl+S"
             } else {
-                "type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S"
+                doc_status_hint(text_input::MACOS)
             })
             // Zoom controls (Word's bottom-right zoom).
             .child(zoom_btn(cx, "zoom-out", "\u{2212}", -0.1))
