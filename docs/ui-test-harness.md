@@ -1337,7 +1337,7 @@ have. `word-header-footer.uit` drives these over a three-section document.
 `window`, `grid`, `chart-panel`, `cell:B3`, `cell:A1:C5`, `chart:0`, `gantt`,
 `bar:<id>` (for example `bar:3`), `project-hbar-table`, `project-hbar-chart`,
 `project-vbar`, `project-timeline`, `project-split`, `gallery`, `ribbon`,
-`ribbon-flyout`, `title-tabs`,
+`ribbon-flyout`, `ribbon-group:<index>`, `title-tabs`,
 `tab-prev`, `tab-next`, `tab-more`, `tab-more-item:<index>` (the last exists while
 the more-tabs list is open), `tab-chip:<index>` — a visible title-bar chip by
 absolute tab index; absent while the chip is scrolled out of the strip. `gantt`
@@ -1351,7 +1351,9 @@ between the entry table and the chart; its drags show in the `table_w` and `gant
 state entries. `gallery` is the Home ribbon's Styles gallery well on a
 document tab, and is an error while another ribbon tab, the Backstage or a
 collapsed ribbon hides it. `ribbon` is the ribbon body (the groups of the tab
-shown), `ribbon-flyout` a collapsed group's open flyout (#1020).
+shown), `ribbon-flyout` a collapsed group's open flyout (#1020), and
+`ribbon-group:<index>` group `index` of the tab shown as it is drawn: in place,
+or its collapsed button (a `pointer-click` there opens or shuts its flyout).
 `filter-button:<column>` (for example
 `filter-button:B`) is the AutoFilter button on that column's header cell
 (#690), an error while the sheet has no filter there or the button is

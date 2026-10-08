@@ -823,6 +823,9 @@ pub enum Region {
     Ribbon,
     /// The open flyout of a collapsed ribbon group or of the chevron (#1020).
     RibbonFlyout,
+    /// Group `.0` of the ribbon tab shown, as drawn: in place, or its
+    /// collapsed button (#1020).
+    RibbonGroup(usize),
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
     /// The File screen's scrolling content pane (#1028).
@@ -876,6 +879,13 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         "gallery" if arg.is_none() => Ok(Region::Gallery),
         "ribbon" if arg.is_none() => Ok(Region::Ribbon),
         "ribbon-flyout" if arg.is_none() => Ok(Region::RibbonFlyout),
+        "ribbon-group" => {
+            let i = arg
+                .ok_or("'ribbon-group' needs a group index, e.g. ribbon-group:6")?
+                .parse::<usize>()
+                .map_err(|_| "'ribbon-group' needs a numeric index".to_string())?;
+            Ok(Region::RibbonGroup(i))
+        }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
         "window" | "grid" | "chart-panel" | "title-tabs" | "tab-prev" | "tab-next" | "tab-more"
@@ -923,7 +933,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, filter-button:B)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, filter-button:B)"
         )),
     }
 }
@@ -953,6 +963,7 @@ pub fn region_name(region: Region) -> String {
         Region::Gallery => "gallery".into(),
         Region::Ribbon => "ribbon".into(),
         Region::RibbonFlyout => "ribbon-flyout".into(),
+        Region::RibbonGroup(i) => format!("ribbon-group:{i}"),
         Region::BackstageContent => "backstage-content".into(),
         Region::BackstageRail => "backstage-rail".into(),
         Region::FilterButton(c) => format!("filter-button:{}", gridcore::sheet::col_name(c)),
@@ -7569,6 +7580,7 @@ mod tests {
             Region::Gallery,
             Region::Ribbon,
             Region::RibbonFlyout,
+            Region::RibbonGroup(6),
             Region::BackstageContent,
             Region::BackstageRail,
             Region::FilterButton(1),

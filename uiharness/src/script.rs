@@ -653,7 +653,7 @@ fn parse_is(rest: &str, line: usize, whole: &str) -> Result<(bool, String), Scri
 // ---------------------------------------------------------------------------
 
 /// The region names, for an error message. Mirrors `harness::parse_region`.
-pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, filter-button:B";
+pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, filter-button:B";
 
 /// A region name a script may use, normalized to the form the app's `rect`
 /// verb takes (`A1:C5` becomes `cell:A1:C5`).
@@ -722,6 +722,14 @@ pub fn validate_region(name: &str) -> Result<String, String> {
                 .ok_or("'tab-chip' needs an index")?;
             a.parse::<usize>()
                 .map_err(|_| "'tab-chip' needs a numeric index")?;
+            Ok(full.clone())
+        }
+        "ribbon-group" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'ribbon-group' needs a group index")?;
+            a.parse::<usize>()
+                .map_err(|_| "'ribbon-group' needs a numeric index")?;
             Ok(full.clone())
         }
         "filter-button" => {
@@ -1473,6 +1481,7 @@ test Smoke-Case
             ("gallery", "gallery"),
             ("ribbon", "ribbon"),
             ("ribbon-flyout", "ribbon-flyout"),
+            ("ribbon-group:6", "ribbon-group:6"),
             ("filter-button:B", "filter-button:B"),
         ] {
             assert_eq!(validate_region(written).unwrap(), normalized, "{written}");
@@ -1488,5 +1497,7 @@ test Smoke-Case
             "gallery takes no argument"
         );
         assert!(validate_region("galery").is_err());
+        assert!(validate_region("ribbon-group").is_err());
+        assert!(validate_region("ribbon-group:x").is_err());
     }
 }

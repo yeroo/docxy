@@ -371,3 +371,34 @@ test widening restores full groups
   # The flyout closed: its group is drawn in place again.
   call ribbon-flyout {}
   assert reply.open is false
+
+# The same flyout through real input (#545): a press on the collapsed
+# button opens it, a second press or a press outside shuts it, and a press
+# on another collapsed button moves it there.
+test a press on a collapsed group opens its flyout and a press outside shuts it
+  open ../fixtures/basic.xlsx
+  call window-size {"w":700,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.groups.6.state is collapsed
+  call pointer-click {"region":"ribbon-group:6"}
+  shot window
+  call ribbon-flyout {}
+  assert reply.open is true
+  assert reply.group is Editing
+  call pointer-click {"region":"ribbon-group:6"}
+  shot window
+  call ribbon-flyout {}
+  assert reply.open is false
+  call pointer-click {"region":"ribbon-group:6"}
+  shot window
+  call pointer-click {"region":"ribbon-group:5"}
+  shot window
+  call ribbon-flyout {}
+  assert reply.open is true
+  assert reply.group is Cells
+  call pointer-click {"region":"cell:D12"}
+  shot window
+  call ribbon-flyout {}
+  assert reply.open is false

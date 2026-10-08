@@ -13364,6 +13364,15 @@ impl Docxy {
                 .ok_or_else(|| "the ribbon's groups are not shown".to_string()),
             Region::RibbonFlyout => lookup(&self.probes.borrow(), "ribbon-flyout")
                 .ok_or_else(|| "no ribbon flyout is open".to_string()),
+            Region::RibbonGroup(i) => {
+                let now = self.ribbon_fit_now(window);
+                let title = now
+                    .titles
+                    .get(i)
+                    .ok_or_else(|| format!("the ribbon tab shown has no group {i}"))?;
+                lookup(&self.probes.borrow(), &format!("ribbon-group:{title}"))
+                    .ok_or_else(|| format!("the ribbon group {title} is not drawn"))
+            }
             Region::Gallery => lookup(&self.probes.borrow(), "gallery").ok_or_else(|| {
                 "the Styles gallery is not shown (it is on a document's Home tab, with the ribbon expanded)"
                     .to_string()

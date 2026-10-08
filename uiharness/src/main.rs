@@ -73,7 +73,8 @@ regions:
   tab-chip:0
   grid  chart-panel  cell:B3  cell:A1:C5  chart:0  gantt  bar:3
   project-hbar-table  project-hbar-chart  project-vbar  project-timeline
-  project-split  gallery  ribbon  ribbon-flyout  filter-button:B
+  project-split  gallery  ribbon  ribbon-flyout  ribbon-group:0
+  filter-button:B
 ";
 
 fn main() -> ExitCode {
