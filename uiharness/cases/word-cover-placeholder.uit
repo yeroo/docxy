@@ -2,7 +2,9 @@
 # content control around the w:tc (#1102). A click in the Abstract while it
 # shows its placeholder selects the whole placeholder, and typing replaces
 # it and clears the flag; the Year, holding a value, takes a plain caret.
-# The controls survive a save after the edit.
+# A drag from inside the placeholder selects what it sweeps. The controls
+# survive a save after an edit elsewhere: the reopened Abstract still
+# selects as a placeholder.
 
 test a click selects a cell-level placeholder and typing replaces it
   open copy:../fixtures/cover-abstract.docx
@@ -35,5 +37,24 @@ test undo brings the placeholder back and a click selects it again
   key ctrl+z
   assert mail.text is ¶2026¶[Type the abstract]¶¶¶Body
   call doc-click {"offset":20}
+  assert sel.start is 5
+  assert sel.end is 24
+
+test a drag from inside a placeholder selects what it sweeps
+  open copy:../fixtures/cover-abstract.docx
+  call doc-click {"offset":8,"drag-to":12}
+  assert sel.start is 8
+  assert sel.end is 12
+
+test the placeholder survives a save after an edit elsewhere
+  open copy:../fixtures/cover-abstract.docx
+  call doc-click {"offset":30}
+  type !
+  assert mail.text is ¶2026¶[Type the abstract]¶¶¶Body!
+  key ctrl+s
+  assert dirty is false
+  call open {"path":"cover-abstract.docx","reopen":"always"}
+  assert mail.text is ¶2026¶[Type the abstract]¶¶¶Body!
+  call doc-click {"offset":10}
   assert sel.start is 5
   assert sel.end is 24
