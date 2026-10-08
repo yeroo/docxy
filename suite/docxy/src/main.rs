@@ -10581,8 +10581,9 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
         (Kind::Xlsx, Some(hp)) => {
             let (surface, sheet_status) = sheet_from_path(hp);
             from_hot = !matches!(surface, Surface::Placeholder);
-            // An unreadable sidecar restores nothing: say so, like the
-            // document arm, instead of "unsaved — restored" on a blank tab.
+            // An unreadable sidecar restores nothing: the tab stays a
+            // placeholder (a repaired one reopens its file below) and says
+            // so, instead of "unsaved — restored" on a blank tab.
             let status = if matches!(surface, Surface::Placeholder) {
                 format!("load error: the restored copy could not be read — {sheet_status}")
             } else if t.dirty {

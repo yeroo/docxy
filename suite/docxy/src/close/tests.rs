@@ -1129,8 +1129,8 @@ fn xlsx_readable_sidecar_keeps_restored_status() {
 #[test]
 fn xlsx_repaired_unreadable_sidecar_reopens_file() {
     let dir = close_test_dir("xlsx-repaired-hot-bad");
-    let damaged = dir.join("damaged.xlsx");
-    damaged_xlsx_at(&damaged);
+    let scratch = crate::open_mode_tests::Scratch::new();
+    let damaged = crate::open_mode_tests::damaged_book(&scratch, "damaged.xlsx");
     // The strict load refuses it: this is a tab that was opened with Repair.
     let strict = tab_from_path(&damaged);
     assert!(
@@ -1287,18 +1287,6 @@ fn basic_xlsx_at(path: &std::path::Path) {
         path,
     )
     .unwrap();
-}
-
-/// `basic.xlsx` with one part's local header signature zeroed, so the strict
-/// load refuses it while Open and Repair stubs the part (gridcore's `damage`).
-fn damaged_xlsx_at(path: &std::path::Path) {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.xlsx");
-    let mut bytes = std::fs::read(src).unwrap();
-    let offset = opccore::zip::ZipArchive::open(&bytes)
-        .and_then(|zip| zip.find("xl/drawings/drawing1.xml").map(|e| e.local_offset))
-        .expect("basic.xlsx lists xl/drawings/drawing1.xml") as usize;
-    bytes[offset..offset + 4].copy_from_slice(&[0, 0, 0, 0]);
-    std::fs::write(path, bytes).unwrap();
 }
 
 fn doc_text(t: &DocTab) -> String {
