@@ -7,6 +7,7 @@
 //! the reference or name, its Special… opens Go To Special, whose OK selects
 //! what it finds as a multi-area selection (#670).
 
+use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::{DocTab, SheetView, Surface};
 use gridcore::edit::{ClearWhat, GoSpecial, Types, apply_clear_sheet, clear_plan};
@@ -102,7 +103,7 @@ fn default_ok(mut d: Dialog) -> Dialog {
 pub(crate) fn goto_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let v = sheet_view(tab)?;
     let mut d = Dialog::message(
-        "goto",
+        catalog::GOTO,
         "Go To",
         String::new(),
         &[
@@ -140,7 +141,7 @@ pub(crate) fn goto_dialog(tab: &DocTab) -> Result<Dialog, String> {
 pub(crate) fn special_dialog(tab: &DocTab) -> Result<Dialog, String> {
     sheet_view(tab)?;
     let mut d = Dialog::message(
-        "goto-special",
+        catalog::GOTO_SPECIAL,
         "Go To Special",
         String::new(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],

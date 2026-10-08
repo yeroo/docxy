@@ -1,0 +1,1540 @@
+# GENERATED from suite/docxy/src/dialog/catalog/entries.rs by
+# `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
+# inputs_typing_case_is_current`; do not edit by hand (#1029).
+#
+# Every editable field of every doc dialog, typed into with real keys
+# only: `real-key` and `real-type` go through the window's own input
+# path, and the field is focused by a real click or by Tab. A test is
+# one field and one step, named `<surface> <dialog>/<field>: <step>`.
+# See qa/inputs-typing.md.
+
+test doc insert-table: matches the catalogue
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc insert-table/cols: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc insert-table/cols: focus by Tab
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"cols"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc insert-table/cols: types
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"3"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 3
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc insert-table/cols: edits
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc insert-table/cols: select-all replaces
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc insert-table/cols: pastes
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc insert-table/cols: copies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc insert-table/cols: OK applies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"3"}
+  call real-key {"key":"enter"}
+  assert dialog is not insert-table
+  assert table.columns is 3
+
+test doc insert-table/cols: Escape cancels
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not insert-table
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc insert-table/cols: refuses invalid
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"3"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 3
+  call real-key {"key":"escape"}
+
+test doc insert-table/rows: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc insert-table/rows: focus by Tab
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"rows"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc insert-table/rows: types
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"4"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 4
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc insert-table/rows: edits
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc insert-table/rows: select-all replaces
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc insert-table/rows: pastes
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc insert-table/rows: copies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc insert-table/rows: OK applies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"4"}
+  call real-key {"key":"enter"}
+  assert dialog is not insert-table
+  assert table.rows is 4
+
+test doc insert-table/rows: Escape cancels
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not insert-table
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc insert-table/rows: refuses invalid
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"4"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 4
+  call real-key {"key":"escape"}
+
+test doc insert-table/width: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc insert-table/width: focus by Tab
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"width"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc insert-table/width: types
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 1.5
+  assert reply.caret is 3
+  call real-key {"key":"escape"}
+
+test doc insert-table/width: edits
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"width"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"width"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc insert-table/width: select-all replaces
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"width"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc insert-table/width: pastes
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc insert-table/width: copies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc insert-table/width: OK applies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call real-key {"key":"enter"}
+  assert dialog is not insert-table
+  assert table.columns is 5
+
+test doc insert-table/width: Escape cancels
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not insert-table
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc delete-cells: matches the catalogue
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"delete-cells"}
+  assert dialog is delete-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc split-cells: matches the catalogue
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc split-cells/cols: focus by click
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc split-cells/cols: focus by Tab
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"cols"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc split-cells/cols: types
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc split-cells/cols: edits
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc split-cells/cols: select-all replaces
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc split-cells/cols: pastes
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc split-cells/cols: copies
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc split-cells/cols: OK applies
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  assert dialog is not split-cells
+  assert table.columns is 3
+
+test doc split-cells/cols: Escape cancels
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not split-cells
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc split-cells/cols: refuses invalid
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test doc split-cells/rows: focus by click
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc split-cells/rows: focus by Tab
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"rows"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc split-cells/rows: types
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc split-cells/rows: edits
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc split-cells/rows: select-all replaces
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc split-cells/rows: pastes
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc split-cells/rows: copies
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc split-cells/rows: OK applies
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  assert dialog is not split-cells
+  assert table.rows is 2
+
+test doc split-cells/rows: Escape cancels
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not split-cells
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc split-cells/rows: refuses invalid
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test doc sort: matches the catalogue
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc sort/sort1: focus by click
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"sort1"}
+  call field-read {"dialog-field":"sort1"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc sort/sort1: Up and Down step
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sort1"}
+  call field-read {"dialog-field":"sort1"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"sort1"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"sort1"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc sort/type1: focus by click
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"type1"}
+  call field-read {"dialog-field":"type1"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc sort/type1: Up and Down step
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"type1"}
+  call field-read {"dialog-field":"type1"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"type1"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"type1"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc sort/sort2: focus by click
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"sort2"}
+  call field-read {"dialog-field":"sort2"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc sort/sort2: Up and Down step
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sort2"}
+  call field-read {"dialog-field":"sort2"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"sort2"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"sort2"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc sort/type2: focus by click
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"type2"}
+  call field-read {"dialog-field":"type2"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc sort/type2: Up and Down step
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"type2"}
+  call field-read {"dialog-field":"type2"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"type2"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"type2"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc sort/sort3: focus by click
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"sort3"}
+  call field-read {"dialog-field":"sort3"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc sort/sort3: Up and Down step
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sort3"}
+  call field-read {"dialog-field":"sort3"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"sort3"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"sort3"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc sort/type3: focus by click
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"type3"}
+  call field-read {"dialog-field":"type3"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc sort/type3: Up and Down step
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"type3"}
+  call field-read {"dialog-field":"type3"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"type3"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"type3"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc convert-to-text: matches the catalogue
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"convert-to-text"}
+  assert dialog is convert-to-text
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc convert-to-text/other: focus by click
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"convert-to-text"}
+  assert dialog is convert-to-text
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"other"}
+  call field-read {"dialog-field":"other"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc convert-to-text/other: focus by Tab
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"convert-to-text"}
+  assert dialog is convert-to-text
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call real-key {"key":"tab","to-field":"other"}
+  call field-read {"dialog-field":"other"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc convert-to-text/other: types
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"convert-to-text"}
+  assert dialog is convert-to-text
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"/"}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is /
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc convert-to-text/other: edits
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"convert-to-text"}
+  assert dialog is convert-to-text
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"other"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"other"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc convert-to-text/other: select-all replaces
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"convert-to-text"}
+  assert dialog is convert-to-text
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"other"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc convert-to-text/other: pastes
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"convert-to-text"}
+  assert dialog is convert-to-text
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc convert-to-text/other: copies
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"convert-to-text"}
+  assert dialog is convert-to-text
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc convert-to-text/other: OK applies
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"convert-to-text"}
+  assert dialog is convert-to-text
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"/"}
+  call real-key {"key":"enter"}
+  assert dialog is not convert-to-text
+  assert table is null
+
+test doc convert-to-text/other: Escape cancels
+  open ../fixtures/doc-table.docx
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"convert-to-text"}
+  assert dialog is convert-to-text
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not convert-to-text
+  call selection-set {"start":7,"end":7}
+  call ribbon-click {"tab":"Table Layout","command":"convert-to-text"}
+  assert dialog is convert-to-text
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table: matches the catalogue
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/cols: focus by click
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/cols: focus by Tab
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"cols"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/cols: types
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/cols: edits
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/cols: select-all replaces
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/cols: pastes
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/cols: copies
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/cols: OK applies
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  assert dialog is not convert-text-to-table
+  assert table.columns is 2
+  assert table.cells.0.1.0 is two
+
+test doc convert-text-to-table/cols: Escape cancels
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not convert-text-to-table
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/cols: refuses invalid
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/other: focus by click
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"other"}
+  call field-read {"dialog-field":"other"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/other: focus by Tab
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call real-key {"key":"tab","to-field":"other"}
+  call field-read {"dialog-field":"other"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/other: types
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"/"}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is /
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/other: edits
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"other"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"other"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/other: select-all replaces
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"other"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/other: pastes
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/other: copies
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc convert-text-to-table/other: OK applies
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"/"}
+  call real-key {"key":"enter"}
+  assert dialog is not convert-text-to-table
+  assert table.columns is 2
+
+test doc convert-text-to-table/other: Escape cancels
+  open ../fixtures/basic.docx
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"other"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not convert-text-to-table
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call real-key {"key":"down","times":2}
+  call field-read {"dialog-field":"other"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}

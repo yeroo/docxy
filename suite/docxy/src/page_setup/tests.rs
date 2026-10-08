@@ -547,7 +547,7 @@ fn columns_opens_on_the_caret_sections_columns() {
     let mut t = three_sections();
     open_columns(&mut t);
     let d = t.dialogs.top().unwrap();
-    assert_eq!((d.id, d.title.as_str()), ("columns", "Columns"));
+    assert_eq!((d.id.as_str(), d.title.as_str()), ("columns", "Columns"));
     assert_eq!(shown(&t, "preset"), "One");
     assert_eq!(shown(&t, "num"), "1");
     assert_eq!(shown(&t, "width1"), "6.5");

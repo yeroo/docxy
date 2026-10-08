@@ -8,6 +8,8 @@
 //! ([`click`]) rather than to `apply_dialog`, because they act on the whole
 //! tab: its merge state, its body, and the documents they open.
 use super::*;
+use crate::dialog::DialogId;
+use crate::dialog::catalog;
 use crate::dialog::{
     Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Reaction, Value,
 };
@@ -41,7 +43,7 @@ fn ok_cancel(ok: &str) -> Vec<Button> {
 }
 
 fn form(
-    id: &'static str,
+    id: DialogId,
     title: &str,
     owner: DialogOwner,
     controls: Vec<Control>,
@@ -271,7 +273,7 @@ pub(crate) fn open(tab: &mut DocTab, act: MailAct) -> Result<Dialog, String> {
                 .map(|c| c.to_text())
                 .unwrap_or_default();
             form(
-                "mail-envelopes",
+                catalog::MAIL_ENVELOPES,
                 "Envelopes and Labels",
                 DialogOwner::MailEnvelopes,
                 vec![
@@ -284,7 +286,7 @@ pub(crate) fn open(tab: &mut DocTab, act: MailAct) -> Result<Dialog, String> {
             )
         }
         MailAct::StartEnvelopes => form(
-            "mail-envelope-options",
+            catalog::MAIL_ENVELOPE_OPTIONS,
             "Envelope Options",
             DialogOwner::MailEnvelopeOptions,
             vec![choice(
@@ -300,7 +302,7 @@ pub(crate) fn open(tab: &mut DocTab, act: MailAct) -> Result<Dialog, String> {
             let mut controls = vec![text("address", "&Address:", "")];
             controls.extend(label_controls());
             let mut d = form(
-                "mail-labels",
+                catalog::MAIL_LABELS,
                 "Envelopes and Labels",
                 DialogOwner::MailLabels,
                 controls,
@@ -311,7 +313,7 @@ pub(crate) fn open(tab: &mut DocTab, act: MailAct) -> Result<Dialog, String> {
         }
         MailAct::StartLabels => {
             let mut d = form(
-                "mail-label-options",
+                catalog::MAIL_LABEL_OPTIONS,
                 "Label Options",
                 DialogOwner::MailLabelOptions,
                 label_controls(),
@@ -344,7 +346,7 @@ pub(crate) fn open(tab: &mut DocTab, act: MailAct) -> Result<Dialog, String> {
                 .collect();
             let row = tab.mail.record.min(r.rows.len().saturating_sub(1));
             let mut d = form(
-                "mail-recipients",
+                catalog::MAIL_RECIPIENTS,
                 "Mail Merge Recipients",
                 DialogOwner::MailRecipients,
                 vec![
@@ -388,7 +390,7 @@ pub(crate) fn open(tab: &mut DocTab, act: MailAct) -> Result<Dialog, String> {
             let mut hidden_without = label("without", "", &without);
             hidden_without.visible = false;
             let mut d = form(
-                "mail-address-block",
+                catalog::MAIL_ADDRESS_BLOCK,
                 "Insert Address Block",
                 DialogOwner::MailAddressBlock,
                 vec![
@@ -403,7 +405,7 @@ pub(crate) fn open(tab: &mut DocTab, act: MailAct) -> Result<Dialog, String> {
             d
         }
         MailAct::GreetingLine => form(
-            "mail-greeting-line",
+            catalog::MAIL_GREETING_LINE,
             "Insert Greeting Line",
             DialogOwner::MailGreetingLine,
             vec![
@@ -459,7 +461,7 @@ pub(crate) fn open(tab: &mut DocTab, act: MailAct) -> Result<Dialog, String> {
                 })
                 .collect();
             form(
-                "mail-match-fields",
+                catalog::MAIL_MATCH_FIELDS,
                 "Match Fields",
                 DialogOwner::MailMatchFields,
                 controls,
@@ -472,7 +474,7 @@ pub(crate) fn open(tab: &mut DocTab, act: MailAct) -> Result<Dialog, String> {
                 .chain(r.headers.iter().cloned())
                 .collect();
             form(
-                "mail-find",
+                catalog::MAIL_FIND,
                 "Find Entry",
                 DialogOwner::MailFind,
                 vec![
@@ -489,7 +491,7 @@ pub(crate) fn open(tab: &mut DocTab, act: MailAct) -> Result<Dialog, String> {
             )
         }
         MailAct::CheckErrors => form(
-            "mail-check-errors",
+            catalog::MAIL_CHECK_ERRORS,
             "Checking and Reporting Errors",
             DialogOwner::MailCheckErrors,
             vec![choice(
@@ -513,7 +515,7 @@ pub(crate) fn open(tab: &mut DocTab, act: MailAct) -> Result<Dialog, String> {
             let mut to = number("to", "&To:", &n);
             to.enabled = false;
             let mut d = form(
-                "mail-merge-new",
+                catalog::MAIL_MERGE_NEW,
                 "Merge to New Document",
                 DialogOwner::MailMergeToNew,
                 vec![
@@ -539,7 +541,7 @@ pub(crate) fn open(tab: &mut DocTab, act: MailAct) -> Result<Dialog, String> {
 /// Word's question before a document's own data source is read.
 pub(crate) fn attach_confirm(source: &str, then: MailAct) -> Dialog {
     Dialog::message(
-        "mail-attach",
+        catalog::MAIL_ATTACH,
         "Microsoft Word",
         format!(
             "Opening this document will run the following SQL command:\n\n\
@@ -553,7 +555,7 @@ pub(crate) fn attach_confirm(source: &str, then: MailAct) -> Dialog {
 
 fn report(title: &str, text: String) -> Dialog {
     Dialog::message(
-        "mail-report",
+        catalog::MAIL_REPORT,
         title,
         text,
         &[("OK", ButtonRole::Cancel)],
@@ -565,7 +567,7 @@ fn report(title: &str, text: String) -> Dialog {
 /// Merge ▸ Envelopes or Labels replaces a document that has text.
 fn replace_confirm(owner: DialogOwner) -> Dialog {
     Dialog::message(
-        "mail-replace",
+        catalog::MAIL_REPLACE,
         "Microsoft Word",
         "Mail merge will replace the contents of this document. Do you want to continue?".into(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],

@@ -9,6 +9,7 @@
 //! (`data-validation`) has the Settings, Input Message and Error Alert tabs;
 //! OK and Clear All apply as one undo step, a refusal keeps it open.
 
+use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::{DocTab, Surface};
 use gridcore::sheet::{AlertStyle, DataValidation};
@@ -40,7 +41,7 @@ pub(crate) fn alert_dialog(v: &Violation) -> Dialog {
         AlertStyle::Information => &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],
     };
     let mut d = Dialog::message(
-        "data-validation-alert",
+        catalog::DATA_VALIDATION_ALERT,
         &v.title,
         v.message.clone(),
         buttons,
@@ -163,7 +164,7 @@ pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
     let current = gridcore::validation::validation_at(v.sheet(), range.0, range.1);
     let b = DialogBoxes::of(current, (range.0, range.1), v.pkg.workbook.date1904);
     let mut d = Dialog::message(
-        "data-validation",
+        catalog::DATA_VALIDATION,
         "Data Validation",
         String::new(),
         &[
@@ -501,7 +502,7 @@ mod tests {
         assert_eq!(enter(&mut t, "250"), None);
         let top = t.dialogs.top().expect("the alert is up");
         assert_eq!(
-            (top.id, top.title.as_str()),
+            (top.id.as_str(), top.title.as_str()),
             ("data-validation-alert", "Score")
         );
         assert_eq!(top.text.as_deref(), Some("10 to 90 only"));

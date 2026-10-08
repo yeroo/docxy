@@ -7,6 +7,7 @@
 //! changes to … before closing?" for a workbook or a Project. Its presses
 //! come through [`Docxy::close_prompt_click`].
 use super::*;
+use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use std::path::Path;
 
@@ -500,7 +501,7 @@ fn prompt_target(
 /// Word's close prompt for a document tab.
 fn doc_prompt(name: &PromptName, quit: bool) -> Dialog {
     let mut d = Dialog::message(
-        "save-on-close",
+        catalog::SAVE_ON_CLOSE,
         SAVE_PROMPT_TITLE,
         String::new(),
         &[],
@@ -550,7 +551,7 @@ fn doc_prompt(name: &PromptName, quit: bool) -> Dialog {
 /// The close prompt for a workbook or a Project tab titled `title`.
 fn message_prompt(title: &str, quit: bool) -> Dialog {
     Dialog::message(
-        "save-on-close",
+        catalog::SAVE_ON_CLOSE,
         "docxy",
         format!("Save changes to {title} before closing?"),
         &[

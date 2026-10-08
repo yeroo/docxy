@@ -81,7 +81,7 @@ fn a_partial_selection_asks_the_sort_warning() {
         let mut t = regions();
         view(&mut t).sel = (5, 1); // B2:B6
         quick(&mut t, true).unwrap();
-        assert_eq!(t.dialogs.top().map(|d| d.id), Some("sort-warning"));
+        assert_eq!(t.dialogs.top().map(|d| d.id.as_str()), Some("sort-warning"));
         assert_eq!(col(&mut t, 1)[0], "Eve", "nothing moved yet");
         set(&mut t, "what", Json::Str(answer.into()));
         press(&mut t, "Sort").unwrap();
@@ -120,7 +120,7 @@ fn the_sort_dialog_takes_levels_a_custom_list_and_case() {
     open_dialog(&mut t).unwrap();
     set(&mut t, "order1", Json::Str("Custom List...".into()));
     assert!(press(&mut t, "OK").is_err());
-    assert_eq!(t.dialogs.top().map(|d| d.id), Some("sort"));
+    assert_eq!(t.dialogs.top().map(|d| d.id.as_str()), Some("sort"));
 }
 
 #[test]

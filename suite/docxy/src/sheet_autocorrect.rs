@@ -13,6 +13,7 @@
 //! hyperlinks a file had (a follow-up).
 
 use super::*;
+use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use gridcore::autocorrect::{AutoCorrect, ExceptionKind, MATH, SWITCHES};
 use std::rc::Rc;
@@ -154,7 +155,7 @@ pub(crate) fn stamp_autocorrect(tabs: &mut [DocTab], ac: &Rc<AutoCorrect>) {
 /// The AutoCorrect dialog (ENT-112), on `ac`.
 pub(crate) fn dialog(ac: &AutoCorrect) -> Dialog {
     let mut d = Dialog::message(
-        "autocorrect",
+        catalog::AUTOCORRECT,
         "AutoCorrect",
         String::new(),
         &[
@@ -289,7 +290,7 @@ fn chosen(d: &Dialog, name: &str) -> Option<String> {
 /// The AutoCorrect Exceptions dialog (ENT-117).
 pub(crate) fn exceptions_dialog(ac: &AutoCorrect) -> Dialog {
     let mut d = Dialog::message(
-        "autocorrect-exceptions",
+        catalog::AUTOCORRECT_EXCEPTIONS,
         "AutoCorrect Exceptions",
         String::new(),
         &[
@@ -332,7 +333,7 @@ pub(crate) fn exceptions_dialog(ac: &AutoCorrect) -> Dialog {
 /// The question before Add replaces an existing entry (ENT-116).
 fn redefine_dialog(replace: &str) -> Dialog {
     Dialog::message(
-        "autocorrect-redefine",
+        catalog::AUTOCORRECT_REDEFINE,
         "AutoCorrect",
         format!("The AutoCorrect entry \"{replace}\" already exists. Do you want to redefine it?"),
         &[("Yes", ButtonRole::Accept), ("No", ButtonRole::Cancel)],

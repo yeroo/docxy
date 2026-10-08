@@ -924,7 +924,13 @@ mod tests {
         let mut t = tab_from_path(
             &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
         );
-        let mut d = Dialog::message("form", "Form", String::new(), &[], DialogOwner::Test);
+        let mut d = Dialog::message(
+            crate::dialog::catalog::TEST_FORM,
+            "Form",
+            String::new(),
+            &[],
+            DialogOwner::Test,
+        );
         d.text = None;
         d.controls = vec![
             Control::new("top", "Top:", ControlKind::Number, Value::Text("1".into())),

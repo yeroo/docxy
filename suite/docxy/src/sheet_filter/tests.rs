@@ -100,7 +100,7 @@ fn set(t: &mut DocTab, control: &str, value: Json) {
 }
 
 fn top_id(t: &DocTab) -> &'static str {
-    t.dialogs.top().map_or("none", |d| d.id)
+    t.dialogs.top().map_or("none", |d| d.id.as_str())
 }
 
 #[test]

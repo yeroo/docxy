@@ -1,0 +1,114 @@
+# GENERATED with the inputs-typing-*.uit cases (see there); do not edit
+# by hand (#1029). A text, a number and a dropdown field under each theme.
+
+test dark theme doc insert-table/width: types
+  open ../fixtures/basic.docx
+  call theme-set {"theme":"dark"}
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 1.5
+  assert reply.caret is 3
+  shot window
+  call real-key {"key":"escape"}
+  call theme-set {"theme":"auto"}
+
+test dark theme doc page-setup/top: types
+  open ../fixtures/basic.docx
+  call theme-set {"theme":"dark"}
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Margins"]}}
+  call menu-click {"label":"Custom Margins..."}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 1.5
+  assert reply.caret is 3
+  shot window
+  call real-key {"key":"escape"}
+  call theme-set {"theme":"auto"}
+
+test dark theme doc page-setup/multiple: Up and Down step
+  open ../fixtures/basic.docx
+  call theme-set {"theme":"dark"}
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Margins"]}}
+  call menu-click {"label":"Custom Margins..."}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call real-key {"key":"tab","to-field":"multiple"}
+  call field-read {"dialog-field":"multiple"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"multiple"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"multiple"}
+  assert reply.index is 1
+  shot window
+  call real-key {"key":"escape"}
+  call theme-set {"theme":"auto"}
+
+test light theme doc insert-table/width: types
+  open ../fixtures/basic.docx
+  call theme-set {"theme":"light"}
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 1.5
+  assert reply.caret is 3
+  shot window
+  call real-key {"key":"escape"}
+  call theme-set {"theme":"auto"}
+
+test light theme doc page-setup/top: types
+  open ../fixtures/basic.docx
+  call theme-set {"theme":"light"}
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Margins"]}}
+  call menu-click {"label":"Custom Margins..."}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 1.5
+  assert reply.caret is 3
+  shot window
+  call real-key {"key":"escape"}
+  call theme-set {"theme":"auto"}
+
+test light theme doc page-setup/multiple: Up and Down step
+  open ../fixtures/basic.docx
+  call theme-set {"theme":"light"}
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Margins"]}}
+  call menu-click {"label":"Custom Margins..."}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call real-key {"key":"tab","to-field":"multiple"}
+  call field-read {"dialog-field":"multiple"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"multiple"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"multiple"}
+  assert reply.index is 1
+  shot window
+  call real-key {"key":"escape"}
+  call theme-set {"theme":"auto"}

@@ -21,6 +21,9 @@
 
 use ctlcore::json::Json;
 
+pub(crate) mod catalog;
+pub(crate) use catalog::DialogId;
+
 /// What an accept button applies the dialog to. The app matches it in
 /// `apply_dialog`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -709,8 +712,9 @@ fn fold(label: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Dialog {
-    /// Stable, for scripts: `delete-summary`.
-    pub id: &'static str,
+    /// Stable, for scripts: `delete-summary`. Only [`catalog`] makes one,
+    /// so no dialog exists that the catalogue lacks (#1029).
+    pub id: DialogId,
     pub title: String,
     /// A message box's message.
     pub text: Option<String>,
@@ -761,7 +765,7 @@ impl Dialog {
     /// A message box: a title, a message and buttons. The first button is the
     /// default, as in Office's message boxes.
     pub fn message(
-        id: &'static str,
+        id: DialogId,
         title: &str,
         text: String,
         buttons: &[(&str, ButtonRole)],
@@ -855,6 +859,113 @@ impl Dialog {
         Ok(i)
     }
 
+    /// The tab label control `c` sits on; `None` on every tab.
+    fn page_label(&self, c: &Control) -> Option<&str> {
+        c.page.and_then(|p| self.tabs.get(p)).map(String::as_str)
+    }
+
+    /// `field-read`: field `name` as it is edited and drawn (#1029): its
+    /// text, whether it has the focus, and the caret and selection the
+    /// overlay draws from (`caret_at`, `selection`), `null` while another
+    /// control has the focus. On any tab, so a script can see a field it has
+    /// not reached yet is there.
+    pub fn field_json(&self, name: &str) -> Result<Json, String> {
+        let i = self
+            .controls
+            .iter()
+            .position(|c| c.name == name)
+            .ok_or_else(|| {
+                format!(
+                    "no field '{name}' in the open dialog ({})",
+                    self.id.as_str()
+                )
+            })?;
+        let c = &self.controls[i];
+        let focused = self.focus == Some(i) && self.focused().is_some();
+        let text = focused && c.kind.is_text();
+        let num = |n: usize| Json::Num(n as f64);
+        Ok(Json::obj(vec![
+            ("name", Json::Str(name.into())),
+            ("kind", Json::Str(c.kind.name().into())),
+            ("value", Json::Str(c.text())),
+            ("focused", Json::Bool(focused)),
+            (
+                "caret",
+                if text {
+                    num(self.caret_at())
+                } else {
+                    Json::Null
+                },
+            ),
+            (
+                "selection",
+                match self.selection().filter(|_| text) {
+                    Some((a, b)) => Json::Arr(vec![num(a), num(b)]),
+                    None => Json::Null,
+                },
+            ),
+            (
+                "tab",
+                self.page_label(c)
+                    .map_or(Json::Null, |t| Json::Str(t.into())),
+            ),
+            (
+                "index",
+                match c.value {
+                    Value::Choice(Some(i)) => num(i),
+                    _ => Json::Null,
+                },
+            ),
+            ("items", num(c.items.len())),
+            ("on_page", Json::Bool(self.on_page(c))),
+            ("enabled", Json::Bool(c.enabled)),
+            ("visible", Json::Bool(c.visible)),
+        ]))
+    }
+
+    /// `dialog-catalog-check`: this dialog's editable controls on every tab,
+    /// as (name, kind, tab), against its catalogue entry's fields, in order
+    /// (#1029). The error lists each difference, so a field added to a
+    /// dialog without its entry fails the case that opens it.
+    pub fn catalog_check(&self) -> Result<Json, String> {
+        let entry = self
+            .id
+            .entry()
+            .ok_or_else(|| format!("'{}' is a test-only dialog", self.id.as_str()))?;
+        let have: Vec<(&str, ControlKind, Option<&str>)> = self
+            .controls
+            .iter()
+            .filter(|c| c.kind.is_editable())
+            .map(|c| (c.name, c.kind, self.page_label(c)))
+            .collect();
+        let want: Vec<(&str, ControlKind, Option<&str>)> = entry
+            .fields
+            .iter()
+            .map(|f| (f.name, f.kind, f.tab))
+            .collect();
+        if have == want {
+            return Ok(Json::obj(vec![
+                ("id", Json::Str(self.id.as_str().into())),
+                ("key", Json::Str(self.id.key().into())),
+                ("fields", Json::Num(have.len() as f64)),
+            ]));
+        }
+        let show = |(name, kind, tab): &(&str, ControlKind, Option<&str>)| match tab {
+            Some(t) => format!("{name} ({}, {t})", kind.name()),
+            None => format!("{name} ({})", kind.name()),
+        };
+        let list = |v: &[(&str, ControlKind, Option<&str>)]| {
+            v.iter().map(show).collect::<Vec<_>>().join(", ")
+        };
+        Err(format!(
+            "dialog '{}' ({}) does not match its catalogue entry: it has [{}], the catalogue lists [{}]; update suite/docxy/src/dialog/catalog/entries.rs",
+            self.id.as_str(),
+            self.id.key(),
+            list(&have),
+            list(&want)
+        ))
+    }
+
     /// Set one control through its input handler.
     pub fn set(&mut self, control: &str, args: &Json) -> Result<(), String> {
         let i = self.control_index(control)?;
@@ -898,6 +1009,30 @@ impl Dialog {
                 self.on_page(c) && c.visible && c.enabled && c.kind.is_editable()
             })
             .collect()
+    }
+
+    /// How many Tab presses move the focus from where it is now to control
+    /// `name` (#1029), as [`Dialog::focus_step`] walks: an error when Tab
+    /// never reaches it (another tab's, hidden or disabled).
+    pub fn tabs_to(&self, name: &str) -> Result<usize, String> {
+        let order = self.focusable();
+        let target = order
+            .iter()
+            .position(|&i| self.controls[i].name == name)
+            .ok_or_else(|| format!("Tab never reaches '{name}' on this tab of the dialog"))?;
+        let n = order.len();
+        let presses = match self.focused().and(self.focus) {
+            Some(f) => {
+                // Already there: a whole round, so Tab still has to work.
+                let at = order.iter().position(|&i| i == f).unwrap_or_default();
+                match (target + n - at) % n {
+                    0 => n,
+                    k => k,
+                }
+            }
+            None => target + 1,
+        };
+        Ok(presses)
     }
 
     /// The focused control, when it is still on the current tab.
@@ -1186,7 +1321,7 @@ impl Dialog {
     fn to_json(&self, depth: usize) -> Json {
         Json::obj(vec![
             ("open", Json::Bool(true)),
-            ("id", Json::Str(self.id.into())),
+            ("id", Json::Str(self.id.as_str().into())),
             ("depth", Json::Num(depth as f64)),
             ("title", Json::Str(self.title.clone())),
             ("text", self.text.clone().map_or(Json::Null, Json::Str)),
@@ -1258,7 +1393,7 @@ impl DialogStack {
 
     /// The top dialog's id, or `none`: the `dialog` state key.
     pub fn top_id(&self) -> &'static str {
-        self.top().map_or("none", |d| d.id)
+        self.top().map_or("none", |d| d.id.as_str())
     }
 
     /// `dialog-read`: the top dialog, or `{open: false}`.
@@ -1357,7 +1492,7 @@ mod tests_support {
     /// from the parent it was opened over.
     pub(super) fn child(parent: &Dialog) -> Dialog {
         Dialog {
-            id: "child",
+            id: catalog::TEST_CHILD,
             title: format!("{} › Details", parent.title),
             text: None,
             tabs: Vec::new(),

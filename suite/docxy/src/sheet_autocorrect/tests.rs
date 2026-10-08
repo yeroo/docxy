@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::dialog::DialogStack;
+use crate::dialog::catalog;
 use core::prelude::v1::test;
 use ctlcore::json::Json;
 use gridcore::sheet::CellValue;
@@ -270,7 +271,7 @@ fn cancel_keeps_the_switches_and_another_dialog_is_not_ours() {
     assert!(!press(&mut stack, &mut ac, "Cancel"));
     assert!(ac.opts.replace_text);
     stack.push(Dialog::message(
-        "t",
+        catalog::TEST_T,
         "T",
         String::new(),
         &[("OK", ButtonRole::Accept)],

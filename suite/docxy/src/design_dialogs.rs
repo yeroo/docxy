@@ -12,6 +12,8 @@ use super::*;
 use crate::design_tab::{
     THEME_COLORS, body, color_name, current_watermark, page_background, palette, set_watermark,
 };
+use crate::dialog::DialogId;
+use crate::dialog::catalog;
 use crate::dialog::{
     Button, ButtonRole, ChildDialog, Control, ControlKind, Dialog, DialogOwner, Reaction, Value,
 };
@@ -33,7 +35,7 @@ fn buttons(ok: &str, apply: bool) -> Vec<Button> {
     b
 }
 
-fn form(id: &'static str, title: &str, owner: DialogOwner, controls: Vec<Control>) -> Dialog {
+fn form(id: DialogId, title: &str, owner: DialogOwner, controls: Vec<Control>) -> Dialog {
     let mut d = Dialog::message(id, title, String::new(), &[], owner);
     d.text = None;
     d.controls = controls;
@@ -167,7 +169,7 @@ fn chosen_color(d: &Dialog, name: &str) -> Option<u32> {
 pub(crate) fn more_colors_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let current = page_background(tab).map_or(0xFFFFFF, |b| b.color);
     Ok(form(
-        "more-colors",
+        catalog::MORE_COLORS,
         "Colors",
         DialogOwner::DesignMoreColors,
         vec![text("hex", "Hex:", &format!("{current:06X}"))],
@@ -187,7 +189,7 @@ pub(crate) fn fill_effects_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let style = grad.map_or(GradientStyle::Horizontal, |g| g.style);
     let styles: Vec<&str> = GradientStyle::ALL.iter().map(|s| s.label()).collect();
     let mut d = form(
-        "fill-effects",
+        catalog::FILL_EFFECTS,
         "Fill Effects",
         DialogOwner::DesignFillEffects,
         vec![
@@ -246,7 +248,7 @@ pub(crate) fn watermark_dialog(tab: &DocTab) -> Result<Dialog, String> {
         .as_ref()
         .is_none_or(|w| (w.rotation - 315.0).abs() < 0.5);
     let mut d = form(
-        "watermark",
+        catalog::WATERMARK,
         "Printed Watermark",
         DialogOwner::DesignWatermark,
         vec![
@@ -521,7 +523,7 @@ pub(crate) fn page_borders_dialog(tab: &DocTab) -> Result<Dialog, String> {
         },
     ));
     let mut d = form(
-        "page-borders",
+        catalog::PAGE_BORDERS,
         "Borders and Shading",
         DialogOwner::DesignPageBorders,
         controls,
@@ -586,7 +588,7 @@ pub(crate) fn border_options_dialog(parent: &Dialog) -> Dialog {
         get_text(parent, "from").parse().unwrap_or(1),
     ));
     form(
-        "page-border-options",
+        catalog::PAGE_BORDER_OPTIONS,
         "Border and Shading Options",
         DialogOwner::DesignBorderOptions,
         controls,

@@ -57,6 +57,7 @@ mod hf;
 mod hf_tab;
 mod hl_mode;
 mod html_bundle;
+mod inputs;
 mod inspector;
 mod layout_tab;
 mod mailings_dialogs;
@@ -119,6 +120,7 @@ mod trusted;
 mod ttc_dialog;
 mod user_name;
 mod windows;
+use crate::dialog::catalog;
 use open_mode::{OpenMode, Reopen, ReopenStep, reopen_step};
 use project::*;
 
@@ -9746,7 +9748,7 @@ fn edit_anyway_tab(tab: &mut DocTab) -> bool {
 /// keeps the tab as it is.
 fn reopen_dialog(path: &std::path::Path, mode: OpenMode) -> dialog::Dialog {
     dialog::Dialog::message(
-        "reopen",
+        catalog::REOPEN,
         "docxy",
         open_mode::reopen_question(&file_name(path)),
         &[
@@ -11555,6 +11557,9 @@ impl Docxy {
             .when(!self.tabs.is_empty(), |d| {
                 d.child(
                     row("bs-custom-lists")
+                        .relative()
+                        // Where `pointer-click {"at":"custom-lists-row"}` clicks (#1029).
+                        .child(probe(&self.probes, "bs-custom-lists"))
                         .child(div().text_color(fg).child("Edit Custom Lists\u{2026}"))
                         .child(div().text_color(dim).child(SharedString::from(format!(
                             "{} of your own",

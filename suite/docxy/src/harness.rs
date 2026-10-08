@@ -1137,6 +1137,32 @@ fn dialog_field_point(
     Ok(point(at, b.center().y))
 }
 
+/// The centre of the open dialog's `{key}:{name}` probe: a tab, a button
+/// (by its label as drawn, `&` and all) or a control row.
+fn dialog_probe_point(app: &crate::Docxy, key: &str, name: &str) -> Result<Point<Pixels>, String> {
+    if app.active_dialogs().is_none() {
+        return Err(crate::dialog::NONE_OPEN.into());
+    }
+    let what = key.trim_start_matches("dialog-");
+    let probes = app.probes.borrow();
+    // A label is matched as drawn: its access-key `&` is not.
+    probes
+        .on_screen(&format!("{key}:{name}"))
+        .or_else(|| {
+            probes
+                .on_screen_frame()
+                .iter()
+                .find(|(n, _)| {
+                    n.strip_prefix(key)
+                        .and_then(|n| n.strip_prefix(':'))
+                        .is_some_and(|n| n.replace('&', "") == name)
+                })
+                .map(|(_, b)| *b)
+        })
+        .map(|b| b.center())
+        .ok_or_else(|| format!("no {what} '{name}' is drawn in the open dialog"))
+}
+
 /// The centre of a named region's recorded bounds — where a pointer verb
 /// presses or releases. Errors name the region. Probe-backed regions read
 /// the frame that is on screen now (see `Docxy::region_bounds_live`), the
@@ -3632,6 +3658,25 @@ fn dispatch_verb(
         // Dialogs (#393). There is no `dialog-open`: a dialog opens through
         // the verb a person would use (`key`, `ribbon-click`, `click-cell`).
         "dialog-read" => Done::ok(app.active_dialogs_mut().to_json()),
+        // One field of the open dialog as it is edited and drawn: its text,
+        // focus, caret and selection (#1029).
+        "field-read" => {
+            let name = arg_str(args, "dialog-field")?;
+            let top = app
+                .active_dialogs()
+                .and_then(|d| d.top())
+                .ok_or(crate::dialog::NONE_OPEN)?;
+            Done::ok(top.field_json(name)?)
+        }
+        // The open dialog's editable controls against its catalogue entry
+        // (#1029): an error lists the difference.
+        "dialog-catalog-check" => {
+            let top = app
+                .active_dialogs()
+                .and_then(|d| d.top())
+                .ok_or(crate::dialog::NONE_OPEN)?;
+            Done::ok(top.catalog_check()?)
+        }
         // The control's input handler, the one the overlay's editable widgets
         // call too (#649).
         "dialog-set" => {
@@ -4301,6 +4346,39 @@ fn dispatch_verb(
         "pointer-click" => {
             // A field of the open dialog: where a person clicks it, a number
             // of pixels `x` in from its left edge (its middle without one).
+            // A tab, a button or a whole control row of the open dialog
+            // (#1029): the dialog's tab strip, a child's Options... button, a
+            // dropdown.
+            let probe = [
+                ("dialog-tab", "a tab label"),
+                ("dialog-button", "a button label"),
+                ("dialog-control", "a control name"),
+            ]
+            .into_iter()
+            .find_map(|(key, what)| args.get(key).map(|v| (key, what, v)));
+            if let Some((key, what, v)) = probe {
+                let name = v
+                    .as_str()
+                    .ok_or_else(|| format!("'{key}' must be {what}"))?;
+                let p = dialog_probe_point(app, key, name)?;
+                let mut done = Done::ok(Json::obj(vec![
+                    ("x", Json::Num(f64::from(p.x))),
+                    ("y", Json::Num(f64::from(p.y))),
+                ]))?;
+                done.input = click_events(p);
+                return Ok(done);
+            }
+            // A registered input outside the dialogs (#1029).
+            if let Some(input) = args.get("input") {
+                let id = input.as_str().ok_or("'input' must be an input id")?;
+                let p = crate::inputs::point(app, id)?;
+                let mut done = Done::ok(Json::obj(vec![
+                    ("x", Json::Num(f64::from(p.x))),
+                    ("y", Json::Num(f64::from(p.y))),
+                ]))?;
+                done.input = click_events(p);
+                return Ok(done);
+            }
             if let Some(field) = args.get("dialog-field") {
                 let name = field
                     .as_str()
@@ -4328,9 +4406,18 @@ fn dispatch_verb(
                         .on_screen("bs-user-name")
                         .ok_or("the User name row is not drawn: open File (backstage) first")?
                         .center(),
+                    // Its Edit Custom Lists… row (#1029).
+                    Some("custom-lists-row") => app
+                        .probes
+                        .borrow()
+                        .on_screen("bs-custom-lists")
+                        .ok_or(
+                            "the Edit Custom Lists row is not drawn: open File (backstage) first",
+                        )?
+                        .center(),
                     Some(other) => {
                         return Err(format!(
-                            "unknown pointer target '{other}' (fill-handle, user-name-row)"
+                            "unknown pointer target '{other}' (fill-handle, user-name-row, custom-lists-row)"
                         ));
                     }
                     None => return Err("'at' must be a string".into()),
@@ -4876,8 +4963,34 @@ fn dispatch_verb(
         "real-key" | "real-type" => {
             let strokes = if verb == "real-type" {
                 typed_keys(arg_str(args, "text")?)?
+            } else if let Some(field) = args.get("to-field") {
+                // As many Tabs as move the open dialog's focus to the field
+                // (#1029), counted now; each is a real key-down.
+                let name = field.as_str().ok_or("'to-field' must be a field name")?;
+                let top = app
+                    .active_dialogs()
+                    .and_then(|d| d.top())
+                    .ok_or(crate::dialog::NONE_OPEN)?;
+                (0..top.tabs_to(name)?)
+                    .map(|_| parse_key("tab"))
+                    .collect::<Result<_, _>>()?
             } else {
-                key_args(args)?
+                // `times` presses the keys again that often (#1029: a
+                // dropdown stepped to its first item).
+                let keys = key_args(args)?;
+                let times = match args.get("times") {
+                    None => 1,
+                    Some(v) => v
+                        .as_f64()
+                        .filter(|n| n.fract() == 0.0 && (1.0..=500.0).contains(n))
+                        .ok_or("'times' must be a whole number from 1 to 500")?
+                        as usize,
+                };
+                let mut all = Vec::with_capacity(keys.len() * times);
+                for _ in 0..times {
+                    all.extend(keys.iter().cloned());
+                }
+                all
             };
             let mut done = Done::ok(Json::obj(vec![("keys", Json::Num(strokes.len() as f64))]))?;
             done.input = strokes
@@ -6193,6 +6306,8 @@ mod tests {
             "ribbon-flyout",
             "clipboard",
             "dialog-read",
+            "field-read",
+            "dialog-catalog-check",
             "status-read",
             "last-url",
             "doc",

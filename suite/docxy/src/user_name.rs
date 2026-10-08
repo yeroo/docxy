@@ -5,6 +5,7 @@
 //! `dialog-click` drive it like any other. Its OK is the app's, not the
 //! tab's: [`click`] takes the press before the tab's own path does, and the
 //! app stores and persists what it returns.
+use crate::dialog::catalog;
 use crate::dialog::{Control as Field, ControlKind, Dialog, DialogOwner, DialogStack, Value};
 use crate::page_setup::{ok_cancel, text_of};
 use crate::{Docxy, review_identity};
@@ -14,7 +15,7 @@ use crate::{Docxy, review_identity};
 pub(crate) fn dialog(user_name: &str, user_initials: &str) -> Dialog {
     let (name, initials) = review_identity(user_name, user_initials);
     let mut d = Dialog::message(
-        "user-name",
+        catalog::USER_NAME,
         "User name",
         String::new(),
         &[],
@@ -152,7 +153,7 @@ mod tests {
     fn another_dialog_is_not_ours() {
         let mut stack = DialogStack::default();
         stack.push(Dialog::message(
-            "t",
+            catalog::TEST_T,
             "T",
             String::new(),
             &[("OK", crate::dialog::ButtonRole::Accept)],

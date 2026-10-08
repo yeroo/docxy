@@ -1,5 +1,6 @@
 //! Project commands and prompt policy: pure DocTab functions first, window host glue last.
 use super::*;
+use crate::dialog::catalog;
 use crate::dialog::{ButtonRole, Dialog, DialogOwner, DialogStack};
 use projcore::editor::{AssignOutcome, FindOutcome, constraint_hint};
 
@@ -1133,7 +1134,7 @@ pub(crate) fn delete_summary_dialog(ed: &ProjectEditor, uid: i32, n: usize) -> D
     let name = ed.project().task(uid).map_or("", |t| &t.name);
     let noun = if n == 1 { "subtask" } else { "subtasks" };
     Dialog::message(
-        "delete-summary",
+        catalog::DELETE_SUMMARY,
         "Delete Task",
         format!("Delete '{name}' and its {n} {noun}?"),
         &[("Yes", ButtonRole::Accept), ("No", ButtonRole::Cancel)],

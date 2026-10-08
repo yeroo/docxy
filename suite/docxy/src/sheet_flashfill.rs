@@ -12,6 +12,7 @@
 //! selection moves and goes with the next edit.
 
 use super::*;
+use crate::dialog::catalog;
 use crate::dialog::{ButtonRole, Dialog, DialogOwner};
 use gridcore::flashfill::FlashFill;
 
@@ -249,7 +250,7 @@ impl Docxy {
             Err(msg) => {
                 if let Some(t) = self.tabs.get_mut(self.active) {
                     t.dialogs.push(Dialog::message(
-                        "flash-fill",
+                        catalog::FLASH_FILL,
                         "Flash Fill",
                         msg,
                         &[("OK", ButtonRole::Accept)],

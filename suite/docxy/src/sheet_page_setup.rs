@@ -13,6 +13,7 @@
 //! `dialog-set` and `dialog-click` drive it. A value Excel refuses keeps the
 //! dialog open, says why and changes nothing.
 
+use crate::dialog::catalog;
 use crate::dialog::{ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::{DocTab, SheetView, Surface};
 use gridcore::print::area::{self, PrintRef, PrintTitles};
@@ -404,7 +405,7 @@ pub(crate) fn dialog(tab: &DocTab, at: SetupTab) -> Result<Dialog, String> {
     let s = v.active;
     let p = &wb.sheets[s].page_setup;
     let mut d = Dialog::message(
-        "page-setup",
+        catalog::SHEET_PAGE_SETUP,
         "Page Setup",
         String::new(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],

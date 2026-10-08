@@ -1,0 +1,1564 @@
+# GENERATED from suite/docxy/src/dialog/catalog/entries.rs by
+# `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
+# inputs_typing_case_is_current`; do not edit by hand (#1029).
+#
+# Every editable field of every doc dialog, typed into with real keys
+# only: `real-key` and `real-type` go through the window's own input
+# path, and the field is focused by a real click or by Tab. A test is
+# one field and one step, named `<surface> <dialog>/<field>: <step>`.
+# See qa/inputs-typing.md.
+
+test doc more-colors: matches the catalogue
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"More Colors..."}
+  assert dialog is more-colors
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc more-colors/hex: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"More Colors..."}
+  assert dialog is more-colors
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"hex"}
+  call field-read {"dialog-field":"hex"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc more-colors/hex: focus by Tab
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"More Colors..."}
+  assert dialog is more-colors
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"hex"}
+  call field-read {"dialog-field":"hex"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc more-colors/hex: types
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"More Colors..."}
+  assert dialog is more-colors
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"hex"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"C00000"}
+  call field-read {"dialog-field":"hex"}
+  assert reply.value is C00000
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test doc more-colors/hex: edits
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"More Colors..."}
+  assert dialog is more-colors
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"hex"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"hex"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"hex"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"hex"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"hex"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"hex"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc more-colors/hex: select-all replaces
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"More Colors..."}
+  assert dialog is more-colors
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"hex"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"hex"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"hex"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc more-colors/hex: pastes
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"More Colors..."}
+  assert dialog is more-colors
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"hex"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"hex"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc more-colors/hex: copies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"More Colors..."}
+  assert dialog is more-colors
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"hex"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc more-colors/hex: OK applies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"More Colors..."}
+  assert dialog is more-colors
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"hex"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"C00000"}
+  call real-key {"key":"enter"}
+  assert dialog is not more-colors
+  assert status is Page color: Dark Red
+
+test doc more-colors/hex: Escape cancels
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"More Colors..."}
+  assert dialog is more-colors
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"hex"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not more-colors
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"More Colors..."}
+  assert dialog is more-colors
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"hex"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc fill-effects: matches the catalogue
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"Fill Effects..."}
+  assert dialog is fill-effects
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc fill-effects/color1: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"Fill Effects..."}
+  assert dialog is fill-effects
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"color1"}
+  call field-read {"dialog-field":"color1"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc fill-effects/color1: Up and Down step
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"Fill Effects..."}
+  assert dialog is fill-effects
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"color1"}
+  call field-read {"dialog-field":"color1"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"color1"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"color1"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc fill-effects/color2: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"Fill Effects..."}
+  assert dialog is fill-effects
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"colors"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-control":"color2"}
+  call field-read {"dialog-field":"color2"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc fill-effects/color2: Up and Down step
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"Fill Effects..."}
+  assert dialog is fill-effects
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"colors"}
+  call real-key {"key":"down","times":1}
+  call real-key {"key":"tab","to-field":"color2"}
+  call field-read {"dialog-field":"color2"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"color2"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"color2"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc watermark: matches the catalogue
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc watermark/text: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"text"}
+  call field-read {"dialog-field":"text"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc watermark/text: focus by Tab
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call real-key {"key":"tab","to-field":"text"}
+  call field-read {"dialog-field":"text"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc watermark/text: types
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"text"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"text"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc watermark/text: edits
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"text"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"text"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"text"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"text"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"text"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"text"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc watermark/text: select-all replaces
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"text"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"text"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"text"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc watermark/text: pastes
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"text"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"text"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc watermark/text: copies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"text"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc watermark/text: OK applies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"text"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call real-key {"key":"enter"}
+  assert dialog is not watermark
+  assert status is "Watermark: Ab1 "
+
+test doc watermark/text: Escape cancels
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"text"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not watermark
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call field-read {"dialog-field":"text"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc watermark/font: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"font"}
+  call field-read {"dialog-field":"font"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc watermark/font: focus by Tab
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call real-key {"key":"tab","to-field":"font"}
+  call field-read {"dialog-field":"font"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc watermark/font: types
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"font"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Arial"}
+  call field-read {"dialog-field":"font"}
+  assert reply.value is Arial
+  assert reply.caret is 5
+  call real-key {"key":"escape"}
+
+test doc watermark/font: edits
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"font"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"font"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"font"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"font"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"font"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"font"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc watermark/font: select-all replaces
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"font"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"font"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"font"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc watermark/font: pastes
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"font"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"font"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc watermark/font: copies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"font"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc watermark/font: OK applies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"font"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Arial"}
+  call real-key {"key":"enter"}
+  assert dialog is not watermark
+  assert status is Watermark: ASAP
+
+test doc watermark/font: Escape cancels
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"font"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not watermark
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call field-read {"dialog-field":"font"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc watermark/size: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"size"}
+  call field-read {"dialog-field":"size"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc watermark/size: focus by Tab
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call real-key {"key":"tab","to-field":"size"}
+  call field-read {"dialog-field":"size"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc watermark/size: types
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"size"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"72"}
+  call field-read {"dialog-field":"size"}
+  assert reply.value is 72
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc watermark/size: edits
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"size"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"size"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"size"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"size"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"size"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"size"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc watermark/size: select-all replaces
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"size"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"size"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"size"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc watermark/size: pastes
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"size"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"size"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc watermark/size: copies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"size"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc watermark/size: OK applies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"size"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"72"}
+  call real-key {"key":"enter"}
+  assert dialog is not watermark
+  assert status is Watermark: ASAP
+
+test doc watermark/size: Escape cancels
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"size"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not watermark
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call field-read {"dialog-field":"size"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc watermark/color: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-control":"color"}
+  call field-read {"dialog-field":"color"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc watermark/color: Up and Down step
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call real-key {"key":"tab","to-field":"color"}
+  call field-read {"dialog-field":"color"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"color"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"color"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc page-borders: matches the catalogue
+  open ../fixtures/basic.docx
+  key alt g p b
+  assert dialog is page-borders
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc page-borders/style: focus by click
+  open ../fixtures/basic.docx
+  key alt g p b
+  assert dialog is page-borders
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"style"}
+  call field-read {"dialog-field":"style"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-borders/style: Up and Down step
+  open ../fixtures/basic.docx
+  key alt g p b
+  assert dialog is page-borders
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"style"}
+  call field-read {"dialog-field":"style"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"style"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"style"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc page-borders/color: focus by click
+  open ../fixtures/basic.docx
+  key alt g p b
+  assert dialog is page-borders
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"color"}
+  call field-read {"dialog-field":"color"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-borders/color: Up and Down step
+  open ../fixtures/basic.docx
+  key alt g p b
+  assert dialog is page-borders
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"color"}
+  call field-read {"dialog-field":"color"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"color"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"color"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc page-borders/width: focus by click
+  open ../fixtures/basic.docx
+  key alt g p b
+  assert dialog is page-borders
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"width"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-borders/width: Up and Down step
+  open ../fixtures/basic.docx
+  key alt g p b
+  assert dialog is page-borders
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"width"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"width"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"width"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc page-borders/apply: focus by click
+  open ../fixtures/basic.docx
+  key alt g p b
+  assert dialog is page-borders
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"apply"}
+  call field-read {"dialog-field":"apply"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-borders/apply: Up and Down step
+  open ../fixtures/basic.docx
+  key alt g p b
+  assert dialog is page-borders
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"apply"}
+  call field-read {"dialog-field":"apply"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"apply"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"apply"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc page-border-options: matches the catalogue
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc page-border-options/top: focus by click
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"top"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-border-options/top: focus by Tab
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"top"}
+  call field-read {"dialog-field":"top"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-border-options/top: types
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 10
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc page-border-options/top: edits
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"top"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"top"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc page-border-options/top: select-all replaces
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"top"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc page-border-options/top: pastes
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc page-border-options/top: copies
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc page-border-options/top: OK applies
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-border-options
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 10
+  call real-key {"key":"escape"}
+
+test doc page-border-options/top: Escape cancels
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-border-options
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc page-border-options/top: refuses invalid
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 10
+  call real-key {"key":"escape"}
+
+test doc page-border-options/left: focus by click
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"left"}
+  call field-read {"dialog-field":"left"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-border-options/left: focus by Tab
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"left"}
+  call field-read {"dialog-field":"left"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-border-options/left: types
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 10
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc page-border-options/left: edits
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"left"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"left"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc page-border-options/left: select-all replaces
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"left"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc page-border-options/left: pastes
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc page-border-options/left: copies
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc page-border-options/left: OK applies
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-border-options
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 10
+  call real-key {"key":"escape"}
+
+test doc page-border-options/left: Escape cancels
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-border-options
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc page-border-options/left: refuses invalid
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 10
+  call real-key {"key":"escape"}
+
+test doc page-border-options/bottom: focus by click
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"bottom"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-border-options/bottom: focus by Tab
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"bottom"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-border-options/bottom: types
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 10
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc page-border-options/bottom: edits
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc page-border-options/bottom: select-all replaces
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc page-border-options/bottom: pastes
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc page-border-options/bottom: copies
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc page-border-options/bottom: OK applies
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-border-options
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 10
+  call real-key {"key":"escape"}
+
+test doc page-border-options/bottom: Escape cancels
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-border-options
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc page-border-options/bottom: refuses invalid
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 10
+  call real-key {"key":"escape"}
+
+test doc page-border-options/right: focus by click
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"right"}
+  call field-read {"dialog-field":"right"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-border-options/right: focus by Tab
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"right"}
+  call field-read {"dialog-field":"right"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-border-options/right: types
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 10
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc page-border-options/right: edits
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"right"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"right"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc page-border-options/right: select-all replaces
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"right"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc page-border-options/right: pastes
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc page-border-options/right: copies
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc page-border-options/right: OK applies
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-border-options
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 10
+  call real-key {"key":"escape"}
+
+test doc page-border-options/right: Escape cancels
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-border-options
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc page-border-options/right: refuses invalid
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 10
+  call real-key {"key":"escape"}
+
+test doc page-border-options/from: focus by click
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"from"}
+  call field-read {"dialog-field":"from"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc page-border-options/from: Up and Down step
+  open ../fixtures/basic.docx
+  key alt g p b
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"from"}
+  call field-read {"dialog-field":"from"}
+  assert reply.focused is true
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"from"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"from"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}

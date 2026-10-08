@@ -3,6 +3,7 @@
 //! ([`gridcore::edit::paste_special_changes`] and its extras); this is where
 //! the grid takes its copy and keeps its undo steps.
 
+use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::sheet_menus::PasteItem;
 use crate::{Docxy, SheetView};
@@ -302,7 +303,7 @@ const WHATS: [PasteWhat; 10] = PasteWhat::DIALOG;
 /// Transpose, and Paste Link is off.
 pub(crate) fn paste_special_dialog(clip: bool) -> Dialog {
     let mut d = Dialog::message(
-        "paste-special",
+        catalog::PASTE_SPECIAL,
         "Paste Special",
         String::new(),
         &[

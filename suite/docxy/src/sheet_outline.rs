@@ -15,6 +15,7 @@
 //! sheet, and Excel shows the result, but this grid does not until that
 //! follow-up lands.
 
+use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::{DocTab, SheetView, Surface};
 use gridcore::edit::{
@@ -206,7 +207,11 @@ const AXES: [&str; 2] = ["Rows", "Columns"];
 /// Excel's Group (Ungroup) question: rows or columns of the selection.
 fn axis_dialog(ungroup: bool) -> Dialog {
     let mut d = Dialog::message(
-        if ungroup { "ungroup" } else { "group" },
+        if ungroup {
+            catalog::UNGROUP
+        } else {
+            catalog::GROUP
+        },
         if ungroup { "Ungroup" } else { "Group" },
         String::new(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],
@@ -300,7 +305,7 @@ pub(crate) fn subtotal_dialog(tab: &DocTab) -> Result<Dialog, String> {
         ));
     }
     let mut d = Dialog::message(
-        "subtotal",
+        catalog::SUBTOTAL,
         "Subtotal",
         String::new(),
         &[
@@ -381,7 +386,7 @@ pub(crate) fn settings_dialog(tab: &DocTab) -> Result<Dialog, String> {
     };
     let now = v.sheet().outline;
     let mut d = Dialog::message(
-        "outline-settings",
+        catalog::OUTLINE_SETTINGS,
         "Settings",
         String::new(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],
@@ -667,7 +672,7 @@ mod tests {
         let mut t = tab();
         select(&mut t, 1, 1, 2, 3);
         run(&mut t, Cmd::Group);
-        assert_eq!(t.dialogs.top().map(|d| d.id), Some("group"));
+        assert_eq!(t.dialogs.top().map(|d| d.id.as_str()), Some("group"));
         set(&mut t, "axis", Json::Str("Columns".into()));
         press(&mut t, "OK");
         assert!(t.dialogs.top().is_none());
@@ -680,7 +685,7 @@ mod tests {
         assert_eq!(sheet(&mut t).max_row_outline(), 0);
         // Ungroup asks too; Rows is the default.
         run(&mut t, Cmd::Ungroup);
-        assert_eq!(t.dialogs.top().map(|d| d.id), Some("ungroup"));
+        assert_eq!(t.dialogs.top().map(|d| d.id.as_str()), Some("ungroup"));
         press(&mut t, "Cancel");
         assert!(t.dialogs.top().is_none());
         assert_eq!(sheet(&mut t).max_col_outline(), 1, "Cancel changes nothing");
@@ -848,7 +853,7 @@ mod tests {
         set(&mut t, "Amt", Json::Bool(false));
         let err = crate::dialog_host::dialog_click(&mut t, "OK").unwrap_err();
         assert_eq!(err, gridcore::edit::SubtotalError::NoColumns.to_string());
-        assert_eq!(t.dialogs.top().map(|d| d.id), Some("subtotal"));
+        assert_eq!(t.dialogs.top().map(|d| d.id.as_str()), Some("subtotal"));
         assert_eq!(undo_len(&mut t), 0);
     }
 

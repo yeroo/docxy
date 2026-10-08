@@ -13,6 +13,7 @@
 //! margins instead of copying the caret section's onto every one. A value out
 //! of range refuses OK with the reason, and the dialog stays open.
 use super::*;
+use crate::dialog::catalog;
 use crate::dialog::{
     Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Reaction, Value,
 };
@@ -121,7 +122,7 @@ pub(crate) fn page_setup_dialog(tab: &DocTab, page: PageSetupTab) -> Result<Dial
     });
     let start_at = STARTS.iter().position(|(st, _)| *st == s.start);
     let mut d = Dialog::message(
-        "page-setup",
+        catalog::PAGE_SETUP,
         "Page Setup",
         String::new(),
         &[],
@@ -691,7 +692,7 @@ pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let c = &s.columns;
     let n = c.count() as usize;
     let mut d = Dialog::message(
-        "columns",
+        catalog::COLUMNS,
         "Columns",
         String::new(),
         &[],

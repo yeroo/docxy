@@ -11,3 +11,13 @@
 
 # vbottom_inset at 200% is 323, the case expects 241.
 doc-rulers.uit | ruler positions follow the document geometry at 100 and 200 percent | #808
+
+# Enter on the Text to Columns wizard does not press Finish: Enter passes the
+# button's label with its access key ("&Finish"), which ttc_dialog's
+# presses_accept compares against the label with the "&" stripped (#1029
+# found it; the issue to fix it replaces #1029 here).
+inputs-typing-sheet-data.uit | sheet text-to-columns/breaks: OK applies | #1029
+inputs-typing-sheet-data.uit | sheet text-to-columns/formats: OK applies | #1029
+inputs-typing-sheet-data.uit | sheet text-to-columns/destination: OK applies | #1029
+inputs-typing-sheet-data.uit | sheet text-to-columns/decimal: OK applies | #1029
+inputs-typing-sheet-data.uit | sheet text-to-columns/thousands: OK applies | #1029

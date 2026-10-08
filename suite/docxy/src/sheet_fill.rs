@@ -5,6 +5,7 @@
 //! gridcore's ([`gridcore::edit::autofill`], [`gridcore::edit::series_changes_for`]);
 //! this is where the grid gathers its input and keeps its undo steps.
 
+use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::{DocTab, Docxy, SheetView, Surface};
 use gridcore::edit::{
@@ -259,7 +260,7 @@ pub(crate) fn series_dialog(tab: &DocTab) -> Result<Dialog, String> {
     }
     let rows = gridcore::edit::series_rows_for(v.range());
     let mut d = Dialog::message(
-        "series",
+        catalog::SERIES,
         "Series",
         String::new(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],
@@ -360,7 +361,7 @@ pub(crate) fn staged_series(d: &Dialog) -> Result<SeriesSpec, String> {
 /// Excel's Justify question: OK writes on below the selection.
 fn justify_question() -> Dialog {
     let mut d = Dialog::message(
-        "justify",
+        catalog::JUSTIFY,
         "Microsoft Excel",
         JUSTIFY_OVERFLOW.to_string(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],
@@ -375,7 +376,7 @@ fn justify_question() -> Dialog {
 /// OK and Cancel. The lists it edits live in a hidden grid, one row each.
 pub(crate) fn custom_lists_dialog(lists: &[Vec<String>], import: Vec<String>) -> Dialog {
     let mut d = Dialog::message(
-        "custom-lists",
+        catalog::CUSTOM_LISTS,
         "Custom Lists",
         String::new(),
         &[
