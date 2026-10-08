@@ -322,7 +322,7 @@ fn set(t: &mut DocTab, control: &str, value: Json) {
 
 fn open(t: &mut DocTab) {
     run(t, PageAct::Dialog(SetupTab::Page));
-    assert_eq!(t.dialogs.top().map(|d| d.id), Some("page-setup"));
+    assert_eq!(t.dialogs.top().map(|d| d.id.as_str()), Some("page-setup"));
 }
 
 fn ok(t: &mut DocTab) {
@@ -568,7 +568,7 @@ fn the_dialog_refuses_what_excel_refuses_and_changes_nothing() {
         set(&mut t, control, Json::Str(value.into()));
         let err = crate::dialog_host::dialog_click(&mut t, "OK").unwrap_err();
         assert_eq!(err, message, "{control} = {value}");
-        assert_eq!(t.dialogs.top().map(|d| d.id), Some("page-setup"));
+        assert_eq!(t.dialogs.top().map(|d| d.id.as_str()), Some("page-setup"));
         assert_eq!(undo_len(&mut t), 0);
         assert!(!t.dirty);
         assert_eq!(setup(&mut t), PageSetup::default());

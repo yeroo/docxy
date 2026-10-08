@@ -33,3 +33,17 @@
   JSON type and pass their own `CARGO_PKG_VERSION` (the suite, xlsxy, yppxy and lookxy are 0.1.0, docxy 0.5.0).
 - `ci.yml` sets `DOCXY_BUILD_KIND: ci` per job and `release.yml` sets `release`, but
   never on `ui-sweep-linux`: `uiharness/cases/build-info.uit` asserts `local`.
+
+## Dialogs and typed input (#1029)
+
+- Every dialog is in `suite/docxy/src/dialog/catalog/entries.rs`: a `DialogId`
+  exists only there, so every dialog carries a catalogued id. Give a new
+  dialog its own entry (how a person opens it, its editable controls, samples,
+  what OK shows); reusing another dialog's id is caught only by review and by
+  `dialog-catalog-check` where a case opens it. Regenerate the cases with
+  `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
+  inputs_typing_case_is_current` and commit `uiharness/cases/inputs-typing-*.uit`;
+  never edit those by hand.
+- The generated cases type with `real-key`/`real-type` and focus by real click
+  or Tab only. An input outside dialogs goes in `suite/docxy/src/inputs.rs` with
+  the issue that covers it. See `qa/inputs-typing.md`.

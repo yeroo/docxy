@@ -9,6 +9,8 @@
 //! tab clean when it changed nothing, and puts `<n> of <m> records found`
 //! in the status line.
 
+use crate::dialog::DialogId;
+use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::{DocTab, Surface};
 use gridcore::filter::{AdvancedFilter, ByCell, ColumnFilter, FilterError, FilterOutcome, Submenu};
@@ -269,7 +271,7 @@ fn checked(d: &Dialog, name: &str) -> bool {
 }
 
 fn dialog(
-    id: &'static str,
+    id: DialogId,
     title: String,
     buttons: &[(&str, ButtonRole)],
     owner: DialogOwner,
@@ -301,7 +303,7 @@ pub(crate) fn menu_dialog(tab: &DocTab, col: u32) -> Result<Dialog, String> {
         m.header.clone()
     };
     let mut d = dialog(
-        "filter-menu",
+        catalog::FILTER_MENU,
         format!("Filter: {header}"),
         &[
             ("Sort A to Z", ButtonRole::Apply),
@@ -427,7 +429,7 @@ pub(crate) fn custom_dialog(
     date: bool,
 ) -> Dialog {
     let mut d = dialog(
-        "custom-autofilter",
+        catalog::CUSTOM_AUTOFILTER,
         "Custom AutoFilter".into(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],
         DialogOwner::CustomFilter { sheet, col, date },
@@ -464,7 +466,7 @@ pub(crate) fn custom_dialog(
 /// Top 10 AutoFilter for column `col`.
 pub(crate) fn top10_dialog(sheet: usize, col: u32) -> Dialog {
     let mut d = dialog(
-        "top10-autofilter",
+        catalog::TOP10_AUTOFILTER,
         "Top 10 AutoFilter".into(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],
         DialogOwner::Top10Filter { sheet, col },
@@ -496,7 +498,7 @@ pub(crate) fn advanced_dialog(tab: &DocTab) -> Result<Dialog, String> {
         .map(|(a, _)| area_text(a))
         .unwrap_or_default();
     let mut d = dialog(
-        "advanced-filter",
+        catalog::ADVANCED_FILTER,
         "Advanced Filter".into(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],
         DialogOwner::AdvancedFilter { sheet: v.active },

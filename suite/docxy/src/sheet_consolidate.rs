@@ -9,6 +9,7 @@
 //! undo step, and a refusal keeps the dialog open and says why. It opens on
 //! the settings the sheet kept from its last Consolidate.
 
+use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::{DocTab, Surface};
 use gridcore::edit::{
@@ -29,7 +30,7 @@ pub(crate) fn consolidate_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let kept = v.sheet().consolidate.clone().unwrap_or_default();
     let (row, col) = v.sel;
     let mut d = Dialog::message(
-        "consolidate",
+        catalog::CONSOLIDATE,
         "Consolidate",
         String::new(),
         &[
@@ -439,7 +440,7 @@ mod tests {
         set(&mut t, "reference", Json::Str("west!A1:B3".into()));
         press(&mut t, "Delete").unwrap();
         assert!(listed(t.dialogs.top().unwrap()).is_empty());
-        assert_eq!(t.dialogs.top().map(|d| d.id), Some("consolidate"));
+        assert_eq!(t.dialogs.top().map(|d| d.id.as_str()), Some("consolidate"));
         assert_eq!(view(&mut t).undo.len(), 0);
         press(&mut t, "Close").unwrap();
         assert!(t.dialogs.top().is_none());
@@ -498,7 +499,7 @@ mod tests {
             err,
             gridcore::edit::ConsolidateError::LinksOnDestSheet.to_string()
         );
-        assert_eq!(t.dialogs.top().map(|d| d.id), Some("consolidate"));
+        assert_eq!(t.dialogs.top().map(|d| d.id.as_str()), Some("consolidate"));
         // An unknown sheet.
         set(&mut t, "links", Json::Bool(false));
         add(&mut t, "Nowhere!A1");

@@ -12,6 +12,7 @@
 //! message box on top when that overwrites data: OK converts, Cancel goes
 //! back to the wizard.
 
+use crate::dialog::catalog;
 use crate::dialog::{
     Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Reaction, Value,
 };
@@ -84,7 +85,7 @@ pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
         .map(|t| vec![t])
         .collect();
     let mut d = Dialog::message(
-        "text-to-columns",
+        catalog::TEXT_TO_COLUMNS,
         "Convert Text to Columns Wizard",
         String::new(),
         &[],
@@ -432,7 +433,7 @@ fn finish(tab: &mut DocTab) -> Result<(), String> {
     };
     if ttc_would_overwrite(&v.pkg.workbook, &src, &opts) {
         tab.dialogs.push(Dialog::message(
-            "text-to-columns-replace",
+            catalog::TEXT_TO_COLUMNS_REPLACE,
             "Text to Columns",
             TTC_REPLACE.into(),
             &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],

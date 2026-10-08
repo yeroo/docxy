@@ -15,6 +15,7 @@
 //! removal, a copy made by unlinking) live in the package and are not undone;
 //! an unreferenced part left behind is harmless.
 use super::*;
+use crate::dialog::catalog;
 use crate::dialog::{Control as Field, ControlKind, Dialog, DialogOwner, Value};
 use crate::hf::PageSlot;
 use crate::page_setup::{ok_cancel, text_of, twips_of};
@@ -853,7 +854,7 @@ pub(crate) fn distance_dialog(tab: &DocTab, is_header: bool) -> Result<Dialog, S
         "Footer from Bottom"
     };
     let mut d = Dialog::message(
-        "hf-distance",
+        catalog::HF_DISTANCE,
         title,
         String::new(),
         &[],

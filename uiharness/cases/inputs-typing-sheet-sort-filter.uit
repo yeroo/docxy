@@ -1,0 +1,2273 @@
+# GENERATED from suite/docxy/src/dialog/catalog/entries.rs by
+# `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
+# inputs_typing_case_is_current`; do not edit by hand (#1029).
+#
+# Every editable field of every sheet dialog, typed into with real keys
+# only: `real-key` and `real-type` go through the window's own input
+# path, and the field is focused by a real click or by Tab. A test is
+# one field and one step, named `<surface> <dialog>/<field>: <step>`.
+# See qa/inputs-typing.md.
+
+test sheet filter-menu: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet filter-menu/typed: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"typed"}
+  call field-read {"dialog-field":"typed"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet filter-menu/typed: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"typed"}
+  call field-read {"dialog-field":"typed"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"typed"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"typed"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"typed"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet filter-menu/search: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"search"}
+  call field-read {"dialog-field":"search"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet filter-menu/search: focus by Tab
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"search"}
+  call field-read {"dialog-field":"search"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet filter-menu/search: types
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"search"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ea"}
+  call field-read {"dialog-field":"search"}
+  assert reply.value is Ea
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet filter-menu/search: edits
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"search"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"search"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"search"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"search"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"search"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"search"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet filter-menu/search: select-all replaces
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"search"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"search"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"search"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet filter-menu/search: pastes
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"search"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"search"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet filter-menu/search: copies
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"search"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet filter-menu/search: Escape cancels
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"search"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not filter-menu
+  shot filter-button:A
+  call pointer-click {"region":"filter-button:A"}
+  assert dialog is filter-menu
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"search"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/op1: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"op1"}
+  call field-read {"dialog-field":"op1"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/op1: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"op1"}
+  call field-read {"dialog-field":"op1"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"op1"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"op1"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"op1"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val1: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val1"}
+  call field-read {"dialog-field":"val1"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val1: focus by Tab
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val2"}
+  call field-read {"dialog-field":"val1"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"val1"}
+  call field-read {"dialog-field":"val1"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val1: types
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val1"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"20"}
+  call field-read {"dialog-field":"val1"}
+  assert reply.value is 20
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val1: edits
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val1"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"val1"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"val1"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"val1"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"val1"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"val1"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val1: select-all replaces
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val1"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"val1"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"val1"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val1: pastes
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"val1"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"val1"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val1: copies
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"val1"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val1: OK applies
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val1"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"20"}
+  call real-key {"key":"enter"}
+  assert dialog is not custom-autofilter
+  assert status is 2 of 4 records found
+
+test sheet custom-autofilter/val1: Escape cancels
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val1"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not custom-autofilter
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"val1"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/op2: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"op2"}
+  call field-read {"dialog-field":"op2"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/op2: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"op2"}
+  call field-read {"dialog-field":"op2"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"op2"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"op2"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"op2"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val2: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val2"}
+  call field-read {"dialog-field":"val2"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val2: focus by Tab
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val1"}
+  call field-read {"dialog-field":"val2"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"val2"}
+  call field-read {"dialog-field":"val2"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val2: types
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val2"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"35"}
+  call field-read {"dialog-field":"val2"}
+  assert reply.value is 35
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val2: edits
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val2"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"val2"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"val2"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"val2"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"val2"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"val2"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val2: select-all replaces
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val2"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"val2"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"val2"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val2: pastes
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"val2"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"val2"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val2: copies
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"val2"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet custom-autofilter/val2: Escape cancels
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"val2"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not custom-autofilter
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Greater Than..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is custom-autofilter
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"val2"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/which: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"which"}
+  call field-read {"dialog-field":"which"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/which: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"which"}
+  call field-read {"dialog-field":"which"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"which"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"which"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"which"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/n: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"n"}
+  call field-read {"dialog-field":"n"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/n: focus by Tab
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"n"}
+  call field-read {"dialog-field":"n"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/n: types
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"n"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call field-read {"dialog-field":"n"}
+  assert reply.value is 1
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/n: edits
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"n"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"n"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"n"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"n"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"n"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"n"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/n: select-all replaces
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"n"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"n"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"n"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/n: pastes
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"n"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"n"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/n: copies
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"n"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/n: OK applies
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"n"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call real-key {"key":"enter"}
+  assert dialog is not top10-autofilter
+  assert status is 1 of 4 records found
+
+test sheet top10-autofilter/n: Escape cancels
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"n"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not top10-autofilter
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"n"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/n: refuses invalid
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"n"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"n"}
+  assert reply.value is 1
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/unit: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"unit"}
+  call field-read {"dialog-field":"unit"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet top10-autofilter/unit: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  key ctrl+shift+l
+  shot filter-button:B
+  call pointer-click {"region":"filter-button:B"}
+  call dialog-set {"control":"typed","value":"Top 10..."}
+  call dialog-click {"button":"Apply Filter"}
+  assert dialog is top10-autofilter
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"unit"}
+  call field-read {"dialog-field":"unit"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"unit"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"unit"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"unit"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/list: focus by click
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-type {"text":"E1:E2"}
+  call pointer-click {"dialog-field":"list"}
+  call field-read {"dialog-field":"list"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/list: focus by Tab
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-type {"text":"E1:E2"}
+  call real-key {"key":"tab","to-field":"list"}
+  call field-read {"dialog-field":"list"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/list: types
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-type {"text":"E1:E2"}
+  call pointer-click {"dialog-field":"list"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"A1:C3"}
+  call field-read {"dialog-field":"list"}
+  assert reply.value is A1:C3
+  assert reply.caret is 5
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/list: edits
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-type {"text":"E1:E2"}
+  call pointer-click {"dialog-field":"list"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"list"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"list"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"list"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"list"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"list"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/list: select-all replaces
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-type {"text":"E1:E2"}
+  call pointer-click {"dialog-field":"list"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"list"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"list"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/list: pastes
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-type {"text":"E1:E2"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"list"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"list"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/list: copies
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-type {"text":"E1:E2"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"list"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/list: OK applies
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-type {"text":"E1:E2"}
+  call pointer-click {"dialog-field":"list"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"A1:C3"}
+  call real-key {"key":"enter"}
+  assert dialog is not advanced-filter
+  assert status is 0 of 2 records found
+
+test sheet advanced-filter/list: Escape cancels
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-type {"text":"E1:E2"}
+  call pointer-click {"dialog-field":"list"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not advanced-filter
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-type {"text":"E1:E2"}
+  call field-read {"dialog-field":"list"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/criteria: focus by click
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/criteria: focus by Tab
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"copy"}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"criteria"}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/criteria: types
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"E1:E2"}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.value is E1:E2
+  assert reply.caret is 5
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/criteria: edits
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/criteria: select-all replaces
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/criteria: pastes
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/criteria: copies
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/criteria: OK applies
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"E1:E2"}
+  call real-key {"key":"enter"}
+  assert dialog is not advanced-filter
+  assert status is 1 of 4 records found
+
+test sheet advanced-filter/criteria: Escape cancels
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not advanced-filter
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"criteria"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/copy: focus by click
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"copy"}
+  call field-read {"dialog-field":"copy"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/copy: focus by Tab
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"criteria"}
+  call field-read {"dialog-field":"copy"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"copy"}
+  call field-read {"dialog-field":"copy"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/copy: types
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"copy"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"G1"}
+  call field-read {"dialog-field":"copy"}
+  assert reply.value is G1
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/copy: edits
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"copy"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"copy"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"copy"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"copy"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"copy"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"copy"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/copy: select-all replaces
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"copy"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"copy"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"copy"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/copy: pastes
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"copy"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"copy"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/copy: copies
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"copy"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet advanced-filter/copy: Escape cancels
+  open ../fixtures/basic.xlsx
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"copy"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not advanced-filter
+  click E1
+  type Region
+  key enter
+  type East
+  key enter
+  click A1
+  call ribbon-click {"tab":"Data","command":"Advanced"}
+  assert dialog is advanced-filter
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"copy"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet sort: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet sort/by1: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"by1"}
+  call field-read {"dialog-field":"by1"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/by1: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"by1"}
+  call field-read {"dialog-field":"by1"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"by1"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"by1"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"by1"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet sort/on1: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"on1"}
+  call field-read {"dialog-field":"on1"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/on1: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"on1"}
+  call field-read {"dialog-field":"on1"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"on1"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"on1"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"on1"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet sort/order1: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"order1"}
+  call field-read {"dialog-field":"order1"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/order1: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"order1"}
+  call field-read {"dialog-field":"order1"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"order1"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"order1"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"order1"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet sort/with1: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with1"}
+  call field-read {"dialog-field":"with1"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/with1: focus by Tab
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with2"}
+  call field-read {"dialog-field":"with1"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"with1"}
+  call field-read {"dialog-field":"with1"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/with1: types
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"West, East"}
+  call field-read {"dialog-field":"with1"}
+  assert reply.value is West, East
+  assert reply.caret is 10
+  call real-key {"key":"escape"}
+
+test sheet sort/with1: edits
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"with1"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"with1"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"with1"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"with1"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"with1"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet sort/with1: select-all replaces
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"with1"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"with1"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet sort/with1: pastes
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"with1"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet sort/with1: copies
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet sort/with1: Escape cancels
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not sort
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"with1"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet sort/by2: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"by2"}
+  call field-read {"dialog-field":"by2"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/by2: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"by2"}
+  call field-read {"dialog-field":"by2"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"by2"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"by2"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"by2"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet sort/on2: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"on2"}
+  call field-read {"dialog-field":"on2"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/on2: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"on2"}
+  call field-read {"dialog-field":"on2"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"on2"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"on2"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"on2"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet sort/order2: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"order2"}
+  call field-read {"dialog-field":"order2"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/order2: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"order2"}
+  call field-read {"dialog-field":"order2"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"order2"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"order2"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"order2"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet sort/with2: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with2"}
+  call field-read {"dialog-field":"with2"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/with2: focus by Tab
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with1"}
+  call field-read {"dialog-field":"with2"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"with2"}
+  call field-read {"dialog-field":"with2"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/with2: types
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with2"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"West, East"}
+  call field-read {"dialog-field":"with2"}
+  assert reply.value is West, East
+  assert reply.caret is 10
+  call real-key {"key":"escape"}
+
+test sheet sort/with2: edits
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with2"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"with2"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"with2"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"with2"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"with2"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"with2"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet sort/with2: select-all replaces
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with2"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"with2"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"with2"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet sort/with2: pastes
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"with2"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"with2"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet sort/with2: copies
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"with2"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet sort/with2: Escape cancels
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with2"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not sort
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"with2"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet sort/by3: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"by3"}
+  call field-read {"dialog-field":"by3"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/by3: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"by3"}
+  call field-read {"dialog-field":"by3"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"by3"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"by3"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"by3"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet sort/on3: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"on3"}
+  call field-read {"dialog-field":"on3"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/on3: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"on3"}
+  call field-read {"dialog-field":"on3"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"on3"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"on3"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"on3"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet sort/order3: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"order3"}
+  call field-read {"dialog-field":"order3"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/order3: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"order3"}
+  call field-read {"dialog-field":"order3"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"order3"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"order3"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"order3"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet sort/with3: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with3"}
+  call field-read {"dialog-field":"with3"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/with3: focus by Tab
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with1"}
+  call field-read {"dialog-field":"with3"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"with3"}
+  call field-read {"dialog-field":"with3"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sort/with3: types
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with3"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"West, East"}
+  call field-read {"dialog-field":"with3"}
+  assert reply.value is West, East
+  assert reply.caret is 10
+  call real-key {"key":"escape"}
+
+test sheet sort/with3: edits
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with3"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"with3"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"with3"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"with3"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"with3"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"with3"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet sort/with3: select-all replaces
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with3"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"with3"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"with3"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet sort/with3: pastes
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"with3"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"with3"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet sort/with3: copies
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"with3"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet sort/with3: Escape cancels
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"with3"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not sort
+  click A2
+  call ribbon-click {"tab":"Data","command":"Sort"}
+  assert dialog is sort
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"with3"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet sort-warning: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click B2
+  click B5 shift
+  call ribbon-click {"tab":"Data","command":"Sort Z to A"}
+  assert dialog is sort-warning
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}

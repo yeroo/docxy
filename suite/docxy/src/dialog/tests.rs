@@ -1,3 +1,4 @@
+use super::catalog;
 use super::*;
 use core::prelude::v1::test;
 
@@ -45,7 +46,7 @@ fn form() -> Dialog {
         c
     };
     let mut d = Dialog {
-        id: "form",
+        id: catalog::TEST_FORM,
         title: "Task Information".into(),
         text: None,
         tabs: vec!["General".into(), "Predecessors".into()],
@@ -479,7 +480,7 @@ fn a_nested_dialog_stacks_and_its_cancel_returns_to_the_parent_intact() {
     s.click("Details...", |_| Ok(())).unwrap();
     let mut note = None;
     s.click("OK", |d| {
-        note = Some(d.id);
+        note = Some(d.id.as_str());
         Ok(())
     })
     .unwrap();
@@ -510,7 +511,7 @@ fn enter_is_the_default_button_escape_the_cancel_one_and_other_keys_nothing() {
 #[test]
 fn a_message_box_defaults_to_its_first_button() {
     let d = Dialog::message(
-        "delete-summary",
+        catalog::DELETE_SUMMARY,
         "Delete",
         "Delete 'A' and its 1 subtask?".into(),
         &[("Yes", ButtonRole::Accept), ("No", ButtonRole::Cancel)],
@@ -758,6 +759,46 @@ fn paste_inserts_at_the_caret_by_characters() {
     d.insert_text("-").unwrap();
     assert_eq!(text(&s, "name"), "a\u{1F600}-c");
     assert_eq!(s.top().unwrap().caret_at(), 3);
+}
+
+/// Ctrl+C copies the selected characters of the focused field, and nothing
+/// without a selection (#1029).
+#[test]
+fn the_selection_is_what_a_copy_takes() {
+    let mut s = focused_on_name();
+    let d = s.top_dialog_mut().unwrap();
+    d.select_all();
+    d.insert_text("a\u{1F600}cd").unwrap();
+    assert_eq!(d.selected_text(), None, "no selection after typing");
+    d.move_caret(false, false);
+    d.move_caret(false, true);
+    d.move_caret(false, true);
+    assert_eq!(d.selected_text().as_deref(), Some("\u{1F600}c"));
+    d.select_all();
+    assert_eq!(d.selected_text().as_deref(), Some("a\u{1F600}cd"));
+}
+
+/// Tab counts are what `real-key {"to-field"}` presses: from no focus the
+/// first stop is one press, and a field that already has it takes a whole
+/// round (#1029).
+#[test]
+fn tabs_to_counts_the_presses_focus_step_takes() {
+    let mut s = stack();
+    let d = s.top_dialog_mut().unwrap();
+    d.focus = None;
+    let order: Vec<&str> = d.focusable().iter().map(|&i| d.controls[i].name).collect();
+    assert!(order.len() > 1, "the test form has several stops");
+    for (k, name) in order.iter().enumerate() {
+        let mut d = d.clone();
+        let n = d.tabs_to(name).unwrap();
+        assert_eq!(n, k + 1, "{name}");
+        for _ in 0..n {
+            d.focus_step(false);
+        }
+        assert_eq!(d.focused().map(|c| c.name), Some(*name));
+        assert_eq!(d.tabs_to(name).unwrap(), order.len(), "a whole round");
+    }
+    assert!(d.tabs_to("no-such").is_err());
 }
 
 /// A field that refuses a character keeps its text and its caret, and a value

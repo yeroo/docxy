@@ -1,0 +1,27 @@
+# GENERATED from suite/docxy/src/dialog/catalog/entries.rs by
+# `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
+# inputs_typing_case_is_current`; do not edit by hand (#1029).
+#
+# Every editable field of every project dialog, typed into with real keys
+# only: `real-key` and `real-type` go through the window's own input
+# path, and the field is focused by a real click or by Tab. A test is
+# one field and one step, named `<surface> <dialog>/<field>: <step>`.
+# See qa/inputs-typing.md.
+
+test project delete-summary: matches the catalogue
+  open ../fixtures/gantt-summary.xml
+  click A1
+  key delete
+  assert dialog is delete-summary
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test project save-on-close: matches the catalogue
+  open copy:../fixtures/gantt-summary.xml
+  click A1
+  key delete
+  key enter
+  call close-tab {}
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}

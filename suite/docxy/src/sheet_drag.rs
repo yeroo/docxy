@@ -3,6 +3,7 @@
 //! copies them, a right-drag asks what to do with a menu, and a drop on
 //! other data asks first. One undo step each.
 
+use crate::dialog::catalog;
 use crate::dialog::{ButtonRole, Dialog, DialogOwner};
 use crate::sheet_menus::DropChoice;
 use crate::{Docxy, GridPasteError, SheetView};
@@ -205,7 +206,7 @@ impl GridDrops {
 /// The replace question, before a drop overwrites data.
 fn replace_question() -> Dialog {
     let mut d = Dialog::message(
-        "drop-replace",
+        catalog::DROP_REPLACE,
         "Microsoft Excel",
         REPLACE_DATA.to_string(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],

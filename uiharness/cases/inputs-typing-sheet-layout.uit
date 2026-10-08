@@ -1,0 +1,2023 @@
+# GENERATED from suite/docxy/src/dialog/catalog/entries.rs by
+# `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
+# inputs_typing_case_is_current`; do not edit by hand (#1029).
+#
+# Every editable field of every sheet dialog, typed into with real keys
+# only: `real-key` and `real-type` go through the window's own input
+# path, and the field is focused by a real click or by Tab. A test is
+# one field and one step, named `<surface> <dialog>/<field>: <step>`.
+# See qa/inputs-typing.md.
+
+test sheet page-setup: matches the catalogue
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet page-setup/scale: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"scale"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/scale: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-width"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"scale"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/scale: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"scale"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"80"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.value is 80
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/scale: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"scale"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/scale: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"scale"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet page-setup/scale: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"scale"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet page-setup/scale: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"scale"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet page-setup/scale: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"scale"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"80"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.value is 80
+  call real-key {"key":"escape"}
+
+test sheet page-setup/scale: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"scale"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet page-setup/scale: refuses invalid
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"scale"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"80"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.value is 80
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-width: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-width"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-width: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"scale"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"fit-width"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-width: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-width: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-width: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-width: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"fit-width"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-width: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"fit-width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-width: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-width: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-width: refuses invalid
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-height: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-height"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-height: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"scale"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"fit-height"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-height: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-height: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-height: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-height: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"fit-height"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-height: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"fit-height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-height: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-height: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet page-setup/fit-height: refuses invalid
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/paper: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-control":"paper"}
+  call field-read {"dialog-field":"paper"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/paper: Up and Down step
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Page"}
+  call real-key {"key":"tab","to-field":"paper"}
+  call field-read {"dialog-field":"paper"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"paper"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"paper"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"paper"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet page-setup/top: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"top"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/top: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"bottom"}
+  call field-read {"dialog-field":"top"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"top"}
+  call field-read {"dialog-field":"top"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/top: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 1.5
+  assert reply.caret is 3
+  call real-key {"key":"escape"}
+
+test sheet page-setup/top: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"top"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"top"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/top: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"top"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet page-setup/top: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet page-setup/top: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet page-setup/top: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 1.5
+  call real-key {"key":"escape"}
+
+test sheet page-setup/top: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet page-setup/top: refuses invalid
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"top"}
+  assert reply.value is 1.5
+  call real-key {"key":"escape"}
+
+test sheet page-setup/bottom: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"bottom"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/bottom: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"bottom"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/bottom: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 1.5
+  assert reply.caret is 3
+  call real-key {"key":"escape"}
+
+test sheet page-setup/bottom: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/bottom: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet page-setup/bottom: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet page-setup/bottom: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet page-setup/bottom: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 1.5
+  call real-key {"key":"escape"}
+
+test sheet page-setup/bottom: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet page-setup/bottom: refuses invalid
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.value is 1.5
+  call real-key {"key":"escape"}
+
+test sheet page-setup/left: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"left"}
+  call field-read {"dialog-field":"left"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/left: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"left"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"left"}
+  call field-read {"dialog-field":"left"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/left: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 1.5
+  assert reply.caret is 3
+  call real-key {"key":"escape"}
+
+test sheet page-setup/left: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"left"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"left"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/left: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"left"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet page-setup/left: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet page-setup/left: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet page-setup/left: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 1.5
+  call real-key {"key":"escape"}
+
+test sheet page-setup/left: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet page-setup/left: refuses invalid
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"left"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"left"}
+  assert reply.value is 1.5
+  call real-key {"key":"escape"}
+
+test sheet page-setup/right: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"right"}
+  call field-read {"dialog-field":"right"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/right: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"right"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"right"}
+  call field-read {"dialog-field":"right"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/right: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 1.5
+  assert reply.caret is 3
+  call real-key {"key":"escape"}
+
+test sheet page-setup/right: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"right"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"right"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/right: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"right"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet page-setup/right: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet page-setup/right: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet page-setup/right: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 1.5
+  call real-key {"key":"escape"}
+
+test sheet page-setup/right: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet page-setup/right: refuses invalid
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"right"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.5"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"right"}
+  assert reply.value is 1.5
+  call real-key {"key":"escape"}
+
+test sheet page-setup/header: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"header"}
+  call field-read {"dialog-field":"header"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/header: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"header"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"header"}
+  call field-read {"dialog-field":"header"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/header: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"header"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.4"}
+  call field-read {"dialog-field":"header"}
+  assert reply.value is 0.4
+  assert reply.caret is 3
+  call real-key {"key":"escape"}
+
+test sheet page-setup/header: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"header"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"header"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"header"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"header"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"header"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"header"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/header: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"header"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"header"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"header"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet page-setup/header: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"header"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"header"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet page-setup/header: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"header"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet page-setup/header: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"header"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.4"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call field-read {"dialog-field":"header"}
+  assert reply.value is 0.4
+  call real-key {"key":"escape"}
+
+test sheet page-setup/header: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"header"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call field-read {"dialog-field":"header"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet page-setup/header: refuses invalid
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"header"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.4"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"header"}
+  assert reply.value is 0.4
+  call real-key {"key":"escape"}
+
+test sheet page-setup/footer: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"footer"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/footer: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"footer"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/footer: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"footer"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.4"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.value is 0.4
+  assert reply.caret is 3
+  call real-key {"key":"escape"}
+
+test sheet page-setup/footer: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"footer"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/footer: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"footer"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet page-setup/footer: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"footer"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet page-setup/footer: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"footer"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet page-setup/footer: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"footer"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.4"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.value is 0.4
+  call real-key {"key":"escape"}
+
+test sheet page-setup/footer: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"footer"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet page-setup/footer: refuses invalid
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"footer"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.4"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.value is 0.4
+  call real-key {"key":"escape"}
+
+test sheet page-setup/print-area: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"print-area"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/print-area: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-rows"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"print-area"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/print-area: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"print-area"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"A1:C5"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.value is A1:C5
+  assert reply.caret is 5
+  call real-key {"key":"escape"}
+
+test sheet page-setup/print-area: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"print-area"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/print-area: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"print-area"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet page-setup/print-area: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"print-area"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet page-setup/print-area: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"print-area"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet page-setup/print-area: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"print-area"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"A1:C5"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.value is A1:C5
+  call real-key {"key":"escape"}
+
+test sheet page-setup/print-area: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"print-area"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-rows: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-rows"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-rows: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"print-area"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"title-rows"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-rows: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"$1:$1"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.value is $1:$1
+  assert reply.caret is 5
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-rows: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-rows: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-rows: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"title-rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-rows: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"title-rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-rows: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"$1:$1"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.value is $1:$1
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-rows: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-rows"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-cols: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-cols"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-cols: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"print-area"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"title-cols"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-cols: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"$A:$A"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.value is $A:$A
+  assert reply.caret is 5
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-cols: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-cols: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-cols: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"title-cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-cols: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"title-cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-cols: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"$A:$A"}
+  call real-key {"key":"enter"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.value is $A:$A
+  call real-key {"key":"escape"}
+
+test sheet page-setup/title-cols: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-cols"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not page-setup
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  assert dialog is page-setup
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Sheet"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}

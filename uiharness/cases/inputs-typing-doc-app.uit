@@ -1,0 +1,1123 @@
+# GENERATED from suite/docxy/src/dialog/catalog/entries.rs by
+# `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
+# inputs_typing_case_is_current`; do not edit by hand (#1029).
+#
+# Every editable field of every doc dialog, typed into with real keys
+# only: `real-key` and `real-type` go through the window's own input
+# path, and the field is focused by a real click or by Tab. A test is
+# one field and one step, named `<surface> <dialog>/<field>: <step>`.
+# See qa/inputs-typing.md.
+
+test doc save-on-close: matches the catalogue
+  open copy:../fixtures/basic.docx
+  type x
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc save-on-close/file-name: focus by click
+  open copy:../fixtures/basic.docx
+  type x
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"file-name"}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc save-on-close/file-name: focus by Tab
+  open copy:../fixtures/basic.docx
+  type x
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"file-name"}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc save-on-close/file-name: types
+  open copy:../fixtures/basic.docx
+  type x
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"file-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc save-on-close/file-name: edits
+  open copy:../fixtures/basic.docx
+  type x
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"file-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc save-on-close/file-name: select-all replaces
+  open copy:../fixtures/basic.docx
+  type x
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"file-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc save-on-close/file-name: pastes
+  open copy:../fixtures/basic.docx
+  type x
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"file-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc save-on-close/file-name: copies
+  open copy:../fixtures/basic.docx
+  type x
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"file-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc save-on-close/file-name: Escape cancels
+  open copy:../fixtures/basic.docx
+  type x
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"file-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not save-on-close
+  type x
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc save-on-close/location: focus by click
+  open copy:../fixtures/basic.docx
+  type x
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"location"}
+  call field-read {"dialog-field":"location"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc save-on-close/location: Up and Down step
+  open copy:../fixtures/basic.docx
+  type x
+  key ctrl+w
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"location"}
+  call field-read {"dialog-field":"location"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"location"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"location"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"location"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc reopen: matches the catalogue
+  open copy:../fixtures/basic.docx
+  type x
+  call open {"path":"basic.docx","reopen":"ask"}
+  assert dialog is reopen
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc user-name: matches the catalogue
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc user-name/user-name: focus by click
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"user-name"}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc user-name/user-name: focus by Tab
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"initials"}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"user-name"}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc user-name/user-name: types
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"user-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc user-name/user-name: edits
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"user-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc user-name/user-name: select-all replaces
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"user-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc user-name/user-name: pastes
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"user-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc user-name/user-name: copies
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"user-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc user-name/user-name: OK applies
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"user-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call real-key {"key":"enter"}
+  assert dialog is not user-name
+  assert user_name is Ab1
+
+test doc user-name/user-name: Escape cancels
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"user-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not user-name
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc user-name/initials: focus by click
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"initials"}
+  call field-read {"dialog-field":"initials"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc user-name/initials: focus by Tab
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"user-name"}
+  call field-read {"dialog-field":"initials"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"initials"}
+  call field-read {"dialog-field":"initials"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc user-name/initials: types
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"initials"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"initials"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc user-name/initials: edits
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"initials"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"initials"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"initials"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"initials"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"initials"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"initials"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc user-name/initials: select-all replaces
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"initials"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"initials"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"initials"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc user-name/initials: pastes
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"initials"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"initials"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc user-name/initials: copies
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"initials"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc user-name/initials: OK applies
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"initials"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call real-key {"key":"enter"}
+  assert dialog is not user-name
+  assert user_initials is Ab1
+
+test doc user-name/initials: Escape cancels
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"initials"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not user-name
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"user-name-row"}
+  assert dialog is user-name
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"initials"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc about: matches the catalogue
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Help","command":"About docxy suite"}
+  assert dialog is about
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc autocorrect: matches the catalogue
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc autocorrect/replace: focus by click
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call pointer-click {"dialog-field":"replace"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc autocorrect/replace: focus by Tab
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call pointer-click {"dialog-field":"with"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"replace"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc autocorrect/replace: types
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call pointer-click {"dialog-field":"replace"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"replace"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc autocorrect/replace: edits
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call pointer-click {"dialog-field":"replace"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc autocorrect/replace: select-all replaces
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call pointer-click {"dialog-field":"replace"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc autocorrect/replace: pastes
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"replace"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc autocorrect/replace: copies
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"replace"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc autocorrect/replace: Escape cancels
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call pointer-click {"dialog-field":"replace"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not autocorrect
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc autocorrect/with: focus by click
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call pointer-click {"dialog-field":"with"}
+  call field-read {"dialog-field":"with"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc autocorrect/with: focus by Tab
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call pointer-click {"dialog-field":"replace"}
+  call field-read {"dialog-field":"with"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"with"}
+  call field-read {"dialog-field":"with"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc autocorrect/with: types
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call pointer-click {"dialog-field":"with"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"with"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc autocorrect/with: edits
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call pointer-click {"dialog-field":"with"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"with"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"with"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"with"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"with"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"with"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc autocorrect/with: select-all replaces
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call pointer-click {"dialog-field":"with"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"with"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"with"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc autocorrect/with: pastes
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"with"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"with"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc autocorrect/with: copies
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"with"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc autocorrect/with: Escape cancels
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call pointer-click {"dialog-field":"with"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not autocorrect
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call field-read {"dialog-field":"with"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions: matches the catalogue
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/first-word: focus by click
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"First Letter"}
+  call pointer-click {"dialog-field":"first-word"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/first-word: focus by Tab
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"First Letter"}
+  call real-key {"key":"tab","to-field":"first-word"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/first-word: types
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"First Letter"}
+  call pointer-click {"dialog-field":"first-word"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/first-word: edits
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"First Letter"}
+  call pointer-click {"dialog-field":"first-word"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/first-word: select-all replaces
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"First Letter"}
+  call pointer-click {"dialog-field":"first-word"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/first-word: pastes
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"First Letter"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"first-word"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/first-word: copies
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"First Letter"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"first-word"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/first-word: Escape cancels
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"First Letter"}
+  call pointer-click {"dialog-field":"first-word"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not autocorrect-exceptions
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"First Letter"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/caps-word: focus by click
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call pointer-click {"dialog-field":"caps-word"}
+  call field-read {"dialog-field":"caps-word"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/caps-word: focus by Tab
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call real-key {"key":"tab","to-field":"caps-word"}
+  call field-read {"dialog-field":"caps-word"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/caps-word: types
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call pointer-click {"dialog-field":"caps-word"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"caps-word"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/caps-word: edits
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call pointer-click {"dialog-field":"caps-word"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"caps-word"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"caps-word"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"caps-word"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"caps-word"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"caps-word"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/caps-word: select-all replaces
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call pointer-click {"dialog-field":"caps-word"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"caps-word"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"caps-word"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/caps-word: pastes
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"caps-word"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"caps-word"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/caps-word: copies
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"caps-word"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/caps-word: Escape cancels
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call pointer-click {"dialog-field":"caps-word"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not autocorrect-exceptions
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call field-read {"dialog-field":"caps-word"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc autocorrect-redefine: matches the catalogue
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-set {"control":"replace","value":"zq"}
+  call dialog-set {"control":"with","value":"one"}
+  call dialog-click {"button":"Add"}
+  call dialog-set {"control":"replace","value":"zq"}
+  call dialog-set {"control":"with","value":"two"}
+  call dialog-click {"button":"Add"}
+  assert dialog is autocorrect-redefine
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}

@@ -3,6 +3,7 @@
 //! binary. The commit, last merged PR and build kind come from the `buildinfo`
 //! crate; this module names the product and shapes the text.
 
+use crate::dialog::catalog;
 use crate::dialog::{
     ButtonRole, Control as Field, ControlKind, Dialog, DialogOwner, DialogStack, NONE_OPEN, Value,
 };
@@ -34,7 +35,7 @@ pub(crate) fn copy_text(info: &BuildInfo) -> String {
 /// press Close.
 pub(crate) fn dialog(info: &BuildInfo) -> Dialog {
     let mut d = Dialog::message(
-        "about",
+        catalog::ABOUT,
         &format!("About {PRODUCT} {}", info.version),
         String::new(),
         &[("Copy", ButtonRole::Apply), ("Close", ButtonRole::Cancel)],

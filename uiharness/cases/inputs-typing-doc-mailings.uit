@@ -1,0 +1,3505 @@
+# GENERATED from suite/docxy/src/dialog/catalog/entries.rs by
+# `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
+# inputs_typing_case_is_current`; do not edit by hand (#1029).
+#
+# Every editable field of every doc dialog, typed into with real keys
+# only: `real-key` and `real-type` go through the window's own input
+# path, and the field is focused by a real click or by Tab. A test is
+# one field and one step, named `<surface> <dialog>/<field>: <step>`.
+# See qa/inputs-typing.md.
+
+test doc mail-envelopes: matches the catalogue
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/delivery: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"delivery"}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/delivery: focus by Tab
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"return"}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"delivery"}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/delivery: types
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"delivery"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/delivery: edits
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"delivery"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/delivery: select-all replaces
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"delivery"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/delivery: pastes
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"delivery"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/delivery: copies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"delivery"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/delivery: OK applies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"delivery"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call real-key {"key":"enter"}
+  assert dialog is not mail-envelopes
+  assert status is Envelope added: Size 10 (4 1/8 x 9 1/2 in)
+  assert mail.text is Ab1
+
+test doc mail-envelopes/delivery: Escape cancels
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"delivery"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-envelopes
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"delivery"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/return: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"return"}
+  call field-read {"dialog-field":"return"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/return: focus by Tab
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"delivery"}
+  call field-read {"dialog-field":"return"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"return"}
+  call field-read {"dialog-field":"return"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/return: types
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"return"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"return"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/return: edits
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"return"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"return"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"return"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"return"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"return"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"return"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/return: select-all replaces
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"return"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"return"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"return"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/return: pastes
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"return"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"return"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/return: copies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"return"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/return: OK applies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"return"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call real-key {"key":"enter"}
+  assert dialog is not mail-envelopes
+  assert status is Envelope added: Size 10 (4 1/8 x 9 1/2 in)
+  assert mail.text is Ab1
+
+test doc mail-envelopes/return: Escape cancels
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"return"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-envelopes
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"return"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/size: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"size"}
+  call field-read {"dialog-field":"size"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-envelopes/size: Up and Down step
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Envelopes"}
+  assert dialog is mail-envelopes
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"size"}
+  call field-read {"dialog-field":"size"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"size"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"size"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"size"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-envelope-options: matches the catalogue
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Envelopes..."}
+  assert dialog is mail-envelope-options
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-envelope-options/size: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Envelopes..."}
+  assert dialog is mail-envelope-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"size"}
+  call field-read {"dialog-field":"size"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-envelope-options/size: Up and Down step
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Envelopes..."}
+  assert dialog is mail-envelope-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"size"}
+  call field-read {"dialog-field":"size"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"size"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"size"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"size"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-labels: matches the catalogue
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-labels/address: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"address"}
+  call field-read {"dialog-field":"address"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-labels/address: focus by Tab
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"address"}
+  call field-read {"dialog-field":"address"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-labels/address: types
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"address"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"address"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc mail-labels/address: edits
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"address"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"address"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"address"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"address"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"address"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"address"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-labels/address: select-all replaces
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"address"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"address"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"address"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc mail-labels/address: pastes
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"address"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"address"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc mail-labels/address: copies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"address"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc mail-labels/address: OK applies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"address"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call real-key {"key":"enter"}
+  assert dialog is not mail-labels
+  assert table.cells.0.0.0 is Ab1
+
+test doc mail-labels/address: Escape cancels
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"address"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-labels
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"address"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc mail-labels/product: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"product"}
+  call field-read {"dialog-field":"product"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-labels/product: Up and Down step
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call field-read {"dialog-field":"product"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"product"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"product"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"product"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-labels/width: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-labels/width: focus by Tab
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"width"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-labels/width: types
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc mail-labels/width: edits
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"width"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"width"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-labels/width: select-all replaces
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"width"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc mail-labels/width: pastes
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc mail-labels/width: copies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc mail-labels/width: Escape cancels
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-labels
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc mail-labels/width: refuses invalid
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test doc mail-labels/height: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call field-read {"dialog-field":"height"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-labels/height: focus by Tab
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"height"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"height"}
+  call field-read {"dialog-field":"height"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-labels/height: types
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.05"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 1.05
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc mail-labels/height: edits
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"height"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"height"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-labels/height: select-all replaces
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"height"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc mail-labels/height: pastes
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc mail-labels/height: copies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc mail-labels/height: Escape cancels
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-labels
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc mail-labels/height: refuses invalid
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.05"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 1.05
+  call real-key {"key":"escape"}
+
+test doc mail-labels/across: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call field-read {"dialog-field":"across"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-labels/across: focus by Tab
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"across"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"across"}
+  call field-read {"dialog-field":"across"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-labels/across: types
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc mail-labels/across: edits
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"across"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"across"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-labels/across: select-all replaces
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"across"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc mail-labels/across: pastes
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc mail-labels/across: copies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc mail-labels/across: OK applies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  assert dialog is not mail-labels
+  assert table.columns is 2
+
+test doc mail-labels/across: Escape cancels
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-labels
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc mail-labels/across: refuses invalid
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test doc mail-labels/down: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call field-read {"dialog-field":"down"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-labels/down: focus by Tab
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"down"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"down"}
+  call field-read {"dialog-field":"down"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-labels/down: types
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"5"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 5
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc mail-labels/down: edits
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"down"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"down"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-labels/down: select-all replaces
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"down"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc mail-labels/down: pastes
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc mail-labels/down: copies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc mail-labels/down: OK applies
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"5"}
+  call real-key {"key":"enter"}
+  assert dialog is not mail-labels
+  assert table.rows is 5
+
+test doc mail-labels/down: Escape cancels
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-labels
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc mail-labels/down: refuses invalid
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Mailings","command":"Labels"}
+  assert dialog is mail-labels
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"5"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 5
+  call real-key {"key":"escape"}
+
+test doc mail-label-options: matches the catalogue
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/product: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"product"}
+  call field-read {"dialog-field":"product"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/product: Up and Down step
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call field-read {"dialog-field":"product"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"product"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"product"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"product"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/width: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/width: focus by Tab
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"width"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/width: types
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/width: edits
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"width"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"width"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/width: select-all replaces
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"width"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/width: pastes
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/width: copies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/width: Escape cancels
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-label-options
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/width: refuses invalid
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"width"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/height: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call field-read {"dialog-field":"height"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/height: focus by Tab
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"height"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"height"}
+  call field-read {"dialog-field":"height"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/height: types
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.05"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 1.05
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/height: edits
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"height"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"height"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/height: select-all replaces
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"height"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/height: pastes
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/height: copies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/height: Escape cancels
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-label-options
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/height: refuses invalid
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1.05"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"height"}
+  assert reply.value is 1.05
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/across: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call field-read {"dialog-field":"across"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/across: focus by Tab
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"across"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"across"}
+  call field-read {"dialog-field":"across"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/across: types
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/across: edits
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"across"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"across"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/across: select-all replaces
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"across"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/across: pastes
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/across: copies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/across: OK applies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  assert dialog is not mail-label-options
+  assert mail.doc_type is Labels
+  assert table.columns is 2
+
+test doc mail-label-options/across: Escape cancels
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-label-options
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/across: refuses invalid
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"across"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"across"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/down: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call field-read {"dialog-field":"down"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/down: focus by Tab
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"width"}
+  call field-read {"dialog-field":"down"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"down"}
+  call field-read {"dialog-field":"down"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/down: types
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"5"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 5
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/down: edits
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"down"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"down"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/down: select-all replaces
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"down"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/down: pastes
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/down: copies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/down: OK applies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"5"}
+  call real-key {"key":"enter"}
+  assert dialog is not mail-label-options
+  assert mail.doc_type is Labels
+  assert table.rows is 5
+
+test doc mail-label-options/down: Escape cancels
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-label-options
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc mail-label-options/down: refuses invalid
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Labels..."}
+  assert dialog is mail-label-options
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"product"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"down"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"5"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"down"}
+  assert reply.value is 5
+  call real-key {"key":"escape"}
+
+test doc mail-replace: matches the catalogue
+  open ../fixtures/basic.docx
+  type Hello
+  call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
+  call menu-click {"label":"Envelopes..."}
+  call dialog-click {"button":"OK"}
+  assert dialog is mail-replace
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-recipients: matches the catalogue
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Recipient List"}
+  assert dialog is mail-recipients
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-recipients/record: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Recipient List"}
+  assert dialog is mail-recipients
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"record"}
+  call field-read {"dialog-field":"record"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-recipients/record: focus by Tab
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Recipient List"}
+  assert dialog is mail-recipients
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"record"}
+  call field-read {"dialog-field":"record"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-recipients/record: types
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Recipient List"}
+  assert dialog is mail-recipients
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"record"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"record"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc mail-recipients/record: edits
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Recipient List"}
+  assert dialog is mail-recipients
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"record"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"record"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"record"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"record"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"record"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"record"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-recipients/record: select-all replaces
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Recipient List"}
+  assert dialog is mail-recipients
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"record"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"record"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"record"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc mail-recipients/record: pastes
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Recipient List"}
+  assert dialog is mail-recipients
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"record"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"record"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc mail-recipients/record: copies
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Recipient List"}
+  assert dialog is mail-recipients
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"record"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc mail-recipients/record: Escape cancels
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Recipient List"}
+  assert dialog is mail-recipients
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"record"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-recipients
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Recipient List"}
+  assert dialog is mail-recipients
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"record"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc mail-recipients/record: refuses invalid
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Recipient List"}
+  assert dialog is mail-recipients
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"record"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"record"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test doc mail-address-block: matches the catalogue
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"addressblock"}
+  assert dialog is mail-address-block
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line: matches the catalogue
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/salutation: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"salutation"}
+  call field-read {"dialog-field":"salutation"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/salutation: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"salutation"}
+  call field-read {"dialog-field":"salutation"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"salutation"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"salutation"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"salutation"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/name: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"name"}
+  call field-read {"dialog-field":"name"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/name: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"name"}
+  call field-read {"dialog-field":"name"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"name"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"name"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"name"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/punctuation: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"punctuation"}
+  call field-read {"dialog-field":"punctuation"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/punctuation: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"punctuation"}
+  call field-read {"dialog-field":"punctuation"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"punctuation"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"punctuation"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"punctuation"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/fallback: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"fallback"}
+  call field-read {"dialog-field":"fallback"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/fallback: focus by Tab
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"fallback"}
+  call field-read {"dialog-field":"fallback"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/fallback: types
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"fallback"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"fallback"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/fallback: edits
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"fallback"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"fallback"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"fallback"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"fallback"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"fallback"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"fallback"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/fallback: select-all replaces
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"fallback"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"fallback"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"fallback"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/fallback: pastes
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"fallback"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"fallback"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/fallback: copies
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"fallback"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc mail-greeting-line/fallback: Escape cancels
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"fallback"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-greeting-line
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"greetingline"}
+  assert dialog is mail-greeting-line
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"fallback"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields: matches the catalogue
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/title: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"title"}
+  call field-read {"dialog-field":"title"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/title: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"title"}
+  call field-read {"dialog-field":"title"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"title"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"title"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"title"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/first: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"first"}
+  call field-read {"dialog-field":"first"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/first: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"first"}
+  call field-read {"dialog-field":"first"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"first"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"first"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"first"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/middle: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"middle"}
+  call field-read {"dialog-field":"middle"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/middle: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"middle"}
+  call field-read {"dialog-field":"middle"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"middle"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"middle"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"middle"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/last: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"last"}
+  call field-read {"dialog-field":"last"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/last: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"last"}
+  call field-read {"dialog-field":"last"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"last"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"last"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"last"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/suffix: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"suffix"}
+  call field-read {"dialog-field":"suffix"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/suffix: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"suffix"}
+  call field-read {"dialog-field":"suffix"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"suffix"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"suffix"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"suffix"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/nickname: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"nickname"}
+  call field-read {"dialog-field":"nickname"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/nickname: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"nickname"}
+  call field-read {"dialog-field":"nickname"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"nickname"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"nickname"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"nickname"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/company: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"company"}
+  call field-read {"dialog-field":"company"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/company: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"company"}
+  call field-read {"dialog-field":"company"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"company"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"company"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"company"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/address1: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"address1"}
+  call field-read {"dialog-field":"address1"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/address1: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"address1"}
+  call field-read {"dialog-field":"address1"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"address1"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"address1"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"address1"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/address2: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"address2"}
+  call field-read {"dialog-field":"address2"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/address2: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"address2"}
+  call field-read {"dialog-field":"address2"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"address2"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"address2"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"address2"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/city: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"city"}
+  call field-read {"dialog-field":"city"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/city: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"city"}
+  call field-read {"dialog-field":"city"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"city"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"city"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"city"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/state: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"state"}
+  call field-read {"dialog-field":"state"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/state: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"state"}
+  call field-read {"dialog-field":"state"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"state"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"state"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"state"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/postal: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"postal"}
+  call field-read {"dialog-field":"postal"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/postal: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"postal"}
+  call field-read {"dialog-field":"postal"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"postal"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"postal"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"postal"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/country: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"country"}
+  call field-read {"dialog-field":"country"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/country: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"country"}
+  call field-read {"dialog-field":"country"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"country"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"country"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"country"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/email: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"email"}
+  call field-read {"dialog-field":"email"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-match-fields/email: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"matchfields"}
+  assert dialog is mail-match-fields
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"email"}
+  call field-read {"dialog-field":"email"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"email"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"email"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"email"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-find: matches the catalogue
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-find/find: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"find"}
+  call field-read {"dialog-field":"find"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-find/find: focus by Tab
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"find"}
+  call field-read {"dialog-field":"find"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-find/find: types
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"find"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"John"}
+  call field-read {"dialog-field":"find"}
+  assert reply.value is John
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc mail-find/find: edits
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"find"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"find"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"find"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"find"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"find"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"find"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-find/find: select-all replaces
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"find"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"find"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"find"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc mail-find/find: pastes
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"find"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"find"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc mail-find/find: copies
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"find"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc mail-find/find: OK applies
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"find"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"John"}
+  call real-key {"key":"enter"}
+  assert status is Found in record 2
+  assert mail.record is 2
+  call real-key {"key":"escape"}
+
+test doc mail-find/find: Escape cancels
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"find"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-find
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"find"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc mail-find/field: focus by click
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"field"}
+  call field-read {"dialog-field":"field"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-find/field: Up and Down step
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"findrecipient"}
+  assert dialog is mail-find
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"field"}
+  call field-read {"dialog-field":"field"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"field"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"field"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"field"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc mail-check-errors: matches the catalogue
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"checkerrors"}
+  assert dialog is mail-check-errors
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-report: matches the catalogue
+  open ../fixtures/basic.docx
+  call mail-attach {"path":"recipients.csv"}
+  call ribbon-click {"tab":"Mailings","command":"checkerrors"}
+  call dialog-click {"button":"OK"}
+  assert dialog is mail-report
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new: matches the catalogue
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/from: focus by click
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"from"}
+  call field-read {"dialog-field":"from"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/from: focus by Tab
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"to"}
+  call field-read {"dialog-field":"from"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"from"}
+  call field-read {"dialog-field":"from"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/from: types
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/from: edits
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"from"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"from"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/from: select-all replaces
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"from"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/from: pastes
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/from: copies
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/from: OK applies
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  assert dialog is not mail-merge-new
+  assert mail.text is DearJohn¶DearAmy
+
+test doc mail-merge-new/from: Escape cancels
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-merge-new
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/from: refuses invalid
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/to: focus by click
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"to"}
+  call field-read {"dialog-field":"to"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/to: focus by Tab
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"from"}
+  call field-read {"dialog-field":"to"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"to"}
+  call field-read {"dialog-field":"to"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/to: types
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"to"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"to"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/to: edits
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"to"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"to"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"to"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"to"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"to"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"to"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/to: select-all replaces
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"to"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"to"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"to"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/to: pastes
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"to"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"to"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/to: copies
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"to"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/to: OK applies
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"to"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  assert dialog is not mail-merge-new
+  assert mail.text is DearJane¶DearJohn
+
+test doc mail-merge-new/to: Escape cancels
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"to"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not mail-merge-new
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call field-read {"dialog-field":"to"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc mail-merge-new/to: refuses invalid
+  open ../fixtures/basic.docx
+  key ctrl+a
+  type Dear
+  call mail-attach {"path":"recipients.csv"}
+  call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
+  call menu-click {"label":"First Name"}
+  call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}
+  assert dialog is mail-merge-new
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"records"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"to"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"to"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}

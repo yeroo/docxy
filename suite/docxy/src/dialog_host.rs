@@ -272,7 +272,8 @@ pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Mo
 /// A key while the tab has a dialog open: Enter presses the default button,
 /// Escape the cancel one, Tab and Shift+Tab move the focus, and the focused
 /// widget takes the rest: a field takes typed characters, Backspace, Delete,
-/// the arrows, Home and End (Shift extends a selection), Ctrl+A and Ctrl+V;
+/// the arrows, Home and End (Shift extends a selection), Ctrl+A and Ctrl+V
+/// (Ctrl+C, which writes the clipboard, is `Docxy::dialog_takes_key`'s);
 /// Space toggles a checkbox, Up and Down step a radio group or dropdown.
 /// Every key (chords and Alt too) is swallowed, so nothing under the dialog
 /// sees it. `typed` is the character the key types, when it types one.
@@ -491,6 +492,21 @@ impl Docxy {
                 self.set_status(e);
             }
             cx.notify();
+            return true;
+        }
+        // Ctrl+C copies the focused field's selection (#1029); with none it
+        // copies nothing, and like every chord it goes no further.
+        let chord = (m.control || m.platform) && !m.alt && !m.shift;
+        if chord && key == "c" {
+            let Some(stack) = self.active_dialogs() else {
+                return false;
+            };
+            if let Some(text) = stack.top().and_then(Dialog::selected_text) {
+                self.clipboard_write(text, cx);
+                // A document copy's rich clip no longer stands for what
+                // the clipboard holds, even when the text matches.
+                self.clip = None;
+            }
             return true;
         }
         // Ctrl+V pastes what the clipboard holds.
@@ -911,7 +927,13 @@ mod tests {
         let mut t = tab_from_path(
             &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
         );
-        let mut d = Dialog::message("form", "Form", String::new(), &[], DialogOwner::Test);
+        let mut d = Dialog::message(
+            crate::dialog::catalog::TEST_FORM,
+            "Form",
+            String::new(),
+            &[],
+            DialogOwner::Test,
+        );
         d.text = None;
         d.controls = vec![
             Control::new("top", "Top:", ControlKind::Number, Value::Text("1".into())),

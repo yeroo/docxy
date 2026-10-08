@@ -9,6 +9,7 @@
 //! holds two, and Remove Page Numbers removes exactly those controls, ours
 //! and Word's, leaving `PAGE` fields typed into the body or a header alone.
 use super::*;
+use crate::dialog::catalog;
 use crate::dialog::{Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::hf_tab::{HfAct, reopen, resolved_part, rewrite_part, set_content, target, target_for};
 use crate::page_setup::{choice, chosen, ok_cancel, text_of};
@@ -385,7 +386,7 @@ pub(crate) fn format_dialog(tab: &DocTab) -> Result<Dialog, String> {
         .as_deref()
         .and_then(|v| SEPARATORS.iter().position(|s| s.1 == v));
     let mut d = Dialog::message(
-        "page-number-format",
+        catalog::PAGE_NUMBER_FORMAT,
         "Page Number Format",
         String::new(),
         &[],

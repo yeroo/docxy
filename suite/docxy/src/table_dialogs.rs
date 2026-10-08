@@ -4,6 +4,8 @@
 //! Each is built from the edited story's editor when its command runs, holds
 //! its staged values until OK, and applies them through one docxcore table
 //! command, one undo step, on the same story.
+use crate::dialog::DialogId;
+use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use docxcore::editor::{CellSep, DeleteShift, Editor, SortKey, SortKind, SortSpec};
 use docxcore::table::{AutoFit, GridMap};
@@ -18,7 +20,7 @@ fn ok_cancel() -> Vec<Button> {
     ]
 }
 
-fn form(id: &'static str, title: &str, owner: DialogOwner, controls: Vec<Control>) -> Dialog {
+fn form(id: DialogId, title: &str, owner: DialogOwner, controls: Vec<Control>) -> Dialog {
     let mut d = Dialog::message(id, title, String::new(), &[], owner);
     d.text = None;
     d.controls = controls;
@@ -91,7 +93,7 @@ const FIT: [&str; 3] = [
 /// defaults).
 pub(crate) fn insert_table_dialog(_: &Editor) -> Result<Dialog, String> {
     Ok(form(
-        "insert-table",
+        catalog::INSERT_TABLE,
         "Insert Table",
         DialogOwner::InsertTable,
         vec![
@@ -147,7 +149,7 @@ const SHIFTS: [&str; 4] = [
 pub(crate) fn delete_cells_dialog(ed: &Editor) -> Result<Dialog, String> {
     need_table(ed)?;
     Ok(form(
-        "delete-cells",
+        catalog::DELETE_CELLS,
         "Delete Cells",
         DialogOwner::DeleteCells,
         vec![choice("shift", "", ControlKind::Radio, &SHIFTS, 0)],
@@ -178,7 +180,7 @@ pub(crate) fn split_cells_dialog(ed: &Editor) -> Result<Dialog, String> {
     );
     merge.enabled = range;
     Ok(form(
-        "split-cells",
+        catalog::SPLIT_CELLS,
         "Split Cells",
         DialogOwner::SplitCells,
         vec![
@@ -218,7 +220,7 @@ pub(crate) fn sort_dialog(ed: &Editor) -> Result<Dialog, String> {
         c
     };
     Ok(form(
-        "sort",
+        catalog::TABLE_SORT,
         "Sort",
         DialogOwner::SortTable,
         vec![
@@ -292,7 +294,7 @@ fn separator(d: &Dialog) -> Result<CellSep, String> {
 pub(crate) fn table_to_text_dialog(ed: &Editor) -> Result<Dialog, String> {
     need_table(ed)?;
     Ok(form(
-        "convert-to-text",
+        catalog::CONVERT_TO_TEXT,
         "Convert Table To Text",
         DialogOwner::TableToText,
         vec![
@@ -332,7 +334,7 @@ pub(crate) fn text_to_table_dialog(ed: &Editor) -> Result<Dialog, String> {
         (1, 0)
     };
     Ok(form(
-        "convert-text-to-table",
+        catalog::CONVERT_TEXT_TO_TABLE,
         "Convert Text to Table",
         DialogOwner::TextToTable,
         vec![

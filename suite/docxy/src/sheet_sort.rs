@@ -8,6 +8,8 @@
 //! The dialogs sit on the tab's [`crate::dialog::DialogStack`], so the
 //! harness drives them; each sort is one undo step.
 
+use crate::dialog::DialogId;
+use crate::dialog::catalog;
 use crate::dialog::{
     Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Reaction, Value,
 };
@@ -272,12 +274,7 @@ fn on_top_in(
     run(tab, area, &[SortLevel { key: at.1, on }], &opts)
 }
 
-fn dialog(
-    id: &'static str,
-    title: &str,
-    buttons: &[(&str, ButtonRole)],
-    owner: DialogOwner,
-) -> Dialog {
+fn dialog(id: DialogId, title: &str, buttons: &[(&str, ButtonRole)], owner: DialogOwner) -> Dialog {
     let mut d = Dialog::message(id, title, String::new(), buttons, owner);
     d.text = None;
     d.buttons = d
@@ -294,7 +291,7 @@ fn dialog(
 /// Excel's Sort Warning.
 fn warning_dialog(sheet: usize, sel: Area, region: Area, header: bool, then: SortThen) -> Dialog {
     let mut d = dialog(
-        "sort-warning",
+        catalog::SORT_WARNING,
         "Sort Warning",
         &[("Sort", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],
         DialogOwner::SortWarning {
@@ -366,7 +363,7 @@ pub(crate) fn sort_dialog(tab: &DocTab, area: Area, header: bool) -> Result<Dial
     };
     let (cols, rows) = key_labels(&v.pkg.workbook, v.active, area, header);
     let mut d = dialog(
-        "sort",
+        catalog::SHEET_SORT,
         "Sort",
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],
         DialogOwner::SortLevels {

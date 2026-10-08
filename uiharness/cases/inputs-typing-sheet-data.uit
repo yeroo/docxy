@@ -1,0 +1,3541 @@
+# GENERATED from suite/docxy/src/dialog/catalog/entries.rs by
+# `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
+# inputs_typing_case_is_current`; do not edit by hand (#1029).
+#
+# Every editable field of every sheet dialog, typed into with real keys
+# only: `real-key` and `real-type` go through the window's own input
+# path, and the field is focused by a real click or by Tab. A test is
+# one field and one step, named `<surface> <dialog>/<field>: <step>`.
+# See qa/inputs-typing.md.
+
+test sheet consolidate: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet consolidate/function: focus by click
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"function"}
+  call field-read {"dialog-field":"function"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet consolidate/function: Up and Down step
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"function"}
+  call field-read {"dialog-field":"function"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"function"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"function"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"function"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet consolidate/reference: focus by click
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet consolidate/reference: focus by Tab
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"reference"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet consolidate/reference: types
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"B2:B5"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is B2:B5
+  assert reply.caret is 5
+  call real-key {"key":"escape"}
+
+test sheet consolidate/reference: edits
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet consolidate/reference: select-all replaces
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet consolidate/reference: pastes
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet consolidate/reference: copies
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet consolidate/reference: OK applies
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"B2:B5"}
+  call real-key {"key":"enter"}
+  assert dialog is not consolidate
+  assert cell E1 is 10
+  assert cell E4 is 40
+
+test sheet consolidate/reference: Escape cancels
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not consolidate
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet drop-replace: matches the catalogue
+  open ../fixtures/basic.xlsx
+  call border-drag {"from":"B2","to":"A2"}
+  assert dialog is drop-replace
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet series: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet series/step: focus by click
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"step"}
+  call field-read {"dialog-field":"step"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet series/step: focus by Tab
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"stop"}
+  call field-read {"dialog-field":"step"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"step"}
+  call field-read {"dialog-field":"step"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet series/step: types
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"step"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"step"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test sheet series/step: edits
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"step"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"step"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"step"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"step"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"step"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"step"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet series/step: select-all replaces
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"step"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"step"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"step"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet series/step: pastes
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"step"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"step"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet series/step: copies
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"step"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet series/step: OK applies
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"step"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  assert dialog is not series
+  assert cell Q2 is 3
+  assert cell Q3 is 5
+
+test sheet series/step: Escape cancels
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"step"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not series
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"step"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet series/stop: focus by click
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"stop"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet series/stop: focus by Tab
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"step"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"stop"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet series/stop: types
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"stop"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"3"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.value is 3
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test sheet series/stop: edits
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"stop"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet series/stop: select-all replaces
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"stop"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet series/stop: pastes
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"stop"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet series/stop: copies
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"stop"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet series/stop: OK applies
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"stop"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"3"}
+  call real-key {"key":"enter"}
+  assert dialog is not series
+  assert cell Q3 is 3
+  assert cell Q4 is nothing
+
+test sheet series/stop: Escape cancels
+  open ../fixtures/basic.xlsx
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"stop"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not series
+  click Q1
+  type 1
+  key enter
+  click Q1
+  click Q6 shift
+  call ribbon-click {"tab":"Home","command":"Fill"}
+  call menu-click {"label":"Series…"}
+  assert dialog is series
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"stop"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet justify: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click P10
+  type alpha beta gamma
+  key enter
+  click P10
+  call menu-open {"target":{"ribbon":["Home","Editing","Fill"]}}
+  call menu-click {"label":"Justify"}
+  assert dialog is justify
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet custom-lists: matches the catalogue
+  open ../fixtures/basic.xlsx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"custom-lists-row"}
+  assert dialog is custom-lists
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet custom-lists/entries: focus by click
+  open ../fixtures/basic.xlsx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"custom-lists-row"}
+  assert dialog is custom-lists
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"entries"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet custom-lists/entries: focus by Tab
+  open ../fixtures/basic.xlsx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"custom-lists-row"}
+  assert dialog is custom-lists
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"entries"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet custom-lists/entries: types
+  open ../fixtures/basic.xlsx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"custom-lists-row"}
+  assert dialog is custom-lists
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"entries"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Lo, Mid, Hi"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.value is Lo, Mid, Hi
+  assert reply.caret is 11
+  call real-key {"key":"escape"}
+
+test sheet custom-lists/entries: edits
+  open ../fixtures/basic.xlsx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"custom-lists-row"}
+  assert dialog is custom-lists
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"entries"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet custom-lists/entries: select-all replaces
+  open ../fixtures/basic.xlsx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"custom-lists-row"}
+  assert dialog is custom-lists
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"entries"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet custom-lists/entries: pastes
+  open ../fixtures/basic.xlsx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"custom-lists-row"}
+  assert dialog is custom-lists
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"entries"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet custom-lists/entries: copies
+  open ../fixtures/basic.xlsx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"custom-lists-row"}
+  assert dialog is custom-lists
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"entries"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet custom-lists/entries: Escape cancels
+  open ../fixtures/basic.xlsx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"custom-lists-row"}
+  assert dialog is custom-lists
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"entries"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not custom-lists
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"custom-lists-row"}
+  assert dialog is custom-lists
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"entries"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet flash-fill: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click E1
+  type zzz
+  key enter
+  click E2
+  key ctrl+e
+  assert dialog is flash-fill
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet goto: matches the catalogue
+  open ../fixtures/basic.xlsx
+  key ctrl+g
+  assert dialog is goto
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet goto/reference: focus by click
+  open ../fixtures/basic.xlsx
+  key ctrl+g
+  assert dialog is goto
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet goto/reference: focus by Tab
+  open ../fixtures/basic.xlsx
+  key ctrl+g
+  assert dialog is goto
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"reference"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet goto/reference: types
+  open ../fixtures/basic.xlsx
+  key ctrl+g
+  assert dialog is goto
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"K3:L4"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is K3:L4
+  assert reply.caret is 5
+  call real-key {"key":"escape"}
+
+test sheet goto/reference: edits
+  open ../fixtures/basic.xlsx
+  key ctrl+g
+  assert dialog is goto
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet goto/reference: select-all replaces
+  open ../fixtures/basic.xlsx
+  key ctrl+g
+  assert dialog is goto
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet goto/reference: pastes
+  open ../fixtures/basic.xlsx
+  key ctrl+g
+  assert dialog is goto
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet goto/reference: copies
+  open ../fixtures/basic.xlsx
+  key ctrl+g
+  assert dialog is goto
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet goto/reference: OK applies
+  open ../fixtures/basic.xlsx
+  key ctrl+g
+  assert dialog is goto
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"K3:L4"}
+  call real-key {"key":"enter"}
+  assert dialog is not goto
+  assert range is K3:L4
+
+test sheet goto/reference: Escape cancels
+  open ../fixtures/basic.xlsx
+  key ctrl+g
+  assert dialog is goto
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not goto
+  key ctrl+g
+  assert dialog is goto
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"reference"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet goto-special: matches the catalogue
+  open ../fixtures/basic.xlsx
+  key f5
+  call dialog-click {"button":"Special…"}
+  assert dialog is goto-special
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet group: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click A2
+  click B3 shift
+  call ribbon-click {"tab":"Data","command":"Group"}
+  assert dialog is group
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet ungroup: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click A2
+  click B3 shift
+  call ribbon-click {"tab":"Data","command":"Ungroup"}
+  assert dialog is ungroup
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet subtotal: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Subtotal"}
+  assert dialog is subtotal
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet subtotal/group: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Subtotal"}
+  assert dialog is subtotal
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"group"}
+  call field-read {"dialog-field":"group"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet subtotal/group: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Subtotal"}
+  assert dialog is subtotal
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"group"}
+  call field-read {"dialog-field":"group"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"group"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"group"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"group"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet subtotal/function: focus by click
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Subtotal"}
+  assert dialog is subtotal
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"function"}
+  call field-read {"dialog-field":"function"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet subtotal/function: Up and Down step
+  open ../fixtures/basic.xlsx
+  click A2
+  call ribbon-click {"tab":"Data","command":"Subtotal"}
+  assert dialog is subtotal
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"function"}
+  call field-read {"dialog-field":"function"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"function"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"function"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"function"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet outline-settings: matches the catalogue
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Data","command":"Settings..."}
+  assert dialog is outline-settings
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet paste-special: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click B2
+  key ctrl+c
+  click E2
+  key ctrl+alt+v
+  assert dialog is paste-special
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet data-validation: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet data-validation/allow: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-control":"allow"}
+  call field-read {"dialog-field":"allow"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/allow: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Settings"}
+  call real-key {"key":"tab","to-field":"allow"}
+  call field-read {"dialog-field":"allow"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"allow"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"allow"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"allow"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet data-validation/operator: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-control":"operator"}
+  call field-read {"dialog-field":"operator"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/operator: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Settings"}
+  call real-key {"key":"tab","to-field":"operator"}
+  call field-read {"dialog-field":"operator"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"operator"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"operator"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"operator"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet data-validation/first: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"second"}
+  call real-type {"text":"90"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-field":"first"}
+  call field-read {"dialog-field":"first"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/first: focus by Tab
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"second"}
+  call real-type {"text":"90"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call real-key {"key":"tab","to-field":"first"}
+  call field-read {"dialog-field":"first"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/first: types
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"second"}
+  call real-type {"text":"90"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-field":"first"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call field-read {"dialog-field":"first"}
+  assert reply.value is 10
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet data-validation/first: edits
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"second"}
+  call real-type {"text":"90"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-field":"first"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"first"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"first"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"first"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"first"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"first"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet data-validation/first: select-all replaces
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"second"}
+  call real-type {"text":"90"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-field":"first"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"first"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"first"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet data-validation/first: pastes
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"second"}
+  call real-type {"text":"90"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"first"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"first"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet data-validation/first: copies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"second"}
+  call real-type {"text":"90"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"first"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet data-validation/first: OK applies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"second"}
+  call real-type {"text":"90"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-field":"first"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10"}
+  call real-key {"key":"enter"}
+  assert dialog is not data-validation
+  assert status is Data validation applied
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"second"}
+  call real-type {"text":"90"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call field-read {"dialog-field":"first"}
+  assert reply.value is 10
+  call real-key {"key":"escape"}
+
+test sheet data-validation/first: Escape cancels
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"second"}
+  call real-type {"text":"90"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-field":"first"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not data-validation
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"second"}
+  call real-type {"text":"90"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call field-read {"dialog-field":"first"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet data-validation/second: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"first"}
+  call real-type {"text":"10"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-field":"second"}
+  call field-read {"dialog-field":"second"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/second: focus by Tab
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"first"}
+  call real-type {"text":"10"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call real-key {"key":"tab","to-field":"second"}
+  call field-read {"dialog-field":"second"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/second: types
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"first"}
+  call real-type {"text":"10"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-field":"second"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"90"}
+  call field-read {"dialog-field":"second"}
+  assert reply.value is 90
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet data-validation/second: edits
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"first"}
+  call real-type {"text":"10"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-field":"second"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"second"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"second"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"second"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"second"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"second"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet data-validation/second: select-all replaces
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"first"}
+  call real-type {"text":"10"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-field":"second"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"second"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"second"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet data-validation/second: pastes
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"first"}
+  call real-type {"text":"10"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"second"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"second"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet data-validation/second: copies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"first"}
+  call real-type {"text":"10"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"second"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet data-validation/second: OK applies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"first"}
+  call real-type {"text":"10"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-field":"second"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"90"}
+  call real-key {"key":"enter"}
+  assert dialog is not data-validation
+  assert status is Data validation applied
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"first"}
+  call real-type {"text":"10"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call field-read {"dialog-field":"second"}
+  assert reply.value is 90
+  call real-key {"key":"escape"}
+
+test sheet data-validation/second: Escape cancels
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"first"}
+  call real-type {"text":"10"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-field":"second"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not data-validation
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"allow"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"first"}
+  call real-type {"text":"10"}
+  call pointer-click {"dialog-tab":"Settings"}
+  call field-read {"dialog-field":"second"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-title: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-title"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-title: focus by Tab
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-message"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"input-title"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-title: types
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-title: edits
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-title: select-all replaces
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-title: pastes
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"input-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-title: copies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"input-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-title: OK applies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call real-key {"key":"enter"}
+  assert dialog is not data-validation
+  assert status is Data validation applied
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.value is "Ab1 "
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-title: Escape cancels
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not data-validation
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-message: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-message"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-message: focus by Tab
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-title"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"input-message"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-message: types
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-message: edits
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-message: select-all replaces
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-message: pastes
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"input-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-message: copies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"input-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-message: OK applies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call real-key {"key":"enter"}
+  assert dialog is not data-validation
+  assert status is Data validation applied
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.value is "Ab1 "
+  call real-key {"key":"escape"}
+
+test sheet data-validation/input-message: Escape cancels
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not data-validation
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Input Message"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-style: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-control":"error-style"}
+  call field-read {"dialog-field":"error-style"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-style: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call real-key {"key":"tab","to-field":"error-style"}
+  call field-read {"dialog-field":"error-style"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"error-style"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"error-style"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"error-style"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-title: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-title"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-title: focus by Tab
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-message"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"error-title"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-title: types
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-title: edits
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-title: select-all replaces
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-title: pastes
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"error-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-title: copies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"error-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-title: OK applies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call real-key {"key":"enter"}
+  assert dialog is not data-validation
+  assert status is Data validation applied
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.value is "Ab1 "
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-title: Escape cancels
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-title"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not data-validation
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-message: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-message"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-message: focus by Tab
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-title"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"error-message"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-message: types
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-message: edits
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-message: select-all replaces
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-message: pastes
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"error-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-message: copies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"error-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-message: OK applies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call real-key {"key":"enter"}
+  assert dialog is not data-validation
+  assert status is Data validation applied
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.value is "Ab1 "
+  call real-key {"key":"escape"}
+
+test sheet data-validation/error-message: Escape cancels
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-message"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not data-validation
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  assert dialog is data-validation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Error Alert"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet data-validation-alert: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Data Validation"}
+  call dialog-set {"control":"allow","value":"Whole number"}
+  call dialog-set {"control":"first","value":"10"}
+  call dialog-set {"control":"second","value":"90"}
+  call dialog-click {"button":"OK"}
+  click B2
+  type 5
+  key enter
+  assert dialog is data-validation-alert
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/other_char: focus by click
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-field":"other_char"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/other_char: focus by Tab
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call real-key {"key":"tab","to-field":"other_char"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/other_char: types
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-field":"other_char"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"|"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.value is |
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/other_char: edits
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-field":"other_char"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/other_char: select-all replaces
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-field":"other_char"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/other_char: pastes
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"other_char"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/other_char: copies
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"other_char"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/other_char: Escape cancels
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-field":"other_char"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not text-to-columns
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/qualifier: focus by click
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"qualifier"}
+  call field-read {"dialog-field":"qualifier"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/qualifier: Up and Down step
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call real-key {"key":"tab","to-field":"qualifier"}
+  call field-read {"dialog-field":"qualifier"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"qualifier"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"qualifier"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"qualifier"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/breaks: focus by click
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-field":"breaks"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/breaks: focus by Tab
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call real-key {"key":"tab","to-field":"breaks"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/breaks: types
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-field":"breaks"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.value is 1
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/breaks: edits
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-field":"breaks"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/breaks: select-all replaces
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-field":"breaks"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/breaks: pastes
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"breaks"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/breaks: copies
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"breaks"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/breaks: OK applies
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-field":"breaks"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call real-key {"key":"enter"}
+  assert dialog is not text-to-columns
+  assert cell J1 is a
+  assert cell K1 is ,b
+
+test sheet text-to-columns/breaks: Escape cancels
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-field":"breaks"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not text-to-columns
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/column: focus by click
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-control":"column"}
+  call field-read {"dialog-field":"column"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/column: Up and Down step
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call real-key {"key":"tab","to-field":"column"}
+  call field-read {"dialog-field":"column"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"column"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"column"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"column"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/date_order: focus by click
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-control":"date_order"}
+  call field-read {"dialog-field":"date_order"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/date_order: Up and Down step
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call real-key {"key":"tab","to-field":"date_order"}
+  call field-read {"dialog-field":"date_order"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"date_order"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"date_order"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"date_order"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/formats: focus by click
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"formats"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/formats: focus by Tab
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call real-key {"key":"tab","to-field":"formats"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/formats: types
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"formats"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"general, skip"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.value is general, skip
+  assert reply.caret is 13
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/formats: edits
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"formats"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/formats: select-all replaces
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"formats"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/formats: pastes
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"formats"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/formats: copies
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"formats"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/formats: OK applies
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"formats"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"general, skip"}
+  call real-key {"key":"enter"}
+  assert dialog is not text-to-columns
+  assert cell J1 is a
+  assert cell K1 is nothing
+
+test sheet text-to-columns/formats: Escape cancels
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"formats"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not text-to-columns
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/destination: focus by click
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/destination: focus by Tab
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"decimal"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"destination"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/destination: types
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"L1"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.value is L1
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/destination: edits
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/destination: select-all replaces
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/destination: pastes
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"destination"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/destination: copies
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"destination"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/destination: OK applies
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"L1"}
+  call real-key {"key":"enter"}
+  assert dialog is not text-to-columns
+  assert cell L1 is a,b
+
+test sheet text-to-columns/destination: Escape cancels
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not text-to-columns
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/decimal: focus by click
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"decimal"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/decimal: focus by Tab
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"decimal"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/decimal: types
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"decimal"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":";"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.value is ;
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/decimal: edits
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"decimal"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/decimal: select-all replaces
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"decimal"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/decimal: pastes
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"decimal"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/decimal: copies
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"decimal"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/decimal: Escape cancels
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"decimal"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not text-to-columns
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/thousands: focus by click
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"thousands"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/thousands: focus by Tab
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"thousands"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/thousands: types
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"thousands"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"'"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.value is '
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/thousands: edits
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"thousands"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/thousands: select-all replaces
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"thousands"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/thousands: pastes
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"thousands"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/thousands: copies
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"thousands"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns/thousands: Escape cancels
+  open ../fixtures/basic.xlsx
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"thousands"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not text-to-columns
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  assert dialog is text-to-columns
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet text-to-columns-replace: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click K1
+  type x
+  key enter
+  click J1
+  type a,b
+  key enter
+  click J1
+  call ribbon-click {"tab":"Data","command":"Text to Columns"}
+  call dialog-tab {"tab":"Step 2: Delimiters"}
+  call dialog-set {"control":"comma","value":true}
+  call dialog-click {"button":"Finish"}
+  assert dialog is text-to-columns-replace
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet save-on-close: matches the catalogue
+  open copy:../fixtures/basic.xlsx
+  click B2
+  type 5
+  key enter
+  call close-tab {}
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
