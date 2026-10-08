@@ -673,11 +673,12 @@ pub fn render_with_page_layout(doc: &Document, opts: &RenderOptions) -> PageRend
     let mut mermaid: Vec<MermaidBox> = Vec::new();
     let mut page_boxes: Vec<PageBox> = Vec::new();
     let mut document_page_index = 0usize;
-    let mut previous_section: Option<(usize, PageGeom, usize, Option<PageParity>)> = None;
+    let mut previous_section: Option<(usize, PageGeom, usize)> = None;
     for (section_index, section) in sections(doc, opts.page).into_iter().enumerate() {
-        if let Some((previous_index, previous_geom, previous_pages, parity)) =
-            previous_section.as_mut()
-            && parity.is_some_and(|parity| parity.needs_blank_before(document_page_index + 1))
+        if section
+            .parity_before
+            .is_some_and(|parity| parity.needs_blank_before(document_page_index + 1))
+            && let Some((previous_index, previous_geom, previous_pages)) = previous_section.as_mut()
         {
             let mut blank_images = Vec::new();
             let mut blank_mermaid = Vec::new();
@@ -710,7 +711,6 @@ pub fn render_with_page_layout(doc: &Document, opts: &RenderOptions) -> PageRend
             end,
             geom,
             col_tw,
-            parity_after,
             ..
         } = section;
         let m = page_metrics(opts.width, geom);
@@ -804,7 +804,7 @@ pub fn render_with_page_layout(doc: &Document, opts: &RenderOptions) -> PageRend
         images.extend(sec_imgs);
         mermaid.extend(sec_mmd);
         page_boxes.extend(section_boxes);
-        previous_section = Some((section_index, geom, section_pages, parity_after));
+        previous_section = Some((section_index, geom, section_pages));
     }
     let (lines, maps) = out.into_iter().unzip();
     PageRender {
@@ -867,10 +867,10 @@ struct RenderSection {
     end: usize,
     geom: PageGeom,
     col_tw: Vec<u32>,
-    /// `oddPage`/`evenPage` on this section's `sectPr` constrains the physical
-    /// page on which the following section begins.
-    parity_after: Option<PageParity>,
-    starts_page_after: bool,
+    /// `oddPage`/`evenPage` on this section's own `sectPr` (the break ending
+    /// it, or the trailing `sectPr` for the final section) constrains the
+    /// physical page on which this section begins.
+    parity_before: Option<PageParity>,
 }
 
 fn section_start_type(sect: &str) -> Option<String> {
@@ -893,7 +893,7 @@ fn section_start_parity(section_type: Option<&str>) -> Option<PageParity> {
 /// Body block ranges per section. A paragraph carrying a `section_break` ends a
 /// section (using that break's geometry); the remaining content forms the final
 /// section (using the trailing `sectPr`). An empty trailing section still owns a
-/// page after a page-starting break, so it must not disappear from page view.
+/// page when its own type starts one, so it must not disappear from page view.
 fn sections(doc: &Document, last: PageGeom) -> Vec<RenderSection> {
     let mut out = Vec::new();
     let mut start = 0;
@@ -907,29 +907,32 @@ fn sections(doc: &Document, last: PageGeom) -> Vec<RenderSection> {
                     end: i + 1,
                     geom: PageGeom::from_sect_pr(sect),
                     col_tw: column_widths(sect),
-                    parity_after: section_start_parity(section_type.as_deref()),
-                    starts_page_after: !matches!(
-                        section_type.as_deref(),
-                        Some("continuous" | "nextColumn")
-                    ),
+                    // The break's type says how the section it ends starts; the
+                    // first section has no predecessor, so its type is moot.
+                    parity_before: if out.is_empty() {
+                        None
+                    } else {
+                        section_start_parity(section_type.as_deref())
+                    },
                 });
                 start = i + 1;
             }
         }
     }
-    // The final section's raw sectPr isn't threaded here, so it falls back to
-    // even columns (the common case for a trailing single-column section).
-    if start < content_end
-        || out.is_empty()
-        || out.last().is_some_and(|section| section.starts_page_after)
-    {
+    // The final section's geometry and columns still fall back to `last`/even
+    // (its raw sectPr is read here only for the start type). An absent trailing
+    // sectPr means the default page-starting type.
+    let final_type = doc
+        .trailing_section_properties()
+        .and_then(|sect| section_start_type(&sect.raw));
+    let final_starts_page = !matches!(final_type.as_deref(), Some("continuous" | "nextColumn"));
+    if start < content_end || out.is_empty() || final_starts_page {
         out.push(RenderSection {
             start,
             end: content_end,
             geom: last,
             col_tw: Vec::new(),
-            parity_after: None,
-            starts_page_after: false,
+            parity_before: section_start_parity(final_type.as_deref()),
         });
     }
     out
@@ -5637,31 +5640,42 @@ mod tests {
         );
     }
 
+    fn section_break_para(section_type: Option<&str>) -> Block {
+        let section_type = section_type
+            .map(|value| format!(r#"<w:type w:val="{value}"/>"#))
+            .unwrap_or_default();
+        Block::Paragraph(Paragraph {
+            props: ParProps {
+                section_break: Some(format!("<w:sectPr>{section_type}</w:sectPr>")),
+                ..ParProps::default()
+            },
+            content: vec![run("section one", RunProps::default())],
+        })
+    }
+
+    fn trailing_sect_pr(raw: &str) -> Block {
+        Block::SectionProperties(SectionProperties {
+            raw: raw.to_string(),
+            property_change: None,
+        })
+    }
+
     #[test]
     fn print_layout_preserves_section_start_parity_and_empty_final_sections() {
-        let break_para = |section_type: Option<&str>| {
-            let section_type = section_type
-                .map(|value| format!(r#"<w:type w:val="{value}"/>"#))
-                .unwrap_or_default();
-            Block::Paragraph(Paragraph {
-                props: ParProps {
-                    section_break: Some(format!("<w:sectPr>{section_type}</w:sectPr>")),
-                    ..ParProps::default()
-                },
-                content: vec![run("section one", RunProps::default())],
-            })
-        };
         let mut o = opts(60);
         o.page_view = true;
 
+        // The break's w:type describes how the section it ends STARTS, and
+        // section 0 is the first section, so its oddPage/evenPage is moot
+        // without a typed trailing sectPr.
         let odd = render_with_page_layout(
             &doc(vec![
-                break_para(Some("oddPage")),
+                section_break_para(Some("oddPage")),
                 para(vec![run("section two", RunProps::default())]),
             ]),
             &o,
         );
-        assert_eq!(odd.pages.len(), 3, "oddPage needs an intervening page");
+        assert_eq!(odd.pages.len(), 2);
         assert_eq!(
             odd.pages
                 .iter()
@@ -5671,22 +5685,143 @@ mod tests {
                     page.document_page_index
                 ))
                 .collect::<Vec<_>>(),
-            vec![(0, 0, 0), (0, 1, 1), (1, 0, 2)]
+            vec![(0, 0, 0), (1, 0, 1)]
         );
 
         let even = render_with_page_layout(
             &doc(vec![
-                break_para(Some("evenPage")),
+                section_break_para(Some("evenPage")),
                 para(vec![run("section two", RunProps::default())]),
             ]),
             &o,
         );
-        assert_eq!(even.pages.len(), 2, "page 2 already has even parity");
+        assert_eq!(even.pages.len(), 2);
 
-        let empty_final = render_with_page_layout(&doc(vec![break_para(None)]), &o);
+        let empty_final = render_with_page_layout(&doc(vec![section_break_para(None)]), &o);
         assert_eq!(empty_final.pages.len(), 2);
         assert_eq!(empty_final.pages[1].section_index, 1);
         assert_eq!(empty_final.pages[1].document_page_index, 1);
+    }
+
+    #[test]
+    fn print_layout_odd_page_type_on_the_starting_section_adds_the_blank_page() {
+        // ECMA-376 17.6.22: w:type on the trailing sectPr says how the FINAL
+        // section starts; page 2 is even, so a blank page precedes it.
+        let d = doc(vec![
+            section_break_para(None),
+            para(vec![run("section two", RunProps::default())]),
+            trailing_sect_pr(r#"<w:sectPr><w:type w:val="oddPage"/></w:sectPr>"#),
+        ]);
+        let mut o = opts(60);
+        o.page_view = true;
+        let r = render_with_page_layout(&d, &o);
+        assert_eq!(r.pages.len(), 3, "oddPage needs an intervening page");
+        assert_eq!(
+            r.pages
+                .iter()
+                .map(|page| (
+                    page.section_index,
+                    page.section_page_index,
+                    page.document_page_index
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0), (0, 1, 1), (1, 0, 2)]
+        );
+    }
+
+    #[test]
+    fn print_layout_type_on_the_ending_section_does_not_apply_to_the_next() {
+        // oddPage on the break ending section 0 constrains section 0's own
+        // start, not the next section's, so no blank page is inserted.
+        let d = doc(vec![
+            section_break_para(Some("oddPage")),
+            para(vec![run("section two", RunProps::default())]),
+            trailing_sect_pr("<w:sectPr/>"),
+        ]);
+        let mut o = opts(60);
+        o.page_view = true;
+        let r = render_with_page_layout(&d, &o);
+        assert_eq!(r.pages.len(), 2);
+        assert_eq!(
+            r.pages
+                .iter()
+                .map(|page| (
+                    page.section_index,
+                    page.section_page_index,
+                    page.document_page_index
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0), (1, 0, 1)]
+        );
+    }
+
+    #[test]
+    fn print_layout_even_page_type_on_the_starting_section_skips_the_blank_page() {
+        // Page 2 already has even parity, so evenPage on the trailing section
+        // adds no blank page.
+        let d = doc(vec![
+            section_break_para(None),
+            para(vec![run("section two", RunProps::default())]),
+            trailing_sect_pr(r#"<w:sectPr><w:type w:val="evenPage"/></w:sectPr>"#),
+        ]);
+        let mut o = opts(60);
+        o.page_view = true;
+        let r = render_with_page_layout(&d, &o);
+        assert_eq!(r.pages.len(), 2);
+    }
+
+    #[test]
+    fn print_layout_empty_final_continuous_section_owns_no_page() {
+        let mut o = opts(60);
+        o.page_view = true;
+
+        // The empty final section's own type is continuous: it owns no page.
+        let continuous = render_with_page_layout(
+            &doc(vec![
+                section_break_para(None),
+                trailing_sect_pr(r#"<w:sectPr><w:type w:val="continuous"/></w:sectPr>"#),
+            ]),
+            &o,
+        );
+        assert_eq!(continuous.pages.len(), 1);
+
+        // Trailing sectPr absent or untyped: the empty final section starts
+        // a page of its own.
+        let absent = render_with_page_layout(&doc(vec![section_break_para(None)]), &o);
+        assert_eq!(absent.pages.len(), 2);
+        let untyped = render_with_page_layout(
+            &doc(vec![
+                section_break_para(None),
+                trailing_sect_pr("<w:sectPr/>"),
+            ]),
+            &o,
+        );
+        assert_eq!(untyped.pages.len(), 2);
+    }
+
+    #[test]
+    fn print_layout_first_section_type_is_ignored() {
+        // oddPage on the break ending section 0 is moot: the first section has
+        // no predecessor to be odd relative to.
+        let d = doc(vec![
+            section_break_para(Some("oddPage")),
+            para(vec![run("section two", RunProps::default())]),
+        ]);
+        let mut o = opts(60);
+        o.page_view = true;
+        let r = render_with_page_layout(&d, &o);
+        assert_eq!(r.pages.len(), 2);
+        assert_eq!(
+            r.pages
+                .iter()
+                .map(|page| (
+                    page.section_index,
+                    page.section_page_index,
+                    page.document_page_index
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0), (1, 0, 1)]
+        );
     }
 
     #[test]
