@@ -1,9 +1,12 @@
 # #215: the Home ribbon's Styles gallery tiles, dark and light. The shots are
 # the review evidence: each tile an "AaBbCc" in its style's size, weight and
-# colour, the name under it, Title selected (the caret's paragraph).
+# colour, the name under it, Title selected (the caret's paragraph). At the
+# default 1180 px window Home collapses Styles to a button (#1020), so the
+# window is widened until the gallery is drawn in place.
 
 test style gallery tiles in dark and light
   open copy:../fixtures/basic.docx
+  call window-size {"w":1400,"h":800}
   call ribbon-click {"tab":"Home","command":"styles:Title"}
   call ribbon-read {}
   assert reply.tabs.1.groups.3.commands.5.checked is true

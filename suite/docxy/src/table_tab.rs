@@ -899,9 +899,12 @@ impl Docxy {
     /// The Table Styles gallery: a tile per built-in style, each a small
     /// table drawn in that style (header row, banding and borders, resolved
     /// as the document view resolves them), the table's own style outlined.
+    /// In a flyout narrower than the gallery (`max_w`), the tiles wrap onto
+    /// rows (#1020).
     pub(crate) fn table_style_gallery(
         &self,
         gal: &rs::Gallery<Act>,
+        max_w: Option<f32>,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -970,8 +973,12 @@ impl Docxy {
                     .into_any_element()
             })
             .collect();
+        let geom = crate::ribbon_fit::gallery_geom(gal);
+        let (_, well_w) = crate::ribbon_fit::gallery_row(geom, gal.items.len(), max_w);
         h_flex()
             .flex_none()
+            .flex_wrap()
+            .w(px(well_w))
             .gap(px(2.))
             .p(px(2.))
             .rounded(px(3.))

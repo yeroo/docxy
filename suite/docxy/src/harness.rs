@@ -819,6 +819,13 @@ pub enum Region {
     ProjectSplit,
     /// The Home ribbon's Styles gallery: the well its tiles sit in.
     Gallery,
+    /// The ribbon body: the groups of the tab shown (#1020).
+    Ribbon,
+    /// The open flyout of a collapsed ribbon group or of the chevron (#1020).
+    RibbonFlyout,
+    /// Group `.0` of the ribbon tab shown, as drawn: in place, or its
+    /// collapsed button (#1020).
+    RibbonGroup(usize),
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
     /// The File screen's scrolling content pane (#1028).
@@ -870,12 +877,23 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         "project-timeline" if arg.is_none() => Ok(Region::ProjectTimeline),
         "project-split" if arg.is_none() => Ok(Region::ProjectSplit),
         "gallery" if arg.is_none() => Ok(Region::Gallery),
+        "ribbon" if arg.is_none() => Ok(Region::Ribbon),
+        "ribbon-flyout" if arg.is_none() => Ok(Region::RibbonFlyout),
+        "ribbon-group" => {
+            let i = arg
+                .ok_or("'ribbon-group' needs a group index, e.g. ribbon-group:6")?
+                .parse::<usize>()
+                .map_err(|_| "'ribbon-group' needs a numeric index".to_string())?;
+            Ok(Region::RibbonGroup(i))
+        }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
         "window" | "grid" | "chart-panel" | "title-tabs" | "tab-prev" | "tab-next" | "tab-more"
         | "gantt" | "project-hbar-table" | "project-hbar-chart" | "project-vbar"
-        | "project-timeline" | "project-split" | "gallery" | "backstage-content"
-        | "backstage-rail" => Err(format!("'{head}' does not take an argument; use '{head}'")),
+        | "project-timeline" | "project-split" | "gallery" | "ribbon" | "ribbon-flyout"
+        | "backstage-content" | "backstage-rail" => {
+            Err(format!("'{head}' does not take an argument; use '{head}'"))
+        }
         "cell" | "cells" => {
             let a = arg.filter(|a| !a.is_empty()).ok_or_else(|| {
                 format!("'{head}' needs a cell or a range, e.g. {head}:B3 or {head}:A1:C5")
@@ -915,7 +933,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, filter-button:B)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, filter-button:B)"
         )),
     }
 }
@@ -943,6 +961,9 @@ pub fn region_name(region: Region) -> String {
         Region::ProjectTimeline => "project-timeline".into(),
         Region::ProjectSplit => "project-split".into(),
         Region::Gallery => "gallery".into(),
+        Region::Ribbon => "ribbon".into(),
+        Region::RibbonFlyout => "ribbon-flyout".into(),
+        Region::RibbonGroup(i) => format!("ribbon-group:{i}"),
         Region::BackstageContent => "backstage-content".into(),
         Region::BackstageRail => "backstage-rail".into(),
         Region::FilterButton(c) => format!("filter-button:{}", gridcore::sheet::col_name(c)),
@@ -1900,6 +1921,110 @@ fn sheet_menu_open(
     }
     app.select_ribbon_tab(ribbon_tab, window, cx);
     open_ribbon_split_menu(app, id, window, cx)
+}
+
+/// `ribbon-flyout`'s reply: whether a flyout is open, and whose; and, from
+/// the last frame, whether the flyout drawn there lies inside the window's
+/// width (the ribbon's edges), `null` before it is drawn.
+fn flyout_json(app: &crate::Docxy) -> Json {
+    let (open, group, overflow) = match app.ribbon_flyout.map(|f| f.target) {
+        None => (false, Json::Null, false),
+        Some(crate::FlyoutTarget::Overflow) => (true, Json::Null, true),
+        Some(crate::FlyoutTarget::Group(t)) => (true, Json::Str(t.into()), false),
+    };
+    let probes = app.probes.borrow();
+    let inside = match (
+        open.then(|| probes.get("ribbon-flyout")).flatten(),
+        crate::ribbon_layout::body(&probes.last),
+    ) {
+        (Some(f), Some(body)) => {
+            Json::Bool(f.origin.x >= body.origin.x - px(0.5) && f.right() <= body.right() + px(0.5))
+        }
+        _ => Json::Null,
+    };
+    Json::obj(vec![
+        ("open", Json::Bool(open)),
+        ("group", group),
+        ("overflow", Json::Bool(overflow)),
+        ("inside", inside),
+    ])
+}
+
+/// The title of the group on the model ribbon's tab `tab` that holds
+/// `command` (a label or id `ribbon-click` resolves), if any.
+fn ribbon_group_of(app: &crate::Docxy, tab: &str, command: &str) -> Option<&'static str> {
+    let def = ribbon_tab_def(app, tab).ok()?;
+    def.groups.iter().find_map(|g| {
+        let mut commands = Vec::new();
+        for control in &g.items {
+            control_commands(control, &mut commands);
+        }
+        resolve_commands(&commands, tab, command)
+            .is_ok()
+            .then_some(g.title)
+    })
+}
+
+/// `ribbon-click` on a command of a collapsed group: the group's flyout opens
+/// first, as a person's click on the collapsed button does, and the command is
+/// clicked in it (#1020). A group drawn in place opens nothing.
+fn open_flyout_of(app: &mut crate::Docxy, group: Option<&'static str>, window: &Window) {
+    let Some(group) = group else { return };
+    let now = app.ribbon_fit_now(window);
+    if let Some(i) = now.titles.iter().position(|t| *t == group) {
+        if now.fit.in_flyout(i) {
+            app.open_ribbon_flyout(crate::FlyoutTarget::Group(now.titles[i]));
+        }
+    }
+}
+
+/// Give every group of every tab in a `ribbon-read` reply its `state` at the
+/// window's width now (#1020): `full`, `icon-only` or `collapsed`. A tab
+/// fits as it would if it were shown.
+fn add_group_states(json: &mut Json, app: &crate::Docxy, window: &Window) {
+    let tw = crate::ribbon_text_width(window);
+    let width = crate::ribbon_width(window);
+    let Json::Obj(fields) = json else { return };
+    let Some((_, Json::Arr(tabs))) = fields.iter_mut().find(|(k, _)| k == "tabs") else {
+        return;
+    };
+    for tab in tabs {
+        let name = tab.get_str("name").unwrap_or_default().to_string();
+        let specs: Vec<crate::ribbon_fit::Spec> = if app.active_is_sheet() {
+            let Ok(t) = ribbon_tab_by_name(crate::Kind::Xlsx, &name) else {
+                continue;
+            };
+            let def = crate::sheet_ribbon::tab_def(t);
+            if crate::ribbon_tab_name(def.tab) != name {
+                continue;
+            }
+            def.groups
+                .iter()
+                .map(|g| {
+                    crate::ribbon_fit::sheet_spec(g, def.titles, &|a| app.sheet_act_toggled(a), &tw)
+                })
+                .collect()
+        } else {
+            let Ok(def) = ribbon_tab_def(app, &name) else {
+                continue;
+            };
+            def.groups
+                .iter()
+                .map(|g| crate::ribbon_fit::model_spec(g, &tw))
+                .collect()
+        };
+        let fit = crate::ribbon_fit::fit(&specs, width);
+        let Json::Obj(tab) = tab else { continue };
+        let Some((_, Json::Arr(groups))) = tab.iter_mut().find(|(k, _)| k == "groups") else {
+            continue;
+        };
+        for (i, g) in groups.iter_mut().enumerate() {
+            let (Json::Obj(g), Some(state)) = (g, fit.states.get(i)) else {
+                continue;
+            };
+            g.push(("state".into(), Json::Str(state.name().into())));
+        }
+    }
 }
 
 /// Open split button or drop-down `id`'s menu where its arrow is drawn (the
@@ -3235,6 +3360,10 @@ fn dispatch_verb(
     if closes_menu(verb, args) && app.close_menu() {
         cx.notify();
     }
+    // An open ribbon flyout too (#1020), which a press outside it closes.
+    if closes_menu(verb, args) && app.ribbon_flyout.take().is_some() {
+        cx.notify();
+    }
     match verb {
         "window-zoom" => {
             window.zoom_window();
@@ -3665,10 +3794,14 @@ fn dispatch_verb(
                 ),
             ]))
         }
-        "ribbon-read" => match ribbon_surface(app)? {
-            RibbonSurface::Model => Done::ok(ribbon_json(app)),
-            RibbonSurface::Sheet => Done::ok(sheet_ribbon_json(app)),
-        },
+        "ribbon-read" => {
+            let mut json = match ribbon_surface(app)? {
+                RibbonSurface::Model => ribbon_json(app),
+                RibbonSurface::Sheet => sheet_ribbon_json(app),
+            };
+            add_group_states(&mut json, app, window);
+            Done::ok(json)
+        }
         // Where each group of the shown ribbon tab drew its content, from the
         // last frame (settle with a `shot` first, as for `title-bar`).
         "ribbon-layout" => {
@@ -3700,33 +3833,88 @@ fn dispatch_verb(
                     return Done::ok(crate::ribbon_layout::unsettled_json(want));
                 }
             }
-            let (name, titles): (String, Vec<&str>) = match surface {
+            let name: String = match surface {
                 RibbonSurface::Sheet => {
-                    let def = crate::sheet_ribbon::tab_def(app.ribbon_tab);
-                    let name = crate::ribbon_tab_name(def.tab);
-                    (name.into(), def.groups.iter().map(|g| g.title).collect())
+                    crate::ribbon_tab_name(crate::sheet_ribbon::tab_def(app.ribbon_tab).tab).into()
                 }
-                RibbonSurface::Model => {
-                    let def = app.active_ribbon_tab_def();
-                    (
-                        def.name.into(),
-                        def.groups.iter().map(|g| g.title).collect(),
-                    )
-                }
+                RibbonSurface::Model => app.active_ribbon_tab_def().name.into(),
             };
+            // Where the fit puts each group at the window's width now (#1020).
+            let now = app.ribbon_fit_now(window);
+            let fits: Vec<crate::ribbon_layout::GroupFit> = now
+                .titles
+                .iter()
+                .enumerate()
+                .map(|(i, title)| crate::ribbon_layout::GroupFit {
+                    title,
+                    state: now.fit.states[i],
+                    in_overflow: now.fit.in_overflow(i),
+                    estimate: now.specs[i].width(now.fit.states[i]),
+                })
+                .collect();
+            let titles: Vec<&str> = now.titles.clone();
             // The last frame may predate the tab shown now (a verb only marks
-            // the view dirty): then it is not this tab's layout.
+            // the view dirty), or a resize: then it is not this layout.
             let probes = app.probes.borrow();
             let measured = crate::ribbon_layout::measure(&probes.last);
             // A tab with no groups (Project's Report) has nothing to wait for.
             let drawn = crate::ribbon_layout::shown_tab(&probes.last) == Some(name.as_str());
             if !titles.is_empty()
-                && !(drawn && crate::ribbon_layout::is_frame_of(&measured, &titles))
+                && !(drawn
+                    && crate::ribbon_layout::is_frame_of(&measured, &titles)
+                    && crate::ribbon_layout::frame_matches(&probes.last, &fits)
+                    && crate::ribbon_layout::drawn_matches(
+                        probes.fit_last.as_ref(),
+                        now.width,
+                        &fits,
+                    ))
             {
                 cx.notify();
                 return Done::ok(crate::ribbon_layout::unsettled_json(&name));
             }
-            Done::ok(crate::ribbon_layout::layout_json(&name, &titles, &measured))
+            let body = crate::ribbon_layout::body(&probes.last);
+            Done::ok(crate::ribbon_layout::layout_json(
+                &name, &fits, &measured, body,
+            ))
+        }
+        // A collapsed group's (or the chevron's) flyout (#1020): `open` with
+        // `group` (a title) or `overflow: true`, `close`, or `read`.
+        "ribbon-flyout" => {
+            let action = args.get_str("action").unwrap_or("read");
+            if action != "read" {
+                app.refuse_under_dialog()?;
+                ribbon_surface(app)?;
+            }
+            match action {
+                "read" => {}
+                "close" => {
+                    app.ribbon_flyout = None;
+                    cx.notify();
+                }
+                "open" => {
+                    let now = app.ribbon_fit_now(window);
+                    let target = if matches!(args.get("overflow"), Some(Json::Bool(true))) {
+                        if now.fit.overflow.is_empty() {
+                            return Err("no group is in the overflow chevron".into());
+                        }
+                        crate::FlyoutTarget::Overflow
+                    } else {
+                        let group = arg_str(args, "group")?;
+                        let i =
+                            now.titles.iter().position(|t| *t == group).ok_or_else(|| {
+                                format!("no group '{group}' on the ribbon tab shown")
+                            })?;
+                        if !now.fit.in_flyout(i) {
+                            return Err(format!("the group '{group}' is not collapsed"));
+                        }
+                        crate::FlyoutTarget::Group(now.titles[i])
+                    };
+                    app.open_ribbon_flyout(target);
+                    cx.notify();
+                }
+                other => return Err(format!("unknown ribbon-flyout action '{other}'")),
+            }
+            Done::ok(flyout_json(app))
         }
         "ribbon-click" => {
             app.refuse_under_dialog()?;
@@ -3736,9 +3924,16 @@ fn dispatch_verb(
             if surface == RibbonSurface::Sheet {
                 // The button's own click: select its tab, then run its act. A
                 // drop-down button opens its menu; a menu item is clicked
-                // through the menu.
+                // through the menu. A command of a collapsed group is clicked
+                // in the group's flyout, opened first (#1020).
                 let (ribbon_tab, cmd) = resolve_sheet_command(app, &tab, &command)?;
                 app.select_ribbon_tab(ribbon_tab, window, cx);
+                let group = crate::sheet_ribbon::tab_def(ribbon_tab)
+                    .groups
+                    .iter()
+                    .find(|g| g.commands().iter().any(|c| c.id == cmd.id))
+                    .map(|g| g.title);
+                open_flyout_of(app, group, window);
                 click_sheet_command(app, ribbon_tab, cmd, window, cx)?;
                 // A New Window button selects the new window: the reply
                 // describes it, like window-new.
@@ -3746,6 +3941,8 @@ fn dispatch_verb(
             }
             let act = resolve_ribbon_command(app, &tab, &command)?;
             app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), &tab)?, window, cx);
+            let group = ribbon_group_of(app, &tab, &command);
+            open_flyout_of(app, group, window);
             app.dispatch(act, window, cx);
             // A New Window button selects the new window: the reply
             // describes it, like window-new.
@@ -5992,6 +6189,8 @@ mod tests {
             "ime-unmark",
             "ribbon-read",
             "ribbon-layout",
+            // It acts on the flyout itself, as the `menu-*` verbs on a menu.
+            "ribbon-flyout",
             "clipboard",
             "dialog-read",
             "status-read",
@@ -7399,6 +7598,9 @@ mod tests {
             Region::ProjectTimeline,
             Region::ProjectSplit,
             Region::Gallery,
+            Region::Ribbon,
+            Region::RibbonFlyout,
+            Region::RibbonGroup(6),
             Region::BackstageContent,
             Region::BackstageRail,
             Region::FilterButton(1),

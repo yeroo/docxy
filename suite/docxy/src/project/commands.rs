@@ -144,10 +144,11 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
             "T",
             vec![
                 // Clipboard leads the Task tab, as in Project: Paste large,
-                // Cut and Copy beside it (#561).
+                // Cut and Copy beside it (#561). It is the last group to
+                // collapse as the window narrows (#1020).
                 rs::group(
                     "Clipboard",
-                    10,
+                    200,
                     vec![
                         Control::Large(cmd("pr-paste", "paste", "Paste", Paste, "Ctrl+V", "W")),
                         rs::column(vec![

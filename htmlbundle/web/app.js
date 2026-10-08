@@ -621,8 +621,10 @@
     layoutRibbon();
   }
 
-  // Responsive collapse, as the suite: drop labels first, then collapse the
-  // lowest-priority groups into an overflow indicator.
+  // Responsive collapse: drop labels first, then hide the lowest-priority
+  // groups (the suite's priorities, from ribbon-docx.json) behind an overflow
+  // indicator. The suite itself no longer hides groups: it collapses them to
+  // a button whose flyout holds the group (#1020); this page has no flyout yet.
   function layoutRibbon() {
     var r = el.ribbon;
     if (r.hidden) return;

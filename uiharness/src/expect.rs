@@ -194,7 +194,7 @@ impl BorderExpect {
 }
 
 /// The region names that are not cell references, for an error message.
-pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, filter-button:B";
+pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, filter-button:B";
 
 /// `A1` and `A1:C5` are written bare in a test; anything with a `:` head the
 /// app knows, or one of its bare names, is passed through untouched.

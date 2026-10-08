@@ -189,6 +189,10 @@ pub(crate) const fn menu(
 
 pub(crate) struct Group {
     pub title: &'static str,
+    /// The order groups shrink as the window narrows (#1020): the lowest
+    /// goes icon-only, then collapses, first. As the document ribbon's
+    /// `ribbonspec::Group::priority`, the leftmost groups are kept longest.
+    pub priority: u8,
     /// Draws the dialog-launcher glyph beside the title.
     pub launcher: bool,
     /// What the launcher runs; `None` draws it inert.
@@ -386,6 +390,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
         groups: &[
             Group {
                 title: "Clipboard",
+                priority: 90,
                 launcher: true,
                 // The Office Clipboard pane (#669).
                 launch: Some(SheetAct::OfficeClipboard),
@@ -414,6 +419,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Font",
+                priority: 80,
                 launcher: true,
                 launch: None,
                 body: rows(&[
@@ -455,6 +461,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Alignment",
+                priority: 70,
                 launcher: true,
                 launch: None,
                 body: rows(&[
@@ -486,6 +493,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Number",
+                priority: 60,
                 launcher: true,
                 launch: None,
                 body: rows(&[
@@ -521,6 +529,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Styles",
+                priority: 50,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -544,6 +553,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Cells",
+                priority: 40,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -569,6 +579,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Editing",
+                priority: 30,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -632,6 +643,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
         groups: &[
             Group {
                 title: "Tables",
+                priority: 90,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -654,6 +666,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Charts",
+                priority: 80,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -699,6 +712,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
         groups: &[
             Group {
                 title: "Themes",
+                priority: 90,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -718,6 +732,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Page Setup",
+                priority: 80,
                 launcher: true,
                 launch: Some(SheetAct::Page(PageAct::Dialog(SetupTab::Page))),
                 body: Body::Strip {
@@ -864,6 +879,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Scale to Fit",
+                priority: 70,
                 launcher: true,
                 launch: Some(SheetAct::Page(PageAct::Dialog(SetupTab::Page))),
                 body: Body::Strip {
@@ -897,6 +913,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             // here reads as its screentip does.
             Group {
                 title: "Sheet Options",
+                priority: 60,
                 launcher: true,
                 launch: Some(SheetAct::Page(PageAct::Dialog(SetupTab::Sheet))),
                 body: Body::Strip {
@@ -938,6 +955,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Arrange",
+                priority: 50,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -983,6 +1001,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
         groups: &[
             Group {
                 title: "Function Library",
+                priority: 90,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1031,6 +1050,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Defined Names",
+                priority: 80,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1055,6 +1075,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Formula Auditing",
+                priority: 70,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1082,6 +1103,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Calculation",
+                priority: 60,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1115,6 +1137,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             // Excel's names; ids prefixed where Home has the same command.
             Group {
                 title: "Sort & Filter",
+                priority: 90,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1164,6 +1187,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Data Tools",
+                priority: 80,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1224,6 +1248,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Outline",
+                priority: 70,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1264,6 +1289,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             // numbers: 1 shows only the top level, 8 everything.
             Group {
                 title: "Show Level",
+                priority: 60,
                 launcher: false,
                 launch: None,
                 body: rows(&[
@@ -1289,6 +1315,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
         groups: &[
             Group {
                 title: "Proofing",
+                priority: 90,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1303,6 +1330,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Comments",
+                priority: 80,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1332,6 +1360,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Protect",
+                priority: 70,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1360,6 +1389,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
         titles: Titles::Plain,
         groups: &[Group {
             title: "Window",
+            priority: 90,
             launcher: false,
             launch: None,
             body: Body::Strip {
@@ -1395,6 +1425,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
         groups: &[
             Group {
                 title: "Help",
+                priority: 90,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1438,6 +1469,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "About",
+                priority: 80,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1460,6 +1492,21 @@ pub(crate) fn tab_def(tab: RibbonTab) -> &'static Tab {
         .iter()
         .find(|t| t.tab == tab)
         .unwrap_or(&SHEET_RIBBON[0])
+}
+
+/// Whether `act` is a toggle drawn pressed while it is on ([`act_on`]): a
+/// press flips it and changes nothing else, so a ribbon flyout stays open
+/// over it (#1020). Fill Color and Font Color open a picker instead.
+pub(crate) fn act_toggles(act: SheetAct) -> bool {
+    matches!(
+        act,
+        SheetAct::Bold
+            | SheetAct::Italic
+            | SheetAct::ToggleBorder
+            | SheetAct::AlignL
+            | SheetAct::AlignC
+            | SheetAct::AlignR
+    )
 }
 
 /// Whether `act`'s button draws pressed for the selection's format `xf`.
@@ -2219,5 +2266,38 @@ mod tests {
         assert!(!act_on(SheetAct::Italic, &bold));
         assert!(!act_on(SheetAct::Bold, &Default::default()));
         assert!(!act_on(SheetAct::Paste, &bold));
+    }
+
+    /// #1020 r1: a command that can draw pressed is a toggle (a flyout stays
+    /// open over it); Fill Color and Font Color open a picker, and are not.
+    #[test]
+    fn the_toggles_are_the_commands_that_draw_pressed() {
+        use gridcore::sheet::{Align, Xf};
+        let on = [
+            Xf {
+                bold: true,
+                italic: true,
+                border: true,
+                align: Align::Left,
+                ..Default::default()
+            },
+            Xf {
+                align: Align::Center,
+                ..Default::default()
+            },
+            Xf {
+                align: Align::Right,
+                ..Default::default()
+            },
+        ];
+        for t in SHEET_RIBBON {
+            for c in t.commands() {
+                if on.iter().any(|xf| act_on(c.act, xf)) {
+                    assert!(act_toggles(c.act), "{} draws pressed", c.id);
+                }
+            }
+        }
+        assert!(!act_toggles(SheetAct::FillColor));
+        assert!(!act_toggles(SheetAct::FontColor));
     }
 }
