@@ -56,7 +56,8 @@
   ⌥←/→ (word start / just after the word, `Editor::move_word_end_caret`) and ⌥⌫
   to editor moves on macOS only; `on_key` tries it before the Ctrl split, and
   lowers the KeyTips the ⌥ key-down raised. Home/End are paragraph offsets, so
-  ⌘←/→ are too, not visual lines.
+  ⌘←/→ are too, not visual lines. Protected View and final documents take the
+  ⌥←/→ word moves (caret only); ⌥⌫ stays refused.
 
 ## Build info
 

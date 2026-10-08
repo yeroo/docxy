@@ -54,7 +54,10 @@ pub(crate) fn run(ed: &mut Editor, shift: bool, nav: MacNav) -> bool {
         MacNav::DocStart => ed.move_doc_start(),
         MacNav::DocEnd => ed.move_doc_end(),
         MacNav::DeleteWordBack => {
-            if !ed.has_selection() {
+            // At a paragraph start plain Backspace decides (it merges, or is
+            // no edit in a cell); a word move there would cross into the
+            // previous cell and select across it.
+            if !ed.has_selection() && ed.caret.offset > 0 {
                 ed.extend_selection(true);
                 ed.move_word_left();
             }
@@ -63,6 +66,12 @@ pub(crate) fn run(ed: &mut Editor, shift: bool, nav: MacNav) -> bool {
         }
     }
     false
+}
+
+/// Whether Protected View and final documents let the chord through: the
+/// word moves only change the caret (⌘ arrows already pass; ⌥⌫ edits).
+pub(crate) fn allowed_when_locked(nav: Option<MacNav>) -> bool {
+    matches!(nav, Some(MacNav::WordLeft | MacNav::WordEnd))
 }
 
 /// Whether the KeyTips Alt raised must go down for this key: on a Mac the ⌥
@@ -228,6 +237,48 @@ mod tests {
         run(&mut e, false, MacNav::DeleteWordBack);
         assert_eq!(e.doc.body[0].plain_text(), LINE);
         assert!(!e.has_selection());
+    }
+
+    /// Word moves are caret moves, so a locked document takes them; ⌥⌫ edits.
+    #[test]
+    fn locked_documents_take_the_word_moves_1073() {
+        let m = |k, alt| mac_nav(true, k, mods(false, alt, false));
+        assert!(allowed_when_locked(m("left", true)));
+        assert!(allowed_when_locked(m("right", true)));
+        assert!(!allowed_when_locked(m("backspace", true)));
+        assert!(!allowed_when_locked(m("left", false)));
+    }
+
+    /// ⌥⌫ at a cell's start is no edit: it must not select across into the
+    /// previous cell and empty it.
+    #[test]
+    fn delete_word_back_at_a_cell_start_keeps_the_cells_1073() {
+        let mut e = Editor::new(docxcore::model::Document {
+            body: vec![docxcore::model::Block::Paragraph(
+                docxcore::model::Paragraph::default(),
+            )],
+        });
+        e.insert_table(2, 2, docxcore::table::AutoFit::Default)
+            .unwrap();
+        for (r, c, t) in [(0, 0, "aa"), (0, 1, "bb"), (1, 0, "cc"), (1, 1, "dd")] {
+            e.set_caret(Caret::at(vec![0, r, c, 0], 0));
+            e.insert_str(t);
+        }
+        let cells = |e: &Editor| {
+            e.table(&[0])
+                .unwrap()
+                .rows
+                .iter()
+                .flat_map(|r| r.cells.iter().map(|c| c.blocks[0].plain_text()))
+                .collect::<Vec<_>>()
+        };
+        let before = cells(&e);
+        for path in [vec![0, 0, 1, 0], vec![0, 1, 0, 0], vec![0, 0, 0, 0]] {
+            e.set_caret(Caret::at(path, 0));
+            run(&mut e, false, MacNav::DeleteWordBack);
+            assert!(!e.has_selection());
+            assert_eq!(cells(&e), before);
+        }
     }
 
     #[test]

@@ -21527,6 +21527,7 @@ impl Docxy {
         // Mac ⌥←/→/⌫: the ⌥ key-down has raised the KeyTips by now (#1073).
         if self.active_is_doc() && mac_nav::lowers_keytips(mac_nav, self.keytips == KeyTip::Tabs) {
             self.keytips = KeyTip::Off;
+            self.cancel_highlight_mode(); // its check above skipped for the KeyTips
         }
         // KeyTips (Alt / F10 access keys): toggle the overlay; while it's showing,
         // letters pick a tab / run a command instead of typing.
@@ -21580,6 +21581,7 @@ impl Docxy {
         if (self.active_locked() || self.view_only_active())
             && !self.find_open
             && !open_mode::protected_allows_doc_key(key.as_str(), ctrl, m.alt)
+            && !mac_nav::allowed_when_locked(mac_nav)
         {
             self.protected_refused(cx);
             return;
@@ -24715,9 +24717,6 @@ mod repeat_tests {
         );
     }
 
-    /// Any caret move ends the typing run, by whatever path: a direct caret
-    /// assignment, as `move_vert` makes, does not reset docxcore's `last`,
-    /// so the record's caret is what ends it.
     /// A document's status hint names the Mac's keys on macOS only (#1073).
     #[test]
     fn the_status_hint_names_the_platform_keys_1073() {
@@ -24727,6 +24726,9 @@ mod repeat_tests {
         assert!(!doc_status_hint(false).contains('⌘'));
     }
 
+    /// Any caret move ends the typing run, by whatever path: a direct caret
+    /// assignment, as `move_vert` makes, does not reset docxcore's `last`,
+    /// so the record's caret is what ends it.
     #[test]
     fn a_caret_move_ends_the_typing_run_618() {
         let mut ed = three();
