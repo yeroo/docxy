@@ -160,14 +160,17 @@ impl ProjectView {
         })
     }
 
-    /// Shift+arrow: extend (or shrink) the range from the anchor to the
-    /// cursor. The first extension anchors where the cursor is; later ones
-    /// move only the cursor, so the anchor never drifts. Up/Down move over
-    /// the shown rows and never step onto the entry row; on it, Shift+arrows
-    /// do nothing. A move that lands the cursor back on the anchor leaves no
+    /// Shift+arrow, Shift+Home/End, and with `ctrl` Shift+Ctrl+arrow and
+    /// Shift+Ctrl+Home/End: extend (or shrink) the range from the anchor to
+    /// the cursor. The first extension anchors where the cursor is; later
+    /// ones move only the cursor, so the anchor never drifts. The cursor
+    /// moves as the key without Shift would (Home/End to the row's first and
+    /// last field, the Ctrl keys to the first and last shown task), but over
+    /// the shown rows only and never onto the entry row; on it, these keys do
+    /// nothing. A move that lands the cursor back on the anchor leaves no
     /// range, which [`Self::selection`] then reports.
-    pub fn extend_selection(&mut self, key: &str) -> bool {
-        if !matches!(key, "up" | "down" | "left" | "right") {
+    pub fn extend_selection(&mut self, key: &str, ctrl: bool) -> bool {
+        if !matches!(key, "up" | "down" | "left" | "right" | "home" | "end") {
             return false;
         }
         if self.on_entry_row() {
@@ -186,8 +189,12 @@ impl ProjectView {
         if self.anchor.is_none() || anchor_gone {
             self.anchor = Some((uid, self.col));
         }
+        if ctrl {
+            // Never the entry row: Ctrl+Up/Down/Home/End go to a shown task.
+            return self.ctrl_key(key);
+        }
         match key {
-            "left" | "right" => self.key(key, false),
+            "left" | "right" | "home" | "end" => self.key(key, false),
             _ => {
                 let at = self.display_row();
                 let next = if key == "up" {
