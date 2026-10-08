@@ -159,7 +159,7 @@ fn snapshot(t: &DocTab) -> Snapshot {
 
 #[test]
 fn selector_distinguishes_indices_paths_ambiguity_and_failed_projects() {
-    let mut tabs = vec![word(), tab(), tab(), new_project_tab()];
+    let mut tabs = vec![word(), tab(), tab(), new_project_tab("Project1")];
     tabs[1].path = Some(PathBuf::from("alpha/first.xml"));
     tabs[1].title = "Same.xml".into();
     tabs[2].path = Some(PathBuf::from("beta/second.xml"));
@@ -226,7 +226,7 @@ fn selector_distinguishes_indices_paths_ambiguity_and_failed_projects() {
 /// and no "loaded" check — the Inbox and a failed load are clickable chips.
 #[test]
 fn tab_matcher_spans_every_kind_and_selects_placeholders() {
-    let mut tabs = vec![word(), tab(), tab(), new_project_tab(), word()];
+    let mut tabs = vec![word(), tab(), tab(), new_project_tab("Project1"), word()];
     tabs[1].path = Some(PathBuf::from("alpha/first.xml"));
     tabs[1].title = "Same.xml".into();
     tabs[2].path = Some(PathBuf::from("beta/second.xml"));
@@ -273,8 +273,8 @@ fn new_project_reply_is_the_apps_blank_plan() {
         check_new_project_args(&args(r#"{"name":"Plan"}"#)).unwrap_err(),
         "proj.new does not take 'name'; name the plan with proj.save {\"path\"}"
     );
-    let tabs = vec![word(), new_project_tab()];
-    assert_eq!(tabs[1].title.as_ref(), "Untitled.yppx");
+    let tabs = vec![word(), new_project_tab("Project1")];
+    assert_eq!(tabs[1].title.as_ref(), "Project1");
     assert!(!tabs[1].dirty);
     let reply = new_project_reply(&tabs, 1);
     assert_eq!(reply.get("tab"), Some(&Json::Num(1.)));
@@ -749,7 +749,7 @@ fn type_enter(t: &mut DocTab, text: &str) {
 
 #[test]
 fn an_empty_plans_entry_row_survives_an_agent_task_add() {
-    let mut tabs = vec![new_project_tab()];
+    let mut tabs = vec![new_project_tab("Project1")];
     call(&mut tabs, 0, "task.add", args(r#"{"name":"Agent"}"#)).unwrap();
     assert!(view(&tabs[0]).on_entry_row());
     assert_eq!(view(&tabs[0]).cursor_row(), 1);

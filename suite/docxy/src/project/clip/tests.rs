@@ -15,7 +15,7 @@ fn vm(t: &mut DocTab) -> &mut ProjectView {
 }
 /// The issue's plan: unlinked tasks A and B, 2 days each.
 fn tab() -> DocTab {
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     for name in ["A", "B"] {
         vm(&mut t).ed.add_task(None, name, 960, false).unwrap();
     }

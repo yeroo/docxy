@@ -361,7 +361,7 @@ fn a_table_scrollbar_drag_is_not_undone_by_the_next_frame() {
 
 #[test]
 fn indent_and_outdent_change_geometry_and_undo_redo_restore_it() {
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     let status = t.status.clone();
     indent_project(&mut t, 1);
     indent_project(&mut t, -1);

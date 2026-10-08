@@ -15,7 +15,7 @@ fn vm(t: &mut DocTab) -> &mut ProjectView {
     v
 }
 fn tab() -> DocTab {
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     for (name, duration) in [("First", 480), ("Second", 960)] {
         vm(&mut t).ed.add_task(None, name, duration, false).unwrap();
     }
@@ -127,7 +127,7 @@ fn completion_reveals_selection_changes_without_disturbing_other_inputs() {
 
 #[test]
 fn baseline_on_an_empty_project_preserves_status_dirtiness_and_history() {
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     let before = v(&t).ed.project().clone();
     let status = t.status.clone();
     apply_project_act(&mut t, ProjectAct::Baseline);
@@ -913,7 +913,7 @@ fn prompts_bind_uid_cancel_and_edit_unicode_without_dispatching_commands() {
     apply_project_act(&mut t, ProjectAct::Undo);
     assert!(v(&t).prompt.is_none());
     // An empty plan has only the entry row, where task prompts do not open.
-    let mut empty = new_project_tab();
+    let mut empty = new_project_tab("Project1");
     let status = empty.status.clone();
     apply_project_act(&mut empty, ProjectAct::Constraint);
     assert!(v(&empty).prompt.is_none());
@@ -1861,7 +1861,7 @@ fn scroll_to_task_puts_the_bar_a_day_in_from_the_left_edge() {
 
 /// Phase over X and Y, then Z; saved, with Phase selected.
 fn outline_tab() -> DocTab {
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     for name in ["Phase", "X", "Y", "Z"] {
         vm(&mut t).ed.add_task(None, name, 480, false).unwrap();
     }
@@ -2100,7 +2100,7 @@ fn ctrl_home_and_end_go_to_the_first_and_last_task_and_field() {
 
 #[test]
 fn ctrl_row_jumps_on_an_empty_plan_move_only_the_column() {
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     vm(&mut t).col = COL_NAME;
     for (key, col) in [
         ("up", COL_NAME),
