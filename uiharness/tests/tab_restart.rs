@@ -73,7 +73,7 @@ fn relaunch_restores_the_tab_list_quit_left() {
     assert_eq!(dirty, ["gantt-summary.xml"], "{before}");
     assert!(
         tabs.iter()
-            .any(|t| t.get_str("title") == Some("Untitled.yppx")
+            .any(|t| t.get_str("title") == Some("Project1")
                 && t.get("path") == Some(&Json::Null)),
         "{before}"
     );

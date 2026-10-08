@@ -8,7 +8,7 @@ test issue 372 F11 opens a new empty project tab and leaves the plan alone
   call task.list {}
   assert tabs is 3
   assert tab is 2
-  assert title is Untitled.yppx
+  assert title is Project1
   assert tasks is 0
   assert dirty is false
   call title-tab {"action":"prev"}

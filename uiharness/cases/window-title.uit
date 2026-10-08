@@ -1,0 +1,35 @@
+# #588: the window title is the active tab's Project-style title. Run
+# against a fresh harness instance: the cases share it, and tab 0 is the
+# sample.docx it starts with.
+
+test issue 588 the window title is the active tab's stem  -  docxy
+  call tab-list {}
+  assert reply.active is 0
+  assert reply.tabs.0.title is sample.docx
+  assert reply.window_title is sample  -  docxy
+  call proj.new {}
+  assert reply.name is Project1
+  call tab-list {}
+  assert reply.active is 1
+  assert reply.tabs.1.title is Project1
+  assert reply.tabs.1.kind is project
+  assert reply.window_title is Project1  -  docxy
+  call proj.new {}
+  assert reply.name is Project2
+  call tab-list {}
+  assert reply.tabs.2.title is Project2
+  assert reply.window_title is Project2  -  docxy
+  call close-tab {"answer":"discard"}
+  assert tabs is 2
+  call proj.new {}
+  assert reply.name is Project3
+  call tab-list {}
+  assert tabs is 3
+  assert reply.tabs.2.title is Project3
+  assert reply.window_title is Project3  -  docxy
+
+test issue 588 a saved plan's window title is the file's stem
+  open copy:../fixtures/gantt-summary.xml
+  assert title is gantt-summary.xml
+  call tab-list {}
+  assert reply.window_title is gantt-summary  -  docxy
