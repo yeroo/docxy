@@ -363,6 +363,39 @@ fn paragraph_edits_keep_what_they_do_not_change() {
     );
 }
 
+/// A list item whose numbering is a tracked insertion and nothing else: its
+/// `w:numPr` holds only the revision mark, no `w:ilvl` or `w:numId` (#1065,
+/// from the corpus's BackgroundReport, Karen's tracked numbering).
+const NUMBERING_INSERTION: &str = "<w:p><w:pPr><w:keepNext/>\
+    <w:numPr><w:ins w:id=\"2\" w:author=\"karen\" w:date=\"2005-06-21T16:50:00Z\"/></w:numPr>\
+    <w:jc w:val=\"both\"/><w:rPr><w:sz w:val=\"22\"/></w:rPr></w:pPr>\
+    <w:r><w:t>item</w:t></w:r></w:p>";
+
+const NUMBERING_INSERTION_NUMPR: &str =
+    "<w:numPr><w:ins w:id=\"2\" w:author=\"karen\" w:date=\"2005-06-21T16:50:00Z\"/></w:numPr>";
+
+#[test]
+fn a_numbering_insertion_alone_in_num_pr_survives_a_save() {
+    let (original, saved) = round_trip(NUMBERING_INSERTION);
+    let xml = document_xml(&saved);
+    assert!(xml.contains(NUMBERING_INSERTION_NUMPR), "{xml}");
+    assert_eq!(losses(&original, &saved), [], "{xml}");
+}
+
+#[test]
+fn paragraph_edits_keep_a_numbering_insertion_alone_in_num_pr() {
+    let xml = edited(NUMBERING_INSERTION, |e| e.set_align(Align::Center));
+    let ppr = &xml[xml.find("<w:pPr>").unwrap()..xml.find("</w:pPr>").unwrap()];
+    assert!(ppr.contains(NUMBERING_INSERTION_NUMPR), "{ppr}");
+    assert!(ppr.contains("<w:jc w:val=\"center\"/>"), "{ppr}");
+    assert_eq!(ppr.matches("<w:jc ").count(), 1, "{ppr}");
+
+    let xml = edited(NUMBERING_INSERTION, |e| e.change_indent(300));
+    let ppr = &xml[xml.find("<w:pPr>").unwrap()..xml.find("</w:pPr>").unwrap()];
+    assert!(ppr.contains(NUMBERING_INSERTION_NUMPR), "{ppr}");
+    assert!(ppr.contains("<w:ind w:left=\"300\"/>"), "{ppr}");
+}
+
 fn para_ids(xml: &str) -> Vec<&str> {
     xml.match_indices("w14:paraId=\"")
         .map(|(at, m)| {
