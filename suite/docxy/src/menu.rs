@@ -36,6 +36,8 @@ pub(crate) enum MenuTarget {
     /// The Quick Access Toolbar Undo button's drop-down (#619): the undo
     /// history, newest first.
     QatUndo,
+    /// The ribbon's own right-click menu (#590): Collapse the Ribbon.
+    RibbonBar,
 }
 
 /// Which grid menu ([`MenuTarget::Grid`]).
@@ -101,6 +103,7 @@ impl MenuTarget {
             )]),
             Self::Grid(g) => Json::obj(vec![("grid", Json::Str(g.name().into()))]),
             Self::QatUndo => Json::obj(vec![("qat", Json::Str(QAT_UNDO_ID.into()))]),
+            Self::RibbonBar => Json::Str("ribbon-bar".into()),
         }
     }
 }
@@ -303,7 +306,8 @@ pub(crate) fn target_stands(
             | MenuTarget::FlashFill
             | MenuTarget::Ribbon { .. }
             | MenuTarget::Grid(_)
-            | MenuTarget::QatUndo,
+            | MenuTarget::QatUndo
+            | MenuTarget::RibbonBar,
             _,
         ) => Ok(()),
     }
@@ -477,6 +481,15 @@ pub(crate) fn document_menu() -> Vec<MenuItem> {
             true,
         )),
     ]
+}
+
+/// The ribbon's right-click menu (#590): one item, ticked while the ribbon
+/// is collapsed; the same toggle as Ctrl+F1 and the chevron.
+pub(crate) fn ribbon_bar_menu(collapsed: bool) -> Vec<MenuItem> {
+    vec![MenuItem::Item(
+        Entry::new("rb-collapse", "Collapse the Ribbon", "", Act::AutoHideRibbon, true)
+            .checked(collapsed),
+    )]
 }
 
 /// A sheet cell's context menu: the clipboard, then Excel's Sort and Filter
@@ -1052,5 +1065,36 @@ mod tests {
                 "New Comment"
             ]
         );
+    }
+
+    #[test]
+    fn ribbon_bar_menu_ticks_when_collapsed() {
+        let shown = ribbon_bar_menu(false);
+        assert_eq!(labels(&shown), ["Collapse the Ribbon"]);
+        let MenuItem::Item(e) = &shown[0] else {
+            panic!("one entry");
+        };
+        assert!(!e.checked, "expanded: no tick");
+        assert!(e.enabled);
+        assert!(
+            matches!(e.act, Some(Act::AutoHideRibbon)),
+            "runs {:?}",
+            e.act
+        );
+        let collapsed = ribbon_bar_menu(true);
+        let MenuItem::Item(e) = &collapsed[0] else {
+            panic!("one entry");
+        };
+        assert!(e.checked, "collapsed: ticked");
+    }
+
+    #[test]
+    fn ribbon_bar_target_json_and_stands() {
+        assert_eq!(
+            MenuTarget::RibbonBar.to_json(),
+            Json::Str("ribbon-bar".into())
+        );
+        assert!(target_stands(&MenuTarget::RibbonBar, Some(Some(1))).is_ok());
+        assert!(target_stands(&MenuTarget::RibbonBar, None).is_ok());
     }
 }

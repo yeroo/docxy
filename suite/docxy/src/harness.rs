@@ -2569,6 +2569,13 @@ fn menu_open(
         // The Flash Fill Options button's menu (#666): there is one only
         // while the last fill stands.
         Json::Str(name) if name == "flash-fill" => app.open_flash_menu(cx),
+        // The ribbon's own right-click menu (#590): the tab strip or the
+        // body, through the same opener the pointer press calls.
+        Json::Str(name) if name == "ribbon-bar" => {
+            let at = menu_point(app, window, Some("ribbon-body"), |b| b.center());
+            app.open_ribbon_bar_menu(at, cx);
+            Ok(())
+        }
         Json::Str(name) if name == "document" => {
             if app.active_is_project() {
                 return Err(
@@ -2680,7 +2687,7 @@ fn menu_open(
                 app.open_undo_menu(at, cx)
             }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, row, ribbon, grid and qat are)"
+                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, ribbon-bar, row, ribbon, grid and qat are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
