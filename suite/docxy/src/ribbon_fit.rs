@@ -33,6 +33,10 @@ pub(crate) const COLLAPSED_TITLE_PX: f32 = 10.0;
 /// A text measure: `tw(text, size_px)` is the drawn width of `text`.
 pub(crate) type TextWidth<'a> = &'a dyn Fn(&str, f32) -> f32;
 
+/// Whether a sheet command's state is on now (`Docxy::sheet_act_toggled`):
+/// Freeze Panes then reads Unfreeze Panes, and is measured so.
+pub(crate) type Toggled<'a> = &'a dyn Fn(crate::SheetAct) -> bool;
+
 /// How a group is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum State {
@@ -366,8 +370,8 @@ pub(crate) fn sheet_cmd_drops_label(c: &SheetCmd) -> bool {
 }
 
 /// One sheet command's drawn width (`Docxy::sheet_cmd_el`).
-pub(crate) fn sheet_cmd_w(c: &SheetCmd, icon_only: bool, tw: TextWidth) -> f32 {
-    let text = c.text(false);
+pub(crate) fn sheet_cmd_w(c: &SheetCmd, icon_only: bool, on: Toggled, tw: TextWidth) -> f32 {
+    let text = c.text(on(c.act));
     match c.shape {
         // `sheet_dropdown_btn`: `px_1p5` around a 22px icon or the label.
         Shape::Menu(_) => (12.0 + menu_label_w(c.label, 11.0, tw).max(22.0)).max(40.0),
@@ -401,15 +405,15 @@ pub(crate) fn sheet_cmd_w(c: &SheetCmd, icon_only: bool, tw: TextWidth) -> f32 {
 
 /// One slot of a sheet strip: a command, a column (its widest command), or
 /// a drop-down button.
-pub(crate) fn sheet_item_w(item: &Item, icon_only: bool, tw: TextWidth) -> f32 {
+pub(crate) fn sheet_item_w(item: &Item, icon_only: bool, on: Toggled, tw: TextWidth) -> f32 {
     match item {
-        Item::One(c) => sheet_cmd_w(c, icon_only, tw),
+        Item::One(c) => sheet_cmd_w(c, icon_only, on, tw),
         Item::Col(col) => col
             .cmds
             .iter()
-            .map(|c| sheet_cmd_w(c, icon_only, tw))
+            .map(|c| sheet_cmd_w(c, icon_only, on, tw))
             .fold(0.0, f32::max),
-        Item::Menu(m) => sheet_cmd_w(&m.button, icon_only, tw),
+        Item::Menu(m) => sheet_cmd_w(&m.button, icon_only, on, tw),
     }
 }
 
@@ -426,13 +430,14 @@ pub(crate) fn sheet_group_w(
     g: &sheet_ribbon::Group,
     titles: sheet_ribbon::Titles,
     icon_only: bool,
+    on: Toggled,
     tw: TextWidth,
 ) -> f32 {
     let body = match &g.body {
         Body::Strip { gap, items } => {
             let widths: f32 = items
                 .iter()
-                .map(|item| sheet_item_w(item, icon_only, tw))
+                .map(|item| sheet_item_w(item, icon_only, on, tw))
                 .sum();
             widths + gap_px(*gap) * items.len().saturating_sub(1) as f32
         }
@@ -441,7 +446,7 @@ pub(crate) fn sheet_group_w(
             .iter()
             .map(|row| {
                 row.iter()
-                    .map(|c| sheet_cmd_w(c, icon_only, tw))
+                    .map(|c| sheet_cmd_w(c, icon_only, on, tw))
                     .sum::<f32>()
                     + 2.0 * row.len().saturating_sub(1) as f32
             })
@@ -458,15 +463,16 @@ pub(crate) fn sheet_group_w(
 pub(crate) fn sheet_spec(
     g: &sheet_ribbon::Group,
     titles: sheet_ribbon::Titles,
+    on: Toggled,
     tw: TextWidth,
 ) -> Spec {
-    let full = sheet_group_w(g, titles, false, tw);
+    let full = sheet_group_w(g, titles, false, on, tw);
     let drops = g.commands().iter().any(|c| sheet_cmd_drops_label(c));
     Spec {
         priority: g.priority,
         full,
         icon: if drops {
-            sheet_group_w(g, titles, true, tw)
+            sheet_group_w(g, titles, true, on, tw)
         } else {
             full
         },
@@ -499,6 +505,37 @@ mod tests {
         approx_tw(text, size)
     }
 
+    fn off(_: crate::SheetAct) -> bool {
+        false
+    }
+
+    /// #1020 r2: a command whose label reads differently while its state is
+    /// on (Freeze Panes, Unfreeze Panes) is measured as it reads now.
+    #[test]
+    fn a_toggled_label_is_measured_as_drawn() {
+        let view = sheet_ribbon::tab_def(crate::RibbonTab::View);
+        let freeze = view
+            .commands()
+            .into_iter()
+            .find(|c| c.alt.is_some())
+            .expect("View has Freeze Panes");
+        let on = |_: crate::SheetAct| true;
+        assert_eq!(
+            sheet_cmd_w(freeze, false, &on, &tw),
+            sheet_cmd_w(
+                &SheetCmd {
+                    text: freeze.alt,
+                    alt: None,
+                    ..*freeze
+                },
+                false,
+                &off,
+                &tw
+            ),
+        );
+        assert!(sheet_cmd_w(freeze, false, &on, &tw) > sheet_cmd_w(freeze, false, &off, &tw));
+    }
+
     /// Every ribbon tab the suite draws, by name: the document's and the
     /// Project's (contextual tabs too) from the model, the workbook's from
     /// the sheet table, each as its groups' specs.
@@ -521,7 +558,7 @@ mod tests {
             let specs = t
                 .groups
                 .iter()
-                .map(|g| sheet_spec(g, t.titles, &tw))
+                .map(|g| sheet_spec(g, t.titles, &off, &tw))
                 .collect();
             out.push((format!("sheet {}", crate::ribbon_tab_name(t.tab)), specs));
         }
@@ -631,7 +668,7 @@ mod tests {
                 sheet
                     .groups
                     .iter()
-                    .map(|g| sheet_spec(g, sheet.titles, &tw))
+                    .map(|g| sheet_spec(g, sheet.titles, &off, &tw))
                     .collect(),
             ),
         ];
@@ -832,7 +869,10 @@ mod tests {
                 let Body::Strip { gap, items } = &g.body else {
                     continue;
                 };
-                let widths: Vec<f32> = items.iter().map(|i| sheet_item_w(i, false, &tw)).collect();
+                let widths: Vec<f32> = items
+                    .iter()
+                    .map(|i| sheet_item_w(i, false, &off, &tw))
+                    .collect();
                 for row in wrap_rows(&widths, gap_px(*gap), sheet_max) {
                     let w: f32 = widths[row.clone()].iter().sum::<f32>()
                         + gap_px(*gap) * (row.len() - 1) as f32;

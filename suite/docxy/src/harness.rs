@@ -2000,7 +2000,9 @@ fn add_group_states(json: &mut Json, app: &crate::Docxy, window: &Window) {
             }
             def.groups
                 .iter()
-                .map(|g| crate::ribbon_fit::sheet_spec(g, def.titles, &tw))
+                .map(|g| {
+                    crate::ribbon_fit::sheet_spec(g, def.titles, &|a| app.sheet_act_toggled(a), &tw)
+                })
                 .collect()
         } else {
             let Ok(def) = ribbon_tab_def(app, &name) else {

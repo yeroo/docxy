@@ -351,6 +351,12 @@ test document Home at the narrowest window
   call ribbon-click {"tab":"Home","command":"indinc"}
   call ribbon-flyout {}
   assert reply.open is false
+  # Font colour opens a picker: it flips no state, so the flyout closes.
+  call ribbon-flyout {"action":"open","group":"Font"}
+  assert reply.open is true
+  call ribbon-click {"tab":"Home","command":"color"}
+  call ribbon-flyout {}
+  assert reply.open is false
 
 test Project Task tab narrow
   open ../fixtures/gantt-summary.xml
@@ -443,6 +449,17 @@ test a flyout wider than the window wraps inside it
   assert reply.inside is true
   call ribbon-click {"tab":"Table Design","command":"tablestyles:Grid Table 4 Accent 1"}
   assert table.style is GridTable4-Accent1
+  # Header Row is a check box in a column: it flips its state, and the
+  # Table Style Options flyout stays open to show it (#1020 r2).
+  call ribbon-flyout {"action":"open","group":"Table Style Options"}
+  assert reply.open is true
+  call ribbon-click {"tab":"Table Design","command":"header-row"}
+  call ribbon-flyout {}
+  assert reply.open is true
+  assert reply.group is Table Style Options
+  call ribbon-click {"tab":"Table Design","command":"header-row"}
+  call ribbon-flyout {}
+  assert reply.open is true
   open ../fixtures/basic.xlsx
   call window-size {"w":460,"h":800}
   call ribbon-layout {"tab":"Formulas"}

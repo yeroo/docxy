@@ -25642,36 +25642,6 @@ fn ribbon_text_width(window: &Window) -> impl Fn(&str, f32) -> f32 + use<> {
     move |text, size| m.width(text, size, false, false)
 }
 
-/// The commands whose button is a plain toggle, drawn pressed while it is on
-/// (`Docxy::act_active`): a press flips it and changes nothing else, so a
-/// ribbon flyout stays open over it (#1020). A button that opens a picker
-/// (Font Color, Text Highlight) or a dialog is not one.
-fn act_toggles(act: Act) -> bool {
-    use Act::*;
-    matches!(
-        act,
-        Bold | Italic
-            | Underline
-            | Strike
-            | Super
-            | Sub
-            | AlignL
-            | AlignC
-            | AlignR
-            | AlignJ
-            | Bullets
-            | Numbers
-            | ParaBorders
-            | ShowHide
-            | ToggleComments
-            | ToggleTrack
-            | ToggleNav
-            | ToggleNotes
-            | PrintLayout
-            | ToggleRuler
-    )
-}
-
 fn move_vert(ed: &mut Editor, down: bool) {
     if ed.caret.path.len() != 1 {
         return;
@@ -28172,14 +28142,28 @@ impl Docxy {
         }
     }
 
+    /// Run `act`, and end an open ribbon flyout's moment (#1020) unless the
+    /// command is one of its group's small buttons or check boxes and it
+    /// flipped its own on state (`act_active`): Bold, Center, Header Row,
+    /// Ruler. Such a toggle leaves the flyout open to show the new state; a
+    /// button that opens a picker or a dialog (Font Color) flips nothing.
     fn dispatch(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
-        // A command run from anywhere ends an open menu's moment (#397).
-        self.close_menu();
-        // And a ribbon flyout's, except a toggle in it, which leaves the
-        // flyout open to show its new state (#1020).
-        if !self.flyout_keeps_open_for_act(act) {
+        let before = self
+            .flyout_holds_small_button(act)
+            .then(|| self.act_active(act));
+        if before.is_none() {
             self.ribbon_flyout = None;
         }
+        self.dispatch_act(act, window, cx);
+        if before.is_some_and(|on| self.act_active(act) == on) {
+            self.ribbon_flyout = None;
+            cx.notify();
+        }
+    }
+
+    fn dispatch_act(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
+        // A command run from anywhere ends an open menu's moment (#397).
+        self.close_menu();
         // Protected View (#633): the ribbon is hidden, but shortcuts, KeyTips,
         // context menus and the harness's `ribbon-click` still come here.
         // Resolve and Delete all hold no text of the view: only Protected View
@@ -28354,11 +28338,12 @@ impl Docxy {
             multiunzip(rows)
         } else {
             let tab = sheet_ribbon::tab_def(self.ribbon_tab);
+            let on = |act| self.sheet_act_toggled(act);
             let rows = tab.groups.iter().map(|g| {
                 (
                     g.title,
                     ribbon_fit::sheet_group_icon(g),
-                    ribbon_fit::sheet_spec(g, tab.titles, &tw),
+                    ribbon_fit::sheet_spec(g, tab.titles, &on, &tw),
                 )
             });
             multiunzip(rows)
@@ -28388,16 +28373,18 @@ impl Docxy {
             .find(|g| g.title == title)
     }
 
-    /// Whether `act` is a toggle of the open flyout's group: a small button
-    /// with an on state (Bold, Center, Bullets: [`act_toggles`]), which keeps
-    /// the flyout open. A button that opens a picker (Font Color) does not.
-    fn flyout_keeps_open_for_act(&self, act: Act) -> bool {
-        if !self.ribbon_is_model() || !act_toggles(act) {
+    /// Whether `act` is a small button or check box of the open flyout's
+    /// group: a toggle, a row button or a column command, the controls that
+    /// can draw an on state (`Docxy::dispatch` keeps the flyout open if the
+    /// command flips it).
+    fn flyout_holds_small_button(&self, act: Act) -> bool {
+        if !self.ribbon_is_model() {
             return false;
         }
         self.flyout_group().is_some_and(|g| {
             g.items.iter().any(|c| match c {
                 Control::Toggle(cmd) => cmd.act == act,
+                Control::Column(cmds) => cmds.iter().any(|cmd| cmd.act == act),
                 Control::Rows(rows) => rows
                     .iter()
                     .flatten()
@@ -28407,7 +28394,7 @@ impl Docxy {
         })
     }
 
-    /// As [`Self::flyout_keeps_open_for_act`] for the sheet ribbon: a check
+    /// As [`Self::dispatch`]'s rule for the sheet ribbon: a check
     /// box, or an icon or glyph button with an on state
     /// ([`sheet_ribbon::act_toggles`]), of the open flyout's group.
     fn flyout_keeps_open_for_sheet_act(&self, act: SheetAct) -> bool {
@@ -28661,7 +28648,9 @@ impl Docxy {
                 let widths = match &g.body {
                     sheet_ribbon::Body::Strip { items, .. } => items
                         .iter()
-                        .map(|i| ribbon_fit::sheet_item_w(i, false, &tw))
+                        .map(|i| {
+                            ribbon_fit::sheet_item_w(i, false, &|a| self.sheet_act_toggled(a), &tw)
+                        })
                         .collect(),
                     sheet_ribbon::Body::Rows(_) => Vec::new(),
                 };
@@ -30624,7 +30613,8 @@ impl Docxy {
 
     /// Whether a toggle command is currently "on" for the caret's formatting, so
     /// the ribbon button can show a pressed state (Word highlights e.g. Bold when
-    /// the caret sits in bold text).
+    /// the caret sits in bold text). A ribbon flyout stays open over a command
+    /// that flips it (`Docxy::dispatch`, #1020).
     fn act_active(&self, act: Act) -> bool {
         use Act::*;
         let doc = match self.tabs.get(self.active).map(|t| &t.surface) {

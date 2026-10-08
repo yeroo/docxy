@@ -1494,7 +1494,6 @@ pub(crate) fn tab_def(tab: RibbonTab) -> &'static Tab {
         .unwrap_or(&SHEET_RIBBON[0])
 }
 
-/// Whether `act`'s button draws pressed for the selection's format `xf`.
 /// Whether `act` is a toggle drawn pressed while it is on ([`act_on`]): a
 /// press flips it and changes nothing else, so a ribbon flyout stays open
 /// over it (#1020). Fill Color and Font Color open a picker instead.
@@ -1510,6 +1509,7 @@ pub(crate) fn act_toggles(act: SheetAct) -> bool {
     )
 }
 
+/// Whether `act`'s button draws pressed for the selection's format `xf`.
 pub(crate) fn act_on(act: SheetAct, xf: &gridcore::sheet::Xf) -> bool {
     use gridcore::sheet::Align;
     match act {
