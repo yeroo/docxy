@@ -1,0 +1,165 @@
+# Multi-window support (#587): window-list / window-new / window-select /
+# window-arrange drive New Window and Arrange All through the same handlers
+# as View > Window. Run against a fresh harness instance, whose one tab is
+# the never-saved sample. The desktop restart check is the ignored test
+# uiharness/tests/windows_restart.rs.
+
+test window list and new window move the active tab
+  assert windows is 1
+  open ../fixtures/basic.docx
+  assert tabs is 2
+  call window-list {}
+  assert reply.count is 1
+  assert reply.windows.0.tabs is 2
+  call window-new {}
+  assert reply.window is 2
+  assert windows is 2
+  # The new window is selected and holds the moved tab; the source kept the sample.
+  assert tabs is 1
+  assert title is basic.docx
+  call window-select {"window":1}
+  assert window is 1
+  assert tabs is 1
+  assert title is sample.docx
+  call tab-list {}
+  assert reply.tabs.0.title is sample.docx
+
+test window new refuses the only tab an out of range tab and a tab under a dialog
+  call window-select {"window":2}
+  assert tabs is 1
+  call-error window-new {"tab":0} => the only tab cannot move to a new window; close the window instead
+  call-error window-new {"tab":5} => no tab 5: this window has 1
+  call-error window-new {"tab":-1} => 'tab' must be a whole number, not below zero
+  call-error window-new {"tab":"0"} => 'tab' must be a whole number, not below zero
+  # A dialog on the named tab refuses the move too, naming it.
+  open copy:../fixtures/gantt-summary.xml
+  assert tabs is 2
+  call tab-select {"tab":"basic.docx"}
+  type edited
+  call close-tab {}
+  assert dialog is save-on-close
+  call-error window-new {"tab":0} => a dialog is open: Save your changes to this file?
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  assert tabs is 2
+
+test window arrange resizes every window and replies the count
+  call window-arrange {}
+  assert reply.arranged is 2
+  assert status is Arranged 2 windows
+
+test the untitled counter is run wide
+  # Ctrl+N in window 2, then again in the window the tab moved to: before
+  # the fix both minted "Document2" (each window carried its own counter).
+  key ctrl+n
+  assert title is Document1
+  call window-new {}
+  assert reply.window is 3
+  key ctrl+n
+  assert title is Document2
+  call window-select {"window":2}
+  call tab-select {"tab":"basic.docx"}
+  key ctrl+n
+  assert title is Document3
+
+test a copy in one window pastes in a new window
+  # The clipboard is the run's: a private one under the harness, so a new
+  # window must paste what window 2 copied, not nothing. The paste target is
+  # a fresh blank document: only a real paste dirties it.
+  call window-select {"window":2}
+  call tab-select {"tab":"basic.docx"}
+  call selection-set {"start":0,"end":6}
+  key ctrl+c
+  call window-select {"window":1}
+  call window-new {}
+  assert reply.window is 4
+  key ctrl+v
+  assert dirty is true
+
+test closing the first window keeps the control server alive
+  # The new window opens through the RIBBON handler — the UI path, not a
+  # harness verb.
+  call window-select {"window":1}
+  call ribbon-click {"tab":"View","command":"New Window"}
+  # The reply describes the NEW window, like window-new's: the ribbon's
+  # New Window selects it.
+  assert reply.title is Document5
+  assert reply.tabs is 1
+  assert windows is 5
+  call window-select {"window":1}
+  call close-window {}
+  assert windows is 4
+  assert window is 5
+  # The server and pump outlived window 1: these verbs still answer.
+  call window-list {}
+  assert reply.count is 4
+  # Selecting the window that is already selected is a plain read of its
+  # state, not a second borrow of its view.
+  call window-select {"window":5}
+  assert window is 5
+  assert tabs is 1
+
+test a moved window carries the harness policies
+  # Window 6 is a New Window view: its Save As refusal must be the harness
+  # one. A native dialog here would open on the test display and hang. The
+  # moved tab is named explicitly so the case does not depend on which tab
+  # was active.
+  call window-select {"window":2}
+  call window-new {"tab":2}
+  assert reply.window is 6
+  key ctrl+n
+  assert title is Document6
+  type edited
+  key ctrl+s
+  assert status is this document has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb
+
+test closing a non last window with unsaved work asks whatever the setting
+  # Ask-on-close is off by default: the Force ask is what a non-last close
+  # does regardless. Document6 (window 6's active tab) is dirty from the
+  # case above.
+  call window-select {"window":6}
+  assert ask_on_close is false
+  call close-window {}
+  assert dialog is save-on-close
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  assert windows is 5
+  # Answered: the window leaves, the app lives, another window keeps working.
+  call close-window {}
+  call dialog-click {"button":"Don't Save"}
+  assert dialog is none
+  assert windows is 4
+  assert window is 5
+  assert tabs is 1
+  assert title is Document5
+  call tab-list {}
+  assert reply.tabs.0.title is Document5
+
+test shift f11 on a project tab opens a window and the key reply describes it
+  call window-select {"window":2}
+  call tab-select {"tab":"gantt-summary.xml"}
+  call key {"key":"shift+f11"}
+  assert reply.window is 7
+  assert reply.title is gantt-summary.xml
+  assert reply.tabs is 1
+
+test a grid cut pastes as text in another window and still moves once at home
+  # The grid clip is per window: a cut pasted into ANOTHER window lands the
+  # clipboard's plain text (like a paste from another application); back
+  # home, the same cut still moves its cells exactly once.
+  call window-select {"window":2}
+  open copy:../fixtures/basic.xlsx
+  assert title is basic.xlsx
+  click A1
+  click B1 shift
+  key ctrl+x
+  call window-select {"window":4}
+  key ctrl+v
+  assert dirty is true
+  call window-select {"window":2}
+  click C1
+  key ctrl+v
+  call cell {"cell":"A1"}
+  assert reply.value is nothing
+  call cell {"cell":"C1"}
+  assert reply.value is not nothing

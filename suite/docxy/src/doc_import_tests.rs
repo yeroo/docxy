@@ -348,7 +348,7 @@ fn a_dirty_imported_tab_survives_hot_exit() {
         if convert {
             convert_tab(&mut tab).unwrap();
         }
-        let persisted = persist_tab(&hot, 0, &tab);
+        let persisted = persist_tab(&hot, 0, 0, &tab);
         let json = serde_json::to_vec(&Session {
             tabs: vec![persisted],
             ..Session::default()

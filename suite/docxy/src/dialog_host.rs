@@ -408,7 +408,7 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         // The user name is the app's setting, not the tab's (#620).
-        if let Some(done) = self.user_name_click(button) {
+        if let Some(done) = self.user_name_click(button, cx) {
             return done;
         }
         // About's Copy and Close are the app's too (#1023).
@@ -416,7 +416,7 @@ impl Docxy {
             return done;
         }
         // So is AutoCorrect (#667).
-        if let Some(done) = self.autocorrect_click(button) {
+        if let Some(done) = self.autocorrect_click(button, cx) {
             return done;
         }
         // The close prompt closes the tab, or goes on with the window's
@@ -425,7 +425,7 @@ impl Docxy {
             return done;
         }
         // So are the custom lists, which the Series dialog reads (#668).
-        if let Some(done) = self.fill_dialog_click(button) {
+        if let Some(done) = self.fill_dialog_click(button, cx) {
             return done;
         }
         // And the copy Paste Special pastes (#669).
@@ -441,7 +441,7 @@ impl Docxy {
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
         dialog_click(tab, button)?;
         if reopen {
-            self.after_reopen();
+            self.after_reopen(cx);
         }
         // A dialog that moved to another sheet (Go To) leaves the grid state
         // of the one it left behind, as a sheet-tab click does (#707 r5 M3).
@@ -449,15 +449,15 @@ impl Docxy {
             self.drop_grid_state();
         }
         // A merge or a sheet of labels opens as a new document.
-        self.take_mail_outputs();
+        self.take_mail_outputs(cx);
         Ok(())
     }
 
     /// The tab may have been replaced by its file: nothing the window held
     /// for the old one applies, and the session should say what is open.
-    fn after_reopen(&mut self) {
+    fn after_reopen(&mut self, cx: &mut App) {
         self.drop_grid_state();
-        self.persist();
+        self.persist(cx);
     }
 
     /// A key for the open dialog, the app's or the active tab's; see
@@ -511,9 +511,9 @@ impl Docxy {
         let taken = dialog_key_with(tab, key, typed, m, clip.as_deref());
         if taken {
             if reopen {
-                self.after_reopen();
+                self.after_reopen(cx);
             }
-            self.take_mail_outputs();
+            self.take_mail_outputs(cx);
             cx.notify();
         }
         taken

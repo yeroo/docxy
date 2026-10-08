@@ -1515,7 +1515,9 @@ fn f11_commits_the_cell_before_the_new_project_and_an_invalid_cell_stays() {
     );
     assert_eq!(v(&t).cell.as_ref().unwrap().buf, "invalid");
     assert_eq!(v(&t).ed.project(), &before);
-    // With a modifier, F11 is just another key to a valid cell: no commit.
+    // With a modifier other than Shift, F11 is just another key to a valid
+    // cell: no commit. Shift+F11 is New Window (#587): like F11's new
+    // project, it commits the cell first.
     let with = |shift, control, alt| Modifiers {
         shift,
         control,
@@ -1523,7 +1525,6 @@ fn f11_commits_the_cell_before_the_new_project_and_an_invalid_cell_stays() {
         ..Modifiers::default()
     };
     for m in [
-        with(true, false, false),
         with(false, true, false),
         with(false, false, true),
         with(true, true, false),
@@ -1534,6 +1535,22 @@ fn f11_commits_the_cell_before_the_new_project_and_an_invalid_cell_stays() {
         assert_eq!(v(&t).cell.as_ref().unwrap().buf, "Named", "{m:?}");
         assert_eq!(v(&t).ed.project().task(10).unwrap().name, "Task 1");
     }
+    let mut t = tab();
+    edit(&mut t, COL_NAME, "Named");
+    assert_eq!(
+        project_input(&mut t, "f11", None, with(true, false, false)),
+        Some(ProjectAct::NewWindow)
+    );
+    assert!(v(&t).cell.is_none());
+    assert_eq!(v(&t).ed.project().task(10).unwrap().name, "Named");
+    // An invalid cell refuses the commit, so New Window does not run.
+    let mut t = tab();
+    edit(&mut t, COL_DURATION, "invalid");
+    assert_eq!(
+        project_input(&mut t, "f11", None, with(true, false, false)),
+        None
+    );
+    assert_eq!(v(&t).cell.as_ref().unwrap().buf, "invalid");
 }
 
 // ---- Range selection (#560) -------------------------------------------------

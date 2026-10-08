@@ -75,6 +75,13 @@ pub(crate) enum ProjectAct {
     Paste,
     /// F11: a new, empty project in its own tab, as Backstage › New › Project.
     NewProject,
+    /// Shift+F11 / View › Window: move the active tab into a new window
+    /// (#587); a one-tab window opens the new window on a blank document.
+    NewWindow,
+    /// View › Window: resize every window to an equal strip of this window's
+    /// display (gpui cannot move windows at the pinned rev, so positions
+    /// stay).
+    ArrangeAll,
 }
 
 impl ProjectAct {
@@ -109,6 +116,8 @@ impl ProjectAct {
         Self::Paste,
         Self::Cut,
         Self::Copy,
+        Self::NewWindow,
+        Self::ArrangeAll,
     ];
 }
 
@@ -444,6 +453,28 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                         "T",
                     )])],
                 ),
+                rs::group(
+                    "Window",
+                    60,
+                    vec![rs::column(vec![
+                        cmd(
+                            "pr-new-window",
+                            "new",
+                            "New Window",
+                            NewWindow,
+                            "Shift+F11",
+                            "N",
+                        ),
+                        cmd(
+                            "pr-arrange-all",
+                            "columns",
+                            "Arrange All",
+                            ArrangeAll,
+                            "Alt, W, A",
+                            "A",
+                        ),
+                    ])],
+                ),
             ],
         ),
         // Help ends the row, as in Project (#1021).
@@ -770,8 +801,9 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
         "insert" => Some(InsertBlankRow),
         "delete" => Some(ClearCell),
         "f3" => Some(FindNext),
-        // Shift+F11 is Project's New Window; it stays unbound.
-        "f11" if !m.shift => Some(NewProject),
+        // Shift+F11 is Project's New Window (#587); plain F11 a new project.
+        "f11" if m.shift => Some(NewWindow),
+        "f11" => Some(NewProject),
         _ => None,
     }
 }
@@ -793,8 +825,10 @@ pub(crate) fn project_input(
         if m.control && !m.alt && !m.platform && key == "s" {
             return commit_project_cell(tab).then_some(ProjectAct::Save);
         }
-        if key_act(key, m) == Some(ProjectAct::NewProject) {
-            return commit_project_cell(tab).then_some(ProjectAct::NewProject);
+        // F11's new project and Shift+F11's New Window (#587) commit the
+        // open cell first, as every command act does (#561).
+        if let Some(act @ (ProjectAct::NewProject | ProjectAct::NewWindow)) = key_act(key, m) {
+            return commit_project_cell(tab).then_some(act);
         }
         // #561: the host edits the open cell's buffer in place; the edit
         // stays open, so the range anchor survives like it does for Copy.
@@ -1478,6 +1512,9 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             // Window-dependent host actions: the file dialog, the clipboard,
             // a new tab.
             Save | ExportGantt | Copy | Cut | Paste | NewProject => {}
+            // App-level View › Window commands (#587): the host dispatches
+            // them on the app before a tab ever sees them.
+            NewWindow | ArrangeAll => {}
         }
         Ok(())
     })();
@@ -1698,6 +1735,16 @@ impl Docxy {
         match act {
             ProjectAct::Save => return self.save_project(false, window, cx),
             ProjectAct::NewProject => return self.add_tab(Kind::Project, window, cx),
+            // View › Window (#587): app-level commands, handled on the app,
+            // not the plan; their refusals reach the status line.
+            ProjectAct::NewWindow => match self.new_window(None, window, cx) {
+                Ok(_) => self.set_status("Opened a new window"),
+                Err(e) => self.set_status(e),
+            },
+            ProjectAct::ArrangeAll => {
+                let n = self.arrange_all(window, cx);
+                self.set_status(format!("Arranged {n} windows"));
+            }
             // Deferred so the status bar can say Busy: render schedules it.
             ProjectAct::Level | ProjectAct::LevelAll | ProjectAct::ClearLeveling => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -1711,7 +1758,7 @@ impl Docxy {
                 let Some(tab) = self.tabs.get(self.active) else {
                     return;
                 };
-                match export_decision(tab, self.harness.is_some()) {
+                match export_decision(tab, self.harness) {
                     ExportDecision::InPlace(p) => finish_project_export(&mut self.tabs[self.active], Some(&p)),
                     ExportDecision::Dialog { suggested } => {
                         let target = rfd::FileDialog::new().add_filter("Markdown", &["md"]).set_file_name(suggested).save_file();

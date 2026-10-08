@@ -323,7 +323,7 @@ fn after_a_restart_an_in_place_save_keeps_the_format() {
         );
         let hot = dir.path("hot");
         std::fs::create_dir_all(&hot).unwrap();
-        let persisted = persist_tab(&hot, 0, &tab);
+        let persisted = persist_tab(&hot, 0, 0, &tab);
         assert!(persisted.hot.is_some(), "{name}");
         let mut back = restore_tab(&persisted);
         assert_eq!(back.path.as_deref(), Some(target.as_path()), "{name}");
@@ -355,7 +355,7 @@ fn without_a_sidecar_the_file_reopens_and_is_not_written_over() {
         let on_disk = std::fs::read(&target).unwrap();
         let hot = dir.path("hot");
         std::fs::create_dir_all(&hot).unwrap();
-        let mut persisted = persist_tab(&hot, 0, &tab);
+        let mut persisted = persist_tab(&hot, 0, 0, &tab);
         persisted.hot = None;
         persisted.dirty = false;
         let mut back = restore_tab(&persisted);

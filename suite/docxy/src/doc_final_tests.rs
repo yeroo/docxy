@@ -120,7 +120,7 @@ fn the_session_keeps_the_packages_answer() {
 
     // Unedited: its hot-exit copy carries the mark, and so does its file.
     let tab = tab_from_path(&src);
-    let mut persisted = persist_tab(&hot, 0, &tab);
+    let mut persisted = persist_tab(&hot, 0, 0, &tab);
     assert!(persisted.hot.is_some());
     assert!(restore_tab(&persisted).access.marked_final);
     persisted.hot = None;
@@ -130,7 +130,7 @@ fn the_session_keeps_the_packages_answer() {
     // the file on disk, never saved, is still final.
     let mut tab = tab_from_path(&src);
     edit_anyway_tab(&mut tab);
-    let persisted = persist_tab(&hot, 1, &tab);
+    let persisted = persist_tab(&hot, 0, 1, &tab);
     let back = restore_tab(&persisted);
     assert!(!back.access.marked_final);
     assert!(!back.access.locked());
@@ -148,7 +148,7 @@ fn recovered_edits_of_a_final_document_are_kept() {
     let mut tab = tab_from_path(&src);
     leak_edit(&mut tab, "Recovered ");
     tab.dirty = true;
-    let persisted = persist_tab(&hot, 0, &tab);
+    let persisted = persist_tab(&hot, 0, 0, &tab);
     assert!(persisted.dirty && persisted.hot.is_some());
 
     let mut back = restore_tab(&persisted);
@@ -162,7 +162,7 @@ fn recovered_edits_of_a_final_document_are_kept() {
     // An edit lands as an edit, and the work survives the next persist.
     back.mark_dirty();
     assert!(text(&back).starts_with("Recovered "));
-    let again = restore_tab(&persist_tab(&hot, 1, &back));
+    let again = restore_tab(&persist_tab(&hot, 0, 1, &back));
     assert!(again.dirty && text(&again).starts_with("Recovered "));
     // The file itself is untouched and still final.
     assert!(saved_is_final(&src));

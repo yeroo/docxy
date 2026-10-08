@@ -142,7 +142,7 @@ impl Docxy {
     /// Open `url` in the browser and record it for `last-url`. A harness run
     /// records it only: a test never starts a browser.
     fn open_help_url(&mut self, url: String, cx: &mut Context<Self>) {
-        if self.harness.is_none() {
+        if !self.harness {
             cx.open_url(&url);
         }
         self.last_opened_url = Some(url);

@@ -257,7 +257,7 @@ fn exit_and_restore(tabs: &mut [DocTab], name: &str) -> Vec<DocTab> {
     let restored = tabs
         .iter()
         .enumerate()
-        .map(|(i, t)| restore_tab(&persist_tab(&dir, i, t)))
+        .map(|(i, t)| restore_tab(&persist_tab(&dir, 0, i, t)))
         .collect();
     let _ = std::fs::remove_dir_all(&dir);
     restored
@@ -1103,7 +1103,7 @@ fn a_session_from_before_the_mark_asks_the_file_whether_it_loads() {
         let mut t = tab_from_path(path);
         t.dirty = true;
         // Written as a session from before #209: sidecar present, no mark.
-        let mut p = persist_tab(&dir, i, &t);
+        let mut p = persist_tab(&dir, 0, i, &t);
         assert!(p.hot.is_some());
         p.load_failed = None;
         let mut r = restore_tab(&p);
@@ -1119,7 +1119,7 @@ fn a_session_from_before_the_mark_asks_the_file_whether_it_loads() {
     let mut t = tab_from_path(&gone);
     t.dirty = true;
     let text = doc_text(&t);
-    let mut p = persist_tab(&dir, 5, &t);
+    let mut p = persist_tab(&dir, 0, 5, &t);
     p.load_failed = None;
     std::fs::remove_file(&gone).unwrap();
     let mut r = restore_tab(&p);
@@ -1140,7 +1140,7 @@ fn a_session_from_before_strict_markdown_decoding_cannot_overwrite_its_source() 
     let mut tab = tab_from_path(&path);
     assert!(!tab.load_failed);
     tab.dirty = true;
-    let persisted = persist_tab(&dir, 0, &tab);
+    let persisted = persist_tab(&dir, 0, 0, &tab);
     assert!(persisted.hot.is_some());
     assert_eq!(persisted.load_failed, Some(false));
 
@@ -1198,7 +1198,7 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
     ] {
         let mut t = tab_from_path(&good);
         t.dirty = dirty;
-        let p = persist_tab(&dir, 0, &t);
+        let p = persist_tab(&dir, 0, 0, &t);
         std::fs::write(p.hot.as_ref().unwrap(), corrupt).unwrap();
         let mut r = restore_tab(&p);
         assert!(!r.load_failed, "dirty={dirty}: {}", r.status);
@@ -1207,7 +1207,7 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
         assert!(r.status.contains("restored copy"), "{}", r.status);
         assert_eq!(doc_text(&r), on_disk);
         // The next exit and restart is an ordinary one.
-        let again = restore_tab(&persist_tab(&dir, 1, &r));
+        let again = restore_tab(&persist_tab(&dir, 0, 1, &r));
         assert!(!again.load_failed && again.status.starts_with("loaded"));
         r.dirty = true;
         assert!(save_doc_tab(&mut r, None), "{}", r.status);
@@ -1241,7 +1241,7 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
     .unwrap();
     let long_text = doc_text(&tab_from_path(&long));
     let t = tab_from_path(&long);
-    let p = persist_tab(&dir, 3, &t);
+    let p = persist_tab(&dir, 0, 3, &t);
     let hot = std::fs::read(p.hot.as_ref().unwrap()).unwrap();
     // Cut inside word/document.xml's own data, past its local header.
     let name = b"word/document.xml";
@@ -1267,7 +1267,7 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
     // A file that is itself broken stays marked, by the fresh load.
     let broken = dir.join("broken.docx");
     std::fs::write(&broken, b"not a zip").unwrap();
-    let p = persist_tab(&dir, 2, &tab_from_path(&broken));
+    let p = persist_tab(&dir, 0, 2, &tab_from_path(&broken));
     std::fs::write(p.hot.as_ref().unwrap(), b"garbage").unwrap();
     let mut r = restore_tab(&p);
     assert!(r.load_failed);
@@ -1278,7 +1278,7 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
     // A never-saved document has no file to protect: unmarked, Save asks.
     let mut t = tab_from_path(&good);
     t.path = None;
-    let p = persist_tab(&dir, 3, &t);
+    let p = persist_tab(&dir, 0, 3, &t);
     std::fs::write(p.hot.as_ref().unwrap(), b"garbage").unwrap();
     let r = restore_tab(&p);
     assert!(!r.load_failed && r.path.is_none());
@@ -1292,7 +1292,7 @@ fn the_persisted_mark_holds_over_a_file_that_loads_at_restart() {
     let path = dir.join("x.docx");
     let t = tab_from_path(&path);
     assert!(t.load_failed, "{}", t.status);
-    let json = serde_json::to_string(&persist_tab(&dir, 0, &t)).unwrap();
+    let json = serde_json::to_string(&persist_tab(&dir, 0, 0, &t)).unwrap();
     let p: PersistTab = serde_json::from_str(&json).unwrap();
     assert_eq!(p.load_failed, Some(true));
     // The file appears (or is repaired) before the restart; the sidecar
@@ -1375,7 +1375,7 @@ fn autorecover_writes_an_unsaved_edit_that_a_crash_restores_as_recovered() {
     let mut tabs = vec![t];
 
     assert!(autorecover_prepare(&mut tabs));
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     let session = root.session();
     assert!(session.tabs[0].dirty);
     let hot = PathBuf::from(session.tabs[0].hot.as_deref().unwrap());
@@ -1404,7 +1404,7 @@ fn a_crash_does_not_label_clean_tabs_recovered() {
     let root = Root::new("clean");
     let mut tabs = vec![tab(Kind::Docx), tab(Kind::Xlsx)];
     tabs[1].dirty = true;
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     let restored = restore_session(
         &root.session(),
         true,
@@ -1443,7 +1443,7 @@ fn autorecover_captures_an_open_header_and_stays_in_header_mode() {
     let part = open_hf(&mut tabs[0], true, "Recovered header");
     assert!(autorecover_prepare(&mut tabs));
     assert!(tabs[0].hf_edit.is_some(), "the header editor stays open");
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     let restored = restore_session(
         &root.session(),
         true,
@@ -1467,7 +1467,7 @@ fn autorecover_is_on_by_default_and_the_setting_round_trips() {
         autorecover_minutes: 0,
         ..prefs()
     };
-    write_session(&root.0, &[tab(Kind::Docx)], 0, prefs);
+    write_session(&root.0, &[tab(Kind::Docx)], 0, prefs, &[], 0);
     assert_eq!(root.session().autorecover_minutes, 0, "off is kept");
 }
 
@@ -1554,7 +1554,7 @@ fn a_crash_still_labels_sheet_and_project_sidecars_it_read() {
     for t in &mut tabs {
         t.dirty = true;
     }
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     let restored = restore_session(
         &root.session(),
         true,
@@ -1628,7 +1628,7 @@ fn keeping_drafts_is_on_by_default_and_the_setting_round_trips() {
         keep_drafts: false,
         ..prefs()
     };
-    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
+    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs, &[], 0);
     assert!(!root.session().keep_drafts, "off is kept");
 }
 
@@ -1662,7 +1662,7 @@ fn sheet_editing_options_round_trip_through_the_session() {
         edit_opts: opts,
         ..prefs()
     };
-    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
+    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs, &[], 0);
     assert_eq!(EditOptions::from_text(&root.session().sheet_editing), opts);
 }
 
@@ -1687,7 +1687,7 @@ fn autocorrect_persists_with_the_sheet_editing_options() {
         autocorrect: ac.to_lines(),
         ..prefs()
     };
-    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
+    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs, &[], 0);
     let saved = root.session().sheet_editing;
     assert_eq!(AutoCorrect::from_text(&saved), ac);
     assert_eq!(EditOptions::from_text(&saved), opts);
@@ -1782,19 +1782,19 @@ fn a_persist_records_the_sidecar_only_while_the_tab_is_unsaved() {
     let root = Root::new("last-hot");
     let mut tabs = vec![tab(Kind::Docx), tab(Kind::Xlsx)];
     tabs[1].dirty = true;
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     assert_eq!(*tabs[0].last_hot.borrow(), None, "clean");
     let hot = tabs[1].last_hot.borrow().clone().unwrap();
     assert_eq!(hot, hot_dir_in(&root.0).join("tab-1.xlsx"));
     assert!(hot.exists());
     // Saved since: the next persist forgets it.
     tabs[1].dirty = false;
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     assert_eq!(*tabs[1].last_hot.borrow(), None);
     // A sibling closed: the path follows the tab to its new index.
     tabs[1].dirty = true;
     tabs.remove(0);
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     assert_eq!(
         tabs[0].last_hot.borrow().as_deref(),
         Some(hot_dir_in(&root.0).join("tab-0.xlsx").as_path())
@@ -1822,7 +1822,7 @@ fn dont_save_keeps_the_last_autorecover_copy_as_a_read_only_draft() {
     let mut tabs = vec![tab(Kind::Xlsx)];
     commit_a1(&mut tabs[0], "Draft me");
     assert!(autorecover_prepare(&mut tabs));
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     commit_a1(&mut tabs[0], "After the tick");
     let step = close_step(&mut tabs[0], Some(CloseAnswer::Discard));
     assert_eq!(step, CloseStep::Discard);
@@ -1856,7 +1856,7 @@ fn no_draft_without_a_write_while_unsaved_or_without_discard() {
     assert_eq!(keep_closed_draft(&root.0, &t, &step, 1, true, now), None);
     // Written while unsaved, but the answer was Cancel.
     let tabs = vec![t];
-    write_session(&root.0, &tabs, 0, prefs());
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     let mut t = tabs.into_iter().next().unwrap();
     let step = close_step(&mut t, Some(CloseAnswer::Cancel));
     assert_eq!(keep_closed_draft(&root.0, &t, &step, 1, true, now), None);
@@ -2202,7 +2202,7 @@ fn dont_save_on_quit_drops_a_never_saved_tab_and_forgets_a_files_edits() {
     assert_eq!(forget, [1]);
     assert_eq!(active, 1);
 
-    write_session_forgetting(&root.0, &tabs, active, prefs(), &forget);
+    write_session_forgetting(&root.0, &tabs, active, prefs(), &forget, &[], 0);
     let session = root.session();
     assert!(session.tabs[0].dirty);
     assert!(

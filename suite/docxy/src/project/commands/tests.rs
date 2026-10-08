@@ -461,6 +461,8 @@ fn project_instruction_paths_exist() {
             HideSubtasks,
         ),
         ("View", "Split View", "Timeline", "Timeline View", Timeline),
+        ("View", "Window", "New Window", "New Window", NewWindow),
+        ("View", "Window", "Arrange All", "Arrange All", ArrangeAll),
         (
             "Gantt Chart Format",
             "Bar Styles",
@@ -2654,8 +2656,9 @@ fn f11_is_new_project_only_without_modifiers() {
         platform: true,
         ..Modifiers::default()
     };
-    // Shift+F11 is Project's New Window, which docxy does not have.
-    for m in [shift, ctrl(), alt, platform, ctrl_shift(), ctrl_alt()] {
+    // Shift+F11 is Project's New Window (#587).
+    assert_eq!(key_act("f11", shift), Some(ProjectAct::NewWindow));
+    for m in [ctrl(), alt, platform, ctrl_shift(), ctrl_alt()] {
         assert_eq!(key_act("f11", m), None, "{m:?}");
         let mut t = tab();
         assert_eq!(project_input(&mut t, "f11", None, m), None, "{m:?}");

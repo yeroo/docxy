@@ -730,6 +730,10 @@
     'Help(ShowTraining)': NOT_YET,
     'Help(WhatsNew)': NOT_YET,
     'Help(About)': NOT_YET,
+    // View › Window (#587): the browser shell has one window; New Window
+    // and Arrange All are the desktop run's multi-window commands.
+    NewWindow: 'Not available in the browser — the browser shell has one window',
+    ArrangeAll: 'Not available in the browser — the browser shell has one window',
   };
 
   root.DocxyEngine = {

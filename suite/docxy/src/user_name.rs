@@ -76,14 +76,26 @@ impl Docxy {
     }
 
     /// [`click`] on the active stack, storing and persisting an OK's values.
-    pub(crate) fn user_name_click(&mut self, button: &str) -> Option<Result<(), String>> {
+    pub(crate) fn user_name_click(
+        &mut self,
+        button: &str,
+        cx: &mut gpui::App,
+    ) -> Option<Result<(), String>> {
         let (done, accepted) = click(self.active_dialogs_mut(), button)?;
         if let Some((name, initials)) = accepted {
             self.user_name = name;
             self.user_initials = initials;
             crate::set_configured_identity(&self.user_name, &self.user_initials);
             crate::reauthor_tracking(&mut self.tabs, &self.user_name, &self.user_initials);
-            self.persist();
+            // The setting is the run's, not this window's: restamp every
+            // other window's open comments too (#587 r1 M6).
+            let (name, initials) = (self.user_name.clone(), self.user_initials.clone());
+            self.share_with_windows(cx, |d| {
+                d.user_name = name.clone();
+                d.user_initials = initials.clone();
+                crate::reauthor_tracking(&mut d.tabs, &name, &initials);
+            });
+            self.persist(cx);
         }
         Some(done)
     }

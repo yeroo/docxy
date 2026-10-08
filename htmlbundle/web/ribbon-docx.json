@@ -3289,6 +3289,42 @@
               ]
             }
           ]
+        },
+        {
+          "title": "Window",
+          "priority": 10,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "newwindow",
+                  "label": "New Window",
+                  "icon": "new",
+                  "act": "NewWindow",
+                  "keyTip": "W",
+                  "tip": {
+                    "title": "New Window",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "arrangeall",
+                  "label": "Arrange All",
+                  "icon": "columns",
+                  "act": "ArrangeAll",
+                  "keyTip": "L",
+                  "tip": {
+                    "title": "Arrange All",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            }
+          ]
         }
       ]
     },

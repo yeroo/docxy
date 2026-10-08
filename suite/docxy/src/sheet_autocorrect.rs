@@ -512,7 +512,11 @@ impl Docxy {
     }
 
     /// [`click`] on the active tab, storing and persisting what changed.
-    pub(crate) fn autocorrect_click(&mut self, button: &str) -> Option<Result<(), String>> {
+    pub(crate) fn autocorrect_click(
+        &mut self,
+        button: &str,
+        cx: &mut App,
+    ) -> Option<Result<(), String>> {
         let tab = self.tabs.get_mut(self.active)?;
         let mut ac = (*self.autocorrect).clone();
         let done = click(&mut tab.dialogs, &mut ac, button)?;
@@ -520,7 +524,13 @@ impl Docxy {
             if changed {
                 self.autocorrect = Rc::new(ac);
                 stamp_autocorrect(&mut self.tabs, &self.autocorrect);
-                self.persist();
+                // The setting is the run's, not this window's (#587 r1 M6).
+                let ac = self.autocorrect.clone();
+                self.share_with_windows(cx, |d| {
+                    d.autocorrect = ac.clone();
+                    stamp_autocorrect(&mut d.tabs, &d.autocorrect);
+                });
+                self.persist(cx);
             }
         }))
     }

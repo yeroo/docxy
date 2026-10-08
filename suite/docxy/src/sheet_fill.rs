@@ -538,13 +538,20 @@ impl Docxy {
     /// The presses of the fill dialogs whose OK needs the app's custom lists
     /// (Series, whose AutoFill type reads them; Edit Custom Lists, which
     /// stores them), taken before the tab's own path.
-    pub(crate) fn fill_dialog_click(&mut self, button: &str) -> Option<Result<(), String>> {
+    pub(crate) fn fill_dialog_click(
+        &mut self,
+        button: &str,
+        cx: &mut gpui::App,
+    ) -> Option<Result<(), String>> {
         let tab = self.tabs.get_mut(self.active)?;
         if let Some(done) = custom_lists_click(tab, button) {
             return Some(done.map(|stored| {
                 if let Some(lists) = stored {
                     self.custom_lists = lists;
-                    self.persist();
+                    // The setting is the run's, not this window's (#587 r1 M6).
+                    let lists = self.custom_lists.clone();
+                    self.share_with_windows(cx, |d| d.custom_lists = lists.clone());
+                    self.persist(cx);
                 }
             }));
         }
