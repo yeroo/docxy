@@ -343,13 +343,25 @@ fn is_label_column_at(grid: &[u32], c: usize) -> bool {
     grid.get(c) == grid.first()
 }
 
-/// Drop `NEXT` fields at the start of the first paragraph.
+/// Drop `NEXT` fields at the start of the first paragraph, smart-tag
+/// boundaries (which show nothing) aside.
 fn strip_leading_next(blocks: &mut [Block]) {
     if let Some(Block::Paragraph(p)) = blocks.first_mut() {
-        while matches!(p.content.first(), Some(Inline::Field { raw, .. })
-            if field_kind(raw) == Some(MergeFieldKind::Next))
-        {
-            p.content.remove(0);
+        let mut i = 0;
+        loop {
+            match p.content.get(i) {
+                Some(Inline::Field { raw, .. })
+                    if field_kind(raw) == Some(MergeFieldKind::Next) =>
+                {
+                    p.content.remove(i);
+                }
+                Some(Inline::Raw(raw))
+                    if crate::hf::is_smart_tag_open(raw) || crate::hf::is_smart_tag_close(raw) =>
+                {
+                    i += 1;
+                }
+                _ => break,
+            }
         }
     }
 }
@@ -532,6 +544,20 @@ mod tests {
             0,
             rule_field(&MergeFieldKind::Next, &RunProps::default()).unwrap(),
         );
+        update_labels(&mut t);
+        let Block::Paragraph(p) = &t.rows[1].cells[0].blocks[0] else {
+            panic!()
+        };
+        assert_eq!(p.content.iter().filter(|i| is_next(i)).count(), 1);
+        // Nor when that NEXT is inside a smart tag the label starts with
+        // (#1069).
+        let Block::Paragraph(p) = &mut t.rows[0].cells[0].blocks[0] else {
+            panic!()
+        };
+        p.content
+            .insert(0, Inline::Raw("<w:smartTag w:element=\"x\">".into()));
+        p.content
+            .push(Inline::Raw(crate::hf::SMART_TAG_CLOSE.into()));
         update_labels(&mut t);
         let Block::Paragraph(p) = &t.rows[1].cells[0].blocks[0] else {
             panic!()

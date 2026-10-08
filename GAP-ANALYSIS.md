@@ -65,9 +65,9 @@ loss outside its shrink-only baseline. Where the losses described above stand:
   property is now written as loaded, so the gate's unedited saves no longer
   hit it. An edited property is still generated from the supported set;
 - run content restructured (runs merged or split, `lastRenderedPageBreak`,
-  `smartTag`, row-level `sdt`): #1069, which now holds every remaining docx
-  entry. That includes intact run properties that read as lost because a
-  split or unwrapped run makes the comparator pair different runs
+  row-level `sdt`): #1069, which now holds every remaining docx entry. That
+  includes intact run properties that read as lost because a split run makes
+  the comparator pair different runs
   (`MISALIGNED_RUNS` in `docxcore/tests/fidelity.rs`).
 
 A save with no edits writes the original parts back

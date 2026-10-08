@@ -244,34 +244,6 @@ pub struct Hyperlink {
     pub content_changed: bool,
 }
 
-impl Hyperlink {
-    /// The link's visible text in source order, each piece with its run
-    /// formatting: its runs, then its content's runs, nested links, runs in
-    /// revision wrappers, and fields' results (a TOC entry's PAGEREF page
-    /// number is a field in the link), whose formatting is their result's
-    /// (see [`crate::load::field_result_props`]).
-    pub fn visible_pieces(&self) -> Vec<(&str, RunProps)> {
-        fn collect<'a>(runs: &'a [Run], content: &'a [Inline], out: &mut Vec<(&'a str, RunProps)>) {
-            out.extend(runs.iter().map(|r| (r.text.as_str(), r.props.clone())));
-            for inline in content {
-                match inline {
-                    Inline::Run(run) => out.push((run.text.as_str(), run.props.clone())),
-                    Inline::Hyperlink(link) => collect(&link.runs, &link.content, out),
-                    Inline::Revision { content, .. } => collect(&[], content, out),
-                    Inline::Field { raw, text } => {
-                        out.push((text.as_str(), crate::load::field_result_props(raw)))
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let mut out = Vec::new();
-        collect(&self.runs, &self.content, &mut out);
-        out
-    }
-}
-
 /// The kind of an in-line break (`w:br`/`w:cr`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BreakKind {

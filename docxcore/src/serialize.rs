@@ -271,6 +271,7 @@ fn tracked_insert_of(item: &Inline) -> Option<&RevisionMetadata> {
 /// `content`, with each stretch of adjacent runs recorded as one tracked
 /// insertion wrapped in its `<w:ins>`.
 fn write_inlines_tracking_inserts(s: &mut String, content: &[Inline]) {
+    let content = &*balanced_smart_tags(content);
     let same = |a: &RevisionMetadata, b: &RevisionMetadata| {
         a.id == b.id && a.author == b.author && a.date == b.date
     };
@@ -1001,6 +1002,65 @@ enum RunTextKind {
     Deleted,
 }
 
+/// An inline container's children (a link's or a changed revision's), with
+/// their smart-tag boundaries balanced.
+fn write_inline_seq(s: &mut String, content: &[Inline], text_kind: RunTextKind) {
+    for item in balanced_smart_tags(content).iter() {
+        write_inline_with_text_kind(s, item, text_kind);
+    }
+}
+
+/// `content` with its smart-tag boundaries (see `load::parse_smart_tag`)
+/// balanced, so the saved container is well formed whatever an edit did to
+/// them (#1069). Smart tags and inline content controls nest on one stack:
+/// a smart tag's close is kept only when that tag is innermost (otherwise it
+/// is dropped, and the tag runs on to where it can close); a content
+/// control's close first closes the smart tags opened inside it; and the
+/// smart tags still open at the end close there. A paragraph split, for one,
+/// leaves a tag's open in one half and its close in the other; joining the
+/// halves again rejoins the tag. Content controls are kept balanced by the
+/// editor itself.
+fn balanced_smart_tags(content: &[Inline]) -> std::borrow::Cow<'_, [Inline]> {
+    use crate::hf::{SMART_TAG_CLOSE, is_sdt_close, is_sdt_open};
+    use crate::hf::{is_smart_tag_close, is_smart_tag_open};
+    let is_tag =
+        |i: &Inline| matches!(i, Inline::Raw(r) if is_smart_tag_open(r) || is_smart_tag_close(r));
+    if !content.iter().any(is_tag) {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    #[derive(PartialEq)]
+    enum Open {
+        SmartTag,
+        Control,
+    }
+    let close = || Inline::Raw(SMART_TAG_CLOSE.to_string());
+    let mut stack: Vec<Open> = Vec::new();
+    let mut out = Vec::with_capacity(content.len() + 1);
+    for item in content {
+        match item {
+            Inline::Raw(r) if is_smart_tag_open(r) => stack.push(Open::SmartTag),
+            Inline::Raw(r) if is_smart_tag_close(r) => {
+                if stack.last() != Some(&Open::SmartTag) {
+                    continue;
+                }
+                stack.pop();
+            }
+            Inline::Raw(r) if is_sdt_open(r) => stack.push(Open::Control),
+            Inline::Raw(r) if is_sdt_close(r) && stack.contains(&Open::Control) => {
+                while stack.pop() == Some(Open::SmartTag) {
+                    out.push(close());
+                }
+            }
+            _ => {}
+        }
+        out.push(item.clone());
+    }
+    while stack.pop() == Some(Open::SmartTag) {
+        out.push(close());
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 fn write_inline(s: &mut String, item: &Inline) {
     write_inline_with_text_kind(s, item, RunTextKind::Normal);
 }
@@ -1053,9 +1113,7 @@ fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunText
                 for run in &h.runs {
                     write_run(s, run, text_kind);
                 }
-                for item in &h.content {
-                    write_inline_with_text_kind(s, item, text_kind);
-                }
+                write_inline_seq(s, &h.content, text_kind);
                 s.push_str("</w:hyperlink>");
                 return;
             }
@@ -1074,9 +1132,7 @@ fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunText
             for r in &h.runs {
                 write_run(s, r, text_kind);
             }
-            for item in &h.content {
-                write_inline_with_text_kind(s, item, text_kind);
-            }
+            write_inline_seq(s, &h.content, text_kind);
             s.push_str("</w:hyperlink>");
         }
         Inline::SmartArt { raw, .. } => s.push_str(raw),
@@ -1143,9 +1199,7 @@ fn write_changed_revision(s: &mut String, kind: RevisionKind, raw: &str, content
         RevisionKind::Insert => RunTextKind::Normal,
         RevisionKind::Delete => RunTextKind::Deleted,
     };
-    for item in content {
-        write_inline_with_text_kind(s, item, text_kind);
-    }
+    write_inline_seq(s, content, text_kind);
     s.push_str("</");
     s.push_str(&name);
     s.push('>');

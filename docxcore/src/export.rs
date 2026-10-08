@@ -1776,6 +1776,38 @@ struct OpenField {
     emitted: bool,
 }
 
+/// What a hyperlink shows, in source order: the text of its runs, then of
+/// its content's runs, nested links, runs in revision wrappers and fields'
+/// results (a TOC entry's PAGEREF page number is a field in the link), each
+/// with its formatting (a field's is its result's, see
+/// [`crate::load::field_result_props`]); and its tabs and breaks.
+enum LinkPiece<'a> {
+    Text(&'a str, RunProps),
+    Tab,
+    Break(BreakKind),
+}
+
+fn link_pieces<'a>(runs: &'a [Run], content: &'a [Inline], out: &mut Vec<LinkPiece<'a>>) {
+    out.extend(
+        runs.iter()
+            .map(|r| LinkPiece::Text(r.text.as_str(), r.props.clone())),
+    );
+    for inline in content {
+        match inline {
+            Inline::Run(run) => out.push(LinkPiece::Text(run.text.as_str(), run.props.clone())),
+            Inline::Hyperlink(link) => link_pieces(&link.runs, &link.content, out),
+            Inline::Revision { content, .. } => link_pieces(&[], content, out),
+            Inline::Field { raw, text } => out.push(LinkPiece::Text(
+                text.as_str(),
+                crate::load::field_result_props(raw),
+            )),
+            Inline::Tab(_) => out.push(LinkPiece::Tab),
+            Inline::Break(kind, _) => out.push(LinkPiece::Break(*kind)),
+            _ => {}
+        }
+    }
+}
+
 fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Seg> {
     let pstyle = p.props.style_id.as_deref();
     let mut segs: Vec<Seg> = vec![Seg::default()];
@@ -1832,7 +1864,31 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                     .or_else(|| h.anchor.as_ref().map(|a| format!("#{a}")))
                     .unwrap_or_default();
                 let rc: Rc<str> = Rc::from(target.as_str());
-                for (text, props) in h.visible_pieces() {
+                let mut pieces = Vec::new();
+                link_pieces(&h.runs, &h.content, &mut pieces);
+                for piece in pieces {
+                    let (text, props) = match piece {
+                        LinkPiece::Text(text, props) => (text, props),
+                        // A tab or break inside the link (a TOC entry's tab
+                        // before its page number) lays out as one outside.
+                        LinkPiece::Tab => {
+                            for _ in 0..4 {
+                                push(
+                                    &mut segs,
+                                    PCell {
+                                        link: Some(rc.clone()),
+                                        ..plain_cell(' ')
+                                    },
+                                );
+                            }
+                            continue;
+                        }
+                        LinkPiece::Break(kind) => {
+                            segs.last_mut().unwrap().brk = Some(kind);
+                            segs.push(Seg::default());
+                            continue;
+                        }
+                    };
                     let eff = styles.effective_run(pstyle, props.style_id.as_deref(), &props);
                     let (font, strike) = (font_index(eff.bold || heading, eff.italic), eff.strike);
                     for ch in text.chars() {
@@ -3115,6 +3171,32 @@ mod tests {
             "the page number is exported: {:?}",
             pages[0].texts
         );
+    }
+
+    /// A tab inside a link that is not plain runs (a TOC entry holding its
+    /// PAGEREF field, or a smart tag, #1069) prints as a tab outside one does,
+    /// inside the link, instead of vanishing.
+    #[test]
+    fn a_tab_inside_a_complex_link_is_exported_1069() {
+        for inner in [
+            r#"<w:r><w:t>Intro</w:t></w:r><w:r><w:tab/></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGEREF _Toc1 \h </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>7</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+            r#"<w:smartTag w:element="place"><w:r><w:t>Intro</w:t></w:r></w:smartTag><w:r><w:tab/></w:r><w:r><w:t>7</w:t></w:r>"#,
+        ] {
+            let body = crate::load::parse_document_xml(
+                &format!(
+                    r#"<w:document><w:body><w:p><w:hyperlink w:anchor="_Toc1">{inner}</w:hyperlink></w:p></w:body></w:document>"#
+                ),
+                &crate::load::Relationships::default(),
+            );
+            let Block::Paragraph(p) = &body.body[0] else {
+                panic!("{:?}", body.body);
+            };
+            let segs = flatten_segments(p, false, &StyleSheet::default());
+            let cells: Vec<&PCell> = segs.iter().flat_map(|s| &s.cells).collect();
+            let text: String = cells.iter().map(|c| c.ch).collect();
+            assert_eq!(text, "Intro    7", "{inner}");
+            assert!(cells.iter().all(|c| c.link.as_deref() == Some("#_Toc1")));
+        }
     }
 
     #[test]
