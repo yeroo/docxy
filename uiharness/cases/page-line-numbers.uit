@@ -43,13 +43,15 @@ test line numbers draw in print layout, continue across pages and columns, and f
   # Zoom out: the caret is a fixed 19px but shrinks with the line, so with
   # the caret in an EMPTY paragraph (offset 8, the first of the trailing
   # empties) it must not add a row — a phantom row would push every later
-  # number's y down a row.
+  # number's y down a row. Wheel to the top first so the y below reads at
+  # a settled scroll position.
   key ctrl+- ctrl+- ctrl+- ctrl+- ctrl+- ctrl+- ctrl+- ctrl+-
   call selection-set {"start":8,"end":8}
+  call pointer-wheel {"region":"window","dy":-6000}
   shot window
   call doc {}
   assert reply.line_numbers.0.n is 1
-  assert reply.line_numbers.5.y is 345
+  assert reply.line_numbers.5.y is 77
   # None removes them again.
   call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
   call menu-click {"label":"None"}
