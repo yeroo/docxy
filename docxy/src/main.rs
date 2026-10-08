@@ -6271,10 +6271,8 @@ impl App {
                 self.save();
                 false
             }
-            "wq" | "x" => {
-                self.save();
-                true
-            }
+            // A failed save keeps the app open, its error the status (#1223).
+            "wq" | "x" => self.try_save().is_ok(),
             "q" => {
                 if self.modified {
                     self.status = Some("unsaved changes (:q! to discard)".to_string());
@@ -14473,6 +14471,40 @@ mod tests {
         app.on_key(key(KeyCode::Char(':')));
         app.on_key(key(KeyCode::Char('q')));
         assert!(app.on_key(key(KeyCode::Enter))); // :q with no changes -> quit
+    }
+
+    /// #1223: `:wq` quits only once the save succeeded; a failed one keeps
+    /// the app open with the error as the status.
+    #[test]
+    fn vim_command_write_quit_stays_open_when_the_save_fails() {
+        let dir = std::env::temp_dir().join(format!("docxy-vim-wq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let type_wq = |app: &mut App| {
+            for c in [':', 'w', 'q'] {
+                assert!(!app.on_key(key(KeyCode::Char(c))));
+            }
+            app.on_key(key(KeyCode::Enter))
+        };
+
+        let failed = dir.join("failed.docx");
+        let mut app = app_in_failing_header_edit();
+        app.vim = Some(VimState::new());
+        app.path = failed.to_string_lossy().into_owned();
+        assert!(!type_wq(&mut app), "a failed save must not quit");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit"),
+            "{status}"
+        );
+        assert!(!failed.exists());
+
+        let saved = dir.join("saved.docx");
+        let mut app = vim_app(&["x"]);
+        app.path = saved.to_string_lossy().into_owned();
+        assert!(type_wq(&mut app), "a good save quits");
+        assert!(saved.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
