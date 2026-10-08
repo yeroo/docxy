@@ -73,6 +73,30 @@ pub(crate) fn first_counts(entries: &[Entry], rows: &[u32]) -> Vec<u32> {
     out
 }
 
+/// The pitch one wrapped line actually draws at. gpui snaps a text line's
+/// height to the device pixel grid before laying wrapped lines out
+/// (`Window::pixel_snap` in gpui's window.rs: round-half-toward-zero of the
+/// logical height times the scale factor, back in logical units). Row
+/// counting must divide by this and not the raw font line height, or the
+/// quotient drifts an extra line every couple dozen lines.
+pub(crate) fn row_pitch(line_h: f32, scale_factor: f32) -> f32 {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    (round_half_toward_zero(line_h * scale) / scale).max(0.0)
+}
+
+/// gpui's `round_to_device_pixel` rounds exact halves toward zero.
+fn round_half_toward_zero(x: f32) -> f32 {
+    if x.fract().abs() == 0.5 {
+        x.trunc()
+    } else {
+        x.round()
+    }
+}
+
 /// Visual rows of a painted wrapping row: its height over the line height.
 /// A single-line row sits at `min_h` (main.rs `paragraph_el`'s
 /// `line_h.max(base + 6.)`), which is taller than `line_h`, so
@@ -259,14 +283,17 @@ mod tests {
         assert_eq!(row_count(40.0, 0.0, 20.5), 1);
     }
 
-    /// gpui draws each wrapped line at the pixel-snapped line height
-    /// (`pixel_snap`): 24 lines of a 19.575px font are 480px at 20px per
-    /// line. The paint closure passes the snapped pitch; the raw 19.575
-    /// would divide 480 into 25 and number a line that is not there.
+    /// gpui snaps each wrapped line's height to the device pixel grid
+    /// (`Window::pixel_snap`, window.rs): 24 lines of a 19.575px font draw
+    /// 480px at the snapped 20px pitch. Counting must use that snapped
+    /// pitch — the raw height would divide 480 into 25 and number a line
+    /// that is not there.
     #[test]
-    fn row_count_counts_at_the_snapped_line_height() {
-        assert_eq!(row_count(480.0, 20.0, 20.5), 24);
-        assert_eq!((480.0f32 / 19.575).round().max(1.0) as u32, 25);
+    fn row_pitch_snaps_like_gpui_and_row_count_uses_it() {
+        assert_eq!(row_pitch(19.575, 1.0), 20.0);
+        assert!((row_pitch(19.575, 1.5) - 29.0 / 1.5).abs() < 1e-6);
+        assert_eq!(row_count(480.0, row_pitch(19.575, 1.0), 20.5), 24);
+        assert_eq!(row_count(480.0, 19.575, 20.5), 25);
     }
 
     /// Port of export.rs `LineNumbers::from_setup`'s distance rule.

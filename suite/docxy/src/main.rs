@@ -26616,14 +26616,18 @@ fn caret_bar_div() -> Div {
 /// The caret bar as it sits in a document paragraph's wrapping row: it keeps
 /// its fixed 19px drawing height but takes no layout height, being
 /// absolutely placed in a zero-height box at the same spot (its left
-/// margin still applies). Otherwise, below ~65% zoom, the bar is taller
-/// than the row's own line height and the row would read as an extra
-/// wrapped line whenever the caret visits it (#746 r1 Major 2).
+/// margin still applies). The bar hangs from `top(-9.5)` because the row is
+/// `items_center` (gpui-component's h_flex): the zero-height wrapper sits
+/// on the line's midpoint, and half the bar's height above that midpoint
+/// reproduces exactly where the old in-flow bar centered itself.
+/// Otherwise, below ~65% zoom, the bar is taller than the row's own line
+/// height and the row would read as an extra wrapped line whenever the
+/// caret visits it (#746 r1 Major 2).
 fn doc_caret_bar() -> AnyElement {
     div()
         .w(px(0.))
         .h(px(0.))
-        .child(caret_bar_div().absolute().top_0().left_0())
+        .child(caret_bar_div().absolute().top(px(-9.5)).left_0())
         .into_any_element()
 }
 
@@ -26917,13 +26921,17 @@ fn emit_tab(
 }
 
 /// A line break is ONE char in the engine; render it as a wrap and keep `idx` in
-/// sync (so caret/selection offsets past it stay correct).
-fn emit_break(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>) {
+/// sync (so caret/selection offsets past it stay correct). `strut`, when
+/// positive, is the height of the break's own flex line: a TRAILING manual
+/// break (nothing but breaks after it) would otherwise leave an empty line
+/// of zero height, and the paragraph's height would depend on whether the
+/// caret happens to be sitting there (#746 r2 Major 2).
+fn emit_break(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>, strut: f32) {
     if *caret == Some(*idx) {
         out.push(doc_caret_bar());
         *caret = None;
     }
-    out.push(div().w_full().h(px(0.)).into_any_element());
+    out.push(div().w_full().h(px(strut)).into_any_element());
     *idx += 1;
 }
 
@@ -27278,7 +27286,7 @@ fn line_number_canvas(
             // pitch or the division drifts a line per ~24 lines. `min_h`
             // stays what paragraph_el laid the row out with.
             let min_h = line_h.max(base + 6.);
-            let line_h = f32::from(window.pixel_snap(px(line_h)));
+            let line_h = line_numbers::row_pitch(line_h, window.scale_factor());
             let rows = line_numbers::row_count(b.size.height.into(), line_h, min_h);
             if slot.ord < probe.rows.len() {
                 probe.rows[slot.ord] = rows;
@@ -27393,6 +27401,16 @@ fn paragraph_el(
         }
     }
     let mut x = indent_layout.first_line_tab_origin();
+    // Line spacing (auto-rule multiple; exact/atLeast fall back to single
+    // here). Needed by the span loop: a trailing manual break's strut is one
+    // of these lines high.
+    let line_mult = p
+        .props
+        .spacing
+        .line_multiple()
+        .unwrap_or(1.0)
+        .clamp(0.5, 4.0);
+    let line_h = base * 1.35 * line_mult;
     // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
     // link take caret offsets exactly as the editor counts them.
     let items = flat_inlines(&p.content);
@@ -27505,7 +27523,20 @@ fn paragraph_el(
                 x += w;
             }
             Inline::Break(..) => {
-                emit_break(&mut spans, &mut idx, &mut caret);
+                // A break at the end of the paragraph (nothing but breaks
+                // follows) gets a one-line strut so the trailing empty line
+                // keeps its height with or without the caret on it; a break
+                // with content after it stays weightless, as before (#746
+                // r2 Major 2).
+                let trailing = items[i + 1..]
+                    .iter()
+                    .all(|(it, _)| matches!(**it, Inline::Break(..)));
+                emit_break(
+                    &mut spans,
+                    &mut idx,
+                    &mut caret,
+                    if trailing { line_h } else { 0.0 },
+                );
                 x = 0.0; // a hard break restarts the line
             }
             Inline::Revision { content, .. } => {
@@ -27706,13 +27737,6 @@ fn paragraph_el(
     }
     let has_border = p.props.borders.bottom.is_some();
     // Line spacing (auto-rule multiple; exact/atLeast fall back to single here).
-    let line_mult = p
-        .props
-        .spacing
-        .line_multiple()
-        .unwrap_or(1.0)
-        .clamp(0.5, 4.0);
-    let line_h = base * 1.35 * line_mult;
     let mut row = h_flex()
         .w_full()
         .flex_wrap()
