@@ -2321,6 +2321,9 @@ pub(crate) fn ppr_of_children(children: &[String]) -> ParProps {
 /// rendering while each run segment remains navigable.
 fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
     let raw_start = p.start_pos();
+    // The prefixes declared below the part root, which the retained `raw`
+    // must declare itself wherever a save writes it (#1063).
+    let bindings = rebuilt_bindings(p);
     let preserve_opener = p
         .attrs()
         .iter()
@@ -2343,7 +2346,7 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
         if let Some(anchor) = anchor {
             let mut inner = Vec::new();
             parse_inlines_into(p, rels, &mut inner);
-            let raw = p.raw_slice(raw_start, p.pos()).to_string();
+            let raw = declare_rebuilt(p.raw_slice(raw_start, p.pos()), &bindings);
             if inner.iter().any(|inline| {
                 !matches!(inline, Inline::Run(_) | Inline::Tab(_) | Inline::Break(..))
             }) {
@@ -2416,7 +2419,7 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
 
     let mut content = Vec::new();
     parse_inlines_into(p, rels, &mut content);
-    let raw = p.raw_slice(raw_start, p.pos()).to_string();
+    let raw = declare_rebuilt(p.raw_slice(raw_start, p.pos()), &bindings);
     let simple = content
         .iter()
         .all(|inline| matches!(inline, Inline::Run(_)));
@@ -3451,6 +3454,33 @@ mod tests {
         );
     }
 
+    /// A link kept as loaded (its `raw` saved as is) declares the prefixes
+    /// declared below the part root that its content uses, a smart tag's
+    /// among them.
+    #[test]
+    fn a_retained_link_keeps_the_prefixes_it_uses_bound_1069() {
+        for link in [
+            "<w:hyperlink w:anchor=\"a\"><w:smartTag x:a=\"1\" w:element=\"e\">\
+             <w:r><w:t>T</w:t></w:r></w:smartTag></w:hyperlink>",
+            "<w:hyperlink r:id=\"rId1\"><w:smartTag x:a=\"1\" w:element=\"e\">\
+             <w:r><w:t>T</w:t></w:r></w:smartTag></w:hyperlink>",
+        ] {
+            let xml = format!(
+                "<w:document><w:body><w:p xmlns:x=\"urn:x\">{link}</w:p></w:body></w:document>"
+            );
+            let rels = parse_rels_xml(
+                "<Relationships><Relationship Id=\"rId1\" Target=\"https://example.com/\" \
+                 TargetMode=\"External\"/></Relationships>",
+            );
+            let d = parse_document_xml(&xml, &rels);
+            let out = crate::serialize::document_to_xml(&d);
+            check_smart_tags(&out);
+            let at = out.find("<w:hyperlink").expect("the link");
+            let opener = &out[at..at + out[at..].find('>').unwrap()];
+            assert!(opener.contains("xmlns:x=\"urn:x\""), "{out}");
+        }
+    }
+
     #[test]
     fn a_field_holding_a_whole_smart_tag_still_collapses_1069() {
         let field = format!(
@@ -3618,6 +3648,33 @@ mod tests {
                 .flatten()
                 .all(|i| !matches!(i, Inline::Raw(_)))
         );
+    }
+
+    /// Enter inside a link right before a tagged word takes the tag down with
+    /// the word, as outside a link.
+    #[test]
+    fn enter_in_a_link_before_a_tagged_word_keeps_its_tag_1069() {
+        use crate::editor::{Caret, Editor};
+        let xml = format!(
+            "<w:document><w:body><w:p><w:hyperlink w:anchor=\"a\">{}{}</w:hyperlink>\
+             </w:p></w:body></w:document>",
+            text_run("Hello "),
+            smart_tag("place", &text_run("Texas"))
+        );
+        let mut ed = Editor::new(doc(&xml));
+        ed.caret = Caret {
+            path: vec![0],
+            offset: 6,
+        };
+        ed.insert_newline();
+        let out = crate::serialize::document_to_xml(&ed.doc);
+        check_smart_tags(&out);
+        let paras: Vec<String> = out
+            .split("</w:p>")
+            .filter(|p| p.contains("<w:p"))
+            .map(|p| smart_tag_outline(p).concat())
+            .collect();
+        assert_eq!(paras, ["Hello ", "<place>@placeTexas</>"], "{out}");
     }
 
     /// A smart tag inside an inline content control: Enter between its

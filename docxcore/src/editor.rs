@@ -3866,8 +3866,11 @@ fn split_link(h: &mut Hyperlink, local: usize) -> Hyperlink {
         ),
         LinkPart::Content(local) => {
             let mut rest = split_content(&mut h.content, local);
-            // A content control in the link that the split cuts closes in
+            // A control or smart tag opening right at the split goes to the
+            // second half whole, as in a paragraph (see `split_paragraph_at`);
+            // a content control in the link that the split cuts closes in
             // each half.
+            move_trailing_opens(&mut h.content, &mut rest);
             repair_cut_controls(&mut h.content, &mut rest);
             (Vec::new(), rest)
         }
