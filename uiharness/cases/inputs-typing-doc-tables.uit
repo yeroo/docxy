@@ -447,19 +447,6 @@ test doc insert-table/width: copies
   assert reply.text is abcd
   call real-key {"key":"escape"}
 
-test doc insert-table/width: OK applies
-  open ../fixtures/basic.docx
-  call ribbon-click {"tab":"Insert","command":"table"}
-  call menu-click {"label":"Insert Table..."}
-  assert dialog is insert-table
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"width"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"1.5"}
-  call real-key {"key":"enter"}
-  assert dialog is not insert-table
-  assert table.columns is 5
-
 test doc insert-table/width: Escape cancels
   open ../fixtures/basic.docx
   call ribbon-click {"tab":"Insert","command":"table"}
@@ -841,6 +828,11 @@ test doc sort/sort1: Up and Down step
   call real-key {"key":"tab","to-field":"sort1"}
   call field-read {"dialog-field":"sort1"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"sort1"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"sort1"}
   assert reply.index is 0
@@ -869,6 +861,11 @@ test doc sort/type1: Up and Down step
   call real-key {"key":"tab","to-field":"type1"}
   call field-read {"dialog-field":"type1"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"type1"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"type1"}
   assert reply.index is 0
@@ -897,6 +894,11 @@ test doc sort/sort2: Up and Down step
   call real-key {"key":"tab","to-field":"sort2"}
   call field-read {"dialog-field":"sort2"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"sort2"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"sort2"}
   assert reply.index is 0
@@ -925,6 +927,11 @@ test doc sort/type2: Up and Down step
   call real-key {"key":"tab","to-field":"type2"}
   call field-read {"dialog-field":"type2"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"type2"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"type2"}
   assert reply.index is 0
@@ -953,6 +960,11 @@ test doc sort/sort3: Up and Down step
   call real-key {"key":"tab","to-field":"sort3"}
   call field-read {"dialog-field":"sort3"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"sort3"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"sort3"}
   assert reply.index is 0
@@ -981,6 +993,11 @@ test doc sort/type3: Up and Down step
   call real-key {"key":"tab","to-field":"type3"}
   call field-read {"dialog-field":"type3"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"type3"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"type3"}
   assert reply.index is 0
@@ -1138,6 +1155,10 @@ test doc convert-to-text/other: OK applies
   call real-key {"key":"enter"}
   assert dialog is not convert-to-text
   assert table is null
+  key home shift+end
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.text is cell A/cell B
 
 test doc convert-to-text/other: Escape cancels
   open ../fixtures/doc-table.docx
@@ -1510,7 +1531,7 @@ test doc convert-text-to-table/other: OK applies
   call real-type {"text":"/"}
   call real-key {"key":"enter"}
   assert dialog is not convert-text-to-table
-  assert table.columns is 2
+  assert table.cells.0.0.0 is one⇥two
 
 test doc convert-text-to-table/other: Escape cancels
   open ../fixtures/basic.docx

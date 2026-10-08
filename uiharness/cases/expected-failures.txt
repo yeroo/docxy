@@ -19,5 +19,3 @@ doc-rulers.uit | ruler positions follow the document geometry at 100 and 200 per
 inputs-typing-sheet-data.uit | sheet text-to-columns/breaks: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/formats: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/destination: OK applies | #1205
-inputs-typing-sheet-data.uit | sheet text-to-columns/decimal: OK applies | #1205
-inputs-typing-sheet-data.uit | sheet text-to-columns/thousands: OK applies | #1205

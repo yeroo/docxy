@@ -42,6 +42,11 @@ test sheet filter-menu/typed: Up and Down step
   call real-key {"key":"tab","to-field":"typed"}
   call field-read {"dialog-field":"typed"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"typed"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"typed"}
   assert reply.index is 0
@@ -238,6 +243,11 @@ test sheet custom-autofilter/op1: Up and Down step
   call real-key {"key":"tab","to-field":"op1"}
   call field-read {"dialog-field":"op1"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"op1"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"op1"}
   assert reply.index is 0
@@ -457,6 +467,11 @@ test sheet custom-autofilter/op2: Up and Down step
   call real-key {"key":"tab","to-field":"op2"}
   call field-read {"dialog-field":"op2"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"op2"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"op2"}
   assert reply.index is 0
@@ -671,6 +686,11 @@ test sheet top10-autofilter/which: Up and Down step
   call real-key {"key":"tab","to-field":"which"}
   call field-read {"dialog-field":"which"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"which"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"which"}
   assert reply.index is 0
@@ -908,6 +928,11 @@ test sheet top10-autofilter/unit: Up and Down step
   call real-key {"key":"tab","to-field":"unit"}
   call field-read {"dialog-field":"unit"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"unit"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"unit"}
   assert reply.index is 0
@@ -1544,6 +1569,11 @@ test sheet sort/by1: Up and Down step
   call real-key {"key":"tab","to-field":"by1"}
   call field-read {"dialog-field":"by1"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"by1"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"by1"}
   assert reply.index is 0
@@ -1572,6 +1602,11 @@ test sheet sort/on1: Up and Down step
   call real-key {"key":"tab","to-field":"on1"}
   call field-read {"dialog-field":"on1"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"on1"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"on1"}
   assert reply.index is 0
@@ -1600,6 +1635,11 @@ test sheet sort/order1: Up and Down step
   call real-key {"key":"tab","to-field":"order1"}
   call field-read {"dialog-field":"order1"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"order1"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"order1"}
   assert reply.index is 0
@@ -1760,6 +1800,11 @@ test sheet sort/by2: Up and Down step
   call real-key {"key":"tab","to-field":"by2"}
   call field-read {"dialog-field":"by2"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"by2"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"by2"}
   assert reply.index is 0
@@ -1788,6 +1833,11 @@ test sheet sort/on2: Up and Down step
   call real-key {"key":"tab","to-field":"on2"}
   call field-read {"dialog-field":"on2"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"on2"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"on2"}
   assert reply.index is 0
@@ -1816,6 +1866,11 @@ test sheet sort/order2: Up and Down step
   call real-key {"key":"tab","to-field":"order2"}
   call field-read {"dialog-field":"order2"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"order2"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"order2"}
   assert reply.index is 0
@@ -1976,6 +2031,11 @@ test sheet sort/by3: Up and Down step
   call real-key {"key":"tab","to-field":"by3"}
   call field-read {"dialog-field":"by3"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"by3"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"by3"}
   assert reply.index is 0
@@ -2004,6 +2064,11 @@ test sheet sort/on3: Up and Down step
   call real-key {"key":"tab","to-field":"on3"}
   call field-read {"dialog-field":"on3"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"on3"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"on3"}
   assert reply.index is 0
@@ -2032,6 +2097,11 @@ test sheet sort/order3: Up and Down step
   call real-key {"key":"tab","to-field":"order3"}
   call field-read {"dialog-field":"order3"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"order3"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"order3"}
   assert reply.index is 0

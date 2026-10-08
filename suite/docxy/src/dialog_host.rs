@@ -503,6 +503,9 @@ impl Docxy {
             };
             if let Some(text) = stack.top().and_then(Dialog::selected_text) {
                 self.clipboard_write(text, cx);
+                // A document copy's rich clip no longer stands for what
+                // the clipboard holds, even when the text matches.
+                self.clip = None;
             }
             return true;
         }

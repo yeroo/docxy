@@ -82,7 +82,9 @@ const STEP3: &str = "Step 3: Column data format";
 // Why a case does not press OK with the sample typed.
 const COLUMN_FIT: &str =
     "OK refuses widths that do not fill the text width, which one width alone cannot";
-const NEW_TAB: &str = "OK opens a new Labels document whose name counts up across the cases";
+const LABEL_SIZE: &str = "a label's size is in no state a script reads; across and down are";
+const SEPARATORS: &str =
+    "the separators only change how numbers parse, and the wizard's column here is text";
 const THROUGH_ADD: &str = "the value takes effect through Add, not OK";
 const SORT_LIST: &str = "its list is read only with Order: Custom List... chosen";
 
@@ -213,7 +215,7 @@ dialogs! {
             radio("fit"),
             Field::text("width")
                 .sample("1.5")
-                .applied(&["assert table.columns is 5"]),
+                .no_ok("no state a script reads reports a table's column width"),
         ],
         reopen: &[],
         accept_closes: true,
@@ -288,7 +290,13 @@ dialogs! {
             Field::text("other")
                 .sample("/")
                 .prep(SEPARATE_WITH_OTHER)
-                .applied(&["assert table is null"]),
+                .applied(&[
+                    "assert table is null",
+                    "key home shift+end",
+                    "key ctrl+c",
+                    r#"call clipboard {"action":"read"}"#,
+                    "assert reply.text is cell A/cell B",
+                ]),
         ],
         reopen: &[],
         accept_closes: true,
@@ -308,10 +316,11 @@ dialogs! {
             Field::number("cols", "2")
                 .applied(&["assert table.columns is 2", "assert table.cells.0.1.0 is two"]),
             radio("sep"),
+            // The text is "one<Tab>two", so a "/" leaves it in one cell.
             Field::text("other")
                 .sample("/")
                 .prep(SEPARATE_WITH_OTHER)
-                .applied(&["assert table.columns is 2"]),
+                .applied(&["assert table.cells.0.0.0 is one⇥two"]),
         ],
         reopen: &[],
         accept_closes: true,
@@ -369,11 +378,8 @@ dialogs! {
             Field::text("font")
                 .sample("Arial")
                 .prep(TEXT_WATERMARK)
-                .applied(&["assert status is Watermark: ASAP"]),
-            Field::text("size")
-                .sample("72")
-                .prep(TEXT_WATERMARK)
-                .applied(&["assert status is Watermark: ASAP"]),
+                .kept("Arial"),
+            Field::text("size").sample("72").prep(TEXT_WATERMARK).kept("72"),
             dropdown("color").prep(TEXT_WATERMARK),
             checkbox("semi"),
             radio("layout"),
@@ -428,8 +434,8 @@ dialogs! {
         fixture: DOCX,
         open: &[r#"call ribbon-click {"tab":"Mailings","command":"Envelopes"}"#],
         fields: &[
-            Field::text("delivery").applied(&[ENVELOPE_ADDED]),
-            Field::text("return").applied(&[ENVELOPE_ADDED]),
+            Field::text("delivery").applied(&[ENVELOPE_ADDED, "assert mail.text is Ab1"]),
+            Field::text("return").applied(&[ENVELOPE_ADDED, "assert mail.text is Ab1"]),
             checkbox("omit"),
             dropdown("size"),
         ],
@@ -458,12 +464,17 @@ dialogs! {
         fixture: DOCX,
         open: &[r#"call ribbon-click {"tab":"Mailings","command":"Labels"}"#],
         fields: &[
-            Field::text("address").no_ok(NEW_TAB),
+            // OK opens the label sheet in a new tab, a table of labels.
+            Field::text("address").applied(&["assert table.cells.0.0.0 is Ab1"]),
             dropdown("product"),
-            Field::number("width", "2").prep(CUSTOM_LABEL).no_ok(NEW_TAB),
-            Field::number("height", "1.05").prep(CUSTOM_LABEL).no_ok(NEW_TAB),
-            Field::number("across", "3").prep(CUSTOM_LABEL).no_ok(NEW_TAB),
-            Field::number("down", "5").prep(CUSTOM_LABEL).no_ok(NEW_TAB),
+            Field::number("width", "2").prep(CUSTOM_LABEL).no_ok(LABEL_SIZE),
+            Field::number("height", "1.05").prep(CUSTOM_LABEL).no_ok(LABEL_SIZE),
+            Field::number("across", "2")
+                .prep(CUSTOM_LABEL)
+                .applied(&["assert table.columns is 2"]),
+            Field::number("down", "5")
+                .prep(CUSTOM_LABEL)
+                .applied(&["assert table.rows is 5"]),
         ],
         reopen: &[],
         accept_closes: true,
@@ -479,10 +490,14 @@ dialogs! {
         ],
         fields: &[
             dropdown("product"),
-            Field::number("width", "2").prep(CUSTOM_LABEL).applied(&["assert mail.doc_type is Labels"]),
-            Field::number("height", "1.05").prep(CUSTOM_LABEL).applied(&["assert mail.doc_type is Labels"]),
-            Field::number("across", "3").prep(CUSTOM_LABEL).applied(&["assert mail.doc_type is Labels"]),
-            Field::number("down", "5").prep(CUSTOM_LABEL).applied(&["assert mail.doc_type is Labels"]),
+            Field::number("width", "2").prep(CUSTOM_LABEL).no_ok(LABEL_SIZE),
+            Field::number("height", "1.05").prep(CUSTOM_LABEL).no_ok(LABEL_SIZE),
+            Field::number("across", "2")
+                .prep(CUSTOM_LABEL)
+                .applied(&["assert mail.doc_type is Labels", "assert table.columns is 2"]),
+            Field::number("down", "5")
+                .prep(CUSTOM_LABEL)
+                .applied(&["assert mail.doc_type is Labels", "assert table.rows is 5"]),
         ],
         reopen: &[],
         accept_closes: true,
@@ -512,7 +527,8 @@ dialogs! {
             r#"call ribbon-click {"tab":"Mailings","command":"Edit Recipient List"}"#,
         ],
         fields: &[
-            Field::number("record", "2").applied(&["assert status is 3 recipients included"]),
+            Field::number("record", "2")
+                .no_ok("OK applies the grid's Include column; Record only moves the dialog's own view"),
             checkbox("include"),
         ],
         reopen: &[],
@@ -546,7 +562,9 @@ dialogs! {
             dropdown("salutation"),
             dropdown("name"),
             dropdown("punctuation"),
-            Field::text("fallback").applied(&["assert status is Inserted Greeting Line"]),
+            Field::text("fallback").no_ok(
+                "it shows only for a record without a name, and recipients.csv names everyone",
+            ),
         ],
         reopen: &[],
         accept_closes: true,
@@ -632,13 +650,21 @@ dialogs! {
         file: "doc-mailings",
         fixture: DOCX,
         open: &[
+            "key ctrl+a",
+            "type Dear",
             r#"call mail-attach {"path":"recipients.csv"}"#,
+            r#"call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}"#,
+            r#"call menu-click {"label":"First Name"}"#,
             r#"call ribbon-click {"tab":"Mailings","command":"Edit Individual Documents..."}"#,
         ],
         fields: &[
             radio("records"),
-            Field::number("from", "2").prep(RECORDS_FROM),
-            Field::number("to", "2").prep(RECORDS_FROM),
+            Field::number("from", "2")
+                .prep(RECORDS_FROM)
+                .applied(&["assert mail.text is DearJohn¶DearAmy"]),
+            Field::number("to", "2")
+                .prep(RECORDS_FROM)
+                .applied(&["assert mail.text is DearJane¶DearJohn"]),
         ],
         reopen: &[],
         accept_closes: true,
@@ -663,7 +689,9 @@ dialogs! {
         fixture: "copy:../fixtures/basic.docx",
         open: &["type x", "key ctrl+w"],
         fields: &[
-            Field::text("file-name"),
+            Field::text("file-name").no_ok(
+                "Save writes into the case's sandbox folder, which a script cannot name; tab-close.uit covers the save",
+            ),
             dropdown("location"),
         ],
         reopen: &[],
@@ -1084,13 +1112,17 @@ dialogs! {
             dropdown("column").on(STEP3).prep(TWO_COLUMNS),
             radio("format").on(STEP3),
             dropdown("date_order").on(STEP3),
-            Field::text("formats").on(STEP3).sample("text").applied(&["assert cell J1 is a,b"]),
+            Field::text("formats")
+                .on(STEP3)
+                .sample("general, skip")
+                .prep(TWO_COLUMNS)
+                .applied(&["assert cell J1 is a", "assert cell K1 is nothing"]),
             Field::text("destination")
                 .on(STEP3)
                 .sample("L1")
                 .applied(&["assert cell L1 is a,b"]),
-            Field::text("decimal").on(STEP3).sample(";").applied(&["assert cell J1 is a,b"]),
-            Field::text("thousands").on(STEP3).sample("'").applied(&["assert cell J1 is a,b"]),
+            Field::text("decimal").on(STEP3).sample(";").no_ok(SEPARATORS),
+            Field::text("thousands").on(STEP3).sample("'").no_ok(SEPARATORS),
             checkbox("trailing_minus").on(STEP3),
         ],
         reopen: &[],
@@ -1271,12 +1303,32 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    SHEET_SAVE_ON_CLOSE = "save-on-close" {
+        surface: Surface::Sheet,
+        file: "sheet-data",
+        fixture: "copy:../fixtures/basic.xlsx",
+        open: &["click B2", "type 5", "key enter", "call close-tab {}"],
+        fields: &[],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
     // ---- Project -----------------------------------------------------------
     DELETE_SUMMARY = "delete-summary" {
         surface: Surface::Project,
         file: "project",
         fixture: "../fixtures/gantt-summary.xml",
         open: &["click A1", "key delete"],
+        fields: &[],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    PROJECT_SAVE_ON_CLOSE = "save-on-close" {
+        surface: Surface::Project,
+        file: "project",
+        fixture: "copy:../fixtures/gantt-summary.xml",
+        open: &["click A1", "key delete", "key enter", "call close-tab {}"],
         fields: &[],
         reopen: &[],
         accept_closes: true,

@@ -7,6 +7,7 @@
 //! changes to … before closing?" for a workbook or a Project. Its presses
 //! come through [`Docxy::close_prompt_click`].
 use super::*;
+use crate::dialog::DialogId;
 use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use std::path::Path;
@@ -548,10 +549,11 @@ fn doc_prompt(name: &PromptName, quit: bool) -> Dialog {
     d
 }
 
-/// The close prompt for a workbook or a Project tab titled `title`.
-fn message_prompt(title: &str, quit: bool) -> Dialog {
+/// The close prompt for a workbook or a Project tab titled `title`: `id` is
+/// the sheet's or the Project's catalogue entry, both `save-on-close`.
+fn message_prompt(id: DialogId, title: &str, quit: bool) -> Dialog {
     Dialog::message(
-        catalog::SAVE_ON_CLOSE,
+        id,
         "docxy",
         format!("Save changes to {title} before closing?"),
         &[
@@ -567,7 +569,8 @@ fn message_prompt(title: &str, quit: bool) -> Dialog {
 fn close_prompt(tab: &DocTab, quit: bool, known: &[PathBuf]) -> Dialog {
     match &tab.surface {
         Surface::Doc(_) => doc_prompt(&prompt_name(tab, known), quit),
-        _ => message_prompt(&tab.title, quit),
+        Surface::Project(_) => message_prompt(catalog::PROJECT_SAVE_ON_CLOSE, &tab.title, quit),
+        _ => message_prompt(catalog::SHEET_SAVE_ON_CLOSE, &tab.title, quit),
     }
 }
 

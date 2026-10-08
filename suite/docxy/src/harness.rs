@@ -1207,6 +1207,50 @@ fn key_args(args: &Json) -> Result<Vec<Keystroke>, String> {
     specs.iter().map(|s| parse_key(s)).collect()
 }
 
+/// `real-key`'s `"to-field"`: the field Tab moves the focus to (#1029). It
+/// presses Tab only, so it takes no other key (`"key":"tab"` may say so) and
+/// no `"keys"` or `"times"`.
+fn to_field_arg(args: &Json) -> Result<Option<&str>, String> {
+    let Some(field) = args.get("to-field") else {
+        return Ok(None);
+    };
+    let name = field.as_str().ok_or("'to-field' must be a field name")?;
+    if args.get("keys").is_some() || args.get("times").is_some() {
+        return Err("'to-field' presses Tab only: it takes no 'keys' or 'times'".into());
+    }
+    match args.get("key") {
+        None => {}
+        Some(k) if k.as_str() == Some("tab") => {}
+        Some(_) => return Err("'to-field' presses Tab only: 'key' may only be \"tab\"".into()),
+    }
+    Ok(Some(name))
+}
+
+/// The targets `pointer-click` takes; a call names exactly one (#1029).
+const POINTER_TARGETS: [&str; 7] = [
+    "region",
+    "at",
+    "dialog-field",
+    "dialog-tab",
+    "dialog-button",
+    "dialog-control",
+    "input",
+];
+
+fn one_pointer_target(args: &Json) -> Result<(), String> {
+    let named: Vec<&str> = POINTER_TARGETS
+        .into_iter()
+        .filter(|k| args.get(k).is_some())
+        .collect();
+    match named.len() {
+        0 | 1 => Ok(()),
+        _ => Err(format!(
+            "pointer-click takes one target, not {}",
+            named.join(" and ")
+        )),
+    }
+}
+
 /// `pointer-click`'s optional `"x"`: pixels in from a dialog field's left edge.
 fn field_x(args: &Json) -> Result<Option<f64>, String> {
     args.get("x")
@@ -4344,6 +4388,7 @@ fn dispatch_verb(
         // exactly like an OS click. `item` is the drift guard for the
         // fill-handle case: which more-tabs item the point landed on.
         "pointer-click" => {
+            one_pointer_target(args)?;
             // A field of the open dialog: where a person clicks it, a number
             // of pixels `x` in from its left edge (its middle without one).
             // A tab, a button or a whole control row of the open dialog
@@ -4963,10 +5008,9 @@ fn dispatch_verb(
         "real-key" | "real-type" => {
             let strokes = if verb == "real-type" {
                 typed_keys(arg_str(args, "text")?)?
-            } else if let Some(field) = args.get("to-field") {
+            } else if let Some(name) = to_field_arg(args)? {
                 // As many Tabs as move the open dialog's focus to the field
                 // (#1029), counted now; each is a real key-down.
-                let name = field.as_str().ok_or("'to-field' must be a field name")?;
                 let top = app
                     .active_dialogs()
                     .and_then(|d| d.top())
@@ -7617,6 +7661,43 @@ mod tests {
     }
 
     /// `pointer-click`'s `x` is optional, and a present one must be a number.
+    #[test]
+    fn to_field_presses_tab_only() {
+        let j = |s: &str| Json::parse(s).unwrap();
+        assert_eq!(to_field_arg(&j(r#"{"to-field":"num"}"#)), Ok(Some("num")));
+        assert_eq!(
+            to_field_arg(&j(r#"{"key":"tab","to-field":"num"}"#)),
+            Ok(Some("num"))
+        );
+        assert_eq!(to_field_arg(&j(r#"{"key":"down"}"#)), Ok(None));
+        for bad in [
+            r#"{"key":"down","to-field":"num"}"#,
+            r#"{"keys":["tab"],"to-field":"num"}"#,
+            r#"{"times":2,"to-field":"num"}"#,
+            r#"{"to-field":3}"#,
+        ] {
+            assert!(to_field_arg(&j(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn pointer_click_names_one_target() {
+        let j = |s: &str| Json::parse(s).unwrap();
+        assert_eq!(
+            one_pointer_target(&j(r#"{"dialog-tab":"Margins"}"#)),
+            Ok(())
+        );
+        assert_eq!(
+            one_pointer_target(&j(r#"{"dialog-field":"top","x":3}"#)),
+            Ok(())
+        );
+        assert_eq!(
+            one_pointer_target(&j(r#"{"dialog-tab":"A","dialog-field":"b"}"#)),
+            Err("pointer-click takes one target, not dialog-field and dialog-tab".into())
+        );
+        assert!(one_pointer_target(&j(r#"{"region":"grid","input":"formula-bar"}"#)).is_err());
+    }
+
     #[test]
     fn field_x_is_an_optional_number() {
         assert_eq!(field_x(&Json::obj(vec![])), Ok(None));

@@ -10,9 +10,11 @@ Every editable input in the suite is typed into with real keys by a case:
 - **Dialog fields** are in the catalogue,
   `suite/docxy/src/dialog/catalog/entries.rs`, and the generated
   `uiharness/cases/inputs-typing-*.uit` type into each one with `real-key` and
-  `real-type`, focusing it by a real click and by Tab. A new dialog cannot be
-  built without an entry (its `DialogId` only exists there), and a field added
-  to a dialog without one fails that dialog's `matches the catalogue` case.
+  `real-type`, focusing it by a real click and by Tab. Every dialog carries a
+  catalogued id (a `DialogId` only exists there); a new dialog that reuses
+  another's id is caught by review, and by `dialog-catalog-check` where a case
+  opens it. A field added to a dialog without its entry fails that dialog's
+  `matches the catalogue` case.
 - **Adding or changing a dialog:** add or update its entry (how a person opens
   it, every editable control with a sample and what OK shows), run
   `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml

@@ -712,8 +712,8 @@ fn fold(label: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Dialog {
-    /// Stable, for scripts: `delete-summary`. Only [`catalog`] makes one,
-    /// so no dialog exists that the catalogue lacks (#1029).
+    /// Stable, for scripts: `delete-summary`. Only [`catalog`] makes one, so
+    /// every dialog carries a catalogued id (#1029).
     pub id: DialogId,
     pub title: String,
     /// A message box's message.

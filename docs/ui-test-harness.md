@@ -1455,7 +1455,9 @@ Every dialog the suite builds is in a catalogue,
 `suite/docxy/src/dialog/catalog/entries.rs`: its id, the fixture and the steps
 that open it the way a person does, and every editable control with its kind,
 tab, a sample value and what OK shows. A `DialogId` can only be made there and
-`Dialog::message` takes one, so a dialog cannot be built without an entry. The
+`Dialog::message` takes one, so every dialog carries a catalogued id; a new
+dialog that reuses another's id is caught by review, and by
+`dialog-catalog-check` where a case opens it. The
 `inputs-typing-*.uit` cases are **generated** from it (one file per group of
 dialogs, each well inside the sweep's per-script timeout), and
 `cargo test --manifest-path suite/Cargo.toml inputs_typing_case_is_current`
@@ -1468,9 +1470,13 @@ arrows, Home, End), `select-all replaces`, `pastes`, `copies`, `OK applies`,
 `Escape cancels` and, for a number field, `refuses invalid`; a dropdown gets
 `focus by click` and `Up and Down step`; and each dialog a
 `<surface> <dialog>: matches the catalogue` test, which runs
-`dialog-catalog-check` on it. After the dialog opens every key is `real-key`
-or `real-type` and every focus a real click or Tab: no `dialog-set`, `key` or
-`type`. A field broken one way fails only that step's test, so
+`dialog-catalog-check` on it. While the dialog under test is open every key
+is `real-key` or `real-type` and every focus a real click or Tab: no
+`dialog-set`, `dialog-click`, `dialog-tab`, `key` or `type`
+(`the_cases_drive_an_open_dialog_with_real_input_only` checks the generated
+files). The steps that set the document up and open the dialog come before it
+and may use handler verbs (`ribbon-click`, `menu-click`, a parent's
+`dialog-click`), as may the checks after it closes. A field broken one way fails only that step's test, so
 `expected-failures.txt` can list it without hiding the rest.
 `inputs-typing-themes.uit` types into one field of each kind under the dark
 and the light theme. The sweep's transcripts read as a table of surface,

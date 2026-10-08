@@ -1,16 +1,19 @@
 //! The `inputs-typing-*.uit` cases, generated from the catalogue (#1029).
 //!
-//! One file per surface, one test per field and step, so a field broken in
-//! one way fails only that test, and `expected-failures.txt` can list it
-//! without hiding the field's other steps. Every key is a real one
+//! One file per `Entry::file` group, plus `inputs-typing-themes.uit`; one
+//! test per field and step, so a field broken in one way fails only that
+//! test, and `expected-failures.txt` can list it without hiding the field's
+//! other steps. While the dialog under test is open every key is a real one
 //! (`real-key`, `real-type`) and every focus a real click or Tab: no
-//! `dialog-set`, no `key`, no `type`.
+//! `dialog-set`, `dialog-click`, `key` or `type`. The steps that set the
+//! document up and open the dialog come before, and may use handler verbs.
 
 use super::{Entry, Field, Refuse, Surface, catalog};
 use crate::dialog::ControlKind;
 
-/// The generated files: (file name under `uiharness/cases/`, text). A
-/// surface with nothing to type into has no file.
+/// The generated files: (file name under `uiharness/cases/`, text), one per
+/// `Entry::file` group and the themes file. A group whose dialogs are all
+/// unreachable has no file.
 pub(crate) fn files() -> Vec<(String, String)> {
     let mut names: Vec<&str> = catalog().iter().map(|e| e.file).collect();
     names.dedup();
@@ -194,7 +197,7 @@ impl Test {
     }
 
     /// Open the fixture and the dialog, check it against its entry, and show
-    /// the field: its tab, then whatever it waits on.
+    /// the field: what it waits on, then its tab.
     fn open(&mut self, e: &Entry, f: &Field) -> &mut Self {
         self.line(format!("open {}", e.fixture));
         self.show(e, f, e.open)
@@ -462,7 +465,9 @@ fn dropdown_tests(e: &Entry, f: &Field) -> Vec<Test> {
         .close();
     tests.push(t);
 
-    // Up as often as it can have items reaches the first; Down steps once.
+    // Down twice leaves the first item (from no choice, the first Down picks
+    // it); Up as often as it can have items gets back to it, so Up is proven
+    // too; Down then steps to the second.
     let mut t = Test::new(e, f, "Up and Down step");
     t.open(e, f)
         .call(
@@ -471,6 +476,11 @@ fn dropdown_tests(e: &Entry, f: &Field) -> Vec<Test> {
         )
         .read(f)
         .assert("reply.focused is true")
+        .key("down")
+        .key("down")
+        .read(f)
+        .assert("reply.index is not 0")
+        .assert("reply.index is not null")
         .call("real-key", "{\"key\":\"up\",\"times\":100}")
         .read(f)
         .assert("reply.index is 0")

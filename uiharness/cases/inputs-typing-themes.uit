@@ -47,6 +47,11 @@ test dark theme doc page-setup/multiple: Up and Down step
   call real-key {"key":"tab","to-field":"multiple"}
   call field-read {"dialog-field":"multiple"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"multiple"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"multiple"}
   assert reply.index is 0
@@ -103,6 +108,11 @@ test light theme doc page-setup/multiple: Up and Down step
   call real-key {"key":"tab","to-field":"multiple"}
   call field-read {"dialog-field":"multiple"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"multiple"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"multiple"}
   assert reply.index is 0

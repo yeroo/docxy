@@ -37,8 +37,10 @@
 ## Dialogs and typed input (#1029)
 
 - Every dialog is in `suite/docxy/src/dialog/catalog/entries.rs`: a `DialogId`
-  exists only there, so a new dialog needs an entry (how a person opens it, its
-  editable controls, samples, what OK shows). Regenerate the cases with
+  exists only there, so every dialog carries a catalogued id. Give a new
+  dialog its own entry (how a person opens it, its editable controls, samples,
+  what OK shows); reusing another dialog's id is caught only by review and by
+  `dialog-catalog-check` where a case opens it. Regenerate the cases with
   `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
   inputs_typing_case_is_current` and commit `uiharness/cases/inputs-typing-*.uit`;
   never edit those by hand.

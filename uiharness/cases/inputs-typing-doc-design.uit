@@ -189,6 +189,11 @@ test doc fill-effects/color1: Up and Down step
   call real-key {"key":"tab","to-field":"color1"}
   call field-read {"dialog-field":"color1"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"color1"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"color1"}
   assert reply.index is 0
@@ -221,6 +226,11 @@ test doc fill-effects/color2: Up and Down step
   call real-key {"key":"tab","to-field":"color2"}
   call field-read {"dialog-field":"color2"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"color2"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"color2"}
   assert reply.index is 0
@@ -542,7 +552,15 @@ test doc watermark/font: OK applies
   call real-type {"text":"Arial"}
   call real-key {"key":"enter"}
   assert dialog is not watermark
-  assert status is Watermark: ASAP
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call field-read {"dialog-field":"font"}
+  assert reply.value is Arial
+  call real-key {"key":"escape"}
 
 test doc watermark/font: Escape cancels
   open ../fixtures/basic.docx
@@ -707,7 +725,15 @@ test doc watermark/size: OK applies
   call real-type {"text":"72"}
   call real-key {"key":"enter"}
   assert dialog is not watermark
-  assert status is Watermark: ASAP
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"kind"}
+  call real-key {"key":"down","times":1}
+  call field-read {"dialog-field":"size"}
+  assert reply.value is 72
+  call real-key {"key":"escape"}
 
 test doc watermark/size: Escape cancels
   open ../fixtures/basic.docx
@@ -756,6 +782,11 @@ test doc watermark/color: Up and Down step
   call real-key {"key":"tab","to-field":"color"}
   call field-read {"dialog-field":"color"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"color"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"color"}
   assert reply.index is 0
@@ -789,6 +820,11 @@ test doc page-borders/style: Up and Down step
   call real-key {"key":"tab","to-field":"style"}
   call field-read {"dialog-field":"style"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"style"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"style"}
   assert reply.index is 0
@@ -815,6 +851,11 @@ test doc page-borders/color: Up and Down step
   call real-key {"key":"tab","to-field":"color"}
   call field-read {"dialog-field":"color"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"color"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"color"}
   assert reply.index is 0
@@ -841,6 +882,11 @@ test doc page-borders/width: Up and Down step
   call real-key {"key":"tab","to-field":"width"}
   call field-read {"dialog-field":"width"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"width"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"width"}
   assert reply.index is 0
@@ -867,6 +913,11 @@ test doc page-borders/apply: Up and Down step
   call real-key {"key":"tab","to-field":"apply"}
   call field-read {"dialog-field":"apply"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"apply"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"apply"}
   assert reply.index is 0
@@ -1555,6 +1606,11 @@ test doc page-border-options/from: Up and Down step
   call real-key {"key":"tab","to-field":"from"}
   call field-read {"dialog-field":"from"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"from"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"from"}
   assert reply.index is 0

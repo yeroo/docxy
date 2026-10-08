@@ -15,3 +15,13 @@ test project delete-summary: matches the catalogue
   assert dialog is delete-summary
   call dialog-catalog-check {}
   call real-key {"key":"escape"}
+
+test project save-on-close: matches the catalogue
+  open copy:../fixtures/gantt-summary.xml
+  click A1
+  key delete
+  key enter
+  call close-tab {}
+  assert dialog is save-on-close
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}

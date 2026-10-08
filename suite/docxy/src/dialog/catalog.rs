@@ -2,8 +2,10 @@
 //! type into (#1029).
 //!
 //! A [`DialogId`] can only be made here: its fields are private to this
-//! module, and `Dialog::message` (the one constructor) takes one. So a dialog
-//! the catalogue lacks cannot be built, and the `inputs-typing-*.uit` cases,
+//! module, and `Dialog::message` (the one constructor) takes one. So every
+//! dialog carries a catalogued id; a new dialog that reuses another's id is
+//! caught by review, and by `dialog-catalog-check` where a case opens it. The
+//! `inputs-typing-*.uit` cases,
 //! generated from [`catalog`], type into every field it lists with real keys.
 //! The harness's `dialog-catalog-check` holds an open dialog's editable
 //! controls to its entry, so a field added to a dialog without one fails the

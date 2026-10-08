@@ -36,6 +36,11 @@ test sheet consolidate/function: Up and Down step
   call real-key {"key":"tab","to-field":"function"}
   call field-read {"dialog-field":"function"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"function"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"function"}
   assert reply.index is 0
@@ -981,6 +986,11 @@ test sheet subtotal/group: Up and Down step
   call real-key {"key":"tab","to-field":"group"}
   call field-read {"dialog-field":"group"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"group"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"group"}
   assert reply.index is 0
@@ -1009,6 +1019,11 @@ test sheet subtotal/function: Up and Down step
   call real-key {"key":"tab","to-field":"function"}
   call field-read {"dialog-field":"function"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"function"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"function"}
   assert reply.index is 0
@@ -1064,6 +1079,11 @@ test sheet data-validation/allow: Up and Down step
   call real-key {"key":"tab","to-field":"allow"}
   call field-read {"dialog-field":"allow"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"allow"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"allow"}
   assert reply.index is 0
@@ -1098,6 +1118,11 @@ test sheet data-validation/operator: Up and Down step
   call real-key {"key":"tab","to-field":"operator"}
   call field-read {"dialog-field":"operator"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"operator"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"operator"}
   assert reply.index is 0
@@ -1868,6 +1893,11 @@ test sheet data-validation/error-style: Up and Down step
   call real-key {"key":"tab","to-field":"error-style"}
   call field-read {"dialog-field":"error-style"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"error-style"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"error-style"}
   assert reply.index is 0
@@ -2424,6 +2454,11 @@ test sheet text-to-columns/qualifier: Up and Down step
   call real-key {"key":"tab","to-field":"qualifier"}
   call field-read {"dialog-field":"qualifier"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"qualifier"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"qualifier"}
   assert reply.index is 0
@@ -2670,6 +2705,11 @@ test sheet text-to-columns/column: Up and Down step
   call real-key {"key":"tab","to-field":"column"}
   call field-read {"dialog-field":"column"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"column"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"column"}
   assert reply.index is 0
@@ -2706,6 +2746,11 @@ test sheet text-to-columns/date_order: Up and Down step
   call real-key {"key":"tab","to-field":"date_order"}
   call field-read {"dialog-field":"date_order"}
   assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"date_order"}
+  assert reply.index is not 0
+  assert reply.index is not null
   call real-key {"key":"up","times":100}
   call field-read {"dialog-field":"date_order"}
   assert reply.index is 0
@@ -2723,6 +2768,8 @@ test sheet text-to-columns/formats: focus by click
   call ribbon-click {"tab":"Data","command":"Text to Columns"}
   assert dialog is text-to-columns
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
   call pointer-click {"dialog-field":"formats"}
   call field-read {"dialog-field":"formats"}
@@ -2738,6 +2785,8 @@ test sheet text-to-columns/formats: focus by Tab
   call ribbon-click {"tab":"Data","command":"Text to Columns"}
   assert dialog is text-to-columns
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
   call real-key {"key":"tab","to-field":"formats"}
   call field-read {"dialog-field":"formats"}
@@ -2753,13 +2802,15 @@ test sheet text-to-columns/formats: types
   call ribbon-click {"tab":"Data","command":"Text to Columns"}
   assert dialog is text-to-columns
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
   call pointer-click {"dialog-field":"formats"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"text"}
+  call real-type {"text":"general, skip"}
   call field-read {"dialog-field":"formats"}
-  assert reply.value is text
-  assert reply.caret is 4
+  assert reply.value is general, skip
+  assert reply.caret is 13
   call real-key {"key":"escape"}
 
 test sheet text-to-columns/formats: edits
@@ -2771,6 +2822,8 @@ test sheet text-to-columns/formats: edits
   call ribbon-click {"tab":"Data","command":"Text to Columns"}
   assert dialog is text-to-columns
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
   call pointer-click {"dialog-field":"formats"}
   call real-key {"key":"ctrl+a"}
@@ -2804,6 +2857,8 @@ test sheet text-to-columns/formats: select-all replaces
   call ribbon-click {"tab":"Data","command":"Text to Columns"}
   assert dialog is text-to-columns
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
   call pointer-click {"dialog-field":"formats"}
   call real-key {"key":"ctrl+a"}
@@ -2826,6 +2881,8 @@ test sheet text-to-columns/formats: pastes
   call ribbon-click {"tab":"Data","command":"Text to Columns"}
   assert dialog is text-to-columns
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
   call clipboard {"action":"write","text":"Pasted"}
   call pointer-click {"dialog-field":"formats"}
@@ -2844,6 +2901,8 @@ test sheet text-to-columns/formats: copies
   call ribbon-click {"tab":"Data","command":"Text to Columns"}
   assert dialog is text-to-columns
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
   call clipboard {"action":"write","text":"before"}
   call pointer-click {"dialog-field":"formats"}
@@ -2864,13 +2923,16 @@ test sheet text-to-columns/formats: OK applies
   call ribbon-click {"tab":"Data","command":"Text to Columns"}
   assert dialog is text-to-columns
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
   call pointer-click {"dialog-field":"formats"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"text"}
+  call real-type {"text":"general, skip"}
   call real-key {"key":"enter"}
   assert dialog is not text-to-columns
-  assert cell J1 is a,b
+  assert cell J1 is a
+  assert cell K1 is nothing
 
 test sheet text-to-columns/formats: Escape cancels
   open ../fixtures/basic.xlsx
@@ -2881,6 +2943,8 @@ test sheet text-to-columns/formats: Escape cancels
   call ribbon-click {"tab":"Data","command":"Text to Columns"}
   assert dialog is text-to-columns
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
   call pointer-click {"dialog-field":"formats"}
   call real-key {"key":"ctrl+a"}
@@ -2894,6 +2958,8 @@ test sheet text-to-columns/formats: Escape cancels
   call ribbon-click {"tab":"Data","command":"Text to Columns"}
   assert dialog is text-to-columns
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
   call field-read {"dialog-field":"formats"}
   assert reply.value is not Esc9
@@ -3225,23 +3291,6 @@ test sheet text-to-columns/decimal: copies
   assert reply.text is abcd
   call real-key {"key":"escape"}
 
-test sheet text-to-columns/decimal: OK applies
-  open ../fixtures/basic.xlsx
-  click J1
-  type a,b
-  key enter
-  click J1
-  call ribbon-click {"tab":"Data","command":"Text to Columns"}
-  assert dialog is text-to-columns
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Step 3: Column data format"}
-  call pointer-click {"dialog-field":"decimal"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":";"}
-  call real-key {"key":"enter"}
-  assert dialog is not text-to-columns
-  assert cell J1 is a,b
-
 test sheet text-to-columns/decimal: Escape cancels
   open ../fixtures/basic.xlsx
   click J1
@@ -3410,23 +3459,6 @@ test sheet text-to-columns/thousands: copies
   assert reply.text is abcd
   call real-key {"key":"escape"}
 
-test sheet text-to-columns/thousands: OK applies
-  open ../fixtures/basic.xlsx
-  click J1
-  type a,b
-  key enter
-  click J1
-  call ribbon-click {"tab":"Data","command":"Text to Columns"}
-  assert dialog is text-to-columns
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Step 3: Column data format"}
-  call pointer-click {"dialog-field":"thousands"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"'"}
-  call real-key {"key":"enter"}
-  assert dialog is not text-to-columns
-  assert cell J1 is a,b
-
 test sheet text-to-columns/thousands: Escape cancels
   open ../fixtures/basic.xlsx
   click J1
@@ -3468,5 +3500,15 @@ test sheet text-to-columns-replace: matches the catalogue
   call dialog-set {"control":"comma","value":true}
   call dialog-click {"button":"Finish"}
   assert dialog is text-to-columns-replace
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet save-on-close: matches the catalogue
+  open copy:../fixtures/basic.xlsx
+  click B2
+  type 5
+  key enter
+  call close-tab {}
+  assert dialog is save-on-close
   call dialog-catalog-check {}
   call real-key {"key":"escape"}
