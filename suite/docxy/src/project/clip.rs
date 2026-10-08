@@ -177,12 +177,13 @@ pub(crate) fn paste_project_rows(tab: &mut DocTab, clip: &ProjectRowsClip) {
             assignments.push(a.clone());
             continue;
         };
-        // The same resource in the same plan, else one of that name.
-        let same = |r: &&projcore::Resource| !name.is_empty() && r.name.eq_ignore_ascii_case(name);
+        // The same resource in the same plan, else one of that name (an
+        // empty name says nothing, so it never matches across resources).
+        let named = |r: &&projcore::Resource| r.name.eq_ignore_ascii_case(name);
         let target = resources
             .iter()
-            .find(|r| r.uid == a.resource_uid && same(r))
-            .or_else(|| resources.iter().find(same));
+            .find(|r| r.uid == a.resource_uid && named(r))
+            .or_else(|| resources.iter().find(|r| !name.is_empty() && named(r)));
         match target {
             Some(r) => assignments.push(projcore::Assignment {
                 resource_uid: r.uid,

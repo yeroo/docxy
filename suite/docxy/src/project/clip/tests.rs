@@ -859,3 +859,43 @@ fn an_unassigned_placeholder_assignment_goes_as_it_is() {
             .any(|a| a.task_uid == new && a.resource_uid == -65535)
     );
 }
+
+#[test]
+fn a_same_plan_paste_keeps_an_assignment_to_an_empty_named_resource() {
+    let mut t = tab();
+    let mut p = v(&t).ed.project().clone();
+    p.resources.push(projcore::Resource {
+        uid: 5,
+        id: 1,
+        name: String::new(),
+        ..projcore::Resource::default()
+    });
+    p.assignments.push(projcore::Assignment {
+        uid: 1,
+        task_uid: p.tasks[0].uid,
+        resource_uid: 5,
+        units: 1.0,
+        ..projcore::Assignment::default()
+    });
+    t.surface = Surface::Project(ProjectView::new(p, false));
+    project_cell_press(&mut t, 0, COL_ID, false);
+    let clip = copy_rows(&t).1.unwrap();
+    unselect_at(&mut t, 1, COL_NAME);
+    paste_project_rows(&mut t, &clip);
+    assert_eq!(t_status(&t), "Pasted 1 row");
+    let p = v(&t).ed.project();
+    let new = p.tasks[1].uid;
+    assert!(
+        p.assignments
+            .iter()
+            .any(|a| a.task_uid == new && a.resource_uid == 5)
+    );
+    // Another plan's differently-numbered empty-named resource is no match.
+    let mut other = tab();
+    unselect_at(&mut other, 1, COL_NAME);
+    paste_project_rows(&mut other, &clip);
+    assert_eq!(
+        t_status(&other),
+        "Pasted 1 row; 1 resource assignment dropped"
+    );
+}

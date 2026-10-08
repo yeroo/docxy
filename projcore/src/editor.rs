@@ -619,7 +619,7 @@ impl Editor {
         // every row keeps its depth below that, as it had in the source.
         let levels: Vec<u32> = rows
             .iter()
-            .map(|t| target + (t.outline_level - top))
+            .map(|t| target.saturating_add(t.outline_level - top))
             .collect();
         if levels.iter().any(|&l| l > 20) {
             return Err("Pasted rows would nest deeper than 20 levels".into());
@@ -686,6 +686,11 @@ impl Editor {
             proj.tasks.splice(at..at, copies);
             proj.assignments.extend(made);
         })?;
+        // A manual copy's pinned dates are what a save writes, as for a task
+        // added or edited.
+        for &uid in &new_uids {
+            self.stamp_pinned_dates(uid);
+        }
         Ok(new_uids)
     }
 
@@ -1737,6 +1742,15 @@ fn new_assignment(
 /// belongs to its project is cleared (see [`Editor::insert_tasks`]). The
 /// caller sets the UID, ID, level, predecessors and calendar.
 fn fresh_copy(t: &Task) -> Task {
+    // An external placeholder's stored dates are all it has; a manual task's
+    // pin may be held only by its stored dates (see `Task::pinned_dates`).
+    let external = t.is_external_leaf();
+    // Only the start: a missing manual finish is derived from the duration.
+    let manual_start = if t.manual {
+        t.manual_start.or(t.stored_start)
+    } else {
+        t.manual_start
+    };
     let mut c = Task {
         uid: 0,
         id: 0,
@@ -1746,8 +1760,9 @@ fn fresh_copy(t: &Task) -> Task {
         extended_attributes: Vec::new(),
         outline_codes: Vec::new(),
         timephased_data: Vec::new(),
-        stored_start: None,
-        stored_finish: None,
+        stored_start: t.stored_start.filter(|_| external),
+        stored_finish: t.stored_finish.filter(|_| external),
+        manual_start,
         guid: None,
         create_date: None,
         wbs: None,
@@ -3326,8 +3341,9 @@ mod tests {
             .map(|t| t.outline_level)
             .collect();
         assert_eq!(levels, [2, 4, 4]);
-        // B(2), C(2), D(1) keep their relation (the copy's top is D's 1):
-        // above D they nest B', C' one below the new D'.
+        // B(2), C(2), D(1): the copy's top is D's 1, so B', C' sit at 3 under
+        // the existing C (the task above, which becomes their summary) and D'
+        // at 2, C's sibling.
         let mut ed = outline_editor();
         let rows = ed.project().tasks[1..].to_vec();
         let new = ed.insert_tasks(Some(4), &rows, &[]).unwrap();
@@ -3375,6 +3391,49 @@ mod tests {
             ed.insert_tasks(None, &[row(40, 2), row(41, 3)], &[])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn insert_tasks_keeps_pins_and_external_dates_and_survives_huge_levels() {
+        let start = DateTime::from_ymd_hm(2026, 2, 9, 8, 0);
+        let finish = DateTime::from_ymd_hm(2026, 2, 9, 17, 0);
+        // A manual task pinned only by its stored start keeps the pin.
+        let mut ed = outline_editor();
+        let mut manual = row(50, 1);
+        manual.manual = true;
+        manual.stored_start = Some(start);
+        let new = ed.insert_tasks(None, &[manual], &[]).unwrap();
+        let t = ed.project().task(new[0]).unwrap();
+        assert_eq!((t.manual_start, t.stored_start), (Some(start), Some(start)));
+        // An external placeholder's dates are its own.
+        let mut external = row(51, 1);
+        external.external_task = Some(true);
+        external.stored_start = Some(start);
+        external.stored_finish = Some(finish);
+        let new = ed.insert_tasks(None, &[external], &[]).unwrap();
+        let t = ed.project().task(new[0]).unwrap();
+        assert_eq!(
+            (t.stored_start, t.stored_finish),
+            (Some(start), Some(finish))
+        );
+        // A task that is neither starts undated.
+        let mut plain = row(52, 1);
+        plain.stored_start = Some(start);
+        plain.stored_finish = Some(finish);
+        let new = ed.insert_tasks(None, &[plain], &[]).unwrap();
+        let t = ed.project().task(new[0]).unwrap();
+        assert_eq!(
+            (t.stored_start, t.stored_finish, t.manual_start),
+            (None, None, None)
+        );
+        // A level near u32::MAX is a depth error, not an overflow.
+        let before = ed.project().clone();
+        let result = ed.insert_tasks(None, &[row(60, 1), row(61, u32::MAX)], &[]);
+        assert_eq!(
+            result,
+            Err("Pasted rows would nest deeper than 20 levels".into())
+        );
+        assert_eq!(ed.project(), &before);
     }
 
     #[test]

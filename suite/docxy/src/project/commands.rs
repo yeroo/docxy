@@ -1849,10 +1849,12 @@ impl Docxy {
             return;
         };
         let text = project_copy_text(v);
-        if act == ProjectAct::Copy {
-            self.project_rows_clip = project_rows_clip(v, &text);
-        }
+        let clip = (act == ProjectAct::Copy)
+            .then(|| project_rows_clip(v, &text))
+            .flatten();
+        // The write ends any earlier clip; this copy's is installed after it.
         self.clipboard_write(text, cx);
+        self.project_rows_clip = clip;
         // A sheet pastes its own clipboard first; this copy is newer.
         self.grid_clip = None;
         if act == ProjectAct::Cut {

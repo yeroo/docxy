@@ -15409,6 +15409,10 @@ impl Docxy {
 
     /// Put `text` on the clipboard: the OS one, or the private one in a harness.
     fn clipboard_write(&mut self, text: String, cx: &mut App) {
+        // Whatever copies or cuts, the whole-rows clip is no longer what the
+        // clipboard holds; a Project whole-row copy installs its own after
+        // this write (#1100).
+        self.project_rows_clip = None;
         let harness = self.harness;
         self.clipboard.write(harness, text, |text| {
             cx.write_to_clipboard(ClipboardItem::new_string(text))
