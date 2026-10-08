@@ -24,6 +24,7 @@ pub use opccore::{inflate, xml, zip, zipwrite};
 pub mod agent;
 pub mod autocorrect;
 pub mod chart;
+pub mod clip_rtf;
 pub mod comments;
 pub mod compare;
 pub mod cover;
