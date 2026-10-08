@@ -429,14 +429,18 @@ Cost Overview), and `yppxy <in> --report-md <slug> <out.md>` writes one
 headless. A report shows what the sheet shows: task fields as the Entry table
 reads them, and costs and work as the stored totals each edit keeps current,
 never repriced; project totals are the project summary row's, else the sum of
-the top-level rows. Blank rows and inactive tasks are left out. Late Tasks and
+the top-level rows (Fixed Cost, which does not roll up, totals every row's
+own). Blank rows, inactive tasks and the tasks under an inactive summary are
+left out, and the overview's start and finish are the remaining tasks' shown
+dates. Late Tasks and
 the overview's late list are the tasks whose Status is Late at the status
 date (`StatusDate`, else `CurrentDate`); a plan with neither says lateness is
 not computed rather than reading the clock. Critical Tasks leaves out complete
-tasks. Overallocated Resources compares each work resource's concurrent
-assignment units over its tasks' shown spans with its Max. Units (or its
-availability periods), because the file's `OverAllocated` flag is never
-refreshed after an edit. Not implemented: Custom reports, the reports that
+tasks. Overallocated Resources books each assignment as the leveler does
+(from its Delay over its own work, on the shown, possibly leveled, dates)
+and compares the total with the resource's Max. Units or availability
+periods in the leveler's working time (`schedule::overbooked`), because the
+file's `OverAllocated` flag is never refreshed after an edit. Not implemented: Custom reports, the reports that
 need timephased data, charts or earned value (Burndown, Cash Flow, Cost
 Overview, Work Overview, Earned Value Report), Cost Overruns, Slipping Tasks
 and Upcoming Tasks, Export › Visual Reports (Excel/Visio) and Project ›
