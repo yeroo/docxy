@@ -364,6 +364,7 @@ State keys, as the app reports them after every driving verb:
 | `picking`, `range_preview`, `sel_hidden` | point mode |
 | `find_open`, `find_query`, `replace_text` | the find bar (Ctrl+F) and its Find and Replace fields; Down moves to Replace |
 | `ime_marked` | the input handler's marked text (a dead key's accent or an IME's provisional text, typed nowhere yet), or null (#1072) |
+| `wm_char_owed` | the WM_CHAR characters typed keys still owe the Windows input handler, lapsed ones included (#1139) |
 | `selected_task`, `tasks`, `bar_<id>`, `baseline_<id>` | Project: cell cursor's row (zero-based; equals `tasks` on the entry row below the last task), task count, and each task's drawn bar and baseline bar by displayed ID |
 | `selected_row` | Project: the cell cursor's drawn row, **one-based** like `rows[].row` (a collapsed summary's hidden subtasks are not counted); the `rows` reply's `count + 1` on the entry row |
 | `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name (empty on the entry row), and `none` or the filename of the last successful Gantt export |
@@ -642,14 +643,33 @@ only while the root has the focus and letters are text: an open dialog always
 takes text, and otherwise KeyTips or an open menu takes letters as commands.
 Any other key stays with `on_key`. `real-key`/`real-type` never pass through
 AppKit, so for a key the root left to it the harness sends the handler the
-`insertText:` AppKit would; for a key `on_key` kept, and on every other
-platform, they go as before. `call ime-mark
+`insertText:` AppKit would; for a key `on_key` kept they go as before, and on
+Windows each key `on_key` typed is followed by its WM_CHAR (below). `call ime-mark
 {"text":"´"}`, `call ime-commit {"text":"é"}` and `call ime-unmark {}` call the
-input handler's own methods with what AppKit sends for marked text
+input handler's macOS paths with what AppKit sends for marked text
 (`setMarkedText:`, which types nothing), a commit (`insertText:`, typed as keys
 through the same handler as typing) and `unmarkText` (the marked text is
-committed as it stands). They work on every platform, though only macOS
-registers the handler. The cases are in `uiharness/cases/ime-dead-key.uit`.
+committed as it stands). They work on every platform; macOS and Windows
+register the handler, and Windows reaches it only through WM_CHAR. The cases
+are in `uiharness/cases/ime-dead-key.uit`.
+
+On Windows the handler also takes WM_CHAR (#1139), which is how text sent as
+Unicode keyboard input (`SendInput` with `KEYEVENTF_UNICODE`: auto-type, text
+expanders, on-screen keyboards) arrives, with no key-down the app sees. A key
+`on_key` typed sends its own WM_CHAR after it, which the handler drops: each
+key-down owes its text, and a WM_CHAR character pays only the oldest debt that
+starts with it, preferring one sure to be paid, or, matching none, is typed. A
+packet whose character a pending debt starts with pays that debt, and the key's
+own WM_CHAR is then typed. A plain dead key owes nothing; an AltGr dead key
+owes its accent until it lapses. A debt waits up to 60 s. `call win-char
+{"text":"é"}` sends the handler that WM_CHAR text, typed while letters are
+text; it works on every platform. `real-key`/`real-type` follow each typed key
+with the WM_CHAR Windows would post when `"wm_char":true` and always on
+Windows, and with `"wm_char":"late"` queue each key's key-up after it and send
+every twin after the last key, as a queue drained of input first delivers them;
+a broken dedupe types twice. The state's `wm_char_owed` is what typed keys
+still owe. The cases are in `uiharness/cases/unicode-packet.uit`; `SendInput`
+itself needs a Windows desktop.
 
 `call autocorrect {}` opens Settings' AutoCorrect Options... dialog (#667,
 id `autocorrect`) on the active tab, as the backstage row does. Its tabs are

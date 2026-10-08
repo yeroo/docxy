@@ -1,0 +1,78 @@
+# Text sent as Unicode keyboard input (#1139): SendInput with KEYEVENTF_UNICODE
+# reaches a Windows window as a VK_PACKET key-down, which gpui reports as no key
+# at all, then a WM_CHAR, which reaches only the input handler. `win-char` calls
+# the handler with what WM_CHAR sends, so these run on every platform. A typed
+# key's own WM_CHAR is dropped: `real-type` with `"wm_char":true` follows each
+# key with the WM_CHAR Windows would post (a Windows build always does), and
+# `"late"` queues each key's key-up and sends the WM_CHARs after the last key,
+# as an input-first drain does, so a broken dedupe types the text twice. SendInput itself needs a Windows desktop.
+
+test packet text lands in the document body after real typing
+  open copy:../fixtures/basic.docx
+  call real-type {"text":"Real keys work.","wm_char":true}
+  assert text is Real keys work.
+  assert wm_char_owed is 0
+  call win-char {"text":" Unicode packet text: caf"}
+  call win-char {"text":"é"}
+  call win-char {"text":"😀"}
+  assert text is Real keys work. Unicode packet text: café😀
+
+test a typed key's WM_CHAR is dropped once and packet text after it types
+  open copy:../fixtures/basic.docx
+  call real-type {"text":"ab","wm_char":true}
+  assert text is ab
+  call win-char {"text":"é"}
+  assert text is abé
+  call real-type {"text":"c","wm_char":true}
+  call win-char {"text":"Z"}
+  assert text is abécZ
+
+test WM_CHARs that arrive after later keys are still dropped
+  open copy:../fixtures/basic.docx
+  call real-type {"text":"hello","wm_char":"late"}
+  assert text is hello
+  assert wm_char_owed is 0
+  call win-char {"text":"é"}
+  assert text is helloé
+
+test packet text lands in a sheet cell
+  open copy:../fixtures/basic.xlsx
+  call click-cell {"cell":"D2"}
+  call win-char {"text":"Z"}
+  call win-char {"text":"é"}
+  call win-char {"text":"😀"}
+  call real-key {"key":"enter"}
+  assert cell D2 is Zé😀
+  call click-cell {"cell":"D3"}
+  call real-type {"text":"=1+2","wm_char":true}
+  call real-key {"key":"enter"}
+  assert cell D3 is 3
+
+test packet text lands in a dialog field
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call user-name {}
+  assert dialog is user-name
+  shot window
+  call pointer-click {"dialog-field":"user-name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Jane ","wm_char":true}
+  call win-char {"text":"Zé"}
+  call win-char {"text":"😀"}
+  call dialog-read {}
+  assert reply.controls.0.value is Jane Zé😀
+  call real-key {"key":"enter"}
+  assert dialog is none
+  assert user_name is Jane Zé😀
+
+test packet letters are not KeyTips commands
+  open copy:../fixtures/basic.docx
+  type ab
+  assert ribbon_tab is Home
+  key alt
+  call win-char {"text":"n"}
+  assert ribbon_tab is Home
+  assert dialog is none
+  key escape
+  call win-char {"text":"c"}
+  assert text is abc

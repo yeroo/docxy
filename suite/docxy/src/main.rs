@@ -34111,7 +34111,8 @@ fn col_px(units: f64) -> f32 {
 
 /// The window root's keyboard: every key to [`Docxy::on_key`] (on macOS
 /// printable keys by way of AppKit's input context and the input handler,
-/// for dead keys and IME composition, #1072; see `text_input`) and the two
+/// for dead keys and IME composition, #1072; on Windows the handler types
+/// WM_CHAR text no key-down typed, #1139; see `text_input`) and the two
 /// bound actions (Tab, Shift+Tab), which gpui matches before it delivers a
 /// key-down. Both of `render`'s roots, the Backstage one too, take it from
 /// here: Backstage without it dropped every key a dialog opened from it
@@ -34127,7 +34128,7 @@ impl KeyRouting for Div {
         let input = canvas(
             |_, _, _| {},
             move |bounds, _, window, cx| {
-                if text_input::MACOS {
+                if text_input::HANDLER {
                     window.handle_input(&focus, ElementInputHandler::new(bounds, view), cx);
                 }
             },

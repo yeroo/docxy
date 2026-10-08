@@ -1,7 +1,7 @@
 # Dead keys and IME composition (#1072). macOS sends ⌥E on ABC as marked
 # text, setMarkedText "´", and the E that follows as insertText "é". The
-# `ime-*` verbs call the input handler's own methods with what AppKit sends,
-# so these run on every platform although only macOS registers the handler.
+# `ime-*` verbs call the input handler's macOS paths with what AppKit sends,
+# so these run on every platform; Windows reaches the handler only by WM_CHAR.
 # A real ⌥E needs a Mac: the keys a macOS root leaves to AppKit are in
 # text_input.rs's unit tests.
 

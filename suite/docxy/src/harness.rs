@@ -27,16 +27,16 @@
 //! Without the flag the separate Project-only control server runs instead;
 //! harness verbs and its UI dialog overrides remain disabled.
 
-use crate::control::Done;
+use crate::control::{Done, WmChar};
 use crate::windows;
 use crate::{CONFIG_DIR_ENV, RefTarget, SheetView};
 use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
 use docxcore::model::{Align, VertAlign};
 use gpui::{
-    App, AppContext as _, Context, EntityInputHandler as _, KeyDownEvent, Keystroke, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point,
-    ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px, size,
+    App, AppContext as _, Context, EntityInputHandler as _, KeyDownEvent, KeyUpEvent, Keystroke,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput,
+    Point, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px, size,
 };
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
@@ -3346,6 +3346,9 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             "ime_marked",
             str_or_null(app.ime.marked().map(str::to_string)),
         ),
+        // The WM_CHAR characters typed keys still owe, lapsed ones included
+        // (#1139).
+        ("wm_char_owed", Json::Num(app.ime.owed() as f64)),
     ]);
     let mut out: Vec<_> = out.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     if active_doc(app).is_ok() {
@@ -5161,9 +5164,25 @@ fn dispatch_verb(
                 all
             };
             let mut done = Done::ok(Json::obj(vec![("keys", Json::Num(strokes.len() as f64))]))?;
+            done.wm_char = match args.get("wm_char") {
+                None | Some(Json::Null) | Some(Json::Bool(false)) => WmChar::Off,
+                Some(Json::Bool(true)) => WmChar::Each,
+                Some(Json::Str(s)) if s == "late" => WmChar::Late,
+                Some(_) => return Err("'wm_char' must be true, false or \"late\"".to_string()),
+            };
+            // `late` stands for a queue drained of input first: each key's
+            // key-up comes before any WM_CHAR, so no debt may end at a key-up.
+            let late = done.wm_char == WmChar::Late;
             done.input = strokes
                 .into_iter()
-                .map(|keystroke| PlatformInput::KeyDown(key_event(keystroke)))
+                .flat_map(|keystroke| {
+                    let up = late.then(|| {
+                        PlatformInput::KeyUp(KeyUpEvent {
+                            keystroke: keystroke.clone(),
+                        })
+                    });
+                    std::iter::once(PlatformInput::KeyDown(key_event(keystroke))).chain(up)
+                })
                 .collect();
             Ok(done)
         }
@@ -5171,8 +5190,10 @@ fn dispatch_verb(
         // What macOS's input context sends the input handler (#1072):
         // `setMarkedText:` (`ime-mark`, a dead key's accent or an IME's
         // provisional text, which types nothing), `insertText:` (`ime-commit`)
-        // and `unmarkText` (`ime-unmark`). The handler's own methods, so they
-        // drive it on every platform, though only macOS registers it.
+        // and `unmarkText` (`ime-unmark`). The handler's macOS paths, called
+        // directly, so they drive them on every platform; macOS and Windows
+        // register the handler, and Windows reaches it only by `win-char`'s
+        // WM_CHAR.
         "ime-mark" => {
             let text = arg_str(args, "text")?;
             app.replace_and_mark_text_in_range(None, text, None, window, cx);
@@ -5180,7 +5201,16 @@ fn dispatch_verb(
         }
         "ime-commit" => {
             let text = arg_str(args, "text")?;
-            app.replace_text_in_range(None, text, window, cx);
+            app.macos_commit(text, window, cx);
+            Done::ok(state(app, window, cx))
+        }
+        // What Windows' WM_CHAR hands the input handler (#1139): a Unicode
+        // packet's text (`SendInput` with KEYEVENTF_UNICODE, which has no
+        // key-down `on_key` sees), or the twin of a key `on_key` typed, which
+        // it drops. The handler's own method, so it runs on every platform.
+        "win-char" => {
+            let text = arg_str(args, "text")?;
+            app.windows_char(text, window, cx);
             Done::ok(state(app, window, cx))
         }
         "ime-unmark" => {
@@ -5387,6 +5417,7 @@ fn dispatch_verb(
                 quit: true,
                 draw: false,
                 input: Vec::new(),
+                wm_char: WmChar::Off,
             })
         }
 
@@ -6511,6 +6542,7 @@ mod tests {
             "ime-mark",
             "ime-commit",
             "ime-unmark",
+            "win-char",
             "ribbon-read",
             "ribbon-layout",
             // It acts on the flyout itself, as the `menu-*` verbs on a menu.
