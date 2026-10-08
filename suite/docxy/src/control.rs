@@ -470,7 +470,7 @@ pub(crate) fn attach_with_dispatch(
                         // ctlcore's connection thread needs time to put the reply on the wire.
                         const QUIT_GRACE: Duration = Duration::from_millis(120);
                         cx.background_executor().timer(QUIT_GRACE).await;
-                        cx.update(|cx| cx.quit());
+                        cx.update(crate::macos_menu::end_process);
                         break;
                     }
                 }
