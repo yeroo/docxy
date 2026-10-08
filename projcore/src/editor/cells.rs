@@ -77,6 +77,29 @@ impl Editor {
         })
     }
 
+    /// Drop the constraint that typing a date adds to an auto task: with
+    /// `constraint` the task's own (Start-No-Earlier-Than for Start,
+    /// Finish-No-Earlier-Than for Finish) it becomes As Soon As Possible, as
+    /// one undo step. `Ok(false)` when there is nothing to reset: a manual
+    /// task (its dates are pinned, and cannot be blank), a blank row, or any
+    /// other constraint.
+    pub fn reset_date_constraint(
+        &mut self,
+        uid: i32,
+        constraint: ConstraintType,
+    ) -> Result<bool, String> {
+        let i = self.index(uid)?;
+        if self.proj.tasks[i].is_external_leaf() {
+            return Err(EXTERNAL_TASK_DATES.into());
+        }
+        let task = &self.proj.tasks[i];
+        if task.is_null || task.manual || task.constraint != constraint {
+            return Ok(false);
+        }
+        self.set_constraint_typed(uid, ConstraintType::AsSoonAsPossible, None)?;
+        Ok(true)
+    }
+
     /// Set a task's start to a typed day. A manual task moves there, at the
     /// day's first working time, keeping its duration; an auto task gets a
     /// Start-No-Earlier-Than constraint at that day's first working time. A

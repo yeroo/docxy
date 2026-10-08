@@ -1,10 +1,10 @@
 //! Entry-table edit state and transitions, shared by keyboard, mouse and host actions.
 use super::*;
-use projcore::LagUnit;
 use projcore::editor::{
     DURATION_HINT, duration_suffix, format_date_field, format_duration_exact, parse_cell_date,
     parse_task_duration_unit, parse_task_predecessors,
 };
+use projcore::{ConstraintType, LagUnit};
 
 pub(crate) const COL_ID: usize = 0;
 pub(crate) const COL_MODE: usize = 1;
@@ -418,8 +418,9 @@ pub(crate) fn apply_cell(
 }
 /// Ctrl+Delete on task `uid`'s `col`: clear the field, or reset it to what a
 /// new task gets where it cannot be empty (a milestone's Duration becomes a
-/// day). Never deletes the task, and a blank row stays blank. A status line
-/// when the field has nothing to reset to.
+/// day; an auto task's Start or Finish drops the Start/Finish-No-Earlier-Than
+/// constraint typing a date adds). Never deletes the task, and a blank row
+/// stays blank. A status line when the field has nothing to reset to.
 pub(crate) fn reset_cell(
     ed: &mut ProjectEditor,
     uid: i32,
@@ -446,6 +447,26 @@ pub(crate) fn reset_cell(
             let manual = ed.project().new_tasks_are_manual;
             ed.set_manual(uid, manual)?;
             Ok(None)
+        }
+        COL_START | COL_FINISH => {
+            if summary_read_only(task, col) {
+                return Err("Summary dates and duration are read-only".into());
+            }
+            let manual = task.manual;
+            // The constraint typing a date in this cell adds to an auto task.
+            let typed = if col == COL_START {
+                ConstraintType::StartNoEarlierThan
+            } else {
+                ConstraintType::FinishNoEarlierThan
+            };
+            if ed.reset_date_constraint(uid, typed)? {
+                Ok(None)
+            } else if manual {
+                // A manual task's dates are pinned; projcore has no blank one.
+                Ok(Some(format!("{} can't be cleared", COLUMNS[col])))
+            } else {
+                Ok(Some(format!("{} has no constraint to reset", COLUMNS[col])))
+            }
         }
         _ => Ok(Some(format!("{} can't be cleared", COLUMNS[col]))),
     }

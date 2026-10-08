@@ -3288,3 +3288,50 @@ fn re_entering_a_cell_keeps_links_shown_in_a_fallback_unit() {
     assert_eq!(plain[0].lag_format, LagFormat::DAYS);
     assert_eq!(plain[1].lag_format.code(), 3);
 }
+
+#[test]
+fn reset_date_constraint_drops_only_its_own_constraint() {
+    let mut ed = editor();
+    let d = Some(DateTime::from_ymd_hm(2026, 2, 3, 8, 0));
+    ed.set_constraint_typed(10, ConstraintType::StartNoEarlierThan, d)
+        .unwrap();
+    ed.mark_saved();
+    // Another constraint is not this one's to drop.
+    assert_eq!(
+        ed.reset_date_constraint(10, ConstraintType::FinishNoEarlierThan),
+        Ok(false)
+    );
+    assert_eq!((ed.undo_depth(), ed.dirty()), (1, false));
+    assert_eq!(
+        ed.reset_date_constraint(10, ConstraintType::StartNoEarlierThan),
+        Ok(true)
+    );
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(
+        (task.constraint, task.constraint_date),
+        (ConstraintType::AsSoonAsPossible, None)
+    );
+    assert_eq!((ed.undo_depth(), ed.dirty()), (2, true));
+    ed.undo();
+    assert_eq!(
+        ed.project().task(10).unwrap().constraint,
+        ConstraintType::StartNoEarlierThan
+    );
+    ed.redo();
+    assert_eq!(
+        ed.reset_date_constraint(10, ConstraintType::StartNoEarlierThan),
+        Ok(false)
+    );
+}
+
+#[test]
+fn reset_date_constraint_leaves_manual_tasks_alone() {
+    let mut ed = editor();
+    ed.set_manual(10, true).unwrap();
+    ed.mark_saved();
+    assert_eq!(
+        ed.reset_date_constraint(10, ConstraintType::StartNoEarlierThan),
+        Ok(false)
+    );
+    assert!(!ed.dirty());
+}

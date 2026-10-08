@@ -3456,8 +3456,9 @@ fn ctrl_delete_on_task_mode_resets_it_to_the_mode_for_new_tasks() {
 }
 
 #[test]
-fn ctrl_delete_on_id_start_and_finish_changes_nothing_and_keeps_the_task() {
-    for col in [COL_ID, COL_START, COL_FINISH] {
+fn ctrl_delete_on_id_changes_nothing_and_keeps_the_task() {
+    let col = COL_ID;
+    {
         let mut t = tab();
         vm(&mut t).ed.mark_saved();
         vm(&mut t).col = col;
@@ -4123,4 +4124,37 @@ fn cmd_is_projects_ctrl_on_macos_only() {
     // Ctrl itself is untouched on every platform.
     assert_eq!(project_mods(ctrl(), true), ctrl());
     assert_eq!(project_mods(ctrl(), false), ctrl());
+}
+
+#[test]
+fn ctrl_delete_on_start_and_finish_resets_an_auto_tasks_typed_constraint() {
+    for col in [COL_START, COL_FINISH] {
+        let mut t = tab();
+        vm(&mut t).col = col;
+        let uid = v(&t).ed.project().tasks[1].uid;
+        let before = v(&t).ed.project().clone();
+        chord(&mut t, "delete", ctrl());
+        assert_eq!(v(&t).ed.project(), &before);
+        assert_eq!(
+            t.status.as_ref(),
+            format!("{} has no constraint to reset", COLUMNS[col])
+        );
+        let typed = if col == COL_START {
+            projcore::ConstraintType::StartNoEarlierThan
+        } else {
+            projcore::ConstraintType::FinishNoEarlierThan
+        };
+        let day = projcore::DateTime::from_ymd_hm(2026, 2, 3, 17, 0);
+        vm(&mut t)
+            .ed
+            .set_constraint_typed(uid, typed, Some(day))
+            .unwrap();
+        vm(&mut t).ed.mark_saved();
+        let depth = v(&t).ed.undo_depth();
+        chord(&mut t, "delete", ctrl());
+        let task = v(&t).ed.project().task(uid).unwrap();
+        assert_eq!(task.constraint, projcore::ConstraintType::AsSoonAsPossible);
+        assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+        assert!(t.dirty);
+    }
 }
