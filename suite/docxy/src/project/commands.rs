@@ -1,7 +1,7 @@
 //! Project commands and prompt policy: pure DocTab functions first, window host glue last.
 use super::*;
 use crate::dialog::catalog;
-use crate::dialog::{ButtonRole, Dialog, DialogOwner, DialogStack};
+use crate::dialog::{ButtonRole, Dialog, DialogOwner};
 use projcore::editor::{AssignOutcome, FindOutcome, constraint_hint};
 use projcore::report::ReportKind;
 
@@ -1336,7 +1336,7 @@ fn level_to(v: &mut ProjectView, want: bool) -> &'static str {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AppState {
     Ready,
-    /// A sheet's cell editor opened by typing (Excel's Enter mode).
+    /// A sheet's cell editor in Enter mode (Excel's): where typing starts one.
     Enter,
     Edit,
     Busy,
@@ -1365,27 +1365,20 @@ pub(crate) fn project_app_state(v: &ProjectView) -> AppState {
     }
 }
 
-/// A Project's status-bar state: [`project_app_state`], and `Edit` while a
-/// dialog is open over it.
-pub(crate) fn project_dialog_state(v: &ProjectView, dialogs: &DialogStack) -> AppState {
-    match project_app_state(v) {
-        AppState::Ready if dialogs.is_open() => AppState::Edit,
-        state => state,
-    }
-}
-
-/// A tab's status-bar state: a Project's [`project_dialog_state`], a sheet's
-/// [`sheet_app_state`], a document's `Ready`; each is `Edit` while a dialog
-/// is open over an otherwise `Ready` tab. `None` on a placeholder.
-pub(crate) fn tab_app_state(tab: &DocTab) -> Option<AppState> {
+/// A tab's status-bar state: a Project's [`project_app_state`], a sheet's
+/// [`sheet_app_state`] (from its editor's current mode, which F2 flips), a
+/// document's `Ready`; each is `Edit` while a dialog is open over an
+/// otherwise `Ready` tab, the tab's own or the app's (`app_dialog`). `None`
+/// on a placeholder.
+pub(crate) fn tab_app_state(tab: &DocTab, app_dialog: bool) -> Option<AppState> {
     let state = match &tab.surface {
-        Surface::Project(v) => return Some(project_dialog_state(v, &tab.dialogs)),
+        Surface::Project(v) => project_app_state(v),
         Surface::Sheet(v) => crate::sheet_app_state(v),
         Surface::Doc(_) => AppState::Ready,
         Surface::Placeholder => return None,
     };
     Some(match state {
-        AppState::Ready if tab.dialogs.is_open() => AppState::Edit,
+        AppState::Ready if app_dialog || tab.dialogs.is_open() => AppState::Edit,
         state => state,
     })
 }

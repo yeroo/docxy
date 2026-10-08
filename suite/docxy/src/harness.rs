@@ -3213,7 +3213,7 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             "app_state",
             app.tabs
                 .get(app.active)
-                .and_then(crate::tab_app_state)
+                .and_then(|t| crate::tab_app_state(t, app.app_dialogs.is_open()))
                 .map_or(Json::Null, |s| Json::Str(s.label().into())),
         ),
         // The open menu's target, or null; `menu-read` has its items.
@@ -3931,7 +3931,10 @@ fn dispatch_verb(
         "last-url" => Done::ok(last_url_json(app.last_opened_url.as_deref())),
         "status-read" => {
             let tab = app.tabs.get(app.active).ok_or("there is no active tab")?;
-            Done::ok(status_json(&crate::status_items(tab)))
+            Done::ok(status_json(&crate::status_items(
+                tab,
+                app.app_dialogs.is_open(),
+            )))
         }
         "backstage" => {
             match arg_str(args, "action")? {

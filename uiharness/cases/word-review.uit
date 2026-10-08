@@ -12,7 +12,7 @@ test display for review: No Markup and Original are view-only, All and Simple ed
   type b
   assert text is helloa
   call status-read {}
-  assert reply.items.0.text is "Edit blocked: Display for Review is No Markup or Original; switch to All Markup or Simple Markup to edit."
+  assert reply.items.1.text is "Edit blocked: Display for Review is No Markup or Original; switch to All Markup or Simple Markup to edit."
   call ribbon-click {"tab":"Review","command":"markuporiginal"}
   assert view.display_mode is original
   key backspace
@@ -27,17 +27,17 @@ test track changes records typing and Resolve / Delete all are on the Review tab
   type hello
   call ribbon-click {"tab":"Review","command":"tracktoggle"}
   call status-read {}
-  assert reply.items.0.text is "Track Changes: On"
+  assert reply.items.1.text is "Track Changes: On"
   type there
   assert text is hellothere
   call inspect {}
   assert reply.revisions.found is true
   call ribbon-click {"tab":"Review","command":"tracktoggle"}
   call status-read {}
-  assert reply.items.0.text is "Track Changes: Off"
+  assert reply.items.1.text is "Track Changes: Off"
   call ribbon-click {"tab":"Review","command":"resolvecomment"}
   call status-read {}
-  assert reply.items.0.text is "Select a comment in the Comments pane first"
+  assert reply.items.1.text is "Select a comment in the Comments pane first"
   call ribbon-click {"tab":"Review","command":"deleteallcomments"}
   call status-read {}
-  assert reply.items.0.text is "Comments: nothing to remove"
+  assert reply.items.1.text is "Comments: nothing to remove"

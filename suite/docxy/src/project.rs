@@ -943,9 +943,9 @@ fn new_tasks_glyph(manual: bool) -> &'static str {
 /// Project the new-tasks mode, the last message, and on a document its
 /// page/word count. Render draws the same texts from the same functions, so
 /// the two cannot drift.
-pub(crate) fn status_items(tab: &DocTab) -> Vec<(&'static str, String)> {
+pub(crate) fn status_items(tab: &DocTab, app_dialog: bool) -> Vec<(&'static str, String)> {
     let mut items = Vec::new();
-    if let Some(state) = tab_app_state(tab) {
+    if let Some(state) = tab_app_state(tab, app_dialog) {
         items.push(("state", state.label().to_string()));
     }
     if let Surface::Project(v) = &tab.surface {

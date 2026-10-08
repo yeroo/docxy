@@ -36,10 +36,10 @@ test document state follows keys, selections, ribbon commands and backstage
   call doc {}
   assert reply.para.index is 1
   call status-read {}
-  assert reply.items.0.text is loaded
+  assert reply.items.1.text is loaded
   key ctrl+s
   call status-read {}
-  assert reply.items.0.text is not loaded
+  assert reply.items.1.text is not loaded
   call backstage {"action":"open"}
   assert reply.open is true
   assert reply.items.0 is "← Back"

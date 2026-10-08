@@ -1546,7 +1546,7 @@ fn deleting_a_summary_asks_first_and_escape_changes_nothing() {
         .map(|b| (b.label.as_str(), b.default))
         .collect();
     assert_eq!(labels, [("Yes", true), ("No", false)]);
-    assert_eq!(tab_app_state(&t), Some(AppState::Edit));
+    assert_eq!(tab_app_state(&t, false), Some(AppState::Edit));
     assert_eq!(v(&t).ed.project(), &before);
 
     // Typing, chords and Tab reach neither the dialog nor the plan under it.
@@ -1568,7 +1568,7 @@ fn deleting_a_summary_asks_first_and_escape_changes_nothing() {
 
     key(&mut t, "escape", None, Modifiers::default());
     assert!(!t.dialogs.is_open());
-    assert_eq!(tab_app_state(&t), Some(AppState::Ready));
+    assert_eq!(tab_app_state(&t, false), Some(AppState::Ready));
     assert_eq!(v(&t).ed.project(), &before);
     assert_eq!(v(&t).ed.undo_depth(), depth);
     assert!(!t.dirty);
@@ -3665,7 +3665,7 @@ fn asking_for_a_pass_commits_the_cell_and_closes_the_prompt() {
 fn status_items_are_the_state_the_mode_and_the_message_in_order() {
     let mut t = tab();
     t.status = "loaded — 2 tasks".into();
-    let items = |t: &DocTab| status_items(t);
+    let items = |t: &DocTab| status_items(t, false);
     assert_eq!(
         items(&t),
         [
@@ -4187,7 +4187,7 @@ fn a_doc_tab_reports_ready_edit_and_its_stats() {
     let mut t = crate::blank_docx_tab("doc");
     t.status = "new".into();
     assert_eq!(
-        status_items(&t),
+        status_items(&t, false),
         [
             ("state", "Ready".to_string()),
             ("message", "new".to_string()),
@@ -4195,8 +4195,13 @@ fn a_doc_tab_reports_ready_edit_and_its_stats() {
         ]
     );
     open_test_dialog(&mut t);
-    assert_eq!(status_items(&t)[0], ("state", "Edit".to_string()));
-    assert_eq!(tab_app_state(&t), Some(AppState::Edit));
+    assert_eq!(status_items(&t, false)[0], ("state", "Edit".to_string()));
+    assert_eq!(tab_app_state(&t, false), Some(AppState::Edit));
+    // An app-level dialog (no tab owns it) reads the same.
+    t.dialogs = Default::default();
+    assert_eq!(tab_app_state(&t, false), Some(AppState::Ready));
+    assert_eq!(tab_app_state(&t, true), Some(AppState::Edit));
+    assert_eq!(status_items(&t, true)[0], ("state", "Edit".to_string()));
 }
 
 #[test]
@@ -4226,34 +4231,34 @@ fn a_sheet_tab_reports_ready_enter_edit() {
     let mut t = sheet_tab();
     t.status = "s".into();
     assert_eq!(
-        status_items(&t),
+        status_items(&t, false),
         [("state", "Ready".to_string()), ("message", "s".to_string())]
     );
     // Typing opens the editor in Enter mode; F2 flips it to Edit.
     sheet_view(&mut t).begin_cell_edit(Some(String::new()));
-    assert_eq!(tab_app_state(&t), Some(AppState::Enter));
+    assert_eq!(tab_app_state(&t, false), Some(AppState::Enter));
     sheet_view(&mut t).edit_toggle_mode();
-    assert_eq!(tab_app_state(&t), Some(AppState::Edit));
+    assert_eq!(tab_app_state(&t, false), Some(AppState::Edit));
     // F2 / double-click / the fx bar open straight into Edit.
     let v = sheet_view(&mut t);
     v.editing = None;
     v.begin_cell_edit(None);
-    assert_eq!(tab_app_state(&t), Some(AppState::Edit));
+    assert_eq!(tab_app_state(&t, false), Some(AppState::Edit));
     let v = sheet_view(&mut t);
     v.editing = None;
-    assert_eq!(tab_app_state(&t), Some(AppState::Ready));
+    assert_eq!(tab_app_state(&t, false), Some(AppState::Ready));
     // A dialog over a Ready sheet is Edit; Enter mode keeps Enter under one.
     open_test_dialog(&mut t);
-    assert_eq!(tab_app_state(&t), Some(AppState::Edit));
+    assert_eq!(tab_app_state(&t, false), Some(AppState::Edit));
     t.dialogs = Default::default();
     sheet_view(&mut t).begin_cell_edit(Some(String::new()));
     open_test_dialog(&mut t);
-    assert_eq!(tab_app_state(&t), Some(AppState::Enter));
+    assert_eq!(tab_app_state(&t, false), Some(AppState::Enter));
 }
 
 #[test]
 fn a_placeholder_has_no_state() {
     let mut t = crate::blank_docx_tab("p");
     t.surface = Surface::Placeholder;
-    assert_eq!(tab_app_state(&t), None);
+    assert_eq!(tab_app_state(&t, false), None);
 }

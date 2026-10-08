@@ -7667,9 +7667,9 @@ pub(crate) fn doc_stats_text(tab: &DocTab) -> Option<String> {
     ))
 }
 
-/// A sheet's status-bar state, as Excel's: `Enter` while a cell editor opened
-/// by typing is active, `Edit` while one opened by F2, a double-click or the
-/// formula bar is, `Ready` otherwise.
+/// A sheet's status-bar state, as Excel's: `Enter` or `Edit` by the active
+/// cell editor's current mode (typing starts Enter, F2 toggles, F2 /
+/// double-click / the formula bar start Edit), `Ready` with no editor.
 pub(crate) fn sheet_app_state(v: &SheetView) -> AppState {
     match (&v.editing, v.edit_mode) {
         (None, _) => AppState::Ready,
@@ -33811,7 +33811,7 @@ impl Render for Docxy {
         let app_state = self
             .tabs
             .get(self.active)
-            .and_then(tab_app_state)
+            .and_then(|t| tab_app_state(t, self.app_dialogs.is_open()))
             .map(AppState::label);
         let new_tasks = match self.tabs.get(self.active) {
             Some(DocTab {
