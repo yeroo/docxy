@@ -2982,17 +2982,45 @@ fn clipboard_app_json(
     Json::obj(vec![("kind", Json::Str("none".into()))])
 }
 
-/// The `clipboard` reply: the clipboard's text (the harness's private one)
-/// and what the active tab's paste would use.
+/// The `clipboard` reply: the clipboard's text (the harness's private one),
+/// its RTF and the text of the RTF's bold runs (#1074), and what the active
+/// tab's paste would use.
 fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
     let now = app.clipboard_read(cx);
+    let rtf = app.clipboard_read_rtf();
     let surface = app.tabs.get(app.active).map(|t| &t.surface);
     // A grid clip whose workbook was edited since is over (#664).
     let used = clipboard_app_json(surface, app.clip.as_ref(), app.grid_clip_current(), &now);
+    let bold = rtf
+        .as_deref()
+        .and_then(|rtf| docxcore::editor::Clip::from_rtf(rtf, now.text()))
+        .map(|clip| rtf_bold_text(&clip));
     Json::obj(vec![
         ("text", str_or_null(now.text().map(str::to_string))),
+        (
+            "rtf",
+            str_or_null(rtf.map(|r| String::from_utf8_lossy(&r).into_owned())),
+        ),
+        ("rtf_bold", str_or_null(bold)),
         ("app", used),
     ])
+}
+
+/// The text of `clip`'s bold runs, in order, each paragraph's on a line of
+/// its own: what an RTF on the clipboard pastes as bold.
+fn rtf_bold_text(clip: &docxcore::editor::Clip) -> String {
+    clip.paras
+        .iter()
+        .map(|p| {
+            p.iter()
+                .filter_map(|i| match i {
+                    docxcore::model::Inline::Run(r) if r.props.bold => Some(r.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The active spreadsheet, or the refusal every cell verb needs.
@@ -4930,14 +4958,25 @@ fn dispatch_verb(
         }
         // The clipboard (#699). A harness instance has a private one (it starts
         // empty and never touches the OS clipboard); `write` puts text on it
-        // as another app's copy would. Copy, cut and paste are the app's own
-        // keys and buttons (`key ctrl+c`, `ribbon-click`), not a second route.
+        // as another app's copy would, with an optional `rtf` beside it as a
+        // rich copy has (#1074). Copy, cut and paste are the app's own keys
+        // and buttons (`key ctrl+c`, `ribbon-click`), not a second route.
         "clipboard" => {
             match arg_str(args, "action")? {
                 "read" => {}
                 "write" => {
                     let text = arg_str(args, "text")?.to_string();
+                    let rtf = match args.get("rtf") {
+                        None | Some(Json::Null) => None,
+                        Some(Json::Str(rtf)) => Some(rtf.clone()),
+                        Some(_) => return Err("'rtf' must be a string".into()),
+                    };
                     app.clipboard_write(text, cx);
+                    if let Some(rtf) = rtf {
+                        let harness = app.harness;
+                        app.clipboard
+                            .write_rtf(harness, rtf, crate::rich_clip::write_rtf);
+                    }
                 }
                 "paste-special" => {
                     return Err(

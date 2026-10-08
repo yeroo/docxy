@@ -97,7 +97,7 @@ pub(crate) struct Windows<V, H> {
     // every window's ClipboardStore clones this Rc, so a copy in any window
     // — document, grid, Project, cell editor, About, the clipboard verb —
     // is what every other window pastes, with no per-site sync.
-    clipboard_text: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    clipboard_text: crate::SharedClip,
 }
 
 impl<V, H> Default for Windows<V, H> {
@@ -317,7 +317,7 @@ pub(crate) fn next_document_title(cx: &mut App) -> String {
 
 /// The run-wide private text clipboard: each window's store clones this Rc
 /// (#587 r3).
-pub(crate) fn shared_clipboard_text(cx: &App) -> std::rc::Rc<std::cell::RefCell<Option<String>>> {
+pub(crate) fn shared_clipboard_text(cx: &App) -> crate::SharedClip {
     with(cx, |w| w.clipboard_text.clone())
         .unwrap_or_else(|| std::rc::Rc::new(std::cell::RefCell::new(None)))
 }
