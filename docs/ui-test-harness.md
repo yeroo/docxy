@@ -480,7 +480,7 @@ footer editor; `selection-set` refuses while it is open.
 | `pointer-wheel {"region":"backstage-content","dy":-600}` | dispatch a real mouse move and wheel notch at the region's centre through gpui's hit testing (#1028); a negative `dy` (logical pixels) scrolls the content down. Replies `{x, y, dy}`. Refuses under a dialog; does not pre-close menus |
 | `backstage-layout {}` | read the File screen's scroll state (refused while it is closed): `page` (`open`, `new`, `info`, `account`, `export`), the content pane's `viewport_h`, `content_h`, `scroll_y`, `scrollable`, `at_top`, `scrolled`, `last_item_visible` (true when the page fits or has been scrolled to its end), and the rail's `rail_viewport_h`, `rail_content_h`, `rail_scrollable`, `rail_last_item_visible`. Settle with `shot window` first; regions `backstage-content` and `backstage-rail` name the two columns |
 | `backstage-page {"page":"new"}` | switch the File screen's page: `new`, `info` and `export` (a document tab only; Export is Change File Type, #635) and `account` call the rail's handler; `open` (the default page) is a setup shortcut with no rail counterpart (the user closes and reopens File; the rail's Open… opens a file picker). Every page starts scrolled to the top. Replies like `backstage-layout`, whose sizes come from the last drawn frame: `shot window` before reading them |
-| `proj.new {}` | make a blank Project and activate it, as Backstage › New › Project does; replies with `proj.path` for it (`tab`, `path: null`, `name: Project1`, 0 `tasks`, `imported`, the cell state). It takes no `tab` and no `name`: the plan is the app's, so name it by saving it (`proj.save {"path":…}`). The Project control server accepts it too |
+| `proj.new {}` | make a blank Project and activate it, as Backstage › New › Project does; replies with `proj.path` for it (`tab`, `path: null`, `name: Project<N>` — the run's next blank-plan number, also the tab title — 0 `tasks`, `imported`, the cell state). It takes no `tab` and no `name`: the plan is the app's, so name it by saving it (`proj.save {"path":…}`). The Project control server accepts it too |
 | `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
 | `window-zoom {}` | call GPUI's zoom action; on Windows it maximizes, while the native caption Max button uses the OS control area. Use a fresh harness window for restored geometry on Windows |
 
@@ -1767,9 +1767,8 @@ stale pixels is exactly the failure a pixel assertion cannot notice by itself.
 
 ## Not covered
 
-- **The drawn window title and a recent-files list.** The title bar draws the
-  tab strip, not a `Project1 - <app>` title, and Backstage's Open lists the
-  open tabs, not a recent-files list, so neither is there to report.
+- **A recent-files list.** Backstage's Open lists the open tabs, not a
+  recent-files MRU, so there is none to report (#1194).
 
 - **Native Wayland capture.** Linux pixel tests use X11 on a private virtual
   display. They do not exercise the Wayland backend or desktop portal dialogs.
