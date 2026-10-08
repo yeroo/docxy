@@ -292,11 +292,11 @@ pub(crate) struct Done {
     /// borrow above it has ended. A dispatch inside `update_in` would
     /// double-borrow the app.
     pub input: Vec<gpui::PlatformInput>,
-    /// Follow each queued key-down `on_key` typed with the WM_CHAR Windows
-    /// would send (#1139), as a Windows build always does: this input never
-    /// passes through the window procedure. Set by `real-type`'s `wm_char`,
-    /// so the dedupe runs on every platform.
-    pub wm_char: bool,
+    /// Whether to follow the queued key-downs `on_key` typed with the
+    /// WM_CHAR Windows would send (#1139), as a Windows build always does:
+    /// this input never passes through the window procedure. Set by
+    /// `real-type`'s `wm_char`, so the dedupe runs on every platform.
+    pub wm_char: WmChar,
 }
 
 impl Done {
@@ -306,7 +306,7 @@ impl Done {
             quit: false,
             draw: false,
             input: Vec::new(),
-            wm_char: false,
+            wm_char: WmChar::Off,
         })
     }
 
@@ -340,9 +340,22 @@ impl Done {
             quit: false,
             draw: cfg!(target_os = "macos"),
             input: Vec::new(),
-            wm_char: false,
+            wm_char: WmChar::Off,
         })
     }
+}
+
+/// When the harness's queued key-downs get their WM_CHAR twins (#1139).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WmChar {
+    /// None (macOS and Linux, unless a verb asks).
+    #[default]
+    Off,
+    /// Each right after its key-down, as a free message queue delivers them.
+    Each,
+    /// All after the last key-down, as a queue drained of input first does
+    /// (gpui's under load): every twin arrives after later keys.
+    Late,
 }
 
 /// Block off the UI thread; the foreground receiver wakes only for arrivals or closure.
@@ -447,11 +460,16 @@ pub(crate) fn attach_with_dispatch(
                     // update the app.
                     if !done.input.is_empty() {
                         let events = std::mem::take(&mut done.input);
-                        let wm_char = done.wm_char || text_input::WINDOWS;
+                        let wm_char = match done.wm_char {
+                            WmChar::Off if text_input::WINDOWS => WmChar::Each,
+                            mode => mode,
+                        };
                         let _ = cx.update_window(target.handle, |_, window, cx| {
+                            let mut late = Vec::new();
                             for event in events {
                                 let deferred = text_input::deferred_text(&event);
-                                let char_message = text_input::char_message_text(&event, wm_char);
+                                let char_message =
+                                    text_input::char_message_text(&event, wm_char != WmChar::Off);
                                 // A key the root left to the input context
                                 // gets the `insertText:` AppKit would send
                                 // (#1072), and a key `on_key` typed on
@@ -466,10 +484,19 @@ pub(crate) fn attach_with_dispatch(
                                         this.macos_commit(&text, window, cx)
                                     });
                                 } else if let Some(text) = char_message {
+                                    if wm_char == WmChar::Late {
+                                        late.push(text);
+                                        continue;
+                                    }
                                     let _ = target.view.update(cx, |this, cx| {
                                         this.windows_char(&text, window, cx)
                                     });
                                 }
+                            }
+                            for text in late {
+                                let _ = target
+                                    .view
+                                    .update(cx, |this, cx| this.windows_char(&text, window, cx));
                             }
                         });
                     }

@@ -34137,7 +34137,6 @@ impl KeyRouting for Div {
         .size_full();
         self.child(input)
             .on_key_down(cx.listener(Docxy::route_key))
-            .on_key_up(cx.listener(Docxy::route_key_up))
             .on_action(
                 cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)),
             )

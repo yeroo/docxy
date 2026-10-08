@@ -27,7 +27,7 @@
 //! Without the flag the separate Project-only control server runs instead;
 //! harness verbs and its UI dialog overrides remain disabled.
 
-use crate::control::Done;
+use crate::control::{Done, WmChar};
 use crate::windows;
 use crate::{CONFIG_DIR_ENV, RefTarget, SheetView};
 use ctlcore::json::Json;
@@ -5167,15 +5167,22 @@ fn dispatch_verb(
                 .into_iter()
                 .map(|keystroke| PlatformInput::KeyDown(key_event(keystroke)))
                 .collect();
-            done.wm_char = arg_flag(args, "wm_char")?;
+            done.wm_char = match args.get("wm_char") {
+                None | Some(Json::Null) | Some(Json::Bool(false)) => WmChar::Off,
+                Some(Json::Bool(true)) => WmChar::Each,
+                Some(Json::Str(s)) if s == "late" => WmChar::Late,
+                Some(_) => return Err("'wm_char' must be true, false or \"late\"".to_string()),
+            };
             Ok(done)
         }
 
         // What macOS's input context sends the input handler (#1072):
         // `setMarkedText:` (`ime-mark`, a dead key's accent or an IME's
         // provisional text, which types nothing), `insertText:` (`ime-commit`)
-        // and `unmarkText` (`ime-unmark`). The handler's own methods, so they
-        // drive it on every platform, though only macOS registers it.
+        // and `unmarkText` (`ime-unmark`). The handler's macOS paths, called
+        // directly, so they drive them on every platform; macOS and Windows
+        // register the handler, and Windows reaches it only by `win-char`'s
+        // WM_CHAR.
         "ime-mark" => {
             let text = arg_str(args, "text")?;
             app.replace_and_mark_text_in_range(None, text, None, window, cx);
@@ -5399,7 +5406,7 @@ fn dispatch_verb(
                 quit: true,
                 draw: false,
                 input: Vec::new(),
-                wm_char: false,
+                wm_char: WmChar::Off,
             })
         }
 

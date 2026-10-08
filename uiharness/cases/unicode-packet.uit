@@ -3,8 +3,9 @@
 # at all, then a WM_CHAR, which reaches only the input handler. `win-char` calls
 # the handler with what WM_CHAR sends, so these run on every platform. A typed
 # key's own WM_CHAR is dropped: `real-type` with `"wm_char":true` follows each
-# key with the WM_CHAR Windows would post (a Windows build always does), so a
-# broken dedupe types the text twice. SendInput itself needs a Windows desktop.
+# key with the WM_CHAR Windows would post (a Windows build always does), and
+# `"late"` sends them all after the last key, as an input-first drain does, so
+# a broken dedupe types the text twice. SendInput itself needs a Windows desktop.
 
 test packet text lands in the document body after real typing
   open copy:../fixtures/basic.docx
@@ -25,6 +26,14 @@ test a typed key's WM_CHAR is dropped once and packet text after it types
   call real-type {"text":"c","wm_char":true}
   call win-char {"text":"Z"}
   assert text is abécZ
+
+test WM_CHARs that arrive after later keys are still dropped
+  open copy:../fixtures/basic.docx
+  call real-type {"text":"hello","wm_char":"late"}
+  assert text is hello
+  assert wm_char_owed is 0
+  call win-char {"text":"é"}
+  assert text is helloé
 
 test packet text lands in a sheet cell
   open copy:../fixtures/basic.xlsx
@@ -56,10 +65,14 @@ test packet text lands in a dialog field
   assert dialog is none
   assert user_name is Jane Zé😀
 
-test packet letters type nothing while a menu is open
+test packet letters are not KeyTips commands
   open copy:../fixtures/basic.docx
   type ab
-  call menu-open {"target":{"ribbon":["Layout","Page Setup","Margins"]}}
-  call win-char {"text":"x"}
-  call menu-close {}
-  assert text is ab
+  assert ribbon_tab is Home
+  key alt
+  call win-char {"text":"n"}
+  assert ribbon_tab is Home
+  assert dialog is none
+  key escape
+  call win-char {"text":"c"}
+  assert text is abc
