@@ -1776,8 +1776,11 @@ struct OpenField {
     emitted: bool,
 }
 
-/// What a hyperlink shows, in order: [`Hyperlink::visible_pieces`] with its
-/// tabs and breaks.
+/// What a hyperlink shows, in source order: the text of its runs, then of
+/// its content's runs, nested links, runs in revision wrappers and fields'
+/// results (a TOC entry's PAGEREF page number is a field in the link), each
+/// with its formatting (a field's is its result's, see
+/// [`crate::load::field_result_props`]); and its tabs and breaks.
 enum LinkPiece<'a> {
     Text(&'a str, RunProps),
     Tab,
