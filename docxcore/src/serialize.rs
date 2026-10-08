@@ -1809,8 +1809,23 @@ fn write_row(s: &mut String, row: &Row) {
             s.push_str(&format!("<w:trPr>{}</w:trPr>", change.raw));
         }
     }
+    // Cell-level content controls around the cells. An edit can leave a
+    // close with nothing open or an open never closed: the first is dropped
+    // and the second closed at the row's end, so the row stays well-formed.
+    let mut open_controls = Vec::new();
     for cell in &row.cells {
+        for raw in &cell.sdt_open {
+            open_controls.push(write_sdt_open(s, raw, false));
+        }
         write_cell(s, cell);
+        for raw in &cell.sdt_close {
+            if let Some(content_needs_close) = open_controls.pop() {
+                write_sdt_close(s, raw, content_needs_close);
+            }
+        }
+    }
+    while let Some(content_needs_close) = open_controls.pop() {
+        write_sdt_close(s, "", content_needs_close);
     }
     s.push_str("</w:tr>");
 }
@@ -1894,6 +1909,9 @@ fn write_cell(s: &mut String, cell: &Cell) {
     }
     s.push_str("</w:tc>");
 }
+
+#[cfg(test)]
+mod cell_sdt_tests;
 
 #[cfg(test)]
 mod tests {

@@ -944,6 +944,14 @@ pub struct Cell {
     /// `raw_tcpr`, but modeled separately so review can enumerate and reject
     /// actions against them explicitly.
     pub unsupported_revisions: Vec<UnsupportedPropertyRevision>,
+    /// Cell-level content controls (`<w:sdt>` wrapping `<w:tc>`, such as the
+    /// cover page's Abstract and Year, #1102) opening right before this cell:
+    /// the exact source from `<w:sdt` through the `<w:sdtContent>` start tag,
+    /// outermost first. A control wrapping several cells opens on its first.
+    pub sdt_open: Vec<String>,
+    /// The `</w:sdtContent>`…`</w:sdt>` suffixes of the cell-level controls
+    /// closing right after this cell, innermost first.
+    pub sdt_close: Vec<String>,
 }
 
 impl Default for Cell {
@@ -955,6 +963,8 @@ impl Default for Cell {
             raw_tcpr: None,
             property_change: None,
             unsupported_revisions: Vec::new(),
+            sdt_open: Vec::new(),
+            sdt_close: Vec::new(),
         }
     }
 }
@@ -970,6 +980,44 @@ pub struct Row {
     pub property_change: Option<PropertyChange>,
     /// The `w:tr` start tag's attributes (`w:rsidR`, `w:rsidTr`, `w14:paraId`, …).
     pub element_attrs: ElementAttrs,
+}
+
+impl Row {
+    /// Remove cell `i`, keeping the row's cell-level content controls where
+    /// they were: a control opening and closing on the removed cell goes with
+    /// it, one it opened now opens on the next cell, and one it closed now
+    /// closes on the previous cell. So deleting the second cell of a control
+    /// over two cells does not stretch the control over the third.
+    pub fn remove_cell(&mut self, i: usize) -> Cell {
+        let mut cell = self.cells.remove(i);
+        let opens = std::mem::take(&mut cell.sdt_open);
+        let closes = std::mem::take(&mut cell.sdt_close);
+        // Its closes end its own innermost opens first.
+        let own = opens.len().min(closes.len());
+        let outer_opens = &opens[..opens.len() - own];
+        let outer_closes = &closes[own..];
+        if let Some(next) = self.cells.get_mut(i) {
+            next.sdt_open.splice(0..0, outer_opens.iter().cloned());
+        }
+        if let Some(prev) = i.checked_sub(1).and_then(|p| self.cells.get_mut(p)) {
+            prev.sdt_close.extend(outer_closes.iter().cloned());
+        }
+        cell
+    }
+
+    /// Whether every cell-level content control opened in the row closes in
+    /// it, and none closes before it opens.
+    pub fn cell_sdt_balanced(&self) -> bool {
+        let mut depth = 0usize;
+        for cell in &self.cells {
+            depth += cell.sdt_open.len();
+            match depth.checked_sub(cell.sdt_close.len()) {
+                Some(d) => depth = d,
+                None => return false,
+            }
+        }
+        depth == 0
+    }
 }
 
 /// An invisible table child anchored at the gap before `rows[at]` (or after the

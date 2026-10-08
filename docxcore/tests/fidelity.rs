@@ -812,6 +812,44 @@ fn corpus_sdt_files_read_sdtrun_as_word_does_1084() {
     }
 }
 
+/// Word's cover pages keep every content control and placeholder flag
+/// through the save the gate tests (#1102): coverpage1's Year and Abstract
+/// are cell-level controls (`w:sdt` around `w:tc`), which the save dropped,
+/// turning the Abstract's placeholder into text. Named here so the gate's
+/// corpus walk cannot silently stop covering them. Skips without the corpus.
+#[test]
+fn cover_pages_keep_their_content_controls_1102() {
+    let (_, Some(dir)) = corpus(&workspace_root()) else {
+        eprintln!("fidelity: SKIP cover_pages_keep_their_content_controls_1102: no corpus");
+        return;
+    };
+    let counts = |bytes: &[u8]| {
+        let parts = read_parts(bytes).expect("a package");
+        let xml = String::from_utf8_lossy(&parts["word/document.xml"]).into_owned();
+        let sdt = xml.matches("<w:sdt>").count() + xml.matches("<w:sdt ").count();
+        (sdt, xml.matches("<w:showingPlcHdr").count())
+    };
+    // The corpus spells the fourth file this way.
+    for name in [
+        "cover page/coverpage1.docx",
+        "cover page/coverpage2.docx",
+        "cover page/coverpage3.docx",
+        "cover page/covwepage4.docx",
+    ] {
+        let Ok(bytes) = std::fs::read(dir.join(name)) else {
+            eprintln!("fidelity: SKIP {name}: not in the corpus");
+            continue;
+        };
+        let mut pkg = load_package(&bytes).expect(name);
+        pkg.document = Editor::new(pkg.document.clone()).doc;
+        let saved = save_package(&pkg);
+        assert_eq!(counts(&saved), counts(&bytes), "{name}");
+        if name.ends_with("coverpage1.docx") {
+            assert_eq!(counts(&saved), (6, 1), "{name}");
+        }
+    }
+}
+
 #[test]
 fn packages_compare_xml_canonically_and_other_parts_by_bytes() {
     use docxcore::zipwrite::write_zip;
