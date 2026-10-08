@@ -673,7 +673,7 @@ fn only_a_range_across_every_column_is_a_whole_row_copy() {
     // A cell, a partial range, and the range up to the last column only.
     unselect_at(&mut t, 0, COL_NAME);
     assert!(copy_rows(&t).1.is_none());
-    vm(&mut t).extend_selection("right");
+    vm(&mut t).extend_selection("right", false);
     assert!(v(&t).selection().is_some());
     assert!(copy_rows(&t).1.is_none());
     at(&mut t, 0, COL_ID);

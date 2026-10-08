@@ -886,9 +886,14 @@ pub(crate) fn project_input(
         return Some(act);
     }
     if m.control && !m.alt && !m.platform {
-        // Shift is ignored, as it is for the plain arrows.
-        v.anchor = None;
-        navigate(tab, |v| v.ctrl_key(key));
+        // Shift+Ctrl+arrows and Shift+Ctrl+Home/End extend the range, as in
+        // Project; any other Ctrl key moves the cursor and clears it.
+        if m.shift && matches!(key, "up" | "down" | "left" | "right" | "home" | "end") {
+            navigate(tab, |v| v.extend_selection(key, true));
+        } else {
+            v.anchor = None;
+            navigate(tab, |v| v.ctrl_key(key));
+        }
         return None;
     }
     if !m.control && !m.alt && !m.platform {
@@ -902,11 +907,11 @@ pub(crate) fn project_input(
             }
             return None;
         }
-        if m.shift && matches!(key, "up" | "down" | "left" | "right") {
-            navigate(tab, |v| v.extend_selection(key));
+        if m.shift && matches!(key, "up" | "down" | "left" | "right" | "home" | "end") {
+            navigate(tab, |v| v.extend_selection(key, false));
         } else {
             // A plain arrow, Tab, Home/End, PageUp/PageDown or Escape moves
-            // the cursor; the range a Shift+arrow made does not survive.
+            // the cursor; the range a Shift key made does not survive.
             v.anchor = None;
             navigate(tab, |v| v.key(key, m.shift));
         }

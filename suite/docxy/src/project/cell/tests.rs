@@ -1962,3 +1962,157 @@ fn the_window_level_gesture_end_reaches_every_project_tab() {
         "ending the drag does not clear the gesture's range"
     );
 }
+
+// ---- Shift+Home/End and Shift+Ctrl keys extend the range (#1087) ------------
+
+fn shift_ctrl(t: &mut DocTab, key_name: &str) {
+    let m = Modifiers {
+        shift: true,
+        control: true,
+        ..Modifiers::default()
+    };
+    assert_eq!(project_input(t, key_name, None, m), None);
+}
+
+const LAST: usize = COLUMN_COUNT - 1;
+
+#[test]
+fn shift_home_and_end_extend_to_the_rows_first_and_last_field_1087() {
+    let mut t = tab();
+    vm(&mut t).ed.select(1);
+    vm(&mut t).col = COL_NAME;
+    shift(&mut t, "end");
+    assert_eq!(sel(&t), Some((vec![20], COL_NAME, LAST)));
+    assert_eq!((v(&t).ed.selected_uid(), v(&t).col), (Some(20), LAST));
+    // Home swings the range to the other side of the anchor, which stays.
+    shift(&mut t, "home");
+    assert_eq!(sel(&t), Some((vec![20], COL_ID, COL_NAME)));
+    assert_eq!(v(&t).col, COL_ID);
+    // A plain Home moves the cursor and drops the range.
+    shift(&mut t, "end");
+    key(&mut t, "home");
+    assert_eq!(sel(&t), None);
+    assert_eq!(v(&t).col, COL_ID);
+}
+
+#[test]
+fn shift_ctrl_left_and_right_are_shift_home_and_end_1087() {
+    let mut t = tab();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    shift_ctrl(&mut t, "right");
+    assert_eq!(sel(&t), Some((vec![10], COL_NAME, LAST)));
+    shift_ctrl(&mut t, "left");
+    assert_eq!(sel(&t), Some((vec![10], COL_ID, COL_NAME)));
+    assert_eq!(v(&t).ed.selected_uid(), Some(10), "the row stays");
+}
+
+#[test]
+fn shift_ctrl_up_and_down_extend_to_the_first_and_last_shown_task_1087() {
+    let mut t = tab();
+    // Task 30 hides under the collapsed summary 20.
+    vm(&mut t).ed.indent(30, 1).unwrap();
+    assert!(vm(&mut t).ed.set_collapsed(20, true).is_ok());
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_DURATION;
+    shift_ctrl(&mut t, "down");
+    assert_eq!(sel(&t), Some((vec![10, 20], COL_DURATION, COL_DURATION)));
+    assert_eq!(
+        (v(&t).ed.selected_uid(), v(&t).col),
+        (Some(20), COL_DURATION)
+    );
+    assert!(!v(&t).on_entry_row(), "never the entry row");
+    // Again at the last shown task: it stays, and so does the range.
+    shift_ctrl(&mut t, "down");
+    assert_eq!(sel(&t), Some((vec![10, 20], COL_DURATION, COL_DURATION)));
+    assert!(!v(&t).on_entry_row());
+    // Up returns to the anchor's row: no range left.
+    shift_ctrl(&mut t, "up");
+    assert_eq!(sel(&t), None);
+    assert_eq!(v(&t).ed.selected_uid(), Some(10));
+}
+
+#[test]
+fn shift_ctrl_home_and_end_extend_to_the_corners_1087() {
+    let mut t = tab();
+    vm(&mut t).ed.select(1);
+    vm(&mut t).col = COL_NAME;
+    shift_ctrl(&mut t, "end");
+    assert_eq!(sel(&t), Some((vec![20, 30], COL_NAME, LAST)));
+    assert_eq!((v(&t).ed.selected_uid(), v(&t).col), (Some(30), LAST));
+    assert!(!v(&t).on_entry_row());
+    shift_ctrl(&mut t, "home");
+    assert_eq!(sel(&t), Some((vec![10, 20], COL_ID, COL_NAME)));
+    assert_eq!((v(&t).ed.selected_uid(), v(&t).col), (Some(10), COL_ID));
+}
+
+#[test]
+fn the_anchor_never_drifts_across_mixed_extensions_1087() {
+    let mut t = tab();
+    vm(&mut t).ed.select(1);
+    vm(&mut t).col = COL_DURATION;
+    shift(&mut t, "end");
+    shift_ctrl(&mut t, "up");
+    shift(&mut t, "left");
+    shift_ctrl(&mut t, "down");
+    shift(&mut t, "home");
+    assert_eq!(v(&t).anchor, Some((20, COL_DURATION)));
+    assert_eq!(sel(&t), Some((vec![20, 30], COL_ID, COL_DURATION)));
+    // Ctrl without Shift moves the cursor and drops the range.
+    ctrl_key(&mut t, "up");
+    assert_eq!(sel(&t), None);
+    assert_eq!(v(&t).anchor, None);
+    assert_eq!((v(&t).ed.selected_uid(), v(&t).col), (Some(10), COL_ID));
+}
+
+#[test]
+fn on_the_entry_row_the_shift_keys_do_nothing_1087() {
+    let mut t = tab();
+    vm(&mut t).enter_entry_row();
+    vm(&mut t).col = COL_NAME;
+    // Plain Ctrl+Up would go to the first task; with Shift it stays, as
+    // Shift+arrows do there: the entry row is never part of a range.
+    for k in ["up", "down", "left", "right", "home", "end"] {
+        shift_ctrl(&mut t, k);
+        shift(&mut t, k);
+    }
+    assert!(v(&t).on_entry_row());
+    assert_eq!((v(&t).col, v(&t).anchor), (COL_NAME, None));
+    assert_eq!(sel(&t), None);
+}
+
+#[test]
+fn a_dragged_or_id_clicked_range_keeps_its_anchor_when_extended_1087() {
+    let mut t = tab();
+    project_cell_press(&mut t, 0, COL_NAME, false);
+    assert!(project_cell_drag_over(&mut t, 1, COL_DURATION));
+    project_cell_release(&mut t);
+    shift(&mut t, "end");
+    assert_eq!(sel(&t), Some((vec![10, 20], COL_NAME, LAST)));
+    // The ID cell's whole-row range grows by whole rows.
+    project_cell_press(&mut t, 1, COL_ID, false);
+    project_cell_release(&mut t);
+    project_cell_click(&mut t, 1, Some(COL_ID), false);
+    shift_ctrl(&mut t, "down");
+    assert_eq!(sel(&t), Some((vec![20, 30], COL_ID, LAST)));
+}
+
+#[test]
+fn mac_command_shift_keys_extend_the_range_1087() {
+    let mut t = tab();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    let cmd_shift = Modifiers {
+        shift: true,
+        platform: true,
+        ..Modifiers::default()
+    };
+    // ⌘⇧→ and ⌘⇧↓ reach the grid as Ctrl+Shift.
+    for k in ["right", "down"] {
+        assert_eq!(
+            project_input(&mut t, k, None, project_mods(cmd_shift, true)),
+            None
+        );
+    }
+    assert_eq!(sel(&t), Some((vec![10, 20, 30], COL_NAME, LAST)));
+}
