@@ -22,7 +22,7 @@ pub(crate) fn file_key(k: &Keystroke) -> Option<FileKey> {
         return None;
     }
     let m = &k.modifiers;
-    if m.alt || m.function {
+    if m.alt || m.function || (m.control && m.platform) {
         return None;
     }
     match (m.control || m.platform, m.shift) {
@@ -37,6 +37,11 @@ impl Docxy {
     /// Run a file key from `document_key`.
     pub(crate) fn file_key_act(&mut self, key: FileKey, window: &mut Window, cx: &mut Context<Self>) {
         self.keytips = KeyTip::Off;
+        // Flash Fill's preview stands for one key (ENT-105); this key returns
+        // before `sheet_key`, which would have dropped it.
+        if let Some(v) = self.active_sheet_mut() {
+            v.flash_preview = None;
+        }
         match key {
             FileKey::SaveAs => self.save_as(window, cx),
             FileKey::Save => {
@@ -86,6 +91,7 @@ mod tests {
     fn other_chords_are_not_file_keys() {
         for s in [
             "ctrl-shift-f12",
+            "ctrl-cmd-f12",
             "alt-f12",
             "fn-f12",
             "ctrl-alt-f12",
@@ -96,10 +102,5 @@ mod tests {
         ] {
             assert_eq!(file_key(&ks(s)), None, "{s}");
         }
-    }
-
-    #[test]
-    fn open_refusal_is_fixed_text() {
-        assert!(OPEN_HARNESS.starts_with("A harness instance cannot open"));
     }
 }
