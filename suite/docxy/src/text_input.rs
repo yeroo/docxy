@@ -39,11 +39,15 @@
 //! automation may queue a key's down and up at once) hands over the key-up
 //! and later key-downs first. So a debt outlives its key's key-up and waits
 //! for its text up to [`WM_CHAR_KEEP`] (60 s). A match pays only its own
-//! debt: the character may be a packet's, queued ahead of the WM_CHARs older
-//! debts wait for. Only an AltGr dead key's accent, which may never come,
-//! is dropped by the next match of a newer debt. A packet's text that no
-//! debt starts with is typed: matched by text, not counted. Packet text
-//! queued behind typed keys under load may land after their text. The
+//! debt and drops none: the character may be a packet's, queued ahead of the
+//! WM_CHARs older debts wait for, and a WM_CHAR does not say which it is. So
+//! an AltGr dead key's accent, which never comes, waits out the keep time.
+//! A character pays the oldest debt that starts with it, preferring one sure
+//! to be paid. A packet's text that no debt starts with is typed: matched by
+//! text, not counted. A packet whose character a pending debt starts with
+//! pays that debt, and the key's own WM_CHAR is then typed in its place, so
+//! the text comes out the same. Packet text queued behind typed keys under
+//! load may land after their text. The
 //! handler never accepts text input there ([`accepts_text_input`]), so the
 //! Windows IME stays off as it was.
 //!
@@ -156,8 +160,7 @@ pub(crate) const WM_CHAR_MAX_DEBTS: usize = 4096;
 /// as preferring character input, and with no Ctrl, Alt or Win held nothing
 /// else sets that flag. Under AltGr the flag marks every character the
 /// modifiers change too, so an AltGr dead key owes its accent ([`may_not_come`])
-/// and the next match of a newer debt drops it. "´" then X owes "´x", which
-/// comes as two WM_CHARs.
+/// until it lapses. "´" then X owes "´x", which comes as two WM_CHARs.
 pub(crate) fn owed_text(ev: &KeyDownEvent) -> Option<String> {
     let m = &ev.keystroke.modifiers;
     if m.alt && !m.control {
@@ -308,13 +311,12 @@ impl ImeState {
     /// Windows' WM_CHAR at `now` (a surrogate pair joined by gpui): the key
     /// events that type what no key-down typed already, one per character.
     /// Each character pays the oldest debt that starts with it, preferring
-    /// one sure to be paid. Only that debt changes: the character may be a
-    /// packet's, ahead of the WM_CHARs older debts still wait for. The older
-    /// debts that [`may_not_come`] go, though: the WM_CHAR of an AltGr
-    /// character would have come first, so they were AltGr dead keys'. A
-    /// character no debt starts with (a packet's) is typed and leaves the
-    /// debts as they are. Empty text (an IME message gpui forwards) changes
-    /// nothing.
+    /// one sure to be paid over one that [`may_not_come`]. Only that debt
+    /// changes, and none is dropped: the character may be a packet's, ahead
+    /// of the WM_CHARs older debts still wait for (an older AltGr debt among
+    /// them). A character no debt starts with (a packet's) is typed and
+    /// leaves the debts as they are. Empty text (an IME message gpui
+    /// forwards) changes nothing.
     pub(crate) fn char_message(&mut self, text: &str, now: Instant) -> Vec<KeyDownEvent> {
         self.lapse(now);
         let mut keys = Vec::new();
@@ -329,13 +331,6 @@ impl ImeState {
                 keys.extend(char_stroke(c).map(typed));
                 continue;
             };
-            let dropped = self.owed.iter().take(i).filter(|d| d.may_not_come).count();
-            let mut index = 0;
-            self.owed.retain(|d| {
-                index += 1;
-                index > i || !d.may_not_come
-            });
-            let i = i - dropped;
             let debt = &mut self.owed[i].text;
             debt.drain(..c.len_utf8());
             if debt.is_empty() {
@@ -1029,7 +1024,7 @@ mod tests {
 
     /// An AltGr dead key then a letter it does not combine with: the
     /// letter's debt "~x" is sure to be paid, so "~" pays it rather than
-    /// the dead key's, which goes, and "x" is not typed twice.
+    /// the dead key's, and "x" is not typed twice.
     #[test]
     fn an_altgr_dead_key_pair_prefers_the_sure_debt() {
         let mut ime = ImeState::default();
@@ -1040,6 +1035,30 @@ mod tests {
         ime.key_down(&typed(plain("x", "~x")), at);
         assert!(ime.char_message("~", at).is_empty());
         assert!(ime.char_message("x", at).is_empty());
+        // The dead key's accent waits out the keep time.
+        assert_eq!(ime.owed(), 1);
+        let later = at + WM_CHAR_KEEP + Duration::from_millis(1);
+        assert_eq!(key_chars(&ime.char_message("~", later)), ["~"]);
+    }
+
+    /// A packet "b" queued ahead of an AltGr € and a typed B: no match
+    /// drops the € debt, whose WM_CHAR is still coming, so only the
+    /// packet's "b" is typed (in the place of B's twin), not "€b€b".
+    #[test]
+    fn a_match_drops_no_older_altgr_debt() {
+        let mut ime = ImeState::default();
+        let at = t0();
+        ime.key_down(&dead("e", "€", ctrl_alt()), at);
+        ime.key_down(&typed(plain("b", "b")), at);
+        let mut typed_chars = Vec::new();
+        for c in ["b", "€", "b"] {
+            typed_chars.extend(
+                key_chars(&ime.char_message(c, at))
+                    .into_iter()
+                    .map(str::to_string),
+            );
+        }
+        assert_eq!(typed_chars, ["b"]);
         assert_eq!(ime.owed(), 0);
     }
 
@@ -1065,10 +1084,10 @@ mod tests {
     }
 
     /// An AltGr dead key cannot be told from an AltGr character, so it owes
-    /// its accent: the composed letter's WM_CHAR matches the letter's debt
-    /// and drops the older one, whose WM_CHAR never came.
+    /// its accent: the composed letter's WM_CHAR pays the letter's debt, and
+    /// the accent's, which never comes, waits out the keep time.
     #[test]
-    fn an_altgr_dead_keys_debt_is_dropped_by_the_next_match() {
+    fn an_altgr_dead_keys_debt_waits_out_the_keep_time() {
         let mut ime = ImeState::default();
         let at = t0();
         let tilde = dead("4", "~", ctrl_alt());
@@ -1076,8 +1095,9 @@ mod tests {
         ime.key_down(&tilde, at);
         ime.key_down(&typed(plain("n", "ñ")), at);
         assert!(ime.char_message("ñ", at).is_empty());
-        assert_eq!(ime.owed(), 0);
-        assert_eq!(key_chars(&ime.char_message("~", at)), ["~"]);
+        assert_eq!(ime.owed(), 1);
+        let later = at + WM_CHAR_KEEP + Duration::from_millis(1);
+        assert_eq!(key_chars(&ime.char_message("~", later)), ["~"]);
     }
 
     /// An unmatched debt goes after `WM_CHAR_KEEP`, and typing after it is

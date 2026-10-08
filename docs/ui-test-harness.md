@@ -658,17 +658,18 @@ Unicode keyboard input (`SendInput` with `KEYEVENTF_UNICODE`: auto-type, text
 expanders, on-screen keyboards) arrives, with no key-down the app sees. A key
 `on_key` typed sends its own WM_CHAR after it, which the handler drops: each
 key-down owes its text, and a WM_CHAR character pays only the oldest debt that
-starts with it or, matching none, is typed. A plain dead key owes nothing; an
-AltGr dead key owes its accent, dropped only by the next match of a newer
-debt. A debt waits up to 60 s. `call win-char {"text":"é"}` sends the handler
-that WM_CHAR text, typed while letters are text; it works on every platform.
-`real-key`/`real-type` follow each typed key with the WM_CHAR Windows would
-post when `"wm_char":true` and always on Windows, and with
-`"wm_char":"late"` queue each key's key-up after it and send every twin after
-the last key, as a queue drained of input first delivers them; a broken
-dedupe types twice. The state's `wm_char_owed` is what typed keys still owe.
-The cases are in `uiharness/cases/unicode-packet.uit`; `SendInput` itself
-needs a Windows desktop.
+starts with it, preferring one sure to be paid, or, matching none, is typed. A
+packet whose character a pending debt starts with pays that debt, and the key's
+own WM_CHAR is then typed. A plain dead key owes nothing; an AltGr dead key
+owes its accent until it lapses. A debt waits up to 60 s. `call win-char
+{"text":"é"}` sends the handler that WM_CHAR text, typed while letters are
+text; it works on every platform. `real-key`/`real-type` follow each typed key
+with the WM_CHAR Windows would post when `"wm_char":true` and always on
+Windows, and with `"wm_char":"late"` queue each key's key-up after it and send
+every twin after the last key, as a queue drained of input first delivers them;
+a broken dedupe types twice. The state's `wm_char_owed` is what typed keys
+still owe. The cases are in `uiharness/cases/unicode-packet.uit`; `SendInput`
+itself needs a Windows desktop.
 
 `call autocorrect {}` opens Settings' AutoCorrect Options... dialog (#667,
 id `autocorrect`) on the active tab, as the backstage row does. Its tabs are
