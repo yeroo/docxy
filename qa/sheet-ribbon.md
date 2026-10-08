@@ -73,3 +73,38 @@ placeholders (Themes, Arrange, Name Manager, Trace Precedents, ...) do nothing.
 
 **Fails when:** a new tab is missing or out of order, a wired command does
 nothing or is not saved, or a placeholder looks like it ran.
+
+## Narrowing the window collapses ribbon groups and every command stays reachable
+
+**Guards:** APP-025 (docxy-excel-spec `docs/spec/application.md`) and #1020:
+as the window narrows, groups drop their labels and then collapse to one
+button that opens the whole group. Every command stays reachable at every
+width.
+
+**Steps:**
+1. Open a workbook and maximise the window. On Home, every group from
+   Clipboard to Editing is drawn whole, with nothing cut off at the right edge.
+2. Drag the window's right edge slowly to its minimum width. Watch the
+   right-hand groups: Editing becomes one button (its icon over "Editing ▾"),
+   then Cells, Styles, Number, Alignment and Font follow, and Clipboard is
+   last.
+3. At about 700 px, click a cell in a column of text, then click the Editing
+   button. Its flyout opens under it with AutoSum, Fill, Clear, Sort & Filter
+   and Find & Select. Open Sort & Filter in the flyout and choose Sort A to Z.
+   The column sorts and the flyout closes.
+4. Click the Font button, then B in its flyout. The cell turns bold and the
+   flyout stays open. Click outside the flyout to close it.
+5. Widen the window again. The groups come back in place in reverse order,
+   and an open flyout closes once its group is drawn in place.
+6. Repeat steps 1, 2 and 5 on a Word document (Home, then Insert and
+   Mailings) and on a Project (Task). On the document's Home tab, open
+   Editing's flyout at about 640 px and click Find & Replace.
+
+**Expect:** at no width is a group cut off at the right edge, scrolled, or
+replaced by a "⋯ N more" marker. A collapsed group's flyout shows the whole
+group at full size, and every control in it works: toggles, combos, split
+buttons and drop-downs.
+
+**Fails when:** a group is hidden or scrolled instead of collapsed, groups
+collapse out of priority order (Clipboard or Font before the groups to their
+right), or a command in a collapsed group's flyout does nothing.

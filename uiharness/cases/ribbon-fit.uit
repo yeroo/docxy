@@ -177,3 +177,197 @@ test ribbon-layout refuses while a final document hides the ribbon
   open copy:../fixtures/final.docx
   assert final is true
   call-error ribbon-layout {} => the ribbon is hidden
+
+# #1020: the ribbon fits the window, as Excel's and Word's do. As it narrows,
+# groups drop their labels, then collapse, lowest priority first, to one
+# button whose flyout holds the whole group; nothing is hidden or scrolled.
+# `ribbon-layout` checks every drawn group against the ribbon's own edges
+# (`any_clipped`) and its drawn width against the width the fit assumed
+# (`estimates_ok`). Each read shows the tab, draws a frame, then reads it.
+
+test sheet Home at the default width: nothing clipped, nothing scrolled
+  open ../fixtures/basic.xlsx
+  call window-size {"w":1180,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.estimates_ok is true
+  shot ribbon
+
+test sheet Home at 900: groups collapse and nothing is clipped
+  open ../fixtures/basic.xlsx
+  call window-size {"w":900,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.estimates_ok is true
+  assert reply.groups.0.title is Clipboard
+  assert reply.groups.0.state is full
+  shot ribbon
+
+test sheet Home narrow: Editing collapses and its commands still work
+  open ../fixtures/basic.xlsx
+  call window-size {"w":700,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.estimates_ok is true
+  assert reply.groups.6.title is Editing
+  assert reply.groups.6.state is collapsed
+  assert reply.groups.6.in_overflow is false
+  call ribbon-read {}
+  assert reply.tabs.1.groups.6.state is collapsed
+  click A1
+  # Through the flyout: Editing's opens, then Sort & Filter's menu in it.
+  call ribbon-click {"tab":"Home","command":"Sort A to Z"}
+  assert dirty is true
+  # A command that is not a toggle closes the flyout, as Excel's does.
+  call ribbon-flyout {}
+  assert reply.open is false
+  shot ribbon
+
+test sheet Home at 640: Clipboard is the last group drawn whole
+  open ../fixtures/basic.xlsx
+  call window-size {"w":640,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.estimates_ok is true
+  assert reply.groups.0.state is full
+  assert reply.groups.1.title is Font
+  assert reply.groups.1.state is collapsed
+  shot ribbon
+
+test sheet Home at the narrowest window: every group is a button
+  open ../fixtures/basic.xlsx
+  call window-size {"w":460,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.estimates_ok is true
+  assert reply.groups.0.state is collapsed
+  assert reply.groups.6.state is collapsed
+
+test a collapsed sheet group's flyout shows the whole group and its toggles work
+  open ../fixtures/basic.xlsx
+  call window-size {"w":640,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  click A1
+  call ribbon-flyout {"action":"open","group":"Font"}
+  assert reply.open is true
+  assert reply.group is Font
+  shot window
+  shot ribbon-flyout
+  # Bold is a toggle: it runs, and the flyout stays open to show it on.
+  call ribbon-click {"tab":"Home","command":"Bold"}
+  assert dirty is true
+  call ribbon-flyout {}
+  assert reply.open is true
+  assert reply.group is Font
+  call ribbon-flyout {"action":"close"}
+  assert reply.open is false
+  # Esc closes it too, and edits nothing under it.
+  call ribbon-flyout {"action":"open","group":"Number"}
+  assert reply.open is true
+  key escape
+  call ribbon-flyout {}
+  assert reply.open is false
+  call-error ribbon-flyout {"action":"open","group":"Clipboard"} => is not collapsed
+
+test document Home narrow: no "N more", every command reachable
+  open ../fixtures/basic.docx
+  call window-size {"w":640,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.estimates_ok is true
+  assert reply.groups.4.title is Editing
+  assert reply.groups.4.state is collapsed
+  # Find is in Editing, a group the old ribbon hid behind "N more".
+  call ribbon-click {"tab":"Home","command":"find"}
+  assert find_open is true
+  shot ribbon
+
+test document Home at 1180 and 900 fit
+  open ../fixtures/basic.docx
+  call window-size {"w":1180,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.estimates_ok is true
+  assert reply.groups.0.title is Clipboard
+  assert reply.groups.0.in_overflow is false
+  call window-size {"w":900,"h":800}
+  shot window
+  call ribbon-layout {}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.estimates_ok is true
+
+test document Home at the narrowest window
+  open ../fixtures/basic.docx
+  call window-size {"w":460,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.estimates_ok is true
+  # A document group's flyout: Paragraph's alignment works from it.
+  call ribbon-flyout {"action":"open","group":"Paragraph"}
+  assert reply.open is true
+  shot window
+  shot ribbon-flyout
+
+test Project Task tab narrow
+  open ../fixtures/gantt-summary.xml
+  call window-size {"w":640,"h":800}
+  call ribbon-layout {"tab":"Task"}
+  shot window
+  call ribbon-layout {"tab":"Task"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.estimates_ok is true
+  assert reply.groups.0.title is Clipboard
+  assert reply.groups.0.state is icon-only
+  call window-size {"w":460,"h":800}
+  shot window
+  call ribbon-layout {}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.estimates_ok is true
+  assert reply.groups.0.state is icon-only
+
+test widening restores full groups
+  open ../fixtures/basic.xlsx
+  call window-size {"w":700,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.groups.6.state is collapsed
+  call ribbon-flyout {"action":"open","group":"Editing"}
+  assert reply.open is true
+  call window-size {"w":1400,"h":800}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.groups.6.state is full
+  # The flyout closed: its group is drawn in place again.
+  call ribbon-flyout {}
+  assert reply.open is false
