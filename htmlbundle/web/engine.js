@@ -651,6 +651,7 @@
     'Layout(LineNumbers(None))': NOT_YET,
     'Layout(LineNumbers(RestartEachPage))': NOT_YET,
     'Layout(LineNumbers(RestartEachSection))': NOT_YET,
+    'Layout(LineNumbersOptions)': NOT_YET,
     'Layout(Margins(Mirrored))': NOT_YET,
     'Layout(Margins(Moderate))': NOT_YET,
     'Layout(Margins(Narrow))': NOT_YET,

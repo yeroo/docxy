@@ -371,7 +371,7 @@ fn menus_follow_word_with_headings_separators_and_placeholders() {
             "-",
             "Suppress for Current Paragraph",
             "-",
-            "(Line Numbering Options...)"
+            "Line Numbering Options..."
         ]
     );
     assert_eq!(

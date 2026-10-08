@@ -35,6 +35,8 @@ pub(crate) enum LayoutAct {
     PageSetup(PageSetupTab),
     /// Open the Columns dialog.
     MoreColumns,
+    /// Open the Line Numbers dialog (#747).
+    LineNumbersOptions,
     /// An item Word has that has nothing behind it yet: drawn disabled.
     Unavailable,
 }
@@ -224,7 +226,11 @@ fn menu_rows(menu: LayoutMenu) -> Vec<Row> {
                 L::SuppressLineNumbers,
             ),
             Row::Separator,
-            item("ln-options", "Line Numbering Options...", L::Unavailable),
+            item(
+                "ln-options",
+                "Line Numbering Options...",
+                L::LineNumbersOptions,
+            ),
         ],
         LayoutMenu::Hyphenation => vec![
             item("hyphen-none", "None", L::Hyphen(false)),
@@ -513,6 +519,7 @@ pub(crate) fn layout_apply(tab: &mut DocTab, act: LayoutAct) -> Result<(), Strin
         LayoutAct::Menu(_)
         | LayoutAct::PageSetup(_)
         | LayoutAct::MoreColumns
+        | LayoutAct::LineNumbersOptions
         | LayoutAct::Unavailable => return Ok(()),
     };
     if changed {
@@ -549,6 +556,9 @@ impl Docxy {
                 self.open_layout_dialog(|t| crate::page_setup::page_setup_dialog(t, page))
             }
             LayoutAct::MoreColumns => self.open_layout_dialog(crate::page_setup::columns_dialog),
+            LayoutAct::LineNumbersOptions => {
+                self.open_layout_dialog(crate::page_setup::line_numbers_dialog)
+            }
             LayoutAct::Unavailable => {}
             _ => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {

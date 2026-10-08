@@ -46,6 +46,12 @@ fn apply_dialog(
                 _ => crate::page_setup::apply_columns(ed, pkg, dialog),
             }
         }
+        DialogOwner::LineNumbers => {
+            let Surface::Doc(ed) = surface else {
+                return Err("this dialog belongs to a .docx document".into());
+            };
+            crate::page_setup::apply_line_numbers(ed, dialog)
+        }
         DialogOwner::HfDistance { is_header, section } => {
             let Surface::Doc(ed) = surface else {
                 return Err("this dialog belongs to a document".into());

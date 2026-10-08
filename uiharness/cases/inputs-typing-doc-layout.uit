@@ -6290,6 +6290,596 @@ test doc columns/apply: Up and Down step
   assert reply.index is 1
   call real-key {"key":"escape"}
 
+test doc line-numbers: matches the catalogue
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc line-numbers/start: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"start"}
+  call field-read {"dialog-field":"start"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc line-numbers/start: focus by Tab
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"by"}
+  call field-read {"dialog-field":"start"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"start"}
+  call field-read {"dialog-field":"start"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc line-numbers/start: types
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"3"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is 3
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc line-numbers/start: edits
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"start"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"start"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc line-numbers/start: select-all replaces
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"start"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc line-numbers/start: pastes
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc line-numbers/start: copies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc line-numbers/start: OK applies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"3"}
+  call real-key {"key":"enter"}
+  assert dialog is not line-numbers
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is 3
+  call real-key {"key":"escape"}
+
+test doc line-numbers/start: Escape cancels
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not line-numbers
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc line-numbers/start: refuses invalid
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"3"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is 3
+  call real-key {"key":"escape"}
+
+test doc line-numbers/from: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-control":"auto"}
+  call pointer-click {"dialog-field":"from"}
+  call field-read {"dialog-field":"from"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc line-numbers/from: focus by Tab
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-control":"auto"}
+  call real-key {"key":"tab","to-field":"from"}
+  call field-read {"dialog-field":"from"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc line-numbers/from: types
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-control":"auto"}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.5"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 0.5
+  assert reply.caret is 3
+  call real-key {"key":"escape"}
+
+test doc line-numbers/from: edits
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-control":"auto"}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"from"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"from"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc line-numbers/from: select-all replaces
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-control":"auto"}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"from"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc line-numbers/from: pastes
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-control":"auto"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc line-numbers/from: copies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-control":"auto"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc line-numbers/from: OK applies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-control":"auto"}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.5"}
+  call real-key {"key":"enter"}
+  assert dialog is not line-numbers
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-control":"auto"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 0.5
+  call real-key {"key":"escape"}
+
+test doc line-numbers/from: Escape cancels
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-control":"auto"}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not line-numbers
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-control":"auto"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc line-numbers/from: refuses invalid
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-control":"auto"}
+  call pointer-click {"dialog-field":"from"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.5"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"from"}
+  assert reply.value is 0.5
+  call real-key {"key":"escape"}
+
+test doc line-numbers/by: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"by"}
+  call field-read {"dialog-field":"by"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc line-numbers/by: focus by Tab
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"start"}
+  call field-read {"dialog-field":"by"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"by"}
+  call field-read {"dialog-field":"by"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc line-numbers/by: types
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"by"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"5"}
+  call field-read {"dialog-field":"by"}
+  assert reply.value is 5
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc line-numbers/by: edits
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"by"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"by"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"by"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"by"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"by"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"by"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc line-numbers/by: select-all replaces
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"by"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"by"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"by"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc line-numbers/by: pastes
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"by"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"by"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc line-numbers/by: copies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"by"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc line-numbers/by: OK applies
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"by"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"5"}
+  call real-key {"key":"enter"}
+  assert dialog is not line-numbers
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call field-read {"dialog-field":"by"}
+  assert reply.value is 5
+  call real-key {"key":"escape"}
+
+test doc line-numbers/by: Escape cancels
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"by"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not line-numbers
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call field-read {"dialog-field":"by"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc line-numbers/by: refuses invalid
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"add"}
+  call pointer-click {"dialog-field":"by"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"5"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"by"}
+  assert reply.value is 5
+  call real-key {"key":"escape"}
+
+test doc line-numbers/apply: focus by click
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"apply"}
+  call field-read {"dialog-field":"apply"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc line-numbers/apply: Up and Down step
+  open ../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
+  call menu-click {"label":"Line Numbering Options..."}
+  assert dialog is line-numbers
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"apply"}
+  call field-read {"dialog-field":"apply"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"apply"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"apply"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"apply"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
 test doc hf-distance: matches the catalogue
   open ../fixtures/basic.docx
   call ribbon-click {"tab":"Insert","command":"Edit Header"}

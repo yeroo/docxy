@@ -36,6 +36,8 @@ pub(crate) enum DialogOwner {
     PageSetup,
     /// Word's Columns, for the caret's sections (#649).
     Columns,
+    /// Word's Line Numbers, for the caret's sections (#747).
+    LineNumbers,
     /// The Header & Footer tab's Header from Top (`is_header`) or Footer from
     /// Bottom Custom... box, for one section (#641).
     HfDistance {

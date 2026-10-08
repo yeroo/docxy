@@ -20,6 +20,9 @@ use crate::dialog::{
 use crate::layout_tab::PageSetupTab;
 use docxcore::sect::{Paper, SectionSetup, SectionStart, TWIPS_PER_INCH};
 
+mod line_numbers;
+pub(crate) use line_numbers::{apply_line_numbers, line_numbers_dialog};
+
 const CUSTOM: &str = "Custom";
 const THIS_SECTION: &str = "This section";
 const SELECTED_SECTIONS: &str = "Selected sections";
