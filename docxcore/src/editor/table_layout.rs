@@ -367,7 +367,7 @@ impl Editor {
                         let removed: usize = hit.iter().map(|&i| rm.cells[i].1).sum();
                         let row = &mut t.rows[ri];
                         for &i in hit.iter().rev() {
-                            row.cells.remove(i);
+                            row.remove_cell(i);
                         }
                         set_row_skips(row, rm.before, rm.after + removed);
                     }
@@ -990,7 +990,7 @@ fn remove_grid_columns(t: &mut Table, left: usize, right: usize) {
         for (ci, &(s, n)) in rm.cells.iter().enumerate().rev() {
             let o = overlap(s, n);
             if o == n {
-                row.cells.remove(ci);
+                row.remove_cell(ci);
             } else if o > 0 {
                 row.cells[ci].grid_span -= o as u32;
             }
@@ -1066,8 +1066,10 @@ fn merge_range(t: &mut Table, r: &CellRange) -> Result<(), String> {
     for (k, (ri, hit)) in per_row.into_iter().enumerate() {
         let row = &mut t.rows[ri];
         let keep = hit[0];
+        // The merged cell takes the cell-level content controls the others
+        // closed (see `Row::remove_cell`).
         for &ci in hit[1..].iter().rev() {
-            row.cells.remove(ci);
+            row.remove_cell(ci);
         }
         let cell = &mut row.cells[keep];
         cell.grid_span = w as u32;

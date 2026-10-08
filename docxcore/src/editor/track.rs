@@ -185,6 +185,7 @@ impl Editor {
     /// Delete the character at editor offset `idx` of the paragraph at `path`:
     /// recorded as a tracked deletion when tracking, else removed outright.
     pub(super) fn delete_char_at(&mut self, path: &[usize], idx: usize) {
+        self.clear_placeholders_around(path);
         let Some(author) = self.track.as_ref().map(|t| t.author.clone()) else {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
                 content_delete(&mut p.content, idx);

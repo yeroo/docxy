@@ -15,8 +15,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 mod autocorrect;
+#[cfg(test)]
+mod cell_sdt_tests;
 mod cover;
 mod flat;
+mod placeholder;
 mod sections;
 mod table_design;
 mod table_layout;
@@ -950,6 +953,8 @@ impl Editor {
             self.last = EditKind::None;
         }
         self.checkpoint(EditKind::Insert);
+        let path = self.caret.path.clone();
+        self.clear_placeholders_around(&path);
         let off = self.caret.offset;
         if ch == LINE_BREAK {
             // A break is an inline of its own, formatted as typing here
@@ -1707,6 +1712,8 @@ impl Editor {
         if clip.paras.is_empty() {
             return;
         }
+        let path = self.caret.path.clone();
+        self.clear_placeholders_around(&path);
         // Recorded as one tracked insertion when tracking; a copy of recorded
         // text is not itself a record when not.
         let recorded = self.clip_for_insertion(clip);
