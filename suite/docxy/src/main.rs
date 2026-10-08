@@ -68,6 +68,7 @@ mod menu;
 mod open_mode;
 #[cfg(test)]
 mod open_mode_tests;
+mod page_flow;
 mod page_number;
 mod page_setup;
 mod project;
@@ -5408,8 +5409,7 @@ fn ruler_scroll_view(
 }
 
 /// The page whose column ranges hold top-level `block` — the block→page
-/// mapping `paginate`/`paginate_cols` produced. `None` when no range
-/// contains it.
+/// mapping `PageFlow::ranges()` produced. `None` when no range contains it.
 fn page_of_block(ranges: &[Vec<(usize, usize)>], block: usize) -> Option<usize> {
     ranges
         .iter()
@@ -5430,6 +5430,25 @@ fn page_needs_scroll(probe: &RulerProbe, page: usize) -> bool {
         .is_some_and(|r| r.intersects(&viewport))
 }
 
+/// The section and geometry of the page the ruler currently tracks, from
+/// the shown body's flow (#745): the page's owning section drives the
+/// margin handles' refusal, the drag starts from the final section's raw
+/// margins (see `PageFlow::drag_geom`). `None` when nothing is tracked yet
+/// or the tab is not a document.
+fn tracked_page_geom(
+    tab: &DocTab,
+    markup: MarkupView,
+    probe: &RulerProbe,
+) -> Option<(usize, docxcore::model::PageGeom, usize)> {
+    let Surface::Doc(ed) = &tab.surface else {
+        return None;
+    };
+    let shown = ed.doc.markup_view(markup);
+    let pf = tab_page_flow(tab, &shown.body);
+    let (section, geom) = pf.drag_geom(tracked_page(probe), final_sect_pr(tab).unwrap_or(""))?;
+    Some((section, geom, pf.sections.len()))
+}
+
 /// The Print Layout page scroll target for a caret at top-level `block`: the
 /// page holding it in the shown body's pagination (the markup view the render
 /// paginates), the last page when no range contains it — never past the
@@ -5437,10 +5456,11 @@ fn page_needs_scroll(probe: &RulerProbe, page: usize) -> bool {
 fn print_caret_page(
     doc: &Document,
     view: MarkupView,
-    geom: &docxcore::model::PageGeom,
+    last_sect: &str,
+    gutter_at_top: bool,
     block: usize,
 ) -> usize {
-    let ranges = page_ranges_of(&doc.markup_view(view).body, geom);
+    let ranges = page_flow::flow(&doc.markup_view(view).body, last_sect, gutter_at_top).ranges();
     // `block` addresses the live body; the view-only markup modes can merge
     // paragraphs, so a merged block lands on the last page.
     page_of_block(&ranges, block).unwrap_or(ranges.len().saturating_sub(1))
@@ -5485,8 +5505,8 @@ mod ruler_geom_tests {
     use super::{
         Block, Document, EffIndent, Inline, LeadingItem, MarkupView, Pal, Paragraph, RulerChange,
         RulerDrag, RulerHandle, RulerProbe, ScreenRect, dragged_left_marker, eff_indent,
-        hruler_geom, hruler_hit, leading_items, next_tab_stop, page_needs_scroll, page_of_block,
-        page_ranges_of, paragraph_indent_layout, print_caret_page, px_tw, ruler_colors,
+        hruler_geom, hruler_hit, leading_items, next_tab_stop, page_flow, page_needs_scroll,
+        page_of_block, paragraph_indent_layout, print_caret_page, px_tw, ruler_colors,
         ruler_drag_result, tracked_page, tw_px, vruler_geom,
     };
     use docxcore::model::{
@@ -5946,7 +5966,6 @@ mod ruler_geom_tests {
                 page: PageGeom::default(),
                 content_x: 300.0,
                 content_right: 900.0,
-                page_x: 100.0,
                 page_right: 100.0 + tw_px(PageGeom::default().w, zoom),
                 sect_checkpointed: false,
             };
@@ -5993,7 +6012,7 @@ mod ruler_geom_tests {
                     right: 1440
                 }
             );
-            near(ml.guide, 101.0 + tw_px(1800, zoom));
+            near(ml.guide, 300.0 + tw_px(1800 - 1440, zoom));
 
             d.handle = RulerHandle::MarginRight;
             let mr = ruler_drag_result(d, pointer);
@@ -6076,7 +6095,9 @@ mod ruler_geom_tests {
             })
         };
         let body: Vec<Block> = (0..300).map(|i| para(&format!("paragraph {i}"))).collect();
-        let ranges = page_ranges_of(&body, &PageGeom::default());
+        // "" is the default sectPr, the same geometry PageGeom::default()
+        // paginated with before #745.
+        let ranges = page_flow::flow(&body, "", false).ranges();
         assert!(ranges.len() > 1, "expected multiple pages, got {ranges:?}");
         let last = body.len() - 1;
         assert_eq!(page_of_block(&ranges, last), Some(ranges.len() - 1));
@@ -6108,15 +6129,16 @@ mod ruler_geom_tests {
             })])
         }));
         let doc = Document { body };
-        let geom = PageGeom::default();
-        let live_pages = page_ranges_of(&doc.body, &geom).len();
-        let shown_pages = page_ranges_of(&doc.markup_view(MarkupView::Simple).body, &geom).len();
+        let live_pages = page_flow::flow(&doc.body, "", false).ranges().len();
+        let shown_pages = page_flow::flow(&doc.markup_view(MarkupView::Simple).body, "", false)
+            .ranges()
+            .len();
         assert!(
             shown_pages < live_pages,
             "the deletion should add a page to the live body only: live {live_pages}, shown {shown_pages}"
         );
         let last = doc.body.len() - 1;
-        let page = print_caret_page(&doc, MarkupView::Simple, &geom, last);
+        let page = print_caret_page(&doc, MarkupView::Simple, "", false, last);
         assert_eq!(page, shown_pages - 1);
         assert!(page < live_pages);
     }
@@ -6132,19 +6154,18 @@ mod ruler_geom_tests {
                 ..Paragraph::default()
             })
         };
-        let geom = PageGeom::default();
         let body: Vec<Block> = (0..8).map(|i| para(&format!("p{i}"))).collect();
         let doc = Document { body };
-        let pages = page_ranges_of(&doc.body, &geom).len();
-        assert_eq!(print_caret_page(&doc, MarkupView::All, &geom, 0), 0);
+        let pages = page_flow::flow(&doc.body, "", false).ranges().len();
+        assert_eq!(print_caret_page(&doc, MarkupView::All, "", false, 0), 0);
         // A block past every range (a live index after a paragraph merge, say)
         // and an empty body both target an existing page, never past the sheets.
         assert_eq!(
-            print_caret_page(&doc, MarkupView::All, &geom, usize::MAX),
+            print_caret_page(&doc, MarkupView::All, "", false, usize::MAX),
             pages - 1
         );
         let empty = Document { body: Vec::new() };
-        assert_eq!(print_caret_page(&empty, MarkupView::All, &geom, 7), 0);
+        assert_eq!(print_caret_page(&empty, MarkupView::All, "", false, 7), 0);
     }
 
     #[test]
@@ -6218,7 +6239,6 @@ struct RulerDrag {
     page: docxcore::model::PageGeom,
     content_x: f32,
     content_right: f32,
-    page_x: f32,
     page_right: f32,
     /// A margin drag already took its undo checkpoint on the body editor, so
     /// later moves of the same drag ride on it.
@@ -6277,7 +6297,9 @@ fn ruler_drag_result(d: RulerDrag, x: f32) -> RulerDragResult {
                     left,
                     right: d.page.mr,
                 },
-                d.page_x + 1.0 + tw(left),
+                // The dragged margin is the raw `w:left` (no gutter), but the
+                // guide tracks the drawn content edge, which includes it.
+                d.content_x + tw(left.saturating_sub(d.page.ml)),
             )
         }
         RulerHandle::MarginRight => {
@@ -19383,7 +19405,12 @@ impl Docxy {
             if let Surface::Doc(ed) = &t.surface {
                 if let Some(&b) = ed.caret.path.first() {
                     if self.page_view {
-                        let page = print_caret_page(&ed.doc, self.markup, &final_page_geom(t), b);
+                        let page = {
+                            let last_sect = final_sect_pr(t).unwrap_or("");
+                            let gutter_at_top =
+                                t.pkg.as_ref().is_some_and(|p| p.has_gutter_at_top());
+                            print_caret_page(&ed.doc, self.markup, last_sect, gutter_at_top, b)
+                        };
                         let needs_scroll = {
                             let probe = self.ruler_probe.borrow();
                             page_needs_scroll(&probe, page)
@@ -20219,11 +20246,30 @@ impl Docxy {
         let Some(indent) = self.tabs.get(self.active).and_then(ruler_drag_indent) else {
             return;
         };
-        let geom = self
+        // The tracked page's own section (page view, #745); when the tracked
+        // page is unknown, the final section's geometry (the pre-#745 shape).
+        // The margin handles edit the final section only, so a drag starting
+        // on an earlier section's page is refused with a hint. Both sides of
+        // the comparison come from the same flow's numbering.
+        let tracked = self
             .tabs
             .get(self.active)
-            .map(final_page_geom)
-            .unwrap_or_default();
+            .filter(|t| matches!(t.surface, Surface::Doc(_)))
+            .and_then(|t| tracked_page_geom(t, self.markup, &self.ruler_probe.borrow()));
+        let geom = tracked
+            .as_ref()
+            .map(|(_, g, _)| *g)
+            .unwrap_or_else(|| final_page_geom(self.tabs.get(self.active).unwrap()));
+        if matches!(handle, RulerHandle::MarginLeft | RulerHandle::MarginRight)
+            && tracked
+                .as_ref()
+                .is_some_and(|(section, _, n)| section + 1 != *n)
+        {
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.status = "Margins of an earlier section: use Layout > Margins".into();
+            }
+            return;
+        }
         self.ruler_drag = Some(RulerDrag {
             handle,
             start_x: x,
@@ -20232,7 +20278,6 @@ impl Docxy {
             page: geom,
             content_x: g.content_x,
             content_right: g.content_right,
-            page_x: g.page_x,
             page_right: g.page_right,
             sect_checkpointed: false,
         });
@@ -27030,34 +27075,25 @@ fn block_height_est(b: &Block, content_w: f32) -> f32 {
     }
 }
 
+/// A tab's print-layout flow over a body: every section with its own page
+/// size, margins, gutter and columns, starting as its `w:type` says (#745).
+fn tab_page_flow(tab: &DocTab, body: &[Block]) -> page_flow::PageFlow {
+    let last_sect = final_sect_pr(tab).unwrap_or("");
+    let gutter_at_top = tab.pkg.as_ref().is_some_and(|p| p.has_gutter_at_top());
+    page_flow::flow(body, last_sect, gutter_at_top)
+}
+
 /// A tab's print-layout pages over the live editor body: each page's column
-/// block ranges, flowed with the final section's geometry. Header/footer
-/// navigation and the status-bar page count share it, so Next and Previous
-/// walk the pages the person sees. The render — and `scroll_to_caret`, which
-/// must land on the sheet the person sees — paginate the shown markup-view
-/// body instead, whose revision filters can make it shorter than the live
-/// body.
+/// block ranges. Header/footer navigation and the status-bar page count
+/// share it, so Next and Previous walk the pages the person sees. The render
+/// — and `scroll_to_caret`, which must land on the sheet the person sees —
+/// flow the shown markup-view body instead, whose revision filters can make
+/// it shorter than the live body.
 fn page_ranges(tab: &DocTab) -> Vec<Vec<(usize, usize)>> {
     let Surface::Doc(ed) = &tab.surface else {
         return Vec::new();
     };
-    page_ranges_of(&ed.doc.body, &final_page_geom(tab))
-}
-
-fn page_ranges_of(body: &[Block], geom: &docxcore::model::PageGeom) -> Vec<Vec<(usize, usize)>> {
-    let content_h = (geom.h - geom.mt - geom.mb).max(1) as f32 / 15.0;
-    let content_w = (geom.w - geom.ml - geom.mr).max(1) as f32 / 15.0;
-    let ncols = geom.cols.max(1) as usize;
-    let colgap = geom.col_space.max(0) as f32 / 15.0;
-    if ncols > 1 {
-        let col_w = ((content_w - colgap * (ncols as f32 - 1.0)) / ncols as f32).max(1.0);
-        paginate_cols(body, content_h, col_w, ncols)
-    } else {
-        paginate(body, content_h, content_w)
-            .into_iter()
-            .map(|r| vec![r])
-            .collect()
-    }
+    tab_page_flow(tab, &ed.doc.body).ranges()
 }
 
 /// The indents a ruler drag starts from: the ones the ruler draws, and the
@@ -27094,90 +27130,7 @@ fn has_page_break(b: &Block) -> bool {
     matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Break(docxcore::model::BreakKind::Page, _))))
 }
 
-/// Group top-level block indices into pages by accumulated estimated height,
-/// hard page breaks and section breaks that start a new page. Returns
-/// `[start, end)` block ranges, one per page.
-fn paginate(blocks: &[Block], content_h: f32, content_w: f32) -> Vec<(usize, usize)> {
-    let section_ends = hf::section_page_ends(blocks);
-    let mut pages = Vec::new();
-    let mut start = 0usize;
-    let mut acc = 0.0_f32;
-    for (i, b) in blocks.iter().enumerate() {
-        let bh = block_height_est(b, content_w);
-        if acc + bh > content_h && i > start {
-            pages.push((start, i));
-            start = i;
-            acc = 0.0;
-        }
-        acc += bh;
-        if has_page_break(b) || section_ends[i] {
-            pages.push((start, i + 1));
-            start = i + 1;
-            acc = 0.0;
-        }
-    }
-    if start < blocks.len() {
-        pages.push((start, blocks.len()));
-    }
-    if pages.is_empty() {
-        pages.push((0, blocks.len()));
-    }
-    pages
-}
-
-/// Flow blocks into `ncols` columns per page (newspaper columns). Each column
-/// holds `content_h` worth of content estimated at the per-column width; a page
-/// is `ncols` such columns. Returns one `Vec<(start,end)>` (the columns) per page.
-fn paginate_cols(
-    blocks: &[Block],
-    content_h: f32,
-    col_w: f32,
-    ncols: usize,
-) -> Vec<Vec<(usize, usize)>> {
-    let section_ends = hf::section_page_ends(blocks);
-    let mut pages: Vec<Vec<(usize, usize)>> = Vec::new();
-    let mut page: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0usize;
-    let mut acc = 0.0_f32;
-    let flush_col = |page: &mut Vec<(usize, usize)>,
-                     pages: &mut Vec<Vec<(usize, usize)>>,
-                     start: usize,
-                     i: usize| {
-        page.push((start, i));
-        if page.len() >= ncols {
-            pages.push(std::mem::take(page));
-        }
-    };
-    for (i, b) in blocks.iter().enumerate() {
-        let bh = block_height_est(b, col_w);
-        if acc + bh > content_h && i > start {
-            flush_col(&mut page, &mut pages, start, i);
-            start = i;
-            acc = 0.0;
-        }
-        acc += bh;
-        if has_page_break(b) || section_ends[i] {
-            flush_col(&mut page, &mut pages, start, i + 1);
-            // A hard break ends the current column *and* the page.
-            if !page.is_empty() {
-                pages.push(std::mem::take(&mut page));
-            }
-            start = i + 1;
-            acc = 0.0;
-        }
-    }
-    if start < blocks.len() {
-        flush_col(&mut page, &mut pages, start, blocks.len());
-    }
-    if !page.is_empty() {
-        pages.push(page);
-    }
-    if pages.is_empty() {
-        pages.push(vec![(0, blocks.len())]);
-    }
-    pages
-}
-
+/// The list markers (`1.`, `•`) for a body's paragraphs, by block index.
 fn list_markers(body: &[Block]) -> Vec<Option<String>> {
     let mut out = Vec::with_capacity(body.len());
     let mut counts: Vec<u32> = Vec::new();
@@ -32917,10 +32870,10 @@ impl Render for Docxy {
                     };
                     let body = &shown.body;
                     if self.page_view {
-                        // Print Layout: split the body into discrete page sheets
-                        // (section margins), stacked on a grey canvas. A sheet is
-                        // white, or the document's page colour (#651).
-                        let geom = final_page_geom(tab);
+                        // Print Layout: split the body into discrete page sheets,
+                        // each section with its own page size, margins and columns
+                        // (#745), stacked on a grey canvas. A sheet is white, or the
+                        // document's page colour (#651).
                         let sheet = hsla_u(design_tab::page_sheet_color(tab));
                         let zoom = self.zoom;
                         let tw = move |t: i32| px(zoom * (t.max(0) as f32) / 15.0); // twips → px @ ~96dpi, zoomed
@@ -32929,8 +32882,10 @@ impl Render for Docxy {
                         } else {
                             hsla_u(0x9a9a9a)
                         };
-                        // Newspaper columns: flow the body into N columns per page.
-                        let pages = page_ranges_of(body, &geom);
+                        // Each section flows with its own geometry (the PDF
+                        // exporter is the oracle; page_flow documents the rules).
+                        let pf = tab_page_flow(tab, body);
+                        let pages = pf.ranges();
                         {
                             let mut probe = self.ruler_probe.borrow_mut();
                             probe.pages = vec![None; pages.len()];
@@ -32951,11 +32906,14 @@ impl Render for Docxy {
                         let tab_label = hf_tab::edit_label(tab);
                         let hf_linked = hf_tab::linked(tab);
                         let hf_parts = pkg.map(|p| hf::resolve(editor, p)).unwrap_or_default();
-                        let first_blocks: Vec<usize> = pages
-                            .iter()
-                            .map(|cols| cols.first().map_or(0, |c| c.0))
-                            .collect();
-                        let slots = hf::page_slots(editor, &first_blocks, even_odd);
+                        // The page's first body block; an empty range (the blank
+                        // page an odd/even start inserts) takes the previous block,
+                        // so the filler shows the previous section's header/footer,
+                        // like the PDF exporter (export.rs new_page(i-1, false, true)).
+                        let first_blocks = page_flow::first_blocks(&pages);
+                        let mut slots = hf::page_slots(editor, &first_blocks, even_odd);
+                        // A filler sheet never takes a section's First variant.
+                        hf::demote_filler_firsts(&mut slots, &pf.fillers(), even_odd);
                         let mut part_blocks: std::collections::HashMap<&str, Vec<Block>> =
                             std::collections::HashMap::new();
                         if let Some(p) = pkg {
@@ -32984,25 +32942,11 @@ impl Render for Docxy {
                                 .and_then(|s| sections.get(s.section))
                                 .map_or(720, |sect| hf::distance(sect, is_h))
                         };
-                        // Header/footer text-area width, for the implicit centre/right tab stops.
-                        let hf_w = self.zoom * (geom.w - geom.ml - geom.mr).max(0) as f32 / 15.0;
+                        // The header/footer text-area width and context are built
+                        // per page below: each page's own section sets the width
+                        // for the implicit centre/right tab stops.
                         let hf_spans = hf.map(|h| h.editor.selection_spans()).unwrap_or_default();
                         let hf_range = hf.and_then(|h| h.editor.cell_range());
-                        let hf_ctx = hf.map(|h| RenderCtx {
-                            caret_path: &h.editor.caret.path,
-                            caret_off: h.editor.caret.offset,
-                            spans: &hf_spans,
-                            ent: &ent,
-                            pal: doc_pal,
-                            marks: false,
-                            zoom: self.zoom,
-                            active: true,
-                            meas: &measurer,
-                            hf_width: Some(hf_w),
-                            tbl: &tbl,
-                            cell_range: hf_range.as_ref(),
-                            merge_hl: tab.mail.highlight,
-                        });
                         // The first page showing the edited section and variant is the
                         // editable page (see `hf::edit_page`).
                         let edit_page = hf.map(|h| hf::edit_page(&slots, h.section, h.variant));
@@ -33010,89 +32954,172 @@ impl Render for Docxy {
                         let hf_label = tab_label.clone();
                         let same_as_previous = hf_linked;
                         let show_text = hf.is_none_or(|h| h.show_text);
-                        // One region's margin content for a given page: the live editor
-                        // blocks (editable on the edit page, read-only on every other
-                        // page showing the edited part), else the page's own part.
-                        let region_children = |pi: usize, is_h: bool| -> Vec<AnyElement> {
-                            if let (Some(h), Some(ep)) = (hf, edit_page) {
-                                if h.is_header == is_h {
-                                    if pi == ep {
-                                        return h
-                                            .editor
-                                            .doc
-                                            .body
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(i, b)| {
-                                                block_el(b, vec![i], None, hf_ctx.unwrap())
-                                            })
-                                            .collect();
-                                    }
-                                    if page_part(pi, is_h) == Some(h.part_name.as_str()) {
-                                        return hf_els(
-                                            &h.editor.doc.body,
-                                            doc_pal,
-                                            &measurer,
-                                            hf_w,
-                                        );
-                                    }
-                                }
-                            }
-                            hf_els(page_blocks(pi, is_h), doc_pal, &measurer, hf_w)
-                        };
-                        // The middle content of a page: a single flow, or an N-column
-                        // row (each column its own block range) when in columns mode.
-                        let build_mid = |cols: &[(usize, usize)]| -> AnyElement {
-                            if cols.len() <= 1 {
-                                let (s, e) = cols.first().copied().unwrap_or((0, 0));
+                        // The middle content of one band: a single flow, or an
+                        // N-column row (each column its own block range) with
+                        // the band's section's own column widths, the space
+                        // after each column, and the rule between them when it
+                        // sets `w:sep`. The ranges are positional — pour
+                        // never skips a column — so column i draws range i,
+                        // and a column the band didn't reach draws empty at
+                        // its configured width.
+                        let build_band = |band: &page_flow::Band,
+                                          sect: &page_flow::SectionBox|
+                         -> AnyElement {
+                            if sect.col_w.len() <= 1 {
+                                let (s, e) = band.cols.first().copied().unwrap_or((0, 0));
                                 let blocks: Vec<AnyElement> = (s..e)
                                     .map(|i| {
                                         block_el(&body[i], vec![i], markers[i].as_deref(), ctx)
                                     })
                                     .collect();
+                                // One column still draws at the section's
+                                // column width (an explicit single `w:col`),
+                                // which is the full text width for an
+                                // ordinary equal-width section.
                                 return v_flex()
-                                    .w_full()
+                                    .w(tw(sect.single_col_w()))
+                                    .flex_none()
                                     .gap_1()
                                     .children(blocks)
                                     .into_any_element();
                             }
-                            let column_els: Vec<AnyElement> = cols
-                                .iter()
-                                .map(|&(s, e)| {
-                                    let blocks: Vec<AnyElement> = (s..e)
-                                        .map(|i| {
-                                            block_el(&body[i], vec![i], markers[i].as_deref(), ctx)
-                                        })
-                                        .collect();
+                            let mut els: Vec<AnyElement> = Vec::new();
+                            for ci in 0..sect.col_w.len() {
+                                if ci > 0 {
+                                    let gap = sect.col_gap.get(ci - 1).copied().unwrap_or(0).max(0);
+                                    let mut g = div()
+                                        .w(tw(gap))
+                                        .flex_none()
+                                        .self_stretch()
+                                        .flex()
+                                        .justify_center();
+                                    if sect.sep {
+                                        g = g.child(div().w(px(1.)).h_full().bg(doc_pal.dim));
+                                    }
+                                    els.push(g.into_any_element());
+                                }
+                                let (s, e) = band.cols.get(ci).copied().unwrap_or((0, 0));
+                                let blocks: Vec<AnyElement> = (s..e)
+                                    .map(|i| {
+                                        block_el(&body[i], vec![i], markers[i].as_deref(), ctx)
+                                    })
+                                    .collect();
+                                els.push(
                                     v_flex()
-                                        .flex_1()
-                                        .min_w(px(0.))
+                                        .w(tw(sect.col_w[ci]))
+                                        .flex_none()
                                         .gap_1()
                                         .children(blocks)
-                                        .into_any_element()
-                                })
-                                .collect();
+                                        .into_any_element(),
+                                );
+                            }
                             h_flex()
                                 .w_full()
                                 .items_start()
-                                .gap(tw(geom.col_space))
-                                .children(column_els)
+                                .children(els)
                                 .into_any_element()
                         };
-                        let sheets: Vec<AnyElement> = pages
+                        let sheets: Vec<AnyElement> = pf
+                            .pages
                             .iter()
                             .enumerate()
-                            .map(|(pi, cols_ranges)| {
+                            .map(|(pi, page)| {
+                                // The page's own section owns the sheet: its
+                                // size, top/bottom margins and header/footer
+                                // text width; every band below draws with its
+                                // own section's left/right margins and columns.
+                                let sb = &pf.sections[page.bands[0].section];
+                                // Header/footer text-area width, for the implicit
+                                // centre/right tab stops.
+                                let hf_w = zoom * (sb.w - sb.left - sb.right).max(0) as f32 / 15.0;
+                                let hf_ctx = hf.map(|h| RenderCtx {
+                                    caret_path: &h.editor.caret.path,
+                                    caret_off: h.editor.caret.offset,
+                                    spans: &hf_spans,
+                                    ent: &ent,
+                                    pal: doc_pal,
+                                    marks: false,
+                                    zoom: self.zoom,
+                                    active: true,
+                                    meas: &measurer,
+                                    hf_width: Some(hf_w),
+                                    tbl: &tbl,
+                                    cell_range: hf_range.as_ref(),
+                                    merge_hl: tab.mail.highlight,
+                                });
+                                // One region's margin content for this page: the live
+                                // editor blocks (editable on the edit page, read-only on
+                                // every other page showing the edited part), else the
+                                // page's own part.
+                                let region_children = |pi: usize, is_h: bool| -> Vec<AnyElement> {
+                                    if let (Some(h), Some(ep)) = (hf, edit_page) {
+                                        if h.is_header == is_h {
+                                            if pi == ep {
+                                                return h
+                                                    .editor
+                                                    .doc
+                                                    .body
+                                                    .iter()
+                                                    .enumerate()
+                                                    .map(|(i, b)| {
+                                                        block_el(b, vec![i], None, hf_ctx.unwrap())
+                                                    })
+                                                    .collect();
+                                            }
+                                            if page_part(pi, is_h) == Some(h.part_name.as_str()) {
+                                                return hf_els(
+                                                    &h.editor.doc.body,
+                                                    doc_pal,
+                                                    &measurer,
+                                                    hf_w,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    hf_els(page_blocks(pi, is_h), doc_pal, &measurer, hf_w)
+                                };
+                                // One child per band, each with its own
+                                // section's left/right margins; the first band
+                                // carries the ruler's content probe.
+                                let band_els: Vec<AnyElement> = page
+                                    .bands
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(bi, band)| {
+                                        let bsect = &pf.sections[band.section];
+                                        let inner = build_band(band, bsect);
+                                        let el = if bi == 0 {
+                                            div()
+                                                .relative()
+                                                .w_full()
+                                                .child(inner)
+                                                .child(ruler_probe_el(
+                                                    &self.ruler_probe,
+                                                    move |state, rect| {
+                                                        if let Some(slot) =
+                                                            state.contents.get_mut(pi)
+                                                        {
+                                                            *slot = Some(rect);
+                                                        }
+                                                    },
+                                                ))
+                                                .into_any_element()
+                                        } else {
+                                            inner
+                                        };
+                                        div()
+                                            .w_full()
+                                            .pl(tw(bsect.left))
+                                            .pr(tw(bsect.right))
+                                            .child(el)
+                                            .into_any_element()
+                                    })
+                                    .collect();
                                 let content = div()
                                     .relative()
                                     .w_full()
                                     .flex_1()
-                                    .child(build_mid(cols_ranges))
-                                    .child(ruler_probe_el(&self.ruler_probe, move |state, rect| {
-                                        if let Some(slot) = state.contents.get_mut(pi) {
-                                            *slot = Some(rect);
-                                        }
-                                    }))
+                                    .children(band_els)
                                     .into_any_element();
                                 let hdr_children = region_children(pi, true);
                                 let ftr_children = region_children(pi, false);
@@ -33101,8 +33128,8 @@ impl Render for Docxy {
                                 let edit_ftr_here =
                                     hf.is_some_and(|h| !h.is_header) && Some(pi) == edit_page;
                                 let page_base = v_flex()
-                                    .w(tw(geom.w))
-                                    .min_h(tw(geom.h))
+                                    .w(tw(sb.w))
+                                    .min_h(tw(sb.h))
                                     .bg(sheet)
                                     .text_color(doc_pal.fg)
                                     .border_1()
@@ -33139,8 +33166,6 @@ impl Render for Docxy {
                                 };
                                 let mut mid = v_flex()
                                     .flex_1()
-                                    .pl(tw(geom.ml))
-                                    .pr(tw(geom.mr))
                                     .child(div().opacity(body_opacity).child(content));
                                 if hf.is_some() {
                                     mid = mid.on_mouse_down(MouseButton::Left, dbl(PageArea::Body));
@@ -33157,8 +33182,8 @@ impl Render for Docxy {
                                 let labels = |at_bottom: bool| {
                                     let row = h_flex()
                                         .absolute()
-                                        .left(tw(geom.ml))
-                                        .right(tw(geom.mr))
+                                        .left(tw(sb.left))
+                                        .right(tw(sb.right))
                                         .justify_between()
                                         .child(chip(hf_label.clone().unwrap_or_default().into()))
                                         .when(same_as_previous, |d| {
@@ -33174,10 +33199,10 @@ impl Render for Docxy {
                                 };
                                 let mut header = div()
                                     .relative()
-                                    .min_h(tw(geom.mt))
+                                    .min_h(tw(sb.top))
                                     .pt(tw(page_dist(pi, true)))
-                                    .pl(tw(geom.ml))
-                                    .pr(tw(geom.mr))
+                                    .pl(tw(sb.left))
+                                    .pr(tw(sb.right))
                                     .bg(hdr_bg)
                                     .children(hdr_children);
                                 if edit_hdr_here {
@@ -33192,11 +33217,11 @@ impl Render for Docxy {
                                 }
                                 let mut footer = v_flex()
                                     .relative()
-                                    .min_h(tw(geom.mb))
+                                    .min_h(tw(sb.bottom))
                                     .justify_end()
                                     .pb(tw(page_dist(pi, false)))
-                                    .pl(tw(geom.ml))
-                                    .pr(tw(geom.mr))
+                                    .pl(tw(sb.left))
+                                    .pr(tw(sb.right))
                                     .bg(ftr_bg)
                                     .children(ftr_children);
                                 if edit_ftr_here {
@@ -33212,7 +33237,7 @@ impl Render for Docxy {
                                 let page = page_base.child(header).child(mid).child(footer);
                                 div()
                                     .relative()
-                                    .w(tw(geom.w))
+                                    .w(tw(sb.w))
                                     .child(page)
                                     .child(ruler_probe_el(&self.ruler_probe, move |state, rect| {
                                         if let Some(slot) = state.pages.get_mut(pi) {
