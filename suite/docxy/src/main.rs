@@ -4482,6 +4482,8 @@ struct Docxy {
     ruler_tab: docxcore::model::TabAlign,
     // Screen bounds measured during prepaint and shared with the ruler paint and hit path.
     ruler_probe: std::rc::Rc<std::cell::RefCell<RulerProbe>>,
+    // Line numbers painted in Print Layout, recorded for the harness (#746).
+    line_probe: std::rc::Rc<std::cell::RefCell<line_numbers::LineProbe>>,
     // A text drag-selection is in progress (mouse down in the doc, not yet up).
     selecting: bool,
     /// Word's highlighting mode (#623): a drag highlights what it crosses.
@@ -6378,6 +6380,18 @@ const FIELDS: &[(&str, &str, &str)] = &[
 struct Click<'a> {
     ent: &'a Entity<Docxy>,
     path: &'a [usize],
+}
+
+/// Where a numbered paragraph's margin numbers go: which probe entry the
+/// paragraph's row owns (`ord`) and the rule its section's `w:lnNumType`
+/// resolved to (#746). The row's canvas counts its own wrapped rows at
+/// paint time and numbers them from every earlier entry's rows.
+#[derive(Clone)]
+struct LineSlot {
+    probe: std::rc::Rc<std::cell::RefCell<line_numbers::LineProbe>>,
+    ord: usize,
+    page: usize,
+    rule: line_numbers::Rule,
 }
 
 /// Shared state for the recursive document renderer, so caret/selection/clicks
@@ -11289,6 +11303,7 @@ impl Docxy {
             ruler_drag: None,
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
+            line_probe: std::rc::Rc::new(std::cell::RefCell::new(line_numbers::LineProbe::default())),
             selecting: false,
             hl_mode: None,
             hl_last: hl_mode::DEFAULT_COLOUR.to_string(),
@@ -27035,6 +27050,8 @@ fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer, hf_width: f32) -> Vec<Any
                 Some(meas),
                 Some(hf_width),
                 false,
+                // Header/footer text is never line-numbered (#746).
+                None,
             )),
             _ => None,
         })
@@ -27215,6 +27232,85 @@ fn emit_revision_text(out: &mut Vec<AnyElement>, content: &[Inline], base: f32, 
     }
 }
 
+/// The absolutely placed canvas over a numbered paragraph's wrapping row
+/// (#746): at paint time it counts the row's wrapped lines (`height /
+/// line_h`), records them in the probe, and draws every multiple of countBy
+/// in the left margin — right-aligned at (text column left − distance), one
+/// per visual line, in `pal.dim` at the text size. Earlier numbered
+/// paragraphs paint earlier in the same frame (tree order = document
+/// order), so their row counts are in the probe before this first number is
+/// computed; entries after `ord` are stale and never read for it.
+fn line_number_canvas(
+    slot: LineSlot,
+    base: f32,
+    line_h: f32,
+    pad: f32,
+    zoom: f32,
+    pal: Pal,
+) -> AnyElement {
+    canvas(
+        |_, _, _| {},
+        move |b, _, window, cx| {
+            let mut probe = slot.probe.borrow_mut();
+            let rows =
+                line_numbers::row_count(b.size.height.into(), line_h, line_h.max(base + 6.));
+            if slot.ord < probe.rows.len() {
+                probe.rows[slot.ord] = rows;
+            }
+            let Some(&first) =
+                line_numbers::first_counts(&probe.entries, &probe.rows).get(slot.ord)
+            else {
+                return;
+            };
+            // The row sits `pad` in from its column's left edge, so the
+            // column's left is `b.origin.x - pad`; the number's right edge
+            // is `distance` further left (export.rs numbers the same way).
+            let right = f32::from(b.origin.x) - pad - tw_px(slot.rule.distance_tw, zoom);
+            let top = f32::from(b.origin.y);
+            let font = window.text_style().font();
+            for j in 0..rows {
+                let n = first + j + 1;
+                if !n.is_multiple_of(slot.rule.count_by) {
+                    continue;
+                }
+                let text = n.to_string();
+                let run = TextRun {
+                    len: text.len(),
+                    font: font.clone(),
+                    color: pal.dim,
+                    ..Default::default()
+                };
+                let line = window
+                    .text_system()
+                    .shape_line(SharedString::from(text), px(base), &[run], None);
+                // A six-digit column right-aligns at `right` whatever the
+                // digit count.
+                let left = right - base * 6.0;
+                let _ = line.paint(
+                    point(px(left), px(top + j as f32 * line_h)),
+                    px(line_h),
+                    TextAlign::Right,
+                    Some(px(base * 6.0)),
+                    window,
+                    cx,
+                );
+                probe.painted.push(line_numbers::Painted {
+                    page: slot.page,
+                    n,
+                    x: right,
+                    y: top + j as f32 * line_h,
+                });
+            }
+        },
+    )
+    .absolute()
+    .left_0()
+    .top_0()
+    .right_0()
+    .bottom_0()
+    .into_any_element()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paragraph_el(
     p: &Paragraph,
@@ -27228,6 +27324,7 @@ fn paragraph_el(
     meas: Option<&Measurer>,
     hf_width: Option<f32>,
     merge_hl: bool,
+    lines: Option<LineSlot>,
 ) -> AnyElement {
     use docxcore::model::TabAlign;
     let base = zoom
@@ -27628,7 +27725,15 @@ fn paragraph_el(
                     });
                 })
         })
-        .child(row.children(spans))
+        .child(match lines {
+            // Numbered (Print Layout): the canvas overlays the row, anchored
+            // to it, and paints the margin numbers in the same frame.
+            Some(slot) => row
+                .relative()
+                .children(spans)
+                .child(line_number_canvas(slot, base, line_h, pad, zoom, pal)),
+            None => row.children(spans),
+        })
         .into_any_element()
 }
 
@@ -27837,6 +27942,29 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
 
 /// Render one block at absolute `path`, wiring caret/selection/click from `ctx`.
 fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -> AnyElement {
+    block_el_lines(b, path, marker, ctx, None)
+}
+
+/// `block_el` for a Print Layout band, where a numbered top-level paragraph
+/// carries its line-number slot; tables, header/footer paragraphs and every
+/// other caller stay unnumbered (#746).
+fn block_el_numbered(
+    b: &Block,
+    path: Vec<usize>,
+    marker: Option<&str>,
+    ctx: RenderCtx,
+    lines: Option<LineSlot>,
+) -> AnyElement {
+    block_el_lines(b, path, marker, ctx, lines)
+}
+
+fn block_el_lines(
+    b: &Block,
+    path: Vec<usize>,
+    marker: Option<&str>,
+    ctx: RenderCtx,
+    lines: Option<LineSlot>,
+) -> AnyElement {
     match b {
         Block::Paragraph(p) => {
             let caret = (ctx.active && ctx.caret_path == path.as_slice()).then_some(ctx.caret_off);
@@ -27865,6 +27993,7 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
                 Some(ctx.meas),
                 ctx.hf_width,
                 ctx.merge_hl,
+                lines,
             )
         }
         Block::Table(t) => table_el(t, &path, ctx),
@@ -32896,12 +33025,27 @@ impl Render for Docxy {
                             probe.draft = false;
                             probe.painted = None;
                         }
+                        // Line numbers are rebuilt with the sheets each frame:
+                        // entries in document order (pushed by `build_band`),
+                        // painted numbers by the rows' canvases below.
+                        {
+                            let mut probe = self.line_probe.borrow_mut();
+                            probe.entries.clear();
+                            probe.painted.clear();
+                        }
                         // Per-page header/footer: each page shows the parts its own
                         // section applies (Link to Previous resolved by docxcore) for
                         // the variant that page takes (#640). Resolution reads the
                         // body editor's sectPrs, so an undone header or titlePg
                         // shows as undone.
                         let pkg = tab.pkg.as_ref();
+                        // The suppress decision resolves paragraph styles once
+                        // per frame (export.rs `emit_paragraph`'s gate, #746).
+                        let styles = pkg
+                            .and_then(|p| p.part("word/styles.xml"))
+                            .and_then(|b| std::str::from_utf8(b).ok())
+                            .map(docxcore::styles::parse_styles_xml)
+                            .unwrap_or_default();
                         let sections = editor.sections();
                         let even_odd = pkg.is_some_and(|p| p.has_even_odd());
                         let tab_label = hf_tab::edit_label(tab);
@@ -32963,14 +33107,49 @@ impl Render for Docxy {
                         // never skips a column — so column i draws range i,
                         // and a column the band didn't reach draws empty at
                         // its configured width.
+                        let line_probe_rc = self.line_probe.clone();
                         let build_band = |band: &page_flow::Band,
-                                          sect: &page_flow::SectionBox|
+                                          sect: &page_flow::SectionBox,
+                                          pi: usize|
                          -> AnyElement {
+                            // One slot per numbered top-level paragraph, pushed
+                            // in document order before the paragraph's canvas
+                            // paints (tree order = document order, #746).
+                            // Tables and anything else stay unnumbered.
+                            let slot_for = |b: &Block| -> Option<LineSlot> {
+                                let Block::Paragraph(p) = b else {
+                                    return None;
+                                };
+                                let rule =
+                                    line_numbers::numbered_rule(p, &styles, sect.line_numbers)?;
+                                let ord = {
+                                    let mut probe = line_probe_rc.borrow_mut();
+                                    let ord = probe.entries.len();
+                                    probe.entries.push(line_numbers::Entry {
+                                        page: pi,
+                                        section: band.section,
+                                        rule,
+                                    });
+                                    ord
+                                };
+                                Some(LineSlot {
+                                    probe: line_probe_rc.clone(),
+                                    ord,
+                                    page: pi,
+                                    rule,
+                                })
+                            };
                             if sect.col_w.len() <= 1 {
                                 let (s, e) = band.cols.first().copied().unwrap_or((0, 0));
                                 let blocks: Vec<AnyElement> = (s..e)
                                     .map(|i| {
-                                        block_el(&body[i], vec![i], markers[i].as_deref(), ctx)
+                                        block_el_numbered(
+                                            &body[i],
+                                            vec![i],
+                                            markers[i].as_deref(),
+                                            ctx,
+                                            slot_for(&body[i]),
+                                        )
                                     })
                                     .collect();
                                 // One column still draws at the section's
@@ -33002,7 +33181,13 @@ impl Render for Docxy {
                                 let (s, e) = band.cols.get(ci).copied().unwrap_or((0, 0));
                                 let blocks: Vec<AnyElement> = (s..e)
                                     .map(|i| {
-                                        block_el(&body[i], vec![i], markers[i].as_deref(), ctx)
+                                        block_el_numbered(
+                                            &body[i],
+                                            vec![i],
+                                            markers[i].as_deref(),
+                                            ctx,
+                                            slot_for(&body[i]),
+                                        )
                                     })
                                     .collect();
                                 els.push(
@@ -33020,6 +33205,13 @@ impl Render for Docxy {
                                 .children(els)
                                 .into_any_element()
                         };
+                        // Every entry exists now (build_band ran in document
+                        // order); the rows fill in as the canvases paint.
+                        {
+                            let mut probe = line_probe_rc.borrow_mut();
+                            let n = probe.entries.len();
+                            probe.rows.resize(n, 0);
+                        }
                         let sheets: Vec<AnyElement> = pf
                             .pages
                             .iter()
@@ -33088,7 +33280,7 @@ impl Render for Docxy {
                                     .enumerate()
                                     .map(|(bi, band)| {
                                         let bsect = &pf.sections[band.section];
-                                        let inner = build_band(band, bsect);
+                                        let inner = build_band(band, bsect, pi);
                                         let el = if bi == 0 {
                                             div()
                                                 .relative()
@@ -33284,6 +33476,14 @@ impl Render for Docxy {
                             probe.draft = true;
                             probe.draft_column = None;
                             probe.painted = None;
+                        }
+                        // Draft/Web draws no numbers; drop last Print Layout
+                        // frame's probe too so `doc {}` reports none (#746).
+                        {
+                            let mut probe = self.line_probe.borrow_mut();
+                            probe.entries.clear();
+                            probe.rows.clear();
+                            probe.painted.clear();
                         }
                         let blocks: Vec<AnyElement> = body
                             .iter()

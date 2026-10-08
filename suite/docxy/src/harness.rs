@@ -1638,6 +1638,29 @@ fn table_state(editor: &Editor) -> Json {
 }
 
 /// Ruler coordinates come from the last painted frame, in logical pixels.
+/// The line numbers Print Layout painted last frame (#746): one
+/// `{page, n, x, y}` per drawn number; `page` is 1-based, `x`/`y` window
+/// px rounded to a tenth. Empty in Draft/Web layout and when the document
+/// has no `w:lnNumType`.
+fn line_numbers_state(app: &crate::Docxy) -> Json {
+    let probe = app.line_probe.borrow();
+    let tenth = |n: f32| Json::Num(((n * 10.0).round() / 10.0) as f64);
+    Json::Arr(
+        probe
+            .painted
+            .iter()
+            .map(|p| {
+                Json::obj(vec![
+                    ("page", Json::Num(p.page as f64 + 1.0)),
+                    ("n", Json::Num(p.n as f64)),
+                    ("x", tenth(p.x)),
+                    ("y", tenth(p.y)),
+                ])
+            })
+            .collect(),
+    )
+}
+
 fn ruler_state(app: &crate::Docxy) -> Json {
     if !app.show_ruler {
         return Json::Null;
@@ -1691,6 +1714,7 @@ fn live_doc_state(app: &crate::Docxy, window: &Window) -> Result<Json, String> {
     let mut doc = doc_state(active_doc(app)?, &ViewFlags::live(app, window));
     if let Json::Obj(fields) = &mut doc {
         fields.push(("ruler".into(), ruler_state(app)));
+        fields.push(("line_numbers".into(), line_numbers_state(app)));
         if let Some(tab) = app.tabs.get(app.active) {
             fields.push(("mail".into(), mail_state(tab)));
         }
