@@ -33,3 +33,15 @@ test issue 588 a saved plan's window title is the file's stem
   assert title is gantt-summary.xml
   call tab-list {}
   assert reply.window_title is gantt-summary  -  docxy
+
+test issue 588 r1 a long window title yields to the tab strip on a narrow window
+  open copy:"../fixtures/basic.docx" as a very long window title that must yield to the tab strip.docx
+  call window-size {"w":500,"h":700}
+  shot window
+  call title-bar {}
+  assert reply.overflow is true
+  assert reply.theme_visible is true
+  assert reply.controls_clear is true
+  assert reply.active_visible is true
+  call tab-list {}
+  assert reply.window_title is a very long window title that must yield to the tab strip  -  docxy
