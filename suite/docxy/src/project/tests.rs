@@ -134,12 +134,36 @@ fn persisted(path: Option<&Path>, hot: Option<&Path>, dirty: bool) -> PersistTab
 
 #[test]
 fn new_project_is_empty_and_clean() {
-    let tab = new_project_tab();
+    let tab = new_project_tab("Project1");
     assert!(tab.kind == Kind::Project);
-    assert_eq!(tab.title.as_ref(), "Untitled.yppx");
+    assert_eq!(tab.title.as_ref(), "Project1");
+    assert_eq!(view(&tab).ed.project().name, "Project1");
     assert!(tab.path.is_none());
     assert!(!tab.dirty && !view(&tab).ed.dirty());
     assert!(view(&tab).ed.project().tasks.is_empty());
+}
+
+#[test]
+fn blank_plan_save_as_proposes_its_title() {
+    let tab = new_project_tab("Project2");
+    assert_eq!(view(&tab).ed.project().name, "Project2");
+    assert_eq!(
+        save_decision(&tab, false, true),
+        SaveDecision::Dialog {
+            suggested: "Project2.yppx".into()
+        }
+    );
+}
+
+#[test]
+fn legacy_restored_title_keeps_the_default_plan_name() {
+    // A session written before #588 can hold a clean untitled plan titled
+    // `Untitled.yppx`: restore keeps the title verbatim, and the plan keeps
+    // `untitled_project()`'s `Project1` — only a minted `Project<n>` name
+    // renames the plan.
+    let tab = new_project_tab("Untitled.yppx");
+    assert_eq!(tab.title.as_ref(), "Untitled.yppx");
+    assert_eq!(view(&tab).ed.project().name, "Project1");
 }
 
 #[test]
@@ -256,7 +280,7 @@ fn save_target_validates_extension_before_writing() {
     let dir = Scratch::new();
     let source = mpp_stub(&dir);
     let before = std::fs::read(&source).unwrap();
-    assert!(write_project(&view(&new_project_tab()).ed, &source).is_err());
+    assert!(write_project(&view(&new_project_tab("Project1")).ed, &source).is_err());
     assert_eq!(std::fs::read(source).unwrap(), before);
 }
 
@@ -273,7 +297,7 @@ fn saved_formats_round_trip_the_complete_project() {
 
 #[test]
 fn save_decisions_cover_in_place_dialog_and_harness_refusal() {
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     for name in [None, Some("a.mpp"), Some("a.yppx"), Some("a.XML")] {
         t.path = name.map(PathBuf::from);
         for explicit in [false, true] {
@@ -526,7 +550,10 @@ fn recovery_reports_lost_content_for_every_unavailable_sidecar_case() {
                 None => {
                     assert!(!view(&clean).ed.dirty());
                     assert!(view(&clean).ed.project().tasks.is_empty());
-                    assert_eq!(clean.title.as_ref(), "Untitled.yppx");
+                    // No original and no sidecar: a clean blank plan comes
+                    // back with its stored title, verbatim (#588).
+                    assert_eq!(clean.title.as_ref(), "Schedule");
+                    assert_eq!(view(&clean).ed.project().name, "Project1");
                     assert_eq!(clean.status.as_ref(), "new project");
                 }
             }
@@ -745,7 +772,7 @@ fn summary_with_zero_stored_duration_is_not_shown_as_a_milestone() {
 
 #[test]
 fn navigation_clamps_and_preserves_dirty_state_even_on_an_empty_project() {
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     // `ctrl-` keys are Project's row jumps, the rest are plain keys.
     let press = |t: &mut DocTab, key: &str| match key.strip_prefix("ctrl-") {
         Some(key) => view_mut(t).ctrl_key(key),
@@ -801,7 +828,7 @@ fn navigation_clamps_and_preserves_dirty_state_even_on_an_empty_project() {
 
 #[test]
 fn page_down_and_up_move_a_screen_of_rows_and_clamp() {
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     for i in 0..100 {
         view_mut(&mut t)
             .ed
@@ -868,7 +895,7 @@ fn paging_skips_rows_under_collapsed_summaries() {
 
 #[test]
 fn paging_keeps_the_column_and_leaves_the_plan_untouched() {
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     for i in 0..20 {
         view_mut(&mut t)
             .ed
@@ -893,7 +920,7 @@ fn paging_keeps_the_column_and_leaves_the_plan_untouched() {
 
 #[test]
 fn paging_on_an_empty_plan_stays_on_the_entry_row() {
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     for key in ["pagedown", "pageup"] {
         assert!(view_mut(&mut t).key(key, false), "{key}");
         assert!(view(&t).on_entry_row());

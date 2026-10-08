@@ -4527,6 +4527,11 @@ struct Docxy {
     // verbs it sent — a verb only marks the view dirty, so the frame that shows
     // its effect has not been laid out by the time the reply goes out.
     frame: u64,
+    // The OS window title last handed to the platform (#588): the platform
+    // forwards every set_title call (the X11 backend writes WM_NAME each
+    // time), so the render below only calls set_window_title when the
+    // computed title changed.
+    last_window_title: Option<String>,
 }
 
 /// Where the regions a harness test can name actually landed, as gpui measured
@@ -10816,6 +10821,116 @@ fn title_bar_geometry(window: &Window) -> f32 {
     )
 }
 
+/// The brand label's absolute cap: a window title is information, not
+/// chrome, so it never gets more than this before it starts clipping.
+const TITLE_LABEL_MAX_W: f32 = 260.0;
+
+/// The QAT's widest form, for the label cap below: two 20px buttons with a
+/// 2px gap, the 10px Undo split arrow, and the cluster's 8px gap before it.
+const TITLE_QAT_MAX_W: f32 = 20.0 + 2.0 + 20.0 + 10.0 + 8.0;
+
+/// The left chrome's width cap and the brand label's cap inside it. The cap
+/// reserves the theme button, the drag region's minimum and the strip's More
+/// button plus a floor-width chip before the label, so a long window title
+/// starves the label, never the strip (#588 r1 m6). `theme_w` is the theme
+/// button's width from the last frame, exactly as the `avail` below consumes
+/// it.
+///
+/// The reservation keeps 1px of slack so fractional f32 widths (device
+/// scales of 125/150/175%) cannot land the render's `avail` just under the
+/// strip floor, whose comparison in `tabstrip::layout` is strict. Below the
+/// width where the QAT and the floor chip both fit, the QAT stays whole and
+/// the strip degrades to MoreOnly, as it did before the label cap existed.
+fn title_left_caps(title_w: f32, theme_w: f32) -> (f32, f32) {
+    // 8 is the pl_2 padding and 24 the three 8px gaps between the four
+    // in-flow children — the render's own arithmetic, shared here so the
+    // test measures the same chain.
+    let pad_gaps = 8.0 + 24.0;
+    // The strip's minimum (More + a floor chip + gap) plus the slack.
+    let strip_floor = tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP + 1.0;
+    // The widest cap that still leaves the strip its floor.
+    let strip_cap = title_w - pad_gaps - theme_w - tabstrip::DRAG_MIN_W - strip_floor;
+    // The widest cap that keeps the QAT whole (label at zero), never eating
+    // into the drag region's minimum.
+    let qat_cap = TITLE_QAT_MAX_W.min((title_w - pad_gaps - tabstrip::DRAG_MIN_W).max(0.0));
+    let left_cap = strip_cap.max(qat_cap).max(0.0);
+    (
+        left_cap,
+        (left_cap - TITLE_QAT_MAX_W).clamp(0.0, TITLE_LABEL_MAX_W),
+    )
+}
+
+#[cfg(test)]
+mod title_caps_tests {
+    use super::{TITLE_LABEL_MAX_W, TITLE_QAT_MAX_W, title_left_caps};
+    use crate::tabstrip;
+
+    /// The render's avail formula, copied deliberately: the test asserts on
+    /// the same f32 chain the layout consumes.
+    fn avail(title_w: f32, left_cap: f32, theme_w: f32) -> f32 {
+        title_w - 8.0 - 24.0 - left_cap - theme_w - tabstrip::DRAG_MIN_W
+    }
+
+    #[test]
+    fn the_label_yields_first_and_the_strip_keeps_its_minimum() {
+        // Wide title content: the label keeps its full cap.
+        let (left, label) = title_left_caps(1280.0, 80.0);
+        assert_eq!(label, TITLE_LABEL_MAX_W);
+        assert!(left > label + TITLE_QAT_MAX_W);
+        // Narrow title-content widths (what `title_w` names here — window
+        // width minus caption controls, left pad and insets): the cap binds,
+        // the label shrinks below its cap, and what it yields keeps the
+        // strip's More button, a floor-width chip and the theme button
+        // alive, with the QAT whole.
+        for w in [300.0, 460.0, 500.0] {
+            let (left, label) = title_left_caps(w, 80.0);
+            assert!(label < TITLE_LABEL_MAX_W, "w={w}");
+            assert!(label >= 0.0, "w={w}");
+            // The label plus the QAT's widest form never exceeds the cap, so
+            // the QAT is never what the strip takes from.
+            assert!(label + TITLE_QAT_MAX_W <= left + f32::EPSILON, "w={w}");
+            let a = avail(w, left, 80.0);
+            assert!(
+                a >= tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP,
+                "w={w}: avail={a}"
+            );
+        }
+        // Fractional widths at device scales like 150%: the two f32 chains
+        // drift by ulps, and the 1px slack keeps the render's avail at or
+        // over the floor wherever the floor and the QAT both fit.
+        let (left, label) = title_left_caps(300.4, 34.4);
+        assert!(label > 0.0);
+        let a = avail(300.4, left, 34.4);
+        assert!(
+            a >= tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP,
+            "avail={a}"
+        );
+        // The (232, 292) band at a typical theme width: the QAT and the
+        // floor chip cannot both fit, so the floor keeps the QAT whole and
+        // the strip falls back to MoreOnly, as before the label cap.
+        for w in [240.0, 260.0, 280.0] {
+            let (left, label) = title_left_caps(w, 80.0);
+            assert_eq!(left, TITLE_QAT_MAX_W, "w={w}");
+            assert_eq!(label, 0.0, "w={w}");
+            assert!(
+                avail(w, left, 80.0) < tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP,
+                "w={w}"
+            );
+        }
+        // The reviewer's fractional point sits in that band: the QAT is
+        // whole, the strip is in the MoreOnly exception.
+        let (left, label) = title_left_caps(240.0, 34.4);
+        assert_eq!(left, TITLE_QAT_MAX_W);
+        assert_eq!(label, 0.0);
+        assert!(
+            avail(240.0, left, 34.4) < tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP
+        );
+        // Absurdly narrow: the caps bottom out at zero rather than going negative.
+        let (left, label) = title_left_caps(60.0, 80.0);
+        assert_eq!((left, label), (0.0, 0.0));
+    }
+}
+
 #[cfg(test)]
 mod frame_border_tests {
     use super::frame_borders;
@@ -10874,6 +10989,17 @@ impl Docxy {
                 this.tabs
                     .iter()
                     .filter(|t| t.kind == Kind::Docx && t.path.is_none())
+                    .map(|t| t.title.as_ref()),
+            ),
+        );
+        // New blank plans continue past the restored ones (#588), from the
+        // run-wide plan counter beside the document one.
+        windows::seed_project_titles(
+            cx,
+            doc_name::next_project_after(
+                this.tabs
+                    .iter()
+                    .filter(|t| t.kind == Kind::Project && t.path.is_none())
                     .map(|t| t.title.as_ref()),
             ),
         );
@@ -11018,6 +11144,7 @@ impl Docxy {
             harness: false,
             probes: Default::default(),
             frame: 0,
+            last_window_title: None,
         }
     }
 
@@ -11713,7 +11840,7 @@ impl Docxy {
             import: Default::default(),
         };
         self.tabs.push(match kind {
-            Kind::Project => new_project_tab(),
+            Kind::Project => new_project_tab(&windows::next_project_title(cx)),
             Kind::Docx => new_tab(
                 &windows::next_document_title(cx),
                 Surface::Doc(Editor::new(empty_doc())),
@@ -31837,9 +31964,11 @@ impl Render for Docxy {
             .map(|b| f32::from(b.size.width))
             .unwrap_or(80.0);
         drop(chrome);
-        // In very narrow windows the left chrome yields space to the drag
-        // region before the caption controls can be affected.
-        let left_cap = (title_w - 8.0 - 24.0 - tabstrip::DRAG_MIN_W).max(0.0);
+        // The left chrome yields before the tab strip does: the cap reserves
+        // the theme button, the drag region's minimum and the strip's More
+        // button plus a floor-width chip, so a long window title starves the
+        // label, never the strip (#588 r1 m6).
+        let (left_cap, label_cap) = title_left_caps(title_w, theme_w);
         // Four children, three 8px gaps, plus our 8px left padding.
         let avail =
             (title_w - 8.0 - 24.0 - left_w.min(left_cap) - theme_w - tabstrip::DRAG_MIN_W).max(0.0);
@@ -32000,11 +32129,21 @@ impl Render for Docxy {
             self.tab_more_open = false;
         }
 
-        // NOTE: the "docxy" brand label and the flex_1 spacer are plain,
+        // NOTE: the brand label and the flex_1 spacer are plain,
         // non-interactive divs, so TitleBar's own drag region shows through them
         // — that idle space is natively draggable and double-click maximizes.
         // Only the *interactive* clusters (chips, theme button) swallow the
         // mouse-down so a drag on them doesn't start a window move.
+        // The brand label draws the active tab's window title, Project's
+        // `<stem>  -  docxy` (#588); no tab draws the bare brand. The OS
+        // window title gets the same string — but only when it changed, as
+        // the platform writes it on every call.
+        let window_title =
+            doc_name::window_title(self.tabs.get(self.active).map(|t| t.title.as_ref()));
+        if self.last_window_title.as_deref() != Some(window_title.as_str()) {
+            window.set_window_title(&window_title);
+            self.last_window_title = Some(window_title.clone());
+        }
         let title_bar = TitleBar::new().child(
             h_flex()
                 .relative()
@@ -32031,7 +32170,11 @@ impl Render for Docxy {
                             div()
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(rgb(BRAND))
-                                .child("docxy"),
+                                .flex_none()
+                                .max_w(px(label_cap))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(window_title),
                         )
                         .child(
                             h_flex()

@@ -89,6 +89,10 @@ pub(crate) struct Windows<V, H> {
     // The run-wide untitled-document counter (#587 r2 m10): "DocumentN" is
     // minted once for the whole run, however many windows create one.
     next_title: u32,
+    // The run-wide blank-plan counter (#588): "ProjectN" is minted once for
+    // the whole run beside the document counter, with the same never-reused
+    // rule.
+    next_project: u32,
     // The harness's private text clipboard, ONE for the whole run (#587 r3):
     // every window's ClipboardStore clones this Rc, so a copy in any window
     // — document, grid, Project, cell editor, About, the clipboard verb —
@@ -106,6 +110,7 @@ impl<V, H> Default for Windows<V, H> {
             links: Vec::new(),
             handles: Default::default(),
             next_title: 1,
+            next_project: 1,
             clipboard_text: Default::default(),
         }
     }
@@ -323,6 +328,26 @@ pub(crate) fn seed_document_titles(cx: &mut App, at_least: u32) {
     update(cx, |w| {
         if w.next_title < at_least {
             w.next_title = at_least;
+        }
+    });
+}
+
+/// Mint the next blank-plan title for the whole run (#588): one counter
+/// beside the document one, so two windows cannot mint the same "ProjectN".
+/// Without a registry (tests) a throwaway counter answers.
+pub(crate) fn next_project_title(cx: &mut App) -> String {
+    update(cx, |w| {
+        crate::doc_name::next_project_title(&mut w.next_project)
+    })
+    .unwrap_or_else(|| crate::doc_name::next_project_title(&mut 1))
+}
+
+/// Raise the run-wide blank-plan counter to at least `at_least`: the first
+/// window seeds it from the restored session's never-saved Project tabs.
+pub(crate) fn seed_project_titles(cx: &mut App, at_least: u32) {
+    update(cx, |w| {
+        if w.next_project < at_least {
+            w.next_project = at_least;
         }
     });
 }

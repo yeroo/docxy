@@ -20,7 +20,7 @@ test issue 396 proj.new makes a blank plan that takes tasks without a fixture
   assert reply.imported is false
   assert tab is 1
   assert tabs is 2
-  assert title is Untitled.yppx
+  assert title is Project1
   assert dirty is false
   call task.add {"name":"Blank plan task","duration":"2d"}
   call task.list {}
@@ -29,7 +29,7 @@ test issue 396 proj.new makes a blank plan that takes tasks without a fixture
   assert dirty is true
   call tab-list {}
   assert reply.active is 1
-  assert reply.tabs.1.title is Untitled.yppx
+  assert reply.tabs.1.title is Project1
   assert reply.tabs.1.kind is project
   assert reply.tabs.1.path is null
   assert reply.tabs.1.dirty is true
@@ -60,7 +60,7 @@ test issue 396 tab-select switches between two plans by title as the chip click 
   assert reply.tabs.2.dirty is true
   assert reply.tabs.3.dirty is false
   call tab-select {"tab":1}
-  assert title is Untitled.yppx
+  assert title is Project1
   call tab-select {"tab":"SAMPLE.docx"}
   assert tab is 0
   call-error tab-select {"tab":"no-such-plan"} => no tab matches 'no-such-plan'
@@ -82,7 +82,7 @@ test issue 396 closing one plan leaves the other's entry and tasks unchanged
   assert reply.tabs.2.title is project-rows.xml
   assert reply.tabs.2.kind is project
   assert reply.tabs.2.dirty is false
-  assert reply.tabs.1.title is Untitled.yppx
+  assert reply.tabs.1.title is Project1
   assert reply.tabs.1.dirty is true
   call task.list {"tab":"project-rows"}
   assert reply.count is 6

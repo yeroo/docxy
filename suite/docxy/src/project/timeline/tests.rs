@@ -303,7 +303,7 @@ fn long_tab() -> DocTab {
     ed.add_task(None, "Late", 20 * 480, false).unwrap();
     ed.add_predecessor(2, 1, projcore::LinkType::FinishStart, 0)
         .unwrap();
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     t.surface = Surface::Project(ProjectView::new(ed.project().clone(), false));
     vm(&mut t).layout(900.);
     t

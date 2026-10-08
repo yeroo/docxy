@@ -1003,7 +1003,7 @@ fn an_empty_or_rejected_entry_row_value_appends_nothing() {
 #[test]
 fn a_new_plan_takes_its_first_task_from_the_entry_row() {
     use ctlcore::json::Json;
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     assert!(v(&t).on_entry_row());
     assert_eq!(state(&t, "cell_row"), Json::Num(0.));
     for c in ["D", "e", "s", "i", "g", "n"] {
@@ -1299,7 +1299,7 @@ fn shift_key(t: &mut DocTab, key: &str) {
 #[test]
 fn up_or_down_commits_a_new_plan_entry_row_edit_as_enter_does() {
     for (arrow, row) in [("down", 1), ("up", 0)] {
-        let mut t = new_project_tab();
+        let mut t = new_project_tab("Project1");
         let col = v(&t).col;
         project_input(&mut t, "a", Some("A"), Modifiers::default());
         key(&mut t, arrow);
@@ -1403,7 +1403,7 @@ fn shift_enter_on_first_row_commits_and_stays() {
 
 #[test]
 fn shift_enter_on_new_entry_row_matches_up() {
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     let col = v(&t).col;
     project_input(&mut t, "a", Some("A"), Modifiers::default());
     shift_key(&mut t, "enter");
@@ -1472,7 +1472,7 @@ fn up_or_down_from_an_unchanged_editor_closes_it_and_moves() {
     assert_eq!(v(&t).ed.project().tasks.len(), 3);
     assert_eq!(v(&t).ed.undo_depth(), 0);
     // An empty plan's entry row: Up has nowhere to go and appends nothing.
-    let mut t = new_project_tab();
+    let mut t = new_project_tab("Project1");
     key(&mut t, "f2");
     key(&mut t, "up");
     assert!(v(&t).cell.is_none());
