@@ -760,6 +760,23 @@ fn paste_inserts_at_the_caret_by_characters() {
     assert_eq!(s.top().unwrap().caret_at(), 3);
 }
 
+/// Ctrl+C copies the selected characters of the focused field, and nothing
+/// without a selection (#1029).
+#[test]
+fn the_selection_is_what_a_copy_takes() {
+    let mut s = focused_on_name();
+    let d = s.top_dialog_mut().unwrap();
+    d.select_all();
+    d.insert_text("a\u{1F600}cd").unwrap();
+    assert_eq!(d.selected_text(), None, "no selection after typing");
+    d.move_caret(false, false);
+    d.move_caret(false, true);
+    d.move_caret(false, true);
+    assert_eq!(d.selected_text().as_deref(), Some("\u{1F600}c"));
+    d.select_all();
+    assert_eq!(d.selected_text().as_deref(), Some("a\u{1F600}cd"));
+}
+
 /// A field that refuses a character keeps its text and its caret, and a value
 /// set from outside (`dialog-set`) puts the caret at the end.
 #[test]

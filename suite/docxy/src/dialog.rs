@@ -1048,6 +1048,18 @@ impl Dialog {
         self.move_caret_to(if end { len } else { 0 }, extend);
     }
 
+    /// The selected text of the focused field: what Ctrl+C copies (#1029).
+    pub fn selected_text(&self) -> Option<String> {
+        let (from, to) = self.selection()?;
+        Some(
+            self.focused_text()?
+                .chars()
+                .skip(from)
+                .take(to - from)
+                .collect(),
+        )
+    }
+
     /// Ctrl+A: the whole text selected, the caret at its end.
     pub fn select_all(&mut self) {
         let Some(len) = self.focused_text().map(|t| t.chars().count()) else {
