@@ -128,6 +128,10 @@ pub fn render(ed: &Editor, kind: ReportKind) -> String {
         ReportKind::LateTasks => r.late(&mut out),
         ReportKind::MilestoneReport => r.milestones(&mut out),
     }
+    // One newline at the end, whatever the last section left.
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
     out
 }
 

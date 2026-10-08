@@ -149,6 +149,10 @@ fn an_empty_plan_renders_every_report() {
             "No tasks."
         };
         assert!(md.contains(empty), "{k:?}: {md}");
+        assert!(
+            md.ends_with(".\n") && !md.ends_with("\n\n"),
+            "{k:?}: {md:?}"
+        );
     }
 }
 
