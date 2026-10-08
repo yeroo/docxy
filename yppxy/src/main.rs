@@ -1493,12 +1493,15 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
                 }
                 return;
             }
-            if app
-                .new_tasks_hit
-                .is_some_and(|(row, start, end)| y == row && (start..end).contains(&x))
-            {
-                app.toggle_new_tasks_manual();
-                return;
+            // The status row is not a task row: a click on it never reaches
+            // the list below, and only the `New Tasks:` segment toggles.
+            if let Some((row, start, end)) = app.new_tasks_hit {
+                if y == row {
+                    if (start..end).contains(&x) {
+                        app.toggle_new_tasks_manual();
+                    }
+                    return;
+                }
             }
             // Click a task row to select it, or a summary's bullet to show
             // or hide its subtasks.
@@ -4384,29 +4387,49 @@ mod tests {
 
     #[test]
     fn the_status_line_shows_and_switches_the_new_task_mode() {
+        // Enough tasks that the status row's screen row maps onto a task row.
         let mut app = two_tasks();
+        for _ in 0..15 {
+            app.add_task();
+        }
+        app.ed.set_new_tasks_manual(false);
+        app.ed.select(0);
+        let undo0 = app.ed.undo_depth();
         let (w, h) = (110u16, 22u16);
         assert!(frame_row(&mut app, w, h - 1).starts_with(" Ready │ New Tasks: Auto Scheduled"));
         press(&mut app, 'M');
         assert!(app.ed.project().new_tasks_are_manual);
-        assert_eq!(app.ed.undo_depth(), 1);
+        assert_eq!(app.ed.undo_depth(), undo0 + 1);
         assert!(
             frame_row(&mut app, w, h - 1).starts_with(" Ready │ New Tasks: Manually Scheduled")
         );
         // A new task follows the plan's mode.
         app.add_task();
         assert!(app.ed.project().tasks[app.ed.sel()].manual);
-        // A click on the segment switches it back.
+        // The segment's columns, read off the rendered row: it starts at the
+        // space before `New Tasks:` and ends after its closing `│`.
+        let row = frame_row(&mut app, w, h - 1);
+        let cells: Vec<char> = row.chars().collect();
+        let start = cells.iter().position(|&c| c == '│').unwrap() as u16 + 1;
+        let end = cells.iter().rposition(|&c| c == '│').unwrap() as u16 + 1;
+        assert_eq!(start, 8);
+        let sel = app.ed.sel();
+        // Clicks outside the segment on the status row leave the mode (Manual)
+        // and the selection alone.
+        for x in [0, 3, start - 1, end, w - 2] {
+            frame_row(&mut app, w, h - 1);
+            click(&mut app, x, h - 1);
+            assert!(app.ed.project().new_tasks_are_manual, "x={x}");
+            assert_eq!(app.ed.sel(), sel, "x={x}");
+        }
+        // The first and last columns of the segment switch it to Auto.
         frame_row(&mut app, w, h - 1);
-        click(&mut app, 12, h - 1);
+        click(&mut app, start, h - 1);
         assert!(!app.ed.project().new_tasks_are_manual);
-        // A click on the state item does not.
+        press(&mut app, 'M');
+        assert!(app.ed.project().new_tasks_are_manual);
         frame_row(&mut app, w, h - 1);
-        click(&mut app, 3, h - 1);
-        assert!(!app.ed.project().new_tasks_are_manual);
-        // A click past it does not.
-        frame_row(&mut app, w, h - 1);
-        click(&mut app, w - 2, h - 1);
+        click(&mut app, end - 1, h - 1);
         assert!(!app.ed.project().new_tasks_are_manual);
     }
 
