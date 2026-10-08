@@ -796,3 +796,66 @@ fn a_paste_that_cannot_apply_changes_nothing() {
         "Pasted rows would nest deeper than 20 levels"
     );
 }
+
+#[test]
+fn a_task_calendar_follows_its_name_into_another_plan_never_its_uid() {
+    let with_calendars = |mut t: DocTab, calendars: &[(i32, &str)], task_cal: Option<i32>| {
+        let mut p = v(&t).ed.project().clone();
+        p.calendars = calendars
+            .iter()
+            .map(|&(uid, name)| projcore::Calendar {
+                name: name.into(),
+                ..projcore::Calendar::standard(uid)
+            })
+            .collect();
+        p.tasks[0].calendar_uid = task_cal;
+        t.surface = Surface::Project(ProjectView::new(p, false));
+        t
+    };
+    let mut src = with_calendars(tab(), &[(7, "Night")], Some(7));
+    project_cell_press(&mut src, 0, COL_ID, false);
+    let clip = copy_rows(&src).1.unwrap();
+    let pasted = |dst: DocTab| {
+        let mut dst = dst;
+        unselect_at(&mut dst, 1, COL_NAME);
+        paste_project_rows(&mut dst, &clip);
+        v(&dst).ed.project().tasks[1].calendar_uid
+    };
+    // The same UID is another calendar here: the task takes the default.
+    assert_eq!(pasted(with_calendars(tab(), &[(7, "Day")], None)), None);
+    // The same name under another UID.
+    assert_eq!(
+        pasted(with_calendars(tab(), &[(3, "Day"), (9, "night")], None)),
+        Some(9)
+    );
+    // The same plan keeps it.
+    assert_eq!(
+        pasted(with_calendars(tab(), &[(7, "Night")], Some(7))),
+        Some(7)
+    );
+}
+
+#[test]
+fn an_unassigned_placeholder_assignment_goes_as_it_is() {
+    let mut t = tab();
+    let mut p = v(&t).ed.project().clone();
+    p.assignments.push(projcore::Assignment {
+        uid: 1,
+        task_uid: p.tasks[0].uid,
+        resource_uid: -65535,
+        ..projcore::Assignment::default()
+    });
+    t.surface = Surface::Project(ProjectView::new(p, false));
+    project_cell_press(&mut t, 0, COL_ID, false);
+    let clip = copy_rows(&t).1.unwrap();
+    unselect_at(&mut t, 1, COL_NAME);
+    paste_project_rows(&mut t, &clip);
+    assert_eq!(t_status(&t), "Pasted 1 row");
+    let p = v(&t).ed.project();
+    let new = p.tasks[1].uid;
+    assert!(
+        p.assignments
+            .iter()
+            .any(|a| a.task_uid == new && a.resource_uid == -65535)
+    );
+}

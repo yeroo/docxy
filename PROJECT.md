@@ -478,13 +478,15 @@ still holds that copy's text, Ctrl+V inserts them above the cursor row (above
 the range's top row; appended from the entry row) instead of overwriting
 cells, as one undo step, and the cursor goes to the first new task. A new
 task has a fresh UID and ID, the copied task's fields and outline depth
-(the shallowest copied row takes the level a task added there takes; deeper
-than 20 is refused), and a collapsed summary brings its hidden subtasks.
+(the shallowest copied row takes the level a task added there takes and every
+row keeps its depth below it; deeper than 20 is refused), and a collapsed summary brings its hidden subtasks.
 Predecessors inside the copied rows follow the copies and the others are
 dropped. Baselines, recorded progress, the GUID, WBS code, stored dates,
 custom field and outline code values, and work and cost totals are not
-carried. Assignments are cloned; in another plan they follow the resource
-of the same name, and ones without it are dropped, which the status says.
+carried. Assignments are cloned (a Cost resource's entered cost kept); in
+another plan they follow the resource of the same name, and ones without it are
+dropped, which the status says; a task calendar follows its name too, else the
+task takes the plan's default.
 Another copy, a Cut, a cell editor's copy or another app's clipboard text
 ends it, and the paste overwrites cells as before.
 

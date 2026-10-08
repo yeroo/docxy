@@ -584,7 +584,8 @@ impl Editor {
     /// plan's UID (the host maps them); each is cloned onto the new row,
     /// keeping its units and work. The block takes the outline level a task
     /// inserted there takes (see [`level_at`]): its shallowest row gets that
-    /// level, the rest keep their depth relative to it. A block that would
+    /// level, the rest keep their depth relative to it (a copied project
+    /// summary's level 0 included). A block that would
     /// go deeper than 20 levels is refused. Returns the new UIDs in order.
     pub fn insert_tasks(
         &mut self,
@@ -592,7 +593,7 @@ impl Editor {
         rows: &[Task],
         assignments: &[Assignment],
     ) -> Result<Vec<i32>, String> {
-        let Some(top) = rows.iter().map(|t| t.outline_level.max(1)).min() else {
+        let Some(top) = rows.iter().map(|t| t.outline_level).min() else {
             return Ok(Vec::new());
         };
         let at = match before {
@@ -614,21 +615,17 @@ impl Editor {
             .map(|t| t.uid)
             .zip(new_uids.iter().copied())
             .collect();
-        // The shallowest row takes `target`; a row never nests more than one
-        // level below the one above it, whatever the copy started with.
-        let mut levels: Vec<u32> = Vec::with_capacity(rows.len());
-        for (k, t) in rows.iter().enumerate() {
-            let level = target + (t.outline_level.max(1) - top);
-            let level = match k {
-                0 => target,
-                _ => level.min(levels[k - 1] + 1),
-            };
-            levels.push(level);
-        }
+        // One offset for the block: its shallowest row takes `target` and
+        // every row keeps its depth below that, as it had in the source.
+        let levels: Vec<u32> = rows
+            .iter()
+            .map(|t| target + (t.outline_level - top))
+            .collect();
         if levels.iter().any(|&l| l > 20) {
             return Err("Pasted rows would nest deeper than 20 levels".into());
         }
         let calendars: Vec<i32> = self.proj.calendars.iter().map(|c| c.uid).collect();
+        let resources = self.proj.resources.clone();
         let mut next_aid = self
             .proj
             .assignments
@@ -654,6 +651,14 @@ impl Editor {
                 cost_rate_table: a.cost_rate_table,
                 delay: a.delay,
                 notes: a.notes.clone(),
+                // A cost resource's cost is what was entered, which nothing
+                // here could price again; work and material are priced from
+                // their work, so their cost stays absent.
+                cost: resources
+                    .iter()
+                    .find(|r| r.uid == a.resource_uid)
+                    .filter(|r| r.kind == ResourceType::Cost)
+                    .and_then(|_| a.cost.clone()),
                 ..Assignment::default()
             });
         }
@@ -3190,8 +3195,8 @@ mod tests {
             &ed.project().tasks[4],
             &ed.project().tasks[5],
         );
-        // Above D (a top-level task after a leaf): the block's top takes D's
-        // level, as a task added there would; B and C were siblings.
+        // Above D, the task above is C (a leaf at level 2): the block's top
+        // takes C's level, as a task added there would; B and C stay siblings.
         assert_eq!(
             (b.outline_level, c.outline_level, d.outline_level),
             (2, 2, 1)
@@ -3296,6 +3301,107 @@ mod tests {
         assert_ne!(uids[0], uids[1]);
         assert!(ed.undo());
         assert_eq!(ed.project().assignments.len(), 1);
+    }
+
+    fn row(uid: i32, level: u32) -> Task {
+        Task {
+            uid,
+            id: uid,
+            name: format!("R{uid}"),
+            outline_level: level,
+            duration_min: 480,
+            ..Task::default()
+        }
+    }
+
+    #[test]
+    fn insert_tasks_keeps_the_blocks_depths_with_one_offset() {
+        // Skipped levels stay skipped: S(1), A(3), B(3) above D, where the
+        // task above is C (level 2).
+        let mut ed = outline_editor();
+        let rows = [row(20, 1), row(21, 3), row(22, 3)];
+        ed.insert_tasks(Some(4), &rows, &[]).unwrap();
+        let levels: Vec<_> = ed.project().tasks[3..6]
+            .iter()
+            .map(|t| t.outline_level)
+            .collect();
+        assert_eq!(levels, [2, 4, 4]);
+        // B(2), C(2), D(1) keep their relation (the copy's top is D's 1):
+        // above D they nest B', C' one below the new D'.
+        let mut ed = outline_editor();
+        let rows = ed.project().tasks[1..].to_vec();
+        let new = ed.insert_tasks(Some(4), &rows, &[]).unwrap();
+        let tasks = &ed.project().tasks[3..6];
+        assert_eq!(
+            tasks.iter().map(|t| t.outline_level).collect::<Vec<_>>(),
+            [3, 3, 2]
+        );
+        assert_eq!(
+            tasks[1]
+                .predecessors
+                .iter()
+                .map(|p| p.uid)
+                .collect::<Vec<_>>(),
+            [new[0]]
+        );
+        // A copied project summary (level 0) keeps its children below it.
+        let mut ed = outline_editor();
+        let rows = [row(30, 0), row(31, 1), row(32, 2)];
+        ed.insert_tasks(None, &rows, &[]).unwrap();
+        let levels: Vec<_> = ed.project().tasks[4..]
+            .iter()
+            .map(|t| t.outline_level)
+            .collect();
+        assert_eq!(levels, [1, 2, 3]);
+    }
+
+    #[test]
+    fn insert_tasks_refuses_a_block_whose_deepest_row_passes_twenty() {
+        let mut ed = outline_editor();
+        let mut p = ed.project().clone();
+        p.tasks = (1..=19).map(|n| row(n, n as u32)).collect();
+        ed.replace_project(p);
+        let before = ed.project().clone();
+        // Appended after a leaf at 19: the top row nests at 19.
+        let result = ed.insert_tasks(None, &[row(40, 2), row(41, 3), row(42, 1)], &[]);
+        assert_eq!(
+            result,
+            Err("Pasted rows would nest deeper than 20 levels".into())
+        );
+        assert_eq!(ed.project(), &before);
+        assert_eq!(ed.undo_depth(), 0);
+        // Level 20 itself is fine.
+        assert!(
+            ed.insert_tasks(None, &[row(40, 2), row(41, 3)], &[])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn insert_tasks_keeps_a_cost_resources_entered_cost_only() {
+        let mut ed = outline_editor();
+        ed.assign_resource(2, "Ann").unwrap();
+        ed.assign_resource(2, "Fee").unwrap();
+        let mut p = ed.project().clone();
+        let cost = crate::model::Rate::parse("125.5");
+        p.resources[1].kind = ResourceType::Cost;
+        for a in &mut p.assignments {
+            a.cost = cost.clone();
+        }
+        ed.replace_project(p);
+        let source = ed.project().assignments.clone();
+        let rows = vec![ed.project().tasks[1].clone()];
+        ed.insert_tasks(Some(4), &rows, &source).unwrap();
+        let made: Vec<_> = ed
+            .project()
+            .assignments
+            .iter()
+            .filter(|a| a.task_uid == 5)
+            .map(|a| (a.resource_uid, a.cost.clone()))
+            .collect();
+        assert_eq!(made[1], (ed.project().resources[1].uid, cost.clone()));
+        // The work resource's cost is priced again, not copied.
+        assert_ne!(made[0].1, cost);
     }
 
     #[test]

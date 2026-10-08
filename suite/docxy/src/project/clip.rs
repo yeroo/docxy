@@ -70,6 +70,9 @@ pub(crate) struct ProjectRowsClip {
     tasks: Vec<Task>,
     assignments: Vec<projcore::Assignment>,
     resources: Vec<(i32, String)>,
+    /// The task calendars the tasks name, with their names, for the same
+    /// reason as `resources`.
+    calendars: Vec<(i32, String)>,
 }
 
 impl ProjectRowsClip {
@@ -127,11 +130,18 @@ pub(crate) fn project_rows_clip(v: &ProjectView, text: &str) -> Option<ProjectRo
         .filter(|r| assignments.iter().any(|a| a.resource_uid == r.uid))
         .map(|r| (r.uid, r.name.clone()))
         .collect();
+    let calendars = proj
+        .calendars
+        .iter()
+        .filter(|c| tasks.iter().any(|t| t.calendar_uid == Some(c.uid)))
+        .map(|c| (c.uid, c.name.clone()))
+        .collect();
     Some(ProjectRowsClip {
         text: text.replace("\r\n", "\n"),
         tasks,
         assignments,
         resources,
+        calendars,
     })
 }
 
@@ -157,14 +167,18 @@ pub(crate) fn paste_project_rows(tab: &mut DocTab, clip: &ProjectRowsClip) {
     let mut dropped = 0;
     let mut assignments = Vec::new();
     for a in &clip.assignments {
-        let name = clip
+        // A resource the copy has no name for (the unassigned placeholder,
+        // UID -65535) is no resource of the plan: it goes as it is.
+        let Some((_, name)) = clip
             .resources
             .iter()
             .find(|(uid, _)| *uid == a.resource_uid)
-            .map(|(_, name)| name.as_str())
-            .unwrap_or_default();
+        else {
+            assignments.push(a.clone());
+            continue;
+        };
         // The same resource in the same plan, else one of that name.
-        let same = |r: &&projcore::Resource| r.name.eq_ignore_ascii_case(name);
+        let same = |r: &&projcore::Resource| !name.is_empty() && r.name.eq_ignore_ascii_case(name);
         let target = resources
             .iter()
             .find(|r| r.uid == a.resource_uid && same(r))
@@ -177,7 +191,22 @@ pub(crate) fn paste_project_rows(tab: &mut DocTab, clip: &ProjectRowsClip) {
             None => dropped += 1,
         }
     }
-    match v.ed.insert_tasks(before, &clip.tasks, &assignments) {
+    // A task calendar is the plan's own: the one of the same name here (the
+    // same UID alone could be another calendar), else the plan's default.
+    let calendars = &v.ed.project().calendars;
+    let mut tasks = clip.tasks.clone();
+    for t in &mut tasks {
+        t.calendar_uid = t.calendar_uid.and_then(|uid| {
+            let (_, name) = clip.calendars.iter().find(|(c, _)| *c == uid)?;
+            let same = |c: &&projcore::Calendar| c.name.eq_ignore_ascii_case(name);
+            calendars
+                .iter()
+                .find(|c| c.uid == uid && same(c))
+                .or_else(|| calendars.iter().find(same))
+                .map(|c| c.uid)
+        });
+    }
+    match v.ed.insert_tasks(before, &tasks, &assignments) {
         Ok(new) => {
             let n = new.len();
             let mut status = format!("Pasted {n} row{}", if n == 1 { "" } else { "s" });
