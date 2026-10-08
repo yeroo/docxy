@@ -723,9 +723,12 @@ step, No or Escape cancels, and nothing else reaches the plan while it is open.
 The state's `dialog` reads `delete-summary`, and `prompt` stays `none`. Ctrl+Delete clears or resets the cell as one undo step: Name,
 Predecessors and Resource Names clear as with Delete, Duration becomes 1 day
 (`1d?` unless the plan's `NewTasksEstimated` is off; an auto summary's is
-refused), and Task Mode becomes the plan's mode for new tasks. On ID, Start and
-Finish it reports `<column> can't be cleared` and never deletes the task; on a
-blank row or the entry row it does nothing. Alt+Shift+Right/Left
+refused), and Task Mode becomes the plan's mode for new tasks. On an auto
+task, Start drops a Start No Earlier Than constraint and Finish a Finish No
+Earlier Than one; with any other constraint it reports `<column> has no
+constraint to reset`, and an auto summary's is refused. On a manual task's
+Start or Finish and on ID it reports `<column> can't be cleared`; it never
+deletes the task, and on a blank row or the entry row it does nothing. Alt+Shift+Right/Left
 indent/outdent, Alt+Right/Left pan the Gantt,
 Alt+Home / Alt+End move it to the project start / finish, and Ctrl+Shift+L toggles leveling.
 Ctrl+F2 opens the Predecessor prompt (Task › Schedule › Link Tasks, screentip

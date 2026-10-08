@@ -368,9 +368,14 @@ first: Enter deletes it with its subtasks, Esc cancels). Ctrl+Delete clears the
 cell or resets it to its default, as one undo step: Name, Predecessors and
 Resource Names are cleared as Delete does, Duration becomes 1 day (estimated
 unless the plan's `NewTasksEstimated` is off; an auto summary's is refused), and
-Task Mode becomes the plan's mode for new tasks. On ID, Start and Finish it
-reports `<column> can't be cleared` and never deletes the task, and it leaves a
-blank row and the entry row alone. A task added with Task › Insert
+Task Mode becomes the plan's mode for new tasks. On an auto task, Start drops a
+Start No Earlier Than constraint (the one typing a Start adds, however it was
+set) and Finish a Finish No Earlier Than one, leaving As Soon As Possible; with
+any other constraint it reports `<column> has no constraint to reset`. A manual
+task's Start and Finish are pinned dates that cannot be blank, so they report
+`<column> can't be cleared`, as does ID; an auto summary's is refused as its
+Duration is. Ctrl+Delete never deletes the task, and it leaves a blank row and
+the entry row alone. A task added with Task › Insert
 › Task (keytip Alt, T, N; here, in yppxy and through projctl's `task.add`) is 1
 day, estimated unless the plan's `NewTasksEstimated` is off, and with the plan's
 `Autolink` on (the default) it is linked into the finish-to-start chain it

@@ -2116,3 +2116,105 @@ fn mac_command_shift_keys_extend_the_range_1087() {
     }
     assert_eq!(sel(&t), Some((vec![10, 20, 30], COL_NAME, LAST)));
 }
+
+fn reset(t: &mut DocTab, uid: i32, col: usize) -> Result<Option<String>, String> {
+    reset_cell(&mut vm(t).ed, uid, col)
+}
+
+#[test]
+fn ctrl_delete_on_start_and_finish_drops_the_constraint_typing_adds() {
+    for (col, typed) in [(COL_START, "2026-02-03"), (COL_FINISH, "2026-02-04")] {
+        let mut t = tab();
+        edit(&mut t, col, typed);
+        key(&mut t, "enter");
+        let typed_constraint = v(&t).ed.project().task(10).unwrap().constraint;
+        assert_ne!(typed_constraint, ConstraintType::AsSoonAsPossible);
+        vm(&mut t).ed.mark_saved();
+        let with = v(&t).ed.project().clone();
+        let depth = v(&t).ed.undo_depth();
+        assert_eq!(reset(&mut t, 10, col), Ok(None));
+        let task = v(&t).ed.project().task(10).unwrap();
+        assert_eq!(
+            (task.constraint, task.constraint_date),
+            (ConstraintType::AsSoonAsPossible, None)
+        );
+        assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+        assert!(v(&t).ed.dirty());
+        vm(&mut t).ed.undo();
+        assert_eq!(v(&t).ed.project(), &with);
+        vm(&mut t).ed.redo();
+        assert_eq!(
+            v(&t).ed.project().task(10).unwrap().constraint,
+            ConstraintType::AsSoonAsPossible
+        );
+    }
+}
+
+#[test]
+fn ctrl_delete_on_start_and_finish_without_its_constraint_changes_nothing() {
+    let date = Some(DateTime::from_ymd_hm(2026, 2, 3, 8, 0));
+    let cases = [
+        (COL_START, ConstraintType::FinishNoEarlierThan, date),
+        (COL_FINISH, ConstraintType::StartNoEarlierThan, date),
+        (COL_START, ConstraintType::AsSoonAsPossible, None),
+        (COL_FINISH, ConstraintType::MustStartOn, date),
+    ];
+    for (col, constraint, d) in cases {
+        let mut t = tab();
+        vm(&mut t)
+            .ed
+            .set_constraint_typed(10, constraint, d)
+            .unwrap();
+        vm(&mut t).ed.mark_saved();
+        let before = v(&t).ed.project().clone();
+        let depth = v(&t).ed.undo_depth();
+        assert_eq!(
+            reset(&mut t, 10, col),
+            Ok(Some(format!("{} has no constraint to reset", COLUMNS[col])))
+        );
+        assert_eq!(v(&t).ed.project(), &before);
+        assert_eq!(v(&t).ed.undo_depth(), depth);
+        assert!(!v(&t).ed.dirty());
+    }
+}
+
+#[test]
+fn ctrl_delete_on_a_manual_tasks_dates_cannot_clear_them() {
+    for col in [COL_START, COL_FINISH] {
+        let mut t = tab();
+        vm(&mut t).ed.set_manual(10, true).unwrap();
+        vm(&mut t).ed.mark_saved();
+        let before = v(&t).ed.project().clone();
+        assert_eq!(
+            reset(&mut t, 10, col),
+            Ok(Some(format!("{} can't be cleared", COLUMNS[col])))
+        );
+        assert_eq!(v(&t).ed.project(), &before);
+        assert!(!v(&t).ed.dirty());
+    }
+}
+
+#[test]
+fn ctrl_delete_on_dates_of_summary_and_blank_rows() {
+    let mut t = tab();
+    vm(&mut t).ed.indent(20, 1).unwrap();
+    vm(&mut t).ed.mark_saved();
+    let before = v(&t).ed.project().clone();
+    for col in [COL_START, COL_FINISH] {
+        assert_eq!(
+            reset(&mut t, 10, col),
+            Err("Summary dates and duration are read-only".into())
+        );
+    }
+    assert_eq!(v(&t).ed.project(), &before);
+    let mut t = tab();
+    vm(&mut t).ed.insert_blank_row(Some(30)).unwrap();
+    let blank = v(&t).ed.project().tasks[2].uid;
+    vm(&mut t).ed.mark_saved();
+    let before = v(&t).ed.project().clone();
+    for col in [COL_START, COL_FINISH] {
+        assert_eq!(reset(&mut t, blank, col), Ok(None));
+    }
+    assert_eq!(v(&t).ed.project(), &before);
+    assert!(!v(&t).ed.dirty());
+}
