@@ -10770,39 +10770,41 @@ fn persist_tab(hd: &std::path::Path, seq: usize, i: usize, t: &DocTab) -> Persis
     // held across a restart (closing never loses work). Docs → .docx,
     // spreadsheets → .xlsx, projects → .yppx; restored in preference to `path`.
     // Missing or unreadable project sidecars use restore_project_tab's recovery policy.
-    let hot = match &t.surface {
-        // A converted tab not converted yet shows a placeholder, not its
-        // document: no sidecar, so the next start converts it again.
+    let hot = hot_bytes(t).and_then(|(ext, bytes)| {
+        let p = hd.join(format!("{}.{ext}", hot_stem(seq, i)));
+        opccore::fsio::write_atomic(&p, &bytes)
+            .ok()
+            .map(|_| p.display().to_string())
+    });
+    PersistTab {
+        hot,
+        ..persist_tab_meta(t)
+    }
+}
+
+/// What hot exit writes for tab `t`, with its sidecar's extension: the
+/// whole file a save would write, so everything a save keeps (a document's
+/// body, headers and footers, comments with their resolved state, Track
+/// Changes; a workbook with its charts; a project). `None` for a tab with
+/// no content of its own: a placeholder, or a converted tab not converted
+/// yet, which shows a placeholder and is converted again at the next start.
+fn hot_bytes(t: &DocTab) -> Option<(&'static str, Vec<u8>)> {
+    match &t.surface {
         Surface::Doc(_) if t.pending_conversion => None,
         Surface::Doc(ed) => {
-            let p = hd.join(format!("{}.docx", hot_stem(seq, i)));
             let live = live_comments(t, &ed.doc);
             let base = save_base(t, &ed.doc, &live);
-            let bytes = doc_to_docx(&ed.doc, &live, base.as_deref());
-            opccore::fsio::write_atomic(&p, &bytes)
-                .ok()
-                .map(|_| p.display().to_string())
+            Some(("docx", doc_to_docx(&ed.doc, &live, base.as_deref())))
         }
-        Surface::Sheet(v) => {
-            let p = hd.join(format!("{}.xlsx", hot_stem(seq, i)));
-            opccore::fsio::write_atomic(&p, &sheet_bytes(v, None).0)
-                .ok()
-                .map(|_| p.display().to_string())
-        }
+        Surface::Sheet(v) => Some(("xlsx", sheet_bytes(v, None).0)),
         Surface::Project(v) => {
-            let p = hd.join(format!("{}.yppx", hot_stem(seq, i)));
             let mut snapshot = v.ed.project().clone();
             snapshot.package.unreadable.clear();
             projcore::yppx::write_yppx(&snapshot)
                 .ok()
-                .and_then(|bytes| opccore::fsio::write_atomic(&p, &bytes).ok())
-                .map(|_| p.display().to_string())
+                .map(|bytes| ("yppx", bytes))
         }
         Surface::Placeholder => None,
-    };
-    PersistTab {
-        hot,
-        ..persist_tab_meta(t)
     }
 }
 

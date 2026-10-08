@@ -399,34 +399,19 @@ impl QuitAgreed {
     }
 }
 
-/// A stamp of tab `t`'s content, to tell whether it changed: a hash of the
-/// model's `Debug` form (document, workbook package and charts, project).
-/// The models hold no caches, so it changes only with an edit. `None` for
-/// a tab with no content of its own (a placeholder, a conversion not done
-/// yet), which nothing can edit.
+/// A stamp of tab `t`'s content, to tell whether it changed: a hash of
+/// what hot exit writes for it ([`hot_bytes`]), so of everything a save
+/// keeps (for a document its body, headers and footers once flushed,
+/// comments and their resolved state, and Track Changes). The writers
+/// read no clock, so it changes only with the content. `None` for a tab
+/// with no content of its own (a placeholder, a conversion not done yet),
+/// which nothing can edit.
 pub(crate) fn tab_stamp(t: &DocTab) -> Option<u64> {
-    use std::fmt::Write as _;
     use std::hash::Hasher as _;
-    struct Hashing(std::collections::hash_map::DefaultHasher);
-    impl std::fmt::Write for Hashing {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            self.0.write(s.as_bytes());
-            Ok(())
-        }
-    }
-    let mut h = Hashing(std::collections::hash_map::DefaultHasher::new());
-    let written = match &t.surface {
-        Surface::Doc(_) if t.pending_conversion => return None,
-        Surface::Doc(ed) => write!(h, "{:?}", ed.doc),
-        Surface::Sheet(v) => write!(h, "{:?}", v.pkg).and_then(|_| {
-            v.charts
-                .iter()
-                .try_for_each(|c| write!(h, "{:?}", (c.sheet, c.from, c.to, &c.data)))
-        }),
-        Surface::Project(v) => write!(h, "{:?}", v.ed.project()),
-        Surface::Placeholder => return None,
-    };
-    written.ok().map(|_| h.0.finish())
+    let (_, bytes) = hot_bytes(t)?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(&bytes);
+    Some(h.finish())
 }
 
 /// How a window's close asks, with `windows` open (#587): a non-last

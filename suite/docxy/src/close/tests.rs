@@ -2951,6 +2951,28 @@ fn a_tab_stamp_changes_with_an_edit_only() {
     ed.insert_str("more");
     assert_ne!(tab_stamp(&doc), before);
 
+    // Work outside the body is saved too: a header edit once flushed (as
+    // the quit commits it), and a comment resolved.
+    let (mut t, _, _) = untouched_existing_header("stamp", true);
+    let before = tab_stamp(&t);
+    commit_pending_for_exit(std::slice::from_mut(&mut t));
+    assert_eq!(tab_stamp(&t), before, "an untouched header flushes nothing");
+    t.hf_edit.as_mut().unwrap().editor.insert_str("new ");
+    commit_pending_for_exit(std::slice::from_mut(&mut t));
+    assert_ne!(tab_stamp(&t), before, "a header edit");
+
+    let mut t = tab(Kind::Docx);
+    t.comments.push(docxcore::comments::Comment {
+        id: "1".into(),
+        author: "a".into(),
+        text: "check".into(),
+        ..Default::default()
+    });
+    let before = tab_stamp(&t);
+    assert_eq!(tab_stamp(&t), before);
+    t.comments[0].resolved = true;
+    assert_ne!(tab_stamp(&t), before, "a comment resolved");
+
     let mut sheet = tab(Kind::Xlsx);
     let before = tab_stamp(&sheet);
     assert_eq!(tab_stamp(&sheet), before);
