@@ -3,10 +3,10 @@
 //! dialog's shape ([`super::columns_dialog`]): the caret section's values,
 //! OK writes through `edit_section_setups` as one undo step, "This point
 //! forward" starts the new section with a Continuous break, and "Apply to"
-//! names the targets. The shown values follow the drawer's rules
-//! (`crate::line_numbers` `Rule::from_setup`): Start at is one more than the
-//! written `w:start`, and an absent or non-positive `w:distance` is Word's
-//! Auto, a quarter inch.
+//! names the targets. Start at shows one more than the written `w:start`
+//! (clamped at 0 like the drawer's `Rule::from_setup`). From text shows Auto
+//! only when the section saved no `w:distance` at all; a written 0 shows as
+//! From text 0, Auto off — the drawer alone draws 0 at Auto's quarter inch.
 use super::*;
 use docxcore::sect::{LineNumbering, LnRestart};
 
@@ -135,22 +135,27 @@ fn after_line_numbers_set(d: &mut Dialog, i: usize, _before: &Value) {
 }
 
 /// Apply an accepted Line Numbers dialog: one undo step on the body editor,
-/// whether anything changed. Like `apply_columns`, each target keeps its own
-/// values for the controls the person did not change — an untouched OK
-/// writes nothing, so a clean document stays clean. The box toggles only
-/// where "add" changed; turning it on gives a section that had no numbering
-/// the dialog's shown values (Count by and Numbering as shown, Start at
-/// omitted at 1, Auto saving no `w:distance`).
+/// whether anything changed. Like `apply_columns`, each numbered target
+/// keeps its own values for the controls the person did not change, so an
+/// untouched OK writes nothing and a clean document stays clean. The gated
+/// fields are parsed and validated only while the box is on; with it off
+/// they are ignored, and an invalid staged value never blocks the removal.
+/// A target with no numbering stays unnumbered unless "add" changed; only
+/// turning the box on numbers it, from the dialog's shown values.
 pub(crate) fn apply_line_numbers(ed: &mut Editor, d: &Dialog) -> Result<bool, String> {
     let on = is_on(d, "add");
     let add_changed = d.changed("add");
     let start_changed = d.changed("start");
     let by_changed = d.changed("by");
-    let from_changed = d.changed("from") || d.changed("auto");
+    // From text counts only while Auto is off: a From text typed during a
+    // brief Auto-off, then abandoned by turning Auto back on, is not a
+    // distance change and must not wipe a target's own saved distance.
+    let from_changed = d.changed("auto") || (!is_on(d, "auto") && d.changed("from"));
     let restart_changed = d.changed("restart");
     // Validate the staged values before anything is written: a refused OK
     // leaves the document untouched and the dialog open. Start at shows one
-    // more than `w:start`, so it may be one past i32::MAX.
+    // more than `w:start`, so it may be one past i32::MAX. With the box off
+    // the fields are disabled and ignored, so nothing is parsed.
     let label = |name: &str| {
         d.controls[index(d, name).unwrap_or_default()]
             .label
@@ -158,67 +163,74 @@ pub(crate) fn apply_line_numbers(ed: &mut Editor, d: &Dialog) -> Result<bool, St
             .trim_end_matches(':')
             .to_string()
     };
-    let whole = |name: &str, max: i64| -> Result<i64, String> {
-        text_of(d, name)
-            .trim()
-            .parse::<i64>()
-            .ok()
-            .filter(|v| (1..=max).contains(v))
-            .ok_or_else(|| format!("{} must be a whole number of 1 or more", label(name)))
-    };
-    let start_at = whole("start", i64::from(i32::MAX) + 1)?;
-    let count_by = i32::try_from(whole("by", i64::from(i32::MAX))?)
-        .expect("validated within i32");
-    // From text is a length in inches: the value is checked non-negative
-    // before it is rounded to twips, so -0.0001 (which would round to 0)
-    // is refused too.
-    let distance = if is_on(d, "auto") {
-        None
+    let (count_by, start, distance, restart) = if on {
+        let whole = |name: &str, max: i64| -> Result<i64, String> {
+            text_of(d, name)
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .filter(|v| (1..=max).contains(v))
+                .ok_or_else(|| format!("{} must be a whole number of 1 or more", label(name)))
+        };
+        let start_at = whole("start", i64::from(i32::MAX) + 1)?;
+        let count_by = i32::try_from(whole("by", i64::from(i32::MAX))?)
+            .expect("validated within i32");
+        // From text is a length in inches: the value is checked non-negative
+        // before it is rounded to twips, so -0.0001 (which would round to 0)
+        // is refused too; and a value beyond i32 twips refuses OK instead of
+        // saturating the cast.
+        let distance = if is_on(d, "auto") {
+            None
+        } else {
+            let inches: f64 = text_of(d, "from")
+                .trim()
+                .parse()
+                .ok()
+                .filter(|v: &f64| v.is_finite())
+                .ok_or_else(|| format!("{} takes a number", label("from")))?;
+            if inches < 0.0 {
+                return Err(format!("{} cannot be negative", label("from")));
+            }
+            let tw = (inches * TWIPS_PER_INCH as f64).round();
+            if tw > f64::from(i32::MAX) {
+                return Err(format!("{} is too large", label("from")));
+            }
+            Some(tw as i32)
+        };
+        let start = i32::try_from(start_at - 1).expect("validated within i32");
+        (
+            count_by,
+            (start_at > 1).then_some(start),
+            distance,
+            RESTARTS[chosen(d, "restart").unwrap_or_default()],
+        )
     } else {
-        let inches: f64 = text_of(d, "from")
-            .trim()
-            .parse()
-            .ok()
-            .filter(|v: &f64| v.is_finite())
-            .ok_or_else(|| format!("{} takes a number", label("from")))?;
-        if inches < 0.0 {
-            return Err(format!("{} cannot be negative", label("from")));
-        }
-        Some((inches * TWIPS_PER_INCH as f64).round() as i32)
+        (1, None, None, LnRestart::NewPage)
     };
-    let restart = RESTARTS[chosen(d, "restart").unwrap_or_default()];
-    let start = i32::try_from(start_at - 1).expect("validated within i32");
     let edit = |s: &mut SectionSetup| {
         let had = s.line_numbers;
-        let field_changed =
-            start_changed || by_changed || from_changed || restart_changed;
         s.line_numbers = match (add_changed, on) {
-            // The box stays off, or nothing but "apply" changed: leave the
-            // section as it is.
+            // The box stays off: removal only if it toggled, else nothing.
             (false, false) => had,
-            (false, true) if !field_changed => had,
-            // The box turns off: numbering is removed.
             (true, false) => None,
-            // Numbering ends on. A section that had none takes the dialog's
-            // shown values; one that had numbering keeps its own for the
+            // The box is on. A target that had no numbering takes the
+            // dialog's shown values only when the box turned on; with the
+            // box already on there is nothing to edit and it stays
+            // unnumbered. A numbered target keeps its own values for the
             // controls the person did not change.
             (_, true) => match had {
-                None => Some(LineNumbering {
-                    count_by: if by_changed { count_by } else { 1 },
-                    start: (start_changed && start_at > 1).then_some(start),
-                    distance: if from_changed { distance } else { None },
-                    restart: if restart_changed {
-                        restart
-                    } else {
-                        LnRestart::NewPage
-                    },
+                None => add_changed.then_some(LineNumbering {
+                    count_by,
+                    start,
+                    distance,
+                    restart,
                 }),
                 Some(mut ln) => {
                     if by_changed {
                         ln.count_by = count_by;
                     }
                     if start_changed {
-                        ln.start = (start_at > 1).then_some(start);
+                        ln.start = start;
                     }
                     if from_changed {
                         ln.distance = distance;
@@ -482,6 +494,8 @@ mod tests {
     /// Criterion 5: From text must be Auto or a non-negative length in
     /// inches. FIX r1 Immaterial: the inch value is checked before it is
     /// rounded to twips, so -0.0001 (which would round to 0) is refused too.
+    /// FIX r2 Immaterial: a value beyond i32 twips refuses OK instead of
+    /// saturating silently.
     #[test]
     fn invalid_from_text_blocks_ok() {
         for bad in ["-0.5", "-0.0001", ""] {
@@ -495,6 +509,19 @@ mod tests {
             assert!(t.dialogs.top().is_some(), "the dialog stays open");
             assert!(!t.dirty, "{bad:?} left the tab clean");
         }
+    }
+
+    #[test]
+    fn huge_from_text_blocks_ok() {
+        let mut t = three_sections();
+        open(&mut t);
+        set(&mut t, "add", Json::Bool(true));
+        set(&mut t, "auto", Json::Bool(false));
+        set(&mut t, "from", s("2000000"));
+        let e = ok(&mut t).unwrap_err();
+        assert!(e.contains("From text") && e.contains("too large"), "{e}");
+        assert!(t.dialogs.top().is_some(), "the dialog stays open");
+        assert!(!t.dirty);
     }
 
     /// Criterion 6: Whole document edits every section, as one undo step.
@@ -599,9 +626,9 @@ mod tests {
         assert_eq!(ed(&t).sections(), before);
     }
 
-    /// FIX r1 Major 1: Whole document with only Count by changed keeps each
-    /// section's own start, distance and restart; a section that had no
-    /// numbering takes Count by with Word's defaults for the rest.
+    /// FIX r1 Major 1 / r2 Major 2: Whole document with only Count by changed
+    /// keeps each numbered section's own start, distance and restart; a
+    /// target with no numbering stays unnumbered unless "add" changed.
     #[test]
     fn whole_document_with_one_field_changed_keeps_each_sections_own() {
         let mut t = three_sections();
@@ -625,9 +652,59 @@ mod tests {
             Some(ln(2, None, None, LnRestart::NewSection))
         );
         assert_eq!(
-            now[2].line_numbers,
-            Some(ln(2, None, None, LnRestart::NewPage))
+            now[2].line_numbers, None,
+            "an unnumbered target stays unnumbered unless the box turns on"
         );
+    }
+
+    /// FIX r2 Major 2: with the box already on, a field edit lands on the
+    /// numbered targets' own values and never numbers an unnumbered target.
+    #[test]
+    fn an_unnumbered_target_stays_unnumbered_unless_the_box_turns_on() {
+        let mut t = three_sections();
+        give(
+            &mut t,
+            1,
+            Some(ln(7, Some(4), Some(720), LnRestart::NewSection)),
+        );
+        let before0 = ed(&t).sections()[0].clone();
+        let before2 = ed(&t).sections()[2].clone();
+        // The selection spans sections 1 (caret) and 2; section 0 is no target.
+        ed_mut(&mut t).anchor = Some(Caret::top(3, 2));
+        open(&mut t);
+        assert_eq!(shown(&t, "apply"), "Selected sections");
+        set(&mut t, "by", s("5"));
+        ok(&mut t).unwrap();
+        assert_eq!(
+            setups(&t)[1].line_numbers,
+            Some(ln(5, Some(4), Some(720), LnRestart::NewSection)),
+            "the numbered target keeps its own values"
+        );
+        assert_eq!(ed(&t).sections()[0], before0, "section 0 is no target");
+        assert_eq!(
+            ed(&t).sections()[2], before2,
+            "the unnumbered target stays unnumbered"
+        );
+    }
+
+    /// FIX r2 Major 2: turning the box on numbers every unnumbered target
+    /// with the dialog's shown values.
+    #[test]
+    fn turning_the_box_on_numbers_every_unnumbered_target_with_the_shown_values() {
+        let mut t = three_sections();
+        open(&mut t);
+        set(&mut t, "add", Json::Bool(true));
+        set(&mut t, "by", s("4"));
+        set(&mut t, "restart", s("Continuous"));
+        set(&mut t, "apply", s("Whole document"));
+        ok(&mut t).unwrap();
+        for (k, setup) in setups(&t).iter().enumerate() {
+            assert_eq!(
+                setup.line_numbers,
+                Some(ln(4, None, None, LnRestart::Continuous)),
+                "section {k}"
+            );
+        }
     }
 
     /// FIX r1 Major 1: turning the box on applies the shown values to a
@@ -761,6 +838,54 @@ mod tests {
             before,
             "a written 0 round-trips untouched"
         );
+    }
+
+    /// FIX r2 Major 1: with the box off the gated fields are ignored, so an
+    /// invalid staged value must not block the removal the box asks for.
+    #[test]
+    fn invalid_gated_values_do_not_block_removal() {
+        for (control, value) in [("start", "0"), ("by", "0"), ("from", "-0.5")] {
+            let mut t = three_sections();
+            give(
+                &mut t,
+                1,
+                Some(ln(5, Some(2), Some(360), LnRestart::NewSection)),
+            );
+            open(&mut t);
+            if control == "from" {
+                set(&mut t, "auto", Json::Bool(false));
+            }
+            set(&mut t, control, s(value));
+            set(&mut t, "add", Json::Bool(false));
+            ok(&mut t).unwrap_or_else(|e| panic!("{control} {value}: {e}"));
+            assert_eq!(
+                setups(&t)[1].line_numbers,
+                None,
+                "{control} {value}: the numbering is removed"
+            );
+            assert!(t.dirty, "{control} {value} removed the numbering");
+        }
+    }
+
+    /// FIX r2 Minor: a From text typed while Auto was briefly off, then
+    /// abandoned by turning Auto back on, is not a distance change and must
+    /// not wipe a target's own saved distance.
+    #[test]
+    fn an_abandoned_from_text_edit_does_not_touch_distances() {
+        let mut t = three_sections();
+        give(&mut t, 0, Some(ln(1, None, Some(283), LnRestart::NewPage)));
+        give(&mut t, 1, Some(ln(1, None, None, LnRestart::NewPage)));
+        let before = ed(&t).sections();
+        // The selection spans sections 0 and 1 (the caret's).
+        ed_mut(&mut t).anchor = Some(Caret::top(0, 0));
+        open(&mut t);
+        assert_eq!(shown(&t, "auto"), "checked");
+        set(&mut t, "auto", Json::Bool(false));
+        set(&mut t, "from", s("0.9"));
+        set(&mut t, "auto", Json::Bool(true));
+        ok(&mut t).unwrap();
+        assert!(!t.dirty, "the abandoned edit writes nothing");
+        assert_eq!(ed(&t).sections(), before, "every distance stays");
     }
 
     /// Criterion 8: the Line Numbers menu checkmarks follow what the dialog

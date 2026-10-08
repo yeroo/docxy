@@ -1069,7 +1069,7 @@ included. Each has a stable id, which the state's `dialog` key reports:
 | Id | Dialog |
 |---|---|
 | `delete-summary` | Project: delete a summary task and its subtasks (`project-dialog.uit`) |
-| `page-setup`, `columns` | Word's Page Setup and Columns (#649) |
+| `page-setup`, `columns`, `line-numbers` | Word's Page Setup and Columns (#649) and Line Numbers (#747) |
 | `more-colors`, `fill-effects`, `watermark`, `page-borders`, `page-border-options` | the Design tab (#651): Page Color's More Colors and Fill Effects, Custom Watermark (Word's Printed Watermark), and Borders and Shading's Page Border tab with its Options... child, whose OK writes its margins back into `page-borders` instead of the document |
 | `hf-distance`, `page-number-format` | the Header & Footer tab's distance box (#641) and Page Number Format (#650) |
 | `insert-table`, `delete-cells`, `split-cells`, `sort`, `convert-to-text`, `convert-text-to-table` | the table dialogs (#646, #647) |
