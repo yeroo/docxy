@@ -939,22 +939,25 @@ fn new_tasks_glyph(manual: bool) -> &'static str {
 }
 
 /// The status bar's items as `status-read` reports them, left to right, each
-/// with a stable id: on a Project tab the state, the new-tasks mode and the
-/// last message; on any other tab the message alone. Render draws the same
-/// texts from the same functions, so the two cannot drift.
+/// with a stable id: the application state (not on a placeholder), on a
+/// Project the new-tasks mode, the last message, and on a document its
+/// page/word count. Render draws the same texts from the same functions, so
+/// the two cannot drift.
 pub(crate) fn status_items(tab: &DocTab) -> Vec<(&'static str, String)> {
     let mut items = Vec::new();
+    if let Some(state) = tab_app_state(tab) {
+        items.push(("state", state.label().to_string()));
+    }
     if let Surface::Project(v) = &tab.surface {
-        items.push((
-            "state",
-            project_dialog_state(v, &tab.dialogs).label().to_string(),
-        ));
         items.push((
             "new-tasks",
             new_tasks_label(v.ed.project().new_tasks_are_manual),
         ));
     }
     items.push(("message", tab.status.to_string()));
+    if let Some(stats) = crate::doc_stats_text(tab) {
+        items.push(("stats", stats));
+    }
     items
 }
 

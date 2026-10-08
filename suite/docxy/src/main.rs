@@ -7650,6 +7650,34 @@ fn next_enter_move(m: EnterMove) -> EnterMove {
     EnterMove::ALL[(i + 1) % EnterMove::ALL.len()]
 }
 
+/// The doc tab's "N pages · M words" status item, `None` off a document.
+/// Render and `status-read` both read it.
+pub(crate) fn doc_stats_text(tab: &DocTab) -> Option<String> {
+    let Surface::Doc(ed) = &tab.surface else {
+        return None;
+    };
+    let w = ed.doc.plain_text().split_whitespace().count();
+    let p = page_ranges(tab).len().max(1);
+    Some(format!(
+        "{} page{} \u{00b7} {} word{}",
+        p,
+        if p == 1 { "" } else { "s" },
+        w,
+        if w == 1 { "" } else { "s" }
+    ))
+}
+
+/// A sheet's status-bar state, as Excel's: `Enter` while a cell editor opened
+/// by typing is active, `Edit` while one opened by F2, a double-click or the
+/// formula bar is, `Ready` otherwise.
+pub(crate) fn sheet_app_state(v: &SheetView) -> AppState {
+    match (&v.editing, v.edit_mode) {
+        (None, _) => AppState::Ready,
+        (Some(_), EditMode::Enter) => AppState::Enter,
+        (Some(_), EditMode::Edit) => AppState::Edit,
+    }
+}
+
 /// The words the sheet status bar shows for the Editing options in force.
 fn sheet_status_words(opts: &EditOptions) -> Vec<&'static str> {
     let mut words = Vec::new();
@@ -33742,17 +33770,11 @@ impl Render for Docxy {
         // Word-style counts for the status bar's left cluster: total pages
         // (Print Layout's own pages, columns and section breaks included) and
         // word count.
-        let doc_stats: Option<(usize, usize)> = is_doc
+        let stats_text = is_doc
             .then(|| self.tabs.get(self.active))
             .flatten()
-            .and_then(|tab| match &tab.surface {
-                Surface::Doc(ed) => {
-                    let words = ed.doc.plain_text().split_whitespace().count();
-                    let pages = page_ranges(tab).len().max(1);
-                    Some((words, pages))
-                }
-                _ => None,
-            });
+            .and_then(doc_stats_text)
+            .map(SharedString::from);
         // Track Changes and Display for Review, when they are not the default.
         let mut review_chips: Vec<String> = Vec::new();
         if is_doc {
@@ -33763,15 +33785,6 @@ impl Render for Docxy {
                 review_chips.push(self.markup.label().to_string());
             }
         }
-        let stats_text = doc_stats.map(|(w, p)| {
-            SharedString::from(format!(
-                "{} page{} \u{00b7} {} word{}",
-                p,
-                if p == 1 { "" } else { "s" },
-                w,
-                if w == 1 { "" } else { "s" }
-            ))
-        });
 
         let zoom_btn =
             |cx: &mut Context<Self>, id: &'static str, glyph: &'static str, delta: f32| {
@@ -33792,19 +33805,19 @@ impl Render for Docxy {
                         this.refocus(window, cx);
                     }))
             };
-        // Project's status bar names the plan's mode for new tasks; a click
+        // Every tab's leftmost item is the application state; Project's
+        // status bar also names the plan's mode for new tasks, and a click
         // switches it.
-        // Its leftmost item is the application state, as in Project.
+        let app_state = self
+            .tabs
+            .get(self.active)
+            .and_then(tab_app_state)
+            .map(AppState::label);
         let new_tasks = match self.tabs.get(self.active) {
-            Some(
-                tab @ DocTab {
-                    surface: Surface::Project(v),
-                    ..
-                },
-            ) => Some((
-                project_dialog_state(v, &tab.dialogs).label(),
-                v.ed.project().new_tasks_are_manual,
-            )),
+            Some(DocTab {
+                surface: Surface::Project(v),
+                ..
+            }) => Some(v.ed.project().new_tasks_are_manual),
             _ => None,
         };
         let status = h_flex()
@@ -33815,12 +33828,14 @@ impl Render for Docxy {
             .bg(panel)
             .text_size(px(11.))
             .text_color(dim)
-            .when_some(new_tasks, |d, (state, manual)| {
+            .when_some(app_state, |d, state| {
                 // Wide enough for the longest label, so the row does not
                 // shift as the state changes.
-                d.child(div().id("app-state").min_w(px(30.)).child(state))
+                d.child(div().id("app-state").min_w(px(34.)).child(state))
                     .child(div().child("·"))
-                    .child(
+            })
+            .when_some(new_tasks, |d, manual| {
+                d.child(
                     div()
                         .id("new-tasks-mode")
                         .cursor_pointer()

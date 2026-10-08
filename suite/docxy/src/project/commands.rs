@@ -1336,6 +1336,8 @@ fn level_to(v: &mut ProjectView, want: bool) -> &'static str {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AppState {
     Ready,
+    /// A sheet's cell editor opened by typing (Excel's Enter mode).
+    Enter,
     Edit,
     Busy,
 }
@@ -1344,6 +1346,7 @@ impl AppState {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Ready => "Ready",
+            Self::Enter => "Enter",
             Self::Edit => "Edit",
             Self::Busy => "Busy",
         }
@@ -1371,12 +1374,20 @@ pub(crate) fn project_dialog_state(v: &ProjectView, dialogs: &DialogStack) -> Ap
     }
 }
 
-/// [`project_dialog_state`] for any tab: `None` off a Project.
+/// A tab's status-bar state: a Project's [`project_dialog_state`], a sheet's
+/// [`sheet_app_state`], a document's `Ready`; each is `Edit` while a dialog
+/// is open over an otherwise `Ready` tab. `None` on a placeholder.
 pub(crate) fn tab_app_state(tab: &DocTab) -> Option<AppState> {
-    let Surface::Project(v) = &tab.surface else {
-        return None;
+    let state = match &tab.surface {
+        Surface::Project(v) => return Some(project_dialog_state(v, &tab.dialogs)),
+        Surface::Sheet(v) => crate::sheet_app_state(v),
+        Surface::Doc(_) => AppState::Ready,
+        Surface::Placeholder => return None,
     };
-    Some(project_dialog_state(v, &tab.dialogs))
+    Some(match state {
+        AppState::Ready if tab.dialogs.is_open() => AppState::Edit,
+        state => state,
+    })
 }
 
 /// A fresh token for a levelling pass, unique for the process, so a frame

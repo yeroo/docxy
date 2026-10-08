@@ -3208,7 +3208,7 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             ),
         ),
         ("sheet_tab", Json::Bool(app.active_is_sheet())),
-        // The Project status bar's Ready / Edit / Busy; null off a Project.
+        // The status bar's Ready / Enter / Edit / Busy; null only on a placeholder.
         (
             "app_state",
             app.tabs

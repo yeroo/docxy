@@ -3687,7 +3687,7 @@ fn status_items_are_the_state_the_mode_and_the_message_in_order() {
     );
     request_level_pass(&mut t, ProjectAct::LevelAll).unwrap();
     assert_eq!(items(&t)[0], ("state", "Busy".to_string()));
-    // Any other surface has only the message.
+    // A placeholder has only the message.
     t.surface = Surface::Placeholder;
     t.status = "saved".into();
     assert_eq!(items(&t), [("message", "saved".to_string())]);
@@ -4157,4 +4157,103 @@ fn ctrl_delete_on_start_and_finish_resets_an_auto_tasks_typed_constraint() {
         assert_eq!(v(&t).ed.undo_depth(), depth + 1);
         assert!(t.dirty);
     }
+}
+
+fn open_test_dialog(t: &mut DocTab) {
+    t.dialogs.push(Dialog::message(
+        catalog::DELETE_SUMMARY,
+        "Test",
+        "ok?".into(),
+        &[("OK", ButtonRole::Accept)],
+        DialogOwner::Test,
+    ));
+}
+
+fn sheet_tab() -> DocTab {
+    let mut t = crate::blank_docx_tab("book");
+    t.surface = crate::new_sheet_surface();
+    t
+}
+
+fn sheet_view(t: &mut DocTab) -> &mut crate::SheetView {
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!("sheet")
+    };
+    v
+}
+
+#[test]
+fn a_doc_tab_reports_ready_edit_and_its_stats() {
+    let mut t = crate::blank_docx_tab("doc");
+    t.status = "new".into();
+    assert_eq!(
+        status_items(&t),
+        [
+            ("state", "Ready".to_string()),
+            ("message", "new".to_string()),
+            ("stats", "1 page · 0 words".to_string()),
+        ]
+    );
+    open_test_dialog(&mut t);
+    assert_eq!(status_items(&t)[0], ("state", "Edit".to_string()));
+    assert_eq!(tab_app_state(&t), Some(AppState::Edit));
+}
+
+#[test]
+fn doc_stats_text_is_singular_and_plural() {
+    let mut t = crate::blank_docx_tab("doc");
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!("doc")
+    };
+    ed.insert_str("one");
+    assert_eq!(
+        crate::doc_stats_text(&t).as_deref(),
+        Some("1 page · 1 word")
+    );
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!("doc")
+    };
+    ed.insert_str(" two");
+    assert_eq!(
+        crate::doc_stats_text(&t).as_deref(),
+        Some("1 page · 2 words")
+    );
+    assert_eq!(crate::doc_stats_text(&sheet_tab()), None);
+}
+
+#[test]
+fn a_sheet_tab_reports_ready_enter_edit() {
+    let mut t = sheet_tab();
+    t.status = "s".into();
+    assert_eq!(
+        status_items(&t),
+        [("state", "Ready".to_string()), ("message", "s".to_string())]
+    );
+    // Typing opens the editor in Enter mode; F2 flips it to Edit.
+    sheet_view(&mut t).begin_cell_edit(Some(String::new()));
+    assert_eq!(tab_app_state(&t), Some(AppState::Enter));
+    sheet_view(&mut t).edit_toggle_mode();
+    assert_eq!(tab_app_state(&t), Some(AppState::Edit));
+    // F2 / double-click / the fx bar open straight into Edit.
+    let v = sheet_view(&mut t);
+    v.editing = None;
+    v.begin_cell_edit(None);
+    assert_eq!(tab_app_state(&t), Some(AppState::Edit));
+    let v = sheet_view(&mut t);
+    v.editing = None;
+    assert_eq!(tab_app_state(&t), Some(AppState::Ready));
+    // A dialog over a Ready sheet is Edit; Enter mode keeps Enter under one.
+    open_test_dialog(&mut t);
+    assert_eq!(tab_app_state(&t), Some(AppState::Edit));
+    t.dialogs = Default::default();
+    sheet_view(&mut t).begin_cell_edit(Some(String::new()));
+    open_test_dialog(&mut t);
+    assert_eq!(tab_app_state(&t), Some(AppState::Enter));
+}
+
+#[test]
+fn a_placeholder_has_no_state() {
+    let mut t = crate::blank_docx_tab("p");
+    t.surface = Surface::Placeholder;
+    assert_eq!(tab_app_state(&t), None);
 }
