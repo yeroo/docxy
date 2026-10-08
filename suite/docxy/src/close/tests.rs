@@ -2877,7 +2877,7 @@ fn exit_comment_edge_whitespace_commit_lands_on_the_selection() {
 }
 
 /// A window's close button asks by window count, then harness, then the
-/// setting (#587); `on_window_should_close` and the harness both use it.
+/// setting (#587), as `on_window_should_close` asks it.
 #[test]
 fn a_close_asks_by_window_count_then_harness_then_setting() {
     assert!(close_ask(2, false) == CloseAsk::Force);
@@ -2913,18 +2913,62 @@ fn ids(names: &[&str]) -> Vec<TabId> {
 /// changed under it.
 #[test]
 fn a_quit_agreement_holds_until_its_window_changes() {
-    // Asked: tab 1 answered Don't Save, tab 0 saved.
-    let asked = QuitAgreed::new(ids(&["a", "b"]), vec![1], true);
-    assert!(asked.holds(&ids(&["a", "b"]), &[false, true]));
+    let same = |_| Some(7);
+    // Asked: tab 1 answered Don't Save (content stamped 7), tab 0 saved.
+    let asked = QuitAgreed::new(ids(&["a", "b"]), vec![(1, Some(7))], true);
+    assert!(asked.holds(&ids(&["a", "b"]), &[false, true], same));
     // Tab 0 edited after its Save: unsaved, unanswered.
-    assert!(!asked.holds(&ids(&["a", "b"]), &[true, true]));
+    assert!(!asked.holds(&ids(&["a", "b"]), &[true, true], same));
+    // Tab 1 edited after its Don't Save: its new work was never asked about.
+    assert!(!asked.holds(&ids(&["a", "b"]), &[false, true], |_| Some(8)));
     // A tab came, went or moved: the answers name tabs by index.
-    assert!(!asked.holds(&ids(&["a", "b", "c"]), &[false, true, false]));
-    assert!(!asked.holds(&ids(&["b", "a"]), &[true, false]));
-    assert!(!asked.holds(&ids(&["a"]), &[false]));
+    assert!(!asked.holds(&ids(&["a", "b", "c"]), &[false, true, false], same));
+    assert!(!asked.holds(&ids(&["b", "a"]), &[true, false], same));
+    assert!(!asked.holds(&ids(&["a"]), &[false], same));
+    // Asked with nothing unsaved when it agreed: an edit since was not.
+    let clean = QuitAgreed::new(ids(&["a"]), Vec::new(), true);
+    assert!(clean.holds(&ids(&["a"]), &[false], same));
+    assert!(!clean.holds(&ids(&["a"]), &[true], same));
     // Not asked ("ask before closing" off): its edits are written when the
     // quit goes ahead, so editing does not void it.
     let silent = QuitAgreed::new(ids(&["a"]), Vec::new(), false);
-    assert!(silent.holds(&ids(&["a"]), &[true]));
-    assert!(!silent.holds(&ids(&["a", "b"]), &[true, false]));
+    assert!(silent.holds(&ids(&["a"]), &[true], same));
+    assert!(!silent.holds(&ids(&["a", "b"]), &[true, false], same));
+}
+
+/// A tab's content stamp (#1071) is the same until the tab is edited, for
+/// each kind of tab, so a Don't Save answer is voided by an edit and by
+/// nothing else.
+#[test]
+fn a_tab_stamp_changes_with_an_edit_only() {
+    let mut doc = tab(Kind::Docx);
+    let before = tab_stamp(&doc);
+    assert!(before.is_some());
+    assert_eq!(tab_stamp(&doc), before);
+    let Surface::Doc(ed) = &mut doc.surface else {
+        panic!()
+    };
+    ed.insert_str("more");
+    assert_ne!(tab_stamp(&doc), before);
+
+    let mut sheet = tab(Kind::Xlsx);
+    let before = tab_stamp(&sheet);
+    assert_eq!(tab_stamp(&sheet), before);
+    let Surface::Sheet(v) = &mut sheet.surface else {
+        panic!()
+    };
+    v.engine.set_cell(
+        &mut v.pkg.workbook,
+        (v.active, 0, 0),
+        gridcore::sheet::Cell::text("changed"),
+    );
+    assert_ne!(tab_stamp(&sheet), before);
+
+    let mut project = tab(Kind::Project);
+    let before = tab_stamp(&project);
+    assert_eq!(tab_stamp(&project), before);
+    project_cell_click(&mut project, 1, Some(COL_DURATION), false);
+    project_input(&mut project, "text", Some("5d"), Modifiers::default());
+    assert!(commit_project_cell(&mut project));
+    assert_ne!(tab_stamp(&project), before);
 }

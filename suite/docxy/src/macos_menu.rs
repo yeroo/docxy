@@ -469,29 +469,19 @@ impl Docxy {
 /// the active window's update, where that window cannot be updated again.
 pub(crate) fn quit(cx: &mut App) {
     let entries = crate::windows::entries_snapshot(cx);
-    let asking: Vec<bool> = entries
-        .iter()
-        .map(|(_, view, _)| {
-            view.upgrade().is_some_and(|v| {
-                let this = v.read(cx);
-                this.app_quit && crate::close::quit_prompt_live(&this.tabs)
-            })
+    // ⌘Q again while a window asks for the quit: wait for that window.
+    let asking = entries.iter().find(|(_, view, _)| {
+        view.upgrade().is_some_and(|v| {
+            let this = v.read(cx);
+            this.app_quit && crate::close::quit_prompt_live(&this.tabs)
         })
-        .collect();
-    if let Some(i) = pending_quit(&asking) {
-        let _ = entries[i]
-            .2
-            .update(cx, |_, window, _| window.activate_window());
+    });
+    if let Some((_, _, handle)) = asking {
+        let _ = handle.update(cx, |_, window, _| window.activate_window());
         return;
     }
     cancel_quit(cx);
     resume_quit(cx);
-}
-
-/// The window already asking for a Quit, if one is: a repeated ⌘Q waits
-/// for it instead of starting over.
-pub(crate) fn pending_quit(asking: &[bool]) -> Option<usize> {
-    asking.iter().position(|&a| a)
 }
 
 /// Drop every window's recorded agreement to a Quit.
@@ -923,15 +913,6 @@ mod tests {
         ] {
             assert_eq!(mac_alias(&key(chord)), (key(chord), false), "{chord}");
         }
-    }
-
-    /// ⌘Q again while a window asks for a Quit waits on that window rather
-    /// than starting the quit over (#1071).
-    #[test]
-    fn a_repeated_quit_waits_on_the_window_asking() {
-        assert_eq!(pending_quit(&[false, true, false]), Some(1));
-        assert_eq!(pending_quit(&[false, false]), None);
-        assert_eq!(pending_quit(&[]), None);
     }
 
     #[test]

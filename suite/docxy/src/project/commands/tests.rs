@@ -3909,3 +3909,34 @@ fn the_range_clearing_rule_is_one_place_and_covers_host_handled_acts() {
     assert_eq!(project_input(&mut t, "c", None, ctrl()), Some(Copy));
     assert!(v(&t).selection().is_some());
 }
+
+/// On macOS ⌘ is a Project tab's Ctrl (#1071): ⌘S, ⌘Z, ⌘⇧… and the menu
+/// bar's Save, Undo, Copy and Find reach Project's own keys. Off macOS a
+/// Cmd/Super chord stays what it was: nothing.
+#[test]
+fn cmd_is_projects_ctrl_on_macos_only() {
+    let cmd = Modifiers {
+        platform: true,
+        ..Default::default()
+    };
+    let cmd_shift = Modifiers { shift: true, ..cmd };
+    for (key, act) in [
+        ("s", ProjectAct::Save),
+        ("z", ProjectAct::Undo),
+        ("y", ProjectAct::Redo),
+        ("c", ProjectAct::Copy),
+        ("x", ProjectAct::Cut),
+        ("v", ProjectAct::Paste),
+        ("f", ProjectAct::Find),
+    ] {
+        assert_eq!(key_act(key, project_mods(cmd, true)), Some(act), "{key}");
+        assert_eq!(key_act(key, project_mods(cmd, false)), None, "{key}");
+    }
+    assert_eq!(
+        key_act("l", project_mods(cmd_shift, true)),
+        Some(ProjectAct::Level)
+    );
+    // Ctrl itself is untouched on every platform.
+    assert_eq!(project_mods(ctrl(), true), ctrl());
+    assert_eq!(project_mods(ctrl(), false), ctrl());
+}

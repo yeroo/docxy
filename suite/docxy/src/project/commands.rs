@@ -754,6 +754,22 @@ pub(crate) fn project_alt_key(key: &str, m: Modifiers) -> bool {
     m.alt && !m.control && !m.platform && key_act(key, m).is_some()
 }
 
+/// The modifiers a Project tab's keys are read with: on macOS ⌘ is their
+/// Ctrl (#1071), as it is on every other surface (`on_key`'s `ctrl`), so
+/// ⌘S, ⌘Z, ⌘C and the menu bar's items reach Project. Off macOS, and for
+/// a chord already holding Ctrl, nothing changes.
+pub(crate) fn project_mods(m: Modifiers, macos: bool) -> Modifiers {
+    if macos && m.platform && !m.control {
+        Modifiers {
+            control: true,
+            platform: false,
+            ..m
+        }
+    } else {
+        m
+    }
+}
+
 pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
     use ProjectAct::*;
     if m.platform {
@@ -1905,7 +1921,7 @@ impl Docxy {
             tab,
             ev.keystroke.key.as_str(),
             ev.keystroke.key_char.as_deref(),
-            ev.keystroke.modifiers,
+            project_mods(ev.keystroke.modifiers, crate::text_input::MACOS),
         ) {
             return self.project_act(act, window, cx);
         }
