@@ -208,9 +208,10 @@ impl Editor {
         Ok(())
     }
 
-    /// [`Editor::insert_section_break`], then `edit` on the section after the
-    /// break, all as one undo step: Page Setup's and Columns' "This point
-    /// forward".
+    /// Insert a section break at the selection's start (its text is kept,
+    /// unlike [`Editor::insert_section_break`]) or at the caret, then `edit`
+    /// on the section after the break, all as one undo step: Page Setup's and
+    /// Columns' "This point forward".
     pub fn insert_section_break_with(
         &mut self,
         start: SectionStart,
@@ -652,7 +653,8 @@ mod tests {
         e.caret = Caret::top(2, 2);
         e.insert_section_break(SectionStart::NextPage).unwrap();
         // "one" keeps "o", "two" goes, the "two b" remainder "o b" merges onto
-        // it taking that paragraph's oddPage mark (keep_section_mark).
+        // it, and the merged paragraph takes the last paragraph's oddPage
+        // mark (keep_section_mark): "one"'s continuous mark is replaced.
         assert_eq!(text_of(&e, 0), "o");
         assert_eq!(text_of(&e, 1), "o b");
         assert_eq!(text_of(&e, 2), "three");
@@ -662,6 +664,11 @@ mod tests {
         );
         // The delete merged two sections (one mark kept); the break adds one.
         assert_eq!(e.sections().len(), 3);
+        assert_eq!(
+            start_of(&e.sections()[0]),
+            SectionStart::OddPage,
+            "the merged paragraph keeps the last paragraph's mark"
+        );
         assert_eq!(start_of(&e.sections()[1]), SectionStart::NextPage);
     }
 
@@ -695,20 +702,25 @@ mod tests {
     #[test]
     fn a_selection_spanning_a_section_break_is_replaced_by_the_break() {
         let mut e = three();
-        let brk = props_of(&e, 2).section_break.clone();
         let saved = saved_sect_prs(&e);
-        e.anchor = Some(Caret::top(1, 0));
-        e.caret = Caret::top(2, 3);
+        e.anchor = Some(Caret::top(1, 1));
+        e.caret = Caret::top(3, 2);
         e.insert_section_break(SectionStart::Continuous).unwrap();
         assert_eq!(text_of(&e, 0), "one");
-        assert_eq!(text_of(&e, 1), "");
-        assert_eq!(text_of(&e, 2), " b");
-        // The mark the selection spanned survives the deletion on the first
-        // half; the break types the section after it.
-        assert_eq!(props_of(&e, 1).section_break, brk);
-        assert_eq!(start_of(&e.sections()[2]), SectionStart::Continuous);
-        assert_eq!(e.sections().len(), 4);
-        assert_eq!(saved_sect_prs(&e), saved + 1);
+        assert_eq!(text_of(&e, 1), "t");
+        assert_eq!(text_of(&e, 2), "ree");
+        // The range covered "two b" whole, so its oddPage mark went with it:
+        // no section reads oddPage any more, and Save writes as many sectPr
+        // as before (the break's own mark replaces the deleted one).
+        assert!(
+            e.sections()
+                .iter()
+                .all(|s| start_of(s) != SectionStart::OddPage),
+            "the spanned oddPage mark is deleted: {:?}",
+            e.sections()
+        );
+        assert_eq!(e.sections().len(), 3);
+        assert_eq!(saved_sect_prs(&e), saved);
     }
 
     #[test]
