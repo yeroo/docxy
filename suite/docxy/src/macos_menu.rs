@@ -235,12 +235,6 @@ impl Cmd {
         }
     }
 
-    /// Whether the app handles it, with or without a window. The rest are
-    /// handled by the window that has the key.
-    pub(crate) fn app_wide(self) -> bool {
-        matches!(self, Cmd::Hide | Cmd::HideOthers | Cmd::ShowAll | Cmd::Quit)
-    }
-
     /// The selector AppKit sends for it, through gpui: the native ones make a
     /// panel's text field cut, copy, paste and select.
     pub(crate) fn os_action(self) -> Option<gpui::OsAction> {
@@ -705,13 +699,6 @@ mod tests {
         // Not on the bar: on_key's own, propagating as before.
         for chord in ["cmd-b", "cmd-y", "ctrl-f", "alt-cmd-f", "cmd-shift-c"] {
             assert_eq!(chord_role(&key(chord)), None, "{chord}");
-        }
-    }
-
-    #[test]
-    fn app_wide_commands_are_menu_only() {
-        for cmd in commands().filter(|c| c.app_wide()) {
-            assert_eq!(cmd.role(), Role::Menu, "{cmd:?}");
         }
     }
 
