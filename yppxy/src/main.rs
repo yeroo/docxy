@@ -36,8 +36,8 @@ use ribbon::{Act, Ribbon};
 use mppread::project::project_from_mpp;
 use projcore::datetime::DateTime;
 use projcore::editor::{
-    AssignOutcome, DURATION_HINT, Editor, FindOutcome, constraint_hint, duration_suffix,
-    format_resource_names, parse_task_duration,
+    AssignOutcome, DURATION_HINT, Editor, FindOutcome, NEW_PROJECT_NAME, constraint_hint,
+    duration_suffix, format_resource_names, parse_task_duration,
 };
 #[cfg(test)]
 use projcore::model::Predecessor;
@@ -316,7 +316,7 @@ fn window_title(path: &Option<String>, dirty: bool) -> String {
     let name = path
         .as_deref()
         .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string())
-        .unwrap_or_else(|| "untitled".into());
+        .unwrap_or_else(|| NEW_PROJECT_NAME.into());
     format!("{}{APP} - {name}", if dirty { "* " } else { "" })
 }
 
@@ -1193,7 +1193,7 @@ impl backstage::BackstageHost for App {
             .as_deref()
             .and_then(|p| std::path::Path::new(p).file_name())
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "untitled.yppx".to_string())
+            .unwrap_or_else(|| format!("{NEW_PROJECT_NAME}.yppx"))
     }
 
     /// Render a quick summary of the highlighted project.
@@ -3016,7 +3016,19 @@ mod tests {
             window_title(&Some("plan.xml".into()), true),
             "* yppxy - plan.xml"
         );
-        assert_eq!(window_title(&None, false), "yppxy - untitled");
+        assert_eq!(window_title(&None, false), "yppxy - Project1");
+    }
+
+    #[test]
+    fn default_save_name_for_new_plan_is_project1() {
+        assert_eq!(
+            App::new(new_project(), None, false).default_save_name(),
+            "Project1.yppx"
+        );
+        assert_eq!(
+            App::new(new_project(), Some("old.yppx".into()), false).default_save_name(),
+            "old.yppx"
+        );
     }
 
     #[test]
