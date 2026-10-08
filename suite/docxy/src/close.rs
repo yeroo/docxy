@@ -326,28 +326,66 @@ pub(crate) enum CloseAsk {
     /// secondary window is not restored, so silently dropping its unsaved
     /// work is data loss.
     Force,
-    /// The app's Quit (⌘Q, #1071), for every window: ask only when "ask
-    /// before closing" is on, as the last window's X does, and leave the
-    /// window registered, so the session keeps every window's tabs. The
-    /// quit itself ([`crate::macos_menu::quit`]) closes the windows once
-    /// each has agreed.
-    Quit,
 }
 
-/// Whether a close of this kind asks about unsaved tabs: the app's Quit
-/// asks as the last window's X does, never in a harness.
-pub(crate) fn asks(ask: CloseAsk, ask_on_close: bool, harness: bool) -> bool {
+/// Whether a window close of this kind asks about unsaved tabs.
+pub(crate) fn asks(ask: CloseAsk, ask_on_close: bool) -> bool {
     match ask {
         CloseAsk::Setting => ask_on_close,
         CloseAsk::HarnessQuit => false,
         CloseAsk::Force => true,
-        CloseAsk::Quit => ask_on_close && !harness,
+    }
+}
+
+/// Whether the app's Quit (⌘Q, #1071) asks about a window's unsaved tabs:
+/// as the last window's X does, in every window, so a quit with "ask
+/// before closing" off is the silent hot exit however many windows are
+/// open. Never in a harness, whose own close never asks.
+pub(crate) fn quit_asks(ask_on_close: bool, harness: bool) -> bool {
+    ask_on_close && !harness
+}
+
+/// A window's agreement to the app's Quit (#1071), recorded while the quit
+/// still asks the other windows. Nothing is applied yet: the answers take
+/// effect only once every window has agreed ([`Docxy::apply_quit`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct QuitAgreed {
+    /// The window's tabs when it agreed.
+    tabs: Vec<TabId>,
+    /// The tabs answered Don't Save, by index.
+    discards: Vec<usize>,
+    /// Whether it was asked: then every unsaved tab was answered.
+    asked: bool,
+}
+
+impl QuitAgreed {
+    pub(crate) fn new(tabs: Vec<TabId>, discards: Vec<usize>, asked: bool) -> Self {
+        QuitAgreed {
+            tabs,
+            discards,
+            asked,
+        }
+    }
+
+    /// Whether the agreement still stands for a window whose tabs are now
+    /// `tabs`, unsaved as `dirty` says. A tab that came, went or moved
+    /// voids it (the answers name tabs by index), and so does, in a window
+    /// that was asked, an unsaved tab nobody answered Don't Save: it was
+    /// edited after its Save, or after the window agreed. A window not asked
+    /// keeps its agreement: its edits are written when the quit goes ahead.
+    pub(crate) fn holds(&self, tabs: &[TabId], dirty: &[bool]) -> bool {
+        self.tabs == tabs
+            && (!self.asked
+                || dirty
+                    .iter()
+                    .enumerate()
+                    .all(|(i, d)| !d || self.discards.contains(&i)))
     }
 }
 
 /// How a window's close asks, with `windows` open (#587): a non-last
 /// window always asks, a harness's own close never does, and otherwise
-/// the setting decides. The close button and Quit (#1071) both ask this.
+/// the setting decides. The app's Quit asks [`quit_asks`] instead.
 pub(crate) fn close_ask(windows: usize, harness: bool) -> CloseAsk {
     if windows > 1 {
         CloseAsk::Force
@@ -919,7 +957,7 @@ impl Docxy {
             (CloseAnswer::Save | CloseAnswer::Discard, false) => {
                 self.close_tab_with(i, Some(answer), window, cx);
             }
-            (CloseAnswer::Cancel, true) => self.quit_cancelled(),
+            (CloseAnswer::Cancel, true) => self.quit_cancelled(cx),
             (CloseAnswer::Save, true) => {
                 // The quit's own Save may have named the tab anew.
                 refresh_tab_id(&mut self.quit_tabs, &self.tabs, i);
@@ -952,20 +990,13 @@ impl Docxy {
                 return false;
             }
             // Its question went away some other way: start again.
-            self.quit_cancelled();
+            self.quit_cancelled(cx);
         }
         self.commit_dialog_buffers_for_exit(cx);
         commit_pending_for_exit(&mut self.tabs);
         self.persist(cx);
-        let app_quit = ask == CloseAsk::Quit;
-        let ask = asks(ask, self.ask_on_close, self.harness);
+        let ask = asks(ask, self.ask_on_close);
         if !(ask && self.tabs.iter().any(|t| t.dirty)) {
-            if app_quit {
-                // Persisted above; the quit marks the exit clean once every
-                // window has agreed. Asking again is harmless here (it only
-                // persists), so the quit asks again rather than remember it.
-                return true;
-            }
             // The persist above is the final one, so only the marker is left —
             // for the LAST window, whose close is the app's quit. A secondary
             // window stays unmarked (the run goes on; its crash must still be
@@ -978,11 +1009,83 @@ impl Docxy {
             return true;
         }
         self.quitting = true;
-        self.app_quit = app_quit;
         self.quit_discards.clear();
         self.quit_tabs = tab_ids(&self.tabs);
         self.next_quit_prompt(window, cx);
         false
+    }
+
+    /// The app's Quit asks this window (#1071): agree, or start asking about
+    /// its unsaved tabs. An agreement already recorded stands while
+    /// [`QuitAgreed::holds`]. Asking has no effect but a persist, as hot
+    /// exit always writes; the answers wait for [`Self::apply_quit`].
+    pub(crate) fn quit_ask(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let dirty: Vec<bool> = self.tabs.iter().map(|t| t.dirty).collect();
+        if let Some(agreed) = &self.quit_agreed {
+            if agreed.holds(&tab_ids(&self.tabs), &dirty) {
+                return true;
+            }
+            self.quit_agreed = None;
+        }
+        cx.notify();
+        if self.quitting {
+            if quit_prompt_live(&self.tabs) {
+                // Already asking, for its own close or the quit: its last
+                // answer now goes on with the quit.
+                self.app_quit = true;
+                return false;
+            }
+            self.quit_cancelled(cx);
+        }
+        self.commit_dialog_buffers_for_exit(cx);
+        commit_pending_for_exit(&mut self.tabs);
+        self.persist(cx);
+        if !(quit_asks(self.ask_on_close, self.harness) && self.tabs.iter().any(|t| t.dirty)) {
+            self.quit_agreed = Some(QuitAgreed::new(tab_ids(&self.tabs), Vec::new(), false));
+            return true;
+        }
+        self.quitting = true;
+        self.app_quit = true;
+        self.quit_discards.clear();
+        self.quit_tabs = tab_ids(&self.tabs);
+        self.next_quit_prompt(window, cx);
+        false
+    }
+
+    /// Every window agreed to the app's Quit (#1071): apply this window's
+    /// answers as its own close's last answer would (keep the drafts of
+    /// workbooks answered Don't Save, drop never-saved tabs answered so,
+    /// forget the others' unsaved work) and write the session, publishing
+    /// what was written for the windows written after it.
+    pub(crate) fn apply_quit(&mut self, cx: &mut Context<Self>) {
+        let discards = self
+            .quit_agreed
+            .take()
+            .map_or_else(Vec::new, |a| a.discards);
+        let root = config_root();
+        let now = std::time::SystemTime::now();
+        for &i in &discards {
+            let _ = keep_closed_draft(
+                &root,
+                &self.tabs[i],
+                &CloseStep::Discard,
+                self.autorecover_minutes,
+                self.keep_drafts,
+                now,
+            );
+        }
+        let forget = forget_on_quit(&mut self.tabs, &mut self.active, discards);
+        let own = write_session_forgetting(
+            &root,
+            &self.tabs,
+            self.active,
+            self.prefs(),
+            &forget,
+            &windows::others_persisted(cx, self.win_id),
+            windows::seq_of(cx, self.win_id),
+        );
+        windows::set_persisted(cx, self.win_id, own);
+        self.last_persist.set(std::time::Instant::now());
     }
 
     /// Ask about the next unsaved tab, in tab order, or go when none is left.
@@ -990,7 +1093,7 @@ impl Docxy {
         if tab_ids(&self.tabs) != self.quit_tabs {
             // A tab came or went (or moved) under the questions: the answers
             // so far name tabs by index, so none of them is applied.
-            self.quit_cancelled();
+            self.quit_cancelled(cx);
             self.set_status(QUIT_TABS_CHANGED);
             self.refocus(window, cx);
             return;
@@ -999,7 +1102,7 @@ impl Docxy {
         match next {
             None => self.finish_quit(window, cx),
             Some(i) if self.tabs[i].dialogs.is_open() => {
-                self.quit_cancelled();
+                self.quit_cancelled(cx);
                 self.refuse_close_under_dialog(i, window, cx);
             }
             Some(i) => {
@@ -1015,10 +1118,15 @@ impl Docxy {
     }
 
     /// Cancel while quitting: the window stays. Tabs already saved stay
-    /// saved; those answered Don't Save keep their unsaved work.
-    fn quit_cancelled(&mut self) {
+    /// saved; those answered Don't Save keep their unsaved work. For the
+    /// app's Quit (#1071) the whole quit stops: every window's recorded
+    /// answers go too, and nothing was applied.
+    fn quit_cancelled(&mut self, cx: &mut App) {
+        if std::mem::take(&mut self.app_quit) {
+            self.quit_agreed = None;
+            App::defer(cx, crate::macos_menu::cancel_quit);
+        }
         self.quitting = false;
-        self.app_quit = false;
         self.quit_discards.clear();
         self.quit_tabs.clear();
     }
@@ -1027,6 +1135,18 @@ impl Docxy {
     /// Don't Save (#613), drop never-saved tabs answered so, persist the
     /// others as their files alone, and go as a clean exit.
     fn finish_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.app_quit) {
+            // The app's Quit (#1071): record the answers, apply nothing, and
+            // go on asking the other windows once this update is done.
+            self.quitting = false;
+            self.quit_agreed = Some(QuitAgreed::new(
+                std::mem::take(&mut self.quit_tabs),
+                std::mem::take(&mut self.quit_discards),
+                true,
+            ));
+            App::defer(cx, crate::macos_menu::resume_quit);
+            return;
+        }
         let root = config_root();
         let now = std::time::SystemTime::now();
         for &i in &self.quit_discards {
@@ -1056,14 +1176,6 @@ impl Docxy {
             windows::seq_of(cx, self.win_id),
         );
         self.last_persist.set(std::time::Instant::now());
-        if std::mem::take(&mut self.app_quit) {
-            // The app's Quit (#1071): this window has agreed; the quit goes
-            // on to the other windows once this update is done.
-            self.quitting = false;
-            self.quit_accepted = true;
-            App::defer(cx, crate::macos_menu::resume_quit);
-            return;
-        }
         let alone = windows::is_alone(cx, self.win_id);
         if alone {
             // The last window's close is the app's quit: the marker can go.

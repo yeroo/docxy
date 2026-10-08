@@ -445,26 +445,66 @@ impl Docxy {
     }
 }
 
-/// Quit (⌘Q): every window agrees through its own close, newest first, as
-/// the last window's X would: the unsaved-work questions when "ask before
-/// closing" is on, then the hot-exit write. No window leaves the registry,
-/// so the session keeps every window's tabs. A window that asks stops the
-/// quit until its last answer, which resumes it ([`resume_quit`]); Cancel
-/// ends it. Once all have agreed, the run is marked clean and the windows
-/// go, the last one ending the process (`QuitMode::LastWindowClosed`).
+/// Quit (⌘Q), in two phases (#1071).
 ///
-/// Deferred by its action handler: a menu action runs inside the active
-/// window's update, where that window cannot be updated again.
+/// **Asking.** Each window, newest first, agrees through
+/// [`Docxy::quit_ask`]: with "ask before closing" on, the last window's
+/// close questions about each unsaved tab, otherwise at once. Answers are
+/// only recorded: Save saves the tab there and then, as any Save does, but
+/// Don't Save forgets nothing yet. A window that asks stops the walk and is
+/// brought to the front; its last answer resumes the walk
+/// ([`resume_quit`]). Cancel in any window stops the whole quit and drops
+/// every window's recorded answers ([`cancel_quit`]): nothing was
+/// forgotten, so every tab answered Don't Save keeps its unsaved work.
+///
+/// **Applying.** Once every window has agreed in one walk (an agreement
+/// that no longer holds, because tabs changed or a tab was edited after
+/// its Save, is asked again), each window applies its answers and writes
+/// the session, the run is marked clean, and the windows go, the last one
+/// ending the process (`QuitMode::LastWindowClosed`). No window leaves the
+/// registry, so the session keeps every window's tabs.
+///
+/// ⌘Q again while a window asks for the quit only brings that window to
+/// the front. The action handler defers this: a menu action runs inside
+/// the active window's update, where that window cannot be updated again.
 pub(crate) fn quit(cx: &mut App) {
-    for (_, view, _) in crate::windows::entries_snapshot(cx) {
-        if let Some(view) = view.upgrade() {
-            view.update(cx, |this, _| this.quit_accepted = false);
-        }
+    let entries = crate::windows::entries_snapshot(cx);
+    let asking: Vec<bool> = entries
+        .iter()
+        .map(|(_, view, _)| {
+            view.upgrade().is_some_and(|v| {
+                let this = v.read(cx);
+                this.app_quit && crate::close::quit_prompt_live(&this.tabs)
+            })
+        })
+        .collect();
+    if let Some(i) = pending_quit(&asking) {
+        let _ = entries[i]
+            .2
+            .update(cx, |_, window, _| window.activate_window());
+        return;
     }
+    cancel_quit(cx);
     resume_quit(cx);
 }
 
-/// Go on with a Quit: ask each window that has not answered yet.
+/// The window already asking for a Quit, if one is: a repeated ⌘Q waits
+/// for it instead of starting over.
+pub(crate) fn pending_quit(asking: &[bool]) -> Option<usize> {
+    asking.iter().position(|&a| a)
+}
+
+/// Drop every window's recorded agreement to a Quit.
+pub(crate) fn cancel_quit(cx: &mut App) {
+    for (_, view, _) in crate::windows::entries_snapshot(cx) {
+        if let Some(view) = view.upgrade() {
+            view.update(cx, |this, _| this.quit_agreed = None);
+        }
+    }
+}
+
+/// Go on with a Quit: ask each window in turn; once all have agreed, apply
+/// their answers and close them.
 pub(crate) fn resume_quit(cx: &mut App) {
     let entries = crate::windows::entries_snapshot(cx);
     for (_, view, handle) in entries.iter().rev() {
@@ -472,16 +512,21 @@ pub(crate) fn resume_quit(cx: &mut App) {
             continue;
         };
         let agreed = handle.update(cx, |_, window, cx| {
-            view.update(cx, |this, cx| {
-                this.quit_accepted
-                    || this.window_should_close(crate::close::CloseAsk::Quit, window, cx)
-            })
+            let agreed = view.update(cx, |this, cx| this.quit_ask(window, cx));
+            if !agreed {
+                window.activate_window();
+            }
+            agreed
         });
         if matches!(agreed, Ok(false)) {
             return;
         }
     }
-    if let Some(view) = entries.first().and_then(|(_, view, _)| view.upgrade()) {
+    let views: Vec<_> = entries.iter().filter_map(|(_, v, _)| v.upgrade()).collect();
+    for view in &views {
+        view.update(cx, |this, cx| this.apply_quit(cx));
+    }
+    if let Some(view) = views.first() {
         view.read(cx).mark_clean_exit();
     }
     for (_, _, handle) in entries {
@@ -878,6 +923,15 @@ mod tests {
         ] {
             assert_eq!(mac_alias(&key(chord)), (key(chord), false), "{chord}");
         }
+    }
+
+    /// ⌘Q again while a window asks for a Quit waits on that window rather
+    /// than starting the quit over (#1071).
+    #[test]
+    fn a_repeated_quit_waits_on_the_window_asking() {
+        assert_eq!(pending_quit(&[false, true, false]), Some(1));
+        assert_eq!(pending_quit(&[false, false]), None);
+        assert_eq!(pending_quit(&[]), None);
     }
 
     #[test]

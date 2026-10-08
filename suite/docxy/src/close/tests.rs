@@ -2876,14 +2876,18 @@ fn exit_comment_edge_whitespace_commit_lands_on_the_selection() {
     assert_eq!(at(0, 0), 1, "A1 keeps its own note, untouched");
 }
 
-/// The close button and Quit (#1071) ask the same way: a non-last window
-/// always, a harness's own close never, otherwise as the setting says.
+/// A window's close button asks by window count, then harness, then the
+/// setting (#587); `on_window_should_close` and the harness both use it.
 #[test]
 fn a_close_asks_by_window_count_then_harness_then_setting() {
     assert!(close_ask(2, false) == CloseAsk::Force);
     assert!(close_ask(2, true) == CloseAsk::Force);
     assert!(close_ask(1, true) == CloseAsk::HarnessQuit);
     assert!(close_ask(1, false) == CloseAsk::Setting);
+    assert!(asks(CloseAsk::Force, false));
+    assert!(asks(CloseAsk::Setting, true));
+    assert!(!asks(CloseAsk::Setting, false));
+    assert!(!asks(CloseAsk::HarnessQuit, true));
 }
 
 /// The app's Quit (#1071) asks as the last window's X does, in every
@@ -2892,10 +2896,35 @@ fn a_close_asks_by_window_count_then_harness_then_setting() {
 /// where a secondary window's own close always asks.
 #[test]
 fn quit_asks_by_the_setting_in_every_window() {
-    assert!(asks(CloseAsk::Quit, true, false));
-    assert!(!asks(CloseAsk::Quit, false, false));
-    assert!(!asks(CloseAsk::Quit, true, true));
-    assert!(asks(CloseAsk::Force, false, false));
-    assert!(asks(CloseAsk::Setting, true, false));
-    assert!(!asks(CloseAsk::HarnessQuit, true, true));
+    assert!(quit_asks(true, false));
+    assert!(!quit_asks(false, false));
+    assert!(!quit_asks(true, true));
+}
+
+fn ids(names: &[&str]) -> Vec<TabId> {
+    names
+        .iter()
+        .map(|n| (SharedString::from(n.to_string()), None))
+        .collect()
+}
+
+/// A Quit's recorded agreement (#1071) stands while the window's tabs and
+/// answers still describe it, so the quit asks again only a window that
+/// changed under it.
+#[test]
+fn a_quit_agreement_holds_until_its_window_changes() {
+    // Asked: tab 1 answered Don't Save, tab 0 saved.
+    let asked = QuitAgreed::new(ids(&["a", "b"]), vec![1], true);
+    assert!(asked.holds(&ids(&["a", "b"]), &[false, true]));
+    // Tab 0 edited after its Save: unsaved, unanswered.
+    assert!(!asked.holds(&ids(&["a", "b"]), &[true, true]));
+    // A tab came, went or moved: the answers name tabs by index.
+    assert!(!asked.holds(&ids(&["a", "b", "c"]), &[false, true, false]));
+    assert!(!asked.holds(&ids(&["b", "a"]), &[true, false]));
+    assert!(!asked.holds(&ids(&["a"]), &[false]));
+    // Not asked ("ask before closing" off): its edits are written when the
+    // quit goes ahead, so editing does not void it.
+    let silent = QuitAgreed::new(ids(&["a"]), Vec::new(), false);
+    assert!(silent.holds(&ids(&["a"]), &[true]));
+    assert!(!silent.holds(&ids(&["a", "b"]), &[true, false]));
 }

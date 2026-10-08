@@ -4299,10 +4299,9 @@ struct Docxy {
     /// The questions `quitting` asks are for the app's Quit (#1071), not
     /// this window's close: the last answer hands the quit on.
     app_quit: bool,
-    /// This window answered the app's Quit's questions (#1071): its last
-    /// write forgot what was answered Don't Save, so the quit does not ask
-    /// again. Cleared when a new Quit starts.
-    quit_accepted: bool,
+    /// This window's agreement to the app's Quit (#1071), applied only once
+    /// every window has agreed. Cleared when a quit starts or stops.
+    quit_agreed: Option<close::QuitAgreed>,
     /// The tabs answered Don't Save while quitting, by index: their unsaved
     /// work is forgotten, but only once the quit goes ahead.
     quit_discards: Vec<usize>,
@@ -11134,7 +11133,7 @@ impl Docxy {
             quitting: false,
             redo_only: false,
             app_quit: false,
-            quit_accepted: false,
+            quit_agreed: None,
             quit_discards: Vec::new(),
             quit_tabs: Vec::new(),
             quit_ready: false,
