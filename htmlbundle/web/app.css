@@ -226,7 +226,7 @@ svg.icon * { fill: currentColor; }
 .doc .atom { user-select: none; }
 .doc .pagebreak { display: block; margin: 6pt 0; border-top: 1px dashed #999; color: #888; font-size: 8pt; text-align: center; line-height: 1.6; }
 .doc .pagebreak::after { content: "Page Break"; }
-.doc .field { background: #e8e8e8; }
+.doc .field { background: #e8e8e8; color: #202020; }
 .doc .rev-ins { color: #1a7f37; text-decoration: underline; }
 .doc .rev-del { color: #cf222e; text-decoration: line-through; }
 .doc .note { vertical-align: super; font-size: 0.7em; color: #2f5496; }
