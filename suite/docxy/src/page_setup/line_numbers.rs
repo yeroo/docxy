@@ -11,11 +11,7 @@ use super::*;
 use docxcore::sect::{LineNumbering, LnRestart};
 
 /// "Numbering:"'s choices, in Word's order.
-const RESTART_LABELS: [&str; 3] = [
-    "Restart each page",
-    "Restart each section",
-    "Continuous",
-];
+const RESTART_LABELS: [&str; 3] = ["Restart each page", "Restart each section", "Continuous"];
 const RESTARTS: [LnRestart; 3] = [
     LnRestart::NewPage,
     LnRestart::NewSection,
@@ -266,10 +262,10 @@ pub(crate) fn apply_line_numbers(ed: &mut Editor, d: &Dialog) -> Result<bool, St
 #[cfg(test)]
 mod tests {
     use super::line_numbers_dialog;
+    use crate::DocTab;
     use crate::dialog::catalog;
     use crate::layout_tab::tests::{ed, ed_mut, setups, three_sections};
-    use crate::layout_tab::{layout_checked, LayoutAct, LnChoice};
-    use crate::DocTab;
+    use crate::layout_tab::{LayoutAct, LnChoice, layout_checked};
     use ctlcore::json::Json;
     use docxcore::editor::Caret;
     use docxcore::sect::{LineNumbering, LnRestart, SectionStart};
@@ -530,10 +526,7 @@ mod tests {
         set(&mut t, "auto", Json::Bool(false));
         set(&mut t, "from", s("2000000"));
         let e = ok(&mut t).unwrap_err();
-        assert!(
-            e.contains("From text") && e.contains("too large"),
-            "{e}"
-        );
+        assert!(e.contains("From text") && e.contains("too large"), "{e}");
         assert!(t.dialogs.top().is_some(), "the dialog stays open");
         assert!(!t.dirty);
     }
@@ -751,7 +744,8 @@ mod tests {
         );
         assert_eq!(ed(&t).sections()[0], before0, "section 0 is no target");
         assert_eq!(
-            ed(&t).sections()[2], before2,
+            ed(&t).sections()[2],
+            before2,
             "the unnumbered target stays unnumbered"
         );
     }
@@ -966,8 +960,14 @@ mod tests {
         set(&mut t, "add", Json::Bool(true));
         set(&mut t, "restart", s("Continuous"));
         ok(&mut t).unwrap();
-        assert!(layout_checked(&t, LayoutAct::LineNumbers(LnChoice::Continuous)));
-        assert!(!layout_checked(&t, LayoutAct::LineNumbers(LnChoice::RestartEachPage)));
+        assert!(layout_checked(
+            &t,
+            LayoutAct::LineNumbers(LnChoice::Continuous)
+        ));
+        assert!(!layout_checked(
+            &t,
+            LayoutAct::LineNumbers(LnChoice::RestartEachPage)
+        ));
         assert!(!layout_checked(&t, LayoutAct::LineNumbers(LnChoice::None)));
         open(&mut t);
         set(&mut t, "add", Json::Bool(false));
@@ -1010,7 +1010,10 @@ mod tests {
         open(&mut t);
         let d = t.dialogs.top().unwrap();
         let names: Vec<&str> = d.controls.iter().map(|c| c.name).collect();
-        assert_eq!(names, ["add", "start", "from", "auto", "by", "restart", "apply"]);
+        assert_eq!(
+            names,
+            ["add", "start", "from", "auto", "by", "restart", "apply"]
+        );
         let json = d.catalog_check().unwrap();
         assert_eq!(json.get_str("id"), Some("line-numbers"));
     }
