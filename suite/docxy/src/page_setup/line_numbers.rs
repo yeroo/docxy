@@ -23,22 +23,26 @@ const RESTARTS: [LnRestart; 3] = [
 ];
 
 /// Start at as the dialog shows it: one more than the written `w:start`,
-/// clamped at 0 like `Rule::from_setup` (a foreign file may carry less).
-fn start_at(ln: Option<LineNumbering>) -> i32 {
-    ln.map(|l| l.start.unwrap_or(0).max(0) + 1).unwrap_or(1)
+/// clamped at 0 like `Rule::from_setup` (a foreign file may carry less), in
+/// i64 so `w:start="2147483647"` cannot overflow.
+fn start_at(ln: Option<LineNumbering>) -> i64 {
+    ln.map(|l| (l.start.unwrap_or(0).max(0) as i64) + 1)
+        .unwrap_or(1)
 }
 
-/// From text in twips as the dialog shows it: absent or non-positive is
-/// Auto's quarter inch.
-fn distance_tw(ln: Option<LineNumbering>) -> i32 {
-    ln.and_then(|l| l.distance)
-        .filter(|&d| d > 0)
-        .unwrap_or(360)
+/// From text as the dialog shows it, in inches: a saved distance as itself
+/// (0 included), Auto (no distance saved) as its quarter inch.
+fn from_text(ln: Option<LineNumbering>) -> String {
+    match ln.and_then(|l| l.distance) {
+        Some(d) => inches(d.max(0)),
+        None => inches(360),
+    }
 }
 
-/// Whether From text is Auto: the section saved no positive distance.
+/// Whether From text is Auto: the section saved no distance at all. A
+/// written `w:distance="0"` is From text 0, Auto off, and round-trips.
 fn is_auto(ln: Option<LineNumbering>) -> bool {
-    ln.map(|l| l.distance.unwrap_or(0) <= 0).unwrap_or(true)
+    ln.and_then(|l| l.distance).is_none()
 }
 
 /// The Line Numbers dialog on the caret section's `w:lnNumType`.
@@ -71,7 +75,7 @@ pub(crate) fn line_numbers_dialog(tab: &DocTab) -> Result<Dialog, String> {
             "from",
             "From te&xt:",
             ControlKind::Number,
-            Value::Text(inches(distance_tw(ln))),
+            Value::Text(from_text(ln)),
         ),
         Control::new(
             "auto",
@@ -131,57 +135,100 @@ fn after_line_numbers_set(d: &mut Dialog, i: usize, _before: &Value) {
 }
 
 /// Apply an accepted Line Numbers dialog: one undo step on the body editor,
-/// whether anything changed. Every section the dialog applies to gets what
-/// the dialog shows; `w:start` is omitted only when Start at is 1 and the
-/// section had none, so an untouched section keeps its own shape (a saved
-/// `w:start="0"` stays).
+/// whether anything changed. Like `apply_columns`, each target keeps its own
+/// values for the controls the person did not change — an untouched OK
+/// writes nothing, so a clean document stays clean. The box toggles only
+/// where "add" changed; turning it on gives a section that had no numbering
+/// the dialog's shown values (Count by and Numbering as shown, Start at
+/// omitted at 1, Auto saving no `w:distance`).
 pub(crate) fn apply_line_numbers(ed: &mut Editor, d: &Dialog) -> Result<bool, String> {
     let on = is_on(d, "add");
-    // Validate everything before anything is written: a refused OK leaves
-    // the document untouched and the dialog open.
-    let (count_by, start_at, distance, restart) = if on {
-        let label = |name: &str| {
-            d.controls[index(d, name).unwrap_or_default()]
-                .label
-                .replace('&', "")
-                .trim_end_matches(':')
-                .to_string()
-        };
-        let whole = |name: &str| -> Result<i32, String> {
-            text_of(d, name)
-                .trim()
-                .parse::<i32>()
-                .ok()
-                .filter(|v| *v >= 1)
-                .ok_or_else(|| format!("{} must be a whole number of 1 or more", label(name)))
-        };
-        let start_at = whole("start")?;
-        let count_by = whole("by")?;
-        let distance = if is_on(d, "auto") {
-            None
-        } else {
-            let tw =
-                twips_of(&text_of(d, "from")).ok_or_else(|| format!("{} takes a number", label("from")))?;
-            if tw < 0 {
-                return Err(format!("{} cannot be negative", label("from")));
-            }
-            Some(tw)
-        };
-        (count_by, start_at, distance, RESTARTS[chosen(d, "restart").unwrap_or_default()])
-    } else {
-        (1, 1, None, LnRestart::NewPage)
+    let add_changed = d.changed("add");
+    let start_changed = d.changed("start");
+    let by_changed = d.changed("by");
+    let from_changed = d.changed("from") || d.changed("auto");
+    let restart_changed = d.changed("restart");
+    // Validate the staged values before anything is written: a refused OK
+    // leaves the document untouched and the dialog open. Start at shows one
+    // more than `w:start`, so it may be one past i32::MAX.
+    let label = |name: &str| {
+        d.controls[index(d, name).unwrap_or_default()]
+            .label
+            .replace('&', "")
+            .trim_end_matches(':')
+            .to_string()
     };
+    let whole = |name: &str, max: i64| -> Result<i64, String> {
+        text_of(d, name)
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|v| (1..=max).contains(v))
+            .ok_or_else(|| format!("{} must be a whole number of 1 or more", label(name)))
+    };
+    let start_at = whole("start", i64::from(i32::MAX) + 1)?;
+    let count_by = i32::try_from(whole("by", i64::from(i32::MAX))?)
+        .expect("validated within i32");
+    // From text is a length in inches: the value is checked non-negative
+    // before it is rounded to twips, so -0.0001 (which would round to 0)
+    // is refused too.
+    let distance = if is_on(d, "auto") {
+        None
+    } else {
+        let inches: f64 = text_of(d, "from")
+            .trim()
+            .parse()
+            .ok()
+            .filter(|v: &f64| v.is_finite())
+            .ok_or_else(|| format!("{} takes a number", label("from")))?;
+        if inches < 0.0 {
+            return Err(format!("{} cannot be negative", label("from")));
+        }
+        Some((inches * TWIPS_PER_INCH as f64).round() as i32)
+    };
+    let restart = RESTARTS[chosen(d, "restart").unwrap_or_default()];
+    let start = i32::try_from(start_at - 1).expect("validated within i32");
     let edit = |s: &mut SectionSetup| {
-        s.line_numbers = if !on {
-            None
-        } else {
-            let keep_none = start_at == 1 && s.line_numbers.and_then(|l| l.start).is_none();
-            Some(LineNumbering {
-                count_by,
-                start: if keep_none { None } else { Some(start_at - 1) },
-                distance,
-                restart,
-            })
+        let had = s.line_numbers;
+        let field_changed =
+            start_changed || by_changed || from_changed || restart_changed;
+        s.line_numbers = match (add_changed, on) {
+            // The box stays off, or nothing but "apply" changed: leave the
+            // section as it is.
+            (false, false) => had,
+            (false, true) if !field_changed => had,
+            // The box turns off: numbering is removed.
+            (true, false) => None,
+            // Numbering ends on. A section that had none takes the dialog's
+            // shown values; one that had numbering keeps its own for the
+            // controls the person did not change.
+            (_, true) => match had {
+                None => Some(LineNumbering {
+                    count_by: if by_changed { count_by } else { 1 },
+                    start: (start_changed && start_at > 1).then_some(start),
+                    distance: if from_changed { distance } else { None },
+                    restart: if restart_changed {
+                        restart
+                    } else {
+                        LnRestart::NewPage
+                    },
+                }),
+                Some(mut ln) => {
+                    if by_changed {
+                        ln.count_by = count_by;
+                    }
+                    if start_changed {
+                        ln.start = (start_at > 1).then_some(start);
+                    }
+                    if from_changed {
+                        ln.distance = distance;
+                    }
+                    if restart_changed {
+                        ln.restart = restart;
+                    }
+                    Some(ln)
+                }
+            },
         };
     };
     Ok(match targets(ed, d) {
@@ -201,6 +248,7 @@ mod tests {
     use crate::layout_tab::{layout_checked, LayoutAct, LnChoice};
     use crate::DocTab;
     use ctlcore::json::Json;
+    use docxcore::editor::Caret;
     use docxcore::sect::{LineNumbering, LnRestart, SectionStart};
 
     fn open(t: &mut DocTab) {
@@ -432,10 +480,11 @@ mod tests {
     }
 
     /// Criterion 5: From text must be Auto or a non-negative length in
-    /// inches.
+    /// inches. FIX r1 Immaterial: the inch value is checked before it is
+    /// rounded to twips, so -0.0001 (which would round to 0) is refused too.
     #[test]
     fn invalid_from_text_blocks_ok() {
-        for bad in ["-0.5", ""] {
+        for bad in ["-0.5", "-0.0001", ""] {
             let mut t = three_sections();
             open(&mut t);
             set(&mut t, "add", Json::Bool(true));
@@ -529,21 +578,152 @@ mod tests {
         assert_eq!(ed(&t).sections(), before, "byte-identical sectPrs");
     }
 
-    /// The edge pins: a foreign negative `w:start` shows as Start at 1
-    /// (clamped like `Rule::from_setup`) and OK writes back the sane 0; a
-    /// section that already has `w:start="0"` keeps it on an untouched OK.
+    /// FIX r1 Major 1: a selection running from a numbered section into an
+    /// unnumbered one opens the box off; an untouched OK must leave both
+    /// sections byte-identical (the box toggles only where "add" changed).
     #[test]
-    fn negative_start_clamps_and_zero_start_survives() {
+    fn untouched_ok_keeps_a_spanning_selections_sections() {
+        let mut t = three_sections();
+        give(
+            &mut t,
+            0,
+            Some(ln(5, Some(2), Some(360), LnRestart::NewSection)),
+        );
+        let before = ed(&t).sections();
+        ed_mut(&mut t).anchor = Some(Caret::top(0, 0));
+        open(&mut t);
+        assert_eq!(shown(&t, "apply"), "Selected sections");
+        assert_eq!(shown(&t, "add"), "unchecked");
+        ok(&mut t).unwrap();
+        assert!(!t.dirty);
+        assert_eq!(ed(&t).sections(), before);
+    }
+
+    /// FIX r1 Major 1: Whole document with only Count by changed keeps each
+    /// section's own start, distance and restart; a section that had no
+    /// numbering takes Count by with Word's defaults for the rest.
+    #[test]
+    fn whole_document_with_one_field_changed_keeps_each_sections_own() {
+        let mut t = three_sections();
+        give(
+            &mut t,
+            0,
+            Some(ln(5, Some(2), Some(283), LnRestart::Continuous)),
+        );
+        give(&mut t, 1, Some(ln(3, None, None, LnRestart::NewSection)));
+        open(&mut t);
+        set(&mut t, "by", s("2"));
+        set(&mut t, "apply", s("Whole document"));
+        ok(&mut t).unwrap();
+        let now = setups(&t);
+        assert_eq!(
+            now[0].line_numbers,
+            Some(ln(2, Some(2), Some(283), LnRestart::Continuous))
+        );
+        assert_eq!(
+            now[1].line_numbers,
+            Some(ln(2, None, None, LnRestart::NewSection))
+        );
+        assert_eq!(
+            now[2].line_numbers,
+            Some(ln(2, None, None, LnRestart::NewPage))
+        );
+    }
+
+    /// FIX r1 Major 1: turning the box on applies the shown values to a
+    /// section that had none and leaves an already-numbered target's own
+    /// values alone.
+    #[test]
+    fn turning_the_box_on_uses_the_shown_values_only_where_numbering_was_off() {
+        let mut t = three_sections();
+        give(
+            &mut t,
+            0,
+            Some(ln(5, Some(2), Some(360), LnRestart::NewSection)),
+        );
+        ed_mut(&mut t).anchor = Some(Caret::top(0, 0));
+        open(&mut t);
+        set(&mut t, "add", Json::Bool(true));
+        set(&mut t, "by", s("2"));
+        ok(&mut t).unwrap();
+        assert_eq!(
+            setups(&t)[0].line_numbers,
+            Some(ln(2, Some(2), Some(360), LnRestart::NewSection)),
+            "section 0 keeps its own start, distance and restart"
+        );
+        let raw1 = ed(&t).sections()[1].clone();
+        assert!(
+            raw1.contains(r#"<w:lnNumType w:countBy="2" w:restart="newPage"/>"#),
+            "{raw1}"
+        );
+    }
+
+    /// FIX r1 Major 2: From text is a rounded display, so an untouched OK
+    /// must not write it back — 283 would drift to 288 and 1 to 0, which the
+    /// drawer reads as Auto — and a written `w:distance="0"` reopens as From
+    /// text 0 with Auto off, not as Auto.
+    #[test]
+    fn distance_round_trips_untouched_and_zero_is_not_auto() {
+        for tw in [283, 1, 0] {
+            let mut t = three_sections();
+            give(&mut t, 1, Some(ln(1, None, Some(tw), LnRestart::NewPage)));
+            let before = ed(&t).sections();
+            open(&mut t);
+            ok(&mut t).unwrap();
+            assert!(!t.dirty, "{tw}: an untouched OK writes nothing");
+            assert_eq!(ed(&t).sections(), before, "{tw} twips drifted");
+        }
+        let mut t = three_sections();
+        give(&mut t, 1, Some(ln(1, None, Some(0), LnRestart::NewPage)));
+        open(&mut t);
+        assert_eq!(shown(&t, "auto"), "unchecked");
+        assert_eq!(shown(&t, "from"), "0");
+        ok(&mut t).unwrap();
+        assert!(!t.dirty);
+    }
+
+    /// FIX r1 Minor: `w:start="2147483647"` shows as Start at 2147483648
+    /// without overflowing i32, and an untouched OK writes nothing.
+    #[test]
+    fn max_start_shows_without_overflow() {
+        let mut t = three_sections();
+        give(
+            &mut t,
+            1,
+            Some(ln(1, Some(i32::MAX), None, LnRestart::NewPage)),
+        );
+        let before = ed(&t).sections();
+        open(&mut t);
+        assert_eq!(shown(&t, "start"), "2147483648");
+        ok(&mut t).unwrap();
+        assert!(!t.dirty);
+        assert_eq!(ed(&t).sections(), before);
+    }
+
+    /// FIX r1 Major 1's per-field rule: a foreign negative `w:start` shows
+    /// as Start at 1 (clamped like `Rule::from_setup`), an untouched OK is
+    /// byte-identical, and changing another field leaves the untouched start
+    /// alone. A section that already has `w:start="0"` also survives an
+    /// untouched OK byte-identically.
+    #[test]
+    fn foreign_start_shows_clamped_and_keeps_until_changed() {
         let mut t = three_sections();
         give(&mut t, 1, Some(ln(1, Some(-3), None, LnRestart::NewPage)));
+        let before = ed(&t).sections();
         open(&mut t);
         assert_eq!(shown(&t, "start"), "1");
         ok(&mut t).unwrap();
+        assert!(!t.dirty, "an untouched OK writes nothing");
+        assert_eq!(ed(&t).sections(), before, "the negative w:start stays");
+
+        let mut t = three_sections();
+        give(&mut t, 1, Some(ln(1, Some(-3), None, LnRestart::NewPage)));
+        open(&mut t);
+        set(&mut t, "by", s("2"));
+        ok(&mut t).unwrap();
         let raw = ed(&t).sections()[1].clone();
-        assert!(
-            raw.contains(r#"<w:lnNumType w:countBy="1" w:start="0" w:restart="newPage"/>"#),
-            "{raw}"
-        );
+        assert!(raw.contains(r#"w:start="-3""#), "{raw}");
+        assert!(raw.contains(r#"w:countBy="2""#), "{raw}");
 
         let mut t = three_sections();
         give(&mut t, 1, Some(ln(1, Some(0), None, LnRestart::NewPage)));
@@ -555,8 +735,9 @@ mod tests {
         assert_eq!(ed(&t).sections(), before, r#"w:start="0" is preserved"#);
     }
 
-    /// The edge pin: From text 0 is a valid non-negative length and is
-    /// written literally (the drawer reads 0 as Auto, `Rule::from_setup`).
+    /// From text 0 is a valid non-negative length and is written literally
+    /// (the drawer reads 0 as Auto, `Rule::from_setup`); it reopens as From
+    /// text 0 with Auto off and round-trips untouched.
     #[test]
     fn zero_from_text_is_written_as_zero() {
         let mut t = three_sections();
@@ -569,6 +750,16 @@ mod tests {
         assert!(
             raw.contains(r#"<w:lnNumType w:countBy="1" w:distance="0" w:restart="newPage"/>"#),
             "{raw}"
+        );
+        open(&mut t);
+        assert_eq!(shown(&t, "auto"), "unchecked");
+        assert_eq!(shown(&t, "from"), "0");
+        let before = ed(&t).sections();
+        ok(&mut t).unwrap();
+        assert_eq!(
+            ed(&t).sections(),
+            before,
+            "a written 0 round-trips untouched"
         );
     }
 

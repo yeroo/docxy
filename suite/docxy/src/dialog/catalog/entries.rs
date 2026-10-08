@@ -184,10 +184,10 @@ dialogs! {
         ],
         fields: &[
             checkbox("add"),
-            Field::number("start", "1").prep(NUMBERING_ON).kept("1"),
-            Field::number("from", "0.25").prep(FROM_TEXT).kept("0.25"),
+            Field::number("start", "3").prep(NUMBERING_ON).kept("3"),
+            Field::number("from", "0.5").prep(FROM_TEXT).kept("0.5"),
             checkbox("auto"),
-            Field::number("by", "1").prep(NUMBERING_ON).kept("1"),
+            Field::number("by", "5").prep(NUMBERING_ON).kept("5"),
             radio("restart"),
             dropdown("apply"),
         ],

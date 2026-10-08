@@ -6334,9 +6334,9 @@ test doc line-numbers/start: types
   call pointer-click {"dialog-control":"add"}
   call pointer-click {"dialog-field":"start"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"1"}
+  call real-type {"text":"3"}
   call field-read {"dialog-field":"start"}
-  assert reply.value is 1
+  assert reply.value is 3
   assert reply.caret is 1
   call real-key {"key":"escape"}
 
@@ -6430,7 +6430,7 @@ test doc line-numbers/start: OK applies
   call pointer-click {"dialog-control":"add"}
   call pointer-click {"dialog-field":"start"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"1"}
+  call real-type {"text":"3"}
   call real-key {"key":"enter"}
   assert dialog is not line-numbers
   call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
@@ -6439,7 +6439,7 @@ test doc line-numbers/start: OK applies
   call dialog-catalog-check {}
   call pointer-click {"dialog-control":"add"}
   call field-read {"dialog-field":"start"}
-  assert reply.value is 1
+  assert reply.value is 3
   call real-key {"key":"escape"}
 
 test doc line-numbers/start: Escape cancels
@@ -6472,10 +6472,10 @@ test doc line-numbers/start: refuses invalid
   call pointer-click {"dialog-control":"add"}
   call pointer-click {"dialog-field":"start"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"1"}
+  call real-type {"text":"3"}
   call real-type {"text":"x"}
   call field-read {"dialog-field":"start"}
-  assert reply.value is 1
+  assert reply.value is 3
   call real-key {"key":"escape"}
 
 test doc line-numbers/from: focus by click
@@ -6514,10 +6514,10 @@ test doc line-numbers/from: types
   call pointer-click {"dialog-control":"auto"}
   call pointer-click {"dialog-field":"from"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"0.25"}
+  call real-type {"text":"0.5"}
   call field-read {"dialog-field":"from"}
-  assert reply.value is 0.25
-  assert reply.caret is 4
+  assert reply.value is 0.5
+  assert reply.caret is 3
   call real-key {"key":"escape"}
 
 test doc line-numbers/from: edits
@@ -6615,7 +6615,7 @@ test doc line-numbers/from: OK applies
   call pointer-click {"dialog-control":"auto"}
   call pointer-click {"dialog-field":"from"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"0.25"}
+  call real-type {"text":"0.5"}
   call real-key {"key":"enter"}
   assert dialog is not line-numbers
   call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
@@ -6625,7 +6625,7 @@ test doc line-numbers/from: OK applies
   call pointer-click {"dialog-control":"add"}
   call pointer-click {"dialog-control":"auto"}
   call field-read {"dialog-field":"from"}
-  assert reply.value is 0.25
+  assert reply.value is 0.5
   call real-key {"key":"escape"}
 
 test doc line-numbers/from: Escape cancels
@@ -6661,10 +6661,10 @@ test doc line-numbers/from: refuses invalid
   call pointer-click {"dialog-control":"auto"}
   call pointer-click {"dialog-field":"from"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"0.25"}
+  call real-type {"text":"0.5"}
   call real-type {"text":"x"}
   call field-read {"dialog-field":"from"}
-  assert reply.value is 0.25
+  assert reply.value is 0.5
   call real-key {"key":"escape"}
 
 test doc line-numbers/by: focus by click
@@ -6703,9 +6703,9 @@ test doc line-numbers/by: types
   call pointer-click {"dialog-control":"add"}
   call pointer-click {"dialog-field":"by"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"1"}
+  call real-type {"text":"5"}
   call field-read {"dialog-field":"by"}
-  assert reply.value is 1
+  assert reply.value is 5
   assert reply.caret is 1
   call real-key {"key":"escape"}
 
@@ -6799,7 +6799,7 @@ test doc line-numbers/by: OK applies
   call pointer-click {"dialog-control":"add"}
   call pointer-click {"dialog-field":"by"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"1"}
+  call real-type {"text":"5"}
   call real-key {"key":"enter"}
   assert dialog is not line-numbers
   call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
@@ -6808,7 +6808,7 @@ test doc line-numbers/by: OK applies
   call dialog-catalog-check {}
   call pointer-click {"dialog-control":"add"}
   call field-read {"dialog-field":"by"}
-  assert reply.value is 1
+  assert reply.value is 5
   call real-key {"key":"escape"}
 
 test doc line-numbers/by: Escape cancels
@@ -6841,10 +6841,10 @@ test doc line-numbers/by: refuses invalid
   call pointer-click {"dialog-control":"add"}
   call pointer-click {"dialog-field":"by"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"1"}
+  call real-type {"text":"5"}
   call real-type {"text":"x"}
   call field-read {"dialog-field":"by"}
-  assert reply.value is 1
+  assert reply.value is 5
   call real-key {"key":"escape"}
 
 test doc line-numbers/apply: focus by click
