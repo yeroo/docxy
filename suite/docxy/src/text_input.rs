@@ -32,17 +32,20 @@
 //! records the text each key-down owes ([`owed_text`]) and the handler drops
 //! WM_CHAR text that matches it, in order, typing only what matches nothing.
 //! The key's text is what gpui's own ToUnicode gave, which leaves the
-//! dead-key state alone for TranslateMessage: a dead key owes nothing (it
-//! makes WM_DEADCHAR) and the letter after it owes "é", which the one WM_CHAR
-//! "é" matches. The WM_CHAR may come late: TranslateMessage posts it, and a
-//! queue drained of input alone (gpui does that under load, and automation
-//! may queue a key's down and up at once) hands over the key-up and later
-//! key-downs first. So a debt outlives its key's key-up and waits for its
-//! text however long that takes. WM_CHARs keep their key-downs' order, so a
-//! match drops the debts older than it, whose WM_CHAR never came (an AltGr
-//! dead key's accent). A packet's text matches no debt and is typed, and it
-//! pays none: matched by text, not counted. The handler never accepts text input
-//! there ([`accepts_text_input`]), so the Windows IME stays off as it was.
+//! dead-key state alone for TranslateMessage: a plain dead key owes nothing
+//! (it makes WM_DEADCHAR) and the letter after it owes "é", which the one
+//! WM_CHAR "é" matches. The WM_CHAR may come late: TranslateMessage posts it,
+//! and a queue drained of input alone (gpui does that under load, and
+//! automation may queue a key's down and up at once) hands over the key-up
+//! and later key-downs first. So a debt outlives its key's key-up and waits
+//! for its text up to [`WM_CHAR_KEEP`] (60 s). A match pays only its own
+//! debt: the character may be a packet's, queued ahead of the WM_CHARs older
+//! debts wait for. Only an AltGr dead key's accent, which may never come,
+//! is dropped by the next match of a newer debt. A packet's text that no
+//! debt starts with is typed: matched by text, not counted. Packet text
+//! queued behind typed keys under load may land after their text. The
+//! handler never accepts text input there ([`accepts_text_input`]), so the
+//! Windows IME stays off as it was.
 //!
 //! Linux registers no handler: it would hand it every unhandled printable
 //! key, which `on_key` has already typed. Off macOS the root also leaves
@@ -135,14 +138,15 @@ pub(crate) fn accepts_text_input(macos: bool, takes_text: bool) -> bool {
     macos && takes_text
 }
 
-/// How long an unmatched WM_CHAR debt is kept (#1139). Not a bound on when a
-/// WM_CHAR may arrive, which matching by text does not need: only hygiene for
-/// debts whose WM_CHAR never comes and that no later match drops, such as on
-/// a platform that sends no WM_CHAR at all.
-pub(crate) const WM_CHAR_KEEP: Duration = Duration::from_secs(5);
+/// How long an unmatched WM_CHAR debt is kept (#1139). Hygiene, not a
+/// correctness bound: it is for debts whose WM_CHAR never comes, such as on a
+/// platform that sends no WM_CHAR at all. A WM_CHAR held back longer than
+/// this is typed again.
+pub(crate) const WM_CHAR_KEEP: Duration = Duration::from_secs(60);
 
-/// At most this many debts are kept; the oldest go first (#1139).
-pub(crate) const WM_CHAR_MAX_DEBTS: usize = 64;
+/// At most this many debts are kept; the oldest go first (#1139). Hygiene
+/// too: a WM_CHAR queued behind more key-downs than this is typed again.
+pub(crate) const WM_CHAR_MAX_DEBTS: usize = 4096;
 
 /// The WM_CHAR text a Windows key-down `on_key` has typed will send (#1139):
 /// its printable text, or none. Alt alone makes WM_SYSCHAR, not WM_CHAR
@@ -151,8 +155,9 @@ pub(crate) const WM_CHAR_MAX_DEBTS: usize = 64;
 /// WM_DEADCHAR, so it owes nothing: gpui flags a key whose ToUnicode is dead
 /// as preferring character input, and with no Ctrl, Alt or Win held nothing
 /// else sets that flag. Under AltGr the flag marks every character the
-/// modifiers change too, so an AltGr dead key owes its accent and the next
-/// match drops it. "´" then X owes "´x", which comes as two WM_CHARs.
+/// modifiers change too, so an AltGr dead key owes its accent ([`may_not_come`])
+/// and the next match of a newer debt drops it. "´" then X owes "´x", which
+/// comes as two WM_CHARs.
 pub(crate) fn owed_text(ev: &KeyDownEvent) -> Option<String> {
     let m = &ev.keystroke.modifiers;
     if m.alt && !m.control {
@@ -166,6 +171,14 @@ pub(crate) fn owed_text(ev: &KeyDownEvent) -> Option<String> {
         .key_char
         .clone()
         .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+}
+
+/// Whether a key-down's debt may never be paid: a key gpui flags as preferring
+/// character input under Ctrl, Alt or Win, which is every AltGr character and
+/// also an AltGr dead key, whose WM_DEADCHAR is no WM_CHAR (#1139).
+pub(crate) fn may_not_come(ev: &KeyDownEvent) -> bool {
+    let m = &ev.keystroke.modifiers;
+    ev.prefer_character_input && (m.control || m.alt || m.platform)
 }
 
 /// The text AppKit would commit for a key event the root may defer: what the
@@ -231,6 +244,17 @@ fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
 
+/// What one Windows key-down `on_key` typed still owes in WM_CHAR (#1139).
+#[derive(Clone, Debug)]
+struct Debt {
+    /// The text not yet matched.
+    text: String,
+    /// When the key was typed, for [`WM_CHAR_KEEP`].
+    at: Instant,
+    /// [`may_not_come`]: a newer debt's match drops it.
+    may_not_come: bool,
+}
+
 /// The composition in progress and the key AppKit has been handed, and on
 /// Windows the WM_CHAR characters a typed key still owes.
 #[derive(Clone, Debug, Default)]
@@ -245,7 +269,7 @@ pub(crate) struct ImeState {
     pending: Option<KeyDownEvent>,
     /// Windows: the WM_CHAR text each key-down `on_key` typed still owes,
     /// oldest first, and when it was typed (#1139).
-    owed: VecDeque<(String, Instant)>,
+    owed: VecDeque<Debt>,
 }
 
 impl ImeState {
@@ -267,37 +291,55 @@ impl ImeState {
             if self.owed.len() == WM_CHAR_MAX_DEBTS {
                 self.owed.pop_front();
             }
-            self.owed.push_back((text, now));
+            self.owed.push_back(Debt {
+                text,
+                at: now,
+                may_not_come: may_not_come(ev),
+            });
         }
     }
 
     /// Drops the debts kept past [`WM_CHAR_KEEP`].
     fn lapse(&mut self, now: Instant) {
         self.owed
-            .retain(|(_, at)| now.saturating_duration_since(*at) <= WM_CHAR_KEEP);
+            .retain(|d| now.saturating_duration_since(d.at) <= WM_CHAR_KEEP);
     }
 
     /// Windows' WM_CHAR at `now` (a surrogate pair joined by gpui): the key
     /// events that type what no key-down typed already, one per character.
-    /// Each character pays the oldest debt that starts with it, and the
-    /// debts older than that one go: their WM_CHARs, posted before it, will
-    /// never come. A character no debt starts with (a packet's) is typed
-    /// and leaves the debts as they are. Empty text (an IME message gpui
-    /// forwards) changes nothing.
+    /// Each character pays the oldest debt that starts with it, preferring
+    /// one sure to be paid. Only that debt changes: the character may be a
+    /// packet's, ahead of the WM_CHARs older debts still wait for. The older
+    /// debts that [`may_not_come`] go, though: the WM_CHAR of an AltGr
+    /// character would have come first, so they were AltGr dead keys'. A
+    /// character no debt starts with (a packet's) is typed and leaves the
+    /// debts as they are. Empty text (an IME message gpui forwards) changes
+    /// nothing.
     pub(crate) fn char_message(&mut self, text: &str, now: Instant) -> Vec<KeyDownEvent> {
         self.lapse(now);
         let mut keys = Vec::new();
         for c in text.chars() {
-            match self.owed.iter().position(|(t, _)| t.starts_with(c)) {
-                Some(i) => {
-                    self.owed.drain(..i);
-                    let debt = &mut self.owed[0].0;
-                    debt.drain(..c.len_utf8());
-                    if debt.is_empty() {
-                        self.owed.pop_front();
-                    }
-                }
-                None => keys.extend(char_stroke(c).map(typed)),
+            let owes = |d: &Debt| d.text.starts_with(c);
+            let found = self
+                .owed
+                .iter()
+                .position(|d| !d.may_not_come && owes(d))
+                .or_else(|| self.owed.iter().position(owes));
+            let Some(i) = found else {
+                keys.extend(char_stroke(c).map(typed));
+                continue;
+            };
+            let dropped = self.owed.iter().take(i).filter(|d| d.may_not_come).count();
+            let mut index = 0;
+            self.owed.retain(|d| {
+                index += 1;
+                index > i || !d.may_not_come
+            });
+            let i = i - dropped;
+            let debt = &mut self.owed[i].text;
+            debt.drain(..c.len_utf8());
+            if debt.is_empty() {
+                self.owed.remove(i);
             }
         }
         keys
@@ -305,7 +347,7 @@ impl ImeState {
 
     /// The WM_CHAR characters typed keys still owe, lapsed or not.
     pub(crate) fn owed(&self) -> usize {
-        self.owed.iter().map(|(t, _)| t.chars().count()).sum()
+        self.owed.iter().map(|d| d.text.chars().count()).sum()
     }
 
     pub(crate) fn marked(&self) -> Option<&str> {
@@ -892,8 +934,8 @@ mod tests {
         assert_eq!(key_chars(&ime.char_message("é", ms(at, 6))), ["é"]);
     }
 
-    /// A WM_CHAR held behind a stall of any length still finds its debt:
-    /// there is no time bound on matching.
+    /// A WM_CHAR held behind a stall still finds its debt, up to
+    /// `WM_CHAR_KEEP`.
     #[test]
     fn a_wm_char_after_a_long_stall_is_still_dropped() {
         let mut ime = ImeState::default();
@@ -927,6 +969,77 @@ mod tests {
         ime.key_down(&typed(plain("b", "b")), at);
         assert_eq!(key_chars(&ime.char_message("é", at)), ["é"]);
         assert!(ime.char_message("b", at).is_empty());
+        assert_eq!(ime.owed(), 0);
+    }
+
+    /// A packet's character that some typed key also owes pays that key's
+    /// debt alone: the older debts' WM_CHARs are still on the way.
+    #[test]
+    fn a_match_pays_only_its_own_debt() {
+        let mut ime = ImeState::default();
+        let at = t0();
+        for c in ["t", "h", "e"] {
+            ime.key_down(&typed(plain(c, c)), at);
+        }
+        let mut typed_chars = Vec::new();
+        for c in ["e", "t", "h", "e"] {
+            typed_chars.extend(
+                key_chars(&ime.char_message(c, at))
+                    .into_iter()
+                    .map(str::to_string),
+            );
+        }
+        assert_eq!(typed_chars, ["e"]);
+        assert_eq!(ime.owed(), 0);
+        // A packet "b" ahead of typed A and B: "b" is typed once, A and B
+        // are not doubled.
+        ime.key_down(&typed(plain("a", "a")), at);
+        ime.key_down(&typed(plain("b", "b")), at);
+        let mut typed_chars = Vec::new();
+        for c in ["b", "a", "b"] {
+            typed_chars.extend(
+                key_chars(&ime.char_message(c, at))
+                    .into_iter()
+                    .map(str::to_string),
+            );
+        }
+        assert_eq!(typed_chars, ["b"]);
+        assert_eq!(ime.owed(), 0);
+    }
+
+    /// Many key-downs drained before their WM_CHARs, then a long stall:
+    /// every WM_CHAR still pays its own key's debt.
+    #[test]
+    fn a_long_queue_and_a_long_stall_still_pay() {
+        let mut ime = ImeState::default();
+        let at = t0();
+        let letters: Vec<String> = (0..100)
+            .map(|i| char::from(b'a' + (i % 26) as u8).to_string())
+            .collect();
+        for c in &letters {
+            ime.key_down(&typed(plain(c, c)), at);
+        }
+        for c in &letters {
+            assert!(ime.char_message(c, at).is_empty(), "{c}");
+        }
+        assert_eq!(ime.owed(), 0);
+        ime.key_down(&typed(plain("a", "a")), at);
+        assert!(ime.char_message("a", ms(at, 10_000)).is_empty());
+    }
+
+    /// An AltGr dead key then a letter it does not combine with: the
+    /// letter's debt "~x" is sure to be paid, so "~" pays it rather than
+    /// the dead key's, which goes, and "x" is not typed twice.
+    #[test]
+    fn an_altgr_dead_key_pair_prefers_the_sure_debt() {
+        let mut ime = ImeState::default();
+        let at = t0();
+        let tilde = dead("4", "~", ctrl_alt());
+        assert!(may_not_come(&tilde));
+        ime.key_down(&tilde, at);
+        ime.key_down(&typed(plain("x", "~x")), at);
+        assert!(ime.char_message("~", at).is_empty());
+        assert!(ime.char_message("x", at).is_empty());
         assert_eq!(ime.owed(), 0);
     }
 

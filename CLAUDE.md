@@ -26,16 +26,19 @@
 - Windows registers the handler too, for WM_CHAR only (#1139): Unicode-packet
   text (`SendInput` `KEYEVENTF_UNICODE`, a `VK_PACKET` key-down gpui drops)
   arrives nowhere else. Each key-down `on_key` typed owes its WM_CHAR text
-  (`owed_text`: printable, no Alt without Ctrl, not a dead key), and each
-  WM_CHAR character pays the oldest debt that starts with it (dropping older
-  ones) or, matching none, is typed: matched by text, not counted, so a
-  packet never pays a key's debt. A WM_CHAR can come after its key-up and
-  later key-downs (gpui drains input alone under load), so no key-up or
-  timer ends a debt; `WM_CHAR_KEEP` (5 s) and a cap are hygiene only. The handler's `accepts_text_input` is false there, so the Windows
-  IME stays off. Linux registers none (it would get every key `on_key`
-  typed). The harness's `win-char` sends WM_CHAR, and `real-type`'s
-  `"wm_char":true` (always on Windows) or `"late"` replays each typed key's
-  twin.
+  (`owed_text`: printable, no Alt without Ctrl), and each WM_CHAR character
+  pays only the oldest debt that starts with it or, matching none, is typed:
+  matched by text, not counted, so a packet never pays a key's debt. A plain
+  dead key owes nothing; an AltGr dead key owes its accent, dropped only by
+  the next match of a newer debt (`may_not_come`). A WM_CHAR can come after
+  its key-up and later key-downs (gpui drains input alone under load), so no
+  key-up ends a debt; it waits up to `WM_CHAR_KEEP` (60 s, with a 4096-debt
+  cap), hygiene only. Packet text queued behind typed keys under load may
+  land after their text. The handler's `accepts_text_input` is false there,
+  so the Windows IME stays off. Linux registers none (it would get every
+  key `on_key` typed). The harness's `win-char` sends WM_CHAR, and
+  `real-type`'s `"wm_char":true` (always on Windows) or `"late"` replays each
+  typed key's twin.
 
 ## macOS menu bar (#1071)
 
