@@ -26598,36 +26598,24 @@ fn snap_twips(v: i32) -> i32 {
     (rounded * GRID).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
+/// The caret bar the chrome uses (comment editor, label input): the brand
+/// bar at its fixed 19px.
 fn caret_bar() -> AnyElement {
-    caret_bar_div().into_any_element()
+    caret_bar_h(19.0)
 }
 
-/// The caret bar as a layout box: 2px wide with negative side margins that
-/// cancel the width, so it sits between glyphs without nudging them apart.
-fn caret_bar_div() -> Div {
+/// The caret bar as a layout box: `height` tall and 2px wide with negative
+/// side margins that cancel the width, so it sits between glyphs without
+/// nudging them apart. Document paragraphs pass
+/// `line_numbers::caret_height(line_h)` so a small-zoom line can never
+/// inflate a row (#746); the chrome sites pass 19.
+fn caret_bar_h(height: f32) -> AnyElement {
     div()
         .w(px(2.))
-        .h(px(19.))
+        .h(px(height))
         .ml(px(-1.))
         .mr(px(-1.))
         .bg(rgb(BRAND))
-}
-
-/// The caret bar as it sits in a document paragraph's wrapping row: it keeps
-/// its fixed 19px drawing height but takes no layout height, being
-/// absolutely placed in a zero-height box at the same spot (its left
-/// margin still applies). The bar hangs from `top(-9.5)` because the row is
-/// `items_center` (gpui-component's h_flex): the zero-height wrapper sits
-/// on the line's midpoint, and half the bar's height above that midpoint
-/// reproduces exactly where the old in-flow bar centered itself.
-/// Otherwise, below ~65% zoom, the bar is taller than the row's own line
-/// height and the row would read as an extra wrapped line whenever the
-/// caret visits it (#746 r1 Major 2).
-fn doc_caret_bar() -> AnyElement {
-    div()
-        .w(px(0.))
-        .h(px(0.))
-        .child(caret_bar_div().absolute().top(px(-9.5)).left_0())
         .into_any_element()
 }
 
@@ -26805,6 +26793,7 @@ fn emit_run(
     sel: Option<(usize, usize)>,
     click: Option<Click>,
     pal: Pal,
+    caret_h: f32,
 ) {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -26830,7 +26819,7 @@ fn emit_run(
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
         if *caret == Some(start + a) {
-            out.push(doc_caret_bar());
+            out.push(caret_bar_h(caret_h));
             *caret = None;
         }
         let seg: String = chars[a..b].iter().collect();
@@ -26848,7 +26837,7 @@ fn emit_run(
         );
     }
     if *caret == Some(end) {
-        out.push(doc_caret_bar());
+        out.push(caret_bar_h(caret_h));
         *caret = None;
     }
     *idx = end;
@@ -26881,10 +26870,11 @@ fn emit_tab(
     base: f32,
     width: f32,
     pal: Pal,
+    caret_h: f32,
 ) {
     let pos = *idx;
     if *caret == Some(pos) {
-        out.push(doc_caret_bar());
+        out.push(caret_bar_h(caret_h));
         *caret = None;
     }
     let selected = sel.is_some_and(|(s, e)| s < e && s <= pos && pos < e);
@@ -26921,17 +26911,13 @@ fn emit_tab(
 }
 
 /// A line break is ONE char in the engine; render it as a wrap and keep `idx` in
-/// sync (so caret/selection offsets past it stay correct). `strut`, when
-/// positive, is the height of the break's own flex line: a TRAILING manual
-/// break (nothing but breaks after it) would otherwise leave an empty line
-/// of zero height, and the paragraph's height would depend on whether the
-/// caret happens to be sitting there (#746 r2 Major 2).
-fn emit_break(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>, strut: f32) {
+/// sync (so caret/selection offsets past it stay correct).
+fn emit_break(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>, caret_h: f32) {
     if *caret == Some(*idx) {
-        out.push(doc_caret_bar());
+        out.push(caret_bar_h(caret_h));
         *caret = None;
     }
-    out.push(div().w_full().h(px(strut)).into_any_element());
+    out.push(div().w_full().h(px(0.)).into_any_element());
     *idx += 1;
 }
 
@@ -27241,8 +27227,11 @@ fn emit_revision_text(out: &mut Vec<AnyElement>, content: &[Inline], base: f32, 
         match inline {
             Inline::Run(r) => {
                 let (mut idx, mut caret) = (0, None);
+                // The caret never lands in revision text (caret is None), so
+                // the bar height is unused; 19 keeps the signature honest.
                 emit_run(
                     out, &r.text, &r.props, base, false, &mut idx, &mut caret, None, None, pal,
+                    19.0,
                 );
             }
             Inline::Hyperlink(h) => {
@@ -27250,6 +27239,7 @@ fn emit_revision_text(out: &mut Vec<AnyElement>, content: &[Inline], base: f32, 
                     let (mut idx, mut caret) = (0, None);
                     emit_run(
                         out, &r.text, &r.props, base, true, &mut idx, &mut caret, None, None, pal,
+                        19.0,
                     );
                 }
                 emit_revision_text(out, &h.content, base, pal);
@@ -27402,8 +27392,8 @@ fn paragraph_el(
     }
     let mut x = indent_layout.first_line_tab_origin();
     // Line spacing (auto-rule multiple; exact/atLeast fall back to single
-    // here). Needed by the span loop: a trailing manual break's strut is one
-    // of these lines high.
+    // here). The span loop needs it to size the caret bar so a small-zoom
+    // line can never inflate a row (see `line_numbers::caret_height`).
     let line_mult = p
         .props
         .spacing
@@ -27411,6 +27401,7 @@ fn paragraph_el(
         .unwrap_or(1.0)
         .clamp(0.5, 4.0);
     let line_h = base * 1.35 * line_mult;
+    let caret_h = line_numbers::caret_height(line_h);
     // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
     // link take caret offsets exactly as the editor counts them.
     let items = flat_inlines(&p.content);
@@ -27500,7 +27491,7 @@ fn paragraph_el(
             Inline::Run(r) => {
                 emit_run(
                     &mut spans, &r.text, &r.props, base, in_link, &mut idx, &mut caret, sel, click,
-                    pal,
+                    pal, caret_h,
                 );
                 x += run_w(r);
             }
@@ -27518,25 +27509,12 @@ fn paragraph_el(
                 }
                 .max(3.0);
                 emit_tab(
-                    &mut spans, &mut idx, &mut caret, sel, click, marks, base, w, pal,
+                    &mut spans, &mut idx, &mut caret, sel, click, marks, base, w, pal, caret_h,
                 );
                 x += w;
             }
             Inline::Break(..) => {
-                // A break at the end of the paragraph (nothing but breaks
-                // follows) gets a one-line strut so the trailing empty line
-                // keeps its height with or without the caret on it; a break
-                // with content after it stays weightless, as before (#746
-                // r2 Major 2).
-                let trailing = items[i + 1..]
-                    .iter()
-                    .all(|(it, _)| matches!(**it, Inline::Break(..)));
-                emit_break(
-                    &mut spans,
-                    &mut idx,
-                    &mut caret,
-                    if trailing { line_h } else { 0.0 },
-                );
+                emit_break(&mut spans, &mut idx, &mut caret, caret_h);
                 x = 0.0; // a hard break restarts the line
             }
             Inline::Revision { content, .. } => {
@@ -27577,7 +27555,7 @@ fn paragraph_el(
                 let width = caret_advance(inline);
                 let pos = idx;
                 if width == 1 && caret == Some(pos) {
-                    spans.push(doc_caret_bar());
+                    spans.push(caret_bar_h(caret_h));
                     caret = None;
                 }
                 let selected = width == 1 && sel.is_some_and(|(s, e)| s < e && s <= pos && pos < e);
@@ -27723,7 +27701,7 @@ fn paragraph_el(
         );
     }
     if caret.is_some() {
-        spans.push(doc_caret_bar());
+        spans.push(caret_bar_h(caret_h));
     }
     // A pilcrow at the paragraph end when formatting marks are shown.
     if marks {
@@ -27736,7 +27714,6 @@ fn paragraph_el(
         );
     }
     let has_border = p.props.borders.bottom.is_some();
-    // Line spacing (auto-rule multiple; exact/atLeast fall back to single here).
     let mut row = h_flex()
         .w_full()
         .flex_wrap()

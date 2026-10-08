@@ -97,6 +97,15 @@ fn round_half_toward_zero(x: f32) -> f32 {
     }
 }
 
+/// The caret bar's layout height in a document row: the brand bar is a
+/// fixed 19px, but never taller than the paragraph's own line height, so
+/// below 100% zoom it cannot inflate a one-line row past `min_h` and make
+/// the row count a line that is not there (#746). The chrome caret sites
+/// (comment editor, label input) pass an explicit 19.
+pub(crate) fn caret_height(line_h: f32) -> f32 {
+    19.0_f32.min(line_h)
+}
+
 /// Visual rows of a painted wrapping row: its height over the line height.
 /// A single-line row sits at `min_h` (main.rs `paragraph_el`'s
 /// `line_h.max(base + 6.)`), which is taller than `line_h`, so
@@ -281,6 +290,17 @@ mod tests {
         assert_eq!(row_count(59.0, 19.6, 20.5), 3);
         assert_eq!(row_count(10.0, 9.8, 20.5), 1);
         assert_eq!(row_count(40.0, 0.0, 20.5), 1);
+    }
+
+    /// The caret bar is a fixed 19px at ordinary line heights but shrinks
+    /// with the line below 100% zoom, so it can never make a one-line row
+    /// taller than `min_h` and read as an extra numbered row (#746 r1
+    /// Major 2, fixed at the source).
+    #[test]
+    fn caret_height_caps_at_the_line_height() {
+        assert_eq!(caret_height(19.575), 19.0);
+        assert_eq!(caret_height(9.79), 9.79);
+        assert_eq!(caret_height(40.0), 19.0);
     }
 
     /// gpui snaps each wrapped line's height to the device pixel grid

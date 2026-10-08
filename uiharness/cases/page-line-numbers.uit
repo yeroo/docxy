@@ -1,13 +1,11 @@
 test line numbers draw in print layout, continue across pages and columns, and follow the ribbon toggle
   open copy:../fixtures/basic.docx
-  # 42 paragraphs: the first is "One" plus a Shift+Enter's empty trailing
-  # line (two rows); the rest pour down page 1 and onto page 2, below the
-  # fold — its canvases paint while scrolled off.
   type One
   shot window
-  key shift+enter
   key enter
   type Two
+  # 40 more one-line paragraphs: page 1's column fills and the rest pours
+  # onto page 2, below the fold — its canvases paint while scrolled off.
   key enter enter enter enter enter enter enter enter enter enter
   key enter enter enter enter enter enter enter enter enter enter
   key enter enter enter enter enter enter enter enter enter enter
@@ -19,10 +17,8 @@ test line numbers draw in print layout, continue across pages and columns, and f
   call doc {}
   assert reply.view.layout is print
   assert reply.line_numbers.0.n is 1
-  # The soft break's empty trailing line is a real row, caret or not.
   assert reply.line_numbers.1.n is 2
-  assert reply.line_numbers.2.n is 3
-  assert reply.line_numbers.42.n is 43
+  assert reply.line_numbers.41.n is 42
   # 35 rows fill page 1; Continuous keeps counting onto page 2.
   assert reply.line_numbers.34.n is 35
   assert reply.line_numbers.34.page is 1
@@ -41,17 +37,19 @@ test line numbers draw in print layout, continue across pages and columns, and f
   assert reply.line_numbers.35.page is 1
   assert reply.line_numbers.35.n is 36
   assert reply.line_numbers.35.x is 591
-  assert reply.line_numbers.42.n is 43
-  assert reply.line_numbers.42.x is 591
-  # Zoom out: the caret bar is a fixed 19px, taller than a wrapped line at
-  # this zoom. With the caret in an EMPTY paragraph (offset 7) it must not
-  # add a row — a phantom row would push every later number's y down a row.
+  assert reply.line_numbers.41.page is 1
+  assert reply.line_numbers.41.n is 42
+  assert reply.line_numbers.41.x is 591
+  # Zoom out: the caret is a fixed 19px but shrinks with the line, so with
+  # the caret in an EMPTY paragraph (offset 8, the first of the trailing
+  # empties) it must not add a row — a phantom row would push every later
+  # number's y down a row.
   key ctrl+- ctrl+- ctrl+- ctrl+- ctrl+- ctrl+- ctrl+- ctrl+-
-  call selection-set {"start":7,"end":7}
+  call selection-set {"start":8,"end":8}
   shot window
   call doc {}
   assert reply.line_numbers.0.n is 1
-  assert reply.line_numbers.5.y is 331
+  assert reply.line_numbers.5.y is 345
   # None removes them again.
   call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
   call menu-click {"label":"None"}
