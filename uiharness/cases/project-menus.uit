@@ -159,12 +159,16 @@ test a press outside a menu, another tab or a command closes it first
   call-error menu-click {"label":"Bold"} => no menu is open
   call-error menu-close {} => no menu is open
 
-test a key under an open menu closes it and goes no further
+test a key under an open menu is swallowed and goes no further
   open copy:../fixtures/basic.docx
   type hello
   call menu-open {"target":"document"}
-  # The first key closes the menu and is swallowed: no x is typed.
+  # A letter that matches no item's key tip stays in the menu and is
+  # swallowed: no x is typed (#591).
   type x
+  assert menu.target is document
+  assert text is hello
+  key escape
   assert menu is nothing
   assert text is hello
   open copy:../fixtures/gantt-summary.xml
