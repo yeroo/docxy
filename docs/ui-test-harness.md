@@ -1243,7 +1243,7 @@ Menus open today:
 | Verb | Args | Reply |
 |---|---|---|
 | `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select, Sort & Filter), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document tab; #619), `"ribbon-bar"` (the ribbon's right-click menu: Collapse the Ribbon, ticked while collapsed; #590) | the menu, as `menu-read` |
-| `menu-read` | `{}` | `{open: true, target, items, highlight}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null |
+| `menu-read` | `{}` | `{open: true, target, items, highlight, depth}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null; `depth` is the submenu level the menu sits at (0 where it opened, +1 per submenu entered in its place; #591) |
 | `menu-click` | `{label}` among the top-level items, `{path: [labels]}` through submenus, or `{index}`: the top-level item at that 0-based index, separators and headings not counted, for labels that repeat | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
 
@@ -1320,12 +1320,17 @@ would. Reads leave it open.
 
 While a menu is open it takes every key. Down and Up move its highlight over
 the items that can run (past separators, headings and disabled items, wrapping
-at the ends; from none, Down takes the first and Up the last), and Enter runs
-the highlighted item — or opens its submenu in the menu's place — or, with
-nothing highlighted, closes the menu. Esc closes it, and so does any other key,
-Tab included. None reaches the document or cell under it. A press outside the
-menu closes it too.
-`project-menus.uit` drives all three menus.
+at the ends; from none, Down takes the first and Up the last). Enter runs the
+highlighted item: an item with a submenu opens it in the menu's place with its
+first item highlighted, and with nothing highlighted Enter closes the menu.
+Right opens the highlighted item's submenu the same way; Left and Esc back out
+one level, and Esc closes the menu at the level it opened on. A bare character
+equal to an item's one-character key tip runs that item like Enter, and any
+other character is swallowed; a modifier chord and any other key close the
+menu and are spent, Tab included. None reaches the document or cell under it.
+A press outside the menu closes it too.
+`project-menus.uit` drives the opening and clicking; `menu-keys.uit` drives
+the keyboard.
 
 ### Headers and footers
 

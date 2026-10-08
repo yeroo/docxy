@@ -62,3 +62,20 @@ test a letter that matches no key tip is swallowed and the menu stays
   # A non-character key is not single-character: it still closes the menu.
   key tab
   assert menu is nothing
+
+test a modified chord closes the menu without running a key tip
+  open ../fixtures/gantt-summary.xml
+  call menu-open {"target":{"ribbon":["Project","Schedule","Set Baseline"]}}
+  # Ctrl+B is not a bare letter: the menu closes and the chord is spent, so
+  # Set Baseline does not run.
+  key ctrl+b
+  assert menu is nothing
+  assert status is not Baseline set — baseline bars now show under the current bars
+  call ribbon-click {"tab":"Project","command":"Clear Baseline"}
+  assert status is No baseline to clear
+
+test a modified chord closes the cell menu without cutting
+  open ../fixtures/basic.xlsx
+  call menu-open {"target":{"cell":"C3"}}
+  key ctrl+x
+  assert menu is nothing

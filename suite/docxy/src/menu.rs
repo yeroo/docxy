@@ -187,11 +187,13 @@ pub(crate) struct Menu {
     pub target: MenuTarget,
     pub at: (f32, f32),
     pub items: Vec<MenuItem>,
-    /// The item Up and Down have highlighted (an index into `items`), for
-    /// Enter to run; `None` until the first arrow.
+    /// The highlighted item (an index into `items`), for Enter to run:
+    /// moved by Up/Down, set by entering or leaving a submenu; `None`
+    /// until the first arrow, and after a pointer-clicked submenu.
     pub hi: Option<usize>,
-    /// The levels above (`items` with the highlight each had), one entry per
-    /// submenu Right or Enter has opened in the menu's place (#591).
+    /// The levels above (`items` with the highlight each had): one entry per
+    /// submenu entered in the menu's place — a click, Right, Enter or a key
+    /// tip (#591).
     parents: Vec<(Vec<MenuItem>, Option<usize>)>,
 }
 

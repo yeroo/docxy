@@ -4781,6 +4781,63 @@ mod probes_tests {
     }
 }
 
+#[cfg(test)]
+mod menu_key_tests {
+    use super::Docxy;
+    use gpui::{Keystroke, Modifiers};
+
+    fn stroke(mods: Modifiers, key: &str, char: Option<&str>) -> Keystroke {
+        Keystroke {
+            modifiers: mods,
+            key: key.into(),
+            key_char: char.map(String::from),
+        }
+    }
+
+    #[test]
+    fn a_key_tip_char_is_a_bare_single_character_only() {
+        // A plain letter — and shifted, a capital still matching a "b" tip.
+        assert_eq!(
+            Docxy::tip_char(&stroke(Modifiers::none(), "b", Some("b"))),
+            Some('b')
+        );
+        assert_eq!(
+            Docxy::tip_char(&stroke(Modifiers::shift(), "B", Some("B"))),
+            Some('B')
+        );
+        // A modifier chord is no key tip: Ctrl+B must not run Set Baseline
+        // with its menu open, and Ctrl+X is spent closing the menu.
+        for mods in [
+            Modifiers::control(),
+            Modifiers::control_shift(),
+            Modifiers::alt(),
+            Modifiers::super_key(),
+            Modifiers::function(),
+        ] {
+            assert_eq!(Docxy::tip_char(&stroke(mods, "b", None)), None, "{mods:?}");
+        }
+        // Named keys deliver no character.
+        assert_eq!(
+            Docxy::tip_char(&stroke(Modifiers::none(), "space", None)),
+            None
+        );
+        assert_eq!(
+            Docxy::tip_char(&stroke(Modifiers::none(), "tab", None)),
+            None
+        );
+        // A non-Latin layout types its own character: и is not a "b".
+        assert_eq!(
+            Docxy::tip_char(&stroke(Modifiers::none(), "b", Some("и"))),
+            Some('и')
+        );
+        // A multi-character delivery is not one key tip.
+        assert_eq!(
+            Docxy::tip_char(&stroke(Modifiers::none(), "ab", Some("ab"))),
+            None
+        );
+    }
+}
+
 /// A zero-paint element that records where it was laid out, under `name`.
 ///
 /// Positioned absolutely and inset to zero, so it takes the whole of whatever
@@ -21357,11 +21414,11 @@ impl Docxy {
         // An open menu takes the key (#397, #591): Up and Down move its
         // highlight, Enter runs the highlighted item (or opens its submenu),
         // Right and Left walk in and out of submenus, Esc backs out of one or
-        // closes the menu, a key tip's letter runs its item, and any other
-        // key closes the menu and is spent. None reaches the document or
-        // cell under it.
+        // closes the menu, a key tip's letter runs its item and any other
+        // character is swallowed; every other key closes the menu and is
+        // spent. None reaches the document or cell under it.
         if self.menu.is_some() {
-            return self.menu_key(&ev.keystroke.key, window, cx);
+            return self.menu_key(&ev.keystroke, window, cx);
         }
         // Esc closes an open ribbon flyout (#1020), and only that.
         if ev.keystroke.key == "escape" && self.ribbon_flyout.take().is_some() {
@@ -28006,17 +28063,17 @@ impl Docxy {
     /// the menu's place, its first item highlighted; Enter with nothing
     /// highlighted closes the menu). Right opens the highlighted item's
     /// submenu the same way; Left and Esc back out one level, and Esc at the
-    /// level the menu opened on closes it. A character equal to an enabled
-    /// item's one-character key tip runs that item like Enter; one that
-    /// matches nothing is swallowed. Every other key closes the menu and is
-    /// spent.
-    fn menu_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// level the menu opened on closes it. A bare character equal to an
+    /// enabled item's one-character key tip runs that item like Enter, and
+    /// any other character is swallowed; a modifier chord or a named key
+    /// closes the menu and is spent.
+    fn menu_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
-        match key {
+        match keystroke.key.as_str() {
             "down" | "up" => {
-                menu.step(key == "down");
+                menu.step(keystroke.key == "down");
                 if let Some(i) = menu.hi {
                     self.menu_scroll.scroll_to_item(i);
                 }
@@ -28046,22 +28103,32 @@ impl Docxy {
                         self.menu_scroll.scroll_to_item(i);
                     }
                     cx.notify();
-                } else if key == "escape" {
+                } else if keystroke.key == "escape" {
                     // The level the menu opened on: Esc closes it, Left is
                     // spent leaving the menu open.
                     self.close_menu();
                     cx.notify();
                 }
             }
-            k if k.chars().count() == 1 => {
-                if let Some(i) = self.menu.as_ref().and_then(|m| m.by_key_tip(k)) {
-                    self.menu_run(i, window, cx);
+            _ => match Self::tip_char(keystroke) {
+                // A bare character: a key tip's letter runs its item, and
+                // any other character is swallowed and the menu stays.
+                Some(c) => {
+                    let mut buf = [0; 4];
+                    if let Some(i) = self
+                        .menu
+                        .as_ref()
+                        .and_then(|m| m.by_key_tip(c.encode_utf8(&mut buf)))
+                    {
+                        self.menu_run(i, window, cx);
+                    }
                 }
-            }
-            _ => {
-                self.close_menu();
-                cx.notify();
-            }
+                // A modifier chord or a named key closes the menu, spent.
+                None => {
+                    self.close_menu();
+                    cx.notify();
+                }
+            },
         }
     }
 
@@ -28089,6 +28156,22 @@ impl Docxy {
             }
             cx.notify();
         }
+    }
+
+    /// The character an open menu's key tips may match, if this keystroke is
+    /// a bare printable character: no modifier but shift held, and the
+    /// platform delivered the single character the key would type (`None`
+    /// for named keys and modifier chords). Matching what would be typed —
+    /// not `key`, the character printed on the key — keeps a Cyrillic и from
+    /// reading as a "b" on a non-Latin layout (gpui's `Keystroke::key_char`).
+    fn tip_char(keystroke: &Keystroke) -> Option<char> {
+        let m = &keystroke.modifiers;
+        if m.control || m.alt || m.platform || m.function {
+            return None;
+        }
+        let mut chars = keystroke.key_char.as_deref()?.chars();
+        let c = chars.next()?;
+        chars.next().is_none().then_some(c)
     }
 
     /// Click the open menu's item at `path` (indices through submenus): the
