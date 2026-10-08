@@ -8023,21 +8023,6 @@ fn about_lines() -> Vec<RLine<'static>> {
         .collect()
 }
 
-/// Every line of an 80x24 frame drawn by `draw`, for the About checks (#1021).
-#[cfg(test)]
-fn screen_80x24(draw: impl FnOnce(&mut Frame)) -> Vec<String> {
-    let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-    term.draw(draw).unwrap();
-    let buf = term.backend().buffer();
-    (0..24)
-        .map(|y| {
-            (0..80)
-                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
-                .collect()
-        })
-        .collect()
-}
-
 /// Open a URL with the OS default handler — **without a shell** (the URL is
 /// passed as a direct argument), and only after [`safe_url`] has approved it.
 fn open_url(url: &str) {
@@ -10045,6 +10030,20 @@ mod tests {
                 .any(|l| l.contains("Build") && l.contains(&line)),
             "{info:?}"
         );
+    }
+
+    /// Every line of an 80x24 frame drawn by `draw`, for the About checks (#1021).
+    fn screen_80x24(draw: impl FnOnce(&mut Frame)) -> Vec<String> {
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(draw).unwrap();
+        let buf = term.backend().buffer();
+        (0..24)
+            .map(|y| {
+                (0..80)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
+                    .collect()
+            })
+            .collect()
     }
 
     /// #1021: Help › About opens File › Info, whose About section lists

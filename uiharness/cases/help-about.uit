@@ -85,6 +85,15 @@ test Help and F1 say the documentation is coming; Training and What's New wait
   assert reply.tabs.8.groups.0.commands.3.enabled is false
   assert reply.tabs.8.groups.0.commands.4.label is What's New
   assert reply.tabs.8.groups.0.commands.4.enabled is false
+  # Their KeyTips (Alt, Y, T / W) reach the disabled commands, which leave the
+  # status line alone.
+  call ribbon-click {"tab":"Help","command":"Feedback"}
+  key alt y t
+  key escape escape
+  key alt y w
+  key escape escape
+  call status-read {}
+  assert reply.items.0.text is Opened the feedback page in your browser
   open ../fixtures/basic.xlsx
   call-error ribbon-click {"tab":"Help","command":"Show Training"} => 'Show Training' is not implemented
   call ribbon-click {"tab":"Help","command":"Feedback"}

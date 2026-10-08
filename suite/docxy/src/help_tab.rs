@@ -117,6 +117,11 @@ pub(crate) fn is_help_key(k: &Keystroke) -> bool {
 impl Docxy {
     /// Run a Help tab command.
     pub(crate) fn help_act(&mut self, act: HelpAct, window: &mut Window, cx: &mut Context<Self>) {
+        // A disabled command (reached by its KeyTip) does nothing, and leaves
+        // the status line as it was.
+        if !help_enabled(act) {
+            return self.refocus(window, cx);
+        }
         match act {
             HelpAct::Help => self.set_status(DOCS_COMING),
             HelpAct::ContactSupport | HelpAct::Feedback => {
@@ -124,9 +129,7 @@ impl Docxy {
                 self.open_help_url(url, cx);
                 self.set_status(FEEDBACK_OPENED);
             }
-            HelpAct::ShowTraining | HelpAct::WhatsNew => {
-                self.set_status(format!("{}: coming later", help_label(act)));
-            }
+            HelpAct::ShowTraining | HelpAct::WhatsNew => {}
             HelpAct::About => {
                 if let Err(e) = self.open_about() {
                     self.set_status(e);
@@ -143,17 +146,6 @@ impl Docxy {
             cx.open_url(&url);
         }
         self.last_opened_url = Some(url);
-    }
-}
-
-fn help_label(act: HelpAct) -> &'static str {
-    match act {
-        HelpAct::Help => "Help",
-        HelpAct::ContactSupport => "Contact Support",
-        HelpAct::Feedback => "Feedback",
-        HelpAct::ShowTraining => "Show Training",
-        HelpAct::WhatsNew => "What's New",
-        HelpAct::About => "About docxy suite",
     }
 }
 

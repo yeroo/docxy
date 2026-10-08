@@ -1713,14 +1713,16 @@ fn last_url_json(url: Option<&str>) -> Json {
     };
     let (page, query) = url.split_once('?').unwrap_or((url, ""));
     let body = percent_decode(query.strip_prefix("body=").unwrap_or(query));
+    // Whole rows by their label: a PR title may hold "host:" or a SHA.
+    let commit = format!("commit:      {}", crate::about::info().commit);
     Json::obj(vec![
         ("url", Json::Str(url.into())),
         ("page", Json::Str(page.into())),
+        ("has_commit", Json::Bool(body.lines().any(|l| l == commit))),
         (
-            "has_commit",
-            Json::Bool(body.contains(&format!("commit:      {}\n", crate::about::info().commit))),
+            "has_host",
+            Json::Bool(body.lines().any(|l| l.starts_with("host:"))),
         ),
-        ("has_host", Json::Bool(body.contains("host:"))),
     ])
 }
 
@@ -5847,6 +5849,12 @@ mod tests {
         assert_eq!(host.get("has_host"), Some(&Json::Bool(true)));
         assert_eq!(host.get("has_commit"), Some(&Json::Bool(false)));
         assert_eq!(percent_decode("a%2"), "a%2", "a cut escape stays");
+        // A PR title naming a host is not the host row.
+        let mut b = crate::about::info().clone();
+        b.last_pr_title = Some("fix host: name in the title bar".into());
+        let titled = last_url_json(Some(&b.feedback_url("suite")));
+        assert_eq!(titled.get("has_host"), Some(&Json::Bool(false)));
+        assert_eq!(titled.get("has_commit"), Some(&Json::Bool(true)));
     }
 
     /// #627: `inspect` reports every category, a count for all but properties.

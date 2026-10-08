@@ -2296,21 +2296,6 @@ fn truncate(s: &str, width: usize) -> String {
     out
 }
 
-/// Every line of an 80x24 frame drawn by `draw`, for the About checks (#1021).
-#[cfg(test)]
-fn screen_80x24(draw: impl FnOnce(&mut Frame)) -> Vec<String> {
-    let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-    term.draw(draw).unwrap();
-    let buf = term.backend().buffer();
-    (0..24)
-        .map(|y| {
-            (0..80)
-                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
-                .collect()
-        })
-        .collect()
-}
-
 /// What Help › Help says until the documentation lands (#1021).
 const HELP_COMING: &str = "Help: the documentation is coming soon";
 
@@ -3103,7 +3088,7 @@ mod tests {
             app.apply_act(Act::AddTask);
         }
         app.apply_act(Act::About);
-        let screen = screen_80x24(|f| draw(f, &mut app));
+        let screen = screen_80x24(&mut app);
         assert!(
             screen.iter().any(|l| l.contains("About yppxy")),
             "{screen:#?}"
@@ -3909,6 +3894,12 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             },
         );
+    }
+
+    /// Every line of an 80x24 frame, for the About checks (#1021).
+    fn screen_80x24(app: &mut App) -> Vec<String> {
+        let text: Vec<char> = buffer_text(app, 80, 24).chars().collect();
+        text.chunks(80).map(|l| l.iter().collect()).collect()
     }
 
     /// Row `y` of a `w`-wide frame, as text.

@@ -11252,21 +11252,6 @@ fn safe_url(url: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
-/// Every line of an 80x24 frame drawn by `draw`, for the About checks (#1021).
-#[cfg(test)]
-fn screen_80x24(draw: impl FnOnce(&mut Frame)) -> Vec<String> {
-    let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-    term.draw(draw).unwrap();
-    let buf = term.backend().buffer();
-    (0..24)
-        .map(|y| {
-            (0..80)
-                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
-                .collect()
-        })
-        .collect()
-}
-
 /// What Help › Help says until the documentation lands (#1021).
 const HELP_COMING: &str = "Help: the documentation is coming soon";
 
@@ -11479,6 +11464,20 @@ mod tests {
                 .any(|l| l.contains("Build") && l.contains(&line)),
             "{info:?}"
         );
+    }
+
+    /// Every line of an 80x24 frame drawn by `draw`, for the About checks (#1021).
+    fn screen_80x24(draw: impl FnOnce(&mut Frame)) -> Vec<String> {
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(draw).unwrap();
+        let buf = term.backend().buffer();
+        (0..24)
+            .map(|y| {
+                (0..80)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
+                    .collect()
+            })
+            .collect()
     }
 
     /// #1021: Help › About opens File › Info, whose About section lists
