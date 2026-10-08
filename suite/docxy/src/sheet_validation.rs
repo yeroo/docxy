@@ -557,6 +557,33 @@ mod tests {
         assert_eq!(view(&mut t).pkg.workbook.tables[0].range, (0, 0, 2, 1));
     }
 
+    /// #1079: a Tab held on a warning and accepted still belongs to its run.
+    #[test]
+    fn an_accepted_tab_keeps_the_run_so_enter_returns_to_its_start() {
+        let mut t = book(AlertStyle::Warning);
+        select(&mut t, "A2");
+        let type_in = |t: &mut DocTab, text: &str| {
+            let v = view(t);
+            v.begin_cell_edit(Some(String::new()));
+            v.edit_caret = 0;
+            for ch in text.chars() {
+                v.edit_type(&ch.to_string());
+            }
+        };
+        type_in(&mut t, "1");
+        assert_eq!(view(&mut t).tab_commit(1), Some(true));
+        type_in(&mut t, "250");
+        assert_eq!(view(&mut t).tab_commit(1), None);
+        let d = alert_dialog(&view(&mut t).dv_pending.clone().unwrap().violation);
+        t.dialogs.push(d);
+        view(&mut t).entry_error = None;
+        press(&mut t, "Yes").unwrap();
+        assert_eq!(view(&mut t).sel, at("C2"));
+        type_in(&mut t, "3");
+        assert_eq!(view(&mut t).enter_commit(false), Some(true));
+        assert_eq!(view(&mut t).sel, at("A3"));
+    }
+
     #[test]
     fn a_warning_asks_yes_no_and_an_information_alert_lets_the_entry_in() {
         let mut t = book(AlertStyle::Warning);

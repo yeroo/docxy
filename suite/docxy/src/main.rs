@@ -3231,20 +3231,23 @@ impl SheetView {
 
     /// Tab (`dc` = 1) or Shift+Tab (-1): commit and step sideways, noting the
     /// column the run of them began in so a later Enter can return to it
-    /// (#1079). A refused entry neither moves nor changes the run.
+    /// (#1079). A refused entry neither moves nor changes the run; one held
+    /// on a data-validation alert extends it, for Yes or OK makes the move.
     fn tab_commit(&mut self, dc: i32) -> Option<bool> {
         let (r, c) = self.sel;
         let start = self
             .tab_run
             .filter(|t| t.sheet == self.active && t.at == self.sel)
             .map_or(c, |t| t.start_col);
-        let res = self.commit_and_move(0, dc)?;
-        self.tab_run = Some(TabRun {
-            sheet: self.active,
-            start_col: start,
-            at: (r, (c as i32 + dc).max(0) as u32),
-        });
-        Some(res)
+        let res = self.commit_and_move(0, dc);
+        if res.is_some() || self.dv_pending.is_some() {
+            self.tab_run = Some(TabRun {
+                sheet: self.active,
+                start_col: start,
+                at: (r, (c as i32 + dc).max(0) as u32),
+            });
+        }
+        res
     }
 
     /// Enter (Shift+Enter: `back`): commit and move as the Editing options
