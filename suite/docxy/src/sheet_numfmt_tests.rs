@@ -36,6 +36,14 @@ fn numfmt_category_general_spellings() {
     assert_eq!(numfmt_category(Some("")), "General");
     assert_eq!(numfmt_category(Some("General")), "General");
     assert_eq!(numfmt_category(Some("general")), "General");
+    assert_eq!(numfmt_category(Some(" General ")), "General");
+}
+
+#[test]
+fn numfmt_category_padded_codes_are_custom() {
+    assert_eq!(numfmt_category(Some("0 ")), "Custom");
+    assert_eq!(numfmt_category(Some(" 0.00")), "Custom");
+    assert_eq!(numfmt_category(Some("  ")), "Custom");
 }
 
 #[test]

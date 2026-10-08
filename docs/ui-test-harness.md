@@ -518,7 +518,9 @@ Number Format`), and `tip.title` is the label (sheet buttons have no
 screentips or KeyTips). `checked` is the pressed state Bold, Italic, Borders
 and the three aligns draw for the selection, or the sheet's own state for a
 check box or a drop-down item (Print Gridlines, Print Headings, the page's
-orientation, size and margins, Filter while the sheet has AutoFilter buttons). A toggle reads its current label
+orientation, size and margins, Filter while the sheet has AutoFilter buttons). The Number
+Format combo (`number-format`) carries the `value` it shows (`General`, `Percentage`,
+`Date`, … or `Custom`, #1140); `sheet-numfmt-box.uit` covers it. A toggle reads its current label
 (`Unfreeze Panes`, `Unprotect Sheet`) and resolves by it. Placeholder buttons
 that do nothing yet (Format Painter, Underline, Cell Styles, Spelling, …) are
 `enabled: false`, and `ribbon-click` refuses them (`'Spelling' is not

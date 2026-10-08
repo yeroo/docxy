@@ -860,8 +860,9 @@ struct EditPoint {
 /// built-in id's code, so a General cell arrives as `Some("General")`, #1140),
 /// "Custom" only for a code that is none of them.
 fn numfmt_category(code: Option<&str>) -> &'static str {
-    let code = code.map_or("", str::trim);
-    if code.is_empty() || code.eq_ignore_ascii_case("general") {
+    // Only the General spelling is trimmed: a padded code like "0 " is custom.
+    let code = code.unwrap_or("");
+    if code.is_empty() || code.trim().eq_ignore_ascii_case("general") {
         return "General";
     }
     // `NUM_FORMATS` codes first, so the picker's highlight is its own label.
