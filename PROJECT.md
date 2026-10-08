@@ -461,10 +461,13 @@ dropped; nothing commits until Enter (one undo step), and a cut whose
 clipboard write failed keeps the buffer and says so.
 
 The entry table also has Project's range selection (#560). Shift+arrows
-extend a rectangle from the anchor (where the cursor was) to the cursor; a
+extend a rectangle from the anchor (where the cursor was) to the cursor, and
+so do Shift+Home/End (the row's first and last field), Shift+Ctrl+Left/Right
+(the same), Shift+Ctrl+Up/Down (the first and last shown task) and
+Shift+Ctrl+Home/End (both), never onto the entry row (#1087); a
 mouse drag over the cells, Shift+click, or a click on a task's ID cell (the
 whole row, like Project's row header) selects too, and any other key, click
-or command clears it. Ctrl+C copies the range as TSV — one line per shown
+or command clears it. Delete still acts on the cursor's cell only. Ctrl+C copies the range as TSV — one line per shown
 row, each field a cell's edit text with tabs and line breaks inside a field
 turned to spaces — and Ctrl+X copies it, then clears whichever of Name,
 Predecessors and Resource Names the range covers, as one undo step; Ctrl+V
