@@ -11,7 +11,10 @@
 //! mark, so its RTF ends without `\par`: a target app would otherwise add a
 //! newline to every partial copy. A copy through the mark (`[["abc"], []]`)
 //! ends with one `\par`. An importer closes the last paragraph either way,
-//! so the paste takes the mark from the plain text copied with the RTF.
+//! so the paste takes the mark from the plain text copied with the RTF: when
+//! that text ends with more newlines than the clip read from the RTF does,
+//! the clip gains the mark it lost (an empty last paragraph). A trailing line
+//! break is a newline in both, so it gains nothing.
 
 use crate::editor::Clip;
 use crate::export_context::ExportContext;
@@ -57,9 +60,10 @@ impl Clip {
 
     /// The clip another app's RTF copy holds, or `None` when `bytes` is not
     /// RTF, holds no text, or is past what an import may cost: the paste
-    /// then takes the plain text. `plain` is the text copied with it: when
-    /// it ends with a newline, so does the clip (see the module). A table
-    /// row is one paragraph, its cells joined by tabs, as in plain text.
+    /// then takes the plain text. `plain` is the text copied with it: it
+    /// says whether the clip ends with a paragraph mark (see the module). A
+    /// table row is one paragraph, its cells joined by tabs, as in plain
+    /// text.
     pub fn from_rtf(bytes: &[u8], plain: Option<&str>) -> Option<Clip> {
         from_rtf_within(bytes, plain, &Budget::standard())
     }
@@ -79,7 +83,7 @@ fn from_rtf_within(bytes: &[u8], plain: Option<&str>, budget: &Budget) -> Option
                         if i > 0 {
                             line.push(Inline::Tab(RunProps::default()));
                         }
-                        cell_inlines(&cell.blocks, &mut line);
+                        cell_inlines(&cell.blocks, &mut line, &mut true);
                     }
                     paras.push(line);
                 }
@@ -90,20 +94,29 @@ fn from_rtf_within(bytes: &[u8], plain: Option<&str>, budget: &Budget) -> Option
     if paras.is_empty() {
         return None;
     }
-    let ends_with_mark = plain.is_some_and(|t| t.ends_with('\n'));
-    if ends_with_mark && paras.last().is_some_and(|p| !p.is_empty()) {
-        paras.push(Vec::new());
+    let mut clip = Clip { paras };
+    if plain.is_some_and(|t| trailing_newlines(t) > trailing_newlines(&clip.to_text())) {
+        clip.paras.push(Vec::new());
     }
-    Some(Clip { paras })
+    Some(clip)
+}
+
+/// How many newlines `text` ends with, a CRLF counting as one.
+fn trailing_newlines(text: &str) -> usize {
+    text.replace("\r\n", "\n")
+        .chars()
+        .rev()
+        .take_while(|&c| c == '\n')
+        .count()
 }
 
 /// A table cell's content on one line: its paragraphs (and a nested table's)
-/// joined by line breaks.
-fn cell_inlines(blocks: &[Block], out: &mut Vec<Inline>) {
+/// joined by line breaks. `first` is true until the cell's first paragraph.
+fn cell_inlines(blocks: &[Block], out: &mut Vec<Inline>, first: &mut bool) {
     for block in blocks {
         match block {
             Block::Paragraph(p) => {
-                if !out.is_empty() && !matches!(out.last(), Some(Inline::Tab(_))) {
+                if !std::mem::take(first) {
                     out.push(Inline::Break(BreakKind::Line, RunProps::default()));
                 }
                 out.extend(p.content.iter().cloned());
@@ -111,7 +124,7 @@ fn cell_inlines(blocks: &[Block], out: &mut Vec<Inline>) {
             Block::Table(t) => {
                 for row in &t.rows {
                     for cell in &row.cells {
-                        cell_inlines(&cell.blocks, out);
+                        cell_inlines(&cell.blocks, out, first);
                     }
                 }
             }
@@ -212,11 +225,23 @@ mod tests {
     fn the_trailing_paragraph_mark_round_trips() {
         let a = || vec![plain("a")];
         let b = || vec![plain("b")];
+        let a_break = || {
+            vec![
+                plain("a"),
+                Inline::Break(BreakKind::Line, RunProps::default()),
+            ]
+        };
         for paras in [
             vec![a()],
             vec![a(), vec![]],
             vec![a(), b()],
             vec![a(), b(), vec![]],
+            // Marks after blank paragraphs.
+            vec![vec![], vec![]],
+            vec![a(), vec![], vec![]],
+            // A trailing line break is no paragraph mark.
+            vec![a_break()],
+            vec![a_break(), vec![]],
         ] {
             let clip = Clip { paras };
             assert_eq!(shape(&round_trip(&clip)), shape(&clip), "{clip:?}");
@@ -318,6 +343,15 @@ mod tests {
         let rtf = br"{\rtf1\ansi\deff0\trowd\cellx1000\cellx2000\intbl a\cell\intbl b\cell\row\trowd\cellx1000\cellx2000\intbl c\cell\intbl d\cell\row}";
         let clip = Clip::from_rtf(rtf, Some("a\tb\nc\td")).unwrap();
         assert_eq!(clip.to_text(), "a\tb\nc\td");
+    }
+
+    /// A cell's paragraphs are joined by a line break whatever they hold: an
+    /// empty first one, or one ending in a tab.
+    #[test]
+    fn a_cell_keeps_its_paragraph_boundaries() {
+        let rtf = br"{\rtf1\ansi\trowd\cellx1000\cellx2000\intbl\par\intbl b\cell\intbl a\tab\par\intbl b\cell\row}";
+        let clip = Clip::from_rtf(rtf, None).unwrap();
+        assert_eq!(clip.to_text(), "\nb\ta\t\nb");
     }
 
     #[test]

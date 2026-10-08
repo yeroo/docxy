@@ -8,7 +8,25 @@
 //! clipboard) both calls do nothing and copy and paste stay plain text.
 //!
 //! A failed write leaves the copy as plain text; a failed read pastes the
-//! plain text.
+//! plain text, and so does an RTF past [`MAX_RTF`], read no further.
+
+/// The largest RTF a paste reads off the clipboard. Word's RTF carries its
+/// pictures as hex, so a page or two of them is megabytes; past this the
+/// paste takes the plain text rather than copying it all to find out.
+const MAX_RTF: usize = 64 << 20;
+
+/// `bytes` copied into a new vector, or `None` past [`MAX_RTF`] or when the
+/// memory cannot be had.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn bounded_copy(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.is_empty() || bytes.len() > MAX_RTF {
+        return None;
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len()).ok()?;
+    out.extend_from_slice(bytes);
+    Some(out)
+}
 
 /// Add `rtf` to the copy on the clipboard.
 pub(crate) fn write_rtf(rtf: String) {
@@ -39,7 +57,9 @@ mod imp {
     pub(super) fn read_rtf() -> Option<Vec<u8>> {
         let board = NSPasteboard::generalPasteboard();
         let data = board.dataForType(&NSString::from_str(RTF))?;
-        Some(data.to_vec()).filter(|bytes| !bytes.is_empty())
+        // Measured before it is copied.
+        let len = data.len();
+        (len > 0 && len <= super::MAX_RTF).then(|| data.to_vec())
     }
 }
 
@@ -137,7 +157,7 @@ mod imp {
         let _open = Open::new()?;
         // SAFETY: the handle belongs to the open clipboard; it is read only
         // while locked, within the size the allocation reports.
-        let mut bytes = unsafe {
+        unsafe {
             let mem = GetClipboardData(format);
             if mem.is_null() {
                 return None;
@@ -146,15 +166,33 @@ mod imp {
             if ptr.is_null() {
                 return None;
             }
-            let bytes = std::slice::from_raw_parts(ptr, GlobalSize(mem)).to_vec();
+            let block = std::slice::from_raw_parts(ptr, GlobalSize(mem));
+            // NUL-terminated, and may be padded past it; the RTF ends at the
+            // NUL (or, without one, where MAX_RTF stops the copy).
+            let end = block
+                .iter()
+                .take(super::MAX_RTF + 1)
+                .position(|&b| b == 0)
+                .unwrap_or(block.len());
+            let bytes = super::bounded_copy(&block[..end]);
             GlobalUnlock(mem);
             bytes
-        };
-        // The block is NUL-terminated and may be padded past it.
-        if let Some(end) = bytes.iter().position(|&b| b == 0) {
-            bytes.truncate(end);
         }
-        Some(bytes).filter(|bytes| !bytes.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_RTF, bounded_copy};
+
+    #[test]
+    fn a_read_is_bounded() {
+        assert_eq!(
+            bounded_copy(b"{\\rtf1 x}").as_deref(),
+            Some(&b"{\\rtf1 x}"[..])
+        );
+        assert_eq!(bounded_copy(b""), None);
+        assert_eq!(bounded_copy(&vec![b' '; MAX_RTF + 1]), None);
     }
 }
 
