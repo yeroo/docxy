@@ -28,6 +28,9 @@ pub(crate) struct SectionBox {
     pub col_gap: Vec<i32>,
     pub sep: bool,
     pub num_start: Option<i32>,
+    /// `w:lnNumType` for the section's paragraphs, if the section numbers
+    /// its lines (#746).
+    pub line_numbers: Option<docxcore::sect::LineNumbering>,
 }
 
 impl SectionBox {
@@ -171,6 +174,7 @@ fn section_box(sect: &str, gutter_at_top: bool) -> SectionBox {
         col_gap,
         sep: cols.sep,
         num_start: PageNumberFormat::parse(sect).start,
+        line_numbers: setup.line_numbers,
     }
 }
 

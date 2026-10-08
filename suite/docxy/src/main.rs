@@ -60,6 +60,7 @@ mod html_bundle;
 mod inputs;
 mod inspector;
 mod layout_tab;
+mod line_numbers;
 mod mac_nav;
 mod macos_menu;
 mod mailings_dialogs;
