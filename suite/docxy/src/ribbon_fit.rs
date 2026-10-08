@@ -164,8 +164,9 @@ fn lines_w(text: &str, size: f32, tw: TextWidth) -> f32 {
         .fold(0.0, f32::max)
 }
 
-/// `menu_button_label`'s width: the label's lines at 11px, the last with " ▾".
-fn menu_label_w(text: &str, tw: TextWidth) -> f32 {
+/// `menu_button_label`'s width: the label's lines at `size` px, the last
+/// with " ▾".
+pub(crate) fn menu_label_w(text: &str, size: f32, tw: TextWidth) -> f32 {
     let lines = crate::label_lines(text);
     let last = lines.len().saturating_sub(1);
     lines
@@ -173,33 +174,89 @@ fn menu_label_w(text: &str, tw: TextWidth) -> f32 {
         .enumerate()
         .map(|(i, l)| {
             if i == last {
-                tw(&format!("{l} \u{25BE}"), 11.0)
+                tw(&format!("{l} \u{25BE}"), size)
             } else {
-                tw(l, 11.0)
+                tw(l, size)
             }
         })
         .fold(0.0, f32::max)
 }
 
-/// The collapsed button's width for a group titled `title`: its title lines
-/// (the last with the drop-down mark) between its padding, at least
-/// [`COLLAPSED_MIN_W`], plus the right divider. The button is drawn exactly
-/// this wide.
+/// The collapsed button's width for a group titled `title`: its title as a
+/// menu button's label (the last line with the drop-down mark) between its
+/// padding, at least [`COLLAPSED_MIN_W`], plus the right divider. The button
+/// is drawn exactly this wide.
 pub(crate) fn collapsed_w(title: &str, tw: TextWidth) -> f32 {
-    let lines = crate::label_lines(title);
-    let last = lines.len().saturating_sub(1);
-    let text = lines
-        .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            if i == last {
-                tw(&format!("{l} \u{25BE}"), COLLAPSED_TITLE_PX)
-            } else {
-                tw(l, COLLAPSED_TITLE_PX)
-            }
-        })
-        .fold(0.0, f32::max);
+    let text = menu_label_w(title, COLLAPSED_TITLE_PX, tw);
     (text + COLLAPSED_PAD).ceil().max(COLLAPSED_MIN_W) + 1.0
+}
+
+/// Greedy rows of items `widths` wide, `gap` apart, each row at most `max_w`
+/// (an item wider than that gets a row to itself): how a flyout wraps a
+/// group too wide for the window, every item at its full size (#1020).
+pub(crate) fn wrap_rows(widths: &[f32], gap: f32, max_w: f32) -> Vec<std::ops::Range<usize>> {
+    let mut rows = Vec::new();
+    let (mut start, mut w) = (0, 0.0);
+    for (i, &iw) in widths.iter().enumerate() {
+        if i > start && w + gap + iw > max_w {
+            rows.push(start..i);
+            (start, w) = (i, iw);
+        } else {
+            w += if i > start { gap + iw } else { iw };
+        }
+    }
+    if start < widths.len() {
+        rows.push(start..widths.len());
+    }
+    rows
+}
+
+/// A gallery's tile pitch: tile width, the gap between tiles, and the
+/// well's padding and border on both sides together.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GalleryGeom {
+    pub tile_w: f32,
+    pub tile_h: f32,
+    pub gap: f32,
+    pub frame: f32,
+}
+
+/// The Styles gallery's (`style_gallery::TILE`) or the Table Styles
+/// gallery's (`table_style_gallery`: 4x12 px cells, 3 px padding and a 2 px
+/// border per tile, 2 px apart, in a well with 2 px padding and a 1 px border).
+pub(crate) fn gallery_geom<A>(gal: &rs::Gallery<A>) -> GalleryGeom {
+    if gal.id == "tablestyles" {
+        GalleryGeom {
+            tile_w: 58.0,
+            tile_h: 4.0 * 8.0 + 10.0,
+            gap: 2.0,
+            frame: 6.0,
+        }
+    } else {
+        let t = crate::style_gallery::TILE;
+        GalleryGeom {
+            tile_w: t.w,
+            tile_h: t.h,
+            gap: t.gap,
+            frame: 2.0 * (t.well_pad + t.well_border),
+        }
+    }
+}
+
+/// How many of a gallery's `n` tiles go on a row at most `max_w` wide (all
+/// of them with no limit, at least one), and the well's width then.
+pub(crate) fn gallery_row(geom: GalleryGeom, n: usize, max_w: Option<f32>) -> (usize, f32) {
+    let width = |k: usize| {
+        let k = k as f32;
+        k * geom.tile_w + (k - 1.0).max(0.0) * geom.gap + geom.frame
+    };
+    let mut k = n.max(1);
+    if let Some(max_w) = max_w {
+        while k > 1 && width(k) > max_w {
+            k -= 1;
+        }
+    }
+    (k, width(k))
 }
 
 // ---- the ribbonspec model (document and Project ribbons) ----
@@ -210,7 +267,14 @@ fn model_icon_btn_w(label: Option<&str>, tw: TextWidth) -> f32 {
     34.0 + label.map_or(0.0, |l| 6.0 + tw(l, 12.0))
 }
 
-fn model_control_w<A>(c: &Control<A>, icon_only: bool, tw: TextWidth) -> f32 {
+/// One control's drawn width; a gallery wraps its tiles to `max_w` (a
+/// flyout's limit) when one is given.
+pub(crate) fn model_control_w<A>(
+    c: &Control<A>,
+    icon_only: bool,
+    max_w: Option<f32>,
+    tw: TextWidth,
+) -> f32 {
     match c {
         Control::Toggle(_) => model_icon_btn_w(None, tw),
         // `large_btn`: `px_2` around the 26px icon or the label's lines.
@@ -218,7 +282,7 @@ fn model_control_w<A>(c: &Control<A>, icon_only: bool, tw: TextWidth) -> f32 {
         // `split_btn` and `dropdown_btn`: `px_1` around the icon or the
         // drop-down label.
         Control::Split { primary: cmd, .. } | Control::Dropdown { cmd, .. } => {
-            8.0 + menu_label_w(cmd.label, tw).max(26.0)
+            8.0 + menu_label_w(cmd.label, 11.0, tw).max(26.0)
         }
         // Columns of at most three buttons, `gap_1` apart.
         Control::Column(cmds) => {
@@ -248,14 +312,7 @@ fn model_control_w<A>(c: &Control<A>, icon_only: bool, tw: TextWidth) -> f32 {
                 cells + row.len().saturating_sub(1) as f32
             })
             .fold(0.0, f32::max),
-        Control::Gallery(gal) if gal.id == "tablestyles" => {
-            // `table_style_gallery`: 4x12px cells, 3px padding and a 2px
-            // border per tile, 2px apart, in a well with 2px padding and a
-            // 1px border.
-            let n = gal.items.len() as f32;
-            n * 58.0 + (n - 1.0).max(0.0) * 2.0 + 6.0
-        }
-        Control::Gallery(gal) => crate::style_gallery::well_width(gal.items.len()),
+        Control::Gallery(gal) => gallery_row(gallery_geom(gal), gal.items.len(), max_w).1,
         // A 1px rule with `mx_1`.
         Control::Separator => 9.0,
     }
@@ -267,7 +324,7 @@ pub(crate) fn model_group_w<A>(g: &rs::Group<A>, icon_only: bool, tw: TextWidth)
     let controls: f32 = g
         .items
         .iter()
-        .map(|c| model_control_w(c, icon_only, tw))
+        .map(|c| model_control_w(c, icon_only, None, tw))
         .sum::<f32>()
         + 4.0 * g.items.len().saturating_sub(1) as f32;
     let title = tw(g.title, 9.0)
@@ -313,7 +370,7 @@ pub(crate) fn sheet_cmd_w(c: &SheetCmd, icon_only: bool, tw: TextWidth) -> f32 {
     let text = c.text(false);
     match c.shape {
         // `sheet_dropdown_btn`: `px_1p5` around a 22px icon or the label.
-        Shape::Menu(_) => (12.0 + menu_label_w(c.label, tw).max(22.0)).max(40.0),
+        Shape::Menu(_) => (12.0 + menu_label_w(c.label, 11.0, tw).max(22.0)).max(40.0),
         // `sheet_lb`: `px_1p5` around a 22px icon or the label's 10px lines.
         Shape::Large(_) | Shape::Split { .. } => {
             (12.0 + lines_w(text, 10.0, tw).max(22.0)).max(40.0)
@@ -342,7 +399,21 @@ pub(crate) fn sheet_cmd_w(c: &SheetCmd, icon_only: bool, tw: TextWidth) -> f32 {
     }
 }
 
-fn gap_px(g: sheet_ribbon::Gap) -> f32 {
+/// One slot of a sheet strip: a command, a column (its widest command), or
+/// a drop-down button.
+pub(crate) fn sheet_item_w(item: &Item, icon_only: bool, tw: TextWidth) -> f32 {
+    match item {
+        Item::One(c) => sheet_cmd_w(c, icon_only, tw),
+        Item::Col(col) => col
+            .cmds
+            .iter()
+            .map(|c| sheet_cmd_w(c, icon_only, tw))
+            .fold(0.0, f32::max),
+        Item::Menu(m) => sheet_cmd_w(&m.button, icon_only, tw),
+    }
+}
+
+pub(crate) fn gap_px(g: sheet_ribbon::Gap) -> f32 {
     match g {
         sheet_ribbon::Gap::Px(v) => v,
         sheet_ribbon::Gap::Rem(v) => v * 16.0,
@@ -361,15 +432,7 @@ pub(crate) fn sheet_group_w(
         Body::Strip { gap, items } => {
             let widths: f32 = items
                 .iter()
-                .map(|item| match item {
-                    Item::One(c) => sheet_cmd_w(c, icon_only, tw),
-                    Item::Col(col) => col
-                        .cmds
-                        .iter()
-                        .map(|c| sheet_cmd_w(c, icon_only, tw))
-                        .fold(0.0, f32::max),
-                    Item::Menu(m) => sheet_cmd_w(&m.button, icon_only, tw),
-                })
+                .map(|item| sheet_item_w(item, icon_only, tw))
                 .sum();
             widths + gap_px(*gap) * items.len().saturating_sub(1) as f32
         }
@@ -678,5 +741,104 @@ mod tests {
         let text = tw(&format!("{} \u{25BE}", lines[1]), COLLAPSED_TITLE_PX)
             .max(tw(&lines[0], COLLAPSED_TITLE_PX));
         assert_eq!(w(long), (text + COLLAPSED_PAD).ceil().max(48.) + 1.);
+    }
+
+    #[test]
+    fn rows_wrap_greedily_and_a_wide_item_gets_its_own() {
+        assert_eq!(
+            wrap_rows(&[], 4., 100.),
+            Vec::<std::ops::Range<usize>>::new()
+        );
+        assert_eq!(wrap_rows(&[40., 40., 40.], 4., 200.), vec![0..3]);
+        // 40 + 4 + 40 = 84 fits 90; a third does not.
+        assert_eq!(wrap_rows(&[40., 40., 40.], 4., 90.), vec![0..2, 2..3]);
+        assert_eq!(
+            wrap_rows(&[30., 150., 30.], 4., 100.),
+            vec![0..1, 1..2, 2..3]
+        );
+    }
+
+    /// `gallery_row`'s width is the Styles well's as `style_gallery` draws it.
+    #[test]
+    fn a_style_gallery_row_is_as_wide_as_its_well() {
+        let home = model_tab(Kind::Docx, "Home");
+        let Some(Control::Gallery(gal)) = home
+            .groups
+            .iter()
+            .flat_map(|g| &g.items)
+            .find(|c| matches!(c, Control::Gallery(_)))
+        else {
+            panic!("Home has the Styles gallery");
+        };
+        let n = gal.items.len();
+        let geom = gallery_geom(gal);
+        assert_eq!(
+            gallery_row(geom, n, None),
+            (n, crate::style_gallery::well_width(n))
+        );
+        let (k, w) = gallery_row(geom, n, Some(200.));
+        assert!(k < n && w <= 200.);
+        assert_eq!(w, crate::style_gallery::well_width(k));
+    }
+
+    /// #1020 r1: a flyout never draws wider than the narrowest window. At the
+    /// 460 px minimum (less the window's insets, the flyout's margins and
+    /// padding, and the group's), every group of every tab wraps to rows no
+    /// wider than that, every control at its full size: Table Design's Table
+    /// Styles gallery (ten 58 px tiles) wraps its tiles.
+    #[test]
+    fn every_flyout_fits_the_narrowest_window() {
+        let max_w = 460. - 2. * 13. - 8. - 10. - 17.;
+        let mut model: Vec<rs::Tab<Act>> = Vec::new();
+        model.extend(crate::ribbon_for(Kind::Docx).tabs);
+        model.extend(crate::ribbon_for(Kind::Project).tabs);
+        model.push(crate::table_tab::table_design_tab());
+        model.push(crate::table_tab::table_layout_tab());
+        model.push(crate::hf_tab::hf_tab());
+        model.push(crate::gantt_format_tab());
+        let mut wrapped_a_gallery = false;
+        for t in &model {
+            for g in &t.groups {
+                let widths: Vec<f32> = g
+                    .items
+                    .iter()
+                    .map(|c| model_control_w(c, false, Some(max_w), &tw))
+                    .collect();
+                for (c, &w) in g.items.iter().zip(&widths) {
+                    assert!(
+                        w <= max_w,
+                        "{} / {}: a control {w} px wide",
+                        t.name,
+                        g.title
+                    );
+                    if let Control::Gallery(gal) = c {
+                        wrapped_a_gallery |= w < model_control_w(c, false, None, &tw);
+                        assert!(
+                            gallery_row(gallery_geom(gal), gal.items.len(), Some(max_w)).0 >= 1
+                        );
+                    }
+                }
+                for row in wrap_rows(&widths, 4., max_w) {
+                    let w: f32 =
+                        widths[row.clone()].iter().sum::<f32>() + 4. * (row.len() - 1) as f32;
+                    assert!(w <= max_w, "{} / {}: a row {w} px wide", t.name, g.title);
+                }
+            }
+        }
+        assert!(wrapped_a_gallery, "Table Styles is wider than the window");
+        let sheet_max = 460. - 2. * 13. - 8. - 10. - 13.;
+        for t in sheet_ribbon::SHEET_RIBBON {
+            for g in t.groups {
+                let Body::Strip { gap, items } = &g.body else {
+                    continue;
+                };
+                let widths: Vec<f32> = items.iter().map(|i| sheet_item_w(i, false, &tw)).collect();
+                for row in wrap_rows(&widths, gap_px(*gap), sheet_max) {
+                    let w: f32 = widths[row.clone()].iter().sum::<f32>()
+                        + gap_px(*gap) * (row.len() - 1) as f32;
+                    assert!(w <= sheet_max, "{}: a row {w} px wide", g.title);
+                }
+            }
+        }
     }
 }

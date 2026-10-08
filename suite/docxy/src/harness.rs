@@ -1923,19 +1923,30 @@ fn sheet_menu_open(
     open_ribbon_split_menu(app, id, window, cx)
 }
 
-/// Open split button or drop-down `id`'s menu where its arrow is drawn (the
-/// pointer's anchor), else mid-window.
-/// `ribbon-flyout`'s reply: whether a flyout is open, and whose.
+/// `ribbon-flyout`'s reply: whether a flyout is open, and whose; and, from
+/// the last frame, whether the flyout drawn there lies inside the window's
+/// width (the ribbon's edges), `null` before it is drawn.
 fn flyout_json(app: &crate::Docxy) -> Json {
     let (open, group, overflow) = match app.ribbon_flyout.map(|f| f.target) {
         None => (false, Json::Null, false),
         Some(crate::FlyoutTarget::Overflow) => (true, Json::Null, true),
         Some(crate::FlyoutTarget::Group(t)) => (true, Json::Str(t.into()), false),
     };
+    let probes = app.probes.borrow();
+    let inside = match (
+        open.then(|| probes.get("ribbon-flyout")).flatten(),
+        crate::ribbon_layout::body(&probes.last),
+    ) {
+        (Some(f), Some(body)) => {
+            Json::Bool(f.origin.x >= body.origin.x - px(0.5) && f.right() <= body.right() + px(0.5))
+        }
+        _ => Json::Null,
+    };
     Json::obj(vec![
         ("open", Json::Bool(open)),
         ("group", group),
         ("overflow", Json::Bool(overflow)),
+        ("inside", inside),
     ])
 }
 
@@ -1972,7 +1983,7 @@ fn open_flyout_of(app: &mut crate::Docxy, group: Option<&'static str>, window: &
 /// fits as it would if it were shown.
 fn add_group_states(json: &mut Json, app: &crate::Docxy, window: &Window) {
     let tw = crate::ribbon_text_width(window);
-    let width = f32::from(window.viewport_size().width);
+    let width = crate::ribbon_width(window);
     let Json::Obj(fields) = json else { return };
     let Some((_, Json::Arr(tabs))) = fields.iter_mut().find(|(k, _)| k == "tabs") else {
         return;
@@ -2014,6 +2025,8 @@ fn add_group_states(json: &mut Json, app: &crate::Docxy, window: &Window) {
     }
 }
 
+/// Open split button or drop-down `id`'s menu where its arrow is drawn (the
+/// pointer's anchor), else mid-window.
 fn open_ribbon_split_menu(
     app: &mut crate::Docxy,
     id: &str,
@@ -3847,7 +3860,12 @@ fn dispatch_verb(
             if !titles.is_empty()
                 && !(drawn
                     && crate::ribbon_layout::is_frame_of(&measured, &titles)
-                    && crate::ribbon_layout::frame_matches(&probes.last, &fits))
+                    && crate::ribbon_layout::frame_matches(&probes.last, &fits)
+                    && crate::ribbon_layout::drawn_matches(
+                        probes.fit_last.as_ref(),
+                        now.width,
+                        &fits,
+                    ))
             {
                 cx.notify();
                 return Done::ok(crate::ribbon_layout::unsettled_json(&name));

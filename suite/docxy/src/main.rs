@@ -4545,6 +4545,11 @@ struct Probes {
     last: Vec<(String, Bounds<Pixels>)>,
     /// Ribbon groups already warned about as clipped (debug builds).
     warned: std::collections::HashSet<String>,
+    /// The width the ribbon was fitted to and each group's state, as the
+    /// frame being laid out drew them (#1020), and as the last finished one
+    /// did: `ribbon-layout` reads a frame only if it drew the fit of now.
+    fit_next: Option<ribbon_layout::DrawnFit>,
+    fit_last: Option<ribbon_layout::DrawnFit>,
 }
 
 impl Probes {
@@ -18957,6 +18962,8 @@ impl Docxy {
         Ok(match reopen_step(reopen, tab.dirty, tab.access, mode) {
             ReopenStep::Reload => {
                 self.tabs[i] = tab_from_path_mode(&path, mode, &trusted)?;
+                // Nor a flyout opened on the document it replaces (#1020).
+                self.ribbon_flyout = None;
                 // A reloaded tab has none of the last Remove All's edits.
                 self.bs_info_status = None;
                 true
@@ -25445,7 +25452,9 @@ fn tab_keytip_cmd(tab: &rs::Tab<Act>, key: &str) -> Option<Act> {
 
 /// A large menu button's label, with the drop-down mark on its last line, as
 /// Office draws a split button's lower half and a drop-down button.
-fn menu_button_label(text: &str, fg: Hsla) -> Div {
+/// `size` is the text's (11 px on a button, a group title's 10 px on a
+/// collapsed group, #1020); `ribbon_fit::menu_label_w` is its width.
+fn menu_button_label(text: &str, size: f32, fg: Hsla) -> Div {
     let lines = label_lines(text);
     let last = lines.len().saturating_sub(1);
     let mut label = v_flex().items_center();
@@ -25457,7 +25466,8 @@ fn menu_button_label(text: &str, fg: Hsla) -> Div {
         };
         label = label.child(
             div()
-                .text_size(px(11.))
+                .whitespace_nowrap()
+                .text_size(px(size))
                 .text_color(fg)
                 .child(SharedString::from(ln)),
         );
@@ -25518,10 +25528,33 @@ fn flyout_toggle(
 /// group, in drawn order, its title, the icon its collapsed button shows, its
 /// widths, and where the fit put it.
 pub(crate) struct RibbonFitNow {
+    /// The width fitted into (`ribbon_width`).
+    pub width: f32,
     pub titles: Vec<&'static str>,
     pub icons: Vec<Option<&'static str>>,
     pub specs: Vec<ribbon_fit::Spec>,
     pub fit: ribbon_fit::Fit,
+}
+
+/// `cells` (`widths` wide) in rows at most `max_w` wide (`ribbon_fit::wrap_rows`),
+/// each row a `row(range)` container, stacked `gap` apart: a flyout's group
+/// too wide for the window (#1020).
+fn wrapped_rows(
+    cells: Vec<AnyElement>,
+    widths: &[f32],
+    gap: f32,
+    max_w: f32,
+    row: impl Fn(std::ops::Range<usize>) -> Div,
+) -> AnyElement {
+    let mut cells = cells.into_iter();
+    let rows = ribbon_fit::wrap_rows(widths, gap, max_w)
+        .into_iter()
+        .map(|r| {
+            let n = r.len();
+            row(r).children(cells.by_ref().take(n).collect::<Vec<_>>())
+        });
+    let rows: Vec<Div> = rows.collect();
+    v_flex().gap(px(gap)).children(rows).into_any_element()
 }
 
 /// Three lists from one of triples.
@@ -25569,6 +25602,9 @@ pub(crate) enum FlyoutTarget {
 #[derive(Clone, Copy)]
 pub(crate) struct RibbonFlyout {
     pub doc: usize,
+    /// How many documents the window had: a close or a move shifts the
+    /// indexes, and another document can take `doc`'s.
+    pub docs: usize,
     pub tab: RibbonTab,
     pub target: FlyoutTarget,
 }
@@ -25578,11 +25614,62 @@ pub(crate) struct RibbonFlyout {
 /// only the groups drawn in the ribbon itself.
 const FLYOUT_PROBE_PREFIX: &str = "ribbon-flyout:";
 
+/// The ribbon's width: the window's, less the client-side decorations' shadow
+/// padding and frame borders (as `title_bar_geometry` counts them), which
+/// the root takes off each side before the ribbon is laid out.
+fn ribbon_width(window: &Window) -> f32 {
+    let padding = gpui_component::window_paddings(window);
+    let borders = window_frame_borders(window);
+    f32::from(window.viewport_size().width)
+        - f32::from(padding.left + padding.right)
+        - borders.left
+        - borders.right
+}
+
+/// How a flyout's copy of a group is drawn (#1020): its probes carry
+/// `FLYOUT_PROBE_PREFIX`, and its controls (`widths` wide, one per strip
+/// item or control) wrap onto rows at most `max_w` wide, the group's content
+/// box in the window, each at its full size; a gallery wraps its tiles.
+pub(crate) struct FlyoutWrap {
+    pub max_w: f32,
+    pub widths: Vec<f32>,
+}
+
 /// The drawn width of `text` at `size` px in the window's UI font, for the
 /// ribbon's width estimates (`ribbon_fit`).
 fn ribbon_text_width(window: &Window) -> impl Fn(&str, f32) -> f32 + use<> {
     let m = Measurer::new(window);
     move |text, size| m.width(text, size, false, false)
+}
+
+/// The commands whose button is a plain toggle, drawn pressed while it is on
+/// (`Docxy::act_active`): a press flips it and changes nothing else, so a
+/// ribbon flyout stays open over it (#1020). A button that opens a picker
+/// (Font Color, Text Highlight) or a dialog is not one.
+fn act_toggles(act: Act) -> bool {
+    use Act::*;
+    matches!(
+        act,
+        Bold | Italic
+            | Underline
+            | Strike
+            | Super
+            | Sub
+            | AlignL
+            | AlignC
+            | AlignR
+            | AlignJ
+            | Bullets
+            | Numbers
+            | ParaBorders
+            | ShowHide
+            | ToggleComments
+            | ToggleTrack
+            | ToggleNav
+            | ToggleNotes
+            | PrintLayout
+            | ToggleRuler
+    )
 }
 
 fn move_vert(ed: &mut Editor, down: bool) {
@@ -28254,7 +28341,7 @@ impl Docxy {
     /// run straight after a resize sees the layout the next frame draws.
     pub(crate) fn ribbon_fit_now(&self, window: &Window) -> RibbonFitNow {
         let tw = ribbon_text_width(window);
-        let width = f32::from(window.viewport_size().width);
+        let width = ribbon_width(window);
         let (titles, icons, specs): (Vec<_>, Vec<_>, Vec<_>) = if self.ribbon_is_model() {
             let tab = self.active_ribbon_tab_def();
             let rows = tab.groups.iter().map(|g| {
@@ -28278,6 +28365,7 @@ impl Docxy {
         };
         let fit = ribbon_fit::fit(&specs, width);
         RibbonFitNow {
+            width,
             titles,
             icons,
             specs,
@@ -28301,9 +28389,10 @@ impl Docxy {
     }
 
     /// Whether `act` is a toggle of the open flyout's group: a small button
-    /// (Bold, Bullets), which keeps the flyout open.
+    /// with an on state (Bold, Center, Bullets: [`act_toggles`]), which keeps
+    /// the flyout open. A button that opens a picker (Font Color) does not.
     fn flyout_keeps_open_for_act(&self, act: Act) -> bool {
-        if !self.ribbon_is_model() {
+        if !self.ribbon_is_model() || !act_toggles(act) {
             return false;
         }
         self.flyout_group().is_some_and(|g| {
@@ -28318,8 +28407,9 @@ impl Docxy {
         })
     }
 
-    /// As [`Self::flyout_keeps_open_for_act`] for the sheet ribbon: an icon,
-    /// glyph or check box of the open flyout's group.
+    /// As [`Self::flyout_keeps_open_for_act`] for the sheet ribbon: a check
+    /// box, or an icon or glyph button with an on state
+    /// ([`sheet_ribbon::act_toggles`]), of the open flyout's group.
     fn flyout_keeps_open_for_sheet_act(&self, act: SheetAct) -> bool {
         let Some(RibbonFlyout {
             target: FlyoutTarget::Group(title),
@@ -28338,12 +28428,13 @@ impl Docxy {
             .flat_map(|g| g.commands())
             .any(|c| {
                 c.act == act
-                    && matches!(
-                        c.shape,
-                        sheet_ribbon::Shape::Icon(_)
-                            | sheet_ribbon::Shape::Glyph(_)
-                            | sheet_ribbon::Shape::Check
-                    )
+                    && match c.shape {
+                        sheet_ribbon::Shape::Check => true,
+                        sheet_ribbon::Shape::Icon(_) | sheet_ribbon::Shape::Glyph(_) => {
+                            sheet_ribbon::act_toggles(act)
+                        }
+                        _ => false,
+                    }
             })
     }
 
@@ -28353,6 +28444,7 @@ impl Docxy {
         self.close_menu();
         self.ribbon_flyout = Some(RibbonFlyout {
             doc: self.active,
+            docs: self.tabs.len(),
             tab: self.ribbon_tab,
             target,
         });
@@ -28364,6 +28456,7 @@ impl Docxy {
     /// still in it.
     fn flyout_still_fits(&self, f: RibbonFlyout, window: &Window) -> bool {
         if f.doc != self.active
+            || f.docs != self.tabs.len()
             || f.tab != self.ribbon_tab
             || self.backstage
             || self.ribbon_min
@@ -28399,7 +28492,7 @@ impl Docxy {
                     pal,
                     cx,
                 ),
-                st => self.render_group(g, st == ribbon_fit::State::IconOnly, "", pal, cx),
+                st => self.render_group(g, st == ribbon_fit::State::IconOnly, None, pal, cx),
             })
         });
         let groups: Vec<AnyElement> = groups.collect();
@@ -28418,6 +28511,11 @@ impl Docxy {
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.probes.borrow_mut().fit_next = Some(ribbon_layout::DrawnFit {
+            width: now.width,
+            states: now.fit.states.clone(),
+            overflow: now.fit.overflow.clone(),
+        });
         h_flex()
             .w_full()
             .h(px(height))
@@ -28451,23 +28549,7 @@ impl Docxy {
     ) -> AnyElement {
         let target = FlyoutTarget::Group(title);
         let open = self.ribbon_flyout.is_some_and(|f| f.target == target);
-        let lines = label_lines(title);
-        let last = lines.len().saturating_sub(1);
-        let mut label = v_flex().items_center();
-        for (i, ln) in lines.into_iter().enumerate() {
-            let ln = if i == last {
-                format!("{ln} \u{25BE}")
-            } else {
-                ln
-            };
-            label = label.child(
-                div()
-                    .whitespace_nowrap()
-                    .text_size(px(ribbon_fit::COLLAPSED_TITLE_PX))
-                    .text_color(pal.fg)
-                    .child(SharedString::from(ln)),
-            );
-        }
+        let label = menu_button_label(title, ribbon_fit::COLLAPSED_TITLE_PX, pal.fg);
         div()
             .id(SharedString::from(format!("ribbon-collapsed-{title}")))
             .relative()
@@ -28547,22 +28629,47 @@ impl Docxy {
                 .map(|b| b.bottom_left())
                 .unwrap_or_default()
         };
+        // The flyout never draws wider than the window: its group wraps its
+        // controls to the room inside the panel's margins (4 px a side), its
+        // padding and border (5 px a side), and the group's own padding.
+        let room = ribbon_width(window) - 8. - 10.;
+        let tw = ribbon_text_width(window);
         let content = match f.target {
             FlyoutTarget::Overflow => self.ribbon_overflow_list(window, pal, cx),
             FlyoutTarget::Group(title) if self.ribbon_is_model() => {
                 let tab = self.active_ribbon_tab_def();
                 let g = tab.groups.iter().find(|g| g.title == title)?;
+                let max_w = room - 17.;
+                let wrap = FlyoutWrap {
+                    max_w,
+                    widths: g
+                        .items
+                        .iter()
+                        .map(|c| ribbon_fit::model_control_w(c, false, Some(max_w), &tw))
+                        .collect(),
+                };
                 div()
                     .flex()
-                    .h(px(94.))
-                    .child(self.render_group(g, false, FLYOUT_PROBE_PREFIX, pal, cx))
+                    .min_h(px(94.))
+                    .child(self.render_group(g, false, Some(&wrap), pal, cx))
                     .into_any_element()
             }
             FlyoutTarget::Group(title) => {
                 let tab = sheet_ribbon::tab_def(self.ribbon_tab);
                 let g = tab.groups.iter().find(|g| g.title == title)?;
                 let xf = self.active_xf();
-                self.sheet_group(g, tab.titles, &xf, false, FLYOUT_PROBE_PREFIX, pal, cx)
+                let widths = match &g.body {
+                    sheet_ribbon::Body::Strip { items, .. } => items
+                        .iter()
+                        .map(|i| ribbon_fit::sheet_item_w(i, false, &tw))
+                        .collect(),
+                    sheet_ribbon::Body::Rows(_) => Vec::new(),
+                };
+                let wrap = FlyoutWrap {
+                    max_w: room - 13.,
+                    widths,
+                };
+                self.sheet_group(g, tab.titles, &xf, false, Some(&wrap), pal, cx)
             }
         };
         let panel = div()
@@ -28570,6 +28677,7 @@ impl Docxy {
             .relative()
             .occlude()
             .flex()
+            .max_w(px(room + 10.))
             .p_1()
             .rounded_md()
             .bg(pal.panel)
@@ -29726,7 +29834,7 @@ impl Docxy {
                     tab.titles,
                     &xf,
                     st == ribbon_fit::State::IconOnly,
-                    "",
+                    None,
                     pal,
                     cx,
                 ),
@@ -29774,10 +29882,15 @@ impl Docxy {
         titles: sheet_ribbon::Titles,
         xf: &gridcore::sheet::Xf,
         icon_only: bool,
-        prefix: &str,
+        wrap: Option<&FlyoutWrap>,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let prefix = if wrap.is_some() {
+            FLYOUT_PROBE_PREFIX
+        } else {
+            ""
+        };
         use sheet_ribbon::{Body, Item};
         let gap = |d: Div, g: sheet_ribbon::Gap| match g {
             sheet_ribbon::Gap::Px(v) => d.gap(px(v)),
@@ -29790,9 +29903,9 @@ impl Docxy {
                 gap: strip_gap,
                 items,
             } => {
-                let mut strip = gap(h_flex().h_full().items_center(), *strip_gap);
+                let mut cells = Vec::new();
                 for (i, item) in items.iter().enumerate() {
-                    strip = strip.child(match item {
+                    cells.push(match item {
                         Item::One(c) => self.sheet_cmd_el(c, xf, icon_only, pal, cx),
                         Item::Col(c) => gap(v_flex(), c.gap)
                             .relative()
@@ -29806,7 +29919,19 @@ impl Docxy {
                         Item::Menu(m) => self.sheet_dropdown_btn(&m.button, pal, cx),
                     });
                 }
-                strip.into_any_element()
+                match wrap {
+                    None => gap(h_flex().h_full().items_center(), *strip_gap)
+                        .children(cells)
+                        .into_any_element(),
+                    // Rows as tall as the strip in place (#1020).
+                    Some(wrap) => wrapped_rows(
+                        cells,
+                        &wrap.widths,
+                        ribbon_fit::gap_px(*strip_gap),
+                        wrap.max_w,
+                        |_| gap(h_flex().h(px(74.)).items_center(), *strip_gap),
+                    ),
+                }
             }
             Body::Rows(r) => v_flex()
                 .relative()
@@ -29823,7 +29948,8 @@ impl Docxy {
         v_flex()
             .relative()
             .flex_none()
-            .h(px(94.))
+            .when(wrap.is_none(), |d| d.h(px(94.)))
+            .when(wrap.is_some(), |d| d.min_h(px(94.)))
             .px_1p5()
             .py(px(3.))
             .justify_between()
@@ -29911,7 +30037,7 @@ impl Docxy {
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
             .child(probe(&self.probes, format!("ribbon-split:{id}")))
             .when_some(icon, |d, ic| d.child(icon_svg(ic, 22., pal.fg)))
-            .child(menu_button_label(c.label, pal.fg))
+            .child(menu_button_label(c.label, 11., pal.fg))
             .on_mouse_down(MouseButton::Left, menu_toggle(id, cx))
             .into_any_element()
     }
@@ -29973,25 +30099,51 @@ impl Docxy {
     }
 
     /// One model ribbon group. `icon_only` drops its button columns' labels
-    /// (#1020); `prefix` goes before its probes' names (a flyout's copy,
-    /// `FLYOUT_PROBE_PREFIX`).
+    /// (#1020); `wrap` draws a flyout's copy (`FlyoutWrap`).
     fn render_group(
         &self,
         g: &rs::Group<Act>,
         icon_only: bool,
-        prefix: &str,
+        wrap: Option<&FlyoutWrap>,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let prefix = if wrap.is_some() {
+            FLYOUT_PROBE_PREFIX
+        } else {
+            ""
+        };
+        let max_w = wrap.map(|w| w.max_w);
         let controls: Vec<AnyElement> = g
             .items
             .iter()
             .enumerate()
             .map(|(i, c)| {
                 let slot = format!("{prefix}ribbon-content:{}:{i}", g.title);
-                self.render_control(c, icon_only, slot, pal, cx)
+                self.render_control(c, icon_only, slot, max_w, pal, cx)
             })
             .collect();
+        let body = match wrap {
+            None => h_flex()
+                .flex_1()
+                .items_center()
+                .gap_1()
+                .children(controls)
+                .into_any_element(),
+            // A row of ordinary controls is as tall as the group's body in
+            // place; one holding a wrapped gallery grows with its tiles.
+            Some(wrap) => wrapped_rows(controls, &wrap.widths, 4., wrap.max_w, |row| {
+                let gallery = g.items[row]
+                    .iter()
+                    .any(|c| matches!(c, Control::Gallery(_)));
+                let d = h_flex().items_center().gap_1();
+                if gallery {
+                    d.min_h(px(76.))
+                } else {
+                    d.h(px(76.))
+                }
+            }),
+        };
         // group title row + optional dialog-box launcher (⤢)
         let title_row = h_flex()
             .relative()
@@ -30020,7 +30172,7 @@ impl Docxy {
             .flex_none()
             .items_center()
             .justify_between()
-            .h_full()
+            .when(wrap.is_none(), |d| d.h_full())
             .px_2()
             .py_0p5()
             .gap_0p5()
@@ -30030,18 +30182,20 @@ impl Docxy {
                 &self.probes,
                 format!("{prefix}ribbon-group:{}", g.title),
             ))
-            .child(h_flex().flex_1().items_center().gap_1().children(controls))
+            .child(body)
             .child(title_row)
             .into_any_element()
     }
 
     /// `slot` names the probe that measures a column or a rows stack, the two
-    /// controls whose height grows with their rows (`ribbon-layout`).
+    /// controls whose height grows with their rows (`ribbon-layout`). A
+    /// gallery wraps its tiles to `max_w` (a flyout's limit) when given.
     fn render_control(
         &self,
         c: &Control<Act>,
         icon_only: bool,
         slot: String,
+        max_w: Option<f32>,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -30095,9 +30249,9 @@ impl Docxy {
                     .into_any_element()
             }
             Control::Gallery(gal) if gal.id == "tablestyles" => {
-                self.table_style_gallery(gal, pal, cx)
+                self.table_style_gallery(gal, max_w, pal, cx)
             }
-            Control::Gallery(gal) => self.style_gallery(gal, pal, cx),
+            Control::Gallery(gal) => self.style_gallery(gal, max_w, pal, cx),
             Control::Separator => div()
                 .w(px(1.))
                 .h(px(44.))
@@ -30123,11 +30277,16 @@ impl Docxy {
     fn style_gallery(
         &self,
         gal: &rs::Gallery<Act>,
+        max_w: Option<f32>,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use style_gallery as sg;
         let g = sg::TILE;
+        // In a flyout narrower than the well, the tiles wrap onto rows (#1020).
+        let geom = ribbon_fit::gallery_geom(gal);
+        let (per_row, _) = ribbon_fit::gallery_row(geom, gal.items.len(), max_w);
+        let rows = gal.items.len().div_ceil(per_row).max(1) as f32;
         let dark = self.applied == Some(ThemeMode::Dark);
         let t = cx.theme();
         let fg = t.foreground.to_rgb();
@@ -30192,10 +30351,11 @@ impl Docxy {
             .collect();
         let well = h_flex()
             .flex_none()
+            .flex_wrap()
             .gap(px(g.gap))
             .p(px(g.well_pad))
-            .w(px(sg::well_width(gal.items.len())))
-            .h(px(sg::well_height()))
+            .w(px(sg::well_width(per_row)))
+            .h(px(sg::well_height() + (rows - 1.) * (g.h + g.gap)))
             .rounded(px(g.well_radius))
             .border(px(g.well_border))
             .border_color(pal.border)
@@ -30382,7 +30542,7 @@ impl Docxy {
             .rounded_b(px(4.))
             .cursor_pointer()
             .hover(|d| d.bg(pal.hover))
-            .child(menu_button_label(cmd.label, fg))
+            .child(menu_button_label(cmd.label, 11., fg))
             .on_mouse_down(MouseButton::Left, menu_toggle(primary_id, cx));
         div()
             .id(SharedString::from(format!("{}-split", cmd.id)))
@@ -30427,7 +30587,7 @@ impl Docxy {
             .hover(|d| d.bg(pal.hover))
             .child(probe(&self.probes, format!("ribbon-split:{id}")))
             .child(icon_svg(cmd.icon.0, 26., fg))
-            .child(menu_button_label(cmd.label, fg))
+            .child(menu_button_label(cmd.label, 11., fg))
             .when(enabled, |d| {
                 d.on_mouse_down(MouseButton::Left, menu_toggle(id, cx))
             })
@@ -31604,6 +31764,7 @@ impl Render for Docxy {
         {
             let mut p = self.probes.borrow_mut();
             p.last = std::mem::take(&mut p.next);
+            p.fit_last = p.fit_next.take();
             // A debug build says so, once per group, when a ribbon group's
             // content is taller than its body (#1018).
             if cfg!(debug_assertions) {
@@ -32766,6 +32927,11 @@ impl Render for Docxy {
                     if phase == DispatchPhase::Capture {
                         pressed.update(cx, |this, _cx| {
                             crate::project_cell_press_reset_all(&mut this.tabs);
+                            // A menu or flyout a press shut is that press's to
+                            // know about (the arrow or button it lands on asks),
+                            // never a later press's at the same point (#1020).
+                            this.menu_closed_at = None;
+                            this.flyout_closed_at = None;
                         });
                     }
                 });

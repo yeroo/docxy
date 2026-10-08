@@ -1495,6 +1495,21 @@ pub(crate) fn tab_def(tab: RibbonTab) -> &'static Tab {
 }
 
 /// Whether `act`'s button draws pressed for the selection's format `xf`.
+/// Whether `act` is a toggle drawn pressed while it is on ([`act_on`]): a
+/// press flips it and changes nothing else, so a ribbon flyout stays open
+/// over it (#1020). Fill Color and Font Color open a picker instead.
+pub(crate) fn act_toggles(act: SheetAct) -> bool {
+    matches!(
+        act,
+        SheetAct::Bold
+            | SheetAct::Italic
+            | SheetAct::ToggleBorder
+            | SheetAct::AlignL
+            | SheetAct::AlignC
+            | SheetAct::AlignR
+    )
+}
+
 pub(crate) fn act_on(act: SheetAct, xf: &gridcore::sheet::Xf) -> bool {
     use gridcore::sheet::Align;
     match act {
@@ -2251,5 +2266,38 @@ mod tests {
         assert!(!act_on(SheetAct::Italic, &bold));
         assert!(!act_on(SheetAct::Bold, &Default::default()));
         assert!(!act_on(SheetAct::Paste, &bold));
+    }
+
+    /// #1020 r1: a command that can draw pressed is a toggle (a flyout stays
+    /// open over it); Fill Color and Font Color open a picker, and are not.
+    #[test]
+    fn the_toggles_are_the_commands_that_draw_pressed() {
+        use gridcore::sheet::{Align, Xf};
+        let on = [
+            Xf {
+                bold: true,
+                italic: true,
+                border: true,
+                align: Align::Left,
+                ..Default::default()
+            },
+            Xf {
+                align: Align::Center,
+                ..Default::default()
+            },
+            Xf {
+                align: Align::Right,
+                ..Default::default()
+            },
+        ];
+        for t in SHEET_RIBBON {
+            for c in t.commands() {
+                if on.iter().any(|xf| act_on(c.act, xf)) {
+                    assert!(act_toggles(c.act), "{} draws pressed", c.id);
+                }
+            }
+        }
+        assert!(!act_toggles(SheetAct::FillColor));
+        assert!(!act_toggles(SheetAct::FontColor));
     }
 }

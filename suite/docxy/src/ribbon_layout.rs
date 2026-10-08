@@ -123,6 +123,30 @@ pub(crate) fn is_frame_of(measured: &[GroupLayout], titles: &[&str]) -> bool {
     !measured.is_empty() && measured.iter().all(|g| titles.contains(&g.title.as_str()))
 }
 
+/// The fit a frame drew the ribbon with: the width fitted into, and where
+/// each group went (`ribbon_fit::Fit`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DrawnFit {
+    pub width: f32,
+    pub states: Vec<State>,
+    pub overflow: Vec<usize>,
+}
+
+/// Whether the finished frame was drawn with the fit of now: the same width
+/// and every group in the same state. A resize that moves no group between
+/// collapsed and drawn (Full to IconOnly, or none at all) changes no probe,
+/// so the probes alone cannot tell such a frame from a fresh one.
+pub(crate) fn drawn_matches(drawn: Option<&DrawnFit>, width: f32, fits: &[GroupFit]) -> bool {
+    drawn.is_some_and(|d| {
+        (d.width - width).abs() <= EPS
+            && d.states.len() == fits.len()
+            && fits
+                .iter()
+                .enumerate()
+                .all(|(i, f)| d.states[i] == f.state && d.overflow.contains(&i) == f.in_overflow)
+    })
+}
+
 /// Whether the finished frame drew the groups as `fits` places them: every
 /// drawn group measured and every chevron group not, a collapsed group as
 /// its button (`ribbon-collapsed:`) and no other group so. A frame from
@@ -417,5 +441,26 @@ mod tests {
             ..fit("Editing", State::Collapsed, 60.)
         };
         assert!(frame_matches(&collapsed, &[chevron]));
+    }
+
+    /// #1020 r1: a resize that only drops labels (Full to IconOnly) changes
+    /// no probe, so the frame's recorded fit tells it apart: another state or
+    /// another width is not the frame of now.
+    #[test]
+    fn a_frame_drawn_with_another_fit_is_not_settled() {
+        let drawn = DrawnFit {
+            width: 900.,
+            states: vec![State::Full],
+            overflow: Vec::new(),
+        };
+        let full = [fit("Editing", State::Full, 60.)];
+        assert!(drawn_matches(Some(&drawn), 900., &full));
+        assert!(!drawn_matches(
+            Some(&drawn),
+            900.,
+            &[fit("Editing", State::IconOnly, 40.)]
+        ));
+        assert!(!drawn_matches(Some(&drawn), 880., &full), "another width");
+        assert!(!drawn_matches(None, 900., &full), "nothing drawn");
     }
 }

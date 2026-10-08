@@ -277,6 +277,12 @@ test a collapsed sheet group's flyout shows the whole group and its toggles work
   assert reply.group is Font
   call ribbon-flyout {"action":"close"}
   assert reply.open is false
+  # Font Color opens a picker under the ribbon: not a toggle, so the flyout
+  # closes rather than cover it.
+  call ribbon-click {"tab":"Home","command":"font-color"}
+  call ribbon-flyout {}
+  assert reply.open is false
+  key escape
   # Esc closes it too, and edits nothing under it.
   call ribbon-flyout {"action":"open","group":"Number"}
   assert reply.open is true
@@ -333,6 +339,18 @@ test document Home at the narrowest window
   assert reply.open is true
   shot window
   shot ribbon-flyout
+  call ribbon-flyout {}
+  assert reply.inside is true
+  # Center is a toggle: it applies, and the flyout stays open to show it on.
+  call ribbon-click {"tab":"Home","command":"ac"}
+  assert para.alignment is center
+  call ribbon-flyout {}
+  assert reply.open is true
+  assert reply.group is Paragraph
+  # Increase Indent is not a toggle: it runs and closes the flyout.
+  call ribbon-click {"tab":"Home","command":"indinc"}
+  call ribbon-flyout {}
+  assert reply.open is false
 
 test Project Task tab narrow
   open ../fixtures/gantt-summary.xml
@@ -402,3 +420,38 @@ test a press on a collapsed group opens its flyout and a press outside shuts it
   shot window
   call ribbon-flyout {}
   assert reply.open is false
+
+# #1020 r1: a flyout never draws wider than the window. A group wider than
+# the narrowest window wraps its controls onto rows, each at full size, and
+# a gallery wraps its tiles: Table Design's Table Styles (ten 58 px tiles)
+# and Formulas' Function Library.
+test a flyout wider than the window wraps inside it
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":3,"rows":3,"click":true}
+  call window-size {"w":460,"h":800}
+  call ribbon-layout {"tab":"Table Design"}
+  shot window
+  call ribbon-layout {"tab":"Table Design"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  call ribbon-flyout {"action":"open","group":"Table Styles"}
+  assert reply.open is true
+  shot window
+  shot ribbon-flyout
+  call ribbon-flyout {}
+  assert reply.inside is true
+  call ribbon-click {"tab":"Table Design","command":"tablestyles:Grid Table 4 Accent 1"}
+  assert table.style is GridTable4-Accent1
+  open ../fixtures/basic.xlsx
+  call window-size {"w":460,"h":800}
+  call ribbon-layout {"tab":"Formulas"}
+  shot window
+  call ribbon-layout {"tab":"Formulas"}
+  assert reply.groups.0.title is Function Library
+  assert reply.groups.0.state is collapsed
+  call ribbon-flyout {"action":"open","group":"Function Library"}
+  shot window
+  shot ribbon-flyout
+  call ribbon-flyout {}
+  assert reply.inside is true
