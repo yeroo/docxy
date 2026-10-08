@@ -501,14 +501,17 @@ The Project ribbon holds only Project's commands, and its Report tab has no
 groups yet (`groups: []`). Extend Selection mode, native prompts,
 and backstage pages are not represented by these verbs.
 
-On a sheet tab the reply lists File, Home, Insert, Data, Review, View and Help from
+On a sheet tab the reply lists File, Home, Insert, Page Layout, Formulas, Data,
+Review, View and Help from
 `sheet_ribbon::SHEET_RIBBON`, the table the sheet ribbon is drawn from, so a
 button cannot be drawn without being listed. Ids are kebab-case and unique
 across the sheet ribbon (`bold`, `sort-a-z`, `freeze-panes`); icon and glyph
 buttons carry Excel's names (`Top Align`, `Increase Decimal`, `Accounting
 Number Format`), and `tip.title` is the label (sheet buttons have no
 screentips or KeyTips). `checked` is the pressed state Bold, Italic, Borders
-and the three aligns draw for the selection. A toggle reads its current label
+and the three aligns draw for the selection, or the sheet's own state for a
+check box or a drop-down item (Print Gridlines, Print Headings, the page's
+orientation, size and margins, Filter while the sheet has AutoFilter buttons). A toggle reads its current label
 (`Unfreeze Panes`, `Unprotect Sheet`) and resolves by it. Placeholder buttons
 that do nothing yet (Format Painter, Underline, Cell Styles, Spelling, …) are
 `enabled: false`, and `ribbon-click` refuses them (`'Spelling' is not

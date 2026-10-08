@@ -19,7 +19,8 @@
 
 use crate::help_tab::HelpAct;
 use crate::sheet_menus::SheetMenu;
-use crate::{RibbonTab, SheetAct};
+use crate::sheet_page_setup::{AreaOp, BreakOp, MarginPreset, PageAct, SetupTab};
+use crate::{RibbonTab, SheetAct, SumFn};
 
 /// A flex gap, in the unit the hand-drawn ribbon used for it (`gap_1` is a
 /// rem quarter, `gap(px(1.))` is a pixel), so the table draws the same pixels.
@@ -47,6 +48,9 @@ pub(crate) enum Shape {
     /// A Large button that opens a drop-down (Sort & Filter); its items are
     /// the group's [`Dropdown`].
     Menu(Option<&'static str>),
+    /// A check box beside its text, checked from the sheet's state
+    /// (`Docxy::sheet_act_checked`): Page Layout › Sheet Options (#1019).
+    Check,
     /// A Large split button: the icon and text run the command, the arrow
     /// under them opens `menu` (Home › Paste and its gallery, #707).
     Split {
@@ -346,6 +350,11 @@ const fn glyph(
 
 const fn combo(id: &'static str, label: &'static str, value: &'static str, wide: bool) -> SheetCmd {
     cmd(id, label, Shape::Combo { value, wide }, SheetAct::Todo)
+}
+
+/// A check box beside its name.
+const fn check(id: &'static str, label: &'static str, act: SheetAct) -> SheetCmd {
+    cmd(id, label, Shape::Check, act)
 }
 
 /// A Large button that reads `alt` while its state is on.
@@ -674,6 +683,423 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             None,
                             SheetAct::InsertChart("pie"),
                         )),
+                    ],
+                },
+            },
+        ],
+    },
+    // Excel's Page Layout tab (#1019): page setup, print area, breaks,
+    // scaling and the print options over `gridcore::print`. Themes,
+    // Background, Right-to-Left, the view check boxes (the sheet keeps no
+    // view state for them) and Arrange wait for their engines.
+    Tab {
+        tab: RibbonTab::PageLayout,
+        // Page Setup, Scale to Fit and Sheet Options launch Page Setup.
+        titles: Titles::WithLaunchers,
+        groups: &[
+            Group {
+                title: "Themes",
+                launcher: false,
+                launch: None,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        Item::One(large("themes", "Themes", None, SheetAct::Todo)),
+                        col(
+                            COL,
+                            &[
+                                row("theme-colors", "Colors", None, SheetAct::Todo),
+                                row("theme-fonts", "Fonts", None, SheetAct::Todo),
+                                row("theme-effects", "Effects", None, SheetAct::Todo),
+                            ],
+                        ),
+                    ],
+                },
+            },
+            Group {
+                title: "Page Setup",
+                launcher: true,
+                launch: Some(SheetAct::Page(PageAct::Dialog(SetupTab::Page))),
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        menu(
+                            "margins",
+                            "Margins",
+                            None,
+                            &[
+                                menu_item(
+                                    "margins-normal",
+                                    "Normal",
+                                    SheetAct::Page(PageAct::Margins(MarginPreset::Normal)),
+                                ),
+                                menu_item(
+                                    "margins-wide",
+                                    "Wide",
+                                    SheetAct::Page(PageAct::Margins(MarginPreset::Wide)),
+                                ),
+                                menu_item(
+                                    "margins-narrow",
+                                    "Narrow",
+                                    SheetAct::Page(PageAct::Margins(MarginPreset::Narrow)),
+                                ),
+                                menu_item(
+                                    "custom-margins",
+                                    "Custom Margins...",
+                                    SheetAct::Page(PageAct::Dialog(SetupTab::Margins)),
+                                ),
+                            ],
+                        ),
+                        menu(
+                            "orientation",
+                            "Orientation",
+                            None,
+                            &[
+                                menu_item(
+                                    "portrait",
+                                    "Portrait",
+                                    SheetAct::Page(PageAct::Landscape(false)),
+                                ),
+                                menu_item(
+                                    "landscape",
+                                    "Landscape",
+                                    SheetAct::Page(PageAct::Landscape(true)),
+                                ),
+                            ],
+                        ),
+                        menu(
+                            "size",
+                            "Size",
+                            None,
+                            &[
+                                menu_item(
+                                    "size-letter",
+                                    "Letter",
+                                    SheetAct::Page(PageAct::Paper(1)),
+                                ),
+                                menu_item(
+                                    "size-tabloid",
+                                    "Tabloid",
+                                    SheetAct::Page(PageAct::Paper(3)),
+                                ),
+                                menu_item("size-legal", "Legal", SheetAct::Page(PageAct::Paper(5))),
+                                menu_item(
+                                    "size-executive",
+                                    "Executive",
+                                    SheetAct::Page(PageAct::Paper(7)),
+                                ),
+                                menu_item("size-a3", "A3", SheetAct::Page(PageAct::Paper(8))),
+                                menu_item("size-a4", "A4", SheetAct::Page(PageAct::Paper(9))),
+                                menu_item("size-a5", "A5", SheetAct::Page(PageAct::Paper(11))),
+                                menu_item(
+                                    "size-b4",
+                                    "B4 (JIS)",
+                                    SheetAct::Page(PageAct::Paper(12)),
+                                ),
+                                menu_item(
+                                    "size-b5",
+                                    "B5 (JIS)",
+                                    SheetAct::Page(PageAct::Paper(13)),
+                                ),
+                                menu_item(
+                                    "more-paper-sizes",
+                                    "More Paper Sizes...",
+                                    SheetAct::Page(PageAct::Dialog(SetupTab::Page)),
+                                ),
+                            ],
+                        ),
+                        menu(
+                            "print-area",
+                            "Print Area",
+                            None,
+                            &[
+                                menu_item(
+                                    "set-print-area",
+                                    "Set Print Area",
+                                    SheetAct::Page(PageAct::Area(AreaOp::Set)),
+                                ),
+                                menu_item(
+                                    "clear-print-area",
+                                    "Clear Print Area",
+                                    SheetAct::Page(PageAct::Area(AreaOp::Clear)),
+                                ),
+                                menu_item(
+                                    "add-to-print-area",
+                                    "Add to Print Area",
+                                    SheetAct::Page(PageAct::Area(AreaOp::Add)),
+                                ),
+                            ],
+                        ),
+                        menu(
+                            "breaks",
+                            "Breaks",
+                            None,
+                            &[
+                                menu_item(
+                                    "insert-page-break",
+                                    "Insert Page Break",
+                                    SheetAct::Page(PageAct::Break(BreakOp::Insert)),
+                                ),
+                                menu_item(
+                                    "remove-page-break",
+                                    "Remove Page Break",
+                                    SheetAct::Page(PageAct::Break(BreakOp::Remove)),
+                                ),
+                                menu_item(
+                                    "reset-page-breaks",
+                                    "Reset All Page Breaks",
+                                    SheetAct::Page(PageAct::Break(BreakOp::Reset)),
+                                ),
+                            ],
+                        ),
+                        Item::One(large("background", "Background...", None, SheetAct::Todo)),
+                        Item::One(large(
+                            "print-titles",
+                            "Print Titles",
+                            None,
+                            SheetAct::Page(PageAct::Dialog(SetupTab::Sheet)),
+                        )),
+                    ],
+                },
+            },
+            Group {
+                title: "Scale to Fit",
+                launcher: true,
+                launch: Some(SheetAct::Page(PageAct::Dialog(SetupTab::Page))),
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[col(
+                        COL,
+                        &[
+                            row(
+                                "fit-width",
+                                "Width:",
+                                None,
+                                SheetAct::Menu(SheetMenu::FitWidth),
+                            ),
+                            row(
+                                "fit-height",
+                                "Height:",
+                                None,
+                                SheetAct::Menu(SheetMenu::FitHeight),
+                            ),
+                            row(
+                                "fit-scale",
+                                "Scale:",
+                                None,
+                                SheetAct::Menu(SheetMenu::Scale),
+                            ),
+                        ],
+                    )],
+                },
+            },
+            // Excel heads each pair with Gridlines and Headings; a check box
+            // here reads as its screentip does.
+            Group {
+                title: "Sheet Options",
+                launcher: true,
+                launch: Some(SheetAct::Page(PageAct::Dialog(SetupTab::Sheet))),
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        col(
+                            COL,
+                            &[row(
+                                "right-to-left",
+                                "Right-to-Left Document",
+                                None,
+                                SheetAct::Todo,
+                            )],
+                        ),
+                        col(
+                            COL,
+                            &[
+                                check("view-gridlines", "View Gridlines", SheetAct::Todo),
+                                check(
+                                    "print-gridlines",
+                                    "Print Gridlines",
+                                    SheetAct::Page(PageAct::PrintGridlines),
+                                ),
+                            ],
+                        ),
+                        col(
+                            COL,
+                            &[
+                                check("view-headings", "View Headings", SheetAct::Todo),
+                                check(
+                                    "print-headings",
+                                    "Print Headings",
+                                    SheetAct::Page(PageAct::PrintHeadings),
+                                ),
+                            ],
+                        ),
+                    ],
+                },
+            },
+            Group {
+                title: "Arrange",
+                launcher: false,
+                launch: None,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        Item::One(large(
+                            "bring-forward",
+                            "Bring Forward",
+                            None,
+                            SheetAct::Todo,
+                        )),
+                        Item::One(large(
+                            "send-backward",
+                            "Send Backward",
+                            None,
+                            SheetAct::Todo,
+                        )),
+                        Item::One(large(
+                            "selection-pane",
+                            "Selection Pane...",
+                            None,
+                            SheetAct::Todo,
+                        )),
+                        col(
+                            COL,
+                            &[
+                                row("arrange-align", "Align", None, SheetAct::Todo),
+                                row("arrange-group", "Group", None, SheetAct::Todo),
+                                row("arrange-rotate", "Rotate", None, SheetAct::Todo),
+                            ],
+                        ),
+                    ],
+                },
+            },
+        ],
+    },
+    // Excel's Formulas tab (#1019). AutoSum and its menu run; Insert
+    // Function, the function galleries, names (#719), auditing, Show
+    // Formulas (#676) and calculation (#674) wait for their engines.
+    Tab {
+        tab: RibbonTab::Formulas,
+        titles: Titles::Plain,
+        groups: &[
+            Group {
+                title: "Function Library",
+                launcher: false,
+                launch: None,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        Item::One(large(
+                            "insert-function",
+                            "Insert Function...",
+                            None,
+                            SheetAct::Todo,
+                        )),
+                        Item::One(cmd(
+                            "formulas-autosum",
+                            "AutoSum",
+                            Shape::Split {
+                                icon: None,
+                                menu: SheetMenu::AutoSum,
+                            },
+                            SheetAct::AutoSumFn(SumFn::Sum),
+                        )),
+                        Item::One(large(
+                            "recently-used",
+                            "Recently Used",
+                            None,
+                            SheetAct::Todo,
+                        )),
+                        Item::One(large("financial", "Financial", None, SheetAct::Todo)),
+                        Item::One(large("logical", "Logical", None, SheetAct::Todo)),
+                        Item::One(large("text-functions", "Text", None, SheetAct::Todo)),
+                        Item::One(large("date-time", "Date & Time", None, SheetAct::Todo)),
+                        col(
+                            COL,
+                            &[
+                                row(
+                                    "lookup-reference",
+                                    "Lookup & Reference",
+                                    None,
+                                    SheetAct::Todo,
+                                ),
+                                row("math-trig", "Math & Trig", None, SheetAct::Todo),
+                                row("more-functions", "More Functions", None, SheetAct::Todo),
+                            ],
+                        ),
+                    ],
+                },
+            },
+            Group {
+                title: "Defined Names",
+                launcher: false,
+                launch: None,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        Item::One(large("name-manager", "Name Manager", None, SheetAct::Todo)),
+                        col(
+                            COL,
+                            &[
+                                row("define-name", "Define Name", None, SheetAct::Todo),
+                                row("use-in-formula", "Use in Formula", None, SheetAct::Todo),
+                                row(
+                                    "create-from-selection",
+                                    "Create from Selection...",
+                                    None,
+                                    SheetAct::Todo,
+                                ),
+                            ],
+                        ),
+                    ],
+                },
+            },
+            Group {
+                title: "Formula Auditing",
+                launcher: false,
+                launch: None,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        col(
+                            COL,
+                            &[
+                                row("trace-precedents", "Trace Precedents", None, SheetAct::Todo),
+                                row("trace-dependents", "Trace Dependents", None, SheetAct::Todo),
+                                row("remove-arrows", "Remove Arrows", None, SheetAct::Todo),
+                            ],
+                        ),
+                        col(
+                            COL,
+                            &[
+                                row("show-formulas", "Show Formulas", None, SheetAct::Todo),
+                                row("error-checking", "Error Checking", None, SheetAct::Todo),
+                                row("evaluate-formula", "Evaluate Formula", None, SheetAct::Todo),
+                            ],
+                        ),
+                        Item::One(large("watch-window", "Watch Window", None, SheetAct::Todo)),
+                    ],
+                },
+            },
+            Group {
+                title: "Calculation",
+                launcher: false,
+                launch: None,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        Item::One(large(
+                            "calculation-options",
+                            "Calculation Options",
+                            None,
+                            SheetAct::Todo,
+                        )),
+                        col(
+                            COL,
+                            &[
+                                row("calculate-now", "Calculate Now", None, SheetAct::Todo),
+                                row("calculate-sheet", "Calculate Sheet", None, SheetAct::Todo),
+                            ],
+                        ),
                     ],
                 },
             },
@@ -1210,6 +1636,47 @@ mod tests {
                 "increase-decimal",
                 "decrease-decimal",
                 "cell-styles",
+                // Page Layout (#1019): no theme, background, view state or
+                // drawing-object engine yet.
+                "themes",
+                "theme-colors",
+                "theme-fonts",
+                "theme-effects",
+                "background",
+                "right-to-left",
+                "view-gridlines",
+                "view-headings",
+                "bring-forward",
+                "send-backward",
+                "selection-pane",
+                "arrange-align",
+                "arrange-group",
+                "arrange-rotate",
+                // Formulas (#1019): Insert Function and the galleries, names
+                // (#719), auditing, Show Formulas (#676), calculation (#674).
+                "insert-function",
+                "recently-used",
+                "financial",
+                "logical",
+                "text-functions",
+                "date-time",
+                "lookup-reference",
+                "math-trig",
+                "more-functions",
+                "name-manager",
+                "define-name",
+                "use-in-formula",
+                "create-from-selection",
+                "trace-precedents",
+                "trace-dependents",
+                "remove-arrows",
+                "show-formulas",
+                "error-checking",
+                "evaluate-formula",
+                "watch-window",
+                "calculation-options",
+                "calculate-now",
+                "calculate-sheet",
                 "spelling",
                 "protect-workbook",
                 // Help (#1021): nothing to show yet.
@@ -1243,6 +1710,279 @@ mod tests {
             resolve_on(home, "Home", "Format Painter", off).unwrap_err(),
             "'Format Painter' is not implemented"
         );
+    }
+
+    /// Excel's tabs on a new workbook, in Excel's order, with Excel's
+    /// KeyTips (APP-021, APP-CASE-014; #1019, Help from #1021).
+    #[test]
+    fn workbook_tabs_are_excels_in_excels_order() {
+        let tabs: Vec<(&str, &str)> = ribbon_tab_set(Kind::Xlsx)
+            .iter()
+            .map(|&(_, name, key)| (name, key))
+            .collect();
+        let excel = [
+            ("File", "F"),
+            ("Home", "H"),
+            ("Insert", "N"),
+            ("Page Layout", "P"),
+            ("Formulas", "M"),
+            ("Data", "A"),
+            ("Review", "R"),
+            ("View", "W"),
+            ("Help", "Y"),
+        ];
+        assert_eq!(tabs, excel);
+        // The strip and its KeyTips come from `ribbon_for`, which agrees.
+        let strip: Vec<(&str, &str)> = crate::ribbon_for(Kind::Xlsx)
+            .tabs
+            .iter()
+            .map(|t| (t.name, t.key_tip))
+            .collect();
+        assert_eq!(strip, excel[1..]);
+        for (tab, name, _) in ribbon_tab_set(Kind::Xlsx).iter().skip(1) {
+            assert_eq!(crate::ribbon_tab_name(tab.unwrap()), *name);
+        }
+        // A document and a project keep their own.
+        let names = |k| {
+            ribbon_tab_set(k)
+                .iter()
+                .map(|&(_, n, _)| n)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(Kind::Docx),
+            [
+                "File", "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View", "Help"
+            ]
+        );
+        assert!(!names(Kind::Project).contains(&"Page Layout"));
+    }
+
+    /// Group titles and the command labels of each group, in drawn order.
+    fn groups_of(tab: RibbonTab) -> Vec<(&'static str, Vec<&'static str>)> {
+        tab_def(tab)
+            .groups
+            .iter()
+            .map(|g| {
+                (
+                    g.title,
+                    g.commands().iter().map(|c| c.label(false)).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_page_layout_tab_has_excels_groups_in_excels_order() {
+        assert!(tab_def(RibbonTab::PageLayout).tab == RibbonTab::PageLayout);
+        assert_eq!(
+            groups_of(RibbonTab::PageLayout),
+            [
+                ("Themes", vec!["Themes", "Colors", "Fonts", "Effects"]),
+                (
+                    "Page Setup",
+                    vec![
+                        "Margins",
+                        "Normal",
+                        "Wide",
+                        "Narrow",
+                        "Custom Margins...",
+                        "Orientation",
+                        "Portrait",
+                        "Landscape",
+                        "Size",
+                        "Letter",
+                        "Tabloid",
+                        "Legal",
+                        "Executive",
+                        "A3",
+                        "A4",
+                        "A5",
+                        "B4 (JIS)",
+                        "B5 (JIS)",
+                        "More Paper Sizes...",
+                        "Print Area",
+                        "Set Print Area",
+                        "Clear Print Area",
+                        "Add to Print Area",
+                        "Breaks",
+                        "Insert Page Break",
+                        "Remove Page Break",
+                        "Reset All Page Breaks",
+                        "Background...",
+                        "Print Titles",
+                    ]
+                ),
+                ("Scale to Fit", vec!["Width:", "Height:", "Scale:"]),
+                (
+                    "Sheet Options",
+                    vec![
+                        "Right-to-Left Document",
+                        "View Gridlines",
+                        "Print Gridlines",
+                        "View Headings",
+                        "Print Headings",
+                    ]
+                ),
+                (
+                    "Arrange",
+                    vec![
+                        "Bring Forward",
+                        "Send Backward",
+                        "Selection Pane...",
+                        "Align",
+                        "Group",
+                        "Rotate",
+                    ]
+                ),
+            ]
+        );
+        // Page Setup, Scale to Fit and Sheet Options open Page Setup.
+        let launched: Vec<_> = tab_def(RibbonTab::PageLayout)
+            .groups
+            .iter()
+            .map(|g| (g.title, g.launcher, g.launch))
+            .collect();
+        let dialog = |at| Some(SheetAct::Page(PageAct::Dialog(at)));
+        assert_eq!(
+            launched,
+            [
+                ("Themes", false, None),
+                ("Page Setup", true, dialog(SetupTab::Page)),
+                ("Scale to Fit", true, dialog(SetupTab::Page)),
+                ("Sheet Options", true, dialog(SetupTab::Sheet)),
+                ("Arrange", false, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_formulas_tab_has_excels_groups_in_excels_order() {
+        assert!(tab_def(RibbonTab::Formulas).tab == RibbonTab::Formulas);
+        assert_eq!(
+            groups_of(RibbonTab::Formulas),
+            [
+                (
+                    "Function Library",
+                    vec![
+                        "Insert Function...",
+                        "AutoSum",
+                        "Recently Used",
+                        "Financial",
+                        "Logical",
+                        "Text",
+                        "Date & Time",
+                        "Lookup & Reference",
+                        "Math & Trig",
+                        "More Functions",
+                    ]
+                ),
+                (
+                    "Defined Names",
+                    vec![
+                        "Name Manager",
+                        "Define Name",
+                        "Use in Formula",
+                        "Create from Selection...",
+                    ]
+                ),
+                (
+                    "Formula Auditing",
+                    vec![
+                        "Trace Precedents",
+                        "Trace Dependents",
+                        "Remove Arrows",
+                        "Show Formulas",
+                        "Error Checking",
+                        "Evaluate Formula",
+                        "Watch Window",
+                    ]
+                ),
+                (
+                    "Calculation",
+                    vec!["Calculation Options", "Calculate Now", "Calculate Sheet"]
+                ),
+            ]
+        );
+    }
+
+    /// The commands whose engine exists run (#1019); the rest are drawn and
+    /// refused as not implemented.
+    #[test]
+    fn wired_commands_are_enabled() {
+        let pl = tab_def(RibbonTab::PageLayout);
+        let off = |_| false;
+        let act = |tab, name, q| resolve_on(tab, name, q, off).map(|c| c.act);
+        let page = |p| Ok(SheetAct::Page(p));
+        for (q, want) in [
+            ("Set Print Area", page(PageAct::Area(AreaOp::Set))),
+            ("Clear Print Area", page(PageAct::Area(AreaOp::Clear))),
+            ("Add to Print Area", page(PageAct::Area(AreaOp::Add))),
+            ("Insert Page Break", page(PageAct::Break(BreakOp::Insert))),
+            ("Remove Page Break", page(PageAct::Break(BreakOp::Remove))),
+            (
+                "Reset All Page Breaks",
+                page(PageAct::Break(BreakOp::Reset)),
+            ),
+            ("Normal", page(PageAct::Margins(MarginPreset::Normal))),
+            ("Wide", page(PageAct::Margins(MarginPreset::Wide))),
+            ("Narrow", page(PageAct::Margins(MarginPreset::Narrow))),
+            (
+                "Custom Margins...",
+                page(PageAct::Dialog(SetupTab::Margins)),
+            ),
+            ("Portrait", page(PageAct::Landscape(false))),
+            ("Landscape", page(PageAct::Landscape(true))),
+            ("Letter", page(PageAct::Paper(1))),
+            ("A4", page(PageAct::Paper(9))),
+            ("Legal", page(PageAct::Paper(5))),
+            ("A3", page(PageAct::Paper(8))),
+            ("More Paper Sizes...", page(PageAct::Dialog(SetupTab::Page))),
+            ("Print Titles", page(PageAct::Dialog(SetupTab::Sheet))),
+            ("Width:", Ok(SheetAct::Menu(SheetMenu::FitWidth))),
+            ("Height:", Ok(SheetAct::Menu(SheetMenu::FitHeight))),
+            ("Scale:", Ok(SheetAct::Menu(SheetMenu::Scale))),
+            ("Print Gridlines", page(PageAct::PrintGridlines)),
+            ("Print Headings", page(PageAct::PrintHeadings)),
+        ] {
+            assert_eq!(act(pl, "Page Layout", q), want, "{q}");
+        }
+        // The Size menu's papers are the dialog's.
+        let sizes: Vec<SheetAct> = pl
+            .commands()
+            .iter()
+            .filter(|c| c.id.starts_with("size-"))
+            .map(|c| c.act)
+            .collect();
+        let papers: Vec<SheetAct> = crate::sheet_page_setup::PAPERS
+            .iter()
+            .map(|&(code, _)| SheetAct::Page(PageAct::Paper(code)))
+            .collect();
+        assert_eq!(sizes, papers);
+        let f = tab_def(RibbonTab::Formulas);
+        let autosum = resolve_on(f, "Formulas", "AutoSum", off).unwrap();
+        assert_eq!(autosum.act, SheetAct::AutoSumFn(SumFn::Sum));
+        assert!(matches!(
+            autosum.shape,
+            Shape::Split {
+                menu: SheetMenu::AutoSum,
+                ..
+            }
+        ));
+        for q in [
+            "Trace Precedents",
+            "Name Manager",
+            "Show Formulas",
+            "Calculate Now",
+        ] {
+            assert_eq!(
+                resolve_on(f, "Formulas", q, off).unwrap_err(),
+                format!("'{q}' is not implemented")
+            );
+        }
+        for q in ["Themes", "View Gridlines", "Background...", "Bring Forward"] {
+            assert!(resolve_on(pl, "Page Layout", q, off).is_err(), "{q}");
+        }
     }
 
     #[test]
