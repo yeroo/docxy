@@ -42,6 +42,7 @@ Built bottom-up, each a pure module:
 | `assign` | assignment dates and costs from the schedule and rate tables, and the refresh of stored totals an edit made stale |
 | `editor` | shared editing, selection, dirty tracking, undo/redo, and live scheduling |
 | `gantt` | export a scheduled project as a Markdown/Mermaid Gantt chart, with a task table (dates, Deadline with a missed-deadline `⚠`, duration, slack) |
+| `report` | Project's Report › View Reports as Markdown, from the plan's stored values |
 | `yppx` | the native `.yppx` OPC package (ZIP + `[Content_Types].xml` + `project.xml`) |
 
 The model is **pure input** — the scheduler never mutates it; it returns a
@@ -411,7 +412,35 @@ button: rename and set durations in the cells (yppxy: Enter/F2 and `d`),
 delete a task with Delete on its ID or the row menu's Delete Task (yppxy `x`), clear resources with Delete
 on Resource Names (yppxy: Assign with an empty name), export with Ctrl+E or
 File › Export, and scroll the Gantt with Alt+Left/Right and Alt+Home / Alt+End (yppxy
-h/l and Alt+Home / Alt+End). The Report tab stays, with no groups yet.
+h/l and Alt+Home / Alt+End).
+
+The Report tab's View Reports group has Project's four menus (#1123), each
+listing only the reports projcore backs with the plan's own data: Dashboards ›
+Project Overview; Resources › Resource Overview and Overallocated Resources;
+Costs › Task Cost Overview and Resource Cost Overview; In Progress › Critical
+Tasks, Late Tasks and Milestone Report. Alt, R opens the tab, D / R / C / I a
+menu, and the item's letter runs it (Alt, R, I, L is Late Tasks). Project
+draws a report on a canvas; docxy writes it as Markdown beside the plan, as
+`<stem>-<slug>.md` (`plan-late-tasks.md`) by Export's rules: an unsaved plan
+asks for a name (a harness instance refuses), the plan itself is never the
+target, and the plan, its dirty flag and its history stay as they were. yppxy
+has no menus, so its Report tab has a group per menu (Report › Costs › Task
+Cost Overview), and `yppxy <in> --report-md <slug> <out.md>` writes one
+headless. A report shows what the sheet shows: task fields as the Entry table
+reads them, and costs and work as the stored totals each edit keeps current,
+never repriced; project totals are the project summary row's, else the sum of
+the top-level rows. Blank rows and inactive tasks are left out. Late Tasks and
+the overview's late list are the tasks whose Status is Late at the status
+date (`StatusDate`, else `CurrentDate`); a plan with neither says lateness is
+not computed rather than reading the clock. Critical Tasks leaves out complete
+tasks. Overallocated Resources compares each work resource's concurrent
+assignment units over its tasks' shown spans with its Max. Units (or its
+availability periods), because the file's `OverAllocated` flag is never
+refreshed after an edit. Not implemented: Custom reports, the reports that
+need timephased data, charts or earned value (Burndown, Cash Flow, Cost
+Overview, Work Overview, Earned Value Report), Cost Overruns, Slipping Tasks
+and Upcoming Tasks, Export › Visual Reports (Excel/Visio) and Project ›
+Compare Projects.
 
 Ctrl+K (and a task row's menu › Hyperlink..., enabled like Information...)
 opens one prompt on the selected task: prefilled from its stored link as

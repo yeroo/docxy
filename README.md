@@ -271,6 +271,7 @@ Gantt** block that renders anywhere docxy's diagrams do.
 ```sh
 yppxy plan.xml                    # open MSPDI XML (or a .yppx package)
 yppxy plan.yppx --gantt-md out.md # headless: export a Markdown Gantt chart
+yppxy plan.xml  --report-md late-tasks out.md  # headless: a View Report
 yppxy plan.xml  --save out.yppx   # headless: convert to the native package
 ```
 
