@@ -476,7 +476,9 @@ footer editor; `selection-set` refuses while it is open.
 | `window-select {window}` | switch the harness to the window with this registry id; every verb after this acts on that window, and reads like `tab-list` and `state` describe it. EVERY newly opened window becomes the selection — a ribbon New Window, Shift+F11 on a Project tab, or `window-new` — and closing the selected window falls back to the most recently opened survivor. Clicking a window with the mouse never moves the selection. The rich document clip, the grid clip and the Office Clipboard are per window: a paste into another window pastes the clipboard's plain text, like a paste from another application (a harness run shares the private text clipboard run-wide) |
 | `window-arrange {}` | the View › Window › Arrange All command: resize every window to an equal vertical strip of the calling window's display, left to right in creation order, and reply `{arranged:N}`. gpui at the suite's pinned revision has no cross-platform way to MOVE a window, so positions stay: Arrange All resizes, it does not tile |
 | `tab-select {"tab":"schedule"}` | make a tab active as clicking its chip does, and reply with the state. `tab` is an index or a case-insensitive title/path substring over **all** tabs, the rule the `proj.*` verbs use; a miss (`no tab matches 'x'`), an ambiguous match (`several tabs match 'x' (2, 3)`) and an index past the end (`no tab at index 9`) are refused. The Backstage stays as it was, as it does for a chip click |
-| `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point; or `{"at":"user-name-row"}`: Backstage's User name... row, #1027); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog, except the `{"dialog-field":"user-name","x":N}` form (#1027), which clicks the open dialog's text field `N` pixels in from its left edge (its middle without `x`) and replies `{x, y}`; a press reaches an open menu's own item or backdrop, so it does not pre-close menus |
+| `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point; or `{"at":"user-name-row"}`: Backstage's User name... row, #1027; or `{"at":"custom-lists-row"}`: its Edit Custom Lists… row, #1029); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog, except the dialog forms, which reply `{x, y}`: `{"dialog-field":"user-name","x":N}` (#1027) clicks the open dialog's text field `N` pixels in from its left edge (its middle without `x`); `{"dialog-tab":"Margins"}`, `{"dialog-button":"Options..."}` and `{"dialog-control":"equal"}` (#1029) click the middle of a tab, a button (by its label as drawn, `&` optional) or a whole control row (a checkbox, a dropdown). `{"input":"formula-bar"}` (#1029) is for the inputs outside the dialogs (`suite/docxy/src/inputs.rs`); none is targetable yet, and each answers which issue makes it so. A press reaches an open menu's own item or backdrop, so it does not pre-close menus |
+| `field-read {"dialog-field":"top"}` | one field of the open dialog as it is edited and drawn (#1029), on any of its tabs: `{name, kind, value, focused, caret, selection, index, items, tab, on_page, enabled, visible}`. `caret` (a character index) and `selection` (`[from, to]`) come from the state the overlay draws the field from, and are `null` unless the field has the focus; `index` is a dropdown's, radio group's or list's chosen item and `items` how many it has |
+| `dialog-catalog-check {}` | hold the open dialog's editable controls (text, number, date, duration, checkbox, radio, dropdown, check list) on every tab, as name, kind and tab in order, to its entry in `suite/docxy/src/dialog/catalog/entries.rs` (#1029). Replies `{id, key, fields}`; a difference is the error, listing both |
 | `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 9 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The ninth pressed move lands at the destination, so the drag's handlers see the final cell before the release. gpui arms a drag once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of 2px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
 | `pointer-move {"to":"cell:C2"}` | dispatch a real hover (a move with no button held) at the region's centre through gpui's hit testing, as between gestures. Replies `{to:[x,y]}` |
 | `pointer-wheel {"region":"backstage-content","dy":-600}` | dispatch a real mouse move and wheel notch at the region's centre through gpui's hit testing (#1028); a negative `dy` (logical pixels) scrolls the content down. Replies `{x, y, dy}`. Refuses under a dialog; does not pre-close menus |
@@ -611,14 +613,20 @@ stamped with that name and those initials (else the OS account name, else
 `docxy`, with initials derived from the name) and the UTC time.
 
 `key` and `type` call the key handler directly, so they pass when a window root
-has no key handler. `call real-key {"key":"ctrl+a"}` (or `"keys":[...]`) and
+has no key handler. `call real-key {"key":"ctrl+a"}` (or `"keys":[...]`; `"times":N`
+presses them again N times, up to 500) and
 `call real-type {"text":"…"}` queue the same strokes as real `KeyDown` input,
 which gpui dispatches through the focused window root and its bound actions
-(Tab, Shift+Tab) as the OS's keys go. `call pointer-click {"dialog-field":"user-name"}`
+(Tab, Shift+Tab) as the OS's keys go. `call real-key {"key":"tab","to-field":"num"}`
+presses Tab as often as moves the open dialog's focus from where it is to that
+field, counted when the verb runs (a whole round when the field already has
+it; refused when Tab never reaches it). `call pointer-click {"dialog-field":"user-name"}`
 clicks the open dialog's text field (`"x":N` pixels in from its left edge, else
 its middle), which focuses it and puts the caret under the click; it needs a
 drawn frame, so `shot window` first. `call pointer-click {"at":"user-name-row"}`
-clicks Backstage's User name... row (open File first). Keys pressed in
+clicks Backstage's User name... row and `{"at":"custom-lists-row"}` its Edit
+Custom Lists… row (open File first, and scroll them into view with
+`pointer-wheel {"region":"backstage-content","dy":-6000}`). Keys pressed in
 Backstage with no dialog up edit nothing under it. `call comments {}` reads the
 active document's comments `{comments:[{id,author,initials,text}]}`. The cases are in
 `uiharness/cases/user-name.uit`; `user-name-no-document.uit` closes every tab,
@@ -1440,6 +1448,39 @@ what they looked like they bit through:
    neither, so no dashes are ever drawn to be seen.
 
 Assert the state *and* the picture. Either alone has a way to be quietly right.
+
+## Typing into every input (`inputs-typing-*.uit`, #1029)
+
+Every dialog the suite builds is in a catalogue,
+`suite/docxy/src/dialog/catalog/entries.rs`: its id, the fixture and the steps
+that open it the way a person does, and every editable control with its kind,
+tab, a sample value and what OK shows. A `DialogId` can only be made there and
+`Dialog::message` takes one, so a dialog cannot be built without an entry. The
+`inputs-typing-*.uit` cases are **generated** from it (one file per group of
+dialogs, each well inside the sweep's per-script timeout), and
+`cargo test --manifest-path suite/Cargo.toml inputs_typing_case_is_current`
+fails when a checked-in file differs; `UPDATE_INPUTS_TYPING=1` rewrites them.
+Do not edit them by hand.
+
+A test is one field and one step, named `<surface> <dialog>/<field>: <step>`:
+`focus by click`, `focus by Tab`, `types`, `edits` (Backspace, Delete,
+arrows, Home, End), `select-all replaces`, `pastes`, `copies`, `OK applies`,
+`Escape cancels` and, for a number field, `refuses invalid`; a dropdown gets
+`focus by click` and `Up and Down step`; and each dialog a
+`<surface> <dialog>: matches the catalogue` test, which runs
+`dialog-catalog-check` on it. After the dialog opens every key is `real-key`
+or `real-type` and every focus a real click or Tab: no `dialog-set`, `key` or
+`type`. A field broken one way fails only that step's test, so
+`expected-failures.txt` can list it without hiding the rest.
+`inputs-typing-themes.uit` types into one field of each kind under the dark
+and the light theme. The sweep's transcripts read as a table of surface,
+dialog, field, step and result with `python3 scripts/inputs-typing-table.py
+<sweep run dir>`.
+
+The inputs outside dialogs (the formula bar, Find, the ribbon's font boxes,
+the comment editor, Backstage's fields, Project's grid, the terminal editors'
+prompts) are listed in `suite/docxy/src/inputs.rs`, each with the issue that
+types into it. See `qa/inputs-typing.md`.
 
 ## The isolation guarantee
 
