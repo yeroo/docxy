@@ -11303,7 +11303,9 @@ impl Docxy {
             ruler_drag: None,
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
-            line_probe: std::rc::Rc::new(std::cell::RefCell::new(line_numbers::LineProbe::default())),
+            line_probe: std::rc::Rc::new(std::cell::RefCell::new(
+                line_numbers::LineProbe::default(),
+            )),
             selecting: false,
             hl_mode: None,
             hl_last: hl_mode::DEFAULT_COLOUR.to_string(),
@@ -27252,8 +27254,7 @@ fn line_number_canvas(
         |_, _, _| {},
         move |b, _, window, cx| {
             let mut probe = slot.probe.borrow_mut();
-            let rows =
-                line_numbers::row_count(b.size.height.into(), line_h, line_h.max(base + 6.));
+            let rows = line_numbers::row_count(b.size.height.into(), line_h, line_h.max(base + 6.));
             if slot.ord < probe.rows.len() {
                 probe.rows[slot.ord] = rows;
             }
@@ -27280,9 +27281,12 @@ fn line_number_canvas(
                     color: pal.dim,
                     ..Default::default()
                 };
-                let line = window
-                    .text_system()
-                    .shape_line(SharedString::from(text), px(base), &[run], None);
+                let line = window.text_system().shape_line(
+                    SharedString::from(text),
+                    px(base),
+                    &[run],
+                    None,
+                );
                 // A six-digit column right-aligns at `right` whatever the
                 // digit count.
                 let left = right - base * 6.0;
@@ -33205,13 +33209,6 @@ impl Render for Docxy {
                                 .children(els)
                                 .into_any_element()
                         };
-                        // Every entry exists now (build_band ran in document
-                        // order); the rows fill in as the canvases paint.
-                        {
-                            let mut probe = line_probe_rc.borrow_mut();
-                            let n = probe.entries.len();
-                            probe.rows.resize(n, 0);
-                        }
                         let sheets: Vec<AnyElement> = pf
                             .pages
                             .iter()
@@ -33440,6 +33437,14 @@ impl Render for Docxy {
                                     .into_any_element()
                             })
                             .collect();
+                        // Every entry exists now (`build_band` ran in document
+                        // order while the sheets collected); the rows fill in
+                        // as the canvases paint.
+                        {
+                            let mut probe = line_probe_rc.borrow_mut();
+                            let n = probe.entries.len();
+                            probe.rows.resize(n, 0);
+                        }
                         let scroll = v_flex()
                             .id("doc-scroll")
                             .track_scroll(&self.doc_scroll)

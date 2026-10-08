@@ -122,7 +122,7 @@ pub(crate) struct Painted {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use docxcore::model::{Block, Paragraph, ParProps, RunProps};
+    use docxcore::model::{Block, ParProps, Paragraph, RunProps};
     use docxcore::sect::{LineNumbering, LnRestart};
 
     fn rule(count_by: u32, start: u32, restart: LnRestart) -> Rule {
