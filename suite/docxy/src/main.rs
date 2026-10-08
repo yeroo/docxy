@@ -33059,6 +33059,7 @@ impl Render for Docxy {
                         {
                             let mut probe = self.line_probe.borrow_mut();
                             probe.entries.clear();
+                            probe.rows.clear();
                             probe.painted.clear();
                             probe.counting = Default::default();
                         }
