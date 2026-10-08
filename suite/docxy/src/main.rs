@@ -31754,8 +31754,8 @@ impl Docxy {
                 })
                 .collect();
             let now = std::time::SystemTime::now();
-            // Recover Unsaved Workbooks (#613), shown on workbook tabs only
-            // (#1077). The row keeps the draft's
+            // Recover Unsaved Workbooks (#613), shown on a workbook tab or while a
+            // draft waits (#1077, recover_section_shown). The row keeps the draft's
             // path, not its index: the list can change before the click.
             let show_recover =
                 recover_section_shown(active.map(|t| t.kind), !self.drafts.is_empty());
