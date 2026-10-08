@@ -21,6 +21,23 @@ test sheet ribbon: no tab is clipped vertically
   assert reply.tab is Insert
   assert reply.settled is true
   assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"Page Layout"}
+  shot window
+  call ribbon-layout {"tab":"Page Layout"}
+  assert reply.tab is Page Layout
+  assert reply.settled is true
+  # Not vacuous: Scale to Fit is a column, so its content was measured.
+  assert reply.groups.2.title is Scale to Fit
+  assert reply.groups.2.content_bounds is not null
+  assert reply.any_clipped_v is false
+  call ribbon-layout {"tab":"Formulas"}
+  shot window
+  call ribbon-layout {"tab":"Formulas"}
+  assert reply.tab is Formulas
+  assert reply.settled is true
+  assert reply.groups.2.title is Formula Auditing
+  assert reply.groups.2.content_bounds is not null
+  assert reply.any_clipped_v is false
   call ribbon-layout {"tab":"Data"}
   shot window
   call ribbon-layout {"tab":"Data"}

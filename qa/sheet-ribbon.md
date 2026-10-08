@@ -17,7 +17,8 @@ most three small-button rows to a column.
 1. Open a workbook. Widen the window to at least 1400 px so nothing collapses.
 2. On Home, look at each group from Clipboard to Editing: no button is cut off
    at the top or bottom, and every group title is visible under its buttons.
-3. Visit Insert, Data, Review, View and Help and look again.
+3. Visit Insert, Page Layout, Formulas, Data, Review, View and Help and look
+   again.
 4. Do the same in a Word document (Home, Insert, Design, Layout, Mailings,
    Review, View, Help) and a Project (Task, Resource, Project, View, Help).
 
@@ -44,3 +45,31 @@ Clear, Reapply, and each runs the Data tab's matching act (Custom Sort... is Dat
 
 **Fails when:** the five-button column returns to Home, or the menu opens but an
 item does not run.
+
+## Page Layout and Formulas sit where Excel puts them
+
+**Guards:** #1019 requires Excel's workbook tabs in Excel's order (APP-021,
+APP-CASE-014), with the commands whose engine exists working.
+
+**Steps:**
+1. Open a workbook. Read the tab row, then press Alt, P and Alt, M.
+2. On Page Layout, select A1:C5 and choose Print Area > Set Print Area; then
+   Orientation > Landscape, Margins > Narrow and Print Gridlines.
+3. Open Orientation and Margins again, and Width: under Scale to Fit.
+4. Click Page Setup's launcher (beside its title), change Adjust to 5% and press
+   OK; then 80% and OK.
+5. Save, close and reopen the workbook, and open Page Setup again.
+6. On Formulas, click a cell under a column of numbers and choose AutoSum's
+   arrow > Average.
+
+**Expect:** the tabs read File, Home, Insert, Page Layout, Formulas, Data,
+Review, View, Help; Alt+P and Alt+M select the two new tabs. Each command in
+step 2 marks the workbook changed and is one undo step; the menus tick
+Landscape and Narrow, Print Gridlines shows a ticked box, and Width: ticks
+Automatic. 5% is refused with "scale 5 is outside 10–400" and the dialog stays;
+80% applies. After the reopen the dialog shows Landscape, the narrow margins, 80%,
+gridlines and A1:C5. AutoSum writes `=AVERAGE(...)` over the run above. The
+placeholders (Themes, Arrange, Name Manager, Trace Precedents, ...) do nothing.
+
+**Fails when:** a new tab is missing or out of order, a wired command does
+nothing or is not saved, or a placeholder looks like it ran.

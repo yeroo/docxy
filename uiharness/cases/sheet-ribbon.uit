@@ -7,11 +7,13 @@ test sheet ribbon read lists the drawn Home tab
   call ribbon-read {}
   assert reply.tabs.0.name is File
   assert reply.tabs.1.name is Home
-  assert reply.tabs.3.name is Data
-  assert reply.tabs.4.name is Review
-  assert reply.tabs.5.name is View
-  assert reply.tabs.6.name is Help
-  assert reply.tab_count is 7
+  assert reply.tabs.3.name is Page Layout
+  assert reply.tabs.4.name is Formulas
+  assert reply.tabs.5.name is Data
+  assert reply.tabs.6.name is Review
+  assert reply.tabs.7.name is View
+  assert reply.tabs.8.name is Help
+  assert reply.tab_count is 9
   assert reply.tabs.1.groups.0.title is Clipboard
   assert reply.tabs.1.groups.0.commands.0.id is paste
   assert reply.tabs.1.groups.1.commands.4.id is bold
@@ -37,10 +39,10 @@ test sheet ribbon click selects the tab and reads a toggle's current label
   call ribbon-click {"tab":"View","command":"Freeze Panes"}
   assert ribbon_tab is View
   call ribbon-read {}
-  assert reply.tabs.5.groups.0.commands.0.label is Unfreeze Panes
+  assert reply.tabs.7.groups.0.commands.0.label is Unfreeze Panes
   call ribbon-click {"tab":"View","command":"Unfreeze Panes"}
   call ribbon-read {}
-  assert reply.tabs.5.groups.0.commands.0.label is Freeze Panes
+  assert reply.tabs.7.groups.0.commands.0.label is Freeze Panes
 
 test sheet ribbon refuses a placeholder, a missing command and a command with no menu
   open ../fixtures/basic.xlsx
@@ -71,25 +73,25 @@ test sheet ribbon menus open through menu-open and the button's own click
 test sheet ribbon data tab lists Excel's groups
   open ../fixtures/basic.xlsx
   call ribbon-read {}
-  assert reply.tabs.3.name is Data
-  assert reply.tabs.3.groups.0.title is Sort & Filter
-  assert reply.tabs.3.groups.1.title is Data Tools
-  assert reply.tabs.3.groups.2.title is Outline
-  assert reply.tabs.3.groups.3.title is Show Level
-  assert reply.tabs.3.groups.0.commands.0.label is Sort A to Z
-  assert reply.tabs.3.groups.0.commands.2.label is Sort
-  assert reply.tabs.3.groups.0.commands.4.label is Clear
-  assert reply.tabs.3.groups.0.commands.4.enabled is true
-  assert reply.tabs.3.groups.0.commands.5.label is Reapply
-  assert reply.tabs.3.groups.0.commands.5.enabled is true
-  assert reply.tabs.3.groups.0.commands.6.label is Advanced
-  assert reply.tabs.3.groups.0.commands.6.enabled is true
-  assert reply.tabs.3.groups.1.commands.1.label is Flash Fill
-  assert reply.tabs.3.groups.1.commands.2.label is Remove Duplicates
-  assert reply.tabs.3.groups.1.commands.4.label is Circle Invalid Data
-  assert reply.tabs.3.groups.1.commands.6.label is Consolidate
-  assert reply.tabs.3.groups.2.commands.0.label is Group
-  assert reply.tabs.3.groups.2.commands.4.label is Hide Detail
+  assert reply.tabs.5.name is Data
+  assert reply.tabs.5.groups.0.title is Sort & Filter
+  assert reply.tabs.5.groups.1.title is Data Tools
+  assert reply.tabs.5.groups.2.title is Outline
+  assert reply.tabs.5.groups.3.title is Show Level
+  assert reply.tabs.5.groups.0.commands.0.label is Sort A to Z
+  assert reply.tabs.5.groups.0.commands.2.label is Sort
+  assert reply.tabs.5.groups.0.commands.4.label is Clear
+  assert reply.tabs.5.groups.0.commands.4.enabled is true
+  assert reply.tabs.5.groups.0.commands.5.label is Reapply
+  assert reply.tabs.5.groups.0.commands.5.enabled is true
+  assert reply.tabs.5.groups.0.commands.6.label is Advanced
+  assert reply.tabs.5.groups.0.commands.6.enabled is true
+  assert reply.tabs.5.groups.1.commands.1.label is Flash Fill
+  assert reply.tabs.5.groups.1.commands.2.label is Remove Duplicates
+  assert reply.tabs.5.groups.1.commands.4.label is Circle Invalid Data
+  assert reply.tabs.5.groups.1.commands.6.label is Consolidate
+  assert reply.tabs.5.groups.2.commands.0.label is Group
+  assert reply.tabs.5.groups.2.commands.4.label is Hide Detail
 
 test sheet ribbon data tab sorts the region by the cursor's column
   open ../fixtures/basic.xlsx
@@ -230,7 +232,7 @@ test sheet Home has no Remove Duplicates and Data keeps it
   open ../fixtures/basic.xlsx
   call-error ribbon-click {"tab":"Home","command":"Remove Duplicates"} => command 'Remove Duplicates' is not on tab 'Home'
   call ribbon-read {}
-  assert reply.tabs.3.groups.1.commands.2.label is Remove Duplicates
+  assert reply.tabs.5.groups.1.commands.2.label is Remove Duplicates
 
 # The measured guard: each group records where its content landed, and
 # ribbon-layout says whether it fits. A fourth button in a column makes
@@ -245,3 +247,125 @@ test sheet Home ribbon: no group is clipped vertically
   # Not vacuous: Editing has a column, so its content was measured.
   assert reply.groups.6.content_bounds is not null
   assert reply.any_clipped_v is false
+
+# Excel's Page Layout and Formulas tabs (#1019), between Insert and Data, with
+# Excel's KeyTips.
+test sheet ribbon lists Excel's tabs
+  open ../fixtures/basic.xlsx
+  call ribbon-read {}
+  assert reply.tab_count is 9
+  assert reply.tabs.3.name is Page Layout
+  assert reply.tabs.3.key_tip is P
+  assert reply.tabs.4.name is Formulas
+  assert reply.tabs.4.key_tip is M
+  assert reply.tabs.5.name is Data
+  assert reply.tabs.3.groups.0.title is Themes
+  assert reply.tabs.3.groups.1.title is Page Setup
+  assert reply.tabs.3.groups.2.title is Scale to Fit
+  assert reply.tabs.3.groups.3.title is Sheet Options
+  assert reply.tabs.3.groups.4.title is Arrange
+  assert reply.tabs.4.groups.0.title is Function Library
+  assert reply.tabs.4.groups.1.title is Defined Names
+  assert reply.tabs.4.groups.2.title is Formula Auditing
+  assert reply.tabs.4.groups.3.title is Calculation
+  # Themes waits for an engine; Margins opens its menu.
+  assert reply.tabs.3.groups.0.commands.0.enabled is false
+  assert reply.tabs.3.groups.1.commands.0.label is Margins
+  assert reply.tabs.3.groups.1.commands.0.enabled is true
+
+test KeyTips open the new tabs
+  open ../fixtures/basic.xlsx
+  key alt p
+  assert ribbon_tab is Page Layout
+  shot window
+  # The first Escape steps back to the tab KeyTips, the second leaves them.
+  key escape
+  key escape
+  key alt m
+  assert ribbon_tab is Formulas
+  shot window
+  key escape
+  key escape
+
+test a wired Page Layout command works from the ribbon
+  open copy:"../fixtures/basic.xlsx" as pl.xlsx
+  click A1
+  click C5 shift
+  call ribbon-click {"tab":"Page Layout","command":"Set Print Area"}
+  assert ribbon_tab is Page Layout
+  assert dirty is true
+  key ctrl+z
+  call ribbon-click {"tab":"Page Layout","command":"Landscape"}
+  call menu-open {"target":{"ribbon":["Page Layout","Page Setup","Orientation"]}}
+  assert reply.items.0.label is Portrait
+  assert reply.items.0.checked is false
+  assert reply.items.1.checked is true
+  call menu-close {}
+
+test a Page Layout command that changes nothing leaves the workbook clean
+  open copy:"../fixtures/basic.xlsx" as clean.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Clear Print Area"}
+  assert dirty is false
+  call ribbon-click {"tab":"Page Layout","command":"Portrait"}
+  assert dirty is false
+
+test Print Gridlines is a check box that follows the sheet
+  open copy:"../fixtures/basic.xlsx" as grid.xlsx
+  click B2
+  call ribbon-read {}
+  assert reply.tabs.3.groups.3.commands.2.id is print-gridlines
+  assert reply.tabs.3.groups.3.commands.2.checked is false
+  call ribbon-click {"tab":"Page Layout","command":"Print Gridlines"}
+  assert dirty is true
+  call ribbon-read {}
+  assert reply.tabs.3.groups.3.commands.2.checked is true
+  key ctrl+z
+  call ribbon-read {}
+  assert reply.tabs.3.groups.3.commands.2.checked is false
+
+test Scale to Fit Width fits the sheet to pages through its menu
+  open copy:"../fixtures/basic.xlsx" as fit.xlsx
+  call menu-open {"target":{"ribbon":["Page Layout","Scale to Fit","Width:"]}}
+  assert reply.items.0.label is Automatic
+  assert reply.items.0.checked is true
+  call menu-click {"label":"1 page"}
+  assert dirty is true
+  call menu-open {"target":{"ribbon":["Page Layout","Scale to Fit","Width:"]}}
+  assert reply.items.1.checked is true
+  assert reply.items.0.checked is false
+  call menu-close {}
+  call menu-open {"target":{"ribbon":["Page Layout","Scale to Fit","Scale:"]}}
+  call menu-click {"label":"75%"}
+  call menu-open {"target":{"ribbon":["Page Layout","Scale to Fit","Width:"]}}
+  assert reply.items.0.checked is true
+  call menu-close {}
+
+test Page Setup opens from Print Titles and refuses a scale outside 10-400
+  open copy:"../fixtures/basic.xlsx" as setup.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
+  call dialog-read {}
+  assert reply.title is Page Setup
+  call dialog-set {"control":"scale","value":"5"}
+  call-error dialog-click {"button":"OK"} => scale 5 is outside 10–400
+  assert dirty is false
+  call dialog-set {"control":"scale","value":"80"}
+  call dialog-set {"control":"title-rows","value":"$1:$1"}
+  call dialog-click {"button":"OK"}
+  assert dirty is true
+
+test Formulas AutoSum and its menu write the function over the run above
+  open copy:"../fixtures/basic.xlsx" as sum.xlsx
+  click B6
+  call ribbon-click {"tab":"Formulas","command":"AutoSum"}
+  assert dirty is true
+  assert cell B6 is 100
+  click C6
+  call menu-open {"target":{"ribbon":["Formulas","Function Library","AutoSum"]}}
+  assert reply.items.1.label is Average
+  call menu-click {"label":"Max"}
+  assert cell C6 is 44
+
+test a placeholder on the new tabs is refused as not implemented
+  open ../fixtures/basic.xlsx
+  call-error ribbon-click {"tab":"Formulas","command":"Trace Precedents"} => 'Trace Precedents' is not implemented
+  call-error ribbon-click {"tab":"Page Layout","command":"Themes"} => 'Themes' is not implemented

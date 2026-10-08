@@ -6,9 +6,9 @@
 test every editor has a Help tab last
   open ../fixtures/basic.xlsx
   call ribbon-read {}
-  assert reply.tab_count is 7
-  assert reply.tabs.6.name is Help
-  assert reply.tabs.6.key_tip is Y
+  assert reply.tab_count is 9
+  assert reply.tabs.8.name is Help
+  assert reply.tabs.8.key_tip is Y
   open copy:../fixtures/basic.docx
   call ribbon-read {}
   assert reply.tab_count is 9
