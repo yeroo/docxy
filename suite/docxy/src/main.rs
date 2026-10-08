@@ -249,10 +249,11 @@ enum Kind {
 }
 
 /// Whether the Open-page backstage offers Recover Unsaved Workbooks (#1077).
-/// Drafts are kept for workbooks only (`close::should_keep_draft`), so any
-/// other tab, or none, would show a spreadsheet entry that can never apply.
-fn recover_section_shown(kind: Option<Kind>) -> bool {
-    kind == Some(Kind::Xlsx)
+/// Drafts are kept for workbooks only (`close::should_keep_draft`), so a
+/// Word tab, or none, shows nothing unless a kept draft is waiting: closing
+/// the last workbook with Don't Save keeps one, and the list is app-wide.
+fn recover_section_shown(kind: Option<Kind>, has_drafts: bool) -> bool {
+    kind == Some(Kind::Xlsx) || has_drafts
 }
 
 impl Kind {
@@ -31756,6 +31757,8 @@ impl Docxy {
             // Recover Unsaved Workbooks (#613), shown on workbook tabs only
             // (#1077). The row keeps the draft's
             // path, not its index: the list can change before the click.
+            let show_recover =
+                recover_section_shown(active.map(|t| t.kind), !self.drafts.is_empty());
             let drafts: Vec<AnyElement> = self
                 .drafts
                 .iter()
@@ -31877,7 +31880,7 @@ impl Docxy {
                     }),
                 ))
                 .child(v_flex().gap_0p5().children(recents))
-                .when(recover_section_shown(active.map(|t| t.kind)), |d| {
+                .when(show_recover, |d| {
                     d
                     .child(
                         div()
@@ -43032,11 +43035,14 @@ mod recover_section_tests {
     use super::{Kind, recover_section_shown};
 
     #[test]
-    fn recover_section_is_for_workbooks_only() {
-        assert!(recover_section_shown(Some(Kind::Xlsx)));
-        assert!(!recover_section_shown(Some(Kind::Docx)));
-        assert!(!recover_section_shown(Some(Kind::Project)));
-        assert!(!recover_section_shown(Some(Kind::Look)));
-        assert!(!recover_section_shown(None));
+    fn recover_section_follows_the_tab_or_a_waiting_draft() {
+        assert!(recover_section_shown(Some(Kind::Xlsx), false));
+        assert!(recover_section_shown(Some(Kind::Xlsx), true));
+        assert!(!recover_section_shown(Some(Kind::Docx), false));
+        assert!(!recover_section_shown(Some(Kind::Project), false));
+        assert!(!recover_section_shown(Some(Kind::Look), false));
+        assert!(!recover_section_shown(None, false));
+        assert!(recover_section_shown(Some(Kind::Docx), true));
+        assert!(recover_section_shown(None, true));
     }
 }
