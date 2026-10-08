@@ -14972,6 +14972,29 @@ mod tests {
     }
 
     #[test]
+    fn a_hyphen_or_paren_space_starts_a_list_1080() {
+        let mut app = app_with(&[""]);
+        type_text(&mut app, "- foo");
+        assert_eq!(body_paragraphs(&app), ["foo"]);
+        let Block::Paragraph(p) = &app.editor.doc.body[0] else {
+            panic!("paragraph")
+        };
+        let num_id = p.props.num_id.expect("a list");
+        assert!(app.editor.all_in_list(num_id));
+        let mut app = app_with(&[""]);
+        type_text(&mut app, "1) ");
+        let Block::Paragraph(p) = &app.editor.doc.body[0] else {
+            panic!("paragraph")
+        };
+        assert!(p.props.num_id.is_some());
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(body_paragraphs(&app), ["1) "]);
+        let mut app = app_with(&[""]);
+        type_text(&mut app, "X- ");
+        assert_eq!(body_paragraphs(&app), ["X- "]);
+    }
+
+    #[test]
     fn locked_formatting_types_no_automatic_list_856() {
         let mut app = app_with(&[""]);
         protect(&mut app, ProtectionEditMode::Unrestricted, true);
