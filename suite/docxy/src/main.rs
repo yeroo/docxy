@@ -31881,8 +31881,7 @@ impl Docxy {
                 ))
                 .child(v_flex().gap_0p5().children(recents))
                 .when(show_recover, |d| {
-                    d
-                    .child(
+                    d.child(
                         div()
                             .text_size(px(13.))
                             .text_color(rgb(BRAND))
