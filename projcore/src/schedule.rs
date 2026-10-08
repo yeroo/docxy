@@ -3302,6 +3302,25 @@ pub fn level(proj: &Project) -> Leveled {
     main
 }
 
+/// The work resources the plan as shown books past their capacity at some
+/// moment, each with its peak booking (1.0 = 100%). `shown` gives each task's
+/// displayed start and finish (leveled while leveling is on). Bookings and
+/// capacity are the leveler's, in its working-time index: only active,
+/// scheduled leaves book; an assignment books its resource over its own
+/// window from its `Delay` (a manual or tracked task's through its finish);
+/// capacity is Max. Units or the availability periods. Unlike the leveler,
+/// which lets a free resource take one assignment above its capacity, any
+/// booking above capacity counts.
+pub fn overbooked(
+    proj: &Project,
+    shown: impl Fn(i32) -> Option<(DateTime, DateTime)>,
+) -> HashMap<i32, f64> {
+    let clean = without_unscheduled_rows(proj);
+    let dormant = dormant_uids(&clean);
+    let active = without_tasks(&clean, &dormant);
+    Scheduler::new(&active).overbooked(shown)
+}
+
 fn level_local(proj: &Project) -> Leveled {
     let dormant = dormant_uids(proj);
     if dormant.is_empty() {
@@ -3581,41 +3600,15 @@ impl Scheduler<'_> {
         }
     }
 
-    fn level(&self) -> Leveled {
-        let base = self.run();
-        self.level_from_base(&base)
-    }
-
-    fn level_from_base(&self, base: &Schedule) -> Leveled {
-        let tl = self
-            .timelines
-            .get(&self.default_cal)
-            .expect("default timeline present");
-
-        if tl.total == 0 {
-            return Leveled {
-                start: base.results().map(|r| (r.uid, r.early_start)).collect(),
-                finish: base.results().map(|r| (r.uid, r.early_finish)).collect(),
-                rollups: base.rollups.clone(),
-                project_finish: base.project_finish,
-            };
-        }
-
-        let graph = self.leaf_graph();
-        let leaves = &graph.leaves;
-        let order = &graph.order;
-
-        // Work-resource capacities and per-task assignments. An assignment
-        // books its resource from its `Delay` into the task on; its stored
-        // `LevelingDelay` is the output of Project's last leveling, which
-        // this pass replaces, so it is not added.
-        let caps: HashMap<i32, Capacity> = self
-            .proj
-            .resources
-            .iter()
-            .filter(|r| r.kind == ResourceType::Work)
-            .map(|r| (r.uid, capacity(r, tl)))
-            .collect();
+    /// Each task's bookings on its work resources (`caps`): an assignment
+    /// books its resource from its `Delay` into the task on; its stored
+    /// `LevelingDelay` is the output of Project's last leveling, which the
+    /// leveler replaces, so it is not added.
+    fn demands(
+        &self,
+        graph: &LeafGraph,
+        caps: &HashMap<i32, Capacity>,
+    ) -> HashMap<i32, Vec<Demand>> {
         let mut assign: HashMap<i32, Vec<Demand>> = HashMap::new();
         for a in &self.proj.assignments {
             if caps.contains_key(&a.resource_uid) {
@@ -3654,6 +3647,105 @@ impl Scheduler<'_> {
                 ));
             }
         }
+        assign
+    }
+
+    /// See [`overbooked`].
+    fn overbooked(&self, shown: impl Fn(i32) -> Option<(DateTime, DateTime)>) -> HashMap<i32, f64> {
+        let tl = self
+            .timelines
+            .get(&self.default_cal)
+            .expect("default timeline present");
+        if tl.total == 0 {
+            return HashMap::new();
+        }
+        let graph = self.leaf_graph();
+        let caps: HashMap<i32, Capacity> = self
+            .proj
+            .resources
+            .iter()
+            .filter(|r| r.kind == ResourceType::Work)
+            .map(|r| (r.uid, capacity(r, tl)))
+            .collect();
+        let assign = self.demands(&graph, &caps);
+        let mut bookings: HashMap<i32, Vec<Booking>> = HashMap::new();
+        for &i in &graph.order {
+            let t = &self.proj.tasks[i];
+            let (Some(res), Some((start, finish))) = (assign.get(&t.uid), shown(t.uid)) else {
+                continue;
+            };
+            let s_idx = tl.to_index(start.minutes());
+            if fixed(t) {
+                book(&mut bookings, res, s_idx, tl.to_index(finish.minutes()));
+            } else {
+                book_demands(&mut bookings, res, s_idx);
+            }
+        }
+        let mut over = HashMap::new();
+        for (rid, bk) in &bookings {
+            let cap = &caps[rid];
+            let mut points: Vec<i64> = bk
+                .iter()
+                .map(|&(s, _, _)| s)
+                .chain(cap.iter().map(|&(from, _)| from))
+                .collect();
+            points.sort_unstable();
+            points.dedup();
+            let (mut peak, mut past) = (0.0f64, false);
+            for p in points {
+                let load: f64 = bk
+                    .iter()
+                    .filter(|&&(s, e, _)| s <= p && p < e)
+                    .map(|&(_, _, u)| u)
+                    .sum();
+                if load > 0.0 {
+                    past |= load > capacity_at(cap, p) + 1e-9;
+                    peak = peak.max(load);
+                }
+            }
+            if past {
+                over.insert(*rid, peak);
+            }
+        }
+        over
+    }
+
+    fn level(&self) -> Leveled {
+        let base = self.run();
+        self.level_from_base(&base)
+    }
+
+    fn level_from_base(&self, base: &Schedule) -> Leveled {
+        let tl = self
+            .timelines
+            .get(&self.default_cal)
+            .expect("default timeline present");
+
+        if tl.total == 0 {
+            return Leveled {
+                start: base.results().map(|r| (r.uid, r.early_start)).collect(),
+                finish: base.results().map(|r| (r.uid, r.early_finish)).collect(),
+                rollups: base.rollups.clone(),
+                project_finish: base.project_finish,
+            };
+        }
+
+        let graph = self.leaf_graph();
+        let leaves = &graph.leaves;
+        let order = &graph.order;
+
+        // Work-resource capacities and per-task assignments. An assignment
+        // books its resource from its `Delay` into the task on; its stored
+        // `LevelingDelay` is the output of Project's last leveling, which
+        // this pass replaces, so it is not added.
+        let caps: HashMap<i32, Capacity> = self
+            .proj
+            .resources
+            .iter()
+            .filter(|r| r.kind == ResourceType::Work)
+            .map(|r| (r.uid, capacity(r, tl)))
+            .collect();
+        let assign = self.demands(&graph, &caps);
 
         let mut delay: HashMap<i32, i64> = HashMap::new();
         let mut bookings: HashMap<i32, Vec<Booking>> = HashMap::new();

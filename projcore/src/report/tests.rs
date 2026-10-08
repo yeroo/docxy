@@ -54,8 +54,10 @@ fn project(tasks: Vec<Task>) -> Project {
 fn costed() -> Project {
     let mut root = task(0, "Demo", 0);
     root.outline_level = 0;
-    root.cost = money("150000");
-    root.work_min = Some(4800);
+    // Not the sum of the rows below (Phase, Sign-off, Permit: $1,500.00 and
+    // 80 hrs), so a total read from this row is told apart from a sum.
+    root.cost = money("155000");
+    root.work_min = Some(5400);
     root.percent_complete = Some(25);
     let mut phase = task(1, "Phase", 0);
     phase.cost = money("100000");
@@ -175,7 +177,17 @@ fn task_costs_are_the_stored_ones_with_the_summary_rows_total() {
     );
     assert_eq!(rows[1][4], "$600.00", "Design's stored Cost");
     assert_eq!(rows[4][1], "$500.00", "Permit's Fixed Cost");
-    assert_eq!(rows[5][4], "$1,500.00", "the project summary row's Cost");
+    assert_eq!(rows[5][4], "$1,550.00", "the project summary row's Cost");
+    // Fixed Cost does not roll up: its total is every row's own.
+    assert_eq!(rows[5][1], "$500.00");
+    let mut p = costed();
+    p.tasks[2].fixed_cost = money("5000");
+    let md = render_of(p, ReportKind::TaskCostOverview);
+    assert_eq!(rows_of(&md)[5][1], "$550.00", "{md}");
+}
+
+fn rows_of(md: &str) -> Vec<Vec<String>> {
+    rows(md, "")
 }
 
 #[test]
@@ -185,10 +197,13 @@ fn without_a_summary_row_totals_sum_only_the_top_level() {
     for t in &mut p.tasks {
         t.outline_level = t.outline_level.max(1);
     }
+    p.tasks[1].fixed_cost = money("5000");
     let md = render_of(p, ReportKind::TaskCostOverview);
     let total = rows(&md, "").pop().unwrap();
     // Phase ($1,000) + Sign-off + Permit ($500): its children are in Phase.
     assert_eq!(total[4], "$1,500.00");
+    // Design's fixed cost, nested under Phase, is in the Fixed Cost total.
+    assert_eq!(total[1], "$550.00");
     let md = render_of(costed_without_root(), ReportKind::ProjectOverview);
     let overview = &rows(&md, "")[0];
     assert_eq!(overview[3], "80 hrs");
@@ -248,8 +263,8 @@ fn the_project_overview_lists_top_level_progress_and_milestones_due() {
     let head = &rows(&md, "")[0];
     assert_eq!(head[0], "Mon 3/2/26");
     assert_eq!(head[2], "25%", "the project summary row's % Complete");
-    assert_eq!(head[3], "80 hrs");
-    assert_eq!(head[4], "$1,500.00");
+    assert_eq!(head[3], "90 hrs", "the project summary row's Work");
+    assert_eq!(head[4], "$1,550.00", "the project summary row's Cost");
     let top: Vec<_> = rows(&md, "## % Complete")
         .into_iter()
         .map(|r| r[0].clone())
@@ -368,4 +383,75 @@ fn reports_ignore_blank_rows_and_baselines_show_variance() {
     let design = &rows(&md, "")[1];
     assert_eq!(design[5], "$500.00");
     assert_eq!(design[6], "$100.00");
+}
+
+#[test]
+fn tasks_under_an_inactive_summary_are_left_out() {
+    // Phase is inactive; Design and Build keep their own Active flag. Build
+    // runs beside Design, and Dev also works on Permit beside them.
+    let mut p = costed();
+    p.tasks[1].active = Some(false);
+    p.tasks[3].predecessors.clear();
+    p.assignments.push(assign(3, 5, 1, 1.0));
+    let costs = render_of(p.clone(), ReportKind::TaskCostOverview);
+    assert!(
+        !costs.contains("Design") && !costs.contains("Build"),
+        "{costs}"
+    );
+    let over = render_of(p.clone(), ReportKind::OverallocatedResources);
+    assert!(over.contains("No overallocated resources."), "{over}");
+    // Active again, all three book Dev at once.
+    p.tasks[1].active = None;
+    let over = render_of(p, ReportKind::OverallocatedResources);
+    assert_eq!(rows(&over, "")[0][2], "300%", "{over}");
+}
+
+#[test]
+fn a_delayed_assignment_books_from_its_delay() {
+    // Build runs ten days beside Design, but Dev starts on it after five,
+    // when Design is done: never booked twice.
+    let mut p = costed();
+    p.tasks[3].predecessors.clear();
+    p.tasks[3].duration_min = 4800;
+    p.assignments[1].work_min = 2400;
+    p.assignments[1].delay = Some(2400 * 10);
+    let md = render_of(p.clone(), ReportKind::OverallocatedResources);
+    assert!(md.contains("No overallocated resources."), "{md}");
+    p.assignments[1].delay = None;
+    let md = render_of(p, ReportKind::OverallocatedResources);
+    assert_eq!(rows(&md, "")[0][2], "200%", "{md}");
+}
+
+#[test]
+fn availability_periods_meeting_overnight_leave_no_gap() {
+    // Design (Mar 2-6) at 100% across periods that end at 17:00 and start
+    // again at 08:00, as MSPDI writes them: Dev is never short.
+    let mut p = costed();
+    let period = |from: (u32, u32), to: Option<(u32, u32)>| AvailabilityPeriod {
+        available_from: Some(DateTime::from_ymd_hm(2026, 3, from.0, from.1, 0)),
+        available_to: to.map(|(d, h)| DateTime::from_ymd_hm(2026, 3, d, h, 0)),
+        available_units: Rate::parse("1"),
+    };
+    p.resources[0].availability_periods = vec![period((2, 8), Some((3, 17))), period((4, 8), None)];
+    let md = render_of(p.clone(), ReportKind::OverallocatedResources);
+    assert!(md.contains("No overallocated resources."), "{md}");
+    // A real gap (no period on Mar 4) leaves Design's work there without
+    // capacity.
+    p.resources[0].availability_periods = vec![period((2, 8), Some((3, 17))), period((5, 8), None)];
+    let md = render_of(p, ReportKind::OverallocatedResources);
+    assert_eq!(rows(&md, "")[0][0], "Dev", "{md}");
+}
+
+#[test]
+fn the_overview_spans_only_active_tasks() {
+    // An inactive twenty-day task starting with the plan does not stretch
+    // its finish.
+    let mut p = costed();
+    let finish = rows(&render_of(p.clone(), ReportKind::ProjectOverview), "")[0][1].clone();
+    let mut long = task(6, "Someday", 20 * 480);
+    long.active = Some(false);
+    p.tasks.push(long);
+    let md = render_of(p, ReportKind::ProjectOverview);
+    assert_eq!(rows(&md, "")[0][1], finish, "{md}");
+    assert_eq!(finish, "Fri 3/13/26");
 }

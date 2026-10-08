@@ -16,6 +16,7 @@
 //! plan without one says so instead of flagging nothing. Nothing reads the
 //! clock, so a report of the same plan is always the same text.
 
+use crate::datetime::DateTime;
 use crate::editor::{
     BaselinePart, Editor, Field, FieldReader, FieldValue, format_money, format_project_date,
     format_work, two_decimals,
@@ -117,6 +118,7 @@ pub fn render(ed: &Editor, kind: ReportKind) -> String {
         ed,
         proj,
         fields: FieldReader::new(ed),
+        active: proj.effective_activity(),
     };
     match kind {
         ReportKind::ProjectOverview => r.project_overview(&mut out),
@@ -139,6 +141,9 @@ struct Report<'a> {
     ed: &'a Editor,
     proj: &'a Project,
     fields: FieldReader<'a>,
+    /// Each row's effective activity: a task under an inactive summary is
+    /// dormant whatever its own flag says.
+    active: Vec<bool>,
 }
 
 /// The columns of a task list in the In Progress reports.
@@ -151,13 +156,16 @@ const TASK_COLUMNS: [Field; 5] = [
 ];
 
 impl Report<'_> {
-    /// The rows a report covers: no blank row, no inactive task, and not the
-    /// project summary row, which a report shows as its totals.
+    /// The rows a report covers: no blank row, no inactive task (nor one
+    /// under an inactive summary), and not the project summary row, which a
+    /// report shows as its totals.
     fn tasks(&self) -> impl Iterator<Item = &Task> {
         self.proj
             .tasks
             .iter()
-            .filter(|t| !t.is_null && t.is_active() && !t.is_project_summary())
+            .zip(&self.active)
+            .filter(|(t, active)| **active && !t.is_project_summary())
+            .map(|(t, _)| t)
     }
 
     fn leaves(&self) -> impl Iterator<Item = &Task> {
@@ -195,12 +203,24 @@ impl Report<'_> {
         self.proj
             .tasks
             .iter()
-            .find(|t| t.is_project_summary() && t.is_active())
+            .zip(&self.active)
+            .find(|(t, active)| **active && t.is_project_summary())
+            .map(|(t, _)| t)
     }
 
     /// A project total of a money or work field: the project summary row's,
-    /// else the sum over the outline level 1 rows.
+    /// else the sum over the outline level 1 rows. Fixed Cost does not roll
+    /// up (a summary's is its own), so its total is every row's.
     fn total(&self, field: Field) -> String {
+        if field == Field::FixedCost {
+            let units: f64 = self
+                .tasks()
+                .chain(self.project_summary())
+                .filter_map(|t| t.fixed_cost.as_ref().and_then(|c| c.to_f64()))
+                .sum::<f64>()
+                / 100.0;
+            return format_money(units);
+        }
         if let Some(sum) = self.project_summary() {
             return self.fields.read(sum, field).text;
         }
@@ -216,6 +236,20 @@ impl Report<'_> {
             Field::Work | Field::ActualWork | Field::RemainingWork => format_work(minutes),
             _ => format_money(money),
         }
+    }
+
+    /// The earliest start or latest finish shown for the tasks a report
+    /// covers (leveled while leveling is on), so a dormant task's span is
+    /// not the project's.
+    fn bound(
+        &self,
+        pick: fn(DateTime, DateTime) -> DateTime,
+        date: impl Fn(i32) -> Option<DateTime>,
+    ) -> String {
+        self.tasks()
+            .filter_map(|t| date(t.uid))
+            .reduce(pick)
+            .map_or_else(|| "NA".into(), format_project_date)
     }
 
     /// The project's % Complete: the summary row's, else the leaves' %
@@ -266,8 +300,8 @@ impl Report<'_> {
             out,
             &["Start", "Finish", "% Complete", "Work", "Cost"],
             vec![vec![
-                format_project_date(self.ed.disp_project_start()),
-                format_project_date(self.ed.disp_project_finish()),
+                self.bound(DateTime::min, |uid| self.ed.disp_start(uid)),
+                self.bound(DateTime::max, |uid| self.ed.disp_finish(uid)),
                 self.percent_complete(),
                 self.total(Field::Work),
                 self.total(Field::Cost),
@@ -456,19 +490,24 @@ impl Report<'_> {
         );
     }
 
+    /// Work resources booked past their capacity, as
+    /// [`crate::schedule::overbooked`] finds them on the shown schedule.
     fn overallocated(&self, out: &mut String) {
         if self.resources().next().is_none() {
             out.push_str("No resources.\n");
             return;
         }
+        let over = crate::schedule::overbooked(self.proj, |uid| {
+            Some((self.ed.disp_start(uid)?, self.ed.disp_finish(uid)?))
+        });
         let rows: Vec<_> = self
             .resources()
             .filter_map(|r| {
-                let peak = self.overallocation(r)?;
+                let peak = over.get(&r.uid)?;
                 Some(vec![
                     resource_name(r),
                     percent(max_units(r)),
-                    percent(peak),
+                    percent(*peak),
                     format_work(r.work_min.unwrap_or(0)),
                 ])
             })
@@ -480,103 +519,11 @@ impl Report<'_> {
             "No overallocated resources.",
         );
     }
-
-    /// A work resource's peak booking, when at some moment its assignments
-    /// together ask for more than it has then: its Max. Units, or within its
-    /// availability periods theirs (none outside them), as the leveler
-    /// reads capacity. An assignment books its task's shown span, start to
-    /// finish, as the leveler does; inactive and external tasks book none.
-    fn overallocation(&self, r: &Resource) -> Option<f64> {
-        if r.kind != ResourceType::Work {
-            return None;
-        }
-        let bookings: Vec<(i64, i64, f64)> = self
-            .proj
-            .assignments
-            .iter()
-            .filter(|a| a.resource_uid == r.uid && a.units > 0.0)
-            .filter_map(|a| {
-                let t = self.proj.task(a.task_uid)?;
-                if t.is_null || t.summary || !t.is_active() || t.is_external_leaf() {
-                    return None;
-                }
-                let start = self.ed.disp_start(t.uid)?.minutes();
-                let finish = self.ed.disp_finish(t.uid)?.minutes();
-                (finish > start).then_some((start, finish, a.units))
-            })
-            .collect();
-        let capacity = capacity(r);
-        let mut points: Vec<i64> = bookings
-            .iter()
-            .map(|&(s, _, _)| s)
-            .chain(capacity.iter().map(|&(from, _)| from))
-            .collect();
-        points.sort_unstable();
-        points.dedup();
-        let (mut peak, mut over) = (0.0f64, false);
-        for p in points {
-            let load: f64 = bookings
-                .iter()
-                .filter(|&&(s, f, _)| s <= p && p < f)
-                .map(|&(_, _, u)| u)
-                .sum();
-            if load <= 0.0 {
-                continue;
-            }
-            let cap = capacity
-                .iter()
-                .rev()
-                .find(|&&(from, _)| from <= p)
-                .map_or(0.0, |&(_, u)| u);
-            over |= load > cap + 1e-9;
-            peak = peak.max(load);
-        }
-        over.then_some(peak)
-    }
 }
 
 /// A resource's Max. Units, 100% when unusable (as the leveler reads it).
 fn max_units(r: &Resource) -> f64 {
     if r.max_units > 0.0 { r.max_units } else { 1.0 }
-}
-
-/// A resource's capacity as steps `(from minute, units)`, each holding until
-/// the next; see `schedule::capacity`, which this follows in minutes.
-fn capacity(r: &Resource) -> Vec<(i64, f64)> {
-    if r.availability_periods.is_empty() {
-        return vec![(i64::MIN, max_units(r))];
-    }
-    let periods: Vec<(i64, i64, f64)> = r
-        .availability_periods
-        .iter()
-        .map(|p| {
-            let from = p.available_from.map_or(i64::MIN, |d| d.minutes());
-            let to = p.available_to.map_or(i64::MAX, |d| d.minutes());
-            let units = match &p.available_units {
-                Some(units) => units.to_f64().unwrap_or(0.0),
-                None => max_units(r),
-            };
-            (from, to, units)
-        })
-        .collect();
-    let mut points: Vec<i64> = periods
-        .iter()
-        .flat_map(|&(from, to, _)| [from, to])
-        .chain([i64::MIN])
-        .filter(|&p| p != i64::MAX)
-        .collect();
-    points.sort_unstable();
-    points.dedup();
-    points
-        .into_iter()
-        .map(|p| {
-            let units = periods
-                .iter()
-                .find(|&&(from, to, _)| from <= p && p < to)
-                .map_or(0.0, |&(_, _, units)| units);
-            (p, units)
-        })
-        .collect()
 }
 
 fn percent(units: f64) -> String {
