@@ -32710,12 +32710,12 @@ impl Render for Docxy {
                                 // column width (an explicit single `w:col`),
                                 // which is the full text width for an
                                 // ordinary equal-width section.
-                                let mut col = v_flex().gap_1().children(blocks);
-                                col = match sect.single_col_w() {
-                                    Some(w) => col.w(tw(w)).flex_none(),
-                                    None => col.w_full(),
-                                };
-                                return col.into_any_element();
+                                return v_flex()
+                                    .w(tw(sect.single_col_w()))
+                                    .flex_none()
+                                    .gap_1()
+                                    .children(blocks)
+                                    .into_any_element();
                             }
                             let mut els: Vec<AnyElement> = Vec::new();
                             for ci in 0..sect.col_w.len() {

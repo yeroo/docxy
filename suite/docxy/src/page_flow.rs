@@ -32,10 +32,11 @@ pub(crate) struct SectionBox {
 
 impl SectionBox {
     /// The width a single-column band draws at: the section's configured
-    /// column width (an explicit single `w:col` keeps it), or `None` when no
-    /// column is declared at all (draw at full text width).
-    pub(crate) fn single_col_w(&self) -> Option<i32> {
-        self.col_w.first().copied()
+    /// column width (an explicit single `w:col` keeps it; an ordinary
+    /// equal-width column is the full text width). `col_w` always holds at
+    /// least one entry.
+    pub(crate) fn single_col_w(&self) -> i32 {
+        self.col_w[0]
     }
 }
 
@@ -125,16 +126,22 @@ pub(crate) fn first_blocks(ranges: &[Vec<(usize, usize)>]) -> Vec<usize> {
 fn section_box(sect: &str, gutter_at_top: bool) -> SectionBox {
     let setup = SectionSetup::parse(sect);
     let m = setup.margins;
-    let left = m.left.abs() + if gutter_at_top { 0 } else { m.gutter.abs() };
-    let top = m.top.abs() + if gutter_at_top { m.gutter.abs() } else { 0 };
+    // i64 math throughout: imported margins/gutter can be near i32::MAX or
+    // i32::MIN, whose abs and sums must not overflow.
+    let gutter = (m.gutter as i64).abs();
+    let left = ((m.left as i64).abs() + if gutter_at_top { 0 } else { gutter })
+        .clamp(0, i32::MAX as i64) as i32;
+    let top = ((m.top as i64).abs() + if gutter_at_top { gutter } else { 0 })
+        .clamp(0, i32::MAX as i64) as i32;
+    let right = (m.right as i64).abs().clamp(0, i32::MAX as i64) as i32;
+    let bottom = (m.bottom as i64).abs().clamp(0, i32::MAX as i64) as i32;
     let cols = &setup.columns;
     let n = cols.count().clamp(1, MAX_COLS) as usize;
     let (col_w, col_gap) = if cols.equal_width() {
         // `left` already holds the side gutter, matching export.rs's
-        // `content_w = w - left - right - gutter`. i64 math: imported
-        // w:space values can be near i32::MAX and must not overflow.
+        // `content_w = w - left - right - gutter`.
         let space = cols.space.max(0);
-        let text_w = setup.page.w as i64 - left as i64 - m.right.abs() as i64;
+        let text_w = setup.page.w as i64 - left as i64 - right as i64;
         let w =
             ((text_w - (n as i64 - 1) * space as i64) / n as i64).clamp(1, i32::MAX as i64) as i32;
         ((0..n).map(|_| w).collect(), (0..n).map(|_| space).collect())
@@ -157,9 +164,9 @@ fn section_box(sect: &str, gutter_at_top: bool) -> SectionBox {
         w: setup.page.w,
         h: setup.page.h,
         top,
-        bottom: m.bottom.abs(),
+        bottom,
         left,
-        right: m.right.abs(),
+        right,
         col_w,
         col_gap,
         sep: cols.sep,
@@ -391,7 +398,10 @@ impl<'a> Flow<'a> {
     fn capacity(&self) -> f32 {
         let page = self.cur.as_ref().expect("a page is open");
         let owner = &self.sections[page.owner()];
-        let content_h = (owner.h - owner.top - owner.bottom).max(1) as f32 / 15.0;
+        // i64: clamped margins still reach i32::MAX, so the subtraction must
+        // not overflow.
+        let content_h =
+            ((owner.h as i64 - owner.top as i64 - owner.bottom as i64).max(1)) as f32 / 15.0;
         content_h - page.used_h
     }
 
@@ -430,20 +440,17 @@ impl<'a> Flow<'a> {
                 // the sheet, not the band: the first block of any empty
                 // column on a sheet with no closed bands may overflow (a
                 // block taller than the page still gets its own sheet).
-                // Under closed bands an empty column instead overflows at
-                // once: the band moves to a new sheet without skipping a
-                // column, so its ranges stay positional (the drawn column i
-                // is always the column pour filled).
                 let empty_column = acc <= 0.0;
                 if bh > 0.0 && acc + bh > self.capacity() && (!empty_column || has_bands) {
                     if empty_column && has_bands {
-                        // The band's first block does not fit under the
-                        // closed bands: the band moves to a new sheet. The
-                        // page keeps the band only if it already holds
-                        // ranges (close_band drops a wholly unoccupied one);
-                        // no column is skipped, so the ranges stay
-                        // positional — column i's range is the column pour
-                        // filled.
+                        // The first block of ANY empty column under closed
+                        // bands overflows at once (not only the band's
+                        // first): the page is finished. Columns already
+                        // filled stay on this page; close_band drops a
+                        // wholly unoccupied band; the block continues on a
+                        // new sheet. No column is ever skipped, so the
+                        // ranges stay positional — column i's range is the
+                        // column pour filled.
                         self.finish_page();
                         continue;
                     }

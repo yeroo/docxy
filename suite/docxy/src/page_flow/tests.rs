@@ -545,7 +545,7 @@ fn single_explicit_column_keeps_its_width() {
     let body = body_blocks(&para("One", Some(&sect)));
     let pf = flow(&body, &sect, false);
     assert_eq!(pf.sections[0].col_w, vec![4320]);
-    assert_eq!(pf.sections[0].single_col_w(), Some(4320));
+    assert_eq!(pf.sections[0].single_col_w(), 4320);
 }
 
 #[test]
@@ -645,10 +645,11 @@ fn band_ranges_fit_their_columns() {
 
 #[test]
 fn zero_height_blocks_keep_the_column_empty() {
-    // A zero-height block (an sdt wrapper, a sectPr) at a column's start
-    // does not make the column "occupied": the page-tall table after it
-    // moves to a fresh sheet, instead of the wrapper closing a metadata-only
-    // band that forces the table over. The wrapper stays in its (heightless)
+    // Under closed bands: a zero-height block (an sdt wrapper, a sectPr) at
+    // a column's start does not make the column occupied, so a page-tall
+    // block after it still sees an empty column and moves the band to a
+    // fresh sheet — instead of being placed mid-column on the full sheet,
+    // where it would overrun the end. The wrapper stays in its (heightless)
     // band on the first sheet; every block stays in exactly one range.
     let rows: Vec<docxcore::model::Row> = (0..30)
         .map(|_| docxcore::model::Row {
@@ -682,4 +683,48 @@ fn zero_height_blocks_keep_the_column_empty() {
         }
     }
     assert_eq!(covered, (0..4).collect::<Vec<_>>(), "no block is lost");
+}
+
+#[test]
+fn fresh_sheet_zero_height_lead_keeps_the_oversize_exception() {
+    // No closed bands: a zero-height wrapper before a page-tall table does
+    // not consume the oversize exception — the column is empty by height —
+    // so the table stays on the first sheet with the wrapper riding its
+    // column. (With `idx == col_start` as the emptiness test the table
+    // would move to a second sheet.)
+    let rows: Vec<docxcore::model::Row> = (0..30)
+        .map(|_| docxcore::model::Row {
+            cells: vec![],
+            raw_props: vec![],
+            property_change: None,
+            element_attrs: Default::default(),
+        })
+        .collect();
+    let sect = letter("");
+    let body = vec![
+        Block::Raw(String::new()),
+        Block::Table(docxcore::model::Table {
+            rows,
+            ..Default::default()
+        }),
+        body_blocks(&sect).remove(0),
+    ];
+    let pf = flow(&body, &sect, false);
+    assert_eq!(pf.ranges(), vec![vec![(0, 3)]], "{:?}", pf.ranges());
+}
+
+#[test]
+fn huge_margins_do_not_overflow() {
+    // Imported extremes: w:left at i32::MAX plus a gutter, and i32::MIN
+    // margins — absolutes and sums run in i64 and clamp.
+    let big = geom_sect(12240, 15840, 1440, 1440, 1440, 2147483647, 720, "");
+    let body = body_blocks(&para("One", Some(&big)));
+    let pf = flow(&body, &big, false);
+    assert_eq!(pf.sections[0].left, i32::MAX);
+    let neg = "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/>\
+               <w:pgMar w:top=\"-2147483648\" w:right=\"-2147483648\" w:bottom=\"-2147483648\" \
+               w:left=\"-2147483648\" w:gutter=\"-2147483648\"/></w:sectPr>";
+    let body = body_blocks(&para("One", Some(neg)));
+    let pf = flow(&body, neg, false);
+    assert_eq!(pf.pages.len(), 1, "{:?}", pf.ranges());
 }
