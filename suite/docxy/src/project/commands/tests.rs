@@ -1483,6 +1483,21 @@ fn a_view_report_exports_beside_the_plan() {
     }
 }
 
+/// An export's name keeps the plan's stem as bytes: a name that is not UTF-8
+/// is not rewritten with replacement characters (#1123 r1).
+#[cfg(unix)]
+#[test]
+fn export_names_keep_a_non_utf8_stem() {
+    use std::os::unix::ffi::OsStrExt;
+    let plan = Path::new("/plans").join(std::ffi::OsStr::from_bytes(b"pl\xffan.xml"));
+    let name = |kind: ExportKind| kind.target(&plan).file_name().unwrap().as_bytes().to_vec();
+    assert_eq!(name(ExportKind::Gantt), b"pl\xffan.md");
+    assert_eq!(
+        name(ExportKind::Report(ReportKind::LateTasks)),
+        b"pl\xffan-late-tasks.md"
+    );
+}
+
 #[test]
 fn project_info_has_schedule_counts_and_outline_bullets() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/mspdi/10-summary.xml");

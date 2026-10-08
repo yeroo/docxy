@@ -1745,10 +1745,25 @@ pub(crate) enum ExportKind {
 }
 
 impl ExportKind {
-    fn file_name(self, stem: &str) -> String {
+    /// Where the export of the plan at `plan` goes: the Gantt chart
+    /// beside it as `<stem>.md`, a report as `<stem>-<slug>.md`. The stem
+    /// keeps its bytes, even when they are not UTF-8.
+    fn target(self, plan: &Path) -> PathBuf {
         match self {
-            ExportKind::Gantt => format!("{stem}.md"),
-            ExportKind::Report(kind) => kind.file_name(stem),
+            ExportKind::Gantt => plan.with_extension("md"),
+            ExportKind::Report(kind) => {
+                let mut name = plan.file_stem().unwrap_or_default().to_os_string();
+                name.push(format!("-{}.md", kind.slug()));
+                plan.with_file_name(name)
+            }
+        }
+    }
+
+    /// The name an unsaved plan's export dialog suggests.
+    fn suggested(self) -> String {
+        match self {
+            ExportKind::Gantt => "schedule.md".into(),
+            ExportKind::Report(kind) => kind.file_name("schedule"),
         }
     }
 
@@ -1780,17 +1795,13 @@ pub(crate) fn export_decision(tab: &DocTab, harness: bool, kind: ExportKind) -> 
         return ExportDecision::Unsaveable;
     }
     if let Some(p) = &tab.path {
-        let stem = p
-            .file_stem()
-            .map(|s| s.to_string_lossy())
-            .unwrap_or_default();
-        return ExportDecision::InPlace(p.with_file_name(kind.file_name(&stem)));
+        return ExportDecision::InPlace(kind.target(p));
     }
     if harness {
         ExportDecision::RefuseHarness
     } else {
         ExportDecision::Dialog {
-            suggested: kind.file_name("schedule"),
+            suggested: kind.suggested(),
         }
     }
 }
