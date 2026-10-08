@@ -19,7 +19,7 @@ test the ribbon's right-click menu collapses and expands it
   assert reply.items.0.checked is true
   call menu-click {"label":"Collapse the Ribbon"}
   call ribbon-read {}
-  assert reply.kind is ribbon
+  assert reply.tabs.1.kind is ribbon
   # Ctrl+F1 collapses first: the menu shows the tick, the item expands.
   key ctrl+f1
   call-error ribbon-read {} => the ribbon is collapsed
@@ -27,7 +27,7 @@ test the ribbon's right-click menu collapses and expands it
   assert reply.items.0.checked is true
   call menu-click {"label":"Collapse the Ribbon"}
   call ribbon-read {}
-  assert reply.kind is ribbon
+  assert reply.tabs.1.kind is ribbon
   # Esc closes it like any other menu.
   call menu-open {"target":"ribbon-bar"}
   key escape

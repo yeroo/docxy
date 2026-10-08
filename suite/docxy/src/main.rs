@@ -27807,6 +27807,9 @@ impl Docxy {
     /// A right-click on the ribbon's tab strip or body, and `menu-open
     /// "ribbon-bar"`: Collapse the Ribbon (#590), ticked while collapsed.
     pub(crate) fn open_ribbon_bar_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        // A group flyout up from a narrow window closes: the menu replaces
+        // it, as a command dispatch clears it (see `dispatch`).
+        self.ribbon_flyout = None;
         self.open_menu(
             menu::MenuTarget::RibbonBar,
             at,
