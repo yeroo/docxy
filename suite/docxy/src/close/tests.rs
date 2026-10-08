@@ -1051,6 +1051,111 @@ fn a_tab_that_failed_to_load_stays_unsaveable_after_a_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A spreadsheet whose hot sidecar exists but cannot be read restores as a
+/// placeholder that holds nothing restored, so the status says so — like the
+/// document arm's "load error" — instead of "unsaved — restored".
+#[test]
+fn xlsx_unreadable_sidecar_says_load_error_dirty() {
+    let dir = close_test_dir("xlsx-hot-unreadable-dirty");
+    let original = dir.join("original.xlsx");
+    basic_xlsx_at(&original);
+    let hot = dir.join("tab-0.xlsx");
+    std::fs::write(&hot, b"not a workbook").unwrap();
+    let mut p = persisted_tab(Kind::Xlsx, Some(&original), Some(&hot));
+    p.dirty = true;
+    let (t, from_hot) = restore_tab_sourced(&p, &crate::trusted::TrustStore::default());
+    assert!(matches!(t.surface, Surface::Placeholder), "{}", t.status);
+    assert!(
+        t.status
+            .starts_with("load error: the restored copy could not be read"),
+        "{}",
+        t.status
+    );
+    assert!(t.dirty, "{}", t.status);
+    assert!(!from_hot, "a placeholder holds nothing restored");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A clean restart of a tab with an unreadable sidecar is not a "loaded" one
+/// either: nothing was read.
+#[test]
+fn xlsx_unreadable_sidecar_says_load_error_clean() {
+    let dir = close_test_dir("xlsx-hot-unreadable-clean");
+    let original = dir.join("original.xlsx");
+    basic_xlsx_at(&original);
+    let hot = dir.join("tab-0.xlsx");
+    std::fs::write(&hot, b"not a workbook").unwrap();
+    let mut p = persisted_tab(Kind::Xlsx, Some(&original), Some(&hot));
+    p.dirty = false;
+    let t = restore_tab(&p);
+    assert!(matches!(t.surface, Surface::Placeholder), "{}", t.status);
+    assert!(
+        t.status
+            .starts_with("load error: the restored copy could not be read"),
+        "{}",
+        t.status
+    );
+    assert!(!t.dirty, "{}", t.status);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A readable sidecar still restores as the sheet it holds, labelled as
+/// before: "unsaved — restored" when dirty, "loaded" when clean.
+#[test]
+fn xlsx_readable_sidecar_keeps_restored_status() {
+    let dir = close_test_dir("xlsx-hot-readable");
+    let original = dir.join("original.xlsx");
+    basic_xlsx_at(&original);
+    let hot = dir.join("tab-0.xlsx");
+    std::fs::copy(&original, &hot).unwrap();
+    for (dirty, want) in [(true, "unsaved — restored"), (false, "loaded")] {
+        let mut p = persisted_tab(Kind::Xlsx, Some(&original), Some(&hot));
+        p.dirty = dirty;
+        let t = restore_tab(&p);
+        assert!(
+            matches!(t.surface, Surface::Sheet(_)),
+            "dirty={dirty}: {}",
+            t.status
+        );
+        assert_eq!(t.status.as_ref(), want, "dirty={dirty}");
+        assert_eq!(t.dirty, dirty);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A repaired tab whose sidecar cannot be read still reopens its damaged file
+/// through the lenient load: the status names the repaired parts, not the
+/// lost sidecar.
+#[test]
+fn xlsx_repaired_unreadable_sidecar_reopens_file() {
+    let dir = close_test_dir("xlsx-repaired-hot-bad");
+    let damaged = dir.join("damaged.xlsx");
+    damaged_xlsx_at(&damaged);
+    // The strict load refuses it: this is a tab that was opened with Repair.
+    let strict = tab_from_path(&damaged);
+    assert!(
+        matches!(strict.surface, Surface::Placeholder),
+        "{}",
+        strict.status
+    );
+    let hot = dir.join("tab-0.xlsx");
+    std::fs::write(&hot, b"not a workbook").unwrap();
+    let mut p = persisted_tab(Kind::Xlsx, Some(&damaged), Some(&hot));
+    p.dirty = true;
+    p.repaired = true;
+    let t = restore_tab(&p);
+    assert!(matches!(t.surface, Surface::Sheet(_)), "{}", t.status);
+    assert!(t.status.starts_with("loaded"), "{}", t.status);
+    assert!(t.status.contains("repaired"), "{}", t.status);
+    assert!(
+        !t.status
+            .starts_with("load error: the restored copy could not be read"),
+        "{}",
+        t.status
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_restore_without_a_sidecar_takes_the_fresh_load_s_mark() {
     let dir = close_test_dir("load-failed-reload");
@@ -1174,6 +1279,26 @@ fn basic_docx_at(path: &std::path::Path) {
         path,
     )
     .unwrap();
+}
+
+fn basic_xlsx_at(path: &std::path::Path) {
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.xlsx"),
+        path,
+    )
+    .unwrap();
+}
+
+/// `basic.xlsx` with one part's local header signature zeroed, so the strict
+/// load refuses it while Open and Repair stubs the part (gridcore's `damage`).
+fn damaged_xlsx_at(path: &std::path::Path) {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.xlsx");
+    let mut bytes = std::fs::read(src).unwrap();
+    let offset = opccore::zip::ZipArchive::open(&bytes)
+        .and_then(|zip| zip.find("xl/drawings/drawing1.xml").map(|e| e.local_offset))
+        .expect("basic.xlsx lists xl/drawings/drawing1.xml") as usize;
+    bytes[offset..offset + 4].copy_from_slice(&[0, 0, 0, 0]);
+    std::fs::write(path, bytes).unwrap();
 }
 
 fn doc_text(t: &DocTab) -> String {
