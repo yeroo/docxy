@@ -104,6 +104,15 @@ pub(crate) fn ed(t: &DocTab) -> &Editor {
     ed
 }
 
+/// The trailing sectPr of the editor's document, as page_flow's `last_sect`.
+pub(crate) fn trailing_sect(t: &DocTab) -> String {
+    ed(t)
+        .doc
+        .trailing_section_properties()
+        .map(|s| s.raw.clone())
+        .unwrap_or_default()
+}
+
 pub(crate) fn ed_mut(t: &mut DocTab) -> &mut Editor {
     let Surface::Doc(ed) = &mut t.surface else {
         panic!("a document")
@@ -161,14 +170,34 @@ pub(crate) fn edited_text(t: &DocTab) -> String {
 fn section_breaks_start_pages_unless_the_next_section_is_continuous() {
     let t = three_sections("pages", true);
     let body = &ed(&t).doc.body;
-    let pages = paginate(body, 10_000.0, 600.0);
-    assert_eq!(pages.len(), 3, "{pages:?}");
-    let firsts: Vec<usize> = pages.iter().map(|p| p.0).collect();
+    let last = trailing_sect(&t);
+    let pf = page_flow::flow(body, &last, false);
+    assert_eq!(pf.pages.len(), 3, "{:?}", pf.ranges());
+    let firsts: Vec<usize> = pf
+        .ranges()
+        .iter()
+        .map(|cols| {
+            cols.first()
+                .map_or(0, |&(s, e)| if s == e { s.saturating_sub(1) } else { s })
+        })
+        .collect();
     let slots = page_slots(ed(&t), &firsts, false);
     let secs: Vec<usize> = slots.iter().map(|s| s.section).collect();
     assert_eq!(secs, vec![0, 1, 2]);
-    // Columns flow breaks the same way.
-    assert_eq!(paginate_cols(body, 10_000.0, 300.0, 2).len(), 3);
+
+    // Columns flow breaks the same way: three two-column sections on three
+    // pages (what `paginate_cols` asserted before #745).
+    let two_col =
+        |extra: &str| format!("<w:sectPr>{MARGINS}<w:cols w:num=\"2\"/>{extra}</w:sectPr>");
+    let cols_body = body_blocks(&format!(
+        "{}{}{}",
+        para("One", Some(&two_col(""))),
+        para("Two", Some(&two_col(""))),
+        two_col("")
+    ));
+    let trailing = two_col("");
+    let pf = page_flow::flow(&cols_body, &trailing, false);
+    assert_eq!(pf.pages.len(), 3, "{:?}", pf.ranges());
 
     // Section 2 starting continuously keeps "One" and "Two" on one page:
     // the break after "One" reads section 2's w:type.
@@ -178,15 +207,24 @@ fn section_breaks_start_pages_unless_the_next_section_is_continuous() {
         para("Two", Some(&sect("", "<w:type w:val=\"continuous\"/>"))),
         sect("", "")
     ));
-    assert_eq!(section_page_ends(&cont), vec![false, true, false]);
-    assert_eq!(paginate(&cont, 10_000.0, 600.0).len(), 2);
-    // A trailing continuous section after a next-page one.
+    let trailing = sect("", "");
+    let pf = page_flow::flow(&cont, &trailing, false);
+    assert_eq!(pf.pages.len(), 2, "{:?}", pf.ranges());
+    assert_eq!(pf.pages[0].bands.len(), 2, "{:?}", pf.ranges());
+    assert_eq!(pf.pages[0].bands[0].cols, vec![(0, 1)]);
+    assert_eq!(pf.pages[0].bands[1].cols, vec![(1, 2)]);
+    // A trailing continuous section after a next-page one: the break after
+    // "One" reads the trailing section's continuous type, so no page splits
+    // there (what `section_page_ends` asserted before #745).
     let tail = body_blocks(&format!(
         "{}{}",
         para("One", Some(&sect("", ""))),
         sect("", "<w:type w:val=\"continuous\"/>")
     ));
-    assert_eq!(section_page_ends(&tail), vec![false, false]);
+    let trailing = sect("", "<w:type w:val=\"continuous\"/>");
+    let pf = page_flow::flow(&tail, &trailing, false);
+    assert_eq!(pf.pages.len(), 1, "{:?}", pf.ranges());
+    assert_eq!(pf.ranges()[0], vec![(0, 1), (1, 2)]);
 }
 
 #[test]

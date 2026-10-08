@@ -645,9 +645,15 @@ pub(crate) fn tab_page_slots(tab: &DocTab) -> Vec<PageSlot> {
         return Vec::new();
     };
     let even_odd = tab.pkg.as_ref().is_some_and(|p| p.has_even_odd());
+    // A page's first body block; an empty range (the blank page an odd/even
+    // section start inserts) takes the previous block, so the filler shows
+    // the previous section's header/footer, like the PDF exporter.
     let firsts: Vec<usize> = crate::page_ranges(tab)
         .iter()
-        .map(|cols| cols.first().map_or(0, |c| c.0))
+        .map(|cols| {
+            cols.first()
+                .map_or(0, |&(s, e)| if s == e { s.saturating_sub(1) } else { s })
+        })
         .collect();
     crate::hf::page_slots(ed, &firsts, even_odd)
 }

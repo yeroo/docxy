@@ -36,7 +36,10 @@ fn landscape_middle_section_gets_its_own_sheet_size() {
     let body = body_blocks(&format!(
         "{}{}{}",
         para("One", Some(&letter(""))),
-        para("Two", Some(&geom_sect(15840, 12240, 1440, 1440, 1440, 1440, 0, ""))),
+        para(
+            "Two",
+            Some(&geom_sect(15840, 12240, 1440, 1440, 1440, 1440, 0, ""))
+        ),
         letter("")
     ));
     let trailing = letter("");
@@ -46,11 +49,7 @@ fn landscape_middle_section_gets_its_own_sheet_size() {
     assert_eq!((pf.sections[1].w, pf.sections[1].h), (15840, 12240));
     assert_eq!((pf.sections[2].w, pf.sections[2].h), (12240, 15840));
     // Each page is owned by its own section (what hf slots and distances use).
-    let owners: Vec<usize> = pf
-        .pages
-        .iter()
-        .map(|p| p.bands[0].section)
-        .collect();
+    let owners: Vec<usize> = pf.pages.iter().map(|p| p.bands[0].section).collect();
     assert_eq!(owners, vec![0, 1, 2]);
 }
 
@@ -60,7 +59,10 @@ fn margins_and_gutter_are_per_section() {
     let body = body_blocks(&para("One", Some(&sect)));
     let pf = flow(&body, &sect, false);
     let sb = &pf.sections[0];
-    assert_eq!((sb.top, sb.right, sb.bottom, sb.left), (2880, 2160, 2880, 2880));
+    assert_eq!(
+        (sb.top, sb.right, sb.bottom, sb.left),
+        (2880, 2160, 2880, 2880)
+    );
 }
 
 #[test]
@@ -129,16 +131,19 @@ fn continuous_with_other_size_starts_a_page() {
     let body = body_blocks(&format!(
         "{}{}",
         para("One", Some(&letter(""))),
-        para("Two", Some(&geom_sect(
-            15840,
-            12240,
-            1440,
-            1440,
-            1440,
-            1440,
-            0,
-            r#"<w:type w:val="continuous"/>"#
-        )))
+        para(
+            "Two",
+            Some(&geom_sect(
+                15840,
+                12240,
+                1440,
+                1440,
+                1440,
+                1440,
+                0,
+                r#"<w:type w:val="continuous"/>"#
+            ))
+        )
     ));
     let pf = flow(&body, "", false);
     assert_eq!(pf.pages.len(), 2, "{:?}", pf.ranges());

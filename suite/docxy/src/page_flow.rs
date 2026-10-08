@@ -59,7 +59,12 @@ impl PageFlow {
     pub(crate) fn ranges(&self) -> Vec<Vec<(usize, usize)>> {
         self.pages
             .iter()
-            .map(|p| p.bands.iter().flat_map(|b| b.cols.iter().copied()).collect())
+            .map(|p| {
+                p.bands
+                    .iter()
+                    .flat_map(|b| b.cols.iter().copied())
+                    .collect()
+            })
             .collect()
     }
 }
@@ -80,14 +85,19 @@ fn section_box(sect: &str, gutter_at_top: bool) -> SectionBox {
         let space = cols.space.max(0);
         let text_w = setup.page.w - left - m.right.abs();
         let w = ((text_w - (n as i32 - 1) * space) / n as i32).max(1);
-        (
-            (0..n).map(|_| w).collect(),
-            (0..n).map(|_| space).collect(),
-        )
+        ((0..n).map(|_| w).collect(), (0..n).map(|_| space).collect())
     } else {
         (
-            cols.cols.iter().take(MAX_COLS as usize).map(|c| c.w).collect(),
-            cols.cols.iter().take(MAX_COLS as usize).map(|c| c.space).collect(),
+            cols.cols
+                .iter()
+                .take(MAX_COLS as usize)
+                .map(|c| c.w)
+                .collect(),
+            cols.cols
+                .iter()
+                .take(MAX_COLS as usize)
+                .map(|c| c.space)
+                .collect(),
         )
     };
     SectionBox {
@@ -193,11 +203,7 @@ impl PageB {
 /// smallest fitting height, as export.rs `balance_region` does. The caller
 /// checked the columns are at least two and equal-width. `None` when the
 /// pour needs more columns than the band has (the layout stays as filled).
-fn balance_band(
-    body: &[Block],
-    b: &BandB,
-    sb: &SectionBox,
-) -> Option<(Vec<(usize, usize)>, f32)> {
+fn balance_band(body: &[Block], b: &BandB, sb: &SectionBox) -> Option<(Vec<(usize, usize)>, f32)> {
     let (s, e) = (b.cols.first()?.0, b.pos);
     if s >= e {
         return None;
