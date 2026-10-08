@@ -29300,8 +29300,6 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// Whether a sheet command's state is on, for the commands whose label
-    /// reads differently then (Unfreeze Panes, Unprotect Sheet).
     /// Whether `act` draws checked from the sheet's own state: a ticked
     /// drop-down item (Filter while the sheet has AutoFilter buttons, the
     /// page's orientation, size and margins, #1019) or a checked box (Print
@@ -29317,6 +29315,8 @@ impl Docxy {
         }
     }
 
+    /// Whether a sheet command's state is on, for the commands whose label
+    /// reads differently then (Unfreeze Panes, Unprotect Sheet).
     fn sheet_act_toggled(&self, act: SheetAct) -> bool {
         match act {
             SheetAct::FreezePanes => self

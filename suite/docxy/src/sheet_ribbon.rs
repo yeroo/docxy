@@ -19,7 +19,7 @@
 
 use crate::help_tab::HelpAct;
 use crate::sheet_menus::SheetMenu;
-use crate::sheet_page_setup::{AreaOp, BreakOp, MarginPreset, PageAct};
+use crate::sheet_page_setup::{AreaOp, BreakOp, MarginPreset, PageAct, SetupTab};
 use crate::{RibbonTab, SheetAct, SumFn};
 
 /// A flex gap, in the unit the hand-drawn ribbon used for it (`gap_1` is a
@@ -352,17 +352,9 @@ const fn combo(id: &'static str, label: &'static str, value: &'static str, wide:
     cmd(id, label, Shape::Combo { value, wide }, SheetAct::Todo)
 }
 
-/// A check box whose drawn text differs from its name.
-const fn check(
-    id: &'static str,
-    label: &'static str,
-    text: &'static str,
-    act: SheetAct,
-) -> SheetCmd {
-    SheetCmd {
-        text: Some(text),
-        ..cmd(id, label, Shape::Check, act)
-    }
+/// A check box beside its name.
+const fn check(id: &'static str, label: &'static str, act: SheetAct) -> SheetCmd {
+    cmd(id, label, Shape::Check, act)
 }
 
 /// A Large button that reads `alt` while its state is on.
@@ -727,7 +719,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Page Setup",
                 launcher: true,
-                launch: Some(SheetAct::Page(PageAct::Dialog)),
+                launch: Some(SheetAct::Page(PageAct::Dialog(SetupTab::Page))),
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -754,7 +746,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                 menu_item(
                                     "custom-margins",
                                     "Custom Margins...",
-                                    SheetAct::Page(PageAct::Dialog),
+                                    SheetAct::Page(PageAct::Dialog(SetupTab::Margins)),
                                 ),
                             ],
                         ),
@@ -812,7 +804,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                 menu_item(
                                     "more-paper-sizes",
                                     "More Paper Sizes...",
-                                    SheetAct::Page(PageAct::Dialog),
+                                    SheetAct::Page(PageAct::Dialog(SetupTab::Page)),
                                 ),
                             ],
                         ),
@@ -865,7 +857,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             "print-titles",
                             "Print Titles",
                             None,
-                            SheetAct::Page(PageAct::Dialog),
+                            SheetAct::Page(PageAct::Dialog(SetupTab::Sheet)),
                         )),
                     ],
                 },
@@ -873,7 +865,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Scale to Fit",
                 launcher: true,
-                launch: Some(SheetAct::Page(PageAct::Dialog)),
+                launch: Some(SheetAct::Page(PageAct::Dialog(SetupTab::Page))),
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[col(
@@ -906,7 +898,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             Group {
                 title: "Sheet Options",
                 launcher: true,
-                launch: Some(SheetAct::Page(PageAct::Dialog)),
+                launch: Some(SheetAct::Page(PageAct::Dialog(SetupTab::Sheet))),
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
@@ -922,15 +914,9 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                         col(
                             COL,
                             &[
-                                check(
-                                    "view-gridlines",
-                                    "View Gridlines",
-                                    "View Gridlines",
-                                    SheetAct::Todo,
-                                ),
+                                check("view-gridlines", "View Gridlines", SheetAct::Todo),
                                 check(
                                     "print-gridlines",
-                                    "Print Gridlines",
                                     "Print Gridlines",
                                     SheetAct::Page(PageAct::PrintGridlines),
                                 ),
@@ -939,15 +925,9 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                         col(
                             COL,
                             &[
-                                check(
-                                    "view-headings",
-                                    "View Headings",
-                                    "View Headings",
-                                    SheetAct::Todo,
-                                ),
+                                check("view-headings", "View Headings", SheetAct::Todo),
                                 check(
                                     "print-headings",
-                                    "Print Headings",
                                     "Print Headings",
                                     SheetAct::Page(PageAct::PrintHeadings),
                                 ),
@@ -1863,14 +1843,14 @@ mod tests {
             .iter()
             .map(|g| (g.title, g.launcher, g.launch))
             .collect();
-        let dialog = Some(SheetAct::Page(PageAct::Dialog));
+        let dialog = |at| Some(SheetAct::Page(PageAct::Dialog(at)));
         assert_eq!(
             launched,
             [
                 ("Themes", false, None),
-                ("Page Setup", true, dialog),
-                ("Scale to Fit", true, dialog),
-                ("Sheet Options", true, dialog),
+                ("Page Setup", true, dialog(SetupTab::Page)),
+                ("Scale to Fit", true, dialog(SetupTab::Page)),
+                ("Sheet Options", true, dialog(SetupTab::Sheet)),
                 ("Arrange", false, None),
             ]
         );
@@ -1947,15 +1927,18 @@ mod tests {
             ("Normal", page(PageAct::Margins(MarginPreset::Normal))),
             ("Wide", page(PageAct::Margins(MarginPreset::Wide))),
             ("Narrow", page(PageAct::Margins(MarginPreset::Narrow))),
-            ("Custom Margins...", page(PageAct::Dialog)),
+            (
+                "Custom Margins...",
+                page(PageAct::Dialog(SetupTab::Margins)),
+            ),
             ("Portrait", page(PageAct::Landscape(false))),
             ("Landscape", page(PageAct::Landscape(true))),
             ("Letter", page(PageAct::Paper(1))),
             ("A4", page(PageAct::Paper(9))),
             ("Legal", page(PageAct::Paper(5))),
             ("A3", page(PageAct::Paper(8))),
-            ("More Paper Sizes...", page(PageAct::Dialog)),
-            ("Print Titles", page(PageAct::Dialog)),
+            ("More Paper Sizes...", page(PageAct::Dialog(SetupTab::Page))),
+            ("Print Titles", page(PageAct::Dialog(SetupTab::Sheet))),
             ("Width:", Ok(SheetAct::Menu(SheetMenu::FitWidth))),
             ("Height:", Ok(SheetAct::Menu(SheetMenu::FitHeight))),
             ("Scale:", Ok(SheetAct::Menu(SheetMenu::Scale))),

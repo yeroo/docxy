@@ -234,7 +234,7 @@ pub(crate) fn find_select_menu() -> Vec<MenuItem> {
 /// pages, the count the sheet shows now (`current`, 0 Automatic) ticked, and
 /// More Pages... (the Page Setup dialog).
 pub(crate) fn fit_menu(width: bool, current: u32) -> Vec<MenuItem> {
-    use crate::sheet_page_setup::{FIT_PAGES, PageAct};
+    use crate::sheet_page_setup::{FIT_PAGES, PageAct, SetupTab};
     let act = |n| {
         SheetAct::Page(if width {
             PageAct::FitWidth(n)
@@ -270,7 +270,7 @@ pub(crate) fn fit_menu(width: bool, current: u32) -> Vec<MenuItem> {
     items.push(item(
         &format!("fit-{axis}-more"),
         "More Pages\u{2026}",
-        SheetAct::Page(PageAct::Dialog),
+        SheetAct::Page(PageAct::Dialog(SetupTab::Page)),
         true,
     ));
     items
@@ -279,7 +279,7 @@ pub(crate) fn fit_menu(width: bool, current: u32) -> Vec<MenuItem> {
 /// Scale to Fit › Scale:: the percentages, the sheet's own ticked while it
 /// prints at a scale (`current`), and Custom... (the Page Setup dialog).
 pub(crate) fn scale_menu(current: Option<u32>) -> Vec<MenuItem> {
-    use crate::sheet_page_setup::{PageAct, SCALES};
+    use crate::sheet_page_setup::{PageAct, SCALES, SetupTab};
     let mut items: Vec<MenuItem> = SCALES
         .iter()
         .map(|&n| {
@@ -299,7 +299,7 @@ pub(crate) fn scale_menu(current: Option<u32>) -> Vec<MenuItem> {
     items.push(item(
         "scale-custom",
         "Custom\u{2026}",
-        SheetAct::Page(PageAct::Dialog),
+        SheetAct::Page(PageAct::Dialog(SetupTab::Page)),
         true,
     ));
     items
@@ -477,7 +477,10 @@ mod tests {
         assert_eq!(w[1].0, "1 page");
         assert_eq!(w[9].0, "9 pages");
         assert_eq!(w[10].0, "More Pages\u{2026}");
-        assert_eq!(w[10].1, SheetAct::Page(PageAct::Dialog));
+        assert_eq!(
+            w[10].1,
+            SheetAct::Page(PageAct::Dialog(crate::sheet_page_setup::SetupTab::Page))
+        );
         let ticked: Vec<&str> = w.iter().filter(|e| e.2).map(|e| e.0.as_str()).collect();
         assert_eq!(ticked, ["2 pages"]);
         let h = entries(&fit_menu(false, 0));

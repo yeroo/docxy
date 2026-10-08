@@ -283,7 +283,8 @@ fn page_acts_sort_into_the_command_tables() {
         PageAct::Scale(50),
         PageAct::PrintGridlines,
         PageAct::PrintHeadings,
-        PageAct::Dialog,
+        PageAct::Dialog(SetupTab::Page),
+        PageAct::Dialog(SetupTab::Sheet),
     ];
     for p in all {
         let act = SheetAct::Page(p);
@@ -302,15 +303,176 @@ fn page_acts_sort_into_the_command_tables() {
 
 // ---- the Page Setup dialog ----------------------------------------------------
 
+/// Set `control`, on whichever tab holds it (as `dialog-tab` then
+/// `dialog-set` would).
 fn set(t: &mut DocTab, control: &str, value: Json) {
+    let d = t.dialogs.top_dialog_mut().unwrap();
+    if let Some(page) = d
+        .controls
+        .iter()
+        .find(|c| c.name == control)
+        .and_then(|c| c.page)
+    {
+        d.tab = page;
+    }
     t.dialogs
         .set(control, &Json::obj(vec![("value", value)]))
         .unwrap();
 }
 
 fn open(t: &mut DocTab) {
-    run(t, PageAct::Dialog);
+    run(t, PageAct::Dialog(SetupTab::Page));
     assert_eq!(t.dialogs.top().map(|d| d.id), Some("page-setup"));
+}
+
+fn ok(t: &mut DocTab) {
+    crate::dialog_host::dialog_click(t, "OK").unwrap();
+    assert!(t.dialogs.top().is_none());
+}
+
+fn defined(t: &mut DocTab, name: &str) -> Option<String> {
+    view(t)
+        .pkg
+        .workbook
+        .defined_names
+        .iter()
+        .find(|d| d.name == name)
+        .map(|d| d.formula.clone())
+}
+
+#[test]
+fn the_dialog_has_three_tabs_and_its_buttons_on_none() {
+    let mut t = tab();
+    for (at, i) in [
+        (SetupTab::Page, 0),
+        (SetupTab::Margins, 1),
+        (SetupTab::Sheet, 2),
+    ] {
+        run(&mut t, PageAct::Dialog(at));
+        let d = t.dialogs.top().unwrap();
+        assert_eq!(d.tabs, ["Page", "Margins", "Sheet"]);
+        assert_eq!(d.tab, i, "{at:?}");
+        // Every control sits on a tab, so none makes one page too tall to
+        // reach OK; the buttons are not controls and show on every tab.
+        assert!(d.controls.iter().all(|c| c.page.is_some_and(|p| p < 3)));
+        let labels: Vec<&str> = d.buttons.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["OK", "Cancel"]);
+        let page_of = |name: &str| d.controls.iter().find(|c| c.name == name).unwrap().page;
+        assert_eq!(page_of("scale"), Some(0));
+        assert_eq!(page_of("left"), Some(1));
+        assert_eq!(page_of("title-rows"), Some(2));
+        crate::dialog_host::dialog_click(&mut t, "Cancel").unwrap();
+    }
+}
+
+#[test]
+fn an_untouched_ok_keeps_full_precision_margins() {
+    let mut t = tab();
+    // As a file written in centimetres loads: 1.8 cm.
+    let exact = 0.708_661_417_322_834_7;
+    view(&mut t).pkg.workbook.sheets[0].page_setup.margins.left = exact;
+    open(&mut t);
+    assert_eq!(text(t.dialogs.top().unwrap(), "left"), "0.7087");
+    ok(&mut t);
+    assert_eq!(setup(&mut t).margins.left, exact);
+    assert_eq!(undo_len(&mut t), 0);
+    assert!(!t.dirty);
+    // Changing another field writes that field and leaves the margin be.
+    open(&mut t);
+    set(&mut t, "gridlines", Json::Bool(true));
+    ok(&mut t);
+    assert_eq!(setup(&mut t).margins.left, exact);
+    assert!(setup(&mut t).grid_lines);
+    assert_eq!(undo_len(&mut t), 1);
+    // A margin typed is written as typed.
+    open(&mut t);
+    set(&mut t, "left", Json::Str("0.7087".into()));
+    set(&mut t, "left", Json::Str("0.5".into()));
+    ok(&mut t);
+    assert_eq!(setup(&mut t).margins.left, 0.5);
+}
+
+#[test]
+fn an_untouched_ok_keeps_definitions_the_fields_cannot_show() {
+    let mut t = tab();
+    let area_f = r#"INDIRECT("Sheet1!A1:B2")"#;
+    let titles_f = "Sheet1!$1:$1,Sheet1!$A:$A";
+    {
+        let wb = &mut view(&mut t).pkg.workbook;
+        for (name, formula) in [(area::PRINT_AREA, area_f), (area::PRINT_TITLES, titles_f)] {
+            wb.defined_names.push(gridcore::sheet::DefinedName {
+                name: name.into(),
+                scope: Some(0),
+                formula: formula.into(),
+            });
+        }
+    }
+    open(&mut t);
+    // The dialog cannot spell INDIRECT, so it shows no print area.
+    assert_eq!(text(t.dialogs.top().unwrap(), "print-area"), "");
+    ok(&mut t);
+    assert_eq!(defined(&mut t, area::PRINT_AREA).as_deref(), Some(area_f));
+    assert_eq!(
+        defined(&mut t, area::PRINT_TITLES).as_deref(),
+        Some(titles_f)
+    );
+    assert_eq!(undo_len(&mut t), 0);
+    // Nor does an unrelated change touch them.
+    open(&mut t);
+    set(&mut t, "orientation", Json::Str("Landscape".into()));
+    ok(&mut t);
+    assert!(setup(&mut t).orientation.is_landscape());
+    assert_eq!(defined(&mut t, area::PRINT_AREA).as_deref(), Some(area_f));
+    assert_eq!(
+        defined(&mut t, area::PRINT_TITLES).as_deref(),
+        Some(titles_f)
+    );
+    // Typing an area is a change: it replaces the definition.
+    open(&mut t);
+    set(&mut t, "print-area", Json::Str("A1:B2".into()));
+    ok(&mut t);
+    assert_eq!(print_area(&mut t), [(0, 0, 1, 1)]);
+    assert_eq!(
+        defined(&mut t, area::PRINT_TITLES).as_deref(),
+        Some(titles_f)
+    );
+}
+
+#[test]
+fn references_name_this_sheet_or_none() {
+    let mut t = tab();
+    view(&mut t).pkg.workbook.sheets[0].name = "Sales, East".into();
+    // Another sheet's range is refused, not applied here.
+    for (control, value) in [
+        ("print-area", "Other!$A$1:$C$10"),
+        ("title-rows", "Other!$1:$1"),
+    ] {
+        open(&mut t);
+        set(&mut t, control, Json::Str(value.into()));
+        let err = crate::dialog_host::dialog_click(&mut t, "OK").unwrap_err();
+        assert!(
+            err.contains("is on sheet 'Other', not on 'Sales, East'"),
+            "{err}"
+        );
+        assert_eq!(undo_len(&mut t), 0);
+        crate::dialog_host::dialog_click(&mut t, "Cancel").unwrap();
+    }
+    // This sheet's name, quoted with a comma in it, and two areas.
+    open(&mut t);
+    set(
+        &mut t,
+        "print-area",
+        Json::Str("'Sales, East'!$A$1:$B$2, D4".into()),
+    );
+    set(
+        &mut t,
+        "title-rows",
+        Json::Str("'sales, east'!$1:$2".into()),
+    );
+    ok(&mut t);
+    assert_eq!(print_area(&mut t), [(0, 0, 1, 1), (3, 3, 3, 3)]);
+    let v = view(&mut t);
+    assert_eq!(area::print_titles(&v.pkg.workbook, 0).rows, Some((0, 1)));
 }
 
 #[test]
@@ -346,8 +508,7 @@ fn the_dialogs_ok_applies_every_field_as_one_undo_step() {
     set(&mut t, "title-rows", Json::Str("$1:$2".into()));
     set(&mut t, "title-cols", Json::Str("A:A".into()));
     set(&mut t, "headings", Json::Bool(true));
-    crate::dialog_host::dialog_click(&mut t, "OK").unwrap();
-    assert!(t.dialogs.top().is_none());
+    ok(&mut t);
     let p = setup(&mut t);
     assert!(p.orientation.is_landscape());
     assert_eq!(p.paper_size, 9);

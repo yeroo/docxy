@@ -80,9 +80,10 @@ pub(crate) enum PageAct {
     /// Sheet Options › Print Gridlines and Print Headings: toggles.
     PrintGridlines,
     PrintHeadings,
-    /// The Page Setup dialog: Custom Margins..., More Paper Sizes..., Print
-    /// Titles, More Pages..., Custom... and the groups' launchers.
-    Dialog,
+    /// The Page Setup dialog, open on a tab: Custom Margins..., More Paper
+    /// Sizes..., Print Titles, More Pages..., Custom... and the groups'
+    /// launchers.
+    Dialog(SetupTab),
 }
 
 impl PageAct {
@@ -138,7 +139,7 @@ pub(crate) fn is_on(act: PageAct, wb: &Workbook, s: usize) -> bool {
         PageAct::Scale(n) => !p.fit_to_page && p.scale == n,
         PageAct::PrintGridlines => p.grid_lines,
         PageAct::PrintHeadings => p.headings,
-        PageAct::Area(_) | PageAct::Break(_) | PageAct::Dialog => false,
+        PageAct::Area(_) | PageAct::Break(_) | PageAct::Dialog(_) => false,
     }
 }
 
@@ -245,7 +246,7 @@ fn apply(v: &mut SheetView, s: usize, act: PageAct) {
                 }
                 PageAct::PrintGridlines => p.grid_lines = !p.grid_lines,
                 PageAct::PrintHeadings => p.headings = !p.headings,
-                PageAct::Area(_) | PageAct::Break(_) | PageAct::Dialog => {}
+                PageAct::Area(_) | PageAct::Break(_) | PageAct::Dialog(_) => {}
             }
         }
     }
@@ -253,8 +254,8 @@ fn apply(v: &mut SheetView, s: usize, act: PageAct) {
 
 /// Run a Page Layout command on the tab.
 pub(crate) fn run(tab: &mut DocTab, act: PageAct) {
-    if act == PageAct::Dialog {
-        match dialog(tab) {
+    if let PageAct::Dialog(at) = act {
+        match dialog(tab, at) {
             Ok(d) => tab.dialogs.push(d),
             Err(e) => tab.status = e.into(),
         }
@@ -265,6 +266,31 @@ pub(crate) fn run(tab: &mut DocTab, act: PageAct) {
         Ok(())
     }) {
         tab.status = e.into();
+    }
+}
+
+/// The Page Setup dialog's tabs; a command opens it on the one it is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SetupTab {
+    /// Orientation, paper and scaling: More Paper Sizes..., the Page Setup
+    /// and Scale to Fit launchers.
+    Page,
+    /// Custom Margins....
+    Margins,
+    /// Print area, titles and the print options: Print Titles and the Sheet
+    /// Options launcher.
+    Sheet,
+}
+
+impl SetupTab {
+    const NAMES: [&str; 3] = ["Page", "Margins", "Sheet"];
+
+    fn index(self) -> usize {
+        match self {
+            SetupTab::Page => 0,
+            SetupTab::Margins => 1,
+            SetupTab::Sheet => 2,
+        }
     }
 }
 
@@ -285,6 +311,17 @@ fn margin_fields(m: &Margins) -> [f64; 6] {
     [m.top, m.bottom, m.left, m.right, m.header, m.footer]
 }
 
+fn margin_mut<'a>(m: &'a mut Margins, name: &str) -> &'a mut f64 {
+    match name {
+        "top" => &mut m.top,
+        "bottom" => &mut m.bottom,
+        "left" => &mut m.left,
+        "right" => &mut m.right,
+        "header" => &mut m.header,
+        _ => &mut m.footer,
+    }
+}
+
 /// The paper list the dialog offers: the Size menu's, and the sheet's own
 /// code when it is not one of them.
 fn papers(current: u32) -> Vec<(u32, String)> {
@@ -295,18 +332,52 @@ fn papers(current: u32) -> Vec<(u32, String)> {
     out
 }
 
-/// A number as a field shows it: `0.7`, not `0.70000`.
+/// A number as a field shows it: `0.7`, not `0.70000`. The field is rounded,
+/// so OK writes a margin only when its field was changed.
 fn num(v: f64) -> String {
     let s = format!("{v:.4}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-fn text_control(name: &'static str, label: &str, kind: ControlKind, value: String) -> Control {
-    Control::new(name, label, kind, Value::Text(value))
+/// A control on tab `page`.
+fn on(page: SetupTab, mut c: Control) -> Control {
+    c.page = Some(page.index());
+    c
 }
 
-/// The Page Setup dialog for the active sheet, as it stands.
-pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
+fn text_control(
+    page: SetupTab,
+    name: &'static str,
+    label: &str,
+    kind: ControlKind,
+    value: String,
+) -> Control {
+    on(page, Control::new(name, label, kind, Value::Text(value)))
+}
+
+fn check_control(page: SetupTab, name: &'static str, label: &str, value: bool) -> Control {
+    on(
+        page,
+        Control::new(name, label, ControlKind::Checkbox, Value::Bool(value)),
+    )
+}
+
+fn choice_control(
+    page: SetupTab,
+    name: &'static str,
+    label: &str,
+    kind: ControlKind,
+    items: Vec<String>,
+    at: Option<usize>,
+) -> Control {
+    let mut c = Control::new(name, label, kind, Value::Choice(at));
+    c.items = items;
+    on(page, c)
+}
+
+/// The Page Setup dialog for the active sheet, as it stands, open on `at`.
+pub(crate) fn dialog(tab: &DocTab, at: SetupTab) -> Result<Dialog, String> {
+    use SetupTab::{Margins as M, Page as P, Sheet as S};
     let Surface::Sheet(v) = &tab.surface else {
         return Err("page setup needs a spreadsheet".into());
     };
@@ -321,72 +392,81 @@ pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
         DialogOwner::SheetPageSetup,
     );
     d.text = None;
-    let mut controls = Vec::new();
-    let mut orientation = Control::new(
-        "orientation",
-        "Orientation",
-        ControlKind::Radio,
-        Value::Choice(Some(usize::from(p.orientation.is_landscape()))),
-    );
-    orientation.items = ORIENTATIONS.iter().map(|s| s.to_string()).collect();
-    controls.push(orientation);
+    d.tabs = SetupTab::NAMES.iter().map(|t| t.to_string()).collect();
+    d.tab = at.index();
+    let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect();
     let list = papers(p.paper_size);
-    let mut paper = Control::new(
-        "paper",
-        "Paper size:",
-        ControlKind::Dropdown,
-        Value::Choice(list.iter().position(|&(c, _)| c == p.paper_size)),
-    );
-    paper.items = list.into_iter().map(|(_, n)| n).collect();
-    controls.push(paper);
-    let mut scaling = Control::new(
-        "scaling",
-        "Scaling",
-        ControlKind::Radio,
-        Value::Choice(Some(usize::from(p.fit_to_page))),
-    );
-    scaling.items = SCALING.iter().map(|s| s.to_string()).collect();
-    controls.push(scaling);
-    controls.push(text_control(
-        "scale",
-        "% normal size",
-        ControlKind::Number,
-        p.scale.to_string(),
-    ));
     // A blank page count is Automatic, as Excel's box reads it.
     let pages = |n: u32| if n == 0 { String::new() } else { n.to_string() };
-    controls.push(text_control(
-        "fit-width",
-        "page(s) wide by",
-        ControlKind::Number,
-        pages(p.fit_width),
-    ));
-    controls.push(text_control(
-        "fit-height",
-        "tall",
-        ControlKind::Number,
-        pages(p.fit_height),
-    ));
+    let mut controls = vec![
+        choice_control(
+            P,
+            "orientation",
+            "Orientation",
+            ControlKind::Radio,
+            strings(&ORIENTATIONS),
+            Some(usize::from(p.orientation.is_landscape())),
+        ),
+        choice_control(
+            P,
+            "scaling",
+            "Scaling",
+            ControlKind::Radio,
+            strings(&SCALING),
+            Some(usize::from(p.fit_to_page)),
+        ),
+        text_control(
+            P,
+            "scale",
+            "% normal size",
+            ControlKind::Number,
+            p.scale.to_string(),
+        ),
+        text_control(
+            P,
+            "fit-width",
+            "page(s) wide by",
+            ControlKind::Number,
+            pages(p.fit_width),
+        ),
+        text_control(
+            P,
+            "fit-height",
+            "tall",
+            ControlKind::Number,
+            pages(p.fit_height),
+        ),
+        choice_control(
+            P,
+            "paper",
+            "Paper size:",
+            ControlKind::Dropdown,
+            list.iter().map(|(_, n)| n.clone()).collect(),
+            list.iter().position(|&(c, _)| c == p.paper_size),
+        ),
+    ];
     for ((name, label), v) in MARGINS.iter().zip(margin_fields(&p.margins)) {
-        controls.push(text_control(name, label, ControlKind::Number, num(v)));
+        controls.push(text_control(M, name, label, ControlKind::Number, num(v)));
     }
-    for (name, label, on) in [
-        ("h-centered", "Center horizontally", p.h_centered),
-        ("v-centered", "Center vertically", p.v_centered),
-    ] {
-        controls.push(Control::new(
-            name,
-            label,
-            ControlKind::Checkbox,
-            Value::Bool(on),
-        ));
-    }
+    controls.push(check_control(
+        M,
+        "h-centered",
+        "Center horizontally",
+        p.h_centered,
+    ));
+    controls.push(check_control(
+        M,
+        "v-centered",
+        "Center vertically",
+        p.v_centered,
+    ));
     let print_area = area::print_area(wb, s)
         .into_iter()
         .map(area::rect_name)
         .collect::<Vec<_>>()
         .join(",");
     controls.push(text_control(
+        S,
         "print-area",
         "Print area:",
         ControlKind::Text,
@@ -403,28 +483,26 @@ pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
         None => String::new(),
     };
     controls.push(text_control(
+        S,
         "title-rows",
         "Rows to repeat at top:",
         ControlKind::Text,
         span(titles.rows, true),
     ));
     controls.push(text_control(
+        S,
         "title-cols",
         "Columns to repeat at left:",
         ControlKind::Text,
         span(titles.cols, false),
     ));
-    for (name, label, on) in [
-        ("gridlines", "Gridlines", p.grid_lines),
-        ("headings", "Row and column headings", p.headings),
-    ] {
-        controls.push(Control::new(
-            name,
-            label,
-            ControlKind::Checkbox,
-            Value::Bool(on),
-        ));
-    }
+    controls.push(check_control(S, "gridlines", "Gridlines", p.grid_lines));
+    controls.push(check_control(
+        S,
+        "headings",
+        "Row and column headings",
+        p.headings,
+    ));
     d.controls = controls;
     d.mark_opened();
     Ok(d)
@@ -449,12 +527,15 @@ fn checked(d: &Dialog, name: &str) -> bool {
     control(d, name).is_some_and(|c| c.value == Value::Bool(true))
 }
 
-/// What the dialog's OK writes: the page setup, the print area and titles.
+/// What the dialog's OK writes: the page setup, and the print area and
+/// titles only when their fields were changed (`None` keeps the sheet's
+/// definition, which the fields may not be able to show: `INDIRECT(...)`,
+/// `#REF!`).
 #[derive(Debug, PartialEq)]
 struct Staged {
     setup: PageSetup,
-    print_area: Vec<area::Rect>,
-    titles: PrintTitles,
+    print_area: Option<Vec<area::Rect>>,
+    titles: Option<PrintTitles>,
 }
 
 /// A whole number typed in `name`; blank reads as `blank`.
@@ -469,29 +550,84 @@ fn whole(d: &Dialog, name: &str, label: &str, blank: Option<u32>) -> Result<u32,
     }
 }
 
-/// The references typed in `name`, each part one reference, or why not.
-fn refs(d: &Dialog, name: &str, label: &str) -> Result<Vec<PrintRef>, String> {
+/// `text` split at commas outside a quoted sheet name (`'Sales, East'!A1`),
+/// blank parts dropped.
+fn split_refs(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut quoted = false;
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        match c {
+            '\'' => quoted = !quoted,
+            ',' if !quoted => {
+                out.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&text[start..]);
+    out.into_iter()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// The sheet a reference names (`Sheet2!A1`, `'My sheet'!A1`), unquoted;
+/// `None` when it names none.
+fn sheet_of(part: &str) -> Option<String> {
+    let mut quoted = false;
+    let mut bang = None;
+    for (i, c) in part.char_indices() {
+        match c {
+            '\'' => quoted = !quoted,
+            '!' if !quoted => bang = Some(i),
+            _ => {}
+        }
+    }
+    let name = part[..bang?].trim();
+    Some(
+        match name.strip_prefix('\'').and_then(|n| n.strip_suffix('\'')) {
+            Some(inner) => inner.replace("''", "'"),
+            None => name.to_string(),
+        },
+    )
+}
+
+/// The references typed in `name`, each part one reference on `sheet`, or
+/// why not.
+fn refs(d: &Dialog, name: &str, label: &str, sheet: &str) -> Result<Vec<PrintRef>, String> {
     let t = text(d, name);
-    let parts = t.split(',').filter(|p| !p.trim().is_empty()).count();
-    let refs = area::parse_refs(&t);
-    if parts == 0 {
-        return Ok(Vec::new());
+    let mut out = Vec::new();
+    for part in split_refs(&t) {
+        if let Some(other) = sheet_of(part).filter(|o| !o.eq_ignore_ascii_case(sheet)) {
+            return Err(format!(
+                "{label} '{}' is on sheet '{other}', not on '{sheet}'",
+                t.trim()
+            ));
+        }
+        match area::parse_refs(part).as_slice() {
+            [r] => out.push(*r),
+            _ => return Err(format!("{label} '{}' is not a reference", t.trim())),
+        }
     }
-    if refs.len() != parts {
-        return Err(format!("{label} '{}' is not a reference", t.trim()));
-    }
-    Ok(refs)
+    Ok(out)
 }
 
 /// The rows or columns typed in a print-titles field: one span of whole
 /// rows (`$1:$2`) or whole columns (`$A:$B`), or blank for none.
-fn title_span(d: &Dialog, name: &str, rows: bool) -> Result<Option<(u32, u32)>, String> {
+fn title_span(
+    d: &Dialog,
+    name: &str,
+    rows: bool,
+    sheet: &str,
+) -> Result<Option<(u32, u32)>, String> {
     let label = if rows {
         "Rows to repeat at top"
     } else {
         "Columns to repeat at left"
     };
-    match refs(d, name, label)?.as_slice() {
+    match refs(d, name, label, sheet)?.as_slice() {
         [] => Ok(None),
         [PrintRef::Rows(a, b)] if rows => Ok(Some((*a, *b))),
         [PrintRef::Cols(a, b)] if !rows => Ok(Some((*a, *b))),
@@ -504,28 +640,43 @@ fn title_span(d: &Dialog, name: &str, rows: bool) -> Result<Option<(u32, u32)>, 
     }
 }
 
-/// Read and check the dialog's values against `now`, the sheet's page setup.
-fn staged(d: &Dialog, now: &PageSetup) -> Result<Staged, String> {
+/// Read and check the dialog against `now`, sheet `sheet`'s page setup. Only
+/// a changed field is read: the dialog shows some values rounded (margins to
+/// four places) or not at all (a definition its fields cannot spell), and an
+/// untouched OK must leave them as they are.
+fn staged(d: &Dialog, now: &PageSetup, sheet: &str) -> Result<Staged, String> {
+    let changed = |name| d.changed(name);
     let mut p = now.clone();
-    p.orientation = match choice(d, "orientation") {
-        Some(1) => Orientation::Landscape,
-        // Unchanged from `default` keeps `default`: it prints portrait.
-        _ if !now.orientation.is_landscape() => now.orientation,
-        _ => Orientation::Portrait,
-    };
-    if let Some(i) = choice(d, "paper") {
-        if let Some(&(code, _)) = papers(now.paper_size).get(i) {
+    if changed("orientation") {
+        p.orientation = match choice(d, "orientation") {
+            Some(1) => Orientation::Landscape,
+            _ => Orientation::Portrait,
+        };
+    }
+    if changed("paper") {
+        let list = papers(now.paper_size);
+        if let Some(&(code, _)) = choice(d, "paper").and_then(|i| list.get(i)) {
             p.paper_size = code;
         }
     }
-    p.scale = whole(d, "scale", "Adjust to", None)?;
-    p.fit_to_page = choice(d, "scaling") == Some(1);
-    p.fit_width = whole(d, "fit-width", "Fit to page(s) wide", Some(0))?;
-    p.fit_height = whole(d, "fit-height", "Fit to pages tall", Some(0))?;
-    let mut m = [0.0; 6];
-    for (slot, (name, label)) in m.iter_mut().zip(MARGINS) {
+    if changed("scaling") {
+        p.fit_to_page = choice(d, "scaling") == Some(1);
+    }
+    if changed("scale") {
+        p.scale = whole(d, "scale", "Adjust to", None)?;
+    }
+    if changed("fit-width") {
+        p.fit_width = whole(d, "fit-width", "Fit to page(s) wide", Some(0))?;
+    }
+    if changed("fit-height") {
+        p.fit_height = whole(d, "fit-height", "Fit to pages tall", Some(0))?;
+    }
+    for (name, label) in MARGINS {
+        if !changed(name) {
+            continue;
+        }
         let t = text(d, name);
-        *slot = t.trim().parse().map_err(|_| {
+        *margin_mut(&mut p.margins, name) = t.trim().parse().map_err(|_| {
             format!(
                 "{} margin must be a number of inches, not '{}'",
                 label.trim_end_matches(':'),
@@ -533,26 +684,34 @@ fn staged(d: &Dialog, now: &PageSetup) -> Result<Staged, String> {
             )
         })?;
     }
-    [
-        p.margins.top,
-        p.margins.bottom,
-        p.margins.left,
-        p.margins.right,
-        p.margins.header,
-        p.margins.footer,
-    ] = m;
-    p.h_centered = checked(d, "h-centered");
-    p.v_centered = checked(d, "v-centered");
-    p.grid_lines = checked(d, "gridlines");
-    p.headings = checked(d, "headings");
+    for (name, field) in [
+        ("h-centered", &mut p.h_centered),
+        ("v-centered", &mut p.v_centered),
+        ("gridlines", &mut p.grid_lines),
+        ("headings", &mut p.headings),
+    ] {
+        if changed(name) {
+            *field = checked(d, name);
+        }
+    }
     p.validate()?;
-    let print_area = refs(d, "print-area", "Print area")?
-        .into_iter()
-        .map(PrintRef::rect)
-        .collect();
-    let titles = PrintTitles {
-        rows: title_span(d, "title-rows", true)?,
-        cols: title_span(d, "title-cols", false)?,
+    let print_area = if changed("print-area") {
+        Some(
+            refs(d, "print-area", "Print area", sheet)?
+                .into_iter()
+                .map(PrintRef::rect)
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let titles = if changed("title-rows") || changed("title-cols") {
+        Some(PrintTitles {
+            rows: title_span(d, "title-rows", true, sheet)?,
+            cols: title_span(d, "title-cols", false, sheet)?,
+        })
+    } else {
+        None
     };
     Ok(Staged {
         setup: p,
@@ -574,16 +733,20 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
     let Surface::Sheet(v) = &tab.surface else {
         return Some(Err("page setup needs a spreadsheet".into()));
     };
-    let now = &v.pkg.workbook.sheets[v.active].page_setup;
-    let staged = match staged(top, now) {
+    let sheet = &v.pkg.workbook.sheets[v.active];
+    let staged = match staged(top, &sheet.page_setup, &sheet.name) {
         Ok(s) => s,
         Err(e) => return Some(Err(e)),
     };
     let outcome = edit(tab, |v, s| {
         let wb = &mut v.pkg.workbook;
         wb.sheets[s].page_setup = staged.setup;
-        area::set_print_area(wb, s, &staged.print_area);
-        area::set_print_titles(wb, s, staged.titles);
+        if let Some(rects) = &staged.print_area {
+            area::set_print_area(wb, s, rects);
+        }
+        if let Some(titles) = staged.titles {
+            area::set_print_titles(wb, s, titles);
+        }
         Ok(())
     });
     tab.dialogs.pop();

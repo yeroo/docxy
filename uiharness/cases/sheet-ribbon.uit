@@ -345,13 +345,25 @@ test Page Setup opens from Print Titles and refuses a scale outside 10-400
   call ribbon-click {"tab":"Page Layout","command":"Print Titles"}
   call dialog-read {}
   assert reply.title is Page Setup
+  # Print Titles opens it on its Sheet tab; OK and Cancel show on every tab.
+  call-error dialog-set {"control":"scale","value":"5"} => '% normal size' is on the 'Page' tab; switch with dialog-tab first
+  call dialog-tab {"tab":"Page"}
   call dialog-set {"control":"scale","value":"5"}
   call-error dialog-click {"button":"OK"} => scale 5 is outside 10–400
   assert dirty is false
   call dialog-set {"control":"scale","value":"80"}
+  call dialog-tab {"tab":"Sheet"}
   call dialog-set {"control":"title-rows","value":"$1:$1"}
   call dialog-click {"button":"OK"}
   assert dirty is true
+
+test an untouched Page Setup OK leaves the workbook clean
+  open copy:"../fixtures/basic.xlsx" as untouched.xlsx
+  call ribbon-click {"tab":"Page Layout","command":"Custom Margins..."}
+  call dialog-read {}
+  assert reply.title is Page Setup
+  call dialog-click {"button":"OK"}
+  assert dirty is false
 
 test Formulas AutoSum and its menu write the function over the run above
   open copy:"../fixtures/basic.xlsx" as sum.xlsx
