@@ -25,12 +25,13 @@
   propagation: a handled key-down on Windows is never translated (#1072).
 - Windows registers the handler too, for WM_CHAR only (#1139): Unicode-packet
   text (`SendInput` `KEYEVENTF_UNICODE`, a `VK_PACKET` key-down gpui drops)
-  arrives nowhere else. Each key-down `on_key` typed owes its WM_CHAR
-  characters (`owed_chars`: printable, no Alt without Ctrl) and the handler
-  pays the debts oldest first, dropping that text. A WM_CHAR can come after
-  its key-up and later key-downs (gpui drains input alone under load), so no
-  key-up clears a debt; it lapses after `WM_CHAR_WINDOW` (a dead key's
-  accent). The handler's `accepts_text_input` is false there, so the Windows
+  arrives nowhere else. Each key-down `on_key` typed owes its WM_CHAR text
+  (`owed_text`: printable, no Alt without Ctrl, not a dead key), and each
+  WM_CHAR character pays the oldest debt that starts with it (dropping older
+  ones) or, matching none, is typed: matched by text, not counted, so a
+  packet never pays a key's debt. A WM_CHAR can come after its key-up and
+  later key-downs (gpui drains input alone under load), so no key-up or
+  timer ends a debt; `WM_CHAR_KEEP` (5 s) and a cap are hygiene only. The handler's `accepts_text_input` is false there, so the Windows
   IME stays off. Linux registers none (it would get every key `on_key`
   typed). The harness's `win-char` sends WM_CHAR, and `real-type`'s
   `"wm_char":true` (always on Windows) or `"late"` replays each typed key's

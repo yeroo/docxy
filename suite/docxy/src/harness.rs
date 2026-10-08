@@ -34,9 +34,9 @@ use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
 use docxcore::model::{Align, VertAlign};
 use gpui::{
-    App, AppContext as _, Context, EntityInputHandler as _, KeyDownEvent, Keystroke, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point,
-    ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px, size,
+    App, AppContext as _, Context, EntityInputHandler as _, KeyDownEvent, KeyUpEvent, Keystroke,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput,
+    Point, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px, size,
 };
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
@@ -3346,7 +3346,8 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             "ime_marked",
             str_or_null(app.ime.marked().map(str::to_string)),
         ),
-        // The WM_CHAR characters the last typed key still owes (#1139).
+        // The WM_CHAR characters typed keys still owe, lapsed ones included
+        // (#1139).
         ("wm_char_owed", Json::Num(app.ime.owed() as f64)),
     ]);
     let mut out: Vec<_> = out.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
@@ -5163,16 +5164,26 @@ fn dispatch_verb(
                 all
             };
             let mut done = Done::ok(Json::obj(vec![("keys", Json::Num(strokes.len() as f64))]))?;
-            done.input = strokes
-                .into_iter()
-                .map(|keystroke| PlatformInput::KeyDown(key_event(keystroke)))
-                .collect();
             done.wm_char = match args.get("wm_char") {
                 None | Some(Json::Null) | Some(Json::Bool(false)) => WmChar::Off,
                 Some(Json::Bool(true)) => WmChar::Each,
                 Some(Json::Str(s)) if s == "late" => WmChar::Late,
                 Some(_) => return Err("'wm_char' must be true, false or \"late\"".to_string()),
             };
+            // `late` stands for a queue drained of input first: each key's
+            // key-up comes before any WM_CHAR, so no debt may end at a key-up.
+            let late = done.wm_char == WmChar::Late;
+            done.input = strokes
+                .into_iter()
+                .flat_map(|keystroke| {
+                    let up = late.then(|| {
+                        PlatformInput::KeyUp(KeyUpEvent {
+                            keystroke: keystroke.clone(),
+                        })
+                    });
+                    std::iter::once(PlatformInput::KeyDown(key_event(keystroke))).chain(up)
+                })
+                .collect();
             Ok(done)
         }
 

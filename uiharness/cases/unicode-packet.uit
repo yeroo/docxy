@@ -4,8 +4,8 @@
 # the handler with what WM_CHAR sends, so these run on every platform. A typed
 # key's own WM_CHAR is dropped: `real-type` with `"wm_char":true` follows each
 # key with the WM_CHAR Windows would post (a Windows build always does), and
-# `"late"` sends them all after the last key, as an input-first drain does, so
-# a broken dedupe types the text twice. SendInput itself needs a Windows desktop.
+# `"late"` queues each key's key-up and sends the WM_CHARs after the last key,
+# as an input-first drain does, so a broken dedupe types the text twice. SendInput itself needs a Windows desktop.
 
 test packet text lands in the document body after real typing
   open copy:../fixtures/basic.docx

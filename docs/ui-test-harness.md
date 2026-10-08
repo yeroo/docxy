@@ -364,6 +364,7 @@ State keys, as the app reports them after every driving verb:
 | `picking`, `range_preview`, `sel_hidden` | point mode |
 | `find_open`, `find_query`, `replace_text` | the find bar (Ctrl+F) and its Find and Replace fields; Down moves to Replace |
 | `ime_marked` | the input handler's marked text (a dead key's accent or an IME's provisional text, typed nowhere yet), or null (#1072) |
+| `wm_char_owed` | the WM_CHAR characters typed keys still owe the Windows input handler, lapsed ones included (#1139) |
 | `selected_task`, `tasks`, `bar_<id>`, `baseline_<id>` | Project: cell cursor's row (zero-based; equals `tasks` on the entry row below the last task), task count, and each task's drawn bar and baseline bar by displayed ID |
 | `selected_row` | Project: the cell cursor's drawn row, **one-based** like `rows[].row` (a collapsed summary's hidden subtasks are not counted); the `rows` reply's `count + 1` on the entry row |
 | `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name (empty on the entry row), and `none` or the filename of the last successful Gantt export |
@@ -656,13 +657,14 @@ On Windows the handler also takes WM_CHAR (#1139), which is how text sent as
 Unicode keyboard input (`SendInput` with `KEYEVENTF_UNICODE`: auto-type, text
 expanders, on-screen keyboards) arrives, with no key-down the app sees. A key
 `on_key` typed sends its own WM_CHAR after it, which the handler drops: each
-key-down owes its characters, paid oldest first, and a debt nothing pays
-lapses after 400 ms (a dead key's accent). `call win-char {"text":"é"}` sends
+key-down owes its text, and a WM_CHAR character pays the oldest debt that
+starts with it (dropping older ones, whose WM_CHAR never came) or, matching
+none, is typed. A dead key owes nothing; a debt nothing pays goes after 5 s. `call win-char {"text":"é"}` sends
 the handler that WM_CHAR text, typed while letters are text; it works on every
 platform. `real-key`/`real-type` follow each typed key with the WM_CHAR
 Windows would post when `"wm_char":true` and always on Windows, and with
-`"wm_char":"late"` send every twin after the last key-down, as a queue drained
-of input first delivers them; a broken dedupe types twice. The state's
+`"wm_char":"late"` queue each key's key-up after it and send every twin after
+the last key, as a queue drained of input first delivers them; a broken dedupe types twice. The state's
 `wm_char_owed` is what typed keys still owe. The cases are in
 `uiharness/cases/unicode-packet.uit`; `SendInput` itself needs a Windows
 desktop.

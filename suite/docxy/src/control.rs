@@ -353,8 +353,9 @@ pub(crate) enum WmChar {
     Off,
     /// Each right after its key-down, as a free message queue delivers them.
     Each,
-    /// All after the last key-down, as a queue drained of input first does
-    /// (gpui's under load): every twin arrives after later keys.
+    /// All after the last key, as a queue drained of input first does
+    /// (gpui's under load): every twin arrives after later keys and after
+    /// its own key's key-up, which `real-type` queues in this mode.
     Late,
 }
 
