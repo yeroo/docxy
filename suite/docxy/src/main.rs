@@ -5347,32 +5347,21 @@ fn page_needs_scroll(probe: &RulerProbe, page: usize) -> bool {
 
 /// The section and geometry of the page the ruler currently tracks, from
 /// the shown body's flow (#745): the page's owning section drives the
-/// margin handles' start values. `None` when nothing is tracked yet or the
-/// tab is not a document.
+/// margin handles' refusal, the drag starts from the final section's raw
+/// margins (see `PageFlow::drag_geom`). `None` when nothing is tracked yet
+/// or the tab is not a document.
 fn tracked_page_geom(
     tab: &DocTab,
     markup: MarkupView,
     probe: &RulerProbe,
-) -> Option<(usize, docxcore::model::PageGeom)> {
+) -> Option<(usize, docxcore::model::PageGeom, usize)> {
     let Surface::Doc(ed) = &tab.surface else {
         return None;
     };
     let shown = ed.doc.markup_view(markup);
     let pf = tab_page_flow(tab, &shown.body);
-    let section = pf.pages.get(tracked_page(probe)?)?.bands.first()?.section;
-    let sb = pf.sections.get(section)?;
-    Some((
-        section,
-        docxcore::model::PageGeom {
-            w: sb.w,
-            h: sb.h,
-            ml: sb.left,
-            mr: sb.right,
-            mt: sb.top,
-            mb: sb.bottom,
-            ..Default::default()
-        },
-    ))
+    let (section, geom) = pf.drag_geom(tracked_page(probe), final_sect_pr(tab).unwrap_or(""))?;
+    Some((section, geom, pf.sections.len()))
 }
 
 /// The Print Layout page scroll target for a caret at top-level `block`: the
@@ -20137,10 +20126,11 @@ impl Docxy {
         let Some(indent) = self.tabs.get(self.active).and_then(ruler_drag_indent) else {
             return;
         };
-        // The tracked page's own section geometry (page view, #745); when the
-        // tracked page is unknown, the final section's (the pre-#745 shape).
+        // The tracked page's own section (page view, #745); when the tracked
+        // page is unknown, the final section's geometry (the pre-#745 shape).
         // The margin handles edit the final section only, so a drag starting
-        // on an earlier section's page is refused with a hint.
+        // on an earlier section's page is refused with a hint. Both sides of
+        // the comparison come from the same flow's numbering.
         let tracked = self
             .tabs
             .get(self.active)
@@ -20148,16 +20138,12 @@ impl Docxy {
             .and_then(|t| tracked_page_geom(t, self.markup, &self.ruler_probe.borrow()));
         let geom = tracked
             .as_ref()
-            .map(|(_, g)| *g)
+            .map(|(_, g, _)| *g)
             .unwrap_or_else(|| final_page_geom(self.tabs.get(self.active).unwrap()));
         if matches!(handle, RulerHandle::MarginLeft | RulerHandle::MarginRight)
-            && tracked.as_ref().is_some_and(|(section, _)| {
-                let final_section = match &self.tabs.get(self.active).unwrap().surface {
-                    Surface::Doc(ed) => ed.sections().len().saturating_sub(1),
-                    _ => 0,
-                };
-                *section != final_section
-            })
+            && tracked
+                .as_ref()
+                .is_some_and(|(section, _, n)| section + 1 != *n)
         {
             if let Some(t) = self.tabs.get_mut(self.active) {
                 t.status = "Margins of an earlier section: use Layout > Margins".into();
@@ -32660,16 +32646,10 @@ impl Render for Docxy {
                         // page an odd/even start inserts) takes the previous block,
                         // so the filler shows the previous section's header/footer,
                         // like the PDF exporter (export.rs new_page(i-1, false, true)).
-                        let first_blocks: Vec<usize> = pages
-                            .iter()
-                            .map(|cols| {
-                                cols.first().map_or(
-                                    0,
-                                    |&(s, e)| if s == e { s.saturating_sub(1) } else { s },
-                                )
-                            })
-                            .collect();
-                        let slots = hf::page_slots(editor, &first_blocks, even_odd);
+                        let first_blocks = page_flow::first_blocks(&pages);
+                        let mut slots = hf::page_slots(editor, &first_blocks, even_odd);
+                        // A filler sheet never takes a section's First variant.
+                        hf::demote_filler_firsts(&mut slots, &pf.fillers(), even_odd);
                         let mut part_blocks: std::collections::HashMap<&str, Vec<Block>> =
                             std::collections::HashMap::new();
                         if let Some(p) = pkg {
@@ -32714,11 +32694,13 @@ impl Render for Docxy {
                         // N-column row (each column its own block range) with
                         // the band's section's own column widths, the space
                         // after each column, and the rule between them when it
-                        // sets `w:sep`.
+                        // sets `w:sep`. A band with fewer occupied ranges than
+                        // columns (the content fit the first column) still
+                        // draws every column at its configured width.
                         let build_band = |band: &page_flow::Band,
                                           sect: &page_flow::SectionBox|
                          -> AnyElement {
-                            if band.cols.len() <= 1 {
+                            if sect.col_w.len() <= 1 {
                                 let (s, e) = band.cols.first().copied().unwrap_or((0, 0));
                                 let blocks: Vec<AnyElement> = (s..e)
                                     .map(|i| {
@@ -32732,16 +32714,21 @@ impl Render for Docxy {
                                     .into_any_element();
                             }
                             let mut els: Vec<AnyElement> = Vec::new();
-                            for (ci, &(s, e)) in band.cols.iter().enumerate() {
+                            for ci in 0..sect.col_w.len() {
                                 if ci > 0 {
                                     let gap = sect.col_gap.get(ci - 1).copied().unwrap_or(0).max(0);
-                                    let mut g =
-                                        div().w(tw(gap)).flex_none().flex().justify_center();
+                                    let mut g = div()
+                                        .w(tw(gap))
+                                        .flex_none()
+                                        .self_stretch()
+                                        .flex()
+                                        .justify_center();
                                     if sect.sep {
                                         g = g.child(div().w(px(1.)).h_full().bg(doc_pal.dim));
                                     }
                                     els.push(g.into_any_element());
                                 }
+                                let (s, e) = band.cols.get(ci).copied().unwrap_or((0, 0));
                                 let blocks: Vec<AnyElement> = (s..e)
                                     .map(|i| {
                                         block_el(&body[i], vec![i], markers[i].as_deref(), ctx)
@@ -32749,14 +32736,18 @@ impl Render for Docxy {
                                     .collect();
                                 els.push(
                                     v_flex()
-                                        .w(tw(*sect.col_w.get(ci).unwrap_or(&0)))
+                                        .w(tw(sect.col_w[ci]))
                                         .flex_none()
                                         .gap_1()
                                         .children(blocks)
                                         .into_any_element(),
                                 );
                             }
-                            h_flex().w_full().children(els).into_any_element()
+                            h_flex()
+                                .w_full()
+                                .items_start()
+                                .children(els)
+                                .into_any_element()
                         };
                         let sheets: Vec<AnyElement> = pf
                             .pages

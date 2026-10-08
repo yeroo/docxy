@@ -173,14 +173,7 @@ fn section_breaks_start_pages_unless_the_next_section_is_continuous() {
     let last = trailing_sect(&t);
     let pf = page_flow::flow(body, &last, false);
     assert_eq!(pf.pages.len(), 3, "{:?}", pf.ranges());
-    let firsts: Vec<usize> = pf
-        .ranges()
-        .iter()
-        .map(|cols| {
-            cols.first()
-                .map_or(0, |&(s, e)| if s == e { s.saturating_sub(1) } else { s })
-        })
-        .collect();
+    let firsts = page_flow::first_blocks(&pf.ranges());
     let slots = page_slots(ed(&t), &firsts, false);
     let secs: Vec<usize> = slots.iter().map(|s| s.section).collect();
     assert_eq!(secs, vec![0, 1, 2]);

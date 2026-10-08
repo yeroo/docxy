@@ -18,6 +18,7 @@ use super::*;
 use crate::dialog::catalog;
 use crate::dialog::{Control as Field, ControlKind, Dialog, DialogOwner, Value};
 use crate::hf::PageSlot;
+use crate::page_flow;
 use crate::page_setup::{ok_cancel, text_of, twips_of};
 use ctlcore::json::Json;
 use docxcore::sect::{TWIPS_PER_INCH, hf_reference, set_hf_reference};
@@ -645,17 +646,15 @@ pub(crate) fn tab_page_slots(tab: &DocTab) -> Vec<PageSlot> {
         return Vec::new();
     };
     let even_odd = tab.pkg.as_ref().is_some_and(|p| p.has_even_odd());
-    // A page's first body block; an empty range (the blank page an odd/even
-    // section start inserts) takes the previous block, so the filler shows
-    // the previous section's header/footer, like the PDF exporter.
-    let firsts: Vec<usize> = crate::page_ranges(tab)
-        .iter()
-        .map(|cols| {
-            cols.first()
-                .map_or(0, |&(s, e)| if s == e { s.saturating_sub(1) } else { s })
-        })
-        .collect();
-    crate::hf::page_slots(ed, &firsts, even_odd)
+    // The same flow the status bar counts, so double-click and Next/Previous
+    // walk the pages the person sees. A page's first body block; an empty
+    // range (a blank odd/even filler) takes the previous block, and a filler
+    // never takes a section's First variant.
+    let pf = crate::tab_page_flow(tab, &ed.doc.body);
+    let firsts = page_flow::first_blocks(&pf.ranges());
+    let mut slots = crate::hf::page_slots(ed, &firsts, even_odd);
+    hf::demote_filler_firsts(&mut slots, &pf.fillers(), even_odd);
+    slots
 }
 
 /// The navigation order Previous and Next walk: each (section, variant) slot

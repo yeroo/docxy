@@ -312,3 +312,164 @@ fn page_break_ends_the_page() {
     assert_eq!(pf.ranges()[2], vec![(2, 3)]);
     assert_eq!(pf.pages.len(), 3, "{:?}", pf.ranges());
 }
+
+#[test]
+fn balance_band_pours_at_most_ncols_columns() {
+    // [10,30,10] in two columns: the smallest height the pour fits at is 40,
+    // giving columns [10,30] and [10] (export.rs balance_region semantics).
+    // The old fixed-target greedy produced three one-block ranges here.
+    let (cols, height) = balance_band(&[10.0, 30.0, 10.0], (0, 3), 2).unwrap();
+    assert_eq!(cols, vec![(0, 2), (2, 3)]);
+    assert_eq!(height, 40.0);
+    // Three equal blocks balance into exactly two ranges.
+    let (cols, _) = balance_band(&[24.0, 24.0, 24.0], (0, 3), 2).unwrap();
+    assert_eq!(cols.len(), 2);
+}
+
+#[test]
+fn bands_never_have_more_ranges_than_the_section_has_columns() {
+    let mut xml = String::new();
+    for i in 0..40 {
+        let sect = match i {
+            39 => Some(letter(r#"<w:cols w:num="2"/>"#)),
+            _ => None,
+        };
+        xml.push_str(&para(&format!("p{i}"), sect.as_deref()));
+    }
+    let body = body_blocks(&xml);
+    let sect = letter(r#"<w:cols w:num="2"/>"#);
+    let pf = flow(&body, &sect, false);
+    for (pi, page) in pf.pages.iter().enumerate() {
+        for band in &page.bands {
+            let ncols = pf.sections[band.section].col_w.len();
+            assert!(
+                band.cols.len() <= ncols,
+                "page {pi} band of section {} has {} ranges for {ncols} columns",
+                band.section,
+                band.cols.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn continuous_band_that_does_not_fit_moves_to_a_new_page() {
+    // 35 one-line paragraphs fill the sheet (35 * 24.3px of 864px); the
+    // continuous section's first block must move to a new page instead of
+    // overflowing under them, and no page may hold only the trailing
+    // sectPr's zero-height block.
+    let mut xml = String::new();
+    for i in 0..35 {
+        let sect = (i == 34).then(|| letter(""));
+        xml.push_str(&para(&format!("p{i}"), sect.as_deref()));
+    }
+    xml.push_str(&para("Y", None));
+    let cont = letter(r#"<w:type w:val="continuous"/>"#);
+    xml.push_str(&cont);
+    let body = body_blocks(&xml);
+    let pf = flow(&body, &cont, false);
+    assert_eq!(pf.ranges(), vec![vec![(0, 35)], vec![(35, 37)]],);
+    assert_eq!(pf.pages[0].bands.len(), 1, "no empty band left on page 0");
+}
+
+#[test]
+fn filler_pages_are_flagged_and_never_take_first() {
+    // Section 1 is continuous with titlePg on page 1; section 2 starts on an
+    // odd page, so a filler is inserted. It must be flagged, and demoted
+    // from a First variant (hf::page_slots sees it as section 1's first
+    // page) to Default, or Even under Different Odd & Even.
+    let cont_title = letter(r#"<w:type w:val="continuous"/><w:titlePg/>"#);
+    let body = body_blocks(&format!(
+        "{}{}{}",
+        para("One", Some(&letter(""))),
+        para("Two", Some(&cont_title)),
+        letter(r#"<w:type w:val="oddPage"/>"#)
+    ));
+    let odd = letter(r#"<w:type w:val="oddPage"/>"#);
+    let pf = flow(&body, &odd, false);
+    assert_eq!(pf.pages.len(), 3, "{:?}", pf.ranges());
+    let flags: Vec<bool> = pf.pages.iter().map(|p| p.filler).collect();
+    assert_eq!(flags, vec![false, true, false]);
+
+    use docxcore::package::HeaderVariant;
+    let slot = |variant| crate::hf::PageSlot {
+        section: 1,
+        variant,
+    };
+    let mut slots = vec![
+        slot(HeaderVariant::Default),
+        slot(HeaderVariant::First),
+        slot(HeaderVariant::Default),
+    ];
+    crate::hf::demote_filler_firsts(&mut slots, &flags, false);
+    assert_eq!(slots[1].variant, HeaderVariant::Default);
+    let mut slots = vec![
+        slot(HeaderVariant::Default),
+        slot(HeaderVariant::First),
+        slot(HeaderVariant::Default),
+    ];
+    crate::hf::demote_filler_firsts(&mut slots, &flags, true);
+    assert_eq!(
+        slots[1].variant,
+        HeaderVariant::Even,
+        "physical page 2 is even"
+    );
+}
+
+#[test]
+fn first_blocks_uses_the_previous_block_for_an_empty_range() {
+    let ranges = vec![vec![(0, 1)], vec![(1, 1)], vec![(1, 2)]];
+    assert_eq!(first_blocks(&ranges), vec![0, 0, 1]);
+    assert_eq!(first_blocks(&[]), Vec::<usize>::new());
+}
+
+#[test]
+fn drag_geom_keeps_the_gutter_out_of_the_margins() {
+    // The ruler's margin drag writes w:left/w:top back; the geometry it
+    // starts from must hold the raw pgMar values (no gutter baked in, no
+    // abs), or every drag double-counts the gutter.
+    let sect = geom_sect(12240, 15840, 1440, 1440, 1440, 1440, 720, "");
+    let body = body_blocks(&para("One", Some(&sect)));
+    let pf = flow(&body, &sect, false);
+    assert_eq!(
+        pf.sections[0].left, 2160,
+        "the drawn margin holds the gutter"
+    );
+    let (_, geom) = pf.drag_geom(Some(0), &sect).unwrap();
+    assert_eq!(geom.ml, 1440, "the drag starts from the raw w:left");
+    assert_eq!((geom.w, geom.h), (12240, 15840));
+    // A left-margin drag then only adds its delta to w:left (360 twips = 24px
+    // at zoom 1).
+    let drag = crate::RulerDrag {
+        handle: crate::RulerHandle::MarginLeft,
+        start_x: 0.0,
+        zoom: 1.0,
+        indent: Default::default(),
+        page: geom,
+        content_x: 0.0,
+        content_right: 0.0,
+        page_x: 0.0,
+        page_right: 0.0,
+        sect_checkpointed: false,
+    };
+    let moved = crate::ruler_drag_result(drag, 24.0);
+    match moved.change {
+        crate::RulerChange::Margins { left, .. } => assert_eq!(left, 1440 + 360),
+        other => panic!("expected a margins change, got {other:?}"),
+    }
+    // gutterAtTop: the top margin the drag writes is the raw w:top.
+    let pf = flow(&body, &sect, true);
+    let (_, geom) = pf.drag_geom(Some(0), &sect).unwrap();
+    assert_eq!(geom.mt, 1440);
+}
+
+#[test]
+fn two_column_section_with_few_blocks_keeps_its_column_count() {
+    // Content that fits column 0 occupies one range; the renderer pads the
+    // missing columns so the band still draws at the section's col_w.
+    let two_col = letter(r#"<w:cols w:num="2"/>"#);
+    let body = body_blocks(&para("One", Some(&two_col)));
+    let pf = flow(&body, &two_col, false);
+    assert_eq!(pf.sections[0].col_w.len(), 2);
+    assert_eq!(pf.pages[0].bands[0].cols, vec![(0, 1)]);
+}

@@ -40,10 +40,13 @@ pub(crate) struct Band {
 /// A printed sheet. `bands[0]`'s section owns the sheet: its page size and
 /// top/bottom margins; every band carries its own left/right margins and
 /// columns. A page always has at least one band, and a band at least one
-/// (possibly empty) column range.
+/// (possibly empty) column range. `filler` marks the blank sheet an
+/// oddPage/evenPage start inserts: it belongs to the previous section and
+/// must not take its First header/footer variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Page {
     pub bands: Vec<Band>,
+    pub filler: bool,
 }
 
 /// The sections of a body and the pages they flow into.
@@ -67,6 +70,43 @@ impl PageFlow {
             })
             .collect()
     }
+
+    /// Whether each page is a blank filler sheet.
+    pub(crate) fn fillers(&self) -> Vec<bool> {
+        self.pages.iter().map(|p| p.filler).collect()
+    }
+
+    /// The section and drag geometry of page `tracked`: the sheet size from
+    /// the page's owning section, the margins raw from `margins_sect` (the
+    /// final section's sectPr — the ruler's margin handles edit it), so a
+    /// gutter is not double-counted and a negative margin is not absolutized
+    /// by a drag.
+    pub(crate) fn drag_geom(
+        &self,
+        tracked: Option<usize>,
+        margins_sect: &str,
+    ) -> Option<(usize, docxcore::model::PageGeom)> {
+        let section = self.pages.get(tracked?)?.bands.first()?.section;
+        let sb = self.sections.get(section)?;
+        let mut geom = docxcore::model::PageGeom::from_sect_pr(margins_sect);
+        geom.w = sb.w;
+        geom.h = sb.h;
+        Some((section, geom))
+    }
+}
+
+/// The first body block of each page in `ranges`: an empty range (the blank
+/// page an odd/even section start inserts) takes the previous block, so the
+/// filler shows the previous section's header/footer, like the PDF exporter
+/// (export.rs `new_page(i - 1, false, true)`).
+pub(crate) fn first_blocks(ranges: &[Vec<(usize, usize)>]) -> Vec<usize> {
+    ranges
+        .iter()
+        .map(|cols| {
+            cols.first()
+                .map_or(0, |&(s, e)| if s == e { s.saturating_sub(1) } else { s })
+        })
+        .collect()
 }
 
 /// A section's drawing geometry from its sectPr, mirroring export.rs
@@ -199,35 +239,52 @@ impl PageB {
     }
 }
 
-/// Greedy re-pour of a closing band's blocks into its columns at the
-/// smallest fitting height, as export.rs `balance_region` does. The caller
-/// checked the columns are at least two and equal-width. `None` when the
-/// pour needs more columns than the band has (the layout stays as filled).
-fn balance_band(body: &[Block], b: &BandB, sb: &SectionBox) -> Option<(Vec<(usize, usize)>, f32)> {
-    let (s, e) = (b.cols.first()?.0, b.pos);
-    if s >= e {
+/// Balance a closing band's blocks into its columns at the smallest column
+/// height the pour fits at, as export.rs `balance_region` does: a greedy
+/// `pour(h)` that fails once a block would open a column past `ncols`, and a
+/// bisection for the smallest fitting `h`. `heights` are the band's block
+/// heights in order; `span` is their block range. `None` when the band is
+/// empty or even the full-height pour cannot fit it (the caller keeps the
+/// layout as filled). The caller checks the columns are at least two and
+/// equal-width.
+fn balance_band(
+    heights: &[f32],
+    (s, e): (usize, usize),
+    ncols: usize,
+) -> Option<(Vec<(usize, usize)>, f32)> {
+    if heights.is_empty() || ncols < 2 {
         return None;
     }
-    let ncols = sb.col_w.len();
-    let wpx = sb.col_w[0].max(0) as f32 / 15.0;
-    let heights: Vec<f32> = (s..e)
-        .map(|i| crate::block_height_est(&body[i], wpx))
-        .collect();
-    let target = (heights.iter().sum::<f32>() / ncols as f32).ceil();
-    let mut cols: Vec<(usize, usize)> = Vec::new();
-    let (mut s0, mut acc) = (s, 0.0_f32);
-    for (k, &h) in heights.iter().enumerate() {
-        if acc > 0.0 && acc + h > target {
-            if cols.len() >= ncols {
-                return None;
+    let pour = |h: f32| -> Option<Vec<(usize, usize)>> {
+        let (mut s0, mut acc) = (s, 0.0_f32);
+        let mut cols: Vec<(usize, usize)> = Vec::new();
+        for (k, &bh) in heights.iter().enumerate() {
+            if acc > 0.0 && acc + bh > h {
+                // The block opens a new column; it must not pass the last.
+                if cols.len() + 1 >= ncols {
+                    return None;
+                }
+                cols.push((s0, s + k));
+                s0 = s + k;
+                acc = 0.0;
             }
-            cols.push((s0, s + k));
-            s0 = s + k;
-            acc = 0.0;
+            acc += bh;
         }
-        acc += h;
+        cols.push((s0, e));
+        Some(cols)
+    };
+    let total = heights.iter().sum::<f32>();
+    pour(total)?;
+    let (mut lo, mut hi) = (heights.iter().copied().fold(0.0_f32, f32::max), total);
+    for _ in 0..40 {
+        let mid = (lo + hi) / 2.0;
+        if pour(mid).is_some() {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
     }
-    cols.push((s0, e));
+    let cols = pour(hi)?;
     let height = cols
         .iter()
         .map(|&(a, z)| (a..z).map(|i| heights[i - s]).sum::<f32>())
@@ -264,21 +321,31 @@ impl<'a> Flow<'a> {
 
     /// Close the open band into the page's band list; `balanced` when a
     /// continuous/nextColumn section ends it (export.rs `balance_region`).
+    /// A later band that received nothing (its first block moved to a new
+    /// page) leaves no trace on this page.
     fn close_band(&mut self, balanced: bool) {
+        let has_bands = self.cur.as_ref().is_some_and(|p| !p.bands.is_empty());
         let mut b = {
             let page = self.cur.as_mut().expect("a page is open");
             std::mem::replace(&mut page.open, BandB::new(usize::MAX, 0))
         };
         b.close_column(b.pos);
         if b.cols.is_empty() {
-            // An empty band (an empty mid-document section) still carries
-            // one (empty) column range.
+            if has_bands {
+                return;
+            }
+            // The page's first band still carries one (empty) column range.
             b.cols.push((b.pos, b.pos));
         }
-        {
+        if balanced {
             let sb = &self.sections[b.section];
-            if balanced && sb.col_w.len() >= 2 && all_equal(&sb.col_w) {
-                if let Some((cols, height)) = balance_band(self.body, &b, sb) {
+            if sb.col_w.len() >= 2 && all_equal(&sb.col_w) {
+                let wpx = sb.col_w[0].max(0) as f32 / 15.0;
+                let span = (b.cols[0].0, b.pos);
+                let heights: Vec<f32> = (span.0..span.1)
+                    .map(|i| crate::block_height_est(&self.body[i], wpx))
+                    .collect();
+                if let Some((cols, height)) = balance_band(&heights, span, sb.col_w.len()) {
                     if height + 0.001 < b.tallest {
                         b.cols = cols;
                         b.tallest = height;
@@ -300,7 +367,10 @@ impl<'a> Flow<'a> {
         if self.cur.is_some() {
             self.close_band(false);
             let page = self.cur.take().expect("a page is open");
-            self.pages.push(Page { bands: page.bands });
+            self.pages.push(Page {
+                bands: page.bands,
+                filler: false,
+            });
         }
     }
 
@@ -315,7 +385,9 @@ impl<'a> Flow<'a> {
 
     /// Pour a section's block range into the open band, closing columns and
     /// pages as they fill; the block heights are estimated at the width of
-    /// the column they land in.
+    /// the column they land in. A band's first block may overflow only a
+    /// fresh sheet (a block taller than the page still gets its own page);
+    /// under closed bands it moves the band to a new page instead.
     fn pour(&mut self, i: usize, range: std::ops::Range<usize>) {
         let col_w: Vec<f32> = self.sections[i]
             .col_w
@@ -332,16 +404,31 @@ impl<'a> Flow<'a> {
                     self.open_page(i, idx, false);
                     col = 0;
                 }
-                let (acc, col_start) = {
+                let (acc, col_start, first_of_band, has_bands) = {
                     let page = self.cur.as_ref().unwrap();
-                    (page.open.acc, page.open.col_start)
+                    let b = &page.open;
+                    (
+                        b.acc,
+                        b.col_start,
+                        b.cols.is_empty() && idx == b.col_start,
+                        !page.bands.is_empty(),
+                    )
                 };
                 let bh = crate::block_height_est(&self.body[idx], col_w[col]);
-                if acc + bh > self.capacity() && idx > col_start {
-                    self.cur.as_mut().unwrap().open.close_column(idx);
-                    col += 1;
-                    if col >= ncols {
-                        // The band's last column closed: the page is full.
+                if acc + bh > self.capacity() && (idx > col_start || (first_of_band && has_bands)) {
+                    if idx > col_start {
+                        self.cur.as_mut().unwrap().open.close_column(idx);
+                        col += 1;
+                        if col >= ncols {
+                            // The band's last column closed: the page is full.
+                            self.finish_page();
+                        }
+                    } else {
+                        // The first block of a later band does not fit under
+                        // the closed bands: drop the empty band and move to a
+                        // new page (never leave an empty band or a page that
+                        // holds only such a band).
+                        self.cur.as_mut().unwrap().open = BandB::new(usize::MAX, 0);
                         self.finish_page();
                     }
                     continue;
@@ -422,6 +509,7 @@ pub(crate) fn flow(body: &[Block], last_sect: &str, gutter_at_top: bool) -> Page
                             section: i - 1,
                             cols: vec![(range.start, range.start)],
                         }],
+                        filler: true,
                     });
                 }
                 f.open_page(i, range.start, true);
@@ -432,15 +520,7 @@ pub(crate) fn flow(body: &[Block], last_sect: &str, gutter_at_top: bool) -> Page
         }
     }
     f.finish_page();
-    if f.pages.is_empty() {
-        // Only an empty body flows to nothing; still one (empty) page.
-        f.pages.push(Page {
-            bands: vec![Band {
-                section: 0,
-                cols: vec![(0, body.len())],
-            }],
-        });
-    }
+    debug_assert!(!f.pages.is_empty());
     PageFlow {
         sections: f.sections,
         pages: f.pages,

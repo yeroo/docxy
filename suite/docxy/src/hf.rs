@@ -74,6 +74,27 @@ pub(crate) fn edit_page(slots: &[PageSlot], section: usize, variant: HeaderVaria
         .unwrap_or(0)
 }
 
+/// The blank sheet an oddPage/evenPage section start inserts must not take a
+/// section's First variant (`w:titlePg`): demote any a filler was given to
+/// Default, or to Even under Different Odd & Even when its physical page is
+/// even. Called on the slots both page-slot consumers build.
+pub(crate) fn demote_filler_firsts(slots: &mut [PageSlot], fillers: &[bool], even_odd: bool) {
+    for (pi, is_filler) in fillers.iter().copied().enumerate() {
+        if !is_filler {
+            continue;
+        }
+        if let Some(slot) = slots.get_mut(pi) {
+            if slot.variant == HeaderVariant::First {
+                slot.variant = if even_odd && (pi + 1).is_multiple_of(2) {
+                    HeaderVariant::Even
+                } else {
+                    HeaderVariant::Default
+                };
+            }
+        }
+    }
+}
+
 /// The paragraph style new header (`Header`) or footer (`Footer`) content uses.
 pub(crate) fn style_id(is_header: bool) -> &'static str {
     if is_header { "Header" } else { "Footer" }
