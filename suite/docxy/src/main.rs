@@ -21527,7 +21527,11 @@ impl Docxy {
         // Mac ⌥←/→/⌫: the ⌥ key-down has raised the KeyTips by now (#1073).
         if self.active_is_doc() && mac_nav::lowers_keytips(mac_nav, self.keytips == KeyTip::Tabs) {
             self.keytips = KeyTip::Off;
-            self.cancel_highlight_mode(); // its check above skipped for the KeyTips
+            // The highlighting-mode check above skipped this key because the
+            // KeyTips were up; the find and comment bars still take their keys.
+            if !self.find_open && !self.comment_open {
+                self.cancel_highlight_mode();
+            }
         }
         // KeyTips (Alt / F10 access keys): toggle the overlay; while it's showing,
         // letters pick a tab / run a command instead of typing.
