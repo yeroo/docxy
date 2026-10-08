@@ -1831,6 +1831,10 @@ fn sheet_command_json(
     if let Some(menu) = menu {
         fields.push(("menu", Json::Str(menu.into())));
     }
+    // The Number Format combo shows the cell's format name (#1140).
+    if matches!(cmd.shape, crate::sheet_ribbon::Shape::NumFmt) {
+        fields.push(("value", Json::Str(app.active_numfmt_name().into())));
+    }
     Json::obj(fields)
 }
 

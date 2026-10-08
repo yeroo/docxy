@@ -1,0 +1,23 @@
+# The Number Format box names the selected cell's format (#1140). A General
+# cell loads as the code "General", which the box once read as "Custom".
+# ribbon-read reports the combo's displayed text as `value`.
+
+test sheet number format box reads General on basic.xlsx
+  open ../fixtures/basic.xlsx
+  click A1
+  call ribbon-read {}
+  assert reply.tabs.1.groups.3.commands.0.id is number-format
+  assert reply.tabs.1.groups.3.commands.0.value is General
+  click B2
+  call ribbon-read {}
+  assert reply.tabs.1.groups.3.commands.0.value is General
+
+test sheet number format box follows the applied style
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Percent Style"}
+  call ribbon-read {}
+  assert reply.tabs.1.groups.3.commands.0.value is Percentage
+  click A1
+  call ribbon-read {}
+  assert reply.tabs.1.groups.3.commands.0.value is General

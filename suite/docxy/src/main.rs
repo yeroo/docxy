@@ -103,6 +103,8 @@ mod sheet_filter;
 mod sheet_flashfill;
 mod sheet_goto;
 mod sheet_menus;
+#[cfg(test)]
+mod sheet_numfmt_tests;
 mod sheet_outline;
 mod sheet_page_setup;
 mod sheet_paste;
@@ -851,6 +853,41 @@ struct EditPoint {
     /// hands pointing to the picked cell (`formula_pick_to` writes a fresh
     /// `EditPoint`), so the arrows carry on from there.
     wrote: (String, usize),
+}
+
+/// The Number Format box's name for a cell's format code: Excel's category for
+/// General and the built-in codes (the xlsx loader fills `Xf::code` with the
+/// built-in id's code, so a General cell arrives as `Some("General")`, #1140),
+/// "Custom" only for a code that is none of them.
+fn numfmt_category(code: Option<&str>) -> &'static str {
+    // Only the General spelling is trimmed: a padded code like "0 " is custom.
+    let code = code.unwrap_or("");
+    if code.is_empty() || code.trim().eq_ignore_ascii_case("general") {
+        return "General";
+    }
+    // `NUM_FORMATS` codes first, so the picker's highlight is its own label.
+    if let Some((name, _)) = NUM_FORMATS.iter().find(|(_, c)| *c == code) {
+        return name;
+    }
+    match code {
+        "0"
+        | "0.00"
+        | "#,##0"
+        | "#,##0.00"
+        | "#,##0;(#,##0)"
+        | "#,##0;[Red](#,##0)"
+        | "#,##0.00;(#,##0.00)"
+        | "#,##0.00;[Red](#,##0.00)" => "Number",
+        "0%" | "0.00%" => "Percentage",
+        "0.00E+00" | "##0.0E+0" => "Scientific",
+        "# ?/?" | "# ??/??" => "Fraction",
+        "m/d/yyyy" | "d-mmm-yy" | "d-mmm" | "mmm-yy" | "m/d/yyyy h:mm" => "Date",
+        "h:mm AM/PM" | "h:mm:ss AM/PM" | "h:mm" | "h:mm:ss" | "mm:ss" | "[h]:mm:ss" | "mm:ss.0" => {
+            "Time"
+        }
+        "@" => "Text",
+        _ => "Custom",
+    }
 }
 
 /// The setter a number-format choice applies: `code`, or General for "".
@@ -5064,7 +5101,7 @@ const NUM_FORMATS: [(&str, &str); 9] = [
     ),
     ("Percentage", "0.00%"),
     ("Scientific", "0.00E+00"),
-    ("Short Date", "yyyy-mm-dd"),
+    ("Date", "yyyy-mm-dd"),
     ("Time", "h:mm:ss"),
     ("Text", "@"),
 ];
@@ -16539,15 +16576,7 @@ impl Docxy {
 
     /// Friendly name for the selected cell's current number format.
     fn active_numfmt_name(&self) -> &'static str {
-        let code = self.active_xf().code;
-        match code {
-            None => "General",
-            Some(c) => NUM_FORMATS
-                .iter()
-                .find(|(_, fc)| *fc == c.as_str())
-                .map(|(n, _)| *n)
-                .unwrap_or("Custom"),
-        }
+        numfmt_category(self.active_xf().code.as_deref())
     }
     /// Set fill or font colour on the selection from a swatch (None = clear), and
     /// close the picker.
