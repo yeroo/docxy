@@ -5345,10 +5345,6 @@ fn page_needs_scroll(probe: &RulerProbe, page: usize) -> bool {
         .is_some_and(|r| r.intersects(&viewport))
 }
 
-/// The Print Layout page scroll target for a caret at top-level `block`: the
-/// page holding it in the shown body's pagination (the markup view the render
-/// paginates), the last page when no range contains it — never past the
-/// rendered sheets.
 /// The section and geometry of the page the ruler currently tracks, from
 /// the shown body's flow (#745): the page's owning section drives the
 /// margin handles' start values. `None` when nothing is tracked yet or the
@@ -5379,6 +5375,10 @@ fn tracked_page_geom(
     ))
 }
 
+/// The Print Layout page scroll target for a caret at top-level `block`: the
+/// page holding it in the shown body's pagination (the markup view the render
+/// paginates), the last page when no range contains it — never past the
+/// rendered sheets.
 fn print_caret_page(
     doc: &Document,
     view: MarkupView,
@@ -26885,9 +26885,6 @@ fn has_page_break(b: &Block) -> bool {
     matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Break(docxcore::model::BreakKind::Page, _))))
 }
 
-/// Group top-level block indices into pages by accumulated estimated height,
-/// hard page breaks and section breaks that start a new page. Returns
-/// `[start, end)` block ranges, one per page.
 /// The list markers (`1.`, `•`) for a body's paragraphs, by block index.
 fn list_markers(body: &[Block]) -> Vec<Option<String>> {
     let mut out = Vec::with_capacity(body.len());
