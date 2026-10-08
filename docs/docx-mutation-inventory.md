@@ -27,7 +27,7 @@ part, and adding a comment is Comment even though it also adds body anchors.
 | Body keys | printable characters, non-breaking space, Tab outside a table, Ctrl+Tab or Alt+Tab in a table cell, Shift+Enter (line break) | Content |
 | Body keys | Enter, Backspace, Delete, Tab in a table's last cell (adds a row) | Structure |
 | Body keys | AutoCorrect / AutoFormat on a printable character (#856): replacements, sentence capitals, smart quotes, em dashes | Content (the key's own class) |
-| Body keys | automatic list on a space after `1.` or `*` (#856); declined, leaving the typing, when Formatting is refused | Formatting |
+| Body keys | automatic list on a space after `1.`, `1)`, `*` or `-` (#856, #1080); declined, leaving the typing, when Formatting is refused | Formatting |
 | Clipboard | Cut | Structure |
 | Clipboard | Plain/merge paste | Content |
 | Clipboard | Rich paste / Paste Special Keep Source Formatting | Content and Formatting |
