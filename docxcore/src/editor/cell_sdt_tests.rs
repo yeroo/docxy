@@ -538,3 +538,70 @@ fn deleting_inside_an_inline_placeholder_clears_its_flag() {
     ed.delete_forward();
     assert!(flag(&ed));
 }
+
+fn inline_doc(after: &str) -> Editor {
+    let xml = format!(
+        "<w:document><w:body><w:p><w:r><w:t xml:space=\"preserve\">Name: </w:t></w:r>{}\
+         <w:r><w:t>[Your name]</w:t></w:r>{CLOSE}<w:r><w:t xml:space=\"preserve\"> end</w:t></w:r></w:p>\
+         {after}<w:p/></w:body></w:document>",
+        open("Name", 7, true)
+    );
+    Editor::new(parse_document_xml(&xml, &Relationships::default()))
+}
+
+fn inline_flagged(ed: &Editor) -> bool {
+    crate::serialize::blocks_to_xml(&ed.doc.body[..1]).contains("showingPlcHdr")
+}
+
+#[test]
+fn a_table_inserted_into_a_placeholder_clears_its_flag() {
+    let mut ed = cover_row();
+    ed.set_caret(at(0, 5));
+    ed.insert_table(1, 1, crate::table::AutoFit::Fixed(None))
+        .unwrap();
+    assert!(!flagged(&ed, 0) && flagged(&ed, 2));
+    assert!(ed.undo());
+    assert!(flagged(&ed, 0));
+
+    let mut ed = inline_doc("");
+    ed.set_caret(Caret::at(vec![0], 10));
+    ed.insert_table(1, 1, crate::table::AutoFit::Fixed(None))
+        .unwrap();
+    assert!(!inline_flagged(&ed));
+    assert!(ed.undo());
+    assert!(inline_flagged(&ed));
+}
+
+#[test]
+fn deleting_from_an_inline_placeholder_into_the_next_paragraph_clears_its_flag() {
+    let mut ed = inline_doc("<w:p><w:r><w:t>Second</w:t></w:r></w:p>");
+    ed.anchor = Some(Caret::at(vec![0], 9));
+    ed.caret = Caret::at(vec![1], 3);
+    assert!(ed.delete_selection());
+    assert!(!inline_flagged(&ed));
+    // A selection that starts after the control leaves it alone.
+    let mut ed = inline_doc("<w:p><w:r><w:t>Second</w:t></w:r></w:p>");
+    ed.anchor = Some(Caret::at(vec![0], 18));
+    ed.caret = Caret::at(vec![1], 3);
+    assert!(ed.delete_selection());
+    assert!(inline_flagged(&ed));
+}
+
+#[test]
+fn typing_or_pasting_inside_an_inline_placeholder_clears_its_flag() {
+    let mut ed = inline_doc("");
+    ed.set_caret(Caret::at(vec![0], 10));
+    ed.insert_char('x');
+    assert!(!inline_flagged(&ed));
+    let mut ed = inline_doc("");
+    ed.set_caret(Caret::at(vec![0], 10));
+    ed.paste(&Clip::from_text("yz"));
+    assert!(!inline_flagged(&ed));
+    // At its very edges typing keeps the flag, as before.
+    for edge in [6, 17] {
+        let mut ed = inline_doc("");
+        ed.set_caret(Caret::at(vec![0], edge));
+        ed.insert_char('x');
+        assert!(inline_flagged(&ed), "edge {edge}");
+    }
+}

@@ -955,6 +955,7 @@ impl Editor {
         self.checkpoint(EditKind::Insert);
         let path = self.caret.path.clone();
         self.clear_placeholders_around(&path);
+        self.clear_inline_placeholders_inside(&path, self.caret.offset);
         let off = self.caret.offset;
         if ch == LINE_BREAK {
             // A break is an inline of its own, formatted as typing here
@@ -1582,6 +1583,14 @@ impl Editor {
             self.caret = lo;
             return true;
         }
+        // The text deleted from the first and last paragraphs.
+        let lo_len = resolve_para(&self.doc.body, &lo.path).map_or(0, para_text_len);
+        if lo.offset < lo_len {
+            self.clear_inline_placeholders(&lo.path, lo.offset, lo_len);
+        }
+        if hi.offset > 0 {
+            self.clear_inline_placeholders(&hi.path, 0, hi.offset);
+        }
         let li = *lo.path.last().unwrap();
         let hii = *hi.path.last().unwrap();
         if let Some((cont, _)) = container_mut(&mut self.doc.body, &lo.path) {
@@ -1722,6 +1731,7 @@ impl Editor {
         }
         let path = self.caret.path.clone();
         self.clear_placeholders_around(&path);
+        self.clear_inline_placeholders_inside(&path, self.caret.offset);
         // Recorded as one tracked insertion when tracking; a copy of recorded
         // text is not itself a record when not.
         let recorded = self.clip_for_insertion(clip);

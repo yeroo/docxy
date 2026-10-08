@@ -491,6 +491,9 @@ impl Editor {
         let off = self.caret.offset.min(len);
         self.checkpoint(EditKind::Structural);
         self.anchor = None;
+        // A table going into a placeholder is content: it shows no longer.
+        self.clear_placeholders_around(&path);
+        self.clear_inline_placeholders_inside(&path, off);
         let Some((cont, idx)) = container_mut(&mut self.doc.body, &path) else {
             return Err("the caret is not in a paragraph".into());
         };

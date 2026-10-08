@@ -158,6 +158,47 @@ impl Editor {
     }
 }
 
+impl Editor {
+    /// Text is going in at offset `at` of the paragraph at `path`: each inline
+    /// content control it lands strictly inside stops showing its
+    /// placeholder. At a control's very edge it keeps the flag; an insertion
+    /// into an empty control clears it where it is inserted.
+    pub(super) fn clear_inline_placeholders_inside(&mut self, path: &[usize], at: usize) {
+        let Some(p) = super::para_mut(&mut self.doc.body, path) else {
+            return;
+        };
+        for i in inline_controls_inside(&p.content, at) {
+            if let Inline::Raw(raw) = &mut p.content[i] {
+                if raw.contains(FLAG) {
+                    *raw = crate::sect::remove_element(raw, "w:showingPlcHdr");
+                }
+            }
+        }
+    }
+}
+
+/// The inline content controls whose content holds offset `at` strictly
+/// inside it, by the index of their opening boundary.
+fn inline_controls_inside(content: &[Inline], at: usize) -> Vec<usize> {
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    let mut out = Vec::new();
+    let mut offset = 0;
+    for (i, inline) in content.iter().enumerate() {
+        match inline {
+            Inline::Raw(raw) if crate::hf::is_sdt_open(raw) => open.push((i, offset)),
+            Inline::Raw(raw) if crate::hf::is_sdt_close(raw) => {
+                if let Some((o, from)) = open.pop() {
+                    if from < at && at < offset {
+                        out.push(o);
+                    }
+                }
+            }
+            other => offset += super::inline_len(other),
+        }
+    }
+    out
+}
+
 /// The inline content controls whose content overlaps `[start, end)`, by
 /// the index of their opening boundary.
 fn inline_controls_over(content: &[Inline], start: usize, end: usize) -> Vec<usize> {
@@ -226,8 +267,8 @@ fn closing_cell(row: &Row, c: usize, k: usize) -> usize {
 }
 
 /// The innermost cell-level control around cell `cell` of the row at
-/// `row_path` showing its placeholder: its first cell's start to its last
-/// cell's end.
+/// `row_path` showing its placeholder that the editor can select (see
+/// [`cell_control_range`]): its first cell's start to its last cell's end.
 fn cell_placeholder(row: &Row, cell: usize, row_path: &[usize]) -> Option<(Caret, Caret)> {
     row.cell_controls(cell)
         .into_iter()
