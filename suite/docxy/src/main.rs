@@ -97,6 +97,7 @@ mod sheet_flashfill;
 mod sheet_goto;
 mod sheet_menus;
 mod sheet_outline;
+mod sheet_page_setup;
 mod sheet_paste;
 mod sheet_ribbon;
 #[cfg(test)]
@@ -466,6 +467,11 @@ enum RibbonTab {
     Project,
     Home,
     Insert,
+    /// Excel's Page Layout tab (#1019); workbooks only. Not Word's page
+    /// [`RibbonTab::Layout`], which a workbook never shows.
+    PageLayout,
+    /// Excel's Formulas tab (#1019); workbooks only.
+    Formulas,
     /// Excel's Data tab (#693); workbooks only.
     Data,
     /// Word's Design tab (#651); documents only.
@@ -1119,7 +1125,11 @@ fn multi_area_ok(act: SheetAct) -> bool {
         | SheetAct::FlashUndo
         | SheetAct::FlashAccept
         | SheetAct::FlashSelectBlank
-        | SheetAct::FlashSelectChanged => true,
+        | SheetAct::FlashSelectChanged
+        // Page Layout (#1019): Set and Add to Print Area take every area,
+        // as Excel's do; Breaks act at the active cell, and the rest are
+        // the sheet's.
+        | SheetAct::Page(_) => true,
         // One rectangle only.
         SheetAct::Cut
         | SheetAct::Paste
@@ -1140,6 +1150,7 @@ fn multi_area_ok(act: SheetAct) -> bool {
         | SheetAct::SortDesc
         | SheetAct::CustomSort
         | SheetAct::AutoSum
+        | SheetAct::AutoSumFn(_)
         | SheetAct::Merge
         | SheetAct::CondFormat
         | SheetAct::DataValidation
@@ -1191,6 +1202,11 @@ fn multi_area_ok(act: SheetAct) -> bool {
 /// Show/Hide Detail, Auto Outline and Subtotal read the selection, and
 /// Consolidate writes at the selected cell.
 fn act_targets_cells(act: SheetAct) -> bool {
+    // Page Layout (#1019): Print Area and Breaks read the selection; page
+    // setup, scaling and the print options are the sheet's.
+    if let SheetAct::Page(p) = act {
+        return p.targets_cells();
+    }
     !matches!(
         act,
         SheetAct::ProtectSheet
@@ -1910,6 +1926,12 @@ enum SheetAct {
     SortDesc,
     CustomSort,
     AutoSum,
+    /// Formulas › AutoSum and its menu (#1019): the AutoSum range rule with
+    /// another function.
+    AutoSumFn(SumFn),
+    /// A Page Layout tab command (#1019): page setup, print area, breaks,
+    /// scale to fit and the print options.
+    Page(sheet_page_setup::PageAct),
     FormatCells,
     Merge,
     CondFormat,
@@ -1997,6 +2019,48 @@ enum SheetAct {
     /// A Help tab command (#1021): the document ribbon's, run the same way.
     Help(help_tab::HelpAct),
     Todo,
+}
+
+/// The function an AutoSum writes (Formulas › AutoSum's menu, #1019).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SumFn {
+    Sum,
+    Average,
+    Count,
+    Max,
+    Min,
+}
+
+impl SumFn {
+    const ALL: [SumFn; 5] = [
+        SumFn::Sum,
+        SumFn::Average,
+        SumFn::Count,
+        SumFn::Max,
+        SumFn::Min,
+    ];
+
+    /// The worksheet function it writes.
+    fn name(self) -> &'static str {
+        match self {
+            SumFn::Sum => "SUM",
+            SumFn::Average => "AVERAGE",
+            SumFn::Count => "COUNT",
+            SumFn::Max => "MAX",
+            SumFn::Min => "MIN",
+        }
+    }
+
+    /// Its item in the AutoSum menu.
+    fn label(self) -> &'static str {
+        match self {
+            SumFn::Sum => "Sum",
+            SumFn::Average => "Average",
+            SumFn::Count => "Count Numbers",
+            SumFn::Max => "Max",
+            SumFn::Min => "Min",
+        }
+    }
 }
 
 /// Parse a conditional-format comparison into an Excel cellIs operator plus one
@@ -2463,6 +2527,47 @@ impl SheetView {
             self.undo.remove(0);
         }
         self.redo.clear();
+    }
+
+    /// AutoSum: insert `=f(range)` (`=SUM(...)`, `=AVERAGE(...)`, ...) in the
+    /// selected cell over the run of numeric cells directly above it (else
+    /// to its left), as Excel does. One undo step when it wrote; with no
+    /// such run it writes nothing and takes no step.
+    fn autosum(&mut self, f: SumFn) -> bool {
+        use gridcore::sheet::{Cell, CellValue, cell_name};
+        let s = self.active;
+        let (r, c) = self.sel;
+        let sh = &self.pkg.workbook.sheets[s];
+        let is_num = |rr: u32, cc: u32| {
+            matches!(
+                sh.cell(rr, cc).map(|x| &x.value),
+                Some(CellValue::Number(_))
+            )
+        };
+        let range = if r > 0 && is_num(r - 1, c) {
+            let mut top = r - 1;
+            while top > 0 && is_num(top - 1, c) {
+                top -= 1;
+            }
+            format!("{}:{}", cell_name(top, c), cell_name(r - 1, c))
+        } else if c > 0 && is_num(r, c - 1) {
+            let mut left = c - 1;
+            while left > 0 && is_num(r, left - 1) {
+                left -= 1;
+            }
+            format!("{}:{}", cell_name(r, left), cell_name(r, c - 1))
+        } else {
+            return false;
+        };
+        let style = sh.cell(r, c).map(|x| x.style).unwrap_or(0);
+        let cell = Cell {
+            style,
+            ..Cell::formula(&format!("{}({range})", f.name()))
+        };
+        self.push_undo();
+        self.engine
+            .set_cell(&mut self.pkg.workbook, (s, r, c), cell);
+        true
     }
 
     /// Commit the cell buffer without moving the selection, including undo/recalc.
@@ -15532,45 +15637,11 @@ impl Docxy {
         cx.notify();
     }
 
-    /// AutoSum (Σ): insert `=SUM(range)` in the selected cell, summing the run of
-    /// numeric cells directly above it (else to its left) — Excel's behaviour.
-    fn sheet_autosum(&mut self, cx: &mut Context<Self>) {
-        use gridcore::sheet::{Cell, CellValue, cell_name};
-        self.sheet_snapshot();
-        if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            let (r, c) = v.sel;
-            let sh = &v.pkg.workbook.sheets[s];
-            let is_num = |rr: u32, cc: u32| {
-                matches!(
-                    sh.cell(rr, cc).map(|x| &x.value),
-                    Some(CellValue::Number(_))
-                )
-            };
-            let range = if r > 0 && is_num(r - 1, c) {
-                let mut top = r - 1;
-                while top > 0 && is_num(top - 1, c) {
-                    top -= 1;
-                }
-                Some(format!("{}:{}", cell_name(top, c), cell_name(r - 1, c)))
-            } else if c > 0 && is_num(r, c - 1) {
-                let mut left = c - 1;
-                while left > 0 && is_num(r, left - 1) {
-                    left -= 1;
-                }
-                Some(format!("{}:{}", cell_name(r, left), cell_name(r, c - 1)))
-            } else {
-                None
-            };
-            let Some(range) = range else { return };
-            let style = sh.cell(r, c).map(|x| x.style).unwrap_or(0);
-            let cell = Cell {
-                style,
-                ..Cell::formula(&format!("SUM({range})"))
-            };
-            v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), cell);
+    /// AutoSum (Σ) and Formulas › AutoSum's menu: [`SheetView::autosum`].
+    fn sheet_autosum(&mut self, f: SumFn, cx: &mut Context<Self>) {
+        if self.active_sheet_mut().is_some_and(|v| v.autosum(f)) {
+            self.mark_sheet_dirty();
         }
-        self.mark_sheet_dirty();
         cx.notify();
     }
 
@@ -17150,15 +17221,25 @@ impl Docxy {
 
     /// The sheet ribbon command `id`'s menu, with what it is drawn in.
     fn sheet_menu_target(m: sheet_menus::SheetMenu) -> menu::MenuTarget {
-        let (id, group, label) = match m {
-            sheet_menus::SheetMenu::Paste => ("paste", "Clipboard", "Paste"),
-            sheet_menus::SheetMenu::Fill => ("fill", "Editing", "Fill"),
-            sheet_menus::SheetMenu::Clear => ("clear", "Editing", "Clear"),
-            sheet_menus::SheetMenu::FindSelect => ("find-select", "Editing", "Find & Select"),
+        use sheet_menus::SheetMenu as M;
+        let (id, tab, group, label) = match m {
+            M::Paste => ("paste", "Home", "Clipboard", "Paste"),
+            M::Fill => ("fill", "Home", "Editing", "Fill"),
+            M::Clear => ("clear", "Home", "Editing", "Clear"),
+            M::FindSelect => ("find-select", "Home", "Editing", "Find & Select"),
+            M::FitWidth => ("fit-width", "Page Layout", "Scale to Fit", "Width:"),
+            M::FitHeight => ("fit-height", "Page Layout", "Scale to Fit", "Height:"),
+            M::Scale => ("fit-scale", "Page Layout", "Scale to Fit", "Scale:"),
+            M::AutoSum => (
+                "formulas-autosum",
+                "Formulas",
+                "Function Library",
+                "AutoSum",
+            ),
         };
         menu::MenuTarget::Ribbon {
             id: id.into(),
-            tab: "Home".into(),
+            tab: tab.into(),
             group: group.into(),
             label: label.into(),
         }
@@ -17184,6 +17265,21 @@ impl Docxy {
             sheet_menus::SheetMenu::Fill => sheet_menus::fill_menu(),
             sheet_menus::SheetMenu::Clear => sheet_menus::clear_menu(),
             sheet_menus::SheetMenu::FindSelect => sheet_menus::find_select_menu(),
+            sheet_menus::SheetMenu::FitWidth | sheet_menus::SheetMenu::FitHeight => {
+                let width = m == sheet_menus::SheetMenu::FitWidth;
+                let (w, h) = self
+                    .active_sheet()
+                    .map(|v| sheet_page_setup::shown_fit(&v.sheet().page_setup))
+                    .unwrap_or_default();
+                sheet_menus::fit_menu(width, if width { w } else { h })
+            }
+            sheet_menus::SheetMenu::Scale => sheet_menus::scale_menu(
+                self.active_sheet()
+                    .map(|v| &v.sheet().page_setup)
+                    .filter(|p| !p.fit_to_page)
+                    .map(|p| p.scale),
+            ),
+            sheet_menus::SheetMenu::AutoSum => sheet_menus::autosum_menu(),
         };
         self.open_menu(Self::sheet_menu_target(m), at, items, cx);
     }
@@ -17368,7 +17464,14 @@ impl Docxy {
             SheetAct::SortDesc => self.sheet_data_cmd(|t| sheet_sort::quick(t, false), cx),
             SheetAct::CustomSort => self.sheet_data_cmd(sheet_sort::open_dialog, cx),
             SheetAct::PutOnTop(by) => self.sheet_data_cmd(|t| sheet_sort::on_top(t, by), cx),
-            SheetAct::AutoSum => self.sheet_autosum(cx),
+            SheetAct::AutoSum => self.sheet_autosum(SumFn::Sum, cx),
+            SheetAct::AutoSumFn(f) => self.sheet_autosum(f, cx),
+            SheetAct::Page(p) => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    sheet_page_setup::run(tab, p);
+                }
+                cx.notify();
+            }
             SheetAct::FormatCells => {
                 self.sheet_fmt_open = true;
                 cx.notify();
@@ -25106,9 +25209,9 @@ fn ribbon_for(kind: Kind) -> rs::Ribbon<Act> {
         Kind::Project => project_ribbon(),
         Kind::Docx => docxy_ribbon(),
         // The same tabs as `ribbon_tab_set` gives a workbook: no Design, no
-        // Layout and no Mailings, and Excel's Data tab (#693) after Insert.
-        // A sheet draws its commands from `sheet_ribbon`; these entries name
-        // the tabs and their KeyTips.
+        // Layout and no Mailings, and Excel's Page Layout, Formulas (#1019)
+        // and Data (#693) after Insert. A sheet draws its commands from
+        // `sheet_ribbon`; these entries name the tabs and their KeyTips.
         _ => {
             let mut ribbon = docxy_ribbon();
             ribbon
@@ -25119,7 +25222,12 @@ fn ribbon_for(kind: Kind) -> rs::Ribbon<Act> {
                 .iter()
                 .position(|t| t.name == "Insert")
                 .map_or(0, |i| i + 1);
-            ribbon.tabs.insert(at, rs::tab("Data", "A", Vec::new()));
+            for (i, (name, key)) in [("Page Layout", "P"), ("Formulas", "M"), ("Data", "A")]
+                .into_iter()
+                .enumerate()
+            {
+                ribbon.tabs.insert(at + i, rs::tab(name, key, Vec::new()));
+            }
             ribbon
         }
     }
@@ -25150,11 +25258,14 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
             (Some(Help), "Help", "Y"),
         ]
     } else {
-        // A workbook shows the document ribbon's tabs but has no page Layout.
+        // Excel's tabs on a new workbook (APP-021): the document ribbon's
+        // Design, Layout and Mailings are Excel's Page Layout and Formulas.
         &[
             (None, "File", "F"),
             (Some(Home), "Home", "H"),
             (Some(Insert), "Insert", "N"),
+            (Some(PageLayout), "Page Layout", "P"),
+            (Some(Formulas), "Formulas", "M"),
             (Some(Data), "Data", "A"),
             (Some(Review), "Review", "R"),
             (Some(View), "View", "W"),
@@ -25197,6 +25308,8 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
     match tab {
         RibbonTab::Home => "Home",
         RibbonTab::Insert => "Insert",
+        RibbonTab::PageLayout => "Page Layout",
+        RibbonTab::Formulas => "Formulas",
         RibbonTab::Data => "Data",
         RibbonTab::Design => "Design",
         RibbonTab::Layout => "Layout",
@@ -27604,12 +27717,7 @@ impl Docxy {
                     group: group.title.into(),
                     label: dd.button.label.into(),
                 },
-                menu::sheet_dropdown(dd.items, |act| {
-                    matches!(act, SheetAct::Filter)
-                        && self
-                            .active_sheet()
-                            .is_some_and(|v| v.sheet().auto_filter.is_some())
-                }),
+                menu::sheet_dropdown(dd.items, |act| self.sheet_act_checked(act)),
             ))
         })
     }
@@ -28208,6 +28316,36 @@ impl Docxy {
                     cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)),
                 )
             })
+            .into_any_element()
+    }
+
+    /// A check box and its text (Page Layout › Sheet Options, #1019),
+    /// checked from the sheet's state; a click runs `act`, which toggles it.
+    fn sheet_check(
+        &self,
+        label: &'static str,
+        act: SheetAct,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let on = self.sheet_act_checked(act);
+        div()
+            .id(ElementId::Name(format!("scb-{label}").into()))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .h(px(20.))
+            .rounded(px(3.))
+            .cursor_pointer()
+            .hover(|d| d.bg(pal.hover))
+            .child(div().text_size(px(12.)).text_color(pal.fg).child(if on {
+                "\u{2611}"
+            } else {
+                "\u{2610}"
+            }))
+            .child(div().text_size(px(11.)).text_color(pal.fg).child(label))
+            .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)))
             .into_any_element()
     }
 
@@ -29164,6 +29302,21 @@ impl Docxy {
 
     /// Whether a sheet command's state is on, for the commands whose label
     /// reads differently then (Unfreeze Panes, Unprotect Sheet).
+    /// Whether `act` draws checked from the sheet's own state: a ticked
+    /// drop-down item (Filter while the sheet has AutoFilter buttons, the
+    /// page's orientation, size and margins, #1019) or a checked box (Print
+    /// Gridlines, Print Headings). The selection's format is [`sheet_ribbon::act_on`].
+    pub(crate) fn sheet_act_checked(&self, act: SheetAct) -> bool {
+        let Some(v) = self.active_sheet() else {
+            return false;
+        };
+        match act {
+            SheetAct::Filter => v.sheet().auto_filter.is_some(),
+            SheetAct::Page(p) => sheet_page_setup::is_on(p, &v.pkg.workbook, v.active),
+            _ => false,
+        }
+    }
+
     fn sheet_act_toggled(&self, act: SheetAct) -> bool {
         match act {
             SheetAct::FreezePanes => self
@@ -29323,6 +29476,7 @@ impl Docxy {
             Shape::Menu(_) => self.sheet_dropdown_btn(c, pal, cx),
             Shape::Large(icon) => self.sheet_lb(icon, text, c.act, pal, cx),
             Shape::Row(icon) => self.sheet_rb(icon, text, c.act, pal, cx),
+            Shape::Check => self.sheet_check(text, c.act, pal, cx),
             Shape::Icon(icon) => {
                 self.sheet_ib(icon, c.act, sheet_ribbon::act_on(c.act, xf), pal, cx)
             }

@@ -94,6 +94,8 @@ fn apply_dialog(
         | DialogOwner::OutlineAxis { .. } => {
             Err("an outline dialog applies through the Data tab".into())
         }
+        // Handled in `sheet_page_setup::click`, before this.
+        DialogOwner::SheetPageSetup => Err("page setup applies through the Page Layout tab".into()),
         // Handled in `reopen_click`, before this: Yes replaces the whole tab.
         DialogOwner::Reopen { .. } => Err("reopening replaces the tab".into()),
         // Handled in `mailings_dialogs::click`, before this: they act on the
@@ -200,6 +202,10 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
     }
     // So do the outline dialogs (#693): Subtotal's OK and Remove All.
     if let Some(done) = crate::sheet_outline::click(tab, button) {
+        return done;
+    }
+    // Page Layout's Page Setup (#1019).
+    if let Some(done) = crate::sheet_page_setup::click(tab, button) {
         return done;
     }
     // Go To's OK selects; its Special… opens Go To Special (#671).

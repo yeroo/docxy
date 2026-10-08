@@ -173,6 +173,9 @@ pub(crate) enum DialogOwner {
     },
     /// The outline Settings (#693): where summary rows and columns sit.
     OutlineSettings,
+    /// Page Layout's Page Setup dialog for the active sheet (#1019), applied
+    /// in `sheet_page_setup::click`.
+    SheetPageSetup,
     /// Home › Find & Select › Go To… and Go To Special… (#671), applied in
     /// `sheet_goto::click`.
     GoTo,

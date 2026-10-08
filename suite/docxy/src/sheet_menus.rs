@@ -17,6 +17,12 @@ pub(crate) enum SheetMenu {
     Fill,
     Clear,
     FindSelect,
+    /// Page Layout › Scale to Fit › Width:, Height: and Scale: (#1019).
+    FitWidth,
+    FitHeight,
+    Scale,
+    /// Formulas › AutoSum's arrow (#1019).
+    AutoSum,
 }
 
 /// One item of the Paste gallery and of the Paste Options menu.
@@ -224,6 +230,101 @@ pub(crate) fn find_select_menu() -> Vec<MenuItem> {
     ]
 }
 
+/// Scale to Fit › Width: (`width`) or Height:: Automatic, then 1 to 9
+/// pages, the count the sheet shows now (`current`, 0 Automatic) ticked, and
+/// More Pages... (the Page Setup dialog).
+pub(crate) fn fit_menu(width: bool, current: u32) -> Vec<MenuItem> {
+    use crate::sheet_page_setup::{FIT_PAGES, PageAct};
+    let act = |n| {
+        SheetAct::Page(if width {
+            PageAct::FitWidth(n)
+        } else {
+            PageAct::FitHeight(n)
+        })
+    };
+    let axis = if width { "width" } else { "height" };
+    let mut items = vec![MenuItem::Item(
+        Entry::new(
+            &format!("fit-{axis}-auto"),
+            "Automatic",
+            "",
+            Act::Sheet(act(0)),
+            true,
+        )
+        .checked(current == 0),
+    )];
+    for n in FIT_PAGES {
+        let label = format!("{n} page{}", if n == 1 { "" } else { "s" });
+        items.push(MenuItem::Item(
+            Entry::new(
+                &format!("fit-{axis}-{n}"),
+                &label,
+                "",
+                Act::Sheet(act(n)),
+                true,
+            )
+            .checked(current == n),
+        ));
+    }
+    items.push(sep());
+    items.push(item(
+        &format!("fit-{axis}-more"),
+        "More Pages\u{2026}",
+        SheetAct::Page(PageAct::Dialog),
+        true,
+    ));
+    items
+}
+
+/// Scale to Fit › Scale:: the percentages, the sheet's own ticked while it
+/// prints at a scale (`current`), and Custom... (the Page Setup dialog).
+pub(crate) fn scale_menu(current: Option<u32>) -> Vec<MenuItem> {
+    use crate::sheet_page_setup::{PageAct, SCALES};
+    let mut items: Vec<MenuItem> = SCALES
+        .iter()
+        .map(|&n| {
+            MenuItem::Item(
+                Entry::new(
+                    &format!("scale-{n}"),
+                    &format!("{n}%"),
+                    "",
+                    Act::Sheet(SheetAct::Page(PageAct::Scale(n))),
+                    true,
+                )
+                .checked(current == Some(n)),
+            )
+        })
+        .collect();
+    items.push(sep());
+    items.push(item(
+        "scale-custom",
+        "Custom\u{2026}",
+        SheetAct::Page(PageAct::Dialog),
+        true,
+    ));
+    items
+}
+
+/// Formulas › AutoSum's arrow: the functions, then More Functions..., which
+/// waits for an Insert Function dialog.
+pub(crate) fn autosum_menu() -> Vec<MenuItem> {
+    let mut items: Vec<MenuItem> = crate::SumFn::ALL
+        .into_iter()
+        .map(|f| {
+            let id = format!("autosum-{}", f.name().to_ascii_lowercase());
+            item(&id, f.label(), SheetAct::AutoSumFn(f), true)
+        })
+        .collect();
+    items.push(sep());
+    items.push(item(
+        "autosum-more-functions",
+        "More Functions\u{2026}",
+        SheetAct::Todo,
+        false,
+    ));
+    items
+}
+
 /// The kinds the Auto Fill Options button offers after a fill: Copy Cells
 /// and Fill Series, the formatting pair, and for dates the date units, for
 /// numbers the trends.
@@ -348,6 +449,82 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// (label, sheet act, checked, enabled) of each item.
+    fn entries(items: &[MenuItem]) -> Vec<(String, SheetAct, bool, bool)> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                MenuItem::Item(e) => {
+                    let Some(Act::Sheet(act)) = e.act else {
+                        panic!("{} runs no sheet act", e.label)
+                    };
+                    Some((e.label.clone(), act, e.checked, e.enabled))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scale_to_fit_menus_tick_the_sheets_count_and_end_in_the_dialog() {
+        use crate::sheet_page_setup::PageAct;
+        let w = entries(&fit_menu(true, 2));
+        assert_eq!(w.len(), 11);
+        assert_eq!(w[0].0, "Automatic");
+        assert_eq!(w[0].1, SheetAct::Page(PageAct::FitWidth(0)));
+        assert_eq!(w[1].0, "1 page");
+        assert_eq!(w[9].0, "9 pages");
+        assert_eq!(w[10].0, "More Pages\u{2026}");
+        assert_eq!(w[10].1, SheetAct::Page(PageAct::Dialog));
+        let ticked: Vec<&str> = w.iter().filter(|e| e.2).map(|e| e.0.as_str()).collect();
+        assert_eq!(ticked, ["2 pages"]);
+        let h = entries(&fit_menu(false, 0));
+        assert_eq!(h[3].1, SheetAct::Page(PageAct::FitHeight(3)));
+        assert!(h[0].2 && h.iter().filter(|e| e.2).count() == 1);
+        let s = entries(&scale_menu(Some(75)));
+        assert_eq!(
+            s.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(),
+            [
+                "50%",
+                "75%",
+                "100%",
+                "125%",
+                "150%",
+                "200%",
+                "Custom\u{2026}"
+            ]
+        );
+        assert_eq!(s[1].1, SheetAct::Page(PageAct::Scale(75)));
+        assert!(s[1].2 && s.iter().filter(|e| e.2).count() == 1);
+        // Fitting to pages ticks no scale.
+        assert!(entries(&scale_menu(None)).iter().all(|e| !e.2));
+    }
+
+    #[test]
+    fn the_autosum_menu_is_excels() {
+        let m = entries(&autosum_menu());
+        assert_eq!(
+            m.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(),
+            [
+                "Sum",
+                "Average",
+                "Count Numbers",
+                "Max",
+                "Min",
+                "More Functions\u{2026}"
+            ]
+        );
+        let acts: Vec<SheetAct> = m.iter().take(5).map(|e| e.1).collect();
+        let want: Vec<SheetAct> = crate::SumFn::ALL
+            .into_iter()
+            .map(SheetAct::AutoSumFn)
+            .collect();
+        assert_eq!(acts, want);
+        assert!(m[..5].iter().all(|e| e.3));
+        // Insert Function has no dialog yet.
+        assert!(!m[5].3);
     }
 
     #[test]

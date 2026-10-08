@@ -1706,7 +1706,10 @@ fn sheet_command_json(
         ("key_tip", Json::Str(String::new())),
         (
             "checked",
-            Json::Bool(crate::sheet_ribbon::act_on(cmd.act, &app.active_xf())),
+            Json::Bool(
+                crate::sheet_ribbon::act_on(cmd.act, &app.active_xf())
+                    || app.sheet_act_checked(cmd.act),
+            ),
         ),
         ("enabled", Json::Bool(cmd.enabled())),
     ];
