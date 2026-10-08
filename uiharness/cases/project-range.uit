@@ -216,3 +216,51 @@ test a press that commits the entry row keeps the click on the new task
   call task.list {}
   assert reply.tasks.2.name is Design
   assert reply.tasks.2.duration_days is 3
+
+# Shift+Home/End and Shift+Ctrl+arrows/Home/End (#1087). The table's
+# columns are ID, Mode, Name, Duration, Start, Finish, Predecessors and
+# Resource Names (A to H).
+
+test shift+end and shift+home extend over the row, and ctrl+x cuts its names
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  key shift+end
+  assert selection is 6
+  assert cell_row is 0
+  key shift+home
+  assert selection is 3
+  assert cell is ID
+  key shift+end
+  key ctrl+x
+  call task.list {}
+  assert reply.tasks.0.name is ""
+  assert reply.tasks.0.duration_days is 2
+  assert reply.tasks.1.name is B
+  assert selection is none
+
+test ctrl+shift+arrows and ctrl+shift+home/end extend to the edges
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  key ctrl+shift+down
+  assert selection is 2
+  assert cell_row is 1
+  assert cell is Name
+  key ctrl+shift+end
+  assert selection is 12
+  key ctrl+shift+home
+  assert selection is 3
+  assert cell_row is 0
+  assert cell is ID
+  key down
+  assert selection is none
+  # Ctrl+Shift+Left from Duration takes the row's first four fields; they
+  # paste back from the ID column (the ID field is ignored) as a new task.
+  call click-cell {"cell":"D1"}
+  key ctrl+shift+left
+  assert selection is 4
+  key ctrl+c
+  call click-cell {"cell":"A3"}
+  key ctrl+v
+  call task.list {}
+  assert reply.tasks.2.name is A
+  assert reply.tasks.2.duration_days is 2
