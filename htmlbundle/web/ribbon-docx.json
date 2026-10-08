@@ -14,7 +14,7 @@
       "groups": [
         {
           "title": "Clipboard",
-          "priority": 10,
+          "priority": 50,
           "launcher": null,
           "items": [
             {
@@ -65,7 +65,7 @@
         },
         {
           "title": "Font",
-          "priority": 40,
+          "priority": 45,
           "launcher": "LaunchFont",
           "items": [
             {
@@ -293,7 +293,7 @@
         },
         {
           "title": "Paragraph",
-          "priority": 30,
+          "priority": 40,
           "launcher": "LaunchParagraph",
           "items": [
             {

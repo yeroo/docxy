@@ -71,6 +71,7 @@ mod project;
 mod recover;
 #[cfg(test)]
 mod ribbon_export;
+mod ribbon_fit;
 mod ribbon_layout;
 #[cfg(test)]
 mod save_preserve_tests;
@@ -4452,6 +4453,12 @@ struct Docxy {
     // The menu the backdrop last closed and where that press was, so a press
     // on a split button's arrow can tell it just shut the arrow's own menu.
     menu_closed_at: Option<(menu::MenuTarget, Point<Pixels>)>,
+    // The open flyout of a collapsed ribbon group, or of the overflow
+    // chevron (#1020); see `RibbonFlyout`.
+    ribbon_flyout: Option<RibbonFlyout>,
+    // The flyout a press outside it last closed, and where, so the press on
+    // its own collapsed button does not open it straight back.
+    flyout_closed_at: Option<(FlyoutTarget, Point<Pixels>)>,
     // What Ctrl+Y / F4 repeat when there is nothing to redo (#618); see
     // `RepeatRecord` for when it is still valid.
     repeat: Option<RepeatRecord>,
@@ -10982,6 +10989,8 @@ impl Docxy {
             keytip_prefix: String::new(),
             menu: None,
             menu_closed_at: None,
+            ribbon_flyout: None,
+            flyout_closed_at: None,
             repeat: None,
             mini_bar: None,
             zoom: 1.0,
@@ -11212,6 +11221,9 @@ impl Docxy {
     }
 
     fn select_ribbon_tab(&mut self, tab: RibbonTab, window: &mut Window, cx: &mut Context<Self>) {
+        if tab != self.ribbon_tab {
+            self.ribbon_flyout = None;
+        }
         self.ribbon_tab = tab;
         self.refocus(window, cx);
     }
@@ -13348,6 +13360,10 @@ impl Docxy {
                 &harness::region_name(region),
             )
             .ok_or_else(|| "the File screen is not open".to_string()),
+            Region::Ribbon => lookup(&self.probes.borrow(), "ribbon-body")
+                .ok_or_else(|| "the ribbon's groups are not shown".to_string()),
+            Region::RibbonFlyout => lookup(&self.probes.borrow(), "ribbon-flyout")
+                .ok_or_else(|| "no ribbon flyout is open".to_string()),
             Region::Gallery => lookup(&self.probes.borrow(), "gallery").ok_or_else(|| {
                 "the Styles gallery is not shown (it is on a document's Home tab, with the ribbon expanded)"
                     .to_string()
@@ -17368,6 +17384,11 @@ impl Docxy {
     /// Dispatch a spreadsheet ribbon command.
     fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
+        // A command ends an open ribbon flyout's moment, except a toggle in
+        // it and a split button's arrow, whose menu opens over it (#1020).
+        if !matches!(act, SheetAct::Menu(_)) && !self.flyout_keeps_open_for_sheet_act(act) {
+            self.ribbon_flyout = None;
+        }
         // The Help tab (#1021) touches no cell: the document ribbon's commands.
         if let SheetAct::Help(a) = act {
             return self.help_act(a, window, cx);
@@ -21192,6 +21213,11 @@ impl Docxy {
         if self.menu.is_some() {
             return self.menu_key(&ev.keystroke.key, window, cx);
         }
+        // Esc closes an open ribbon flyout (#1020), and only that.
+        if ev.keystroke.key == "escape" && self.ribbon_flyout.take().is_some() {
+            cx.notify();
+            return;
+        }
         // The highlighting mode (#623) ends on Esc, which it consumes, and on
         // any other key but a bare modifier. KeyTips, the find bar and the
         // comment bar take their keys (Esc included) first; the KeyTips' Alt
@@ -24666,7 +24692,7 @@ mod repeat_tests {
 
 // ---- the ribbon, defined once via ribbonspec (shared model) ----------------
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Act {
     Project(ProjectAct),
     /// A sheet command from a menu: the sheet ribbon's menus (#707) and the
@@ -24835,9 +24861,10 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             "H",
             vec![
                 // Clipboard: a large Paste button + a small Cut/Copy column (Word).
+                // Clipboard and Font are the last groups to collapse (#1020).
                 rs::group(
                     "Clipboard",
-                    10,
+                    50,
                     vec![
                         Control::Large(cmdt("paste", "paste", "Paste", Paste, "Ctrl+V").key("V")),
                         rs::column(vec![
@@ -24849,7 +24876,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 // Font: two rows — combos + size controls on top, character toggles below.
                 rs::group(
                     "Font",
-                    40,
+                    45,
                     vec![rs::rows(vec![
                         vec![
                             rs::combo(cmdt("fontname", "font-name", "Font", FontName, ""), true),
@@ -24891,7 +24918,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 // Paragraph: two rows — lists/indent/sort/marks on top, alignment below.
                 rs::group(
                     "Paragraph",
-                    30,
+                    40,
                     vec![rs::rows(vec![
                         vec![
                             rs::btn(
@@ -25454,6 +25481,51 @@ fn menu_toggle(
     })
 }
 
+/// The press on a collapsed ribbon group or the overflow chevron (#1020):
+/// it opens `target`'s flyout, or shuts it when it is the one open, whichever
+/// of this handler and the flyout backdrop's runs first.
+fn flyout_toggle(
+    target: FlyoutTarget,
+    cx: &mut Context<Docxy>,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+        cx.stop_propagation();
+        let closed = this
+            .flyout_closed_at
+            .take()
+            .filter(|(_, at)| *at == ev.position)
+            .map(|(t, _)| t);
+        let open = this.ribbon_flyout.map(|f| f.target);
+        if open == Some(target) || closed == Some(target) {
+            this.ribbon_flyout = None;
+        } else {
+            this.open_ribbon_flyout(target);
+        }
+        cx.notify();
+    })
+}
+
+/// The active ribbon tab fitted to the window (`Docxy::ribbon_fit_now`): per
+/// group, in drawn order, its title, the icon its collapsed button shows, its
+/// widths, and where the fit put it.
+pub(crate) struct RibbonFitNow {
+    pub titles: Vec<&'static str>,
+    pub icons: Vec<Option<&'static str>>,
+    pub specs: Vec<ribbon_fit::Spec>,
+    pub fit: ribbon_fit::Fit,
+}
+
+/// Three lists from one of triples.
+fn multiunzip<A, B, C>(rows: impl Iterator<Item = (A, B, C)>) -> (Vec<A>, Vec<B>, Vec<C>) {
+    let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
+    for (x, y, z) in rows {
+        a.push(x);
+        b.push(y);
+        c.push(z);
+    }
+    (a, b, c)
+}
+
 /// A small KeyTip access-key badge, centred at the bottom of its host element.
 fn keytip_badge(text: &str) -> AnyElement {
     div()
@@ -25474,73 +25546,34 @@ fn keytip_badge(text: &str) -> AnyElement {
         .into_any_element()
 }
 
-/// One icon button's share of a ribbon row, in px (see `group_est`).
-const ROW_BTN_PITCH: f32 = 35.0;
-
-/// Which of a ribbon tab's groups fit `width`: whether labels are dropped, and
-/// the groups still shown after the lowest priorities collapse.
-fn ribbon_fit(groups: &[rs::Group<Act>], width: f32) -> (bool, Vec<usize>) {
-    let avail = (width - 28.0).max(120.0);
-    // 1) drop control labels if the full layout overflows.
-    let icon_only = groups.iter().map(|g| group_est(g, false)).sum::<f32>() > avail;
-    // 2) collapse lowest-priority groups until what remains fits.
-    let mut shown: Vec<usize> = (0..groups.len()).collect();
-    loop {
-        let total: f32 = shown
-            .iter()
-            .map(|&i| group_est(&groups[i], icon_only))
-            .sum();
-        if total <= avail || shown.len() <= 1 {
-            break;
-        }
-        let victim = *shown.iter().min_by_key(|&&i| groups[i].priority).unwrap();
-        shown.retain(|&i| i != victim);
-    }
-    (icon_only, shown)
+/// What a ribbon flyout shows (#1020): one collapsed group, whole, or the
+/// overflow chevron's list of the groups it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlyoutTarget {
+    Group(&'static str),
+    Overflow,
 }
 
-/// Rough natural width (px) of a group, for responsive collapse decisions.
-fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
-    let mut w: f32 = 22.0;
-    for c in &g.items {
-        w += match c {
-            Control::Toggle(_) => 26.0,
-            Control::Large(_) | Control::Split { .. } | Control::Dropdown { .. } => 58.0,
-            Control::Column(_) => {
-                if icon_only {
-                    34.0
-                } else {
-                    104.0
-                }
-            }
-            // A two-row grid: its width is that of the widest row.
-            Control::Rows(rows) => rows
-                .iter()
-                .map(|row| {
-                    row.iter()
-                        .map(|cell| match cell {
-                            rs::Cell::Combo { wide, .. } => {
-                                if *wide {
-                                    106.0
-                                } else {
-                                    48.0
-                                }
-                            }
-                            // `icon_btn` without its label: 1px border and
-                            // `px_2` each side around a 16px icon (34px), plus
-                            // the row's 1px gap. At 25 the Font and Paragraph
-                            // rows underran by ~70px, and at the default
-                            // 1180px window the Home tab clipped Editing.
-                            rs::Cell::Btn(_) => ROW_BTN_PITCH,
-                        })
-                        .sum::<f32>()
-                })
-                .fold(0.0_f32, f32::max),
-            Control::Gallery(gal) => style_gallery::well_width(gal.items.len()),
-            Control::Separator => 10.0,
-        };
-    }
-    w.max(44.0)
+/// An open ribbon flyout, and the ribbon it belongs to: it closes when the
+/// window shows another document, another ribbon tab, or the group is no
+/// longer collapsed (`Docxy::flyout_still_fits`).
+#[derive(Clone, Copy)]
+pub(crate) struct RibbonFlyout {
+    pub doc: usize,
+    pub tab: RibbonTab,
+    pub target: FlyoutTarget,
+}
+
+/// The prefix a flyout's copy of a group puts on its `ribbon-group:`,
+/// `ribbon-title:` and `ribbon-content:` probes, so `ribbon-layout` measures
+/// only the groups drawn in the ribbon itself.
+const FLYOUT_PROBE_PREFIX: &str = "ribbon-flyout:";
+
+/// The drawn width of `text` at `size` px in the window's UI font, for the
+/// ribbon's width estimates (`ribbon_fit`).
+fn ribbon_text_width(window: &Window) -> impl Fn(&str, f32) -> f32 + use<> {
+    let m = Measurer::new(window);
+    move |text, size| m.width(text, size, false, false)
 }
 
 fn move_vert(ed: &mut Editor, down: bool) {
@@ -28046,6 +28079,11 @@ impl Docxy {
     fn dispatch(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
         // A command run from anywhere ends an open menu's moment (#397).
         self.close_menu();
+        // And a ribbon flyout's, except a toggle in it, which leaves the
+        // flyout open to show its new state (#1020).
+        if !self.flyout_keeps_open_for_act(act) {
+            self.ribbon_flyout = None;
+        }
         // Protected View (#633): the ribbon is hidden, but shortcuts, KeyTips,
         // context menus and the harness's `ribbon-click` still come here.
         // Resolve and Delete all hold no text of the view: only Protected View
@@ -28195,48 +28233,415 @@ impl Docxy {
         }
     }
 
-    /// The ribbon body for the active tab, rendered from the shared ribbonspec
-    /// model with Fluent icons — and RESPONSIVE: as `width` drops, control labels
-    /// are dropped first, then the lowest-`priority` groups collapse into an
-    /// overflow indicator (Office-style scaling driven by ribbonspec::priority).
-    fn ribbon_body(&self, width: f32, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let tab = &self.active_ribbon_tab_def();
-        let (icon_only, shown) = ribbon_fit(&tab.groups, width);
-        let hidden = tab.groups.len() - shown.len();
+    /// Whether the active tab's ribbon is the ribbonspec model (a document or
+    /// a Project) rather than the spreadsheet table, as `render` draws it.
+    fn ribbon_is_model(&self) -> bool {
+        self.active_is_doc() || self.active_is_project()
+    }
 
-        let mut groups: Vec<AnyElement> = shown
-            .iter()
-            .map(|&i| self.render_group(&tab.groups[i], icon_only, pal, cx))
-            .collect();
-        if hidden > 0 {
-            groups.push(
-                v_flex()
-                    .items_center()
-                    .justify_center()
-                    .h_full()
-                    .px_2()
-                    .gap_1()
-                    .text_color(pal.dim)
-                    .child(div().text_size(px(18.)).child("\u{22EF}"))
-                    .child(
-                        div()
-                            .text_size(px(9.))
-                            .child(SharedString::from(format!("{hidden} more"))),
-                    )
-                    .into_any_element(),
-            );
+    /// The active ribbon tab fitted to the window now (#1020): each group's
+    /// widths and where it went. The ribbon draws from this, and
+    /// `ribbon-read`, `ribbon-layout` and `ribbon-click` ask it too, so a verb
+    /// run straight after a resize sees the layout the next frame draws.
+    pub(crate) fn ribbon_fit_now(&self, window: &Window) -> RibbonFitNow {
+        let tw = ribbon_text_width(window);
+        let width = f32::from(window.viewport_size().width);
+        let (titles, icons, specs): (Vec<_>, Vec<_>, Vec<_>) = if self.ribbon_is_model() {
+            let tab = self.active_ribbon_tab_def();
+            let rows = tab.groups.iter().map(|g| {
+                (
+                    g.title,
+                    ribbon_fit::model_group_icon(g),
+                    ribbon_fit::model_spec(g, &tw),
+                )
+            });
+            multiunzip(rows)
+        } else {
+            let tab = sheet_ribbon::tab_def(self.ribbon_tab);
+            let rows = tab.groups.iter().map(|g| {
+                (
+                    g.title,
+                    ribbon_fit::sheet_group_icon(g),
+                    ribbon_fit::sheet_spec(g, tab.titles, &tw),
+                )
+            });
+            multiunzip(rows)
+        };
+        let fit = ribbon_fit::fit(&specs, width);
+        RibbonFitNow {
+            titles,
+            icons,
+            specs,
+            fit,
         }
+    }
+
+    /// The model ribbon group whose flyout is open.
+    fn flyout_group(&self) -> Option<rs::Group<Act>> {
+        let Some(RibbonFlyout {
+            target: FlyoutTarget::Group(title),
+            ..
+        }) = self.ribbon_flyout
+        else {
+            return None;
+        };
+        self.active_ribbon_tab_def()
+            .groups
+            .into_iter()
+            .find(|g| g.title == title)
+    }
+
+    /// Whether `act` is a toggle of the open flyout's group: a small button
+    /// (Bold, Bullets), which keeps the flyout open.
+    fn flyout_keeps_open_for_act(&self, act: Act) -> bool {
+        if !self.ribbon_is_model() {
+            return false;
+        }
+        self.flyout_group().is_some_and(|g| {
+            g.items.iter().any(|c| match c {
+                Control::Toggle(cmd) => cmd.act == act,
+                Control::Rows(rows) => rows
+                    .iter()
+                    .flatten()
+                    .any(|cell| matches!(cell, rs::Cell::Btn(cmd) if cmd.act == act)),
+                _ => false,
+            })
+        })
+    }
+
+    /// As [`Self::flyout_keeps_open_for_act`] for the sheet ribbon: an icon,
+    /// glyph or check box of the open flyout's group.
+    fn flyout_keeps_open_for_sheet_act(&self, act: SheetAct) -> bool {
+        let Some(RibbonFlyout {
+            target: FlyoutTarget::Group(title),
+            ..
+        }) = self.ribbon_flyout
+        else {
+            return false;
+        };
+        if self.ribbon_is_model() {
+            return false;
+        }
+        let tab = sheet_ribbon::tab_def(self.ribbon_tab);
+        tab.groups
+            .iter()
+            .filter(|g| g.title == title)
+            .flat_map(|g| g.commands())
+            .any(|c| {
+                c.act == act
+                    && matches!(
+                        c.shape,
+                        sheet_ribbon::Shape::Icon(_)
+                            | sheet_ribbon::Shape::Glyph(_)
+                            | sheet_ribbon::Shape::Check
+                    )
+            })
+    }
+
+    /// Open the flyout of a collapsed group or of the overflow chevron. It
+    /// replaces any menu or other flyout, as a press outside them would.
+    pub(crate) fn open_ribbon_flyout(&mut self, target: FlyoutTarget) {
+        self.close_menu();
+        self.ribbon_flyout = Some(RibbonFlyout {
+            doc: self.active,
+            tab: self.ribbon_tab,
+            target,
+        });
+    }
+
+    /// Whether the open flyout still belongs to what the window shows: the
+    /// same document and ribbon tab, and its group still collapsed (a wider
+    /// window draws the group in place again) or, for the chevron, groups
+    /// still in it.
+    fn flyout_still_fits(&self, f: RibbonFlyout, window: &Window) -> bool {
+        if f.doc != self.active
+            || f.tab != self.ribbon_tab
+            || self.backstage
+            || self.ribbon_min
+            || self.ribbon_body_hidden()
+        {
+            return false;
+        }
+        let now = self.ribbon_fit_now(window);
+        match f.target {
+            FlyoutTarget::Overflow => !now.fit.overflow.is_empty(),
+            FlyoutTarget::Group(title) => now
+                .titles
+                .iter()
+                .position(|t| *t == title)
+                .is_some_and(|i| now.fit.in_flyout(i)),
+        }
+    }
+
+    /// The ribbon body for the active tab, rendered from the shared ribbonspec
+    /// model with Fluent icons, fitted to the window (#1020): groups drop their
+    /// labels, then collapse to a button whose flyout holds the whole group,
+    /// lowest `priority` first; what still does not fit goes in the chevron.
+    fn ribbon_body(&self, window: &Window, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let tab = &self.active_ribbon_tab_def();
+        let now = self.ribbon_fit_now(window);
+        let groups = tab.groups.iter().enumerate().filter_map(|(i, g)| {
+            Some(match *now.fit.states.get(i)? {
+                _ if now.fit.in_overflow(i) => return None,
+                ribbon_fit::State::Collapsed => self.ribbon_collapsed_btn(
+                    g.title,
+                    now.icons[i],
+                    now.specs[i].collapsed,
+                    pal,
+                    cx,
+                ),
+                st => self.render_group(g, st == ribbon_fit::State::IconOnly, "", pal, cx),
+            })
+        });
+        let groups: Vec<AnyElement> = groups.collect();
+        self.ribbon_strip(98., groups, &now, tab.name, pal, cx)
+    }
+
+    /// The ribbon body's strip: the groups, then the overflow chevron when
+    /// the fit put groups in it. Nothing scrolls; the clip only guards the
+    /// window edge, and `ribbon-layout` reports a group past it as clipped.
+    fn ribbon_strip(
+        &self,
+        height: f32,
+        groups: Vec<AnyElement>,
+        now: &RibbonFitNow,
+        tab_name: &str,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         h_flex()
             .w_full()
-            .h(px(98.))
+            .h(px(height))
             .items_stretch()
             .px_1()
             .bg(pal.panel)
             .border_b_1()
             .border_color(pal.border)
             .relative()
+            .overflow_hidden()
             .children(groups)
-            .child(probe(&self.probes, format!("ribbon-tab:{}", tab.name)))
+            .when(!now.fit.overflow.is_empty(), |d| {
+                d.child(self.ribbon_chevron(pal, cx))
+            })
+            .child(probe(&self.probes, format!("ribbon-tab:{tab_name}")))
+            .child(probe(&self.probes, "ribbon-body"))
+            .into_any_element()
+    }
+
+    /// A collapsed ribbon group (#1020): the group's icon over its title and a
+    /// drop-down mark, drawn exactly `w` px wide (its estimate). A press opens
+    /// the whole group in a flyout under it, or shuts the flyout when it is
+    /// this group's.
+    fn ribbon_collapsed_btn(
+        &self,
+        title: &'static str,
+        icon: Option<&'static str>,
+        w: f32,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let target = FlyoutTarget::Group(title);
+        let open = self.ribbon_flyout.is_some_and(|f| f.target == target);
+        let lines = label_lines(title);
+        let last = lines.len().saturating_sub(1);
+        let mut label = v_flex().items_center();
+        for (i, ln) in lines.into_iter().enumerate() {
+            let ln = if i == last {
+                format!("{ln} \u{25BE}")
+            } else {
+                ln
+            };
+            label = label.child(
+                div()
+                    .whitespace_nowrap()
+                    .text_size(px(ribbon_fit::COLLAPSED_TITLE_PX))
+                    .text_color(pal.fg)
+                    .child(SharedString::from(ln)),
+            );
+        }
+        div()
+            .id(SharedString::from(format!("ribbon-collapsed-{title}")))
+            .relative()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .w(px(w))
+            .h_full()
+            .px_1p5()
+            .border_r_1()
+            .border_color(pal.border)
+            .cursor_pointer()
+            .when(open, |d| d.bg(pal.hover))
+            .hover(|d| d.bg(pal.hover))
+            .child(probe(&self.probes, format!("ribbon-group:{title}")))
+            .child(probe(&self.probes, format!("ribbon-collapsed:{title}")))
+            .child(match icon {
+                Some(ic) => icon_svg(ic, 24., pal.fg).into_any_element(),
+                None => div().size(px(24.)).into_any_element(),
+            })
+            .child(label)
+            .tooltip(move |w, cx| Tooltip::new(title).build(w, cx))
+            .on_mouse_down(MouseButton::Left, flyout_toggle(target, cx))
+            .into_any_element()
+    }
+
+    /// The trailing overflow chevron: its flyout lists the collapsed groups
+    /// that did not fit even as buttons.
+    fn ribbon_chevron(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let open = self
+            .ribbon_flyout
+            .is_some_and(|f| f.target == FlyoutTarget::Overflow);
+        div()
+            .id("ribbon-overflow")
+            .relative()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(ribbon_fit::CHEVRON_W))
+            .h_full()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .text_size(px(16.))
+            .text_color(pal.fg)
+            .when(open, |d| d.bg(pal.hover))
+            .hover(|d| d.bg(pal.hover))
+            .child(probe(&self.probes, "ribbon-overflow"))
+            .child("\u{00BB}")
+            .tooltip(|w, cx| Tooltip::new("More groups").build(w, cx))
+            .on_mouse_down(MouseButton::Left, flyout_toggle(FlyoutTarget::Overflow, cx))
+            .into_any_element()
+    }
+
+    /// The open ribbon flyout, under its collapsed button (or the chevron),
+    /// slid to stay inside the window: the whole group at full size, drawn by
+    /// the same renderer as in place, so every control works as it does
+    /// there; or the chevron's list of groups. A press outside closes it.
+    fn ribbon_flyout_el(
+        &self,
+        window: &Window,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let f = self.ribbon_flyout?;
+        let anchor = {
+            let probes = self.probes.borrow();
+            let own = match f.target {
+                FlyoutTarget::Group(t) => probes.current(&format!("ribbon-collapsed:{t}")),
+                FlyoutTarget::Overflow => None,
+            };
+            own.or_else(|| probes.current("ribbon-overflow"))
+                .or_else(|| probes.current("ribbon-body"))
+                .map(|b| b.bottom_left())
+                .unwrap_or_default()
+        };
+        let content = match f.target {
+            FlyoutTarget::Overflow => self.ribbon_overflow_list(window, pal, cx),
+            FlyoutTarget::Group(title) if self.ribbon_is_model() => {
+                let tab = self.active_ribbon_tab_def();
+                let g = tab.groups.iter().find(|g| g.title == title)?;
+                div()
+                    .flex()
+                    .h(px(94.))
+                    .child(self.render_group(g, false, FLYOUT_PROBE_PREFIX, pal, cx))
+                    .into_any_element()
+            }
+            FlyoutTarget::Group(title) => {
+                let tab = sheet_ribbon::tab_def(self.ribbon_tab);
+                let g = tab.groups.iter().find(|g| g.title == title)?;
+                let xf = self.active_xf();
+                self.sheet_group(g, tab.titles, &xf, false, FLYOUT_PROBE_PREFIX, pal, cx)
+            }
+        };
+        let panel = div()
+            .id("ribbon-flyout")
+            .relative()
+            .occlude()
+            .flex()
+            .p_1()
+            .rounded_md()
+            .bg(pal.panel)
+            .border_1()
+            .border_color(pal.border)
+            .shadow_lg()
+            // A press on the flyout itself is not a press outside it.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(probe(&self.probes, "ribbon-flyout"))
+            .child(content);
+        Some(
+            div()
+                .id("ribbon-flyout-backdrop")
+                .absolute()
+                .inset_0()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                        // A press that shuts a menu opened from the flyout
+                        // shuts only the menu, whichever backdrop hears it first.
+                        let shut_menu = this
+                            .menu_closed_at
+                            .as_ref()
+                            .is_some_and(|(_, at)| *at == ev.position);
+                        if this.menu.is_some() || shut_menu {
+                            return;
+                        }
+                        if let Some(f) = this.ribbon_flyout.take() {
+                            this.flyout_closed_at = Some((f.target, ev.position));
+                        }
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    anchored()
+                        .position(anchor)
+                        .snap_to_window_with_margin(px(4.))
+                        .child(panel),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The overflow chevron's flyout: one entry per group in it, each
+    /// opening that group's flyout.
+    fn ribbon_overflow_list(
+        &self,
+        window: &Window,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let now = self.ribbon_fit_now(window);
+        let items = now.fit.overflow.iter().map(|&i| {
+            let title = now.titles[i];
+            h_flex()
+                .id(SharedString::from(format!("ribbon-overflow-{title}")))
+                .relative()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|d| d.bg(pal.hover))
+                .text_size(px(12.))
+                .text_color(pal.fg)
+                .child(probe(&self.probes, format!("ribbon-overflow-item:{title}")))
+                .child(match now.icons[i] {
+                    Some(ic) => icon_svg(ic, 14., pal.fg).into_any_element(),
+                    None => div().w(px(14.)).into_any_element(),
+                })
+                .child(div().flex_1().child(title))
+                .child("\u{25B8}")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_ribbon_flyout(FlyoutTarget::Group(title));
+                    cx.notify();
+                }))
+        });
+        v_flex()
+            .min_w(px(160.))
+            .py_1()
+            .children(items)
             .into_any_element()
     }
 
@@ -28298,12 +28703,14 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// A small icon+label row (Clipboard Cut/Copy, Editing AutoSum/Fill/Clear).
+    /// A small icon+label row (Clipboard Cut/Copy, Editing AutoSum/Fill/Clear);
+    /// `icon_only` draws the icon alone, the label as its tooltip (#1020).
     fn sheet_rb(
         &self,
         icon: Option<&'static str>,
         label: &'static str,
         act: SheetAct,
+        icon_only: bool,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -28321,7 +28728,12 @@ impl Docxy {
             .rounded(px(3.))
             .when(enabled, |d| d.cursor_pointer().hover(|d| d.bg(pal.hover)))
             .when_some(icon, |d, ic| d.child(icon_svg(ic, 14., ink)))
-            .child(div().text_size(px(11.)).text_color(ink).child(label))
+            .when(!icon_only, |d| {
+                d.child(div().text_size(px(11.)).text_color(ink).child(label))
+            })
+            .when(icon_only, |d| {
+                d.tooltip(move |w, cx| Tooltip::new(label).build(w, cx))
+            })
             .when(enabled, |d| {
                 d.on_click(
                     cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)),
@@ -29284,31 +29696,35 @@ impl Docxy {
 
     /// The spreadsheet ribbon body for the selected tab, drawn from the
     /// `sheet_ribbon` table (Home for a tab without its own entry). The table
-    /// is also what `ribbon-read` reports, so the two cannot disagree.
-    fn sheet_ribbon_body(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+    /// is also what `ribbon-read` reports, so the two cannot disagree. It fits
+    /// the window as the document ribbon does (#1020), never scrolling.
+    fn sheet_ribbon_body(&self, window: &Window, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let tab = sheet_ribbon::tab_def(self.ribbon_tab);
         let xf = self.active_xf();
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .overflow_x_scroll()
-            .relative()
-            .children(
-                tab.groups
-                    .iter()
-                    .map(|g| self.sheet_group(g, tab.titles, &xf, pal, cx)),
-            )
-            .child(probe(
-                &self.probes,
-                format!("ribbon-tab:{}", ribbon_tab_name(tab.tab)),
-            ))
-            .into_any_element()
+        let now = self.ribbon_fit_now(window);
+        let groups = tab.groups.iter().enumerate().filter_map(|(i, g)| {
+            Some(match *now.fit.states.get(i)? {
+                _ if now.fit.in_overflow(i) => return None,
+                ribbon_fit::State::Collapsed => self.ribbon_collapsed_btn(
+                    g.title,
+                    now.icons[i],
+                    now.specs[i].collapsed,
+                    pal,
+                    cx,
+                ),
+                st => self.sheet_group(
+                    g,
+                    tab.titles,
+                    &xf,
+                    st == ribbon_fit::State::IconOnly,
+                    "",
+                    pal,
+                    cx,
+                ),
+            })
+        });
+        let groups: Vec<AnyElement> = groups.collect();
+        self.ribbon_strip(100., groups, &now, ribbon_tab_name(tab.tab), pal, cx)
     }
 
     /// Whether `act` draws checked from the sheet's own state: a ticked
@@ -29340,12 +29756,16 @@ impl Docxy {
 
     /// One sheet ribbon group: content on top, a centered label (+ optional
     /// dialog launcher) at the bottom, and a right divider — exactly like the
-    /// doc ribbon.
+    /// doc ribbon. `icon_only` drops the row buttons' labels (#1020); `prefix`
+    /// goes before its probes' names (a flyout's copy, `FLYOUT_PROBE_PREFIX`).
+    #[allow(clippy::too_many_arguments)]
     fn sheet_group(
         &self,
         g: &sheet_ribbon::Group,
         titles: sheet_ribbon::Titles,
         xf: &gridcore::sheet::Xf,
+        icon_only: bool,
+        prefix: &str,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -29355,7 +29775,7 @@ impl Docxy {
             sheet_ribbon::Gap::Rem(v) => d.gap(rems(v)),
         };
         let probes = &self.probes;
-        let content = |i: usize| probe(probes, format!("ribbon-content:{}:{i}", g.title));
+        let content = |i: usize| probe(probes, format!("{prefix}ribbon-content:{}:{i}", g.title));
         let body = match &g.body {
             Body::Strip {
                 gap: strip_gap,
@@ -29364,10 +29784,14 @@ impl Docxy {
                 let mut strip = gap(h_flex().h_full().items_center(), *strip_gap);
                 for (i, item) in items.iter().enumerate() {
                     strip = strip.child(match item {
-                        Item::One(c) => self.sheet_cmd_el(c, xf, pal, cx),
+                        Item::One(c) => self.sheet_cmd_el(c, xf, icon_only, pal, cx),
                         Item::Col(c) => gap(v_flex(), c.gap)
                             .relative()
-                            .children(c.cmds.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
+                            .children(
+                                c.cmds
+                                    .iter()
+                                    .map(|c| self.sheet_cmd_el(c, xf, icon_only, pal, cx)),
+                            )
                             .child(content(i))
                             .into_any_element(),
                         Item::Menu(m) => self.sheet_dropdown_btn(&m.button, pal, cx),
@@ -29379,23 +29803,27 @@ impl Docxy {
                 .relative()
                 .gap(px(1.))
                 .children(r.rows.iter().map(|r| {
-                    h_flex()
-                        .items_center()
-                        .gap(px(2.))
-                        .children(r.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
+                    h_flex().items_center().gap(px(2.)).children(
+                        r.iter()
+                            .map(|c| self.sheet_cmd_el(c, xf, icon_only, pal, cx)),
+                    )
                 }))
                 .child(content(0))
                 .into_any_element(),
         };
         v_flex()
             .relative()
+            .flex_none()
             .h(px(94.))
             .px_1p5()
             .py(px(3.))
             .justify_between()
             .border_r_1()
             .border_color(pal.border)
-            .child(probe(&self.probes, format!("ribbon-group:{}", g.title)))
+            .child(probe(
+                &self.probes,
+                format!("{prefix}ribbon-group:{}", g.title),
+            ))
             .child(div().flex_1().flex().items_center().child(body))
             .child(match titles {
                 sheet_ribbon::Titles::WithLaunchers => h_flex()
@@ -29404,7 +29832,10 @@ impl Docxy {
                     .items_center()
                     .justify_center()
                     .gap_1()
-                    .child(probe(&self.probes, format!("ribbon-title:{}", g.title)))
+                    .child(probe(
+                        &self.probes,
+                        format!("{prefix}ribbon-title:{}", g.title),
+                    ))
                     .child(div().text_size(px(10.)).text_color(pal.dim).child(g.title))
                     .when(g.launcher, |d| {
                         let launch = g.launch;
@@ -29431,7 +29862,10 @@ impl Docxy {
                     .text_size(px(10.))
                     .text_color(pal.dim)
                     .text_center()
-                    .child(probe(&self.probes, format!("ribbon-title:{}", g.title)))
+                    .child(probe(
+                        &self.probes,
+                        format!("{prefix}ribbon-title:{}", g.title),
+                    ))
                     .child(g.title)
                     .into_any_element(),
             })
@@ -29473,11 +29907,13 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// One sheet ribbon command, drawn in its shape.
+    /// One sheet ribbon command, drawn in its shape; `icon_only` drops a row
+    /// button's label (its group is icon-only, #1020).
     fn sheet_cmd_el(
         &self,
         c: &sheet_ribbon::SheetCmd,
         xf: &gridcore::sheet::Xf,
+        icon_only: bool,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -29486,7 +29922,14 @@ impl Docxy {
         match c.shape {
             Shape::Menu(_) => self.sheet_dropdown_btn(c, pal, cx),
             Shape::Large(icon) => self.sheet_lb(icon, text, c.act, pal, cx),
-            Shape::Row(icon) => self.sheet_rb(icon, text, c.act, pal, cx),
+            Shape::Row(icon) => self.sheet_rb(
+                icon,
+                text,
+                c.act,
+                icon_only && ribbon_fit::sheet_cmd_drops_label(c),
+                pal,
+                cx,
+            ),
             Shape::Check => self.sheet_check(text, c.act, pal, cx),
             Shape::Icon(icon) => {
                 self.sheet_ib(icon, c.act, sheet_ribbon::act_on(c.act, xf), pal, cx)
@@ -29520,10 +29963,14 @@ impl Docxy {
         }
     }
 
+    /// One model ribbon group. `icon_only` drops its button columns' labels
+    /// (#1020); `prefix` goes before its probes' names (a flyout's copy,
+    /// `FLYOUT_PROBE_PREFIX`).
     fn render_group(
         &self,
         g: &rs::Group<Act>,
         icon_only: bool,
+        prefix: &str,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -29532,7 +29979,7 @@ impl Docxy {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let slot = format!("ribbon-content:{}:{i}", g.title);
+                let slot = format!("{prefix}ribbon-content:{}:{i}", g.title);
                 self.render_control(c, icon_only, slot, pal, cx)
             })
             .collect();
@@ -29541,7 +29988,10 @@ impl Docxy {
             .relative()
             .items_center()
             .gap_1()
-            .child(probe(&self.probes, format!("ribbon-title:{}", g.title)))
+            .child(probe(
+                &self.probes,
+                format!("{prefix}ribbon-title:{}", g.title),
+            ))
             .child(div().text_size(px(9.)).text_color(pal.dim).child(g.title))
             .when_some(g.launcher, |d, act| {
                 d.child(
@@ -29558,6 +30008,7 @@ impl Docxy {
             });
         v_flex()
             .relative()
+            .flex_none()
             .items_center()
             .justify_between()
             .h_full()
@@ -29566,7 +30017,10 @@ impl Docxy {
             .gap_0p5()
             .border_r_1()
             .border_color(pal.border)
-            .child(probe(&self.probes, format!("ribbon-group:{}", g.title)))
+            .child(probe(
+                &self.probes,
+                format!("{prefix}ribbon-group:{}", g.title),
+            ))
             .child(h_flex().flex_1().items_center().gap_1().children(controls))
             .child(title_row)
             .into_any_element()
@@ -31546,7 +32000,13 @@ impl Render for Docxy {
             self.project_gantt_showing(),
             self.hf_active(),
         );
-        let vw = f32::from(window.viewport_size().width);
+        // An open ribbon flyout closes once its group is drawn in place again
+        // (a wider window), or the window shows another tab or document (#1020).
+        if let Some(f) = self.ribbon_flyout {
+            if !self.flyout_still_fits(f, window) {
+                self.ribbon_flyout = None;
+            }
+        }
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
         // Protected View (#610, documents #633), or a document marked as
         // final (#617), hides the ribbon's commands, as Excel and Word grey
@@ -31554,9 +32014,9 @@ impl Render for Docxy {
         let protected = self.ribbon_locked();
         let ribbon_body = (!self.ribbon_body_hidden()).then(|| {
             if is_doc || self.active_is_project() {
-                self.ribbon_body(vw, pal, cx)
+                self.ribbon_body(window, pal, cx)
             } else {
-                self.sheet_ribbon_body(pal, cx)
+                self.sheet_ribbon_body(window, pal, cx)
             }
         });
         let project_prompt = self.project_prompt_bar(pal, cx);
@@ -32263,6 +32723,7 @@ impl Render for Docxy {
             .as_ref()
             .filter(|_| !self.tab_more_open)
             .map(|m| self.menu_el(m, pal, cx));
+        let ribbon_flyout = self.ribbon_flyout_el(window, pal, cx);
         let mini_bar = (is_doc && self.menu.is_none())
             .then_some(self.mini_bar)
             .flatten()
@@ -32373,6 +32834,8 @@ impl Render for Docxy {
             .child(body)
             .child(status)
             .when_some(mini_bar, |d, m| d.child(m))
+            // Under the menu: a menu opened from the flyout draws over it.
+            .when_some(ribbon_flyout, |d, f| d.child(f))
             .when_some(context_menu, |d, m| d.child(m))
             .when_some(sheet_fmt_panel, |d, p| d.child(p))
             .when_some(tab_popup, |d, popup| d.child(popup))
@@ -41711,71 +42174,6 @@ mod config_root_tests {
         assert_eq!(hot_dir_in(&config_root()), real.join("docxy").join("hot"));
         assert!(!session_path_in(&config_root()).starts_with(over));
         assert!(!hot_dir_in(&config_root()).starts_with(over));
-    }
-}
-
-#[cfg(test)]
-mod ribbon_fit_tests {
-    // Not `super::*`: that brings gpui's `test` attribute in over the std one.
-    use super::{docxy_ribbon, group_est, ribbon_fit};
-
-    fn home_titles(width: f32) -> (bool, Vec<&'static str>) {
-        let ribbon = docxy_ribbon();
-        let home = ribbon.tabs.iter().find(|t| t.name == "Home").unwrap();
-        let (icon_only, shown) = ribbon_fit(&home.groups, width);
-        (
-            icon_only,
-            shown.iter().map(|&i| home.groups[i].title).collect(),
-        )
-    }
-
-    // At the suite's default 1180px window the Home tab drops its labels
-    // and collapses Clipboard, the lowest priority. Editing stays, and the
-    // window shot shows it whole: the estimates are the rendered widths, so
-    // what fits here fits on screen. (Issue 215, review r1: at 25px a row
-    // button the estimate said Clipboard fit too, and Editing was clipped.)
-    #[test]
-    fn home_at_the_default_window_collapses_clipboard_and_keeps_editing() {
-        let (icon_only, shown) = home_titles(1180.);
-        assert!(icon_only);
-        assert_eq!(shown, ["Font", "Paragraph", "Styles", "Editing"]);
-    }
-
-    /// Project's Report tab has no groups yet (#370); its body lays out empty,
-    /// with no overflow indicator.
-    #[test]
-    fn an_empty_tab_fits_with_nothing_shown() {
-        let ribbon = super::project_ribbon();
-        let report = ribbon.tabs.iter().find(|t| t.name == "Report").unwrap();
-        assert!(report.groups.is_empty());
-        for width in [0., 400., 1600.] {
-            assert_eq!(ribbon_fit(&report.groups, width), (false, Vec::new()));
-        }
-    }
-
-    #[test]
-    fn a_wide_window_shows_every_home_group() {
-        let (_, shown) = home_titles(1600.);
-        assert_eq!(
-            shown,
-            ["Clipboard", "Font", "Paragraph", "Styles", "Editing"]
-        );
-    }
-
-    /// The Paragraph group's two rows are all icon buttons; the wider row
-    /// (7) sets the width, each at `icon_btn`'s rendered pitch.
-    #[test]
-    fn a_row_of_icon_buttons_is_estimated_at_their_rendered_pitch() {
-        let ribbon = docxy_ribbon();
-        let home = ribbon.tabs.iter().find(|t| t.name == "Home").unwrap();
-        let para = home.groups.iter().find(|g| g.title == "Paragraph").unwrap();
-        // `icon_btn` without its label: border 1 + `px_2` 8 + icon 16 + `px_2`
-        // 8 + border 1, then the row's 1px gap. Written out, not the constant,
-        // so changing the estimate means changing this too.
-        assert_eq!(
-            group_est(para, true),
-            22. + 7. * (1. + 8. + 16. + 8. + 1. + 1.)
-        );
     }
 }
 

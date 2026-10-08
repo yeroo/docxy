@@ -6,13 +6,32 @@
 //! its title row (`ribbon-title:`) and the columns / row stacks inside it
 //! (`ribbon-content:`), the way the title bar records its regions. `ribbon-layout`
 //! reports them, and a debug build warns when a group's content does not fit.
+//!
+//! Since #1020 the ribbon fits the window (`ribbon_fit`), and the report says
+//! where each group went (`state`, `in_overflow`), checks every drawn group
+//! against the ribbon's own edges (`ribbon-body:`; a group past the window's
+//! edge is clipped, not merely one whose content spills out of it), and sets
+//! each group's drawn width beside the width the fit assumed (`estimate`).
 
 use crate::Probes;
+use crate::ribbon_fit::State;
 use ctlcore::json::Json;
 use gpui::{Bounds, Pixels};
 
 /// A rounding tolerance, in logical pixels.
 const EPS: f32 = 0.5;
+
+/// How far a drawn group's width may be from its estimate (#1020, #357).
+pub(crate) const ESTIMATE_TOL: f32 = 6.0;
+
+/// Where the fit put one group of the tab shown, and the width it assumed.
+pub(crate) struct GroupFit<'a> {
+    pub title: &'a str,
+    pub state: State,
+    /// Listed in the overflow chevron rather than drawn.
+    pub in_overflow: bool,
+    pub estimate: f32,
+}
 
 /// One group's measured layout. `content` is the union of its columns and row
 /// stacks, `None` for a group made of buttons that size to the group.
@@ -104,50 +123,102 @@ pub(crate) fn is_frame_of(measured: &[GroupLayout], titles: &[&str]) -> bool {
     !measured.is_empty() && measured.iter().all(|g| titles.contains(&g.title.as_str()))
 }
 
+/// Whether the finished frame drew the groups as `fits` places them: every
+/// drawn group measured and every chevron group not, a collapsed group as
+/// its button (`ribbon-collapsed:`) and no other group so. A frame from
+/// before a resize is not the layout `fits` describes.
+pub(crate) fn frame_matches(probes: &[(String, Bounds<Pixels>)], fits: &[GroupFit]) -> bool {
+    let has = |name: String| probes.iter().any(|(n, _)| *n == name);
+    fits.iter().all(|f| {
+        has(format!("ribbon-group:{}", f.title)) != f.in_overflow
+            && has(format!("ribbon-collapsed:{}", f.title))
+                == (f.state == State::Collapsed && !f.in_overflow)
+    })
+}
+
+/// The ribbon's own bounds in the finished frame (`ribbon-body`).
+pub(crate) fn body(probes: &[(String, Bounds<Pixels>)]) -> Option<Bounds<Pixels>> {
+    probes
+        .iter()
+        .find(|(n, _)| n == "ribbon-body")
+        .map(|(_, b)| *b)
+}
+
 /// The `ribbon-layout` reply while the frame on record is not the shown tab's:
 /// no groups yet, ask again after a frame.
 pub(crate) fn unsettled_json(tab: &str) -> Json {
     Json::obj(vec![
         ("tab", Json::Str(tab.into())),
         ("settled", Json::Bool(false)),
+        ("any_clipped", Json::Bool(false)),
         ("any_clipped_v", Json::Bool(false)),
         ("any_clipped_h", Json::Bool(false)),
+        ("estimates_ok", Json::Bool(false)),
         ("groups", Json::Arr(Vec::new())),
     ])
 }
 
-/// The `ribbon-layout` reply for the groups of the tab shown. A group the
-/// ribbon dropped (responsive collapse) is listed `hidden`.
-pub(crate) fn layout_json(tab: &str, titles: &[&str], measured: &[GroupLayout]) -> Json {
-    let groups: Vec<Json> = titles
+/// The `ribbon-layout` reply for the groups of the tab shown, in the order
+/// `fits` lists them. A drawn group whose bounds pass the ribbon's left or
+/// right edge (`body`) is clipped horizontally: its commands are off screen.
+/// A group in the overflow chevron has no bounds and is not clipped.
+pub(crate) fn layout_json(
+    tab: &str,
+    fits: &[GroupFit],
+    measured: &[GroupLayout],
+    body: Option<Bounds<Pixels>>,
+) -> Json {
+    let groups: Vec<Json> = fits
         .iter()
-        .map(|title| {
-            let Some(g) = measured.iter().find(|g| g.title == *title) else {
-                return Json::obj(vec![
-                    ("title", Json::Str((*title).into())),
-                    ("hidden", Json::Bool(true)),
+        .map(|f| {
+            let head = |rest: Vec<(&'static str, Json)>| {
+                let mut fields = vec![
+                    ("title", Json::Str(f.title.into())),
+                    ("state", Json::Str(f.state.name().into())),
+                    ("in_overflow", Json::Bool(f.in_overflow)),
+                    ("estimate", Json::Num(f.estimate.round() as f64)),
+                ];
+                fields.extend(rest);
+                Json::obj(fields)
+            };
+            let Some(g) = measured.iter().find(|g| g.title == f.title) else {
+                return head(vec![
                     ("bounds", Json::Null),
                     ("content_bounds", Json::Null),
+                    ("estimate_ok", Json::Bool(f.in_overflow)),
                     ("clipped_v", Json::Bool(false)),
-                    ("clipped_h", Json::Bool(false)),
+                    ("clipped_h", Json::Bool(!f.in_overflow)),
                 ]);
             };
-            Json::obj(vec![
-                ("title", Json::Str(g.title.clone())),
-                ("hidden", Json::Bool(false)),
+            let (gl, _, gr, _) = edges(g.bounds);
+            let off_ribbon = body.is_some_and(|b| {
+                let (bl, _, br, _) = edges(b);
+                gl < bl - EPS || gr > br + EPS
+            });
+            head(vec![
                 ("bounds", rect_json(g.bounds)),
                 ("content_bounds", g.content.map_or(Json::Null, rect_json)),
+                (
+                    "estimate_ok",
+                    Json::Bool(((gr - gl) - f.estimate).abs() <= ESTIMATE_TOL),
+                ),
                 ("clipped_v", Json::Bool(g.clipped_v)),
-                ("clipped_h", Json::Bool(g.clipped_h)),
+                ("clipped_h", Json::Bool(g.clipped_h || off_ribbon)),
             ])
         })
         .collect();
-    let any = |key: &str| Json::Bool(groups.iter().any(|g| g.get(key) == Some(&Json::Bool(true))));
+    let any = |key: &str| groups.iter().any(|g| g.get(key) == Some(&Json::Bool(true)));
+    let all = |key: &str| groups.iter().all(|g| g.get(key) == Some(&Json::Bool(true)));
     Json::obj(vec![
         ("tab", Json::Str(tab.into())),
         ("settled", Json::Bool(true)),
-        ("any_clipped_v", any("clipped_v")),
-        ("any_clipped_h", any("clipped_h")),
+        (
+            "any_clipped",
+            Json::Bool(any("clipped_v") || any("clipped_h")),
+        ),
+        ("any_clipped_v", Json::Bool(any("clipped_v"))),
+        ("any_clipped_h", Json::Bool(any("clipped_h"))),
+        ("estimates_ok", Json::Bool(all("estimate_ok"))),
         ("groups", Json::Arr(groups)),
     ])
 }
@@ -192,7 +263,7 @@ mod tests {
         assert!(!fits[0].clipped_v && !fits[0].clipped_h);
         let five = measure(&frame(104.));
         assert!(five[0].clipped_v);
-        let json = layout_json("Home", &["Editing"], &five);
+        let json = layout_json("Home", &[fit("Editing", State::Full, 60.)], &five, None);
         assert_eq!(json.get("any_clipped_v"), Some(&Json::Bool(true)));
         assert_eq!(json.get("any_clipped_h"), Some(&Json::Bool(false)));
     }
@@ -239,15 +310,112 @@ mod tests {
         assert_eq!(json.get("settled"), Some(&Json::Bool(false)));
         assert_eq!(json.get("groups"), Some(&Json::Arr(Vec::new())));
         assert_eq!(
-            layout_json("Home", &["Editing"], &m).get("settled"),
+            layout_json("Home", &[fit("Editing", State::Full, 60.)], &m, None).get("settled"),
             Some(&Json::Bool(true))
         );
     }
 
+    fn fit(title: &str, state: State, estimate: f32) -> GroupFit<'_> {
+        GroupFit {
+            title,
+            state,
+            in_overflow: false,
+            estimate,
+        }
+    }
+
+    fn group(json: &Json, i: usize) -> &Json {
+        &json.get("groups").unwrap().as_array().unwrap()[i]
+    }
+
+    /// #1020, issue comment 3: a group drawn whole but past the ribbon's
+    /// right edge (off screen) is clipped, though its content fits it.
     #[test]
-    fn a_dropped_group_is_listed_hidden() {
-        let json = layout_json("Home", &["Editing"], &[]);
-        let g = &json.get("groups").unwrap().as_array().unwrap()[0];
-        assert_eq!(g.get("hidden"), Some(&Json::Bool(true)));
+    fn a_group_past_the_ribbons_edge_is_clipped() {
+        let mut f = frame(62.);
+        for (_, bounds) in f.iter_mut() {
+            bounds.origin.x += px(380.);
+        }
+        let m = measure(&f);
+        assert!(!m[0].clipped_h, "the content fits its group");
+        let fits = [fit("Editing", State::Full, 60.)];
+        let inside = layout_json("Home", &fits, &m, Some(b(0., 0., 500., 100.)));
+        assert_eq!(group(&inside, 0).get("clipped_h"), Some(&Json::Bool(false)));
+        assert_eq!(inside.get("any_clipped"), Some(&Json::Bool(false)));
+        let narrow = layout_json("Home", &fits, &m, Some(b(0., 0., 400., 100.)));
+        assert_eq!(group(&narrow, 0).get("clipped_h"), Some(&Json::Bool(true)));
+        assert_eq!(narrow.get("any_clipped"), Some(&Json::Bool(true)));
+    }
+
+    #[test]
+    fn each_group_reports_its_state_and_estimate() {
+        let m = measure(&frame(62.));
+        let near = layout_json("Home", &[fit("Editing", State::IconOnly, 64.)], &m, None);
+        let g = group(&near, 0);
+        assert_eq!(g.get("state"), Some(&Json::Str("icon-only".into())));
+        assert_eq!(g.get("estimate"), Some(&Json::Num(64.)));
+        assert_eq!(g.get("estimate_ok"), Some(&Json::Bool(true)));
+        assert_eq!(near.get("estimates_ok"), Some(&Json::Bool(true)));
+        let far = layout_json("Home", &[fit("Editing", State::Full, 80.)], &m, None);
+        assert_eq!(far.get("estimates_ok"), Some(&Json::Bool(false)));
+    }
+
+    /// A group in the overflow chevron is not drawn: no bounds, and not
+    /// clipped. A drawn group with no bounds on record is.
+    #[test]
+    fn a_chevron_group_has_no_bounds_and_is_not_clipped() {
+        let fits = [GroupFit {
+            in_overflow: true,
+            ..fit("Cells", State::Collapsed, 50.)
+        }];
+        let json = layout_json("Home", &fits, &[], None);
+        let g = group(&json, 0);
+        assert_eq!(g.get("in_overflow"), Some(&Json::Bool(true)));
+        assert_eq!(g.get("bounds"), Some(&Json::Null));
+        assert_eq!(json.get("any_clipped"), Some(&Json::Bool(false)));
+        let lost = layout_json("Home", &[fit("Cells", State::Full, 50.)], &[], None);
+        assert_eq!(lost.get("any_clipped"), Some(&Json::Bool(true)));
+    }
+
+    /// A flyout's copy of a group carries `ribbon-flyout:` probes, which
+    /// neither add a group nor move the one drawn in the ribbon.
+    #[test]
+    fn a_flyouts_probes_are_not_measured() {
+        let mut f = frame(62.);
+        let plain = measure(&f);
+        for (name, bounds) in frame(104.) {
+            f.push((format!("{}{name}", crate::FLYOUT_PROBE_PREFIX), bounds));
+        }
+        let with_flyout = measure(&f);
+        assert_eq!(with_flyout.len(), 1);
+        assert_eq!(with_flyout[0].bounds, plain[0].bounds);
+        assert!(!with_flyout[0].clipped_v);
+    }
+
+    /// The frame on record must be the layout the fit describes: a group
+    /// drawn in place is not the collapsed button the fit now asks for.
+    #[test]
+    fn a_frame_from_before_a_resize_does_not_match_the_fit() {
+        let f = frame(62.);
+        assert!(frame_matches(&f, &[fit("Editing", State::Full, 60.)]));
+        assert!(!frame_matches(&f, &[fit("Editing", State::Collapsed, 60.)]));
+        let mut collapsed = vec![
+            ("ribbon-group:Editing".to_string(), b(0., 0., 60., 94.)),
+            ("ribbon-collapsed:Editing".to_string(), b(0., 0., 60., 94.)),
+        ];
+        assert!(frame_matches(
+            &collapsed,
+            &[fit("Editing", State::Collapsed, 60.)]
+        ));
+        assert!(!frame_matches(
+            &collapsed,
+            &[fit("Editing", State::IconOnly, 60.)]
+        ));
+        collapsed.clear();
+        let chevron = GroupFit {
+            in_overflow: true,
+            ..fit("Editing", State::Collapsed, 60.)
+        };
+        assert!(frame_matches(&collapsed, &[chevron]));
     }
 }
