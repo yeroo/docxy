@@ -3256,8 +3256,14 @@ fn link_part(h: &Hyperlink, local: usize) -> LinkPart {
 }
 
 /// A zero-width child that shows nothing: a bookmark, proofing or permission
-/// mark, or a comment range. These may leave a link whose text is all deleted.
+/// mark, a comment range, or a smart tag's boundary. These may leave a link
+/// whose text is all deleted.
 fn is_marker(inline: &Inline) -> bool {
+    if let Inline::Raw(raw) = inline {
+        if crate::hf::is_smart_tag_open(raw) || crate::hf::is_smart_tag_close(raw) {
+            return true;
+        }
+    }
     const MARKERS: &[&str] = &[
         "w:proofErr",
         "w:bookmarkStart",
@@ -3627,20 +3633,19 @@ fn insert_inlines(
     len
 }
 
-/// Move the content controls that open at the end of `head` (nothing of
-/// their content in it, zero-width markers aside) to the start of `tail`:
-/// the trailing zero-width inlines from the first open among them on.
+/// Move the content controls and smart tags that open at the end of `head`
+/// (nothing of their content in it, zero-width markers aside) to the start of
+/// `tail`: the trailing zero-width inlines from the first open among them on.
 fn move_trailing_opens(head: &mut Vec<Inline>, tail: &mut Vec<Inline>) {
+    let is_open = |x: &Inline| {
+        matches!(x, Inline::Raw(r)
+            if crate::hf::is_sdt_open(r) || crate::hf::is_smart_tag_open(r))
+    };
     let mut k = head.len();
-    while k > 0
-        && (is_marker(&head[k - 1])
-            || matches!(&head[k - 1], Inline::Raw(r) if crate::hf::is_sdt_open(r)))
-    {
+    while k > 0 && (is_marker(&head[k - 1]) || is_open(&head[k - 1])) {
         k -= 1;
     }
-    if let Some(m) =
-        (k..head.len()).find(|&i| matches!(&head[i], Inline::Raw(r) if crate::hf::is_sdt_open(r)))
-    {
+    if let Some(m) = (k..head.len()).find(|&i| is_open(&head[i])) {
         let moved: Vec<Inline> = head.drain(m..).collect();
         tail.splice(0..0, moved);
     }

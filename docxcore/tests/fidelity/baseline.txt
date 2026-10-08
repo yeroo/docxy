@@ -11,8 +11,6 @@ ext:unable to normalized/document with password.docx		load-error
 ext:Normalize/conflicting IDs.docx	word/document.xml	lost-attr	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/@w14:paraId
 
 # run and paragraph content restructured on save (runs merged or split, lastRenderedPageBreak, smartTag, row-level sdt, special characters) (#1069)
-ext:MiscNode/WithMiscNodes.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:smartTag
-ext:MiscNode/WithMiscNodes.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r
 ext:Normalize/complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:Normalize/complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:Normalize/complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr
@@ -45,7 +43,6 @@ ext:bookmark/bookmark.docx	word/document.xml	lost-element	/w:document/w:body/w:p
 ext:bookmark/bookmark.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr/w:vertAlign
 ext:bookmark/bookmark.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
 ext:bookmark/bookmark.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:tab
-ext:bookmark/bookmark.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
 ext:bookmark/bookmark.docx	word/document.xml	lost-attr	/w:document/w:body/w:p/w:r/@w:rsidR
 ext:bookmark/bookmark.docx	word/document.xml	lost-attr	/w:document/w:body/w:p/w:r/@w:rsidRPr
 ext:bookmark/bookmark.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/@w:rsidR
@@ -69,8 +66,6 @@ ext:columns/columns1.docx	word/document.xml	lost-element	/w:document/w:body/w:p/
 ext:columns/columns1.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
 ext:columns/columns1.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:columns/columns2.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
-ext:columns/columns2.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
-ext:columns/columns2.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:complex0.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr
@@ -99,7 +94,6 @@ ext:cover page/covwepage4.docx	word/document.xml	lost-element	/w:document/w:body
 ext:equation/equation-1.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r/w:lastRenderedPageBreak
 ext:footer & header/40101 2004.Rules and Regulations of the Board of Regents.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:footer & header/40101 2004.Rules and Regulations of the Board of Regents.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
-ext:footer & header/40101 2004.Rules and Regulations of the Board of Regents.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
 ext:footer & header/40101 2004.Rules and Regulations of the Board of Regents.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r
 ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
@@ -116,20 +110,16 @@ ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.
 ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r/w:rPr/w:lang
 ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r/w:tab
 ext:footer & header/Business Plan for a Startup Business_July.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
-ext:footer & header/Business Plan for a Startup Business_July.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
 ext:footer & header/Business Plan for a Startup Business_July.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r/w:lastRenderedPageBreak
-ext:footer & header/Business Plan for a Startup Business_July.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:footer & header/Outreach_Toolkit_2007_After_the_Flood_Fact_Sheet[1].docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:hyperlink for splitPara/632404333468899776 PFVI_Nutrition.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:hyperlink for splitPara/Hyperlink - internal.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:hyperlink/632399205748969391 Moon Tregillus.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:hyperlink/632399205748969391 Moon Tregillus.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
-ext:hyperlink/632399205748969391 Moon Tregillus.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
 ext:hyperlink/632399205748969391 Moon Tregillus.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:hyperlink/632399964516872542 1.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:hyperlink/632399964516872542 1.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
 ext:hyperlink/632399964516872542 1.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:tab
-ext:hyperlink/632399964516872542 1.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
 ext:hyperlink/632399964516872542 1.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:t/text()
 ext:hyperlink/632399964516872542 1.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:hyperlink/632404333468899776 PFVI_Nutrition.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
@@ -150,37 +140,16 @@ ext:mixed features/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.d
 ext:mixed features/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r/w:tab
 ext:mixed features/MSDN - EULA.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:mixed features/MSDN - EULA.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
-ext:mixed features/MSDN - EULA.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
 ext:mixed features/MSDN - EULA.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:mixed features/webappdis.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:mixed features/webappdis.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
 ext:mixed features/webappdis.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:mixed languages/Unit1Translation.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:page layout/page layout(big file)/A4.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr/w:kern
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	lost-attr	/w:document/w:body/w:p/w:r/@w:rsidR
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	lost-attr	/w:document/w:body/w:p/w:r/w:rPr/w:rFonts/@w:hint
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/@w:rsidR
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:rPr/w:rFonts/@w:ascii
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:rPr/w:rFonts/@w:eastAsia
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:rPr/w:rFonts/@w:hAnsi
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:t/text()
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r/w:rPr/w:b
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r/w:rPr/w:bCs
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	extra-attr	/w:document/w:body/w:p/w:r/@w:rsidR
-ext:page layout/page layout(big file)/A4.docx	word/document.xml	extra-attr	/w:document/w:body/w:p/w:r/w:rPr/w:rFonts/@w:hint
 ext:page layout/page layout(big file)/Indent_Spacing.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:page layout/page layout(big file)/column2.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
-ext:page layout/page layout(big file)/column2.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
-ext:page layout/page layout(big file)/column2.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:page layout/page layout(big file)/landScape.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:page layout/page layout(big file)/pageBorders.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
-ext:page layout/page layout(big file)/pageBorders.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
-ext:page layout/page layout(big file)/pageBorders.docx	word/document.xml	lost-attr	/w:document/w:body/w:p/w:r/@w:rsidRPr
-ext:page layout/page layout(big file)/pageBorders.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:t/text()
-ext:page layout/page layout(big file)/pageBorders.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:page layout/pagelayout with break in the end/Columns-Right.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:page layout/text direction/text direction-2.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:paragraph/Paragraph.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
@@ -189,32 +158,18 @@ ext:paragraph/sectionBreak.docx	word/document.xml	lost-element	/w:document/w:bod
 ext:run/lastRenderedPageBreak.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:section break/paraWithSect.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:section break/sectionBreak.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
-ext:smart tag for splitPara/smartTag 1run.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
-ext:smart tag for splitPara/smartTag 1run.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-ext:smart tag for splitPara/smartTag 3run.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
-ext:smart tag for splitPara/smartTag 3run.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-ext:smart tag for splitPara/smartTag Nesting 2 run.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
-ext:smart tag for splitPara/smartTag Nesting 2 run.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-ext:smart tag for splitPara/smartTag Nesting.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
-ext:smart tag for splitPara/smartTag Nesting.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-ext:smart tag/smartTag.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
-ext:smart tag/smartTag.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:style/1.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:style/2.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:style/style.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:style/style2.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:style/style3.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:table/2003 Consumer Confidence Report.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
-ext:table/2003 Consumer Confidence Report.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
 ext:table/2003 Consumer Confidence Report.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r/w:lastRenderedPageBreak
 ext:table/2003 Consumer Confidence Report.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r/w:t
-ext:table/2003 Consumer Confidence Report.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:smartTag
-ext:table/2003 Consumer Confidence Report.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 ext:table/2003 Consumer Confidence Report.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r
 ext:table/2007.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:lastRenderedPageBreak
 ext:table/2007.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:rPr/w:spacing
 ext:table/2007.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
-ext:table/2007.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
 ext:table/2007.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r/w:lastRenderedPageBreak
 ext:table/2007.docx	word/document.xml	changed-value	/w:document/w:body/w:p/w:r/w:t/text()
 ext:table/2007.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
@@ -228,7 +183,3 @@ repo:corpus/legacy/word/fields-breaks.docx	word/document.xml	changed-value	/w:do
 repo:corpus/legacy/word/fields-breaks.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
 repo:corpus/word-import/source.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:r/w:t
 repo:corpus/word-import/source.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-repo:docxcore/tests/fixtures/smarttag-pr.docx	word/document.xml	lost-element	/w:document/w:body/w:p/w:smartTag
-repo:docxcore/tests/fixtures/smarttag-pr.docx	word/document.xml	lost-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:smartTag
-repo:docxcore/tests/fixtures/smarttag-pr.docx	word/document.xml	extra-element	/w:document/w:body/w:p/w:r
-repo:docxcore/tests/fixtures/smarttag-pr.docx	word/document.xml	extra-element	/w:document/w:body/w:tbl/w:tr/w:tc/w:p/w:r

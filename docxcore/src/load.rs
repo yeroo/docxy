@@ -966,9 +966,9 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                     // A simple field: keep its XML verbatim (lossless save) but surface
                     // its cached result text so the value is visible.
                     "w:fldSimple" => parse_fld_simple(p, rels, &mut para.content),
-                    // A smart tag wraps runs in (deprecated) metadata; unwrap to its
-                    // inner content so the text isn't lost.
-                    "w:smartTag" => parse_inlines_into(p, rels, &mut para.content),
+                    // A smart tag wraps runs in (deprecated) metadata: its runs
+                    // load as usual, bracketed by its preserved wrapper.
+                    "w:smartTag" => parse_smart_tag(p, rels, &mut para.content),
                     // Inline content control (content placeholder, etc.): unwrap it.
                     "w:sdt" => parse_inline_sdt(p, rels, &mut para.content),
                     // OMML math: render it to a text equation (lossless raw kept).
@@ -1136,12 +1136,18 @@ fn is_clean_code_run(run: &str) -> bool {
 /// Whether an inline may sit inside a field that collapses into one
 /// [`Inline::Field`]: a plain run (its text becomes the result), a field (a
 /// nested `w:fldSimple`, a `w:sym` symbol, or a nested field already
-/// collapsed), or a proofing mark, which shows nothing and anchors nothing.
+/// collapsed), or a proofing mark, which shows nothing and anchors nothing. Or
+/// a smart tag's boundary: the loop sees a smart tag only as one whole child,
+/// so a field that holds one holds all of it.
 fn allowed_in_field(inline: &Inline) -> bool {
     match inline {
         Inline::Run(r) => r.props.property_change.is_none(),
         Inline::Field { .. } => true,
-        Inline::Raw(raw) => raw.trim_start().starts_with("<w:proofErr"),
+        Inline::Raw(raw) => {
+            raw.trim_start().starts_with("<w:proofErr")
+                || crate::hf::is_smart_tag_open(raw)
+                || crate::hf::is_smart_tag_close(raw)
+        }
         _ => false,
     }
 }
@@ -1307,6 +1313,17 @@ pub(crate) fn sdt_run_props(open: &str) -> Option<RunProps> {
 /// Parse inline content (runs, hyperlinks, nested content controls) up to the
 /// enclosing End, pushing into `out`.
 fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    parse_inlines_with_smart_tag_pr(p, rels, out, None);
+}
+
+/// [`parse_inlines_into`], appending a `w:smartTagPr` child verbatim to
+/// `smart_tag_pr` (the content of a smart tag) instead of skipping it.
+fn parse_inlines_with_smart_tag_pr(
+    p: &mut XmlParser,
+    rels: &Relationships,
+    out: &mut Vec<Inline>,
+    mut smart_tag_pr: Option<&mut String>,
+) {
     let mut fields = FieldCollapse::default();
     loop {
         match p.next() {
@@ -1327,11 +1344,18 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
                     "w:ins" => out.push(parse_revision(p, rels, RevisionKind::Insert)),
                     "w:del" => out.push(parse_revision(p, rels, RevisionKind::Delete)),
                     "w:fldSimple" => parse_fld_simple(p, rels, out),
-                    "w:smartTag" => parse_inlines_into(p, rels, out),
-                    // The unwrapped smart tag's own metadata. CT_SmartTagPr is
-                    // valid only inside CT_SmartTagRun, so kept raw it would land
-                    // under `w:p`, which Word rejects as corrupt (#1083).
-                    "w:smartTagPr" => p.skip_element(),
+                    "w:smartTag" => parse_smart_tag(p, rels, out),
+                    // A smart tag's own metadata goes into its opening boundary.
+                    // CT_SmartTagPr is valid only inside CT_SmartTagRun: kept raw
+                    // elsewhere it would land under `w:p`, which Word rejects as
+                    // corrupt (#1083).
+                    "w:smartTagPr" => match smart_tag_pr.as_mut() {
+                        Some(pr) => {
+                            p.skip_element();
+                            pr.push_str(p.raw_slice(start, p.pos()));
+                        }
+                        None => p.skip_element(),
+                    },
                     "w:sdt" => parse_inline_sdt(p, rels, out),
                     _ => parse_raw_or_unsupported_revision(p, out),
                 }
@@ -1341,6 +1365,25 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
             Event::Text => {}
         }
     }
+}
+
+/// Parse a `<w:smartTag>` (deprecated recognizer metadata around runs),
+/// preserving its wrapper the way [`parse_inline_sdt`] does: its runs load as
+/// usual between two zero-width `Inline::Raw` boundaries, the opening tag with
+/// its `w:smartTagPr` and the close (#1069). Save keeps the boundaries
+/// balanced after edits (see `serialize`).
+fn parse_smart_tag(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    let opener = p.raw_slice(p.start_pos(), p.pos());
+    let mut open = match opener.strip_suffix("/>") {
+        Some(head) => format!("{}>", head.trim_end()),
+        None => opener.to_string(),
+    };
+    let at = out.len();
+    let mut pr = String::new();
+    parse_inlines_with_smart_tag_pr(p, rels, out, Some(&mut pr));
+    open.push_str(&pr);
+    out.insert(at, Inline::Raw(open));
+    out.push(Inline::Raw(crate::hf::SMART_TAG_CLOSE.to_string()));
 }
 
 /// Parse a `<w:ins>` / `<w:del>` tracked change: capture the whole element raw
@@ -3221,8 +3264,9 @@ mod tests {
 
     #[test]
     fn smart_tag_properties_are_not_saved_outside_their_tag_1083() {
-        // An unwrapped smart tag drops its `w:smartTagPr`: under `w:p` (body or
-        // table cell) Word rejects the file. Nested tags and the text stay.
+        // A smart tag's `w:smartTagPr` stays inside its tag (#1069): under `w:p`
+        // (body or table cell) Word rejects the file. Nested tags and the text
+        // stay.
         let tag = |el: &str, inner: &str| {
             format!(
                 "<w:smartTag w:uri=\"urn:schemas-microsoft-com:office:smarttags\" \
@@ -3248,9 +3292,350 @@ mod tests {
         let d = doc(&xml);
         assert_eq!(first_para(&d).plain_text(), "University of Texas");
         let out = crate::serialize::document_to_xml(&d);
-        assert!(!out.contains("smartTagPr"), "{out}");
-        assert!(!out.contains("w:attr"), "{out}");
+        check_smart_tags(&out);
+        assert_eq!(out.matches("<w:smartTagPr>").count(), 3, "{out}");
         assert!(out.contains(">2003</w:t>"), "{out}");
+    }
+
+    /// `xml` is well formed, and every `w:smartTagPr` is the first child of a
+    /// `w:smartTag`.
+    fn check_smart_tags(xml: &str) {
+        let mut p = XmlParser::new(xml);
+        let mut stack: Vec<&str> = Vec::new();
+        let mut first_child = false;
+        loop {
+            match p.next() {
+                Event::Start => {
+                    if p.name() == "w:smartTagPr" {
+                        assert!(
+                            stack.last() == Some(&"w:smartTag") && first_child,
+                            "w:smartTagPr outside the start of a w:smartTag: {xml}"
+                        );
+                    }
+                    stack.push(p.name());
+                    first_child = true;
+                }
+                Event::End => {
+                    assert_eq!(stack.pop(), Some(p.name()), "malformed: {xml}");
+                    first_child = false;
+                }
+                Event::Text => {}
+                Event::Eof => break,
+            }
+        }
+        assert!(stack.is_empty() && !p.is_malformed(), "malformed: {xml}");
+    }
+
+    /// A smart tag `el` with properties around `inner`, and a run of `t`.
+    fn smart_tag(el: &str, inner: &str) -> String {
+        format!(
+            "<w:smartTag w:uri=\"urn:schemas-microsoft-com:office:smarttags\" \
+             w:element=\"{el}\"><w:smartTagPr><w:attr w:name=\"{el}\" w:val=\"v\"/>\
+             </w:smartTagPr>{inner}</w:smartTag>"
+        )
+    }
+
+    fn text_run(t: &str) -> String {
+        format!("<w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r>")
+    }
+
+    /// The smart-tag markup of saved XML, in order: each tag's opener with its
+    /// properties, its close, and the text between them.
+    fn smart_tag_outline(xml: &str) -> Vec<String> {
+        let mut p = XmlParser::new(xml);
+        let mut out = Vec::new();
+        let mut in_t = false;
+        loop {
+            match p.next() {
+                Event::Start => match p.name() {
+                    "w:smartTag" => out.push(format!("<{}>", p.attr("w:element"))),
+                    "w:attr" => out.push(format!("@{}", p.attr("w:name"))),
+                    "w:t" => in_t = true,
+                    _ => {}
+                },
+                Event::End => match p.name() {
+                    "w:smartTag" => out.push("</>".into()),
+                    "w:t" => in_t = false,
+                    _ => {}
+                },
+                Event::Text if in_t => out.push(p.text().to_string()),
+                Event::Text => {}
+                Event::Eof => break,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn smart_tags_survive_save_with_their_nesting_and_properties_1069() {
+        let nested = smart_tag(
+            "place",
+            &format!(
+                "{}{}{}",
+                smart_tag("PlaceType", &text_run("University")),
+                text_run(" of "),
+                smart_tag("PlaceName", &text_run("Texas"))
+            ),
+        );
+        let xml = format!(
+            "<w:document><w:body><w:p>{}{nested}{}</w:p>\
+             <w:tbl><w:tr><w:tc><w:p>{}</w:p></w:tc></w:tr></w:tbl>\
+             </w:body></w:document>",
+            text_run("The "),
+            text_run(" System"),
+            smart_tag("date", &text_run("2003"))
+        );
+        let d = doc(&xml);
+        // The tags are zero-width: text and offsets are the runs' alone.
+        assert_eq!(
+            first_para(&d).plain_text(),
+            "The University of Texas System"
+        );
+        let out = crate::serialize::document_to_xml(&d);
+        check_smart_tags(&out);
+        assert_eq!(
+            smart_tag_outline(&out),
+            [
+                "The ",
+                "<place>",
+                "@place",
+                "<PlaceType>",
+                "@PlaceType",
+                "University",
+                "</>",
+                " of ",
+                "<PlaceName>",
+                "@PlaceName",
+                "Texas",
+                "</>",
+                "</>",
+                " System",
+                "<date>",
+                "@date",
+                "2003",
+                "</>"
+            ]
+        );
+        // Saved again, nothing moves.
+        assert_eq!(crate::serialize::document_to_xml(&doc(&out)), out);
+        // An empty tag (`<w:smartTag …/>`) is kept too.
+        let d = para_doc("<w:smartTag w:element=\"x\"/>");
+        let out = crate::serialize::document_to_xml(&d);
+        check_smart_tags(&out);
+        assert_eq!(smart_tag_outline(&out), ["<x>", "</>"]);
+    }
+
+    #[test]
+    fn a_field_holding_a_whole_smart_tag_still_collapses_1069() {
+        let field = format!(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText xml:space=\"preserve\"> REF x </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>{}\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+            smart_tag("place", &text_run("Texas"))
+        );
+        let d = para_doc(&field);
+        assert_eq!(kinds(&first_para(&d).content), ["Field"]);
+        assert_eq!(first_para(&d).plain_text(), "Texas");
+        let out = crate::serialize::document_to_xml(&d);
+        check_smart_tags(&out);
+        assert_eq!(
+            smart_tag_outline(&out),
+            ["<place>", "@place", "Texas", "</>"]
+        );
+    }
+
+    /// A smart tag inside a link or a tracked change survives a save of the
+    /// container rebuilt after an edit, and a tag the edit left unbalanced
+    /// there closes inside it.
+    #[test]
+    fn smart_tags_in_links_and_revisions_survive_an_edit_1069() {
+        use crate::editor::{Caret, Editor};
+        let link = format!(
+            "<w:hyperlink w:anchor=\"a\">{}</w:hyperlink>",
+            smart_tag("place", &text_run("Texas"))
+        );
+        let mut ed = Editor::new(para_doc(&link));
+        ed.caret = Caret {
+            path: vec![0],
+            offset: 2,
+        };
+        ed.insert_char('x');
+        assert_eq!(ed.doc.body[0].plain_text(), "Texxas");
+        let out = crate::serialize::document_to_xml(&ed.doc);
+        check_smart_tags(&out);
+        assert!(
+            out.contains("<w:hyperlink w:anchor=\"a\"><w:smartTag"),
+            "{out}"
+        );
+        assert_eq!(
+            smart_tag_outline(&out).concat(),
+            "<place>@placeTexxas</>",
+            "{out}"
+        );
+
+        let ins = format!(
+            "<w:ins w:id=\"1\" w:author=\"A\">{}</w:ins>",
+            smart_tag("place", &text_run("Texas"))
+        );
+        let mut d = para_doc(&ins);
+        let Block::Paragraph(para) = &mut d.body[0] else {
+            panic!("{:?}", d.body);
+        };
+        let Inline::Revision {
+            content,
+            content_changed,
+            ..
+        } = &mut para.content[0]
+        else {
+            panic!("{:?}", para.content);
+        };
+        // The tag's close is lost, as a cut through the revision could leave it.
+        assert!(matches!(content.pop(), Some(Inline::Raw(r)) if r == "</w:smartTag>"));
+        *content_changed = true;
+        let out = crate::serialize::document_to_xml(&d);
+        check_smart_tags(&out);
+        assert!(
+            out.contains("<w:ins w:id=\"1\" w:author=\"A\"><w:smartTag"),
+            "{out}"
+        );
+        assert_eq!(smart_tag_outline(&out).concat(), "<place>@placeTexas</>");
+    }
+
+    /// Edits across a smart tag's boundaries never leave the saved XML with
+    /// half a tag (#1069), Enter keeps a tag that starts at the caret whole,
+    /// and Backspace after Enter makes a split tag one again.
+    #[test]
+    fn edits_across_smart_tags_keep_the_saved_xml_well_formed_1069() {
+        use crate::editor::{Caret, Editor};
+        let xml = format!(
+            "<w:document><w:body><w:p>{}{}{}</w:p><w:p>{}</w:p></w:body></w:document>",
+            text_run("Hello "),
+            smart_tag("place", &text_run("Texas")),
+            text_run(" now"),
+            text_run("Next")
+        );
+        let at = |para: usize, offset: usize| Caret {
+            path: vec![para],
+            offset,
+        };
+        let save = |ed: &Editor| {
+            let out = crate::serialize::document_to_xml(&ed.doc);
+            check_smart_tags(&out);
+            out
+        };
+        let paras = |out: &str| -> Vec<String> {
+            out.split("</w:p>")
+                .filter(|p| p.contains("<w:p"))
+                .map(|p| smart_tag_outline(p).concat())
+                .collect()
+        };
+        let original = save(&Editor::new(doc(&xml)));
+
+        // Enter inside the tag: the first half keeps it, closed; the second
+        // half's text is untagged. Backspace joins the tag back up.
+        let mut ed = Editor::new(doc(&xml));
+        ed.caret = at(0, 8);
+        ed.insert_newline();
+        let out = save(&ed);
+        assert_eq!(paras(&out), ["Hello <place>@placeTe</>", "xas now", "Next"]);
+        ed.backspace();
+        assert_eq!(paras(&save(&ed)), paras(&original));
+        assert!(ed.undo());
+        assert!(ed.undo());
+        assert_eq!(save(&ed), original);
+
+        // Enter right before the tagged word: the tag goes down with it.
+        let mut ed = Editor::new(doc(&xml));
+        ed.caret = at(0, 6);
+        ed.insert_newline();
+        assert_eq!(
+            paras(&save(&ed)),
+            ["Hello ", "<place>@placeTexas</> now", "Next"]
+        );
+
+        // Selections deleted across the tag's start, its end, and the
+        // paragraph break after it.
+        for (from, to, left) in [
+            (
+                at(0, 3),
+                at(0, 8),
+                ["Hel<place>@placexas</> now", "Next"].as_slice(),
+            ),
+            (
+                at(0, 8),
+                at(0, 13),
+                ["Hello <place>@placeTe</>ow", "Next"].as_slice(),
+            ),
+            (
+                at(0, 8),
+                at(1, 2),
+                ["Hello <place>@placeTe</>xt"].as_slice(),
+            ),
+        ] {
+            let mut ed = Editor::new(doc(&xml));
+            ed.anchor = Some(from);
+            ed.caret = to;
+            ed.delete_selection();
+            assert_eq!(paras(&save(&ed)), left);
+        }
+
+        // Copying the tagged word copies its text alone.
+        let mut ed = Editor::new(doc(&xml));
+        ed.anchor = Some(at(0, 6));
+        ed.caret = at(0, 11);
+        let clip = ed.copy().expect("a selection");
+        assert_eq!(clip.to_text(), "Texas");
+        assert!(
+            clip.paras
+                .iter()
+                .flatten()
+                .all(|i| !matches!(i, Inline::Raw(_)))
+        );
+    }
+
+    /// A smart tag inside an inline content control: Enter between its
+    /// letters closes the tag before the control's close in the first half,
+    /// and Enter where the control's text starts with a tag moves the control
+    /// down whole (#652).
+    #[test]
+    fn smart_tags_in_content_controls_split_well_formed_1069() {
+        use crate::editor::{Caret, Editor};
+        let xml = format!(
+            "<w:document><w:body><w:p>{}<w:sdt><w:sdtPr><w:alias w:val=\"c\"/></w:sdtPr>\
+             <w:sdtContent>{}</w:sdtContent></w:sdt></w:p></w:body></w:document>",
+            text_run("Hello "),
+            smart_tag("place", &text_run("ab"))
+        );
+        let mut ed = Editor::new(doc(&xml));
+        ed.caret = Caret {
+            path: vec![0],
+            offset: 7,
+        };
+        ed.insert_newline();
+        let out = crate::serialize::document_to_xml(&ed.doc);
+        check_smart_tags(&out);
+        assert_eq!(out.matches("<w:sdt>").count(), 2, "{out}");
+        assert!(
+            out.contains(">a</w:t></w:r></w:smartTag></w:sdtContent>"),
+            "{out}"
+        );
+
+        let mut ed = Editor::new(doc(&xml));
+        ed.caret = Caret {
+            path: vec![0],
+            offset: 6,
+        };
+        ed.insert_newline();
+        let out = crate::serialize::document_to_xml(&ed.doc);
+        check_smart_tags(&out);
+        let (first, second) = out.split_once("</w:p>").expect("two paragraphs");
+        assert!(
+            !first.contains("w:sdt") && !first.contains("w:smartTag"),
+            "{out}"
+        );
+        assert_eq!(second.matches("<w:sdt>").count(), 1, "{out}");
+        assert!(second.contains("<w:sdtContent><w:smartTag"), "{out}");
     }
 
     #[test]

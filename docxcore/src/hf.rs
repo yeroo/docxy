@@ -105,6 +105,22 @@ pub(crate) fn is_sdt_close(raw: &str) -> bool {
     raw.trim_start().starts_with("</w:sdtContent>")
 }
 
+/// The closing boundary of a preserved smart tag (see `load::parse_smart_tag`).
+pub(crate) const SMART_TAG_CLOSE: &str = "</w:smartTag>";
+
+/// The opening boundary of a preserved smart tag: its start tag, with its
+/// `w:smartTagPr` if it has one.
+pub(crate) fn is_smart_tag_open(raw: &str) -> bool {
+    raw.trim_start()
+        .strip_prefix("<w:smartTag")
+        .is_some_and(|rest| rest.starts_with(|c: char| c == '>' || c.is_whitespace()))
+        && !raw.trim_end().ends_with(SMART_TAG_CLOSE)
+}
+
+pub(crate) fn is_smart_tag_close(raw: &str) -> bool {
+    raw.trim() == SMART_TAG_CLOSE
+}
+
 /// The `w:docPartGallery` value in an SDT's properties, if any.
 pub(crate) fn doc_part_gallery(raw: &str) -> Option<String> {
     let (a, b) = crate::sect::find_element(raw, "w:docPartGallery")?;

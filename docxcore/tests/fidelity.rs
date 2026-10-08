@@ -61,9 +61,8 @@ const CLASSES: &[LossClass] = &[
     },
 ];
 
-/// Run-property findings that are no property loss: a run split or unwrapped
-/// by #1069 (a `w:tab` split off its text, an unwrapped `w:smartTag`, a dropped
-/// `w:lastRenderedPageBreak`) makes the comparator pair a run with a different
+/// Run-property findings that are no property loss: a run split by #1069 (a
+/// `w:tab` split off its text, a dropped `w:lastRenderedPageBreak`) makes the comparator pair a run with a different
 /// one, so intact properties read as lost, changed or added. Checked per file
 /// when #1063 was fixed: every character's run properties and run attributes
 /// are the same in the original and the saved file. Listed entry by entry (file,
@@ -108,19 +107,6 @@ const MISALIGNED_RUNS: &[(&str, &[(Kind, &str)])] = &[
             (Kind::LostElement, "/w:p/w:r/w:rPr/w:lang"),
             (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:b"),
             (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:lang"),
-        ],
-    ),
-    (
-        "ext:page layout/page layout(big file)/A4.docx",
-        &[
-            (Kind::LostElement, "/w:p/w:r/w:rPr/w:kern"),
-            (Kind::LostAttr, "/w:p/w:r/w:rPr/w:rFonts/@w:hint"),
-            (Kind::ChangedValue, "/w:p/w:r/w:rPr/w:rFonts/@w:ascii"),
-            (Kind::ChangedValue, "/w:p/w:r/w:rPr/w:rFonts/@w:eastAsia"),
-            (Kind::ChangedValue, "/w:p/w:r/w:rPr/w:rFonts/@w:hAnsi"),
-            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:b"),
-            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:bCs"),
-            (Kind::ExtraAttr, "/w:p/w:r/w:rPr/w:rFonts/@w:hint"),
         ],
     ),
     (
