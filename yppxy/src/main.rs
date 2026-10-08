@@ -12,6 +12,9 @@
 //!   yppxy <file.(xml|yppx|mpp)>        open MSPDI XML, a .yppx package, or a
 //!                                      legacy .mpp (validated task tables)
 //!   yppxy <in> --gantt-md <out.md>     headless: export a Markdown Gantt chart
+//!   yppxy <in> --report-md <report> <out.md>
+//!                                      headless: export a View Report
+//!                                      (`project-overview`, `late-tasks`, …)
 //!   yppxy <in> --save <out.(yppx|xml)> headless: convert/save and exit
 //!   yppxy --version (-V)               print the build (commit, last merged PR, kind)
 
@@ -42,8 +45,9 @@ use projcore::editor::{
 #[cfg(test)]
 use projcore::model::Predecessor;
 use projcore::model::{LinkType, Project, Task};
+use projcore::report::ReportKind;
 use projcore::schedule::{Schedule, schedule};
-use projcore::{gantt, mspdi, yppx};
+use projcore::{gantt, mspdi, report, yppx};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -116,14 +120,14 @@ fn main() -> ExitCode {
         Err(m) => {
             eprintln!("{m}");
             eprintln!(
-                "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>] | --version (-V)"
+                "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--report-md <report> <out>] [--save <out.(yppx|xml)>] | --version (-V)"
             );
             return ExitCode::from(2);
         }
     };
     if parsed.help {
         println!(
-            "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>] | --version (-V)"
+            "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--report-md <report> <out>] [--save <out.(yppx|xml)>] | --version (-V)"
         );
         return ExitCode::SUCCESS;
     }
@@ -141,6 +145,14 @@ fn main() -> ExitCode {
     };
 
     // Headless modes: do the job and exit, no TUI.
+    if let Some((kind, out)) = &parsed.report_md {
+        let ed = Editor::new(proj);
+        if let Err(e) = write_report_md(&ed, *kind, parsed.input.as_deref(), out) {
+            eprintln!("{out}: {e}");
+            return ExitCode::FAILURE;
+        }
+        return ExitCode::SUCCESS;
+    }
     if let Some(out) = &parsed.gantt_md {
         let s = schedule(&proj);
         if let Err(e) = write_gantt_md(&proj, &s, parsed.input.as_deref(), out) {
@@ -169,6 +181,7 @@ fn main() -> ExitCode {
 struct Args {
     input: Option<String>,
     gantt_md: Option<String>,
+    report_md: Option<(ReportKind, String)>,
     save: Option<String>,
     help: bool,
     vim: bool,
@@ -178,6 +191,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut out = Args {
         input: None,
         gantt_md: None,
+        report_md: None,
         save: None,
         help: false,
         vim: false,
@@ -190,6 +204,17 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--gantt-md" => {
                 i += 1;
                 out.gantt_md = Some(args.get(i).ok_or("--gantt-md needs a path")?.clone());
+            }
+            "--report-md" => {
+                let slug = args
+                    .get(i + 1)
+                    .ok_or("--report-md needs a report and a path")?;
+                let kind = ReportKind::parse(slug).ok_or_else(|| {
+                    format!("unknown report: {slug} (one of {})", ReportKind::slugs())
+                })?;
+                let out_path = args.get(i + 2).ok_or("--report-md needs a path")?;
+                out.report_md = Some((kind, out_path.clone()));
+                i += 2;
             }
             "--save" => {
                 i += 1;
@@ -209,6 +234,9 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     // silently skip one of them.
     if out.gantt_md.is_some() && out.save.is_some() {
         return Err("--gantt-md and --save cannot be combined".into());
+    }
+    if out.report_md.is_some() && (out.gantt_md.is_some() || out.save.is_some()) {
+        return Err("--report-md cannot be combined with --gantt-md or --save".into());
     }
     Ok(out)
 }
@@ -242,6 +270,34 @@ fn write_gantt_md(
         source.map(Path::new),
         Path::new(out),
         gantt::to_markdown(proj, sched).as_bytes(),
+    )
+}
+
+/// A View Report of the editor's plan, written like the Gantt export.
+fn write_report_md(
+    ed: &Editor,
+    kind: ReportKind,
+    source: Option<&str>,
+    out: &str,
+) -> std::io::Result<()> {
+    export_atomic(
+        source.map(Path::new),
+        Path::new(out),
+        report::render(ed, kind).as_bytes(),
+    )
+}
+
+/// Where the plan's exports go: its path without the extension (the Gantt
+/// chart adds `.md`, a View Report `-<slug>.md`), or `schedule` unsaved.
+fn export_base(path: Option<&str>) -> String {
+    path.map_or_else(
+        || "schedule".into(),
+        |p| {
+            Path::new(p)
+                .with_extension("")
+                .to_string_lossy()
+                .into_owned()
+        },
     )
 }
 
@@ -776,6 +832,7 @@ impl App {
                 }
             }
             Act::Todo(name) => self.status = format!("{name}: not implemented yet"),
+            Act::Report(kind) => self.export_report(kind),
         }
     }
 
@@ -986,11 +1043,7 @@ impl App {
     }
 
     fn export_md(&mut self) {
-        let out = self
-            .path
-            .as_deref()
-            .map(|p| format!("{}.md", p.rsplit_once('.').map(|(a, _)| a).unwrap_or(p)))
-            .unwrap_or_else(|| "schedule.md".into());
+        let out = format!("{}.md", export_base(self.path.as_deref()));
         match write_gantt_md(
             self.ed.project(),
             self.ed.schedule(),
@@ -998,6 +1051,16 @@ impl App {
             &out,
         ) {
             Ok(()) => self.status = format!("Exported Gantt to {out}"),
+            Err(e) => self.status = format!("Export failed: {e}"),
+        }
+    }
+
+    /// Report › View Reports: the report beside the plan, as
+    /// `<stem>-<slug>.md` (#1123).
+    fn export_report(&mut self, kind: ReportKind) {
+        let out = kind.file_name(&export_base(self.path.as_deref()));
+        match write_report_md(&self.ed, kind, self.path.as_deref(), &out) {
+            Ok(()) => self.status = format!("Exported {} to {out}", kind.title()),
             Err(e) => self.status = format!("Export failed: {e}"),
         }
     }
@@ -3434,11 +3497,18 @@ mod tests {
         assert_eq!(app.hscroll, 0);
     }
 
-    /// Report has no groups (#370) but is still a tab you can select: Enter
-    /// and the arrow keys make it active, and it draws an empty body.
+    /// Report › View Reports (#1123): Enter on the Report tab enters its
+    /// first button, Project Overview, and Enter runs it, writing the report
+    /// beside the plan as `<stem>-<slug>.md` without touching the plan.
     #[test]
-    fn the_empty_report_tab_can_be_selected() {
-        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+    fn the_report_tab_writes_view_reports_beside_the_plan() {
+        let dir = std::env::temp_dir().join(format!("yppxy-report-tab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("plan.v2.xml");
+        std::fs::write(&source, mspdi::write_mspdi(&new_project())).unwrap();
+        let path = source.to_str().unwrap();
+        let mut app = App::new(load(path).unwrap(), Some(path.into()), false);
         let report = (0..)
             .map_while(|i| app.ribbon.tab_label(i).map(|l| (i, l)))
             .find(|(_, l)| *l == "Report")
@@ -3447,16 +3517,59 @@ mod tests {
         app.rfocus = ribbon::Focus::Tab(report);
         on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.ribbon.active_tab(), report);
-        assert_eq!(app.rfocus, ribbon::Focus::Tab(report), "nothing to enter");
-        let s = buffer_text(&mut app, 110, 24);
-        assert!(s.contains("Report"));
-        assert!(!s.contains("Milestone"), "the Task body is gone");
-        // Arrowing off and back on selects it too.
-        app.rfocus = ribbon::Focus::Tab(report);
-        on_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(app.ribbon.active_tab(), report - 1);
-        on_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        assert_eq!(app.ribbon.active_tab(), report);
+        assert_eq!(app.rfocus, ribbon::Focus::Button(0));
+        let s = buffer_text(&mut app, 120, 24);
+        assert!(s.contains("Project Overview") && s.contains("In Progress"));
+        assert!(!s.contains("Indent"), "the Task body is gone");
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let out = dir.join("plan.v2-project-overview.md");
+        assert_eq!(
+            app.status,
+            format!("Exported Project Overview to {}", out.display())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            report::render(&app.ed, ReportKind::ProjectOverview)
+        );
+        app.apply_act(Act::Report(ReportKind::LateTasks));
+        assert!(dir.join("plan.v2-late-tasks.md").exists(), "{}", app.status);
+        assert!(!app.ed.dirty());
+        // Unsaved, the report goes to schedule-<slug>.md, as Export's
+        // schedule.md; never over the plan itself.
+        assert_eq!(
+            ReportKind::LateTasks.file_name(&export_base(None)),
+            "schedule-late-tasks.md"
+        );
+        assert!(write_report_md(&app.ed, ReportKind::LateTasks, Some(path), path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn report_md_takes_a_report_and_a_path_alone() {
+        let args = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let parsed = args(&["plan.xml", "--report-md", "late-tasks", "out.md"]).unwrap();
+        assert_eq!(parsed.input.as_deref(), Some("plan.xml"));
+        assert_eq!(
+            parsed.report_md,
+            Some((ReportKind::LateTasks, "out.md".to_string()))
+        );
+        let Err(e) = args(&["plan.xml", "--report-md", "burndown", "out.md"]) else {
+            panic!("an unknown report");
+        };
+        assert!(
+            e.contains("unknown report: burndown") && e.contains("late-tasks"),
+            "{e}"
+        );
+        assert!(args(&["--report-md", "late-tasks"]).is_err());
+        assert!(args(&["--report-md"]).is_err());
+        for other in [["--gantt-md", "g.md"], ["--save", "s.xml"]] {
+            let mut a = vec!["plan.xml", "--report-md", "late-tasks", "out.md"];
+            a.extend(other);
+            assert_eq!(
+                args(&a).err().as_deref(),
+                Some("--report-md cannot be combined with --gantt-md or --save")
+            );
+        }
     }
 
     /// Clear Resources left the ribbon (#370); Assign with an empty name is

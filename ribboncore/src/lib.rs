@@ -106,7 +106,7 @@ pub struct Ribbon<A> {
     /// Groups per tab (aligned with `tabs`). A tab with no groups has no
     /// in-ribbon body: `set_active` skips it as a backstage tab (File, which
     /// the app opens as a backstage), while `show_tab` selects it and draws
-    /// an empty body (yppxy's Report).
+    /// an empty body.
     tab_groups: Vec<Vec<Group<A>>>,
     placed: Vec<Placed<A>>,
     tab_cols: Vec<(u16, u16)>, // (start, end_exclusive) of each tab header
@@ -186,8 +186,8 @@ impl<A: Copy + PartialEq> Ribbon<A> {
     }
 
     /// Switch to tab `i` even when it has no groups, for an app whose empty
-    /// tab is a ribbon tab with nothing on it yet rather than a backstage
-    /// (yppxy's Report). The body lays out empty.
+    /// tab is a ribbon tab with nothing on it yet rather than a backstage.
+    /// The body lays out empty.
     pub fn show_tab(&mut self, i: usize) {
         if i < self.tabs.len() {
             self.active = i;
