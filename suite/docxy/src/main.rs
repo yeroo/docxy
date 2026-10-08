@@ -4482,7 +4482,8 @@ struct Docxy {
     ruler_tab: docxcore::model::TabAlign,
     // Screen bounds measured during prepaint and shared with the ruler paint and hit path.
     ruler_probe: std::rc::Rc<std::cell::RefCell<RulerProbe>>,
-    // Line numbers painted in Print Layout, recorded for the harness (#746).
+    // The frame's line-number counting state and harness record, shared by
+    // the numbered rows' canvases in paint order (#746; LineProbe).
     line_probe: std::rc::Rc<std::cell::RefCell<line_numbers::LineProbe>>,
     // A text drag-selection is in progress (mouse down in the doc, not yet up).
     selecting: bool,
@@ -26598,14 +26599,31 @@ fn snap_twips(v: i32) -> i32 {
 }
 
 fn caret_bar() -> AnyElement {
-    // Negative side margins cancel the 2px width so the caret takes no layout
-    // space — it sits between glyphs without nudging them apart to make room.
+    caret_bar_div().into_any_element()
+}
+
+/// The caret bar as a layout box: 2px wide with negative side margins that
+/// cancel the width, so it sits between glyphs without nudging them apart.
+fn caret_bar_div() -> Div {
     div()
         .w(px(2.))
         .h(px(19.))
         .ml(px(-1.))
         .mr(px(-1.))
         .bg(rgb(BRAND))
+}
+
+/// The caret bar as it sits in a document paragraph's wrapping row: it keeps
+/// its fixed 19px drawing height but takes no layout height, being
+/// absolutely placed in a zero-height box at the same spot (its left
+/// margin still applies). Otherwise, below ~65% zoom, the bar is taller
+/// than the row's own line height and the row would read as an extra
+/// wrapped line whenever the caret visits it (#746 r1 Major 2).
+fn doc_caret_bar() -> AnyElement {
+    div()
+        .w(px(0.))
+        .h(px(0.))
+        .child(caret_bar_div().absolute().top_0().left_0())
         .into_any_element()
 }
 
@@ -26808,7 +26826,7 @@ fn emit_run(
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
         if *caret == Some(start + a) {
-            out.push(caret_bar());
+            out.push(doc_caret_bar());
             *caret = None;
         }
         let seg: String = chars[a..b].iter().collect();
@@ -26826,7 +26844,7 @@ fn emit_run(
         );
     }
     if *caret == Some(end) {
-        out.push(caret_bar());
+        out.push(doc_caret_bar());
         *caret = None;
     }
     *idx = end;
@@ -26862,7 +26880,7 @@ fn emit_tab(
 ) {
     let pos = *idx;
     if *caret == Some(pos) {
-        out.push(caret_bar());
+        out.push(doc_caret_bar());
         *caret = None;
     }
     let selected = sel.is_some_and(|(s, e)| s < e && s <= pos && pos < e);
@@ -26902,7 +26920,7 @@ fn emit_tab(
 /// sync (so caret/selection offsets past it stay correct).
 fn emit_break(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>) {
     if *caret == Some(*idx) {
-        out.push(caret_bar());
+        out.push(doc_caret_bar());
         *caret = None;
     }
     out.push(div().w_full().h(px(0.)).into_any_element());
@@ -27254,7 +27272,14 @@ fn line_number_canvas(
         |_, _, _| {},
         move |b, _, window, cx| {
             let mut probe = slot.probe.borrow_mut();
-            let rows = line_numbers::row_count(b.size.height.into(), line_h, line_h.max(base + 6.));
+            // gpui draws each wrapped line at the pixel-snapped line height
+            // (elements/text.rs `pixel_snap`): 19.575 becomes 20, and a
+            // 24-line row is 480px. Count rows and step y at the snapped
+            // pitch or the division drifts a line per ~24 lines. `min_h`
+            // stays what paragraph_el laid the row out with.
+            let min_h = line_h.max(base + 6.);
+            let line_h = f32::from(window.pixel_snap(px(line_h)));
+            let rows = line_numbers::row_count(b.size.height.into(), line_h, min_h);
             if slot.ord < probe.rows.len() {
                 probe.rows[slot.ord] = rows;
             }
@@ -27521,7 +27546,7 @@ fn paragraph_el(
                 let width = caret_advance(inline);
                 let pos = idx;
                 if width == 1 && caret == Some(pos) {
-                    spans.push(caret_bar());
+                    spans.push(doc_caret_bar());
                     caret = None;
                 }
                 let selected = width == 1 && sel.is_some_and(|(s, e)| s < e && s <= pos && pos < e);
@@ -27667,7 +27692,7 @@ fn paragraph_el(
         );
     }
     if caret.is_some() {
-        spans.push(caret_bar());
+        spans.push(doc_caret_bar());
     }
     // A pilcrow at the paragraph end when formatting marks are shown.
     if marks {
@@ -27946,23 +27971,13 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
 
 /// Render one block at absolute `path`, wiring caret/selection/click from `ctx`.
 fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -> AnyElement {
-    block_el_lines(b, path, marker, ctx, None)
+    block_el_numbered(b, path, marker, ctx, None)
 }
 
 /// `block_el` for a Print Layout band, where a numbered top-level paragraph
 /// carries its line-number slot; tables, header/footer paragraphs and every
-/// other caller stay unnumbered (#746).
+/// other caller pass `None` and stay unnumbered (#746).
 fn block_el_numbered(
-    b: &Block,
-    path: Vec<usize>,
-    marker: Option<&str>,
-    ctx: RenderCtx,
-    lines: Option<LineSlot>,
-) -> AnyElement {
-    block_el_lines(b, path, marker, ctx, lines)
-}
-
-fn block_el_lines(
     b: &Block,
     path: Vec<usize>,
     marker: Option<&str>,

@@ -75,8 +75,15 @@ pub(crate) fn first_counts(entries: &[Entry], rows: &[u32]) -> Vec<u32> {
 
 /// Visual rows of a painted wrapping row: its height over the line height.
 /// A single-line row sits at `min_h` (main.rs `paragraph_el`'s
-/// `line_h.max(base + 6.)`), which is taller than `line_h`, so at-or-under
-/// `min_h + 0.5` means one row. A dead `line_h` means "cannot tell": one.
+/// `line_h.max(base + 6.)`), which is taller than `line_h`, so
+/// at-or-under `min_h + 0.5` means one row. A dead `line_h` means "cannot
+/// tell": one. KNOWN LIMITATION: rows are counted from painted height
+/// alone, so two (or more) tight lines (a small line-spacing multiple)
+/// whose combined height stays under `min_h` are indistinguishable from
+/// one line at `min_h` and read as one row — numbering after such a
+/// paragraph can run one short until the next restart. Laying the row out
+/// without `min_h` would change pagination, and gpui reports no wrapped
+/// line count, so there is nothing safe to count instead.
 pub(crate) fn row_count(height: f32, line_h: f32, min_h: f32) -> u32 {
     if height <= min_h + 0.5 || line_h <= 0.0 {
         return 1;
@@ -102,8 +109,12 @@ pub(crate) fn numbered_rule(
     .then(|| Rule::from_setup(ln))
 }
 
-/// What the page view painted, for the harness (`doc {}`): the drawn
-/// numbers with their window position. `page` is the 0-based sheet index.
+/// The frame's line-number state, shared by the numbered rows' canvases in
+/// paint order — numbering depends on it, so the render rebuilds `entries`
+/// and `rows` (document order) before the canvases paint and each canvas
+/// records its own row count before reading earlier ones. `painted` is
+/// only the harness's record of what was drawn (`doc {}`). `page` is the
+/// 0-based sheet index.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LineProbe {
     pub entries: Vec<Entry>,
@@ -248,6 +259,16 @@ mod tests {
         assert_eq!(row_count(40.0, 0.0, 20.5), 1);
     }
 
+    /// gpui draws each wrapped line at the pixel-snapped line height
+    /// (`pixel_snap`): 24 lines of a 19.575px font are 480px at 20px per
+    /// line. The paint closure passes the snapped pitch; the raw 19.575
+    /// would divide 480 into 25 and number a line that is not there.
+    #[test]
+    fn row_count_counts_at_the_snapped_line_height() {
+        assert_eq!(row_count(480.0, 20.0, 20.5), 24);
+        assert_eq!((480.0f32 / 19.575).round().max(1.0) as u32, 25);
+    }
+
     /// Port of export.rs `LineNumbers::from_setup`'s distance rule.
     #[test]
     fn distance_defaults_to_360_when_absent_or_zero() {
@@ -262,6 +283,16 @@ mod tests {
         assert_eq!(Rule::from_setup(mk(Some(720))).distance_tw, 720);
         // countBy and start clamp like export.rs.
         assert_eq!(Rule::from_setup(mk(None)).count_by, 1);
+        assert_eq!(
+            Rule::from_setup(LineNumbering {
+                count_by: 0,
+                start: Some(-3),
+                distance: Some(720),
+                restart: LnRestart::NewPage,
+            })
+            .count_by,
+            1
+        );
         assert_eq!(
             Rule::from_setup(LineNumbering {
                 count_by: 0,

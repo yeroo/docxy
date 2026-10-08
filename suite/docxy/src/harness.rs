@@ -1637,7 +1637,6 @@ fn table_state(editor: &Editor) -> Json {
     ])
 }
 
-/// Ruler coordinates come from the last painted frame, in logical pixels.
 /// The line numbers Print Layout painted last frame (#746): one
 /// `{page, n, x, y}` per drawn number; `page` is 1-based, `x`/`y` window
 /// px rounded to a tenth. Empty in Draft/Web layout and when the document
@@ -1661,6 +1660,7 @@ fn line_numbers_state(app: &crate::Docxy) -> Json {
     )
 }
 
+/// Ruler coordinates come from the last painted frame, in logical pixels.
 fn ruler_state(app: &crate::Docxy) -> Json {
     if !app.show_ruler {
         return Json::Null;

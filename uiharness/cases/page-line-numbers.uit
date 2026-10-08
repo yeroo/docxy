@@ -39,6 +39,15 @@ test line numbers draw in print layout, continue across pages and columns, and f
   assert reply.line_numbers.41.page is 1
   assert reply.line_numbers.41.n is 42
   assert reply.line_numbers.41.x is 591
+  # Zoom out: the caret bar is a fixed 19px, taller than a wrapped line at
+  # this zoom. With the caret in an empty paragraph it must not add a row,
+  # so the count around it must not shift.
+  key ctrl+- ctrl+- ctrl+- ctrl+- ctrl+- ctrl+- ctrl+- ctrl+-
+  call selection-set {"start":4,"end":4}
+  shot window
+  call doc {}
+  assert reply.line_numbers.20.n is 21
+  assert reply.line_numbers.41.n is 42
   # None removes them again.
   call menu-open {"target":{"ribbon":["Layout","Page Setup","Line Numbers"]}}
   call menu-click {"label":"None"}
