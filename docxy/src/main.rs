@@ -2571,8 +2571,9 @@ impl App {
             self.status = Some(format!("Save As editable HTML: {}", html::NO_ENGINE));
             return;
         }
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
+        // The edit's error stays the status, and nothing is written (#1223).
+        if self.commit_hf_edit(true).is_err() {
+            return;
         }
         // Serialize in the target format, then rebind in-memory state to the saved
         // file so format, view and numbering all stay consistent.
@@ -4103,9 +4104,17 @@ impl App {
     /// Return from header/footer editing, committing the edits (splice back into
     /// the part and update the print-layout source) when `commit`.
     fn exit_hf_edit(&mut self, commit: bool) {
+        let _ = self.commit_hf_edit(commit);
+    }
+
+    /// [`App::exit_hf_edit`], reporting a commit that failed: the Err is the
+    /// status bar's text. Editing is left either way, so on Err the edit is
+    /// already discarded and cannot be retried (#1223).
+    fn commit_hf_edit(&mut self, commit: bool) -> Result<(), String> {
         let Some(hf) = self.hf_edit.take() else {
-            return;
+            return Ok(());
         };
+        let mut outcome = Ok(());
         let edited = std::mem::replace(&mut self.editor, hf.body);
         let blocks = edited.doc.body;
         let changed = if hf.is_header {
@@ -4153,10 +4162,9 @@ impl App {
                     self.modified = true;
                 }
                 Err(why) => {
-                    self.status = Some(format!(
-                        "Couldn't write the {what} edit to {}: {why}.",
-                        hf.part
-                    ));
+                    let msg = format!("Couldn't write the {what} edit to {}: {why}.", hf.part);
+                    self.status = Some(msg.clone());
+                    outcome = Err(msg);
                 }
             }
         }
@@ -4165,6 +4173,7 @@ impl App {
         // discarded edit: the panel follows (#971).
         self.sync_tracked_comments();
         self.dirty = true;
+        outcome
     }
 
     /// Run a package edit of the final section's `w:sectPr` against the body
@@ -4233,10 +4242,9 @@ impl App {
     /// [`App::save`], reporting the outcome: every failure branch sets the
     /// status bar to the same text it returns as the error.
     fn try_save(&mut self) -> Result<(), String> {
-        // Commit any in-progress header/footer edit first.
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
-        }
+        // Commit any in-progress header/footer edit first; a save without
+        // it would drop the edit and still report Saved (#1223).
+        self.commit_hf_edit(true)?;
         let path = self.path.clone();
         if self.format == DocFormat::Markdown {
             let md = self.current_markdown();
@@ -6263,10 +6271,8 @@ impl App {
                 self.save();
                 false
             }
-            "wq" | "x" => {
-                self.save();
-                true
-            }
+            // A failed save keeps the app open, its error the status (#1223).
+            "wq" | "x" => self.try_save().is_ok(),
             "q" => {
                 if self.modified {
                     self.status = Some("unsaved changes (:q! to discard)".to_string());
@@ -10960,26 +10966,90 @@ mod tests {
         assert!(pdf.contains("/URI (https://b.example/)"));
     }
 
+    /// A header body of one paragraph holding a link to `url`.
+    fn header_link_body(url: &str) -> Vec<Block> {
+        vec![Block::Paragraph(MPara {
+            props: ParProps::default(),
+            content: vec![Inline::Hyperlink(docxcore::model::Hyperlink {
+                target: Some(url.to_string()),
+                runs: vec![Run {
+                    text: url.to_string(),
+                    props: RunProps::default(),
+                }],
+                ..docxcore::model::Hyperlink::default()
+            })],
+        })]
+    }
+
+    /// An app left in a header edit whose commit fails (#1223): a first
+    /// link created the header's rels, which then turned unreadable, and
+    /// the edit adds a second link. Not modified, as after a save.
+    pub(crate) fn app_in_failing_header_edit() -> App {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        let part = app.header_part.clone().expect("header part created");
+        app.editor.doc.body = header_link_body("https://a.example/");
+        app.on_key(key(KeyCode::F(6)));
+        let rels_name = part.replace("word/", "word/_rels/") + ".rels";
+        assert!(
+            app.pkg
+                .set_part(&rels_name, b"<NotRelationships/>".to_vec())
+        );
+        app.run_act(ribbon::Act::EditHeader);
+        app.editor.doc.body = header_link_body("https://b.example/");
+        app.modified = false;
+        app
+    }
+
+    /// #1223: a save that cannot commit the open header edit writes
+    /// nothing and answers the commit's error, which the status keeps.
+    #[test]
+    fn save_with_failed_header_commit_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("docxy-save-hf-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.docx");
+        let mut app = app_in_failing_header_edit();
+        app.path = path.to_string_lossy().into_owned();
+
+        let err = app.try_save().unwrap_err();
+        assert!(err.contains("Couldn't write the header edit"), "{err}");
+        assert_eq!(app.status.as_deref(), Some(err.as_str()));
+        assert!(!path.exists(), "nothing written");
+        assert!(!app.modified);
+        assert!(app.hf_edit.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1223: Save As stops the same way: no file, and the document stays
+    /// bound to its old path and format.
+    #[test]
+    fn save_as_with_failed_header_commit_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("docxy-saveas-hf-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = app_in_failing_header_edit();
+
+        app.commit_save_as(dir.clone(), "out.docx".to_string());
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit"),
+            "{status}"
+        );
+        assert!(!dir.join("out.docx").exists(), "nothing written");
+        assert_eq!(app.path, "test.docx");
+        assert_eq!(app.format, DocFormat::Docx);
+        assert!(!app.modified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn header_edit_link_with_unreadable_header_rels_writes_nothing() {
-        let link_body = |url: &str| {
-            vec![Block::Paragraph(MPara {
-                props: ParProps::default(),
-                content: vec![Inline::Hyperlink(docxcore::model::Hyperlink {
-                    target: Some(url.to_string()),
-                    runs: vec![Run {
-                        text: url.to_string(),
-                        props: RunProps::default(),
-                    }],
-                    ..docxcore::model::Hyperlink::default()
-                })],
-            })]
-        };
         // A first link creates the header's rels, which then turn unreadable.
         let mut app = app_with(&["body"]);
         app.run_act(ribbon::Act::EditHeader);
         let part = app.header_part.clone().expect("header part created");
-        app.editor.doc.body = link_body("https://a.example/");
+        app.editor.doc.body = header_link_body("https://a.example/");
         app.on_key(key(KeyCode::F(6)));
         let rels_name = part.replace("word/", "word/_rels/") + ".rels";
         assert!(
@@ -10989,7 +11059,7 @@ mod tests {
         let header_before = app.pkg.part(&part).unwrap().to_vec();
         let shown_before = app.headers.default.clone();
         app.run_act(ribbon::Act::EditHeader);
-        app.editor.doc.body = link_body("https://b.example/");
+        app.editor.doc.body = header_link_body("https://b.example/");
         app.on_key(key(KeyCode::F(6)));
         assert!(app.hf_edit.is_none());
         assert_eq!(
@@ -14401,6 +14471,40 @@ mod tests {
         app.on_key(key(KeyCode::Char(':')));
         app.on_key(key(KeyCode::Char('q')));
         assert!(app.on_key(key(KeyCode::Enter))); // :q with no changes -> quit
+    }
+
+    /// #1223: `:wq` quits only once the save succeeded; a failed one keeps
+    /// the app open with the error as the status.
+    #[test]
+    fn vim_command_write_quit_stays_open_when_the_save_fails() {
+        let dir = std::env::temp_dir().join(format!("docxy-vim-wq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let type_wq = |app: &mut App| {
+            for c in [':', 'w', 'q'] {
+                assert!(!app.on_key(key(KeyCode::Char(c))));
+            }
+            app.on_key(key(KeyCode::Enter))
+        };
+
+        let failed = dir.join("failed.docx");
+        let mut app = app_in_failing_header_edit();
+        app.vim = Some(VimState::new());
+        app.path = failed.to_string_lossy().into_owned();
+        assert!(!type_wq(&mut app), "a failed save must not quit");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit"),
+            "{status}"
+        );
+        assert!(!failed.exists());
+
+        let saved = dir.join("saved.docx");
+        let mut app = vim_app(&["x"]);
+        app.path = saved.to_string_lossy().into_owned();
+        assert!(type_wq(&mut app), "a good save quits");
+        assert!(saved.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
