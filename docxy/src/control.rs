@@ -163,7 +163,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "doc.redo" => Ok(redo(app)),
         "doc.export-pdf" => export_pdf(app, args),
         "doc.save" => {
-            app.save();
+            app.try_save()?;
             Ok(path_info(app))
         }
         "doc.reload" => {
@@ -2698,6 +2698,58 @@ mod tests {
         assert_eq!(path_info(&app).get("final"), Some(&Json::Bool(true)));
         assert_eq!(path_info(&app_with(&["plain"])).get("final"), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #729: a failed write answers Err (the status bar's text, word for
+    /// word), leaves the document modified and the path alone, and a later
+    /// save recovers once the cause is fixed.
+    #[test]
+    fn doc_save_reports_a_failed_write() {
+        let dir = std::env::temp_dir().join(format!("docxy-ctl-save-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The parent directory does not exist, so the write fails.
+        let path = dir.join("missing").join("t.docx");
+        let mut app = app_with(&["A"]);
+        app.path = path.to_string_lossy().into_owned();
+        app.modified = true;
+
+        let err = dispatch(&mut app, "doc.save", &Json::Null).unwrap_err();
+        assert!(err.starts_with("save failed: "), "{err}");
+        // The error is the status bar's text, word for word.
+        assert_eq!(app.status.as_deref(), Some(err.as_str()));
+        assert!(
+            app.modified,
+            "a failed save must leave the document modified"
+        );
+        assert_eq!(std::path::Path::new(&app.path), path.as_path());
+        assert!(!path.exists());
+
+        // Fixing the cause lets the next doc.save succeed.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let r = dispatch(&mut app, "doc.save", &Json::Null).unwrap();
+        assert_eq!(r.get_str("path"), Some(path.to_str().unwrap()));
+        assert!(!app.modified);
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #729: an html document whose bundle HTML is gone answers Err instead
+    /// of ok:true, and stays modified.
+    #[test]
+    fn doc_save_reports_a_missing_html_bundle() {
+        let mut app = App::new(new_package(doc_with(&["A"])), "page.html", false);
+        app.modified = true;
+
+        let err = dispatch(&mut app, "doc.save", &Json::Null).unwrap_err();
+        assert_eq!(
+            err,
+            "save failed: the editable HTML this file came from is gone"
+        );
+        assert_eq!(app.status.as_deref(), Some(err.as_str()));
+        assert!(
+            app.modified,
+            "a failed save must leave the document modified"
+        );
     }
 
     #[test]

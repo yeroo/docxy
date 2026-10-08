@@ -4227,6 +4227,12 @@ impl App {
     }
 
     fn save(&mut self) {
+        let _ = self.try_save();
+    }
+
+    /// [`App::save`], reporting the outcome: every failure branch sets the
+    /// status bar to the same text it returns as the error.
+    fn try_save(&mut self) -> Result<(), String> {
         // Commit any in-progress header/footer edit first.
         if self.hf_edit.is_some() {
             self.exit_hf_edit(true);
@@ -4234,8 +4240,7 @@ impl App {
         let path = self.path.clone();
         if self.format == DocFormat::Markdown {
             let md = self.current_markdown();
-            self.finish_save(&path, md.as_bytes(), None);
-            return;
+            return self.finish_save(&path, md.as_bytes(), None);
         }
         self.reconcile_tracked_comments();
         let docx = if self.modified {
@@ -4245,32 +4250,38 @@ impl App {
             save_package_preserving_document(&self.pkg)
         };
         if self.format == DocFormat::Docx {
-            self.finish_save(&path, &docx, Some(&docx));
-            return;
+            return self.finish_save(&path, &docx, Some(&docx));
         }
         // An opened bundle keeps its engine and UI: only the payload changes.
         // Nothing but a bundle is ever written to an .html path.
         let Some(old) = self.bundle_html.as_deref() else {
-            self.status = Some("save failed: the editable HTML this file came from is gone".into());
-            return;
+            let msg = "save failed: the editable HTML this file came from is gone".to_string();
+            self.status = Some(msg.clone());
+            return Err(msg);
         };
         if let Err(e) = htmlbundle::check_html_target(Path::new(&path)) {
-            self.status = Some(format!("save failed: {e}"));
-            return;
+            let msg = format!("save failed: {e}");
+            self.status = Some(msg.clone());
+            return Err(msg);
         }
         match htmlbundle::rewrap(old, &docx) {
             Ok(page) => {
-                if self.finish_save(&path, page.as_bytes(), Some(&docx)) {
-                    self.bundle_html = Some(page);
-                }
+                self.finish_save(&path, page.as_bytes(), Some(&docx))?;
+                self.bundle_html = Some(page);
+                Ok(())
             }
-            Err(e) => self.status = Some(format!("save failed: {e}")),
+            Err(e) => {
+                let msg = format!("save failed: {e}");
+                self.status = Some(msg.clone());
+                Err(msg)
+            }
         }
     }
 
     /// Write `bytes` to `path` and settle the saved state; `docx` (the package
-    /// just serialized) becomes the new base. Returns whether it was written.
-    fn finish_save(&mut self, path: &str, bytes: &[u8], docx: Option<&[u8]>) -> bool {
+    /// just serialized) becomes the new base. Err carries the same text the
+    /// status bar shows.
+    fn finish_save(&mut self, path: &str, bytes: &[u8], docx: Option<&[u8]>) -> Result<(), String> {
         match write_atomic(Path::new(path), bytes) {
             Ok(()) => {
                 if let Some(pkg) = docx.and_then(|d| load_package(d).ok()) {
@@ -4278,11 +4289,12 @@ impl App {
                 }
                 self.modified = false;
                 self.status = Some(format!("Saved {} ({} bytes)", path, bytes.len()));
-                true
+                Ok(())
             }
             Err(e) => {
-                self.status = Some(format!("save failed: {e}"));
-                false
+                let msg = format!("save failed: {e}");
+                self.status = Some(msg.clone());
+                Err(msg)
             }
         }
     }
