@@ -10579,12 +10579,17 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
         // keep the original on-disk `path` (so Save still targets the real
         // file; a never-saved sheet keeps path=None → Save prompts Save As).
         (Kind::Xlsx, Some(hp)) => {
-            let (surface, _) = sheet_from_path(hp);
+            let (surface, sheet_status) = sheet_from_path(hp);
             from_hot = !matches!(surface, Surface::Placeholder);
-            let status = if t.dirty {
-                "unsaved — restored"
+            // An unreadable sidecar restores nothing: the tab stays a
+            // placeholder (a repaired one reopens its file below) and says
+            // so, instead of "unsaved — restored" on a blank tab.
+            let status = if matches!(surface, Surface::Placeholder) {
+                format!("load error: the restored copy could not be read — {sheet_status}")
+            } else if t.dirty {
+                "unsaved — restored".to_string()
             } else {
-                "loaded"
+                "loaded".to_string()
             };
             DocTab {
                 kind: Kind::Xlsx,
