@@ -58,6 +58,9 @@ pub(crate) fn project_copy_text(v: &ProjectView) -> String {
     }
 }
 
+/// The resource UID of an assignment to nobody (MS Project's placeholder).
+const UNASSIGNED_RESOURCE: i32 = -65535;
+
 /// Tasks copied as whole rows: the rows' tasks (a collapsed summary's hidden
 /// subtree with it), their assignments, and the names of the resources those
 /// name, since another plan's resource UIDs mean other resources. They are
@@ -162,19 +165,22 @@ pub(crate) fn paste_project_rows(tab: &mut DocTab, clip: &ProjectRowsClip) {
     } else {
         v.selected_uid()
     };
-    v.anchor = None;
     let resources = v.ed.project().resources.clone();
     let mut dropped = 0;
     let mut assignments = Vec::new();
     for a in &clip.assignments {
-        // A resource the copy has no name for (the unassigned placeholder,
-        // UID -65535) is no resource of the plan: it goes as it is.
+        // The unassigned placeholder is no resource of any plan: it goes
+        // as it is. A resource the copy has no record of is dropped.
         let Some((_, name)) = clip
             .resources
             .iter()
             .find(|(uid, _)| *uid == a.resource_uid)
         else {
-            assignments.push(a.clone());
+            if a.resource_uid == UNASSIGNED_RESOURCE {
+                assignments.push(a.clone());
+            } else {
+                dropped += 1;
+            }
             continue;
         };
         // The same resource in the same plan, else one of that name (an
@@ -218,6 +224,7 @@ pub(crate) fn paste_project_rows(tab: &mut DocTab, clip: &ProjectRowsClip) {
                 );
             }
             tab.status = status.into();
+            v.anchor = None;
             if let Some(index) = new
                 .first()
                 .and_then(|&uid| v.ed.project().tasks.iter().position(|t| t.uid == uid))

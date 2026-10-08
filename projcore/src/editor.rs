@@ -577,7 +577,8 @@ impl Editor {
     /// everything that belongs to the row's source stays (name, duration,
     /// links to rows in `rows`, constraint, notes, ...), what belongs to
     /// the source project or its history is reset: baselines, recorded
-    /// progress, dates Project stored, GUID, WBS code, custom field and
+    /// progress, dates Project stored (except a manual task's pin and an
+    /// external placeholder's dates), GUID, WBS code, custom field and
     /// outline code values, work and cost totals, and a task calendar this
     /// plan does not have. A predecessor outside `rows` is dropped.
     /// `assignments` name rows by their old UID and resources by this
@@ -1744,7 +1745,7 @@ fn new_assignment(
 fn fresh_copy(t: &Task) -> Task {
     // An external placeholder's stored dates are all it has; a manual task's
     // pin may be held only by its stored dates (see `Task::pinned_dates`).
-    let external = t.is_external_leaf();
+    let external = t.external_task == Some(true) && !t.is_null;
     // Only the start: a missing manual finish is derived from the duration.
     let manual_start = if t.manual {
         t.manual_start.or(t.stored_start)
@@ -3416,6 +3417,14 @@ mod tests {
             (t.stored_start, t.stored_finish),
             (Some(start), Some(finish))
         );
+        // The summary flag of a source row does not matter: a placeholder
+        // is a placeholder.
+        let mut stale = row(53, 1);
+        stale.external_task = Some(true);
+        stale.summary = true;
+        stale.stored_start = Some(start);
+        let new = ed.insert_tasks(None, &[stale], &[]).unwrap();
+        assert_eq!(ed.project().task(new[0]).unwrap().stored_start, Some(start));
         // A task that is neither starts undated.
         let mut plain = row(52, 1);
         plain.stored_start = Some(start);
@@ -3428,7 +3437,7 @@ mod tests {
         );
         // A level near u32::MAX is a depth error, not an overflow.
         let before = ed.project().clone();
-        let result = ed.insert_tasks(None, &[row(60, 1), row(61, u32::MAX)], &[]);
+        let result = ed.insert_tasks(Some(4), &[row(60, 1), row(61, u32::MAX)], &[]);
         assert_eq!(
             result,
             Err("Pasted rows would nest deeper than 20 levels".into())

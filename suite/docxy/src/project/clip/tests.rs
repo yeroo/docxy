@@ -892,10 +892,79 @@ fn a_same_plan_paste_keeps_an_assignment_to_an_empty_named_resource() {
     );
     // Another plan's differently-numbered empty-named resource is no match.
     let mut other = tab();
+    let mut p = v(&other).ed.project().clone();
+    p.resources.push(projcore::Resource {
+        uid: 9,
+        id: 1,
+        name: String::new(),
+        ..projcore::Resource::default()
+    });
+    other.surface = Surface::Project(ProjectView::new(p, false));
     unselect_at(&mut other, 1, COL_NAME);
     paste_project_rows(&mut other, &clip);
     assert_eq!(
         t_status(&other),
         "Pasted 1 row; 1 resource assignment dropped"
+    );
+}
+
+#[test]
+fn a_resource_the_copy_has_no_record_of_is_dropped_and_counted() {
+    let mut t = tab();
+    let mut p = v(&t).ed.project().clone();
+    p.assignments.push(projcore::Assignment {
+        uid: 1,
+        task_uid: p.tasks[0].uid,
+        resource_uid: 77,
+        ..projcore::Assignment::default()
+    });
+    t.surface = Surface::Project(ProjectView::new(p, false));
+    project_cell_press(&mut t, 0, COL_ID, false);
+    let clip = copy_rows(&t).1.unwrap();
+    unselect_at(&mut t, 1, COL_NAME);
+    paste_project_rows(&mut t, &clip);
+    assert_eq!(t_status(&t), "Pasted 1 row; 1 resource assignment dropped");
+    assert!(
+        v(&t)
+            .ed
+            .project()
+            .assignments
+            .iter()
+            .all(|a| a.resource_uid != 77 || a.task_uid == 1)
+    );
+}
+
+#[test]
+fn a_refused_paste_keeps_the_range_selected() {
+    let mut src = tab();
+    vm(&mut src).ed.add_task(None, "C", 480, false).unwrap();
+    vm(&mut src).ed.indent(2, 1).unwrap();
+    vm(&mut src).ed.indent(3, 2).unwrap();
+    select_rows(&mut src, 0, 2);
+    let clip = copy_rows(&src).1.unwrap();
+    let mut dst = tab();
+    let mut p = v(&dst).ed.project().clone();
+    p.tasks = (1..=19)
+        .map(|n| Task {
+            uid: n,
+            id: n,
+            name: format!("T{n}"),
+            outline_level: n as u32,
+            duration_min: 480,
+            ..Task::default()
+        })
+        .collect();
+    dst.surface = Surface::Project(ProjectView::new(p, false));
+    unselect_at(&mut dst, 18, COL_NAME);
+    vm(&mut dst).anchor = Some((19, COL_ID));
+    assert!(v(&dst).selection().is_some());
+    paste_project_rows(&mut dst, &clip);
+    assert_eq!(
+        t_status(&dst),
+        "Pasted rows would nest deeper than 20 levels"
+    );
+    assert!(
+        v(&dst).selection().is_some(),
+        "the range survives a refusal"
     );
 }
