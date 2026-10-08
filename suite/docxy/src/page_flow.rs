@@ -30,6 +30,15 @@ pub(crate) struct SectionBox {
     pub num_start: Option<i32>,
 }
 
+impl SectionBox {
+    /// The width a single-column band draws at: the section's configured
+    /// column width (an explicit single `w:col` keeps it), or `None` when no
+    /// column is declared at all (draw at full text width).
+    pub(crate) fn single_col_w(&self) -> Option<i32> {
+        self.col_w.first().copied()
+    }
+}
+
 /// One section's columns on a page: the block range each column holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Band {
@@ -95,16 +104,17 @@ impl PageFlow {
     }
 }
 
-/// The first body block of each page in `ranges`: an empty range (the blank
-/// page an odd/even section start inserts) takes the previous block, so the
+/// The first body block of each page in `ranges`: the start of its first
+/// non-empty column range; a page whose ranges are all empty (the blank page
+/// an odd/even section start inserts) takes the previous block, so the
 /// filler shows the previous section's header/footer, like the PDF exporter
 /// (export.rs `new_page(i - 1, false, true)`).
 pub(crate) fn first_blocks(ranges: &[Vec<(usize, usize)>]) -> Vec<usize> {
     ranges
         .iter()
-        .map(|cols| {
-            cols.first()
-                .map_or(0, |&(s, e)| if s == e { s.saturating_sub(1) } else { s })
+        .map(|cols| match cols.iter().find(|&&(s, e)| s != e) {
+            Some(&(s, _)) => s,
+            None => cols.first().map_or(0, |&(s, _)| s.saturating_sub(1)),
         })
         .collect()
 }
@@ -387,9 +397,12 @@ impl<'a> Flow<'a> {
 
     /// Pour a section's block range into the open band, closing columns and
     /// pages as they fill; the block heights are estimated at the width of
-    /// the column they land in. A band's first block may overflow only a
-    /// fresh sheet (a block taller than the page still gets its own page);
-    /// under closed bands it moves the band to a new page instead.
+    /// the column they land in. A block overflows when it does not fit the
+    /// band's remaining height; the only exception is the first block of an
+    /// empty column on a sheet with no closed bands (a block taller than the
+    /// page still gets its own sheet). Under closed bands an overflowing
+    /// first block moves the whole band to a new sheet, so no column is ever
+    /// skipped and the band's ranges stay positional.
     fn pour(&mut self, i: usize, range: std::ops::Range<usize>) {
         let col_w: Vec<f32> = self.sections[i]
             .col_w
@@ -406,22 +419,34 @@ impl<'a> Flow<'a> {
                     self.open_page(i, idx, false);
                     col = 0;
                 }
-                let (acc, col_start, has_bands) = {
+                let (acc, has_bands) = {
                     let page = self.cur.as_ref().unwrap();
-                    let b = &page.open;
-                    (b.acc, b.col_start, !page.bands.is_empty())
+                    (page.open.acc, !page.bands.is_empty())
                 };
                 let bh = crate::block_height_est(&self.body[idx], col_w[col]);
                 // A block that adds no height never needs a new column. Any
                 // other block overflows when it does not fit the band's
-                // remaining height — except the first block of a fresh
-                // sheet's first column (a block taller than the page still
-                // gets its own page). Under closed bands, an empty column
-                // overflows too: closing it advances the column index until
-                // the page finishes, so the block continues on a new page
-                // and can never spin.
-                let empty_column = idx == col_start;
+                // remaining height. The oversize exception is a property of
+                // the sheet, not the band: the first block of any empty
+                // column on a sheet with no closed bands may overflow (a
+                // block taller than the page still gets its own sheet).
+                // Under closed bands an empty column instead overflows at
+                // once: the band moves to a new sheet without skipping a
+                // column, so its ranges stay positional (the drawn column i
+                // is always the column pour filled).
+                let empty_column = acc <= 0.0;
                 if bh > 0.0 && acc + bh > self.capacity() && (!empty_column || has_bands) {
+                    if empty_column && has_bands {
+                        // The band's first block does not fit under the
+                        // closed bands: the band moves to a new sheet. The
+                        // page keeps the band only if it already holds
+                        // ranges (close_band drops a wholly unoccupied one);
+                        // no column is skipped, so the ranges stay
+                        // positional — column i's range is the column pour
+                        // filled.
+                        self.finish_page();
+                        continue;
+                    }
                     self.cur.as_mut().unwrap().open.close_column(idx);
                     col += 1;
                     if col >= ncols {

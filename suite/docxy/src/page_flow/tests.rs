@@ -539,12 +539,13 @@ fn oversize_block_after_closed_bands_gets_its_own_page() {
 
 #[test]
 fn single_explicit_column_keeps_its_width() {
-    // One explicit w:col: pagination and rendering use col_w[0], not the
-    // full text width.
+    // One explicit w:col: the band's drawn width is the configured column
+    // width (SectionBox::single_col_w), not the full text width.
     let sect = letter(r#"<w:cols w:num="1" w:equalWidth="0"><w:col w:w="4320"/></w:cols>"#);
     let body = body_blocks(&para("One", Some(&sect)));
     let pf = flow(&body, &sect, false);
     assert_eq!(pf.sections[0].col_w, vec![4320]);
+    assert_eq!(pf.sections[0].single_col_w(), Some(4320));
 }
 
 #[test]
@@ -556,4 +557,129 @@ fn huge_column_space_does_not_overflow() {
     let pf = flow(&body, &sect, false);
     assert_eq!(pf.sections[0].col_w, vec![1, 1, 1]);
     assert_eq!(pf.pages.len(), 1, "{:?}", pf.ranges());
+}
+
+#[test]
+fn later_band_skips_no_columns() {
+    // 33 one-line paragraphs leave ~62px of the sheet; the continuous
+    // section's unequal columns (2640/6000, Word's Left preset) see an
+    // 80-char paragraph estimate ~85px in narrow column 0 (does not fit)
+    // but ~45px in wide column 1 (fits). It must not be silently placed in
+    // column 1 and drawn in column 0: the band moves to a new sheet and the
+    // paragraph lands there in column 0, so a band's ranges stay positional.
+    let unequal_cont = letter(
+        r#"<w:cols w:num="2" w:equalWidth="0"><w:col w:w="2640" w:space="720"/><w:col w:w="6000"/></w:cols><w:type w:val="continuous"/>"#,
+    );
+    let mut xml = String::new();
+    for i in 0..33 {
+        let sect = (i == 32).then(|| letter(""));
+        xml.push_str(&para(&format!("p{i}"), sect.as_deref()));
+    }
+    xml.push_str(&para(&"P".repeat(80), None));
+    xml.push_str(&unequal_cont);
+    let body = body_blocks(&xml);
+    let pf = flow(&body, &unequal_cont, false);
+    assert_eq!(
+        pf.ranges(),
+        vec![vec![(0, 33)], vec![(33, 35)]],
+        "{:?}",
+        pf.ranges()
+    );
+    assert_eq!(pf.pages[0].bands.len(), 1);
+}
+
+#[test]
+fn band_ranges_fit_their_columns() {
+    // Every occupied range's estimated height at its own column width fits
+    // the sheet's content height, except the fresh-sheet oversize exception
+    // (a block taller than the page still gets its own sheet).
+    let mut xml = String::new();
+    for i in 0..40 {
+        let sect = match i {
+            19 => Some(letter(r#"<w:cols w:num="2"/>"#)),
+            39 => Some(letter("")),
+            _ => None,
+        };
+        xml.push_str(&para(&format!("p{i}"), sect.as_deref()));
+    }
+    let body = body_blocks(&xml);
+    let cont = letter(r#"<w:type w:val="continuous"/>"#);
+    let mut body = body;
+    body.extend([
+        Block::Paragraph(docxcore::model::Paragraph {
+            content: vec![
+                Inline::Run(docxcore::model::Run {
+                    text: "after".into(),
+                    ..Default::default()
+                }),
+                Inline::Break(docxcore::model::BreakKind::Page, Default::default()),
+            ],
+            ..Default::default()
+        }),
+        Block::Paragraph(docxcore::model::Paragraph {
+            content: vec![Inline::Run(docxcore::model::Run {
+                text: "tail".into(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        }),
+    ]);
+    let pf = flow(&body, &cont, false);
+    assert!(pf.pages.len() >= 2, "{:?}", pf.ranges());
+    for page in &pf.pages {
+        let owner = &pf.sections[page.bands[0].section];
+        let content_h = (owner.h - owner.top - owner.bottom).max(1) as f32 / 15.0;
+        for (bi, band) in page.bands.iter().enumerate() {
+            let sb = &pf.sections[band.section];
+            for (ci, &(s, e)) in band.cols.iter().enumerate() {
+                let wpx = sb.col_w[ci].max(0) as f32 / 15.0;
+                let h: f32 = (s..e).map(|i| crate::block_height_est(&body[i], wpx)).sum();
+                assert!(
+                    h <= content_h + 0.01 || (page.bands.len() == 1 && bi == 0),
+                    "band {bi} range {ci} ({s},{e}) is {h}px of {content_h}px"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn zero_height_blocks_keep_the_column_empty() {
+    // A zero-height block (an sdt wrapper, a sectPr) at a column's start
+    // does not make the column "occupied": the page-tall table after it
+    // moves to a fresh sheet, instead of the wrapper closing a metadata-only
+    // band that forces the table over. The wrapper stays in its (heightless)
+    // band on the first sheet; every block stays in exactly one range.
+    let rows: Vec<docxcore::model::Row> = (0..30)
+        .map(|_| docxcore::model::Row {
+            cells: vec![],
+            raw_props: vec![],
+            property_change: None,
+            element_attrs: Default::default(),
+        })
+        .collect();
+    let cont = letter(r#"<w:type w:val="continuous"/>"#);
+    let body = vec![
+        body_blocks(&para("One", Some(&letter("")))).remove(0),
+        Block::Raw(String::new()),
+        Block::Table(docxcore::model::Table {
+            rows,
+            ..Default::default()
+        }),
+        body_blocks(&cont).remove(0),
+    ];
+    let pf = flow(&body, &cont, false);
+    assert_eq!(
+        pf.ranges(),
+        vec![vec![(0, 1), (1, 2)], vec![(2, 4)]],
+        "{:?}",
+        pf.ranges()
+    );
+    let mut covered: Vec<usize> = Vec::new();
+    for page in &pf.ranges() {
+        for &(s, e) in page {
+            covered.extend(s..e);
+        }
+    }
+    assert_eq!(covered, (0..4).collect::<Vec<_>>(), "no block is lost");
 }

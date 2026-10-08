@@ -5323,8 +5323,7 @@ fn ruler_scroll_view(
 }
 
 /// The page whose column ranges hold top-level `block` — the block→page
-/// mapping `paginate`/`paginate_cols` produced. `None` when no range
-/// contains it.
+/// mapping `PageFlow::ranges()` produced. `None` when no range contains it.
 fn page_of_block(ranges: &[Vec<(usize, usize)>], block: usize) -> Option<usize> {
     ranges
         .iter()
@@ -32693,9 +32692,10 @@ impl Render for Docxy {
                         // N-column row (each column its own block range) with
                         // the band's section's own column widths, the space
                         // after each column, and the rule between them when it
-                        // sets `w:sep`. A band with fewer occupied ranges than
-                        // columns (the content fit the first column) still
-                        // draws every column at its configured width.
+                        // sets `w:sep`. The ranges are positional — pour
+                        // never skips a column — so column i draws range i,
+                        // and a column the band didn't reach draws empty at
+                        // its configured width.
                         let build_band = |band: &page_flow::Band,
                                           sect: &page_flow::SectionBox|
                          -> AnyElement {
@@ -32711,8 +32711,8 @@ impl Render for Docxy {
                                 // which is the full text width for an
                                 // ordinary equal-width section.
                                 let mut col = v_flex().gap_1().children(blocks);
-                                col = match sect.col_w.first() {
-                                    Some(&w) => col.w(tw(w)).flex_none(),
+                                col = match sect.single_col_w() {
+                                    Some(w) => col.w(tw(w)).flex_none(),
                                     None => col.w_full(),
                                 };
                                 return col.into_any_element();

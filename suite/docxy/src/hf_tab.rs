@@ -646,10 +646,12 @@ pub(crate) fn tab_page_slots(tab: &DocTab) -> Vec<PageSlot> {
         return Vec::new();
     };
     let even_odd = tab.pkg.as_ref().is_some_and(|p| p.has_even_odd());
-    // The same flow the status bar counts, so double-click and Next/Previous
-    // walk the pages the person sees. A page's first body block; an empty
-    // range (a blank odd/even filler) takes the previous block, and a filler
-    // never takes a section's First variant.
+    // The same flow the status bar counts, over the live editor body (the
+    // render flows the shown markup view, which can paginate differently
+    // under Simple Markup — a recorded pre-existing follow-up, so a header
+    // double-click can resolve against different pagination there). A page's
+    // first body block; an empty range (a blank odd/even filler) takes the
+    // previous block, and a filler never takes a section's First variant.
     let pf = crate::tab_page_flow(tab, &ed.doc.body);
     let firsts = page_flow::first_blocks(&pf.ranges());
     let mut slots = crate::hf::page_slots(ed, &firsts, even_odd);
