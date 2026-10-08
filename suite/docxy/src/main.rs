@@ -54,6 +54,7 @@ mod doc_templates_tests;
 mod harness;
 mod help_tab;
 mod hf;
+mod page_flow;
 mod hf_tab;
 mod hl_mode;
 mod html_bundle;
