@@ -59,3 +59,14 @@ test no ribbon menu opens while File covers the tab
   call backstage {"action":"close"}
   call menu-open {"target":"ribbon-bar"}
   assert reply.open is true
+
+test an open group flyout closes when the ribbon's menu opens
+  open ../fixtures/basic.xlsx
+  call window-size {"w":640,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  # At 640 px Font does not fit: it is a collapsed group with a flyout.
+  call ribbon-flyout {"action":"open","group":"Font"}
+  assert reply.open is true
+  call menu-open {"target":"ribbon-bar"}
+  call ribbon-flyout {}
+  assert reply.open is false

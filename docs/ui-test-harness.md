@@ -1285,7 +1285,7 @@ Refusals change nothing, and each names what it refuses: `menu-open` under a
 dialog, a `row` off a Project tab, an unknown uid, a task hidden under a
 collapsed summary (there is no row to right-click), a ribbon command that has
 no menu, `"document"` on a Project, `"cell"` off a sheet, and the targets
-without a menu yet (`bar`, `column`, the ribbon's own right-click); `menu-click` with no
+without a menu yet (`bar`, `column`); `menu-click` with no
 menu open, on a disabled item, an unknown or ambiguous label, a heading, or an
 item that opens a submenu; `menu-click` and `menu-close` under a dialog;
 `menu-open` and `menu-click` while File (the backstage) or the more-tabs list
