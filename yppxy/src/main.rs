@@ -3540,6 +3540,9 @@ mod tests {
             ReportKind::LateTasks.file_name(&export_base(None)),
             "schedule-late-tasks.md"
         );
+        // The extension is the file name's, never a dotted directory's.
+        assert_eq!(export_base(Some("a.b/plan")), "a.b/plan");
+        assert_eq!(export_base(Some("a.b/plan.v2.xml")), "a.b/plan.v2");
         assert!(write_report_md(&app.ed, ReportKind::LateTasks, Some(path), path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }

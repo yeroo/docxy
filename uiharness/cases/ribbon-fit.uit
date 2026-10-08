@@ -117,7 +117,8 @@ test Project ribbon: no tab is clipped vertically
   # measured it.
   assert reply.groups.0.content_bounds is not null
   assert reply.any_clipped_v is false
-  # Report has no groups: nothing to wait for, so it is settled at once.
+  # Report's View Reports group is measured like any tab's: settled after
+  # the shot has drawn it.
   call ribbon-layout {"tab":"Report"}
   shot window
   call ribbon-layout {"tab":"Report"}

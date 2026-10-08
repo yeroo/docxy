@@ -501,8 +501,10 @@ Baseline...` read `menu: "pr-baseline"`). Each command carries a `label` and a
 screentip `tip.title`; on the Project ribbon they are Microsoft Project 2024's,
 and they differ for icon-only commands (Indent is `Indent Task`, Link Tasks is
 `Link the Selected Tasks`), so `ribbon-click` finds a command by either name.
-The Project ribbon holds only Project's commands, and its Report tab has no
-groups yet (`groups: []`). Extend Selection mode, native prompts,
+The Project ribbon holds only Project's commands. Its Report tab has one
+group, View Reports, whose four drop-downs (Dashboards, Resources, Costs, In
+Progress) list their reports as items with `menu` naming the drop-down (#1123).
+Extend Selection mode, native prompts,
 and backstage pages are not represented by these verbs.
 
 On a sheet tab the reply lists File, Home, Insert, Page Layout, Formulas, Data,
