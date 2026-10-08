@@ -36,6 +36,7 @@ pub use fields::{
     BaselinePart, ENTRY_FIELDS, Field, FieldRead, FieldReader, FieldValue, field_names,
     format_date_field, format_project_date, task_mode_name,
 };
+pub(crate) use fields::{format_money, format_work, two_decimals};
 // Re-entering a task's cell goes through `parse_task_predecessors`, which
 // keeps links shown in a fallback unit; the plain parser stays internal.
 #[cfg(test)]
