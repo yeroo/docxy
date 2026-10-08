@@ -3090,6 +3090,7 @@ fn kind_name(kind: crate::Kind) -> &'static str {
 
 /// `tab-list`: every open tab, in strip order, and which one is active.
 fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
+    let window_title = crate::doc_name::window_title(tabs.get(active).map(|t| t.title.as_ref()));
     let tabs = tabs
         .iter()
         .enumerate()
@@ -3114,6 +3115,7 @@ fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
         .collect();
     Json::obj(vec![
         ("active", Json::Num(active as f64)),
+        ("window_title", Json::Str(window_title)),
         ("tabs", Json::Arr(tabs)),
     ])
 }
@@ -5154,12 +5156,17 @@ mod tests {
         word.path = Some("C:/work/a.docx".into());
         word.set_dirty();
         let book = doc(crate::Kind::Xlsx, "Untitled.xlsx");
-        let blank = crate::new_project_tab();
+        let blank = crate::new_project_tab("Project1");
         let mut mpp = doc(crate::Kind::Project, "plan.mpp");
         mpp.path = Some("C:/work/plan.mpp".into());
         let inbox = doc(crate::Kind::Look, "Inbox");
         let list = tab_list(&[word, book, blank, mpp, inbox], 2);
         assert_eq!(list.get("active"), Some(&Json::Num(2.)));
+        assert_eq!(
+            list.get_str("window_title"),
+            Some("Project1  -  docxy"),
+            "{list}"
+        );
         let tabs = list.get("tabs").and_then(Json::as_array).unwrap();
         let row = |i: usize| {
             let t = &tabs[i];
@@ -5191,10 +5198,7 @@ mod tests {
             row(1),
             expect(1, "Untitled.xlsx", "xlsx", None, false, false)
         );
-        assert_eq!(
-            row(2),
-            expect(2, "Untitled.yppx", "project", None, false, false)
-        );
+        assert_eq!(row(2), expect(2, "Project1", "project", None, false, false));
         assert_eq!(
             row(3),
             expect(

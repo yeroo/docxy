@@ -4395,6 +4395,11 @@ struct Docxy {
     // verbs it sent — a verb only marks the view dirty, so the frame that shows
     // its effect has not been laid out by the time the reply goes out.
     frame: u64,
+    // The OS window title last handed to the platform (#588): the platform
+    // forwards every set_title call (the X11 backend writes WM_NAME each
+    // time), so the render below only calls set_window_title when the
+    // computed title changed.
+    last_window_title: Option<String>,
 }
 
 /// Where the regions a harness test can name actually landed, as gpui measured
@@ -10740,6 +10745,17 @@ impl Docxy {
                     .map(|t| t.title.as_ref()),
             ),
         );
+        // New blank plans continue past the restored ones (#588), from the
+        // same run-wide counter the mint above uses.
+        windows::seed_project_titles(
+            cx,
+            doc_name::next_project_after(
+                this.tabs
+                    .iter()
+                    .filter(|t| t.kind == Kind::Project && t.path.is_none())
+                    .map(|t| t.title.as_ref()),
+            ),
+        );
         this.autorecover_minutes = session.autorecover_minutes;
         this.keep_drafts = session.keep_drafts;
         this.edit_opts = EditOptions::from_text(&session.sheet_editing);
@@ -10878,6 +10894,7 @@ impl Docxy {
             harness: false,
             probes: Default::default(),
             frame: 0,
+            last_window_title: None,
         }
     }
 
@@ -11570,7 +11587,7 @@ impl Docxy {
             import: Default::default(),
         };
         self.tabs.push(match kind {
-            Kind::Project => new_project_tab(),
+            Kind::Project => new_project_tab(&windows::next_project_title(cx)),
             Kind::Docx => new_tab(
                 &windows::next_document_title(cx),
                 Surface::Doc(Editor::new(empty_doc())),
@@ -31161,11 +31178,21 @@ impl Render for Docxy {
             self.tab_more_open = false;
         }
 
-        // NOTE: the "docxy" brand label and the flex_1 spacer are plain,
+        // NOTE: the brand label and the flex_1 spacer are plain,
         // non-interactive divs, so TitleBar's own drag region shows through them
         // — that idle space is natively draggable and double-click maximizes.
         // Only the *interactive* clusters (chips, theme button) swallow the
         // mouse-down so a drag on them doesn't start a window move.
+        // The brand label draws the active tab's window title, Project's
+        // `<stem>  -  docxy` (#588); no tab draws the bare brand. The OS
+        // window title gets the same string — but only when it changed, as
+        // the platform writes it on every call.
+        let window_title =
+            doc_name::window_title(self.tabs.get(self.active).map(|t| t.title.as_ref()));
+        if self.last_window_title.as_deref() != Some(window_title.as_str()) {
+            window.set_window_title(&window_title);
+            self.last_window_title = Some(window_title.clone());
+        }
         let title_bar = TitleBar::new().child(
             h_flex()
                 .relative()
@@ -31192,7 +31219,9 @@ impl Render for Docxy {
                             div()
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(rgb(BRAND))
-                                .child("docxy"),
+                                .max_w(px(260.))
+                                .overflow_hidden()
+                                .child(window_title),
                         )
                         .child(
                             h_flex()

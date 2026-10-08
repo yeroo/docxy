@@ -1,9 +1,13 @@
 //! Word's names for new documents (#631): a new blank document is
 //! `Document1`, `Document2`, … (numbers never reused in a session), and the
 //! first save of one proposes its first words as the file name.
+//!
+//! Project's blank plans use the same scheme with its own prefix (#588):
+//! `Project1`, `Project2`, …, and the window title is `<stem>  -  docxy`.
 use docxcore::model::Document;
 
 const PREFIX: &str = "Document";
+const PROJECT_PREFIX: &str = "Project";
 
 /// The longest name proposed from a document's first words, in characters.
 const MAX_FIRST_WORDS: usize = 50;
@@ -33,6 +37,51 @@ pub(crate) fn next_document_title(next: &mut u32) -> String {
     let title = format!("{PREFIX}{next}");
     *next = next.saturating_add(1);
     title
+}
+
+/// `n` when `title` is Project's `Project<n>` name of a new blank plan
+/// (#588): the prefix, then digits, nothing else — `Project1.yppx` and
+/// `project1` are file names, not minted names.
+pub(crate) fn project_number(title: &str) -> Option<u32> {
+    let digits = title.strip_prefix(PROJECT_PREFIX)?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().filter(|&n| n > 0)
+}
+
+/// The number the next new plan takes after a session whose never-saved
+/// Project tabs are titled `titles`: one past the highest `Project<n>`, so
+/// a restored `Project3` is never named twice.
+pub(crate) fn next_project_after<'a>(titles: impl IntoIterator<Item = &'a str>) -> u32 {
+    titles
+        .into_iter()
+        .filter_map(project_number)
+        .max()
+        .map_or(1, |n| n.saturating_add(1))
+}
+
+/// The next new plan's title, advancing the run's counter.
+pub(crate) fn next_project_title(next: &mut u32) -> String {
+    let title = format!("{PROJECT_PREFIX}{next}");
+    *next = next.saturating_add(1);
+    title
+}
+
+/// The window title drawn for the active tab's title `tab_title`: Project's
+/// `<stem>  -  <app>` (stem = the title without its extension, two spaces
+/// either side of the hyphen). No tab draws the bare brand.
+pub(crate) fn window_title(tab_title: Option<&str>) -> String {
+    match tab_title {
+        Some(t) => {
+            let stem = std::path::Path::new(t)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| t.to_string());
+            format!("{stem}  -  docxy")
+        }
+        None => "docxy".to_string(),
+    }
 }
 
 /// Word's file name for the first save of `doc`: its first line of text, up
@@ -128,6 +177,54 @@ mod tests {
         // Closing Document4 does not give its number back: the counter only
         // goes up.
         assert_eq!(next_document_title(&mut next), "Document5");
+    }
+
+    #[test]
+    fn project_numbers() {
+        assert_eq!(project_number("Project1"), Some(1));
+        assert_eq!(project_number("Project27"), Some(27));
+        for not in [
+            "Project",
+            "Project0",
+            "Project1.yppx",
+            "project1",
+            "Proj1",
+            "Project-1",
+        ] {
+            assert_eq!(project_number(not), None, "{not}");
+        }
+    }
+
+    #[test]
+    fn project_numbers_continue_and_are_never_reused() {
+        assert_eq!(next_project_after([]), 1);
+        assert_eq!(
+            next_project_after(["Project1", "Project3", "notes.yppx"]),
+            4
+        );
+        let mut next = next_project_after(["Project2"]);
+        assert_eq!(next_project_title(&mut next), "Project3");
+        assert_eq!(next_project_title(&mut next), "Project4");
+        // Closing Project4 does not give its number back: the counter only
+        // goes up.
+        assert_eq!(next_project_title(&mut next), "Project5");
+    }
+
+    #[test]
+    fn window_title_strips_the_extension() {
+        assert_eq!(
+            window_title(Some("Project1")).as_str(),
+            "Project1  -  docxy"
+        );
+        assert_eq!(
+            window_title(Some("sample.docx")).as_str(),
+            "sample  -  docxy"
+        );
+        assert_eq!(
+            window_title(Some("Untitled.xlsx")).as_str(),
+            "Untitled  -  docxy"
+        );
+        assert_eq!(window_title(None).as_str(), "docxy");
     }
 
     #[test]

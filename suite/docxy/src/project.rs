@@ -736,11 +736,20 @@ pub(super) fn project_tab_from_path(path: &Path) -> DocTab {
     )
 }
 
-pub(super) fn new_project_tab() -> DocTab {
+/// A blank plan (#588): the tab is titled `title` — the run-minted
+/// `Project<n>` — and the plan's name is that title, so the tab, the
+/// `proj.new` reply and the saved `<Name>` can never disagree. A restored
+/// plan with a legacy title (`Untitled.yppx`) is not a minted name, so its
+/// plan keeps `untitled_project()`'s default `Project1`.
+pub(super) fn new_project_tab(title: &str) -> DocTab {
+    let mut project = untitled_project();
+    if crate::doc_name::project_number(title).is_some() {
+        project.name = title.into();
+    }
     project_tab(
-        "Untitled.yppx".into(),
+        title.into(),
         None,
-        Surface::Project(ProjectView::new(untitled_project(), false)),
+        Surface::Project(ProjectView::new(project, false)),
         false,
         "new project".into(),
     )
@@ -881,7 +890,8 @@ pub(super) fn restore_project_tab(t: &PersistTab) -> DocTab {
     if !t.dirty {
         return match path {
             Some(path) => project_tab_from_path(&path),
-            None => new_project_tab(),
+            // Clean and never saved: keep the stored title verbatim (#588).
+            None => new_project_tab(&t.title),
         };
     }
     let (surface, status) = match path.as_deref() {
