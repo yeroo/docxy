@@ -63,7 +63,7 @@ test Feedback opens the new-issue page with the build, not the host
   assert reply.has_commit is true
   assert reply.has_host is false
   call status-read {}
-  assert reply.items.0.text is Opened the feedback page in your browser
+  assert reply.items.1.text is Opened the feedback page in your browser
   open copy:../fixtures/basic.docx
   call ribbon-click {"tab":"Help","command":"Contact Support"}
   call last-url {}
@@ -73,13 +73,13 @@ test Help and F1 say the documentation is coming; Training and What's New wait
   open copy:../fixtures/basic.docx
   call ribbon-click {"tab":"Help","command":"Help"}
   call status-read {}
-  assert reply.items.0.text is Help: the documentation is coming soon
+  assert reply.items.1.text is Help: the documentation is coming soon
   call ribbon-click {"tab":"Help","command":"Feedback"}
   call status-read {}
-  assert reply.items.0.text is Opened the feedback page in your browser
+  assert reply.items.1.text is Opened the feedback page in your browser
   key f1
   call status-read {}
-  assert reply.items.0.text is Help: the documentation is coming soon
+  assert reply.items.1.text is Help: the documentation is coming soon
   call ribbon-read {}
   assert reply.tabs.8.groups.0.commands.3.label is Show Training
   assert reply.tabs.8.groups.0.commands.3.enabled is false
@@ -93,13 +93,13 @@ test Help and F1 say the documentation is coming; Training and What's New wait
   key alt y w
   key escape escape
   call status-read {}
-  assert reply.items.0.text is Opened the feedback page in your browser
+  assert reply.items.1.text is Opened the feedback page in your browser
   open ../fixtures/basic.xlsx
   call-error ribbon-click {"tab":"Help","command":"Show Training"} => 'Show Training' is not implemented
   call ribbon-click {"tab":"Help","command":"Feedback"}
   key f1
   call status-read {}
-  assert reply.items.0.text is Help: the documentation is coming soon
+  assert reply.items.1.text is Help: the documentation is coming soon
 
 test the Help tab fits its ribbon on every kind
   open copy:../fixtures/basic.docx
@@ -127,19 +127,19 @@ test F1 leaves an open entry alone, and a find bar elsewhere does not stop it
   key f2
   key f1
   call status-read {}
-  assert reply.items.0.text is not Help: the documentation is coming soon
+  assert reply.items.1.text is not Help: the documentation is coming soon
   key escape
   call ribbon-click {"tab":"Home","command":"Row Height"}
   key f1
   call status-read {}
-  assert reply.items.0.text is not Help: the documentation is coming soon
+  assert reply.items.1.text is not Help: the documentation is coming soon
   key escape
   open copy:../fixtures/basic.docx
   call ribbon-click {"tab":"Help","command":"Feedback"}
   key ctrl+f
   key f1
   call status-read {}
-  assert reply.items.0.text is not Help: the documentation is coming soon
+  assert reply.items.1.text is not Help: the documentation is coming soon
   # The document's find bar stays open, but a Project draws none.
   open ../fixtures/gantt-summary.xml
   key f1

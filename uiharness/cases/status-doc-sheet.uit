@@ -1,0 +1,41 @@
+# #1132: the Ready / Enter / Edit state item on doc and sheet tabs, and the
+# doc tab's page/word count in `status-read`.
+
+test doc status bar reports Ready, Edit under a dialog, and its stats
+  open copy:../fixtures/basic.docx
+  call status-read {}
+  assert reply.items.0.id is state
+  assert reply.items.0.text is Ready
+  assert reply.items.1.id is message
+  assert reply.items.2.id is stats
+  assert app_state is Ready
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  assert app_state is Edit
+  call status-read {}
+  assert reply.items.0.text is Edit
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  assert app_state is Ready
+
+test sheet status bar reports Ready, Enter, Edit
+  open copy:../fixtures/basic.xlsx
+  call status-read {}
+  assert reply.items.0.id is state
+  assert reply.items.0.text is Ready
+  assert reply.items.1.id is message
+  assert app_state is Ready
+  click A1
+  type x
+  call status-read {}
+  assert reply.items.0.text is Enter
+  assert app_state is Enter
+  key f2
+  assert app_state is Edit
+  key escape
+  assert app_state is Ready
+  key f2
+  assert app_state is Edit
+  key enter
+  assert app_state is Ready
