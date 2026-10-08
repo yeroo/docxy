@@ -165,37 +165,48 @@ pub(crate) fn apply_line_numbers(ed: &mut Editor, d: &Dialog) -> Result<bool, St
     };
     let (count_by, start, distance, restart) = if on {
         let whole = |name: &str, max: i64| -> Result<i64, String> {
-            text_of(d, name)
-                .trim()
-                .parse::<i64>()
-                .ok()
-                .filter(|v| (1..=max).contains(v))
-                .ok_or_else(|| format!("{} must be a whole number of 1 or more", label(name)))
+            match text_of(d, name).trim().parse::<i64>() {
+                Ok(v) if v < 1 => Err(format!(
+                    "{} must be a whole number of 1 or more",
+                    label(name)
+                )),
+                Ok(v) if v > max => Err(format!("{} is too large", label(name))),
+                Ok(v) => Ok(v),
+                Err(_) => Err(format!(
+                    "{} must be a whole number of 1 or more",
+                    label(name)
+                )),
+            }
         };
         let start_at = whole("start", i64::from(i32::MAX) + 1)?;
-        let count_by = i32::try_from(whole("by", i64::from(i32::MAX))?)
-            .expect("validated within i32");
-        // From text is a length in inches: the value is checked non-negative
-        // before it is rounded to twips, so -0.0001 (which would round to 0)
-        // is refused too; and a value beyond i32 twips refuses OK instead of
-        // saturating the cast.
-        let distance = if is_on(d, "auto") {
-            None
+        let count_by =
+            i32::try_from(whole("by", i64::from(i32::MAX))?).expect("validated within i32");
+        // From text is parsed only when its distance will be written, so a
+        // saved distance at the extreme of the range never blocks an OK
+        // that keeps it (its two-decimal display would overflow i32 twips).
+        // The inch value is checked non-negative before it is rounded to
+        // twips, so -0.0001 (which would round to 0) is refused too.
+        let distance = if from_changed {
+            if is_on(d, "auto") {
+                None
+            } else {
+                let inches: f64 = text_of(d, "from")
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|v: &f64| v.is_finite())
+                    .ok_or_else(|| format!("{} takes a number", label("from")))?;
+                if inches < 0.0 {
+                    return Err(format!("{} cannot be negative", label("from")));
+                }
+                let tw = (inches * TWIPS_PER_INCH as f64).round();
+                if tw > f64::from(i32::MAX) {
+                    return Err(format!("{} is too large", label("from")));
+                }
+                Some(tw as i32)
+            }
         } else {
-            let inches: f64 = text_of(d, "from")
-                .trim()
-                .parse()
-                .ok()
-                .filter(|v: &f64| v.is_finite())
-                .ok_or_else(|| format!("{} takes a number", label("from")))?;
-            if inches < 0.0 {
-                return Err(format!("{} cannot be negative", label("from")));
-            }
-            let tw = (inches * TWIPS_PER_INCH as f64).round();
-            if tw > f64::from(i32::MAX) {
-                return Err(format!("{} is too large", label("from")));
-            }
-            Some(tw as i32)
+            None
         };
         let start = i32::try_from(start_at - 1).expect("validated within i32");
         (
@@ -519,9 +530,67 @@ mod tests {
         set(&mut t, "auto", Json::Bool(false));
         set(&mut t, "from", s("2000000"));
         let e = ok(&mut t).unwrap_err();
-        assert!(e.contains("From text") && e.contains("too large"), "{e}");
+        assert!(
+            e.contains("From text") && e.contains("too large"),
+            "{e}"
+        );
         assert!(t.dialogs.top().is_some(), "the dialog stays open");
         assert!(!t.dirty);
+    }
+
+    /// FIX r3 Minor: over the upper bound refuses with "too large", not the
+    /// "1 or more" message the value already satisfies.
+    #[test]
+    fn over_the_upper_bound_says_too_large() {
+        for (control, value, label) in [
+            ("by", "3000000000", "Count by"),
+            ("start", "2147483649", "Start at"),
+        ] {
+            let mut t = three_sections();
+            open(&mut t);
+            set(&mut t, "add", Json::Bool(true));
+            set(&mut t, control, s(value));
+            let e = ok(&mut t).unwrap_err();
+            assert!(
+                e.contains(label) && e.contains("too large"),
+                "{control} {value}: {e}"
+            );
+            assert!(t.dialogs.top().is_some(), "the dialog stays open");
+            assert!(!t.dirty);
+        }
+    }
+
+    /// FIX r3 Immaterial: From text is parsed only when its distance will be
+    /// written, so an extreme saved distance never blocks an OK that keeps
+    /// it (its rounded display would overflow i32 twips).
+    #[test]
+    fn an_extreme_saved_distance_never_blocks_ok() {
+        let mut t = three_sections();
+        give(
+            &mut t,
+            1,
+            Some(ln(1, None, Some(i32::MAX), LnRestart::NewPage)),
+        );
+        let before = ed(&t).sections();
+        open(&mut t);
+        ok(&mut t).unwrap();
+        assert!(!t.dirty, "an untouched OK keeps the saved distance");
+        assert_eq!(ed(&t).sections(), before);
+
+        let mut t = three_sections();
+        give(
+            &mut t,
+            1,
+            Some(ln(1, None, Some(i32::MAX), LnRestart::NewPage)),
+        );
+        open(&mut t);
+        set(&mut t, "by", s("2"));
+        ok(&mut t).unwrap();
+        assert_eq!(
+            setups(&t)[1].line_numbers,
+            Some(ln(2, None, Some(i32::MAX), LnRestart::NewPage)),
+            "Count by alone keeps the saved distance"
+        );
     }
 
     /// Criterion 6: Whole document edits every section, as one undo step.
