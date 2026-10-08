@@ -470,8 +470,27 @@ turned to spaces — and Ctrl+X copies it, then clears whichever of Name,
 Predecessors and Resource Names the range covers, as one undo step; Ctrl+V
 pastes from the range's top-left. With 2+ rows selected, Ctrl+F2 links the tasks
 finish-to-start in row order and Ctrl+Shift+F2 unlinks them, each one undo
-step, the selection kept (#558). Pasting whole rows so that it inserts tasks
-is not done yet (its own issue).
+step, the selection kept (#558).
+
+Whole rows paste as new tasks (#1100). A Ctrl+C of a range across every column
+(the ID cells' row selection) also keeps the tasks; while the system clipboard
+still holds that copy's text, Ctrl+V inserts them above the cursor row (above
+the range's top row; appended from the entry row) instead of overwriting
+cells, as one undo step, and the cursor goes to the first new task. A new
+task has a fresh UID and ID, the copied task's fields and outline depth
+(the shallowest copied row takes the level a task added there takes and every
+row keeps its depth below it; deeper than 20 is refused), and a collapsed summary brings its hidden subtasks.
+Rows before the shallowest copied row can make the task above the paste a
+summary of the copies. Predecessors inside the copied rows follow the copies
+and the others are dropped. Baselines, recorded progress, the GUID, WBS code,
+stored dates (except a manual task's pin and an external placeholder's dates,
+which stay), custom field and outline code values, and work and cost totals are not
+carried. Assignments are cloned (a Cost resource's entered cost kept); in
+another plan they follow the resource of the same name, and ones without it are
+dropped, which the status says; a task calendar follows its name too, else the
+task takes the plan's default.
+Another copy, a Cut, a cell editor's copy or another app's clipboard text
+ends it, and the paste overwrites cells as before.
 
 A summary's subtasks can be hidden and shown again, as in Project: View › Data
 › Show Subtasks / Hide Subtasks (Alt+Shift+Plus / Alt+Shift+Minus; yppxy `+` or
