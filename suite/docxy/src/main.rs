@@ -4567,6 +4567,9 @@ struct Docxy {
     // The spreadsheet clipboard: a rectangular block of cells from the last grid
     // copy/cut, pasted at the selection on Ctrl+V.
     grid_clip: Option<GridClip>,
+    /// The Project tasks of the last whole-rows copy (#1100); Paste inserts
+    /// them while the clipboard still holds that copy's text.
+    project_rows_clip: Option<ProjectRowsClip>,
     /// The text clipboard: the OS one, or a private one in a harness.
     clipboard: ClipboardStore,
     // Open sheet colour-swatch picker (fill or font), None = closed.
@@ -11295,6 +11298,7 @@ impl Docxy {
             zoom: 1.0,
             ruler_guide: None,
             grid_clip: None,
+            project_rows_clip: None,
             clipboard: ClipboardStore::shared(windows::shared_clipboard_text(cx)),
             sheet_pick: None,
             sheet_rename: None,

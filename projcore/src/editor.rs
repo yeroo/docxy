@@ -609,8 +609,11 @@ impl Editor {
             .checked_add(count - 1)
             .ok_or("No task IDs available")?;
         let new_uids: Vec<i32> = (first..=last).collect();
-        let new_of: std::collections::HashMap<i32, i32> =
-            rows.iter().map(|t| t.uid).zip(new_uids.iter().copied()).collect();
+        let new_of: std::collections::HashMap<i32, i32> = rows
+            .iter()
+            .map(|t| t.uid)
+            .zip(new_uids.iter().copied())
+            .collect();
         // The shallowest row takes `target`; a row never nests more than one
         // level below the one above it, whatever the copy started with.
         let mut levels: Vec<u32> = Vec::with_capacity(rows.len());
@@ -626,13 +629,21 @@ impl Editor {
             return Err("Pasted rows would nest deeper than 20 levels".into());
         }
         let calendars: Vec<i32> = self.proj.calendars.iter().map(|c| c.uid).collect();
-        let mut next_aid = self.proj.assignments.iter().map(|a| a.uid).max().unwrap_or(0);
+        let mut next_aid = self
+            .proj
+            .assignments
+            .iter()
+            .map(|a| a.uid)
+            .max()
+            .unwrap_or(0);
         let mut made = Vec::new();
         for a in assignments {
             let Some(&task_uid) = new_of.get(&a.task_uid) else {
                 continue;
             };
-            next_aid = next_aid.checked_add(1).ok_or("No assignment IDs available")?;
+            next_aid = next_aid
+                .checked_add(1)
+                .ok_or("No assignment IDs available")?;
             made.push(Assignment {
                 uid: next_aid,
                 task_uid,
@@ -657,10 +668,9 @@ impl Editor {
                     .predecessors
                     .iter()
                     .filter_map(|p| {
-                        new_of.get(&p.uid).map(|&uid| Predecessor {
-                            uid,
-                            ..p.clone()
-                        })
+                        new_of
+                            .get(&p.uid)
+                            .map(|&uid| Predecessor { uid, ..p.clone() })
                     })
                     .collect(),
                 calendar_uid: t.calendar_uid.filter(|c| calendars.contains(c)),
@@ -3169,22 +3179,40 @@ mod tests {
         let mut ed = outline_editor();
         let rows = ed.project().tasks[1..3].to_vec();
         let mut new = Vec::new();
-        assert_edit(&mut ed, |e| new = e.insert_tasks(Some(4), &rows, &[]).unwrap());
+        assert_edit(&mut ed, |e| {
+            new = e.insert_tasks(Some(4), &rows, &[]).unwrap()
+        });
         assert_eq!(new, [5, 6]);
         let names: Vec<_> = ed.project().tasks.iter().map(|t| &*t.name).collect();
         assert_eq!(names, ["A", "B", "C", "B", "C", "D"]);
-        let (b, c, d) = (&ed.project().tasks[3], &ed.project().tasks[4], &ed.project().tasks[5]);
+        let (b, c, d) = (
+            &ed.project().tasks[3],
+            &ed.project().tasks[4],
+            &ed.project().tasks[5],
+        );
         // Above D (a top-level task after a leaf): the block's top takes D's
         // level, as a task added there would; B and C were siblings.
-        assert_eq!((b.outline_level, c.outline_level, d.outline_level), (2, 2, 1));
+        assert_eq!(
+            (b.outline_level, c.outline_level, d.outline_level),
+            (2, 2, 1)
+        );
         assert_eq!((b.uid, b.id, c.uid), (5, 5, 6));
         assert_eq!(b.notes.as_deref(), Some("note"));
         assert_eq!(b.duration_min, 480);
         // History and source-project state do not come along.
-        assert_eq!((b.percent_complete, &b.guid, b.baselines.len()), (None, &None, 0));
+        assert_eq!(
+            (b.percent_complete, &b.guid, b.baselines.len()),
+            (None, &None, 0)
+        );
         // The link inside the block follows the copy; D keeps its own.
-        assert_eq!(c.predecessors.iter().map(|p| p.uid).collect::<Vec<_>>(), [5]);
-        assert_eq!(d.predecessors.iter().map(|p| p.uid).collect::<Vec<_>>(), [3]);
+        assert_eq!(
+            c.predecessors.iter().map(|p| p.uid).collect::<Vec<_>>(),
+            [5]
+        );
+        assert_eq!(
+            d.predecessors.iter().map(|p| p.uid).collect::<Vec<_>>(),
+            [3]
+        );
         let uids: std::collections::HashSet<_> = ed.project().tasks.iter().map(|t| t.uid).collect();
         assert_eq!(uids.len(), 6);
     }
@@ -3213,7 +3241,10 @@ mod tests {
         // nothing, so it nests one below the row above it, not two.
         let rows = vec![ed.project().tasks[3].clone(), ed.project().tasks[1].clone()];
         ed.insert_tasks(Some(1), &rows, &[]).unwrap();
-        let levels: Vec<_> = ed.project().tasks[..2].iter().map(|t| t.outline_level).collect();
+        let levels: Vec<_> = ed.project().tasks[..2]
+            .iter()
+            .map(|t| t.outline_level)
+            .collect();
         assert_eq!(levels, [1, 2]);
         // Under a summary at the top of the plan the block nests as deep as
         // the first child there; 20 is the limit.
@@ -3238,7 +3269,10 @@ mod tests {
         child.uid = 10;
         child.outline_level = 20;
         let result = deep.insert_tasks(Some(9), &[row, child], &[]);
-        assert_eq!(result, Err("Pasted rows would nest deeper than 20 levels".into()));
+        assert_eq!(
+            result,
+            Err("Pasted rows would nest deeper than 20 levels".into())
+        );
         assert_eq!(deep.project(), &before);
         assert_eq!(deep.undo_depth(), 0);
     }

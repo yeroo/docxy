@@ -172,6 +172,44 @@ test a click on the ID cell selects the whole row, and drags whole rows
   assert reply.tasks.3.name is B
   assert reply.tasks.2.duration_days is 2
 
+test pasting whole rows inserts them above the cursor row in one undo step (#1100)
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"A1"}
+  key ctrl+c
+  call click-cell {"cell":"C2"}
+  key ctrl+v
+  assert tasks is 3
+  call task.list {}
+  assert reply.tasks.0.name is A
+  assert reply.tasks.1.name is A
+  assert reply.tasks.2.name is B
+  assert reply.tasks.1.duration_days is 2
+  call status-read {}
+  assert reply.items.2.text is Pasted 1 row
+  key ctrl+z
+  assert tasks is 2
+  call task.list {}
+  assert reply.tasks.1.name is B
+
+test a partial copy or another copy on the clipboard still overwrites cells (#1100)
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"A1"}
+  key ctrl+c
+  call clipboard {"action":"write","text":"X\n"}
+  call click-cell {"cell":"C2"}
+  key ctrl+v
+  assert tasks is 2
+  call task.list {}
+  assert reply.tasks.1.name is X
+  # A name cell's copy is not a whole row either.
+  call click-cell {"cell":"C1"}
+  key ctrl+c
+  call click-cell {"cell":"C2"}
+  key ctrl+v
+  assert tasks is 2
+  call task.list {}
+  assert reply.tasks.1.name is A
+
 test ctrl+f2 links the selected rows and ctrl+shift+f2 unlinks them
   open copy:../fixtures/project-clipboard.xml
   call click-cell {"cell":"A1"}

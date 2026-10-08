@@ -596,3 +596,203 @@ fn whole_rows_copy_and_paste_back_from_the_id_column() {
         t.status
     );
 }
+
+// ---- Pasting whole rows inserts tasks (#1100) ----
+
+/// What Ctrl+C on the selection does to the app: the TSV the clipboard gets
+/// and the whole-rows clip beside it.
+fn copy_rows(t: &DocTab) -> (String, Option<ProjectRowsClip>) {
+    let text = project_copy_text(v(t));
+    let clip = project_rows_clip(v(t), &text);
+    (text, clip)
+}
+/// Select task rows `from..=to` as dragging down the ID cells does.
+fn select_rows(t: &mut DocTab, from: usize, to: usize) {
+    project_cell_press(t, from, COL_ID, false);
+    project_cell_drag_over(t, to, COL_ID);
+}
+/// A click elsewhere: the range is gone and the cursor is on the cell.
+fn unselect_at(t: &mut DocTab, row: usize, col: usize) {
+    vm(t).anchor = None;
+    at(t, row, col);
+}
+fn names(t: &DocTab) -> Vec<String> {
+    tasks(t).into_iter().map(|t| t.1).collect()
+}
+
+#[test]
+fn whole_rows_paste_above_the_cursor_row_as_one_undo_step() {
+    let mut t = tab();
+    vm(&mut t).ed.assign_resource(1, "Ann").unwrap();
+    project_cell_press(&mut t, 0, COL_ID, false);
+    let (text, clip) = copy_rows(&t);
+    let clip = clip.expect("a row selected by its ID cell is a whole row");
+    assert!(clip.live(&text) && clip.live(&text.replace('\n', "\r\n")));
+    assert!(!clip.live("something else"));
+    let before = v(&t).ed.project().clone();
+    let depth = v(&t).ed.undo_depth();
+    unselect_at(&mut t, 1, COL_DURATION);
+    paste_project_rows(&mut t, &clip);
+    // Above B: nothing is overwritten.
+    assert_eq!(names(&t), ["A", "A", "B"]);
+    assert_eq!(v(&t).ed.project().tasks[1].duration_min, 960);
+    assert_eq!(v(&t).ed.project().tasks[1].uid, 3);
+    assert_eq!(t.status.to_string(), "Pasted 1 row");
+    assert_eq!(v(&t).ed.project().assignments.len(), 2);
+    assert_eq!(
+        (v(&t).ed.sel(), v(&t).entry, v(&t).selection()),
+        (1, false, None)
+    );
+    assert!(t.dirty);
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    undo(&mut t);
+    assert_eq!(v(&t).ed.project(), &before);
+}
+
+#[test]
+fn several_whole_rows_paste_from_the_entry_row_as_appended_tasks() {
+    let mut t = tab();
+    select_rows(&mut t, 0, 1);
+    let (_, clip) = copy_rows(&t);
+    unselect_at(&mut t, 2, COL_NAME);
+    assert!(v(&t).on_entry_row());
+    paste_project_rows(&mut t, &clip.unwrap());
+    assert_eq!(names(&t), ["A", "B", "A", "B"]);
+    assert_eq!(t.status.to_string(), "Pasted 2 rows");
+    assert_eq!((v(&t).entry, v(&t).ed.sel()), (false, 2));
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    undo(&mut t);
+    assert_eq!(names(&t), ["A", "B"]);
+    apply_project_act(&mut t, ProjectAct::Redo);
+    assert_eq!(names(&t), ["A", "B", "A", "B"]);
+}
+
+#[test]
+fn only_a_range_across_every_column_is_a_whole_row_copy() {
+    let mut t = tab();
+    // A cell, a partial range, and the range up to the last column only.
+    unselect_at(&mut t, 0, COL_NAME);
+    assert!(copy_rows(&t).1.is_none());
+    vm(&mut t).extend_selection("right");
+    assert!(v(&t).selection().is_some());
+    assert!(copy_rows(&t).1.is_none());
+    at(&mut t, 0, COL_ID);
+    vm(&mut t).anchor = Some((v(&t).ed.project().tasks[0].uid, COL_ID));
+    vm(&mut t).col = COLUMN_COUNT - 1;
+    vm(&mut t).ed.select(1);
+    assert!(copy_rows(&t).1.is_some(), "ID..last column is whole rows");
+    vm(&mut t).col = COLUMN_COUNT - 2;
+    assert!(copy_rows(&t).1.is_none());
+}
+
+#[test]
+fn a_whole_row_copy_keeps_links_inside_the_block_only() {
+    let mut t = tab();
+    // A, B, C; B links to A, C to B.
+    vm(&mut t).ed.add_task(None, "C", 480, false).unwrap();
+    vm(&mut t)
+        .ed
+        .add_link(2, projcore::Predecessor::fs(1))
+        .unwrap();
+    vm(&mut t)
+        .ed
+        .add_link(3, projcore::Predecessor::fs(2))
+        .unwrap();
+    // B and C: B's predecessor A is outside the copy.
+    select_rows(&mut t, 1, 2);
+    let (_, clip) = copy_rows(&t);
+    unselect_at(&mut t, 3, COL_NAME);
+    paste_project_rows(&mut t, &clip.unwrap());
+    let p = v(&t).ed.project();
+    let pasted: Vec<_> = p.tasks[3..]
+        .iter()
+        .map(|t| {
+            (
+                t.name.as_str(),
+                t.predecessors.iter().map(|p| p.uid).collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    assert_eq!(pasted, [("B", vec![]), ("C", vec![p.tasks[3].uid])]);
+}
+
+#[test]
+fn a_collapsed_summary_copies_with_its_hidden_subtree() {
+    let mut t = tab();
+    vm(&mut t).ed.add_task(Some(1), "Sub", 480, false).unwrap();
+    vm(&mut t).ed.indent(3, 1).unwrap();
+    // A over Sub, then B.
+    assert_eq!(vm(&mut t).ed.set_collapsed(1, true), Ok(true));
+    project_cell_press(&mut t, 0, COL_ID, false);
+    let (_, clip) = copy_rows(&t);
+    unselect_at(&mut t, 2, COL_NAME);
+    paste_project_rows(&mut t, &clip.unwrap());
+    assert_eq!(names(&t), ["A", "Sub", "A", "Sub", "B"].map(String::from));
+    assert_eq!(t.status.to_string(), "Pasted 2 rows");
+}
+
+#[test]
+fn another_plans_resources_map_by_name_and_unmatched_assignments_drop() {
+    let mut src = tab();
+    for name in ["Ann", "Bob"] {
+        vm(&mut src).ed.assign_resource(1, name).unwrap();
+    }
+    project_cell_press(&mut src, 0, COL_ID, false);
+    let clip = copy_rows(&src).1.unwrap();
+    let mut dst = tab();
+    // The target has Bob only, under a uid the source's Bob does not have.
+    vm(&mut dst).ed.assign_resource(2, "Bob").unwrap();
+    let bob = v(&dst).ed.project().resources[0].uid;
+    unselect_at(&mut dst, 1, COL_NAME);
+    paste_project_rows(&mut dst, &clip);
+    assert_eq!(
+        t_status(&dst),
+        "Pasted 1 row; 1 resource assignment dropped"
+    );
+    let p = v(&dst).ed.project();
+    let new = p.tasks[1].uid;
+    let on_new: Vec<_> = p
+        .assignments
+        .iter()
+        .filter(|a| a.task_uid == new)
+        .map(|a| a.resource_uid)
+        .collect();
+    assert_eq!(on_new, [bob]);
+    assert_eq!(p.resources.len(), 1, "no resource is added");
+}
+fn t_status(t: &DocTab) -> String {
+    t.status.to_string()
+}
+
+#[test]
+fn a_paste_that_cannot_apply_changes_nothing() {
+    // A chain of three levels, copied into a plan whose last task is at 19.
+    let mut src = tab();
+    vm(&mut src).ed.add_task(None, "C", 480, false).unwrap();
+    vm(&mut src).ed.indent(2, 1).unwrap();
+    vm(&mut src).ed.indent(3, 2).unwrap();
+    select_rows(&mut src, 0, 2);
+    let clip = copy_rows(&src).1.unwrap();
+    let mut dst = tab();
+    let mut p = v(&dst).ed.project().clone();
+    p.tasks = (1..=19)
+        .map(|n| Task {
+            uid: n,
+            id: n,
+            name: format!("T{n}"),
+            outline_level: n as u32,
+            duration_min: 480,
+            ..Task::default()
+        })
+        .collect();
+    dst.surface = Surface::Project(ProjectView::new(p, false));
+    unselect_at(&mut dst, 19, COL_NAME);
+    let before = v(&dst).ed.project().clone();
+    paste_project_rows(&mut dst, &clip);
+    assert_eq!(v(&dst).ed.project(), &before);
+    assert_eq!(v(&dst).ed.undo_depth(), 0);
+    assert_eq!(
+        t_status(&dst),
+        "Pasted rows would nest deeper than 20 levels"
+    );
+}

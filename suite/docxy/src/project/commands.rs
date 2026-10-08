@@ -1833,14 +1833,25 @@ impl Docxy {
         if act == ProjectAct::Paste {
             let now = self.clipboard_read(cx);
             if let (Some(tab), Some(text)) = (self.tabs.get_mut(self.active), now.text()) {
-                paste_project_text(tab, text);
+                // Whole rows copied here insert as tasks while the clipboard
+                // still holds that copy's text (#1100); anything else
+                // overwrites cells from the cursor.
+                match self.project_rows_clip.clone().filter(|c| c.live(text)) {
+                    Some(clip) => paste_project_rows(tab, &clip),
+                    None => paste_project_text(tab, text),
+                }
             }
             return;
         }
+        // Any new copy or cut ends the previous whole-rows copy.
+        self.project_rows_clip = None;
         let Some(Surface::Project(v)) = self.tabs.get(self.active).map(|t| &t.surface) else {
             return;
         };
         let text = project_copy_text(v);
+        if act == ProjectAct::Copy {
+            self.project_rows_clip = project_rows_clip(v, &text);
+        }
         self.clipboard_write(text, cx);
         // A sheet pastes its own clipboard first; this copy is newer.
         self.grid_clip = None;
@@ -1856,6 +1867,10 @@ impl Docxy {
     /// Paste inserts the clipboard's text at the caret. The edit stays open;
     /// the project, its undo stack and its dirty flag are untouched.
     fn project_cell_clipboard(&mut self, act: ProjectAct, cx: &mut Context<Self>) {
+        if act != ProjectAct::Paste {
+            // The buffer is on the clipboard now: the rows copied before are not.
+            self.project_rows_clip = None;
+        }
         if act == ProjectAct::Paste {
             let now = self.clipboard_read(cx);
             if let (Some(tab), Some(text)) = (self.tabs.get_mut(self.active), now.text())

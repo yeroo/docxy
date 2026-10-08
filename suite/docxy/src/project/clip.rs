@@ -8,6 +8,12 @@
 //! overwritten, blank rows and the entry row become tasks, no row is
 //! inserted, and the whole paste is one undo step. The host moves the text
 //! to and from the system clipboard.
+//!
+//! Whole rows (#1100): a copy of a range covering every column, as a click
+//! on an ID cell selects (#560), also records the rows as tasks
+//! ([`ProjectRowsClip`]). While the system clipboard still holds the text
+//! that copy wrote, Paste inserts those tasks above the cursor row instead
+//! of overwriting cells, as Project does, as one undo step.
 use super::*;
 
 /// The clipboard's text: the range's TSV when one is selected, else the
@@ -49,6 +55,150 @@ pub(crate) fn project_copy_text(v: &ProjectView) -> String {
         project_row(&v.ed, task)[v.col].clone()
     } else {
         cell_edit_text(&v.ed, task, v.col)
+    }
+}
+
+/// Tasks copied as whole rows: the rows' tasks (a collapsed summary's hidden
+/// subtree with it), their assignments, and the names of the resources those
+/// name, since another plan's resource UIDs mean other resources. They are
+/// snapshots taken at copy time, so an edit to the source plan does not touch
+/// them. `text` is what the copy wrote to the system clipboard: the clip is
+/// live only while the clipboard still holds it (see [`Self::live`]).
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectRowsClip {
+    text: String,
+    tasks: Vec<Task>,
+    assignments: Vec<projcore::Assignment>,
+    resources: Vec<(i32, String)>,
+}
+
+impl ProjectRowsClip {
+    /// Whether the clipboard's `text` is still the copy this clip recorded
+    /// (a clipboard round trip may turn `\n` into `\r\n`).
+    pub fn live(&self, text: &str) -> bool {
+        text.replace("\r\n", "\n") == self.text
+    }
+}
+
+/// The whole-rows clip of the selected range, when it spans every column.
+/// Blank rows are skipped. `text` is the clipboard text the copy writes.
+pub(crate) fn project_rows_clip(v: &ProjectView, text: &str) -> Option<ProjectRowsClip> {
+    let sel = v.selection()?;
+    if *sel.cols.start() != COL_ID || *sel.cols.end() != COLUMN_COUNT - 1 {
+        return None;
+    }
+    let proj = v.ed.project();
+    let mut picked: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    for &uid in &sel.uids {
+        let Some(i) = proj.tasks.iter().position(|t| t.uid == uid) else {
+            continue;
+        };
+        picked.insert(uid);
+        if v.ed.is_collapsed(uid) {
+            // The rows a collapsed summary hides are part of the row.
+            let level = proj.tasks[i].outline_level;
+            picked.extend(
+                proj.tasks[i + 1..]
+                    .iter()
+                    .filter(|t| !t.is_null)
+                    .take_while(|t| t.outline_level > level)
+                    .map(|t| t.uid),
+            );
+        }
+    }
+    let tasks: Vec<Task> = proj
+        .tasks
+        .iter()
+        .filter(|t| !t.is_null && picked.contains(&t.uid))
+        .cloned()
+        .collect();
+    if tasks.is_empty() {
+        return None;
+    }
+    let assignments: Vec<projcore::Assignment> = proj
+        .assignments
+        .iter()
+        .filter(|a| tasks.iter().any(|t| t.uid == a.task_uid))
+        .cloned()
+        .collect();
+    let resources = proj
+        .resources
+        .iter()
+        .filter(|r| assignments.iter().any(|a| a.resource_uid == r.uid))
+        .map(|r| (r.uid, r.name.clone()))
+        .collect();
+    Some(ProjectRowsClip {
+        text: text.replace("\r\n", "\n"),
+        tasks,
+        assignments,
+        resources,
+    })
+}
+
+/// Paste whole rows as new tasks above the cursor row (above the range's top
+/// row when one is selected; appended from the entry row), as one undo step.
+/// An assignment follows its resource into another plan by name; one whose
+/// resource that plan lacks is dropped, and the status says how many. The
+/// cursor goes to the first new task. A paste that cannot apply changes
+/// nothing and says why.
+pub(crate) fn paste_project_rows(tab: &mut DocTab, clip: &ProjectRowsClip) {
+    let Surface::Project(v) = &mut tab.surface else {
+        return;
+    };
+    let before = if v.on_entry_row() {
+        None
+    } else if let Some(sel) = v.selection() {
+        sel.uids.first().copied()
+    } else {
+        v.selected_uid()
+    };
+    v.anchor = None;
+    let resources = v.ed.project().resources.clone();
+    let mut dropped = 0;
+    let mut assignments = Vec::new();
+    for a in &clip.assignments {
+        let name = clip
+            .resources
+            .iter()
+            .find(|(uid, _)| *uid == a.resource_uid)
+            .map(|(_, name)| name.as_str())
+            .unwrap_or_default();
+        // The same resource in the same plan, else one of that name.
+        let same = |r: &&projcore::Resource| r.name.eq_ignore_ascii_case(name);
+        let target = resources
+            .iter()
+            .find(|r| r.uid == a.resource_uid && same(r))
+            .or_else(|| resources.iter().find(same));
+        match target {
+            Some(r) => assignments.push(projcore::Assignment {
+                resource_uid: r.uid,
+                ..a.clone()
+            }),
+            None => dropped += 1,
+        }
+    }
+    match v.ed.insert_tasks(before, &clip.tasks, &assignments) {
+        Ok(new) => {
+            let n = new.len();
+            let mut status = format!("Pasted {n} row{}", if n == 1 { "" } else { "s" });
+            if dropped > 0 {
+                status += &format!(
+                    "; {dropped} resource assignment{} dropped",
+                    if dropped == 1 { "" } else { "s" }
+                );
+            }
+            tab.status = status.into();
+            if let Some(index) = new
+                .first()
+                .and_then(|&uid| v.ed.project().tasks.iter().position(|t| t.uid == uid))
+            {
+                // As typing into the entry row does: the cursor goes to the task.
+                v.entry = false;
+                v.ed.select(index);
+            }
+            complete_project(tab, true);
+        }
+        Err(e) => tab.status = e.into(),
     }
 }
 
