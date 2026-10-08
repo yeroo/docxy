@@ -21,10 +21,17 @@
   registers `text_input`'s `EntityInputHandler`, which replays a commit of the
   key's own text as that key and types composed text as keys into `on_key`;
   marked text types nothing. While KeyTips or a menu is up (and no dialog is
-  open), letters stay with `on_key`. The handler is macOS-only (Windows and
-  Linux would hand it every character `on_key` already typed), and off macOS
-  the root never stops a key's propagation: a handled key-down on Windows is
-  never translated (#1072).
+  open), letters stay with `on_key`. Off macOS the root never stops a key's
+  propagation: a handled key-down on Windows is never translated (#1072).
+- Windows registers the handler too, for WM_CHAR only (#1139): Unicode-packet
+  text (`SendInput` `KEYEVENTF_UNICODE`, a `VK_PACKET` key-down gpui drops)
+  arrives nowhere else. Each key-down `on_key` typed owes its WM_CHAR
+  characters (`owed_chars`: printable, no Win, no Alt without Ctrl) and the
+  handler drops that many; the key-up clears the rest (a dead key). The
+  handler's `accepts_text_input` is false there, so the Windows IME stays off.
+  Linux registers none (it would get every key `on_key` typed). The harness's
+  `win-char` sends WM_CHAR, and `real-type`'s `"wm_char":true` (always on
+  Windows) replays each typed key's twin.
 
 ## macOS menu bar (#1071)
 

@@ -23,25 +23,45 @@
 //! it saw before. A composed commit ("é", a CJK phrase) arrives as one typed
 //! key per character. Marked text inserts nothing until it is committed.
 //!
-//! The handler is registered on macOS only: Windows sends every WM_CHAR to a
-//! registered handler and Linux every unhandled printable key, and `on_key`
-//! has already typed those. Off macOS the root also leaves every key
-//! propagating, as it always has: on Windows a handled key-down is never
-//! translated, which would lose WM_CHAR and the system's Alt+F4 and Alt+Space.
-//! Everything else here builds everywhere, and [`route`] takes the platform
-//! as an argument, so the macOS rules are tested on every CI leg.
+//! Windows registers the handler too, for WM_CHAR alone (#1139). Text sent as
+//! Unicode keyboard input (`SendInput` with `KEYEVENTF_UNICODE`: password
+//! managers' auto-type, AutoHotkey, on-screen keyboards) arrives as a
+//! `VK_PACKET` key-down, which gpui reports as no key at all, and then a
+//! WM_CHAR, which reaches nothing but the handler. A real key's key-down has
+//! already been typed by `on_key`, and its WM_CHAR follows it, so the root
+//! counts the characters each key-down owes ([`owed_chars`]) and the handler
+//! drops that many WM_CHAR characters before it types the rest. The key's
+//! key-up clears what is still owed (a dead key, whose WM_DEADCHAR is no
+//! WM_CHAR): TranslateMessage posts WM_CHAR while the key-down is handled,
+//! so it is always handled before the key-up, while a packet's key-up never
+//! reaches the app. The handler never accepts text input there
+//! ([`accepts_text_input`]), so the Windows IME stays off as it was.
+//!
+//! Linux registers no handler: it would hand it every unhandled printable
+//! key, which `on_key` has already typed. Off macOS the root also leaves
+//! every key propagating, as it always has: on Windows a handled key-down is
+//! never translated, which would lose WM_CHAR and the system's Alt+F4 and
+//! Alt+Space. Everything else here builds everywhere, and [`route`] and
+//! [`owed_chars`] take what they need as arguments, so the macOS and Windows
+//! rules are tested on every CI leg.
 
 use std::ops::Range;
 
 use gpui::{
-    Bounds, Context, EntityInputHandler, KeyDownEvent, Keystroke, Modifiers, Pixels, PlatformInput,
-    Point, UTF16Selection, Window,
+    Bounds, Context, EntityInputHandler, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, Pixels,
+    PlatformInput, Point, UTF16Selection, Window,
 };
 
 use crate::Docxy;
 
-/// Whether this build registers the input handler and defers keys to it.
+/// Whether this build defers keys to the input handler.
 pub(crate) const MACOS: bool = cfg!(target_os = "macos");
+
+/// Whether this build takes WM_CHAR text through the input handler (#1139).
+pub(crate) const WINDOWS: bool = cfg!(target_os = "windows");
+
+/// Whether this build registers the input handler at all.
+pub(crate) const HANDLER: bool = MACOS || WINDOWS;
 
 /// Where the window root sends a key-down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +119,32 @@ pub(crate) fn takes_text(dialog_open: bool, keytips_up: bool, menu_open: bool) -
     dialog_open || (!keytips_up && !menu_open)
 }
 
+/// Whether the handler tells the platform it takes text input. gpui turns an
+/// input method on for a handler that does, and on Windows that IME (its
+/// composition through WM_IME_*) is not supported yet, so only macOS does.
+pub(crate) fn accepts_text_input(macos: bool, takes_text: bool) -> bool {
+    macos && takes_text
+}
+
+/// How many characters of WM_CHAR a Windows key-down `on_key` has typed will
+/// send (#1139): those of its printable text, or none. Alt alone makes
+/// WM_SYSCHAR, not WM_CHAR (AltGr is Ctrl+Alt, which does), and the system
+/// takes Win chords. A dead key's accent is counted, though it makes no
+/// WM_CHAR, and its key-up clears it: gpui flags it as preferring character
+/// input exactly as it flags every AltGr character, so that flag cannot tell
+/// them apart. "´" then X owes two: the accent and the letter come as two
+/// WM_CHARs.
+pub(crate) fn owed_chars(keystroke: &Keystroke) -> usize {
+    let m = &keystroke.modifiers;
+    if m.platform || (m.alt && !m.control) {
+        return 0;
+    }
+    match keystroke.key_char.as_deref() {
+        Some(text) if !text.chars().any(char::is_control) => text.chars().count(),
+        _ => 0,
+    }
+}
+
 /// The text AppKit would commit for a key event the root may defer: what the
 /// harness's queued real input types for itself, since it never reaches
 /// AppKit. `None` for any other event, and for every event off macOS. It
@@ -109,6 +155,19 @@ pub(crate) fn deferred_text(event: &PlatformInput) -> Option<String> {
         PlatformInput::KeyDown(ev)
             if route(&ev.keystroke, ev.is_held, MACOS, true) == Route::Defer =>
         {
+            ev.keystroke.key_char.clone()
+        }
+        _ => None,
+    }
+}
+
+/// The text of the WM_CHAR Windows posts for a key event `on_key` typed: what
+/// the harness's queued real input sends the handler when `windows`, since it
+/// never passes through the window procedure. `None` for any other event, and
+/// for a key that owes no WM_CHAR ([`owed_chars`]).
+pub(crate) fn char_message_text(event: &PlatformInput, windows: bool) -> Option<String> {
+    match event {
+        PlatformInput::KeyDown(ev) if windows && owed_chars(&ev.keystroke) > 0 => {
             ev.keystroke.key_char.clone()
         }
         _ => None,
@@ -151,7 +210,8 @@ fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
 
-/// The composition in progress and the key AppKit has been handed.
+/// The composition in progress and the key AppKit has been handed, and on
+/// Windows the WM_CHAR characters a typed key still owes.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ImeState {
     /// The provisional text (`setMarkedText:`), shown nowhere yet; `None`
@@ -162,6 +222,9 @@ pub(crate) struct ImeState {
     /// input context takes first, during a composition, does not clear it,
     /// and `mark` has by then.)
     pending: Option<KeyDownEvent>,
+    /// Windows: the WM_CHAR characters the last key-down `on_key` typed
+    /// will still send, which the handler drops (#1139).
+    owed: usize,
 }
 
 impl ImeState {
@@ -173,6 +236,35 @@ impl ImeState {
     /// A key went to `on_key`: whatever AppKit commits next is not its text.
     pub(crate) fn forget_key(&mut self) {
         self.pending = None;
+    }
+
+    /// Windows: a key-down reached `on_key`; its WM_CHAR is on the way. Any
+    /// count left from the key before is settled by now.
+    pub(crate) fn key_down(&mut self, keystroke: &Keystroke) {
+        self.owed = owed_chars(keystroke);
+    }
+
+    /// Windows: a key-up, after the key's own WM_CHAR. What it still owes
+    /// will never come (a dead key's accent).
+    pub(crate) fn key_up(&mut self) {
+        self.owed = 0;
+    }
+
+    /// Windows' WM_CHAR (a surrogate pair joined by gpui): the key events
+    /// that type what no key-down typed already, one per character. Empty
+    /// text (an IME message gpui forwards) changes nothing.
+    pub(crate) fn char_message(&mut self, text: &str) -> Vec<KeyDownEvent> {
+        let skip = self.owed.min(text.chars().count());
+        self.owed -= skip;
+        text.chars()
+            .skip(skip)
+            .filter_map(char_stroke)
+            .map(typed)
+            .collect()
+    }
+
+    pub(crate) fn owed(&self) -> usize {
+        self.owed
     }
 
     pub(crate) fn marked(&self) -> Option<&str> {
@@ -244,9 +336,36 @@ impl Docxy {
             }
             Route::AppPropagate => {
                 self.ime.forget_key();
+                self.ime.key_down(&ev.keystroke);
                 self.on_key(ev, window, cx);
             }
             Route::MenuBar => self.ime.forget_key(),
+        }
+    }
+
+    /// The window root's key-up listener: see [`ImeState::key_up`].
+    pub(crate) fn route_key_up(
+        &mut self,
+        _ev: &KeyUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.ime.key_up();
+    }
+
+    /// AppKit's `insertText:` (#1072): see [`ImeState::commit`].
+    pub(crate) fn macos_commit(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let keys = self.ime.commit(text);
+        self.type_committed(keys, window, cx);
+    }
+
+    /// Windows' WM_CHAR (#1139): see [`ImeState::char_message`]. Text is
+    /// typed only while the app takes it; under KeyTips or a menu its
+    /// letters would be commands.
+    pub(crate) fn windows_char(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let keys = self.ime.char_message(text);
+        if !keys.is_empty() && self.takes_text() {
+            self.type_committed(keys, window, cx);
         }
     }
 
@@ -319,8 +438,11 @@ impl EntityInputHandler for Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let keys = self.ime.commit(text);
-        self.type_committed(keys, window, cx);
+        if MACOS {
+            self.macos_commit(text, window, cx);
+        } else {
+            self.windows_char(text, window, cx);
+        }
     }
 
     fn replace_and_mark_text_in_range(
@@ -357,9 +479,10 @@ impl EntityInputHandler for Docxy {
     }
 
     // Under an input-method source gpui hands printable keys to the input
-    // context before the root only while this is true.
+    // context before the root only while this is true; on Windows it turns
+    // the IME on, which is why it stays false there.
     fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
-        self.takes_text()
+        accepts_text_input(MACOS, self.takes_text())
     }
 
     fn text_length_utf16(
@@ -692,5 +815,144 @@ mod tests {
         let k = char_stroke('Q').unwrap();
         assert!(k.modifiers.shift);
         assert_eq!(k.key, "q");
+    }
+
+    fn ctrl_alt() -> Modifiers {
+        Modifiers {
+            control: true,
+            alt: true,
+            ..Default::default()
+        }
+    }
+
+    /// Windows (#1139): a typed key owes its WM_CHAR, so the handler drops
+    /// it, and a Unicode packet, which has no key-down, is typed.
+    #[test]
+    fn a_typed_keys_wm_char_is_dropped_and_packet_text_typed() {
+        let mut ime = ImeState::default();
+        ime.key_down(&plain("a", "a"));
+        assert!(ime.char_message("a").is_empty());
+        assert_eq!(ime.owed(), 0);
+        ime.key_up();
+        // SendInput's KEYEVENTF_UNICODE: WM_CHAR alone.
+        assert_eq!(key_chars(&ime.char_message("Z")), ["Z"]);
+        assert_eq!(key_chars(&ime.char_message("é")), ["é"]);
+        // A key's twin, then a packet before the key is released.
+        ime.key_down(&plain("b", "b"));
+        assert!(ime.char_message("b").is_empty());
+        assert_eq!(key_chars(&ime.char_message("é")), ["é"]);
+    }
+
+    /// gpui joins a surrogate pair into one WM_CHAR call: one character,
+    /// one typed key.
+    #[test]
+    fn a_non_bmp_packet_is_one_typed_key() {
+        let mut ime = ImeState::default();
+        let keys = ime.char_message("😀");
+        assert_eq!(key_chars(&keys), ["😀"]);
+        assert_eq!(keys[0].keystroke.key, "😀");
+        // And a key typing one owes one character, not two UTF-16 units.
+        ime.key_down(&plain("😀", "😀"));
+        assert_eq!(ime.owed(), 1);
+        assert!(ime.char_message("😀").is_empty());
+        assert_eq!(key_chars(&ime.char_message("x")), ["x"]);
+    }
+
+    /// Keys that make no WM_CHAR owe nothing, so a packet after them types:
+    /// Enter, Tab and arrows have no printable text, Alt+letter makes
+    /// WM_SYSCHAR, a Ctrl chord's text is a control character, and Win
+    /// chords are the system's.
+    #[test]
+    fn keys_without_a_wm_char_owe_nothing() {
+        let ctrl = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        let win = Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        for k in [
+            stroke("enter", Some("\r"), Modifiers::default()),
+            stroke("tab", None, Modifiers::default()),
+            stroke("left", None, Modifiers::default()),
+            stroke("f", Some("f"), alt()),
+            stroke("a", Some("\u{1}"), ctrl),
+            stroke("e", Some("e"), win),
+        ] {
+            assert_eq!(owed_chars(&k), 0, "{k}");
+            let mut ime = ImeState::default();
+            ime.key_down(&plain("x", "x"));
+            ime.key_down(&k);
+            assert_eq!(key_chars(&ime.char_message("é")), ["é"], "{k}");
+        }
+    }
+
+    /// AltGr is Ctrl+Alt on Windows and its character comes as WM_CHAR, so
+    /// it is typed once, not twice.
+    #[test]
+    fn an_altgr_character_is_typed_once() {
+        let mut ime = ImeState::default();
+        let euro = stroke("e", Some("€"), ctrl_alt());
+        assert_eq!(owed_chars(&euro), 1);
+        ime.key_down(&euro);
+        assert!(ime.char_message("€").is_empty());
+        assert_eq!(ime.owed(), 0);
+    }
+
+    /// A dead key's accent is owed but never sent (WM_DEADCHAR): its key-up
+    /// clears it, so a packet after it types in full. "´" then X sends two
+    /// WM_CHARs for one key-down, both owed.
+    #[test]
+    fn a_dead_key_owes_until_its_key_up_and_a_pair_owes_two() {
+        let mut ime = ImeState::default();
+        ime.key_down(&plain("´", "´"));
+        ime.key_up();
+        assert_eq!(key_chars(&ime.char_message("é")), ["é"]);
+        ime.key_down(&plain("´", "´"));
+        ime.key_down(&plain("x", "´x"));
+        assert_eq!(ime.owed(), 2);
+        assert!(ime.char_message("´").is_empty());
+        assert!(ime.char_message("x").is_empty());
+        assert_eq!(key_chars(&ime.char_message("y")), ["y"]);
+        // A WM_CHAR longer than what is owed types the rest.
+        ime.key_down(&plain("a", "a"));
+        assert_eq!(key_chars(&ime.char_message("aé")), ["é"]);
+    }
+
+    /// gpui forwards an IME message with no text as an empty commit: it
+    /// types nothing and pays off nothing.
+    #[test]
+    fn an_empty_wm_char_changes_nothing() {
+        let mut ime = ImeState::default();
+        ime.key_down(&plain("a", "a"));
+        assert!(ime.char_message("").is_empty());
+        assert_eq!(ime.owed(), 1);
+        assert!(ime.char_message("a").is_empty());
+        // Control characters are never typed.
+        assert!(ime.char_message("\u{8}").is_empty());
+    }
+
+    /// The handler turns gpui's input method on only on macOS: the Windows
+    /// IME stays off as it was before the handler was registered there.
+    #[test]
+    fn only_macos_accepts_text_input() {
+        assert!(accepts_text_input(true, true));
+        assert!(!accepts_text_input(true, false));
+        assert!(!accepts_text_input(false, true));
+        assert!(!accepts_text_input(false, false));
+    }
+
+    /// The harness's real input stands in for the window procedure: on
+    /// Windows a key `on_key` typed gets its WM_CHAR twin.
+    #[test]
+    fn real_input_gets_a_wm_char_twin_only_on_windows() {
+        let key = PlatformInput::KeyDown(typed(plain("a", "a")));
+        assert_eq!(char_message_text(&key, true).as_deref(), Some("a"));
+        assert_eq!(char_message_text(&key, false), None);
+        let alt_f = PlatformInput::KeyDown(typed(stroke("f", Some("f"), alt())));
+        assert_eq!(char_message_text(&alt_f, true), None);
+        let euro = PlatformInput::KeyDown(typed(stroke("e", Some("€"), ctrl_alt())));
+        assert_eq!(char_message_text(&euro, true).as_deref(), Some("€"));
     }
 }

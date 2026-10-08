@@ -651,6 +651,18 @@ through the same handler as typing) and `unmarkText` (the marked text is
 committed as it stands). They work on every platform, though only macOS
 registers the handler. The cases are in `uiharness/cases/ime-dead-key.uit`.
 
+On Windows the handler also takes WM_CHAR (#1139), which is how text sent as
+Unicode keyboard input (`SendInput` with `KEYEVENTF_UNICODE`: auto-type, text
+expanders, on-screen keyboards) arrives, with no key-down the app sees. A key
+`on_key` typed sends its own WM_CHAR after it, which the handler drops (each
+key-down owes its characters; its key-up clears what is left). `call win-char
+{"text":"é"}` sends the handler that WM_CHAR text, typed while letters are
+text; it works on every platform. `real-key`/`real-type` follow each typed key
+with the WM_CHAR Windows would post when `"wm_char":true` and always on
+Windows, so a broken dedupe types twice. The state's `wm_char_owed` is what the
+last key still owes. The cases are in `uiharness/cases/unicode-packet.uit`;
+`SendInput` itself needs a Windows desktop.
+
 `call autocorrect {}` opens Settings' AutoCorrect Options... dialog (#667,
 id `autocorrect`) on the active tab, as the backstage row does. Its tabs are
 AutoCorrect, AutoFormat As You Type, Actions and Math AutoCorrect; each

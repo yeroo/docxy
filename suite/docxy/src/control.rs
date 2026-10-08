@@ -1,7 +1,6 @@
 //! Project control policy over live tabs and the shared control server pump.
 use crate::*;
 use ctlcore::json::Json;
-use gpui::EntityInputHandler as _;
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
@@ -293,6 +292,11 @@ pub(crate) struct Done {
     /// borrow above it has ended. A dispatch inside `update_in` would
     /// double-borrow the app.
     pub input: Vec<gpui::PlatformInput>,
+    /// Follow each queued key-down `on_key` typed with the WM_CHAR Windows
+    /// would send (#1139), as a Windows build always does: this input never
+    /// passes through the window procedure. Set by `real-type`'s `wm_char`,
+    /// so the dedupe runs on every platform.
+    pub wm_char: bool,
 }
 
 impl Done {
@@ -302,6 +306,7 @@ impl Done {
             quit: false,
             draw: false,
             input: Vec::new(),
+            wm_char: false,
         })
     }
 
@@ -335,6 +340,7 @@ impl Done {
             quit: false,
             draw: cfg!(target_os = "macos"),
             input: Vec::new(),
+            wm_char: false,
         })
     }
 }
@@ -441,18 +447,27 @@ pub(crate) fn attach_with_dispatch(
                     // update the app.
                     if !done.input.is_empty() {
                         let events = std::mem::take(&mut done.input);
+                        let wm_char = done.wm_char || text_input::WINDOWS;
                         let _ = cx.update_window(target.handle, |_, window, cx| {
                             for event in events {
                                 let deferred = text_input::deferred_text(&event);
+                                let char_message = text_input::char_message_text(&event, wm_char);
                                 // A key the root left to the input context
                                 // gets the `insertText:` AppKit would send
-                                // (#1072): this input never passes through
-                                // AppKit, so nothing else would type it.
-                                if window.dispatch_event(event, cx).propagate
-                                    && let Some(text) = deferred
-                                {
+                                // (#1072), and a key `on_key` typed on
+                                // Windows the WM_CHAR TranslateMessage would
+                                // post (#1139): this input never passes
+                                // through AppKit or the window procedure.
+                                if !window.dispatch_event(event, cx).propagate {
+                                    continue;
+                                }
+                                if let Some(text) = deferred {
                                     let _ = target.view.update(cx, |this, cx| {
-                                        this.replace_text_in_range(None, &text, window, cx)
+                                        this.macos_commit(&text, window, cx)
+                                    });
+                                } else if let Some(text) = char_message {
+                                    let _ = target.view.update(cx, |this, cx| {
+                                        this.windows_char(&text, window, cx)
                                     });
                                 }
                             }

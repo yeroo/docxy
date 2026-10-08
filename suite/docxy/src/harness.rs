@@ -3346,6 +3346,8 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             "ime_marked",
             str_or_null(app.ime.marked().map(str::to_string)),
         ),
+        // The WM_CHAR characters the last typed key still owes (#1139).
+        ("wm_char_owed", Json::Num(app.ime.owed() as f64)),
     ]);
     let mut out: Vec<_> = out.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     if active_doc(app).is_ok() {
@@ -5165,6 +5167,7 @@ fn dispatch_verb(
                 .into_iter()
                 .map(|keystroke| PlatformInput::KeyDown(key_event(keystroke)))
                 .collect();
+            done.wm_char = arg_flag(args, "wm_char")?;
             Ok(done)
         }
 
@@ -5180,7 +5183,16 @@ fn dispatch_verb(
         }
         "ime-commit" => {
             let text = arg_str(args, "text")?;
-            app.replace_text_in_range(None, text, window, cx);
+            app.macos_commit(text, window, cx);
+            Done::ok(state(app, window, cx))
+        }
+        // What Windows' WM_CHAR hands the input handler (#1139): a Unicode
+        // packet's text (`SendInput` with KEYEVENTF_UNICODE, which has no
+        // key-down `on_key` sees), or the twin of a key `on_key` typed, which
+        // it drops. The handler's own method, so it runs on every platform.
+        "win-char" => {
+            let text = arg_str(args, "text")?;
+            app.windows_char(text, window, cx);
             Done::ok(state(app, window, cx))
         }
         "ime-unmark" => {
@@ -5387,6 +5399,7 @@ fn dispatch_verb(
                 quit: true,
                 draw: false,
                 input: Vec::new(),
+                wm_char: false,
             })
         }
 
@@ -6511,6 +6524,7 @@ mod tests {
             "ime-mark",
             "ime-commit",
             "ime-unmark",
+            "win-char",
             "ribbon-read",
             "ribbon-layout",
             // It acts on the flyout itself, as the `menu-*` verbs on a menu.
