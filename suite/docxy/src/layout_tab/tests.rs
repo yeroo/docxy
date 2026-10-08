@@ -408,12 +408,12 @@ fn the_tab_sits_between_insert_and_review_for_documents_only() {
     assert_eq!(
         names(Kind::Docx),
         [
-            "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View"
+            "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View", "Help"
         ]
     );
     assert_eq!(
         names(Kind::Xlsx),
-        ["Home", "Insert", "Data", "Review", "View"]
+        ["Home", "Insert", "Data", "Review", "View", "Help"]
     );
     for kind in [Kind::Docx, Kind::Xlsx] {
         let set: Vec<&str> = ribbon_tab_set(kind)[1..].iter().map(|t| t.1).collect();

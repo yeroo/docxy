@@ -121,6 +121,10 @@ docxy assets/sample.docx
   scroll/select, and a fully clickable ribbon and File menu.
 - Safe **clickable links** — only `http(s)`, shown for confirmation, opened
   without a shell.
+- A **Help** tab ends every ribbon (docxy, xlsxy, yppxy and the suite): Feedback
+  and Contact Support open a GitHub issue with the build filled in (never the
+  machine's name), and About shows every build field (File › Info in the
+  terminal editors, a dialog with Copy in the suite, where F1 is Help too).
 - **Vim mode** (`--vim`): motions, operators, visual mode, `/` search, `:w`/`:q`.
 - **PDF export**, including headless.
 
@@ -272,7 +276,7 @@ yppxy plan.xml  --save out.yppx   # headless: convert to the native package
 
 Like docxy and xlsxy, yppxy has the same **ribbon** — with Microsoft Project's
 tabs, groups and command names (File · Task · Resource · Report · Project ·
-View, e.g. Project › Schedule › Set Baseline; `F9` to engage) — the same **File
+View · Help, e.g. Project › Schedule › Set Baseline; `F9` to engage) — the same **File
 backstage** (`Alt-F`: New / Open / Info / Save / Save As / Export / Exit with a
 folder browser and live preview), a start screen, a light/dark theme toggle
 (the `◐ Theme` button at the right of the tab strip, or `T`), and mouse support. Try it:

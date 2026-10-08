@@ -67,11 +67,9 @@ pub(crate) fn dialog(info: &BuildInfo) -> Dialog {
 }
 
 impl Docxy {
-    /// The Account page's About docxy suite button: the dialog on the active tab.
+    /// About docxy suite, from the Account page or Help › About (#1021): the
+    /// dialog on the active tab.
     pub(crate) fn open_about(&mut self) -> Result<(), String> {
-        if !self.bs_account {
-            return Err("the Account page is not open; use account open".into());
-        }
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
         tab.dialogs.push(dialog(info()));
         Ok(())

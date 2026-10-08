@@ -2356,10 +2356,30 @@ impl App {
                 self.status = Some(format!("Applied style: {id}"));
             }
             StylesDialog => self.open_styles_dialog(),
+            Help => {
+                self.status = Some(HELP_COMING.to_string());
+                self.dirty = true;
+            }
+            ContactSupport | Feedback => {
+                // A test never starts a browser.
+                #[cfg(not(test))]
+                open_url(&feedback_url());
+                self.status = Some(FEEDBACK_OPENED.to_string());
+                self.dirty = true;
+            }
+            About => self.open_about(),
             Todo(name) => {
                 self.status = Some(format!("{name} — not implemented yet"));
                 self.dirty = true;
             }
+        }
+    }
+
+    /// Help › About docxy (#1021): File › Info, where every build field is.
+    fn open_about(&mut self) {
+        self.open_backstage();
+        if let Some(bs) = self.backstage.as_mut() {
+            bs.item = backstage::Item::Info;
         }
     }
 
@@ -7653,11 +7673,18 @@ impl backstage::BackstageHost for App {
                 "  Build       {}",
                 buildinfo::get(env!("CARGO_PKG_VERSION")).short_line()
             )),
+        ]
+        .into_iter()
+        // Before the document's own lines, so Help › About shows every build
+        // row on an 80x24 terminal (the page does not scroll).
+        .chain(about_lines())
+        .chain([
             RLine::raw(String::new()),
             RLine::raw(format!("  Paragraphs  {paras}")),
             RLine::raw(format!("  Words       {words}")),
             RLine::raw(format!("  Characters  {chars}")),
-        ]
+        ])
+        .collect()
     }
 
     fn accent(&self) -> Color {
@@ -7969,6 +7996,31 @@ fn clip_has_formatting(clip: &Clip) -> bool {
     }
 
     clip.paras.iter().flatten().any(inline_has_formatting)
+}
+
+/// What Help › Help says until the documentation lands (#1021).
+const HELP_COMING: &str = "Help: the documentation is coming soon";
+
+/// The status line after Help › Feedback or Contact Support.
+const FEEDBACK_OPENED: &str = "Opened the feedback page in your browser";
+
+/// Help › Feedback's page: the GitHub new-issue form with this build filled in.
+fn feedback_url() -> String {
+    buildinfo::get(env!("CARGO_PKG_VERSION")).feedback_url("docxy")
+}
+
+/// The Info page's About section (#1021): a blank line, then every build
+/// field, headed by "Manual build" on a manual one.
+fn about_lines() -> Vec<RLine<'static>> {
+    std::iter::once(RLine::raw(String::new()))
+        .chain(std::iter::once(RLine::raw("  About docxy".to_string())))
+        .chain(
+            buildinfo::get(env!("CARGO_PKG_VERSION"))
+                .about_lines()
+                .into_iter()
+                .map(|l| RLine::raw(format!("    {l}"))),
+        )
+        .collect()
 }
 
 /// Open a URL with the OS default handler — **without a shell** (the URL is
@@ -9978,6 +10030,56 @@ mod tests {
                 .any(|l| l.contains("Build") && l.contains(&line)),
             "{info:?}"
         );
+    }
+
+    /// Every line of an 80x24 frame drawn by `draw`, for the About checks (#1021).
+    fn screen_80x24(draw: impl FnOnce(&mut Frame)) -> Vec<String> {
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(draw).unwrap();
+        let buf = term.backend().buffer();
+        (0..24)
+            .map(|y| {
+                (0..80)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// #1021: Help › About opens File › Info, whose About section lists
+    /// every build field; Help and Feedback answer on the status line.
+    #[test]
+    fn help_tab_commands() {
+        let mut app = app_with(&["A"]);
+        let info: Vec<String> = app.info_lines().iter().map(|l| l.to_string()).collect();
+        let b = buildinfo::get(env!("CARGO_PKG_VERSION"));
+        assert!(info.iter().any(|l| l.trim() == "About docxy"), "{info:?}");
+        assert!(
+            info.iter()
+                .any(|l| l.trim() == format!("commit      {}", b.commit)),
+            "{info:?}"
+        );
+        assert_eq!(info.iter().any(|l| l.trim() == "Manual build"), b.manual());
+        app.run_act(ribbon::Act::Help);
+        assert_eq!(app.status.as_deref(), Some(HELP_COMING));
+        app.run_act(ribbon::Act::Feedback);
+        assert_eq!(app.status.as_deref(), Some(FEEDBACK_OPENED));
+        app.run_act(ribbon::Act::About);
+        let bs = app.backstage.as_ref().expect("About opens File");
+        assert_eq!(bs.item, backstage::Item::Info);
+        // The last build row is on screen at 80x24, under a long document.
+        let mut app = app_with(&["para"; 40]);
+        app.run_act(ribbon::Act::About);
+        let screen = screen_80x24(|f| app.draw(f));
+        assert!(
+            screen.iter().any(|l| l.contains("About docxy")),
+            "{screen:#?}"
+        );
+        let kind = format!("kind        {}", b.kind.as_str());
+        assert!(screen.iter().any(|l| l.contains(&kind)), "{screen:#?}");
+        let url = feedback_url();
+        assert!(safe_url(&url), "{url}");
+        assert!(url.starts_with("https://github.com/yeroo/docxy/issues/new?body=docxy%20"));
     }
 
     fn app_with(paras: &[&str]) -> App {

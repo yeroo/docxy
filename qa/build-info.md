@@ -103,3 +103,30 @@ line, `kind: release`). Step 3 prints the block on the console. Step 4 opens the
 
 **Fails when:** step 1 or 2 is empty (the console was attached ahead of the redirect), or step 3
 prints nothing (no fallback to the parent's console).
+
+## Help › About on a manual build shows the Manual build badge and the right commit
+
+**Guards:** #1021 makes Help › About docxy suite open the same About dialog from every editor's
+Help tab, with File closed, and Feedback carry the same build to GitHub.
+
+**Steps:**
+1. Build the suite from a dirty scratch clone as in the first case (edit a tracked file,
+   `git add -u`, `cargo build --manifest-path suite/Cargo.toml`).
+2. Open a workbook, a document and a Project file. On each, click the **Help** tab (the last
+   tab; Alt, Y reaches it by KeyTips) and press **About docxy suite**. Compare the `commit` row with
+   `git rev-parse HEAD`, then press **Close**.
+3. On one of them press **Feedback**. The browser opens
+   `https://github.com/yeroo/docxy/issues/new` with the body filled in; do not submit it.
+4. Press **F1** in a document, in a sheet cell (not editing) and in Project.
+
+**Expect:**
+- Help is the last tab of every kind (a Project's Gantt Chart Format comes after it). About shows
+  the **Manual build** badge and the `commit` row equals `git rev-parse HEAD`.
+- The issue body lists the version, commit, branch, last PR, `dirty: yes`, `kind: local` and
+  `manual build`, and **no `host:` line**.
+- F1 and Help › Help say "Help: the documentation is coming soon" on the status line. Show
+  Training and What's New are drawn disabled.
+
+**Fails when:** the Help tab is missing or not last, About refuses with File closed, the badge is
+missing or the SHA is stale, Feedback opens nothing or its body names the build host, or F1 does
+nothing.

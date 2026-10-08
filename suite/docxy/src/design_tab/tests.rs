@@ -33,7 +33,7 @@ fn the_tab_sits_between_insert_and_layout_for_documents_only() {
     assert_eq!(
         names(Kind::Docx),
         [
-            "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View"
+            "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View", "Help"
         ]
     );
     assert!(!names(Kind::Xlsx).contains(&"Design"));

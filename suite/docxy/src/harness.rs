@@ -1716,6 +1716,56 @@ fn sheet_command_json(
     Json::obj(fields)
 }
 
+/// `last-url`: the URL, the page it opens (before `?`), and whether its
+/// decoded body names this build's commit and leaves the host out (#1021).
+fn last_url_json(url: Option<&str>) -> Json {
+    let Some(url) = url else {
+        return Json::obj(vec![
+            ("url", Json::Null),
+            ("page", Json::Null),
+            ("has_commit", Json::Bool(false)),
+            ("has_host", Json::Bool(false)),
+        ]);
+    };
+    let (page, query) = url.split_once('?').unwrap_or((url, ""));
+    let body = percent_decode(query.strip_prefix("body=").unwrap_or(query));
+    // Whole rows by their label: a PR title may hold "host:" or a SHA.
+    let commit = format!("commit:      {}", crate::about::info().commit);
+    Json::obj(vec![
+        ("url", Json::Str(url.into())),
+        ("page", Json::Str(page.into())),
+        ("has_commit", Json::Bool(body.lines().any(|l| l == commit))),
+        (
+            "has_host",
+            Json::Bool(body.lines().any(|l| l.starts_with("host:"))),
+        ),
+    ])
+}
+
+/// Undo `%XX` escapes (a malformed one is kept as written).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = (b[i] == b'%')
+            .then(|| s.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(v) => {
+                out.push(v);
+                i += 3;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The spreadsheet ribbon as `ribbon-read` reports it: File, then every tab
 /// the sheet strip offers with the groups `sheet_ribbon_body` draws for it.
 fn sheet_ribbon_json(app: &crate::Docxy) -> Json {
@@ -3541,6 +3591,9 @@ fn dispatch_verb(
                 ("dirty", Json::Bool(tab.dirty)),
             ]))
         }
+        // The page Help › Feedback or Contact Support last opened (#1021); a
+        // harness run records it instead of starting a browser.
+        "last-url" => Done::ok(last_url_json(app.last_opened_url.as_deref())),
         "status-read" => {
             let tab = app.tabs.get(app.active).ok_or("there is no active tab")?;
             Done::ok(status_json(&crate::status_items(tab)))
@@ -3579,6 +3632,10 @@ fn dispatch_verb(
                     if action == "open" {
                         app.open_account(cx);
                     } else {
+                        // The page's button: Help › About opens it from anywhere.
+                        if !app.bs_account {
+                            return Err("the Account page is not open; use account open".into());
+                        }
                         app.open_about()?;
                         cx.notify();
                     }
@@ -5520,7 +5577,7 @@ mod tests {
                 .map(|t| t.get_str("name").unwrap())
                 .collect::<Vec<_>>(),
             vec![
-                "File", "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View"
+                "File", "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View", "Help"
             ]
         );
         let tabs_on = on.get("tabs").unwrap().as_array().unwrap();
@@ -5623,6 +5680,7 @@ mod tests {
                 "Report",
                 "Project",
                 "View",
+                "Help",
                 "Gantt Chart Format"
             ]
         );
@@ -5934,6 +5992,7 @@ mod tests {
             "clipboard",
             "dialog-read",
             "status-read",
+            "last-url",
             "doc",
             "rows",
             "cell",
@@ -5961,6 +6020,32 @@ mod tests {
         assert!(!closes_menu("ribbon-layout", &Json::obj(vec![])), "a read");
         let tab = Json::obj(vec![("tab", Json::Str("Data".into()))]);
         assert!(closes_menu("ribbon-layout", &tab));
+    }
+
+    /// #1021: `last-url` reads the page Feedback opened and what its body says.
+    #[test]
+    fn last_url_reports_the_page_and_the_body() {
+        let none = last_url_json(None);
+        assert_eq!(none.get("url"), Some(&Json::Null));
+        let url = crate::about::info().feedback_url("suite");
+        let got = last_url_json(Some(&url));
+        assert_eq!(got.get_str("url"), Some(url.as_str()));
+        assert_eq!(
+            got.get_str("page"),
+            Some("https://github.com/yeroo/docxy/issues/new")
+        );
+        assert_eq!(got.get("has_commit"), Some(&Json::Bool(true)));
+        assert_eq!(got.get("has_host"), Some(&Json::Bool(false)));
+        let host = last_url_json(Some("https://x/new?body=host%3A%20box%0A"));
+        assert_eq!(host.get("has_host"), Some(&Json::Bool(true)));
+        assert_eq!(host.get("has_commit"), Some(&Json::Bool(false)));
+        assert_eq!(percent_decode("a%2"), "a%2", "a cut escape stays");
+        // A PR title naming a host is not the host row.
+        let mut b = crate::about::info().clone();
+        b.last_pr_title = Some("fix host: name in the title bar".into());
+        let titled = last_url_json(Some(&b.feedback_url("suite")));
+        assert_eq!(titled.get("has_host"), Some(&Json::Bool(false)));
+        assert_eq!(titled.get("has_commit"), Some(&Json::Bool(true)));
     }
 
     /// #627: `inspect` reports every category, a count for all but properties.

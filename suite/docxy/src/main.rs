@@ -52,6 +52,7 @@ mod doc_templates;
 #[cfg(test)]
 mod doc_templates_tests;
 mod harness;
+mod help_tab;
 mod hf;
 mod hf_tab;
 mod hl_mode;
@@ -487,6 +488,8 @@ enum RibbonTab {
     /// Project's contextual Gantt Chart Format tab — only reachable while a
     /// Project document's Gantt pane is showing.
     GanttFormat,
+    /// The Help tab every ribbon ends with (#1021).
+    Help,
 }
 
 #[derive(Clone, Copy)]
@@ -1023,6 +1026,7 @@ fn protected_view_allows_act(act: SheetAct) -> bool {
             | SheetAct::PrevComment
             | SheetAct::NextComment
             | SheetAct::Todo
+            | SheetAct::Help(_)
             | SheetAct::NewWindow
             | SheetAct::ArrangeAll
     )
@@ -1053,6 +1057,7 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
             | Act::PrintLayout
             | Act::ToggleRuler
             | Act::Project(_)
+            | Act::Help(_)
             // `run_sheet_act` asks Protected View itself.
             | Act::Sheet(_)
     )
@@ -1102,6 +1107,7 @@ fn multi_area_ok(act: SheetAct) -> bool {
         | SheetAct::OfficeClipboard
         | SheetAct::CustomLists
         | SheetAct::Todo
+        | SheetAct::Help(_)
         // The sheet's filter as a whole, wherever the selection is (#690).
         | SheetAct::ClearFilter
         | SheetAct::ReapplyFilter
@@ -1988,6 +1994,8 @@ enum SheetAct {
     FlashAccept,
     FlashSelectBlank,
     FlashSelectChanged,
+    /// A Help tab command (#1021): the document ribbon's, run the same way.
+    Help(help_tab::HelpAct),
     Todo,
 }
 
@@ -4144,6 +4152,9 @@ struct Docxy {
     /// The backstage shows the Account page: the build line and About (#1023).
     /// New, Info, Export and Account clear one another.
     bs_account: bool,
+    /// The last page Help › Feedback or Contact Support opened (#1021); the
+    /// harness's `last-url` reads it, since a harness run opens no browser.
+    last_opened_url: Option<String>,
     /// The backstage shows a document's Export page, Change File Type
     /// (#635). Cleared wherever `bs_new` is.
     bs_export: bool,
@@ -10787,6 +10798,7 @@ impl Docxy {
             bs_rail_scroll: ScrollHandle::new(),
             bs_info: false,
             bs_account: false,
+            last_opened_url: None,
             bs_info_status: None,
             clip: None,
             theme_pref,
@@ -14424,6 +14436,25 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Whether a text entry the active surface draws takes the keyboard: the
+    /// find or comment bar where it is shown, a Project entry, or a sheet's
+    /// cell, rename, comment, range, rule or row-height entry. F1 leaves these
+    /// alone (#1021).
+    fn entry_owns_keys(&self) -> bool {
+        let doc = self.active_is_doc();
+        let sheet = self.active_is_sheet();
+        (self.find_open && (doc || sheet))
+            || (self.comment_open && doc)
+            || self.project_edit_open()
+            || (sheet
+                && (self.sheet_rename.is_some()
+                    || self.sheet_comment_edit.is_some()
+                    || self.range_edit.is_some()
+                    || self.sheet_cf_edit.is_some()
+                    || self.sheet_rowh_edit.is_some()
+                    || self.active_sheet().is_some_and(|v| v.editing.is_some())))
+    }
+
     fn active_is_doc(&self) -> bool {
         matches!(
             self.tabs.get(self.active).map(|t| &t.surface),
@@ -17230,6 +17261,10 @@ impl Docxy {
     /// Dispatch a spreadsheet ribbon command.
     fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
+        // The Help tab (#1021) touches no cell: the document ribbon's commands.
+        if let SheetAct::Help(a) = act {
+            return self.help_act(a, window, cx);
+        }
         // Protected View (#610): the ribbon is hidden, but shortcuts, KeyTips
         // and the harness's `ribbon-click` still come here.
         if !protected_view_allows_act(act) && self.protected_refused(cx) {
@@ -17473,7 +17508,8 @@ impl Docxy {
                 cx.notify();
             }
             SheetAct::Drop(choice) => self.border_drop_choice(choice, cx),
-            SheetAct::Todo => {}
+            // Help ran at the top of `run_sheet_act`; Todo does nothing.
+            SheetAct::Help(_) | SheetAct::Todo => {}
         }
         self.refocus(window, cx);
     }
@@ -21069,6 +21105,12 @@ impl Docxy {
         if let Some(done) = self.document_key(ev, window, cx) {
             return done;
         }
+        // F1 is Help › Help on every surface (#1021), unless an entry owns
+        // the keyboard.
+        if help_tab::is_help_key(&ev.keystroke) && !self.entry_owns_keys() {
+            self.keytips = KeyTip::Off;
+            return self.dispatch(Act::Help(help_tab::HelpAct::Help), window, cx);
+        }
         if self.project_edit_open() {
             return self.project_key(ev, window, cx);
         }
@@ -23394,8 +23436,8 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         | ResolveComment | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | NewWindow
         | ArrangeAll | DarkMode | AutoHideRibbon | InsertField | PageBreak | BlankPage
         | Cover(_) | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing
-        | Hf(_) | Design(_) | Layout(_) | Mail(_) | Table(_) | PrintLayout | ToggleRuler
-        | UndoTo(_) => {}
+        | Hf(_) | Design(_) | Layout(_) | Mail(_) | Help(_) | Table(_) | PrintLayout
+        | ToggleRuler | UndoTo(_) => {}
     }
 }
 
@@ -24593,6 +24635,8 @@ enum Act {
     Layout(layout_tab::LayoutAct),
     /// A Mailings tab command (#628).
     Mail(mailings_tab::MailAct),
+    /// A Help tab command (#1021).
+    Help(help_tab::HelpAct),
     InsertEquation,
     /// A Table Design or table Layout command, or an Insert > Table item
     /// (#646-#648).
@@ -25052,6 +25096,8 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 ),
             ],
         ),
+        // Help ends the row, as in Word (#1021).
+        help_tab::help_tab(),
     ])
 }
 
@@ -25089,6 +25135,7 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
             (Some(Report), "Report", "R"),
             (Some(Project), "Project", "P"),
             (Some(View), "View", "W"),
+            (Some(Help), "Help", "Y"),
         ]
     } else if kind == Kind::Docx {
         &[
@@ -25100,6 +25147,7 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
             (Some(Mailings), "Mailings", "M"),
             (Some(Review), "Review", "R"),
             (Some(View), "View", "W"),
+            (Some(Help), "Help", "Y"),
         ]
     } else {
         // A workbook shows the document ribbon's tabs but has no page Layout.
@@ -25110,6 +25158,7 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
             (Some(Data), "Data", "A"),
             (Some(Review), "Review", "R"),
             (Some(View), "View", "W"),
+            (Some(Help), "Help", "Y"),
         ]
     }
 }
@@ -25162,6 +25211,7 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
         RibbonTab::Resource => "Resource",
         RibbonTab::Report => "Report",
         RibbonTab::Project => "Project",
+        RibbonTab::Help => "Help",
     }
 }
 
@@ -25177,6 +25227,7 @@ fn act_enabled(act: Act) -> bool {
         // As a document with no recipient list has them.
         Act::Mail(act) => mailings_tab::mail_enabled(&mailings_tab::MailState::default(), act),
         Act::Table(act) => act != table_tab::TableAct::Unavailable,
+        Act::Help(act) | Act::Sheet(SheetAct::Help(act)) => help_tab::help_enabled(act),
         _ => true,
     }
 }
@@ -27905,6 +27956,7 @@ impl Docxy {
                 | Act::ToggleNotes
                 | Act::Markup(_)
                 | Act::PrintLayout
+                | Act::Help(_)
         ) {
             self.cancel_highlight_mode();
         }
@@ -27936,6 +27988,7 @@ impl Docxy {
         match act {
             Project(p) => self.project_act(p, window, cx),
             Sheet(a) => self.run_sheet_act(a, window, cx),
+            Help(a) => self.help_act(a, window, cx),
             Cut => self.do_copy(true, window, cx),
             Copy => self.do_copy(false, window, cx),
             Paste => self.do_paste(window, cx),
@@ -28135,6 +28188,10 @@ impl Docxy {
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Help's placeholders (#1021) draw dim and take no click, as the
+        // document ribbon draws a disabled command.
+        let enabled = !matches!(act, SheetAct::Help(a) if !help_tab::help_enabled(a));
+        let ink = if enabled { pal.fg } else { pal.dim };
         div()
             .id(ElementId::Name(format!("srb-{label}").into()))
             .flex()
@@ -28143,11 +28200,14 @@ impl Docxy {
             .px_1()
             .h(px(20.))
             .rounded(px(3.))
-            .cursor_pointer()
-            .hover(|d| d.bg(pal.hover))
-            .when_some(icon, |d, ic| d.child(icon_svg(ic, 14., pal.fg)))
-            .child(div().text_size(px(11.)).text_color(pal.fg).child(label))
-            .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)))
+            .when(enabled, |d| d.cursor_pointer().hover(|d| d.bg(pal.hover)))
+            .when_some(icon, |d, ic| d.child(icon_svg(ic, 14., ink)))
+            .child(div().text_size(px(11.)).text_color(ink).child(label))
+            .when(enabled, |d| {
+                d.on_click(
+                    cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)),
+                )
+            })
             .into_any_element()
     }
 

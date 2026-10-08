@@ -10,7 +10,8 @@ test sheet ribbon read lists the drawn Home tab
   assert reply.tabs.3.name is Data
   assert reply.tabs.4.name is Review
   assert reply.tabs.5.name is View
-  assert reply.tab_count is 6
+  assert reply.tabs.6.name is Help
+  assert reply.tab_count is 7
   assert reply.tabs.1.groups.0.title is Clipboard
   assert reply.tabs.1.groups.0.commands.0.id is paste
   assert reply.tabs.1.groups.1.commands.4.id is bold

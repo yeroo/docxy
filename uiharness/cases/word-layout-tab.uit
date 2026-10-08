@@ -14,6 +14,7 @@ test the Layout tab sits between Insert and Review
   assert reply.tabs.5.name is Mailings
   assert reply.tabs.6.name is Review
   assert reply.tabs.7.name is View
+  assert reply.tabs.8.name is Help
   key alt p escape escape
   assert ribbon_tab is Layout
 

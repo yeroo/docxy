@@ -248,6 +248,102 @@ impl BuildInfo {
         }
         s
     }
+
+    /// The terminal editors' About screen (File › Info, which Help › About
+    /// opens, #1021): "Manual build" first when it is one, then every row as
+    /// `label       value`.
+    pub fn about_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.manual() {
+            lines.push("Manual build".to_string());
+        }
+        for (label, value) in self.rows() {
+            lines.push(format!("{label:<12}{value}"));
+        }
+        lines
+    }
+
+    /// Help › Feedback and Contact Support: the docxy GitHub new-issue page with
+    /// the build pre-filled in the body. The body is the [`BuildInfo::version_block`]
+    /// rows without `host` (the machine's name has no place in a public issue),
+    /// and the URL stays within [`FEEDBACK_URL_MAX`] bytes, the most the editors'
+    /// `safe_url` opens: the last PR's title is shortened first, then rows are
+    /// dropped from the end, and when the title line alone is too long the
+    /// page comes with no body.
+    pub fn feedback_url(&self, product: &str) -> String {
+        let mut b = self.clone();
+        let title: Vec<char> = b
+            .last_pr_title
+            .clone()
+            .unwrap_or_default()
+            .chars()
+            .collect();
+        let mut keep = title.len();
+        let mut drop = 0;
+        loop {
+            b.last_pr_title = self.last_pr_title.as_ref().map(|_| {
+                let mut t: String = title[..keep].iter().collect();
+                if keep < title.len() {
+                    t.push('…');
+                }
+                t
+            });
+            let url = format!(
+                "{FEEDBACK_NEW_ISSUE}?body={}",
+                percent_encode(&b.feedback_body(product, drop))
+            );
+            if url.len() <= FEEDBACK_URL_MAX {
+                return url;
+            }
+            if keep > 0 {
+                keep -= 1;
+            } else if drop < self.rows().len() {
+                drop += 1;
+            } else {
+                // Even the title line is too long: the page with no body.
+                return FEEDBACK_NEW_ISSUE.to_string();
+            }
+        }
+    }
+
+    /// The feedback body: the title line, the rows but `host` (the last `drop`
+    /// of them left out) and the manual-build line.
+    fn feedback_body(&self, product: &str, drop: usize) -> String {
+        let mut s = format!("{product} {}\n", self.version);
+        let rows: Vec<_> = self
+            .rows()
+            .into_iter()
+            .filter(|(l, _)| *l != "host")
+            .collect();
+        for (label, value) in &rows[..rows.len().saturating_sub(drop)] {
+            s.push_str(&format!("{:<12} {value}\n", format!("{label}:")));
+        }
+        if self.manual() {
+            s.push_str("manual build\n");
+        }
+        s
+    }
+}
+
+/// Where Help › Feedback files an issue.
+pub const FEEDBACK_NEW_ISSUE: &str = "https://github.com/yeroo/docxy/issues/new";
+
+/// The longest URL [`BuildInfo::feedback_url`] returns: the editors' `safe_url`
+/// refuses anything longer.
+pub const FEEDBACK_URL_MAX: usize = 2048;
+
+/// RFC 3986 percent-encoding of a query value: unreserved characters stay, every
+/// other byte of the UTF-8 becomes `%XX`.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn json_str(out: &mut String, t: &str) {
@@ -382,6 +478,123 @@ mod tests {
         assert_eq!(b.short_commit(), "unknown");
         assert!(b.short_line().contains("no merged PR"));
         assert!(b.fields().contains(&("commit_hex", Value::Bool(false))));
+    }
+
+    #[test]
+    fn about_lines_mark_a_manual_build_and_list_every_row() {
+        let local = BuildInfo::from_raw(&raw("local", false), "0.5.0");
+        let lines = local.about_lines();
+        assert_eq!(lines[0], "Manual build");
+        assert_eq!(lines.len(), 1 + local.rows().len());
+        assert!(lines.contains(&format!("commit      {}", local.commit)));
+        assert!(lines.contains(&"kind        local".to_string()));
+        let release = BuildInfo::from_raw(&raw("release", false), "0.5.0");
+        assert_eq!(
+            release.about_lines()[0],
+            format!("commit      {}", release.commit)
+        );
+    }
+
+    /// Undo [`percent_encode`], for checking the body a URL carries.
+    fn decode(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' {
+                out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    fn body(url: &str) -> String {
+        let q = url
+            .strip_prefix("https://github.com/yeroo/docxy/issues/new?body=")
+            .unwrap_or_else(|| panic!("{url}"));
+        decode(q)
+    }
+
+    #[test]
+    fn feedback_url_carries_the_build_but_not_the_host() {
+        let b = BuildInfo::from_raw(&raw("local", false), "0.1.0");
+        let url = b.feedback_url("suite");
+        let text = body(&url);
+        assert!(text.starts_with("suite 0.1.0\ncommit:"), "{text}");
+        assert!(text.contains("commit:      0123456789abcdef0123456789abcdef01234567\n"));
+        assert!(text.contains("branch:      main\n"));
+        assert!(text.contains("last PR:     #1015 Batch Word repeat\n"));
+        assert!(
+            text.ends_with("kind:        local\nmanual build\n"),
+            "{text}"
+        );
+        assert!(!text.contains("host") && !text.contains("box"), "{text}");
+        let release = BuildInfo::from_raw(&raw("release", false), "0.5.0");
+        assert!(!body(&release.feedback_url("docxy")).contains("manual build"));
+    }
+
+    #[test]
+    fn feedback_url_percent_encodes_newlines_and_reserved_characters() {
+        let mut r = raw("local", false);
+        r.last_pr_title = Some("a&b=c #d ?e/f+g% \"ü\"");
+        let url = BuildInfo::from_raw(&r, "0.5.0").feedback_url("docxy");
+        let q = url.split_once("?body=").unwrap().1;
+        assert!(
+            q.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-._~%".contains(&c)),
+            "{q}"
+        );
+        assert!(q.contains("%0A") && !q.contains('\n'));
+        assert!(q.contains("%C3%BC"), "{q}");
+        assert!(body(&url).contains("#1015 a&b=c #d ?e/f+g% \"ü\"\n"));
+    }
+
+    #[test]
+    fn feedback_url_of_a_git_less_build_says_unknown() {
+        let mut r = raw("local", false);
+        r.commit = "unknown";
+        r.branch = "unknown";
+        r.last_pr = None;
+        r.last_pr_title = None;
+        let text = body(&BuildInfo::from_raw(&r, "0.5.0").feedback_url("xlsxy"));
+        assert!(text.contains("commit:      unknown\n"), "{text}");
+        assert!(text.contains("last PR:     none\n"), "{text}");
+    }
+
+    #[test]
+    fn feedback_url_shortens_a_long_title_to_fit() {
+        let long = "ü".repeat(2000);
+        let mut r = raw("local", true);
+        r.last_pr_title = Some(Box::leak(long.into_boxed_str()));
+        let url = BuildInfo::from_raw(&r, "0.5.0").feedback_url("yppxy");
+        assert!(url.len() <= FEEDBACK_URL_MAX, "{}", url.len());
+        let text = body(&url);
+        assert!(text.contains("last PR:     #1015 ü"), "{text}");
+        assert!(text.contains("…\n"), "{text}");
+        // Shortening the title was enough: every later row is still there.
+        assert!(
+            text.ends_with("kind:        local\nmanual build\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn feedback_url_without_room_for_the_title_line_has_no_body() {
+        let b = BuildInfo::from_raw(&raw("local", false), "0.5.0");
+        assert_eq!(b.feedback_url(&"p".repeat(2048)), FEEDBACK_NEW_ISSUE);
+    }
+
+    #[test]
+    fn feedback_url_drops_trailing_rows_when_the_title_is_not_enough() {
+        let mut r = raw("local", false);
+        r.branch = Box::leak("b".repeat(3000).into_boxed_str());
+        let url = BuildInfo::from_raw(&r, "0.5.0").feedback_url("docxy");
+        assert!(url.len() <= FEEDBACK_URL_MAX, "{}", url.len());
+        assert!(body(&url).starts_with("docxy 0.5.0\ncommit:"));
     }
 
     #[test]
