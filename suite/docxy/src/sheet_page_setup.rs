@@ -203,8 +203,26 @@ fn edit(
     Ok(true)
 }
 
-/// Apply one command to `v`'s sheet `s`.
-fn apply(v: &mut SheetView, s: usize, act: PageAct) {
+/// Excel's Add to Print Area extends a list of ranges; a print area defined
+/// any other way (`OFFSET(...)`, `INDIRECT(...)`) has nothing to add to.
+pub(crate) const ADD_REFUSED: &str = "The print area is not a list of ranges, so nothing can be added to it. Set Print Area replaces it.";
+
+/// Whether the sheet's print area, if any, is the list of ranges it reads as:
+/// spelling those ranges again gives the definition back.
+fn print_area_is_ranges(wb: &Workbook, s: usize) -> bool {
+    let Some(d) = wb
+        .defined_names
+        .iter()
+        .find(|d| d.name == area::PRINT_AREA && d.scope == Some(s))
+    else {
+        return true;
+    };
+    let f = d.formula.trim().trim_start_matches('=');
+    area::spell_refs(&wb.sheets[s].name, &area::parse_refs(f)) == f
+}
+
+/// Apply one command to `v`'s sheet `s`. A refusal comes before any change.
+fn apply(v: &mut SheetView, s: usize, act: PageAct) -> Result<(), String> {
     let areas = v.areas_all();
     let (row, col) = v.sel;
     // A choice already shown leaves the sheet as it is: Portrait on a
@@ -215,6 +233,9 @@ fn apply(v: &mut SheetView, s: usize, act: PageAct) {
     match act {
         PageAct::Area(AreaOp::Set) => area::set_print_area(wb, s, &areas),
         PageAct::Area(AreaOp::Add) => {
+            if !print_area_is_ranges(wb, s) {
+                return Err(ADD_REFUSED.into());
+            }
             for a in areas {
                 area::add_print_area(wb, s, a);
             }
@@ -250,6 +271,7 @@ fn apply(v: &mut SheetView, s: usize, act: PageAct) {
             }
         }
     }
+    Ok(())
 }
 
 /// Run a Page Layout command on the tab.
@@ -261,10 +283,7 @@ pub(crate) fn run(tab: &mut DocTab, act: PageAct) {
         }
         return;
     }
-    if let Err(e) = edit(tab, |v, s| {
-        apply(v, s, act);
-        Ok(())
-    }) {
+    if let Err(e) = edit(tab, |v, s| apply(v, s, act)) {
         tab.status = e.into();
     }
 }
@@ -550,57 +569,21 @@ fn whole(d: &Dialog, name: &str, label: &str, blank: Option<u32>) -> Result<u32,
     }
 }
 
-/// `text` split at commas outside a quoted sheet name (`'Sales, East'!A1`),
-/// blank parts dropped.
-fn split_refs(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut quoted = false;
-    let mut start = 0;
-    for (i, c) in text.char_indices() {
-        match c {
-            '\'' => quoted = !quoted,
-            ',' if !quoted => {
-                out.push(&text[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    out.push(&text[start..]);
-    out.into_iter()
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect()
-}
-
-/// The sheet a reference names (`Sheet2!A1`, `'My sheet'!A1`), unquoted;
-/// `None` when it names none.
-fn sheet_of(part: &str) -> Option<String> {
-    let mut quoted = false;
-    let mut bang = None;
-    for (i, c) in part.char_indices() {
-        match c {
-            '\'' => quoted = !quoted,
-            '!' if !quoted => bang = Some(i),
-            _ => {}
-        }
-    }
-    let name = part[..bang?].trim();
-    Some(
-        match name.strip_prefix('\'').and_then(|n| n.strip_suffix('\'')) {
-            Some(inner) => inner.replace("''", "'"),
-            None => name.to_string(),
-        },
-    )
-}
-
 /// The references typed in `name`, each part one reference on `sheet`, or
 /// why not.
 fn refs(d: &Dialog, name: &str, label: &str, sheet: &str) -> Result<Vec<PrintRef>, String> {
     let t = text(d, name);
     let mut out = Vec::new();
-    for part in split_refs(&t) {
-        if let Some(other) = sheet_of(part).filter(|o| !o.eq_ignore_ascii_case(sheet)) {
+    // Commas outside a quoted sheet name ('Sales, East'!A1) split it.
+    for part in area::split_top_level(&t)
+        .into_iter()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        if let Some(other) = area::split_sheet(part)
+            .0
+            .filter(|o| !o.eq_ignore_ascii_case(sheet))
+        {
             return Err(format!(
                 "{label} '{}' is on sheet '{other}', not on '{sheet}'",
                 t.trim()

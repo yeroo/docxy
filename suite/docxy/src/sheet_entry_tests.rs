@@ -1900,7 +1900,7 @@ fn autosum_writes_each_function_over_the_run_above_else_to_the_left() {
             put(&mut v, r, 0, Cell::number(f64::from(r + 1)));
         }
         select(&mut v, 3, 0);
-        assert!(v.autosum(f), "{f:?}");
+        assert_eq!(v.autosum(f), Ok(true), "{f:?}");
         let cell = v.sheet().cell(3, 0).unwrap();
         assert_eq!(
             cell.formula.as_deref(),
@@ -1913,7 +1913,7 @@ fn autosum_writes_each_function_over_the_run_above_else_to_the_left() {
         put(&mut v, 0, c, Cell::number(4.0));
     }
     select(&mut v, 0, 2);
-    assert!(v.autosum(SumFn::Average));
+    assert_eq!(v.autosum(SumFn::Average), Ok(true));
     assert_eq!(value(&v, 0, 2), CellValue::Number(4.0));
     assert_eq!(
         v.sheet().cell(0, 2).unwrap().formula.as_deref(),
@@ -1929,8 +1929,44 @@ fn autosum_with_nothing_to_sum_takes_no_undo_step() {
     let mut v = view();
     select(&mut v, 4, 4);
     for f in SumFn::ALL {
-        assert!(!v.autosum(f));
+        assert_eq!(v.autosum(f), Ok(false));
     }
     assert_eq!(v.undo.len(), 0);
     assert!(v.sheet().cell(4, 4).is_none());
+}
+
+#[test]
+fn autosum_again_with_the_same_result_takes_no_second_step() {
+    let mut v = view();
+    for r in 0..2 {
+        put(&mut v, r, 0, Cell::number(1.0));
+    }
+    select(&mut v, 2, 0);
+    assert_eq!(v.autosum(SumFn::Sum), Ok(true));
+    assert_eq!(v.autosum(SumFn::Sum), Ok(false));
+    assert_eq!(v.undo.len(), 1);
+    // Another function is another formula: a step.
+    assert_eq!(v.autosum(SumFn::Max), Ok(true));
+    assert_eq!(v.undo.len(), 2);
+}
+
+/// Home's AutoSum (`Sum`) and Formulas' (`Max` here) on a protected sheet:
+/// Excel's refusal, before any undo step or write.
+#[test]
+fn autosum_on_a_protected_sheet_is_refused_and_writes_nothing() {
+    for f in [SumFn::Sum, SumFn::Max] {
+        let mut v = view();
+        for r in 0..2 {
+            put(&mut v, r, 0, Cell::number(1.0));
+        }
+        let s = v.active;
+        v.pkg.workbook.sheets[s].protection = Some(r#"sheet="1""#.into());
+        select(&mut v, 2, 0);
+        assert_eq!(
+            v.autosum(f),
+            Err(crate::sheet_goto::SHEET_PROTECTED.to_string())
+        );
+        assert!(v.sheet().cell(2, 0).is_none(), "{f:?}");
+        assert_eq!(v.undo.len(), 0);
+    }
 }

@@ -2531,10 +2531,15 @@ impl SheetView {
 
     /// AutoSum: insert `=f(range)` (`=SUM(...)`, `=AVERAGE(...)`, ...) in the
     /// selected cell over the run of numeric cells directly above it (else
-    /// to its left), as Excel does. One undo step when it wrote; with no
-    /// such run it writes nothing and takes no step.
-    fn autosum(&mut self, f: SumFn) -> bool {
+    /// to its left), as Excel does. `Ok(true)` and one undo step when it
+    /// wrote; `Ok(false)` and no step when there is no such run or the cell
+    /// already holds that formula. A protected sheet is refused with Excel's
+    /// message before anything changes, as Fill and Paste are.
+    fn autosum(&mut self, f: SumFn) -> Result<bool, String> {
         use gridcore::sheet::{Cell, CellValue, cell_name};
+        if self.sheet().is_protected() {
+            return Err(crate::sheet_goto::SHEET_PROTECTED.into());
+        }
         let s = self.active;
         let (r, c) = self.sel;
         let sh = &self.pkg.workbook.sheets[s];
@@ -2557,17 +2562,21 @@ impl SheetView {
             }
             format!("{}:{}", cell_name(r, left), cell_name(r, c - 1))
         } else {
-            return false;
+            return Ok(false);
         };
+        let formula = format!("{}({range})", f.name());
+        if sh.cell(r, c).and_then(|x| x.formula.as_deref()) == Some(formula.as_str()) {
+            return Ok(false);
+        }
         let style = sh.cell(r, c).map(|x| x.style).unwrap_or(0);
         let cell = Cell {
             style,
-            ..Cell::formula(&format!("{}({range})", f.name()))
+            ..Cell::formula(&formula)
         };
         self.push_undo();
         self.engine
             .set_cell(&mut self.pkg.workbook, (s, r, c), cell);
-        true
+        Ok(true)
     }
 
     /// Commit the cell buffer without moving the selection, including undo/recalc.
@@ -15639,8 +15648,10 @@ impl Docxy {
 
     /// AutoSum (Σ) and Formulas › AutoSum's menu: [`SheetView::autosum`].
     fn sheet_autosum(&mut self, f: SumFn, cx: &mut Context<Self>) {
-        if self.active_sheet_mut().is_some_and(|v| v.autosum(f)) {
-            self.mark_sheet_dirty();
+        match self.active_sheet_mut().map(|v| v.autosum(f)) {
+            Some(Ok(true)) => self.mark_sheet_dirty(),
+            Some(Err(e)) => self.set_status(e),
+            _ => {}
         }
         cx.notify();
     }

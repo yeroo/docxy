@@ -66,7 +66,7 @@ pub fn parse_refs(formula: &str) -> Vec<PrintRef> {
 }
 
 /// `formula` split at commas outside quoted sheet names.
-fn split_top_level(formula: &str) -> Vec<&str> {
+pub fn split_top_level(formula: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut quoted = false;
     let mut start = 0;
@@ -84,8 +84,9 @@ fn split_top_level(formula: &str) -> Vec<&str> {
     out
 }
 
-/// The reference after a `Sheet!` / `'My sheet'!` prefix.
-fn strip_sheet(part: &str) -> &str {
+/// A reference split at its `Sheet!` / `'My sheet'!` prefix: the sheet it
+/// names, unquoted (`''` read as `'`), or `None`, and the reference after it.
+pub fn split_sheet(part: &str) -> (Option<String>, &str) {
     let mut quoted = false;
     let mut bang = None;
     for (i, c) in part.char_indices() {
@@ -95,10 +96,20 @@ fn strip_sheet(part: &str) -> &str {
             _ => {}
         }
     }
-    match bang {
-        Some(i) => &part[i + 1..],
-        None => part,
-    }
+    let Some(i) = bang else {
+        return (None, part);
+    };
+    let name = part[..i].trim();
+    let name = match name.strip_prefix('\'').and_then(|n| n.strip_suffix('\'')) {
+        Some(inner) => inner.replace("''", "'"),
+        None => name.to_string(),
+    };
+    (Some(name), &part[i + 1..])
+}
+
+/// The reference after a `Sheet!` / `'My sheet'!` prefix.
+fn strip_sheet(part: &str) -> &str {
+    split_sheet(part).1
 }
 
 fn parse_ref(r: &str) -> Option<PrintRef> {
@@ -113,7 +124,8 @@ fn parse_ref(r: &str) -> Option<PrintRef> {
     }
     let row = |s: &str| {
         let n: u32 = s.trim().trim_start_matches('$').parse().ok()?;
-        (1..=MAX_ROWS).contains(&n).then_some(n - 1)
+        // `then`, not `then_some`: row 0 must not reach `n - 1`.
+        (1..=MAX_ROWS).contains(&n).then(|| n - 1)
     };
     if let (Some(x), Some(y)) = (row(a), row(b)) {
         return Some(PrintRef::Rows(x.min(y), x.max(y)));
@@ -332,6 +344,27 @@ pub fn manual_breaks(sheet: &Sheet) -> (Vec<u32>, Vec<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_zero_is_no_reference_and_does_not_panic() {
+        assert!(parse_refs("$0:$1").is_empty());
+        assert!(parse_refs("Sheet1!$0:$0").is_empty());
+        assert_eq!(parse_refs("$1:$2"), [PrintRef::Rows(0, 1)]);
+    }
+
+    #[test]
+    fn split_sheet_unquotes_the_prefix_and_split_top_level_respects_quotes() {
+        assert_eq!(split_sheet("Sheet1!$A$1"), (Some("Sheet1".into()), "$A$1"));
+        assert_eq!(
+            split_sheet("'Bob''s, East'!A1:B2"),
+            (Some("Bob's, East".into()), "A1:B2")
+        );
+        assert_eq!(split_sheet("A1"), (None, "A1"));
+        assert_eq!(
+            split_top_level("'Sales, East'!A1,B2"),
+            ["'Sales, East'!A1", "B2"]
+        );
+    }
 
     fn wb(names: &[&str]) -> Workbook {
         Workbook {

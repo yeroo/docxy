@@ -381,3 +381,14 @@ test a placeholder on the new tabs is refused as not implemented
   open ../fixtures/basic.xlsx
   call-error ribbon-click {"tab":"Formulas","command":"Trace Precedents"} => 'Trace Precedents' is not implemented
   call-error ribbon-click {"tab":"Page Layout","command":"Themes"} => 'Themes' is not implemented
+
+test AutoSum on a protected sheet is refused from Home and Formulas
+  open copy:"../fixtures/basic.xlsx" as locked.xlsx
+  click B6
+  call ribbon-click {"tab":"Review","command":"Protect Sheet"}
+  call ribbon-click {"tab":"Home","command":"AutoSum"}
+  assert status is The cell or chart you're trying to change is on a protected sheet.
+  assert cell B6 is nothing
+  call ribbon-click {"tab":"Formulas","command":"AutoSum"}
+  assert status is The cell or chart you're trying to change is on a protected sheet.
+  assert cell B6 is nothing

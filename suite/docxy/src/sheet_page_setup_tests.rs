@@ -613,3 +613,41 @@ fn page_layout_edits_survive_save_and_reload() {
     assert_eq!(area::print_area(wb, 0), [(0, 0, 9, 3)]);
     assert_eq!(area::manual_breaks(&wb.sheets[0]), (vec![5], vec![]));
 }
+
+#[test]
+fn add_to_print_area_refuses_a_definition_that_is_not_a_list_of_ranges() {
+    let mut t = tab();
+    let f = "OFFSET(Sheet1!$A$1,0,0,5,3)";
+    view(&mut t)
+        .pkg
+        .workbook
+        .defined_names
+        .push(gridcore::sheet::DefinedName {
+            name: area::PRINT_AREA.into(),
+            scope: Some(0),
+            formula: f.into(),
+        });
+    select(&mut t, 9, 0, 9, 1);
+    run(&mut t, PageAct::Area(AreaOp::Add));
+    assert_eq!(&*t.status, ADD_REFUSED);
+    assert_eq!(defined(&mut t, area::PRINT_AREA).as_deref(), Some(f));
+    assert_eq!(undo_len(&mut t), 0);
+    assert!(!t.dirty);
+    // Set Print Area replaces it.
+    run(&mut t, PageAct::Area(AreaOp::Set));
+    assert_eq!(print_area(&mut t), [(9, 0, 9, 1)]);
+    // A list of ranges, as Excel writes it, takes an addition.
+    select(&mut t, 0, 0, 0, 0);
+    run(&mut t, PageAct::Area(AreaOp::Add));
+    assert_eq!(print_area(&mut t), [(9, 0, 9, 1), (0, 0, 0, 0)]);
+}
+
+#[test]
+fn the_dialog_refuses_row_zero_without_panicking() {
+    let mut t = tab();
+    open(&mut t);
+    set(&mut t, "title-rows", Json::Str("$0:$1".into()));
+    let err = crate::dialog_host::dialog_click(&mut t, "OK").unwrap_err();
+    assert_eq!(err, "Rows to repeat at top '$0:$1' is not a reference");
+    assert_eq!(undo_len(&mut t), 0);
+}
