@@ -1181,6 +1181,8 @@ impl Editor {
             return;
         }
         self.checkpoint(EditKind::Structural);
+        let path = self.caret.path.clone();
+        self.clear_placeholders_around(&path);
         let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
             return;
         };
@@ -1236,6 +1238,8 @@ impl Editor {
             return;
         }
         self.checkpoint(EditKind::Structural);
+        let path = self.caret.path.clone();
+        self.clear_placeholders_around(&path);
         let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
             return;
         };
@@ -1943,6 +1947,8 @@ impl Editor {
             Box::new(|s: &str| s.to_uppercase()) // mixed → ALL CAPS
         };
         for (path, s, e) in &spans {
+            self.clear_placeholders_around(path);
+            self.clear_inline_placeholders(path, *s, *e);
             if let Some(p) = para_mut(&mut self.doc.body, path) {
                 map_text_range(&mut p.content, *s, *e, &*f);
             }

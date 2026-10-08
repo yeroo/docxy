@@ -397,7 +397,7 @@ impl Editor {
                             // A cell-level content control stays with its
                             // cell, so shifted text would land in another
                             // control, or out of its own (#1102).
-                            if !cell.sdt_open.is_empty() || !cell.sdt_close.is_empty() {
+                            if !t.rows[ri].cell_controls(ci).is_empty() {
                                 return Err("cells cannot shift up through content controls".into());
                             }
                             cells.push((ri, ci));
@@ -1052,6 +1052,14 @@ fn merge_range(t: &mut Table, r: &CellRange) -> Result<(), String> {
         }
         per_row.push((ri, hit));
     }
+    // A merged cell would carry a cell-level content control over its
+    // neighbours' text, or lose it (#1102).
+    if per_row.iter().any(|(ri, hit)| {
+        hit.iter()
+            .any(|&ci| !t.rows[*ri].cell_controls(ci).is_empty())
+    }) {
+        return Err("cells in a content control cannot be merged".into());
+    }
     // The contents, in reading order; empty cells add nothing.
     let mut blocks = Vec::new();
     for (ri, hit) in &per_row {
@@ -1072,8 +1080,6 @@ fn merge_range(t: &mut Table, r: &CellRange) -> Result<(), String> {
     for (k, (ri, hit)) in per_row.into_iter().enumerate() {
         let row = &mut t.rows[ri];
         let keep = hit[0];
-        // The merged cell takes the cell-level content controls the others
-        // closed (see `Row::remove_cell`).
         for &ci in hit[1..].iter().rev() {
             row.remove_cell(ci);
         }

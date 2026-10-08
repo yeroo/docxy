@@ -186,6 +186,7 @@ impl Editor {
     /// recorded as a tracked deletion when tracking, else removed outright.
     pub(super) fn delete_char_at(&mut self, path: &[usize], idx: usize) {
         self.clear_placeholders_around(path);
+        self.clear_inline_placeholders(path, idx, idx + 1);
         let Some(author) = self.track.as_ref().map(|t| t.author.clone()) else {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
                 content_delete(&mut p.content, idx);
@@ -285,6 +286,7 @@ impl Editor {
         with: &str,
     ) {
         self.clear_placeholders_around(path);
+        self.clear_inline_placeholders(path, start, end);
         if self.track.is_none() {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
                 super::replace_range_in_content(&mut p.content, start, end, with);

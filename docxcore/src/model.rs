@@ -1005,6 +1005,23 @@ impl Row {
         cell
     }
 
+    /// The cell-level content controls around cell `cell`, outermost first,
+    /// each as (the cell it opens on, its index in that cell's `sdt_open`).
+    /// Empty when no control wraps the cell.
+    pub(crate) fn cell_controls(&self, cell: usize) -> Vec<(usize, usize)> {
+        let mut open: Vec<(usize, usize)> = Vec::new();
+        for (c, here) in self.cells.iter().enumerate() {
+            open.extend((0..here.sdt_open.len()).map(|k| (c, k)));
+            if c == cell {
+                return open;
+            }
+            for _ in &here.sdt_close {
+                open.pop();
+            }
+        }
+        Vec::new()
+    }
+
     /// Whether every cell-level content control opened in the row closes in
     /// it, and none closes before it opens.
     #[cfg(test)]

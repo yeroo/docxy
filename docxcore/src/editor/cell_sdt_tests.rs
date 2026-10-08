@@ -246,17 +246,39 @@ fn deleting_the_second_cell_of_a_control_leaves_the_third_outside_it() {
 }
 
 #[test]
-fn merging_a_controls_cells_keeps_the_control_on_the_merged_cell() {
-    let mut ed = pair_row(false);
+fn a_merge_touching_a_cell_level_control_is_refused() {
+    // The Abstract with its plain right neighbour, both cells of a control,
+    // and a plain cell with the control's last cell.
+    for (ed, a, b) in [
+        (cover_row(), 0, 1),
+        (pair_row(false), 0, 1),
+        (pair_row(false), 1, 2),
+    ] {
+        let mut ed = ed;
+        let before = document_to_xml(&ed.doc);
+        ed.anchor = Some(at(a, 0));
+        ed.caret = at(b, 0);
+        let err = ed.merge_cells().unwrap_err();
+        assert!(err.contains("content control"), "{err}");
+        assert_eq!(document_to_xml(&ed.doc), before);
+        assert!(!ed.undo(), "a refusal records no step");
+    }
+}
+
+#[test]
+fn plain_cells_merge_in_a_row_with_a_control_elsewhere() {
+    let mut ed = editor(&format!(
+        "<w:tr>{}{}{}{}{CLOSE}</w:tr>",
+        cell("a"),
+        cell("b"),
+        open("Year", 2, true),
+        cell("[Year]")
+    ));
     ed.anchor = Some(at(0, 0));
     ed.caret = at(1, 0);
     ed.merge_cells().unwrap();
-    let r = row(&ed);
-    assert_eq!(r.cells.len(), 2);
-    assert_eq!(
-        (r.cells[0].sdt_open.len(), r.cells[0].sdt_close.len()),
-        (1, 1)
-    );
+    assert_eq!(row(&ed).cells.len(), 2);
+    assert!(flagged(&ed, 1));
     assert_sound(&ed);
 }
 
@@ -408,4 +430,111 @@ fn a_placeholder_starting_in_a_nested_table_selects_nothing() {
         ed.placeholder_range_at(&Caret::at(vec![0, 0, 0, 1], 1)),
         None
     );
+}
+
+#[test]
+fn shift_up_refuses_the_middle_cell_of_a_three_cell_control() {
+    let mut ed = editor(&format!(
+        "<w:tr>{}{}{}</w:tr><w:tr>{}{}{}{}{CLOSE}</w:tr>",
+        cell("a"),
+        cell("b"),
+        cell("c"),
+        open("Wide", 1, false),
+        cell("x"),
+        cell("y"),
+        cell("z"),
+    ));
+    let before = document_to_xml(&ed.doc);
+    ed.set_caret(Caret::at(vec![0, 0, 1, 0], 0));
+    let err = ed.delete_cells(DeleteShift::ShiftUp).unwrap_err();
+    assert!(err.contains("content control"), "{err}");
+    assert_eq!(document_to_xml(&ed.doc), before);
+}
+
+#[test]
+fn a_two_cell_placeholder_a_vertical_merge_would_widen_selects_nothing() {
+    let mut ed = pair_row(true);
+    let Some(Block::Table(t)) = ed.doc.body.get_mut(0) else {
+        unreachable!()
+    };
+    t.rows[0].cells[1].v_merge = VMerge::Restart;
+    assert_eq!(ed.placeholder_range_at(&at(0, 0)), None);
+    ed.set_caret(at(0, 0));
+    assert!(!ed.select_placeholder_at_caret());
+}
+
+#[test]
+fn joining_paragraphs_in_a_cell_placeholder_clears_its_flag() {
+    for backspace in [true, false] {
+        let mut ed = editor(&format!(
+            "<w:tr>{}<w:tc><w:p><w:r><w:t>[One]</w:t></w:r></w:p><w:p><w:r><w:t>[Two]</w:t></w:r></w:p></w:tc>{CLOSE}{}</w:tr>",
+            open("Abstract", 1, true),
+            cell("x")
+        ));
+        if backspace {
+            ed.set_caret(Caret::at(vec![0, 0, 0, 1], 0));
+            ed.backspace();
+        } else {
+            ed.set_caret(Caret::at(vec![0, 0, 0, 0], 5));
+            ed.delete_forward();
+        }
+        assert_eq!(row(&ed).cells[0].blocks.len(), 1, "backspace {backspace}");
+        assert!(!flagged(&ed, 0), "backspace {backspace}");
+        while ed.undo() {}
+        assert!(flagged(&ed, 0));
+    }
+}
+
+#[test]
+fn change_case_in_a_cell_placeholder_clears_its_flag() {
+    let mut ed = cover_row();
+    ed.set_caret(at(0, 1));
+    assert!(ed.select_placeholder_at_caret());
+    ed.cycle_case();
+    assert_ne!(text(&ed, 0), "[Type the abstract]");
+    assert!(!flagged(&ed, 0) && flagged(&ed, 2));
+}
+
+#[test]
+fn an_off_flag_with_spaces_around_its_equals_sign_is_off() {
+    let ed = editor(&format!(
+        "<w:tr><w:sdt><w:sdtPr><w:showingPlcHdr w:val = \"false\" /></w:sdtPr><w:sdtContent>{}{CLOSE}</w:tr>",
+        cell("[A]")
+    ));
+    assert_eq!(ed.placeholder_range_at(&at(0, 1)), None);
+}
+
+#[test]
+fn deleting_inside_an_inline_placeholder_clears_its_flag() {
+    let xml = |_: ()| {
+        format!(
+            "<w:document><w:body><w:p><w:r><w:t xml:space=\"preserve\">Name: </w:t></w:r>{}\
+             <w:r><w:t>[Your name]</w:t></w:r>{CLOSE}<w:r><w:t xml:space=\"preserve\"> end</w:t></w:r></w:p>\
+             <w:p/></w:body></w:document>",
+            open("Name", 7, true)
+        )
+    };
+    let flag =
+        |ed: &Editor| crate::serialize::blocks_to_xml(&ed.doc.body[..1]).contains("showingPlcHdr");
+    let load = || Editor::new(parse_document_xml(&xml(()), &Relationships::default()));
+    // Backspace and Delete inside it, and a replace over part of it.
+    let mut ed = load();
+    ed.set_caret(Caret::at(vec![0], 10));
+    ed.backspace();
+    assert!(!flag(&ed));
+    let mut ed = load();
+    ed.set_caret(Caret::at(vec![0], 6));
+    ed.delete_forward();
+    assert!(!flag(&ed));
+    let mut ed = load();
+    let m = ed.find_all("name]", false);
+    ed.replace_matches(m, "x]");
+    assert!(!flag(&ed));
+    // Outside it: kept.
+    let mut ed = load();
+    ed.set_caret(Caret::at(vec![0], 3));
+    ed.backspace();
+    ed.set_caret(Caret::at(vec![0], 17));
+    ed.delete_forward();
+    assert!(flag(&ed));
 }
