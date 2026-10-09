@@ -51,6 +51,7 @@ mod doc_protected_tests;
 mod doc_templates;
 #[cfg(test)]
 mod doc_templates_tests;
+mod file_keys;
 mod harness;
 mod help_tab;
 mod hf;
@@ -12170,7 +12171,8 @@ impl Docxy {
     /// Ctrl+N (#631): a new blank document on a document tab, a new workbook
     /// on a workbook tab; on any other tab it does nothing. Ctrl+W (#629):
     /// close the active tab, as File > Close and its X do. On macOS, ⌘⇧S is
-    /// Save As (#1071). `None` for a key that is not one of these.
+    /// Save As (#1071). F12 is Save As, Shift+F12 Save and Ctrl/⌘+F12 Open
+    /// (#1141). `None` for a key that is not one of these.
     fn document_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -12181,6 +12183,11 @@ impl Docxy {
         if macos_menu::is_save_as(&ev.keystroke, text_input::MACOS) {
             self.keytips = KeyTip::Off;
             self.save_as(window, cx);
+            return Some(());
+        }
+        // F12 / Shift+F12 / Ctrl+F12 are Save As / Save / Open (#1141).
+        if let Some(fk) = file_keys::file_key(&ev.keystroke) {
+            self.file_key_act(fk, window, cx);
             return Some(());
         }
         let m = &ev.keystroke.modifiers;
@@ -19376,8 +19383,9 @@ impl Docxy {
         }
         // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
         // this thread and stops the control pump dead (see `save_sheet_tab`).
-        // The Backstage's Save As… is pointer-only, but a dead pump is the
-        // worst way a harness run can fail, so it refuses in words.
+        // The Backstage's Save As…, F12 and ⌘⇧S reach here from a harness
+        // key, and a dead pump is the worst way a harness run can fail, so
+        // it refuses in words.
         if doc_save_as_target(self.harness) == DocSaveTarget::RefuseHarness {
             self.set_status(DOC_SAVE_AS_HARNESS);
             return self.refocus(window, cx);
@@ -21891,7 +21899,8 @@ impl Docxy {
         }
         // Word's and Excel's document keys come before every surface's own,
         // so they work on any tab, in Protected View and in a document
-        // marked as final too.
+        // marked as final too. (Shift+F12 is Save: a locked document refuses
+        // it like Ctrl+S.)
         if let Some(done) = self.document_key(ev, window, cx) {
             return done;
         }
