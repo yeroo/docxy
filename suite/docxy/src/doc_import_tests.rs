@@ -5,7 +5,7 @@
 use crate::doc_import::{
     self, BINARY_PATH_HARNESS, BINARY_TARGET_REFUSED, COMPAT_SUFFIX, DocImport, IMPORTED_STATUS,
     IN_PLACE_REFUSED, SOURCE_TARGET_REFUSED, convert_tab, harness_save_refusal, is_binary_doc_path,
-    save_dir, save_name,
+    save_dir, save_name, save_start_dir, save_start_dir_of,
 };
 use crate::open_mode_tests::Scratch;
 use crate::{
@@ -316,7 +316,7 @@ fn save_as_onto_the_binary_original_is_refused() {
 }
 
 /// The Save As dialog for a `.doc` opens beside it, suggesting `<stem>.docx`;
-/// a document that isn't an import keeps the dialog's own folder.
+/// once rebound to the `.docx` it wrote, it opens in that same folder.
 #[test]
 fn save_as_suggests_the_docx_beside_the_original() {
     let dir = Scratch::new();
@@ -328,6 +328,7 @@ fn save_as_suggests_the_docx_beside_the_original() {
     let mut tab = tab;
     assert!(save_doc_tab(&mut tab, Some(target)), "{}", tab.status);
     assert_eq!(save_dir(&tab), None);
+    assert_eq!(save_start_dir_of(&tab), Some(absolute_parent(&path)));
     assert_eq!(save_name(&tab), "Report.docx");
 }
 
@@ -463,4 +464,46 @@ fn harness_save_refusal_names_its_cause() {
 
     tab.path = None;
     assert_eq!(harness_save_refusal(&tab), crate::DOC_NEVER_SAVED_HARNESS);
+}
+
+/// #1144: Save As opens in the file's own folder, whatever its kind; a new
+/// tab (no path) and a bare filename leave the dialog at the OS default.
+#[test]
+fn save_start_dir_is_the_files_folder() {
+    for name in ["c.xlsx", "c.docx", "c.yppx"] {
+        let path = Path::new("/a/b").join(name);
+        assert_eq!(
+            save_start_dir(Some(&path)),
+            Some(std::path::absolute("/a/b").unwrap())
+        );
+    }
+}
+
+#[test]
+fn save_start_dir_makes_a_relative_folder_absolute() {
+    let dir = save_start_dir(Some(Path::new("reports/book.xlsx"))).unwrap();
+    assert!(dir.is_absolute(), "{dir:?}");
+    assert!(dir.ends_with("reports"), "{dir:?}");
+}
+
+#[test]
+fn save_start_dir_is_none_for_a_new_tab() {
+    assert_eq!(save_start_dir(None), None);
+    assert_eq!(save_start_dir(Some(Path::new("c.xlsx"))), None);
+}
+
+#[test]
+fn save_start_dir_of_a_tab_follows_its_path() {
+    let dir = Scratch::new();
+    let path = write_doc(&dir, "plain.docx");
+    let mut tab = tab_from_path(&path);
+    assert_eq!(save_start_dir_of(&tab), Some(absolute_parent(&path)));
+    tab.path = None;
+    assert_eq!(save_start_dir_of(&tab), None);
+}
+
+/// A path's folder as the Save As dialog gets it: absolute, with any `..`
+/// collapsed (the scratch folders sit under `suite/docxy/../target`).
+fn absolute_parent(path: &Path) -> PathBuf {
+    std::path::absolute(path.parent().unwrap()).unwrap()
 }
