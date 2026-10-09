@@ -1029,7 +1029,21 @@ impl Editor {
         });
     }
 
+    /// Enter: with a real selection, replace it — the selection deletes and
+    /// the paragraph splits at its start in one undo step, as Word does. A
+    /// click's collapsed anchor is no selection; the split alone runs.
     pub fn insert_newline(&mut self) {
+        if self.has_selection() {
+            self.one_step("Typing", |ed| {
+                ed.delete_selection();
+                ed.insert_newline_collapsed();
+            });
+            return;
+        }
+        self.insert_newline_collapsed();
+    }
+
+    fn insert_newline_collapsed(&mut self) {
         // Only a collapsed anchor: `insert_hrule` moves the caret to the end
         // of the paragraph before calling this, so deleting a real selection
         // here would delete from the anchor to the paragraph end.
@@ -1078,6 +1092,10 @@ impl Editor {
     /// horizontal rule (a bottom paragraph border) and move to a fresh paragraph
     /// below. Returns true if it fired (so the caller skips the normal newline).
     pub fn hrule_autoformat(&mut self) -> bool {
+        // Over a real selection Enter replaces the selection instead.
+        if self.has_selection() {
+            return false;
+        }
         let kind = match para_mut(&mut self.doc.body, &self.caret.path) {
             Some(p) => match hrule_kind(&p.plain_text()) {
                 Some(k) => k,
@@ -1095,7 +1113,7 @@ impl Editor {
         }
         self.caret.offset = 0;
         // A fresh paragraph below for the caret, without inheriting the rule.
-        self.insert_newline();
+        self.insert_newline_collapsed();
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
             p.props.borders = ParBorders::default();
         }
@@ -1105,14 +1123,15 @@ impl Editor {
     /// Insert a horizontal line at the caret (Insert ▸ Horizontal Line): give the
     /// current paragraph a bottom border, then drop to a fresh paragraph below.
     pub fn insert_hrule(&mut self) {
-        // Before `move_end` moves the caret off a click's anchor.
-        self.drop_collapsed_anchor();
+        // Before `move_end` moves the caret off the anchor: a real selection
+        // collapses here, it is not deleted.
+        self.clear_selection();
         self.checkpoint(EditKind::Structural);
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
             p.props.borders.bottom = Some(BorderKind::Single);
         }
         self.move_end();
-        self.insert_newline();
+        self.insert_newline_collapsed();
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
             p.props.borders = ParBorders::default();
         }
@@ -5225,6 +5244,62 @@ mod tests {
         assert_eq!(top_text(&ed), vec!["x", "zy"]);
     }
 
+    /// #751: Enter over a real selection replaces it, as Word does: the
+    /// selected text is gone and the paragraph splits at the selection's
+    /// start.
+    #[test]
+    fn enter_over_selection_replaces_it() {
+        let mut ed = Editor::new(doc(&["hello"]));
+        ed.anchor = Some(Caret::top(0, 1));
+        ed.caret = Caret::top(0, 4); // select "ell"
+        ed.insert_newline();
+        assert_eq!(top_text(&ed), vec!["h", "o"]);
+        assert_eq!(ed.caret, Caret::top(1, 0));
+        assert!(!ed.has_selection());
+    }
+
+    /// #751: a selection across sibling paragraphs goes the same way: the
+    /// range deletes down to one paragraph, which then splits at the caret.
+    #[test]
+    fn enter_over_cross_paragraph_selection_replaces_it() {
+        let mut ed = Editor::new(doc(&["one", "two", "three"]));
+        ed.anchor = Some(Caret::top(0, 1));
+        ed.caret = Caret::top(2, 1);
+        ed.insert_newline();
+        assert_eq!(top_text(&ed), vec!["o", "hree"]);
+        assert_eq!(ed.caret, Caret::top(1, 0));
+        assert!(!ed.has_selection());
+    }
+
+    /// #751: the delete and the split are one undo step, and undoing it
+    /// selects the text again, as #853 made a delete do.
+    #[test]
+    fn enter_over_selection_is_one_undo_step() {
+        let mut ed = Editor::new(doc(&["hello"]));
+        ed.anchor = Some(Caret::top(0, 1));
+        ed.caret = Caret::top(0, 4);
+        ed.insert_newline();
+        assert_eq!(top_text(&ed), vec!["h", "o"], "selection replaced");
+        assert!(ed.undo());
+        assert_eq!(top_text(&ed), vec!["hello"]);
+        assert!(ed.has_selection(), "undo re-selects, as #853");
+        assert!(!ed.undo(), "one Enter over a selection is one step");
+    }
+
+    /// #751: a click's collapsed anchor is no selection; Enter still just
+    /// splits at the caret and deletes nothing.
+    #[test]
+    fn enter_with_collapsed_anchor_unchanged() {
+        let mut ed = Editor::new(doc(&["ab"]));
+        ed.set_caret(Caret::top(0, 1));
+        ed.extend_selection(true);
+        assert!(!ed.has_selection());
+        ed.insert_newline();
+        assert_eq!(top_text(&ed), vec!["a", "b"]);
+        assert_eq!(ed.caret, Caret::top(1, 0));
+        assert_eq!(ed.anchor, None);
+    }
+
     #[test]
     fn horizontal_line_after_a_click_leaves_no_selection_698() {
         let mut ed = clicked_at_1();
@@ -5236,6 +5311,28 @@ mod tests {
         assert_eq!(top_text(&ed), vec!["xy", "z"]);
     }
 
+    /// #751: with a real selection, Insert ▸ Horizontal Line still borders
+    /// the whole paragraph and moves below it; the selection is collapsed,
+    /// not deleted.
+    #[test]
+    fn insert_hrule_with_selection_keeps_text() {
+        let mut ed = Editor::new(doc(&["hello"]));
+        ed.anchor = Some(Caret::top(0, 1));
+        ed.caret = Caret::top(0, 4);
+        ed.insert_hrule();
+        assert_eq!(top_text(&ed), vec!["hello", ""]);
+        assert_eq!(ed.anchor, None, "the selection is collapsed, not deleted");
+        assert!(!ed.has_selection());
+        match &ed.doc.body[0] {
+            Block::Paragraph(p) => assert_eq!(p.props.borders.bottom, Some(BorderKind::Single)),
+            _ => panic!(),
+        }
+        match &ed.doc.body[1] {
+            Block::Paragraph(p) => assert_eq!(p.props.borders.bottom, None),
+            _ => panic!(),
+        }
+    }
+
     #[test]
     fn rule_autoformat_after_a_click_leaves_no_selection_698() {
         let mut ed = Editor::new(doc(&["---"]));
@@ -5245,6 +5342,22 @@ mod tests {
         assert_eq!(ed.anchor, None);
         ed.insert_char('z');
         assert_eq!(top_text(&ed), vec!["", "z"]);
+    }
+
+    /// #751: the "---"-to-rule autoformat declines over a real selection;
+    /// Enter's replace-the-selection wins instead.
+    #[test]
+    fn hrule_autoformat_declines_over_selection() {
+        let mut ed = Editor::new(doc(&["---"]));
+        ed.anchor = Some(Caret::top(0, 1));
+        ed.caret = Caret::top(0, 3);
+        assert!(ed.has_selection());
+        assert!(!ed.hrule_autoformat());
+        assert_eq!(top_text(&ed), vec!["---"]);
+        match &ed.doc.body[0] {
+            Block::Paragraph(p) => assert_eq!(p.props.borders.bottom, None),
+            _ => panic!(),
+        }
     }
 
     /// #619: coalesced typing is one step named by its text, and other
