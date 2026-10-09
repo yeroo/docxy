@@ -698,8 +698,15 @@ struct SheetView {
     /// A cell the arrow keys are pointing at while a formula is typed in Enter
     /// mode. `None` whenever the last key wasn't a pointing arrow.
     edit_point: Option<EditPoint>,
-    /// The buffer as the editor opened — Ctrl+Z while editing returns to it.
+    /// The cell's input text as the editor opened, in either mode (empty for
+    /// an empty cell) — Ctrl+Z / Alt+Backspace while editing returns to it.
     edit_start: String,
+    /// The typing a Ctrl+Z set aside (text, caret): an immediate second
+    /// Ctrl+Z puts it back, any other key drops it (#1147).
+    edit_redo: Option<(String, usize)>,
+    /// After a revert in Enter mode the restored text is selected: the next
+    /// typed character replaces it, Backspace or Delete empties it.
+    edit_select_all: bool,
     /// The last formatting change, for F4 (repeat). A resolved setter
     /// (bold ON), so repeating applies it rather than flipping it.
     last_format: Option<FormatFn>,
@@ -2460,7 +2467,9 @@ impl SheetView {
                 (seed.clone(), Some(seed), EditMode::Edit)
             }
         };
-        self.edit_start = buf.clone();
+        self.edit_start = self.edit_string(r, c);
+        self.edit_redo = None;
+        self.edit_select_all = false;
         self.editing = Some(buf);
         self.edit_seed = seed;
         self.edit_origin = Some((self.active, r, c));
@@ -3101,6 +3110,7 @@ impl SheetView {
 
     /// Type `s` at the caret, over the next character in overtype mode.
     fn edit_type(&mut self, s: &str) {
+        self.edit_clear_selected();
         if self.edit_overtype {
             for _ in s.chars() {
                 self.edit_delete();
@@ -3152,8 +3162,22 @@ impl SheetView {
                 return;
             }
             self.edit_proposal = None;
+            self.edit_correction = None;
+            // Straight after a revert, the typing it set aside comes back.
+            if let Some((text, caret)) = self.edit_redo.take() {
+                self.editing = Some(text);
+                self.edit_caret = caret;
+                self.edit_select_all = false;
+                return;
+            }
+            let typed = self.editing.take().unwrap_or_default();
+            self.edit_redo = Some((typed, self.edit_caret));
             self.editing = Some(self.edit_start.clone());
             self.edit_caret_to_end();
+            // Typing over a cell leaves the restored text selected.
+            self.edit_select_all = self.edit_mode == EditMode::Enter;
+            // Unchanged, it commits as the cell was (a 17-digit number stays).
+            self.edit_seed = Some(self.edit_start.clone());
         }
     }
 
@@ -3733,12 +3757,28 @@ impl SheetView {
     }
     /// Insert text at the caret, advancing it.
     fn edit_insert(&mut self, s: &str) {
+        self.edit_redo = None;
         if let Some(buf) = self.editing.as_mut() {
             buf_insert(buf, &mut self.edit_caret, s);
         }
     }
+    /// A revert's selected text goes when anything is typed or deleted.
+    fn edit_clear_selected(&mut self) -> bool {
+        self.edit_redo = None;
+        if !std::mem::take(&mut self.edit_select_all) {
+            return false;
+        }
+        if let Some(buf) = self.editing.as_mut() {
+            buf.clear();
+        }
+        self.edit_caret = 0;
+        true
+    }
     /// Delete the char before the caret (Backspace).
     fn edit_backspace(&mut self) {
+        if self.edit_clear_selected() {
+            return;
+        }
         self.edit_tail_left();
         if let Some(buf) = self.editing.as_mut() {
             buf_backspace(buf, &mut self.edit_caret);
@@ -3746,6 +3786,9 @@ impl SheetView {
     }
     /// Delete the char at the caret (Delete).
     fn edit_delete(&mut self) {
+        if self.edit_clear_selected() {
+            return;
+        }
         self.edit_tail_left();
         let caret = self.edit_caret;
         if let Some(buf) = self.editing.as_mut() {
@@ -9926,6 +9969,8 @@ fn new_sheet_surface() -> Surface {
         edit_overtype: false,
         edit_point: None,
         edit_start: String::new(),
+        edit_redo: None,
+        edit_select_all: false,
         last_format: None,
         entry_error: None,
         dv_pending: None,
@@ -10009,6 +10054,8 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     edit_overtype: false,
                     edit_point: None,
                     edit_start: String::new(),
+                    edit_redo: None,
+                    edit_select_all: false,
                     last_format: None,
                     entry_error: None,
                     dv_pending: None,
@@ -18398,6 +18445,21 @@ impl Docxy {
                 v.edit_point = None;
             }
         }
+        // Any key but the revert (Ctrl+Z, Alt+Backspace) ends its toggle and
+        // its selection (#1147); a lone modifier is no key.
+        if editing && !modifier && !((ctrl && key == "z") || (alt && key == "backspace")) {
+            if let Some(v) = self.active_sheet_mut() {
+                v.edit_redo = None;
+                // A typed character, Backspace or Delete uses the selection
+                // up itself; any other key just drops it.
+                let uses_it = !ctrl
+                    && !alt
+                    && (key.chars().count() == 1 || key == "backspace" || key == "delete");
+                if !uses_it {
+                    v.edit_select_all = false;
+                }
+            }
+        }
         // What the key does to a live AutoComplete proposal (#672) before it
         // acts: see `SheetView::proposal_before_key`.
         if editing {
@@ -18693,7 +18755,11 @@ impl Docxy {
             "backspace" => {
                 if editing {
                     if let Some(v) = self.active_sheet_mut() {
-                        if !v.drop_proposal() {
+                        if alt {
+                            // Alt+Backspace is Ctrl+Z (#1147).
+                            v.proposal_before_key("z", true, false);
+                            v.edit_revert();
+                        } else if !v.drop_proposal() {
                             v.edit_backspace();
                         }
                     }

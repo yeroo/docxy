@@ -90,6 +90,42 @@ test ctrl z while editing undoes the typing only
   type Z
   assert edit is Z
 
+# #1147: Ctrl+Z (and Alt+Backspace) in the editor puts the cell's own text
+# back, a second press puts the typing back, and after typing over a cell the
+# restored text is selected.
+test ctrl z restores the cell text and toggles
+  open copy:../fixtures/basic.xlsx
+  click A1
+  type abc
+  key ctrl+z
+  assert editing is true
+  assert edit is Region
+  type x
+  assert edit is x
+  key ctrl+z
+  assert edit is Region
+  key ctrl+z
+  assert edit is x
+  key escape
+  click A1
+  type abc
+  key alt+backspace
+  assert edit is Region
+  key alt+backspace
+  assert edit is abc
+  key escape
+  assert cell A1 is Region
+
+# #1147: after F2 the restored text keeps the caret at its end.
+test ctrl z after f2 appends
+  open copy:../fixtures/basic.xlsx
+  click A1
+  key f2
+  type XY
+  key ctrl+z
+  type Z
+  assert edit is RegionZ
+
 # Enter mode: an arrow commits and moves, a formula's too — except where the
 # formula wants a reference next: there it points at a cell and writes it
 # (#757), and the editor stays open.
