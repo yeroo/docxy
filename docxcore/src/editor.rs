@@ -926,12 +926,14 @@ impl Editor {
         // after this character takes the character's own props.
         let pending = self.pending_format().cloned();
         let pushed_before = undo_serial_counter();
-        if self.has_selection() {
-            self.delete_selection();
-        }
         if ch == '\n' {
+            // A newline over a selection is one step: `insert_newline`
+            // deletes the selection and splits (#751).
             self.insert_newline();
             return;
+        }
+        if self.has_selection() {
+            self.delete_selection();
         }
         // Typing over a selection is one step, as in Word: the step the
         // deletion pushed (its snapshot is the state before it) becomes the
@@ -1035,6 +1037,10 @@ impl Editor {
     pub fn insert_newline(&mut self) {
         if self.has_selection() {
             self.one_step("Typing", |ed| {
+                // `delete_selection`'s cross-container fallback only
+                // collapses (no step of its own); checkpoint first so undo
+                // restores the selection even there (#751).
+                ed.checkpoint(EditKind::Structural);
                 ed.delete_selection();
                 ed.insert_newline_collapsed();
             });
@@ -1103,8 +1109,8 @@ impl Editor {
             },
             None => return false,
         };
-        // Before the caret moves to 0, or `insert_newline` would no longer
-        // see the anchor as collapsed.
+        // Before the caret moves to 0, or `insert_newline_collapsed` would
+        // no longer see the anchor as collapsed.
         self.drop_collapsed_anchor();
         self.checkpoint(EditKind::Structural);
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
@@ -1493,8 +1499,8 @@ impl Editor {
     /// Every edit that moves the caret through content calls this first,
     /// before its undo checkpoint and before it moves the caret (so undo
     /// restores a plain caret), including the ones that reach
-    /// `insert_newline` only after moving it (`insert_hrule`,
-    /// `hrule_autoformat`).
+    /// `insert_newline_collapsed` only after moving it (`hrule_autoformat`;
+    /// `insert_hrule` clears any selection with `clear_selection` instead).
     fn drop_collapsed_anchor(&mut self) {
         if self.anchor.as_ref() == Some(&self.caret) {
             self.anchor = None;
@@ -5283,6 +5289,45 @@ mod tests {
         assert!(ed.undo());
         assert_eq!(top_text(&ed), vec!["hello"]);
         assert!(ed.has_selection(), "undo re-selects, as #853");
+        assert!(!ed.undo(), "one Enter over a selection is one step");
+    }
+
+    /// #751: a typed newline (`insert_char('\n')`) over a selection replaces
+    /// it in one step too: the character hands the selection to the
+    /// selection-aware `insert_newline` instead of deleting first and
+    /// splitting as two steps.
+    #[test]
+    fn typed_newline_over_selection_is_one_undo_step() {
+        let mut ed = Editor::new(doc(&["hello"]));
+        ed.anchor = Some(Caret::top(0, 1));
+        ed.caret = Caret::top(0, 4); // select "ell"
+        ed.insert_char('\n');
+        assert_eq!(top_text(&ed), vec!["h", "o"], "selection replaced");
+        assert!(ed.undo());
+        assert_eq!(top_text(&ed), vec!["hello"]);
+        assert!(ed.has_selection(), "undo re-selects, as #853");
+        assert!(!ed.undo(), "one typed newline over a selection is one step");
+    }
+
+    /// #751: a selection that spans from a body paragraph into a table cell
+    /// cannot be deleted (cross-container); Enter collapses it to its low
+    /// end and splits there — and one undo restores the text and the
+    /// selection, which the collapse-only fallback takes no step for.
+    #[test]
+    fn enter_over_cross_container_selection_is_one_undo_step() {
+        let mut ed = Editor::new(table_doc());
+        ed.caret = Caret::top(0, 4); // in "before"
+        ed.anchor = Some(Caret::at(vec![1, 0, 0, 0], 1)); // in cell "A"
+        ed.insert_newline();
+        assert!(!ed.has_selection());
+        assert_eq!(top_text(&ed), vec!["befo", "re", "after"]);
+        assert_eq!(ed.caret, Caret::top(1, 0));
+        assert!(ed.undo());
+        assert_eq!(top_text(&ed), vec!["before", "after"]);
+        assert!(
+            ed.has_selection(),
+            "undo restores the cross-container selection"
+        );
         assert!(!ed.undo(), "one Enter over a selection is one step");
     }
 
