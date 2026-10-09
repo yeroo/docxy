@@ -1490,6 +1490,15 @@ fn values_agree(a: &CellValue, b: &CellValue) -> bool {
 // App state
 // ---------------------------------------------------------------------------
 
+/// The typing a Ctrl+Z set aside, with the editor state that went with it.
+struct Redo {
+    text: String,
+    cursor: usize,
+    typed_tail: bool,
+    kept: Option<usize>,
+    seed: Option<String>,
+}
+
 /// In-cell editing state. `replace` distinguishes Excel's two modes: typing
 /// over a cell (arrows commit + move) vs F2 (arrows move inside the text).
 #[derive(Default)]
@@ -1507,7 +1516,7 @@ struct EditState {
     start: String,
     /// The typing a Ctrl+Z set aside (text, caret), for an immediate second
     /// Ctrl+Z to put back. Any other key drops it.
-    redo_text: Option<(String, usize)>,
+    redo_text: Option<Redo>,
     /// Typing over a cell, the restored text is selected: the next typed
     /// character replaces it, Backspace or Delete empties it.
     select_all: bool,
@@ -5450,7 +5459,7 @@ impl App {
     fn pick_value(&mut self, value: String) {
         let (seed, start) = match self.edit.take() {
             Some(e) => (e.seed, e.start),
-            None => (None, String::new()),
+            None => (None, self.current_input_text()),
         };
         self.edit = Some(EditState {
             start,
@@ -5604,18 +5613,27 @@ impl App {
                 return;
             }
         }
-        e.kept = None;
-        e.typed_tail = false;
-        // Straight after a revert, the typing it set aside comes back.
-        if let Some((text, cursor)) = e.redo_text.take() {
-            e.text = text;
-            e.cursor = cursor;
+        // Straight after a revert, the typing it set aside comes back, with
+        // its typing marker, exemption and seed.
+        if let Some(r) = e.redo_text.take() {
+            e.text = r.text;
+            e.cursor = r.cursor;
+            e.typed_tail = r.typed_tail;
+            e.kept = r.kept;
+            e.seed = r.seed;
             e.select_all = false;
             return;
         }
         // Otherwise the cell's text from when editing began, the typing kept
-        // for the next press. Typing over a cell leaves it selected.
-        e.redo_text = Some((std::mem::take(&mut e.text), e.cursor));
+        // for the next press; the restored text was not typed, so it carries
+        // no marker or exemption. Typing over a cell leaves it selected.
+        e.redo_text = Some(Redo {
+            text: std::mem::take(&mut e.text),
+            cursor: e.cursor,
+            typed_tail: std::mem::take(&mut e.typed_tail),
+            kept: e.kept.take(),
+            seed: e.seed.take(),
+        });
         e.text = e.start.clone();
         e.cursor = e.text.chars().count();
         e.select_all = e.replace;
@@ -10868,6 +10886,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                     if std::mem::take(&mut e.select_all) {
                         e.text.clear();
                         e.cursor = 0;
+                        e.seed = None;
                     } else if e.cursor > 0 {
                         let idx = char_index(&e.text, e.cursor - 1);
                         e.text.remove(idx);
@@ -10883,6 +10902,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                     if std::mem::take(&mut e.select_all) {
                         e.text.clear();
                         e.cursor = 0;
+                        e.seed = None;
                     } else if e.cursor < e.text.chars().count() {
                         let idx = char_index(&e.text, e.cursor);
                         e.text.remove(idx);
@@ -10898,6 +10918,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                     if std::mem::take(&mut e.select_all) {
                         e.text.clear();
                         e.cursor = 0;
+                        e.seed = None;
                     }
                     let idx = char_index(&e.text, e.cursor);
                     e.typed_tail = e.cursor == e.text.chars().count();
@@ -21338,6 +21359,68 @@ mod tests {
         assert!(app.edit.is_some());
         chord(&mut app, 'z');
         assert_eq!(app.edit.as_ref().unwrap().text, "old");
+    }
+
+    #[test]
+    fn a_pick_refused_by_validation_keeps_the_cell_text_to_revert_to_1147() {
+        use gridcore::sheet::AlertStyle;
+        let mut app = dv_app(AlertStyle::Stop);
+        // Pick From Drop-down List with no editor open, B2 (`50`) the cell.
+        app.pick_value("250".into());
+        assert!(app.dv_alert.is_some());
+        press(&mut app, KeyCode::Enter); // Retry
+        chord(&mut app, 'z');
+        assert_eq!(app.edit.as_ref().unwrap().text, "50");
+    }
+
+    #[test]
+    fn a_taken_list_item_ends_the_reverts_toggle_and_selection_1147() {
+        // Revert to `=SU`, Alt+Down for the list, Tab to take an item, type:
+        // the typing lands after it instead of replacing the formula.
+        let mut app = opts_app();
+        app.pkg.workbook.sheets[app.sheet].set_cell(2, 0, gridcore::sheet::Cell::formula("SU"));
+        app.rebuild_engine();
+        app.cur = (2, 0);
+        type_text(&mut app, "abc");
+        chord(&mut app, 'z');
+        assert_eq!(app.edit.as_ref().unwrap().text, "=SU");
+        alt(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Tab);
+        let taken = app.edit.as_ref().unwrap().text.clone();
+        assert!(taken.starts_with("=SU") && taken.len() > 3, "{taken}");
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.edit.as_ref().unwrap().text, format!("{taken}1"));
+        chord(&mut app, 'z');
+        assert_eq!(app.edit.as_ref().unwrap().text, "=SU", "the toggle is over");
+    }
+
+    #[test]
+    fn the_second_ctrl_z_restores_the_typing_marker_and_seed_1147() {
+        // The word is corrected at the commit as typed (`teh` -> `the`), also
+        // after Ctrl+Z, Ctrl+Z; and typing over the restored text is an entry
+        // even when it equals the cell's own text.
+        let mut app = opts_app();
+        put(&mut app, 2, 0, "old");
+        app.cur = (2, 0);
+        type_text(&mut app, "teh");
+        chord(&mut app, 'z');
+        chord(&mut app, 'z');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 2, 0), "the");
+        let mut app = opts_app();
+        put(&mut app, 2, 0, "old");
+        app.cur = (2, 0);
+        type_text(&mut app, "abc");
+        chord(&mut app, 'z');
+        type_text(&mut app, "old");
+        assert_eq!(app.edit.as_ref().unwrap().seed, None);
+        let mut app = opts_app();
+        put(&mut app, 2, 0, "1234");
+        app.cur = (2, 0);
+        type_text(&mut app, "abc");
+        chord(&mut app, 'z');
+        chord(&mut app, 'z');
+        assert_eq!(app.edit.as_ref().unwrap().seed, None);
     }
 
     #[test]

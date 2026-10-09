@@ -124,8 +124,11 @@ test ctrl z then space replaces the restored text
   type abc
   key ctrl+z
   key space
-  type x
-  assert edit is  x
+  type y
+  assert edit is y
+  key space
+  type z
+  assert edit is y z
   key escape
   click A1
   type abc

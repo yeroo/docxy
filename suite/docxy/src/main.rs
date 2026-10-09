@@ -667,8 +667,17 @@ enum Surface {
     Placeholder,
 }
 
-/// The typing a revert set aside: its text, caret and typing marker.
-type EditRedo = (String, usize, Option<(String, usize)>);
+/// The typing a revert set aside, with the editor state that went with it.
+struct EditRedo {
+    text: String,
+    caret: usize,
+    /// `edit_typed_tail`: the restored text was not typed.
+    tail: Option<(String, usize)>,
+    /// `edit_kept`: a word whose AutoCorrect was taken back.
+    kept: Option<usize>,
+    /// `edit_seed` as it was before the revert set it.
+    seed: Option<String>,
+}
 
 /// A spreadsheet tab's live state: the loaded workbook package, which sheet is
 /// active, the selected cell, and the grid's scroll handle.
@@ -705,8 +714,9 @@ struct SheetView {
     /// The cell's input text as the editor opened, in either mode (empty for
     /// an empty cell) — Ctrl+Z / Alt+Backspace while editing returns to it.
     edit_start: String,
-    /// The typing a Ctrl+Z set aside (text, caret): an immediate second
-    /// Ctrl+Z puts it back, any other key drops it (#1147).
+    /// The typing a Ctrl+Z set aside (text, caret, typing marker, exemption,
+    /// seed): an immediate second Ctrl+Z puts it back, any other key drops
+    /// it (#1147).
     edit_redo: Option<EditRedo>,
     /// After a revert in Enter mode the restored text is selected: the next
     /// typed character replaces it, Backspace or Delete empties it.
@@ -3157,6 +3167,23 @@ impl SheetView {
         }
     }
 
+    /// What `key` does to a revert's toggle and selection (#1147): the revert
+    /// itself (Ctrl+Z, Alt+Backspace) keeps them, a typed character, Backspace
+    /// or Delete uses the selection up itself, any other key (a lone modifier
+    /// aside) drops both.
+    fn end_revert_for_key(&mut self, key: &str, ctrl: bool, alt: bool, typed: bool) {
+        let modifier = matches!(key, "shift" | "control" | "alt" | "platform" | "function");
+        if self.editing.is_none() || modifier || (ctrl && key == "z") || (alt && key == "backspace")
+        {
+            return;
+        }
+        self.edit_redo = None;
+        let uses_it = !ctrl && !alt && (typed || key == "backspace" || key == "delete");
+        if !uses_it {
+            self.edit_select_all = false;
+        }
+    }
+
     /// The caret or buffer changed by something other than typing (a click, a
     /// pointed reference, a taken completion): the revert's toggle and
     /// selection end (#1147).
@@ -3179,17 +3206,26 @@ impl SheetView {
             self.edit_proposal = None;
             self.edit_correction = None;
             // Straight after a revert, the typing it set aside comes back.
-            if let Some((text, caret, tail)) = self.edit_redo.take() {
-                self.editing = Some(text);
-                self.edit_caret = caret;
-                self.edit_typed_tail = tail;
+            if let Some(r) = self.edit_redo.take() {
+                self.editing = Some(r.text);
+                self.edit_caret = r.caret;
+                self.edit_typed_tail = r.tail;
+                self.edit_kept = r.kept;
+                self.edit_seed = r.seed;
                 self.edit_select_all = false;
                 return;
             }
             let typed = self.editing.take().unwrap_or_default();
-            // The typing marker goes with the typing: the restored text was
-            // not typed, so a commit's AutoCorrect must not see it.
-            self.edit_redo = Some((typed, self.edit_caret, self.edit_typed_tail.take()));
+            // The typing marker, a taken-back word's exemption and the seed go
+            // with the typing: the restored text was not typed, so a commit's
+            // AutoCorrect must not see them.
+            self.edit_redo = Some(EditRedo {
+                text: typed,
+                caret: self.edit_caret,
+                tail: self.edit_typed_tail.take(),
+                kept: self.edit_kept.take(),
+                seed: self.edit_seed.take(),
+            });
             self.editing = Some(self.edit_start.clone());
             self.edit_caret_to_end();
             // Typing over a cell leaves the restored text selected.
@@ -3790,6 +3826,8 @@ impl SheetView {
             buf.clear();
         }
         self.edit_caret = 0;
+        // What is typed now is an entry, not the restored cell text.
+        self.edit_seed = None;
         true
     }
     /// Delete the char before the caret (Backspace).
@@ -18418,6 +18456,18 @@ impl Docxy {
                 v.flash_preview = None;
             }
         }
+        // Any key but the revert ends its toggle and selection (#1147), ahead
+        // of the keys below that return early (Alt+Down, the formula list's).
+        if editing {
+            let typed = ev
+                .keystroke
+                .key_char
+                .as_deref()
+                .is_some_and(|c| !c.is_empty() && !c.starts_with(char::is_control));
+            if let Some(v) = self.active_sheet_mut() {
+                v.end_revert_for_key(key, ctrl, alt, typed);
+            }
+        }
         // Alt+Down opens a drop-down list (#665), before point mode or the
         // type-over arrows can take the Down.
         if alt && !ctrl && !shift && key == "down" {
@@ -18463,24 +18513,6 @@ impl Docxy {
         if editing && arrow.is_none() && !modifier {
             if let Some(v) = self.active_sheet_mut() {
                 v.edit_point = None;
-            }
-        }
-        // Any key but the revert (Ctrl+Z, Alt+Backspace) ends its toggle and
-        // its selection (#1147); a lone modifier is no key.
-        if editing && !modifier && !((ctrl && key == "z") || (alt && key == "backspace")) {
-            if let Some(v) = self.active_sheet_mut() {
-                v.edit_redo = None;
-                // A typed character, Backspace or Delete uses the selection
-                // up itself; any other key just drops it.
-                let typed = ev
-                    .keystroke
-                    .key_char
-                    .as_deref()
-                    .is_some_and(|c| !c.is_empty() && !c.starts_with(char::is_control));
-                let uses_it = !ctrl && !alt && (typed || key == "backspace" || key == "delete");
-                if !uses_it {
-                    v.edit_select_all = false;
-                }
             }
         }
         // What the key does to a live AutoComplete proposal (#672) before it
