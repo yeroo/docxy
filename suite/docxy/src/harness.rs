@@ -3441,8 +3441,10 @@ fn tab_list(tabs: &[crate::DocTab], active: usize, os_title: Option<&str>) -> Js
     Json::obj(vec![
         ("active", Json::Num(active as f64)),
         ("window_title", Json::Str(window_title)),
-        // What the platform window was last given: not recomputed, so it
-        // catches a render that stops calling `set_window_title` (#1143).
+        // `last_window_title`, the cache render updates beside its
+        // `set_window_title` call: not recomputed from the tabs, so it catches
+        // a render that stops updating the title (#1143), though not a dropped
+        // `set_window_title` call alone.
         ("os_title", str_or_null(os_title.map(str::to_owned))),
         ("tabs", Json::Arr(tabs)),
     ])
