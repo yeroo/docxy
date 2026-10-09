@@ -316,7 +316,7 @@ fn save_as_onto_the_binary_original_is_refused() {
 }
 
 /// The Save As dialog for a `.doc` opens beside it, suggesting `<stem>.docx`;
-/// a document that isn't an import keeps the dialog's own folder.
+/// once rebound to the `.docx` it wrote, it opens in that same folder.
 #[test]
 fn save_as_suggests_the_docx_beside_the_original() {
     let dir = Scratch::new();
@@ -328,6 +328,7 @@ fn save_as_suggests_the_docx_beside_the_original() {
     let mut tab = tab;
     assert!(save_doc_tab(&mut tab, Some(target)), "{}", tab.status);
     assert_eq!(save_dir(&tab), None);
+    assert_eq!(save_start_dir_of(&tab), path.parent().map(PathBuf::from));
     assert_eq!(save_name(&tab), "Report.docx");
 }
 
@@ -473,6 +474,13 @@ fn save_start_dir_is_the_files_folder() {
         let path = Path::new("/a/b").join(name);
         assert_eq!(save_start_dir(Some(&path)), Some(PathBuf::from("/a/b")));
     }
+}
+
+#[test]
+fn save_start_dir_makes_a_relative_folder_absolute() {
+    let dir = save_start_dir(Some(Path::new("reports/book.xlsx"))).unwrap();
+    assert!(dir.is_absolute(), "{dir:?}");
+    assert!(dir.ends_with("reports"), "{dir:?}");
 }
 
 #[test]

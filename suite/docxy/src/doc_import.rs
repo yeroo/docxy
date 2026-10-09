@@ -137,8 +137,9 @@ pub(super) fn save_name(tab: &DocTab) -> String {
     }
 }
 
-/// The folder the Save As dialog opens in for an imported document: its
-/// original's, so the `.docx` goes beside it. `None` for anything else.
+/// The folder of an imported document's original, `None` for anything else.
+/// Close's own-folder pick uses it; the Save As dialogs start in
+/// [`save_start_dir_of`].
 pub(super) fn save_dir(tab: &DocTab) -> Option<&Path> {
     tab.import
         .binary_source
@@ -147,13 +148,12 @@ pub(super) fn save_dir(tab: &DocTab) -> Option<&Path> {
 }
 
 /// The folder a Save As dialog opens in for a file at `path`: its own folder
-/// (#1144). `None` for a new tab and for a bare filename, which leave the
-/// dialog at the OS default.
+/// (#1144), made absolute. `None` for a new tab and for a bare filename,
+/// which leave the dialog at the OS default.
 pub(super) fn save_start_dir(path: Option<&Path>) -> Option<PathBuf> {
-    path?
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .map(Path::to_path_buf)
+    let dir = path?.parent().filter(|dir| !dir.as_os_str().is_empty())?;
+    // A relative folder means nothing to a dialog that may not share the cwd.
+    Some(std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf()))
 }
 
 /// [`save_start_dir`] for a tab.
