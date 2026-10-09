@@ -328,7 +328,7 @@ fn save_as_suggests_the_docx_beside_the_original() {
     let mut tab = tab;
     assert!(save_doc_tab(&mut tab, Some(target)), "{}", tab.status);
     assert_eq!(save_dir(&tab), None);
-    assert_eq!(save_start_dir_of(&tab), path.parent().map(PathBuf::from));
+    assert_eq!(save_start_dir_of(&tab), Some(absolute_parent(&path)));
     assert_eq!(save_name(&tab), "Report.docx");
 }
 
@@ -472,7 +472,10 @@ fn harness_save_refusal_names_its_cause() {
 fn save_start_dir_is_the_files_folder() {
     for name in ["c.xlsx", "c.docx", "c.yppx"] {
         let path = Path::new("/a/b").join(name);
-        assert_eq!(save_start_dir(Some(&path)), Some(PathBuf::from("/a/b")));
+        assert_eq!(
+            save_start_dir(Some(&path)),
+            Some(std::path::absolute("/a/b").unwrap())
+        );
     }
 }
 
@@ -494,7 +497,13 @@ fn save_start_dir_of_a_tab_follows_its_path() {
     let dir = Scratch::new();
     let path = write_doc(&dir, "plain.docx");
     let mut tab = tab_from_path(&path);
-    assert_eq!(save_start_dir_of(&tab), path.parent().map(PathBuf::from));
+    assert_eq!(save_start_dir_of(&tab), Some(absolute_parent(&path)));
     tab.path = None;
     assert_eq!(save_start_dir_of(&tab), None);
+}
+
+/// A path's folder as the Save As dialog gets it: absolute, with any `..`
+/// collapsed (the scratch folders sit under `suite/docxy/../target`).
+fn absolute_parent(path: &Path) -> PathBuf {
+    std::path::absolute(path.parent().unwrap()).unwrap()
 }
