@@ -3414,7 +3414,7 @@ fn kind_name(kind: crate::Kind) -> &'static str {
 }
 
 /// `tab-list`: every open tab, in strip order, and which one is active.
-fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
+fn tab_list(tabs: &[crate::DocTab], active: usize, os_title: Option<&str>) -> Json {
     let window_title = crate::doc_name::window_title(tabs.get(active).map(|t| t.title.as_ref()));
     let tabs = tabs
         .iter()
@@ -3441,6 +3441,9 @@ fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
     Json::obj(vec![
         ("active", Json::Num(active as f64)),
         ("window_title", Json::Str(window_title)),
+        // What the platform window was last given: not recomputed, so it
+        // catches a render that stops calling `set_window_title` (#1143).
+        ("os_title", str_or_null(os_title.map(str::to_owned))),
         ("tabs", Json::Arr(tabs)),
     ])
 }
@@ -3629,7 +3632,11 @@ fn dispatch_verb(
             }
             Done::ok(state(app, window, cx))
         }
-        "tab-list" => Done::ok(tab_list(&app.tabs, app.active)),
+        "tab-list" => Done::ok(tab_list(
+            &app.tabs,
+            app.active,
+            app.last_window_title.as_deref(),
+        )),
         // The run's windows (#587). These go through the same handlers as
         // View › Window: `window-new` is the New Window command (it moves
         // the tab named by `tab`, or the active one, and selects the new
@@ -5750,7 +5757,12 @@ mod tests {
         let mut mpp = doc(crate::Kind::Project, "plan.mpp");
         mpp.path = Some("C:/work/plan.mpp".into());
         let inbox = doc(crate::Kind::Look, "Inbox");
-        let list = tab_list(&[word, book, blank, mpp, inbox], 2);
+        let list = tab_list(
+            &[word, book, blank, mpp, inbox],
+            2,
+            Some("Project1  -  docxy"),
+        );
+        assert_eq!(list.get_str("os_title"), Some("Project1  -  docxy"));
         assert_eq!(list.get("active"), Some(&Json::Num(2.)));
         assert_eq!(
             list.get_str("window_title"),
