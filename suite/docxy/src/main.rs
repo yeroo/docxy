@@ -667,6 +667,9 @@ enum Surface {
     Placeholder,
 }
 
+/// The typing a revert set aside: its text, caret and typing marker.
+type EditRedo = (String, usize, Option<(String, usize)>);
+
 /// A spreadsheet tab's live state: the loaded workbook package, which sheet is
 /// active, the selected cell, and the grid's scroll handle.
 struct SheetView {
@@ -704,7 +707,7 @@ struct SheetView {
     edit_start: String,
     /// The typing a Ctrl+Z set aside (text, caret): an immediate second
     /// Ctrl+Z puts it back, any other key drops it (#1147).
-    edit_redo: Option<(String, usize, Option<(String, usize)>)>,
+    edit_redo: Option<EditRedo>,
     /// After a revert in Enter mode the restored text is selected: the next
     /// typed character replaces it, Backspace or Delete empties it.
     edit_select_all: bool,
