@@ -5855,6 +5855,10 @@ impl App {
     }
 
     fn vim_enter_insert(&mut self) {
+        // #751: a Visual selection does not survive into Insert mode; the
+        // anchor it leaves behind would make the next typed character
+        // delete a stale selection.
+        self.editor.clear_selection();
         self.vim_set_mode(VimMode::Insert);
     }
 
@@ -5988,6 +5992,9 @@ impl App {
         if !self.paste_allowed(mutation, &c, true) {
             return;
         }
+        // #751: paste at the caret; a Visual selection does not survive to
+        // be deleted by the paste or the newline below.
+        self.editor.clear_selection();
         if linewise {
             if before {
                 self.editor.move_home();
@@ -6126,6 +6133,10 @@ impl App {
                     return;
                 }
                 self.clear_visual_hint();
+                // #751: before the caret moves, or the selection-aware
+                // `insert_newline` would delete from the anchor to the
+                // paragraph end.
+                self.editor.clear_selection();
                 self.editor.move_end();
                 self.editor.insert_newline();
                 self.after_edit();
@@ -6136,6 +6147,10 @@ impl App {
                     return;
                 }
                 self.clear_visual_hint();
+                // #751: before the caret moves, or the selection-aware
+                // `insert_newline` would delete from the anchor to the
+                // paragraph start.
+                self.editor.clear_selection();
                 self.editor.move_home();
                 self.editor.insert_newline();
                 self.move_vert(false);
@@ -14463,6 +14478,108 @@ mod tests {
         app.on_key(key(KeyCode::Char('l'))); // select "abc" (caret moved to 2, anchor 0)
         app.on_key(key(KeyCode::Char('d'))); // delete selection
         assert_eq!(first_line(&app), "d");
+    }
+
+    /// #751: in Visual mode `A` moves the caret but must not leave the
+    /// Visual anchor behind: the typed text inserts at the line end instead
+    /// of deleting a stale selection.
+    #[test]
+    fn vim_visual_append_clears_selection_751() {
+        let mut app = vim_app(&["hello"]);
+        app.editor.move_home();
+        app.on_key(key(KeyCode::Char('l'))); // caret 1
+        app.on_key(key(KeyCode::Char('v'))); // visual, anchor on the caret
+        app.on_key(key(KeyCode::Char('A'))); // append at line end
+        assert!(!app.editor.has_selection(), "A drops the Visual selection");
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(first_line(&app), "hellox");
+    }
+
+    /// #751: the other standalone commands that move the caret in Visual
+    /// mode (`I`, `a`, `o`, `O`, `p`, `P`) drop the Visual anchor too, so
+    /// the next edit inserts and never deletes a stale selection.
+    #[test]
+    fn vim_visual_standalone_commands_clear_selection_751() {
+        let texts = |app: &App| -> Vec<String> {
+            app.editor
+                .doc
+                .body
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Paragraph(p) => Some(p.plain_text()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // I: insert at the line start.
+        let mut app = vim_app(&["hello"]);
+        app.editor.move_home();
+        app.on_key(key(KeyCode::Char('l')));
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Char('I')));
+        assert!(!app.editor.has_selection(), "I drops the Visual selection");
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(first_line(&app), "xhello");
+
+        // a: append right after the caret (offset 1 -> insert at 2).
+        let mut app = vim_app(&["hello"]);
+        app.editor.move_home();
+        app.on_key(key(KeyCode::Char('l')));
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(!app.editor.has_selection(), "a drops the Visual selection");
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(first_line(&app), "hexllo");
+
+        // o: a fresh paragraph below, the text intact.
+        let mut app = vim_app(&["hello"]);
+        app.editor.move_home();
+        app.on_key(key(KeyCode::Char('l')));
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Char('o')));
+        assert!(!app.editor.has_selection(), "o drops the Visual selection");
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(texts(&app), vec!["hello", "x"]);
+
+        // O: a fresh paragraph above, the text intact. The typed text lands
+        // at the start of "hello": the new empty row has no editable
+        // segment for the vertical move to land on (pre-existing O
+        // behavior, not #751).
+        let mut app = vim_app(&["hello"]);
+        app.editor.move_home();
+        app.on_key(key(KeyCode::Char('l')));
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Char('O')));
+        assert!(!app.editor.has_selection(), "O drops the Visual selection");
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(texts(&app), vec!["", "xhello"]);
+
+        // p and P: the clipboard lands at the caret, the text intact.
+        for before in [false, true] {
+            let mut app = vim_app(&["hello"]);
+            app.editor.move_home();
+            app.on_key(key(KeyCode::Char('l'))); // caret 1
+            app.on_key(key(KeyCode::Char('v')));
+            app.on_key(key(KeyCode::Char('l'))); // select "e"
+            app.on_key(key(KeyCode::Char('y'))); // yank it
+            app.on_key(key(KeyCode::Char('v'))); // visual again at caret 1
+            app.on_key(key(KeyCode::Char('l'))); // select "e"
+            app.on_key(key(KeyCode::Char(if before { 'P' } else { 'p' })));
+            assert!(
+                !app.editor.has_selection(),
+                "{} drops the Visual selection",
+                if before { 'P' } else { 'p' }
+            );
+            assert_eq!(
+                first_line(&app),
+                // A charwise Visual selection is inclusive, so the yank
+                // holds "el"; p pastes it after the caret ("hel"+"el"+"lo"),
+                // P at it ("he"+"el"+"llo").
+                if before { "heelllo" } else { "helello" },
+                "clipboard inserted, original text intact"
+            );
+        }
     }
 
     #[test]
