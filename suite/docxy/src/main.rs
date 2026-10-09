@@ -51,8 +51,8 @@ mod doc_protected_tests;
 mod doc_templates;
 #[cfg(test)]
 mod doc_templates_tests;
-mod harness;
 mod file_keys;
+mod harness;
 mod help_tab;
 mod hf;
 mod hf_tab;

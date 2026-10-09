@@ -35,7 +35,12 @@ pub(crate) fn file_key(k: &Keystroke) -> Option<FileKey> {
 
 impl Docxy {
     /// Run a file key from `document_key`.
-    pub(crate) fn file_key_act(&mut self, key: FileKey, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn file_key_act(
+        &mut self,
+        key: FileKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.keytips = KeyTip::Off;
         // Flash Fill's preview stands for one key (ENT-105); this key returns
         // before `sheet_key`, which would have dropped it.
