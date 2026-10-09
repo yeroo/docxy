@@ -13,7 +13,7 @@
 //!   says `[Compatibility Mode]`, a save keeps `compatibilityMode` 11, and
 //!   File > Info > Convert raises it to 15.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::DocTab;
 
@@ -144,6 +144,21 @@ pub(super) fn save_dir(tab: &DocTab) -> Option<&Path> {
         .binary_source
         .then_some(tab.path.as_deref()?.parent()?)
         .filter(|dir| !dir.as_os_str().is_empty())
+}
+
+/// The folder a Save As dialog opens in for a file at `path`: its own folder
+/// (#1144). `None` for a new tab and for a bare filename, which leave the
+/// dialog at the OS default.
+pub(super) fn save_start_dir(path: Option<&Path>) -> Option<PathBuf> {
+    path?
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
+/// [`save_start_dir`] for a tab.
+pub(super) fn save_start_dir_of(tab: &DocTab) -> Option<PathBuf> {
+    save_start_dir(tab.path.as_deref())
 }
 
 /// File > Info > Convert: take the document out of Compatibility Mode

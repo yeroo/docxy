@@ -2012,11 +2012,15 @@ impl Docxy {
                 finish_project_export(&mut self.tabs[self.active], Some(&p), kind)
             }
             ExportDecision::Dialog { suggested } => {
+                let start = crate::doc_import::save_start_dir_of(tab);
                 let target = crate::macos_menu::native_modal(|| {
-                    rfd::FileDialog::new()
+                    let mut dialog = rfd::FileDialog::new()
                         .add_filter("Markdown", &["md"])
-                        .set_file_name(suggested)
-                        .save_file()
+                        .set_file_name(suggested);
+                    if let Some(dir) = start {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    dialog.save_file()
                 });
                 finish_project_export(&mut self.tabs[self.active], target.as_deref(), kind);
             }

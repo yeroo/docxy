@@ -231,11 +231,10 @@ impl Docxy {
             .filter(|f| f.is_template())
             .map(|_| doc_templates::templates_dir())
             .filter(|dir| std::fs::create_dir_all(dir).is_ok());
-        // An imported document's .docx goes beside its Word 97-2003 original
-        // (#634); the save refuses the original itself, whatever its name.
-        if let Some(dir) =
-            templates.or_else(|| tab.and_then(doc_import::save_dir).map(PathBuf::from))
-        {
+        // A saved document opens beside its file (#1144), so an imported
+        // one's .docx goes beside its Word 97-2003 original (#634; the save
+        // refuses the original itself, whatever its name).
+        if let Some(dir) = templates.or_else(|| tab.and_then(doc_import::save_start_dir_of)) {
             dialog = dialog.set_directory(dir);
         }
         // The name is written as picked (the dialog already asked about

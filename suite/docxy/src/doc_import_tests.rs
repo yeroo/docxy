@@ -5,7 +5,7 @@
 use crate::doc_import::{
     self, BINARY_PATH_HARNESS, BINARY_TARGET_REFUSED, COMPAT_SUFFIX, DocImport, IMPORTED_STATUS,
     IN_PLACE_REFUSED, SOURCE_TARGET_REFUSED, convert_tab, harness_save_refusal, is_binary_doc_path,
-    save_dir, save_name,
+    save_dir, save_name, save_start_dir, save_start_dir_of,
 };
 use crate::open_mode_tests::Scratch;
 use crate::{
@@ -463,4 +463,30 @@ fn harness_save_refusal_names_its_cause() {
 
     tab.path = None;
     assert_eq!(harness_save_refusal(&tab), crate::DOC_NEVER_SAVED_HARNESS);
+}
+
+/// #1144: Save As opens in the file's own folder, whatever its kind; a new
+/// tab (no path) and a bare filename leave the dialog at the OS default.
+#[test]
+fn save_start_dir_is_the_files_folder() {
+    for name in ["c.xlsx", "c.docx", "c.yppx"] {
+        let path = Path::new("/a/b").join(name);
+        assert_eq!(save_start_dir(Some(&path)), Some(PathBuf::from("/a/b")));
+    }
+}
+
+#[test]
+fn save_start_dir_is_none_for_a_new_tab() {
+    assert_eq!(save_start_dir(None), None);
+    assert_eq!(save_start_dir(Some(Path::new("c.xlsx"))), None);
+}
+
+#[test]
+fn save_start_dir_of_a_tab_follows_its_path() {
+    let dir = Scratch::new();
+    let path = write_doc(&dir, "plain.docx");
+    let mut tab = tab_from_path(&path);
+    assert_eq!(save_start_dir_of(&tab), path.parent().map(PathBuf::from));
+    tab.path = None;
+    assert_eq!(save_start_dir_of(&tab), None);
 }

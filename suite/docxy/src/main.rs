@@ -15136,12 +15136,16 @@ impl Docxy {
                 finish_project_save(&mut self.tabs[self.active], Some(&path))
             }
             SaveDecision::Dialog { suggested } => {
+                let start = doc_import::save_start_dir_of(tab);
                 let target = macos_menu::native_modal(|| {
-                    rfd::FileDialog::new()
+                    let mut dialog = rfd::FileDialog::new()
                         .add_filter("Project schedule", &["yppx"])
                         .add_filter("MSPDI", &["xml"])
-                        .set_file_name(suggested)
-                        .save_file()
+                        .set_file_name(suggested);
+                    if let Some(dir) = start {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    dialog.save_file()
                 });
                 finish_project_save(&mut self.tabs[self.active], target.as_deref());
             }
@@ -19343,12 +19347,16 @@ impl Docxy {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
+        let start = doc_import::save_start_dir_of(tab);
         let pick = |suggested| {
             macos_menu::native_modal(|| {
-                rfd::FileDialog::new()
+                let mut dialog = rfd::FileDialog::new()
                     .add_filter("Excel workbook", &SHEET_EXTENSIONS)
-                    .set_file_name(suggested)
-                    .save_file()
+                    .set_file_name(suggested);
+                if let Some(dir) = &start {
+                    dialog = dialog.set_directory(dir);
+                }
+                dialog.save_file()
             })
         };
         if !save_sheet_tab(tab, harness, explicit_save_as, pick, |features| {
