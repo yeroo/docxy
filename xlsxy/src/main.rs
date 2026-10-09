@@ -1501,6 +1501,15 @@ struct EditState {
     /// typing replaced it. Committing it unchanged leaves the cell alone:
     /// re-reading it would round a 17-digit number to Excel's 15.
     seed: Option<String>,
+    /// The cell's input text when editing began, in either mode (empty for
+    /// an empty cell): what Ctrl+Z / Alt+Backspace put back (#1147).
+    start: String,
+    /// The typing a Ctrl+Z set aside (text, caret), for an immediate second
+    /// Ctrl+Z to put back. Any other key drops it.
+    redo_text: Option<(String, usize)>,
+    /// Typing over a cell, the restored text is selected: the next typed
+    /// character replaces it, Backspace or Delete empties it.
+    select_all: bool,
     /// AutoComplete's proposal (#672): the char index its selected suffix
     /// starts at (the caret stays there) and the value it completes to. Any
     /// commit takes the value; Backspace or Delete drops the suffix; a caret
@@ -2338,8 +2347,13 @@ impl App {
             None => self.current_input_text(),
         };
         let cursor = text.chars().count();
+        let start = match initial {
+            Some(_) => self.current_input_text(),
+            None => text.clone(),
+        };
         self.edit = Some(EditState {
             seed: initial.is_none().then(|| text.clone()),
+            start,
             text,
             cursor,
             replace: initial.is_some(),
@@ -5428,8 +5442,12 @@ impl App {
     /// [`Self::commit_edit`], as a taken proposal, so AutoCorrect leaves the
     /// column's own spelling alone.
     fn pick_value(&mut self, value: String) {
-        let seed = self.edit.take().and_then(|e| e.seed);
+        let (seed, start) = match self.edit.take() {
+            Some(e) => (e.seed, e.start),
+            None => (None, String::new()),
+        };
         self.edit = Some(EditState {
+            start,
             cursor: value.chars().count(),
             text: value.clone(),
             replace: true,
@@ -5524,6 +5542,7 @@ impl App {
                 }
             }
             KeyCode::Char('z') | KeyCode::Char('Z') if ctrl => self.edit_undo(),
+            KeyCode::Backspace if alt && !ctrl => self.edit_undo(),
             _ => return false,
         }
         true
@@ -5576,10 +5595,22 @@ impl App {
                 return;
             }
         }
-        e.text = e.seed.clone().unwrap_or_default();
-        e.cursor = e.text.chars().count();
         e.kept = None;
         e.typed_tail = false;
+        // Straight after a revert, the typing it set aside comes back.
+        if let Some((text, cursor)) = e.redo_text.take() {
+            e.text = text;
+            e.cursor = cursor;
+            e.select_all = false;
+            return;
+        }
+        // Otherwise the cell's text from when editing began, the typing kept
+        // for the next press. Typing over a cell leaves it selected.
+        e.redo_text = Some((std::mem::take(&mut e.text), e.cursor));
+        e.text = e.start.clone();
+        e.cursor = e.text.chars().count();
+        e.select_all = e.replace;
+        e.seed = Some(e.text.clone());
     }
 
     /// After `ch` was typed into the editor: when it ends a word, AutoCorrect
@@ -10817,7 +10848,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                     return false;
                 }
                 if let Some(e) = &mut app.edit {
-                    if e.cursor > 0 {
+                    if std::mem::take(&mut e.select_all) {
+                        e.text.clear();
+                        e.cursor = 0;
+                    } else if e.cursor > 0 {
                         let idx = char_index(&e.text, e.cursor - 1);
                         e.text.remove(idx);
                         e.cursor -= 1;
@@ -10829,7 +10863,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                     return false;
                 }
                 if let Some(e) = &mut app.edit {
-                    if e.cursor < e.text.chars().count() {
+                    if std::mem::take(&mut e.select_all) {
+                        e.text.clear();
+                        e.cursor = 0;
+                    } else if e.cursor < e.text.chars().count() {
                         let idx = char_index(&e.text, e.cursor);
                         e.text.remove(idx);
                     }
@@ -10841,6 +10878,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 // again on the longer text.
                 app.drop_proposal();
                 if let Some(e) = &mut app.edit {
+                    if std::mem::take(&mut e.select_all) {
+                        e.text.clear();
+                        e.cursor = 0;
+                    }
                     let idx = char_index(&e.text, e.cursor);
                     e.typed_tail = e.cursor == e.text.chars().count();
                     e.text.insert(idx, ch);
@@ -10855,6 +10896,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         // Any other change to the text or caret ends a correction's Ctrl+Z
         // (the typed character set its own), and moves the formula list.
         let now = app.edit.as_ref().map(|e| (e.text.clone(), e.cursor));
+        // Any key but Ctrl+Z ends the revert's toggle and its selection (#1147).
+        if let Some(e) = &mut app.edit {
+            e.redo_text = None;
+            e.select_all = false;
+        }
         if now.is_some() && now != was {
             if !matches!(key.code, KeyCode::Char(_)) {
                 if let Some(e) = &mut app.edit {
@@ -21152,6 +21198,103 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(text_at(&app, 6, 0), "teh x");
         assert_eq!(app.cur, (7, 0), "the earlier entry was not undone");
+    }
+
+    // ---- #1147: Ctrl+Z in the cell editor, like Excel's ----
+
+    /// `old` in A1:A5, the cursor on A3; returns the app.
+    fn revert_app() -> App {
+        let mut app = opts_app();
+        app.autocorrect.opts.replace_text = false;
+        for r in 0..5 {
+            put(&mut app, r, 0, "old");
+        }
+        app.cur = (2, 0);
+        app
+    }
+
+    fn revert_undo_len(app: &App) -> usize {
+        app.undo.len()
+    }
+
+    /// Run `keys` (a char types it, `^` is Ctrl+Z, `~` Alt+Backspace, `<`
+    /// Backspace, `|` F2, `.` Enter) on A3 and give A3 and the workbook's
+    /// undo depth at the end.
+    fn revert_run(keys: &str) -> (String, usize, App) {
+        let mut app = revert_app();
+        let before = revert_undo_len(&app);
+        for k in keys.chars() {
+            match k {
+                '^' => chord(&mut app, 'z'),
+                '~' => alt(&mut app, KeyCode::Backspace),
+                '<' => press(&mut app, KeyCode::Backspace),
+                '|' => press(&mut app, KeyCode::F(2)),
+                '.' => press(&mut app, KeyCode::Enter),
+                ch => press(&mut app, KeyCode::Char(ch)),
+            }
+        }
+        let steps = revert_undo_len(&app) - before;
+        (text_at(&app, 2, 0), steps, app)
+    }
+
+    #[test]
+    fn ctrl_z_in_the_editor_restores_the_start_text_1147() {
+        // Typing over a cell: back to `old`, and the next char replaces it.
+        assert_eq!(revert_run("abc^x.").0, "x");
+        assert_eq!(revert_run("abc^.").0, "old");
+        assert_eq!(revert_run("abc^^.").0, "abc");
+        // A third press reverts again.
+        assert_eq!(revert_run("abc^^^.").0, "old");
+        // F2: the caret ends at the text's end, typing appends.
+        assert_eq!(revert_run("|XY^Z.").0, "oldZ");
+        assert_eq!(revert_run("|XY<^.").0, "old");
+        // Alt+Backspace is Ctrl+Z.
+        assert_eq!(revert_run("abc~x.").0, "x");
+        assert_eq!(revert_run("abc~~.").0, "abc");
+        assert_eq!(revert_run("|XY~Z.").0, "oldZ");
+    }
+
+    #[test]
+    fn ctrl_z_in_the_editor_keeps_the_workbook_undo_1147() {
+        let (_, steps, app) = revert_run("abc^x.");
+        // Only the one entry itself is a step; A1:A5's neighbours are as put.
+        assert_eq!(steps, 1);
+        for r in [0, 1, 3, 4] {
+            assert_eq!(text_at(&app, r, 0), "old");
+        }
+        let (_, steps, _) = revert_run("abc^^^");
+        assert_eq!(steps, 0, "no commit, no step");
+    }
+
+    #[test]
+    fn ctrl_z_in_the_editor_toggle_ends_with_any_other_key_1147() {
+        // Typing between two presses ends the toggle: the second reverts.
+        assert_eq!(revert_run("|XY^Z^.").0, "old");
+        // A caret move ends it too.
+        assert_eq!(revert_run("|XY^<^.").0, "old");
+        // Backspace after a type-over revert empties the selected text.
+        let mut app = revert_app();
+        type_text(&mut app, "abc");
+        chord(&mut app, 'z');
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.edit.as_ref().unwrap().text, "");
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.sheet()
+                .cell(2, 0)
+                .is_none_or(|c| c.value == CellValue::Empty)
+        );
+    }
+
+    #[test]
+    fn ctrl_z_in_the_editor_reverts_a_long_number_exactly_1147() {
+        let mut app = opts_app();
+        put(&mut app, 0, 0, "12345678901234567");
+        let before = app.sheet().cell(0, 0).cloned().unwrap();
+        type_text(&mut app, "9");
+        chord(&mut app, 'z');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.sheet().cell(0, 0).cloned().unwrap().value, before.value);
     }
 
     #[test]
