@@ -728,6 +728,206 @@ fn ctrl_z_while_editing_undoes_only_the_typing() {
     assert_eq!(v.editing.as_deref(), Some("1"));
 }
 
+// ---- #1147: Ctrl+Z in the editor puts the cell's own text back ----------------
+
+/// `old` in A1:A5 and A3 selected.
+fn old_book() -> SheetView {
+    let mut v = view();
+    for r in 0..5 {
+        let cell = Cell::text("old");
+        put(&mut v, r, 0, cell);
+    }
+    select(&mut v, 2, 0);
+    v
+}
+
+/// Open A3 as typing over it (`over`) or as F2 would, do `steps`, Enter, and
+/// give A3's text. Each step: `^` the revert, `<` Backspace, else typed.
+fn revert_run(over: bool, steps: &str) -> (String, usize) {
+    let mut v = old_book();
+    let undo = v.undo.len();
+    if over {
+        v.begin_cell_edit(Some(String::new()));
+        v.edit_caret = 0;
+    } else {
+        v.begin_cell_edit(None);
+        v.edit_caret_to_end();
+    }
+    for ch in steps.chars() {
+        match ch {
+            '^' => v.edit_revert(),
+            '<' => v.edit_backspace(),
+            ch => v.edit_type(&ch.to_string()),
+        }
+    }
+    v.commit_edit();
+    let text = match value(&v, 2, 0) {
+        CellValue::Text(t) => t,
+        other => format!("{other:?}"),
+    };
+    (text, v.undo.len() - undo)
+}
+
+#[test]
+fn ctrl_z_after_typing_over_a_cell_restores_its_text_1147() {
+    // Not empty: the editor holds `old`, selected, so the next char replaces it.
+    assert_eq!(revert_run(true, "abc^x").0, "x");
+    assert_eq!(revert_run(true, "abc^").0, "old");
+    // Again straight away: the typing is back; a third press reverts.
+    assert_eq!(revert_run(true, "abc^^").0, "abc");
+    assert_eq!(revert_run(true, "abc^^^").0, "old");
+    // Backspace on the selected text empties it.
+    assert_eq!(revert_run(true, "abc^<").0, "Empty");
+}
+
+#[test]
+fn ctrl_z_after_f2_restores_the_text_with_the_caret_at_its_end_1147() {
+    assert_eq!(revert_run(false, "XY^Z").0, "oldZ");
+    assert_eq!(revert_run(false, "XY<^").0, "old");
+    assert_eq!(revert_run(false, "XY^^").0, "oldXY");
+    // Other typing between two presses ends the toggle.
+    assert_eq!(revert_run(false, "XY^Z^").0, "old");
+}
+
+#[test]
+fn ctrl_z_in_the_editor_never_touches_the_workbook_undo_1147() {
+    let (_, steps) = revert_run(true, "abc^x");
+    assert_eq!(steps, 1, "only the final entry is a step");
+    let mut v = old_book();
+    let undo = v.undo.len();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("q");
+    v.edit_revert();
+    v.edit_revert();
+    assert_eq!(v.undo.len(), undo);
+    for r in [0, 1, 3, 4] {
+        assert_eq!(value(&v, r, 0), CellValue::Text("old".into()));
+    }
+}
+
+#[test]
+fn a_reverted_long_number_commits_unchanged_1147() {
+    // More digits than a typed entry keeps: re-reading the editor's text
+    // would round it, so the revert must leave an unchanged commit alone.
+    let noisy = 0.1 + 0.2;
+    let mut v = view();
+    put(&mut v, 0, 0, Cell::number(noisy));
+    select(&mut v, 0, 0);
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("9");
+    v.edit_revert();
+    v.commit_edit();
+    assert_eq!(value(&v, 0, 0), CellValue::Number(noisy));
+}
+
+#[test]
+fn a_revert_sets_the_typing_marker_aside_1147() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abc");
+    v.edit_typed_tail = Some(("abc".into(), 3));
+    v.edit_revert();
+    assert_eq!(v.edit_typed_tail, None, "the restored text was not typed");
+    v.edit_revert();
+    assert_eq!(v.edit_typed_tail, Some(("abc".into(), 3)));
+}
+
+#[test]
+fn a_taken_completion_ends_the_reverts_toggle_and_selection_1147() {
+    // The real path: Formula AutoComplete's list, Tab (`complete_insert`),
+    // then typing, which must not replace the whole restored formula.
+    let mut v = view();
+    put(&mut v, 2, 0, Cell::formula("SU"));
+    select(&mut v, 2, 0);
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abc");
+    v.edit_revert();
+    assert_eq!(v.editing.as_deref(), Some("=SU"));
+    assert!(v.complete_open(), "the list for SU shows");
+    assert!(v.complete_insert());
+    let taken = v.editing.clone().unwrap();
+    assert!(taken.starts_with("=SU") && taken.len() > 3, "{taken}");
+    v.edit_type("1");
+    assert_eq!(v.editing.as_deref(), Some(format!("{taken}1").as_str()));
+    // And the toggle is over: Ctrl+Z reverts again instead of restoring `abc`.
+    v.edit_revert();
+    assert_eq!(v.editing.as_deref(), Some("=SU"));
+}
+
+#[test]
+fn a_caret_click_ends_the_reverts_toggle_and_selection_1147() {
+    // `fx_segment`'s click is `edit_touched` plus a caret set (it needs a
+    // window); the helper is what ends the state.
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abc");
+    v.edit_revert();
+    v.edit_touched();
+    v.edit_caret = 1;
+    v.edit_type("X");
+    assert_eq!(v.editing.as_deref(), Some("oXld"));
+    v.edit_revert();
+    v.edit_touched();
+    v.edit_revert();
+    assert_eq!(
+        v.editing.as_deref(),
+        Some("old"),
+        "no toggle back to typing"
+    );
+}
+
+#[test]
+fn keys_other_than_the_revert_end_its_state_even_when_they_return_early_1147() {
+    // `sheet_key` runs this before Alt+Down and the formula list's keys.
+    for (key, ctrl, alt) in [
+        ("down", false, true),
+        ("escape", false, false),
+        ("f2", false, false),
+    ] {
+        let mut v = old_book();
+        v.begin_cell_edit(Some(String::new()));
+        v.edit_type("abc");
+        v.edit_revert();
+        v.end_revert_for_key(key, ctrl, alt, false);
+        assert!(v.edit_redo.is_none() && !v.edit_select_all, "{key}");
+    }
+    // The revert, a lone modifier, typing and Backspace keep what they use.
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abc");
+    v.edit_revert();
+    v.end_revert_for_key("z", true, false, false);
+    v.end_revert_for_key("alt", false, true, false);
+    assert!(v.edit_redo.is_some() && v.edit_select_all);
+    v.end_revert_for_key("space", false, false, true);
+    assert!(v.edit_select_all, "the typed character uses it up itself");
+}
+
+#[test]
+fn the_reverts_seed_and_exemption_follow_the_typing_1147() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abc");
+    v.edit_kept = Some(0);
+    v.edit_revert();
+    assert_eq!(
+        v.edit_seed.as_deref(),
+        Some("old"),
+        "unchanged commits leave the cell"
+    );
+    assert_eq!(v.edit_kept, None, "the typing's exemption is set aside");
+    // Straight back: the typing is an entry again, with its exemption.
+    v.edit_revert();
+    assert_eq!(v.editing.as_deref(), Some("abc"));
+    assert_eq!(v.edit_seed, None);
+    assert_eq!(v.edit_kept, Some(0));
+    // Typing over the restored selection is an entry too: retyping the
+    // cell's own text must commit, not count as untouched.
+    v.edit_revert();
+    v.edit_type("old");
+    assert_eq!(v.edit_seed, None);
+}
+
 // ---- #663: entry shortcuts -------------------------------------------------------
 
 fn abc_book() -> SheetView {

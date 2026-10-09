@@ -17,6 +17,12 @@ pub(crate) fn alt_down_key(key: &str, m: Modifiers) -> bool {
     key == "down" && m.alt && !m.control && !m.platform && !m.shift
 }
 
+/// Is this keystroke Alt+Backspace, the editor's revert (#1147)? Routed past
+/// the KeyTips like Alt+Down.
+pub(crate) fn alt_backspace_key(key: &str, m: Modifiers) -> bool {
+    key == "backspace" && m.alt && !m.control && !m.platform && !m.shift
+}
+
 /// What Alt+Down opens, in Excel's order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AltDown {
@@ -213,6 +219,7 @@ impl SheetView {
         self.editing = Some(text);
         self.edit_caret = caret;
         self.edit_proposal = None;
+        self.edit_touched();
         // Closed for the buffer the insert made, until it is edited.
         self.edit_complete = Some(CompleteList {
             closed: true,
