@@ -45,3 +45,30 @@ test issue 588 r1 a long window title yields to the tab strip on a narrow window
   assert reply.active_visible is true
   call tab-list {}
   assert reply.window_title is a very long window title that must yield to the tab strip  -  docxy
+
+# #1143: os_title is the window's cached last title (set in render beside the
+# set_window_title call), not one recomputed from the tabs, so it catches a
+# render that stops updating the title. The window sets it in its render, so each step that changes the title is followed by a shot,
+# which paints the window before the next read.
+test issue 1143 the OS window title follows the active tab
+  open copy:"../fixtures/basic.docx" as title1143.docx
+  shot window
+  call tab-list {}
+  assert reply.os_title is title1143  -  docxy
+  open copy:../fixtures/basic.xlsx
+  shot window
+  call tab-list {}
+  assert reply.os_title is basic  -  docxy
+  call tab-select {"tab":"title1143.docx"}
+  shot window
+  call tab-list {}
+  assert reply.os_title is title1143  -  docxy
+  call tab-select {"tab":"basic.xlsx"}
+  call save-as {"path":"renamed1143.xlsx"}
+  shot window
+  call tab-list {}
+  assert reply.os_title is renamed1143  -  docxy
+  call close-tab {"answer":"discard"}
+  shot window
+  call tab-list {}
+  assert reply.os_title is title1143  -  docxy
