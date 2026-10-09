@@ -12193,7 +12193,9 @@ impl Docxy {
     /// on a workbook tab; on any other tab it does nothing. Ctrl+W (#629):
     /// close the active tab, as File > Close and its X do. On macOS, ⌘⇧S is
     /// Save As (#1071). F12 is Save As, Shift+F12 Save and Ctrl/⌘+F12 Open
-    /// (#1141). `None` for a key that is not one of these.
+    /// (#1141). Ctrl+F6 / Ctrl+Tab (Shift: back) cycle the open documents,
+    /// except Ctrl+Tab in a table cell (#1142). `None` for a key that is not
+    /// one of these.
     fn document_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -12216,10 +12218,7 @@ impl Docxy {
         // documents, wrapping at the ends (#1142). A document's table cell
         // keeps Ctrl+Tab: it types a tab character there.
         if (m.control || m.platform) && !m.alt {
-            let in_cell = matches!(
-                self.tabs.get(self.active).map(|t| &t.surface),
-                Some(Surface::Doc(ed)) if ed.in_table()
-            );
+            let in_cell = self.caret_in_table();
             if let Some(i) = cycle_tab_key(
                 ev.keystroke.key.as_str(),
                 m.shift,
@@ -12228,6 +12227,11 @@ impl Docxy {
                 in_cell,
             ) {
                 self.keytips = KeyTip::Off;
+                // Flash Fill's preview stands for one key; this key returns
+                // before `sheet_key`, which would have dropped it.
+                if let Some(v) = self.active_sheet_mut() {
+                    v.flash_preview = None;
+                }
                 if i != self.active {
                     self.select_tab(i, window, cx);
                 }
