@@ -1,0 +1,90 @@
+# Ctrl+F6 / Ctrl+Tab select the next open document and the Shift variants the
+# previous one, wrapping at the ends (#1142). A fresh instance starts with the
+# one sample.docx tab; the first case swaps it for basic.docx.
+
+test ctrl+tab drops a Flash Fill preview on a lone workbook
+  call close-tab {}
+  assert tabs is 0
+  open copy:../fixtures/flash-fill.xlsx
+  assert tabs is 1
+  click B5
+  key delete
+  click B1
+  type Ada
+  key enter
+  type Alan
+  key enter
+  assert flash_preview.range is B3:B6
+  key ctrl+tab
+  assert flash_preview is nothing
+  key enter
+  assert cell B3 is nothing
+  call close-tab {"answer":"discard"}
+  open ../fixtures/basic.docx
+  assert tabs is 1
+
+test ctrl+f6 and ctrl+shift+f6 cycle the open documents and wrap
+  assert tabs is 1
+  key ctrl+n
+  key ctrl+n
+  assert tabs is 3
+  assert tab is 2
+  key ctrl+f6
+  assert tab is 0
+  key ctrl+f6
+  assert tab is 1
+  key ctrl+f6
+  assert tab is 2
+  key ctrl+shift+f6
+  assert tab is 1
+  key ctrl+shift+f6
+  assert tab is 0
+  key ctrl+shift+f6
+  assert tab is 2
+
+test ctrl+tab and ctrl+shift+tab cycle the open documents and wrap
+  assert tab is 2
+  key ctrl+tab
+  assert tab is 0
+  key ctrl+tab
+  assert tab is 1
+  key ctrl+shift+tab
+  assert tab is 0
+  key ctrl+shift+tab
+  assert tab is 2
+
+test ctrl+tab on a workbook switches too, and a lone tab stays put
+  open ../fixtures/basic.xlsx
+  assert tab is 3
+  key ctrl+tab
+  assert tab is 0
+  key ctrl+shift+tab
+  assert tab is 3
+  call close-tab {}
+  call close-tab {}
+  call close-tab {}
+  call close-tab {}
+  assert tabs is 0
+  key ctrl+n
+  assert tabs is 1
+  key ctrl+f6
+  key ctrl+tab
+  assert tab is 0
+  call close-tab {}
+
+test ctrl+tab in a table cell types a tab and does not switch documents
+  open ../fixtures/doc-table.docx
+  key ctrl+n
+  assert tabs is 2
+  key ctrl+f6
+  assert tab is 0
+  call selection-set {"start":7,"end":7}
+  assert dirty is false
+  key ctrl+tab
+  assert tab is 0
+  assert dirty is true
+  key ctrl+shift+tab
+  assert tab is 0
+  key ctrl+f6
+  assert tab is 1
+  # The edited table document stays open: closing it would ask to save.

@@ -5209,6 +5209,27 @@ enum LeadingItem {
     MarkerGap(f32),
 }
 
+/// The tab Ctrl+F6 / Ctrl+Tab (next) or the Shift variants (previous) select
+/// from `active` among `len` tabs, wrapping (#1142). `in_cell`: a table cell
+/// keeps Ctrl+Tab for itself, as Word does; F6 is always the window switch.
+/// `None` for any other key.
+fn cycle_tab_key(
+    key: &str,
+    shift: bool,
+    active: usize,
+    len: usize,
+    in_cell: bool,
+) -> Option<usize> {
+    if len == 0 || !(key == "f6" || (key == "tab" && !in_cell)) {
+        return None;
+    }
+    Some(if shift {
+        (active + len - 1) % len
+    } else {
+        (active + 1) % len
+    })
+}
+
 fn next_tab_stop(
     xm: f32,
     pad_l: f32,
@@ -12172,7 +12193,9 @@ impl Docxy {
     /// on a workbook tab; on any other tab it does nothing. Ctrl+W (#629):
     /// close the active tab, as File > Close and its X do. On macOS, ⌘⇧S is
     /// Save As (#1071). F12 is Save As, Shift+F12 Save and Ctrl/⌘+F12 Open
-    /// (#1141). `None` for a key that is not one of these.
+    /// (#1141). Ctrl+F6 / Ctrl+Tab (Shift: back) cycle the open documents,
+    /// except Ctrl+Tab in a table cell (#1142). `None` for a key that is not
+    /// one of these.
     fn document_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -12191,6 +12214,31 @@ impl Docxy {
             return Some(());
         }
         let m = &ev.keystroke.modifiers;
+        // Ctrl+F6 / Ctrl+Shift+F6 and Ctrl+Tab / Ctrl+Shift+Tab cycle the open
+        // documents, wrapping at the ends (#1142). A document's table cell
+        // keeps Ctrl+Tab: it types a tab character there.
+        if (m.control || m.platform) && !m.alt {
+            let in_cell = self.caret_in_table();
+            if let Some(i) = cycle_tab_key(
+                ev.keystroke.key.as_str(),
+                m.shift,
+                self.active,
+                self.tabs.len(),
+                in_cell,
+            ) {
+                self.keytips = KeyTip::Off;
+                // Flash Fill's preview stands for one key; this key returns
+                // before `sheet_key`, which would have dropped it.
+                if let Some(v) = self.active_sheet_mut() {
+                    v.flash_preview = None;
+                }
+                if i != self.active {
+                    self.select_tab(i, window, cx);
+                }
+                cx.notify();
+                return Some(());
+            }
+        }
         if !(m.control || m.platform) || m.alt || m.shift {
             return None;
         }
@@ -43545,5 +43593,40 @@ mod recover_section_tests {
         assert!(!recover_section_shown(None, false));
         assert!(recover_section_shown(Some(Kind::Docx), true));
         assert!(recover_section_shown(None, true));
+    }
+}
+
+#[cfg(test)]
+mod cycle_tab_key_tests {
+    use super::cycle_tab_key;
+
+    #[test]
+    fn f6_and_tab_step_forward_and_wrap() {
+        for key in ["f6", "tab"] {
+            assert_eq!(cycle_tab_key(key, false, 0, 3, false), Some(1));
+            assert_eq!(cycle_tab_key(key, false, 2, 3, false), Some(0));
+        }
+    }
+
+    #[test]
+    fn shift_steps_back_and_wraps() {
+        for key in ["f6", "tab"] {
+            assert_eq!(cycle_tab_key(key, true, 2, 3, false), Some(1));
+            assert_eq!(cycle_tab_key(key, true, 0, 3, false), Some(2));
+        }
+    }
+
+    #[test]
+    fn a_table_cell_keeps_ctrl_tab_but_not_f6() {
+        assert_eq!(cycle_tab_key("tab", false, 0, 3, true), None);
+        assert_eq!(cycle_tab_key("tab", true, 0, 3, true), None);
+        assert_eq!(cycle_tab_key("f6", false, 0, 3, true), Some(1));
+    }
+
+    #[test]
+    fn other_keys_and_no_tabs_do_nothing() {
+        assert_eq!(cycle_tab_key("f5", false, 0, 3, false), None);
+        assert_eq!(cycle_tab_key("f6", false, 0, 0, false), None);
+        assert_eq!(cycle_tab_key("f6", false, 0, 1, false), Some(0));
     }
 }
