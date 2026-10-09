@@ -70,6 +70,22 @@ test the Breaks menu has Word's headings and a section break splits the section
   assert status is Section break (continuous)
   assert dirty is true
 
+test a section break over a selection replaces the selection
+  open copy:../fixtures/basic.docx
+  type hello
+  key home shift+right shift+right
+  assert sel.start is 0
+  assert sel.end is 2
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Breaks"]}}
+  call menu-click {"label":"Continuous"}
+  assert status is Section break (continuous)
+  assert dirty is true
+  assert text is llo
+  call doc {}
+  assert reply.mail.text is ¶llo
+  key ctrl+z
+  assert text is hello
+
 test Custom Margins opens Page Setup, which takes typed keys
   open copy:../fixtures/basic.docx
   call menu-open {"target":{"ribbon":["Layout","Page Setup","Margins"]}}

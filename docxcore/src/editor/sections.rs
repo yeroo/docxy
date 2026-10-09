@@ -170,8 +170,12 @@ impl Editor {
         }
     }
 
-    /// Insert a section break at the caret, as one undo step. With a selection,
-    /// the break goes at its start and the selection collapses there.
+    /// Insert a section break at the caret, as one undo step. With a
+    /// selection, the selected text is deleted and the break goes where it
+    /// started, as one step; a selection that cannot be deleted (one that
+    /// spans a table) is refused with the reason, as is a caret that is not
+    /// in a body paragraph: a table cell, a text box, or another story
+    /// cannot carry a sectPr.
     ///
     /// The caret's paragraph P, in section k, splits at the caret. The first
     /// half takes a copy of section k's sectPr with its original `w:type`, so it
@@ -179,16 +183,35 @@ impl Editor {
     /// the section after the break, and `w:type` describes how *that* section
     /// starts, so it takes `start`. The second half keeps P's own break, if P
     /// had one.
-    ///
-    /// Refused (with the reason) when the caret is not in a body paragraph:
-    /// a table cell, a text box, or another story cannot carry a sectPr.
     pub fn insert_section_break(&mut self, start: SectionStart) -> Result<(), String> {
-        self.insert_section_break_with(start, |_| {})
+        if !self.has_selection() {
+            return self.insert_section_break_with(start, |_| {});
+        }
+        // Validate before anything changes: the selection must start in a
+        // body paragraph and be one delete_selection container, so the delete
+        // below cannot bail out halfway (a cell range empties cells; a
+        // cross-container range just collapses — Word deletes neither here).
+        if self.cell_range().is_some() {
+            return Err("A section break cannot replace a selection of table cells".into());
+        }
+        self.break_point()?;
+        let (lo, hi) = self.selection_range().expect("checked above");
+        let same_container = hi.path.len() == lo.path.len()
+            && hi.path[..hi.path.len() - 1] == lo.path[..lo.path.len() - 1];
+        if !same_container {
+            return Err("A section break cannot replace a selection that spans a table".into());
+        }
+        self.one_step("Section break", |e| {
+            e.delete_selection();
+            let _ = e.insert_section_break_with(start, |_| {});
+        });
+        Ok(())
     }
 
-    /// [`Editor::insert_section_break`], then `edit` on the section after the
-    /// break, all as one undo step: Page Setup's and Columns' "This point
-    /// forward".
+    /// Insert a section break at the selection's start (its text is kept,
+    /// unlike [`Editor::insert_section_break`]) or at the caret, then `edit`
+    /// on the section after the break, all as one undo step: Page Setup's and
+    /// Columns' "This point forward".
     pub fn insert_section_break_with(
         &mut self,
         start: SectionStart,
@@ -280,9 +303,11 @@ impl Editor {
         self.doc.initialize_revision_targets();
     }
 
-    /// Where a section break goes: the selection's start, else the caret; its
-    /// body block; and the section it lands in, the one whose setup the
-    /// section after the break takes. Refused outside a body paragraph.
+    /// Where a section break goes: the selection's start, else the caret (for
+    /// [`Editor::insert_section_break`] the start after the selection's
+    /// deletion); its body block; and the section it lands in, the one whose
+    /// setup the section after the break takes. Refused outside a body
+    /// paragraph.
     fn break_point(&self) -> Result<(Caret, usize, usize), String> {
         let at = match self.selection_range() {
             Some((lo, _)) => lo,
@@ -592,15 +617,123 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_collapses_to_its_start() {
+    fn a_selection_is_replaced_by_the_break() {
         let mut e = three();
-        e.anchor = Some(Caret::top(3, 4));
+        e.anchor = Some(Caret::top(1, 0));
         e.caret = Caret::top(1, 1);
         e.insert_section_break(SectionStart::Continuous).unwrap();
         assert!(e.anchor.is_none());
-        assert_eq!(e.doc.body[1].plain_text(), "t");
-        assert_eq!(e.doc.body.last().map(|_| e.sections().len()), Some(4));
-        assert!(e.doc.plain_text().contains("three"), "nothing was deleted");
+        assert_eq!(text_of(&e, 1), "", "the selected \"t\" is gone");
+        assert_eq!(text_of(&e, 2), "wo");
+        assert_eq!(text_of(&e, 3), "two b");
+        assert_eq!(text_of(&e, 4), "three");
+        assert_eq!(e.sections().len(), 4);
+    }
+
+    #[test]
+    fn a_break_over_a_selection_is_one_undo_step() {
+        let mut e = three();
+        e.anchor = Some(Caret::top(1, 0));
+        e.caret = Caret::top(1, 1);
+        let before = e.doc.clone();
+        let sections_before = e.sections();
+        e.insert_section_break(SectionStart::Continuous).unwrap();
+        assert_eq!(text_of(&e, 1), "");
+        assert!(e.undo(), "the delete and the break are one undo step");
+        assert_eq!(e.doc, before);
+        assert_eq!(e.sections(), sections_before);
+        assert_eq!(e.anchor, Some(Caret::top(1, 0)), "undo reselects (#853)");
+        assert_eq!(e.caret, Caret::top(1, 1));
+    }
+
+    #[test]
+    fn a_multi_paragraph_selection_is_deleted_by_the_break() {
+        let mut e = three();
+        e.anchor = Some(Caret::top(0, 1));
+        e.caret = Caret::top(2, 2);
+        e.insert_section_break(SectionStart::NextPage).unwrap();
+        // "one" keeps "o", "two" goes, the "two b" remainder "o b" merges onto
+        // it, and the merged paragraph takes the last paragraph's oddPage
+        // mark (keep_section_mark): "one"'s continuous mark is replaced.
+        assert_eq!(text_of(&e, 0), "o");
+        assert_eq!(text_of(&e, 1), "o b");
+        assert_eq!(text_of(&e, 2), "three");
+        assert!(
+            !e.doc.plain_text().contains("two"),
+            "the range text is gone"
+        );
+        // The delete merged two sections (one mark kept); the break adds one.
+        assert_eq!(e.sections().len(), 3);
+        assert_eq!(
+            start_of(&e.sections()[0]),
+            SectionStart::OddPage,
+            "the merged paragraph keeps the last paragraph's mark"
+        );
+        assert_eq!(start_of(&e.sections()[1]), SectionStart::NextPage);
+    }
+
+    #[test]
+    fn an_undeletable_selection_refuses_the_break() {
+        let mut e = three();
+        e.doc.body.push(Block::Table(Table {
+            rows: vec![crate::model::Row {
+                cells: vec![crate::model::Cell {
+                    blocks: vec![para("cell", None)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        // The selection starts in a body paragraph and ends in the table: not
+        // one delete_selection container, so the break is refused up front.
+        e.anchor = Some(Caret::top(0, 1));
+        e.caret = Caret::at(vec![4, 0, 0, 0], 2);
+        let before = e.doc.clone();
+        let err = e
+            .insert_section_break(SectionStart::Continuous)
+            .unwrap_err();
+        assert!(err.contains("section break"), "{err}");
+        assert_eq!(e.doc, before, "a refusal changes nothing");
+        assert!(!e.undo(), "a refusal records no undo step");
+        assert_eq!(e.anchor, Some(Caret::top(0, 1)), "the selection is kept");
+    }
+
+    #[test]
+    fn a_selection_spanning_a_section_break_is_replaced_by_the_break() {
+        let mut e = three();
+        let saved = saved_sect_prs(&e);
+        e.anchor = Some(Caret::top(1, 1));
+        e.caret = Caret::top(3, 2);
+        e.insert_section_break(SectionStart::Continuous).unwrap();
+        assert_eq!(text_of(&e, 0), "one");
+        assert_eq!(text_of(&e, 1), "t");
+        assert_eq!(text_of(&e, 2), "ree");
+        // The range covered "two b" whole, so its oddPage mark went with it:
+        // no section reads oddPage any more, and Save writes as many sectPr
+        // as before (the break's own mark replaces the deleted one).
+        assert!(
+            e.sections()
+                .iter()
+                .all(|s| start_of(s) != SectionStart::OddPage),
+            "the spanned oddPage mark is deleted: {:?}",
+            e.sections()
+        );
+        assert_eq!(e.sections().len(), 3);
+        assert_eq!(saved_sect_prs(&e), saved);
+    }
+
+    #[test]
+    fn insert_section_break_with_keeps_the_selected_text() {
+        let mut e = three();
+        e.anchor = Some(Caret::top(3, 4));
+        e.caret = Caret::top(1, 1);
+        e.insert_section_break_with(SectionStart::Continuous, |_| {})
+            .unwrap();
+        assert!(e.anchor.is_none());
+        assert_eq!(text_of(&e, 1), "t", "Page Setup's point-forward keeps text");
+        assert_eq!(text_of(&e, 2), "wo");
+        assert_eq!(e.sections().len(), 4);
     }
 
     #[test]
