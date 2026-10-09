@@ -12235,6 +12235,7 @@ impl Docxy {
                 if i != self.active {
                     self.select_tab(i, window, cx);
                 }
+                cx.notify();
                 return Some(());
             }
         }

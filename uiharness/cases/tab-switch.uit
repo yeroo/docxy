@@ -1,6 +1,27 @@
 # Ctrl+F6 / Ctrl+Tab select the next open document and the Shift variants the
 # previous one, wrapping at the ends (#1142). A fresh instance starts with the
-# one sample.docx tab.
+# one sample.docx tab; the first case swaps it for basic.docx.
+
+test ctrl+tab drops a Flash Fill preview on a lone workbook
+  call close-tab {}
+  assert tabs is 0
+  open copy:../fixtures/flash-fill.xlsx
+  assert tabs is 1
+  click B5
+  key delete
+  click B1
+  type Ada
+  key enter
+  type Alan
+  key enter
+  assert flash_preview.range is B3:B6
+  key ctrl+tab
+  assert flash_preview is nothing
+  key enter
+  assert cell B3 is nothing
+  call close-tab {"answer":"discard"}
+  open ../fixtures/basic.docx
+  assert tabs is 1
 
 test ctrl+f6 and ctrl+shift+f6 cycle the open documents and wrap
   assert tabs is 1
