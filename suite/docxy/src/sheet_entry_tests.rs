@@ -807,20 +807,49 @@ fn ctrl_z_in_the_editor_never_touches_the_workbook_undo_1147() {
 
 #[test]
 fn a_reverted_long_number_commits_unchanged_1147() {
+    // More digits than a typed entry keeps: re-reading the editor's text
+    // would round it, so the revert must leave an unchanged commit alone.
+    let noisy = 0.1 + 0.2;
     let mut v = view();
-    v.begin_cell_edit(Some(String::new()));
-    v.edit_caret = 0;
-    for ch in "12345678901234567".chars() {
-        v.edit_type(&ch.to_string());
-    }
-    v.commit_edit();
-    let stored = value(&v, 0, 0);
+    put(&mut v, 0, 0, Cell::number(noisy));
     select(&mut v, 0, 0);
     v.begin_cell_edit(Some(String::new()));
     v.edit_type("9");
     v.edit_revert();
     v.commit_edit();
-    assert_eq!(value(&v, 0, 0), stored);
+    assert_eq!(value(&v, 0, 0), CellValue::Number(noisy));
+}
+
+#[test]
+fn a_revert_sets_the_typing_marker_aside_1147() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abc");
+    v.edit_typed_tail = Some(("abc".into(), 3));
+    v.edit_revert();
+    assert_eq!(v.edit_typed_tail, None, "the restored text was not typed");
+    v.edit_revert();
+    assert_eq!(v.edit_typed_tail, Some(("abc".into(), 3)));
+}
+
+#[test]
+fn a_caret_click_ends_the_reverts_toggle_and_selection_1147() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abc");
+    v.edit_revert();
+    v.edit_touched(); // a click in the formula bar
+    v.edit_caret = 1;
+    v.edit_type("X");
+    assert_eq!(v.editing.as_deref(), Some("oXld"));
+    v.edit_revert();
+    v.edit_touched();
+    v.edit_revert();
+    assert_eq!(
+        v.editing.as_deref(),
+        Some("old"),
+        "no toggle back to typing"
+    );
 }
 
 // ---- #663: entry shortcuts -------------------------------------------------------

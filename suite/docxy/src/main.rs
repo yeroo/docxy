@@ -681,8 +681,9 @@ struct SheetView {
     /// When `Some`, the cell at `edit_origin` is being edited, even if selection
     /// has moved. This is its in-progress buffer (a leading `=` marks a formula).
     editing: Option<String>,
-    /// Original buffer only for an editor opened from the stored cell. Meaningful
-    /// while `editing` is Some; `begin_cell_edit` sets it.
+    /// Original buffer only for an editor opened from the stored cell, or the
+    /// cell's text once a Ctrl+Z restored it. Meaningful while `editing` is
+    /// Some; `begin_cell_edit` and `edit_revert` set it.
     edit_seed: Option<String>,
     /// Sheet and cell where the current edit began, even if selection moves.
     /// Meaningful while `editing` is Some; `begin_cell_edit` sets it.
@@ -703,7 +704,7 @@ struct SheetView {
     edit_start: String,
     /// The typing a Ctrl+Z set aside (text, caret): an immediate second
     /// Ctrl+Z puts it back, any other key drops it (#1147).
-    edit_redo: Option<(String, usize)>,
+    edit_redo: Option<(String, usize, Option<(String, usize)>)>,
     /// After a revert in Enter mode the restored text is selected: the next
     /// typed character replaces it, Backspace or Delete empties it.
     edit_select_all: bool,
@@ -3153,8 +3154,19 @@ impl SheetView {
         }
     }
 
-    /// Ctrl+Z while editing: undo the typing, back to the text the editor
-    /// opened with; the editor stays open and the workbook's undo is untouched.
+    /// The caret or buffer changed by something other than typing (a click, a
+    /// pointed reference, a taken completion): the revert's toggle and
+    /// selection end (#1147).
+    fn edit_touched(&mut self) {
+        self.edit_redo = None;
+        self.edit_select_all = false;
+    }
+
+    /// Ctrl+Z (or Alt+Backspace) while editing: put the cell's own text back
+    /// (`edit_start`, whichever way the editor was opened); the editor stays
+    /// open and the workbook's undo is untouched. Pressed again straight away
+    /// it puts the typing back. Typing over a cell leaves the restored text
+    /// selected, so the next character replaces it (#1147).
     fn edit_revert(&mut self) {
         if self.editing.is_some() {
             // Right after an AutoCorrect change, only it goes (ENT-119).
@@ -3164,14 +3176,17 @@ impl SheetView {
             self.edit_proposal = None;
             self.edit_correction = None;
             // Straight after a revert, the typing it set aside comes back.
-            if let Some((text, caret)) = self.edit_redo.take() {
+            if let Some((text, caret, tail)) = self.edit_redo.take() {
                 self.editing = Some(text);
                 self.edit_caret = caret;
+                self.edit_typed_tail = tail;
                 self.edit_select_all = false;
                 return;
             }
             let typed = self.editing.take().unwrap_or_default();
-            self.edit_redo = Some((typed, self.edit_caret));
+            // The typing marker goes with the typing: the restored text was
+            // not typed, so a commit's AutoCorrect must not see it.
+            self.edit_redo = Some((typed, self.edit_caret, self.edit_typed_tail.take()));
             self.editing = Some(self.edit_start.clone());
             self.edit_caret_to_end();
             // Typing over a cell leaves the restored text selected.
@@ -7635,6 +7650,7 @@ fn fx_segment(
                 if let Some(v) = this.active_sheet_mut() {
                     v.edit_caret = idx;
                     v.edit_proposal = None;
+                    v.edit_touched();
                     v.edit_tail_left();
                 }
                 cx.notify();
@@ -14224,6 +14240,7 @@ impl Docxy {
             v.editing = Some(next);
             v.edit_caret = next_caret;
             v.edit_point = Some(point);
+            v.edit_touched();
         }
         cx.notify();
     }
@@ -18452,9 +18469,12 @@ impl Docxy {
                 v.edit_redo = None;
                 // A typed character, Backspace or Delete uses the selection
                 // up itself; any other key just drops it.
-                let uses_it = !ctrl
-                    && !alt
-                    && (key.chars().count() == 1 || key == "backspace" || key == "delete");
+                let typed = ev
+                    .keystroke
+                    .key_char
+                    .as_deref()
+                    .is_some_and(|c| !c.is_empty() && !c.starts_with(char::is_control));
+                let uses_it = !ctrl && !alt && (typed || key == "backspace" || key == "delete");
                 if !uses_it {
                     v.edit_select_all = false;
                 }
@@ -18757,7 +18777,7 @@ impl Docxy {
                     if let Some(v) = self.active_sheet_mut() {
                         if alt {
                             // Alt+Backspace is Ctrl+Z (#1147).
-                            v.proposal_before_key("z", true, false);
+                            v.drop_proposal();
                             v.edit_revert();
                         } else if !v.drop_proposal() {
                             v.edit_backspace();
@@ -22047,6 +22067,15 @@ impl Docxy {
         // Alt+Shift+Right/Left group and ungroup (#693). Alt has raised the
         // KeyTips by the time the arrow comes, so they go down unasked.
         if self.active_is_sheet() && sheet_outline::group_key(&key, ctrl, shift, m.alt).is_some() {
+            self.keytips = KeyTip::Off;
+            return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
+        }
+        // Alt+Backspace in an open cell editor is Ctrl+Z (#1147): past the
+        // KeyTips the bare Alt raised, as Alt+Down is.
+        if self.active_is_sheet()
+            && sheet_complete::alt_backspace_key(&key, *m)
+            && self.active_sheet().is_some_and(|v| v.editing.is_some())
+        {
             self.keytips = KeyTip::Off;
             return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
         }

@@ -116,6 +116,24 @@ test ctrl z restores the cell text and toggles
   key escape
   assert cell A1 is Region
 
+# #1147: a space typed over the restored text replaces it like any character,
+# and Alt+Backspace works after the bare Alt has raised the KeyTips.
+test ctrl z then space replaces the restored text
+  open copy:../fixtures/basic.xlsx
+  click A1
+  type abc
+  key ctrl+z
+  key space
+  type x
+  assert edit is  x
+  key escape
+  click A1
+  type abc
+  key alt alt+backspace
+  assert edit is Region
+  key alt alt+backspace
+  assert edit is abc
+
 # #1147: after F2 the restored text keeps the caret at its end.
 test ctrl z after f2 appends
   open copy:../fixtures/basic.xlsx
