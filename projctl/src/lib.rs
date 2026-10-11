@@ -1905,6 +1905,45 @@ mod tests {
     }
 
     #[test]
+    fn an_assignment_reads_its_custom_fields() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Project xmlns="http://schemas.microsoft.com/project">
+  <StartDate>2026-03-02T08:00:00</StartDate>
+  <ExtendedAttributes>
+    <ExtendedAttribute><FieldID>188743731</FieldID><FieldName>Text1</FieldName>
+      <SecondaryPID>255868938</SecondaryPID></ExtendedAttribute>
+    <ExtendedAttribute><FieldID>255869002</FieldID><FieldName>Number1</FieldName></ExtendedAttribute>
+  </ExtendedAttributes>
+  <Tasks>
+    <Task><UID>1</UID><ID>1</ID><Name>Build</Name><OutlineLevel>1</OutlineLevel>
+      <Duration>PT16H0M0S</Duration></Task>
+  </Tasks>
+  <Resources>
+    <Resource><UID>1</UID><ID>1</ID><Name>Ann</Name><Type>1</Type></Resource>
+  </Resources>
+  <Assignments>
+    <Assignment><UID>7</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID><Units>1</Units>
+      <Work>PT16H0M0S</Work>
+      <ExtendedAttribute><FieldID>255868938</FieldID><Value>Civil</Value></ExtendedAttribute>
+      <ExtendedAttribute><FieldID>255869002</FieldID><Value>12.5</Value></ExtendedAttribute>
+    </Assignment>
+  </Assignments>
+</Project>"#;
+        let mut ed = Editor::new(projcore::mspdi::read_mspdi(xml).unwrap());
+        let a = run(
+            &mut ed,
+            "assign.get",
+            r#"{"uid":7,"fields":["Text1","number1","Flag1"]}"#,
+        )
+        .unwrap();
+        assert_eq!(field(&a, "Text1"), ("Civil", &Json::Str("Civil".into())));
+        assert_eq!(field(&a, "number1"), ("12.5", &Json::Num(12.5)));
+        assert_eq!(field(&a, "Flag1"), ("No", &Json::Bool(false)));
+        let err = run(&mut ed, "assign.get", r#"{"uid":7,"fields":["Text31"]}"#).unwrap_err();
+        assert_eq!(err, "unknown assignment field 'Text31'");
+    }
+
+    #[test]
     fn an_assignment_reads_its_own_numbers_and_asked_fields() {
         use projcore::model::TaskType;
         let mut ed = staffed(TaskType::FixedUnits, false);

@@ -157,8 +157,19 @@ assignment field names (`assign.fields` lists them: Unique ID, Task ID, Task
 Name, Resource Name, Units, Work, Regular, Overtime, Actual, Remaining and
 Baseline Work, Cost, Actual, Remaining and Baseline Cost, % Work Complete,
 Start, Finish, Delay, Cost Rate Table, Work Contour, Peak, Budget Work and
-Budget Cost); `{"Work": {"text": "40 hrs", "value": 2400}, "Units": {"text":
-"100%", "value": 1}}`. Peak and the budget fields read what the plan stores.
+Budget Cost, then the custom fields as for tasks: Text1–Text30,
+Number1–Number20, Cost1–Cost10, Flag1–Flag20 and Date, Start, Finish and
+Duration1–10); `{"Work": {"text": "40 hrs", "value": 2400}, "Units": {"text":
+"100%", "value": 1}}`. Peak and the budget fields read what the plan stores. An
+assignment custom field resolves through a matching definition whose `FieldID`
+names one of the assignment's values, else through one whose `SecondaryPID`
+does: Project defines no assignment fields of its own, and we read a task or
+resource definition's `SecondaryPID` as its paired assignment field's id. That
+reading is not verified against Project. Among the definitions paired by
+`SecondaryPID`, a Text value stored by `ValueGUID` takes the one whose lookup
+table holds it. Otherwise the task rules
+apply: no resolvable definition reads unset, and an unparseable value reads as
+its raw text and `null`. An assignment never shows its task's value.
 
 File handling differs from the TUI:
 
