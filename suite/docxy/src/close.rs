@@ -734,24 +734,8 @@ impl Docxy {
     /// for the same reason. A cancelled close therefore keeps the committed
     /// text (its bar gone), never a half-typed rule.
     pub(crate) fn commit_dialog_buffers_for_exit(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = self.sheet_comment_edit.take() {
-            let author = self.comment_author();
-            // The seed says what the bar opened with — the exit commit skips
-            // a buffer that is it. The anchor says where: the commit lands
-            // on the bar's cell, as Enter and the bar's label do. Both
-            // fallbacks are unreachable while the buffer opens with them.
-            let seed = self
-                .sheet_comment_seed
-                .take()
-                .unwrap_or_else(|| self.selected_comment().unwrap_or_default());
-            let cell = self
-                .sheet_comment_cell
-                .take()
-                .or_else(|| self.active_sheet().map(|v| (v.active, v.sel.0, v.sel.1)));
-            if let (Some(cell), Some(t)) = (cell, self.tabs.get_mut(self.active)) {
-                commit_comment_buffer_for_exit(t, cell, &seed, &author, &text);
-            }
-        }
+        // The bar's exit commit is the same leave a cell click does.
+        self.sheet_comment_bar_leave();
         if let Some((idx, buf)) = self.sheet_rename.take() {
             if let Some(t) = self.tabs.get_mut(self.active) {
                 commit_rename_buffer_for_exit(t, idx, &buf);

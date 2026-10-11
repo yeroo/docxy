@@ -4914,9 +4914,11 @@ struct Docxy {
     // buffer opens, cleared with it.
     sheet_comment_seed: Option<String>,
     // The cell (sheet index, row, col) the bar opened on: the label, Enter,
-    // Save and the exit commit all target it, so a click that moves the
-    // selection while the bar is open does not move the note. Set with the
-    // seed, cleared with it.
+    // Save and the exit commit all target it. A cell click, right-click,
+    // Previous/Next Comment or a row/column insert/delete commits a changed
+    // buffer to it and closes the bar first; the anchor still matters for
+    // moves that leave the bar open (header clicks, the Name Box, Go To) and
+    // for the exit commit. Set with the seed, cleared with it.
     sheet_comment_cell: Option<(usize, u32, u32)>,
     // Whether the data-validation list dropdown is open on the selected cell.
     sheet_dv_open: bool,
@@ -14049,6 +14051,11 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // `grid_press_cell` commits an open bar on the press, but the pointer
+        // never reaches it on frozen sheets (`cell_at` refuses them) — the
+        // cell's own click always runs, so it leaves the bar too (a no-op
+        // when the press already closed it).
+        self.sheet_comment_bar_leave();
         if shift {
             self.extend_to(r, c, cx)
         } else if ctrl && !self.formula_pick_active() && !self.range_field_active() {
@@ -16343,9 +16350,11 @@ impl Docxy {
     /// Open the comment entry bar for the selected cell, seeded with its
     /// existing comment text (so New Comment doubles as Edit). The bar
     /// remembers the cell it opened on — the anchor — alongside the seed:
-    /// the selection moves freely while the bar is open, and the label,
-    /// Enter and an exit commit all target the anchor, not the live
-    /// selection.
+    /// the label, Enter and an exit commit all target the anchor, not the
+    /// live selection, and a cell click, right-click, Previous/Next Comment
+    /// or a row/column insert/delete commits a changed buffer to the anchor
+    /// and closes the bar first. Selection moves that leave the bar open
+    /// (header clicks, the Name Box, Go To) still never move the note.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet() {
             let cell = (v.active, v.sel.0, v.sel.1);
@@ -16369,8 +16378,11 @@ impl Docxy {
     /// selection moves or rows/columns shift: a changed buffer commits to the
     /// anchor cell (the exit commit's rules — an untouched bar, or one whose
     /// text the anchor's note already holds, writes nothing), then the bar
-    /// closes. No-op when the bar is closed.
-    fn sheet_comment_bar_leave(&mut self) {
+    /// closes. No-op when the bar is closed. A cell click, right-click,
+    /// Previous/Next Comment and a row/column insert/delete all leave it;
+    /// the window-close exit commit (`commit_dialog_buffers_for_exit`) is
+    /// this same leave.
+    pub(crate) fn sheet_comment_bar_leave(&mut self) {
         let Some(text) = self.sheet_comment_edit.clone() else {
             return;
         };
