@@ -37,6 +37,7 @@ pub mod export_text;
 pub mod field;
 pub mod final_mark;
 pub mod hf;
+pub mod highlight;
 pub mod import;
 pub mod inspect;
 pub mod latex;

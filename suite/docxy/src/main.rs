@@ -26960,25 +26960,46 @@ fn xml_escape(s: &str) -> String {
 
 /// Map a Word highlight name (`w:highlight`) to an approximate RGB, and whether
 /// its text should read dark (true) or light (false).
+/// A name Word does not define is a pale yellow with dark text.
 fn highlight_rgb(name: &str) -> (u32, bool) {
-    match name {
-        "yellow" => (0xFFFF00, true),
-        "green" => (0x00FF00, true),
-        "cyan" => (0x00FFFF, true),
-        "magenta" => (0xFF00FF, true),
-        "blue" => (0x0000FF, false),
-        "red" => (0xFF0000, false),
-        "darkYellow" => (0x808000, false),
-        "darkGreen" => (0x008000, false),
-        "darkCyan" => (0x008080, false),
-        "darkMagenta" => (0x800080, false),
-        "darkBlue" => (0x000080, false),
-        "darkRed" => (0x800000, false),
-        "lightGray" => (0xC0C0C0, true),
-        "darkGray" => (0x808080, false),
-        "black" => (0x000000, false),
-        "white" => (0xFFFFFF, true),
-        _ => (0xFFF29A, true),
+    match docxcore::highlight::highlight_rgb(name) {
+        Some((r, g, b)) => (
+            u32::from_be_bytes([0, r, g, b]),
+            matches!(
+                name,
+                "yellow" | "green" | "cyan" | "magenta" | "lightGray" | "white"
+            ),
+        ),
+        None => (0xFFF29A, true),
+    }
+}
+
+#[cfg(test)]
+mod highlight_rgb_tests {
+    #[test]
+    fn highlight_colours_and_text_shades_are_wordish() {
+        let expected = [
+            ("yellow", 0xFFFF00, true),
+            ("green", 0x00FF00, true),
+            ("cyan", 0x00FFFF, true),
+            ("magenta", 0xFF00FF, true),
+            ("blue", 0x0000FF, false),
+            ("red", 0xFF0000, false),
+            ("darkYellow", 0x808000, false),
+            ("darkGreen", 0x008000, false),
+            ("darkCyan", 0x008080, false),
+            ("darkMagenta", 0x800080, false),
+            ("darkBlue", 0x000080, false),
+            ("darkRed", 0x800000, false),
+            ("lightGray", 0xC0C0C0, true),
+            ("darkGray", 0x808080, false),
+            ("black", 0x000000, false),
+            ("white", 0xFFFFFF, true),
+            ("none", 0xFFF29A, true),
+        ];
+        for (name, rgb, dark) in expected {
+            assert_eq!(super::highlight_rgb(name), (rgb, dark), "{name}");
+        }
     }
 }
 
