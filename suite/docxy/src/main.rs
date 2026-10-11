@@ -13180,6 +13180,14 @@ impl Docxy {
         // A drag by the selection's border, or a drop waiting on its menu or
         // question, belongs to the grid it started on (#707 r2 M4).
         self.drops.clear();
+        // The comment entry bar and a ruler drag belong to the document
+        // they started on. Carried into another tab, Enter would comment
+        // on its selection and the drag would apply the old document's
+        // geometry to its paragraph (#1286).
+        self.comment_open = false;
+        self.comment_text.clear();
+        self.ruler_drag = None;
+        self.ruler_guide = None;
     }
 
     /// A right-button release anywhere in the window. Over the grid its own
