@@ -309,8 +309,8 @@ fn budget_work_and_cost_read_stored_else_zero() {
         read(&ed, steel, "Budget Work"),
         shows("0 tons", FieldValue::Minutes(0))
     );
-    // The values a budget resource's assignment stores read back
-    // (corpus/mspdi/13-resource-fields.xml: 18h and 1000).
+    // Stored values read back: the 18h and 1000 that
+    // corpus/mspdi/13-resource-fields.xml stores on Alice's (work) assignment.
     let mut p = ed.project().clone();
     p.assignments[0].budget_work_min = Some(18 * 60);
     p.assignments[0].budget_cost = Rate::parse("1000");
