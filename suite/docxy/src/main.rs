@@ -14292,6 +14292,11 @@ impl Docxy {
                 .ok_or_else(|| "the ribbon's groups are not shown".to_string()),
             Region::RibbonFlyout => lookup(&self.probes.borrow(), "ribbon-flyout")
                 .ok_or_else(|| "no ribbon flyout is open".to_string()),
+            Region::RibbonLaunch(title) => lookup(
+                &self.probes.borrow(),
+                &harness::region_name(region),
+            )
+            .ok_or_else(|| format!("the ribbon group {title}'s launcher is not drawn")),
             Region::RibbonGroup(i) => {
                 let now = self.ribbon_fit_now(window);
                 let title = now
@@ -31375,6 +31380,10 @@ impl Docxy {
                         d.child(
                             div()
                                 .id(SharedString::from(format!("sheet-launch-{}", g.title)))
+                                .child(probe(
+                                    &self.probes,
+                                    format!("{prefix}ribbon-launch:{}", g.title),
+                                ))
                                 .text_size(px(9.))
                                 .text_color(pal.dim)
                                 .when(launch.is_some(), |d| {
