@@ -1317,8 +1317,8 @@ first, in the `delete-summary` dialog.
   other commands by their Excel names. The Redo list (`{"qat": "qat-redo"}`,
   refused off a sheet tab) lists the steps Redo would redo, the next one
   first, and its item `k` redoes `k + 1` of them. Either pick is one action;
-  with nothing to list, one disabled `Can't Undo` / `Can't Redo`, as the
-  Redo list always shows in the cell editor.
+  with nothing to list, one disabled `Can't Undo` / `Can't Redo`, as both
+  lists show in the cell editor (a pick would drop the typed entry).
 
 A press on a split button's arrow or a drop-down button while its own menu is
 open shuts the menu, as in Office; the harness's `menu-open` always opens.
