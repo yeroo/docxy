@@ -90,6 +90,23 @@ test insert table dialog defaults and convert text to table (646)
   assert table.cells.0.0.0 is one
   assert table.cells.0.1.0 is two
 
+test insert table dialog opens with number of columns focused (1163)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is true
+  call real-key {"key":"backspace"}
+  call real-type {"text":"3"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.value is 3
+  assert reply.focused is true
+  call real-key {"key":"enter"}
+  assert dialog is none
+  assert table.columns is 3
+  assert table.rows is 2
+
 test layout tab selects, merges, splits, aligns, sorts and converts (647)
   open copy:../fixtures/basic.docx
   call ribbon-click {"tab":"Insert","command":"table"}
