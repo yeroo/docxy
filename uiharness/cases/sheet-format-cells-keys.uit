@@ -66,6 +66,9 @@ test keys under format cells change nothing behind it
   call real-key {"key":"backspace"}
   assert editing is false
   assert cell J1 is x
+  call real-key {"key":"ctrl+1"}
+  assert format_cells_open is true
+  assert cell J1 is x
   call real-key {"key":"f10"}
   assert keytips_up is false
   call real-key {"key":"alt"}
@@ -87,3 +90,73 @@ test format cells keys work again once it is closed
   assert sel is J2
   call real-type {"text":"zz"}
   assert editing is true
+
+# Ctrl+1 opens Format Cells as in Excel (#1164); ⌘1 is the same key on a Mac,
+# where `on_key` reads ⌘ as Ctrl (a unit test pins that no menu takes ⌘1).
+
+test ctrl+1 opens format cells
+  open copy:../fixtures/basic.xlsx
+  click J1
+  assert format_cells_open is false
+  call real-key {"key":"ctrl+1"}
+  assert format_cells_open is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  assert sel is J1
+  assert editing is false
+  assert cell J1 is nothing
+
+test ctrl+shift+1 ctrl+alt+1 and a plain 1 do not open format cells
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call real-key {"key":"ctrl+shift+1"}
+  assert format_cells_open is false
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+alt+1"}
+  assert format_cells_open is false
+  assert cell J1 is nothing
+  call real-key {"key":"escape"}
+  assert editing is false
+  call real-type {"text":"1"}
+  assert format_cells_open is false
+  assert editing is true
+  call real-key {"key":"enter"}
+  assert cell J1 is 1
+
+test ctrl+1 while editing opens format cells and keeps the entry
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call real-type {"text":"ab"}
+  assert editing is true
+  call real-key {"key":"ctrl+1"}
+  assert format_cells_open is true
+  assert editing is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  assert editing is true
+  call real-key {"key":"enter"}
+  assert editing is false
+  assert cell J1 is ab
+
+# The Home tab's Font, Alignment and Number launchers (↘) open it too, by a
+# real click on the launcher.
+
+test the home font alignment and number launchers open format cells
+  open copy:../fixtures/basic.xlsx
+  click J1
+  assert ribbon_tab is Home
+  call pointer-click {"region":"ribbon-launch:Number"}
+  assert format_cells_open is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  call pointer-click {"region":"ribbon-launch:Font"}
+  assert format_cells_open is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  call pointer-click {"region":"ribbon-launch:Alignment"}
+  assert format_cells_open is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  assert sel is J1
+  assert cell J1 is nothing
+  call-error pointer-click {"region":"ribbon-launch:Styles"} => the ribbon group Styles draws no launcher

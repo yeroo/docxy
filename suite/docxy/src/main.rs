@@ -1641,6 +1641,13 @@ fn fx_toggle_key(ctrl: bool, shift: bool, key: &str) -> bool {
     ctrl && shift && key.eq_ignore_ascii_case("u")
 }
 
+/// Is this Ctrl+1 (⌘1 on a Mac), which opens Format Cells (#1164)? Not with
+/// Shift, Excel's number-format row, nor with Alt: AltGr is Ctrl+Alt on
+/// Windows, and its `1` is a character.
+fn format_cells_key(key: &str, ctrl: bool, shift: bool, alt: bool) -> bool {
+    ctrl && !shift && !alt && key == "1"
+}
+
 /// The sheet a tab holds, with the app's Editing options stamped on it: what
 /// [`Docxy::active_sheet_mut`] hands out. A second guard beside
 /// [`stamp_edit_opts`], which is the mechanism: it stamps every tab on
@@ -18860,6 +18867,7 @@ impl Docxy {
             // rest of the block acts on the document or the window, not on
             // the selection.
             if matches!(key, "c" | "x" | "v" | "a" | "b" | "i")
+                || format_cells_key(key, ctrl, shift, alt)
                 || (shift && matches!(key, "p" | "k"))
             {
                 self.chart_hand_back(cx);
@@ -18884,6 +18892,10 @@ impl Docxy {
                 "y" => self.sheet_redo_or_repeat(cx),
                 "b" => return self.run_sheet_act(SheetAct::Bold, window, cx),
                 "i" => return self.run_sheet_act(SheetAct::Italic, window, cx),
+                // Format Cells (#1164), Home › Cells › Format's own act.
+                "1" if format_cells_key(key, ctrl, shift, alt) => {
+                    return self.run_sheet_act(SheetAct::FormatCells, window, cx);
+                }
                 // Insert a PivotTable for the selection (also on the Insert ribbon).
                 "p" if shift => return self.run_sheet_act(SheetAct::InsertPivot, window, cx),
                 // Insert a chart of the selection (also on the Insert ribbon).
