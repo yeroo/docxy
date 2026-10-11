@@ -22,6 +22,18 @@ fn numfmt_category_names_builtin_ids() {
 }
 
 #[test]
+fn numfmt_category_names_currency_and_accounting_ids() {
+    for id in 5u32..=8 {
+        assert_eq!(name_of_id(id), "Currency", "id {id}");
+    }
+    for id in 41u32..=44 {
+        assert_eq!(name_of_id(id), "Accounting", "id {id}");
+    }
+    assert_eq!(name_of_id(12), "Fraction");
+    assert_eq!(name_of_id(13), "Fraction");
+}
+
+#[test]
 fn numfmt_category_every_builtin_code_is_a_category() {
     for id in 0..50 {
         if let Some(code) = gridcore::numfmt::builtin_code(id) {
