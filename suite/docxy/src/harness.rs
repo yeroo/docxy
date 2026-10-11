@@ -1439,7 +1439,7 @@ struct ViewFlags {
 }
 
 impl ViewFlags {
-    fn live(app: &crate::Docxy, _window: &Window) -> Self {
+    fn live(app: &crate::Docxy) -> Self {
         Self {
             hf_edit: app.hf_active(),
             page: app.page_view,
@@ -1730,8 +1730,8 @@ fn ruler_state(app: &crate::Docxy) -> Json {
     Json::obj(fields)
 }
 
-fn live_doc_state(app: &crate::Docxy, window: &Window) -> Result<Json, String> {
-    let mut doc = doc_state(active_doc(app)?, &ViewFlags::live(app, window));
+fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> {
+    let mut doc = doc_state(active_doc(app)?, &ViewFlags::live(app));
     if let Json::Obj(fields) = &mut doc {
         fields.push(("ruler".into(), ruler_state(app)));
         fields.push(("line_numbers".into(), line_numbers_state(app)));

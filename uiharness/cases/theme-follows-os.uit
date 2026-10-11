@@ -1,9 +1,11 @@
 # #1075: Auto theme follows an OS Light/Dark switch. `appearance-set` plays
-# the switch through the same handler gpui's window appearance observer calls
-# on macOS, so this case is the fix's event path end to end: Auto follows
-# both ways, a chosen Light/Dark ignores the switch, and back on Auto the
-# current OS appearance applies at once (`applied` is the drawn mode, read
-# after the call). The tests share one instance, as the runner runs them;
+# the switch through the handler gpui's window appearance observer calls on
+# macOS (`Docxy::os_appearance_changed`); the observer registration in
+# `open_docxy_window` is not exercised by this case — it is checked by review
+# and on macOS. Auto follows the switch both ways, a chosen Light/Dark
+# ignores it, and back on Auto the current OS appearance applies at once
+# (`applied` is the drawn mode, read after the call). The tests share one
+# instance, as the runner runs them;
 # the second sets the appearance before every assert that reads it, so
 # neither test depends on the machine's real appearance.
 
