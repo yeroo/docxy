@@ -1065,7 +1065,9 @@ impl App {
         }
     }
 
-    /// Load a project from disk into the app, replacing the current one.
+    /// Load a project from disk into the app, replacing the current one. An
+    /// open text prompt is closed — it belonged to the replaced project
+    /// (#1049).
     fn open_file(&mut self, path: &str) {
         match load(path) {
             Ok(p) => {
@@ -1073,6 +1075,7 @@ impl App {
                 self.path = Some(path.to_string());
                 self.top = 0;
                 self.hscroll = 0;
+                self.prompt = None;
                 self.backstage = None;
                 self.start_screen = false;
                 let is_mpp = path.to_ascii_lowercase().ends_with(".mpp");
@@ -1093,12 +1096,14 @@ impl App {
 
     /// Start a fresh blank schedule (one task), discarding any current file
     /// binding. Shared by the File ▸ New backstage item and the welcome
-    /// screen's "New schedule" choice.
+    /// screen's "New schedule" choice. An open text prompt is closed — it
+    /// belonged to the replaced project (#1049).
     fn new_schedule(&mut self) {
         self.ed.replace_project(new_project());
         self.path = None;
         self.top = 0;
         self.hscroll = 0;
+        self.prompt = None;
         self.status = "New schedule".into();
     }
 
@@ -4195,6 +4200,58 @@ mod tests {
         assert_eq!(app.ed.project().task(b).unwrap().notes, None);
         assert_eq!(app.ed.undo_depth(), depth);
         assert!(app.status.is_empty());
+    }
+
+    /// #1049: File > New replaces the project, so an open Notes prompt must
+    /// not survive into it — Enter would commit the old project's prefill onto
+    /// the task with the same UID there.
+    #[test]
+    fn notes_prompt_closes_when_file_new_replaces_the_project() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.ed.set_notes(1, "old").unwrap();
+        app.apply_act(Act::Notes);
+        app.apply_backstage_event(backstage::BackstageEvent::New);
+        assert!(app.prompt.is_none());
+        // Enter reaches the fresh project: no stale prefill is committed.
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.ed.project().task(1).unwrap().notes, None);
+        assert_eq!(app.ed.undo_depth(), 0);
+        assert!(!app.ed.dirty());
+    }
+
+    /// #1049: File > Open replaces the project, so an open Notes prompt must
+    /// not survive into the file being opened.
+    #[test]
+    fn notes_prompt_closes_when_file_open_replaces_the_project() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.ed.set_notes(1, "old").unwrap();
+        app.apply_act(Act::Notes);
+        let path = std::env::temp_dir().join(format!(
+            "yppxy-editor-open-prompt-{}.yppx",
+            std::process::id()
+        ));
+        save_to(&new_project(), path.to_str().unwrap()).unwrap();
+        app.apply_backstage_event(backstage::BackstageEvent::Open(path.clone()));
+        std::fs::remove_file(&path).unwrap();
+        assert!(app.prompt.is_none());
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.ed.project().task(1).unwrap().notes, None);
+        assert_eq!(app.ed.undo_depth(), 0);
+        assert!(!app.ed.dirty());
+    }
+
+    /// #1049: a failed open replaces nothing, so an open prompt still belongs
+    /// to the loaded project and stays as it was.
+    #[test]
+    fn failed_open_keeps_an_open_prompt() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.ed.set_notes(1, "old").unwrap();
+        app.apply_act(Act::Notes);
+        app.open_file("/nonexistent/yppxy/editor-test/missing.yppx");
+        assert!(app.status.starts_with("Open failed:"));
+        let p = app.prompt.as_ref().expect("prompt survives a failed open");
+        assert!(matches!(p.kind, PromptKind::Notes(1)));
+        assert_eq!(p.buf, "old");
     }
 
     /// #454 r1: a note holding a backslash and a newline survives Enter on
