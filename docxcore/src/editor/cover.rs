@@ -100,9 +100,7 @@ impl Editor {
     /// paragraphs. One undo step (a selection's deletion aside). The breaks
     /// take the formatting typing at the caret would.
     pub fn insert_blank_page(&mut self) {
-        if self.has_selection() {
-            self.delete_selection();
-        }
+        self.delete_selection_to_replace();
         let props = resolve_para(&self.doc.body, &self.caret.path)
             .map(|p| tab_props_at(&p.content, self.caret.offset))
             .unwrap_or_default();
