@@ -135,20 +135,52 @@ unset), `start`/`finish` the assignment's own dates.
 ```json
 {"verb": "assign.add", "args": {"task": 3, "resource": "Ann", "units": "50%"}}
 {"verb": "assign.set", "args": {"uid": 7, "units": 1, "rate_table": "B"}}
+{"verb": "assign.set", "args": {"uid": 7, "overtime_work": 8, "contour": "Back Loaded"}}
+{"verb": "assign.set", "args": {"uid": 7, "actual_work": "2d"}}
 {"verb": "assign.del", "args": {"uid": 7}}
 ```
 
 `assign.add {task, resource, units?, work?}` takes a resource uid or name (a new
 name is staged as a work resource; a new name that is a number or contains a
 comma is refused, so pass a uid as a number) and refuses a resource already on
-the task. `assign.set {uid, units?, work?, rate_table?,
-delay?}` needs at least one of them; units are a number or `"50%"`, work and
-delay a number of hours or a duration (`"40h"`, `"5d"`), the rate table `"A"` to
-`"E"`. The task is rescheduled by its type, as in Project: on a Fixed Units task
-a units edit keeps the work and moves the duration, on Fixed Duration the work
-follows the units (and units given together with work are recomputed from the
-work); a work edit clears the assignment's overtime. A bare number of work or
-delay, even as a string (`"8"`), is hours. `assign.del
+the task. `assign.set {uid, units?, work?, overtime_work?,
+contour?, rate_table?, delay?, actual_work? | percent_work_complete?}` needs at
+least one of them; units are a number or `"50%"`, work, overtime work, actual
+work and delay a number of hours or a duration (`"40h"`, `"5d"`), the contour
+Project's name (`"Back Loaded"`, ASCII case ignored) or its code 0 (Flat) to 7
+(Turtle), the rate table `"A"` to `"E"`, and `percent_work_complete` a whole
+number 0 to 100 or `"50%"`, given instead of `actual_work`. The task is
+rescheduled by its type, as in Project: on a Fixed Units task a units edit
+keeps the work and moves the duration, on Fixed Duration the work follows the
+units (and units given together with work are recomputed from the work); a
+work edit clears the assignment's overtime. A bare number of work or delay,
+even as a string (`"8"`), is hours.
+
+The edit applies the delay, units and work first, then the overtime, the
+contour, the rate table and last the actuals, so overtime given with work is
+kept and checked against the new work, and a percent is a share of the final
+work.
+
+- Overtime work is a work resource's, at most its work. Regular work is the
+  rest; the cost prices it at the overtime rate, and the task's and
+  resource's overtime totals follow. Overtime is not scheduled: where Project
+  shortens a Fixed Units or Fixed Work task, here the duration stays.
+- A contour (Contoured is refused: Project sets it from timephased edits)
+  keeps the work, units and duration, and the assignment spans its task;
+  Project would keep the peak and stretch the task instead. A cost resource
+  takes none.
+- Actual work (at most the work; raise the work first) sets the actual start
+  to the assignment's start, at the whole work its actual finish too, and 0
+  clears both. The actual cost follows the resource's accrual (Start: the
+  whole cost once work has begun; End: none until it is done; Prorated: the
+  share worked), and remaining work, remaining cost and % work complete are
+  derived, as are the task's and resource's actual work, actual cost and %
+  work complete where the plan stores them. The task's own progress (its
+  actual start and finish, % complete) is not derived from it, and an actual
+  finish stays when a later work edit raises the work past the actual.
+- A delayed assignment whose work runs past its task's duration extends the
+  task; an actual start or finish, or a contour, ends that extension, so the
+  task returns to its duration. `assign.del
 {uid}` replies `{deleted, task}`; an effort-driven task keeps its work across
 the assignments left. Each edit is one undo step, a value the assignment
 already has records none, and every argument is checked first, so a rejected

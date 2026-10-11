@@ -349,12 +349,20 @@ fn tool_defs() -> Json {
         ),
         tool(
             "yppxy_assign_set",
-            "Edit an assignment: units, work, cost rate table, or delay. The task is rescheduled \
+            "Edit an assignment: units, work, overtime work, work contour, cost rate table, \
+             delay, or actuals (actual work, or percent work complete). The task is rescheduled \
              by its type, as in Project: a units edit on a Fixed Units task keeps the work and \
              moves the duration; on Fixed Duration the work follows the units, and units given \
-             together with work are recomputed from the work. Every argument is checked before \
-             the edit, so a rejected call changes nothing. Returns the updated assignment. One \
-             undo step.",
+             together with work are recomputed from the work. Overtime (a work resource's, at \
+             most the work; a work edit clears it, so given together it applies after the work) \
+             is priced at the overtime rate but does not shorten the task. A contour keeps the \
+             work, units and duration, and the assignment spans its task. Actual work (at most \
+             the work) sets the actual start, at the whole work the actual finish, prices the \
+             actual cost by the resource's accrual and derives remaining work, remaining cost \
+             and percent work complete; it does not update the task's own progress. A contour \
+             or an actual start ends a delayed assignment's extension of its task. Every \
+             argument is checked before the edit, so a rejected call changes nothing. Returns \
+             the updated assignment. One undo step.",
             vec![
                 assign_uid(),
                 units(),
@@ -368,6 +376,34 @@ fn tool_defs() -> Json {
                     prop_types(
                         &["number", "string"],
                         "Assignment delay: a number of hours (a bare number is hours, even as a string), or a duration such as \"5d\".",
+                    ),
+                ),
+                (
+                    "overtime_work",
+                    prop_types(
+                        &["number", "string"],
+                        "Overtime work, part of the work: a number of hours, or a duration such as \"1d\". A work resource's only.",
+                    ),
+                ),
+                (
+                    "contour",
+                    prop_types(
+                        &["string", "integer"],
+                        "Work contour: Flat, Back Loaded, Front Loaded, Double Peak, Early Peak, Late Peak, Bell or Turtle (ASCII case ignored), or its code 0 to 7. Contoured is refused.",
+                    ),
+                ),
+                (
+                    "actual_work",
+                    prop_types(
+                        &["number", "string"],
+                        "Actual work, at most the work: a number of hours, or a duration such as \"2d\". 0 clears the actual dates.",
+                    ),
+                ),
+                (
+                    "percent_work_complete",
+                    prop_types(
+                        &["integer", "string"],
+                        "Instead of actual_work: the actual work as a whole percent of the work, 0 to 100, or \"50%\".",
                     ),
                 ),
                 assign_fields(),
@@ -672,6 +708,15 @@ mod tests {
             assert_eq!(types_of(schema, "work"), ["number", "string"]);
         }
         assert_eq!(types_of(&set, "delay"), ["number", "string"]);
+        for hours in ["overtime_work", "actual_work"] {
+            assert_eq!(types_of(&set, hours), ["number", "string"], "{hours}");
+        }
+        assert_eq!(types_of(&set, "contour"), ["string", "integer"]);
+        assert!(prop_of(&set, "contour").get("enum").is_none());
+        assert_eq!(
+            types_of(&set, "percent_work_complete"),
+            ["integer", "string"]
+        );
         // The verb reads the letter in either case, so no enum narrows it.
         assert_eq!(types_of(&set, "rate_table"), ["string"]);
         assert!(prop_of(&set, "rate_table").get("enum").is_none());
