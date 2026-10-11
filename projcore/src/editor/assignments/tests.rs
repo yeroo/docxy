@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{Rate, RateEntry};
+use crate::model::{AccrueAt, Rate, RateEntry};
 
 const DAY: i64 = 480;
 
@@ -398,7 +398,8 @@ fn rejected_edits_leave_the_editor_untouched() {
     assert_eq!(
         ed.set_assignment(1, AssignmentPatch::default())
             .unwrap_err(),
-        "nothing to set: give units, work, rate_table or delay"
+        "nothing to set: give units, work, overtime_work, contour, rate_table, delay, \
+         actual_work or percent_work_complete"
     );
 }
 
@@ -549,4 +550,441 @@ fn a_material_takes_units_and_a_cost_resource_neither() {
             .unwrap_err(),
         "'Fee' is a cost resource; it takes no units or work"
     );
+}
+
+// ---- overtime, contour and actuals (#1180) ----------------------------------
+
+fn overtime(min: i64) -> AssignmentPatch {
+    AssignmentPatch {
+        overtime_work_min: Some(min),
+        ..AssignmentPatch::default()
+    }
+}
+
+fn contour(c: u8) -> AssignmentPatch {
+    AssignmentPatch {
+        work_contour: Some(c),
+        ..AssignmentPatch::default()
+    }
+}
+
+fn actual(min: i64) -> AssignmentPatch {
+    AssignmentPatch {
+        actual_work_min: Some(min),
+        ..AssignmentPatch::default()
+    }
+}
+
+fn percent(p: u8) -> AssignmentPatch {
+    AssignmentPatch {
+        percent_work_complete: Some(p),
+        ..AssignmentPatch::default()
+    }
+}
+
+fn at(day: u32, hour: u32) -> DateTime {
+    DateTime::from_ymd_hm(2026, 1, day, hour, 0)
+}
+
+fn money_text(r: &Option<Rate>) -> Option<&str> {
+    r.as_ref().map(Rate::as_str)
+}
+
+/// `plan` with Ann's 40 hours (priced at $2000) as assignment 1, its task's
+/// totals stored as Project writes them, then `edit` applied to the project
+/// before the editor opens it.
+fn tracked(kind: Option<TaskType>, edit: impl FnOnce(&mut Project)) -> Editor {
+    let a = Assignment {
+        cost: Rate::parse("200000"),
+        regular_work_min: Some(5 * DAY),
+        remaining_work_min: Some(5 * DAY),
+        remaining_cost: Rate::parse("200000"),
+        ..assignment(1, 1, 1.0, 5 * DAY)
+    };
+    let mut proj = plan(kind, kind == Some(TaskType::FixedWork), vec![a]).proj;
+    let task = &mut proj.tasks[0];
+    task.work_min = Some(5 * DAY);
+    task.regular_work_min = Some(5 * DAY);
+    task.cost = Rate::parse("200000");
+    task.overtime_work_min = Some(0);
+    task.overtime_cost = Rate::parse("0");
+    task.actual_work_min = Some(0);
+    task.actual_cost = Rate::parse("0");
+    task.percent_work_complete = Some(0);
+    edit(&mut proj);
+    Editor::new(proj)
+}
+
+#[test]
+fn overtime_work_is_priced_at_the_overtime_rate_and_moves_the_totals() {
+    for kind in [None, Some(TaskType::FixedWork)] {
+        let mut ed = tracked(kind, |p| p.resources[0].overtime_rate = Rate::parse("75"));
+        assert_one_step(&mut ed, |ed| ed.set_assignment(1, overtime(DAY)).unwrap());
+        let a = get(&ed, 1);
+        assert_eq!(
+            (a.work_min, a.overtime_work_min, a.regular_work_min),
+            (5 * DAY, Some(DAY), Some(4 * DAY))
+        );
+        // 32h at $50 and 8h at $75.
+        assert_eq!(cost(&ed, 1), 2200.0);
+        assert_eq!(money_text(&a.overtime_cost), Some("60000"));
+        assert_eq!(a.remaining_overtime_work_min, Some(DAY));
+        assert_eq!(money_text(&a.remaining_overtime_cost), Some("60000"));
+        let task = &ed.proj.tasks[0];
+        assert_eq!(
+            (task.work_min, task.overtime_work_min, task.regular_work_min),
+            (Some(5 * DAY), Some(DAY), Some(4 * DAY))
+        );
+        assert_eq!(money_text(&task.cost), Some("220000"));
+        assert_eq!(money_text(&task.overtime_cost), Some("60000"));
+        let ann = &ed.proj.resources[0];
+        assert_eq!(ann.overtime_work_min, Some(DAY));
+        assert_eq!(money_text(&ann.overtime_cost), Some("60000"));
+        // Overtime is not scheduled: the duration stays.
+        assert_eq!(duration(&ed), 5 * DAY);
+    }
+}
+
+#[test]
+fn overtime_given_with_work_is_kept_and_checked_against_the_new_work() {
+    let mut a = assignment(1, 1, 1.0, 5 * DAY);
+    a.overtime_work_min = Some(DAY);
+    let mut ed = plan(None, false, vec![a]);
+    // The same overtime alone is no change.
+    let depth = ed.undo_depth();
+    ed.set_assignment(1, overtime(DAY)).unwrap();
+    assert_eq!(ed.undo_depth(), depth);
+    // With a work edit, which clears it, it is an edit.
+    let both = AssignmentPatch {
+        work_min: Some(4 * DAY),
+        overtime_work_min: Some(DAY),
+        ..AssignmentPatch::default()
+    };
+    assert_one_step(&mut ed, |ed| ed.set_assignment(1, both).unwrap());
+    let a = get(&ed, 1);
+    assert_eq!(
+        (a.work_min, a.overtime_work_min, a.regular_work_min),
+        (4 * DAY, Some(DAY), Some(3 * DAY))
+    );
+    // Checked against the work the patch leaves, after its work stage.
+    let over = AssignmentPatch {
+        work_min: Some(DAY),
+        overtime_work_min: Some(2 * DAY),
+        ..AssignmentPatch::default()
+    };
+    let err = ed.set_assignment(1, over.clone()).unwrap_err();
+    assert_eq!(err, "overtime work must not be more than the work");
+    assert_untouched(&mut ed, |ed| ed.set_assignment(1, over));
+}
+
+#[test]
+fn a_rate_table_change_prices_the_overtime_again() {
+    let mut a = assignment(1, 1, 1.0, 5 * DAY);
+    a.overtime_work_min = Some(DAY);
+    // Project's own value, from rates the plan no longer has.
+    a.overtime_cost = Rate::parse("12345");
+    let mut proj = plan(None, false, vec![a]).proj;
+    proj.resources[0].rates[0].overtime_rate = Rate::parse("100");
+    let mut ed = Editor::new(proj);
+    ed.set_assignment(1, table(1)).unwrap();
+    let a = get(&ed, 1);
+    // Table B: 32h at $80 and 8h at $100.
+    assert_eq!(cost(&ed, 1), 3360.0);
+    assert_eq!(money_text(&a.overtime_cost), Some("80000"));
+    assert_eq!(money_text(&a.remaining_overtime_cost), Some("80000"));
+}
+
+#[test]
+fn a_contour_spans_the_task_and_keeps_work_units_and_duration() {
+    let mut a = assignment(1, 1, 0.5, 2 * DAY);
+    a.peak_units = Rate::parse("0.5");
+    a.timephased_data = vec![
+        TimephasedValue {
+            kind: TimephasedValue::REMAINING_WORK,
+            ..TimephasedValue::default()
+        },
+        TimephasedValue {
+            kind: 2,
+            ..TimephasedValue::default()
+        },
+    ];
+    let mut ed = plan(None, false, vec![a]);
+    // Flat: 2 days of work at 50% run 4 days from the start.
+    ed.set_assignment(1, table(1)).unwrap();
+    assert_eq!(get(&ed, 1).finish, Some(at(8, 17)));
+    // Flat on an assignment without a contour is the value it has.
+    let depth = ed.undo_depth();
+    ed.set_assignment(1, contour(0)).unwrap();
+    assert_eq!(ed.undo_depth(), depth);
+    assert_one_step(&mut ed, |ed| ed.set_assignment(1, contour(6)).unwrap());
+    let a = get(&ed, 1);
+    assert_eq!(a.work_contour, Some(6));
+    assert_eq!(
+        (a.work_min, a.units, a.peak_units.clone()),
+        (2 * DAY, 0.5, None)
+    );
+    // A contoured assignment spans its task.
+    assert_eq!((a.start, a.finish), (Some(at(5, 8)), Some(at(9, 17))));
+    let kinds: Vec<u8> = a.timephased_data.iter().map(|t| t.kind).collect();
+    assert_eq!(kinds, [2]);
+    assert_eq!(duration(&ed), 5 * DAY);
+    // The contour it has is no change.
+    let depth = ed.undo_depth();
+    ed.set_assignment(1, contour(6)).unwrap();
+    assert_eq!(ed.undo_depth(), depth);
+}
+
+#[test]
+fn a_material_takes_a_contour_a_cost_resource_none() {
+    let steel = assignment(3, 3, 5.0, 300);
+    let fee = assignment(4, 4, 1.0, 0);
+    let mut ed = plan(None, false, vec![steel, fee]);
+    ed.set_assignment(3, table(1)).unwrap();
+    let dates = (get(&ed, 3).start, get(&ed, 3).finish);
+    ed.set_assignment(3, contour(2)).unwrap();
+    assert_eq!(get(&ed, 3).work_contour, Some(2));
+    assert_eq!((get(&ed, 3).start, get(&ed, 3).finish), dates);
+    for (patch, what) in [
+        (contour(2), "work contour"),
+        (overtime(60), "overtime work"),
+        (actual(0), "actual work"),
+        (percent(0), "actual work"),
+    ] {
+        let err = ed.set_assignment(4, patch.clone()).unwrap_err();
+        assert_eq!(err, format!("'Fee' is a cost resource; it takes no {what}"));
+        assert_untouched(&mut ed, |ed| ed.set_assignment(4, patch));
+    }
+    let err = ed.set_assignment(3, overtime(60)).unwrap_err();
+    assert_eq!(
+        err,
+        "'Steel' is a material resource; it takes no overtime work"
+    );
+}
+
+/// Task 1 (5 days stored) whose delayed assignment runs a day past it, and
+/// task 3 after it: the forward pass extends task 1 (#469).
+fn delayed_with_successor() -> Editor {
+    let mut a = assignment(1, 1, 1.0, 5 * DAY);
+    a.delay = Some(DAY * 10);
+    let mut proj = plan(None, false, vec![a]).proj;
+    proj.tasks.push(Task {
+        uid: 3,
+        id: 3,
+        name: "Next".into(),
+        outline_level: 1,
+        duration_min: DAY,
+        predecessors: vec![Predecessor::fs(1)],
+        ..Task::default()
+    });
+    Editor::new(proj)
+}
+
+fn finish_and_next_start(ed: &Editor) -> (DateTime, DateTime) {
+    let sched = ed.schedule();
+    (
+        sched.get(1).unwrap().early_finish,
+        sched.get(3).unwrap().early_start,
+    )
+}
+
+#[test]
+fn an_actual_start_or_a_contour_ends_a_delayed_assignment_s_extension() {
+    let extended = (at(12, 17), at(13, 8));
+    let stored = (at(9, 17), at(12, 8));
+    let mut ed = delayed_with_successor();
+    assert_eq!(finish_and_next_start(&ed), extended);
+    ed.set_assignment(1, actual(DAY)).unwrap();
+    assert_eq!(get(&ed, 1).actual_start, Some(at(6, 8)));
+    assert_eq!(finish_and_next_start(&ed), stored);
+    assert_eq!(duration(&ed), 5 * DAY);
+
+    let mut ed = delayed_with_successor();
+    ed.set_assignment(1, contour(6)).unwrap();
+    assert_eq!(finish_and_next_start(&ed), stored);
+    ed.set_assignment(1, contour(0)).unwrap();
+    assert_eq!(finish_and_next_start(&ed), extended);
+}
+
+#[test]
+fn actual_work_sets_progress_dates_cost_and_totals() {
+    let mut ed = tracked(None, |_| {});
+    assert_one_step(&mut ed, |ed| ed.set_assignment(1, actual(2 * DAY)).unwrap());
+    let a = get(&ed, 1);
+    assert_eq!(
+        (
+            a.actual_work_min,
+            a.remaining_work_min,
+            a.percent_work_complete
+        ),
+        (Some(2 * DAY), Some(3 * DAY), Some(40))
+    );
+    assert_eq!((a.actual_start, a.actual_finish), (Some(at(5, 8)), None));
+    // Prorated: 16 of the 40 hours at $50.
+    assert_eq!(money_text(&a.actual_cost), Some("80000"));
+    assert_eq!(money_text(&a.remaining_cost), Some("120000"));
+    let task = &ed.proj.tasks[0];
+    assert_eq!(task.actual_work_min, Some(2 * DAY));
+    assert_eq!(money_text(&task.actual_cost), Some("80000"));
+    assert_eq!(task.percent_work_complete, Some(40));
+    let ann = &ed.proj.resources[0];
+    assert_eq!(
+        (ann.actual_work_min, ann.percent_work_complete),
+        (Some(2 * DAY), Some(40))
+    );
+    assert_eq!(money_text(&ann.actual_cost), Some("80000"));
+
+    // All of it: the actual finish too, and the whole cost.
+    ed.set_assignment(1, actual(5 * DAY)).unwrap();
+    let a = get(&ed, 1);
+    assert_eq!(
+        (a.actual_start, a.actual_finish),
+        (Some(at(5, 8)), Some(at(9, 17)))
+    );
+    assert_eq!(
+        (a.remaining_work_min, a.percent_work_complete),
+        (Some(0), Some(100))
+    );
+    assert_eq!(money_text(&a.actual_cost), Some("200000"));
+    assert_eq!(money_text(&a.remaining_cost), Some("0"));
+
+    // None: both dates go.
+    ed.set_assignment(1, actual(0)).unwrap();
+    let a = get(&ed, 1);
+    assert_eq!((a.actual_start, a.actual_finish), (None, None));
+    assert_eq!(
+        (a.remaining_work_min, a.percent_work_complete),
+        (Some(5 * DAY), Some(0))
+    );
+    assert_eq!(money_text(&a.actual_cost), Some("0"));
+    assert_eq!(ed.proj.tasks[0].actual_work_min, Some(0));
+    assert_eq!(duration(&ed), 5 * DAY);
+}
+
+#[test]
+fn a_task_without_stored_actuals_gains_none() {
+    let mut ed = plan(None, false, vec![assignment(1, 1, 1.0, 5 * DAY)]);
+    ed.set_assignment(1, actual(DAY)).unwrap();
+    let task = &ed.proj.tasks[0];
+    assert_eq!(
+        (
+            task.actual_work_min,
+            task.actual_cost.clone(),
+            task.percent_work_complete
+        ),
+        (None, None, None)
+    );
+}
+
+#[test]
+fn a_percent_sets_that_share_of_the_final_work() {
+    let mut ed = tracked(None, |_| {});
+    assert_one_step(&mut ed, |ed| ed.set_assignment(1, percent(50)).unwrap());
+    let a = get(&ed, 1);
+    assert_eq!(
+        (a.actual_work_min, a.percent_work_complete),
+        (Some(1200), Some(50))
+    );
+    // The same share, or the same actual work, is no change.
+    for patch in [percent(50), actual(1200)] {
+        let depth = ed.undo_depth();
+        ed.set_assignment(1, patch).unwrap();
+        assert_eq!(ed.undo_depth(), depth);
+    }
+    // With a work edit it is a share of the new work.
+    let both = AssignmentPatch {
+        work_min: Some(4 * DAY),
+        percent_work_complete: Some(50),
+        ..AssignmentPatch::default()
+    };
+    assert_one_step(&mut ed, |ed| ed.set_assignment(1, both).unwrap());
+    let a = get(&ed, 1);
+    assert_eq!(
+        (a.work_min, a.actual_work_min, a.percent_work_complete),
+        (4 * DAY, Some(2 * DAY), Some(50))
+    );
+}
+
+#[test]
+fn the_actual_cost_follows_the_resource_s_accrual() {
+    for (accrue, part, all) in [
+        (AccrueAt::Start, "200000", "200000"),
+        (AccrueAt::End, "0", "200000"),
+        (AccrueAt::Prorated, "80000", "200000"),
+    ] {
+        let mut ed = tracked(None, |p| p.resources[0].accrue_at = Some(accrue));
+        ed.set_assignment(1, actual(2 * DAY)).unwrap();
+        assert_eq!(
+            money_text(&get(&ed, 1).actual_cost),
+            Some(part),
+            "{accrue:?}"
+        );
+        ed.set_assignment(1, actual(5 * DAY)).unwrap();
+        assert_eq!(
+            money_text(&get(&ed, 1).actual_cost),
+            Some(all),
+            "{accrue:?}"
+        );
+    }
+}
+
+#[test]
+fn rejected_progress_edits_leave_the_editor_untouched() {
+    let mut ed = plan(
+        None,
+        false,
+        vec![assignment(1, 1, 1.0, 5 * DAY), assignment(2, 2, 1.0, 0)],
+    );
+    let both = AssignmentPatch {
+        actual_work_min: Some(60),
+        percent_work_complete: Some(10),
+        ..AssignmentPatch::default()
+    };
+    for (uid, patch, err) in [
+        (1, overtime(-1), "overtime work must not be negative"),
+        (
+            1,
+            overtime(5 * DAY + 1),
+            "overtime work must not be more than the work",
+        ),
+        (1, actual(-1), "actual work must not be negative"),
+        (
+            1,
+            actual(5 * DAY + 1),
+            "actual work must not be more than the work; raise the work first",
+        ),
+        (
+            1,
+            percent(101),
+            "percent_work_complete must be 0 to 100, not 101",
+        ),
+        (
+            1,
+            both,
+            "give actual_work or percent_work_complete, not both",
+        ),
+        (
+            1,
+            contour(8),
+            "Contoured comes from editing timephased work; set Flat to Turtle (0 to 7)",
+        ),
+        (
+            1,
+            contour(9),
+            "no work contour 9; use 0 (Flat) to 7 (Turtle)",
+        ),
+        (
+            2,
+            percent(50),
+            "the assignment has no work; percent_work_complete can only be 0",
+        ),
+    ] {
+        assert_eq!(ed.set_assignment(uid, patch.clone()).unwrap_err(), err);
+        assert_untouched(&mut ed, |ed| ed.set_assignment(uid, patch));
+    }
+    let late = AssignmentPatch {
+        work_min: Some(DAY),
+        actual_work_min: Some(2 * DAY),
+        ..AssignmentPatch::default()
+    };
+    assert_untouched(&mut ed, |ed| ed.set_assignment(1, late));
 }

@@ -343,10 +343,14 @@ fn resource_names_edits_keep_assignment_progress() {
             remaining_work_min: tracked[0].remaining_work_min,
             cost: tracked[0].cost.clone(),
             remaining_cost: tracked[0].remaining_cost.clone(),
+            percent_work_complete: tracked[0].percent_work_complete,
             ..alice.clone()
         },
         tracked[0]
     );
+    // Its % work complete follows the new work (#1180): the actual now
+    // covers all of it.
+    assert_eq!(alice.percent_work_complete, Some(100));
     assert_eq!(ed.proj.assignments[1], tracked[1]);
 }
 
@@ -2842,11 +2846,14 @@ fn a_duration_change_rescales_assignment_work_and_keeps_progress() {
                 finish: was.finish,
                 remaining_work_min: was.remaining_work_min,
                 remaining_cost: was.remaining_cost.clone(),
+                percent_work_complete: was.percent_work_complete,
                 ..a.clone()
             },
             was
         );
     }
+    // The % work complete follows the doubled work (#1180).
+    assert_eq!(after[0].percent_work_complete, Some(25));
     assert_eq!(after[2], before[2]);
 
     // A save writes the new Work.
@@ -3019,9 +3026,21 @@ fn fixed_work_material_and_cost_work_survive_a_duration_change() {
             remaining_cost: fixed.remaining_cost.clone(),
             timephased_data: fixed.timephased_data.clone(),
             units: fixed.units,
+            overtime_cost: fixed.overtime_cost.clone(),
+            remaining_overtime_work_min: fixed.remaining_overtime_work_min,
+            remaining_overtime_cost: fixed.remaining_overtime_cost.clone(),
             ..after.clone()
         },
         fixed
+    );
+    // Its overtime is priced again too (#1180), at the (absent) rate.
+    assert_eq!(
+        (
+            after.overtime_cost.as_ref().map(Rate::as_str),
+            after.remaining_overtime_work_min,
+            after.remaining_overtime_cost.as_ref().map(Rate::as_str)
+        ),
+        (Some("0"), Some(60), Some("0"))
     );
     assert_eq!(after.units, 0.5);
     assert_eq!(ed.proj.task(20).unwrap().duration_min, 960);
