@@ -220,33 +220,49 @@ test qat undo in the editor drops the autocomplete proposal as ctrl z does
   assert edit is spr
   key escape
 
-# FIX r2 1: a bar that takes the keys (here Row Height) keeps Ctrl+Z from
-# the history, so the QAT buttons and both lists leave it alone too.
+# FIX r2 1, r3: a bar that takes the keys (here Row Height) keeps Ctrl+Z
+# and Ctrl+Y from the history, so the QAT buttons read Can't, do nothing,
+# and both lists are empty; closed, they name their steps again.
 test an open entry bar keeps the history from the qat buttons and lists
   open copy:../fixtures/basic.xlsx
   click J1
   type 7
   key enter
-  key ctrl+z
   type 8
   key enter
-  call ribbon-click {"tab":"Home","command":"Row Height"}
+  # J2's entry waits as a redo, J1's as an undo.
   key ctrl+z
-  assert cell J1 is 8
+  assert cell J2 is nothing
+  call ribbon-click {"tab":"Home","command":"Row Height"}
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Can't Undo (Ctrl+Z)
+  assert reply.qat.0.enabled is false
+  assert reply.qat.1.tip.title is Can't Redo (Ctrl+Y)
+  assert reply.qat.1.enabled is false
+  key ctrl+z
+  key ctrl+y
+  assert cell J1 is 7
+  assert cell J2 is nothing
   shot window
   call pointer-click {"region":"qat-undo"}
-  assert cell J1 is 8
+  assert cell J1 is 7
   call pointer-click {"region":"qat-redo"}
-  assert cell J1 is 8
+  assert cell J2 is nothing
   call menu-open {"target":{"qat":"qat-undo"}}
   assert reply.items.0.label is Can't Undo
   assert reply.items.0.enabled is false
   call menu-close {}
   call menu-open {"target":{"qat":"qat-redo"}}
   assert reply.items.0.label is Can't Redo
+  assert reply.items.0.enabled is false
   call menu-close {}
   # Closed, the history is the QAT's again.
   key escape
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Undo Typing '7' in J1 (Ctrl+Z)
+  assert reply.qat.1.tip.title is Redo Typing '8' in J2 (Ctrl+Y)
   shot window
+  call pointer-click {"region":"qat-redo"}
+  assert cell J2 is 8
   call pointer-click {"region":"qat-undo"}
-  assert cell J1 is nothing
+  assert cell J2 is nothing

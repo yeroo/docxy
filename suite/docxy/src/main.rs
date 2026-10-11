@@ -3257,11 +3257,6 @@ impl SheetView {
         self.edit_select_all = false;
     }
 
-    /// Ctrl+Z (or Alt+Backspace) while editing: put the cell's own text back
-    /// (`edit_start`, whichever way the editor was opened); the editor stays
-    /// open and the workbook's undo is untouched. Pressed again straight away
-    /// it puts the typing back. Typing over a cell leaves the restored text
-    /// selected, so the next character replaces it (#1147).
     /// Ctrl+Z in the editor as Alt+Backspace and the QAT Undo run it (#1147,
     /// #1149): the AutoComplete proposal goes, then [`Self::edit_revert`].
     fn edit_undo(&mut self) {
@@ -3269,6 +3264,11 @@ impl SheetView {
         self.edit_revert();
     }
 
+    /// Ctrl+Z (or Alt+Backspace) while editing: put the cell's own text back
+    /// (`edit_start`, whichever way the editor was opened); the editor stays
+    /// open and the workbook's undo is untouched. Pressed again straight away
+    /// it puts the typing back. Typing over a cell leaves the restored text
+    /// selected, so the next character replaces it (#1147).
     fn edit_revert(&mut self) {
         if self.editing.is_some() {
             // Right after an AutoCorrect change, only it goes (ENT-119).
@@ -19140,8 +19140,11 @@ impl Docxy {
     /// #1149).
     fn qat_state(&self) -> QatState {
         if let Some(v) = self.active_sheet() {
-            // In the cell editor Ctrl+Y does nothing ([`SheetView::redo_or_repeat`]).
-            let idle = v.editing.is_none();
+            // In the cell editor Ctrl+Y does nothing ([`SheetView::redo_or_repeat`]);
+            // under a bar that takes the keys neither button does anything,
+            // so both read Can't, as their lists do.
+            let held = self.sheet_bar_holds_keys();
+            let idle = v.editing.is_none() && !held;
             let redo = v.redo.last().filter(|_| idle).map(|u| u.step.label());
             let repeat = v
                 .last_format
@@ -19149,7 +19152,7 @@ impl Docxy {
                 .filter(|_| idle && redo.is_none() && !self.sheet_protected())
                 .map(|(_, step)| step.label());
             return QatState::Sheet {
-                undo: v.undo.last().map(|u| u.step.label()),
+                undo: v.undo.last().filter(|_| !held).map(|u| u.step.label()),
                 redo,
                 repeat,
             };
