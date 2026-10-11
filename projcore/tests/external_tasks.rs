@@ -369,3 +369,52 @@ fn external_gantt_bar_uses_stored_span() {
         "{table}"
     );
 }
+
+#[test]
+fn a_cross_name_that_reads_as_a_local_id_shows_the_id() {
+    // #1046 r2: a cross name that reads as a local-ID entry (digits, then
+    // nothing, a sign, or a link-type code) would shadow that local ID, so
+    // the link shows its placeholder's task ID instead; the stored name
+    // survives only inside the link, never as the cell's text.
+    for name in ["12", " 12 ", "1", "12FS", "12ss", "12+1d", "3-2d"] {
+        let mut proj = read_mspdi(&fixture(r"C:\plans\other.mpp", "")).unwrap();
+        proj.tasks
+            .iter_mut()
+            .find(|t| t.uid == 2)
+            .unwrap()
+            .predecessors[1]
+            .cross_project_name = Some(name.into());
+        let task = proj.task(2).unwrap();
+        let shown = format_predecessors(task, &proj);
+        assert_eq!(shown, "1, 3", "{name}");
+        let parsed = parse_task_predecessors(&shown, task, &proj).unwrap();
+        assert_eq!(parsed, task.predecessors, "{name}");
+    }
+    // Typing the local ID of another task means that local task, not the
+    // cross link that carried a digits-only name.
+    let mut proj = read_mspdi(&fixture(r"C:\plans\other.mpp", "")).unwrap();
+    proj.tasks
+        .iter_mut()
+        .find(|t| t.uid == 2)
+        .unwrap()
+        .predecessors[1]
+        .cross_project_name = Some("1".into());
+    let task = proj.task(2).unwrap();
+    let typed = parse_task_predecessors("1", task, &proj).unwrap();
+    assert_eq!(typed, vec![projcore::Predecessor::fs(1)]);
+    // A digit-led name with any other following character still shows.
+    for name in [r"12 plan.mpp\7", r"2024\x.mpp\7"] {
+        let mut proj = read_mspdi(&fixture(r"C:\plans\other.mpp", "")).unwrap();
+        proj.tasks
+            .iter_mut()
+            .find(|t| t.uid == 2)
+            .unwrap()
+            .predecessors[1]
+            .cross_project_name = Some(name.into());
+        let task = proj.task(2).unwrap();
+        let shown = format_predecessors(task, &proj);
+        assert_eq!(shown, format!("1, {name}"), "{name}");
+        let parsed = parse_task_predecessors(&shown, task, &proj).unwrap();
+        assert_eq!(parsed, task.predecessors, "{name}");
+    }
+}
