@@ -165,8 +165,9 @@ assignment custom field resolves through a matching definition whose `FieldID`
 names one of the assignment's values, else through one whose `SecondaryPID`
 does: Project defines no assignment fields of its own, and we read a task or
 resource definition's `SecondaryPID` as its paired assignment field's id. That
-reading is not verified against Project. A Text value stored by `ValueGUID`
-takes the definition whose lookup table holds it. Otherwise the task rules
+reading is not verified against Project. Among the definitions paired by
+`SecondaryPID`, a Text value stored by `ValueGUID` takes the one whose lookup
+table holds it. Otherwise the task rules
 apply: no resolvable definition reads unset, and an unparseable value reads as
 its raw text and `null`. An assignment never shows its task's value.
 

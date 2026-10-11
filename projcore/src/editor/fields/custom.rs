@@ -38,11 +38,12 @@ pub(super) fn read(proj: &Project, task: &Task, kind: CustomKind, n: u8) -> Fiel
 }
 
 /// Read one custom field of one assignment: the first matching definition
-/// whose `FieldID` names one of its values (an assignment definition), else
-/// the first whose `SecondaryPID` does. Among those, a Text value stored by
-/// `ValueGUID` takes the definition whose `ValueList` holds that guid, so a
-/// task and a resource definition sharing a `SecondaryPID` each read from
-/// their own table.
+/// whose own `FieldID` names one of its values (normally an assignment
+/// definition, but any owner's counts), else the first whose `SecondaryPID`
+/// does. Among the definitions paired by `SecondaryPID`, a Text value stored
+/// by `ValueGUID` takes the one whose `ValueList` holds that guid, so a task
+/// and a resource definition sharing a `SecondaryPID` each read from their
+/// own table.
 pub(super) fn read_assignment(
     proj: &Project,
     a: &Assignment,

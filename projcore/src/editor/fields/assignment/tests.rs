@@ -424,13 +424,18 @@ fn custom_fields_do_not_cross_owners() {
     );
     assert_eq!(task_read(&ed, "Text1"), txt("task"));
     assert_eq!(read(&ed, 1, "Text1"), txt("assignment"));
-    // The task's value never reads as the assignment's.
+    // A task's value is never read for its assignment, and an assignment
+    // value under an id no definition names reads unset.
     let ed = custom_editor(
         defs(),
         vec![value(TASK_TEXT1, "task")],
         vec![value("188743999", "other")],
     );
     assert_eq!(read(&ed, 1, "Text1"), shows("", FieldValue::Null));
+    // An assignment value stored under the task definition's own FieldID is
+    // the assignment's value, and reads through that definition.
+    let ed = custom_editor(defs(), Vec::new(), vec![value(TASK_TEXT1, "own")]);
+    assert_eq!(read(&ed, 1, "Text1"), txt("own"));
     // The task resolver ignores SecondaryPID, even for a task value under
     // that id.
     let ed = custom_editor(
