@@ -86,6 +86,8 @@ fn apply_dialog(
         DialogOwner::DataValidation { .. } | DialogOwner::DataValidationAlert => {
             Err("data validation applies through the Data tab".into())
         }
+        // Handled in `sheet_format_cells::click`, before this.
+        DialogOwner::FormatCells { .. } => Err("Format Cells applies through its OK".into()),
         // Handled in `sheet_filter::click` and `sheet_sort::click`, before this.
         DialogOwner::FilterMenu { .. }
         | DialogOwner::CustomFilter { .. }
@@ -227,6 +229,10 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
         return done;
     }
     if let Some(done) = crate::sheet_validation::click(tab, button) {
+        return done;
+    }
+    // Format Cells (#1165).
+    if let Some(done) = crate::sheet_format_cells::click(tab, button) {
         return done;
     }
     // The filter drop-down and its dialogs (#690), and the sorts (#691).

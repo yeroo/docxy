@@ -1,6 +1,6 @@
-# Home › Cells › Format opens the Format Cells panel over the sheet (#1161).
-# While it is open it owns every key, as a dialog does (#393): Esc closes it,
-# Return is its Done, and nothing else reaches the grid behind it. The keys
+# Home › Cells › Format opens the Format Cells dialog over the sheet (#1161,
+# #1165). While it is open it owns every key, as every dialog does (#393): Esc
+# cancels it, Return is its OK, and nothing else reaches the grid behind it. The keys
 # are real (`real-key`/`real-type`), so they take the window's own input path,
 # the one a person's keyboard takes. Run with:
 #
@@ -18,7 +18,7 @@ test esc closes format cells
   assert sel is J1
   assert editing is false
 
-test return is format cells done and moves nothing
+test return is format cells ok and moves nothing
   open copy:../fixtures/basic.xlsx
   click J1
   call ribbon-click {"tab":"Home","command":"Format"}
@@ -66,9 +66,10 @@ test keys under format cells change nothing behind it
   call real-key {"key":"backspace"}
   assert editing is false
   assert cell J1 is x
-  # Ctrl+1 under the panel keeps it open. A leaked Ctrl+1 would only reopen
-  # it, so this cannot show the key is swallowed: `format_panel_key`'s unit
-  # test does (#1164).
+  # Ctrl+1 under the dialog keeps it open. A leaked Ctrl+1 would only find
+  # it up, so this cannot show the key is swallowed: the dialog takes every
+  # key (#393), and `sheet_format_cells`' `opening_again_keeps_one_dialog`
+  # shows another open leaves the one dialog (#1164, #1165).
   call real-key {"key":"ctrl+1"}
   assert format_cells_open is true
   assert cell J1 is x
@@ -140,6 +141,29 @@ test ctrl+1 while editing opens format cells and keeps the entry
   call real-key {"key":"enter"}
   assert editing is false
   assert cell J1 is ab
+
+# OK while the cell is being edited formats the cell and keeps the entry,
+# which Enter then writes in the new format (#1165).
+
+test format cells ok while editing formats the entry
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call real-type {"text":"7"}
+  assert editing is true
+  call real-key {"key":"ctrl+1"}
+  assert format_cells_open is true
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"decimals"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call real-key {"key":"enter"}
+  assert format_cells_open is false
+  assert editing is true
+  call real-key {"key":"enter"}
+  assert editing is false
+  call cell {"cell":"J1"}
+  assert reply.text is 7.0
 
 # The Home tab's Font, Alignment and Number launchers (↘) open it too, by a
 # real click on the launcher.

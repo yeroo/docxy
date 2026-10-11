@@ -3386,10 +3386,14 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
         ("find_open", Json::Bool(app.find_open)),
         ("find_query", Json::Str(app.find_query.clone())),
         ("replace_text", Json::Str(app.replace_text.clone())),
-        // The Format Cells panel, which owns every key while it is open (#1161).
+        // Format Cells is the active tab's top dialog (#1161, #1165).
         (
             "format_cells_open",
-            Json::Bool(app.format_panel_owns_keys()),
+            Json::Bool(
+                app.active_dialogs()
+                    .and_then(|s| s.top())
+                    .is_some_and(|d| d.id == crate::dialog::catalog::FORMAT_CELLS),
+            ),
         ),
         // The Alt / F10 access-key overlay, at either level.
         ("keytips_up", Json::Bool(app.keytips != crate::KeyTip::Off)),
