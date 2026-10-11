@@ -64,7 +64,9 @@ use its tools:
   `resource_name`, `units` (a fraction, 1.0 = 100%), `work_hours`, `cost`,
   `rate_table`, actual, remaining and baseline values, `start`/`finish`
 - `yppxy_assign_get` `{uid, fields?}` — one assignment by its own uid
-- `yppxy_assign_fields` — every assignment field name their `fields` can read
+- `yppxy_assign_fields` — every assignment field name their `fields` can read.
+  A field's `value` gives work and delay in minutes, unlike `work_hours`,
+  `delay_hours` and the `work`/`delay` arguments, which are hours
 - `yppxy_assign_add` `{task, resource, units?, work?, fields?}` — assign a
   resource (uid, or name: a new name becomes a work resource; one that is a
   number or contains a comma is refused) to task `task`
@@ -74,10 +76,10 @@ use its tools:
 - `yppxy_assign_del` `{uid}` — the reply is `{deleted, task}`
 
 Assignments are addressed by their own uid, from `yppxy_assign_list` (whose
-`uid` filter is a task's). Tasks are addressed by **uid** (stable). When several yppxy editors are open,
-pass `target` (a substring of the pane id; `yppxy_list` shows them). Typical
-flow: `yppxy_tasks` to see the plan, then `yppxy_set`/`yppxy_add`/`yppxy_link`,
-then `yppxy_save`.
+`uid` filter is a task's). Tasks are addressed by **uid** (stable). When
+several yppxy editors are open, pass `target` (a substring of the pane id;
+`yppxy_list` shows them). Typical flow: `yppxy_tasks` to see the plan, then
+`yppxy_set`/`yppxy_add`/`yppxy_link`, then `yppxy_save`.
 
 ## Fallback: the control pipe
 Without MCP, talk to yppxy directly over loopback TCP + newline-delimited JSON.
