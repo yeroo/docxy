@@ -14016,6 +14016,7 @@ impl Docxy {
     /// reproduced this body instead of calling it would keep passing after this
     /// one changed.
     fn grid_press_cell(&mut self, cell: (u32, u32), ctrl: bool, _cx: &mut Context<Self>) {
+        self.sheet_comment_bar_leave();
         self.drag_ctrl = ctrl;
         if self.formula_pick_active() {
             // Anchor the reference on the pressed cell, with the buffer as it
@@ -14098,6 +14099,7 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sheet_comment_bar_leave();
         let inside = self.active_sheet().is_some_and(|v| {
             let (r1, c1, r2, c2) = sel_range(v.sel, v.anchor);
             (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
@@ -16363,6 +16365,32 @@ impl Docxy {
         self.sheet_comment_cell = None;
     }
 
+    /// Leave the comment bar as Excel leaves a note being edited when the
+    /// selection moves or rows/columns shift: a changed buffer commits to the
+    /// anchor cell (the exit commit's rules — an untouched bar, or one whose
+    /// text the anchor's note already holds, writes nothing), then the bar
+    /// closes. No-op when the bar is closed.
+    fn sheet_comment_bar_leave(&mut self) {
+        let Some(text) = self.sheet_comment_edit.clone() else {
+            return;
+        };
+        let seed = self
+            .sheet_comment_seed
+            .clone()
+            .unwrap_or_else(|| self.selected_comment().unwrap_or_default());
+        let cell = self
+            .sheet_comment_cell
+            .or_else(|| self.active_sheet().map(|v| (v.active, v.sel.0, v.sel.1)));
+        self.sheet_comment_bar_close();
+        let Some(cell) = cell else {
+            return;
+        };
+        let author = self.comment_author();
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            crate::close::commit_comment_buffer_for_exit(t, cell, &seed, &author, &text);
+        }
+    }
+
     /// Route a keystroke into the conditional-format entry bar; Enter applies the
     /// rule (Light-Red preset) to the selection, Esc cancels.
     fn sheet_cf_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
@@ -16523,6 +16551,7 @@ impl Docxy {
 
     /// Move the selection to the next / previous commented cell (row-major).
     fn sheet_comment_nav(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.sheet_comment_bar_leave();
         if let Some(v) = self.active_sheet_mut() {
             let mut cells: Vec<(u32, u32)> = v
                 .pkg
@@ -16734,6 +16763,7 @@ impl Docxy {
     /// Insert/delete every row or column the selection touches (Home ▸
     /// Cells), then rebuild the recalc engine so shifted formulas re-evaluate.
     fn sheet_structural(&mut self, op: StructOp, cx: &mut Context<Self>) {
+        self.sheet_comment_bar_leave();
         if self
             .active_sheet_mut()
             .is_some_and(|v| v.structural_edit(op))

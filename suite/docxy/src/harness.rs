@@ -3341,6 +3341,14 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             ),
             // The sheet comment editor New Comment opens, and its text.
             ("comment_edit", str_or_null(app.sheet_comment_edit.clone())),
+            // The cell the comment editor writes to — its anchor — as an A1
+            // name (null while the bar is closed).
+            (
+                "comment_cell",
+                str_or_null(app.sheet_comment_cell.map(|(_, r, c)| a1((r, c)))),
+            ),
+            // The comment text on the selected cell, if it has one.
+            ("comment", str_or_null(app.selected_comment())),
         ]);
         // The option buttons a fill or a paste leaves (#668, #669), and
         // the Office Clipboard's count.
