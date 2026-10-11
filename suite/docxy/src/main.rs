@@ -12011,11 +12011,14 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> bool {
         // An open dialog takes every key first (#393): nothing under it, not
-        // the tab list, KeyTips or a Project shortcut, may see one.
+        // the tab list, KeyTips or a Project shortcut, may see one. A
+        // character ⌥ made on macOS reaches it as plain typing, since a field
+        // swallows ⌥ keys (#1162); Windows' AltGr text comes by WM_CHAR.
+        let stroke = text_input::dialog_stroke(ev, text_input::MACOS);
         if self.dialog_takes_key(
-            &ev.keystroke.key,
-            ev.keystroke.key_char.as_deref(),
-            ev.keystroke.modifiers,
+            &stroke.key,
+            stroke.key_char.as_deref(),
+            stroke.modifiers,
             window,
             cx,
         ) {
