@@ -99,8 +99,7 @@ impl SheetView {
             FillTarget::Clear(_) => req.src,
             _ => (r0, c0, r1, c1),
         };
-        let (cr0, cc0, cr1, cc1) = changed;
-        self.push_undo_at(s, crate::sel_range((cr0, cc0), (cr1, cc1)));
+        self.push_undo_at(s, changed);
         let filled = gridcore::edit::autofill(&mut self.pkg.workbook, s, req);
         self.anchor = (r0, c0);
         self.sel = (r1, c1);
