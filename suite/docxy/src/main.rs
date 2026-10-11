@@ -25020,7 +25020,7 @@ fn redo_or_repeat(ed: &mut Editor, rec: &mut Option<RepeatRecord>) -> bool {
         Repeat::Break(kind) => ed.insert_break(kind),
         Repeat::Act(act) => apply_doc_act(ed, act),
     }
-    if !ed.undo_serial().is_some_and(|s| s > since) {
+    if ed.undo_serial().is_none_or(|s| s <= since) {
         return false;
     }
     if let Some(name) = r.what.step_name() {
@@ -25045,7 +25045,7 @@ fn note_edit(ed: &mut Editor, rec: &mut Option<RepeatRecord>, since: u64, what: 
         *rec = RepeatRecord::now(what, ed);
         return rec.is_some();
     }
-    if !ed.undo_serial().is_some_and(|s| s > since) {
+    if ed.undo_serial().is_none_or(|s| s <= since) {
         return false;
     }
     if let Some(name) = what.step_name() {

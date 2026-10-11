@@ -4177,15 +4177,15 @@ fn dispatch_verb(
             let measured = crate::ribbon_layout::measure(&probes.last);
             // A tab with no groups has nothing to wait for.
             let drawn = crate::ribbon_layout::shown_tab(&probes.last) == Some(name.as_str());
-            if !titles.is_empty()
-                && !(drawn
+            if !(titles.is_empty()
+                || (drawn
                     && crate::ribbon_layout::is_frame_of(&measured, &titles)
                     && crate::ribbon_layout::frame_matches(&probes.last, &fits)
                     && crate::ribbon_layout::drawn_matches(
                         probes.fit_last.as_ref(),
                         now.width,
                         &fits,
-                    ))
+                    )))
             {
                 cx.notify();
                 return Done::ok(crate::ribbon_layout::unsettled_json(&name));
