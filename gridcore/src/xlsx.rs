@@ -11472,9 +11472,10 @@ mod tests {
 
     /// #1279: a `cellXfs` xf on builtin numFmtId 7 with no `<numFmt>` element
     /// loads with the builtin's code (so the cell renders as currency), and
-    /// an unedited save keeps the builtin id instead of minting a custom one.
+    /// a style derived from it keeps the builtin id instead of minting a
+    /// custom numFmt (an unedited save never rewrites styles.xml at all).
     #[test]
-    fn builtin_currency_id_without_numfmt_loads_and_round_trips() {
+    fn builtin_currency_id_without_numfmt_loads_and_a_derived_xf_keeps_it() {
         let sheet1 = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" s="1"><v>1234.5</v></c></row></sheetData></worksheet>"#;
         let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0"/><xf numFmtId="7" fontId="0" applyNumberFormat="1"/></cellXfs></styleSheet>"#;
         let workbook = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
@@ -11490,19 +11491,33 @@ mod tests {
             ("xl/styles.xml".into(), styles.into()),
         ]);
 
-        let pkg = load_xlsx(&bytes).expect("load");
-        let wb = &pkg.workbook;
-        let a1 = wb.sheets[0].cell(0, 0).unwrap();
-        let xf = wb.styles.xf(a1.style);
+        let mut pkg = load_xlsx(&bytes).expect("load");
+        let style = pkg.workbook.sheets[0].cell(0, 0).unwrap().style;
+        let xf = pkg.workbook.styles.xf(style);
         assert_eq!(xf.code.as_deref(), crate::numfmt::builtin_code(7));
         assert_eq!(
             crate::sheet::format_with(&xf, &CellValue::Number(1234.5), false),
             "$1,234.50 "
         );
 
+        // A format command on A1 (bold) derives a new xf: the save mints a
+        // font but must keep the builtin numFmtId, not a custom <numFmt>.
+        let mut bold = pkg.workbook.styles.xf(style);
+        bold.bold = true;
+        let b = pkg.workbook.styles.intern(bold);
+        let a1 = pkg.workbook.sheets[0].cell(0, 0).unwrap().clone();
+        pkg.workbook.sheets[0].set_cell(0, 0, crate::sheet::Cell { style: b, ..a1 });
+
         let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
-        let styles = part_text(&saved, "xl/styles.xml");
-        assert!(styles.contains("numFmtId=\"7\""), "{styles}");
+        let styles = String::from_utf8(saved.part("xl/styles.xml").unwrap().to_vec()).unwrap();
+        let xfs = cell_xf_elements(&styles);
+        let i = saved.workbook.sheets[0].cell(0, 0).unwrap().style as usize;
+        assert_ne!(
+            i, 1,
+            "deriving bold must add a new xf, not rewrite the loaded id-7 one"
+        );
+        assert_eq!(tag_attr(xfs[i], "numFmtId"), Some("7"), "{}", xfs[i]);
+        assert_ne!(tag_attr(xfs[i], "fontId"), Some("0"), "{}", xfs[i]);
         assert!(!styles.contains("<numFmt "), "{styles}");
     }
 

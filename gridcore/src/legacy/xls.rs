@@ -1646,11 +1646,17 @@ pub(crate) mod tests {
     /// strings there are the codes the table must carry.
     #[test]
     fn xls_builtin_format_records_match_builtin_code() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../corpus/legacy/calc-3d.xls");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../corpus/legacy/oracle-basic.xls"
+        );
         // A missing corpus file is a failure, never a skip.
         let data = std::fs::read(path).unwrap();
         let cfb = opccore::cfb::Cfb::open(&data).unwrap();
-        let stream = cfb.read_stream("Workbook").unwrap();
+        let stream = ["Workbook", "Book"]
+            .iter()
+            .find_map(|n| cfb.read_stream(n))
+            .unwrap();
         let mut codes = std::collections::HashMap::new();
         for r in records(&stream) {
             if r.ty == 0x041E {
@@ -1662,7 +1668,7 @@ pub(crate) mod tests {
         for id in [5u16, 6, 7, 8, 41, 42, 43, 44] {
             let recorded = codes
                 .get(&id)
-                .unwrap_or_else(|| panic!("calc-3d.xls has no FORMAT record for ifmt {id}"));
+                .unwrap_or_else(|| panic!("oracle-basic.xls has no FORMAT record for ifmt {id}"));
             assert_eq!(
                 Some(recorded.as_str()),
                 crate::numfmt::builtin_code(u32::from(id)),
