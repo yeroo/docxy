@@ -2567,14 +2567,6 @@ impl SheetView {
         true
     }
 
-    /// Set the selected cell's comment to `text` by `author` (blank deletes
-    /// it), as one undo step of the whole package (see [`Self::comment_cell_at`]).
-    /// Test-only: production callers name the cell (`comment_cell_at`).
-    #[cfg(test)]
-    fn comment_cell(&mut self, author: &str, text: &str) -> bool {
-        self.comment_cell_at((self.active, self.sel.0, self.sel.1), author, text)
-    }
-
     /// Delete the comment on cell `(s, r, c)`, as one undo step of the whole
     /// package (see [`Self::comment_cell_at`]). No comment there, no step.
     fn delete_comment_at(&mut self, (s, r, c): (usize, u32, u32)) {
@@ -4788,8 +4780,8 @@ struct Docxy {
     // Grid width (px) captured each render, so the horizontal scroll track can map
     // a click x back to a column fraction.
     sheet_grid_w: f32,
-    // In-progress cell-comment entry for the selected cell (the input buffer);
-    // None = the comment bar is closed.
+    // In-progress comment entry for the bar's cell (`sheet_comment_cell`),
+    // the input buffer; None = the comment bar is closed.
     sheet_comment_edit: Option<String>,
     // The raw text a comment bar opened with (its seed): an exit commit uses
     // the seed only to tell an untouched buffer from an edit — so a bar
@@ -24450,7 +24442,7 @@ mod sheet_save_tests {
         v.active = 0;
         v.sel = (0, 0);
         v.clear_areas();
-        assert!(v.comment_cell("me", "check"));
+        assert!(v.comment_cell_at((0, 0, 0), "me", "check"));
         assert_eq!(comment_texts(v), note);
         assert!(v.undo_step());
         assert!(comment_texts(v).is_empty());
@@ -24471,7 +24463,7 @@ mod sheet_save_tests {
         v.active = 0;
         v.sel = (0, 0);
         v.clear_areas();
-        assert!(v.comment_cell("me", "check"));
+        assert!(v.comment_cell_at((0, 0, 0), "me", "check"));
         assert!(!v.redo_step());
         assert_eq!(comment_texts(v), note);
         assert_eq!(v.pkg.workbook.sheets.len(), 3);
