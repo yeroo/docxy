@@ -50,7 +50,10 @@ fn sheet_pending_edit_commits_before_asking_and_is_undoable() {
     v.sel = (0, 0);
     v.anchor = (2, 2);
     let before = v.edit_string(0, 0);
-    v.redo.push(v.snapshot());
+    v.redo.push(crate::SheetUndo {
+        snap: v.snapshot(),
+        step: crate::SheetStep::Named("Fill"),
+    });
     v.begin_cell_edit(Some("12345".into()));
     let step = close_step(&mut t, Some(CloseAnswer::Cancel));
     // What it asked about: the pending edit, committed.
@@ -70,7 +73,7 @@ fn sheet_pending_edit_commits_before_asking_and_is_undoable() {
     assert!(v.redo.is_empty());
     assert_eq!(v.anchor, v.sel);
     let snap = v.undo.pop().unwrap();
-    v.restore(snap);
+    v.restore(snap.snap);
     assert_eq!(v.edit_string(0, 0), before);
     assert_eq!(v.anchor, (2, 2));
     assert!(!v.commit_edit());
@@ -518,7 +521,10 @@ fn untouched_commit_keeps_every_cell_kind() {
             .set_cell(&mut v.pkg.workbook, (v.active, 0, 0), cell.clone());
         let before = v.sheet().cell(0, 0).cloned();
         v.begin_cell_edit(None);
-        v.redo.push(v.snapshot());
+        v.redo.push(crate::SheetUndo {
+            snap: v.snapshot(),
+            step: crate::SheetStep::Named("Fill"),
+        });
 
         assert!(!v.commit_edit(), "{cell:?}");
         assert!(v.editing.is_none(), "{cell:?}");
@@ -540,7 +546,10 @@ fn changed_commit_still_parses_and_records_undo() {
         let Surface::Sheet(v) = &mut t.surface else {
             panic!()
         };
-        v.redo.push(v.snapshot());
+        v.redo.push(crate::SheetUndo {
+            snap: v.snapshot(),
+            step: crate::SheetStep::Named("Fill"),
+        });
         v.editing = Some(buffer.into());
 
         assert!(v.commit_edit(), "{buffer:?}");
@@ -549,7 +558,7 @@ fn changed_commit_still_parses_and_records_undo() {
         assert!(v.redo.is_empty());
         assert_eq!(v.sheet().cell(0, 0).map(|c| &c.value), Some(&expected));
         assert_eq!(
-            v.undo[0].workbook().sheets[v.active].cell(0, 0),
+            v.undo[0].snap.workbook().sheets[v.active].cell(0, 0),
             Some(&Cell::text("007"))
         );
     }

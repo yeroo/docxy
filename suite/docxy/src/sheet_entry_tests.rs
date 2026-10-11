@@ -1081,7 +1081,7 @@ fn f4_repeats_the_ribbons_last_toggle_as_a_setter() {
     let mut v = view();
     // Ctrl+B on A1 records what the ribbon's toggle resolved: bold ON.
     let bold = v.toggle_setter(|x| x.bold, |x, on| x.bold = on);
-    v.apply_format(bold);
+    v.apply_format(bold, crate::SheetStep::Named("Bold"));
     assert!(xf(&v, 0, 0).bold);
     // F4 on E1, twice: it applies, never flips.
     select(&mut v, 0, 4);
@@ -1092,7 +1092,7 @@ fn f4_repeats_the_ribbons_last_toggle_as_a_setter() {
     // The same toggle on a bold cell resolves to OFF.
     select(&mut v, 0, 0);
     let off = v.toggle_setter(|x| x.bold, |x, on| x.bold = on);
-    v.apply_format(off);
+    v.apply_format(off, crate::SheetStep::Named("Bold"));
     assert!(!xf(&v, 0, 0).bold);
     v.last_format = None;
     assert!(!v.repeat_format());
@@ -1102,8 +1102,8 @@ fn f4_repeats_the_ribbons_last_toggle_as_a_setter() {
 /// resolved toggle, recorded for Repeat.
 fn bold_selection(v: &mut SheetView) {
     let bold = v.toggle_setter(|x| x.bold, |x, on| x.bold = on);
-    v.push_undo();
-    v.apply_format(bold);
+    v.push_undo(crate::SheetStep::Named("Bold"));
+    v.apply_format(bold, crate::SheetStep::Named("Bold"));
 }
 
 #[test]
@@ -1235,7 +1235,7 @@ fn a_number_format_choice_moves_the_classification_too() {
     let mut v = view();
     type_fresh(&mut v, "50%");
     v.commit_edit();
-    v.apply_format(numfmt_setter("#,##0"));
+    v.apply_format(numfmt_setter("#,##0"), crate::SheetStep::Named("Bold"));
     type_fresh(&mut v, "5");
     v.commit_edit();
     assert_eq!(value(&v, 0, 0), CellValue::Number(5.0));
@@ -1243,7 +1243,7 @@ fn a_number_format_choice_moves_the_classification_too() {
     select(&mut v, 1, 0);
     type_fresh(&mut v, "1/15/2024");
     v.commit_edit();
-    v.apply_format(numfmt_setter(""));
+    v.apply_format(numfmt_setter(""), crate::SheetStep::Named("Bold"));
     type_fresh(&mut v, "-1");
     v.commit_edit();
     assert_eq!(v.cell_text(1, 0), "-1");

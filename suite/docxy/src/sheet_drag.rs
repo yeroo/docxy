@@ -11,6 +11,9 @@ use gridcore::edit::{PasteSpec, PasteWhat};
 
 use gridcore::edit::Area;
 
+/// Excel's name for a drop's undo step (#1149).
+const DRAG_AND_DROP: &str = "Drag and Drop";
+
 /// Excel's question before a drop overwrites data.
 pub(crate) const REPLACE_DATA: &str = "There's already data here. Do you want to replace it?";
 
@@ -101,13 +104,13 @@ impl SheetView {
                 let clip = self.grid_clip(true).map_err(str::to_string)?;
                 self.anchor = at;
                 self.sel = at;
-                self.paste_move(&clip).map_err(refused)?;
+                self.paste_move(&clip, DRAG_AND_DROP).map_err(refused)?;
             }
             DropChoice::Copy => {
                 let clip = self.grid_clip(false).map_err(str::to_string)?;
                 self.anchor = at;
                 self.sel = at;
-                self.paste_copy(&clip).map_err(refused)?;
+                self.paste_copy(&clip, DRAG_AND_DROP).map_err(refused)?;
             }
             DropChoice::CopyValues | DropChoice::CopyFormats | DropChoice::Link => {
                 let block = self.clip_block((src.0..=src.2).collect(), (src.1..=src.3).collect());

@@ -1925,7 +1925,10 @@ fn sheet_ribbon_json(app: &crate::Docxy) -> Json {
             ("groups", Json::Arr(groups)),
         ]));
     }
-    ribbon_reply(tabs)
+    // The Quick Access Toolbar names a sheet's steps (#1149).
+    let mut json = ribbon_reply(tabs);
+    set_live_qat(&mut json, app.qat_state());
+    json
 }
 
 /// Find a command on the sheet ribbon tab `tab_name`, as drawn now.
@@ -2772,17 +2775,24 @@ fn menu_open(
                 let at = menu_point(app, window, None, |b| b.center());
                 app.open_grid_menu(kind, at, cx)
             }
-            // The Quick Access Toolbar Undo arrow (#619).
+            // The Quick Access Toolbar Undo arrow (#619), and a sheet's Redo
+            // arrow (#1149).
             "qat" => {
-                if fields[0].1.as_str() != Some(crate::menu::QAT_UNDO_ID) {
+                let id = fields[0].1.as_str().unwrap_or_default();
+                if !matches!(id, crate::menu::QAT_UNDO_ID | crate::menu::QAT_REDO_ID) {
                     return Err(format!(
-                        "'qat' names a Quick Access Toolbar split button; only \"{}\" has a menu",
-                        crate::menu::QAT_UNDO_ID
+                        "'qat' names a Quick Access Toolbar split button: \"{}\" or (on a sheet) \"{}\"",
+                        crate::menu::QAT_UNDO_ID,
+                        crate::menu::QAT_REDO_ID
                     ));
                 }
-                let anchor = crate::qat_undo_anchor(&app.probes.borrow());
+                let anchor = crate::qat_arrow_anchor(&app.probes.borrow(), id);
                 let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
-                app.open_undo_menu(at, cx)
+                if id == crate::menu::QAT_REDO_ID {
+                    app.open_redo_menu(at, cx)
+                } else {
+                    app.open_undo_menu(at, cx)
+                }
             }
             other => Err(format!(
                 "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, ribbon-bar, row, ribbon, grid and qat are)"
@@ -6158,6 +6168,41 @@ mod tests {
 
     /// #618, #619: `ribbon-read`'s Quick Access Toolbar is the one drawn: a
     /// document's live state replaces the plain Undo and Redo.
+    #[test]
+    fn ribbon_read_reports_a_sheets_named_steps_1149() {
+        let tip = |json: &Json, k: usize| {
+            let q = &json.get("qat").unwrap().as_array().unwrap()[k];
+            (
+                q.get_str("label").unwrap().to_string(),
+                q.get("tip").unwrap().get_str("title").unwrap().to_string(),
+                q.get("enabled") == Some(&Json::Bool(true)),
+                q.get("menu") == Some(&Json::Bool(true)),
+            )
+        };
+        let mut json = ribbon_reply(Vec::new());
+        set_live_qat(
+            &mut json,
+            crate::QatState::Sheet {
+                undo: Some("Fill".into()),
+                redo: Some("Typing 'abc' in A1".into()),
+                repeat: None,
+            },
+        );
+        assert_eq!(
+            tip(&json, 0),
+            ("Undo".into(), "Undo Fill (Ctrl+Z)".into(), true, true)
+        );
+        assert_eq!(
+            tip(&json, 1),
+            (
+                "Redo".into(),
+                "Redo Typing 'abc' in A1 (Ctrl+Y)".into(),
+                true,
+                true
+            )
+        );
+    }
+
     #[test]
     fn ribbon_read_reports_the_live_qat_618_619() {
         let item = |json: &Json, id: &str| {

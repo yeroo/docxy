@@ -201,7 +201,7 @@ fn undo_restores_the_areas() {
     let mut v = view();
     select(&mut v, "A1", "A1");
     v.add_area(at("C3"));
-    v.push_undo();
+    v.push_undo(crate::SheetStep::Named("Typing"));
     select(&mut v, "B2", "B2");
     put(&mut v, "B2", Cell::number(2.0));
     assert!(v.undo_step());

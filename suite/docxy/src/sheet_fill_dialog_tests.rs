@@ -163,7 +163,7 @@ fn auto_fill_options_redo_the_fill_as_one_step() {
         numbers: true,
         gone: Default::default(),
     };
-    v.push_undo();
+    v.push_undo(crate::SheetStep::Named("Fill"));
     assert!(!stale.stands(v));
     assert!(v.refill(&stale, FillKind::Series, &[]).is_err());
 }

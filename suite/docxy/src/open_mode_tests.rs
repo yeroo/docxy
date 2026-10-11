@@ -71,7 +71,7 @@ fn edit(tab: &mut DocTab, n: f64) {
     let Surface::Sheet(v) = &mut tab.surface else {
         panic!("not a workbook: {}", tab.status);
     };
-    v.push_undo();
+    v.push_undo(crate::SheetStep::Named("Typing"));
     v.pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(n));
     tab.dirty = true;
 }

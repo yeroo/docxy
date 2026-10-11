@@ -12,6 +12,7 @@
 use crate::dialog::DialogId;
 use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
+use crate::sheet_step::SheetStep;
 use crate::{DocTab, Surface};
 use gridcore::filter::{AdvancedFilter, ByCell, ColumnFilter, FilterError, FilterOutcome, Submenu};
 use gridcore::sheet::{Workbook, cell_name, col_name};
@@ -40,6 +41,7 @@ fn filter_changed(a: &Workbook, b: &Workbook, s: usize) -> bool {
 /// the tab dirty only when something changed, and say what it found.
 pub(crate) fn run(
     tab: &mut DocTab,
+    step: &'static str,
     op: impl FnOnce(&mut Workbook, usize, f64) -> Result<FilterOutcome, FilterError>,
 ) -> Result<FilterOutcome, String> {
     let Surface::Sheet(v) = &mut tab.surface else {
@@ -70,7 +72,7 @@ pub(crate) fn run(
     };
     let changed = filter_changed(snap.workbook(), &v.pkg.workbook, s);
     if changed {
-        v.push_undo_snapshot(snap);
+        v.push_undo_snapshot(snap, SheetStep::Named(step));
         // The rebuilt engine keeps the clock the old one had.
         let clock = v.engine.clock;
         v.engine = crate::sheet_engine(&v.pkg.workbook);
@@ -94,7 +96,7 @@ pub(crate) fn toggle(tab: &mut DocTab) -> Result<(), String> {
     let (sel, at) = (crate::sel_range(v.sel, v.anchor), v.sel);
     let multi = (sel.0, sel.1) != (sel.2, sel.3);
     let range = v.sheet().auto_filter.as_ref().map(|a| a.range);
-    run(tab, |wb, s, _| {
+    run(tab, "Filter", |wb, s, _| {
         let r = if on {
             gridcore::filter::auto_filter_off(wb, s);
             range.unwrap_or_default()
@@ -120,7 +122,7 @@ pub(crate) fn by_cell(tab: &mut DocTab, by: ByCell) -> Result<(), String> {
         return Err("Filter needs a spreadsheet".into());
     };
     let at = v.sel;
-    run(tab, |wb, s, today| {
+    run(tab, "Filter", |wb, s, today| {
         gridcore::filter::filter_by_cell(wb, s, at, by, today)
     })
     .map(|_| ())
@@ -704,7 +706,7 @@ fn apply_and_close(
     tab: &mut DocTab,
     op: impl FnOnce(&mut Workbook, usize, f64) -> Result<FilterOutcome, FilterError>,
 ) -> Result<(), String> {
-    run(tab, op)?;
+    run(tab, "Filter", op)?;
     tab.dialogs.pop();
     Ok(())
 }

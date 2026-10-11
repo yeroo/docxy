@@ -113,8 +113,11 @@ mod sheet_ribbon;
 #[cfg(test)]
 mod sheet_select_tests;
 mod sheet_sort;
+mod sheet_step;
 #[cfg(test)]
 mod sheet_struct_tests;
+#[cfg(test)]
+mod sheet_undo_names_tests;
 mod sheet_validation;
 mod style_gallery;
 mod table_dialogs;
@@ -129,6 +132,7 @@ mod ttc_dialog;
 mod user_name;
 mod windows;
 use crate::dialog::catalog;
+use crate::sheet_step::SheetStep;
 use open_mode::{OpenMode, Reopen, ReopenStep, reopen_step};
 use project::*;
 
@@ -214,19 +218,20 @@ fn tab_edit_target_ref(tab: &DocTab) -> Option<&Editor> {
 fn qat_btn(
     id: &'static str,
     icon: &'static str,
-    tip: &'static str,
+    tip: SharedString,
     enabled: bool,
     pal: Pal,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     let btn = div()
         .id(id)
+        .relative()
         .flex()
         .items_center()
         .justify_center()
         .size(px(20.))
         .rounded(px(3.))
-        .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx));
+        .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx));
     if !enabled {
         return btn.child(icon_svg(icon, 14., pal.dim));
     }
@@ -237,10 +242,19 @@ fn qat_btn(
         .on_click(on_click)
 }
 
-/// Where the Undo drop-down opens: below the arrow, when the last frame drew
-/// it.
-fn qat_undo_anchor(probes: &Probes) -> Option<Point<Pixels>> {
-    probes.current("qat-undo-arrow").map(|b| b.bottom_left())
+/// The probe on Quick Access Toolbar split button `id`'s arrow.
+fn qat_arrow_probe(id: &str) -> &'static str {
+    if id == menu::QAT_REDO_ID {
+        "qat-redo-arrow"
+    } else {
+        "qat-undo-arrow"
+    }
+}
+
+/// Where the Undo (or a sheet's Redo, #1149) drop-down opens: below the
+/// arrow, when the last frame drew it.
+fn qat_arrow_anchor(probes: &Probes, id: &str) -> Option<Point<Pixels>> {
+    probes.current(qat_arrow_probe(id)).map(|b| b.bottom_left())
 }
 
 // ---- session model ---------------------------------------------------------
@@ -721,15 +735,17 @@ struct SheetView {
     /// After a revert in Enter mode the restored text is selected: the next
     /// typed character replaces it, Backspace or Delete empties it.
     edit_select_all: bool,
-    /// The last formatting change, for F4 (repeat). A resolved setter
-    /// (bold ON), so repeating applies it rather than flipping it.
-    last_format: Option<FormatFn>,
+    /// The last formatting change, for F4 (repeat), and its step's name. A
+    /// resolved setter (bold ON), so repeating applies it rather than
+    /// flipping it.
+    last_format: Option<(FormatFn, SheetStep)>,
     /// The recalc engine, indexed over the workbook's formulas, so an edit
     /// re-evaluates only the affected cells.
     engine: gridcore::engine::Engine,
-    /// Undo / redo stacks of workbook snapshots (with the selection at the time).
-    undo: Vec<SheetSnapshot>,
-    redo: Vec<SheetSnapshot>,
+    /// Undo / redo stacks of workbook snapshots (with the selection at the
+    /// time), each named as Excel names the step (#1149).
+    undo: Vec<SheetUndo>,
+    redo: Vec<SheetUndo>,
     /// An in-progress column-resize drag (the header border being dragged).
     col_drag: Option<ColDrag>,
     /// Live PivotTable definitions authored in the UI, one per output sheet, so
@@ -990,6 +1006,16 @@ struct SheetSnapshot {
     /// The selection's other areas (#670), so undo restores them too.
     areas: Vec<(u32, u32, u32, u32)>,
 }
+
+/// One step on a sheet's undo or redo stack: the state it goes back to, and
+/// what the Undo and Redo buttons call it (#1149).
+struct SheetUndo {
+    snap: SheetSnapshot,
+    step: SheetStep,
+}
+
+/// The undo step a conditional-formatting rule or its clearing makes (#1149).
+const CF_STEP: &str = "Conditional Formatting";
 
 /// What an undo step puts back of the package.
 enum SnapshotBody {
@@ -1387,6 +1413,8 @@ struct DvPending {
     violation: gridcore::validation::Violation,
     /// What Yes or OK goes on to do; `None` keeps the selection.
     then: Option<DvThen>,
+    /// The undo step Yes or OK makes: the typing (#1149).
+    step: SheetStep,
 }
 
 /// A live text field: which target it edits, its buffer, the caret and the
@@ -2510,33 +2538,56 @@ impl SheetView {
             .is_some_and(|(buf, seed)| buf == seed)
     }
 
-    /// Snapshot before a mutation; share the history limit across all edits.
-    fn push_undo(&mut self) {
-        self.push_undo_snapshot(self.snapshot());
+    /// Snapshot before a mutation, named `step`; share the history limit
+    /// across all edits.
+    fn push_undo(&mut self, step: SheetStep) {
+        self.push_undo_snapshot(self.snapshot(), step);
     }
 
     /// Undo one step: the current state goes on the redo stack, taken the
-    /// same way as the step (a package step's redo restores the parts too).
-    /// Returns whether there was a step.
+    /// same way as the step (a package step's redo restores the parts too),
+    /// under the step's name. Returns whether there was a step.
     fn undo_step(&mut self) -> bool {
-        let Some(snap) = self.undo.pop() else {
+        let Some(SheetUndo { snap, step }) = self.undo.pop() else {
             return false;
         };
         let now = self.snapshot_like(&snap);
-        self.redo.push(now);
+        self.redo.push(SheetUndo { snap: now, step });
         self.restore(snap);
         true
     }
 
     /// Redo one step, the mirror of [`Self::undo_step`].
     fn redo_step(&mut self) -> bool {
-        let Some(snap) = self.redo.pop() else {
+        let Some(SheetUndo { snap, step }) = self.redo.pop() else {
             return false;
         };
         let now = self.snapshot_like(&snap);
-        self.undo.push(now);
+        self.undo.push(SheetUndo { snap: now, step });
         self.restore(snap);
         true
+    }
+
+    /// Undo `n` steps (the Undo drop-down's `n`th entry, #1149); stops at
+    /// the bottom of the stack. Whether any step was undone.
+    fn undo_steps(&mut self, n: usize) -> bool {
+        (0..n).take_while(|_| self.undo_step()).count() > 0
+    }
+
+    /// Redo `n` steps (the Redo drop-down), the mirror of
+    /// [`Self::undo_steps`].
+    fn redo_steps(&mut self, n: usize) -> bool {
+        (0..n).take_while(|_| self.redo_step()).count() > 0
+    }
+
+    /// The undo steps' names, newest (the one Undo takes back next) first.
+    fn undo_names(&self) -> Vec<String> {
+        self.undo.iter().rev().map(|u| u.step.label()).collect()
+    }
+
+    /// The redo steps' names, the one Redo redoes next first.
+    fn redo_names(&self) -> Vec<String> {
+        self.redo.iter().rev().map(|u| u.step.label()).collect()
     }
 
     /// The current state, taken as `snap` was: the package when it holds one.
@@ -2563,7 +2614,7 @@ impl SheetView {
         if !self.pkg.set_comment(s, r, c, author, t) {
             return false;
         }
-        self.push_undo_snapshot(snap);
+        self.push_undo_snapshot(snap, SheetStep::Named("Edit Comment"));
         true
     }
 
@@ -2574,7 +2625,7 @@ impl SheetView {
         if !self.pkg.comments().iter().any(here) {
             return;
         }
-        self.push_undo_snapshot(self.snapshot_package());
+        self.push_undo_snapshot(self.snapshot_package(), SheetStep::Named("Delete Comment"));
         self.pkg.remove_comment(s, r, c);
     }
 
@@ -2588,7 +2639,7 @@ impl SheetView {
     /// [`gridcore::xlsx::SheetPackage::add_sheet`] does) as one undo step,
     /// and switch to it. Returns its index.
     fn add_sheet(&mut self, name: &str) -> usize {
-        self.push_undo_snapshot(self.snapshot_package());
+        self.push_undo_snapshot(self.snapshot_package(), SheetStep::Named("Insert Sheet"));
         let idx = self.pkg.add_sheet(name);
         self.active = idx;
         self.sel = (0, 0);
@@ -2630,7 +2681,7 @@ impl SheetView {
         if !self.pkg.remove_sheet(idx) {
             return false;
         }
-        self.push_undo_snapshot(snap);
+        self.push_undo_snapshot(snap, SheetStep::Named("Delete Sheet"));
         // Validation circles of the removed sheet go; later sheets renumber.
         self.circles.retain(|&(s, ..)| s != idx);
         for c in &mut self.circles {
@@ -2681,15 +2732,16 @@ impl SheetView {
         // UI-authored charts live in the snapshot alongside the workbook, so
         // without this Ctrl+Z would undo the edit BEFORE the insert and leave
         // the chart standing.
-        self.push_undo();
+        self.push_undo(SheetStep::Named("Insert Chart"));
         self.charts.push(chart);
         true
     }
 
-    /// Record `snap`, taken before an edit that has now landed.
-    fn push_undo_snapshot(&mut self, snap: SheetSnapshot) {
+    /// Record `snap`, taken before an edit that has now landed, as the step
+    /// `step`.
+    fn push_undo_snapshot(&mut self, snap: SheetSnapshot, step: SheetStep) {
         self.edit_gen += 1;
-        self.undo.push(snap);
+        self.undo.push(SheetUndo { snap, step });
         if self.undo.len() > 100 {
             self.undo.remove(0);
         }
@@ -2740,7 +2792,7 @@ impl SheetView {
             style,
             ..Cell::formula(&formula)
         };
-        self.push_undo();
+        self.push_undo(SheetStep::Named("AutoSum"));
         self.engine
             .set_cell(&mut self.pkg.workbook, (s, r, c), cell);
         Ok(true)
@@ -2813,14 +2865,15 @@ impl SheetView {
         // The cell's data-validation rule: a breaking entry waits for its
         // alert, the editor kept with the text.
         if let Some(cell) = &cell {
-            if self.dv_violation(origin, vec![(r, c, cell.clone())], Some(self.dv_then)) {
+            let step = SheetStep::typing(&buf, (r, c));
+            if self.dv_violation(origin, vec![(r, c, cell.clone())], Some(self.dv_then), step) {
                 return false;
             }
         }
         let link = self.typed_link(&buf, took, cell.as_ref());
         self.editing = None;
         self.end_cell_edit();
-        self.push_undo();
+        self.push_undo(SheetStep::typing(&buf, (r, c)));
         let typed = cell.is_some();
         if let Some(cell) = cell {
             self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
@@ -2856,7 +2909,13 @@ impl SheetView {
         if !(grew || filled) {
             return;
         }
-        self.push_undo_snapshot(snap);
+        // Excel names the step by what it did (#1149).
+        let step = SheetStep::Named(if grew {
+            "Table AutoExpansion"
+        } else {
+            "Calculated Column"
+        });
+        self.push_undo_snapshot(snap, step);
         // Structured references now cover a grown table: recalculate.
         self.engine = sheet_engine(&self.pkg.workbook);
         self.engine.recalc_all(&mut self.pkg.workbook);
@@ -2872,6 +2931,7 @@ impl SheetView {
         origin: (usize, u32, u32),
         cells: Vec<(u32, u32, gridcore::sheet::Cell)>,
         then: Option<DvThen>,
+        step: SheetStep,
     ) -> bool {
         let (s, r, c) = origin;
         let Some(cell) = cells.iter().find(|(cr, cc, _)| (*cr, *cc) == (r, c)) else {
@@ -2893,6 +2953,7 @@ impl SheetView {
             cells,
             violation,
             then,
+            step,
         });
         true
     }
@@ -2906,7 +2967,7 @@ impl SheetView {
         let s = p.origin.0;
         self.editing = None;
         self.end_cell_edit();
-        self.push_undo();
+        self.push_undo(p.step);
         match <[_; 1]>::try_from(p.cells) {
             Ok([(cr, cc, cell)]) => {
                 self.engine
@@ -3531,10 +3592,11 @@ impl SheetView {
         gridcore::entry::reenter_cell(&cell, styles, &ctx, &text, &new).ok()
     }
 
-    /// Apply a formatting change to the selection and keep it for F4.
-    fn apply_format(&mut self, f: FormatFn) {
+    /// Apply a formatting change to the selection and keep it, with its
+    /// step's name, for F4.
+    fn apply_format(&mut self, f: FormatFn, step: SheetStep) {
         self.format_selection(&*f);
-        self.last_format = Some(f);
+        self.last_format = Some((f, step));
     }
 
     /// A toggle resolved against the active cell (bold ON when it is not
@@ -3604,8 +3666,9 @@ impl SheetView {
         }
         // The typed entry is checked once, against the active cell's rule,
         // and then fills the range.
+        let step = SheetStep::typing_range(&buf, self.range());
         if let Some(cells) = &cells {
-            if self.dv_violation((s, r, c), cells.clone(), None) {
+            if self.dv_violation((s, r, c), cells.clone(), None, step.clone()) {
                 return false;
             }
         }
@@ -3616,7 +3679,7 @@ impl SheetView {
             .and_then(|(_, _, cell)| self.typed_link(&buf, took, Some(cell)));
         let filled: Vec<(u32, u32)> = cells.iter().flatten().map(|(r, c, _)| (*r, *c)).collect();
         self.end_cell_edit();
-        self.push_undo();
+        self.push_undo(step);
         if let Some(cells) = cells {
             self.engine
                 .set_cells_prechecked(&mut self.pkg.workbook, s, cells);
@@ -3639,7 +3702,7 @@ impl SheetView {
         if changes.is_empty() || self.refuses(self.active, &changes) {
             return false;
         }
-        self.push_undo();
+        self.push_undo(SheetStep::Named("Fill"));
         let s = self.active;
         self.engine
             .set_cells_prechecked(&mut self.pkg.workbook, s, changes);
@@ -3679,10 +3742,10 @@ impl SheetView {
     /// Repeat the last formatting change on the selection (one undo step,
     /// which clears the redo stack). False when there is nothing to repeat.
     fn repeat_format(&mut self) -> bool {
-        let Some(f) = self.last_format.clone() else {
+        let Some((f, step)) = self.last_format.clone() else {
             return false;
         };
-        self.push_undo();
+        self.push_undo(step);
         self.format_selection(&*f);
         true
     }
@@ -3741,7 +3804,10 @@ impl SheetView {
         }
         // Rows or columns are about to move: circles name cells, not rules.
         self.circles.clear();
-        self.push_undo();
+        self.push_undo(SheetStep::Named(match op {
+            StructOp::InsertRow | StructOp::InsertCol => "Insert Cells",
+            StructOp::DeleteRow | StructOp::DeleteCol => "Delete",
+        }));
         let wb = &mut self.pkg.workbook;
         let shift = match op {
             StructOp::InsertRow => {
@@ -4122,13 +4188,15 @@ impl SheetView {
     }
 
     /// Write `block` at `at` on the active sheet as one undo step, unless it
-    /// would change part of an array (refused whole, with Excel's message).
+    /// would change part of an array (refused whole, with Excel's message),
+    /// named `step` (`Paste`, `Drag and Drop`).
     /// A pasted spilling array still spills, and an array block pasted back
     /// in place keeps its block (`Engine::paste_block`).
     fn write_block(
         &mut self,
         at: (u32, u32),
         block: &[Vec<gridcore::sheet::Cell>],
+        step: &'static str,
     ) -> Result<(), GridPasteError> {
         let s = self.active;
         if self
@@ -4139,7 +4207,7 @@ impl SheetView {
                 gridcore::engine::PART_OF_ARRAY.to_string(),
             ));
         }
-        self.push_undo();
+        self.push_undo(SheetStep::Named(step));
         self.engine
             .paste_block_prechecked(&mut self.pkg.workbook, s, at, block);
         self.select_block(at, block);
@@ -4153,11 +4221,12 @@ impl SheetView {
     /// keeps its source. (Protecting the sheet after the cut is an edit,
     /// which cancels it.)
     fn paste_grid_clip(&mut self, clip: &GridClip) -> Result<GridPasted, GridPasteError> {
+        const PASTE: &str = "Paste";
         if !clip.cut {
-            return self.paste_copy(clip);
+            return self.paste_copy(clip, PASTE);
         }
         if clip.view != self.id {
-            let lost = matches!(self.paste_copy(clip)?, GridPasted::WithoutRules(_));
+            let lost = matches!(self.paste_copy(clip, PASTE)?, GridPasted::WithoutRules(_));
             return Ok(GridPasted::KeptAsCopy(if lost {
                 "The cut was pasted as a copy, without its data validation (this sheet can't hold it): cells move only within their own workbook"
             } else {
@@ -4168,14 +4237,14 @@ impl SheetView {
             return Err(GridPasteError::CutCancelled);
         }
         if self.pkg.workbook.sheets[clip.sheet].is_protected() {
-            let lost = matches!(self.paste_copy(clip)?, GridPasted::WithoutRules(_));
+            let lost = matches!(self.paste_copy(clip, PASTE)?, GridPasted::WithoutRules(_));
             return Ok(GridPasted::KeptAsCopy(if lost {
                 "The cut was pasted as a copy, without its data validation (this sheet can't hold it): its sheet is protected"
             } else {
                 "The cut was pasted as a copy: its sheet is protected"
             }));
         }
-        self.paste_move(clip).map(|()| GridPasted::Done)
+        self.paste_move(clip, PASTE).map(|()| GridPasted::Done)
     }
 
     /// A copy pasted over the selection: tiled over a paste area that is a
@@ -4185,7 +4254,12 @@ impl SheetView {
     /// refused, as is a tiling that would write more than
     /// [`gridcore::edit::MAX_PASTE_CELLS`] cells (a copy pasted once is
     /// written whatever its size, as before #664).
-    fn paste_copy(&mut self, clip: &GridClip) -> Result<GridPasted, GridPasteError> {
+    /// `step` names the undo step (`Paste`, `Drag and Drop`).
+    fn paste_copy(
+        &mut self,
+        clip: &GridClip,
+        step: &'static str,
+    ) -> Result<GridPasted, GridPasteError> {
         use gridcore::edit::{MAX_PASTE_CELLS, PASTE_SHAPE, paste_tiles, tiled_block};
         let h = clip.block.cells.len() as u32;
         let w = clip.block.cells.iter().map(Vec::len).max().unwrap_or(0) as u32;
@@ -4207,7 +4281,7 @@ impl SheetView {
             at,
             tiles,
         );
-        self.write_block(at, &block)?;
+        self.write_block(at, &block, step)?;
         // The source cells' rules replace the target's (#688) — an ordinary
         // paste moves validation along with the cells, so a source with no
         // rule clears the target's. A copy that left out filtered rows (or
@@ -4267,7 +4341,8 @@ impl SheetView {
     /// ([`gridcore::formula::move_block_formula`]). One undo step; refused
     /// whole, before anything changes, when it would change part of an array
     /// or run past the sheet's edge.
-    fn paste_move(&mut self, clip: &GridClip) -> Result<(), GridPasteError> {
+    /// `step` names the undo step (`Paste`, `Drag and Drop`).
+    fn paste_move(&mut self, clip: &GridClip, step: &'static str) -> Result<(), GridPasteError> {
         use gridcore::sheet::{Cell, MAX_COLS, MAX_ROWS, is_array_f};
         let (fr0, fc0, fr1, fc1) = clip.rect;
         let (h, w) = (fr1 - fr0 + 1, fc1 - fc0 + 1);
@@ -4334,7 +4409,7 @@ impl SheetView {
                 gridcore::engine::PART_OF_ARRAY.to_string(),
             ));
         }
-        self.push_undo();
+        self.push_undo(SheetStep::Named(step));
         // References follow first, and the engine is rebuilt on them, so the
         // writes below recalculate what reads the moved cells where they land.
         gridcore::edit::move_refs(&mut self.pkg.workbook, src, &mv);
@@ -5016,8 +5091,8 @@ mod backstage_scroll_tests {
 /// toggles it. The pointer and `menu-open` both anchor here; `None` when the
 /// button has not been laid out.
 fn split_menu_anchor(probes: &Probes, primary_id: &str) -> Option<Point<Pixels>> {
-    if primary_id == menu::QAT_UNDO_ID {
-        return qat_undo_anchor(probes);
+    if matches!(primary_id, menu::QAT_UNDO_ID | menu::QAT_REDO_ID) {
+        return qat_arrow_anchor(probes, primary_id);
     }
     probes
         .current(&format!("ribbon-split:{primary_id}"))
@@ -10225,7 +10300,7 @@ fn protected_rollback(tab: &mut DocTab) {
                 && !v.undo.is_empty()
             {
                 let at_open = v.undo.remove(0);
-                v.restore(at_open);
+                v.restore(at_open.snap);
             }
         }
     }
@@ -11959,6 +12034,25 @@ impl Docxy {
                 cx,
             );
         }
+        // A sheet's buttons are its Ctrl+Z and Ctrl+Y (#1149): in the cell
+        // editor Undo takes back the typing (#662) and Redo does nothing.
+        if self.active_is_sheet() {
+            match action {
+                QatAction::Undo => {
+                    let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
+                    if editing {
+                        if let Some(v) = self.active_sheet_mut() {
+                            v.edit_revert();
+                        }
+                        cx.notify();
+                    } else {
+                        self.sheet_undo(cx);
+                    }
+                }
+                QatAction::Redo => self.sheet_redo_or_repeat(cx),
+            }
+            return self.refocus(window, cx);
+        }
         let untouched = repeat_untouched(&self.repeat);
         match action {
             QatAction::Undo => {
@@ -13105,7 +13199,7 @@ impl Docxy {
         }) {
             return;
         }
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named("Chart Data"));
         if let Some(v) = self.active_sheet_mut() {
             let sidx = v.active;
             match loc {
@@ -14467,6 +14561,7 @@ impl Docxy {
     fn chart_edit_anchor(
         &mut self,
         idx: usize,
+        step: &'static str,
         f: impl Fn(&gridcore::sheet::Sheet, (u32, u32), (u32, u32)) -> ((u32, u32), (u32, u32)),
     ) -> bool {
         let Some(loc) = self.chart_locate(idx) else {
@@ -14487,7 +14582,7 @@ impl Docxy {
         if (nf, nt) == (from, to) {
             return false;
         }
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named(step));
         if let Some(v) = self.active_sheet_mut() {
             match loc {
                 ChartRef::Ui(i) => {
@@ -14528,7 +14623,7 @@ impl Docxy {
         }
         // `chart_edit_anchor` takes the snapshot, and only if the cells change.
         let changed = if d.edge == (0, 0) {
-            self.chart_edit_anchor(d.idx, |sh, from, to| {
+            self.chart_edit_anchor(d.idx, "Move Chart", |sh, from, to| {
                 // The far corner rides along, so the card keeps its cell span.
                 let nf = (
                     shift_row(sh, from.0, d.delta.1),
@@ -14544,7 +14639,7 @@ impl Docxy {
                 )
             })
         } else {
-            self.chart_edit_anchor(d.idx, |sh, from, to| {
+            self.chart_edit_anchor(d.idx, "Resize Chart", |sh, from, to| {
                 let (w, h) = chart_span_px(sh, from, to);
                 let (x_off, w_delta) = resize_axis(d.edge.0, d.delta.0, w, MIN_CHART_W);
                 let (y_off, h_delta) = resize_axis(d.edge.1, d.delta.1, h, MIN_CHART_H);
@@ -14573,7 +14668,7 @@ impl Docxy {
         // `SeriesValues(i)` field pointing into whichever chart slid into the
         // gap.
         self.chart_drop_selection();
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named("Delete Chart"));
         if let Some(v) = self.active_sheet_mut() {
             let sidx = v.active;
             let ui_n = v.charts.iter().filter(|c| c.sheet == sidx).count();
@@ -15207,7 +15302,11 @@ impl Docxy {
     /// Toggle protection on the active sheet (undoable; Excel's default flag set).
     fn sheet_toggle_protection(&mut self, cx: &mut Context<Self>) {
         let now = !self.sheet_protected();
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named(if now {
+            "Protect Sheet"
+        } else {
+            "Unprotect Sheet"
+        }));
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
             v.pkg.workbook.sheets[s].set_protected(now);
@@ -15556,33 +15655,33 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Push a workbook snapshot onto the undo stack (clearing redo). Called before
-    /// each mutating grid operation.
-    fn sheet_snapshot(&mut self) {
+    /// Push a workbook snapshot onto the undo stack as the step `step`
+    /// (clearing redo). Called before each mutating grid operation.
+    fn sheet_snapshot(&mut self, step: SheetStep) {
         if let Some(v) = self.active_sheet_mut() {
-            v.push_undo();
+            v.push_undo(step);
         }
     }
 
     /// Run a package edit that the workbook's file can refuse (its worksheet
     /// XML is damaged where the edit would go). Landed, it gets an undo step
-    /// (with `undoable`) and dirties the tab; refused, nothing changed, so
-    /// neither happens and the status says so.
+    /// (when `step` names one) and dirties the tab; refused, nothing changed,
+    /// so neither happens and the status says so.
     fn sheet_try_edit(
         &mut self,
-        undoable: bool,
+        step: Option<SheetStep>,
         edit: impl FnOnce(&mut SheetView) -> bool,
     ) -> bool {
         let Some(v) = self.active_sheet_mut() else {
             return false;
         };
-        let snap = undoable.then(|| v.snapshot());
+        let snap = step.map(|step| (v.snapshot(), step));
         if !edit(v) {
             self.set_status(DAMAGED_SHEET_STATUS);
             return false;
         }
-        if let Some(snap) = snap {
-            v.push_undo_snapshot(snap);
+        if let Some((snap, step)) = snap {
+            v.push_undo_snapshot(snap, step);
         }
         self.mark_sheet_dirty();
         true
@@ -15595,6 +15694,34 @@ impl Docxy {
             self.chart_drop_selection();
             self.mark_sheet_dirty();
         }
+        cx.notify();
+    }
+
+    /// A sheet's Undo or Redo drop-down entry (#1149): undo (or `redo`) `n`
+    /// steps as one action, so the tab is dirtied, the chart selection
+    /// dropped and the window repainted once. Nothing on another tab: a
+    /// document has no Redo list.
+    fn sheet_history_to(
+        &mut self,
+        n: usize,
+        redo: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self.active_sheet_mut().is_some_and(|v| {
+            if redo {
+                // In the cell editor Redo does nothing (`redo_or_repeat`).
+                v.editing.is_none() && v.redo_steps(n)
+            } else {
+                v.undo_steps(n)
+            }
+        });
+        if changed {
+            // The chart list just changed under it (see `sheet_undo`).
+            self.chart_drop_selection();
+            self.mark_sheet_dirty();
+        }
+        self.refocus(window, cx);
         cx.notify();
     }
 
@@ -15778,7 +15905,7 @@ impl Docxy {
         if self.sheet_protected() || self.protected_refused(cx) || self.sheet_clear_refused(cx) {
             return;
         }
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named("Clear"));
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
             let changes = v.clear_changes();
@@ -16024,7 +16151,7 @@ impl Docxy {
         if block.is_empty() {
             return false;
         }
-        let res = v.write_block((br, bc), &block);
+        let res = v.write_block((br, bc), &block, "Paste");
         let landed = res.is_ok();
         if let Err(GridPasteError::Refused(why)) = res {
             self.set_status(why);
@@ -16068,7 +16195,7 @@ impl Docxy {
         if self.protected_refused(cx) {
             return;
         }
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named("Column Width"));
         if let Some(v) = self.active_sheet_mut() {
             let w = v.sheet().col_width(col);
             v.col_drag = Some(ColDrag {
@@ -16112,15 +16239,18 @@ impl Docxy {
     /// and formulas are untouched, so no recalc is needed.
     fn sheet_format(
         &mut self,
+        step: &'static str,
         apply: impl Fn(&mut gridcore::sheet::Xf) + 'static,
         cx: &mut Context<Self>,
     ) {
-        self.sheet_format_rc(std::rc::Rc::new(apply), cx);
+        self.sheet_format_rc(step, std::rc::Rc::new(apply), cx);
     }
 
     /// [`Self::sheet_format`] for a setter already shared (a toggle resolved
     /// by `SheetView::toggle_setter`).
-    fn sheet_format_rc(&mut self, apply: FormatFn, cx: &mut Context<Self>) {
+    /// `step` is the undo step's name (`Bold`, `Font`, ...), which F4's
+    /// repeat keeps.
+    fn sheet_format_rc(&mut self, step: &'static str, apply: FormatFn, cx: &mut Context<Self>) {
         // This writes to `v.range()`, so the selection it acts on has to be the
         // one the grid is DRAWING. `run_sheet_act` hands the selection back for
         // the ribbon commands, but not every formatting writer arrives that way
@@ -16129,11 +16259,12 @@ impl Docxy {
         // `sheet_apply_color` directly. Asking here covers the lot: it returns
         // immediately when no chart is selected, so the common path is free.
         self.chart_hand_back(cx);
-        self.sheet_snapshot();
+        let step = SheetStep::Named(step);
+        self.sheet_snapshot(step.clone());
         if let Some(v) = self.active_sheet_mut() {
             // F4 repeats it. Toggles arrive here already resolved (bold ON),
             // so a repeat applies rather than flips.
-            v.apply_format(apply);
+            v.apply_format(apply, step);
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -16210,14 +16341,14 @@ impl Docxy {
             "enter" => {
                 let cells = self.bar_cells();
                 if buf.trim().eq_ignore_ascii_case("clear") {
-                    self.sheet_try_edit(true, |v| {
+                    self.sheet_try_edit(Some(SheetStep::Named(CF_STEP)), |v| {
                         let s = v.active;
                         let done = v.pkg.clear_conditional_formats(s);
                         v.engine = sheet_engine(&v.pkg.workbook);
                         done
                     });
                 } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
-                    self.sheet_try_edit(true, |v| {
+                    self.sheet_try_edit(Some(SheetStep::Named(CF_STEP)), |v| {
                         let s = v.active;
                         let done = v.pkg.add_conditional_format(
                             s,
@@ -16397,7 +16528,7 @@ impl Docxy {
     /// anchor's contents), or unmerge if the anchor is already a merge origin.
     fn sheet_merge_toggle(&mut self, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named("Merge & Center"));
         if let Some(v) = self.active_sheet_mut() {
             let (r0, c0, r1, c1) = v.range();
             let s = v.active;
@@ -16437,7 +16568,7 @@ impl Docxy {
     /// (header-aware), keeping the first occurrence.
     fn sheet_remove_duplicates(&mut self, cx: &mut Context<Self>) {
         use gridcore::sheet::CellValue;
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named("Remove Duplicates"));
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
             let sc = v.sel.1;
@@ -16471,7 +16602,7 @@ impl Docxy {
     fn sheet_format_as_table(&mut self, cx: &mut Context<Self>) {
         use gridcore::sheet::CellValue;
         let mut refused = None;
-        self.sheet_try_edit(true, |v| {
+        self.sheet_try_edit(Some(SheetStep::Named("Format as Table")), |v| {
             let s = v.active;
             let (max_r, max_c) = v.extent();
             let region = if v.has_range() {
@@ -16686,7 +16817,7 @@ impl Docxy {
             self.sheet_entry_refused(cx);
             return;
         }
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::typing(&choice.label, (r, c)));
         if let Some(v) = self.active_sheet_mut() {
             v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), cell);
             v.prune_circles();
@@ -16700,28 +16831,29 @@ impl Docxy {
     /// cell the grid is drawing.
     fn sheet_toggle(
         &mut self,
+        step: &'static str,
         get: fn(&gridcore::sheet::Xf) -> bool,
         set: fn(&mut gridcore::sheet::Xf, bool),
         cx: &mut Context<Self>,
     ) {
         self.chart_hand_back(cx);
         if let Some(f) = self.active_sheet().map(|v| v.toggle_setter(get, set)) {
-            self.sheet_format_rc(f, cx);
+            self.sheet_format_rc(step, f, cx);
         }
     }
     fn sheet_toggle_bold(&mut self, cx: &mut Context<Self>) {
-        self.sheet_toggle(|x| x.bold, |x, on| x.bold = on, cx);
+        self.sheet_toggle("Bold", |x| x.bold, |x, on| x.bold = on, cx);
     }
     fn sheet_toggle_italic(&mut self, cx: &mut Context<Self>) {
-        self.sheet_toggle(|x| x.italic, |x, on| x.italic = on, cx);
+        self.sheet_toggle("Italic", |x| x.italic, |x, on| x.italic = on, cx);
     }
     fn sheet_align(&mut self, a: gridcore::sheet::Align, cx: &mut Context<Self>) {
-        self.sheet_format(move |xf| xf.align = a, cx);
+        self.sheet_format("Alignment", move |xf| xf.align = a, cx);
     }
     /// Toggle Wrap Text on the selection. Wrapped cells render across multiple
     /// lines and grow their row (the grid uses a variable-height gpui `list`).
     fn sheet_toggle_wrap(&mut self, cx: &mut Context<Self>) {
-        self.sheet_toggle(|x| x.wrap, |x, on| x.wrap = on, cx);
+        self.sheet_toggle("Wrap Text", |x| x.wrap, |x, on| x.wrap = on, cx);
     }
     /// Set an explicit height (points) on every selected row, or clear it back
     /// to auto-fit when `pts` is `None`.
@@ -16729,7 +16861,7 @@ impl Docxy {
         if self.protected_refused(cx) {
             return;
         }
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named("Row Height"));
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
             let (r0, _, r1, _) = v.range();
@@ -16743,6 +16875,7 @@ impl Docxy {
     /// Grow / shrink the font of the selection by one point (default base 11).
     fn sheet_font_step(&mut self, delta: f64, cx: &mut Context<Self>) {
         self.sheet_format(
+            "Font",
             move |xf| {
                 let cur = xf.font_size.unwrap_or(11.0);
                 xf.font_size = Some((cur + delta).clamp(1.0, 409.0));
@@ -16752,12 +16885,12 @@ impl Docxy {
     }
     /// Apply a number format code to the selection (Excel's %, currency, comma).
     fn sheet_numfmt(&mut self, code: &'static str, cx: &mut Context<Self>) {
-        self.sheet_format_rc(numfmt_setter(code), cx);
+        self.sheet_format_rc("Number Format", numfmt_setter(code), cx);
     }
 
     /// Apply a number format from the Number dropdown ("" = General/clear) + close.
     fn sheet_apply_numfmt(&mut self, code: &str, cx: &mut Context<Self>) {
-        self.sheet_format_rc(numfmt_setter(code), cx);
+        self.sheet_format_rc("Number Format", numfmt_setter(code), cx);
         self.sheet_numfmt_open = false;
     }
 
@@ -16773,7 +16906,12 @@ impl Docxy {
         rgb: Option<(u8, u8, u8)>,
         cx: &mut Context<Self>,
     ) {
+        let step = match pick {
+            SheetPick::Fill => "Fill Color",
+            SheetPick::Font => "Font Color",
+        };
         self.sheet_format(
+            step,
             move |xf| match pick {
                 SheetPick::Fill => xf.fill = rgb,
                 SheetPick::Font => xf.color = rgb,
@@ -16785,7 +16923,7 @@ impl Docxy {
     }
     /// Toggle a thin box border on the selected cells.
     fn sheet_toggle_border(&mut self, cx: &mut Context<Self>) {
-        self.sheet_toggle(|x| x.border, |x, on| x.border = on, cx);
+        self.sheet_toggle("Borders", |x| x.border, |x, on| x.border = on, cx);
     }
     /// Freeze panes at the selected cell (toggles off if already frozen). Rows
     /// above and columns left of the selection stay pinned while scrolling.
@@ -16887,7 +17025,7 @@ impl Docxy {
             self.sheet_entry_refused(cx);
             return;
         }
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named("Replace"));
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
             v.replace_in_cell(r, c, &q, &rep);
@@ -16913,7 +17051,7 @@ impl Docxy {
             self.sheet_entry_refused(cx);
             return;
         }
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named("Replace"));
         let n = self
             .active_sheet_mut()
             .map_or(0, |v| v.replace_all_cells(&q, &rep));
@@ -17069,7 +17207,7 @@ impl Docxy {
         if self.protected_refused(cx) {
             return;
         }
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named("PivotTable"));
         if let Some(v) = self.active_sheet_mut() {
             if let Some(d) = v.pivot_views.get_mut(idx) {
                 if let Some(r) = d.role.get_mut(field) {
@@ -17088,7 +17226,7 @@ impl Docxy {
         if self.protected_refused(cx) {
             return;
         }
-        self.sheet_snapshot();
+        self.sheet_snapshot(SheetStep::Named("PivotTable"));
         if let Some(v) = self.active_sheet_mut() {
             if let Some(d) = v.pivot_views.get_mut(idx) {
                 if let Some(a) = d.agg.get_mut(field) {
@@ -18277,7 +18415,7 @@ impl Docxy {
             SheetAct::Filter => self.sheet_data_cmd(sheet_filter::toggle, cx),
             SheetAct::ClearFilter => self.sheet_data_cmd(
                 |t| {
-                    sheet_filter::run(t, |wb, s, today| {
+                    sheet_filter::run(t, "Clear Filter", |wb, s, today| {
                         gridcore::filter::clear(wb, s, None, today)
                     })
                     .map(|_| ())
@@ -18285,7 +18423,7 @@ impl Docxy {
                 cx,
             ),
             SheetAct::ReapplyFilter => self.sheet_data_cmd(
-                |t| sheet_filter::run(t, gridcore::filter::reapply).map(|_| ()),
+                |t| sheet_filter::run(t, "Reapply", gridcore::filter::reapply).map(|_| ()),
                 cx,
             ),
             SheetAct::AdvancedFilter => self.sheet_data_cmd(
@@ -18959,8 +19097,24 @@ impl Docxy {
         (ed, &mut self.repeat)
     }
 
-    /// What the Quick Access Toolbar shows for the active tab (#618, #619).
+    /// What the Quick Access Toolbar shows for the active tab (#618, #619,
+    /// #1149).
     fn qat_state(&self) -> QatState {
+        if let Some(v) = self.active_sheet() {
+            // In the cell editor Ctrl+Y does nothing ([`SheetView::redo_or_repeat`]).
+            let idle = v.editing.is_none();
+            let redo = v.redo.last().filter(|_| idle).map(|u| u.step.label());
+            let repeat = v
+                .last_format
+                .as_ref()
+                .filter(|_| idle && redo.is_none() && !self.sheet_protected())
+                .map(|(_, step)| step.label());
+            return QatState::Sheet {
+                undo: v.undo.last().map(|u| u.step.label()),
+                redo,
+                repeat,
+            };
+        }
         let Some(ed) = self.tabs.get(self.active).and_then(tab_edit_target_ref) else {
             return QatState::Plain;
         };
@@ -24579,7 +24733,7 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         | ArrangeAll | DarkMode | AutoHideRibbon | InsertField | PageBreak | BlankPage
         | Cover(_) | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing
         | Hf(_) | Design(_) | Layout(_) | Mail(_) | Help(_) | Table(_) | PrintLayout
-        | ToggleRuler | UndoTo(_) => {}
+        | ToggleRuler | UndoTo(_) | RedoTo(_) => {}
     }
 }
 
@@ -24875,20 +25029,33 @@ fn key_repeat(key: &str, ctrl: bool, shift: bool) -> Option<Repeat> {
 
 /// What the Quick Access Toolbar shows for the active tab: a document's
 /// redo button reads Redo or Repeat (#618), and its Undo has a drop-down
-/// (#619); Project and sheet tabs keep plain Undo and Redo.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// (#619); a sheet's buttons name their steps and both have drop-downs
+/// (#1149); Project tabs keep plain Undo and Redo.
+#[derive(Clone, Debug, PartialEq)]
 enum QatState {
     Plain,
-    Doc { can_redo: bool, can_repeat: bool },
+    Doc {
+        can_redo: bool,
+        can_repeat: bool,
+    },
+    /// A sheet's buttons name their steps, as Excel's do (#1149): the step
+    /// Undo takes back, the one Redo redoes, and with nothing to redo the
+    /// format Redo repeats (Repeat). `None` when there is none (Redo has none
+    /// in the cell editor).
+    Sheet {
+        undo: Option<String>,
+        redo: Option<String>,
+        repeat: Option<String>,
+    },
 }
 
 /// One Quick Access Toolbar button as drawn and as `ribbon-read` reports it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct QatEntry {
     id: &'static str,
     icon: &'static str,
     label: &'static str,
-    tip: &'static str,
+    tip: SharedString,
     enabled: bool,
     /// A split button whose arrow opens a menu.
     menu: bool,
@@ -24903,12 +25070,12 @@ fn qat_entries(state: QatState) -> Vec<QatEntry> {
                 id: item.id,
                 icon: item.icon,
                 label: item.label,
-                tip: item.tip,
+                tip: item.tip.into(),
                 enabled: true,
                 menu: false,
                 action: item.action,
             };
-            match (state, item.action) {
+            match (&state, item.action) {
                 (QatState::Plain, _) => plain,
                 (QatState::Doc { .. }, QatAction::Undo) => QatEntry {
                     menu: true,
@@ -24918,14 +25085,42 @@ fn qat_entries(state: QatState) -> Vec<QatEntry> {
                 // The redo icon stays: the suite ships no Repeat icon.
                 (QatState::Doc { can_repeat, .. }, QatAction::Redo) => QatEntry {
                     label: "Repeat",
-                    tip: if can_repeat {
+                    tip: if *can_repeat {
                         "Repeat (Ctrl+Y)"
                     } else {
                         "Can't Repeat"
-                    },
-                    enabled: can_repeat,
+                    }
+                    .into(),
+                    enabled: *can_repeat,
                     ..plain
                 },
+                // Excel's tips (#1149): `Undo Typing 'abc' in A1 (Ctrl+Z)`,
+                // `Can't Undo (Ctrl+Z)`; both buttons are split, the lists
+                // opening even when empty (one disabled `Can't` row).
+                (QatState::Sheet { undo, .. }, QatAction::Undo) => QatEntry {
+                    tip: match undo {
+                        Some(step) => format!("Undo {step} (Ctrl+Z)"),
+                        None => "Can't Undo (Ctrl+Z)".into(),
+                    }
+                    .into(),
+                    enabled: undo.is_some(),
+                    menu: true,
+                    ..plain
+                },
+                (QatState::Sheet { redo, repeat, .. }, QatAction::Redo) => {
+                    let (label, tip) = match (redo, repeat) {
+                        (Some(step), _) => ("Redo", format!("Redo {step} (Ctrl+Y)")),
+                        (None, Some(step)) => ("Repeat", format!("Repeat {step} (Ctrl+Y)")),
+                        (None, None) => ("Redo", "Can't Redo (Ctrl+Y)".into()),
+                    };
+                    QatEntry {
+                        label,
+                        tip: tip.into(),
+                        enabled: redo.is_some() || repeat.is_some(),
+                        menu: true,
+                        ..plain
+                    }
+                }
             }
         })
         .collect()
@@ -25663,10 +25858,15 @@ mod repeat_tests {
 
     #[test]
     fn the_qat_reads_redo_or_repeat_618_619() {
+        // The tip is a `SharedString` since #1149 named a sheet's steps;
+        // leaked here so the rows compare with the literals below.
         let read = |state| {
             qat_entries(state)
                 .into_iter()
-                .map(|e| (e.id, e.label, e.tip, e.enabled, e.menu))
+                .map(|e| {
+                    let tip: &str = e.tip.to_string().leak();
+                    (e.id, e.label, tip, e.enabled, e.menu)
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -25801,6 +26001,9 @@ enum Act {
     /// Undo the `n` newest steps in one go: an entry in the Quick Access
     /// Toolbar Undo drop-down (#619).
     UndoTo(usize),
+    /// Redo the next `n` steps in one go: an entry in a sheet's Quick
+    /// Access Toolbar Redo drop-down (#1149).
+    RedoTo(usize),
 }
 
 /// The gallery's selected item follows the paragraph formatting its actions set.
@@ -28717,21 +28920,48 @@ impl Docxy {
     }
 
     /// The Quick Access Toolbar Undo arrow, and `menu-open {"qat":
-    /// "qat-undo"}`: the active document's undo steps, newest first (#619).
-    /// Project and sheet tabs have no list.
+    /// "qat-undo"}`: the active document's (#619) or sheet's (#1149) undo
+    /// steps, newest first. A Project tab has no list.
     pub(crate) fn open_undo_menu(
         &mut self,
         at: Point<Pixels>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        if !matches!(self.qat_state(), QatState::Doc { .. }) {
-            return Err("the Undo drop-down opens on a document tab".into());
-        }
-        let names = self
-            .edit_target()
-            .map(|ed| ed.undo_names())
-            .unwrap_or_default();
+        let names = match self.qat_state() {
+            QatState::Doc { .. } => self
+                .edit_target()
+                .map(|ed| ed.undo_names())
+                .unwrap_or_default(),
+            QatState::Sheet { .. } => self
+                .active_sheet()
+                .map(SheetView::undo_names)
+                .unwrap_or_default(),
+            QatState::Plain => {
+                return Err("the Undo drop-down opens on a document or sheet tab".into());
+            }
+        };
         self.open_menu(menu::MenuTarget::QatUndo, at, menu::undo_menu(&names), cx);
+        Ok(())
+    }
+
+    /// A sheet's Quick Access Toolbar Redo arrow, and `menu-open {"qat":
+    /// "qat-redo"}`: the steps Redo would redo, the next one first (#1149).
+    /// A document's Redo has no list.
+    pub(crate) fn open_redo_menu(
+        &mut self,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(v) = self.active_sheet() else {
+            return Err("the Redo drop-down opens on a sheet tab".into());
+        };
+        // In the cell editor Redo does nothing, so its list is empty.
+        let names = if v.editing.is_some() {
+            Vec::new()
+        } else {
+            v.redo_names()
+        };
+        self.open_menu(menu::MenuTarget::QatRedo, at, menu::redo_menu(&names), cx);
         Ok(())
     }
 
@@ -28806,9 +29036,13 @@ impl Docxy {
         at: Point<Pixels>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        // The Quick Access Toolbar's Undo arrow opens the undo list (#619).
+        // The Quick Access Toolbar's Undo arrow opens the undo list (#619),
+        // a sheet's Redo arrow its redo list (#1149).
         if primary_id == menu::QAT_UNDO_ID {
             return self.open_undo_menu(at, cx);
+        }
+        if primary_id == menu::QAT_REDO_ID {
+            return self.open_redo_menu(at, cx);
         }
         let (target, items) = self
             .split_menu_for(primary_id)
@@ -29384,8 +29618,9 @@ impl Docxy {
                 note_edit(ed, rec, since, Repeat::Act(act));
             }
         }
-        // The Undo drop-down only undoes (#619).
-        if matches!(act, Act::UndoTo(_)) {
+        // The Undo drop-down only undoes (#619), a sheet's Redo drop-down
+        // only redoes (#1149).
+        if matches!(act, Act::UndoTo(_) | Act::RedoTo(_)) {
             self.keep_repeat_current(untouched);
         }
     }
@@ -29478,6 +29713,9 @@ impl Docxy {
                 self.show_notes = !self.show_notes;
                 self.refocus(window, cx);
             }
+            // A sheet's lists (#1149).
+            UndoTo(n) if self.active_is_sheet() => self.sheet_history_to(n, false, window, cx),
+            RedoTo(n) => self.sheet_history_to(n, true, window, cx),
             UndoTo(n) => self.with_editor(window, cx, |e| {
                 e.undo_to(n);
             }),
@@ -30771,14 +31009,14 @@ impl Docxy {
         }
         let cells = self.bar_cells();
         if buf.trim().eq_ignore_ascii_case("clear") {
-            self.sheet_try_edit(true, |v| {
+            self.sheet_try_edit(Some(SheetStep::Named(CF_STEP)), |v| {
                 let s = v.active;
                 let done = v.pkg.clear_conditional_formats(s);
                 v.engine = sheet_engine(&v.pkg.workbook);
                 done
             });
         } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
-            self.sheet_try_edit(true, |v| {
+            self.sheet_try_edit(Some(SheetStep::Named(CF_STEP)), |v| {
                 let s = v.active;
                 let done = v.pkg.add_conditional_format(
                     s,
@@ -33246,6 +33484,8 @@ impl Render for Docxy {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .children(qat_entries(qat_state).into_iter().map(|entry| {
                                     let action = entry.action;
+                                    // Probed so `pointer-click` can press it
+                                    // (#1149).
                                     let btn = qat_btn(
                                         entry.id,
                                         entry.icon,
@@ -33255,18 +33495,21 @@ impl Render for Docxy {
                                         cx.listener(move |this, _, window, cx| {
                                             this.qat_action(action, window, cx)
                                         }),
-                                    );
+                                    )
+                                    .child(probe(&self.probes, entry.id));
                                     if !entry.menu {
                                         return btn.into_any_element();
                                     }
                                     // A split button: its arrow opens the
-                                    // Undo drop-down (#619).
+                                    // Undo drop-down (#619), or a sheet's
+                                    // Redo drop-down (#1149).
+                                    let arrow = qat_arrow_probe(entry.id);
                                     h_flex()
                                         .items_center()
                                         .child(btn)
                                         .child(
                                             div()
-                                                .id("qat-undo-arrow")
+                                                .id(arrow)
                                                 .relative()
                                                 .flex()
                                                 .items_center()
@@ -33278,11 +33521,11 @@ impl Render for Docxy {
                                                 .hover(|d| d.bg(pal.hover))
                                                 .text_size(px(8.))
                                                 .text_color(pal.fg)
-                                                .child(probe(&self.probes, "qat-undo-arrow"))
+                                                .child(probe(&self.probes, arrow))
                                                 .child("\u{25BE}")
                                                 .on_mouse_down(
                                                     MouseButton::Left,
-                                                    menu_toggle(menu::QAT_UNDO_ID, cx),
+                                                    menu_toggle(entry.id, cx),
                                                 ),
                                         )
                                         .into_any_element()

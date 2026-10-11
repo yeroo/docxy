@@ -16,6 +16,7 @@ use crate::dialog::catalog;
 use crate::dialog::{
     Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Reaction, Value,
 };
+use crate::sheet_step::SheetStep;
 use crate::{DocTab, Surface};
 use gridcore::edit::{TTC_REPLACE, TtcSource, text_to_columns, ttc_would_overwrite};
 use gridcore::textio::{ColFormat, DateOrder, Delimiters, SplitKind, TextParse, split_value};
@@ -465,7 +466,7 @@ fn convert(tab: &mut DocTab, src: &TtcSource, opts: &TextParse) {
     let Surface::Sheet(v) = &mut tab.surface else {
         return;
     };
-    v.push_undo();
+    v.push_undo(SheetStep::Named("Text to Columns"));
     let today = v.engine.clock;
     let n = text_to_columns(&mut v.pkg.workbook, src, opts, today);
     v.engine = crate::sheet_engine(&v.pkg.workbook);
