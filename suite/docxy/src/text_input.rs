@@ -51,6 +51,11 @@
 //! handler never accepts text input there ([`accepts_text_input`]), so the
 //! Windows IME stays off as it was.
 //!
+//! A replayed ⌥ key still carries ⌥, and so does a Windows AltGr key
+//! (Ctrl+Alt). The document and the find bar type any key's character, but a
+//! dialog field swallows ⌥ keys, so the dialog is handed the plain typed key
+//! the modifiers made instead ([`modifier_char`], #1162).
+//!
 //! Linux registers no handler: it would hand it every unhandled printable
 //! key, which `on_key` has already typed. Off macOS the root also leaves
 //! every key propagating, as it always has: on Windows a handled key-down is
@@ -233,6 +238,38 @@ pub(crate) fn char_stroke(c: char) -> Option<Keystroke> {
         key: c.to_lowercase().to_string(),
         key_char: Some(c.to_string()),
     })
+}
+
+/// The plain typed key a key-down stands for when its modifiers made its
+/// character (#1162): ⌥ on macOS (no ⌃, ⌘ or Fn), as AppKit's commit of the
+/// key's own text replays it, and AltGr on Windows (Ctrl+Alt that gpui flags
+/// as changing the character). `None` for any other key, including Windows'
+/// plain Alt chords, whose character is the bare key's, and every key off
+/// macOS and Windows. A dialog field types what this returns; `edit_key`
+/// swallows every other ⌥ key.
+pub(crate) fn modifier_char(ev: &KeyDownEvent, macos: bool, windows: bool) -> Option<Keystroke> {
+    let m = &ev.keystroke.modifiers;
+    let made = if macos {
+        m.alt && !m.control && !m.platform && !m.function
+    } else if windows {
+        m.control && m.alt && !m.platform && ev.prefer_character_input
+    } else {
+        false
+    };
+    if !made {
+        return None;
+    }
+    let mut chars = ev.keystroke.key_char.as_deref()?.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => char_stroke(c),
+        _ => None,
+    }
+}
+
+/// The keystroke an open dialog takes for a key-down: [`modifier_char`]'s
+/// plain typed key, else the key-down's own (#1162).
+pub(crate) fn dialog_stroke(ev: &KeyDownEvent, macos: bool, windows: bool) -> Keystroke {
+    modifier_char(ev, macos, windows).unwrap_or_else(|| ev.keystroke.clone())
 }
 
 fn typed(keystroke: Keystroke) -> KeyDownEvent {
@@ -893,6 +930,119 @@ mod tests {
             alt: true,
             ..Default::default()
         }
+    }
+
+    /// An AltGr key-down as gpui reports it on Windows: Ctrl+Alt changed
+    /// ToUnicode's character.
+    fn altgr(key: &str, key_char: &str) -> KeyDownEvent {
+        KeyDownEvent {
+            prefer_character_input: true,
+            ..typed(stroke(key, Some(key_char), ctrl_alt()))
+        }
+    }
+
+    /// macOS (#1162): an ⌥ key with one printable character is the plain
+    /// typed key for that character, Shift kept for an upper-case one, and
+    /// ⌥Space's no-break space is a character, not Space.
+    #[test]
+    fn an_option_character_is_a_plain_typed_key_on_macos() {
+        let alt_shift = Modifiers {
+            shift: true,
+            ..alt()
+        };
+        for (k, want) in [
+            (stroke("g", Some("©"), alt()), plain("©", "©")),
+            (stroke("2", Some("™"), alt()), plain("™", "™")),
+            (stroke("`", Some("`"), alt()), plain("`", "`")),
+            (stroke("2", Some("€"), alt_shift), plain("€", "€")),
+            (
+                stroke("space", Some("\u{a0}"), alt()),
+                plain("\u{a0}", "\u{a0}"),
+            ),
+        ] {
+            assert_eq!(
+                modifier_char(&typed(k.clone()), true, false),
+                Some(want),
+                "{k}"
+            );
+        }
+        let a_acute = modifier_char(&typed(stroke("y", Some("Á"), alt_shift)), true, false);
+        assert_eq!(a_acute, char_stroke('Á'));
+        assert_eq!(a_acute.and_then(|k| k.key_char).as_deref(), Some("Á"));
+    }
+
+    /// Windows (#1162): an AltGr character is the plain typed key for it.
+    #[test]
+    fn an_altgr_character_is_a_plain_typed_key_on_windows() {
+        assert_eq!(
+            modifier_char(&altgr("e", "€"), false, true),
+            Some(plain("€", "€"))
+        );
+        assert_eq!(
+            modifier_char(&altgr("q", "@"), false, true),
+            Some(plain("@", "@"))
+        );
+    }
+
+    /// Keys whose modifiers made no character stay as they are (#1162):
+    /// ⌥ arrows, ⌥⌫ and ⌥Enter; ⌃⌥ and ⌘⌥ chords on macOS; plain Alt and
+    /// Ctrl+Alt that changed nothing on Windows; and every key elsewhere.
+    #[test]
+    fn keys_whose_modifiers_made_no_character_are_not_text() {
+        let fn_alt = Modifiers {
+            function: true,
+            ..alt()
+        };
+        let cmd_alt = Modifiers {
+            platform: true,
+            ..alt()
+        };
+        let mac = [
+            stroke("left", None, fn_alt),
+            stroke("backspace", Some("\u{8}"), alt()),
+            stroke("enter", Some("\r"), alt()),
+            stroke("g", Some("©"), ctrl_alt()),
+            stroke("g", Some("©"), cmd_alt),
+            stroke("g", Some("©"), fn_alt),
+            stroke("g", Some("g"), Modifiers::default()),
+            stroke("e", Some("´x"), alt()),
+            stroke("e", None, alt()),
+        ];
+        for k in &mac {
+            assert_eq!(modifier_char(&typed(k.clone()), true, false), None, "{k}");
+        }
+        // Windows: plain Alt's character is the bare key's; Ctrl+Alt
+        // without the flag changed nothing; AltGr+Win is a shell chord.
+        let win_altgr = KeyDownEvent {
+            keystroke: stroke(
+                "e",
+                Some("€"),
+                Modifiers {
+                    platform: true,
+                    ..ctrl_alt()
+                },
+            ),
+            ..altgr("e", "€")
+        };
+        for ev in [
+            typed(stroke("g", Some("g"), alt())),
+            dead("g", "g", alt()),
+            typed(stroke("e", Some("€"), ctrl_alt())),
+            win_altgr,
+            altgr("enter", "\r"),
+        ] {
+            assert_eq!(modifier_char(&ev, false, true), None, "{}", ev.keystroke);
+        }
+        // Linux, and macOS's rule never applies on Windows or the reverse.
+        assert_eq!(modifier_char(&altgr("e", "€"), false, false), None);
+        assert_eq!(
+            modifier_char(&typed(stroke("g", Some("©"), alt())), false, false),
+            None
+        );
+        assert_eq!(
+            modifier_char(&typed(stroke("g", Some("©"), alt())), false, true),
+            None
+        );
     }
 
     /// A dead key's key-down as gpui reports it: ToUnicode was negative.

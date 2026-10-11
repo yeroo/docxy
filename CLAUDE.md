@@ -40,6 +40,10 @@
   registers none (it would get every key `on_key` typed). The harness's
   `win-char` sends WM_CHAR, and `real-type`'s `"wm_char":true` (always on
   Windows) or `"late"` replays each typed key's twin.
+- A dialog field takes the character ⌥ (macOS) or AltGr (Windows, Ctrl+Alt
+  with `prefer_character_input`) made: `modal_takes_key` hands the dialog
+  `text_input::dialog_stroke`'s plain typed key (#1162). `edit_key` still
+  swallows every other ⌥ key, and Windows' plain Alt is never text.
 
 ## macOS menu bar (#1071)
 

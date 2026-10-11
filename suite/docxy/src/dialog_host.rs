@@ -1035,6 +1035,139 @@ mod tests {
         }
     }
 
+    /// A platform key-down as `Docxy::modal_takes_key` hands it to the
+    /// dialog: the plain typed key when its modifiers made its character.
+    fn platform_key(t: &mut DocTab, ev: &KeyDownEvent, macos: bool, windows: bool) -> bool {
+        let k = crate::text_input::dialog_stroke(ev, macos, windows);
+        dialog_key(t, &k.key, k.key_char.as_deref(), k.modifiers)
+    }
+
+    fn key_down(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers,
+                key: key.into(),
+                key_char: key_char.map(Into::into),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    /// The issue's keys on macOS (#1162): ⌥G, ⌥2 and ABC-India's ⌥` type
+    /// their characters into a dialog field, as in the document. ⌥ keys
+    /// with no character of their own, and ⌘⌥ or ⌃⌥ chords, still edit
+    /// nothing.
+    #[test]
+    fn option_characters_type_into_a_dialog_field_on_macos() {
+        let mut t = tab_with_form();
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "tab", None));
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        let alt_shift = Modifiers { shift: true, ..alt };
+        let plain = Modifiers::default();
+        for ev in [
+            key_down("`", Some("`"), plain),
+            key_down("space", Some(" "), plain),
+            key_down("x", Some("x"), plain),
+            key_down("g", Some("©"), alt),
+            key_down("2", Some("™"), alt),
+            key_down("`", Some("`"), alt),
+            key_down("y", Some("Á"), alt_shift),
+            key_down("y", Some("y"), plain),
+        ] {
+            assert!(platform_key(&mut t, &ev, true, false));
+        }
+        assert_eq!(value(&t, "note"), Value::Text("` x©™`Áy".into()));
+        let swallowed = [
+            key_down("backspace", Some("\u{8}"), alt),
+            key_down(
+                "left",
+                None,
+                Modifiers {
+                    function: true,
+                    ..alt
+                },
+            ),
+            key_down(
+                "g",
+                Some("©"),
+                Modifiers {
+                    platform: true,
+                    ..alt
+                },
+            ),
+            key_down(
+                "g",
+                Some("©"),
+                Modifiers {
+                    control: true,
+                    ..alt
+                },
+            ),
+        ];
+        for ev in &swallowed {
+            assert!(platform_key(&mut t, ev, true, false));
+        }
+        assert_eq!(value(&t, "note"), Value::Text("` x©™`Áy".into()));
+        // Off macOS an ⌥ key is no text: Linux, and Windows' plain Alt.
+        for windows in [false, true] {
+            assert!(platform_key(
+                &mut t,
+                &key_down("g", Some("©"), alt),
+                false,
+                windows
+            ));
+        }
+        assert_eq!(value(&t, "note"), Value::Text("` x©™`Áy".into()));
+    }
+
+    /// Windows AltGr (#1162): Ctrl+Alt that changed the character types it
+    /// into a dialog field; Ctrl+Alt that changed nothing, and plain Alt,
+    /// edit nothing.
+    #[test]
+    fn altgr_characters_type_into_a_dialog_field_on_windows() {
+        let mut t = tab_with_form();
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "tab", None));
+        let ctrl_alt = Modifiers {
+            control: true,
+            alt: true,
+            ..Modifiers::default()
+        };
+        let altgr = |key: &str, ch: &str| KeyDownEvent {
+            prefer_character_input: true,
+            ..key_down(key, Some(ch), ctrl_alt)
+        };
+        assert!(platform_key(&mut t, &altgr("q", "@"), false, true));
+        assert!(platform_key(&mut t, &altgr("e", "€"), false, true));
+        assert_eq!(value(&t, "note"), Value::Text("@€".into()));
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        assert!(platform_key(
+            &mut t,
+            &key_down("g", Some("g"), alt),
+            false,
+            true
+        ));
+        assert!(platform_key(
+            &mut t,
+            &key_down("e", Some("€"), ctrl_alt),
+            false,
+            true
+        ));
+        assert!(
+            platform_key(&mut t, &altgr("e", "€"), false, false),
+            "Linux"
+        );
+        assert_eq!(value(&t, "note"), Value::Text("@€".into()));
+    }
+
     /// Ctrl+A selects the field's text and typing replaces it; Ctrl+V pastes
     /// the clipboard's text (its line breaks dropped); other chords still
     /// edit nothing (#1027).
