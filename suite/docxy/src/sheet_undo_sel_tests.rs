@@ -409,3 +409,69 @@ fn undo_scrolls_its_target_into_view_whole_rows_at_their_start() {
     assert_eq!(v.col0, 3);
     assert_eq!(v.reveal_col, Some(3));
 }
+
+#[test]
+fn undo_of_a_wide_paste_keeps_its_active_cell_on_screen() {
+    let mut v = view();
+    for c in 0..30 {
+        let s = v.active;
+        v.engine
+            .set_cell(&mut v.pkg.workbook, (s, 0, c), Cell::number(f64::from(c)));
+    }
+    select(&mut v, "A1", "AD1");
+    let clip = v.grid_clip(false).expect("something to copy");
+    select(&mut v, "B5", "B5");
+    assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    v.reveal_col = None;
+    assert!(v.undo_step());
+    assert_eq!(selected(&v), (at("B5"), at("AE5")));
+    assert_eq!(v.reveal_col, Some(1), "column B, not AE");
+}
+
+#[test]
+fn undo_of_a_step_on_the_selection_it_was_taken_with_leaves_the_view() {
+    // A chart move or a column width: no cells named, so nothing scrolls.
+    let mut v = view();
+    select(&mut v, "A1", "A1");
+    v.push_undo();
+    let s = v.active;
+    v.pkg.workbook.sheets[s].set_col_width(3, 30.0);
+    v.col0 = 40;
+    v.reveal_col = None;
+    assert!(v.undo_step());
+    assert_eq!(selected(&v), (at("A1"), at("A1")));
+    assert_eq!((v.col0, v.reveal_col), (40, None));
+    v.col0 = 40;
+    assert!(v.redo_step());
+    assert_eq!((v.col0, v.reveal_col), (40, None));
+}
+
+#[test]
+fn undo_and_redo_of_a_fill_handle_shrink_select_the_source_with_the_cleared_cells() {
+    use gridcore::edit::{FillKind, FillReq};
+    let mut v = view();
+    for name in ["B1", "B2", "B3", "B4"] {
+        put(&mut v, name, Cell::number(1.0));
+    }
+    let req = FillReq {
+        src: rect("B1:B4"),
+        to: at("B2"),
+        kind: FillKind::Auto,
+        ctrl: false,
+        lists: &[],
+    };
+    v.fill_drag(&req).unwrap();
+    assert_eq!(
+        value(&v, "B3"),
+        CellValue::Empty,
+        "the handle cleared B3:B4"
+    );
+    select(&mut v, "F9", "F9");
+    assert!(v.undo_step());
+    assert_eq!(value(&v, "B4"), CellValue::Number(1.0));
+    assert_eq!(selected(&v), (at("B1"), at("B4")));
+    select(&mut v, "F9", "F9");
+    assert!(v.redo_step());
+    assert_eq!(value(&v, "B4"), CellValue::Empty);
+    assert_eq!(selected(&v), (at("B1"), at("B4")));
+}

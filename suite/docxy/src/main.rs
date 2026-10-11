@@ -1007,6 +1007,10 @@ struct UndoTarget {
     rect: (u32, u32, u32, u32),
     /// The other areas of a multi-area selection the step changed.
     areas: Vec<(u32, u32, u32, u32)>,
+    /// Scrolled into view: the edit named its cells. A step that targets
+    /// the selection it was taken with (a chart move, a column width) leaves
+    /// the view where it is.
+    reveal: bool,
 }
 
 /// What an undo step puts back of the package.
@@ -1029,6 +1033,7 @@ impl SheetSnapshot {
             sheet,
             rect,
             areas: Vec::new(),
+            reveal: true,
         });
         self
     }
@@ -2575,6 +2580,7 @@ impl SheetView {
             sheet: snap.active,
             rect: sel_range(snap.sel, snap.anchor),
             areas: snap.areas.clone(),
+            reveal: false,
         });
         let mut now = self.snapshot_like(&snap);
         now.target = Some(target.clone());
@@ -2597,11 +2603,17 @@ impl SheetView {
         self.anchor = (r1, c1);
         self.areas = t.areas;
         self.stamp_areas();
-        // Whole rows or columns show their start, not the sheet's far edge.
-        let last = (gridcore::sheet::MAX_ROWS - 1, gridcore::sheet::MAX_COLS - 1);
-        let r1 = if (r0, r1) == (0, last.0) { r0 } else { r1 };
-        let c1 = if (c0, c1) == (0, last.1) { c0 } else { c1 };
-        self.reveal((r0, c0, r1, c1));
+        if !t.reveal {
+            return;
+        }
+        // The active cell's column, so a wide target keeps it on screen, and
+        // its rows (whole columns from row 1), as many as fit.
+        let r1 = if (r0, r1) == (0, gridcore::sheet::MAX_ROWS - 1) {
+            r0
+        } else {
+            r1
+        };
+        self.reveal((r0, c0, r1, c0));
     }
 
     /// The current state, taken as `snap` was: the package when it holds one.
