@@ -336,9 +336,7 @@ impl Editor {
     /// typing at the caret would, except next to a hyperlink, and text typed
     /// after it keeps that formatting (#279).
     pub fn insert_break(&mut self, kind: BreakKind) {
-        if self.has_selection() {
-            self.delete_selection();
-        }
+        self.delete_selection_to_replace();
         let props = resolve_para(&self.doc.body, &self.caret.path)
             .map(|p| tab_props_at(&p.content, self.caret.offset))
             .unwrap_or_default();
