@@ -1,0 +1,89 @@
+# Home › Cells › Format opens the Format Cells panel over the sheet (#1161).
+# While it is open it owns every key, as a dialog does (#393): Esc closes it,
+# Return is its Done, and nothing else reaches the grid behind it. The keys
+# are real (`real-key`/`real-type`), so they take the window's own input path,
+# the one a person's keyboard takes. Run with:
+#
+#   cargo run -p uiharness -- run uiharness/cases/sheet-format-cells-keys.uit
+#
+# J1 is clear of the fixture's data (A1:C5) and its chart (B9:H21).
+
+test esc closes format cells
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert format_cells_open is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  assert sel is J1
+  assert editing is false
+
+test return is format cells done and moves nothing
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert format_cells_open is true
+  call real-key {"key":"enter"}
+  assert format_cells_open is false
+  assert sel is J1
+  assert editing is false
+
+test typing under format cells edits no cell
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call ribbon-click {"tab":"Home","command":"Format"}
+  call real-type {"text":"zz"}
+  assert format_cells_open is true
+  assert editing is false
+  assert sel is J1
+  assert cell J1 is nothing
+  assert cell J2 is nothing
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  assert editing is false
+  assert cell J1 is nothing
+
+test keys under format cells change nothing behind it
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type x
+  key enter
+  click J1
+  assert cell J1 is x
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert format_cells_open is true
+  call real-key {"key":"ctrl+z"}
+  assert cell J1 is x
+  call real-key {"key":"down"}
+  call real-key {"key":"right"}
+  assert sel is J1
+  call real-key {"key":"tab"}
+  assert sel is J1
+  call real-key {"key":"shift+tab"}
+  assert sel is J1
+  call real-key {"key":"delete"}
+  assert cell J1 is x
+  call real-key {"key":"backspace"}
+  assert editing is false
+  assert cell J1 is x
+  call real-key {"key":"f10"}
+  assert keytips_up is false
+  call real-key {"key":"alt"}
+  assert keytips_up is false
+  assert cell J1 is x
+  assert sel is J1
+  assert editing is false
+  assert format_cells_open is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  assert cell J1 is x
+
+test format cells keys work again once it is closed
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call ribbon-click {"tab":"Home","command":"Format"}
+  call real-key {"key":"escape"}
+  call real-key {"key":"down"}
+  assert sel is J2
+  call real-type {"text":"zz"}
+  assert editing is true
