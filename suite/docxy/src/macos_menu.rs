@@ -452,11 +452,11 @@ impl Docxy {
         self.redo_only = false;
     }
 
-    /// Whether a menu-only item may run: not under an open dialog or the
-    /// sheet's Format Cells panel (#1161), which cover the window, nor an
-    /// open menu, as a click there could not.
+    /// Whether a menu-only item may run: not under an open dialog (Format
+    /// Cells among them, #1161), which covers the window, nor an open menu,
+    /// as a click there could not.
     fn menu_click_allowed(&self) -> bool {
-        self.refuse_under_dialog().is_ok() && !self.format_panel_owns_keys() && self.menu.is_none()
+        self.refuse_under_dialog().is_ok() && self.menu.is_none()
     }
 }
 
