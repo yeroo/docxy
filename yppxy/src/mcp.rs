@@ -73,34 +73,57 @@ fn tool_verb(name: &str) -> Option<&'static str> {
         "yppxy_unlink" => "link.del",
         "yppxy_find" => "find",
         "yppxy_save" => "proj.save",
+        "yppxy_assign_list" => "assign.list",
+        "yppxy_assign_get" => "assign.get",
+        "yppxy_assign_fields" => "assign.fields",
+        "yppxy_assign_add" => "assign.add",
+        "yppxy_assign_set" => "assign.set",
+        "yppxy_assign_del" => "assign.del",
         _ => return None,
     })
 }
 
 const FIELDS_DESC: &str = "Optional: Project field names to read for each task returned, e.g. [\"% Complete\", \"Actual Start\", \"Baseline Finish\", \"Total Slack\"] (yppxy_fields lists them). Each comes back under `fields` as {text: as the sheet shows it, value: dates \"YYYY-MM-DD HH:MM\", durations, work and slack in minutes, money a number, null when unset}. An unknown name fails the call before any edit.";
 
+const ASSIGN_FIELDS_DESC: &str = "Optional: Project assignment field names to read for each assignment returned, e.g. [\"Work\", \"Actual Work\", \"Baseline Cost\", \"Units\"] (yppxy_assign_fields lists them). Each comes back under `fields` as {text: as the sheet shows it, value: dates \"YYYY-MM-DD HH:MM\", work and delay in minutes (unlike work_hours/delay_hours and the work/delay arguments, which are hours), money a number, units a number, null when unset}. An unknown name fails the call before any edit.";
+
+const UNITS_DESC: &str = "Assignment units: a fraction (0.5) or a percent string (\"50%\"); for a material resource, its quantity.";
+
 const TARGET_DESC: &str = "Optional: which yppxy or suite instance to act on (a substring of its instance/pane id) when several are open.";
 
 fn tool_defs() -> Json {
     let target = || ("target", prop("string", TARGET_DESC));
     let tab = || {
-        let description = "Suite only: absolute zero-based tab index or case-insensitive Project title/path substring. Omit for the active tab.";
         (
             "tab",
-            Json::obj(vec![
-                (
-                    "type",
-                    Json::Arr(vec![
-                        Json::Str("integer".into()),
-                        Json::Str("string".into()),
-                    ]),
-                ),
-                ("description", Json::Str(description.into())),
-            ]),
+            prop_types(
+                &["integer", "string"],
+                "Suite only: absolute zero-based tab index or case-insensitive Project title/path substring. Omit for the active tab.",
+            ),
         )
     };
     let uid = || ("uid", prop("integer", "The task's UID (from yppxy_tasks)."));
     let fields = || ("fields", prop_array(item_ty("string"), FIELDS_DESC));
+    let assign_uid = || {
+        (
+            "uid",
+            prop(
+                "integer",
+                "The assignment's own UID (from yppxy_assign_list).",
+            ),
+        )
+    };
+    let assign_fields = || ("fields", prop_array(item_ty("string"), ASSIGN_FIELDS_DESC));
+    let units = || ("units", prop_types(&["number", "string"], UNITS_DESC));
+    let work = || {
+        (
+            "work",
+            prop_types(
+                &["number", "string"],
+                "Assignment work: a number of hours (a bare number is hours, even as a string such as \"8\"), or a duration such as \"40h\" or \"5d\".",
+            ),
+        )
+    };
     Json::Arr(vec![
         tool(
             "yppxy_list",
@@ -254,6 +277,123 @@ fn tool_defs() -> Json {
             ],
             &[],
         ),
+        tool(
+            "yppxy_assign_list",
+            "List resource assignments of the live schedule: every one, or those of task `uid` \
+             and/or of `resource` (a resource uid, or a name matched ignoring ASCII case). Each \
+             assignment has its own uid (which the other yppxy_assign_* tools take), task, \
+             resource, resource_name, units (a fraction, 1.0 = 100%; a material's quantity), \
+             work_hours, regular/overtime work, cost, rate_table (a letter, A when unset), \
+             baseline, actual and remaining work and cost, percent_work_complete, its own \
+             start/finish, delay_hours and contour; pass `fields` to read more.",
+            vec![
+                (
+                    "uid",
+                    prop(
+                        "integer",
+                        "Optional: only this task's assignments (the task's UID, from yppxy_tasks).",
+                    ),
+                ),
+                (
+                    "resource",
+                    prop_types(
+                        &["integer", "string"],
+                        "Optional: only this resource's assignments (a resource uid, or a name matched ignoring ASCII case).",
+                    ),
+                ),
+                assign_fields(),
+                target(),
+                tab(),
+            ],
+            &[],
+        ),
+        tool(
+            "yppxy_assign_get",
+            "Read one assignment by its own UID; pass `fields` to read any Project assignment \
+             field as shown and as a value.",
+            vec![assign_uid(), assign_fields(), target(), tab()],
+            &["uid"],
+        ),
+        tool(
+            "yppxy_assign_fields",
+            "List the Project assignment field names `fields` can read on the yppxy_assign_* \
+             tools, so a missing one is known to be unsupported rather than empty.",
+            vec![target(), tab()],
+            &[],
+        ),
+        tool(
+            "yppxy_assign_add",
+            "Assign a resource to task `task`. `resource` is a resource uid, or a name: a new \
+             name is created as a work resource, but a new name that is a number or contains a \
+             comma is refused (pass a uid as a number). Returns the new assignment with its \
+             uid. One undo step; the task reschedules.",
+            vec![
+                (
+                    "task",
+                    prop("integer", "The task's UID (from yppxy_tasks)."),
+                ),
+                (
+                    "resource",
+                    prop_types(
+                        &["integer", "string"],
+                        "The resource: its uid, or its name (a new name creates a work resource).",
+                    ),
+                ),
+                units(),
+                work(),
+                assign_fields(),
+                target(),
+                tab(),
+            ],
+            &["task", "resource"],
+        ),
+        tool(
+            "yppxy_assign_set",
+            "Edit an assignment: units, work, cost rate table, or delay. The task is rescheduled \
+             by its type, as in Project: a units edit on a Fixed Units task keeps the work and \
+             moves the duration; on Fixed Duration the work follows the units, and units given \
+             together with work are recomputed from the work. Every argument is checked before \
+             the edit, so a rejected call changes nothing. Returns the updated assignment. One \
+             undo step.",
+            vec![
+                assign_uid(),
+                units(),
+                work(),
+                (
+                    "rate_table",
+                    prop("string", "Cost rate table: a letter \"A\" to \"E\"."),
+                ),
+                (
+                    "delay",
+                    prop_types(
+                        &["number", "string"],
+                        "Assignment delay: a number of hours (a bare number is hours, even as a string), or a duration such as \"5d\".",
+                    ),
+                ),
+                assign_fields(),
+                target(),
+                tab(),
+            ],
+            &["uid"],
+        ),
+        tool(
+            "yppxy_assign_del",
+            "Remove an assignment by its own UID; the reply is {deleted, task}. One undo step; \
+             the task reschedules.",
+            vec![assign_uid(), target(), tab()],
+            &["uid"],
+        ),
+    ])
+}
+
+/// A JSON-schema property that accepts any of `types`.
+fn prop_types(types: &[&str], desc: &str) -> Json {
+    Json::obj(vec![
+        (
+            "type",
+            Json::Arr(types.iter().map(|t| Json::Str((*t).into())).collect()),
+        ),
+        ("description", Json::Str(desc.into())),
     ])
 }
 
@@ -391,6 +531,12 @@ mod tests {
             "yppxy_add",
             "yppxy_link",
             "yppxy_save",
+            "yppxy_assign_list",
+            "yppxy_assign_get",
+            "yppxy_assign_fields",
+            "yppxy_assign_add",
+            "yppxy_assign_set",
+            "yppxy_assign_del",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -406,6 +552,16 @@ mod tests {
     fn task_tools_take_fields_and_yppxy_fields_lists_them() {
         assert_eq!(tool_verb("yppxy_fields"), Some("task.fields"));
         assert_eq!(tool_verb("yppxy_nope"), None);
+        for (name, verb) in [
+            ("yppxy_assign_list", "assign.list"),
+            ("yppxy_assign_get", "assign.get"),
+            ("yppxy_assign_fields", "assign.fields"),
+            ("yppxy_assign_add", "assign.add"),
+            ("yppxy_assign_set", "assign.set"),
+            ("yppxy_assign_del", "assign.del"),
+        ] {
+            assert_eq!(tool_verb(name), Some(verb));
+        }
         let defs = tool_defs();
         for tool in defs.as_array().unwrap() {
             let name = tool.get_str("name").unwrap();
@@ -413,27 +569,146 @@ mod tests {
                 assert!(tool_verb(name).is_some(), "{name} forwards nowhere");
             }
             let props = tool.get("inputSchema").unwrap().get("properties").unwrap();
-            let takes = matches!(
-                tool_verb(name),
-                Some(
-                    "task.list"
-                        | "task.get"
-                        | "task.set"
-                        | "task.add"
-                        | "link.add"
-                        | "link.del"
-                        | "find"
-                )
+            let verb = tool_verb(name);
+            let assign = matches!(
+                verb,
+                Some("assign.list" | "assign.get" | "assign.add" | "assign.set")
             );
+            let takes = assign
+                || matches!(
+                    verb,
+                    Some(
+                        "task.list"
+                            | "task.get"
+                            | "task.set"
+                            | "task.add"
+                            | "link.add"
+                            | "link.del"
+                            | "find"
+                    )
+                );
             match props.get("fields") {
                 Some(f) if takes => {
                     assert_eq!(f.get_str("type"), Some("array"), "{name}");
                     assert_eq!(f.get("items").unwrap().get_str("type"), Some("string"));
+                    // Each points to the tool that lists its own field names.
+                    let desc = f.get_str("description").unwrap();
+                    let lister = if assign {
+                        "yppxy_assign_fields"
+                    } else {
+                        "yppxy_fields"
+                    };
+                    assert!(desc.contains(lister), "{name}: {desc}");
+                    assert_eq!(desc.contains("yppxy_assign_fields"), assign, "{name}");
+                    // A field's work is minutes; the assign arguments are hours.
+                    assert!(
+                        desc.contains("work and delay in minutes") || !assign,
+                        "{name}"
+                    );
                 }
                 None if !takes => {}
                 other => panic!("{name}: fields {other:?}"),
             }
         }
+    }
+
+    /// The input schema of tool `name`.
+    fn schema_of(name: &str) -> Json {
+        tool_defs()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t.get_str("name") == Some(name))
+            .unwrap_or_else(|| panic!("no tool {name}"))
+            .get("inputSchema")
+            .unwrap()
+            .clone()
+    }
+
+    fn prop_of<'a>(schema: &'a Json, prop: &str) -> &'a Json {
+        schema.get("properties").unwrap().get(prop).unwrap()
+    }
+
+    fn types_of(schema: &Json, prop: &str) -> Vec<String> {
+        match prop_of(schema, prop).get("type").unwrap() {
+            Json::Str(ty) => vec![ty.clone()],
+            Json::Arr(tys) => tys.iter().map(|t| t.as_str().unwrap().into()).collect(),
+            other => panic!("{prop}: type {other:?}"),
+        }
+    }
+
+    fn required_of(schema: &Json) -> Vec<String> {
+        let required = schema.get("required").unwrap().as_array().unwrap();
+        required
+            .iter()
+            .map(|r| r.as_str().unwrap().into())
+            .collect()
+    }
+
+    #[test]
+    fn assign_tools_take_the_types_the_verbs_accept() {
+        let list = schema_of("yppxy_assign_list");
+        assert_eq!(types_of(&list, "uid"), ["integer"]);
+        // `uid` here filters by task, unlike the other assign tools.
+        let task_uid = prop_of(&list, "uid").get_str("description").unwrap();
+        assert!(task_uid.contains("yppxy_tasks"), "{task_uid}");
+        assert_eq!(types_of(&list, "resource"), ["integer", "string"]);
+        assert!(required_of(&list).is_empty());
+        assert!(required_of(&schema_of("yppxy_assign_fields")).is_empty());
+        for name in ["yppxy_assign_get", "yppxy_assign_set", "yppxy_assign_del"] {
+            let schema = schema_of(name);
+            assert_eq!(types_of(&schema, "uid"), ["integer"], "{name}");
+            let own = prop_of(&schema, "uid").get_str("description").unwrap();
+            assert!(own.contains("yppxy_assign_list"), "{name}: {own}");
+            assert_eq!(required_of(&schema), ["uid"], "{name}");
+        }
+        let add = schema_of("yppxy_assign_add");
+        assert_eq!(types_of(&add, "task"), ["integer"]);
+        assert_eq!(types_of(&add, "resource"), ["integer", "string"]);
+        assert_eq!(required_of(&add), ["task", "resource"]);
+        let set = schema_of("yppxy_assign_set");
+        for schema in [&add, &set] {
+            assert_eq!(types_of(schema, "units"), ["number", "string"]);
+            assert_eq!(types_of(schema, "work"), ["number", "string"]);
+        }
+        assert_eq!(types_of(&set, "delay"), ["number", "string"]);
+        // The verb reads the letter in either case, so no enum narrows it.
+        assert_eq!(types_of(&set, "rate_table"), ["string"]);
+        assert!(prop_of(&set, "rate_table").get("enum").is_none());
+    }
+
+    #[test]
+    fn assign_tool_forwards_to_its_verb() {
+        let root = std::env::temp_dir().join(format!("yppxy-mcp-assign-{}", std::process::id()));
+        let suite_dir = root.join("suite");
+        let sources = [Source {
+            dir: &suite_dir,
+            app: "suite",
+        }];
+        let (suite, requests) = ctlcore::serve(&suite_dir, "suite-assign").unwrap();
+        let args = Json::obj(vec![
+            ("uid", Json::Num(7.0)),
+            ("units", Json::Str("50%".into())),
+            ("fields", Json::Arr(vec![Json::Str("Actual Work".into())])),
+            ("tab", Json::Num(1.0)),
+        ]);
+        let sent = args.clone();
+        let reply = Json::obj(vec![("uid", Json::Num(7.0)), ("units", Json::Num(0.5))]);
+        let answer = reply.clone();
+        let worker = std::thread::spawn(move || {
+            let req = requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(req.verb, "assign.set");
+            assert_eq!(req.args, sent);
+            req.reply_ok(answer);
+        });
+        let result = do_tool_in(&sources, "yppxy_assign_set", &args).unwrap();
+        worker.join().unwrap();
+        assert_eq!(Json::parse(&result).unwrap(), reply);
+        drop(suite);
+        std::fs::remove_dir(suite_dir).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[test]
