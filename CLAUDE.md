@@ -43,8 +43,11 @@
 - A dialog field takes the character ⌥ made on macOS: `modal_takes_key`
   hands the dialog `text_input::dialog_stroke`'s plain typed key (#1162).
   On Windows an AltGr key (Ctrl+Alt with `prefer_character_input`) under a
-  dialog owes no WM_CHAR (`dialog_altgr`, decided before `on_key`), so its
-  WM_CHAR types it and an AltGr dead key, which sends none, types nothing.
+  dialog owes the dialog (`dialog_altgr`, decided before `on_key`): its
+  WM_CHAR types it while a dialog is open and nothing once none is, and an
+  AltGr dead key, which sends none, types nothing. Under load that WM_CHAR
+  may land after later keys' text, or in the next field after a Tab. A plain
+  Windows dead key still types its accent into a dialog field.
   `edit_key` still swallows every ⌥ key, and Windows' plain Alt is never text.
 
 ## macOS menu bar (#1071)

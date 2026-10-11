@@ -1045,15 +1045,25 @@ mod tests {
 
     /// A Windows key-down as `Docxy::route_key` takes it: the dialog's key,
     /// then the WM_CHAR debt, decided by whether the dialog was open; then
-    /// the WM_CHAR `wm_char`, if any, whose unowed characters `on_key` types.
+    /// its WM_CHAR `wm_char`, if one comes at once.
     fn windows_key(t: &mut DocTab, ime: &mut ImeState, ev: &KeyDownEvent, wm_char: Option<&str>) {
-        let now = std::time::Instant::now();
         let open = t.dialogs.is_open();
         assert!(platform_key(t, ev, false));
-        ime.typed_key(ev, now, open);
-        for k in ime.char_message(wm_char.unwrap_or(""), now) {
-            assert!(platform_key(t, &k, false));
+        ime.typed_key(ev, std::time::Instant::now(), open);
+        if let Some(text) = wm_char {
+            windows_char(t, ime, text);
         }
+    }
+
+    /// A WM_CHAR as `Docxy::windows_char` takes it: the keys it types go to
+    /// the dialog; with none open, the count of keys for the surface below.
+    fn windows_char(t: &mut DocTab, ime: &mut ImeState, text: &str) -> usize {
+        let open = t.dialogs.is_open();
+        let keys = ime.char_message(text, std::time::Instant::now(), open);
+        for k in &keys {
+            assert!(platform_key(t, k, false));
+        }
+        if open { 0 } else { keys.len() }
     }
 
     fn key_down(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> KeyDownEvent {
@@ -1163,7 +1173,19 @@ mod tests {
         windows_key(&mut t, &mut ime, &n, Some("ñ"));
         windows_key(&mut t, &mut ime, &key_down("g", Some("g"), alt), None);
         assert_eq!(value(&t, "note"), Value::Text("@€ñ".into()));
-        assert_eq!(ime.owed(), 0);
+        // AltGr+Q, then Enter closes the dialog before the "@" WM_CHAR comes
+        // (gpui drained input alone): the "@" reaches nothing below.
+        windows_key(&mut t, &mut ime, &altgr("q", "@"), None);
+        windows_key(
+            &mut t,
+            &mut ime,
+            &key_down("enter", None, Modifiers::default()),
+            None,
+        );
+        assert!(!t.dialogs.is_open());
+        assert_eq!(windows_char(&mut t, &mut ime, "@"), 0);
+        // The tilde dead key's debt alone is left, to lapse.
+        assert_eq!(ime.owed(), 1);
     }
 
     /// Ctrl+A selects the field's text and typing replaces it; Ctrl+V pastes
