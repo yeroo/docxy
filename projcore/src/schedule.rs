@@ -1948,16 +1948,19 @@ impl<'a> Scheduler<'a> {
             // start plus its duration; an auto task finishes where the
             // forward pass placed it — a delayed flat-work assignment extends
             // that past the stored Duration (#469). A pinned (manual) task
-            // still measures from its start plus its stored Duration rather
-            // than its pinned finish, a known gap.
-            let finish = tracked.map(|_| tl.to_index(e_f)).unwrap_or_else(|| {
+            // with a pinned finish finishes there (#1052); one whose finish
+            // is derived measures from its start plus its stored Duration.
+            let pinned_finish = matches!(t.pinned_dates(), Some((_, Some(_))));
+            let finish = if tracked.is_some() || pinned_finish {
+                tl.to_index(e_f)
+            } else {
                 tl.to_index(e_s)
                     + if fixed(t) {
                         t.duration_min
                     } else {
                         self.scheduled_span(i)
                     }
-            });
+            };
             let free = self.free_slack(
                 t,
                 tl,
@@ -2121,8 +2124,7 @@ impl<'a> Scheduler<'a> {
     /// before the earliest successor must move. `None` ⇒ fall back to total.
     /// `finish` is the task's scheduled finish index (its actuals for a
     /// tracked task, the forward pass's placement for an auto task; a pinned
-    /// manual task still measures from its start plus its stored Duration, a
-    /// known gap).
+    /// manual task's pinned finish when it has one).
     fn free_slack(
         &self,
         t: &Task,
@@ -9309,6 +9311,53 @@ mod tests {
         let r = s.get(1).unwrap();
         assert_eq!(r.late_start.to_mspdi(), "2026-03-10T08:00:00");
         assert_eq!(r.total_slack_min, 6 * 480);
+    }
+
+    #[test]
+    fn pinned_manual_finish_free_slack_counts_from_its_pinned_finish() {
+        // Pinned Mon..Wed with a Duration of one day: free slack measures
+        // from the pinned finish, so the successor starting Thursday leaves
+        // none (#1052). Total slack is pinned too; the fix must not move it.
+        let mut pinned = manual(1, "Pinned", 480, at(2, 8));
+        pinned.manual_finish = Some(at(4, 17));
+        let mut succ = task(2, "S", 480);
+        succ.predecessors.push(fs(1));
+        let long = task(3, "Long", 4800);
+        let s = schedule(&march2(vec![pinned, succ, long]));
+        assert_eq!(dates(&s, 2).0, "2026-03-05T08:00:00");
+        let r = s.get(1).unwrap();
+        assert_eq!(r.free_slack_min, 0);
+        // Side effect check: total slack is untouched by this fix.
+        assert_eq!(r.total_slack_min, 2880);
+    }
+
+    #[test]
+    fn pinned_finish_before_its_duration_frees_slack_up_to_the_successor() {
+        // Pinned to finish Monday evening with a Duration of three days: the
+        // stored Duration overshoots the successor's Wednesday start, but the
+        // pinned finish leaves it Tuesday (#1052).
+        let mut pinned = manual(1, "P", 1440, at(2, 8));
+        pinned.manual_finish = Some(at(2, 17));
+        let mut succ = manual(2, "S", 480, at(4, 8));
+        succ.predecessors.push(fs(1));
+        let long = task(3, "Long", 4800);
+        let s = schedule(&march2(vec![pinned, succ, long]));
+        let r = s.get(1).unwrap();
+        assert_eq!(r.free_slack_min, 480);
+        // Side effect check: total slack is untouched by this fix.
+        assert_eq!(r.total_slack_min, 3840);
+    }
+
+    #[test]
+    fn pinned_derived_finish_free_slack_still_counts_from_its_duration() {
+        // No manual finish: the finish derives from start + Duration, and
+        // free slack keeps measuring from there (#1052).
+        let pinned = manual(1, "P", 480, at(2, 8));
+        let mut succ = manual(2, "S", 480, at(5, 8));
+        succ.predecessors.push(fs(1));
+        let long = task(3, "Long", 4800);
+        let s = schedule(&march2(vec![pinned, succ, long]));
+        assert_eq!(s.get(1).unwrap().free_slack_min, 960);
     }
 
     #[test]
