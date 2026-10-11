@@ -5028,6 +5028,51 @@ fn backstage_scroll_target(key: &str, cur_y: f32, view_h: f32, max_y: f32) -> Op
     Some(y.clamp(-max_y.max(0.0), 0.0))
 }
 
+/// What a key does while the Format Cells panel is open (#1161).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FmtPanelKey {
+    /// Close it: Esc, as every dialog, and Return, its Done. Its changes
+    /// are applied live, so Done has nothing left to apply.
+    Close,
+    /// Any other key: the panel owns it, so nothing reaches the grid.
+    Swallow,
+}
+
+/// The Format Cells panel's handling of a key, whatever its modifiers.
+fn format_panel_key(key: &str) -> FmtPanelKey {
+    match key {
+        "escape" | "enter" => FmtPanelKey::Close,
+        _ => FmtPanelKey::Swallow,
+    }
+}
+
+#[cfg(test)]
+mod format_panel_key_tests {
+    use super::{FmtPanelKey, format_panel_key};
+
+    /// #1161: Esc and Return close the panel; every other key is its own.
+    #[test]
+    fn esc_and_return_close_and_every_other_key_is_swallowed() {
+        assert_eq!(format_panel_key("escape"), FmtPanelKey::Close);
+        assert_eq!(format_panel_key("enter"), FmtPanelKey::Close);
+        for key in [
+            "z",
+            "down",
+            "right",
+            "tab",
+            "delete",
+            "backspace",
+            "alt",
+            "f10",
+            "f2",
+            "space",
+            "home",
+        ] {
+            assert_eq!(format_panel_key(key), FmtPanelKey::Swallow, "{key}");
+        }
+    }
+}
+
 /// The backstage content pane's layout, as `backstage-layout` reports it.
 struct BackstageLayout {
     viewport_h: f32,
@@ -11928,6 +11973,19 @@ impl Docxy {
     /// A dialog or the more-tabs list owns the key before any surface sees
     /// it (#393): true when one took it. (An open menu is `on_key`'s next
     /// check, `menu_key`.)
+    /// Whether the sheet's Format Cells panel is up, owning every key as a
+    /// dialog does (#1161). It is drawn only over a sheet, and the flag can
+    /// outlive a switch to another tab, whose keys it must not take.
+    fn format_panel_owns_keys(&self) -> bool {
+        self.active_is_sheet() && self.sheet_fmt_open
+    }
+
+    /// Close the Format Cells panel: its ×, Done, backdrop, Esc and Return.
+    fn close_sheet_format_panel(&mut self, cx: &mut Context<Self>) {
+        self.sheet_fmt_open = false;
+        cx.notify();
+    }
+
     fn modal_takes_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -11944,6 +12002,12 @@ impl Docxy {
             cx,
         ) {
             return true;
+        }
+        if self.format_panel_owns_keys() {
+            if format_panel_key(&ev.keystroke.key) == FmtPanelKey::Close {
+                self.close_sheet_format_panel(cx);
+            }
+            return true; // the panel owns every key; nothing reaches the grid
         }
         if self.tab_more_open {
             if ev.keystroke.key == "escape" {
@@ -22021,7 +22085,7 @@ impl Docxy {
         if self.dialog_takes_key("tab", None, Modifiers::default(), window, cx) {
             return;
         }
-        if self.tab_more_open {
+        if self.tab_more_open || self.format_panel_owns_keys() {
             return;
         }
         // File (backstage) covers the window; Tab there edits nothing under it.
@@ -22146,7 +22210,7 @@ impl Docxy {
         if self.dialog_takes_key("tab", None, shift, window, cx) {
             return;
         }
-        if self.tab_more_open {
+        if self.tab_more_open || self.format_panel_owns_keys() {
             return;
         }
         // File (backstage) covers the window; Tab there edits nothing under it.
@@ -30568,10 +30632,9 @@ impl Docxy {
                             .text_color(pal.dim)
                             .hover(|d| d.text_color(pal.fg))
                             .child("\u{00d7}")
-                            .on_click(cx.listener(|this, _, _w, cx| {
-                                this.sheet_fmt_open = false;
-                                cx.notify();
-                            })),
+                            .on_click(
+                                cx.listener(|this, _, _w, cx| this.close_sheet_format_panel(cx)),
+                            ),
                     ),
             )
             .child(v_flex().gap_1().child(heading("NUMBER")).child(number))
@@ -30604,10 +30667,7 @@ impl Docxy {
                         .bg(hsla_u(BRAND))
                         .text_color(hsla_u(0xffffff))
                         .child("Done")
-                        .on_click(cx.listener(|this, _, _w, cx| {
-                            this.sheet_fmt_open = false;
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(|this, _, _w, cx| this.close_sheet_format_panel(cx))),
                 ),
             );
 
@@ -30626,10 +30686,7 @@ impl Docxy {
             })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _w, cx| {
-                    this.sheet_fmt_open = false;
-                    cx.notify();
-                }),
+                cx.listener(|this, _, _w, cx| this.close_sheet_format_panel(cx)),
             )
             .child(
                 // Stop the card's own clicks from dismissing.
