@@ -115,6 +115,8 @@ mod sheet_select_tests;
 mod sheet_sort;
 #[cfg(test)]
 mod sheet_struct_tests;
+#[cfg(test)]
+mod sheet_undo_sel_tests;
 mod sheet_validation;
 mod style_gallery;
 mod table_dialogs;
@@ -989,6 +991,26 @@ struct SheetSnapshot {
     anchor: (u32, u32),
     /// The selection's other areas (#670), so undo restores them too.
     areas: Vec<(u32, u32, u32, u32)>,
+    /// What Undo and Redo of this step select (#1148), when the edit named
+    /// it: the cell typed in, the block pasted, the rows inserted. Without
+    /// one, the selection taken with the step. Carried to the other stack,
+    /// so Redo selects what Undo did.
+    target: Option<UndoTarget>,
+}
+
+/// What an undo step's Undo and Redo select (#1148), as Excel's do: what
+/// the step changes, wherever the selection is now, with the active cell at
+/// its top-left.
+#[derive(Clone)]
+struct UndoTarget {
+    sheet: usize,
+    rect: (u32, u32, u32, u32),
+    /// The other areas of a multi-area selection the step changed.
+    areas: Vec<(u32, u32, u32, u32)>,
+    /// Scrolled into view: the edit named its cells. A step that targets
+    /// the selection it was taken with (a chart move, a column width) leaves
+    /// the view where it is.
+    reveal: bool,
 }
 
 /// What an undo step puts back of the package.
@@ -1004,6 +1026,18 @@ enum SnapshotBody {
 }
 
 impl SheetSnapshot {
+    /// This step, its Undo and Redo selecting `rect` on sheet `sheet`
+    /// (#1148) rather than the selection taken with it.
+    fn targeting(mut self, sheet: usize, rect: (u32, u32, u32, u32)) -> Self {
+        self.target = Some(UndoTarget {
+            sheet,
+            rect,
+            areas: Vec::new(),
+            reveal: true,
+        });
+        self
+    }
+
     /// The workbook this step restores: what a command compares against to
     /// tell whether it changed anything, without a second copy.
     fn workbook(&self) -> &gridcore::sheet::Workbook {
@@ -2522,9 +2556,8 @@ impl SheetView {
         let Some(snap) = self.undo.pop() else {
             return false;
         };
-        let now = self.snapshot_like(&snap);
+        let now = self.take_step(snap);
         self.redo.push(now);
-        self.restore(snap);
         true
     }
 
@@ -2533,10 +2566,54 @@ impl SheetView {
         let Some(snap) = self.redo.pop() else {
             return false;
         };
-        let now = self.snapshot_like(&snap);
+        let now = self.take_step(snap);
         self.undo.push(now);
-        self.restore(snap);
         true
+    }
+
+    /// Restore the undo or redo step `snap` and select its target (#1148);
+    /// the current state, for the other stack, carries the same target. A
+    /// step that adds or removes a sheet keeps the selection it restores:
+    /// its target's sheet index may name another sheet, or none, now.
+    fn take_step(&mut self, snap: SheetSnapshot) -> SheetSnapshot {
+        let target = snap.target.clone().unwrap_or_else(|| UndoTarget {
+            sheet: snap.active,
+            rect: sel_range(snap.sel, snap.anchor),
+            areas: snap.areas.clone(),
+            reveal: false,
+        });
+        let mut now = self.snapshot_like(&snap);
+        now.target = Some(target.clone());
+        let sheets = self.pkg.workbook.sheets.len();
+        self.restore(snap);
+        if self.pkg.workbook.sheets.len() == sheets {
+            self.select_target(target);
+        }
+        now
+    }
+
+    /// Select an undo step's target: its rectangle with the active cell at
+    /// the top-left, and its other areas.
+    fn select_target(&mut self, t: UndoTarget) {
+        let (r0, c0, r1, c1) = t.rect;
+        self.active = t
+            .sheet
+            .min(self.pkg.workbook.sheets.len().saturating_sub(1));
+        self.sel = (r0, c0);
+        self.anchor = (r1, c1);
+        self.areas = t.areas;
+        self.stamp_areas();
+        if !t.reveal {
+            return;
+        }
+        // The active cell's column, so a wide target keeps it on screen, and
+        // its rows (whole columns from row 1), as many as fit.
+        let r1 = if (r0, r1) == (0, gridcore::sheet::MAX_ROWS - 1) {
+            r0
+        } else {
+            r1
+        };
+        self.reveal((r0, c0, r1, c0));
     }
 
     /// The current state, taken as `snap` was: the package when it holds one.
@@ -2686,6 +2763,12 @@ impl SheetView {
         true
     }
 
+    /// [`Self::push_undo`] for an edit that changes `rect` on sheet `sheet`:
+    /// its Undo and Redo select that, not the selection (#1148).
+    fn push_undo_at(&mut self, sheet: usize, rect: (u32, u32, u32, u32)) {
+        self.push_undo_snapshot(self.snapshot().targeting(sheet, rect));
+    }
+
     /// Record `snap`, taken before an edit that has now landed.
     fn push_undo_snapshot(&mut self, snap: SheetSnapshot) {
         self.edit_gen += 1;
@@ -2820,7 +2903,7 @@ impl SheetView {
         let link = self.typed_link(&buf, took, cell.as_ref());
         self.editing = None;
         self.end_cell_edit();
-        self.push_undo();
+        self.push_undo_at(s, (r, c, r, c));
         let typed = cell.is_some();
         if let Some(cell) = cell {
             self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
@@ -2906,7 +2989,11 @@ impl SheetView {
         let s = p.origin.0;
         self.editing = None;
         self.end_cell_edit();
-        self.push_undo();
+        // An entry in one cell selects it; Ctrl+Enter's range, the selection.
+        match p.cells.as_slice() {
+            [(r, c, _)] => self.push_undo_at(s, (*r, *c, *r, *c)),
+            _ => self.push_undo(),
+        }
         match <[_; 1]>::try_from(p.cells) {
             Ok([(cr, cc, cell)]) => {
                 self.engine
@@ -3741,7 +3828,13 @@ impl SheetView {
         }
         // Rows or columns are about to move: circles name cells, not rules.
         self.circles.clear();
-        self.push_undo();
+        // Undo and Redo select the whole rows or columns (#1148).
+        let (last_r, last_c) = (gridcore::sheet::MAX_ROWS - 1, gridcore::sheet::MAX_COLS - 1);
+        let target = match op {
+            StructOp::InsertRow | StructOp::DeleteRow => (r0, 0, r1, last_c),
+            StructOp::InsertCol | StructOp::DeleteCol => (0, c0, last_r, c1),
+        };
+        self.push_undo_at(s, target);
         let wb = &mut self.pkg.workbook;
         let shift = match op {
             StructOp::InsertRow => {
@@ -3894,6 +3987,7 @@ impl SheetView {
             sel: self.sel,
             anchor: self.anchor,
             areas: self.extra_areas(),
+            target: None,
         }
     }
 
@@ -4112,12 +4206,24 @@ impl SheetView {
     /// Select the block just written at `at`: the active cell at its
     /// top-left, as Excel leaves a paste.
     fn select_block(&mut self, at: (u32, u32), block: &[Vec<gridcore::sheet::Cell>]) {
-        let h = block.len() as u32;
-        let w = block.iter().map(Vec::len).max().unwrap_or(0) as u32;
-        if h > 0 && w > 0 {
+        if let Some((_, _, r1, c1)) = block_rect(at, block) {
             self.sel = at;
             self.clear_areas();
-            self.anchor = (at.0 + h - 1, at.1 + w - 1);
+            self.anchor = (r1, c1);
+        }
+    }
+
+    /// [`Self::push_undo`] for a paste of `block` at `at` on sheet `sheet`:
+    /// its Undo and Redo select the block (#1148).
+    fn push_undo_block(
+        &mut self,
+        sheet: usize,
+        at: (u32, u32),
+        block: &[Vec<gridcore::sheet::Cell>],
+    ) {
+        match block_rect(at, block) {
+            Some(rect) => self.push_undo_at(sheet, rect),
+            None => self.push_undo(),
         }
     }
 
@@ -4139,7 +4245,7 @@ impl SheetView {
                 gridcore::engine::PART_OF_ARRAY.to_string(),
             ));
         }
-        self.push_undo();
+        self.push_undo_block(s, at, block);
         self.engine
             .paste_block_prechecked(&mut self.pkg.workbook, s, at, block);
         self.select_block(at, block);
@@ -4334,7 +4440,7 @@ impl SheetView {
                 gridcore::engine::PART_OF_ARRAY.to_string(),
             ));
         }
-        self.push_undo();
+        self.push_undo_block(dst, at, &block);
         // References follow first, and the engine is rebuilt on them, so the
         // writes below recalculate what reads the moved cells where they land.
         gridcore::edit::move_refs(&mut self.pkg.workbook, src, &mv);
@@ -9792,6 +9898,17 @@ fn series_resolved_preview(name: &str, name_ref: Option<&str>, max_chars: usize)
     name_ref
         .and_then(gridcore::sheet::ChartSource::parse_f_ref)
         .map(|_| bounded_label(name, max_chars))
+}
+
+/// The rectangle `block` covers written at `at`, top-left to bottom-right;
+/// `None` for an empty block.
+fn block_rect(
+    at: (u32, u32),
+    block: &[Vec<gridcore::sheet::Cell>],
+) -> Option<(u32, u32, u32, u32)> {
+    let h = block.len() as u32;
+    let w = block.iter().map(Vec::len).max().unwrap_or(0) as u32;
+    (h > 0 && w > 0).then(|| (at.0, at.1, at.0 + h - 1, at.1 + w - 1))
 }
 
 /// The rectangle a selection covers, whichever corner it was dragged from.
