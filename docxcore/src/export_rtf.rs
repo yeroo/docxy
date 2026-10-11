@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use crate::export_context::{ExportContext, final_view};
+use crate::highlight::highlight_rgb;
 use crate::model::{
     Align, Block, BreakKind, Cell, Document, Inline, Paragraph, RevisionKind, RunProps, Table,
     VMerge, VertAlign,
@@ -493,17 +494,30 @@ impl Writer<'_> {
             .as_deref()
             .filter(|c| c.len() == 6 && c.chars().all(|ch| ch.is_ascii_hexdigit()))
         {
-            let color = color.to_ascii_uppercase();
-            let i = match self.colors.iter().position(|c| *c == color) {
-                Some(i) => i,
-                None => {
-                    self.colors.push(color);
-                    self.colors.len() - 1
-                }
-            };
-            let _ = write!(out, "\\cf{}", i + 1);
+            let i = self.color_index(color.to_ascii_uppercase());
+            let _ = write!(out, "\\cf{i}");
+        }
+        // Word reads `\highlight`; Cocoa (TextEdit, Pages) reads only `\cb`.
+        let highlight = |p: &RunProps| p.highlight.as_deref().and_then(highlight_rgb);
+        if let Some((r, g, b)) = highlight(p) {
+            let i = self.color_index(format!("{r:02X}{g:02X}{b:02X}"));
+            let _ = write!(out, "\\highlight{i}\\cb{i}");
+        } else if highlight(base).is_some() {
+            out.push_str("\\highlight0\\cb0");
         }
         out
+    }
+
+    /// The `\colortbl` index of hex `color` (1-based: entry 0 is auto),
+    /// added to the table if new.
+    fn color_index(&mut self, color: String) -> usize {
+        match self.colors.iter().position(|c| *c == color) {
+            Some(i) => i + 1,
+            None => {
+                self.colors.push(color);
+                self.colors.len()
+            }
+        }
     }
 }
 
@@ -1019,6 +1033,34 @@ pub(crate) mod tests {
         assert!(s.contains("{\\f1\\fnil\\fcharset0 Georgia;}"), "{s}");
         assert!(s.contains("{\\colortbl;\\red255\\green0\\blue0;}"), "{s}");
         assert!(s.contains("{\\f1\\fs28\\cf1 x}"), "{s}");
+    }
+
+    #[test]
+    fn highlight_writes_highlight_and_cb() {
+        let props = |color: Option<&str>, highlight: &str| RunProps {
+            color: color.map(Into::into),
+            highlight: Some(highlight.into()),
+            ..RunProps::default()
+        };
+        let doc = Document {
+            body: vec![para(
+                ParProps::default(),
+                vec![
+                    run("a", props(Some("FF0000"), "yellow")),
+                    run("b", props(None, "red")),
+                    run("c", props(None, "none")),
+                ],
+            )],
+        };
+        let s = rtf(&doc);
+        assert!(
+            s.contains("{\\colortbl;\\red255\\green0\\blue0;\\red255\\green255\\blue0;}"),
+            "{s}"
+        );
+        assert!(s.contains("\\fs22\\cf1\\highlight2\\cb2 a}"), "{s}");
+        // Red as a highlight reuses the red text colour's entry.
+        assert!(s.contains("\\fs22\\highlight1\\cb1 b}"), "{s}");
+        assert!(s.contains("\\fs22 c}"), "{s}");
     }
 
     #[test]

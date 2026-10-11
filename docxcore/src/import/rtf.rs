@@ -9,8 +9,12 @@
 //! (hyperlink text), `\uN` with its `\ucN` fallback skipped, and `\'hh`
 //! decoded in the code page the font's `\fcharset` (or `\ansicpg`) names.
 //!
+//! Also kept: font colour (`\cf`) and highlight (`\highlight`, Cocoa's
+//! `\cb`, or `\chcbpat`) through the colour table, a highlight as the
+//! nearest Word highlight name.
+//!
 //! Dropped: pictures, objects, headers / footers, notes, annotations, field
-//! instructions, hidden text, fonts, sizes and colours. A double-byte code
+//! instructions, hidden text, fonts and sizes. A double-byte code
 //! page (`\ansicpg932`, 936, 949, 950) has no table here: each of its byte
 //! pairs comes out as U+FFFD rather than failing the document.
 
@@ -18,6 +22,7 @@ use super::{Budget, Builder, MAX_DEPTH, TOO_BIG, heading_props, marker_is_number
 
 /// The longest list marker or style name kept, in bytes.
 const MAX_NAME: usize = 64;
+use crate::highlight::nearest_highlight;
 use crate::model::{Align, Document, ParProps, RunProps, VertAlign};
 use std::collections::HashMap;
 
@@ -61,6 +66,8 @@ enum Dest {
     /// Dropped: an ignorable or unwanted destination.
     Skip,
     FontTable,
+    /// `\colortbl`: `\red`/`\green`/`\blue`, each entry ended by `;`.
+    ColorTable,
     StyleSheet,
     /// The list marker Word writes before a list paragraph.
     ListText,
@@ -132,6 +139,11 @@ struct Reader<'a> {
     style_entry: Option<(Option<i32>, String)>,
     style_depth: usize,
     font_entry: i32,
+    /// The colour table: `None` for an entry that names no colour (auto),
+    /// as entry 0 usually is. Charged to the budget as kept.
+    colors: Vec<Option<(u8, u8, u8)>>,
+    /// The colour table entry being read.
+    color_entry: Option<(u8, u8, u8)>,
     /// `\uN` fallback bytes still to drop.
     skip: usize,
     /// A UTF-16 high surrogate waiting for its low half.
@@ -178,6 +190,8 @@ impl<'a> Reader<'a> {
             style_entry: None,
             style_depth: 0,
             font_entry: 0,
+            colors: Vec::new(),
+            color_entry: None,
             skip: 0,
             high: None,
             lead: false,
@@ -364,8 +378,13 @@ impl<'a> Reader<'a> {
                 self.st.dest = Dest::Body;
                 return;
             }
+            b"colortbl" => {
+                self.st.dest = Dest::ColorTable;
+                self.colors.clear();
+                self.color_entry = None;
+                return;
+            }
             b"upr"
-            | b"colortbl"
             | b"info"
             | b"pict"
             | b"object"
@@ -424,6 +443,7 @@ impl<'a> Reader<'a> {
         }
         match self.st.dest {
             Dest::FontTable => return self.font_word(w, num),
+            Dest::ColorTable => return self.color_word(w, num),
             Dest::StyleSheet => {
                 if self.stack.len() == self.style_depth + 1 {
                     match w {
@@ -500,6 +520,20 @@ impl<'a> Reader<'a> {
             b"sub" => self.st.run.vert_align = VertAlign::Subscript,
             b"nosupersub" => self.st.run.vert_align = VertAlign::Baseline,
             b"v" => self.st.hidden = on,
+            b"cf" => {
+                self.st.run.color = self
+                    .color(num)
+                    .map(|(r, g, b)| format!("{r:02X}{g:02X}{b:02X}"));
+            }
+            // A white background is Cocoa's "none" as often as a choice, and
+            // a white highlight paints nothing, so white is no highlight.
+            b"highlight" | b"cb" | b"chcbpat" => {
+                self.st.run.highlight = self
+                    .color(num)
+                    .map(nearest_highlight)
+                    .filter(|&h| h != "white")
+                    .map(Into::into);
+            }
             b"f" => self.st.font = n,
             b"pard" => {
                 self.st.style = None;
@@ -616,6 +650,33 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// A control word in `\colortbl`: a component of the entry being read.
+    fn color_word(&mut self, w: &[u8], num: Option<i32>) {
+        let v = num.unwrap_or(0).clamp(0, 255) as u8;
+        let entry = self.color_entry.get_or_insert((0, 0, 0));
+        match w {
+            b"red" => entry.0 = v,
+            b"green" => entry.1 = v,
+            b"blue" => entry.2 = v,
+            _ => {}
+        }
+    }
+
+    /// The `;` that ends a colour table entry: kept while the budget allows.
+    fn end_color(&mut self) {
+        let entry = self.color_entry.take();
+        if self.budget.keep::<Option<(u8, u8, u8)>>(0) {
+            self.colors.push(entry);
+        }
+    }
+
+    /// Colour table entry `num`; `None` for auto (entry 0, or an entry with
+    /// no colour), a missing number, or an entry past the table.
+    fn color(&self, num: Option<i32>) -> Option<(u8, u8, u8)> {
+        let i = usize::try_from(num?).ok()?;
+        *self.colors.get(i)?
+    }
+
     /// Font table entry `n`, a new one charged as kept memory.
     fn font_slot(&mut self, n: i32) -> Option<&mut Font> {
         if !self.fonts.contains_key(&n) && !self.budget.keep::<(i32, Font)>(0) {
@@ -645,6 +706,11 @@ impl<'a> Reader<'a> {
             Dest::ListText => {
                 if self.list_text.len() < MAX_NAME {
                     self.list_text.push_str(s);
+                }
+            }
+            Dest::ColorTable => {
+                for _ in s.matches(';') {
+                    self.end_color();
                 }
             }
             Dest::StyleSheet => {
@@ -821,6 +887,78 @@ mod tests {
         let p = paras(&doc);
         assert!(matches!(p[0].content[1], Inline::Tab(_)));
         assert!(matches!(p[1].content[1], Inline::Break(..)));
+    }
+
+    /// Each run's text, colour and highlight.
+    fn colours(rtf: &str) -> Vec<(String, Option<String>, Option<String>)> {
+        let doc = import_rtf(rtf.as_bytes()).unwrap();
+        paras(&doc)
+            .iter()
+            .flat_map(|p| &p.content)
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some((
+                    r.text.clone(),
+                    r.props.color.clone(),
+                    r.props.highlight.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn run(
+        text: &str,
+        color: Option<&str>,
+        highlight: Option<&str>,
+    ) -> (String, Option<String>, Option<String>) {
+        (
+            text.into(),
+            color.map(Into::into),
+            highlight.map(Into::into),
+        )
+    }
+
+    #[test]
+    fn pages_cf_and_cb_set_colour_and_highlight() {
+        // As Cocoa writes it: entry 1 white (its "no background"), then red
+        // and Pages' pale yellow highlight.
+        let rtf = r"{\rtf1\ansi\cocoartf2822{\fonttbl\f0\fswiss Helvetica;}{\colortbl;\red255\green255\blue255;\red255\green0\blue0;\red255\green252\blue158;}{\*\expandedcolortbl;;}\f0\cf0\cb1 a \cf2 red\cf0 \cb3 hi\cb1  plain\par}";
+        assert_eq!(
+            colours(rtf),
+            [
+                run("a ", None, None),
+                run("red", Some("FF0000"), None),
+                run("hi", None, Some("yellow")),
+                run(" plain", None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn word_highlight_and_chcbpat_map_to_nearest_name() {
+        let rtf = r"{\rtf1{\colortbl;\red0\green0\blue0;\red0\green255\blue0;\red0\green0\blue128;}{\highlight2 green}{\chcbpat3 navy}{\cf1 black}\par}";
+        assert_eq!(
+            colours(rtf),
+            [
+                run("green", None, Some("green")),
+                run("navy", None, Some("darkBlue")),
+                run("black", Some("000000"), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_index_and_white_background_clear() {
+        let rtf = r"{\rtf1{\colortbl;\red255\green0\blue0;\red255\green255\blue255;}\cf1\highlight1 a\highlight0\cf0 b\cf1\cb1 c\plain d\cb2 e\cb9\cf9 f\par}";
+        assert_eq!(
+            colours(rtf),
+            [
+                run("a", Some("FF0000"), Some("red")),
+                run("b", None, None),
+                run("c", Some("FF0000"), Some("red")),
+                run("def", None, None),
+            ]
+        );
     }
 
     #[test]

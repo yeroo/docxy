@@ -219,6 +219,38 @@ mod tests {
         assert_eq!(shape(&round_trip(&clip)), shape(&clip));
     }
 
+    #[test]
+    fn colour_and_highlight_round_trip() {
+        let props = |color: Option<&str>, highlight: Option<&str>| RunProps {
+            color: color.map(Into::into),
+            highlight: highlight.map(Into::into),
+            ..RunProps::default()
+        };
+        let clip = Clip {
+            paras: vec![vec![
+                plain("Plain "),
+                run("red", props(Some("FF0000"), None)),
+                run("marked", props(None, Some("yellow"))),
+                run("both", props(Some("0070C0"), Some("darkGreen"))),
+                plain(" end"),
+            ]],
+        };
+        let colours = |clip: &Clip| -> Vec<(String, Option<String>, Option<String>)> {
+            clip.paras[0]
+                .iter()
+                .filter_map(|i| match i {
+                    Inline::Run(r) => Some((
+                        r.text.clone(),
+                        r.props.color.clone(),
+                        r.props.highlight.clone(),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(colours(&round_trip(&clip)), colours(&clip));
+    }
+
     /// The paragraph mark survives exactly: a partial copy gains no mark, a
     /// copy through it keeps it (and gains no empty paragraph).
     #[test]
