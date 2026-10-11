@@ -2343,8 +2343,8 @@ impl App {
     /// The selection intersected with the sheet's used range, so operations
     /// that iterate every coordinate (copy, clear) never walk the full
     /// 1,048,576 × 16,384 grid when the user selects whole rows/columns or
-    /// the entire sheet. Falls back to the cursor cell when the selection
-    /// covers only empty area (nothing to iterate).
+    /// the entire sheet. Falls back to the selection's top-left corner when
+    /// the selection starts past the data (nothing to iterate).
     fn iter_selection(&self) -> (u32, u32, u32, u32) {
         let (r1, c1, r2, c2) = self.selection();
         let (used_r, used_c) = self.sheet().used_size();
@@ -5121,7 +5121,14 @@ impl App {
         get: fn(&Xf) -> bool,
         set: fn(&mut Xf, bool),
     ) -> impl Fn(&mut Xf) + 'static {
-        let (r, c) = self.cur;
+        // The active cell, when the selection's formatted part holds it;
+        // else that part's top-left corner, so a toggle always reads a cell
+        // it writes and can turn back off.
+        let (r1, c1, r2, c2) = self.iter_selection();
+        let (r, c) = match self.cur {
+            (r, c) if (r1..=r2).contains(&r) && (c1..=c2).contains(&c) => (r, c),
+            _ => (r1, c1),
+        };
         let style = self.sheet().cell(r, c).map_or(0, |cl| cl.style);
         let on = !get(&self.pkg.workbook.styles.xf(style));
         move |x| set(x, on)
@@ -22347,6 +22354,39 @@ mod tests {
         assert!(xf_at(&app, 1, 0).bold, "and so does A2: not flipped off");
         chord(&mut app, 'b');
         assert!(!xf_at(&app, 0, 0).bold && !xf_at(&app, 1, 0).bold);
+    }
+
+    #[test]
+    fn a_toggle_whose_cursor_is_past_the_data_still_turns_off() {
+        // A1:A3 bold data; the selection runs on to A5, past the data, so
+        // only A1:A3 are written and the toggle must read one of them.
+        let mut app = repeat_app();
+        for _ in 0..3 {
+            type_text(&mut app, "1");
+            press(&mut app, KeyCode::Enter);
+        }
+        app.anchor = Some((0, 0));
+        app.cur = (2, 0);
+        chord(&mut app, 'b');
+        assert!((0..3).all(|r| xf_at(&app, r, 0).bold));
+        go(&mut app, 0, 0);
+        for _ in 0..4 {
+            press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        }
+        assert_eq!((app.cur, app.anchor), ((4, 0), Some((0, 0))));
+        chord(&mut app, 'b');
+        assert!((0..3).all(|r| !xf_at(&app, r, 0).bold), "un-bolded");
+        chord(&mut app, 'b');
+        assert!((0..3).all(|r| xf_at(&app, r, 0).bold), "bold again");
+        // An empty sheet formats only the corner: A1, read from A1.
+        let mut app = repeat_app();
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(app.cur, (2, 0));
+        chord(&mut app, 'b');
+        assert!(xf_at(&app, 0, 0).bold, "first press bolds A1");
+        chord(&mut app, 'b');
+        assert!(!xf_at(&app, 0, 0).bold, "second press un-bolds it");
     }
 
     #[test]
