@@ -4624,6 +4624,9 @@ struct Docxy {
     /// `Cell` because `persist` takes `&self`.
     last_persist: std::cell::Cell<std::time::Instant>,
     applied: Option<ThemeMode>,
+    /// The OS appearance Auto follows: seeded when the window opens, updated
+    /// by gpui's appearance observer (#1075).
+    os_appearance: gpui::WindowAppearance,
     // Find & replace bar (Ctrl+F). Self-managed text fields (no gpui-component
     // InputState entity) — keystrokes route here while `find_open`.
     find_open: bool,
@@ -11587,6 +11590,7 @@ impl Docxy {
             trusted_error: None,
             last_persist: std::cell::Cell::new(std::time::Instant::now()),
             applied: None,
+            os_appearance: gpui::WindowAppearance::Light,
             find_open: false,
             find_query: String::new(),
             replace_text: String::new(),
@@ -12014,6 +12018,31 @@ impl Docxy {
         });
         self.persist(cx);
         self.refocus(window, cx);
+    }
+
+    /// Apply the theme choice (Auto follows the OS appearance) if the drawn
+    /// theme is not already it. `Theme` is a gpui global shared by every
+    /// window; `applied` is per window, so each window checks its own.
+    fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let desired = self.theme_pref.resolve(self.os_appearance);
+        if self.applied != Some(desired) {
+            Theme::change(desired, Some(window), cx);
+            self.applied = Some(desired);
+        }
+    }
+
+    /// gpui's window appearance observer calls this (#1075): record the OS
+    /// switch, draw what it resolves to, and let the view paint it. The
+    /// harness's `appearance-set` verb plays the same switch through here.
+    fn os_appearance_changed(
+        &mut self,
+        appearance: gpui::WindowAppearance,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.os_appearance = appearance;
+        self.apply_theme(window, cx);
+        cx.notify();
     }
 
     fn set_ask_on_close(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -32935,11 +32964,7 @@ impl Render for Docxy {
             }
         }
         // Apply the theme choice (Auto follows the OS appearance).
-        let desired = self.theme_pref.resolve(window.appearance());
-        if self.applied != Some(desired) {
-            Theme::change(desired, Some(window), cx);
-            self.applied = Some(desired);
-        }
+        self.apply_theme(window, cx);
         if !self.focused {
             self.focus.focus(window, cx);
             self.focused = true;
@@ -38176,6 +38201,18 @@ fn open_docxy_window(
                     control::attach(server, rx, window, cx);
                 }
             }
+            // Auto follows the OS appearance (#1075): seed it from the window
+            // before the first render, and let gpui's appearance observer
+            // drive the same handler a macOS Light/Dark switch would. The
+            // observer drops itself once the view is gone, so `detach` is
+            // enough.
+            view.update(cx, |this, cx| {
+                this.os_appearance = window.appearance();
+                cx.observe_window_appearance(window, |this, window, cx| {
+                    this.os_appearance_changed(window.appearance(), window, cx)
+                })
+                .detach();
+            });
             // Open any command-line files on top of the restored session.
             if !startup_files.is_empty() {
                 view.update(cx, move |this, cx| {
