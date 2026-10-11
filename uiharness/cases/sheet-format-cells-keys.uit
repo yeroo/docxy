@@ -66,6 +66,9 @@ test keys under format cells change nothing behind it
   call real-key {"key":"backspace"}
   assert editing is false
   assert cell J1 is x
+  # Ctrl+1 under the panel keeps it open. A leaked Ctrl+1 would only reopen
+  # it, so this cannot show the key is swallowed: `format_panel_key`'s unit
+  # test does (#1164).
   call real-key {"key":"ctrl+1"}
   assert format_cells_open is true
   assert cell J1 is x

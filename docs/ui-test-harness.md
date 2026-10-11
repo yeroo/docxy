@@ -363,7 +363,7 @@ State keys, as the app reports them after every driving verb:
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
 | `picking`, `range_preview`, `sel_hidden` | point mode |
 | `find_open`, `find_query`, `replace_text` | the find bar (Ctrl+F) and its Find and Replace fields; Down moves to Replace |
-| `format_cells_open` | the sheet's Format Cells panel (Home › Cells › Format) is open and owns every key; Esc and Return close it (#1161). False on a non-sheet tab or in File (backstage) |
+| `format_cells_open` | the sheet's Format Cells panel (Home › Cells › Format, Ctrl+1 or ⌘1, or the Home Font, Alignment and Number launchers, #1164) is open and owns every key; Esc and Return close it (#1161). False on a non-sheet tab or in File (backstage) |
 | `keytips_up` | the Alt / F10 KeyTips overlay is up, at either level |
 | `ime_marked` | the input handler's marked text (a dead key's accent or an IME's provisional text, typed nowhere yet), or null (#1072) |
 | `wm_char_owed` | the WM_CHAR characters typed keys still owe the Windows input handler, lapsed ones included (#1139) |
@@ -1385,7 +1385,7 @@ have. `word-header-footer.uit` drives these over a three-section document.
 `window`, `grid`, `chart-panel`, `cell:B3`, `cell:A1:C5`, `chart:0`, `gantt`,
 `bar:<id>` (for example `bar:3`), `project-hbar-table`, `project-hbar-chart`,
 `project-vbar`, `project-timeline`, `project-split`, `gallery`, `ribbon`,
-`ribbon-flyout`, `ribbon-group:<index>`, `title-tabs`,
+`ribbon-flyout`, `ribbon-group:<index>`, `ribbon-launch:<group title>`, `title-tabs`,
 `tab-prev`, `tab-next`, `tab-more`, `tab-more-item:<index>` (the last exists while
 the more-tabs list is open), `tab-chip:<index>` — a visible title-bar chip by
 absolute tab index; absent while the chip is scrolled out of the strip. `gantt`
@@ -1402,6 +1402,11 @@ collapsed ribbon hides it. `ribbon` is the ribbon body (the groups of the tab
 shown), `ribbon-flyout` a collapsed group's open flyout (#1020), and
 `ribbon-group:<index>` group `index` of the tab shown as it is drawn: in place,
 or its collapsed button (a `pointer-click` there opens or shuts its flyout).
+`ribbon-launch:<group title>` (for example `ribbon-launch:Number`, the title
+matched without regard to case) is the dialog launcher (↘) of the sheet ribbon
+group with that title, while the group is drawn in place on the tab shown
+(#1164). It is an error when the group draws no launcher, and when the group is
+not drawn in place (collapsed into a flyout, or on another tab).
 `filter-button:<column>` (for example
 `filter-button:B`) is the AutoFilter button on that column's header cell
 (#690), an error while the sheet has no filter there or the button is

@@ -5091,6 +5091,8 @@ mod format_panel_key_tests {
             "f2",
             "space",
             "home",
+            // Ctrl+1, which opens the panel (#1164), does nothing more under it.
+            "1",
         ] {
             assert_eq!(format_panel_key(key), FmtPanelKey::Swallow, "{key}");
         }
@@ -26853,8 +26855,10 @@ pub(crate) struct RibbonFlyout {
 }
 
 /// The prefix a flyout's copy of a group puts on its `ribbon-group:`,
-/// `ribbon-title:` and `ribbon-content:` probes, so `ribbon-layout` measures
-/// only the groups drawn in the ribbon itself.
+/// `ribbon-title:`, `ribbon-content:` and `ribbon-launch:` probes, so
+/// `ribbon-layout` measures only the groups drawn in the ribbon itself, and
+/// the harness's `ribbon-launch:<group>` region finds only a launcher drawn
+/// there (#1164).
 const FLYOUT_PROBE_PREFIX: &str = "ribbon-flyout:";
 
 /// The ribbon's width: the window's, less the client-side decorations' shadow
