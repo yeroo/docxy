@@ -2019,6 +2019,15 @@ mod tests {
             panic!()
         };
         assert_eq!(read.len(), listed.len());
+        // Peak and the budget derive (#1179): the units, and 0 without a budget.
+        let fields = all.get("fields").unwrap();
+        for (name, value) in [("Peak", 1.0), ("Budget Work", 0.0), ("Budget Cost", 0.0)] {
+            assert_eq!(
+                fields.get(name).unwrap().get("value"),
+                Some(&Json::Num(value)),
+                "{name}"
+            );
+        }
     }
 
     #[test]
