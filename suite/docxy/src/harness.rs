@@ -832,13 +832,21 @@ pub enum Region {
     BackstageContent,
     /// The File screen's left rail (#1028).
     BackstageRail,
+    /// A Quick Access Toolbar button (`qat-undo`, `qat-redo`) or its
+    /// split arrow (`qat-undo-arrow`, `qat-redo-arrow`), by its probe
+    /// (#1149).
+    Qat(&'static str),
 }
+
+/// The Quick Access Toolbar's probed parts [`Region::Qat`] names.
+const QAT_REGIONS: [&str; 4] = ["qat-undo", "qat-redo", "qat-undo-arrow", "qat-redo-arrow"];
 
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
 /// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-hbar-table`,
 /// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`,
 /// `gallery`, `tab-chip:0`, `filter-button:B`, `backstage-content`,
-/// `backstage-rail`.
+/// `backstage-rail`, `qat-undo`, `qat-redo`, `qat-undo-arrow`,
+/// `qat-redo-arrow`.
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.
@@ -888,6 +896,12 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
+        qat if arg.is_none() && QAT_REGIONS.contains(&qat) => Ok(Region::Qat(
+            QAT_REGIONS
+                .into_iter()
+                .find(|q| *q == qat)
+                .unwrap_or_default(),
+        )),
         "window" | "grid" | "chart-panel" | "title-tabs" | "tab-prev" | "tab-next" | "tab-more"
         | "gantt" | "project-hbar-table" | "project-hbar-chart" | "project-vbar"
         | "project-timeline" | "project-split" | "gallery" | "ribbon" | "ribbon-flyout"
@@ -966,6 +980,7 @@ pub fn region_name(region: Region) -> String {
         Region::RibbonGroup(i) => format!("ribbon-group:{i}"),
         Region::BackstageContent => "backstage-content".into(),
         Region::BackstageRail => "backstage-rail".into(),
+        Region::Qat(name) => name.into(),
         Region::FilterButton(c) => format!("filter-button:{}", gridcore::sheet::col_name(c)),
     }
 }
@@ -8065,6 +8080,10 @@ mod tests {
             Region::BackstageContent,
             Region::BackstageRail,
             Region::FilterButton(1),
+            Region::Qat("qat-undo"),
+            Region::Qat("qat-redo"),
+            Region::Qat("qat-undo-arrow"),
+            Region::Qat("qat-redo-arrow"),
         ] {
             assert_eq!(parse_region(&region_name(r)), Ok(r));
         }

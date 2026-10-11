@@ -1,0 +1,175 @@
+# A sheet's Quick Access Toolbar Undo and Redo name their steps as Excel's
+# do (#1149): `Undo Typing 'abc' in A1 (Ctrl+Z)`, `Redo Fill (Ctrl+Y)`,
+# `Can't Undo (Ctrl+Z)`, and both drop-downs list the steps, newest first;
+# a pick undoes (redoes) back to and including it. A click on either button
+# does what Ctrl+Z / Ctrl+Y do. Run with:
+#
+#   cargo run -p uiharness -- run uiharness/cases/sheet-undo-names.uit
+#
+# The fixture's data is A1:C5 and its chart B9:H21; column J is clear.
+
+test an opened workbook has nothing to undo or redo
+  open copy:../fixtures/basic.xlsx
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Can't Undo (Ctrl+Z)
+  assert reply.qat.0.enabled is false
+  assert reply.qat.0.menu is true
+  assert reply.qat.1.label is Redo
+  assert reply.qat.1.tip.title is Can't Redo (Ctrl+Y)
+  assert reply.qat.1.enabled is false
+  assert reply.qat.1.menu is true
+  call menu-open {"target":{"qat":"qat-undo"}}
+  assert reply.items.0.label is Can't Undo
+  assert reply.items.0.enabled is false
+  key escape
+  call menu-open {"target":{"qat":"qat-redo"}}
+  assert reply.items.0.label is Can't Redo
+  assert reply.items.0.enabled is false
+  key escape
+
+test every step of the issue is named in the undo list
+  open copy:../fixtures/basic.xlsx
+  # Sort: Home › Sort Z to A on the fixture's list.
+  click B2
+  call ribbon-click {"tab":"Home","command":"Sort Z to A"}
+  assert cell B2 is 40
+  # Typing.
+  click A1
+  type abc
+  key enter
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Undo Typing 'abc' in A1 (Ctrl+Z)
+  assert reply.qat.0.enabled is true
+  # Fill: Ctrl+D down A1:A3.
+  click A1
+  click A3 shift
+  key ctrl+d
+  assert cell A3 is abc
+  # Paste: Ctrl+C A1, Ctrl+V into J1.
+  click A1
+  key ctrl+c
+  click J1
+  key ctrl+v
+  assert cell J1 is abc
+  key escape
+  # Clear: the Delete key on J1.
+  click J1
+  key delete
+  assert cell J1 is nothing
+  # Insert Cells and Delete: a row inserted at row 7, then deleted.
+  click J7
+  key shift+space
+  key ctrl+shift+=
+  key ctrl+-
+  # Bold, then Font: Ctrl+B and Home › Increase Font Size on J1.
+  click J1
+  key ctrl+b
+  call ribbon-click {"tab":"Home","command":"Increase Font Size"}
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Undo Font (Ctrl+Z)
+  call menu-open {"target":{"qat":"qat-undo"}}
+  assert reply.items.0.label is Font
+  assert reply.items.1.label is Bold
+  assert reply.items.2.label is Delete
+  assert reply.items.3.label is Insert Cells
+  assert reply.items.4.label is Clear
+  assert reply.items.5.label is Paste
+  assert reply.items.6.label is Fill
+  assert reply.items.7.label is Typing 'abc' in A1
+  assert reply.items.8.label is Sort
+  key escape
+
+test the qat buttons undo and redo a sheet and name the step
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 5
+  key enter
+  click J1
+  click J3 shift
+  key ctrl+d
+  assert cell J3 is 5
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Undo Fill (Ctrl+Z)
+  assert reply.qat.1.tip.title is Can't Redo (Ctrl+Y)
+  shot window
+  call pointer-click {"region":"qat-undo"}
+  assert cell J2 is nothing
+  assert cell J3 is nothing
+  assert cell J1 is 5
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Undo Typing '5' in J1 (Ctrl+Z)
+  assert reply.qat.1.label is Redo
+  assert reply.qat.1.tip.title is Redo Fill (Ctrl+Y)
+  assert reply.qat.1.enabled is true
+  call menu-open {"target":{"qat":"qat-redo"}}
+  assert reply.items.0.label is Fill
+  key escape
+  shot window
+  call pointer-click {"region":"qat-redo"}
+  assert cell J3 is 5
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Undo Fill (Ctrl+Z)
+  assert reply.qat.1.tip.title is Can't Redo (Ctrl+Y)
+
+test a pick in either list undoes or redoes back to it as one step
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 1
+  key enter
+  type 2
+  key enter
+  type 3
+  key enter
+  call menu-open {"target":{"qat":"qat-undo"}}
+  assert reply.items.0.label is Typing '3' in J3
+  assert reply.items.1.label is Typing '2' in J2
+  assert reply.items.2.label is Typing '1' in J1
+  call menu-click {"index":1}
+  assert cell J1 is 1
+  assert cell J2 is nothing
+  assert cell J3 is nothing
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Undo Typing '1' in J1 (Ctrl+Z)
+  assert reply.qat.1.tip.title is Redo Typing '2' in J2 (Ctrl+Y)
+  call menu-open {"target":{"qat":"qat-redo"}}
+  assert reply.items.0.label is Typing '2' in J2
+  assert reply.items.1.label is Typing '3' in J3
+  call menu-click {"index":1}
+  assert cell J2 is 2
+  assert cell J3 is 3
+  call ribbon-read {}
+  assert reply.qat.1.tip.title is Can't Redo (Ctrl+Y)
+  # Everything undone: the list has nothing to undo.
+  call menu-open {"target":{"qat":"qat-undo"}}
+  call menu-click {"index":2}
+  assert cell J1 is nothing
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Can't Undo (Ctrl+Z)
+  assert reply.qat.0.enabled is false
+
+test redo turns into repeat with a format to repeat and greys in the editor
+  open copy:../fixtures/basic.xlsx
+  click J1
+  key ctrl+b
+  click J2
+  call ribbon-read {}
+  assert reply.qat.1.label is Repeat
+  assert reply.qat.1.tip.title is Repeat Bold (Ctrl+Y)
+  assert reply.qat.1.enabled is true
+  key ctrl+z
+  call ribbon-read {}
+  assert reply.qat.1.label is Redo
+  assert reply.qat.1.tip.title is Redo Bold (Ctrl+Y)
+  # In the cell editor Ctrl+Y does nothing, so Redo greys; Undo keeps its tip.
+  type x
+  assert editing is true
+  call ribbon-read {}
+  assert reply.qat.1.tip.title is Can't Redo (Ctrl+Y)
+  assert reply.qat.1.enabled is false
+  key escape
+
+test a word tab keeps its own qat and has no redo list
+  open copy:../fixtures/basic.docx
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Undo (Ctrl+Z)
+  call-error menu-open {"target":{"qat":"qat-redo"}} => the Redo drop-down opens on a sheet tab

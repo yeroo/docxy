@@ -14151,6 +14151,8 @@ impl Docxy {
                 &harness::region_name(region),
             )
             .ok_or_else(|| "the File screen is not open".to_string()),
+            Region::Qat(name) => lookup(&self.probes.borrow(), name)
+                .ok_or_else(|| format!("{name} is not drawn (a document or sheet tab draws it)")),
             Region::Ribbon => lookup(&self.probes.borrow(), "ribbon-body")
                 .ok_or_else(|| "the ribbon's groups are not shown".to_string()),
             Region::RibbonFlyout => lookup(&self.probes.borrow(), "ribbon-flyout")
