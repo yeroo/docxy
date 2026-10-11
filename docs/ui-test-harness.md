@@ -363,7 +363,7 @@ State keys, as the app reports them after every driving verb:
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
 | `picking`, `range_preview`, `sel_hidden` | point mode |
 | `find_open`, `find_query`, `replace_text` | the find bar (Ctrl+F) and its Find and Replace fields; Down moves to Replace |
-| `format_cells_open` | the sheet's Format Cells panel (Home › Cells › Format, Ctrl+1 or ⌘1, or the Home Font, Alignment and Number launchers, #1164) is open and owns every key; Esc and Return close it (#1161). False on a non-sheet tab or in File (backstage) |
+| `format_cells_open` | the active tab's top dialog is the sheet's Format Cells (`format-cells`: Home › Cells › Format, Ctrl+1 or ⌘1, or the Home Font, Alignment and Number launchers, #1164, #1165); as a dialog it owns every key, Esc cancels and Return is OK (#1161). False on a non-sheet tab |
 | `keytips_up` | the Alt / F10 KeyTips overlay is up, at either level |
 | `ime_marked` | the input handler's marked text (a dead key's accent or an IME's provisional text, typed nowhere yet), or null (#1072) |
 | `wm_char_owed` | the WM_CHAR characters typed keys still owe the Windows input handler, lapsed ones included (#1139) |

@@ -1,0 +1,117 @@
+# Format Cells' Number tab (#1165): Decimal places, Use 1000 Separator, the
+# Negative numbers list and Custom's Type box, typed with real keys into the
+# dialog that Ctrl+1 opens, the Sample following each change, and OK writing
+# the code to the cell. Every key and focus after the dialog opens is real
+# (`real-key`, `real-type`, a real click or Tab). Run with:
+#
+#   cargo run -p uiharness -- run uiharness/cases/sheet-format-cells-number.uit
+#
+# The Negative numbers list shows -1234.10 in each form, as Excel does.
+# basic.xlsx: B2 holds 10, B3 20; J1 is clear of its data and chart.
+
+test number decimals and separator show in the sample and apply
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 1234.5
+  key enter
+  click J1
+  call real-key {"key":"ctrl+1"}
+  assert dialog is format-cells
+  call field-read {"dialog-field":"sample"}
+  assert reply.value is 1234.5
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"category"}
+  assert reply.value is Number
+  call field-read {"dialog-field":"sample"}
+  assert reply.value is 1234.50
+  call pointer-click {"dialog-field":"decimals"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"3"}
+  call field-read {"dialog-field":"sample"}
+  assert reply.value is 1234.500
+  call pointer-click {"dialog-control":"thousands"}
+  call field-read {"dialog-field":"sample"}
+  assert reply.value is 1,234.500
+  call field-read {"dialog-field":"negative"}
+  assert reply.value is -1,234.100
+  call real-key {"key":"enter"}
+  assert dialog is not format-cells
+  call cell {"cell":"J1"}
+  assert reply.text is 1,234.500
+
+test the negative numbers list picks parentheses
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type -5
+  key enter
+  click J1
+  call real-key {"key":"ctrl+1"}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down"}
+  call real-key {"key":"tab","to-field":"negative"}
+  call real-key {"key":"down","times":2}
+  call field-read {"dialog-field":"negative"}
+  assert reply.value is (1234.10)
+  call field-read {"dialog-field":"sample"}
+  assert reply.value is (5.00)
+  call real-key {"key":"enter"}
+  call cell {"cell":"J1"}
+  assert reply.text is (5.00)
+
+test custom type box takes a typed code and the sample follows it
+  open copy:../fixtures/basic.xlsx
+  click B2
+  call real-key {"key":"ctrl+1"}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call field-read {"dialog-field":"category"}
+  assert reply.value is Custom
+  call field-read {"dialog-field":"code"}
+  assert reply.value is General
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.0 \"kg\""}
+  call field-read {"dialog-field":"sample"}
+  assert reply.value is "10.0 kg"
+  call real-key {"key":"enter"}
+  assert dialog is not format-cells
+  call cell {"cell":"B2"}
+  assert reply.text is "10.0 kg"
+  # It opens again on the cell's code, as Custom.
+  call real-key {"key":"ctrl+1"}
+  call field-read {"dialog-field":"category"}
+  assert reply.value is Custom
+  call field-read {"dialog-field":"code"}
+  assert reply.value is 0.0 "kg"
+  call real-key {"key":"escape"}
+
+test custom refuses a code docxy cannot use and keeps the dialog open
+  open copy:../fixtures/basic.xlsx
+  click B2
+  call real-key {"key":"ctrl+1"}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0 ?/4"}
+  call real-key {"key":"enter"}
+  assert dialog is format-cells
+  assert status is docxy cannot use this number format: 0 ?/4
+  call real-key {"key":"escape"}
+  assert dialog is not format-cells
+  call cell {"cell":"B2"}
+  assert reply.text is 10
+
+test escape discards the number tab
+  open copy:../fixtures/basic.xlsx
+  click B3
+  call real-key {"key":"ctrl+1"}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":6}
+  call field-read {"dialog-field":"category"}
+  assert reply.value is Percentage
+  call real-key {"key":"escape"}
+  assert dialog is not format-cells
+  call cell {"cell":"B3"}
+  assert reply.text is 20
