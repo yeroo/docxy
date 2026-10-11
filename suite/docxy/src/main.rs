@@ -4777,6 +4777,10 @@ struct Docxy {
     /// not saved; No Markup and Original refuse edits.
     markup: docxcore::markup::MarkupView,
     comment_text: String,
+    /// The document the comment entry bar or a ruler drag was started on
+    /// (#1286), named as `selected_comment` names it: a change of active
+    /// tab to any other document cancels both (`drop_grid_state`).
+    doc_entry_tab: Option<close::TabId>,
     // Show formatting marks (¶, tab arrows) — View ▸ Show/Hide.
     show_marks: bool,
     // Comments review side panel (View / Review ▸ Comments).
@@ -11735,6 +11739,7 @@ impl Docxy {
             selected_comment: None,
             markup: Default::default(),
             comment_text: String::new(),
+            doc_entry_tab: None,
             show_marks: false,
             show_comments: false,
             show_nav: false,
@@ -13157,6 +13162,13 @@ impl Docxy {
         chart_panel_shown(self.panel_chart, self.chart_count())
     }
 
+    /// The active tab as a [`close::TabId`], as `selected_comment` keeps it.
+    fn active_tab_id(&self) -> Option<close::TabId> {
+        self.tabs
+            .get(self.active)
+            .map(|t| (t.title.clone(), t.path.clone()))
+    }
+
     /// Everything the UI holds that points INTO one grid: the chart selection
     /// and panel field, the open entry bar, a fill drag, a formula's pick. The
     /// moment the grid under them changes — another sheet, another tab, a sheet
@@ -13183,11 +13195,15 @@ impl Docxy {
         // The comment entry bar and a ruler drag belong to the document
         // they started on. Carried into another tab, Enter would comment
         // on its selection and the drag would apply the old document's
-        // geometry to its paragraph (#1286).
-        self.comment_open = false;
-        self.comment_text.clear();
-        self.ruler_drag = None;
-        self.ruler_guide = None;
+        // geometry to its paragraph (#1286). A click on the tab already
+        // in front, or the close of a background tab, keeps them.
+        if self.doc_entry_tab.is_some() && self.doc_entry_tab != self.active_tab_id() {
+            self.comment_open = false;
+            self.comment_text.clear();
+            self.ruler_drag = None;
+            self.ruler_guide = None;
+            self.doc_entry_tab = None;
+        }
     }
 
     /// A right-button release anywhere in the window. Over the grid its own
@@ -20803,6 +20819,7 @@ impl Docxy {
             return self.refocus(window, cx);
         }
         self.comment_open = true;
+        self.doc_entry_tab = self.active_tab_id();
         self.comment_text.clear();
         self.picker = None;
         self.find_open = false;
@@ -20904,6 +20921,7 @@ impl Docxy {
             page_right: g.page_right,
             sect_checkpointed: false,
         });
+        self.doc_entry_tab = self.active_tab_id();
         self.ruler_guide = Some(x); // guide starts under the pointer
         cx.notify();
     }

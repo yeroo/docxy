@@ -30,3 +30,19 @@ test a tab switch cancels a comment draft
   assert tab is 0
   call comments {}
   assert reply.comments is []
+
+test a click on the tab in front or closing another tab keeps a comment draft
+  assert tabs is 2
+  assert tab is 0
+  type more
+  key shift+home
+  call ribbon-click {"tab":"Review","command":"newcomment"}
+  type Kept
+  call pointer-click {"region":"tab-chip:0"}
+  assert tab is 0
+  call close-tab {"index":1,"answer":"discard"}
+  assert tabs is 1
+  assert tab is 0
+  key enter
+  call comments {}
+  assert reply.comments.0.text is Kept
