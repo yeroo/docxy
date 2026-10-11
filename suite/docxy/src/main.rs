@@ -2547,20 +2547,19 @@ impl SheetView {
         }
     }
 
-    /// Set the selected cell's comment to `text` by `author` (blank deletes
+    /// Set cell `(s, r, c)`'s comment to `text` by `author` (blank deletes
     /// it), as one undo step of the whole package: a comment lives in the
     /// parts (its part, VML, rels and content type), so a model-only step
     /// could not undo it, and a later package step's undo would silently
     /// take it away. False when the sheet's XML refuses it: nothing changed
     /// and there is no step.
-    fn comment_cell(&mut self, author: &str, text: &str) -> bool {
+    fn comment_cell_at(&mut self, (s, r, c): (usize, u32, u32), author: &str, text: &str) -> bool {
         let t = text.trim();
         if t.is_empty() {
-            self.delete_comment();
+            self.delete_comment_at((s, r, c));
             return true;
         }
         let snap = self.snapshot_package();
-        let ((r, c), s) = (self.sel, self.active);
         if !self.pkg.set_comment(s, r, c, author, t) {
             return false;
         }
@@ -2568,16 +2567,29 @@ impl SheetView {
         true
     }
 
-    /// Delete the comment on the selected cell, as one undo step of the whole
-    /// package (see [`Self::comment_cell`]). No comment there, no step.
-    fn delete_comment(&mut self) {
-        let ((r, c), s) = (self.sel, self.active);
+    /// Set the selected cell's comment to `text` by `author` (blank deletes
+    /// it), as one undo step of the whole package (see [`Self::comment_cell_at`]).
+    /// Test-only: production callers name the cell (`comment_cell_at`).
+    #[cfg(test)]
+    fn comment_cell(&mut self, author: &str, text: &str) -> bool {
+        self.comment_cell_at((self.active, self.sel.0, self.sel.1), author, text)
+    }
+
+    /// Delete the comment on cell `(s, r, c)`, as one undo step of the whole
+    /// package (see [`Self::comment_cell_at`]). No comment there, no step.
+    fn delete_comment_at(&mut self, (s, r, c): (usize, u32, u32)) {
         let here = |cm: &gridcore::comments::Comment| cm.sheet == s && cm.row == r && cm.col == c;
         if !self.pkg.comments().iter().any(here) {
             return;
         }
         self.push_undo_snapshot(self.snapshot_package());
         self.pkg.remove_comment(s, r, c);
+    }
+
+    /// Delete the comment on the selected cell, as one undo step of the whole
+    /// package (see [`Self::comment_cell_at`]). No comment there, no step.
+    fn delete_comment(&mut self) {
+        self.delete_comment_at((self.active, self.sel.0, self.sel.1));
     }
 
     /// Add sheet `name` (its part, relationship and `<sheet>` element, as
@@ -4779,12 +4791,16 @@ struct Docxy {
     // In-progress cell-comment entry for the selected cell (the input buffer);
     // None = the comment bar is closed.
     sheet_comment_edit: Option<String>,
-    // The raw text a comment bar opened with (its seed): the selection moves
-    // freely while the bar is open, and an exit commit uses the seed only to
-    // tell an untouched buffer from an edit — so a bar merely open never
-    // deletes or copies onto a clicked cell. Set where the buffer opens,
-    // cleared with it.
+    // The raw text a comment bar opened with (its seed): an exit commit uses
+    // the seed only to tell an untouched buffer from an edit — so a bar
+    // merely open never deletes or copies onto a clicked cell. Set where the
+    // buffer opens, cleared with it.
     sheet_comment_seed: Option<String>,
+    // The cell (sheet index, row, col) the bar opened on: the label, Enter,
+    // Save and the exit commit all target it, so a click that moves the
+    // selection while the bar is open does not move the note. Set with the
+    // seed, cleared with it.
+    sheet_comment_cell: Option<(usize, u32, u32)>,
     // Whether the data-validation list dropdown is open on the selected cell.
     sheet_dv_open: bool,
     // Whether the Number-group format picker strip is open.
@@ -11646,6 +11662,7 @@ impl Docxy {
             sheet_grid_w: 1000.0,
             sheet_comment_edit: None,
             sheet_comment_seed: None,
+            sheet_comment_cell: None,
             sheet_dv_open: false,
             sheet_numfmt_open: false,
             sheet_fmt_open: false,
@@ -12997,9 +13014,10 @@ impl Docxy {
         self.chart_drop_selection();
         self.bar_close();
         // The bars that act on Enter point into the grid too: a rename names
-        // a sheet by index, and the row-height and comment bars act on the
-        // selection. Carried into another tab, Enter would apply them
-        // there, a Protected View tab included (#610).
+        // a sheet by index, the row-height bar acts on the selection, and
+        // the comment bar on the cell it opened on. Carried into another
+        // tab, Enter would apply them there, a Protected View tab included
+        // (#610).
         self.sheet_rename = None;
         self.sheet_rowh_edit = None;
         self.sheet_comment_bar_close();
@@ -16162,24 +16180,28 @@ impl Docxy {
     }
 
     /// Open the comment entry bar for the selected cell, seeded with its
-    /// existing comment text (so New Comment doubles as Edit). The seed — the
-    /// raw text — is remembered with the buffer: the selection moves freely
-    /// while the bar is open, and an exit commit uses it only to skip a
-    /// buffer that is the seed, untouched, after a click moved on.
+    /// existing comment text (so New Comment doubles as Edit). The bar
+    /// remembers the cell it opened on — the anchor — alongside the seed:
+    /// the selection moves freely while the bar is open, and the label,
+    /// Enter and an exit commit all target the anchor, not the live
+    /// selection.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
-        if self.active_sheet().is_some() {
+        if let Some(v) = self.active_sheet() {
+            let cell = (v.active, v.sel.0, v.sel.1);
             let text = self.selected_comment().unwrap_or_default();
             self.sheet_comment_seed = Some(text.clone());
             self.sheet_comment_edit = Some(text);
+            self.sheet_comment_cell = Some(cell);
             cx.notify();
         }
     }
 
     /// Drop the comment bar: its buffer and, with it, the seed that says
-    /// what text it opened with.
+    /// what text it opened with and the anchor that says on which cell.
     fn sheet_comment_bar_close(&mut self) {
         self.sheet_comment_edit = None;
         self.sheet_comment_seed = None;
+        self.sheet_comment_cell = None;
     }
 
     /// Route a keystroke into the conditional-format entry bar; Enter applies the
@@ -16307,7 +16329,8 @@ impl Docxy {
         }
     }
 
-    /// Commit the comment bar's buffer onto the selected cell (empty = delete).
+    /// Commit the comment bar's buffer onto the cell the bar opened on
+    /// (empty = delete), not the live selection.
     fn sheet_commit_comment(&mut self, cx: &mut Context<Self>) {
         if self.protected_refused(cx) {
             return;
@@ -16315,10 +16338,18 @@ impl Docxy {
         let Some(text) = self.sheet_comment_edit.take() else {
             return;
         };
+        // The close clears the anchor: read it first.
+        let cell = self
+            .sheet_comment_cell
+            .or_else(|| self.active_sheet().map(|v| (v.active, v.sel.0, v.sel.1)));
         self.sheet_comment_bar_close();
+        let Some(cell) = cell else {
+            cx.notify();
+            return;
+        };
         let author = self.comment_author();
         if let Some(t) = self.tabs.get_mut(self.active) {
-            crate::close::commit_comment_buffer(t, &author, &text);
+            crate::close::commit_comment_buffer(t, cell, &author, &text);
         }
         cx.notify();
     }
@@ -30757,9 +30788,13 @@ impl Docxy {
     /// sheet_comment_key) with the target cell, Save/Cancel. Enter commits.
     fn sheet_comment_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         use gridcore::sheet::cell_name;
+        // The label names the cell the bar opened on — the anchor — not the
+        // live selection: that is the cell Enter, Save and the exit commit
+        // all write to.
         let cell = self
-            .active_sheet()
-            .map(|v| cell_name(v.sel.0, v.sel.1))
+            .sheet_comment_cell
+            .map(|(_, r, c)| cell_name(r, c))
+            .or_else(|| self.active_sheet().map(|v| cell_name(v.sel.0, v.sel.1)))
             .unwrap_or_default();
         let ent = cx.entity();
         let (ent_save, ent_cancel) = (ent.clone(), ent.clone());
