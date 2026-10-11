@@ -160,7 +160,10 @@ Start, Finish, Delay, Cost Rate Table, Work Contour, Peak, Budget Work and
 Budget Cost, then the custom fields as for tasks: Text1–Text30,
 Number1–Number20, Cost1–Cost10, Flag1–Flag20 and Date, Start, Finish and
 Duration1–10); `{"Work": {"text": "40 hrs", "value": 2400}, "Units": {"text":
-"100%", "value": 1}}`. Peak and the budget fields read what the plan stores. An
+"100%", "value": 1}}`. Peak reads like Units (a quantity for a material,
+blank for a cost resource): the peak a file stores until an edit changes the
+units, else the units. Budget Work and Budget Cost read what the plan stores,
+else 0, as Project writes for every assignment but a budget resource's. An
 assignment custom field resolves through a matching definition whose `FieldID`
 names one of the assignment's values, else through one whose `SecondaryPID`
 does: Project defines no assignment fields of its own, and we read a task or
