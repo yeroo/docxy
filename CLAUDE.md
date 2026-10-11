@@ -84,6 +84,9 @@
   window's own clip while the clipboard still holds its text, else the
   clipboard's RTF, else its text (`doc_paste_clip`). A partial copy's RTF ends
   without `\par`; the paste takes the trailing mark from the plain text.
+  Font colour and highlight cross both ways: highlight goes out as
+  `\highlightN` (Word) and `\cbN` (Cocoa), and comes in as the nearest Word
+  name (`docxcore::highlight`, the one name → RGB table); white is none.
 - The harness's private clipboard holds the RTF beside the text, and any
   plain write drops it. `clipboard {"action":"write","rtf":…}` plays another
   app's rich copy; `read` reports `rtf` and `rtf_bold`.
