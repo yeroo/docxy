@@ -406,6 +406,14 @@ pub struct Editor {
     pending: Option<PendingFormat>,
 }
 
+/// Whether `lo` and `hi` sit in different containers (a body paragraph and
+/// a table cell, say): a selection between them `delete_selection` cannot
+/// delete.
+fn spans_containers(lo: &Caret, hi: &Caret) -> bool {
+    !(lo.path.len() == hi.path.len()
+        && lo.path[..lo.path.len() - 1] == hi.path[..hi.path.len() - 1])
+}
+
 impl Editor {
     pub fn new(mut doc: Document) -> Self {
         doc.initialize_revision_targets();
@@ -1585,10 +1593,7 @@ impl Editor {
             return true;
         }
 
-        // Same container (siblings)? Compare the parent path.
-        let same_container = lo.path.len() == hi.path.len()
-            && lo.path[..lo.path.len() - 1] == hi.path[..hi.path.len() - 1];
-        if !same_container {
+        if spans_containers(&lo, &hi) {
             self.anchor = None;
             self.caret = lo; // cross-container: collapse (rare)
             return false;
@@ -1681,9 +1686,7 @@ impl Editor {
         let Some((lo, hi)) = self.selection_range() else {
             return;
         };
-        let same_container = lo.path.len() == hi.path.len()
-            && lo.path[..lo.path.len() - 1] == hi.path[..hi.path.len() - 1];
-        if self.cell_range().is_none() && lo.path != hi.path && !same_container {
+        if self.cell_range().is_none() && spans_containers(&lo, &hi) {
             self.checkpoint(EditKind::Structural);
         }
         self.delete_selection();
@@ -5492,6 +5495,38 @@ mod tests {
             assert_eq!(ed.doc, before, "{key}");
             assert!(!ed.undo(), "{key}: no undo step");
         }
+    }
+
+    /// #1285: the helper adds no step for a selection `delete_selection` can
+    /// delete — sibling paragraphs here: typing stays one `Typing` step and
+    /// undo re-selects, as over a selection within one paragraph.
+    #[test]
+    fn typing_over_sibling_paragraph_selection_is_one_undo_step_1285() {
+        let mut ed = Editor::new(doc(&["one", "two"]));
+        let before = ed.doc.clone();
+        ed.anchor = Some(Caret::top(0, 1));
+        ed.caret = Caret::top(1, 2);
+        ed.insert_char('x');
+        assert_eq!(top_text(&ed), vec!["oxo"]);
+        assert_eq!(ed.undo_names(), vec!["Typing \"x\""]);
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert!(ed.has_selection());
+        assert!(!ed.undo());
+    }
+
+    /// #1285: the helper adds no step over a cell range either: `clear_cells`
+    /// takes the only step, typing renames it, exactly as without the helper.
+    #[test]
+    fn typing_over_cell_range_takes_no_extra_step_1285() {
+        let mut ed = Editor::new(table_doc());
+        ed.anchor = Some(Caret::at(vec![1, 0, 0, 0], 0)); // cell A
+        ed.caret = Caret::at(vec![1, 0, 1, 0], 1); // cell B
+        assert!(ed.cell_range().is_some(), "a cell rectangle");
+        ed.insert_char('x');
+        assert_eq!(ed.undo_names(), vec!["Typing \"x\""]);
+        assert!(ed.undo());
+        assert!(!ed.undo(), "no extra step from the helper");
     }
 
     /// #751: a click's collapsed anchor is no selection; Enter still just
