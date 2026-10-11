@@ -1559,6 +1559,22 @@ struct UndoGroup {
     /// changed them (a paste, the Data Validation dialog): undo and redo put
     /// the matching state back.
     rules: Option<(RuleState, RuleState)>,
+    /// What Undo and Redo of this group select (#1148): the cells the edit
+    /// meant to change (a fill's or a clear's whole selection, a paste's
+    /// block), the active cell at the top-left. `None` for a group that
+    /// changed only rules.
+    target: Option<CellRect>,
+}
+
+/// A cell rectangle, `(r1, c1, r2, c2)` top-left to bottom-right.
+type CellRect = (u32, u32, u32, u32);
+
+/// The rectangle around `cells`; `None` when there are none.
+fn bbox(cells: &[(u32, u32)]) -> Option<CellRect> {
+    let (&(r, c), rest) = cells.split_first()?;
+    Some(rest.iter().fold((r, c, r, c), |(r1, c1, r2, c2), &(r, c)| {
+        (r1.min(r), c1.min(c), r2.max(r), c2.max(c))
+    }))
 }
 
 /// A sheet's data-validation rules, and the elements of its part a save
@@ -1680,6 +1696,9 @@ enum UndoAction {
     Structural {
         before: WbSnapshot,
         after: WbSnapshot,
+        /// What Undo and Redo select (#1148): the rows or columns inserted
+        /// or deleted, or the cells of a header edit. `None` keeps the cursor.
+        target: Option<(usize, CellRect)>,
     },
 }
 
@@ -2042,6 +2061,10 @@ struct App {
     /// Steps ever pushed onto `undo`; unlike `undo.len()` it still moves at
     /// [`UNDO_CAP`], so [`App::with_rules`] can tell a step was recorded.
     undo_pushes: u64,
+    /// The (sheet, rect) the next undo step selects on Undo and Redo, when
+    /// the command knows better than the cells it records (#1148); set by
+    /// [`App::with_undo_target`] and taken by the next step recorded.
+    undo_target: Option<(usize, CellRect)>,
     clip: Option<ClipData>,
     os_clip: Option<arboard::Clipboard>,
     clip_text: Option<String>,
@@ -2209,6 +2232,7 @@ impl App {
             undo: Vec::new(),
             redo: Vec::new(),
             undo_pushes: 0,
+            undo_target: None,
             clip: None,
             os_clip: arboard::Clipboard::new().ok(),
             clip_text: None,
@@ -2838,9 +2862,19 @@ impl App {
         cut_from: Option<(usize, (u32, u32, u32, u32))>,
         write: impl FnOnce(&mut Self),
     ) {
+        let explicit = self.undo_target.take();
         let keys: Vec<_> = keys.into_iter().filter(|(_, k)| !k.is_empty()).collect();
         if keys.is_empty() {
             return;
+        }
+        // What each group selects on Undo and Redo: the cells asked for,
+        // before the frozen spill keys widen them.
+        let mut targets: Vec<Option<CellRect>> =
+            keys.iter().map(|(_, cells)| bbox(cells)).collect();
+        if let Some((sheet, rect)) = explicit {
+            if let Some(i) = keys.iter().rposition(|(s, _)| *s == sheet) {
+                targets[i] = Some(rect);
+            }
         }
         // An edit can take what only its undo puts back from outside the
         // keys: overwriting a frozen anchor clears its cached block, and
@@ -2898,7 +2932,13 @@ impl App {
             // cut's cells were captured before the formulas were rewritten.
             // When this step is the cut-paste itself, the cut is spent.
             self.cancel_cut();
-            self.push_undo(UndoAction::Structural { before, after });
+            let target =
+                (keys.iter().zip(&targets).rev()).find_map(|((s, _), t)| t.map(|t| (*s, t)));
+            self.push_undo(UndoAction::Structural {
+                before,
+                after,
+                target,
+            });
             self.redo.clear();
             self.modified = true;
             self.warn_new_circles(&circles_before);
@@ -2912,8 +2952,9 @@ impl App {
         }
         let undo = keys
             .iter()
+            .zip(targets)
             .zip(befores.into_iter().zip(afters))
-            .map(|((s, cells), (before, after))| UndoGroup {
+            .map(|(((s, cells), target), (before, after))| UndoGroup {
                 sheet: *s,
                 changes: cells
                     .iter()
@@ -2922,6 +2963,7 @@ impl App {
                     .collect(),
                 styles_only: false,
                 rules: None,
+                target,
             })
             .collect();
         self.push_undo(UndoAction::Cells(undo));
@@ -2968,11 +3010,13 @@ impl App {
             .zip(before)
             .map(|(&(r, c, _), before)| (r, c, before, sheet.cell(r, c).cloned()))
             .collect();
+        let cells: Vec<(u32, u32)> = styles.iter().map(|&(r, c, _)| (r, c)).collect();
         self.push_undo(UndoAction::Cells(vec![UndoGroup {
             sheet: sheet_idx,
             changes,
             styles_only: true,
             rules: None,
+            target: bbox(&cells),
         }]));
         self.redo.clear();
         self.modified = true;
@@ -3053,7 +3097,11 @@ impl App {
             Ok(false) => Ok(false),
             Ok(true) => {
                 let after = self.wb_snapshot();
-                self.push_undo(UndoAction::Structural { before, after });
+                self.push_undo(UndoAction::Structural {
+                    before,
+                    after,
+                    target: None,
+                });
                 self.redo.clear();
                 self.modified = true;
                 Ok(true)
@@ -3152,7 +3200,12 @@ impl App {
         if self.circles_shown() && self.engine.circular_refs().len() > circles_before {
             self.circle_warning_pending = true;
         }
-        self.push_undo(UndoAction::Structural { before, after });
+        let target = self.undo_target.take();
+        self.push_undo(UndoAction::Structural {
+            before,
+            after,
+            target,
+        });
         self.redo.clear();
         self.modified = true;
         self.clamp_cursor();
@@ -3251,7 +3304,7 @@ impl App {
                     }
                 }
                 UndoAction::Cells(_) => {}
-                UndoAction::Structural { before, after } => {
+                UndoAction::Structural { before, after, .. } => {
                     rename_sheet_in_snapshot(before, idx, &old, name);
                     rename_sheet_in_snapshot(after, idx, &old, name);
                 }
@@ -3793,6 +3846,7 @@ impl App {
                     changes: Vec::new(),
                     styles_only: false,
                     rules: Some((b, a)),
+                    target: None,
                 }),
             }
         }
@@ -3832,29 +3886,66 @@ impl App {
                     self.engine
                         .restore_cells(&mut self.pkg.workbook, group.sheet, &cells);
                 }
-                self.show_undo_group(groups.last());
+                self.show_undo_groups(&groups);
                 self.redo.push(UndoAction::Cells(groups));
                 self.modified = true;
                 self.prune_circles();
                 self.status = Some("Undid".to_string());
             }
-            Some(UndoAction::Structural { before, after }) => {
+            Some(UndoAction::Structural {
+                before,
+                after,
+                target,
+            }) => {
                 self.restore(&before);
-                self.redo.push(UndoAction::Structural { before, after });
+                if let Some((sheet, rect)) = target {
+                    self.select_undo_target(sheet, rect);
+                }
+                self.redo.push(UndoAction::Structural {
+                    before,
+                    after,
+                    target,
+                });
                 self.status = Some("Undid".to_string());
             }
             None => self.status = Some("Nothing to undo".to_string()),
         }
     }
 
-    /// Move the view to an undone/redone group: its sheet and first cell.
-    fn show_undo_group(&mut self, group: Option<&UndoGroup>) {
-        let Some(group) = group else { return };
-        self.sheet = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-        if let Some(&(r, c, _, _)) = group.changes.first() {
-            self.cur = (r, c);
-            self.ensure_visible();
+    /// Move the view to an undone/redone step's groups (#1148): select the
+    /// target of the last group that has one, else go to the last group's
+    /// sheet (a step that changed only rules).
+    fn show_undo_groups(&mut self, groups: &[UndoGroup]) {
+        let target = (groups.iter().rev()).find_map(|g| g.target.map(|t| (g.sheet, t)));
+        match (target, groups.last()) {
+            (Some((sheet, rect)), _) => self.select_undo_target(sheet, rect),
+            (None, Some(g)) => self.sheet = g.sheet.min(self.pkg.workbook.sheets.len() - 1),
+            (None, None) => {}
         }
+    }
+
+    /// Select what an Undo or Redo changed, as Excel does (#1148): `rect` on
+    /// sheet `sheet`, the cursor at its top-left.
+    fn select_undo_target(&mut self, sheet: usize, (r1, c1, r2, c2): CellRect) {
+        self.sheet = sheet.min(self.pkg.workbook.sheets.len() - 1);
+        self.cur = (r1, c1);
+        self.anchor = ((r1, c1) != (r2, c2)).then_some((r2, c2));
+        self.ensure_visible();
+    }
+
+    /// Run `f` so that the undo step it records selects `rect` on sheet
+    /// `sheet` on Undo and Redo (#1148), rather than the cells it recorded:
+    /// a fill's or a clear's whole selection, a paste's block, whole rows.
+    fn with_undo_target<R>(
+        &mut self,
+        sheet: usize,
+        rect: CellRect,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.undo_target = Some((sheet, rect));
+        let out = f(self);
+        self.undo_target = None;
+        out
     }
 
     fn redo(&mut self) {
@@ -3874,15 +3965,26 @@ impl App {
                     self.engine
                         .restore_cells(&mut self.pkg.workbook, group.sheet, &cells);
                 }
-                self.show_undo_group(groups.last());
+                self.show_undo_groups(&groups);
                 self.push_undo(UndoAction::Cells(groups));
                 self.modified = true;
                 self.prune_circles();
                 self.status = Some("Redid".to_string());
             }
-            Some(UndoAction::Structural { before, after }) => {
+            Some(UndoAction::Structural {
+                before,
+                after,
+                target,
+            }) => {
                 self.restore(&after);
-                self.push_undo(UndoAction::Structural { before, after });
+                if let Some((sheet, rect)) = target {
+                    self.select_undo_target(sheet, rect);
+                }
+                self.push_undo(UndoAction::Structural {
+                    before,
+                    after,
+                    target,
+                });
                 self.status = Some("Redid".to_string());
             }
             None => self.status = Some("Nothing to redo".to_string()),
@@ -4059,6 +4161,8 @@ impl App {
                     return;
                 }
                 self.cancel_cut();
+                // Undo and Redo select the block written, not a cut's source.
+                let block_rect = bbox(&writes);
                 let clear_keys: Vec<_> = clears.iter().map(|&(r, c, _)| (r, c)).collect();
                 let keys = if same_sheet {
                     vec![(here, clear_keys.into_iter().chain(writes).collect())]
@@ -4115,10 +4219,16 @@ impl App {
                     })
                 };
                 // A cut's undo entry holds no rules: it changes none.
-                if cut {
-                    write(self);
-                } else {
-                    self.with_rules(&[here], write);
+                let write = |app: &mut Self| {
+                    if cut {
+                        write(app);
+                    } else {
+                        app.with_rules(&[here], write);
+                    }
+                };
+                match block_rect {
+                    Some(rect) => self.with_undo_target(here, rect, write),
+                    None => write(self),
                 }
                 self.status = Some(if source_locked {
                     "Pasted (source sheet is protected; cut kept as copy)".to_string()
@@ -6825,7 +6935,9 @@ impl App {
                 }
             }
         }
-        self.apply(changes);
+        // Undo and Redo select the selection, its empty cells too.
+        let (sheet, sel) = (self.sheet, self.selection());
+        self.with_undo_target(sheet, sel, |app| app.apply(changes));
     }
 
     fn switch_sheet(&mut self, delta: i64) {
@@ -6896,12 +7008,15 @@ impl App {
             return;
         }
         let kept = (self.cur, self.anchor);
-        self.structural(|wb| {
-            if insert {
-                gridcore::edit::insert_rows(wb, sheet, r1, count);
-            } else {
-                gridcore::edit::delete_rows(wb, sheet, r1, count);
-            }
+        // Undo and Redo select the whole rows (#1148).
+        self.with_undo_target(sheet, (r1, 0, r2, MAX_COLS - 1), |app| {
+            app.structural(|wb| {
+                if insert {
+                    gridcore::edit::insert_rows(wb, sheet, r1, count);
+                } else {
+                    gridcore::edit::delete_rows(wb, sheet, r1, count);
+                }
+            })
         });
         (self.cur, self.anchor) = kept;
         self.status = Some(format!(
@@ -6928,12 +7043,15 @@ impl App {
             return;
         }
         let kept = (self.cur, self.anchor);
-        self.structural(|wb| {
-            if insert {
-                gridcore::edit::insert_cols(wb, sheet, c1, count);
-            } else {
-                gridcore::edit::delete_cols(wb, sheet, c1, count);
-            }
+        // Undo and Redo select the whole columns (#1148).
+        self.with_undo_target(sheet, (0, c1, MAX_ROWS - 1, c2), |app| {
+            app.structural(|wb| {
+                if insert {
+                    gridcore::edit::insert_cols(wb, sheet, c1, count);
+                } else {
+                    gridcore::edit::delete_cols(wb, sheet, c1, count);
+                }
+            })
         });
         (self.cur, self.anchor) = kept;
         self.status = Some(format!(
@@ -7179,7 +7297,11 @@ impl App {
                 }
                 self.rebuild_engine();
                 let after = self.wb_snapshot();
-                self.push_undo(UndoAction::Structural { before, after });
+                self.push_undo(UndoAction::Structural {
+                    before,
+                    after,
+                    target: None,
+                });
                 self.redo.clear();
                 self.modified = true;
                 self.cancel_cut();
@@ -8228,7 +8350,9 @@ impl App {
             return;
         }
         let n = changes.len();
-        if !self.apply(changes) {
+        // Undo and Redo select the whole selection, the source row too.
+        let (sheet, sel) = (self.sheet, self.selection());
+        if !self.with_undo_target(sheet, sel, |app| app.apply(changes)) {
             return;
         }
         self.status = Some(format!(
@@ -20896,6 +21020,7 @@ mod tests {
             sheet: 0,
             changes: Vec::new(),
             styles_only: false,
+            target: None,
             rules: Some((
                 (Vec::new(), Vec::new()),
                 (vec![rule("Data!$A$1:$A$3")], Vec::new()),
@@ -21804,6 +21929,230 @@ mod tests {
         assert!(app.overlay_open());
         app.validation_dialog = None;
         assert!(!app.overlay_open());
+    }
+
+    // --- where Undo and Redo leave the selection (#1148) ------------------
+
+    /// Put the cursor somewhere else, as a click on F9 would.
+    fn away(app: &mut App) {
+        app.cur = (8, 5);
+        app.anchor = None;
+    }
+
+    #[test]
+    fn undo_and_redo_of_an_entry_select_its_cell() {
+        let mut app = opts_app();
+        type_text(&mut app, "one");
+        press(&mut app, KeyCode::Enter);
+        app.cur = (0, 0);
+        type_text(&mut app, "two");
+        press(&mut app, KeyCode::Enter);
+        away(&mut app);
+        handle_key(&mut app, ctrl('z'));
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            CellValue::Text("one".into())
+        );
+        assert_eq!((app.cur, app.anchor), ((0, 0), None));
+        away(&mut app);
+        handle_key(&mut app, ctrl('y'));
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            CellValue::Text("two".into())
+        );
+        assert_eq!((app.cur, app.anchor), ((0, 0), None));
+    }
+
+    #[test]
+    fn undo_and_redo_of_a_fill_select_the_whole_selection() {
+        let mut app = opts_app();
+        app.pkg.workbook.sheets[0].set_cell(0, 1, Cell::number(5.0));
+        app.rebuild_engine();
+        // B1:B4, dragged from B1 down: the cursor at the far corner.
+        app.anchor = Some((0, 1));
+        app.cur = (3, 1);
+        handle_key(&mut app, ctrl('d'));
+        assert_eq!(
+            app.sheet().cell(3, 1).unwrap().value,
+            CellValue::Number(5.0)
+        );
+        away(&mut app);
+        handle_key(&mut app, ctrl('z'));
+        assert!(app.sheet().cell(3, 1).is_none());
+        assert_eq!(app.selection(), (0, 1, 3, 1));
+        assert_eq!(app.cur, (0, 1));
+        away(&mut app);
+        handle_key(&mut app, ctrl('y'));
+        assert_eq!(app.selection(), (0, 1, 3, 1));
+        assert_eq!(app.cur, (0, 1));
+    }
+
+    #[test]
+    fn undo_and_redo_of_a_clear_select_the_whole_selection() {
+        let mut app = opts_app();
+        app.pkg.workbook.sheets[0].set_cell(1, 1, Cell::number(5.0));
+        app.rebuild_engine();
+        // A1:C3 holds one value, at B2: the step records B2 alone.
+        app.anchor = Some((2, 2));
+        app.cur = (0, 0);
+        app.clear_selection();
+        assert!(app.sheet().cell(1, 1).is_none());
+        away(&mut app);
+        app.undo();
+        assert_eq!(app.selection(), (0, 0, 2, 2));
+        assert_eq!(app.cur, (0, 0));
+    }
+
+    #[test]
+    fn undo_and_redo_of_a_paste_select_the_pasted_block() {
+        let mut app = opts_app();
+        for r in 0..3 {
+            app.pkg.workbook.sheets[0].set_cell(r, 0, Cell::number(f64::from(r) + 1.0));
+        }
+        app.rebuild_engine();
+        app.anchor = Some((0, 0));
+        app.cur = (2, 0);
+        app.copy(false);
+        app.anchor = None;
+        app.cur = (0, 3);
+        app.paste_from(None);
+        assert_eq!(
+            app.sheet().cell(2, 3).unwrap().value,
+            CellValue::Number(3.0)
+        );
+        away(&mut app);
+        app.undo();
+        assert!(app.sheet().cell(2, 3).is_none());
+        assert_eq!(app.selection(), (0, 3, 2, 3));
+        assert_eq!(app.cur, (0, 3));
+        away(&mut app);
+        app.redo();
+        assert_eq!(app.selection(), (0, 3, 2, 3));
+        assert_eq!(app.cur, (0, 3));
+    }
+
+    #[test]
+    fn undo_of_a_cut_pasted_on_its_own_sheet_selects_where_it_landed() {
+        // One group holds the cut's clears and the writes: its cells span
+        // A1:D3, but Undo selects the block written.
+        let mut app = opts_app();
+        for r in 0..3 {
+            app.pkg.workbook.sheets[0].set_cell(r, 0, Cell::number(1.0));
+        }
+        app.rebuild_engine();
+        app.anchor = Some((0, 0));
+        app.cur = (2, 0);
+        app.copy(true);
+        app.anchor = None;
+        app.cur = (0, 3);
+        app.paste_from(None);
+        assert!(app.sheet().cell(0, 0).is_none(), "the cut moved");
+        away(&mut app);
+        app.undo();
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            CellValue::Number(1.0)
+        );
+        assert_eq!(app.selection(), (0, 3, 2, 3));
+        assert_eq!(app.cur, (0, 3));
+    }
+
+    #[test]
+    fn undo_of_a_cut_pasted_on_another_sheet_selects_where_it_landed() {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Sheet2");
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        for r in 0..3 {
+            app.pkg.workbook.sheets[0].set_cell(r, 0, Cell::number(1.0));
+        }
+        app.rebuild_engine();
+        app.anchor = Some((0, 0));
+        app.cur = (2, 0);
+        app.copy(true);
+        app.goto_sheet(1);
+        app.cur = (0, 3);
+        app.paste_from(None);
+        app.goto_sheet(0);
+        away(&mut app);
+        app.undo();
+        assert_eq!(app.sheet, 1, "the last group's sheet");
+        assert_eq!(app.selection(), (0, 3, 2, 3));
+        assert_eq!(app.cur, (0, 3));
+    }
+
+    #[test]
+    fn undo_and_redo_of_inserted_and_deleted_rows_select_them_whole() {
+        let mut app = opts_app();
+        app.cur = (1, 1);
+        press(&mut app, KeyCode::F(5));
+        away(&mut app);
+        handle_key(&mut app, ctrl('z'));
+        assert_eq!(app.selection(), (1, 0, 1, MAX_COLS - 1));
+        assert_eq!(app.cur, (1, 0));
+        away(&mut app);
+        handle_key(&mut app, ctrl('y'));
+        assert_eq!(app.selection(), (1, 0, 1, MAX_COLS - 1));
+        assert_eq!(app.cur, (1, 0));
+
+        let mut app = opts_app();
+        app.anchor = Some((1, 0));
+        app.cur = (2, 0);
+        app.row_op(false);
+        away(&mut app);
+        app.undo();
+        assert_eq!(app.selection(), (1, 0, 2, MAX_COLS - 1));
+        assert_eq!(app.cur, (1, 0));
+        away(&mut app);
+        app.redo();
+        assert_eq!(app.selection(), (1, 0, 2, MAX_COLS - 1));
+    }
+
+    #[test]
+    fn undo_and_redo_of_inserted_columns_select_them_whole() {
+        let mut app = opts_app();
+        app.anchor = Some((0, 1));
+        app.cur = (4, 2);
+        app.col_op(true);
+        away(&mut app);
+        app.undo();
+        assert_eq!(app.selection(), (0, 1, MAX_ROWS - 1, 2));
+        assert_eq!(app.cur, (0, 1));
+        away(&mut app);
+        app.redo();
+        assert_eq!(app.selection(), (0, 1, MAX_ROWS - 1, 2));
+    }
+
+    #[test]
+    fn undo_of_a_table_header_edit_selects_its_cell() {
+        // The header rename makes it a structural step, which still selects.
+        let mut app = header_app();
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        assert!(matches!(
+            app.undo.last(),
+            Some(UndoAction::Structural { .. })
+        ));
+        away(&mut app);
+        app.undo();
+        assert_eq!((app.cur, app.anchor), ((0, 1), None));
+        away(&mut app);
+        app.redo();
+        assert_eq!((app.cur, app.anchor), ((0, 1), None));
+    }
+
+    #[test]
+    fn a_step_that_changed_only_rules_keeps_the_cursor() {
+        let mut app = opts_app();
+        app.push_undo(UndoAction::Cells(vec![UndoGroup {
+            sheet: 0,
+            changes: Vec::new(),
+            styles_only: false,
+            rules: Some(((Vec::new(), Vec::new()), (Vec::new(), Vec::new()))),
+            target: None,
+        }]));
+        away(&mut app);
+        app.undo();
+        assert_eq!((app.cur, app.anchor), ((8, 5), None));
     }
 }
 
