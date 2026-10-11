@@ -1738,8 +1738,9 @@ fn custom_unset_and_unparseable_read_leniently() {
 
 #[test]
 fn custom_date_with_oversized_year_reads_leniently() {
-    // A stored custom date whose year overflows parse_mspdi's civil-day
-    // arithmetic reads as its raw text and Null, like any unparseable value.
+    // A stored custom date whose year parse_mspdi rejects (arithmetic
+    // overflow, or outside its range) reads as its raw text and Null, like
+    // any unparseable value.
     let mut p = untitled_project();
     p.extended_attribute_definitions = vec![
         custom_def("555000001", "Date1"),
@@ -1748,7 +1749,7 @@ fn custom_date_with_oversized_year_reads_leniently() {
     let mut t = task(1, "Bare", 480);
     t.extended_attributes = vec![
         custom_value("555000001", "9223372036854775807-03-01"),
-        custom_value("555000002", "10000-01-01T08:00:00"),
+        custom_value("555000002", "100000-01-01T08:00:00"),
     ];
     p.tasks = vec![t];
     let ed = Editor::new(p);
@@ -1758,7 +1759,7 @@ fn custom_date_with_oversized_year_reads_leniently() {
     );
     assert_eq!(
         tv(&ed, 1, "Start1"),
-        (s("10000-01-01T08:00:00"), FieldValue::Null)
+        (s("100000-01-01T08:00:00"), FieldValue::Null)
     );
 }
 
