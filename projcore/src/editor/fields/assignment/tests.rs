@@ -1,6 +1,6 @@
 use super::*;
-use crate::editor::ResourceRef;
-use crate::model::{ExtendedAttributeValue, XmlElement};
+use crate::editor::{AssignmentPatch, ResourceRef};
+use crate::model::{ExtendedAttributeValue, TaskType, XmlElement};
 
 /// Task 1 (5 days) with no assignments; Ann (1) at $50/h, Steel (2) a
 /// material labelled `tons`, Fee (3) a cost resource.
@@ -135,12 +135,9 @@ fn absent_stored_values_read_null_with_project_s_text() {
         ("Overtime Work", "0 hrs"),
         ("Actual Work", "0 hrs"),
         ("Baseline Work", "0 hrs"),
-        ("Budget Work", "0 hrs"),
         ("Actual Cost", "$0.00"),
         ("Baseline Cost", "$0.00"),
-        ("Budget Cost", "$0.00"),
         ("% Work Complete", "0%"),
-        ("Peak", "0%"),
     ] {
         assert_eq!(
             read(&ed, uid, name),
@@ -198,6 +195,134 @@ fn stored_rate_table_contour_delay_and_dates_read_back() {
     let span = crate::assign::assignment_span(ed.project(), ed.schedule(), &a).unwrap();
     assert_eq!(assignment_dates(&ed, &a), Some(span));
     assert_eq!(uid, 1);
+}
+
+/// Task 1 made Fixed Duration, with Ann assigned at `units`.
+fn fixed_duration(units: f64) -> (Editor, i32) {
+    let mut p = editor().project().clone();
+    p.tasks[0].task_type = Some(TaskType::FixedDuration);
+    let mut ed = Editor::new(p);
+    let uid = ed
+        .add_assignment(1, ResourceRef::Uid(1), Some(units), None)
+        .unwrap();
+    (ed, uid)
+}
+
+#[test]
+fn peak_is_the_units_of_a_new_or_edited_assignment() {
+    let mut ed = editor();
+    let uid = ed
+        .add_assignment(1, ResourceRef::Uid(1), Some(0.5), None)
+        .unwrap();
+    assert_eq!(
+        read(&ed, uid, "Peak"),
+        shows("50%", FieldValue::Number(0.5))
+    );
+
+    // A file's own peak shows until a units edit, then the new units do.
+    let mut p = ed.project().clone();
+    p.assignments[0].peak_units = Rate::parse("1.5");
+    let mut ed = Editor::new(p);
+    assert_eq!(
+        read(&ed, uid, "Peak"),
+        shows("150%", FieldValue::Number(1.5))
+    );
+    ed.set_assignment(
+        uid,
+        AssignmentPatch {
+            units: Some(0.75),
+            ..AssignmentPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        read(&ed, uid, "Peak"),
+        shows("75%", FieldValue::Number(0.75))
+    );
+
+    // A Fixed Duration work edit works the new work over the same span, at
+    // new units, and the peak follows them.
+    let (mut ed, uid) = fixed_duration(1.0);
+    let mut p = ed.project().clone();
+    p.assignments[0].peak_units = Rate::parse("1");
+    ed = Editor::new(p);
+    ed.set_assignment(
+        uid,
+        AssignmentPatch {
+            work_min: Some(20 * 60),
+            ..AssignmentPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(read(&ed, uid, "Units"), read(&ed, uid, "Peak"));
+    assert_eq!(
+        read(&ed, uid, "Peak"),
+        shows("50%", FieldValue::Number(0.5))
+    );
+}
+
+#[test]
+fn peak_reads_like_units_for_materials_and_cost_resources() {
+    let mut ed = editor();
+    let steel = ed
+        .add_assignment(1, ResourceRef::Uid(2), Some(5.0), None)
+        .unwrap();
+    let fee = ed
+        .add_assignment(1, ResourceRef::Uid(3), None, None)
+        .unwrap();
+    assert_eq!(
+        read(&ed, steel, "Peak"),
+        shows("5 tons", FieldValue::Number(5.0))
+    );
+    assert_eq!(read(&ed, fee, "Peak"), shows("", FieldValue::Null));
+    // A stored peak shows the same way, not as a percent.
+    let mut p = ed.project().clone();
+    for a in &mut p.assignments {
+        a.peak_units = Rate::parse("1.5");
+    }
+    let ed = Editor::new(p);
+    assert_eq!(
+        read(&ed, steel, "Peak"),
+        shows("1.5 tons", FieldValue::Number(1.5))
+    );
+    assert_eq!(read(&ed, fee, "Peak"), shows("", FieldValue::Null));
+}
+
+#[test]
+fn budget_work_and_cost_read_stored_else_zero() {
+    let mut ed = editor();
+    let uid = ed
+        .add_assignment(1, ResourceRef::Uid(1), None, None)
+        .unwrap();
+    let steel = ed
+        .add_assignment(1, ResourceRef::Uid(2), Some(5.0), None)
+        .unwrap();
+    assert_eq!(
+        read(&ed, uid, "Budget Work"),
+        shows("0 hrs", FieldValue::Minutes(0))
+    );
+    assert_eq!(
+        read(&ed, uid, "Budget Cost"),
+        shows("$0.00", FieldValue::Money(0.0))
+    );
+    assert_eq!(
+        read(&ed, steel, "Budget Work"),
+        shows("0 tons", FieldValue::Minutes(0))
+    );
+    // The values a budget resource's assignment stores read back
+    // (corpus/mspdi/13-resource-fields.xml: 18h and 1000).
+    let mut p = ed.project().clone();
+    p.assignments[0].budget_work_min = Some(18 * 60);
+    p.assignments[0].budget_cost = Rate::parse("1000");
+    let ed = Editor::new(p);
+    assert_eq!(
+        read(&ed, uid, "Budget Work"),
+        shows("18 hrs", FieldValue::Minutes(1080))
+    );
+    assert_eq!(
+        read(&ed, uid, "Budget Cost"),
+        shows("$10.00", FieldValue::Money(10.0))
+    );
 }
 
 // ---- custom fields (#1178) ----

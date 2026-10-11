@@ -82,6 +82,20 @@ pub(crate) fn contoured(a: &Assignment) -> bool {
     !matches!(a.work_contour, None | Some(0))
 }
 
+/// The assignment's Peak: the most units it works at. A stored `PeakUnits`
+/// is Project's own, which may reflect timephased edits this model does not
+/// make, and it lasts only while no edit has touched the units (every rule
+/// that changes the rate clears it). Otherwise the model's own: a flat
+/// assignment works at exactly its units and a contoured one's units are its
+/// peak, so its units. A material's is its quantity; what a cost resource
+/// shows is the caller's (it has no units).
+pub(crate) fn peak_units(a: &Assignment) -> Option<f64> {
+    a.peak_units
+        .as_ref()
+        .and_then(Rate::to_f64)
+        .or(Some(a.units).filter(|u| u.is_finite()))
+}
+
 /// Whether an assignment's work is working time: a work resource's, or one
 /// without a resource (Project's unassigned -65535). A material's work is a
 /// quantity and a cost resource has none, so a task's Work leaves them out.
