@@ -1019,7 +1019,9 @@ resource assignments, by assignment UID), `proj.save {path?}`, `proj.reload`,
 reschedule the plan (CPM) live. MCP: `claude mcp add yppxy -- yppxy --mcp` →
 `yppxy_list`, `yppxy_status`, `yppxy_tasks`, `yppxy_get`, `yppxy_set`,
 `yppxy_fields`, `yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`,
-`yppxy_find`, `yppxy_save` (the task tools take `fields`). Skill: `yppxy install skill`.
+`yppxy_find`, `yppxy_save`, `yppxy_assign_list`, `yppxy_assign_get`,
+`yppxy_assign_fields`, `yppxy_assign_add`, `yppxy_assign_set`,
+`yppxy_assign_del` (the task and assign tools take `fields`). Skill: `yppxy install skill`.
 
 Everything else — discovery, the wire protocol, tokens, `target`
 disambiguation, the status-dot flash on agent edits — works identically across
