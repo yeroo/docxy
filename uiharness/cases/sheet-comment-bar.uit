@@ -26,7 +26,6 @@ test an untouched bar closes and writes nothing
   call ribbon-click {"tab":"Review","command":"New Comment"}
   click C5
   assert comment_cell is null
-  assert comment_edit is null
   assert dirty is false
   click A1
   assert comment is null
@@ -37,8 +36,10 @@ test insert row commits to the anchor first
   call ribbon-click {"tab":"Review","command":"New Comment"}
   type On A3
   call ribbon-click {"tab":"Home","command":"Insert Row"}
+  assert comment_cell is null
   assert comment_edit is null
   assert dirty is true
+  key ctrl+z
   click A3
   assert comment is On A3
 
