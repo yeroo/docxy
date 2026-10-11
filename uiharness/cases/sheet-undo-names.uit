@@ -173,3 +173,49 @@ test a word tab keeps its own qat and has no redo list
   call ribbon-read {}
   assert reply.qat.0.tip.title is Undo (Ctrl+Z)
   call-error menu-open {"target":{"qat":"qat-redo"}} => the Redo drop-down opens on a sheet tab
+
+# FIX r1 1: in the cell editor the Undo list moves nothing, as Redo's
+# doesn't: a restore would throw the typed entry away.
+test the undo list is empty in the cell editor and keeps the typing
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type abc
+  key enter
+  click J2
+  type xyz
+  assert editing is true
+  call menu-open {"target":{"qat":"qat-undo"}}
+  assert reply.items.0.label is Can't Undo
+  assert reply.items.0.enabled is false
+  call menu-close {}
+  assert editing is true
+  assert edit is xyz
+  assert cell J1 is abc
+  key enter
+  assert cell J2 is xyz
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Undo Typing 'xyz' in J2 (Ctrl+Z)
+
+# FIX r1 2: QAT Undo in the editor is Ctrl+Z there, AutoComplete proposal
+# dropped first: the typing it sets aside is what was typed.
+test qat undo in the editor drops the autocomplete proposal as ctrl z does
+  open copy:../fixtures/autocomplete.xlsx
+  click A8
+  type spr
+  assert edit is sprockets
+  key ctrl+z
+  key ctrl+z
+  assert edit is spr
+  key escape
+  # A step to undo, so the button is enabled (it greys on an empty history).
+  click C1
+  type x
+  key enter
+  click A8
+  type spr
+  assert edit is sprockets
+  shot window
+  call pointer-click {"region":"qat-undo"}
+  call pointer-click {"region":"qat-undo"}
+  assert edit is spr
+  key escape

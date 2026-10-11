@@ -12042,6 +12042,8 @@ impl Docxy {
                     let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
                     if editing {
                         if let Some(v) = self.active_sheet_mut() {
+                            // As Ctrl+Z: the AutoComplete proposal goes first.
+                            v.proposal_before_key("z", true, false);
                             v.edit_revert();
                         }
                         cx.notify();
@@ -15710,13 +15712,16 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // In the cell editor neither list moves the history, as Excel greys
+        // them there: a restore would throw the typed entry away. The lists
+        // open empty then; this guards a pick from one opened before.
         let changed = self.active_sheet_mut().is_some_and(|v| {
-            if redo {
-                // In the cell editor Redo does nothing (`redo_or_repeat`).
-                v.editing.is_none() && v.redo_steps(n)
-            } else {
-                v.undo_steps(n)
-            }
+            v.editing.is_none()
+                && if redo {
+                    v.redo_steps(n)
+                } else {
+                    v.undo_steps(n)
+                }
         });
         if changed {
             // The chart list just changed under it (see `sheet_undo`).
@@ -28934,8 +28939,11 @@ impl Docxy {
                 .edit_target()
                 .map(|ed| ed.undo_names())
                 .unwrap_or_default(),
+            // In the cell editor the list is empty, as the Redo list is: a
+            // pick would restore over the typed entry and drop it.
             QatState::Sheet { .. } => self
                 .active_sheet()
+                .filter(|v| v.editing.is_none())
                 .map(SheetView::undo_names)
                 .unwrap_or_default(),
             QatState::Plain => {

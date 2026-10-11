@@ -6181,8 +6181,8 @@ mod tests {
         );
     }
 
-    /// #618, #619: `ribbon-read`'s Quick Access Toolbar is the one drawn: a
-    /// document's live state replaces the plain Undo and Redo.
+    /// #1149: a sheet's Quick Access Toolbar names the steps Undo and Redo
+    /// act on, and both buttons are split.
     #[test]
     fn ribbon_read_reports_a_sheets_named_steps_1149() {
         let tip = |json: &Json, k: usize| {
@@ -6218,6 +6218,8 @@ mod tests {
         );
     }
 
+    /// #618, #619: `ribbon-read`'s Quick Access Toolbar is the one drawn: a
+    /// document's live state replaces the plain Undo and Redo.
     #[test]
     fn ribbon_read_reports_the_live_qat_618_619() {
         let item = |json: &Json, id: &str| {

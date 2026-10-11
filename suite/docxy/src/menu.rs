@@ -747,36 +747,28 @@ pub(crate) fn split_menu(
 /// [`UNDO_LIST_CAP`]); the `k`th undoes `k + 1` steps, back to and
 /// including it. With nothing to undo, one disabled `Can't Undo`.
 pub(crate) fn undo_menu(names: &[String]) -> Vec<MenuItem> {
-    if names.is_empty() {
-        return vec![MenuItem::Item(Entry::unavailable(
-            "undo-none",
-            "Can't Undo",
-        ))];
-    }
-    names
-        .iter()
-        .take(UNDO_LIST_CAP)
-        .enumerate()
-        .map(|(k, name)| {
-            MenuItem::Item(Entry::new(
-                &format!("undo-{}", k + 1),
-                name,
-                "",
-                Act::UndoTo(k + 1),
-                true,
-            ))
-        })
-        .collect()
+    history_menu(names, "undo", "Can't Undo", Act::UndoTo)
 }
 
 /// A sheet's Redo drop-down (#1149), the mirror of [`undo_menu`]: the redo
 /// steps' names, the next one first (at most [`UNDO_LIST_CAP`]); the `k`th
 /// redoes `k + 1` steps. With nothing to redo, one disabled `Can't Redo`.
 pub(crate) fn redo_menu(names: &[String]) -> Vec<MenuItem> {
+    history_menu(names, "redo", "Can't Redo", Act::RedoTo)
+}
+
+/// An Undo or Redo drop-down: entry `k` is `{prefix}-{k + 1}` and acts
+/// `act(k + 1)`; with no names, one disabled `none`.
+fn history_menu(
+    names: &[String],
+    prefix: &str,
+    none: &str,
+    act: fn(usize) -> Act,
+) -> Vec<MenuItem> {
     if names.is_empty() {
         return vec![MenuItem::Item(Entry::unavailable(
-            "redo-none",
-            "Can't Redo",
+            &format!("{prefix}-none"),
+            none,
         ))];
     }
     names
@@ -785,10 +777,10 @@ pub(crate) fn redo_menu(names: &[String]) -> Vec<MenuItem> {
         .enumerate()
         .map(|(k, name)| {
             MenuItem::Item(Entry::new(
-                &format!("redo-{}", k + 1),
+                &format!("{prefix}-{}", k + 1),
                 name,
                 "",
-                Act::RedoTo(k + 1),
+                act(k + 1),
                 true,
             ))
         })
