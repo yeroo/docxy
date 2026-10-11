@@ -2349,7 +2349,7 @@ impl App {
         let (r1, c1, r2, c2) = self.selection();
         let (used_r, used_c) = self.sheet().used_size();
         if used_r == 0 || used_c == 0 || r1 >= used_r || c1 >= used_c {
-            return (r1, c1, r1, c1); // just the anchor corner
+            return (r1, c1, r1, c1); // just the selection's top-left corner
         }
         (r1, c1, r2.min(used_r - 1), c2.min(used_c - 1))
     }
