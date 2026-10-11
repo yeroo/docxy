@@ -268,7 +268,12 @@ impl Editor {
         let mut seen = std::collections::HashSet::new();
         let current = &self.proj.tasks[i].predecessors;
         for p in &predecessors {
-            self.index(p.uid)?;
+            // A link to a uid naming no task is kept only when the task
+            // already has it (a dangling link the file carried, which the
+            // cell shows as `?uid`); a new one is refused.
+            if self.proj.task(p.uid).is_none() && !current.iter().any(|c| c.uid == p.uid) {
+                self.index(p.uid)?;
+            }
             // A link to a blank row the task already has is kept (it shows in
             // the cell); only a new one is refused.
             if self.is_blank(p.uid) && !current.iter().any(|c| c.uid == p.uid) {
@@ -805,10 +810,29 @@ pub fn format_lag(p: &Predecessor, proj: &Project) -> String {
 
 /// The external reference a cross-project link shows in the cell: its
 /// trimmed, non-blank `CrossProjectName`. A local link, or a cross link
-/// without a usable name, shows the task ID instead.
+/// without a usable name, shows the task ID instead. A name that reads as a
+/// local-ID entry — digits, then nothing, a `+`/`-`, or a link-type code —
+/// is not usable either: it would shadow that local ID, so the link shows
+/// the task ID instead, as an unnamed cross link already does.
 fn shown_name(p: &Predecessor) -> Option<&str> {
     let name = p.cross_project_name.as_deref()?.trim();
-    (p.cross_project == Some(true) && !name.is_empty()).then_some(name)
+    if p.cross_project != Some(true) || name.is_empty() {
+        return None;
+    }
+    let digits = name.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 {
+        let after = &name[digits..];
+        let head = &after.as_bytes()[..after.len().min(2)];
+        let reads_as_id = after.is_empty()
+            || after.starts_with(['+', '-'])
+            || ["FS", "SS", "FF", "SF"]
+                .into_iter()
+                .any(|code| head.eq_ignore_ascii_case(code.as_bytes()));
+        if reads_as_id {
+            return None;
+        }
+    }
+    Some(name)
 }
 
 /// One link as the Predecessors cell shows it. A cross-project link shows
@@ -864,7 +888,9 @@ pub(crate) fn parse_predecessors(text: &str, proj: &Project) -> Result<Vec<Prede
 /// days, a fraction of a day in minutes) keeps its format unless it is
 /// edited. A cross-project link may be spelled by its external reference
 /// (its `CrossProjectName`), in any ASCII letter case, with an optional
-/// link type and lag.
+/// link type and lag. A link to a uid the project does not have, which the
+/// cell shows as `?<uid>`, may be spelled that way; only one of the task's
+/// own links is accepted.
 pub fn parse_task_predecessors(
     text: &str,
     task: &Task,
@@ -969,19 +995,37 @@ fn parse_predecessors_keeping(
         let (uid, name_len) = match cross {
             Some((p, name_len)) => (p.uid, name_len),
             None => {
-                let end = entry.bytes().take_while(u8::is_ascii_digit).count();
-                let id: i32 = entry[..end]
-                    .parse()
-                    .map_err(|_| "Expected predecessor task ID")?;
-                let mut matches = proj.tasks.iter().filter(|t| t.id == id);
-                let uid = matches
-                    .next()
-                    .ok_or_else(|| format!("No task with ID {id}"))?
-                    .uid;
-                if matches.next().is_some() {
-                    return Err(format!("Ambiguous task ID {id}"));
+                // #1046 r1: an entry spelled `?uid` is one of the task's own
+                // links the cell shows that way — a link to a uid naming no
+                // task, with no usable cross name. It re-parses to that link;
+                // anything else is the digit parse's error below.
+                if let Some(after_q) = entry.strip_prefix('?') {
+                    let digits = after_q.bytes().take_while(u8::is_ascii_digit).count();
+                    let q_uid: i32 = after_q[..digits]
+                        .parse()
+                        .map_err(|_| "Expected predecessor task ID")?;
+                    let shown_as_q = existing.iter().any(|p| {
+                        p.uid == q_uid && proj.task(q_uid).is_none() && shown_name(p).is_none()
+                    });
+                    if !shown_as_q {
+                        return Err("Expected predecessor task ID".into());
+                    }
+                    (q_uid, 1 + digits)
+                } else {
+                    let end = entry.bytes().take_while(u8::is_ascii_digit).count();
+                    let id: i32 = entry[..end]
+                        .parse()
+                        .map_err(|_| "Expected predecessor task ID")?;
+                    let mut matches = proj.tasks.iter().filter(|t| t.id == id);
+                    let uid = matches
+                        .next()
+                        .ok_or_else(|| format!("No task with ID {id}"))?
+                        .uid;
+                    if matches.next().is_some() {
+                        return Err(format!("Ambiguous task ID {id}"));
+                    }
+                    (uid, end)
                 }
-                (uid, end)
             }
         };
         if out.iter().any(|p: &Predecessor| p.uid == uid) {

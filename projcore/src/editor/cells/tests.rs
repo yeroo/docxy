@@ -3335,3 +3335,96 @@ fn reset_date_constraint_leaves_manual_tasks_alone() {
     );
     assert!(!ed.dirty());
 }
+
+fn project_with_a_dangling_link() -> Project {
+    let mut p = untitled_project();
+    p.tasks = (1..=3)
+        .map(|id| Task {
+            id,
+            uid: id * 10,
+            name: format!("Task {id}"),
+            duration_min: 480,
+            ..Task::default()
+        })
+        .collect();
+    // A link a file carried whose uid names no task; the cell shows it as
+    // `?99` and committing it back is what r1 fixes.
+    p.tasks[2].predecessors = vec![Predecessor::fs(10), lag_pred(99, 60, 5)];
+    p
+}
+
+#[test]
+fn a_link_to_a_missing_task_re_enters_as_its_question_uid() {
+    // #1046 r1: the `?uid` spelling of the task's own dangling link re-parses
+    // to that link, so re-committing the cell unchanged is no edit, the link
+    // can be extended, and its type and lag can be edited.
+    let mut ed = Editor::new(project_with_a_dangling_link());
+    let task = ed.project().task(30).unwrap();
+    let text = format_predecessors(task, ed.project());
+    assert_eq!(text, "1, ?99FS+1h");
+    let parsed = parse_task_predecessors(&text, task, ed.project()).unwrap();
+    assert_eq!(parsed, task.predecessors);
+    let depth = ed.undo_depth();
+    ed.set_predecessors(30, parsed).unwrap();
+    assert_eq!(ed.undo_depth(), depth);
+    // Adding a link keeps the dangling one byte-exact and commits.
+    let task = ed.project().task(30).unwrap();
+    let more = parse_task_predecessors(&format!("{text}, 2"), task, ed.project()).unwrap();
+    ed.set_predecessors(30, more).unwrap();
+    assert_eq!(
+        ed.project().task(30).unwrap().predecessors,
+        vec![
+            Predecessor::fs(10),
+            lag_pred(99, 60, 5),
+            Predecessor::fs(20)
+        ]
+    );
+    // Editing the dangling link's type and lag keeps its uid and commits.
+    let task = ed.project().task(30).unwrap();
+    let edited = parse_task_predecessors("1, ?99SS", task, ed.project()).unwrap();
+    assert_eq!(edited[1].uid, 99);
+    assert_eq!(edited[1].link, LinkType::StartStart);
+    assert_eq!((edited[1].lag, edited[1].lag_format), (0, LagFormat::DAYS));
+    ed.set_predecessors(30, edited).unwrap();
+    assert_eq!(
+        ed.project().task(30).unwrap().predecessors[1],
+        Predecessor {
+            link: LinkType::StartStart,
+            ..Predecessor::fs(99)
+        }
+    );
+}
+
+#[test]
+fn a_question_uid_is_only_the_tasks_own_missing_link() {
+    // #1046 r1: `?uid` is accepted only for a link this task already has that
+    // the cell shows as `?uid`. This guard passes on the unfixed code.
+    let mut ed = Editor::new(project_with_a_dangling_link());
+    let proj = ed.project().clone();
+    let task = proj.task(30).unwrap();
+    for text in ["?98", "?", "?20", "?99?"] {
+        assert!(
+            parse_task_predecessors(text, task, &proj).is_err(),
+            "{text}"
+        );
+    }
+    // A new link to a uid naming no task is still refused, as a whole-cell edit.
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    assert!(ed.set_predecessors(20, vec![Predecessor::fs(99)]).is_err());
+    unchanged(&ed, &before, history);
+    // A dangling link with a usable cross name shows the name, not `?uid`, so
+    // `?uid` is not one of its spellings.
+    let mut named = project_with_a_dangling_link();
+    let link = &mut named.tasks[2].predecessors[1];
+    link.cross_project = Some(true);
+    link.cross_project_name = Some(r"C:\x.mpp\7".into());
+    let task = named.task(30).unwrap();
+    let text = format_predecessors(task, &named);
+    assert_eq!(text, r"1, C:\x.mpp\7FS+1h");
+    assert_eq!(
+        parse_task_predecessors(&text, task, &named).unwrap(),
+        task.predecessors
+    );
+    assert!(parse_task_predecessors("1, ?99", task, &named).is_err());
+}
