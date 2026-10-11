@@ -498,12 +498,11 @@ impl Writer<'_> {
             let _ = write!(out, "\\cf{i}");
         }
         // Word reads `\highlight`; Cocoa (TextEdit, Pages) reads only `\cb`.
-        let highlight = |p: &RunProps| p.highlight.as_deref().and_then(highlight_rgb);
-        if let Some((r, g, b)) = highlight(p) {
+        // A style's highlight is not resolved into runs, so `base` has none
+        // to turn off.
+        if let Some((r, g, b)) = p.highlight.as_deref().and_then(highlight_rgb) {
             let i = self.color_index(format!("{r:02X}{g:02X}{b:02X}"));
             let _ = write!(out, "\\highlight{i}\\cb{i}");
-        } else if highlight(base).is_some() {
-            out.push_str("\\highlight0\\cb0");
         }
         out
     }

@@ -259,6 +259,13 @@ impl<'a> Reader<'a> {
         let Some(prev) = self.stack.pop() else {
             return false;
         };
+        // A last colour table entry with no `;` after it still counts.
+        if self.st.dest == Dest::ColorTable
+            && prev.dest != Dest::ColorTable
+            && self.color_entry.is_some()
+        {
+            self.end_color();
+        }
         self.st = prev;
         self.skip = 0;
         !self.stack.is_empty()
@@ -651,14 +658,18 @@ impl<'a> Reader<'a> {
     }
 
     /// A control word in `\colortbl`: a component of the entry being read.
+    /// Anything else (a theme colour's `\ctextone`, `\ctint`) leaves an
+    /// entry with no RGB auto.
     fn color_word(&mut self, w: &[u8], num: Option<i32>) {
+        if !matches!(w, b"red" | b"green" | b"blue") {
+            return;
+        }
         let v = num.unwrap_or(0).clamp(0, 255) as u8;
         let entry = self.color_entry.get_or_insert((0, 0, 0));
         match w {
             b"red" => entry.0 = v,
             b"green" => entry.1 = v,
-            b"blue" => entry.2 = v,
-            _ => {}
+            _ => entry.2 = v,
         }
     }
 
@@ -949,16 +960,30 @@ mod tests {
 
     #[test]
     fn zero_index_and_white_background_clear() {
-        let rtf = r"{\rtf1{\colortbl;\red255\green0\blue0;\red255\green255\blue255;}\cf1\highlight1 a\highlight0\cf0 b\cf1\cb1 c\plain d\cb2 e\cb9\cf9 f\par}";
+        let rtf = r"{\rtf1{\colortbl;\red255\green0\blue0;\red255\green255\blue255;}\cf1\highlight1 a\highlight0\cf0 b\cf1\cb1 c\plain d\cb2 e\cf1\highlight1 g\cb9\cf9 f\par}";
         assert_eq!(
             colours(rtf),
             [
                 run("a", Some("FF0000"), Some("red")),
                 run("b", None, None),
                 run("c", Some("FF0000"), Some("red")),
-                run("def", None, None),
+                run("de", None, None),
+                run("g", Some("FF0000"), Some("red")),
+                run("f", None, None),
             ]
         );
+    }
+
+    #[test]
+    fn a_theme_only_entry_is_auto() {
+        let rtf = r"{\rtf1{\colortbl;\ctextone\ctint255\cshade255;}\cf1\highlight1 x\par}";
+        assert_eq!(colours(rtf), [run("x", None, None)]);
+    }
+
+    #[test]
+    fn the_last_colour_without_a_semicolon_counts() {
+        let rtf = r"{\rtf1{\colortbl;\red255\green0\blue0;\red0\green0\blue255}\cf2 x\par}";
+        assert_eq!(colours(rtf), [run("x", Some("0000FF"), None)]);
     }
 
     #[test]
