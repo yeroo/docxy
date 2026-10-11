@@ -3365,6 +3365,13 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
         ("find_open", Json::Bool(app.find_open)),
         ("find_query", Json::Str(app.find_query.clone())),
         ("replace_text", Json::Str(app.replace_text.clone())),
+        // The Format Cells panel, which owns every key while it is open (#1161).
+        (
+            "format_cells_open",
+            Json::Bool(app.format_panel_owns_keys()),
+        ),
+        // The Alt / F10 access-key overlay, at either level.
+        ("keytips_up", Json::Bool(app.keytips != crate::KeyTip::Off)),
         // The input handler's marked text (#1072), typed nowhere yet.
         (
             "ime_marked",
