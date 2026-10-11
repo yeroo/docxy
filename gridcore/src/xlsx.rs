@@ -11470,6 +11470,57 @@ mod tests {
         assert_eq!(s.merges, vec![(4, 0, 5, 1)]);
     }
 
+    /// #1279: a `cellXfs` xf on builtin numFmtId 7 with no `<numFmt>` element
+    /// loads with the builtin's code (so the cell renders as currency), and
+    /// a style derived from it keeps the builtin id instead of minting a
+    /// custom numFmt (an unedited save never rewrites styles.xml at all).
+    #[test]
+    fn builtin_currency_id_without_numfmt_loads_and_a_derived_xf_keeps_it() {
+        let sheet1 = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" s="1"><v>1234.5</v></c></row></sheetData></worksheet>"#;
+        let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0"/><xf numFmtId="7" fontId="0" applyNumberFormat="1"/></cellXfs></styleSheet>"#;
+        let workbook = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let wb_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#;
+        let root_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+        let content_types = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+        let bytes = write_zip(&[
+            ("[Content_Types].xml".into(), content_types.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("xl/workbook.xml".into(), workbook.into()),
+            ("xl/_rels/workbook.xml.rels".into(), wb_rels.into()),
+            ("xl/worksheets/sheet1.xml".into(), sheet1.into()),
+            ("xl/styles.xml".into(), styles.into()),
+        ]);
+
+        let mut pkg = load_xlsx(&bytes).expect("load");
+        let style = pkg.workbook.sheets[0].cell(0, 0).unwrap().style;
+        let xf = pkg.workbook.styles.xf(style);
+        assert_eq!(xf.code.as_deref(), crate::numfmt::builtin_code(7));
+        assert_eq!(
+            crate::sheet::format_with(&xf, &CellValue::Number(1234.5), false),
+            "$1,234.50 "
+        );
+
+        // A format command on A1 (bold) derives a new xf: the save mints a
+        // font but must keep the builtin numFmtId, not a custom <numFmt>.
+        let mut bold = pkg.workbook.styles.xf(style);
+        bold.bold = true;
+        let b = pkg.workbook.styles.intern(bold);
+        let a1 = pkg.workbook.sheets[0].cell(0, 0).unwrap().clone();
+        pkg.workbook.sheets[0].set_cell(0, 0, crate::sheet::Cell { style: b, ..a1 });
+
+        let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        let styles = String::from_utf8(saved.part("xl/styles.xml").unwrap().to_vec()).unwrap();
+        let xfs = cell_xf_elements(&styles);
+        let i = saved.workbook.sheets[0].cell(0, 0).unwrap().style as usize;
+        assert_ne!(
+            i, 1,
+            "deriving bold must add a new xf, not rewrite the loaded id-7 one"
+        );
+        assert_eq!(tag_attr(xfs[i], "numFmtId"), Some("7"), "{}", xfs[i]);
+        assert_ne!(tag_attr(xfs[i], "fontId"), Some("0"), "{}", xfs[i]);
+        assert!(!styles.contains("<numFmt "), "{styles}");
+    }
+
     #[test]
     fn calc_chain_first_relationship_keeps_rels_root() {
         let mut pkg = load_xlsx(&fixture()).expect("load");
