@@ -4347,8 +4347,8 @@ impl App {
         if self.format != DocFormat::Markdown || self.md_source == source {
             return;
         }
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
+        if self.commit_hf_edit(true).is_err() {
+            return;
         }
         let doc = if source {
             // Render the live document to Markdown, then edit it as literal lines.
@@ -4726,7 +4726,8 @@ impl App {
     ) -> Result<CompareSummary, String> {
         // Leave header/footer editing first: committing makes its edits count
         // as unsaved, and its swapped-out body must not outlive the document.
-        self.exit_hf_edit(true);
+        // A failed commit stops the compare (#1239).
+        self.commit_hf_edit(true)?;
         if self.modified && !discard {
             return Err("unsaved changes; save or reload first".to_string());
         }
@@ -4786,7 +4787,9 @@ impl App {
             return;
         }
         self.compare_dialog = None;
-        self.exit_hf_edit(true);
+        if self.commit_hf_edit(true).is_err() {
+            return;
+        }
         if self.modified {
             self.confirm = Some(
                 backstage::Confirm::new(
@@ -5154,10 +5157,15 @@ impl App {
     /// header/footer edit first so its editor cannot write a header part
     /// back over a watermark and the section edits hit the body editor.
     fn apply_design_pick(&mut self, kind: PickerKind, item: &str) {
+        // A failed header/footer commit stops the pick; its error stays the
+        // status, which the arms below would overwrite (#1239).
+        if self.commit_hf_edit(true).is_err() {
+            return;
+        }
         match kind {
             PickerKind::PageColor => {
                 let rgb = PAGE_COLORS.iter().find(|c| c.0 == item).map(|c| c.1);
-                self.set_page_color(rgb);
+                let _ = self.set_page_color(rgb);
                 self.status = Some(match rgb {
                     Some(_) => format!("Page color: {item}"),
                     None => "Page color: No Color".to_string(),
@@ -5180,7 +5188,7 @@ impl App {
             }
             PickerKind::PageBorders => {
                 let pb = (item != "None").then(|| box_page_borders(item == "Shadow", None));
-                self.set_page_borders(pb.as_ref());
+                let _ = self.set_page_borders(pb.as_ref());
                 // after_edit clears the status: report the pick after it.
                 self.status = Some(format!("Page borders: {item}"));
             }
@@ -5191,11 +5199,10 @@ impl App {
 
     /// Set or remove the page colour (Design ▸ Page Color): the package's
     /// `w:background` and `w:displayBackgroundShape`. A package edit with no
-    /// undo. Returns whether anything changed.
-    pub(crate) fn set_page_color(&mut self, rgb: Option<u32>) -> bool {
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
-        }
+    /// undo. Returns whether anything changed. Errs, changing nothing, when
+    /// an open header/footer edit cannot be committed (#1239).
+    pub(crate) fn set_page_color(&mut self, rgb: Option<u32>) -> Result<bool, String> {
+        self.commit_hf_edit(true)?;
         let bg = rgb.map(|color| PageBackground {
             color,
             gradient: None,
@@ -5204,7 +5211,7 @@ impl App {
         if changed {
             self.modified = true;
         }
-        changed
+        Ok(changed)
     }
 
     /// Write or remove the text watermark in every shown header (Design ▸
@@ -5213,14 +5220,13 @@ impl App {
     /// a watermark was requested but the document cannot take a header. An
     /// Err may follow a partial edit (the removed watermark's header parts
     /// and section references are already gone) — the Err carries `changed`
-    /// so callers can report whether one happened.
+    /// so callers can report whether one happened. Errs, changing nothing,
+    /// when an open header/footer edit cannot be committed (#1239).
     pub(crate) fn set_text_watermark(
         &mut self,
         spec: Option<&TextWatermarkSpec>,
     ) -> Result<bool, (bool, String)> {
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
-        }
+        self.commit_hf_edit(true).map_err(|msg| (false, msg))?;
         let mut sects = self.editor.sections();
         let before = sects.clone();
         let parts = self.pkg.set_text_watermark(spec, &mut sects);
@@ -5252,11 +5258,10 @@ impl App {
     }
 
     /// Write or remove page borders on every section (Design ▸ Page Borders)
-    /// as one undo step. Returns whether anything changed.
-    pub(crate) fn set_page_borders(&mut self, pb: Option<&PageBorders>) -> bool {
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
-        }
+    /// as one undo step. Returns whether anything changed. Errs, changing
+    /// nothing, when an open header/footer edit cannot be committed (#1239).
+    pub(crate) fn set_page_borders(&mut self, pb: Option<&PageBorders>) -> Result<bool, String> {
+        self.commit_hf_edit(true)?;
         let n = self.editor.sections().len();
         let changed = self
             .editor
@@ -5266,7 +5271,7 @@ impl App {
         if changed {
             self.after_edit();
         }
-        changed
+        Ok(changed)
     }
 
     fn picker_key(&mut self, key: KeyEvent) -> bool {
@@ -8845,7 +8850,7 @@ mod tests {
     #[test]
     fn page_color_paints_the_print_layout_sheet() {
         let mut app = app_with(&["body"]);
-        assert!(app.set_page_color(Some(0xFF0000)));
+        assert_eq!(app.set_page_color(Some(0xFF0000)), Ok(true));
         app.page_view = true; // light_page stays false: the dark terminal theme
         app.dirty = true;
         let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
@@ -8878,7 +8883,7 @@ mod tests {
     #[test]
     fn page_color_light_sheet_uses_dark_ink() {
         let mut app = app_with(&["body"]);
-        assert!(app.set_page_color(Some(0xFFFF00)));
+        assert_eq!(app.set_page_color(Some(0xFFFF00)), Ok(true));
         app.page_view = true;
         app.light_page = true;
         app.dirty = true;
@@ -8901,7 +8906,7 @@ mod tests {
     #[test]
     fn page_color_not_painted_outside_print_layout() {
         let mut app = app_with(&["body"]);
-        assert!(app.set_page_color(Some(0xFF0000)));
+        assert_eq!(app.set_page_color(Some(0xFF0000)), Ok(true));
         app.page_view = false; // Read Mode: continuous, no page frame
         app.dirty = true;
         let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
@@ -8924,7 +8929,7 @@ mod tests {
         picked.run_act(ribbon::Act::PageColor);
         pick(&mut picked, PickerKind::PageColor, "Red");
         let mut direct = app_with(&["body"]);
-        assert!(direct.set_page_color(Some(0xFF0000)));
+        assert_eq!(direct.set_page_color(Some(0xFF0000)), Ok(true));
         for part in ["word/document.xml", "word/settings.xml"] {
             assert_eq!(
                 picked.pkg.part_text(part),
@@ -11056,6 +11061,147 @@ mod tests {
         assert_eq!(app.format, DocFormat::Docx);
         assert!(!app.modified);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1239: a Design pick with an open header edit that cannot be committed
+    /// stops: the commit's error stays the status and the pick's edit does
+    /// not land.
+    #[test]
+    fn design_picks_keep_a_failed_header_commit_status() {
+        for (kind, item) in [
+            (PickerKind::PageColor, PAGE_COLORS[1].0),
+            (PickerKind::Watermark, WATERMARK_PRESETS[0].0),
+            (PickerKind::PageBorders, "Box"),
+        ] {
+            let mut app = app_in_failing_header_edit();
+            app.apply_design_pick(kind, item);
+            let status = app.status.clone().unwrap_or_default();
+            assert!(
+                status.contains("Couldn't write the header edit"),
+                "{kind:?}: {status}"
+            );
+            assert!(
+                app.pkg.page_background().is_none(),
+                "{kind:?}: the page background must stay unset"
+            );
+            assert!(
+                app.pkg
+                    .shown_text_watermarks(&app.editor.sections())
+                    .is_empty(),
+                "{kind:?}: no watermark may be added"
+            );
+            assert!(
+                app.editor
+                    .sections()
+                    .iter()
+                    .all(|s| !s.contains("<w:pgBorders")),
+                "{kind:?}: no page borders may be added"
+            );
+            assert!(!app.modified, "{kind:?}");
+        }
+    }
+
+    /// #1239: Compare stops on a failed header/footer commit: the error is
+    /// answered, the open document is not replaced, and run_compare's status
+    /// keeps the reason.
+    #[test]
+    fn compare_with_failed_header_commit_keeps_the_document() {
+        let (dir, original, revised) = compare_fixture("hf-fail");
+        let mut app = app_in_failing_header_edit();
+        let err = match app.compare_paths(&original, &revised, true) {
+            Err(err) => err,
+            Ok(_) => panic!("a failed header commit must stop the compare"),
+        };
+        assert!(err.contains("Couldn't write the header edit"), "{err}");
+        assert_eq!(app.path, "test.docx");
+
+        let mut app = app_in_failing_header_edit();
+        app.run_compare(&original, &revised, true);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit"),
+            "{status}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1239: submitting the Compare dialog with a failing header commit
+    /// closes the dialog but opens no confirm, keeps the document, and the
+    /// commit's error stays the status.
+    #[test]
+    fn compare_dialog_keeps_a_failed_header_commit_status() {
+        let (dir, original, revised) = compare_fixture("hf-fail-dialog");
+        let mut app = app_in_failing_header_edit();
+        app.compare_dialog = Some(CompareDialog {
+            original,
+            revised,
+            field: 1,
+        });
+        app.submit_compare_dialog();
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit"),
+            "{status}"
+        );
+        assert!(app.confirm.is_none());
+        assert_eq!(app.path, "test.docx");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1239: switching a Markdown file to source view stops on a failed
+    /// header commit: the view stays as it was and the error stays the
+    /// status.
+    #[test]
+    fn md_source_switch_keeps_a_failed_header_commit_status() {
+        let mut app = app_in_failing_header_edit();
+        app.format = DocFormat::Markdown;
+        app.md_source = false;
+        app.set_md_source(true);
+        assert!(!app.md_source, "the view must not switch");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit"),
+            "{status}"
+        );
+    }
+
+    /// #1239: the Design setters answer the failed header commit's error and
+    /// change nothing.
+    #[test]
+    fn design_setters_err_on_a_failed_header_commit() {
+        let mut app = app_in_failing_header_edit();
+        let err = app.set_page_color(Some(0xFF0000)).unwrap_err();
+        assert!(err.contains("Couldn't write the header edit"), "{err}");
+        assert!(
+            app.pkg.page_background().is_none(),
+            "the page background must stay unset"
+        );
+
+        let mut app = app_in_failing_header_edit();
+        let err = app
+            .set_page_borders(Some(&box_page_borders(false, None)))
+            .unwrap_err();
+        assert!(err.contains("Couldn't write the header edit"), "{err}");
+        assert!(
+            app.editor
+                .sections()
+                .iter()
+                .all(|s| !s.contains("<w:pgBorders")),
+            "no page borders may be added"
+        );
+
+        let mut app = app_in_failing_header_edit();
+        let (changed, msg) = app
+            .set_text_watermark(Some(&TextWatermarkSpec::preset("X", true)))
+            .unwrap_err();
+        assert!(!changed, "a failed commit changes nothing");
+        assert!(msg.contains("Couldn't write the header edit"), "{msg}");
+        assert!(
+            app.pkg
+                .shown_text_watermarks(&app.editor.sections())
+                .is_empty(),
+            "no watermark may be added"
+        );
     }
 
     #[test]
