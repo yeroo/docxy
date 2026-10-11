@@ -1022,6 +1022,17 @@ enum SnapshotBody {
 }
 
 impl SheetSnapshot {
+    /// This step, its Undo and Redo selecting `rect` on sheet `sheet`
+    /// (#1148) rather than the selection taken with it.
+    fn targeting(mut self, sheet: usize, rect: (u32, u32, u32, u32)) -> Self {
+        self.target = Some(UndoTarget {
+            sheet,
+            rect,
+            areas: Vec::new(),
+        });
+        self
+    }
+
     /// The workbook this step restores: what a command compares against to
     /// tell whether it changed anything, without a second copy.
     fn workbook(&self) -> &gridcore::sheet::Workbook {
@@ -2586,6 +2597,11 @@ impl SheetView {
         self.anchor = (r1, c1);
         self.areas = t.areas;
         self.stamp_areas();
+        // Whole rows or columns show their start, not the sheet's far edge.
+        let last = (gridcore::sheet::MAX_ROWS - 1, gridcore::sheet::MAX_COLS - 1);
+        let r1 = if (r0, r1) == (0, last.0) { r0 } else { r1 };
+        let c1 = if (c0, c1) == (0, last.1) { c0 } else { c1 };
+        self.reveal((r0, c0, r1, c1));
     }
 
     /// The current state, taken as `snap` was: the package when it holds one.
@@ -2738,13 +2754,7 @@ impl SheetView {
     /// [`Self::push_undo`] for an edit that changes `rect` on sheet `sheet`:
     /// its Undo and Redo select that, not the selection (#1148).
     fn push_undo_at(&mut self, sheet: usize, rect: (u32, u32, u32, u32)) {
-        let mut snap = self.snapshot();
-        snap.target = Some(UndoTarget {
-            sheet,
-            rect,
-            areas: Vec::new(),
-        });
-        self.push_undo_snapshot(snap);
+        self.push_undo_snapshot(self.snapshot().targeting(sheet, rect));
     }
 
     /// Record `snap`, taken before an edit that has now landed.
@@ -9878,7 +9888,6 @@ fn series_resolved_preview(name: &str, name_ref: Option<&str>, max_chars: usize)
         .map(|_| bounded_label(name, max_chars))
 }
 
-/// The rectangle a selection covers, whichever corner it was dragged from.
 /// The rectangle `block` covers written at `at`, top-left to bottom-right;
 /// `None` for an empty block.
 fn block_rect(
@@ -9890,6 +9899,7 @@ fn block_rect(
     (h > 0 && w > 0).then(|| (at.0, at.1, at.0 + h - 1, at.1 + w - 1))
 }
 
+/// The rectangle a selection covers, whichever corner it was dragged from.
 fn sel_range(sel: (u32, u32), anchor: (u32, u32)) -> (u32, u32, u32, u32) {
     let ((ar, ac), (br, bc)) = (sel, anchor);
     (ar.min(br), ac.min(bc), ar.max(br), ac.max(bc))

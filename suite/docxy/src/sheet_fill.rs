@@ -91,9 +91,10 @@ impl SheetView {
         if self.engine.refuses_area(&self.pkg.workbook, s, area) {
             return Err(gridcore::engine::PART_OF_ARRAY.to_string());
         }
-        self.push_undo();
-        let filled = gridcore::edit::autofill(&mut self.pkg.workbook, s, req);
         let (r0, c0, r1, c1) = target.selection(req.src);
+        // Undo and Redo select what the gesture leaves selected (#1148).
+        self.push_undo_at(s, crate::sel_range((r0, c0), (r1, c1)));
+        let filled = gridcore::edit::autofill(&mut self.pkg.workbook, s, req);
         self.anchor = (r0, c0);
         self.sel = (r1, c1);
         self.clear_areas();
@@ -137,8 +138,11 @@ impl SheetView {
         let snap = self.undo.pop()?;
         let edit_gen = self.edit_gen;
         let now = self.snapshot_like(&snap);
+        // A refusal puts the step back with what it selects (#1148).
+        let target = snap.target.clone();
         self.restore(snap);
-        let before = self.snapshot_like(&now);
+        let mut before = self.snapshot_like(&now);
+        before.target = target;
         let done = again(self);
         if done.is_err() {
             self.restore(now);

@@ -7593,7 +7593,10 @@ impl App {
             }
         };
         let n = changes.len();
-        if self.apply(changes) {
+        // Undo and Redo select the pasted range, cells a skip-blanks paste
+        // left alone too (#1148).
+        let rect = block.pasted_rect(self.cur, spec.transpose);
+        if self.with_undo_target(s, rect, |app| app.apply(changes)) {
             self.status = Some(format!("Pasted {} into {n} cell(s)", spec.what.label()));
         }
     }
@@ -22001,6 +22004,45 @@ mod tests {
         app.undo();
         assert_eq!(app.selection(), (0, 0, 2, 2));
         assert_eq!(app.cur, (0, 0));
+        away(&mut app);
+        app.redo();
+        assert!(app.sheet().cell(1, 1).is_none());
+        assert_eq!(app.selection(), (0, 0, 2, 2));
+        assert_eq!(app.cur, (0, 0));
+    }
+
+    #[test]
+    fn undo_and_redo_of_a_skip_blanks_paste_special_select_the_pasted_range() {
+        // A1 and A2 hold values, A3 is blank (C3 keeps row 3 in the used
+        // range): Skip Blanks writes D1:D2 only, but Undo and Redo select
+        // D1:D3.
+        let mut app = opts_app();
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(1.0));
+        app.pkg.workbook.sheets[0].set_cell(1, 0, Cell::number(2.0));
+        app.pkg.workbook.sheets[0].set_cell(2, 2, Cell::number(9.0));
+        app.rebuild_engine();
+        app.anchor = Some((0, 0));
+        app.cur = (2, 0);
+        app.copy(false);
+        app.anchor = None;
+        app.cur = (0, 3);
+        let mut spec = gridcore::edit::PasteSpec::of(gridcore::edit::PasteWhat::Values);
+        spec.skip_blanks = true;
+        app.paste_special(spec);
+        assert_eq!(
+            app.sheet().cell(1, 3).unwrap().value,
+            CellValue::Number(2.0)
+        );
+        assert!(app.sheet().cell(2, 3).is_none(), "the blank was skipped");
+        away(&mut app);
+        app.undo();
+        assert!(app.sheet().cell(1, 3).is_none());
+        assert_eq!(app.selection(), (0, 3, 2, 3));
+        assert_eq!(app.cur, (0, 3));
+        away(&mut app);
+        app.redo();
+        assert_eq!(app.selection(), (0, 3, 2, 3));
+        assert_eq!(app.cur, (0, 3));
     }
 
     #[test]
