@@ -268,15 +268,15 @@ impl Editor {
         let mut seen = std::collections::HashSet::new();
         let current = &self.proj.tasks[i].predecessors;
         for p in &predecessors {
-            // A link to a uid naming no task is kept only when the task
-            // already has it (a dangling link the file carried, which the
-            // cell shows as `?uid`); a new one is refused.
-            if self.proj.task(p.uid).is_none() && !current.iter().any(|c| c.uid == p.uid) {
+            // A link the task already has is kept (it shows in the cell),
+            // whether its uid names no task (a dangling link the file
+            // carried, which the cell shows as `?uid`) or its row is blank;
+            // only a new one is refused.
+            let kept = current.iter().any(|c| c.uid == p.uid);
+            if !kept {
                 self.index(p.uid)?;
             }
-            // A link to a blank row the task already has is kept (it shows in
-            // the cell); only a new one is refused.
-            if self.is_blank(p.uid) && !current.iter().any(|c| c.uid == p.uid) {
+            if !kept && self.is_blank(p.uid) {
                 let id = self.proj.task(p.uid).map_or(p.uid, |t| t.id);
                 return Err(format!("No task with ID {id}"));
             }
@@ -991,7 +991,9 @@ fn parse_predecessors_keeping(
             .find(|p| format_link(p, proj).to_ascii_uppercase() == entry);
         // A name entry takes its uid from the matched link, and the kind and
         // lag from the text after the name (its byte length: ASCII-uppercasing
-        // preserves byte offsets); any other entry parses a local task ID.
+        // preserves byte offsets); a `?uid` entry takes one of the task's own
+        // links the cell shows that way, and any other entry parses a local
+        // task ID.
         let (uid, name_len) = match cross {
             Some((p, name_len)) => (p.uid, name_len),
             None => {
@@ -1000,8 +1002,15 @@ fn parse_predecessors_keeping(
                 // task, with no usable cross name. It re-parses to that link;
                 // anything else is the digit parse's error below.
                 if let Some(after_q) = entry.strip_prefix('?') {
-                    let digits = after_q.bytes().take_while(u8::is_ascii_digit).count();
-                    let q_uid: i32 = after_q[..digits]
+                    // Uids can be negative (the mspdi reader keeps them); a
+                    // `-` here is the uid's sign, not a lag — a lag needs a
+                    // uid before it.
+                    let sign_len = usize::from(after_q.starts_with('-'));
+                    let digits = after_q[sign_len..]
+                        .bytes()
+                        .take_while(u8::is_ascii_digit)
+                        .count();
+                    let q_uid: i32 = after_q[..sign_len + digits]
                         .parse()
                         .map_err(|_| "Expected predecessor task ID")?;
                     let shown_as_q = existing.iter().any(|p| {
@@ -1010,7 +1019,7 @@ fn parse_predecessors_keeping(
                     if !shown_as_q {
                         return Err("Expected predecessor task ID".into());
                     }
-                    (q_uid, 1 + digits)
+                    (q_uid, 1 + sign_len + digits)
                 } else {
                     let end = entry.bytes().take_while(u8::is_ascii_digit).count();
                     let id: i32 = entry[..end]
