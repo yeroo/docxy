@@ -1,0 +1,69 @@
+# Where Undo and Redo leave the selection (#1148), as Excel 2024 does: both
+# select what the step changes, wherever the selection is now, with the
+# active cell at its top-left. `sheet_undo_sel_tests.rs` covers the rest
+# (rows, columns, areas, sheets) on SheetView.
+
+# The issue's repro 2: Redo used to put the selection back on D5.
+test undo and redo of an entry select its cell
+  open copy:../fixtures/basic.xlsx
+  click A1
+  type one
+  key enter
+  click A1
+  type two
+  key enter
+  click D5
+  key ctrl+z
+  assert cell A1 is one
+  assert sel is A1
+  assert range is A1
+  click F9
+  key ctrl+y
+  assert cell A1 is two
+  assert sel is A1
+  assert range is A1
+
+test undo and redo of a paste select the pasted block
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 1
+  key enter
+  type 2
+  key enter
+  type 3
+  key enter
+  click J1
+  click J3 shift
+  key ctrl+c
+  click M1
+  key ctrl+v
+  click F9
+  key ctrl+z
+  assert cell M3 is nothing
+  assert range is M1:M3
+  assert sel is M1
+  click F9
+  key ctrl+y
+  assert cell M3 is 3
+  assert range is M1:M3
+  assert sel is M1
+
+test undo and redo of a fill select its range with the active cell top left
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 5
+  key enter
+  click J1
+  click J4 shift
+  key ctrl+d
+  assert cell J4 is 5
+  click F9
+  key ctrl+z
+  assert cell J4 is nothing
+  assert range is J1:J4
+  assert sel is J1
+  click F9
+  key ctrl+y
+  assert cell J4 is 5
+  assert range is J1:J4
+  assert sel is J1

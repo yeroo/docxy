@@ -187,11 +187,14 @@ impl SheetView {
         // The undo step holds the styles as they were before the paste.
         let interned = std::mem::replace(&mut self.pkg.workbook.styles, styles);
         let package = !extras.notes.is_empty() || !extras.rules.is_empty();
-        if package {
-            self.push_undo_snapshot(self.snapshot_package(), SheetStep::Named("Paste Special"));
+        // Undo and Redo select the pasted range (#1148).
+        let rect = block.pasted_rect(at, spec.transpose);
+        let snap = if package {
+            self.snapshot_package()
         } else {
-            self.push_undo(SheetStep::Named("Paste Special"));
-        }
+            self.snapshot()
+        };
+        self.push_undo_snapshot(snap.targeting(s, rect), SheetStep::Named("Paste Special"));
         self.pkg.workbook.styles = interned;
         self.engine
             .set_cells_prechecked(&mut self.pkg.workbook, s, changes);
@@ -223,7 +226,6 @@ impl SheetView {
         let noted: Vec<(u32, u32)> = extras.notes.iter().map(|n| (n.0, n.1)).collect();
         self.pkg.remove_comments(s, &noted);
         self.pkg.set_comments(s, &extras.notes);
-        let rect = block.pasted_rect(at, spec.transpose);
         self.sel = (rect.0, rect.1);
         self.anchor = (rect.2, rect.3);
         self.clear_areas();
@@ -244,10 +246,10 @@ impl SheetView {
         if self.refuses(s, &changes) {
             return Err(gridcore::engine::PART_OF_ARRAY.into());
         }
-        self.push_undo(SheetStep::Named("Paste"));
+        let rect = block.pasted_rect(at, false);
+        self.push_undo_at(s, rect, SheetStep::Named("Paste"));
         self.engine
             .set_cells_prechecked(&mut self.pkg.workbook, s, changes);
-        let rect = block.pasted_rect(at, false);
         self.sel = (rect.0, rect.1);
         self.anchor = (rect.2, rect.3);
         self.clear_areas();

@@ -817,17 +817,24 @@ pub(crate) fn start_tags<'a>(xml: &'a str, tag: &str) -> Vec<(usize, &'a str)> {
     out
 }
 
-/// Read the value of attribute `key="…"` from a raw XML element slice (a
-/// small scoped scan, not a full attribute parser — sufficient for locating
-/// one known attribute on one already-located element, as used by
+/// Read the value of attribute `key="…"` (or `key='…'`) from a raw XML element
+/// slice (a small scoped scan, not a full attribute parser — sufficient for
+/// locating one known attribute on one already-located element, as used by
 /// [`header_footer_ref_rid`] and callers that check on/off flags like
-/// `w:val="false"`).
+/// `w:val="false"`). When both quote styles appear, the earliest occurrence
+/// wins.
 pub fn xml_attr_value(el: &str, key: &str) -> Option<String> {
-    let k = format!("{key}=\"");
-    let s = el.find(&k)? + k.len();
-    let rest = &el[s..];
-    let e = rest.find('"')?;
-    Some(rest[..e].to_string())
+    let hit = ['"', '\'']
+        .iter()
+        .filter_map(|q| {
+            let k = format!("{key}={q}");
+            el.find(&k).map(|i| (i, i + k.len(), *q))
+        })
+        .min_by_key(|(i, _, _)| *i);
+    let (_, start, q) = hit?;
+    let rest = &el[start..];
+    let end = rest.find(q)?;
+    Some(rest[..end].to_string())
 }
 
 /// Parse a block-level `<w:sdt>` (content control: cover pages, TOC, …) while
@@ -3120,6 +3127,39 @@ mod tests {
             Some("rId2".to_string())
         );
         assert_eq!(xml_attr_value("<w:p/", "r:id"), None);
+    }
+
+    #[test]
+    fn xml_attr_value_reads_a_single_quoted_attribute() {
+        assert_eq!(
+            xml_attr_value("<w:type w:val='oddPage'/", "w:val"),
+            Some("oddPage".to_string())
+        );
+        assert_eq!(
+            xml_attr_value("<w:x w:a='1' w:b=\"2\"/", "w:b"),
+            Some("2".to_string())
+        );
+        // A value containing the other quote style is untouched (passes today;
+        // guards the new scan against reading to the wrong closing quote).
+        assert_eq!(
+            xml_attr_value("<w:x w:a=\"it's\"/", "w:a"),
+            Some("it's".to_string())
+        );
+        // The single-quoted direction of the same guard.
+        assert_eq!(
+            xml_attr_value("<w:x w:a='say \"hi\"'/", "w:a"),
+            Some("say \"hi\"".to_string())
+        );
+        // Both quote styles present: the earliest occurrence wins, whichever
+        // style it uses.
+        assert_eq!(
+            xml_attr_value("<w:x w:val='first' w:val=\"second\"/", "w:val"),
+            Some("first".to_string())
+        );
+        assert_eq!(
+            xml_attr_value("<w:x w:val=\"second\" w:val='first'/", "w:val"),
+            Some("second".to_string())
+        );
     }
 
     #[test]

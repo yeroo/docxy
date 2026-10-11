@@ -926,7 +926,12 @@ fn sections(doc: &Document, last: PageGeom) -> Vec<RenderSection> {
         .trailing_section_properties()
         .and_then(|sect| section_start_type(&sect.raw));
     let final_starts_page = !matches!(final_type.as_deref(), Some("continuous" | "nextColumn"));
-    if start < content_end || out.is_empty() || final_starts_page {
+    // Content-control wrapper boundaries render as nothing, so a final section
+    // holding only them is empty even though the block range is non-zero.
+    let final_has_content = doc.body[start..content_end]
+        .iter()
+        .any(|b| !matches!(b, Block::Raw(r) if crate::load::is_sdt_boundary(r)));
+    if final_has_content || out.is_empty() || final_starts_page {
         out.push(RenderSection {
             start,
             end: content_end,
@@ -5793,6 +5798,100 @@ mod tests {
             &o,
         );
         assert_eq!(untyped.pages.len(), 2);
+    }
+
+    #[test]
+    fn print_layout_empty_content_control_after_the_last_break_owns_no_page() {
+        // Content-control wrapper boundaries render as nothing, so they must not
+        // make the final section own a page.
+        let mut o = opts(60);
+        o.page_view = true;
+        let open = || Block::Raw("<w:sdt><w:sdtContent>".into());
+        let close = || Block::Raw(crate::load::SDT_BLOCK_CLOSE.into());
+        for trailing in [
+            trailing_sect_pr(r#"<w:sectPr><w:type w:val="continuous"/></w:sectPr>"#),
+            trailing_sect_pr(r#"<w:sectPr><w:type w:val="nextColumn"/></w:sectPr>"#),
+        ] {
+            let r = render_with_page_layout(
+                &doc(vec![section_break_para(None), open(), close(), trailing]),
+                &o,
+            );
+            assert_eq!(r.pages.len(), 1);
+        }
+        // A content-less content control is one self-contained boundary block.
+        let r = render_with_page_layout(
+            &doc(vec![
+                section_break_para(None),
+                Block::Raw("<w:sdt></w:sdt>".into()),
+                trailing_sect_pr(r#"<w:sectPr><w:type w:val="continuous"/></w:sectPr>"#),
+            ]),
+            &o,
+        );
+        assert_eq!(r.pages.len(), 1);
+    }
+
+    #[test]
+    fn print_layout_content_control_with_a_paragraph_keeps_the_final_section() {
+        // The wrapper boundaries are invisible, but the paragraph they wrap is
+        // real content: the final section stays and its text renders.
+        let d = doc(vec![
+            section_break_para(None),
+            Block::Raw("<w:sdt><w:sdtContent>".into()),
+            para(vec![run("inside", RunProps::default())]),
+            Block::Raw(crate::load::SDT_BLOCK_CLOSE.into()),
+            trailing_sect_pr(r#"<w:sectPr><w:type w:val="continuous"/></w:sectPr>"#),
+        ]);
+        let mut o = opts(60);
+        o.page_view = true;
+        let r = render_with_page_layout(&d, &o);
+        let text: Vec<String> = r.lines.iter().map(|l| l.plain()).collect();
+        assert!(
+            text.iter().any(|l| l.contains("inside")),
+            "wrapped paragraph renders: {text:?}"
+        );
+        assert_eq!(r.pages.last().unwrap().section_index, 1);
+    }
+
+    #[test]
+    fn print_layout_single_quoted_odd_page_type_adds_the_blank_page() {
+        // The single-quoted twin of
+        // print_layout_odd_page_type_on_the_starting_section_adds_the_blank_page:
+        // the loader accepts both attribute quote styles, so `w:val='oddPage'`
+        // must behave exactly like the double-quoted case.
+        let d = doc(vec![
+            section_break_para(None),
+            para(vec![run("section two", RunProps::default())]),
+            trailing_sect_pr("<w:sectPr><w:type w:val='oddPage'/></w:sectPr>"),
+        ]);
+        let mut o = opts(60);
+        o.page_view = true;
+        let r = render_with_page_layout(&d, &o);
+        assert_eq!(r.pages.len(), 3, "oddPage needs an intervening page");
+        assert_eq!(
+            r.pages
+                .iter()
+                .map(|page| (
+                    page.section_index,
+                    page.section_page_index,
+                    page.document_page_index
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0), (0, 1, 1), (1, 0, 2)]
+        );
+    }
+
+    #[test]
+    fn print_layout_single_quoted_continuous_empty_final_owns_no_page() {
+        let mut o = opts(60);
+        o.page_view = true;
+        let r = render_with_page_layout(
+            &doc(vec![
+                section_break_para(None),
+                trailing_sect_pr("<w:sectPr><w:type w:val='continuous'/></w:sectPr>"),
+            ]),
+            &o,
+        );
+        assert_eq!(r.pages.len(), 1);
     }
 
     #[test]

@@ -1080,6 +1080,34 @@ mod tests {
         assert_eq!(value(&mut t, "B3"), CellValue::Empty);
     }
 
+    #[test]
+    fn an_entry_taken_from_its_alert_undoes_to_its_cell() {
+        // #1148: the entry typed in a range's active cell selects that cell
+        // on Undo and Redo, not the range.
+        let mut t = book(AlertStyle::Warning);
+        let v = view(&mut t);
+        v.anchor = at("C3");
+        v.sel = at("B2");
+        v.begin_cell_edit(Some(String::new()));
+        v.edit_caret = 0;
+        for ch in "250".chars() {
+            v.edit_type(&ch.to_string());
+        }
+        assert!(!v.commit_edit());
+        let p = v.dv_pending.clone().expect("held for its alert");
+        t.dialogs.push(alert_dialog(&p.violation));
+        press(&mut t, "Yes").unwrap();
+        let v = view(&mut t);
+        v.sel = at("F9");
+        v.anchor = at("F9");
+        assert!(v.undo_step());
+        assert_eq!((v.sel, v.anchor), (at("B2"), at("B2")));
+        v.sel = at("F9");
+        v.anchor = at("F9");
+        assert!(v.redo_step());
+        assert_eq!((v.sel, v.anchor), (at("B2"), at("B2")));
+    }
+
     /// Type `text` into B2 and commit it the way a click away from it does
     /// (`then` is the click), putting up the alert as the app does.
     fn click_away(t: &mut DocTab, text: &str, then: crate::DvThen) -> Option<bool> {

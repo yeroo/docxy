@@ -118,6 +118,8 @@ mod sheet_step;
 mod sheet_struct_tests;
 #[cfg(test)]
 mod sheet_undo_names_tests;
+#[cfg(test)]
+mod sheet_undo_sel_tests;
 mod sheet_validation;
 mod style_gallery;
 mod table_dialogs;
@@ -1005,6 +1007,26 @@ struct SheetSnapshot {
     anchor: (u32, u32),
     /// The selection's other areas (#670), so undo restores them too.
     areas: Vec<(u32, u32, u32, u32)>,
+    /// What Undo and Redo of this step select (#1148), when the edit named
+    /// it: the cell typed in, the block pasted, the rows inserted. Without
+    /// one, the selection taken with the step. Carried to the other stack,
+    /// so Redo selects what Undo did.
+    target: Option<UndoTarget>,
+}
+
+/// What an undo step's Undo and Redo select (#1148), as Excel's do: what
+/// the step changes, wherever the selection is now, with the active cell at
+/// its top-left.
+#[derive(Clone)]
+struct UndoTarget {
+    sheet: usize,
+    rect: (u32, u32, u32, u32),
+    /// The other areas of a multi-area selection the step changed.
+    areas: Vec<(u32, u32, u32, u32)>,
+    /// Scrolled into view: the edit named its cells. A step that targets
+    /// the selection it was taken with (a chart move, a column width) leaves
+    /// the view where it is.
+    reveal: bool,
 }
 
 /// One step on a sheet's undo or redo stack: the state it goes back to, and
@@ -1030,6 +1052,18 @@ enum SnapshotBody {
 }
 
 impl SheetSnapshot {
+    /// This step, its Undo and Redo selecting `rect` on sheet `sheet`
+    /// (#1148) rather than the selection taken with it.
+    fn targeting(mut self, sheet: usize, rect: (u32, u32, u32, u32)) -> Self {
+        self.target = Some(UndoTarget {
+            sheet,
+            rect,
+            areas: Vec::new(),
+            reveal: true,
+        });
+        self
+    }
+
     /// The workbook this step restores: what a command compares against to
     /// tell whether it changed anything, without a second copy.
     fn workbook(&self) -> &gridcore::sheet::Workbook {
@@ -2551,9 +2585,8 @@ impl SheetView {
         let Some(SheetUndo { snap, step }) = self.undo.pop() else {
             return false;
         };
-        let now = self.snapshot_like(&snap);
+        let now = self.take_step(snap);
         self.redo.push(SheetUndo { snap: now, step });
-        self.restore(snap);
         true
     }
 
@@ -2562,9 +2595,8 @@ impl SheetView {
         let Some(SheetUndo { snap, step }) = self.redo.pop() else {
             return false;
         };
-        let now = self.snapshot_like(&snap);
+        let now = self.take_step(snap);
         self.undo.push(SheetUndo { snap: now, step });
-        self.restore(snap);
         true
     }
 
@@ -2588,6 +2620,51 @@ impl SheetView {
     /// The redo steps' names, the one Redo redoes next first.
     fn redo_names(&self) -> Vec<String> {
         self.redo.iter().rev().map(|u| u.step.label()).collect()
+    }
+
+    /// Restore the undo or redo step `snap` and select its target (#1148);
+    /// the current state, for the other stack, carries the same target. A
+    /// step that adds or removes a sheet keeps the selection it restores:
+    /// its target's sheet index may name another sheet, or none, now.
+    fn take_step(&mut self, snap: SheetSnapshot) -> SheetSnapshot {
+        let target = snap.target.clone().unwrap_or_else(|| UndoTarget {
+            sheet: snap.active,
+            rect: sel_range(snap.sel, snap.anchor),
+            areas: snap.areas.clone(),
+            reveal: false,
+        });
+        let mut now = self.snapshot_like(&snap);
+        now.target = Some(target.clone());
+        let sheets = self.pkg.workbook.sheets.len();
+        self.restore(snap);
+        if self.pkg.workbook.sheets.len() == sheets {
+            self.select_target(target);
+        }
+        now
+    }
+
+    /// Select an undo step's target: its rectangle with the active cell at
+    /// the top-left, and its other areas.
+    fn select_target(&mut self, t: UndoTarget) {
+        let (r0, c0, r1, c1) = t.rect;
+        self.active = t
+            .sheet
+            .min(self.pkg.workbook.sheets.len().saturating_sub(1));
+        self.sel = (r0, c0);
+        self.anchor = (r1, c1);
+        self.areas = t.areas;
+        self.stamp_areas();
+        if !t.reveal {
+            return;
+        }
+        // The active cell's column, so a wide target keeps it on screen, and
+        // its rows (whole columns from row 1), as many as fit.
+        let r1 = if (r0, r1) == (0, gridcore::sheet::MAX_ROWS - 1) {
+            r0
+        } else {
+            r1
+        };
+        self.reveal((r0, c0, r1, c0));
     }
 
     /// The current state, taken as `snap` was: the package when it holds one.
@@ -2737,6 +2814,12 @@ impl SheetView {
         true
     }
 
+    /// [`Self::push_undo`] for an edit that changes `rect` on sheet `sheet`:
+    /// its Undo and Redo select that, not the selection (#1148).
+    fn push_undo_at(&mut self, sheet: usize, rect: (u32, u32, u32, u32), step: SheetStep) {
+        self.push_undo_snapshot(self.snapshot().targeting(sheet, rect), step);
+    }
+
     /// Record `snap`, taken before an edit that has now landed, as the step
     /// `step`.
     fn push_undo_snapshot(&mut self, snap: SheetSnapshot, step: SheetStep) {
@@ -2873,7 +2956,7 @@ impl SheetView {
         let link = self.typed_link(&buf, took, cell.as_ref());
         self.editing = None;
         self.end_cell_edit();
-        self.push_undo(SheetStep::typing(&buf, (r, c)));
+        self.push_undo_at(s, (r, c, r, c), SheetStep::typing(&buf, (r, c)));
         let typed = cell.is_some();
         if let Some(cell) = cell {
             self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
@@ -2967,7 +3050,11 @@ impl SheetView {
         let s = p.origin.0;
         self.editing = None;
         self.end_cell_edit();
-        self.push_undo(p.step);
+        // An entry in one cell selects it; Ctrl+Enter's range, the selection.
+        match p.cells.as_slice() {
+            [(r, c, _)] => self.push_undo_at(s, (*r, *c, *r, *c), p.step),
+            _ => self.push_undo(p.step),
+        }
         match <[_; 1]>::try_from(p.cells) {
             Ok([(cr, cc, cell)]) => {
                 self.engine
@@ -3811,10 +3898,17 @@ impl SheetView {
         }
         // Rows or columns are about to move: circles name cells, not rules.
         self.circles.clear();
-        self.push_undo(SheetStep::Named(match op {
+        // Undo and Redo select the whole rows or columns (#1148).
+        let (last_r, last_c) = (gridcore::sheet::MAX_ROWS - 1, gridcore::sheet::MAX_COLS - 1);
+        let target = match op {
+            StructOp::InsertRow | StructOp::DeleteRow => (r0, 0, r1, last_c),
+            StructOp::InsertCol | StructOp::DeleteCol => (0, c0, last_r, c1),
+        };
+        let step = SheetStep::Named(match op {
             StructOp::InsertRow | StructOp::InsertCol => "Insert Cells",
             StructOp::DeleteRow | StructOp::DeleteCol => "Delete",
-        }));
+        });
+        self.push_undo_at(s, target, step);
         let wb = &mut self.pkg.workbook;
         let shift = match op {
             StructOp::InsertRow => {
@@ -3967,6 +4061,7 @@ impl SheetView {
             sel: self.sel,
             anchor: self.anchor,
             areas: self.extra_areas(),
+            target: None,
         }
     }
 
@@ -4185,12 +4280,26 @@ impl SheetView {
     /// Select the block just written at `at`: the active cell at its
     /// top-left, as Excel leaves a paste.
     fn select_block(&mut self, at: (u32, u32), block: &[Vec<gridcore::sheet::Cell>]) {
-        let h = block.len() as u32;
-        let w = block.iter().map(Vec::len).max().unwrap_or(0) as u32;
-        if h > 0 && w > 0 {
+        if let Some((_, _, r1, c1)) = block_rect(at, block) {
             self.sel = at;
             self.clear_areas();
-            self.anchor = (at.0 + h - 1, at.1 + w - 1);
+            self.anchor = (r1, c1);
+        }
+    }
+
+    /// [`Self::push_undo`] for a paste of `block` at `at` on sheet `sheet`:
+    /// its Undo and Redo select the block (#1148). `step` names it (#1149).
+    fn push_undo_block(
+        &mut self,
+        sheet: usize,
+        at: (u32, u32),
+        block: &[Vec<gridcore::sheet::Cell>],
+        step: &'static str,
+    ) {
+        let step = SheetStep::Named(step);
+        match block_rect(at, block) {
+            Some(rect) => self.push_undo_at(sheet, rect, step),
+            None => self.push_undo(step),
         }
     }
 
@@ -4214,7 +4323,7 @@ impl SheetView {
                 gridcore::engine::PART_OF_ARRAY.to_string(),
             ));
         }
-        self.push_undo(SheetStep::Named(step));
+        self.push_undo_block(s, at, block, step);
         self.engine
             .paste_block_prechecked(&mut self.pkg.workbook, s, at, block);
         self.select_block(at, block);
@@ -4416,7 +4525,7 @@ impl SheetView {
                 gridcore::engine::PART_OF_ARRAY.to_string(),
             ));
         }
-        self.push_undo(SheetStep::Named(step));
+        self.push_undo_block(dst, at, &block, step);
         // References follow first, and the engine is rebuilt on them, so the
         // writes below recalculate what reads the moved cells where they land.
         gridcore::edit::move_refs(&mut self.pkg.workbook, src, &mv);
@@ -4706,6 +4815,9 @@ struct Docxy {
     /// `Cell` because `persist` takes `&self`.
     last_persist: std::cell::Cell<std::time::Instant>,
     applied: Option<ThemeMode>,
+    /// The OS appearance Auto follows: seeded when the window opens, updated
+    /// by gpui's appearance observer (#1075).
+    os_appearance: gpui::WindowAppearance,
     // Find & replace bar (Ctrl+F). Self-managed text fields (no gpui-component
     // InputState entity) — keystrokes route here while `find_open`.
     find_open: bool,
@@ -9876,6 +9988,17 @@ fn series_resolved_preview(name: &str, name_ref: Option<&str>, max_chars: usize)
         .map(|_| bounded_label(name, max_chars))
 }
 
+/// The rectangle `block` covers written at `at`, top-left to bottom-right;
+/// `None` for an empty block.
+fn block_rect(
+    at: (u32, u32),
+    block: &[Vec<gridcore::sheet::Cell>],
+) -> Option<(u32, u32, u32, u32)> {
+    let h = block.len() as u32;
+    let w = block.iter().map(Vec::len).max().unwrap_or(0) as u32;
+    (h > 0 && w > 0).then(|| (at.0, at.1, at.0 + h - 1, at.1 + w - 1))
+}
+
 /// The rectangle a selection covers, whichever corner it was dragged from.
 fn sel_range(sel: (u32, u32), anchor: (u32, u32)) -> (u32, u32, u32, u32) {
     let ((ar, ac), (br, bc)) = (sel, anchor);
@@ -11669,6 +11792,7 @@ impl Docxy {
             trusted_error: None,
             last_persist: std::cell::Cell::new(std::time::Instant::now()),
             applied: None,
+            os_appearance: gpui::WindowAppearance::Light,
             find_open: false,
             find_query: String::new(),
             replace_text: String::new(),
@@ -12119,6 +12243,31 @@ impl Docxy {
         });
         self.persist(cx);
         self.refocus(window, cx);
+    }
+
+    /// Apply the theme choice (Auto follows the OS appearance) if the drawn
+    /// theme is not already it. `Theme` is a gpui global shared by every
+    /// window; `applied` is per window, so each window checks its own.
+    fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let desired = self.theme_pref.resolve(self.os_appearance);
+        if self.applied != Some(desired) {
+            Theme::change(desired, Some(window), cx);
+            self.applied = Some(desired);
+        }
+    }
+
+    /// gpui's window appearance observer calls this (#1075): record the OS
+    /// switch, draw what it resolves to, and let the view paint it. The
+    /// harness's `appearance-set` verb plays the same switch through here.
+    fn os_appearance_changed(
+        &mut self,
+        appearance: gpui::WindowAppearance,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.os_appearance = appearance;
+        self.apply_theme(window, cx);
+        cx.notify();
     }
 
     fn set_ask_on_close(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -33240,11 +33389,7 @@ impl Render for Docxy {
             }
         }
         // Apply the theme choice (Auto follows the OS appearance).
-        let desired = self.theme_pref.resolve(window.appearance());
-        if self.applied != Some(desired) {
-            Theme::change(desired, Some(window), cx);
-            self.applied = Some(desired);
-        }
+        self.apply_theme(window, cx);
         if !self.focused {
             self.focus.focus(window, cx);
             self.focused = true;
@@ -38486,6 +38631,18 @@ fn open_docxy_window(
                     control::attach(server, rx, window, cx);
                 }
             }
+            // Auto follows the OS appearance (#1075): seed it from the window
+            // before the first render, and let gpui's appearance observer
+            // drive the same handler a macOS Light/Dark switch would. The
+            // observer drops itself once the view is gone, so `detach` is
+            // enough.
+            view.update(cx, |this, cx| {
+                this.os_appearance = window.appearance();
+                cx.observe_window_appearance(window, |this, window, cx| {
+                    this.os_appearance_changed(window.appearance(), window, cx)
+                })
+                .detach();
+            });
             // Open any command-line files on top of the restored session.
             if !startup_files.is_empty() {
                 view.update(cx, move |this, cx| {

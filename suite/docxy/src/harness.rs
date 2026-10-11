@@ -38,6 +38,7 @@ use gpui::{
     Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput,
     Point, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px, size,
 };
+use gpui_component::ActiveTheme;
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -749,7 +750,7 @@ pub fn typed_keys(text: &str) -> Result<Vec<Keystroke>, String> {
     Ok(out)
 }
 
-// ---- theme preference (pure) -----------------------------------------------
+// ---- theme preference and OS appearance (pure) ------------------------------
 
 /// The `theme-set` verb's `theme`: `light`, `dark` or `auto` (follow the OS).
 pub(crate) fn parse_theme_pref(name: &str) -> Result<crate::ThemePref, String> {
@@ -767,6 +768,25 @@ pub(crate) fn theme_pref_name(pref: crate::ThemePref) -> &'static str {
         crate::ThemePref::Light => "light",
         crate::ThemePref::Dark => "dark",
         crate::ThemePref::Auto => "auto",
+    }
+}
+
+/// The `appearance-set` verb's `appearance`: the OS's `light` or `dark`
+/// (#1075), played through the same handler gpui's appearance observer calls.
+pub(crate) fn parse_appearance(name: &str) -> Result<gpui::WindowAppearance, String> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "light" => Ok(gpui::WindowAppearance::Light),
+        "dark" => Ok(gpui::WindowAppearance::Dark),
+        other => Err(format!("unknown appearance '{other}' (light or dark)")),
+    }
+}
+
+/// [`parse_appearance`]'s inverse: the Vibrant macOS variants are the same
+/// halves of the switch the theme resolves.
+pub(crate) fn appearance_name(appearance: gpui::WindowAppearance) -> &'static str {
+    match appearance {
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => "dark",
+        gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => "light",
     }
 }
 
@@ -1437,7 +1457,7 @@ struct ViewFlags {
 }
 
 impl ViewFlags {
-    fn live(app: &crate::Docxy, window: &Window) -> Self {
+    fn live(app: &crate::Docxy) -> Self {
         Self {
             hf_edit: app.hf_active(),
             page: app.page_view,
@@ -1447,7 +1467,7 @@ impl ViewFlags {
             comments: app.show_comments,
             notes: app.show_notes,
             zoom: app.zoom,
-            dark: app.theme_pref.resolve(window.appearance()) == gpui_component::ThemeMode::Dark,
+            dark: app.theme_pref.resolve(app.os_appearance) == gpui_component::ThemeMode::Dark,
             gridlines: app.view_gridlines,
             display_mode: app.markup.name(),
         }
@@ -1728,8 +1748,8 @@ fn ruler_state(app: &crate::Docxy) -> Json {
     Json::obj(fields)
 }
 
-fn live_doc_state(app: &crate::Docxy, window: &Window) -> Result<Json, String> {
-    let mut doc = doc_state(active_doc(app)?, &ViewFlags::live(app, window));
+fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> {
+    let mut doc = doc_state(active_doc(app)?, &ViewFlags::live(app));
     if let Json::Obj(fields) = &mut doc {
         fields.push(("ruler".into(), ruler_state(app)));
         fields.push(("line_numbers".into(), line_numbers_state(app)));
@@ -4034,7 +4054,43 @@ fn dispatch_verb(
                 (
                     "resolved",
                     Json::Str(
-                        if pref.resolve(window.appearance()) == gpui_component::ThemeMode::Dark {
+                        if pref.resolve(app.os_appearance) == gpui_component::ThemeMode::Dark {
+                            "dark"
+                        } else {
+                            "light"
+                        }
+                        .into(),
+                    ),
+                ),
+            ]))
+        }
+        // Play the OS's Light/Dark switch (#1075) through the same handler
+        // gpui's window appearance observer calls. Auto follows it at once;
+        // a chosen Light or Dark ignores it. `applied` is the drawn theme's
+        // mode, read after the call.
+        "appearance-set" => {
+            let appearance = parse_appearance(arg_str(args, "appearance")?)?;
+            app.os_appearance_changed(appearance, window, cx);
+            Done::ok(Json::obj(vec![
+                ("appearance", Json::Str(appearance_name(appearance).into())),
+                ("theme", Json::Str(theme_pref_name(app.theme_pref).into())),
+                (
+                    "resolved",
+                    Json::Str(
+                        if app.theme_pref.resolve(app.os_appearance)
+                            == gpui_component::ThemeMode::Dark
+                        {
+                            "dark"
+                        } else {
+                            "light"
+                        }
+                        .into(),
+                    ),
+                ),
+                (
+                    "applied",
+                    Json::Str(
+                        if cx.theme().mode.is_dark() {
                             "dark"
                         } else {
                             "light"
@@ -5880,6 +5936,44 @@ mod tests {
         );
         assert_eq!(
             crate::ThemePref::Auto.resolve(WindowAppearance::Light),
+            ThemeMode::Light
+        );
+    }
+
+    /// #1075: `appearance-set`'s `light`/`dark` are the two halves of an OS
+    /// Light/Dark switch; the Vibrant macOS variants name the same halves.
+    #[test]
+    fn appearance_names_round_trip() {
+        use gpui::WindowAppearance;
+        assert_eq!(
+            parse_appearance(appearance_name(WindowAppearance::Light)),
+            Ok(WindowAppearance::Light)
+        );
+        assert_eq!(
+            parse_appearance(appearance_name(WindowAppearance::Dark)),
+            Ok(WindowAppearance::Dark)
+        );
+        assert_eq!(parse_appearance(" Dark "), Ok(WindowAppearance::Dark));
+        assert_eq!(appearance_name(WindowAppearance::VibrantDark), "dark");
+        assert_eq!(appearance_name(WindowAppearance::VibrantLight), "light");
+        let e = parse_appearance("dim").unwrap_err();
+        assert!(
+            e.contains("unknown appearance 'dim'") && e.contains("light or dark"),
+            "{e}"
+        );
+    }
+
+    /// #1075: on Auto the theme is the OS appearance the observer recorded,
+    /// whichever way the switch went.
+    #[test]
+    fn auto_follows_os_appearance_both_ways() {
+        use gpui_component::ThemeMode;
+        assert_eq!(
+            crate::ThemePref::Auto.resolve(parse_appearance("dark").unwrap()),
+            ThemeMode::Dark
+        );
+        assert_eq!(
+            crate::ThemePref::Auto.resolve(parse_appearance("light").unwrap()),
             ThemeMode::Light
         );
     }
