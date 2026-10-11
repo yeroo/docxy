@@ -1641,6 +1641,13 @@ fn fx_toggle_key(ctrl: bool, shift: bool, key: &str) -> bool {
     ctrl && shift && key.eq_ignore_ascii_case("u")
 }
 
+/// Is this Ctrl+1 (⌘1 on a Mac), which opens Format Cells (#1164)? Not with
+/// Shift, Excel's number-format row, nor with Alt: AltGr is Ctrl+Alt on
+/// Windows, and its `1` is a character.
+fn format_cells_key(key: &str, ctrl: bool, shift: bool, alt: bool) -> bool {
+    ctrl && !shift && !alt && key == "1"
+}
+
 /// The sheet a tab holds, with the app's Editing options stamped on it: what
 /// [`Docxy::active_sheet_mut`] hands out. A second guard beside
 /// [`stamp_edit_opts`], which is the mechanism: it stamps every tab on
@@ -5084,6 +5091,8 @@ mod format_panel_key_tests {
             "f2",
             "space",
             "home",
+            // Ctrl+1, which opens the panel (#1164), does nothing more under it.
+            "1",
         ] {
             assert_eq!(format_panel_key(key), FmtPanelKey::Swallow, "{key}");
         }
@@ -14292,6 +14301,11 @@ impl Docxy {
                 .ok_or_else(|| "the ribbon's groups are not shown".to_string()),
             Region::RibbonFlyout => lookup(&self.probes.borrow(), "ribbon-flyout")
                 .ok_or_else(|| "no ribbon flyout is open".to_string()),
+            Region::RibbonLaunch(title) => lookup(
+                &self.probes.borrow(),
+                &harness::region_name(region),
+            )
+            .ok_or_else(|| format!("the ribbon group {title}'s launcher is not drawn")),
             Region::RibbonGroup(i) => {
                 let now = self.ribbon_fit_now(window);
                 let title = now
@@ -18855,6 +18869,7 @@ impl Docxy {
             // rest of the block acts on the document or the window, not on
             // the selection.
             if matches!(key, "c" | "x" | "v" | "a" | "b" | "i")
+                || format_cells_key(key, ctrl, shift, alt)
                 || (shift && matches!(key, "p" | "k"))
             {
                 self.chart_hand_back(cx);
@@ -18879,6 +18894,10 @@ impl Docxy {
                 "y" => self.sheet_redo_or_repeat(cx),
                 "b" => return self.run_sheet_act(SheetAct::Bold, window, cx),
                 "i" => return self.run_sheet_act(SheetAct::Italic, window, cx),
+                // Format Cells (#1164), Home › Cells › Format's own act.
+                "1" if format_cells_key(key, ctrl, shift, alt) => {
+                    return self.run_sheet_act(SheetAct::FormatCells, window, cx);
+                }
                 // Insert a PivotTable for the selection (also on the Insert ribbon).
                 "p" if shift => return self.run_sheet_act(SheetAct::InsertPivot, window, cx),
                 // Insert a chart of the selection (also on the Insert ribbon).
@@ -26836,8 +26855,10 @@ pub(crate) struct RibbonFlyout {
 }
 
 /// The prefix a flyout's copy of a group puts on its `ribbon-group:`,
-/// `ribbon-title:` and `ribbon-content:` probes, so `ribbon-layout` measures
-/// only the groups drawn in the ribbon itself.
+/// `ribbon-title:`, `ribbon-content:` and `ribbon-launch:` probes, so
+/// `ribbon-layout` measures only the groups drawn in the ribbon itself, and
+/// the harness's `ribbon-launch:<group>` region finds only a launcher drawn
+/// there (#1164).
 const FLYOUT_PROBE_PREFIX: &str = "ribbon-flyout:";
 
 /// The ribbon's width: the window's, less the client-side decorations' shadow
@@ -31375,6 +31396,10 @@ impl Docxy {
                         d.child(
                             div()
                                 .id(SharedString::from(format!("sheet-launch-{}", g.title)))
+                                .child(probe(
+                                    &self.probes,
+                                    format!("{prefix}ribbon-launch:{}", g.title),
+                                ))
                                 .text_size(px(9.))
                                 .text_color(pal.dim)
                                 .when(launch.is_some(), |d| {

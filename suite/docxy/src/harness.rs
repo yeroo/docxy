@@ -846,6 +846,9 @@ pub enum Region {
     /// Group `.0` of the ribbon tab shown, as drawn: in place, or its
     /// collapsed button (#1020).
     RibbonGroup(usize),
+    /// The dialog launcher (↘) of the sheet ribbon group titled `.0`, in
+    /// place on the tab shown (#1164).
+    RibbonLaunch(&'static str),
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
     /// The File screen's scrolling content pane (#1028).
@@ -858,7 +861,7 @@ pub enum Region {
 /// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-hbar-table`,
 /// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`,
 /// `gallery`, `tab-chip:0`, `filter-button:B`, `backstage-content`,
-/// `backstage-rail`.
+/// `backstage-rail`, `ribbon-launch:Number`.
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.
@@ -905,6 +908,23 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .parse::<usize>()
                 .map_err(|_| "'ribbon-group' needs a numeric index".to_string())?;
             Ok(Region::RibbonGroup(i))
+        }
+        "ribbon-launch" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'ribbon-launch' needs a group title, e.g. ribbon-launch:Number")?;
+            let group = crate::sheet_ribbon::SHEET_RIBBON
+                .iter()
+                .flat_map(|t| t.groups.iter())
+                .find(|g| g.title.eq_ignore_ascii_case(a))
+                .ok_or_else(|| format!("no sheet ribbon group is titled '{a}'"))?;
+            if !group.launcher {
+                return Err(format!(
+                    "the ribbon group {} draws no launcher",
+                    group.title
+                ));
+            }
+            Ok(Region::RibbonLaunch(group.title))
         }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
@@ -953,7 +973,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, filter-button:B)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B)"
         )),
     }
 }
@@ -984,6 +1004,7 @@ pub fn region_name(region: Region) -> String {
         Region::Ribbon => "ribbon".into(),
         Region::RibbonFlyout => "ribbon-flyout".into(),
         Region::RibbonGroup(i) => format!("ribbon-group:{i}"),
+        Region::RibbonLaunch(title) => format!("ribbon-launch:{title}"),
         Region::BackstageContent => "backstage-content".into(),
         Region::BackstageRail => "backstage-rail".into(),
         Region::FilterButton(c) => format!("filter-button:{}", gridcore::sheet::col_name(c)),
@@ -8118,6 +8139,8 @@ mod tests {
             Region::Ribbon,
             Region::RibbonFlyout,
             Region::RibbonGroup(6),
+            Region::RibbonLaunch("Number"),
+            Region::RibbonLaunch("Page Setup"),
             Region::BackstageContent,
             Region::BackstageRail,
             Region::FilterButton(1),
@@ -8135,6 +8158,15 @@ mod tests {
         assert!(parse_region("bar:").is_err());
         assert!(parse_region("tab-chip").is_err());
         assert!(parse_region("tab-chip:x").is_err());
+        // A launcher is named by its group's title, as drawn (#1164).
+        assert_eq!(
+            parse_region("ribbon-launch:number"),
+            Ok(Region::RibbonLaunch("Number"))
+        );
+        assert!(parse_region("ribbon-launch").is_err());
+        assert!(parse_region("ribbon-launch:Nope").is_err());
+        let e = parse_region("ribbon-launch:Styles").unwrap_err();
+        assert!(e.contains("draws no launcher"), "{e}");
     }
 
     /// #545: the drag arms once a pressed move lands more than 2px from the

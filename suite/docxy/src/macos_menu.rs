@@ -1103,6 +1103,17 @@ mod tests {
     }
 
     #[test]
+    fn cmd_1_is_not_a_menu_bar_chord() {
+        // ⌘1 is the sheet's Format Cells (#1164): no menu item owns it, so
+        // it reaches `on_key`, which reads Cmd as Ctrl, and `sheet_key`.
+        assert_eq!(chord_role(&key("cmd-1")), None);
+        assert_eq!(
+            crate::text_input::route(&key("cmd-1"), false, true, true),
+            crate::text_input::Route::AppPropagate
+        );
+    }
+
+    #[test]
     fn cmd_shift_z_reaches_on_key_as_redo() {
         let (y, redo_only) = mac_alias(&key("cmd-shift-z"));
         assert!(redo_only, "a Mac's Redo does not fall back to Repeat");
