@@ -5,7 +5,9 @@
 //! it, `0 hrs`, `$0.00`, `0%`). Work shows in hours (a material's as its
 //! quantity and label), money as currency units, the delay in working days.
 //! Peak and the budget fields read their stored values; nothing computes them
-//! yet.
+//! yet. The custom fields (Text1-30, Number1-20, Cost1-10, Flag1-20,
+//! Date/Start/Finish/Duration1-10, #1178) follow the built-ins and read as
+//! the task registry's do (see `custom`).
 use super::*;
 use crate::editor::cells::{format_quantity, format_units, shown_label};
 
@@ -36,6 +38,8 @@ pub enum AssignmentField {
     Peak,
     BudgetWork,
     BudgetCost,
+    /// A custom field, `Text1` for `Custom(Text, 1)`.
+    Custom(CustomKind, u8),
 }
 
 const NAMES: &[(AssignmentField, &str)] = &[
@@ -66,17 +70,24 @@ const NAMES: &[(AssignmentField, &str)] = &[
 ];
 
 impl AssignmentField {
-    /// Every readable field, in registry order.
+    /// Every readable field, in registry order: the built-ins, then the
+    /// custom fields in the task registry's family order.
     pub fn all() -> Vec<AssignmentField> {
-        NAMES.iter().map(|&(f, _)| f).collect()
+        let customs = CUSTOM_KINDS
+            .iter()
+            .flat_map(|&(kind, _, max)| (1..=max).map(move |n| AssignmentField::Custom(kind, n)));
+        NAMES.iter().map(|&(f, _)| f).chain(customs).collect()
     }
 
-    /// Project's name for the field (`% Work Complete`).
-    pub fn name(self) -> &'static str {
+    /// Project's name for the field (`% Work Complete`, `Text1`).
+    pub fn name(self) -> String {
+        if let AssignmentField::Custom(kind, n) = self {
+            return Field::Custom(kind, n).name();
+        }
         NAMES
             .iter()
             .find(|(f, _)| *f == self)
-            .map_or("", |(_, name)| name)
+            .map_or_else(String::new, |(_, name)| (*name).to_string())
     }
 
     /// The field with this name, trimmed and matched without regard to ASCII
@@ -94,7 +105,7 @@ impl AssignmentField {
 pub fn assignment_field_names() -> Vec<String> {
     AssignmentField::all()
         .into_iter()
-        .map(|f| f.name().to_string())
+        .map(AssignmentField::name)
         .collect()
 }
 
@@ -190,6 +201,7 @@ pub fn read_assignment_field(ed: &Editor, a: &Assignment, field: AssignmentField
         }
         AssignmentField::BudgetWork => work(a.budget_work_min),
         AssignmentField::BudgetCost => money(a.budget_cost.as_ref()),
+        AssignmentField::Custom(kind, n) => custom::read_assignment(proj, a, kind, n),
     }
 }
 
