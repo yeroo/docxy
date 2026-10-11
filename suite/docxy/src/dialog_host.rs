@@ -926,6 +926,7 @@ fn on_widget(
 mod tests {
     use super::*;
     use crate::dialog::{Button, ButtonRole, Control, Value};
+    use crate::text_input::ImeState;
     use core::prelude::v1::test;
 
     /// A document tab with a two-field form open: Top (a number) and Note.
@@ -1036,10 +1037,23 @@ mod tests {
     }
 
     /// A platform key-down as `Docxy::modal_takes_key` hands it to the
-    /// dialog: the plain typed key when its modifiers made its character.
-    fn platform_key(t: &mut DocTab, ev: &KeyDownEvent, macos: bool, windows: bool) -> bool {
-        let k = crate::text_input::dialog_stroke(ev, macos, windows);
+    /// dialog: on macOS the plain typed key when ⌥ made its character.
+    fn platform_key(t: &mut DocTab, ev: &KeyDownEvent, macos: bool) -> bool {
+        let k = crate::text_input::dialog_stroke(ev, macos);
         dialog_key(t, &k.key, k.key_char.as_deref(), k.modifiers)
+    }
+
+    /// A Windows key-down as `Docxy::route_key` takes it: the dialog's key,
+    /// then the WM_CHAR debt, decided by whether the dialog was open; then
+    /// the WM_CHAR `wm_char`, if any, whose unowed characters `on_key` types.
+    fn windows_key(t: &mut DocTab, ime: &mut ImeState, ev: &KeyDownEvent, wm_char: Option<&str>) {
+        let now = std::time::Instant::now();
+        let open = t.dialogs.is_open();
+        assert!(platform_key(t, ev, false));
+        ime.typed_key(ev, now, open);
+        for k in ime.char_message(wm_char.unwrap_or(""), now) {
+            assert!(platform_key(t, &k, false));
+        }
     }
 
     fn key_down(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> KeyDownEvent {
@@ -1079,7 +1093,7 @@ mod tests {
             key_down("y", Some("Á"), alt_shift),
             key_down("y", Some("y"), plain),
         ] {
-            assert!(platform_key(&mut t, &ev, true, false));
+            assert!(platform_key(&mut t, &ev, true));
         }
         assert_eq!(value(&t, "note"), Value::Text("` x©™`Áy".into()));
         let swallowed = [
@@ -1110,29 +1124,24 @@ mod tests {
             ),
         ];
         for ev in &swallowed {
-            assert!(platform_key(&mut t, ev, true, false));
+            assert!(platform_key(&mut t, ev, true));
         }
         assert_eq!(value(&t, "note"), Value::Text("` x©™`Áy".into()));
-        // Off macOS an ⌥ key is no text: Linux, and Windows' plain Alt.
-        for windows in [false, true] {
-            assert!(platform_key(
-                &mut t,
-                &key_down("g", Some("©"), alt),
-                false,
-                windows
-            ));
-        }
+        // Off macOS an Alt key-down is no text.
+        assert!(platform_key(&mut t, &key_down("g", Some("©"), alt), false));
         assert_eq!(value(&t, "note"), Value::Text("` x©™`Áy".into()));
     }
 
-    /// Windows AltGr (#1162): Ctrl+Alt that changed the character types it
-    /// into a dialog field; Ctrl+Alt that changed nothing, and plain Alt,
-    /// edit nothing.
+    /// Windows AltGr (#1162): the character's WM_CHAR types it into a
+    /// dialog field once; an AltGr dead key, which sends no WM_CHAR, types
+    /// nothing and its accent joins the next letter ("ñ", not "~ñ"); plain
+    /// Alt (WM_SYSCHAR, no WM_CHAR) edits nothing.
     #[test]
     fn altgr_characters_type_into_a_dialog_field_on_windows() {
         let mut t = tab_with_form();
         assert!(key(&mut t, "tab", None));
         assert!(key(&mut t, "tab", None));
+        let mut ime = ImeState::default();
         let ctrl_alt = Modifiers {
             control: true,
             alt: true,
@@ -1142,30 +1151,19 @@ mod tests {
             prefer_character_input: true,
             ..key_down(key, Some(ch), ctrl_alt)
         };
-        assert!(platform_key(&mut t, &altgr("q", "@"), false, true));
-        assert!(platform_key(&mut t, &altgr("e", "€"), false, true));
-        assert_eq!(value(&t, "note"), Value::Text("@€".into()));
         let alt = Modifiers {
             alt: true,
             ..Modifiers::default()
         };
-        assert!(platform_key(
-            &mut t,
-            &key_down("g", Some("g"), alt),
-            false,
-            true
-        ));
-        assert!(platform_key(
-            &mut t,
-            &key_down("e", Some("€"), ctrl_alt),
-            false,
-            true
-        ));
-        assert!(
-            platform_key(&mut t, &altgr("e", "€"), false, false),
-            "Linux"
-        );
+        windows_key(&mut t, &mut ime, &altgr("q", "@"), Some("@"));
+        windows_key(&mut t, &mut ime, &altgr("e", "€"), Some("€"));
+        windows_key(&mut t, &mut ime, &altgr("4", "~"), None);
         assert_eq!(value(&t, "note"), Value::Text("@€".into()));
+        let n = key_down("n", Some("ñ"), Modifiers::default());
+        windows_key(&mut t, &mut ime, &n, Some("ñ"));
+        windows_key(&mut t, &mut ime, &key_down("g", Some("g"), alt), None);
+        assert_eq!(value(&t, "note"), Value::Text("@€ñ".into()));
+        assert_eq!(ime.owed(), 0);
     }
 
     /// Ctrl+A selects the field's text and typing replaces it; Ctrl+V pastes

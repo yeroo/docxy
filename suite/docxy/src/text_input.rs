@@ -51,10 +51,13 @@
 //! handler never accepts text input there ([`accepts_text_input`]), so the
 //! Windows IME stays off as it was.
 //!
-//! A replayed ⌥ key still carries ⌥, and so does a Windows AltGr key
-//! (Ctrl+Alt). The document and the find bar type any key's character, but a
-//! dialog field swallows ⌥ keys, so the dialog is handed the plain typed key
-//! the modifiers made instead ([`modifier_char`], #1162).
+//! A replayed ⌥ key still carries ⌥. On macOS the document and the find bar
+//! type its character, but a dialog field swallows ⌥ keys, so the dialog is
+//! handed the plain typed key ⌥ made instead ([`modifier_char`], #1162). A
+//! Windows AltGr key (Ctrl+Alt) is swallowed there too, and its key-down
+//! cannot tell a character from an AltGr dead key, so under a dialog it owes
+//! no WM_CHAR and the WM_CHAR, which a dead key never sends, types it
+//! ([`dialog_altgr`]).
 //!
 //! Linux registers no handler: it would hand it every unhandled printable
 //! key, which `on_key` has already typed. Off macOS the root also leaves
@@ -240,23 +243,15 @@ pub(crate) fn char_stroke(c: char) -> Option<Keystroke> {
     })
 }
 
-/// The plain typed key a key-down stands for when its modifiers made its
-/// character (#1162): ⌥ on macOS (no ⌃, ⌘ or Fn), as AppKit's commit of the
-/// key's own text replays it, and AltGr on Windows (Ctrl+Alt that gpui flags
-/// as changing the character). `None` for any other key, including Windows'
-/// plain Alt chords, whose character is the bare key's, and every key off
-/// macOS and Windows. A dialog field types what this returns; `edit_key`
+/// The plain typed key a macOS key-down stands for when ⌥ made its
+/// character (#1162): ⌥ with no ⌃, ⌘ or Fn, as AppKit's commit of the key's
+/// own text replays it. `None` for any other key, and for every key off
+/// macOS: Windows' AltGr text reaches a dialog by its WM_CHAR instead
+/// ([`dialog_altgr`]). A dialog field types what this returns; `edit_key`
 /// swallows every other ⌥ key.
-pub(crate) fn modifier_char(ev: &KeyDownEvent, macos: bool, windows: bool) -> Option<Keystroke> {
+pub(crate) fn modifier_char(ev: &KeyDownEvent, macos: bool) -> Option<Keystroke> {
     let m = &ev.keystroke.modifiers;
-    let made = if macos {
-        m.alt && !m.control && !m.platform && !m.function
-    } else if windows {
-        m.control && m.alt && !m.platform && ev.prefer_character_input
-    } else {
-        false
-    };
-    if !made {
+    if !(macos && m.alt && !m.control && !m.platform && !m.function) {
         return None;
     }
     let mut chars = ev.keystroke.key_char.as_deref()?.chars();
@@ -268,8 +263,19 @@ pub(crate) fn modifier_char(ev: &KeyDownEvent, macos: bool, windows: bool) -> Op
 
 /// The keystroke an open dialog takes for a key-down: [`modifier_char`]'s
 /// plain typed key, else the key-down's own (#1162).
-pub(crate) fn dialog_stroke(ev: &KeyDownEvent, macos: bool, windows: bool) -> Keystroke {
-    modifier_char(ev, macos, windows).unwrap_or_else(|| ev.keystroke.clone())
+pub(crate) fn dialog_stroke(ev: &KeyDownEvent, macos: bool) -> Keystroke {
+    modifier_char(ev, macos).unwrap_or_else(|| ev.keystroke.clone())
+}
+
+/// Whether a Windows key-down is AltGr under an open dialog (#1162):
+/// Ctrl+Alt that gpui flags as changing the character. The dialog swallows
+/// it, as it does every Alt key, and the key-down cannot tell a character
+/// from an AltGr dead key (whose accent then joins the next letter). So it
+/// owes no WM_CHAR ([`ImeState::typed_key`]), and the WM_CHAR, which only
+/// a character sends, types the character into the dialog.
+pub(crate) fn dialog_altgr(ev: &KeyDownEvent, dialog_open: bool) -> bool {
+    let m = &ev.keystroke.modifiers;
+    dialog_open && m.control && m.alt && !m.platform && ev.prefer_character_input
 }
 
 fn typed(keystroke: Keystroke) -> KeyDownEvent {
@@ -336,6 +342,15 @@ impl ImeState {
                 at: now,
                 may_not_come: may_not_come(ev),
             });
+        }
+    }
+
+    /// Windows: a key-down `on_key` was handed at `now`, `dialog_open`
+    /// when it was: [`ImeState::key_down`], except for AltGr under a dialog,
+    /// which `on_key` did not type ([`dialog_altgr`]).
+    pub(crate) fn typed_key(&mut self, ev: &KeyDownEvent, now: Instant, dialog_open: bool) {
+        if !dialog_altgr(ev, dialog_open) {
+            self.key_down(ev, now);
         }
     }
 
@@ -451,10 +466,13 @@ impl Docxy {
             }
             Route::AppPropagate => {
                 self.ime.forget_key();
+                // Whether a dialog took the key is decided before on_key,
+                // which may close it.
+                let dialog_open = self.dialog_open();
                 self.on_key(ev, window, cx);
                 // After on_key, which may run long (a save): the debt's
                 // keeping time starts once the key is typed.
-                self.ime.key_down(ev, Instant::now());
+                self.ime.typed_key(ev, Instant::now(), dialog_open);
             }
             Route::MenuBar => self.ime.forget_key(),
         }
@@ -476,9 +494,13 @@ impl Docxy {
         }
     }
 
+    fn dialog_open(&self) -> bool {
+        self.active_dialogs().is_some_and(|d| d.is_open())
+    }
+
     fn takes_text(&self) -> bool {
         takes_text(
-            self.active_dialogs().is_some_and(|d| d.is_open()),
+            self.dialog_open(),
             self.keytips != crate::KeyTip::Off,
             self.menu.is_some(),
         )
@@ -960,33 +982,74 @@ mod tests {
                 plain("\u{a0}", "\u{a0}"),
             ),
         ] {
-            assert_eq!(
-                modifier_char(&typed(k.clone()), true, false),
-                Some(want),
-                "{k}"
-            );
+            assert_eq!(modifier_char(&typed(k.clone()), true), Some(want), "{k}");
         }
-        let a_acute = modifier_char(&typed(stroke("y", Some("Á"), alt_shift)), true, false);
+        let a_acute = modifier_char(&typed(stroke("y", Some("Á"), alt_shift)), true);
         assert_eq!(a_acute, char_stroke('Á'));
         assert_eq!(a_acute.and_then(|k| k.key_char).as_deref(), Some("Á"));
     }
 
-    /// Windows (#1162): an AltGr character is the plain typed key for it.
+    /// Windows (#1162): under a dialog an AltGr key, character or dead key
+    /// alike, owes no WM_CHAR, so the WM_CHAR a character sends is typed
+    /// once and a dead key's accent joins the next letter as it should.
     #[test]
-    fn an_altgr_character_is_a_plain_typed_key_on_windows() {
-        assert_eq!(
-            modifier_char(&altgr("e", "€"), false, true),
-            Some(plain("€", "€"))
-        );
-        assert_eq!(
-            modifier_char(&altgr("q", "@"), false, true),
-            Some(plain("@", "@"))
-        );
+    fn altgr_under_a_dialog_is_typed_by_its_wm_char() {
+        let at = t0();
+        let mut ime = ImeState::default();
+        assert!(dialog_altgr(&altgr("e", "€"), true));
+        ime.typed_key(&altgr("e", "€"), at, true);
+        assert_eq!(ime.owed(), 0);
+        assert_eq!(key_chars(&ime.char_message("€", at)), ["€"]);
+        // AltGr+4 dead "~" sends WM_DEADCHAR; N then owes and pays "ñ".
+        let tilde = dead("4", "~", ctrl_alt());
+        assert!(dialog_altgr(&tilde, true));
+        ime.typed_key(&tilde, at, true);
+        ime.typed_key(&typed(plain("n", "ñ")), at, true);
+        assert!(ime.char_message("ñ", at).is_empty());
+        assert_eq!(ime.owed(), 0);
+        // With no dialog, the document's AltGr debt is kept as before.
+        assert!(!dialog_altgr(&altgr("e", "€"), false));
+        ime.typed_key(&altgr("e", "€"), at, false);
+        assert!(ime.char_message("€", at).is_empty());
+        assert_eq!(ime.owed(), 0);
+    }
+
+    /// Only AltGr owes nothing under a dialog (#1162): plain keys, plain Alt
+    /// (WM_SYSCHAR), Ctrl+Alt that changed nothing and a Win chord keep
+    /// their debts, so their WM_CHAR is still not typed again.
+    #[test]
+    fn other_keys_under_a_dialog_keep_their_debts() {
+        let win_altgr = KeyDownEvent {
+            keystroke: stroke(
+                "e",
+                Some("€"),
+                Modifiers {
+                    platform: true,
+                    ..ctrl_alt()
+                },
+            ),
+            ..altgr("e", "€")
+        };
+        for ev in [
+            typed(plain("a", "a")),
+            typed(stroke("g", Some("g"), alt())),
+            dead("g", "g", alt()),
+            typed(stroke("e", Some("€"), ctrl_alt())),
+            dead("´", "´", Modifiers::default()),
+            win_altgr,
+        ] {
+            assert!(!dialog_altgr(&ev, true), "{}", ev.keystroke);
+            let mut a = ImeState::default();
+            let mut b = ImeState::default();
+            a.typed_key(&ev, t0(), true);
+            b.key_down(&ev, t0());
+            assert_eq!(a.owed(), b.owed(), "{}", ev.keystroke);
+        }
     }
 
     /// Keys whose modifiers made no character stay as they are (#1162):
-    /// ⌥ arrows, ⌥⌫ and ⌥Enter; ⌃⌥ and ⌘⌥ chords on macOS; plain Alt and
-    /// Ctrl+Alt that changed nothing on Windows; and every key elsewhere.
+    /// ⌥ arrows, ⌥⌫ and ⌥Enter; ⌃⌥ and ⌘⌥ chords on macOS; and every key
+    /// off macOS, Windows' AltGr included (its WM_CHAR types it).
     #[test]
     fn keys_whose_modifiers_made_no_character_are_not_text() {
         let fn_alt = Modifiers {
@@ -1009,40 +1072,15 @@ mod tests {
             stroke("e", None, alt()),
         ];
         for k in &mac {
-            assert_eq!(modifier_char(&typed(k.clone()), true, false), None, "{k}");
+            assert_eq!(modifier_char(&typed(k.clone()), true), None, "{k}");
         }
-        // Windows: plain Alt's character is the bare key's; Ctrl+Alt
-        // without the flag changed nothing; AltGr+Win is a shell chord.
-        let win_altgr = KeyDownEvent {
-            keystroke: stroke(
-                "e",
-                Some("€"),
-                Modifiers {
-                    platform: true,
-                    ..ctrl_alt()
-                },
-            ),
-            ..altgr("e", "€")
-        };
         for ev in [
+            typed(stroke("g", Some("©"), alt())),
             typed(stroke("g", Some("g"), alt())),
-            dead("g", "g", alt()),
-            typed(stroke("e", Some("€"), ctrl_alt())),
-            win_altgr,
-            altgr("enter", "\r"),
+            altgr("e", "€"),
         ] {
-            assert_eq!(modifier_char(&ev, false, true), None, "{}", ev.keystroke);
+            assert_eq!(modifier_char(&ev, false), None, "{}", ev.keystroke);
         }
-        // Linux, and macOS's rule never applies on Windows or the reverse.
-        assert_eq!(modifier_char(&altgr("e", "€"), false, false), None);
-        assert_eq!(
-            modifier_char(&typed(stroke("g", Some("©"), alt())), false, false),
-            None
-        );
-        assert_eq!(
-            modifier_char(&typed(stroke("g", Some("©"), alt())), false, true),
-            None
-        );
     }
 
     /// A dead key's key-down as gpui reports it: ToUnicode was negative.
