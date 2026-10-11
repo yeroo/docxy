@@ -182,23 +182,29 @@ fn with_negative_bare(x: &str, negative: usize) -> Option<String> {
     }
 }
 
+/// Number's and Currency's positive part: the digits, after Currency's
+/// symbol.
+fn positive(b: &NumberBoxes) -> String {
+    let dec = b.decimals.min(MAX_DECIMALS);
+    if b.category == CURRENCY {
+        let sym = SYMBOLS[b.symbol.min(SYMBOLS.len() - 1)].1;
+        format!("{sym}{}", digits(dec, true))
+    } else {
+        digits(dec, b.thousands)
+    }
+}
+
 /// The format code the boxes make; `""` is General (no code).
 pub(crate) fn build(b: &NumberBoxes) -> String {
     let dec = b.decimals.min(MAX_DECIMALS);
     let sym = SYMBOLS[b.symbol.min(SYMBOLS.len() - 1)].1;
     match b.category {
         GENERAL => String::new(),
-        NUMBER => with_negative(&digits(dec, b.thousands), b.negative),
-        CURRENCY => with_negative(&format!("{sym}{}", digits(dec, true)), b.negative),
+        NUMBER | CURRENCY => with_negative(&positive(b), b.negative),
         ACCOUNTING => {
             let n = digits(dec, true);
             let zero: String = std::iter::repeat_n('?', dec as usize).collect();
-            let s = if sym.is_empty() {
-                String::new()
-            } else {
-                sym.to_string()
-            };
-            format!("_({s}* {n}_);_({s}* ({n});_({s}* \"-\"{zero}_);_(@_)")
+            format!("_({sym}* {n}_);_({sym}* ({n});_({sym}* \"-\"{zero}_);_(@_)")
         }
         DATE => DATES[b.date.min(DATES.len() - 1)].into(),
         TIME => TIMES[b.time.min(TIMES.len() - 1)].into(),
@@ -274,21 +280,20 @@ pub(crate) fn decompose(code: Option<&str>) -> NumberBoxes {
         custom: raw.to_string(),
         ..b
     };
-    // `$` also comes quoted or escaped (newer Excel writes `"$"#,##0.00`).
-    let norm = raw.replace("\"$\"", "$").replace("\\$", "$");
+    // `$` also comes quoted or escaped (newer Excel writes `"$"#,##0.00`),
+    // and so do parentheses: Excel writes out the built-ins with no number
+    // of their own here (5–8, 41–44) as `_("$"* \(#,##0.00\)`.
+    let norm = raw
+        .replace("\"$\"", "$")
+        .replace("\\$", "$")
+        .replace("\\(", "(")
+        .replace("\\)", ")");
     // The Accounting code the ribbon's Number list writes has no text section.
     let with_text = format!("{norm};_(@_)");
     for b in option_grid() {
         let built = build(&b);
         let bare = match b.category {
-            NUMBER | CURRENCY => with_negative_bare(
-                &if b.category == NUMBER {
-                    digits(b.decimals, b.thousands)
-                } else {
-                    format!("{}{}", SYMBOLS[b.symbol].1, digits(b.decimals, true))
-                },
-                b.negative,
-            ),
+            NUMBER | CURRENCY => with_negative_bare(&positive(&b), b.negative),
             _ => None,
         };
         let accounting = b.category == ACCOUNTING && built == with_text;
@@ -717,8 +722,16 @@ pub(crate) fn open(tab: &mut DocTab) -> Result<(), String> {
 fn setter(d: &Dialog) -> Result<Option<FormatFn>, String> {
     let mut parts: Vec<FormatFn> = Vec::new();
     if NUMBER_CONTROLS.iter().any(|n| d.changed(n)) {
-        let code = build(&now(d));
-        if code != build(&opened(d)) {
+        let (now, was) = (now(d), opened(d));
+        let code = build(&now);
+        // A Custom code counts as typed, against the cell's own code; the
+        // boxes' codes compare as built, so a box set back writes nothing.
+        let differs = if now.category == CUSTOM {
+            now.custom != was.custom
+        } else {
+            code != build(&was)
+        };
+        if differs {
             if !code.is_empty() && gridcore::numfmt::parse_format(&code).is_none() {
                 return Err(format!("docxy cannot use this number format: {code}"));
             }

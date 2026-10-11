@@ -618,3 +618,85 @@ fn ok_while_editing_keeps_the_entry() {
     view(&mut t).commit_and_move(1, 0);
     assert_eq!(shows(&mut t, "A1"), "7.0");
 }
+
+/// #1165 r1: the built-ins Excel writes out itself (5–8, 41–44), with
+/// `"$"` and escaped parentheses, open on their category's boxes.
+#[test]
+fn excels_written_out_builtins_open_on_their_boxes() {
+    // (code, category, decimals, symbol, negative)
+    let cases: [(&str, usize, u32, usize, usize); 9] = [
+        (r##""$"#,##0_);\("$"#,##0\)"##, CURRENCY, 0, 1, 2),
+        (r##""$"#,##0_);[Red]\("$"#,##0\)"##, CURRENCY, 0, 1, 3),
+        (r##""$"#,##0.00_);\("$"#,##0.00\)"##, CURRENCY, 2, 1, 2),
+        (r##""$"#,##0.00_);[Red]\("$"#,##0.00\)"##, CURRENCY, 2, 1, 3),
+        (
+            r##"_(* #,##0_);_(* \(#,##0\);_(* "-"_);_(@_)"##,
+            ACCOUNTING,
+            0,
+            0,
+            0,
+        ),
+        (
+            r##"_("$"* #,##0_);_("$"* \(#,##0\);_("$"* "-"_);_(@_)"##,
+            ACCOUNTING,
+            0,
+            1,
+            0,
+        ),
+        (
+            r##"_(* #,##0.00_);_(* \(#,##0.00\);_(* "-"??_);_(@_)"##,
+            ACCOUNTING,
+            2,
+            0,
+            0,
+        ),
+        (
+            r##"_("$"* #,##0.00_);_("$"* \(#,##0.00\);_("$"* "-"??_);_(@_)"##,
+            ACCOUNTING,
+            2,
+            1,
+            0,
+        ),
+        (r##"#,##0.00_);\(#,##0.00\)"##, NUMBER, 2, 1, 2),
+    ];
+    for (code, cat, dec, sym, neg) in cases {
+        let b = decompose(Some(code));
+        let got_sym = if cat == NUMBER { 1 } else { b.symbol };
+        assert_eq!(
+            (b.category, b.decimals, got_sym, b.negative),
+            (cat, dec, sym, neg),
+            "{code}"
+        );
+        assert_eq!(b.custom, code, "Custom keeps the code as written");
+    }
+    assert!(decompose(Some(r##"#,##0.00_);\(#,##0.00\)"##)).thousands);
+}
+
+/// #1165 r1: a Custom code typed over the cell's code is written even
+/// when it builds the same boxes as the code the cell has.
+#[test]
+fn a_typed_custom_code_is_written_as_typed() {
+    let mut t = tab();
+    put(&mut t, "A1", CellValue::Number(5.0), coded("#,##0;(#,##0)"));
+    select(&mut t, "A1", "A1");
+    open_on(&mut t);
+    set(&mut t, "category", s("Custom"));
+    assert_eq!(read(&t, "code"), "#,##0;(#,##0)");
+    set(&mut t, "code", s("#,##0_);(#,##0)"));
+    press(&mut t, "OK").unwrap();
+    assert_eq!(xf_at(&mut t, "A1").code.as_deref(), Some("#,##0_);(#,##0)"));
+
+    // A mixed selection: the active cell's code in another spelling still
+    // goes to every cell.
+    let mut t = tab();
+    put(&mut t, "A1", CellValue::Number(5.0), coded("\"$\"#,##0.00"));
+    put(&mut t, "A2", CellValue::Number(6.0), Xf::default());
+    select(&mut t, "A1", "A2");
+    open_on(&mut t);
+    set(&mut t, "category", s("Custom"));
+    set(&mut t, "code", s("$#,##0.00"));
+    press(&mut t, "OK").unwrap();
+    assert_eq!(xf_at(&mut t, "A1").code.as_deref(), Some("$#,##0.00"));
+    assert_eq!(xf_at(&mut t, "A2").code.as_deref(), Some("$#,##0.00"));
+    assert_eq!(shows(&mut t, "A2"), "$6.00");
+}

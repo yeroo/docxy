@@ -18104,7 +18104,6 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// Data › Data Validation: the dialog over the selection (#689).
     /// Home › Cells › Format, Ctrl+1 and the Home launchers: Format Cells
     /// over the selection (#1165). Another press leaves the one that is up.
     fn sheet_format_cells(&mut self, cx: &mut Context<Self>) {
@@ -18116,6 +18115,7 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Data › Data Validation: the dialog over the selection (#689).
     fn sheet_data_validation(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             match sheet_validation::dialog(tab) {
