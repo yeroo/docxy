@@ -126,9 +126,10 @@ impl DateTime {
 
     /// Parse MSPDI's `yyyy-mm-ddThh:mm:ss` (or a bare `yyyy-mm-dd`). Returns
     /// `None` on any structural surprise rather than guessing; a year
-    /// outside `0..=99_999` returns `None` too (wide enough for any year
-    /// `to_mspdi` writes for a scheduled date, far below the `i64` overflow
-    /// in `days_from_civil`).
+    /// outside `0..=99_999` returns `None` too (wide enough to read back
+    /// what `to_mspdi` writes for a schedule built from four-digit years,
+    /// which can run past 9999; far below the `i64` overflow in
+    /// `days_from_civil`).
     pub fn parse_mspdi(s: &str) -> Option<Self> {
         let s = s.trim();
         let (date, time) = match s.split_once('T') {
@@ -227,8 +228,8 @@ mod tests {
         // absent, not panic (debug) or wrap (release).
         assert!(DateTime::parse_mspdi("9223372036854775807-03-01").is_none());
         assert!(DateTime::parse_mspdi("9223372036854775807-01-01T08:00:00").is_none());
-        // Six digits is outside even the scheduled-horizon range to_mspdi
-        // can write past 9999.
+        // Six digits is rejected: past what a schedule from four-digit years
+        // reaches, and the bound that keeps the arithmetic far from overflow.
         assert!(DateTime::parse_mspdi("100000-01-01T00:00:00").is_none());
         // A five-digit year is what to_mspdi writes past 9999 (a scheduled
         // date can land there); it must round-trip.
