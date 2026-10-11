@@ -2860,6 +2860,21 @@ mod tests {
     }
 
     #[test]
+    fn oversized_year_date_reads_as_absent() {
+        // A task date whose year overflows parse_mspdi's civil-day
+        // arithmetic reads as absent; the rest of the task still reads.
+        let project = read_mspdi(
+            r#"<Project><Tasks><Task><UID>1</UID><ID>1</ID><Name>Huge</Name><Start>9223372036854775807-03-01T08:00:00</Start><Finish>2026-03-02T17:00:00</Finish></Task></Tasks></Project>"#,
+        )
+        .unwrap();
+        assert_eq!(project.tasks[0].stored_start, None);
+        assert_eq!(
+            project.tasks[0].stored_finish,
+            Some(DateTime::from_ymd_hm(2026, 3, 2, 17, 0))
+        );
+    }
+
+    #[test]
     fn duplicate_explicit_uids_name_both_tasks_including_zero() {
         for uid in [0, 7] {
             let xml = uid_xml(&format!(

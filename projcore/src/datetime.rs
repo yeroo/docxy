@@ -125,7 +125,8 @@ impl DateTime {
     }
 
     /// Parse MSPDI's `yyyy-mm-ddThh:mm:ss` (or a bare `yyyy-mm-dd`). Returns
-    /// `None` on any structural surprise rather than guessing.
+    /// `None` on any structural surprise rather than guessing; a year
+    /// outside `0..=9999` returns `None` too.
     pub fn parse_mspdi(s: &str) -> Option<Self> {
         let s = s.trim();
         let (date, time) = match s.split_once('T') {
@@ -136,7 +137,11 @@ impl DateTime {
         let year: i64 = dp.next()?.parse().ok()?;
         let month: u32 = dp.next()?.parse().ok()?;
         let day: u32 = dp.next()?.parse().ok()?;
-        if dp.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        if dp.next().is_some()
+            || !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || !(0..=9999).contains(&year)
+        {
             return None;
         }
         let (hour, minute) = match time {
@@ -212,6 +217,24 @@ mod tests {
         );
         assert!(DateTime::parse_mspdi("not-a-date").is_none());
         assert!(DateTime::parse_mspdi("2026-13-01T00:00:00").is_none());
+    }
+
+    #[test]
+    fn mspdi_parse_rejects_out_of_range_year() {
+        // A year that overflows the civil-day arithmetic must read as
+        // absent, not panic (debug) or wrap (release).
+        assert!(DateTime::parse_mspdi("9223372036854775807-03-01").is_none());
+        assert!(DateTime::parse_mspdi("9223372036854775807-01-01T08:00:00").is_none());
+        // Five digits is outside MSPDI's yyyy and to_mspdi's round-trip.
+        assert!(DateTime::parse_mspdi("10000-01-01T00:00:00").is_none());
+        // The range ends are accepted and round-trip.
+        assert_eq!(
+            DateTime::parse_mspdi("9999-12-31T23:59:00")
+                .unwrap()
+                .to_mspdi(),
+            "9999-12-31T23:59:00"
+        );
+        assert!(DateTime::parse_mspdi("0000-03-01").is_some());
     }
 
     #[test]
