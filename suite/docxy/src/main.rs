@@ -3262,6 +3262,13 @@ impl SheetView {
     /// open and the workbook's undo is untouched. Pressed again straight away
     /// it puts the typing back. Typing over a cell leaves the restored text
     /// selected, so the next character replaces it (#1147).
+    /// Ctrl+Z in the editor as Alt+Backspace and the QAT Undo run it (#1147,
+    /// #1149): the AutoComplete proposal goes, then [`Self::edit_revert`].
+    fn edit_undo(&mut self) {
+        self.drop_proposal();
+        self.edit_revert();
+    }
+
     fn edit_revert(&mut self) {
         if self.editing.is_some() {
             // Right after an AutoCorrect change, only it goes (ENT-119).
@@ -3666,7 +3673,7 @@ impl SheetView {
         }
         // The typed entry is checked once, against the active cell's rule,
         // and then fills the range.
-        let step = SheetStep::typing_range(&buf, self.range());
+        let step = SheetStep::typing_areas(&buf, &areas);
         if let Some(cells) = &cells {
             if self.dv_violation((s, r, c), cells.clone(), None, step.clone()) {
                 return false;
@@ -12035,16 +12042,18 @@ impl Docxy {
             );
         }
         // A sheet's buttons are its Ctrl+Z and Ctrl+Y (#1149): in the cell
-        // editor Undo takes back the typing (#662) and Redo does nothing.
+        // editor Undo takes back the typing (#662) and Redo does nothing;
+        // under a bar that takes the keys they do nothing, as the keys do.
         if self.active_is_sheet() {
+            if self.sheet_bar_holds_keys() {
+                return self.refocus(window, cx);
+            }
             match action {
                 QatAction::Undo => {
                     let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
                     if editing {
                         if let Some(v) = self.active_sheet_mut() {
-                            // As Ctrl+Z: the AutoComplete proposal goes first.
-                            v.proposal_before_key("z", true, false);
-                            v.edit_revert();
+                            v.edit_undo();
                         }
                         cx.notify();
                     } else {
@@ -14153,8 +14162,15 @@ impl Docxy {
                 &harness::region_name(region),
             )
             .ok_or_else(|| "the File screen is not open".to_string()),
-            Region::Qat(name) => lookup(&self.probes.borrow(), name)
-                .ok_or_else(|| format!("{name} is not drawn (a document or sheet tab draws it)")),
+            Region::Qat(name) => lookup(&self.probes.borrow(), name).ok_or_else(|| {
+                if name == "qat-redo-arrow" {
+                    format!("{name} is not drawn: only a sheet tab draws it")
+                } else if name == "qat-undo-arrow" {
+                    format!("{name} is not drawn: a document or sheet tab draws it")
+                } else {
+                    format!("{name} is not drawn yet: `shot window` first")
+                }
+            }),
             Region::Ribbon => lookup(&self.probes.borrow(), "ribbon-body")
                 .ok_or_else(|| "the ribbon's groups are not shown".to_string()),
             Region::RibbonFlyout => lookup(&self.probes.borrow(), "ribbon-flyout")
@@ -15659,6 +15675,21 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Whether a sheet bar takes the keys, Ctrl+Z and Ctrl+Y among them, so
+    /// they never reach the history: the sheet-tab rename, the comment,
+    /// conditional-format (unless its range field has the focus) and
+    /// row-height bars, and Find (see `sheet_key`). They hold sheet indices
+    /// and cells an undo would move under them, so the QAT buttons and the
+    /// Undo and Redo lists leave the history alone too (#1149).
+    fn sheet_bar_holds_keys(&self) -> bool {
+        let bar_field = matches!(&self.range_edit, Some(f) if f.target.is_bar());
+        self.sheet_rename.is_some()
+            || self.sheet_comment_edit.is_some()
+            || (self.sheet_cf_edit.is_some() && !bar_field)
+            || self.sheet_rowh_edit.is_some()
+            || self.find_open
+    }
+
     /// Push a workbook snapshot onto the undo stack as the step `step`
     /// (clearing redo). Called before each mutating grid operation.
     fn sheet_snapshot(&mut self, step: SheetStep) {
@@ -15668,25 +15699,23 @@ impl Docxy {
     }
 
     /// Run a package edit that the workbook's file can refuse (its worksheet
-    /// XML is damaged where the edit would go). Landed, it gets an undo step
-    /// (when `step` names one) and dirties the tab; refused, nothing changed,
-    /// so neither happens and the status says so.
+    /// XML is damaged where the edit would go). Landed, it is the undo step
+    /// `step` and dirties the tab; refused, nothing changed, so neither
+    /// happens and the status says so.
     fn sheet_try_edit(
         &mut self,
-        step: Option<SheetStep>,
+        step: SheetStep,
         edit: impl FnOnce(&mut SheetView) -> bool,
     ) -> bool {
         let Some(v) = self.active_sheet_mut() else {
             return false;
         };
-        let snap = step.map(|step| (v.snapshot(), step));
+        let snap = v.snapshot();
         if !edit(v) {
             self.set_status(DAMAGED_SHEET_STATUS);
             return false;
         }
-        if let Some((snap, step)) = snap {
-            v.push_undo_snapshot(snap, step);
-        }
+        v.push_undo_snapshot(snap, step);
         self.mark_sheet_dirty();
         true
     }
@@ -15713,8 +15742,12 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         // In the cell editor neither list moves the history, as Excel greys
-        // them there: a restore would throw the typed entry away. The lists
+        // them there: a restore would throw the typed entry away. Nor under
+        // a bar that takes the keys (`sheet_bar_holds_keys`). The lists
         // open empty then; this guards a pick from one opened before.
+        if self.sheet_bar_holds_keys() {
+            return self.refocus(window, cx);
+        }
         let changed = self.active_sheet_mut().is_some_and(|v| {
             v.editing.is_none()
                 && if redo {
@@ -16348,14 +16381,14 @@ impl Docxy {
             "enter" => {
                 let cells = self.bar_cells();
                 if buf.trim().eq_ignore_ascii_case("clear") {
-                    self.sheet_try_edit(Some(SheetStep::Named(CF_STEP)), |v| {
+                    self.sheet_try_edit(SheetStep::Named(CF_STEP), |v| {
                         let s = v.active;
                         let done = v.pkg.clear_conditional_formats(s);
                         v.engine = sheet_engine(&v.pkg.workbook);
                         done
                     });
                 } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
-                    self.sheet_try_edit(Some(SheetStep::Named(CF_STEP)), |v| {
+                    self.sheet_try_edit(SheetStep::Named(CF_STEP), |v| {
                         let s = v.active;
                         let done = v.pkg.add_conditional_format(
                             s,
@@ -16609,7 +16642,7 @@ impl Docxy {
     fn sheet_format_as_table(&mut self, cx: &mut Context<Self>) {
         use gridcore::sheet::CellValue;
         let mut refused = None;
-        self.sheet_try_edit(Some(SheetStep::Named("Format as Table")), |v| {
+        self.sheet_try_edit(SheetStep::Named("Format as Table"), |v| {
             let s = v.active;
             let (max_r, max_c) = v.extent();
             let region = if v.has_range() {
@@ -18980,8 +19013,7 @@ impl Docxy {
                     if let Some(v) = self.active_sheet_mut() {
                         if alt {
                             // Alt+Backspace is Ctrl+Z (#1147).
-                            v.drop_proposal();
-                            v.edit_revert();
+                            v.edit_undo();
                         } else if !v.drop_proposal() {
                             v.edit_backspace();
                         }
@@ -28943,7 +28975,7 @@ impl Docxy {
             // pick would restore over the typed entry and drop it.
             QatState::Sheet { .. } => self
                 .active_sheet()
-                .filter(|v| v.editing.is_none())
+                .filter(|v| v.editing.is_none() && !self.sheet_bar_holds_keys())
                 .map(SheetView::undo_names)
                 .unwrap_or_default(),
             QatState::Plain => {
@@ -28965,8 +28997,9 @@ impl Docxy {
         let Some(v) = self.active_sheet() else {
             return Err("the Redo drop-down opens on a sheet tab".into());
         };
-        // In the cell editor Redo does nothing, so its list is empty.
-        let names = if v.editing.is_some() {
+        // In the cell editor, or under a bar that takes the keys, Redo does
+        // nothing, so its list is empty.
+        let names = if v.editing.is_some() || self.sheet_bar_holds_keys() {
             Vec::new()
         } else {
             v.redo_names()
@@ -31019,14 +31052,14 @@ impl Docxy {
         }
         let cells = self.bar_cells();
         if buf.trim().eq_ignore_ascii_case("clear") {
-            self.sheet_try_edit(Some(SheetStep::Named(CF_STEP)), |v| {
+            self.sheet_try_edit(SheetStep::Named(CF_STEP), |v| {
                 let s = v.active;
                 let done = v.pkg.clear_conditional_formats(s);
                 v.engine = sheet_engine(&v.pkg.workbook);
                 done
             });
         } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
-            self.sheet_try_edit(Some(SheetStep::Named(CF_STEP)), |v| {
+            self.sheet_try_edit(SheetStep::Named(CF_STEP), |v| {
                 let s = v.active;
                 let done = v.pkg.add_conditional_format(
                     s,

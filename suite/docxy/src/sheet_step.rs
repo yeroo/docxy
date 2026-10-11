@@ -14,7 +14,8 @@ const TYPED_SHOWN: usize = 40;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SheetStep {
     /// An entry typed into a cell (`at` is `A1`) or, by Ctrl+Enter, into a
-    /// range (`A1:B3`): `text` is the entry as committed, before AutoCorrect.
+    /// range (`A1:B3`, or every area of the selection: `A1:A3,C5`): `text`
+    /// is what lands in the cell, after AutoComplete and AutoCorrect.
     Typing { text: String, at: String },
     /// A command, by Excel's name for it (`Fill`, `Paste`, `Clear`, ...).
     Named(&'static str),
@@ -29,15 +30,24 @@ impl SheetStep {
         }
     }
 
-    /// Typing `text` into the 0-based range `(r0, c0, r1, c1)` (one cell
-    /// reads as `A1`).
-    pub(crate) fn typing_range(text: &str, (r0, c0, r1, c1): (u32, u32, u32, u32)) -> Self {
-        if (r0, c0) == (r1, c1) {
-            return Self::typing(text, (r0, c0));
-        }
+    /// Typing `text` into every 0-based area `(r0, c0, r1, c1)` of a
+    /// selection, in selection order (Ctrl+Enter, #670): `A1:A3,C5`; a
+    /// one-cell area reads as `A1`.
+    pub(crate) fn typing_areas(text: &str, areas: &[(u32, u32, u32, u32)]) -> Self {
+        let at = areas
+            .iter()
+            .map(|&(r0, c0, r1, c1)| {
+                if (r0, c0) == (r1, c1) {
+                    cell_name(r0, c0)
+                } else {
+                    format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         Self::Typing {
             text: text.to_string(),
-            at: format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1)),
+            at,
         }
     }
 
@@ -71,12 +81,16 @@ mod tests {
         );
         assert_eq!(SheetStep::typing("", (2, 27)).label(), "Typing '' in AB3");
         assert_eq!(
-            SheetStep::typing_range("x", (0, 0, 2, 1)).label(),
+            SheetStep::typing_areas("x", &[(0, 0, 2, 1)]).label(),
             "Typing 'x' in A1:B3"
         );
         assert_eq!(
-            SheetStep::typing_range("x", (4, 2, 4, 2)).label(),
+            SheetStep::typing_areas("x", &[(4, 2, 4, 2)]).label(),
             "Typing 'x' in C5"
+        );
+        assert_eq!(
+            SheetStep::typing_areas("x", &[(0, 0, 2, 0), (4, 2, 4, 2)]).label(),
+            "Typing 'x' in A1:A3,C5"
         );
         assert_eq!(SheetStep::Named("Fill").label(), "Fill");
     }

@@ -856,6 +856,15 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         Some((h, a)) => (h.trim(), Some(a.trim())),
         None => (name, None),
     };
+    if let Some(qat) = QAT_REGIONS
+        .into_iter()
+        .find(|q| q.eq_ignore_ascii_case(head))
+    {
+        return match arg {
+            None => Ok(Region::Qat(qat)),
+            Some(_) => Err(format!("'{qat}' does not take an argument; use '{qat}'")),
+        };
+    }
     match head.to_ascii_lowercase().as_str() {
         "window" if arg.is_none() => Ok(Region::Window),
         "title-tabs" if arg.is_none() => Ok(Region::TitleTabs),
@@ -896,12 +905,6 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
-        qat if arg.is_none() && QAT_REGIONS.contains(&qat) => Ok(Region::Qat(
-            QAT_REGIONS
-                .into_iter()
-                .find(|q| *q == qat)
-                .unwrap_or_default(),
-        )),
         "window" | "grid" | "chart-panel" | "title-tabs" | "tab-prev" | "tab-next" | "tab-more"
         | "gantt" | "project-hbar-table" | "project-hbar-chart" | "project-vbar"
         | "project-timeline" | "project-split" | "gallery" | "ribbon" | "ribbon-flyout"

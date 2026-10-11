@@ -101,6 +101,21 @@ fn ctrl_enter_names_the_range_it_typed_into_1149() {
 }
 
 #[test]
+fn ctrl_enter_names_every_area_it_typed_into_1149() {
+    let mut v = view();
+    // A1:A3, then C5 added with Ctrl+click: C5 is the active area.
+    select(&mut v, (0, 0), (2, 0));
+    v.add_area((4, 2));
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_caret = 0;
+    v.edit_type("x");
+    assert!(v.commit_edit_to_selection());
+    assert_eq!(value(&v, 1, 0), CellValue::Text("x".into()));
+    assert_eq!(value(&v, 4, 2), CellValue::Text("x".into()));
+    assert_eq!(v.undo_names(), ["Typing 'x' in A1:A3,C5"]);
+}
+
+#[test]
 fn a_tables_autocorrect_step_is_named_for_what_it_did_1149() {
     let mut v = view();
     for (c, h) in ["Qty", "Price"].iter().enumerate() {
