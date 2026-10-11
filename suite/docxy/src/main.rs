@@ -5038,6 +5038,12 @@ enum FmtPanelKey {
     Swallow,
 }
 
+/// Whether the Format Cells panel is drawn: its flag is set, a sheet is the
+/// active tab, and File (backstage) does not cover the window.
+fn format_panel_shown(open: bool, sheet: bool, backstage: bool) -> bool {
+    open && sheet && !backstage
+}
+
 /// The Format Cells panel's handling of a key, whatever its modifiers.
 fn format_panel_key(key: &str) -> FmtPanelKey {
     match key {
@@ -5048,7 +5054,18 @@ fn format_panel_key(key: &str) -> FmtPanelKey {
 
 #[cfg(test)]
 mod format_panel_key_tests {
-    use super::{FmtPanelKey, format_panel_key};
+    use super::{FmtPanelKey, format_panel_key, format_panel_shown};
+
+    /// #1161: the panel owns keys only where it is drawn. Its flag outlives
+    /// a switch to another tab or to File (⌘, on macOS), whose keys it must
+    /// not take.
+    #[test]
+    fn the_panel_owns_keys_only_over_a_sheet_outside_file() {
+        assert!(format_panel_shown(true, true, false));
+        assert!(!format_panel_shown(false, true, false));
+        assert!(!format_panel_shown(true, false, false));
+        assert!(!format_panel_shown(true, true, true));
+    }
 
     /// #1161: Esc and Return close the panel; every other key is its own.
     #[test]
@@ -11970,14 +11987,12 @@ impl Docxy {
         cx.notify();
     }
 
-    /// A dialog or the more-tabs list owns the key before any surface sees
-    /// it (#393): true when one took it. (An open menu is `on_key`'s next
-    /// check, `menu_key`.)
     /// Whether the sheet's Format Cells panel is up, owning every key as a
-    /// dialog does (#1161). It is drawn only over a sheet, and the flag can
-    /// outlive a switch to another tab, whose keys it must not take.
+    /// dialog does (#1161). It is drawn only over a sheet and not in File
+    /// (backstage), and the flag can outlive a switch to either, whose keys
+    /// it must not take.
     fn format_panel_owns_keys(&self) -> bool {
-        self.active_is_sheet() && self.sheet_fmt_open
+        format_panel_shown(self.sheet_fmt_open, self.active_is_sheet(), self.backstage)
     }
 
     /// Close the Format Cells panel: its ×, Done, backdrop, Esc and Return.
@@ -11986,6 +12001,9 @@ impl Docxy {
         cx.notify();
     }
 
+    /// A dialog, the sheet's Format Cells panel (#1161) or the more-tabs list
+    /// owns the key before any surface sees it (#393): true when one took it.
+    /// (An open menu is `on_key`'s next check, `menu_key`.)
     fn modal_takes_key(
         &mut self,
         ev: &KeyDownEvent,

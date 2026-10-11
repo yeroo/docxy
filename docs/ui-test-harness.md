@@ -363,6 +363,8 @@ State keys, as the app reports them after every driving verb:
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
 | `picking`, `range_preview`, `sel_hidden` | point mode |
 | `find_open`, `find_query`, `replace_text` | the find bar (Ctrl+F) and its Find and Replace fields; Down moves to Replace |
+| `format_cells_open` | the sheet's Format Cells panel (Home › Cells › Format) is open and owns every key; Esc and Return close it (#1161). False on a non-sheet tab or in File (backstage) |
+| `keytips_up` | the Alt / F10 KeyTips overlay is up, at either level |
 | `ime_marked` | the input handler's marked text (a dead key's accent or an IME's provisional text, typed nowhere yet), or null (#1072) |
 | `wm_char_owed` | the WM_CHAR characters typed keys still owe the Windows input handler, lapsed ones included (#1139) |
 | `selected_task`, `tasks`, `bar_<id>`, `baseline_<id>` | Project: cell cursor's row (zero-based; equals `tasks` on the entry row below the last task), task count, and each task's drawn bar and baseline bar by displayed ID |
