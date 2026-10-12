@@ -380,7 +380,8 @@ mod sys {
                     &mut slave,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut size,
+                    // `*const` on Linux, `*mut` on macOS: a raw pointer fits both.
+                    &raw mut size as _,
                 )
             };
             if rc != 0 {

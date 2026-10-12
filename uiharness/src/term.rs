@@ -35,6 +35,7 @@
 use crate::driver::Driver;
 use crate::pty::{Pty, Spawn};
 use crate::termkeys::{self, Key};
+use ctlcore::client::Conn;
 use ctlcore::json::Json;
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -216,7 +217,10 @@ fn counts_of(j: &Json) -> Result<Counts, String> {
 struct Session {
     pty: Pty,
     input: Box<dyn Write + Send>,
-    driver: Driver,
+    /// One connection for the whole session: waiting on a key polls
+    /// `field-read` in a tight loop, and a socket per poll runs Windows out
+    /// of ephemeral ports within a case file.
+    conn: Conn,
     screen: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -324,10 +328,11 @@ impl Terminal {
             }
             std::thread::sleep(Duration::from_millis(50));
         };
+        let conn = driver.instance().client().connect()?;
         let session = Session {
             pty,
             input,
-            driver,
+            conn,
             screen,
         };
         self.session = Some(session);
@@ -345,7 +350,7 @@ impl Terminal {
 
     fn counts(&mut self) -> Result<Counts, String> {
         let s = self.session()?;
-        counts_of(&s.driver.call("field-read", Json::obj(vec![]))?)
+        counts_of(&s.conn.call("field-read", Json::obj(vec![]))?)
     }
 
     /// Poll the counters until `done` holds.
@@ -418,7 +423,7 @@ impl Terminal {
             .ok_or("a terminal's pointer-click takes {\"input\":id}")?
             .to_string();
         let s = self.session()?;
-        let read = s.driver.call(
+        let read = s.conn.call(
             "field-read",
             Json::obj(vec![("input", Json::Str(id.clone()))]),
         )?;
@@ -485,7 +490,7 @@ impl Terminal {
                 self.press(&keys)
             }
             "pointer-click" => self.click(&args),
-            _ => self.session()?.driver.call(verb, args),
+            _ => self.session()?.conn.call(verb, args),
         }
     }
 }
