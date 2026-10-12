@@ -1903,7 +1903,7 @@ fn mail_state(tab: &crate::DocTab) -> Json {
     ])
 }
 
-fn active_doc(app: &crate::Docxy) -> Result<&Editor, String> {
+pub(crate) fn active_doc(app: &crate::Docxy) -> Result<&Editor, String> {
     match app.tabs.get(app.active).map(|t| &t.surface) {
         Some(crate::Surface::Doc(ed)) => Ok(ed),
         _ => Err("the active tab is not a document".into()),
@@ -4856,9 +4856,24 @@ fn dispatch_verb(
                             .ok_or("the Find bar is not drawn: open it first (Ctrl+F)")?
                             .center()
                     }
+                    // The document Find bar's Replace and All buttons
+                    // (#1201), which no key presses either.
+                    Some(at @ ("doc-replace-button" | "doc-replace-all-button")) => {
+                        active_doc(app)?;
+                        let probe = if at == "doc-replace-button" {
+                            "df-rep"
+                        } else {
+                            "df-all"
+                        };
+                        app.probes
+                            .borrow()
+                            .on_screen(probe)
+                            .ok_or("the Find bar is not drawn: open it first (Ctrl+F)")?
+                            .center()
+                    }
                     Some(other) => {
                         return Err(format!(
-                            "unknown pointer target '{other}' (fill-handle, user-name-row, custom-lists-row, sheet-replace-button, sheet-replace-all-button)"
+                            "unknown pointer target '{other}' (fill-handle, user-name-row, custom-lists-row, sheet-replace-button, sheet-replace-all-button, doc-replace-button, doc-replace-all-button)"
                         ));
                     }
                     None => return Err("'at' must be a string".into()),

@@ -8056,6 +8056,28 @@ fn fx_bar_text(view: &SheetView) -> String {
     }
 }
 
+/// What a document Font box shows for the caret's run (`props`, `None` off a
+/// document): `fontname`'s family, else `fontsize`'s points. Drawn by
+/// `combo_box` and read by `field-read` (#1201) alike.
+fn doc_combo_value(cmd_id: &str, props: Option<RunProps>) -> String {
+    if cmd_id == "fontname" {
+        return props
+            .and_then(|p| p.font)
+            .unwrap_or_else(|| "Calibri".into());
+    }
+    props
+        .and_then(|p| p.size_half_pts)
+        .map(|h| {
+            let s = h as f32 / 2.0;
+            if s.fract() == 0.0 {
+                format!("{}", s as u32)
+            } else {
+                format!("{s}")
+            }
+        })
+        .unwrap_or_else(|| "11".into())
+}
+
 /// The formula bar's height in px: one line, or about four with
 /// Ctrl+Shift+U (#672).
 fn fx_bar_height(expanded: bool) -> f32 {
@@ -21681,7 +21703,10 @@ impl Docxy {
                     .child("New comment"),
             )
             .child(
+                // Probed where the harness's `pointer-click` finds it (#1201).
                 h_flex()
+                    .relative()
+                    .child(probe(&self.probes, "comment-edit"))
                     .flex_1()
                     .items_center()
                     .px_2()
@@ -22325,8 +22350,13 @@ impl Docxy {
             format!("{count} match{}", if count == 1 { "" } else { "es" })
         };
 
-        let field = |label: &'static str, text: &str, active: bool| {
+        // Each field and the Replace and All buttons are probed under their
+        // own ids, where the harness's `pointer-click` finds them (#1201).
+        let field = |id: &'static str, label: &'static str, text: &str, active: bool| {
             h_flex()
+                .id(id)
+                .relative()
+                .child(probe(&self.probes, id))
                 .items_center()
                 .gap_1p5()
                 .px_2()
@@ -22365,6 +22395,8 @@ impl Docxy {
         let text_btn = |id: &'static str, label: &'static str| {
             div()
                 .id(id)
+                .relative()
+                .child(probe(&self.probes, id))
                 .flex()
                 .items_center()
                 .px_2()
@@ -22390,6 +22422,7 @@ impl Docxy {
             .border_color(pal.border)
             .child(
                 field(
+                    "df-q",
                     "Find",
                     &self.find_query,
                     self.find_field == FindField::Query,
@@ -22420,6 +22453,7 @@ impl Docxy {
             .child(div().w(px(1.)).h(px(18.)).bg(pal.border))
             .child(
                 field(
+                    "df-r",
                     "Replace",
                     &self.replace_text,
                     self.find_field == FindField::Replace,
@@ -22433,11 +22467,11 @@ impl Docxy {
                 ),
             )
             .child(
-                text_btn("f-rep", "Replace")
+                text_btn("df-rep", "Replace")
                     .on_click(cx.listener(|this, _, _, cx| this.replace_one(cx))),
             )
             .child(
-                text_btn("f-all", "All")
+                text_btn("df-all", "All")
                     .on_click(cx.listener(|this, _, _, cx| this.replace_all_now(cx))),
             )
             .child(div().flex_1())
@@ -32026,7 +32060,7 @@ impl Docxy {
     }
 
     /// The current font family / size at the caret (for the Font combos).
-    fn caret_run_props(&self) -> Option<RunProps> {
+    pub(crate) fn caret_run_props(&self) -> Option<RunProps> {
         match self.tabs.get(self.active).map(|t| &t.surface) {
             Some(Surface::Doc(ed)) => Some(ed.caret_props()),
             _ => None,
@@ -32055,28 +32089,19 @@ impl Docxy {
                 .map(|t| t.mail.record_text())
                 .unwrap_or_default()
                 .into()
-        } else if cmd.id == "fontname" {
-            props
-                .and_then(|p| p.font)
-                .unwrap_or_else(|| "Calibri".into())
-                .into()
         } else {
-            props
-                .and_then(|p| p.size_half_pts)
-                .map(|h| {
-                    let s = h as f32 / 2.0;
-                    if s.fract() == 0.0 {
-                        format!("{}", s as u32)
-                    } else {
-                        format!("{s}")
-                    }
-                })
-                .unwrap_or_else(|| "11".into())
-                .into()
+            doc_combo_value(cmd.id, props).into()
         };
         let act = cmd.act;
+        // The Font and Font Size boxes are probed where the harness's
+        // `pointer-click {"input":id}` finds them (#1201).
+        let probed = matches!(cmd.id, "fontname" | "fontsize");
         div()
             .id(cmd.id)
+            .relative()
+            .when(probed, |d| {
+                d.child(probe(&self.probes, format!("doc-combo:{}", cmd.id)))
+            })
             .flex()
             .items_center()
             .justify_between()
