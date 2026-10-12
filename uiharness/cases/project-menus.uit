@@ -104,7 +104,7 @@ test Set Baseline's split menu sets and clears the baseline
   assert status is Baseline set — baseline bars now show under the current bars
   call ribbon-click {"tab":"Project","command":"Clear Baseline"}
   assert status is Baseline cleared
-  key alt p l
+  key alt p b l
   assert status is No baseline to clear
   call ribbon-read {}
   assert reply.tabs.4.groups.0.commands.1.label is Set Baseline

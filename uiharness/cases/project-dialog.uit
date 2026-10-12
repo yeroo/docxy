@@ -56,12 +56,13 @@ test the keyboard answers the message box and nothing under it sees a key
   click A1
   key delete
   # Typing, Tab, a chord and KeyTips all stop at the dialog: Alt O would
-  # switch to Gantt Chart Format, Alt P B would set a baseline.
+  # switch to Gantt Chart Format, Alt P B would open Set Baseline's menu.
   type x
   key tab
   key ctrl+z
   key alt o
   key alt p b
+  assert menu is nothing
   assert ribbon_tab is not Gantt Chart Format
   assert undo_depth is 0
   assert dialog is delete-summary

@@ -13,7 +13,7 @@ test gantt chart format bar styles toggle critical and baseline drawing
   assert border bar:2 solid amber
   assert dirty is false
   assert undo_depth is 0
-  key alt p b
+  key alt p b b
   assert baseline_2 is 1-2
   assert status is Baseline set — baseline bars now show under the current bars
   assert undo_depth is 1
@@ -21,7 +21,7 @@ test gantt chart format bar styles toggle critical and baseline drawing
   assert baseline_2 is none
   assert bar_2 is critical 1-2
   assert undo_depth is 1
-  key alt p b
+  key alt p b b
   assert status is Baseline set — baseline bars are hidden (Gantt Chart Format › Baseline)
   assert baseline_2 is none
   assert undo_depth is 2

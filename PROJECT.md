@@ -398,10 +398,11 @@ Task, Outdent Task and Link the Selected Tasks; Information... is View Task
 Information; Move, Milestone and Blank Row are Move Task, Insert Milestone and
 Insert Blank Row; View › Timeline is Timeline View. The harness's
 `ribbon-click` finds a command by either name. Project › Schedule › Set
-Baseline is a split button (#397): its upper half sets the baseline at once
-(Alt, P, B), and its lower half opens Set Baseline... and Clear Baseline...
-(Alt, P, L). Project 2024 draws a menu button there, with no one-press half;
-the one press is kept.
+Baseline is a split button (#397): its upper half sets the baseline at once,
+and its lower half opens Set Baseline... and Clear Baseline.... From the
+keyboard Alt, P, B opens that menu, and B or L picks the item (#1212). Project
+2024 draws a menu button there, with no one-press half; the mouse keeps the
+one press.
 
 Right-clicking a task row's table cells selects the row and opens Project's
 row menu, in Project's order (#397): Cut, Copy, Paste, Scroll to Task, Insert

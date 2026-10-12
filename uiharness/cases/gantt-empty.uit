@@ -2,7 +2,7 @@ test empty gantt indent is a no-op
   open ../fixtures/gantt-empty.xml
   assert tasks is 0
   assert dirty is false
-  key alt p b
+  key alt p b b
   assert dirty is false
   assert cell_edit is none
   key tab shift+tab
