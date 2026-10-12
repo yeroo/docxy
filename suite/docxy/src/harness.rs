@@ -34,9 +34,9 @@ use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
 use docxcore::model::{Align, VertAlign};
 use gpui::{
-    App, AppContext as _, Context, EntityInputHandler as _, KeyDownEvent, KeyUpEvent, Keystroke,
-    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput,
-    Point, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px, size,
+    App, AppContext as _, Bounds, Context, EntityInputHandler as _, KeyDownEvent, KeyUpEvent,
+    Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px, size,
 };
 use gpui_component::ActiveTheme;
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
@@ -1053,6 +1053,63 @@ fn item_at_point(probes: &crate::Probes, p: Point<Pixels>) -> i64 {
                 .map(|i| i as i64)
         })
         .unwrap_or(-1)
+}
+
+/// A cell's fill-handle point measured against one of `fill-handle-into`'s
+/// targets: `off` is its distance from that target's centre when inside it,
+/// or from the target when outside.
+#[derive(Debug, PartialEq)]
+struct FillCorner {
+    target: usize,
+    cell: (u32, u32),
+    at: Point<Pixels>,
+    off: f32,
+}
+
+/// `fill-handle-into`'s choice (FIX r5 of #1149): of the cells' fill-handle
+/// points (`corners`, each a cell's bottom-right corner), the one inside a
+/// target nearest that target's centre, so a layout change never needs a
+/// case retuned. The edges count as inside. With none inside, the miss is
+/// the corner nearest any target, or `None` for no corners or targets.
+fn pick_fill_corner(
+    targets: &[Bounds<Pixels>],
+    corners: &[((u32, u32), Point<Pixels>)],
+) -> Result<FillCorner, Option<FillCorner>> {
+    let mut best: Option<FillCorner> = None;
+    let mut nearest: Option<FillCorner> = None;
+    for (target, b) in targets.iter().enumerate() {
+        let (l, t) = (f32::from(b.left()), f32::from(b.top()));
+        let (r, bt) = (f32::from(b.right()), f32::from(b.bottom()));
+        let c = b.center();
+        let (cx, cy) = (f32::from(c.x), f32::from(c.y));
+        for &(cell, at) in corners {
+            let (x, y) = (f32::from(at.x), f32::from(at.y));
+            // Distance to the rect: 0 on or inside it.
+            let out = (l - x)
+                .max(0.0)
+                .max(x - r)
+                .hypot((t - y).max(0.0).max(y - bt));
+            if out == 0.0 {
+                let off = (x - cx).hypot(y - cy);
+                if best.as_ref().is_none_or(|f| off < f.off) {
+                    best = Some(FillCorner {
+                        target,
+                        cell,
+                        at,
+                        off,
+                    });
+                }
+            } else if nearest.as_ref().is_none_or(|f| out < f.off) {
+                nearest = Some(FillCorner {
+                    target,
+                    cell,
+                    at,
+                    off: out,
+                });
+            }
+        }
+    }
+    best.ok_or(nearest)
 }
 
 fn mouse_move(p: Point<Pixels>, pressed: Option<MouseButton>) -> PlatformInput {
@@ -2901,10 +2958,12 @@ fn account_json(app: &crate::Docxy) -> Json {
 /// current state. gpui draws a dirty window before a key-down but never
 /// before a mouse event, so without this a pointer verb after a verb that
 /// changed the view hit-tested whichever frame the platform's tick last drew.
+/// `fill-handle-into` aims the next `pointer-click`, so it reads the same
+/// fresh frame (FIX r5 of #1149).
 fn hit_tests_rendered_frame(verb: &str) -> bool {
     matches!(
         verb,
-        "pointer-click" | "pointer-drag" | "pointer-move" | "pointer-wheel"
+        "pointer-click" | "pointer-drag" | "pointer-move" | "pointer-wheel" | "fill-handle-into"
     )
 }
 
@@ -4697,6 +4756,151 @@ fn dispatch_verb(
             ]))?;
             done.input = click_events(p);
             Ok(done)
+        }
+        // Select the cell whose fill-handle point lies inside a probe's drawn
+        // bounds, inset by `inset` px on every edge (FIX r5 of #1149): the
+        // more-tabs case reads where the list landed instead of naming a
+        // cell tuned to one platform's title bar. A `probe` ending in `*`
+        // takes every drawn probe it starts, e.g. each more-tabs item: rows
+        // and items differ in height, so a row line can miss one item's
+        // inset band but not every item's. Only cells of `within` that are
+        // fully on screen count, so a case can snapshot them all. The
+        // selection is set as a click's would be, without the click, so the
+        // open list stays open and the grid does not scroll. No fit is a
+        // refusal that gives the bounds and the nearest corner.
+        "fill-handle-into" => {
+            app.refuse_under_dialog()?;
+            let name = arg_str(args, "probe")?;
+            let inset = args
+                .get("inset")
+                .and_then(Json::as_f64)
+                .filter(|n| *n >= 0.0)
+                .ok_or("'inset' must be a number of logical pixels, 0 or more")?
+                as f32;
+            let within = arg_str(args, "within")?;
+            let (r0, c0, r1, c1) = parse_range_name(within.trim())
+                .ok_or_else(|| format!("'within' must be a range like A1:Z40, not '{within}'"))?;
+            if u64::from(r1 - r0 + 1) * u64::from(c1 - c0 + 1) > 4000 {
+                return Err(format!(
+                    "'within' {within} is too large; keep it to 4000 cells"
+                ));
+            }
+            // `except` names probes a wildcard skips, e.g. the active tab's
+            // own item, whose click would leave the same tab active.
+            let except: Vec<&str> = match args.get("except") {
+                None => Vec::new(),
+                Some(Json::Arr(items)) => items
+                    .iter()
+                    .map(|v| v.as_str().ok_or("'except' must be an array of probe names"))
+                    .collect::<Result<_, _>>()?,
+                Some(_) => return Err("'except' must be an array of probe names".into()),
+            };
+            // The probes, in drawn order, with their bounds inset.
+            let raw: Vec<(String, Bounds<Pixels>)> = {
+                let probes = app.probes.borrow();
+                match name.strip_suffix('*') {
+                    Some(prefix) => probes
+                        .on_screen_frame()
+                        .iter()
+                        .filter(|(n, _)| n.starts_with(prefix) && !except.contains(&n.as_str()))
+                        .cloned()
+                        .collect(),
+                    None => probes
+                        .on_screen(name)
+                        .map(|b| vec![(name.to_string(), b)])
+                        .unwrap_or_default(),
+                }
+            };
+            if raw.is_empty() {
+                return Err(format!("'{name}' is not drawn"));
+            }
+            let targets: Vec<Bounds<Pixels>> = raw
+                .iter()
+                .map(|(_, b)| {
+                    Bounds::new(
+                        point(b.origin.x + px(inset), b.origin.y + px(inset)),
+                        size(
+                            (b.size.width - px(2. * inset)).max(px(0.)),
+                            (b.size.height - px(2. * inset)).max(px(0.)),
+                        ),
+                    )
+                })
+                .collect();
+            let rect = |b: &Bounds<Pixels>| {
+                format!(
+                    "x {} y {} w {} h {}",
+                    f32::from(b.origin.x),
+                    f32::from(b.origin.y),
+                    f32::from(b.size.width),
+                    f32::from(b.size.height)
+                )
+            };
+            sheet(app)?;
+            let mut corners = Vec::new();
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    if let Ok(b) = app.cells_bounds((r, c), (r, c)) {
+                        corners.push(((r, c), b.bottom_right()));
+                    }
+                }
+            }
+            let pick = pick_fill_corner(&targets, &corners).map_err(|nearest| {
+                // The item a wildcard's nearest miss missed, with its bounds;
+                // one named probe's are given below.
+                let missed = |t: usize| match raw.len() {
+                    1 => String::new(),
+                    _ => format!(
+                        " from '{}' ({}; inset {inset}: {})",
+                        raw[t].0,
+                        rect(&raw[t].1),
+                        rect(&targets[t])
+                    ),
+                };
+                let near = match nearest {
+                    Some(f) => format!(
+                        "the nearest is {}'s at ({}, {}), {:.1} px away{}",
+                        cell_name(f.cell.0, f.cell.1),
+                        f32::from(f.at.x),
+                        f32::from(f.at.y),
+                        f.off,
+                        missed(f.target)
+                    ),
+                    None => format!("no cell of {within} is on screen"),
+                };
+                let what = match raw.as_slice() {
+                    [(n, b)] => {
+                        format!("'{n}' ({}; inset {inset}: {})", rect(b), rect(&targets[0]))
+                    }
+                    _ => format!("any of the {} '{name}' probes", raw.len()),
+                };
+                format!("no fill-handle point of {within} lies inside {what}; {near}")
+            })?;
+            let ((r, c), p) = (pick.cell, pick.at);
+            let open = app.tab_more_open;
+            app.select_cell(r, c, cx);
+            // Check what the click will press: the handle of the selection
+            // the app now holds, with the list as open as it was.
+            let got = fill_handle_point(app)?;
+            if got != p || app.tab_more_open != open {
+                return Err(format!(
+                    "selecting {} moved its fill handle to ({}, {}) or changed the more-tabs list",
+                    cell_name(r, c),
+                    f32::from(got.x),
+                    f32::from(got.y)
+                ));
+            }
+            Done::ok(Json::obj(vec![
+                ("cell", Json::Str(cell_name(r, c))),
+                ("x", Json::Num(f64::from(p.x))),
+                ("y", Json::Num(f64::from(p.y))),
+                ("probe", Json::Str(raw[pick.target].0.clone())),
+                // As `pointer-click` reports it: the more-tabs item under
+                // the point, or -1.
+                (
+                    "item",
+                    Json::Num(item_at_point(&app.probes.borrow(), p) as f64),
+                ),
+            ]))
         }
         // A real wheel turn over a region (#1028), dispatched like the click.
         "pointer-wheel" => {
@@ -6741,6 +6945,7 @@ mod tests {
             "pointer-click",
             "pointer-drag",
             "pointer-wheel",
+            "fill-handle-into",
             "backstage-layout",
         ] {
             assert!(!closes_menu(verb, &Json::obj(vec![])), "{verb}");
@@ -6832,6 +7037,7 @@ mod tests {
             "pointer-drag",
             "pointer-move",
             "pointer-wheel",
+            "fill-handle-into",
         ] {
             assert!(hit_tests_rendered_frame(verb), "{verb}");
         }
@@ -8309,6 +8515,58 @@ mod tests {
         // records is not reported — a pointer would not hit it either.
         probes.next = vec![item(0, 140.)];
         assert_eq!(item_at_point(&probes, point(px(150.), px(80.))), -1);
+    }
+
+    /// FIX r5 of #1149: `fill-handle-into` takes the corner inside a target
+    /// nearest that target's centre, counts the edges as inside, and reports
+    /// the nearest corner when none fits.
+    #[test]
+    fn pick_fill_corner_fits_on_the_edge_and_names_the_nearest_miss() {
+        let target = Bounds::new(point(px(100.), px(40.)), size(px(200.), px(20.)));
+        let at = |x: f32, y: f32| point(px(x), px(y));
+        let pick = |targets: &[Bounds<Pixels>], corners: &[((u32, u32), Point<Pixels>)]| {
+            pick_fill_corner(targets, corners).map(|f| (f.target, f.cell, f.at))
+        };
+        // Two fit; the one nearer the centre (200, 50) wins.
+        let corners = [
+            ((2, 12), at(120., 45.)),
+            ((2, 13), at(185., 52.)),
+            ((3, 13), at(185., 70.)),
+        ];
+        assert_eq!(pick(&[target], &corners), Ok((0, (2, 13), at(185., 52.))));
+        // Exactly on the edges, top-left and bottom-right: inside.
+        let corner = [((0, 0), at(100., 40.))];
+        assert_eq!(pick(&[target], &corner), Ok((0, (0, 0), at(100., 40.))));
+        let corner = [((0, 1), at(300., 60.))];
+        assert_eq!(pick(&[target], &corner), Ok((0, (0, 1), at(300., 60.))));
+        // Half a pixel past the right edge misses.
+        assert!(pick(&[target], &[((0, 2), at(300.5, 50.))]).is_err());
+        // Of two targets, the one a corner sits nearer the middle of: a row
+        // line can miss one item's inset band and cross the next one's.
+        let below = Bounds::new(point(px(100.), px(70.)), size(px(200.), px(20.)));
+        assert_eq!(
+            pick(
+                &[target, below],
+                &[((4, 3), at(150., 41.)), ((5, 3), at(190., 79.))]
+            ),
+            Ok((1, (5, 3), at(190., 79.)))
+        );
+        // A miss reports the nearest corner, its target and its distance.
+        let miss = pick_fill_corner(
+            &[target, below],
+            &[((5, 5), at(50., 50.)), ((1, 20), at(306., 98.))],
+        );
+        assert_eq!(
+            miss,
+            Err(Some(FillCorner {
+                target: 1,
+                cell: (1, 20),
+                at: at(306., 98.),
+                off: 10.
+            }))
+        );
+        assert_eq!(pick_fill_corner(&[target], &[]), Err(None));
+        assert_eq!(pick_fill_corner(&[], &corners), Err(None));
     }
 
     // ---- logical rect -> physical screen pixels ----

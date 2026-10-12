@@ -151,6 +151,9 @@ pub struct Runner<'a> {
     /// Reply from the most recent driving verb, for `assert reply.<path>`;
     /// opening another file clears it so a case cannot assert stale data.
     last_reply: Option<Json>,
+    /// The last reply of each verb in this case, for an expected value that
+    /// names one (`{pointer-click.item}`); cleared with `last_reply`.
+    replies: BTreeMap<String, Json>,
 }
 
 impl<'a> Runner<'a> {
@@ -167,6 +170,7 @@ impl<'a> Runner<'a> {
             sandbox: sandbox.into(),
             opts: ProbeOpts::default(),
             last_reply: None,
+            replies: BTreeMap::new(),
         }
     }
 
@@ -187,6 +191,7 @@ impl<'a> Runner<'a> {
     /// would report failures that are only that step's failure again.
     pub fn run_case(&mut self, case: &Case) -> CaseOutcome {
         self.last_reply = None;
+        self.replies.clear();
         let mut steps = Vec::new();
         let mut snapshot: BTreeMap<String, String> = BTreeMap::new();
         let mut snapshot_range = String::new();
@@ -237,6 +242,7 @@ impl<'a> Runner<'a> {
             },
             Action::Open(path) | Action::OpenCopy(path) | Action::OpenCopyAs { path, .. } => {
                 self.last_reply = None;
+                self.replies.clear();
                 let full = self.base.join(path);
                 if !full.is_file() {
                     return err(out, format!("no such file: {}", full.display()));
@@ -355,6 +361,7 @@ impl<'a> Runner<'a> {
     fn verb(&mut self, out: StepOutcome, verb: &str, args: Json) -> StepOutcome {
         match self.driver.call(verb, args) {
             Ok(reply) => {
+                self.replies.insert(verb.to_string(), reply.clone());
                 self.last_reply = Some(reply);
                 out
             }
@@ -400,16 +407,16 @@ impl<'a> Runner<'a> {
                     );
                 };
                 let got = scalar_text(got);
-                if value_matches(&got, value, *negated) {
+                let (want, shown) = match expected_value(value, &self.replies) {
+                    Ok(Some(want)) => (want.clone(), format!("{value} ({want})")),
+                    Ok(None) => (value.clone(), value.clone()),
+                    Err(e) => return err(out, e),
+                };
+                if value_matches(&got, &want, *negated) {
                     out
                 } else {
-                    fail(
-                        out,
-                        format!(
-                            "expected: {key} is {}{value}\nobserved: {key} is {got}",
-                            if *negated { "not " } else { "" }
-                        ),
-                    )
+                    let reply = key.starts_with("reply.").then_some(&state);
+                    fail(out, mismatch(key, *negated, &shown, &got, reply))
                 }
             }
 
@@ -574,6 +581,41 @@ fn fail(mut out: StepOutcome, detail: impl Into<String>) -> StepOutcome {
     out.status = Status::Failed;
     out.detail = detail.into();
     out
+}
+
+/// An expected value that names another verb's reply, `{<verb>.<path>}`: the
+/// field of that verb's last reply in this case (FIX r5 of #1149), so a case
+/// can hold two replies to each other, e.g. the tab a click selected to the
+/// item it pressed. `None` for a plain value.
+fn expected_value(value: &str, replies: &BTreeMap<String, Json>) -> Result<Option<String>, String> {
+    let Some(inner) = value.strip_prefix('{').and_then(|v| v.strip_suffix('}')) else {
+        return Ok(None);
+    };
+    let (verb, path) = inner.split_once('.').ok_or_else(|| {
+        format!("'{value}' must name a verb and a field, e.g. {{pointer-click.item}}")
+    })?;
+    let reply = replies
+        .get(verb)
+        .ok_or_else(|| format!("'{value}': no '{verb}' has replied in this case"))?;
+    let got = json_path(reply, path).ok_or_else(|| {
+        format!(
+            "'{value}': '{verb}' replied no '{path}'; it reports {}",
+            keys_of(reply).join(", ")
+        )
+    })?;
+    Ok(Some(scalar_text(got)))
+}
+
+/// A failed `assert <key> is <value>`. A `reply.` assert also prints the whole
+/// reply it read, so a `pointer-click`'s press point (`x`, `y`) and what it
+/// hit (`item`) show beside the field that failed (FIX r5 of #1149).
+fn mismatch(key: &str, negated: bool, value: &str, got: &str, reply: Option<&Json>) -> String {
+    let not = if negated { "not " } else { "" };
+    let mut s = format!("expected: {key} is {not}{value}\nobserved: {key} is {got}");
+    if let Some(reply) = reply {
+        s.push_str(&format!("\nreply: {reply}"));
+    }
+    s
 }
 
 /// A path as the `open` verb wants it: a plain string. For the verbatim paths
@@ -745,6 +787,50 @@ pub fn copy_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FIX r5 of #1149: a failed `reply.` assert shows the whole reply, so a
+    /// `pointer-click`'s press point is in the transcript; a state assert,
+    /// which reads the app's state, does not print it all.
+    /// FIX r5 of #1149: `{verb.path}` reads that verb's last reply; a plain
+    /// value is itself, and a missing verb or field is an error, not a match.
+    #[test]
+    fn an_expected_value_can_name_another_verbs_reply() {
+        let mut replies = BTreeMap::new();
+        replies.insert(
+            "pointer-click".to_string(),
+            Json::obj(vec![("item", Json::Num(14.0))]),
+        );
+        assert_eq!(
+            expected_value("{pointer-click.item}", &replies),
+            Ok(Some("14".to_string()))
+        );
+        assert_eq!(expected_value("13", &replies), Ok(None));
+        assert_eq!(expected_value("{x", &replies), Ok(None));
+        let e = expected_value("{title-bar.active}", &replies).unwrap_err();
+        assert!(e.contains("no 'title-bar' has replied"), "{e}");
+        let e = expected_value("{pointer-click.x}", &replies).unwrap_err();
+        assert!(e.contains("replied no 'x'; it reports item"), "{e}");
+        let e = expected_value("{pointer-click}", &replies).unwrap_err();
+        assert!(e.contains("must name a verb and a field"), "{e}");
+    }
+
+    #[test]
+    fn a_failed_reply_assert_prints_the_reply() {
+        let reply = Json::obj(vec![
+            ("x", Json::Num(1326.0)),
+            ("y", Json::Num(422.0)),
+            ("item", Json::Num(-1.0)),
+        ]);
+        assert_eq!(
+            mismatch("reply.item", false, "13", "-1", Some(&reply)),
+            "expected: reply.item is 13\nobserved: reply.item is -1\n\
+             reply: {\"x\":1326,\"y\":422,\"item\":-1}"
+        );
+        assert_eq!(
+            mismatch("active", true, "23", "23", None),
+            "expected: active is not 23\nobserved: active is 23"
+        );
+    }
 
     #[test]
     fn dotted_state_paths_read_objects_and_array_items() {
