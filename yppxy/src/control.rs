@@ -29,7 +29,7 @@
 //! | `assign.get` | `{uid, fields?}` | one assignment |
 //! | `assign.fields` | — | `{count, fields:[name…]}`: the assignment field names |
 //! | `assign.add` | `{task, resource, units?, work?, fields?}` | the new assignment |
-//! | `assign.set` | `{uid, units?, work?, rate_table?, delay?, fields?}` | the updated assignment |
+//! | `assign.set` | `{uid, units?, work?, overtime_work?, contour?, rate_table?, delay?, actual_work? \| percent_work_complete?, fields?}` | the updated assignment |
 //! | `assign.del` | `{uid}` | `{deleted, task}` |
 //! | `proj.save` | `{path?}` (.yppx/.xml only; extensionless adds .yppx) | `{path, …}` with the actual saved path |
 //! | `proj.reload` | — | `{path, …}` |

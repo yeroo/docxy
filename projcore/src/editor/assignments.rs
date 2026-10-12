@@ -34,6 +34,16 @@ pub struct AssignmentPatch {
     pub rate_table: Option<u8>,
     /// The assignment's `Delay`, in working minutes.
     pub delay_min: Option<i64>,
+    /// Overtime work, in minutes: part of the work, priced at the overtime
+    /// rate. A work resource's only.
+    pub overtime_work_min: Option<i64>,
+    /// 0 = Flat .. 7 = Turtle; 8 (Contoured) is refused.
+    pub work_contour: Option<u8>,
+    /// Actual work, in minutes, never more than the work.
+    pub actual_work_min: Option<i64>,
+    /// 0..=100: the actual work as a share of the work. Exclusive with
+    /// `actual_work_min`.
+    pub percent_work_complete: Option<u8>,
 }
 
 impl AssignmentPatch {
@@ -84,6 +94,56 @@ fn check_kind(r: &Resource, units: bool, work: bool) -> Result<(), String> {
         )),
         _ => Ok(()),
     }
+}
+
+/// Refuse what a resource of this kind does not take: a cost resource has no
+/// overtime, contour or actual work, and a material no overtime.
+fn check_progress_kind(
+    r: &Resource,
+    overtime: bool,
+    contour: bool,
+    actuals: bool,
+) -> Result<(), String> {
+    let what = match r.kind {
+        ResourceType::Cost if overtime => "overtime work",
+        ResourceType::Cost if contour => "work contour",
+        ResourceType::Cost if actuals => "actual work",
+        ResourceType::Material if overtime => {
+            return Err(format!(
+                "'{}' is a material resource; it takes no overtime work",
+                r.name
+            ));
+        }
+        _ => return Ok(()),
+    };
+    Err(format!(
+        "'{}' is a cost resource; it takes no {what}",
+        r.name
+    ))
+}
+
+/// The work contour an agent gives: Flat (0) to Turtle (7). Project sets
+/// Contoured (8) itself, from edits to the timephased work.
+fn checked_contour(contour: u8) -> Result<u8, String> {
+    match contour {
+        0..=7 => Ok(contour),
+        8 => {
+            Err("Contoured comes from editing timephased work; set Flat to Turtle (0 to 7)".into())
+        }
+        _ => Err(format!(
+            "no work contour {contour}; use 0 (Flat) to 7 (Turtle)"
+        )),
+    }
+}
+
+/// A percent of no work is no actual work, so only 0 means what it says.
+const NO_WORK_PERCENT: &str = "the assignment has no work; percent_work_complete can only be 0";
+
+/// The actual work a patch asks for, in minutes, on `work_min` of work:
+/// its actual work, or its percent of the work.
+fn asked_actual(actual: Option<i64>, percent: Option<u8>, work_min: i64) -> Option<i64> {
+    actual
+        .or_else(|| percent.map(|p| (work_min.max(0) as f64 * f64::from(p) / 100.0).round() as i64))
 }
 
 impl Editor {
@@ -197,15 +257,30 @@ impl Editor {
         Ok(uid)
     }
 
-    /// Change assignment `uid`'s units, work, cost rate table or delay, as
-    /// one undo step, then reschedule its task by its type (see
-    /// `effort::same_resources`). The changes apply in that order: the delay,
-    /// then the units (a work resource works them from its delay to the task
-    /// finish), then the work, so given work is what it keeps, then the rate
-    /// table. So on a Fixed Duration task, units given together with work
-    /// are recomputed from the work. A work edit clears the overtime. Values
-    /// it already has are no change (given work only when no units edit
-    /// restages it), and a patch that changes nothing records no undo step.
+    /// Change assignment `uid`'s units, work, overtime work, work contour,
+    /// cost rate table, delay or actual work, as one undo step, then
+    /// reschedule its task by its type (see `effort::same_resources`). The
+    /// changes apply in this order: the delay, then the units (a work
+    /// resource works them from its delay to the task finish), then the
+    /// work, so given work is what it keeps; so on a Fixed Duration task,
+    /// units given together with work are recomputed from the work. Then
+    /// the overtime (a work edit clears it, so given overtime is checked
+    /// against the new work), the contour, the rate table, and last the
+    /// actual work, or the percent of the final work given instead. Actual
+    /// work above zero sets the actual start to the assignment's start if it
+    /// has none, the whole work also the actual finish to its finish, and
+    /// zero clears both; actual overtime above the new actual is cut to it,
+    /// and the timephased actual and remaining work and actual cost go. The
+    /// refresh then derives the actual cost by the resource's accrual
+    /// ([`crate::assign::actual_cost`]), the remaining work and cost and the
+    /// % work complete. Overtime is not
+    /// scheduled and a contour keeps the work, units and duration (the
+    /// assignment spans its task), but a contour or an actual start or
+    /// finish ends a delayed assignment's extension of its task
+    /// (`assign::delayed_extent_min`). Values it already has are no change
+    /// (given work, overtime and actuals only when no units or work edit
+    /// restages them), and a patch that changes nothing records no undo
+    /// step.
     /// A rejected edit leaves the editor untouched, except inside a caller's
     /// [`Self::batch`], where stages made before a rejection that needs
     /// their result stay until that batch fails.
@@ -217,7 +292,9 @@ impl Editor {
             .find(|a| a.uid == uid)
             .ok_or_else(|| format!("no assignment with uid {uid}"))?;
         if patch.is_empty() {
-            return Err("nothing to set: give units, work, rate_table or delay".into());
+            return Err("nothing to set: give units, work, overtime_work, contour, \
+                        rate_table, delay, actual_work or percent_work_complete"
+                .into());
         }
         let i = self.index(a.task_uid)?;
         let units = patch.units.map(positive_units).transpose()?;
@@ -234,9 +311,29 @@ impl Editor {
         {
             return Err(format!("no cost rate table {table}; use A to E"));
         }
+        let overtime = patch
+            .overtime_work_min
+            .map(|o| checked_minutes("overtime work", o))
+            .transpose()?;
+        let contour = patch.work_contour.map(checked_contour).transpose()?;
+        let actual = patch
+            .actual_work_min
+            .map(|w| checked_minutes("actual work", w))
+            .transpose()?;
+        let percent = patch.percent_work_complete;
+        if let Some(p) = percent
+            && p > 100
+        {
+            return Err(format!("percent_work_complete must be 0 to 100, not {p}"));
+        }
+        if actual.is_some() && percent.is_some() {
+            return Err("give actual_work or percent_work_complete, not both".into());
+        }
+        let actuals = actual.is_some() || percent.is_some();
         let r = self.proj.resources.iter().find(|r| r.uid == a.resource_uid);
         if let Some(r) = r {
             check_kind(r, units.is_some(), work.is_some())?;
+            check_progress_kind(r, overtime.is_some(), contour.is_some(), actuals)?;
         }
         let kind = r.map(|r| r.kind);
         // Only what differs from the assignment is an edit.
@@ -248,7 +345,22 @@ impl Editor {
         let table = patch
             .rate_table
             .filter(|&t| t != a.cost_rate_table.unwrap_or(0));
-        if (delay, units, work, table) == (None, None, None, None) {
+        // A units or work edit restages the work, which clears the overtime
+        // and moves what a percent asks for: given overtime and actuals are
+        // then edits.
+        let restaged = units.is_some() || work.is_some();
+        if !restaged && percent.is_some_and(|p| p > 0) && a.work_min <= 0 {
+            return Err(NO_WORK_PERCENT.into());
+        }
+        let overtime = overtime.filter(|&o| restaged || o != a.overtime_work_min.unwrap_or(0));
+        let contour = contour.filter(|&c| c != a.work_contour.unwrap_or(0));
+        let actuals = actuals
+            && (restaged
+                || asked_actual(actual, percent, a.work_min)
+                    != Some(a.actual_work_min.unwrap_or(0)));
+        if (delay, units, work, table, overtime, contour) == (None, None, None, None, None, None)
+            && !actuals
+        {
             return Ok(());
         }
         let edit = |ed: &mut Editor| {
@@ -287,8 +399,37 @@ impl Editor {
                 }
                 stage(ed, &|a| a.set_work(w))?;
             }
+            if let Some(o) = overtime {
+                let a = ed.proj.assignments.iter().find(|a| a.uid == uid);
+                if o > a.expect("checked").work_min {
+                    return Err("overtime work must not be more than the work".into());
+                }
+                stage(ed, &|a| {
+                    // What described the old overtime goes; the refresh
+                    // prices the new one.
+                    a.overtime_work_min = Some(o);
+                    a.overtime_cost = None;
+                    a.remaining_overtime_work_min = None;
+                    a.remaining_overtime_cost = None;
+                    a.timephased_data
+                        .retain(|t| t.kind != TimephasedValue::REMAINING_WORK);
+                })?;
+            }
+            if let Some(c) = contour {
+                stage(ed, &|a| {
+                    // The planned spread had the old shape, and a contour's
+                    // units are its peak.
+                    a.work_contour = Some(c);
+                    a.peak_units = None;
+                    a.timephased_data
+                        .retain(|t| t.kind != TimephasedValue::REMAINING_WORK);
+                })?;
+            }
             if let Some(t) = table {
                 stage(ed, &|a| a.cost_rate_table = Some(t))?;
+            }
+            if actuals {
+                ed.stage_actuals(i, uid, actual, percent)?;
             }
             Ok(())
         };
@@ -297,6 +438,64 @@ impl Editor {
         } else {
             self.batch(edit)
         }
+    }
+
+    /// Record `actual` minutes of actual work on assignment `uid` (or
+    /// `percent` of its work), with the actual dates and cost that follow:
+    /// [`Self::set_assignment`]'s last stage, when its work and dates are
+    /// final.
+    fn stage_actuals(
+        &mut self,
+        i: usize,
+        uid: i32,
+        actual: Option<i64>,
+        percent: Option<u8>,
+    ) -> Result<(), String> {
+        let a = self.proj.assignments.iter().find(|a| a.uid == uid);
+        let a = a.expect("checked");
+        let done = asked_actual(actual, percent, a.work_min).expect("asked");
+        if done > a.work_min {
+            return Err("actual work must not be more than the work; raise the work first".into());
+        }
+        if percent.is_some_and(|p| p > 0) && a.work_min <= 0 {
+            return Err(NO_WORK_PERCENT.into());
+        }
+        let (start, finish) = if done > 0 {
+            let (start, finish) = a
+                .start
+                .zip(a.finish)
+                .or_else(|| crate::assign::assignment_span(&self.proj, self.schedule(), a))
+                .ok_or_else(|| format!("task {} is not scheduled", a.task_uid))?;
+            let start = a.actual_start.unwrap_or(start);
+            let actual_finish = (done >= a.work_min).then(|| a.actual_finish.unwrap_or(finish));
+            (Some(start), actual_finish)
+        } else {
+            (None, None)
+        };
+        // Actual overtime is part of the actual work.
+        let overtime = a.actual_overtime_work_min.map(|o| o.min(done));
+        let mut assignments = self.proj.assignments.clone();
+        let a = assignments
+            .iter_mut()
+            .find(|a| a.uid == uid)
+            .expect("checked");
+        // The spread of the work left described the old actual, and the
+        // actuals' spread the old actual (an actual given beside a work edit
+        // may be the one it has); the baselines stay.
+        let actual_moved = done != a.actual_work_min.unwrap_or(0);
+        let stale = |kind: u8| match kind {
+            TimephasedValue::REMAINING_WORK => true,
+            TimephasedValue::ACTUAL_WORK | TimephasedValue::ACTUAL_COST => actual_moved,
+            TimephasedValue::ACTUAL_OVERTIME_WORK => overtime != a.actual_overtime_work_min,
+            _ => false,
+        };
+        a.timephased_data.retain(|t| !stale(t.kind));
+        a.actual_work_min = Some(done);
+        a.actual_start = start;
+        a.actual_finish = finish;
+        a.actual_overtime_work_min = overtime;
+        // The refresh prices the actual cost, and the actual overtime's.
+        self.commit_assignments(i, self.proj.resources.clone(), assignments)
     }
 
     /// Remove assignment `uid` as one undo step and return its task's UID.

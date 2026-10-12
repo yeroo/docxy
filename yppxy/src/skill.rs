@@ -70,9 +70,13 @@ use its tools:
 - `yppxy_assign_add` `{task, resource, units?, work?, fields?}` — assign a
   resource (uid, or name: a new name becomes a work resource; one that is a
   number or contains a comma is refused) to task `task`
-- `yppxy_assign_set` `{uid, units?, work?, rate_table?, delay?, fields?}` —
-  units as `0.5` or `"50%"`, work and delay as hours or `"40h"`/`"5d"`, the
-  rate table `"A"`..`"E"`; the task reschedules by its type
+- `yppxy_assign_set` `{uid, units?, work?, overtime_work?, contour?,
+  rate_table?, delay?, actual_work? | percent_work_complete?, fields?}` —
+  units as `0.5` or `"50%"`, work, overtime, actual work and delay as hours or
+  `"40h"`/`"5d"`, the contour by name (`"Back Loaded"`) or code 0..7, the rate
+  table `"A"`..`"E"`, the percent 0..100 or `"50%"`; the task reschedules by
+  its type. Overtime is priced, not scheduled; actual work derives remaining
+  work, cost and % work complete but not the task's own progress
 - `yppxy_assign_del` `{uid}` — the reply is `{deleted, task}`
 
 Assignments are addressed by their own uid, from `yppxy_assign_list` (whose
@@ -102,9 +106,11 @@ Assignments are addressed by their own UID, as `assign.list {uid?, resource?}`
 reports it. `assign.add {task, resource, units?, work?}` takes a resource uid or
 name (a new name becomes a work resource; one that is a number or contains a
 comma is refused, so pass a uid as a number); `assign.set {uid, units?, work?,
-rate_table?, delay?}` takes units as `0.5` or `"50%"`, work and delay as hours or
-`"40h"`/`"5d"`, the rate table as `"A"`..`"E"`, and reschedules the task by its
-type. Each assignment reports `units`, `work_hours`, `cost`, `rate_table`,
+overtime_work?, contour?, rate_table?, delay?, actual_work? |
+percent_work_complete?}` takes units as `0.5` or `"50%"`, work, overtime,
+actual work and delay as hours or `"40h"`/`"5d"`, the contour as a name or code
+0..7, the rate table as `"A"`..`"E"`, the percent as 0..100 or `"50%"`, and
+reschedules the task by its type. Each assignment reports `units`, `work_hours`, `cost`, `rate_table`,
 overtime, actual, remaining and baseline values, and its own `start`/`finish`;
 `fields` reads Project's assignment fields (`assign.fields` lists them).
 
