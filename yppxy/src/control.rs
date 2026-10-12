@@ -34,6 +34,7 @@
 //! | `proj.save` | `{path?}` (.yppx/.xml only; extensionless adds .yppx) | `{path, …}` with the actual saved path |
 //! | `proj.reload` | — | `{path, …}` |
 //! | `proj.open` | `{path}` | `{path, …}` |
+//! | `field-read` | `{input?}` | a text prompt (`yppxy-prompt`, `yppxy-save-as`): `{input, value, focused, caret, selection, at, kind, keys, clicks, frames, dirty}`; with no `input`, the counters and the ids (`ctlcore::field`, #1204) |
 //!
 //! `fields` reads Project fields by name as `{text, value}`; it is checked
 //! before an edit, so a bad list changes nothing. See `projctl`, which also
@@ -49,6 +50,12 @@ fn app_info() -> Result<Json, String> {
 
 /// Route one control verb against the live project, returning the JSON result
 /// or an error message.
+/// yppxy's text prompts, as `field-read {"input":id}` names them (#1204):
+/// the prompt every command shares (its vim `:` line and Ctrl+S Save As
+/// included) and Backstage Save As's file name. The suite's input registry
+/// lists the same ids.
+pub(crate) const INPUTS: &[&str] = &["yppxy-prompt", "yppxy-save-as"];
+
 pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> {
     let out = match verb {
         "proj.path" => Ok(path_info(app)),
@@ -78,6 +85,9 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
             app.open_file(&p);
             Ok(path_info(app))
         }
+        "field-read" => ctlcore::field::reply(args, INPUTS, app.counts, app.ed.dirty(), |id| {
+            app.input_field(id)
+        }),
         other => projctl::dispatch_editor(&mut app.ed, other, args)
             .unwrap_or_else(|| Err(format!("unknown verb '{other}'"))),
     };
@@ -324,5 +334,61 @@ mod tests {
         assert!(dispatch(&mut a, "task.list", &Json::Null).is_ok());
         let err = dispatch(&mut a, "proj.frobnicate", &Json::Null).unwrap_err();
         assert!(err.contains("unknown verb"));
+    }
+
+    /// `field-read` for each prompt, closed and then open and drawn, typed
+    /// into with the keys a person presses (#1204).
+    #[test]
+    fn field_read_reports_each_prompt_closed_and_open() {
+        let read = |app: &mut App, id: &str| {
+            dispatch(
+                app,
+                "field-read",
+                &Json::obj(vec![("input", Json::Str(id.into()))]),
+            )
+            .unwrap()
+        };
+        let draw = |app: &mut App| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            term.draw(|f| crate::draw(f, app)).unwrap();
+        };
+        let mut app = app();
+        draw(&mut app);
+        for id in INPUTS {
+            let r = read(&mut app, id);
+            assert_eq!(r.get("value"), Some(&Json::Null), "{id}: {r}");
+            assert_eq!(r.get("at"), Some(&Json::Null), "{id}: {r}");
+        }
+        assert!(
+            dispatch(
+                &mut app,
+                "field-read",
+                &Json::obj(vec![("input", Json::Str("x".into()))])
+            )
+            .unwrap_err()
+            .contains("yppxy-save-as")
+        );
+        // F2 renames the selected task, prefilled with its name.
+        crate::on_key(&mut app, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        crate::on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+        );
+        draw(&mut app);
+        let r = read(&mut app, "yppxy-prompt");
+        assert_eq!(r.get_str("value"), Some("New task!"), "{r}");
+        assert_eq!(r.get_usize("caret"), Some(9));
+        assert_eq!(r.get_str("kind"), Some("Rename"));
+        assert_eq!(r.get("focused").and_then(Json::as_bool), Some(true));
+        let at = r.get("at").unwrap();
+        assert_eq!(
+            at.get_usize("row"),
+            Some(21),
+            "the prompt box's middle row: {r}"
+        );
+        assert_eq!(at.get_usize("col"), Some(30 + 1 + " Rename: ".len()), "{r}");
+        let all = dispatch(&mut app, "field-read", &Json::obj(vec![])).unwrap();
+        assert_eq!(all.get_usize("frames"), Some(2), "{all}");
     }
 }
