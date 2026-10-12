@@ -817,8 +817,9 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
     let Some(f) = f else {
         return Some(Ok(()));
     };
-    v.push_undo();
-    v.apply_format(f);
+    let step = crate::SheetStep::Named("Format Cells");
+    v.push_undo(step.clone());
+    v.apply_format(f, step);
     v.prune_circles();
     tab.set_dirty();
     Some(Ok(()))

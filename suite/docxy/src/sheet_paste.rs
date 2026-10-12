@@ -6,6 +6,7 @@
 use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::sheet_menus::PasteItem;
+use crate::sheet_step::SheetStep;
 use crate::{Docxy, SheetView};
 use gridcore::edit::{ClipBlock, PasteOp, PasteSpec, PasteWhat};
 use gridcore::sheet::Cell;
@@ -193,7 +194,7 @@ impl SheetView {
         } else {
             self.snapshot()
         };
-        self.push_undo_snapshot(snap.targeting(s, rect));
+        self.push_undo_snapshot(snap.targeting(s, rect), SheetStep::Named("Paste Special"));
         self.pkg.workbook.styles = interned;
         self.engine
             .set_cells_prechecked(&mut self.pkg.workbook, s, changes);
@@ -246,7 +247,7 @@ impl SheetView {
             return Err(gridcore::engine::PART_OF_ARRAY.into());
         }
         let rect = block.pasted_rect(at, false);
-        self.push_undo_at(s, rect);
+        self.push_undo_at(s, rect, SheetStep::Named("Paste"));
         self.engine
             .set_cells_prechecked(&mut self.pkg.workbook, s, changes);
         self.sel = (rect.0, rect.1);

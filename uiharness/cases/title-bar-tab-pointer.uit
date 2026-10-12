@@ -68,23 +68,29 @@ test the more-tabs list wins a real click over the sheet fill handle
   open copy:"../fixtures/basic.xlsx" as sheet-19.xlsx
   open copy:"../fixtures/basic.xlsx" as sheet-20.xlsx
   call window-size {"w":1000,"h":700}
-  click M3
-  # Around the handle, on sheet-20, which owns the selection.
-  snapshot L2:N6
+  # Every cell the step below may pick, on sheet-20, which owns the
+  # selection.
+  snapshot A1:T30
   call title-tab {"action":"more"}
   shot tab-more-item:0
+  # Select a cell whose fill handle lies inside a more-tabs item, 4 px in
+  # from its edges, read from where the list and the grid are drawn, so no
+  # cell or item is tuned to a platform's title bar. Item 23 is sheet-20's
+  # own tab, whose click would leave it active. No fit fails here, naming
+  # the nearest handle and the item it missed.
+  call fill-handle-into {"probe":"tab-more-item:*","except":["tab-more-item:23"],"inset":4,"within":"A1:T30"}
+  assert reply.item is not -1
   call pointer-click {"at":"fill-handle"}
-  # The drift guard: M3's bottom-right corner lands on item 13 (a sheet tab
-  # well over the grid). If layout shifts and it lands elsewhere, the case
-  # fails here instead of passing vacuously.
-  assert reply.item is 13
+  # The drift guard: the press lands on the picked item. If it lands
+  # elsewhere the case fails here, and the failure prints the press point.
+  assert reply.item is {fill-handle-into.item}
   call title-bar {}
-  assert reply.active is 13
-  # The guard is `assert reply.active is 13` above: the fill handle stops
-  # propagation, so a lost hit order would leave tab 23 active and the
-  # item's tab unselected. What follows is belt-and-braces — a press alone
-  # writes nothing, and sheet_fill_start refuses while the list is open, so
-  # these cannot fire on their own.
+  assert reply.active is {pointer-click.item}
+  # The guard is `assert reply.active is {pointer-click.item}` above: the
+  # fill handle stops propagation, so a lost hit order would leave tab 23
+  # active and the item's tab unselected. What follows is belt-and-braces:
+  # a press alone writes nothing, and sheet_fill_start refuses while the
+  # list is open, so these cannot fire on their own.
   call tab-list {}
   assert reply.tabs.23.dirty is false
   call tab-select {"tab":23}

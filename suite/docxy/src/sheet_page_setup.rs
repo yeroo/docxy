@@ -15,6 +15,7 @@
 
 use crate::dialog::catalog;
 use crate::dialog::{ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
+use crate::sheet_step::SheetStep;
 use crate::{DocTab, SheetView, Surface};
 use gridcore::print::area::{self, PrintRef, PrintTitles};
 use gridcore::print::setup::{Margins, Orientation, PageSetup};
@@ -199,7 +200,7 @@ fn edit(
     if layout_state(&v.pkg.workbook, s) == before {
         return Ok(false);
     }
-    v.push_undo_snapshot(snap);
+    v.push_undo_snapshot(snap, SheetStep::Named("Page Setup"));
     tab.set_dirty();
     Ok(true)
 }

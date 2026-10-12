@@ -14,6 +14,7 @@
 use super::*;
 use crate::dialog::catalog;
 use crate::dialog::{ButtonRole, Dialog, DialogOwner};
+use crate::sheet_step::SheetStep;
 use gridcore::flashfill::FlashFill;
 
 /// The greyed preview after a typed commit (ENT-105): the fill it would
@@ -124,7 +125,7 @@ impl SheetView {
             self.engine
                 .set_cell(&mut self.pkg.workbook, (s, r, c), cell);
         }
-        self.push_undo_snapshot(snap);
+        self.push_undo_snapshot(snap, SheetStep::Named("Flash Fill"));
         self.flash_preview = None;
         self.last_flash = Some(LastFlash {
             sheet: s,

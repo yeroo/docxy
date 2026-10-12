@@ -172,7 +172,7 @@ fn paste_options_repaste_in_place_as_one_step() {
         foreign: false,
         gone: Default::default(),
     };
-    v.push_undo();
+    v.push_undo(crate::SheetStep::Named("Paste"));
     assert!(v.repaste(&stale, PasteItem::Values).is_err());
 }
 

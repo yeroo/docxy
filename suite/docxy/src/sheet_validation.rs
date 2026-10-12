@@ -11,6 +11,7 @@
 
 use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
+use crate::sheet_step::SheetStep;
 use crate::{DocTab, Surface};
 use gridcore::sheet::{AlertStyle, DataValidation};
 use gridcore::validation::{
@@ -354,7 +355,7 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
         tab.status = "Data validation unchanged".into();
         return Some(Ok(()));
     }
-    v.push_undo_snapshot(snap);
+    v.push_undo_snapshot(snap, SheetStep::Named("Data Validation"));
     v.prune_circles();
     tab.set_dirty();
     tab.status = if clear {

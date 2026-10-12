@@ -7,6 +7,7 @@
 
 use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
+use crate::sheet_step::SheetStep;
 use crate::{DocTab, Docxy, SheetView, Surface};
 use gridcore::edit::{
     FillKind, FillReq, FillTarget, Filled, JUSTIFY_OVERFLOW, SeriesSpec, SeriesType, fill_target,
@@ -99,7 +100,7 @@ impl SheetView {
             FillTarget::Clear(_) => req.src,
             _ => (r0, c0, r1, c1),
         };
-        self.push_undo_at(s, changed);
+        self.push_undo_at(s, changed, SheetStep::Named("Auto Fill"));
         let filled = gridcore::edit::autofill(&mut self.pkg.workbook, s, req);
         self.anchor = (r0, c0);
         self.sel = (r1, c1);
@@ -141,7 +142,7 @@ impl SheetView {
         &mut self,
         again: impl FnOnce(&mut Self) -> Result<T, String>,
     ) -> Option<Result<T, String>> {
-        let snap = self.undo.pop()?;
+        let crate::SheetUndo { snap, step } = self.undo.pop()?;
         let edit_gen = self.edit_gen;
         let now = self.snapshot_like(&snap);
         // A refusal puts the step back with what it selects (#1148).
@@ -152,7 +153,7 @@ impl SheetView {
         let done = again(self);
         if done.is_err() {
             self.restore(now);
-            self.undo.push(before);
+            self.undo.push(crate::SheetUndo { snap: before, step });
             // Nothing changed after all: copy mode, which an edit ends,
             // stays on (#707 r2 m1).
             self.edit_gen = edit_gen;
@@ -179,7 +180,7 @@ impl SheetView {
         if self.refuses(s, &changes) {
             return Err(gridcore::engine::PART_OF_ARRAY.to_string());
         }
-        self.push_undo();
+        self.push_undo(SheetStep::Named("Series"));
         let n = changes.len();
         self.engine
             .set_cells_prechecked(&mut self.pkg.workbook, s, changes);
@@ -242,7 +243,7 @@ impl SheetView {
         if self.refuses(s, &changes) {
             return Err(gridcore::engine::PART_OF_ARRAY.to_string());
         }
-        self.push_undo();
+        self.push_undo(SheetStep::Named("Justify"));
         self.engine
             .set_cells_prechecked(&mut self.pkg.workbook, s, changes);
         Ok(true)

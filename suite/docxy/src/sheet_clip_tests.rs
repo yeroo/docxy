@@ -510,7 +510,7 @@ fn an_edit_in_its_own_workbook_ends_copy_mode() {
     let mut other = view();
     put(&mut other, "A1", Cell::number(1.0));
     for _ in 0..3 {
-        other.push_undo();
+        other.push_undo(crate::SheetStep::Named("Typing"));
     }
     let fresh = copy(&mut v, "A1", "A3");
     assert_ne!(other.edit_gen, fresh.view_gen);
@@ -535,7 +535,7 @@ fn a_copy_pasted_into_its_own_workbook_stays_in_copy_mode() {
     let mut other = view();
     let gen_before = clip.view_gen;
     for _ in 0..3 {
-        other.push_undo();
+        other.push_undo(crate::SheetStep::Named("Typing"));
     }
     assert_ne!(other.edit_gen, gen_before);
     clip.restamp(&other);

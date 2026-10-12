@@ -11,6 +11,7 @@
 
 use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
+use crate::sheet_step::SheetStep;
 use crate::{DocTab, Surface};
 use gridcore::edit::{
     ConsolidateOptions, SubtotalFunc, canonical_consolidate_ref, consolidate, sheets_differ,
@@ -274,7 +275,7 @@ fn apply(
         tab.status = "Consolidate changed nothing".into();
         return Ok(());
     }
-    v.push_undo_snapshot(snap);
+    v.push_undo_snapshot(snap, SheetStep::Named("Consolidate"));
     // Linked output is formulas: evaluate them now, or they show (and
     // save) blank.
     v.engine = crate::sheet_engine(&v.pkg.workbook);

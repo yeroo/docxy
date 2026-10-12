@@ -173,7 +173,7 @@ fn the_preview_goes_with_any_move_and_obeys_the_option() {
     type_enter(&mut v, 1, 1, "Alan");
     assert!(v.live_preview().is_some(), "a fresh preview");
     put(&mut v, 9, 9, "x");
-    v.push_undo();
+    v.push_undo(crate::SheetStep::Named("Typing"));
     assert!(v.live_preview().is_none(), "the edit generation moved");
     assert!(!v.accept_preview());
 

@@ -58,6 +58,7 @@
 //! | `border A1:C5 solid teal` | the pixels ([`crate::expect`]) |
 //! | `no border H20 teal` | the pixels |
 //! | `<key> is [not] [exactly] <value>` | one key of the app's state reply |
+//! | `<key> is [not] {<verb>.<path>}` | that key against a field of the verb's last reply in the case |
 //! | `cell B2 is [not] [exactly] <text>` | what that cell shows |
 //! | `no fill preview` | `filling` and `fill_preview` together |
 //! | `cells unchanged` | every cell of the last `snapshot` |

@@ -122,7 +122,7 @@ fn filter_toggles_buttons_and_turning_it_off_shows_every_row() {
     // One undo step: back to every row.
     let v = view(&mut t);
     let snap = v.undo.pop().unwrap();
-    v.restore(snap);
+    v.restore(snap.snap);
     assert_eq!(shown(&mut t), vec![2, 3, 4, 5, 6, 7]);
     // Filter again, then off: every row shows and the buttons go.
     t.dialogs.push(menu_dialog(&t, 0).unwrap());
@@ -139,7 +139,7 @@ fn clear_with_nothing_filtered_leaves_the_tab_clean() {
     toggle(&mut t).unwrap();
     t.dirty = false;
     let undo = view(&mut t).undo.len();
-    run(&mut t, |wb, s, today| {
+    run(&mut t, "Filter", |wb, s, today| {
         gridcore::filter::clear(wb, s, None, today)
     })
     .unwrap();
@@ -377,7 +377,7 @@ fn ok_reads_the_list_shown_not_the_search_typed_since() {
 fn ok_on_an_untouched_list_keeps_a_non_checklist_criterion() {
     let mut t = list();
     toggle(&mut t).unwrap();
-    run(&mut t, |wb, s, today| {
+    run(&mut t, "Filter", |wb, s, today| {
         let top = ColumnFilter::Top10 {
             top: true,
             percent: false,
@@ -404,7 +404,7 @@ fn a_filter_command_that_fails_still_keeps_the_typed_value() {
     v.begin_cell_edit(None);
     v.editing = Some("Zed".into());
     // No filter on the sheet: Reapply refuses, but the typed value is in.
-    assert!(run(&mut t, gridcore::filter::reapply).is_err());
+    assert!(run(&mut t, "Filter", gridcore::filter::reapply).is_err());
     assert!(t.dirty, "the committed value makes the tab dirty");
     let v = view(&mut t);
     assert!(v.editing.is_none());
@@ -425,7 +425,7 @@ fn a_typed_date_compares_as_a_date_only_on_a_date_column() {
     press(&mut t, "OK").unwrap();
     assert_eq!(shown(&mut t), vec![7]);
     // When is a date column: `2024-03-13` is that date.
-    run(&mut t, |wb, s, today| {
+    run(&mut t, "Filter", |wb, s, today| {
         gridcore::filter::clear(wb, s, None, today)
     })
     .unwrap();
@@ -459,7 +459,7 @@ fn a_search_for_a_month_name_keeps_that_month() {
 fn add_to_filter_takes_the_searched_checks_and_keeps_the_old_values() {
     let mut t = list();
     toggle(&mut t).unwrap();
-    run(&mut t, |wb, s, today| {
+    run(&mut t, "Filter", |wb, s, today| {
         let ann = ColumnFilter::values(vec!["Ann".into()]);
         gridcore::filter::set_criterion(wb, s, 0, Some(ann), today)
     })
@@ -517,7 +517,7 @@ fn a_filter_command_under_an_entry_that_cannot_commit_says_why() {
     let v = view(&mut t);
     v.sel = (3, 0);
     v.begin_cell_edit(Some("y".repeat(32_768)));
-    let e = run(&mut t, gridcore::filter::reapply).unwrap_err();
+    let e = run(&mut t, "Filter", gridcore::filter::reapply).unwrap_err();
     assert!(e.contains("32767"), "the entry's own reason: {e}");
     assert!(view(&mut t).editing.is_some(), "the editor stays open");
 }

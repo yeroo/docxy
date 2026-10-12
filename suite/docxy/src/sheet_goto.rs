@@ -9,6 +9,7 @@
 
 use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
+use crate::sheet_step::SheetStep;
 use crate::{DocTab, SheetView, Surface};
 use gridcore::edit::{ClearWhat, GoSpecial, Types, apply_clear_sheet, clear_plan};
 
@@ -49,9 +50,9 @@ impl SheetView {
             return Err(gridcore::engine::PART_OF_ARRAY.into());
         }
         if plan.notes.is_empty() {
-            self.push_undo();
+            self.push_undo(SheetStep::Named("Clear"));
         } else {
-            self.push_undo_snapshot(self.snapshot_package());
+            self.push_undo_snapshot(self.snapshot_package(), SheetStep::Named("Clear"));
         }
         self.engine
             .set_cells_prechecked(&mut self.pkg.workbook, s, plan.cells.clone());

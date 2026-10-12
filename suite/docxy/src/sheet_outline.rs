@@ -17,6 +17,7 @@
 
 use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
+use crate::sheet_step::SheetStep;
 use crate::{DocTab, SheetView, Surface};
 use gridcore::edit::{
     Area, SubtotalFunc, SubtotalOptions, numeric_columns, remove_subtotals, subtotal,
@@ -79,10 +80,11 @@ fn outline_state(s: &Sheet) -> OutlineState {
     (s.row_attrs.clone(), s.col_defs.clone(), s.outline)
 }
 
-/// Run `op` on the active sheet as one undo step. `Err` or no change pushes
-/// nothing. `Ok(true)` when the sheet changed.
+/// Run `op` on the active sheet as one undo step named `step` (#1149).
+/// `Err` or no change pushes nothing. `Ok(true)` when the sheet changed.
 fn edit_sheet(
     tab: &mut DocTab,
+    step: &'static str,
     op: impl FnOnce(&mut Sheet) -> Result<(), OutlineError>,
 ) -> Result<bool, String> {
     let Surface::Sheet(v) = &mut tab.surface else {
@@ -98,7 +100,7 @@ fn edit_sheet(
     if outline_state(&v.pkg.workbook.sheets[s]) == before {
         return Ok(false);
     }
-    v.push_undo_snapshot(snap);
+    v.push_undo_snapshot(snap, SheetStep::Named(step));
     // Hidden rows change what SUBTOTAL(101..111) and AGGREGATE return.
     v.engine = crate::sheet_engine(&v.pkg.workbook);
     tab.set_dirty();
@@ -142,7 +144,8 @@ pub(crate) fn run(tab: &mut DocTab, cmd: Cmd) {
             };
             // Whole columns act on columns; otherwise the cursor's row, then
             // its column when no row group is there.
-            let outcome = edit_sheet(tab, |s| match axis {
+            let step = if show { "Show Detail" } else { "Hide Detail" };
+            let outcome = edit_sheet(tab, step, |s| match axis {
                 Some((Axis::Cols, _, _)) => detail(s, Axis::Cols, col),
                 _ => detail(s, Axis::Rows, row).or_else(|_| detail(s, Axis::Cols, col)),
             });
@@ -158,7 +161,7 @@ pub(crate) fn run(tab: &mut DocTab, cmd: Cmd) {
         }
         Cmd::ShowLevel(n) => {
             // One set of level buttons: each axis with an outline goes to `n`.
-            let outcome = edit_sheet(tab, |s| {
+            let outcome = edit_sheet(tab, "Outline Level", |s| {
                 let axes: Vec<Axis> = [Axis::Rows, Axis::Cols]
                     .into_iter()
                     .filter(|&a| outline::max_level(s, a) > 0)
@@ -175,11 +178,11 @@ pub(crate) fn run(tab: &mut DocTab, cmd: Cmd) {
         }
         Cmd::AutoOutline => {
             let area = has_range.then_some((r0, c0, r1, c1));
-            let outcome = edit_sheet(tab, |s| outline::auto_outline(s, area));
+            let outcome = edit_sheet(tab, "Auto Outline", |s| outline::auto_outline(s, area));
             report(tab, outcome, "Outline created");
         }
         Cmd::ClearOutline => {
-            let outcome = edit_sheet(tab, outline::clear_outline);
+            let outcome = edit_sheet(tab, "Clear Outline", outline::clear_outline);
             report(tab, outcome, "Outline cleared");
         }
     }
@@ -187,7 +190,8 @@ pub(crate) fn run(tab: &mut DocTab, cmd: Cmd) {
 
 /// Group or ungroup rows (columns) `a..=b`.
 fn group_span(tab: &mut DocTab, ungroup: bool, axis: Axis, a: u32, b: u32) {
-    let outcome = edit_sheet(tab, |s| {
+    let step = if ungroup { "Ungroup" } else { "Group" };
+    let outcome = edit_sheet(tab, step, |s| {
         if ungroup {
             outline::ungroup(s, axis, a, b)
         } else {
@@ -451,7 +455,7 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
         DialogOwner::OutlineSettings if ok => {
             let below = checked(top, "below");
             let right = checked(top, "right");
-            let outcome = edit_sheet(tab, |s| {
+            let outcome = edit_sheet(tab, "Outline Settings", |s| {
                 s.outline.summary_below = below;
                 s.outline.summary_right = right;
                 Ok(())
@@ -522,7 +526,7 @@ fn apply_subtotal(
         tab.status = "There are no subtotals to remove".into();
         return Ok(());
     }
-    v.push_undo_snapshot(snap);
+    v.push_undo_snapshot(snap, SheetStep::Named("Subtotals"));
     v.engine = crate::sheet_engine(&v.pkg.workbook);
     tab.set_dirty();
     tab.status = status.into();

@@ -36,6 +36,9 @@ pub(crate) enum MenuTarget {
     /// The Quick Access Toolbar Undo button's drop-down (#619): the undo
     /// history, newest first.
     QatUndo,
+    /// A sheet's Quick Access Toolbar Redo drop-down (#1149): the steps
+    /// Redo would redo, the next one first.
+    QatRedo,
     /// The ribbon's own right-click menu (#590): Collapse the Ribbon.
     RibbonBar,
 }
@@ -76,6 +79,10 @@ impl GridMenu {
 /// [`MenuTarget::QatUndo`].
 pub(crate) const QAT_UNDO_ID: &str = "qat-undo";
 
+/// A sheet's Quick Access Toolbar Redo split button (#1149), whose arrow
+/// opens [`MenuTarget::QatRedo`].
+pub(crate) const QAT_REDO_ID: &str = "qat-redo";
+
 /// The most undo steps the Undo drop-down lists.
 pub(crate) const UNDO_LIST_CAP: usize = 100;
 
@@ -103,6 +110,7 @@ impl MenuTarget {
             )]),
             Self::Grid(g) => Json::obj(vec![("grid", Json::Str(g.name().into()))]),
             Self::QatUndo => Json::obj(vec![("qat", Json::Str(QAT_UNDO_ID.into()))]),
+            Self::QatRedo => Json::obj(vec![("qat", Json::Str(QAT_REDO_ID.into()))]),
             Self::RibbonBar => Json::Str("ribbon-bar".into()),
         }
     }
@@ -369,6 +377,7 @@ pub(crate) fn target_stands(
             Err("this menu runs on a sheet tab".into())
         }
         (MenuTarget::QatUndo, Some(_)) => Err("the undo list does not run on a Project tab".into()),
+        (MenuTarget::QatRedo, Some(_)) => Err("the redo list does not run on a Project tab".into()),
         (
             MenuTarget::Document
             | MenuTarget::Cell
@@ -377,6 +386,7 @@ pub(crate) fn target_stands(
             | MenuTarget::Ribbon { .. }
             | MenuTarget::Grid(_)
             | MenuTarget::QatUndo
+            | MenuTarget::QatRedo
             | MenuTarget::RibbonBar,
             _,
         ) => Ok(()),
@@ -396,6 +406,7 @@ pub(crate) fn split_arrow_opens(
     let mine = |t: Option<&MenuTarget>| match t {
         Some(MenuTarget::Ribbon { id: i, .. }) => i == id,
         Some(MenuTarget::QatUndo) => id == QAT_UNDO_ID,
+        Some(MenuTarget::QatRedo) => id == QAT_REDO_ID,
         _ => false,
     };
     !(mine(open) || mine(closed_by_this_press))
@@ -736,10 +747,28 @@ pub(crate) fn split_menu(
 /// [`UNDO_LIST_CAP`]); the `k`th undoes `k + 1` steps, back to and
 /// including it. With nothing to undo, one disabled `Can't Undo`.
 pub(crate) fn undo_menu(names: &[String]) -> Vec<MenuItem> {
+    history_menu(names, "undo", "Can't Undo", Act::UndoTo)
+}
+
+/// A sheet's Redo drop-down (#1149), the mirror of [`undo_menu`]: the redo
+/// steps' names, the next one first (at most [`UNDO_LIST_CAP`]); the `k`th
+/// redoes `k + 1` steps. With nothing to redo, one disabled `Can't Redo`.
+pub(crate) fn redo_menu(names: &[String]) -> Vec<MenuItem> {
+    history_menu(names, "redo", "Can't Redo", Act::RedoTo)
+}
+
+/// An Undo or Redo drop-down: entry `k` is `{prefix}-{k + 1}` and acts
+/// `act(k + 1)`; with no names, one disabled `none`.
+fn history_menu(
+    names: &[String],
+    prefix: &str,
+    none: &str,
+    act: fn(usize) -> Act,
+) -> Vec<MenuItem> {
     if names.is_empty() {
         return vec![MenuItem::Item(Entry::unavailable(
-            "undo-none",
-            "Can't Undo",
+            &format!("{prefix}-none"),
+            none,
         ))];
     }
     names
@@ -748,10 +777,10 @@ pub(crate) fn undo_menu(names: &[String]) -> Vec<MenuItem> {
         .enumerate()
         .map(|(k, name)| {
             MenuItem::Item(Entry::new(
-                &format!("undo-{}", k + 1),
+                &format!("{prefix}-{}", k + 1),
                 name,
                 "",
-                Act::UndoTo(k + 1),
+                act(k + 1),
                 true,
             ))
         })
@@ -1155,6 +1184,47 @@ mod tests {
             "never on a Project"
         );
         assert!(target_stands(&undo, None).is_ok());
+    }
+
+    #[test]
+    fn a_sheets_qat_redo_arrow_toggles_its_own_menu_1149() {
+        let (undo, redo) = (MenuTarget::QatUndo, MenuTarget::QatRedo);
+        assert!(split_arrow_opens(QAT_REDO_ID, None, None));
+        assert!(!split_arrow_opens(QAT_REDO_ID, Some(&redo), None));
+        assert!(!split_arrow_opens(QAT_REDO_ID, None, Some(&redo)));
+        // Each arrow opens its own list over the other's.
+        assert!(split_arrow_opens(QAT_REDO_ID, Some(&undo), None));
+        assert!(split_arrow_opens(QAT_UNDO_ID, Some(&redo), None));
+        assert_eq!(redo.to_json().to_string(), r#"{"qat":"qat-redo"}"#);
+        assert!(
+            target_stands(&redo, Some(None)).is_err(),
+            "never on a Project"
+        );
+        assert!(target_stands(&redo, None).is_ok());
+    }
+
+    #[test]
+    fn the_redo_menu_lists_the_next_step_first_and_redoes_up_to_the_pick_1149() {
+        let names: Vec<String> = ["Fill", "Typing 'abc' in A1"].map(String::from).into();
+        let items = redo_menu(&names);
+        assert_eq!(labels(&items), names);
+        let acts: Vec<usize> = items
+            .iter()
+            .map(|item| match item {
+                MenuItem::Item(Entry {
+                    act: Some(Act::RedoTo(n)),
+                    enabled: true,
+                    ..
+                }) => *n,
+                _ => panic!("every entry redoes"),
+            })
+            .collect();
+        assert_eq!(acts, [1, 2]);
+        let none = redo_menu(&[]);
+        assert_eq!(labels(&none), ["Can't Redo"]);
+        assert!(resolve_index(&none, 0).is_err(), "disabled");
+        let many: Vec<String> = (0..150).map(|i| format!("Step {i}")).collect();
+        assert_eq!(redo_menu(&many).len(), UNDO_LIST_CAP);
     }
 
     #[test]

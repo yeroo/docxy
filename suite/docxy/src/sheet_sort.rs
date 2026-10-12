@@ -13,6 +13,7 @@ use crate::dialog::catalog;
 use crate::dialog::{
     Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Reaction, Value,
 };
+use crate::sheet_step::SheetStep;
 use crate::{DocTab, Surface};
 use gridcore::edit::{
     SORT_WARNING, SortLevel, SortOn, SortOptions, sort_range, sort_region, sort_warning,
@@ -72,7 +73,7 @@ pub(crate) fn sort_view(
         Ok(n) => {
             let changed = snap.workbook().sheets[s].cells != v.pkg.workbook.sheets[s].cells;
             if changed {
-                v.push_undo_snapshot(snap);
+                v.push_undo_snapshot(snap, SheetStep::Named("Sort"));
                 // Validation circles name cells, and the rows just moved.
                 v.circles.clear();
                 // The rebuilt engine keeps the clock the old one had.

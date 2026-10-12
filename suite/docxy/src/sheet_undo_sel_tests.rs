@@ -231,7 +231,7 @@ fn a_step_over_a_multi_area_selection_selects_every_area() {
 fn a_format_undoes_to_its_range_active_cell_top_left() {
     let mut v = view();
     select(&mut v, "A1", "B3");
-    v.push_undo();
+    v.push_undo(crate::SheetStep::Named("Bold"));
     v.format_selection(&|x| x.bold = true);
     select(&mut v, "F9", "F9");
     assert!(v.undo_step());
@@ -433,7 +433,7 @@ fn undo_of_a_step_on_the_selection_it_was_taken_with_leaves_the_view() {
     // A chart move or a column width: no cells named, so nothing scrolls.
     let mut v = view();
     select(&mut v, "A1", "A1");
-    v.push_undo();
+    v.push_undo(crate::SheetStep::Named("Column Width"));
     let s = v.active;
     v.pkg.workbook.sheets[s].set_col_width(3, 30.0);
     v.col0 = 40;
