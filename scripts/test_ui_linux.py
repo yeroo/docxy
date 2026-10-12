@@ -94,7 +94,15 @@ raise SystemExit(1)
 """
 
 XPROP = """\
-print('_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x1')
+import os
+import sys
+from pathlib import Path
+
+# Like real xprop: the property exists only once a live WM has set it.
+if (Path(os.environ['FAKE_DIR']) / 'wm.pid').exists():
+    print('_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x1')
+else:
+    print('_NET_SUPPORTING_WM_CHECK:  not found.')
 """
 
 # Keeps running after SIGTERM so stop() takes its 3 s wait: the window in
