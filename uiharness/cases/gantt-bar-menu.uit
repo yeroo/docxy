@@ -9,6 +9,8 @@
 test a bar's menu is Project's and opens for that task by uid
   open copy:../fixtures/gantt-bar-uids.xml
   assert selected_name is Alpha
+  # The bar is pressed where the frame on screen drew it: draw one first.
+  shot window
   call menu-open {"target":{"bar":2}}
   assert reply.open is true
   assert reply.target.bar is 2
