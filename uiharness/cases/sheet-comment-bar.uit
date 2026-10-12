@@ -1,0 +1,108 @@
+# The sheet comment bar (#1292): Excel commits a note being edited when the
+# selection moves off it. A grid click (plain, Shift, Ctrl, double), a
+# right-click, a row/column insert or delete and Review › Previous/Next
+# Comment all leave the bar first: a changed buffer commits to the cell the
+# bar opened on (the anchor, `comment_cell`), an untouched one writes nothing,
+# and the bar closes. basic.xlsx has no notes; A1 holds Region.
+
+test leave on click commits to the anchor
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  assert comment_cell is A1
+  type Check A1
+  assert comment_edit is Check A1
+  click C5
+  assert comment_edit is null
+  assert sel is C5
+  assert comment is null
+  assert dirty is true
+  click A1
+  assert comment is Check A1
+
+test an untouched bar closes and writes nothing
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  click C5
+  assert comment_cell is null
+  assert dirty is false
+  click A1
+  assert comment is null
+
+test insert row commits to the anchor first
+  open copy:../fixtures/basic.xlsx
+  click A3
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  type On A3
+  call ribbon-click {"tab":"Home","command":"Insert Row"}
+  assert comment_cell is null
+  assert comment_edit is null
+  assert dirty is true
+  key ctrl+z
+  click A3
+  assert comment is On A3
+
+test enter still writes to the anchor
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  type Kept
+  key enter
+  assert comment_edit is null
+  assert comment is Kept
+
+# A drag's press leaves the bar: the harness drag verb runs grid_press_cell
+# and never cell_click, so the press-time leave is the only one.
+test a drag leaves the bar on the press
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  type X
+  drag B2 -> D5
+  assert comment_cell is null
+  click A1
+  assert comment is X
+
+test a right-click leaves the bar before the cell menu
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  type R
+  call menu-open {"target":{"cell":"C5"}}
+  assert comment_cell is null
+  key escape
+  click A1
+  assert comment is R
+
+test next comment leaves the bar before moving
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  type N
+  call ribbon-click {"tab":"Review","command":"Next"}
+  assert comment_cell is null
+  assert sel is A1
+  assert comment is N
+
+# Go To is a move that leaves the bar open: the selection goes to C9 while
+# the anchor stays A1, and the later click's leave still writes the note to
+# the anchor, not the live selection.
+test go to moves the selection but the note lands on the anchor
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  type G
+  call menu-open {"target":{"ribbon":["Home","Editing","Find & Select"]}}
+  call menu-click {"label":"Go To…"}
+  assert dialog is goto
+  call dialog-set {"control":"reference","value":"C9"}
+  call dialog-click {"button":"OK"}
+  assert sel is C9
+  assert comment_cell is A1
+  assert comment_edit is G
+  click C5
+  assert comment_cell is null
+  assert comment is null
+  click A1
+  assert comment is G

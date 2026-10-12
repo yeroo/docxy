@@ -1584,7 +1584,7 @@ pub(crate) fn resolve_on(
     let buttons: Vec<&'static SheetCmd> = all
         .iter()
         .copied()
-        .filter(|c| !tab.menu_owner(c).is_some())
+        .filter(|c| tab.menu_owner(c).is_none())
         .collect();
     let mut matches = tier_matches(&buttons, query, &toggled);
     if matches.is_empty() {
@@ -1635,7 +1635,7 @@ mod tests {
                 for c in tab
                     .commands()
                     .into_iter()
-                    .filter(|c| !tab.menu_owner(c).is_some())
+                    .filter(|c| tab.menu_owner(c).is_none())
                 {
                     assert!(
                         seen.insert(c.label(toggled)),

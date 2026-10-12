@@ -358,6 +358,8 @@ State keys, as the app reports them after every driving verb:
 | `flash_preview` | Flash Fill's greyed preview after the second example is typed (#666, ENT-105): `{range, values}`, the cells it covers and the values Enter writes, or null. Any other key, an edit or a selection change (mouse and Tab included) drops it for good: moving back does not revive it. Ctrl+E and Data › Flash Fill fill without one; no pattern opens the `flash-fill` message dialog (`dialog-read`, OK closes it), and the Flash Fill Options menu is `menu-open "flash-fill"` while the last fill stands |
 | `completions` | Formula AutoComplete's list under a formula being typed (#686): `{items: [labels], sel}` (`sel` the highlighted index), or null while none shows. Up/Down move `sel`, Tab inserts it, Esc closes the list and leaves the editor open; Alt+Down opens it on demand |
 | `comment_edit` | the sheet comment editor's text (`null` when closed) |
+| `comment_cell` | the cell the comment editor writes to (`null` when closed) |
+| `comment` | the selected cell's note text (`null` when it has none) |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
 | `field`, `field_text` | the focused reference field, and its buffer |
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |

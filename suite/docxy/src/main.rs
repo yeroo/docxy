@@ -4918,9 +4918,11 @@ struct Docxy {
     // buffer opens, cleared with it.
     sheet_comment_seed: Option<String>,
     // The cell (sheet index, row, col) the bar opened on: the label, Enter,
-    // Save and the exit commit all target it, so a click that moves the
-    // selection while the bar is open does not move the note. Set with the
-    // seed, cleared with it.
+    // Save and the exit commit all target it. A cell click, right-click,
+    // Previous/Next Comment or a row/column insert/delete commits a changed
+    // buffer to it and closes the bar first; the anchor still matters for
+    // moves that leave the bar open (header clicks, the Name Box, Go To) and
+    // for the exit commit. Set with the seed, cleared with it.
     sheet_comment_cell: Option<(usize, u32, u32)>,
     // Whether the data-validation list dropdown is open on the selected cell.
     sheet_dv_open: bool,
@@ -14040,6 +14042,7 @@ impl Docxy {
     /// reproduced this body instead of calling it would keep passing after this
     /// one changed.
     fn grid_press_cell(&mut self, cell: (u32, u32), ctrl: bool, _cx: &mut Context<Self>) {
+        self.sheet_comment_bar_leave();
         self.drag_ctrl = ctrl;
         if self.formula_pick_active() {
             // Anchor the reference on the pressed cell, with the buffer as it
@@ -14072,6 +14075,12 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // `grid_press_cell` leaves the bar on the press, but the pointer
+        // never reaches it on sheets with frozen rows (`cell_at` refuses
+        // them); a click on the cell still runs here, so it leaves the bar
+        // too (a no-op when the press already closed it). A drag fires no
+        // click: there the press's leave is the only one.
+        self.sheet_comment_bar_leave();
         if shift {
             self.extend_to(r, c, cx)
         } else if ctrl && !self.formula_pick_active() && !self.range_field_active() {
@@ -14122,6 +14131,7 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sheet_comment_bar_leave();
         let inside = self.active_sheet().is_some_and(|v| {
             let (r1, c1, r2, c2) = sel_range(v.sel, v.anchor);
             (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
@@ -16365,9 +16375,11 @@ impl Docxy {
     /// Open the comment entry bar for the selected cell, seeded with its
     /// existing comment text (so New Comment doubles as Edit). The bar
     /// remembers the cell it opened on — the anchor — alongside the seed:
-    /// the selection moves freely while the bar is open, and the label,
-    /// Enter and an exit commit all target the anchor, not the live
-    /// selection.
+    /// the label, Enter and an exit commit all target the anchor, not the
+    /// live selection, and a cell click, right-click, Previous/Next Comment
+    /// or a row/column insert/delete commits a changed buffer to the anchor
+    /// and closes the bar first. Selection moves that leave the bar open
+    /// (header clicks, the Name Box, Go To) still never move the note.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet() {
             let cell = (v.active, v.sel.0, v.sel.1);
@@ -16385,6 +16397,37 @@ impl Docxy {
         self.sheet_comment_edit = None;
         self.sheet_comment_seed = None;
         self.sheet_comment_cell = None;
+    }
+
+    /// Leave the comment bar as Excel leaves a note being edited when the
+    /// selection moves or rows/columns shift: a changed buffer commits to the
+    /// anchor cell (the exit commit's rules — an untouched bar, or one whose
+    /// text the anchor's note already holds, writes nothing), then the bar
+    /// closes. No-op when the bar is closed. A cell click, right-click,
+    /// Previous/Next Comment and a row/column insert/delete all leave it;
+    /// the window-close exit commit (`commit_dialog_buffers_for_exit`) is
+    /// this same leave.
+    pub(crate) fn sheet_comment_bar_leave(&mut self) {
+        let Some(text) = self.sheet_comment_edit.clone() else {
+            return;
+        };
+        // The seed and anchor open with the buffer (sheet_new_comment): both
+        // fallbacks are unreachable.
+        let seed = self
+            .sheet_comment_seed
+            .clone()
+            .unwrap_or_else(|| self.selected_comment().unwrap_or_default());
+        let cell = self
+            .sheet_comment_cell
+            .or_else(|| self.active_sheet().map(|v| (v.active, v.sel.0, v.sel.1)));
+        self.sheet_comment_bar_close();
+        let Some(cell) = cell else {
+            return;
+        };
+        let author = self.comment_author();
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            crate::close::commit_comment_buffer_for_exit(t, cell, &seed, &author, &text);
+        }
     }
 
     /// Route a keystroke into the conditional-format entry bar; Enter applies the
@@ -16547,6 +16590,7 @@ impl Docxy {
 
     /// Move the selection to the next / previous commented cell (row-major).
     fn sheet_comment_nav(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.sheet_comment_bar_leave();
         if let Some(v) = self.active_sheet_mut() {
             let mut cells: Vec<(u32, u32)> = v
                 .pkg
@@ -16758,6 +16802,7 @@ impl Docxy {
     /// Insert/delete every row or column the selection touches (Home ▸
     /// Cells), then rebuild the recalc engine so shifted formulas re-evaluate.
     fn sheet_structural(&mut self, op: StructOp, cx: &mut Context<Self>) {
+        self.sheet_comment_bar_leave();
         if self
             .active_sheet_mut()
             .is_some_and(|v| v.structural_edit(op))
@@ -25016,7 +25061,7 @@ fn redo_or_repeat(ed: &mut Editor, rec: &mut Option<RepeatRecord>) -> bool {
         Repeat::Break(kind) => ed.insert_break(kind),
         Repeat::Act(act) => apply_doc_act(ed, act),
     }
-    if !ed.undo_serial().is_some_and(|s| s > since) {
+    if ed.undo_serial().is_none_or(|s| s <= since) {
         return false;
     }
     if let Some(name) = r.what.step_name() {
@@ -25041,7 +25086,7 @@ fn note_edit(ed: &mut Editor, rec: &mut Option<RepeatRecord>, since: u64, what: 
         *rec = RepeatRecord::now(what, ed);
         return rec.is_some();
     }
-    if !ed.undo_serial().is_some_and(|s| s > since) {
+    if ed.undo_serial().is_none_or(|s| s <= since) {
         return false;
     }
     if let Some(name) = what.step_name() {

@@ -3341,6 +3341,14 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             ),
             // The sheet comment editor New Comment opens, and its text.
             ("comment_edit", str_or_null(app.sheet_comment_edit.clone())),
+            // The cell the comment editor writes to — its anchor — as an A1
+            // name (null while the bar is closed).
+            (
+                "comment_cell",
+                str_or_null(app.sheet_comment_cell.map(|(_, r, c)| a1((r, c)))),
+            ),
+            // The comment text on the selected cell, if it has one.
+            ("comment", str_or_null(app.selected_comment())),
         ]);
         // The option buttons a fill or a paste leaves (#668, #669), and
         // the Office Clipboard's count.
@@ -4169,15 +4177,15 @@ fn dispatch_verb(
             let measured = crate::ribbon_layout::measure(&probes.last);
             // A tab with no groups has nothing to wait for.
             let drawn = crate::ribbon_layout::shown_tab(&probes.last) == Some(name.as_str());
-            if !titles.is_empty()
-                && !(drawn
+            if !(titles.is_empty()
+                || (drawn
                     && crate::ribbon_layout::is_frame_of(&measured, &titles)
                     && crate::ribbon_layout::frame_matches(&probes.last, &fits)
                     && crate::ribbon_layout::drawn_matches(
                         probes.fit_last.as_ref(),
                         now.width,
                         &fits,
-                    ))
+                    )))
             {
                 cx.notify();
                 return Done::ok(crate::ribbon_layout::unsettled_json(&name));
