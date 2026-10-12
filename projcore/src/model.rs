@@ -430,8 +430,10 @@ pub struct Task {
     pub over_allocated: Option<bool>,
     // Recorded progress, kept as read so a save writes it back. docxy neither
     // computes nor reconciles it: edits leave it as read, except that
-    // `remaining_work_min`, `remaining_cost`, regular work and overtime totals
-    // move with assignment deltas as `work_min` and `cost` do. The scheduler
+    // `remaining_work_min` and `remaining_cost` move with assignment deltas
+    // and, absent, are filled from the rollup when an edit moves them, as
+    // `work_min` and `cost` are; regular work and overtime totals only move
+    // by delta, and an absent one stays absent. The scheduler
     // reads a leaf's actual dates, `Stop`/`Resume` and durations through
     // [`Task::tracked`].
     // Durations and work are whole minutes, rounded from the source.
