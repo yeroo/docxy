@@ -85,6 +85,20 @@ test ctrl+x over a range copies it and clears names in one undo step
   assert reply.tasks.0.name is A
   assert reply.tasks.1.name is B
 
+test delete over a range clears names in one undo step and keeps the tasks
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  key shift+down
+  key delete
+  call task.list {}
+  assert reply.tasks.0.name is ""
+  assert reply.tasks.1.name is ""
+  assert selection is none
+  key ctrl+z
+  call task.list {}
+  assert reply.tasks.0.name is A
+  assert reply.tasks.1.name is B
+
 test a drag selects the rectangle and the release-click keeps it
   open copy:../fixtures/project-clipboard.xml
   drag C1 -> C2

@@ -505,7 +505,14 @@ so do Shift+Home/End (the row's first and last field), Shift+Ctrl+Left/Right
 Shift+Ctrl+Home/End (both), never onto the entry row (#1087); a
 mouse drag over the cells, Shift+click, or a click on a task's ID cell (the
 whole row, like Project's row header) selects too, and any other key, click
-or command clears it. Delete still acts on the cursor's cell only. Ctrl+C copies the range as TSV — one line per shown
+or command clears it. Delete over a range clears whichever of Name,
+Predecessors and Resource Names the range covers, for every non-blank task
+in it, as one undo step — what Ctrl+X does, without the clipboard — and
+never deletes a task; a row selection made on the ID cells (a click or a
+drag there) is the row header's: Delete deletes the cursor's task as before;
+any other range, even across every column, only clears cells. With no range,
+Delete still acts on the cursor's cell only (#1260).
+Ctrl+C copies the range as TSV — one line per shown
 row, each field a cell's edit text with tabs and line breaks inside a field
 turned to spaces — and Ctrl+X copies it, then clears whichever of Name,
 Predecessors and Resource Names the range covers, as one undo step; Ctrl+V
