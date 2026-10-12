@@ -1067,27 +1067,48 @@ fn mouse_move(p: Point<Pixels>, pressed: Option<MouseButton>) -> PlatformInput {
 }
 
 fn mouse_down(p: Point<Pixels>) -> PlatformInput {
+    mouse_down_n(p, 1)
+}
+
+/// The `n`th press of a multi-click at `p`, as the platform counts it.
+fn mouse_down_n(p: Point<Pixels>, n: usize) -> PlatformInput {
     PlatformInput::MouseDown(MouseDownEvent {
         button: MouseButton::Left,
         position: p,
         modifiers: Modifiers::default(),
-        click_count: 1,
+        click_count: n,
         first_mouse: false,
     })
 }
 
 fn mouse_up(p: Point<Pixels>) -> PlatformInput {
+    mouse_up_n(p, 1)
+}
+
+fn mouse_up_n(p: Point<Pixels>, n: usize) -> PlatformInput {
     PlatformInput::MouseUp(MouseUpEvent {
         button: MouseButton::Left,
         position: p,
         modifiers: Modifiers::default(),
-        click_count: 1,
+        click_count: n,
     })
 }
 
 /// The hover-press-release a `pointer-click` dispatches at `p`.
 fn click_events(p: Point<Pixels>) -> Vec<PlatformInput> {
     vec![mouse_move(p, None), mouse_down(p), mouse_up(p)]
+}
+
+/// A double-click at `p`: the second press and release count 2, which is
+/// what a handler's `click_count` reads (#1200).
+fn double_click_events(p: Point<Pixels>) -> Vec<PlatformInput> {
+    vec![
+        mouse_move(p, None),
+        mouse_down_n(p, 1),
+        mouse_up_n(p, 1),
+        mouse_down_n(p, 2),
+        mouse_up_n(p, 2),
+    ]
 }
 
 /// The wheel notch a `pointer-wheel` dispatches at `p`: the pointer moves
@@ -3105,7 +3126,7 @@ fn rtf_bold_text(clip: &docxcore::editor::Clip) -> String {
 }
 
 /// The active spreadsheet, or the refusal every cell verb needs.
-fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
+pub(crate) fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
     app.active_sheet()
         .ok_or_else(|| "the active tab is not a spreadsheet".to_string())
 }
@@ -3918,7 +3939,19 @@ fn dispatch_verb(
         "dialog-read" => Done::ok(app.active_dialogs_mut().to_json()),
         // One field of the open dialog as it is edited and drawn: its text,
         // focus, caret and selection (#1029).
+        // A sheet input outside the dialogs (#1200), or the open dialog's
+        // field: exactly one of the two.
         "field-read" => {
+            match (args.get("input"), args.get("dialog-field")) {
+                (Some(_), Some(_)) => {
+                    return Err("field-read takes 'input' or 'dialog-field', not both".into());
+                }
+                (Some(input), None) => {
+                    let id = input.as_str().ok_or("'input' must be an input id")?;
+                    return Done::ok(crate::inputs::read(app, id)?);
+                }
+                _ => {}
+            }
             let name = arg_str(args, "dialog-field")?;
             let top = app
                 .active_dialogs()
@@ -4666,15 +4699,24 @@ fn dispatch_verb(
                 done.input = click_events(p);
                 return Ok(done);
             }
-            // A registered input outside the dialogs (#1029).
+            // A registered input outside the dialogs (#1029): where it is
+            // drawn, or a double-click on the active cell for the in-cell
+            // editor (#1200).
             if let Some(input) = args.get("input") {
                 let id = input.as_str().ok_or("'input' must be an input id")?;
-                let p = crate::inputs::point(app, id)?;
+                app.refuse_under_dialog()?;
+                let press = crate::inputs::press(app, id)?;
+                let p = press.at;
                 let mut done = Done::ok(Json::obj(vec![
                     ("x", Json::Num(f64::from(p.x))),
                     ("y", Json::Num(f64::from(p.y))),
+                    ("clicks", Json::Num(if press.double { 2.0 } else { 1.0 })),
                 ]))?;
-                done.input = click_events(p);
+                done.input = if press.double {
+                    double_click_events(p)
+                } else {
+                    click_events(p)
+                };
                 return Ok(done);
             }
             if let Some(field) = args.get("dialog-field") {
@@ -4713,9 +4755,23 @@ fn dispatch_verb(
                             "the Edit Custom Lists row is not drawn: open File (backstage) first",
                         )?
                         .center(),
+                    // The sheet Find bar's Replace and All buttons (#1200),
+                    // which no key presses.
+                    Some(at @ ("sheet-replace-button" | "sheet-replace-all-button")) => {
+                        let probe = if at == "sheet-replace-button" {
+                            "sf-rep"
+                        } else {
+                            "sf-all"
+                        };
+                        app.probes
+                            .borrow()
+                            .on_screen(probe)
+                            .ok_or("the Find bar is not drawn: open it first (Ctrl+F)")?
+                            .center()
+                    }
                     Some(other) => {
                         return Err(format!(
-                            "unknown pointer target '{other}' (fill-handle, user-name-row, custom-lists-row)"
+                            "unknown pointer target '{other}' (fill-handle, user-name-row, custom-lists-row, sheet-replace-button, sheet-replace-all-button)"
                         ));
                     }
                     None => return Err("'at' must be a string".into()),

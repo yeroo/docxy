@@ -7883,6 +7883,7 @@ fn fx_edit_row(
     sel_from: Option<usize>,
     expanded: bool,
     ent: &Entity<Docxy>,
+    probe: AnyElement,
 ) -> AnyElement {
     let cc = caret.min(text.chars().count());
     let bar = || div().w(px(1.5)).h(px(13.)).bg(hsla_u(BRAND)).flex_none();
@@ -7910,7 +7911,7 @@ fn fx_edit_row(
             }
             col = col.child(row);
         }
-        return col.into_any_element();
+        return col.relative().child(probe).into_any_element();
     }
     let mut row = h_flex().flex_1().h_full().items_center();
     let mut placed = false;
@@ -7934,7 +7935,7 @@ fn fx_edit_row(
     if !placed {
         row = row.child(bar());
     }
-    row.into_any_element()
+    row.relative().child(probe).into_any_element()
 }
 
 /// The wash an AutoComplete proposal's suffix is drawn in: selected text.
@@ -7942,6 +7943,31 @@ fn proposal_bg() -> Hsla {
     Hsla {
         a: 0.25,
         ..hsla_u(BRAND)
+    }
+}
+
+/// What the Name Box at the formula bar's left shows: the selected range, or
+/// the active cell. Drawn and read by `field-read` (#1200) alike.
+fn name_box_text(view: &SheetView) -> String {
+    use gridcore::sheet::cell_name;
+    if view.has_range() {
+        let (r0, c0, r1, c1) = view.range();
+        format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1))
+    } else {
+        cell_name(view.sel.0, view.sel.1)
+    }
+}
+
+/// What the formula bar shows for the active cell while no entry is open: a
+/// formula with its `=`, else the cell's text. Drawn and read by
+/// `field-read` (#1200) alike.
+fn fx_bar_text(view: &SheetView) -> String {
+    let (r, c) = view.sel;
+    match view.sheet().cell(r, c) {
+        Some(cell) if cell.formula.is_some() => {
+            format!("={}", cell.formula.as_deref().unwrap_or_default())
+        }
+        _ => view.cell_text(r, c),
     }
 }
 
@@ -30482,6 +30508,7 @@ impl Docxy {
     /// A combo-box display (font name/size) — inert for now.
     fn sheet_combo(
         &self,
+        id: &'static str,
         value: &'static str,
         wide: bool,
         act: SheetAct,
@@ -30496,6 +30523,9 @@ impl Docxy {
             .gap_1()
             .w(px(if wide { 108. } else { 50. }))
             .h(px(22.))
+            .relative()
+            // Where `pointer-click {"input":…}` finds it (#1200).
+            .child(probe(&self.probes, format!("sheet-combo:{id}")))
             .px_1p5()
             .rounded(px(3.))
             .border_1()
@@ -31019,10 +31049,14 @@ impl Docxy {
     fn sheet_find_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let qf = self.find_field == FindField::Query;
         let rf = self.find_field == FindField::Replace;
+        // Each field and button is probed under its own id, where the
+        // harness's `pointer-click` finds it (#1200).
         let field = |id: &'static str, val: &str, focused: bool, ph: &'static str| {
             let empty = val.is_empty();
             div()
                 .id(id)
+                .relative()
+                .child(probe(&self.probes, id))
                 .flex()
                 .items_center()
                 .min_w(px(150.))
@@ -31051,6 +31085,8 @@ impl Docxy {
         let btn = |id: &'static str, label: SharedString| {
             div()
                 .id(id)
+                .relative()
+                .child(probe(&self.probes, id))
                 .px_2()
                 .h(px(24.))
                 .flex()
@@ -31393,7 +31429,7 @@ impl Docxy {
                 self.sheet_ib(icon, c.act, sheet_ribbon::act_on(c.act, xf), pal, cx)
             }
             Shape::Glyph(glyph) => self.sheet_gb(glyph, c.act, pal, cx),
-            Shape::Combo { value, wide } => self.sheet_combo(value, wide, c.act, pal, cx),
+            Shape::Combo { value, wide } => self.sheet_combo(c.id, value, wide, c.act, pal, cx),
             Shape::NumFmt => self.sheet_numfmt_combo(pal, cx),
             Shape::Split { icon, menu } => v_flex()
                 .h_full()
@@ -37062,9 +37098,7 @@ fn sheet_el(
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     cx: &mut Context<Docxy>,
 ) -> AnyElement {
-    use gridcore::sheet::cell_name;
     let sh = view.sheet();
-    let (sr, sc) = view.sel;
     let (max_r, max_c) = view.extent();
     // Frozen columns (freeze panes, cols axis): pinned at the left, always shown.
     let (frz_r, frz_c) = sh.freeze;
@@ -37093,20 +37127,10 @@ fn sheet_el(
 
     let editing = view.editing.clone();
     // ---- formula / reference bar ----
-    let sel_ref = if view.has_range() {
-        format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1))
-    } else {
-        cell_name(sr, sc)
-    };
-    let sel_full = if let Some(buf) = &editing {
-        buf.clone()
-    } else {
-        match sh.cell(sr, sc) {
-            Some(c) if c.formula.is_some() => {
-                format!("={}", c.formula.as_deref().unwrap_or_default())
-            }
-            _ => view.cell_text(sr, sc),
-        }
+    let sel_ref = name_box_text(view);
+    let sel_full = match &editing {
+        Some(buf) => buf.clone(),
+        None => fx_bar_text(view),
     };
     let sel_content = sel_full.replace('\n', LINE_FEED_GLYPH);
     let expanded = ov.fx_expanded;
@@ -37132,7 +37156,9 @@ fn sheet_el(
                 .border_color(gridline)
                 .text_size(px(12.))
                 .text_color(hsla_u(0x333333))
-                .child(SharedString::from(sel_ref)),
+                .relative()
+                .child(SharedString::from(sel_ref))
+                .child(probe(probes, "name-box")),
         )
         .child(
             div()
@@ -37150,12 +37176,15 @@ fn sheet_el(
                 view.edit_proposal.as_ref().map(|p| p.0),
                 expanded,
                 ent,
+                probe(probes, "fx-edit"),
             )
         } else {
             // Not editing: clicking the bar starts editing the selected cell.
             let ent_fx = ent.clone();
             div()
                 .id("fx-edit")
+                .relative()
+                .child(probe(probes, "fx-edit"))
                 .flex_1()
                 .h_full()
                 .flex()

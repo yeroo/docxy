@@ -376,6 +376,7 @@ impl<'a> Runner<'a> {
             Assertion::State {
                 key,
                 negated,
+                exact,
                 value,
             } => {
                 let path = key.strip_prefix("reply.").unwrap_or(key);
@@ -400,15 +401,12 @@ impl<'a> Runner<'a> {
                     );
                 };
                 let got = scalar_text(got);
-                if value_matches(&got, value, *negated) {
+                if value_matches_as(&got, value, *negated, *exact) {
                     out
                 } else {
                     fail(
                         out,
-                        format!(
-                            "expected: {key} is {}{value}\nobserved: {key} is {got}",
-                            if *negated { "not " } else { "" }
-                        ),
+                        mismatch_text(key, *negated, *exact, value, &got, false),
                     )
                 }
             }
@@ -416,24 +414,17 @@ impl<'a> Runner<'a> {
             Assertion::Cell {
                 cell,
                 negated,
+                exact,
                 value,
             } => match self.cell_text(cell) {
                 Err(e) => err(out, e),
                 Ok(got) => {
-                    if value_matches(&got, value, *negated) {
+                    if value_matches_as(&got, value, *negated, *exact) {
                         out
                     } else {
                         fail(
                             out,
-                            format!(
-                                "expected: {cell} is {}{value}\nobserved: {cell} is {}",
-                                if *negated { "not " } else { "" },
-                                if got.is_empty() {
-                                    "empty".to_string()
-                                } else {
-                                    got
-                                }
-                            ),
+                            mismatch_text(cell, *negated, *exact, value, &got, true),
                         )
                     }
                 }
@@ -645,6 +636,37 @@ pub fn value_matches(observed: &str, expected: &str, negated: bool) -> bool {
     same != negated
 }
 
+/// What a failed `<subject> is [not] [exactly] <value>` reports. An exact
+/// one (#1200) quotes both values, so a case or a space that differs shows;
+/// otherwise a cell's empty text reads `empty`, as a case writes it.
+pub fn mismatch_text(
+    subject: &str,
+    negated: bool,
+    exact: bool,
+    expected: &str,
+    got: &str,
+    cell: bool,
+) -> String {
+    let not = if negated { "not " } else { "" };
+    if exact {
+        return format!(
+            "expected: {subject} is {not}exactly {expected:?}\nobserved: {subject} is {got:?}"
+        );
+    }
+    let got = if cell && got.is_empty() { "empty" } else { got };
+    format!("expected: {subject} is {not}{expected}\nobserved: {subject} is {got}")
+}
+
+/// [`value_matches`], or with `exact` (`is exactly`, #1200) the text as
+/// written: case, surrounding spaces and all, with no word for `null`.
+pub fn value_matches_as(observed: &str, expected: &str, negated: bool, exact: bool) -> bool {
+    if exact {
+        (observed == expected) != negated
+    } else {
+        value_matches(observed, expected, negated)
+    }
+}
+
 /// Whether the app is drawing, or is armed to draw, a fill preview.
 ///
 /// Both keys, not one. A sweep that armed the fill handle shows in `filling`
@@ -780,6 +802,44 @@ mod tests {
         assert!(!value_matches("true", "false", false));
         assert!(value_matches("true", "false", true), "negation flips it");
         assert!(!value_matches("true", "true", true));
+    }
+
+    /// #1200: `is exactly` tells a lost Shift and a dropped space apart.
+    #[test]
+    fn an_exact_value_matches_only_as_written() {
+        assert!(value_matches_as("Ab1 ", "Ab1 ", false, true));
+        assert!(!value_matches_as("ab1 ", "Ab1 ", false, true));
+        assert!(!value_matches_as("Ab1", "Ab1 ", false, true));
+        assert!(
+            value_matches_as("ab1", "Ab1", true, true),
+            "negation flips it"
+        );
+        assert!(!value_matches_as("null", "nothing", false, true));
+        assert!(
+            value_matches_as("ab1", "Ab1", false, false),
+            "not exact folds case"
+        );
+    }
+
+    /// #1200 r2: an exact mismatch says `exactly` and quotes both sides.
+    #[test]
+    fn an_exact_mismatch_quotes_both_values() {
+        assert_eq!(
+            mismatch_text("reply.value", false, true, "Ab1 ", "ab1", false),
+            "expected: reply.value is exactly \"Ab1 \"\nobserved: reply.value is \"ab1\""
+        );
+        assert_eq!(
+            mismatch_text("E1", true, true, "x", "", true),
+            "expected: E1 is not exactly \"x\"\nobserved: E1 is \"\""
+        );
+        assert_eq!(
+            mismatch_text("E1", false, false, "x", "", true),
+            "expected: E1 is x\nobserved: E1 is empty"
+        );
+        assert_eq!(
+            mismatch_text("sel", true, false, "A1", "A1", false),
+            "expected: sel is not A1\nobserved: sel is A1"
+        );
     }
 
     /// `null` has three spellings because all three turn up in a case, and a
